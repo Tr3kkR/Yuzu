@@ -502,14 +502,24 @@ enrolled:
         analytics_store_->emit(std::move(ae));
     }
 
-    // Create notification for agent enrollment
-    if (notification_store_ && notification_store_->is_open()) {
+    // Create notification for FIRST enrollment only (#3261 governance
+    // hardening, Gate 4 happy-path + unhappy-path UP-3). Unconditional on
+    // is_reauth would fire "Agent Enrolled" on every gRPC reconnect - a
+    // server restart with N connected agents floods the (unreaper'd,
+    // docs/enterprise-readiness-soc2-first-customer.md:316) notification
+    // feed with N rows for zero new enrollments. This is deliberately
+    // narrower than the webhook/offload suppression below: `agent.registered`
+    // firing on reauth IS the documented contract
+    // (docs/user-manual/rest-api.md's webhook/offload sections say "enrolls
+    // or re-enrolls"), so only the dashboard-toast side is gated here.
+    if (!is_reauth && notification_store_ && notification_store_->is_open()) {
         notification_store_->create("success", "Agent Enrolled",
                                     "Agent " + info.agent_id() + " (" + info.hostname() +
                                         ") enrolled successfully");
     }
 
-    // Fire webhook + offload for agent enrollment.
+    // Fire webhook + offload for agent enrollment (documented to fire on
+    // both first enrollment AND re-enrollment - see the comment above).
     //
     // Both sinks receive the same serialised body; we build the JSON +
     // dump it ONCE (perf-S1) outside either guard so that one sink being
@@ -530,13 +540,25 @@ enrolled:
         }
     }
 
-    // Sync agent-reported tags to persistent TagStore
+    // Sync agent-reported tags to persistent TagStore. A failed sync cannot
+    // fail the Register RPC (enrollment must not hinge on a tag write), but
+    // it is surfaced rather than swallowed — the sync rolled back
+    // atomically, so the agent keeps its PRIOR complete tag set and
+    // re-syncs on its next Register. Observability is this warn line ONLY:
+    // write-path failures have no counter (yuzu_server_tag_store_read_
+    // degrade_total is reads-only — governance sec-L1/sre-2; a wave-level
+    // write-degrade-metric decision is tracked as follow-up, deliberately
+    // not a one-store one-off here).
     if (tag_store_ && !info.scopable_tags().empty()) {
         std::unordered_map<std::string, std::string> tags;
         for (const auto& [k, v] : info.scopable_tags()) {
             tags[k] = v;
         }
-        tag_store_->sync_agent_tags(info.agent_id(), tags);
+        if (auto sync = tag_store_->sync_agent_tags(info.agent_id(), tags); !sync) {
+            spdlog::warn("Register({}): tag sync failed ({}) — prior tag set retained, agent "
+                         "re-syncs on next Register",
+                         info.agent_id(), sync.error());
+        }
     }
 
     auto session_id =

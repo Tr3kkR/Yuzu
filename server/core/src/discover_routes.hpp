@@ -83,7 +83,8 @@ DiscoveryDoc build_permissions_catalog(RbacStore& rbac_store, bool include_roles
 /// (enabled_only=true — only invokable definitions are published) to
 /// {id, name, plugin, action, description, parameter_schema, platforms,
 /// approval_mode}. `parameter_schema` is parsed into a nested JSON Schema
-/// object when the stored value is valid JSON, else emitted as `null`.
+/// object when the stored value is valid JSON AND is itself an object, else
+/// emitted as `null` (an array/string/number/bool value is nulled out too).
 /// `instruction_store` must be non-null.
 DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store);
 

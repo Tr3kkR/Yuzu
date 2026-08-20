@@ -10,6 +10,7 @@
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <expected>
@@ -558,6 +559,15 @@ TEST_CASE("route: find results — service-scoped token denied, no data leaked, 
     REQUIRE(res);
     REQUIRE(res->status == 403);
     REQUIRE_FALSE(contains(res->body, "agent-alpha"));
+    // #3167: no `.permission` (no grant admits a service-scoped caller here —
+    // naming one is a false self-remediation claim), and header/body
+    // correlation-id parity.
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body["error"].contains("permission"));
+    CHECK_FALSE(body["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(res->get_header_value("X-Correlation-Id") ==
+         body["error"]["correlation_id"].get<std::string>());
     bool denied = false;
     for (const auto& a : h.audits) {
         if (a == "inventory.software.query|denied")
@@ -664,6 +674,15 @@ TEST_CASE("route: devices list — service-scoped token denied, denial audited",
     REQUIRE(res);
     REQUIRE(res->status == 403);
     REQUIRE_FALSE(contains(res->body, "WIN-1"));
+    // #3167: no `.permission` (no grant admits a service-scoped caller here —
+    // naming one is a false self-remediation claim), and header/body
+    // correlation-id parity.
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body["error"].contains("permission"));
+    CHECK_FALSE(body["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(res->get_header_value("X-Correlation-Id") ==
+         body["error"]["correlation_id"].get<std::string>());
     bool denied = false;
     for (const auto& a : h.audits) {
         if (a == "inventory.devices|denied")

@@ -1,7 +1,7 @@
 #include "schedule_routes.hpp"
 
 #include "auth_routes.hpp"
-#include "rest_a4_envelope.hpp" // detail::error_json_a4, make_correlation_id
+#include "rest_a4_envelope_http.hpp" // detail::a4_denial (deny_service_scoped_schedule)
 #include "schedule_engine.hpp"
 #include "schedule_params_parsers.hpp"
 
@@ -16,14 +16,20 @@ bool deny_service_scoped_schedule(AuthRoutes& auth_routes, const httplib::Reques
     auto session = auth_routes.resolve_session(req);
     if (!session || session->token_scope_service.empty())
         return false;
-    const auto cid = detail::make_correlation_id();
     // Write the 403 FIRST, audit after (mirrors PreflightRoutes/DeploymentRoutes'
     // deny_service_scoped_): a throwing audit_log must not suppress the 403.
-    res.set_header("X-Correlation-Id", cid);
+    // `permission` defaults empty (see header) — a caller passing a non-empty
+    // override is now itself a bug, since no grant admits a service-scoped
+    // caller here. `a4_denial` also mints/reuses the X-Correlation-Id header
+    // (this call site used to set it unconditionally via `res.set_header`,
+    // which `emplace`s into httplib's header multimap rather than replacing
+    // in place — an upstream-minted cid wasn't overwritten so much as joined
+    // by a second entry, both of which reached the wire. Now reused
+    // instead — #3167).
     res.status = 403;
     res.set_content(
-        detail::error_json_a4(
-            403, "service-scoped tokens may not access this fleet-wide schedule surface", cid,
+        detail::a4_denial(
+            res, 403, "service-scoped tokens may not access this fleet-wide schedule surface",
             detail::A4ErrorOpts{.permission = permission}),
         "application/json");
     // target_type "schedule" (lowercase) matches every existing schedule.*
@@ -58,8 +64,7 @@ void handle_create_schedule(AuthRoutes& auth_routes, ScheduleEngine* schedule_en
     // both gates above via the ITServiceOwner role, which carries neither
     // gate's confinement, so it must be stopped before it can arm a
     // recurring, unconfined-dispatch schedule.
-    if (deny_service_scoped_schedule(auth_routes, req, res, "schedule.create", "",
-                                     "Schedule:Write"))
+    if (deny_service_scoped_schedule(auth_routes, req, res, "schedule.create", ""))
         return;
     if (!schedule_engine) {
         res.status = 503;

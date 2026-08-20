@@ -24,6 +24,7 @@
 #include "api_token_store.hpp"
 #include "engine_principal_store.hpp"   // EngineLookupStatus — #2384 MCP pin test
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
+#include "test_tag_store_pg_helper.hpp"  // TagStorePg — ADR-0050 PG port
 #include "approval_manager.hpp"
 #include "auth_routes.hpp"           // real-AuthRoutes integration test (C1)
 #include "sqlite_raii.hpp"
@@ -494,27 +495,40 @@ TEST_CASE("MCP JSON-RPC: unicode control chars escaped", "[mcp][jsonrpc]") {
 
 // ── Tag store integration (used by get_tags / search_agents_by_tag) ───────
 
-TEST_CASE("MCP TagStore: get_all_tags and agents_with_tag", "[mcp][tag]") {
-    TagStore store(":memory:");
-    REQUIRE(store.is_open());
+namespace {
+// Typed-read unwrap (ADR-0050): asserts the read is not a degrade; an absent
+// tag reads as "".
+std::string tag_val(const yuzu::server::TagStore& s, const std::string& agent,
+                    const std::string& key) {
+    auto v = s.get_tag(agent, key);
+    REQUIRE(v.has_value());
+    return v->value_or("");
+}
+} // namespace
 
-    store.set_tag("agent-1", "env", "prod", "server");
-    store.set_tag("agent-1", "role", "web", "server");
-    store.set_tag("agent-2", "env", "prod", "server");
-    store.set_tag("agent-3", "env", "staging", "server");
+TEST_CASE("MCP TagStore: get_all_tags and agents_with_tag", "[pg][mcp][tag]") {
+    yuzu::test::TagStorePg tag_bundle;
+    TagStore& store = *tag_bundle;
 
-    // get_all_tags
+    REQUIRE(store.set_tag("agent-1", "env", "prod", "server").has_value());
+    REQUIRE(store.set_tag("agent-1", "role", "web", "server").has_value());
+    REQUIRE(store.set_tag("agent-2", "env", "prod", "server").has_value());
+    REQUIRE(store.set_tag("agent-3", "env", "staging", "server").has_value());
+    // get_all_tags (typed read — ADR-0050)
     auto tags = store.get_all_tags("agent-1");
-    CHECK(tags.size() == 2);
+    REQUIRE(tags.has_value());
+    CHECK(tags->size() == 2);
 
     // agents_with_tag (key only)
     auto prod_agents = store.agents_with_tag("env");
-    CHECK(prod_agents.size() >= 2);
+    REQUIRE(prod_agents.has_value());
+    CHECK(prod_agents->size() >= 2);
 
     // agents_with_tag (key + value)
     auto staging_agents = store.agents_with_tag("env", "staging");
-    CHECK(staging_agents.size() == 1);
-    CHECK(staging_agents[0] == "agent-3");
+    REQUIRE(staging_agents.has_value());
+    CHECK(staging_agents->size() == 1);
+    CHECK((*staging_agents)[0] == "agent-3");
 }
 
 // ── Response store integration (used by query_responses) ──────────────────
@@ -692,6 +706,7 @@ struct McpTestServer {
     std::vector<std::string> audit_log; // records "action|result" pairs
     std::vector<std::string> audit_details; // records the detail string per audit call (M2)
     std::vector<std::string> audit_target_ids; // records the target_id string per audit call (#2917)
+    std::vector<std::string> audit_target_types; // records target_type per audit call (#3289 Gate 8)
     bool audit_succeeds_{true};         // false → AuditFn returns false (dropped row)
     bool audit_throws_{false};          // true → AuditFn throws (bad_alloc-class) (#1647)
     bool read_only_mode_{false};        // captured by ref by build_handler
@@ -1005,12 +1020,13 @@ private:
         // Mock audit: record calls. Returns audit_succeeds_ so a test can simulate
         // a dropped audit row (#1240: AuditFn is bool; revoke surfaces the gap).
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
-                               const std::string& result, const std::string& /*target_type*/,
+                               const std::string& result, const std::string& target_type,
                                const std::string& target_id,
                                const std::string& detail) -> bool {
             audit_log.push_back(action + "|" + result);
             audit_details.push_back(detail);
             audit_target_ids.push_back(target_id);
+            audit_target_types.push_back(target_type);
             if (audit_throws_)
                 throw std::runtime_error("audit DB write blew up"); // bad_alloc-class (#1647)
             return audit_succeeds_;
@@ -1442,8 +1458,8 @@ TEST_CASE("MCP 2383: registration validator fails closed on table drift", "[mcp]
         auto names = tool_names_for_test();
         std::vector<ToolSecurityRowOwned> rows;
         for (const auto& r : tool_security_rows_for_test())
-            rows.push_back(
-                {std::string(r.name), std::string(r.securable), std::string(r.operation)});
+            rows.push_back({std::string(r.name), std::string(r.securable),
+                            std::string(r.operation), r.service_scope});
         std::vector<std::string> writes;
         for (const auto& w : write_tool_names_for_test())
             writes.emplace_back(w);
@@ -1529,6 +1545,32 @@ TEST_CASE("MCP 2383: registration validator fails closed on table drift", "[mcp]
         CHECK(p_gamma < p_alpha);
         CHECK(p_alpha < p_beta);
     }
+
+    // (h) #2298 PR 3 §3c: a `global_safe` row must be backed by an entry in
+    // the real (seeded-EMPTY) kServiceScopeGlobalSafe policy table — every
+    // global_safe classification in a synthetic test therefore throws, since
+    // there is no override seam for the free function
+    // `authz::service_scope_global_safe` the way `require_permission`'s
+    // admit path has one on AuthRoutes (test_auth_routes.cpp's
+    // set_service_scope_global_safe_override_for_test). That asymmetry is
+    // deliberate, not a gap: the cross-check itself is one boolean AND
+    // (`global_safe && !service_scope_global_safe(...)`), and
+    // `service_scope_global_safe`'s own matching logic is exercised directly
+    // via the require_permission testonly-override tests — this pins the
+    // offense path, which is the only one reachable while the table stays
+    // empty.
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"g"}, {{"g", "Tag", "Read", ServiceScopeClassForTest::kGlobalSafe}}, {}, {}),
+        ContainsSubstring("tool 'g' is classified global_safe for (Tag, Read) but that pair is "
+                          "not in kServiceScopeGlobalSafe"));
+
+    // (i) `denied` (the default, and `confined`) never trigger the global_safe
+    // cross-check — only an explicit global_safe classification does.
+    CHECK_NOTHROW(validate_tool_registration_for_test(
+        {"d"}, {{"d", "Tag", "Read", ServiceScopeClassForTest::kDenied}}, {}, {}));
+    CHECK_NOTHROW(validate_tool_registration_for_test(
+        {"c"}, {{"c", "Tag", "Write", ServiceScopeClassForTest::kConfined}}, {"c"}, {}));
 }
 
 // #2383 hardening: the validator's RBAC catalogue mirrors cannot drift from
@@ -2720,11 +2762,14 @@ TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integrati
     // "additionalProperties":true}) for a non-exempt tool whose result shape
     // is actually stable, per docs/agentic-first-principle.md A5 item 4's
     // own text. assign_engine_role/unassign_engine_role/list_engine_roles
-    // were typed properly as a result of that review; a handful of other
-    // non-exempt tools (the discover_* family, classify_operational_
-    // question, get_incident_playbook, summarize_working_set) still ship
-    // the placeholder and pass this gate anyway - tracked as #2986, not
-    // silently ignored.
+    // were typed properly as a result of that review; #2986 (2026-08-19)
+    // closed the remaining known gap the same way - the discover_* family
+    // and classify_operational_question/get_incident_playbook/
+    // summarize_working_set now carry real typed outputSchemas too (see the
+    // A5 ledger's now-CLOSED #2986 row in docs/agentic-first-principle.md
+    // for why these turned out stable rather than still-settling). This
+    // caveat comment stays: the gate itself is still presence-only, so a
+    // FUTURE tool can still slip through it the same way these did.
     static const std::set<std::string> kOutputSchemaExempt = {};
     for (const auto& tool : tools) {
         const auto name = tool["name"].get<std::string>();
@@ -3097,6 +3142,58 @@ TEST_CASE("MCP: all five discover_* tools are advertised in tools/list",
         CHECK(names.count(n) == 1);
 }
 
+// #2986: the 8 tools this fixed (the A2 discovery family + the agentic-demo/
+// incident-response family) previously advertised the generic
+// `kObjectOutputSchema` placeholder ({"type":"object","additionalProperties":
+// true}) as their outputSchema — invisible to the #2972 completeness gate
+// above because that gate only checks PRESENCE, not typed-ness (see its own
+// comment block). This regression guard checks each schema actually carries
+// its real per-field properties now, so a future revert back to the
+// placeholder (which would still pass #2972) fails HERE instead.
+TEST_CASE("MCP: #2986 tools carry real typed outputSchema, not the kObjectOutputSchema "
+          "placeholder",
+          "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":29})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+
+    std::map<std::string, std::vector<std::string>> expected_props = {
+        {"discover_permissions", {"securable_types", "operations", "roles_omitted"}},
+        {"discover_instructions", {"count", "truncated", "instructions"}},
+        {"discover_routes", {"source", "count", "routes"}},
+        {"discover_scope_kinds", {"ground_kinds", "attribute_kinds", "operators", "combinators"}},
+        {"discover_plugins", {"limitation", "actions_enriched_with_schema", "plugins", "commands"}},
+        {"classify_operational_question",
+         {"classification", "rationale", "recommended_next_tools"}},
+        {"get_incident_playbook", {"scenario", "expected_first_tool", "steps", "safety"}},
+        {"summarize_working_set", {"narrative", "resource_links", "recommended_next_tools"}},
+    };
+
+    std::set<std::string> seen;
+    for (const auto& t : body["result"]["tools"]) {
+        const auto name = t["name"].get<std::string>();
+        auto it = expected_props.find(name);
+        if (it == expected_props.end())
+            continue;
+        seen.insert(name);
+        INFO("tool = " << name);
+        REQUIRE(t.contains("outputSchema"));
+        const auto& schema = t["outputSchema"];
+        // The placeholder never has a "properties" object with real keys —
+        // it is exactly {"type":"object","additionalProperties":true}.
+        REQUIRE(schema.contains("properties"));
+        CHECK_FALSE((schema.value("additionalProperties", false) &&
+                     schema["properties"].empty()));
+        for (const auto& prop : it->second) {
+            INFO("property = " << prop);
+            CHECK(schema["properties"].contains(prop));
+        }
+    }
+    CHECK(seen.size() == expected_props.size());
+}
+
 // ── DEX read tools (parity with /api/v1/dex/*; ar-S1) ───────────────────────
 // The audit BOUNDARY is the load-bearing contract: the catalogue rollup and the
 // per-OS scope are fleet aggregates (only the generic mcp.<tool> tool-call audit
@@ -3432,6 +3529,63 @@ TEST_CASE("MCP DEX: tools report unavailable when no Guaranteed State store is w
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
 }
 
+// #2298 PR 3 §3c: the C8 chokepoint's default-deny classification. Before
+// this, list_agents had NO per-tool deny_fleet_wide_service_scoped call and
+// no scoped_perm_fn — a service-scoped token with ITServiceOwner's
+// Infrastructure:Read reached the real handler exactly like any other
+// caller. list_agents is deliberately unclassified in kToolSecurity (2-arg
+// {securable, operation} initializer), so it defaults to
+// ServiceScopeClass::denied and is denied structurally at C8, before
+// tier_allows ever runs — proving the DEFAULT closes an unclassified tool,
+// not just the ones explicitly marked `confined`.
+TEST_CASE("MCP C8: a service-scoped token is denied by the default-deny "
+          "classification, before tier/approval (unclassified tool)",
+          "[mcp][integration][security][service_scope]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.mock_token_scope_service = "printers";
+    ts.metrics_for_test = &reg;
+    ts.start("readonly");
+
+    auto res =
+        ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":48,"params":{"name":"list_agents"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+
+    bool saw_denied = false;
+    for (const auto& a : ts.audit_log) {
+        if (a == "mcp.list_agents|denied")
+            saw_denied = true;
+        CHECK(a != "mcp.list_agents|success");
+    }
+    CHECK(saw_denied);
+
+    // sre Gate 6 (#2298 PR 3 hardening round): this C8 short-circuit returns
+    // before require_permission ever runs, so it must increment the same
+    // Phase-2-prioritization metric itself — otherwise every `denied`-class
+    // MCP tool (this one included) is structurally invisible to the signal
+    // the ADR's Consequences section names.
+    CHECK(reg.counter("yuzu_auth_service_scope_default_denied_total",
+                       {{"permission", "Infrastructure:Read"}, {"path_class", "mcp"}})
+              .value() == 1.0);
+}
+
+TEST_CASE("MCP C8: a non-service session still reaches list_agents "
+          "(regression — the default-deny classification is service-scoped "
+          "only)",
+          "[mcp][integration][security][service_scope]") {
+    McpTestServer ts;
+    ts.start("readonly"); // mock_token_scope_service left empty
+
+    auto res =
+        ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":49,"params":{"name":"list_agents"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK_FALSE(body.contains("error"));
+}
+
 // guardian-confinement-2298 hardening sweep: ITServiceOwner grants full CRUD
 // on Schedule, and ScheduleEngine::query_schedules has no owner/service
 // filter of any kind, so a bare Schedule:Read tier/perm gate alone let a
@@ -3439,7 +3593,10 @@ TEST_CASE("MCP DEX: tools report unavailable when no Guaranteed State store is w
 // The deny fires BEFORE the `!schedule_engine` null-check (mirrors the
 // ordering of every other deny_fleet_wide_service_scoped call site), so this
 // needs no real ScheduleEngine wired to prove — schedule_engine_for_test
-// stays nullptr.
+// stays nullptr. Still denied post-#2298-PR-3: `list_schedules` is
+// classified `confined` (C8 lets it reach the handler), and this per-tool
+// deny_fleet_wide_service_scoped call inside the handler is the thing that
+// actually denies it — confined is "may reach the handler", not "usable".
 TEST_CASE("MCP: list_schedules denies a service-scoped token, denial audited",
           "[mcp][integration][schedule][security]") {
     McpTestServer ts;
@@ -3864,10 +4021,15 @@ TEST_CASE("MCP DEX perf: devices — cohort_value presence semantics + limit par
 // SEC-3 sibling class (Gate 8 review): list_dex_perf_devices names an
 // agent_id per row fleet-wide, no per-agent parameter to scope against —
 // same gap as the REST sibling GET /api/v1/dex/perf/devices. Its three
-// siblings in the shared block (fleet/cohorts/cohort_diff) are genuine
-// aggregates and stay unconfined; only the device list denies.
-TEST_CASE("MCP DEX perf: list_dex_perf_devices denies a service-scoped "
-          "token, denial audited; aggregate siblings unaffected",
+// siblings in the shared block (fleet/cohorts/cohort_diff) carry no
+// per-agent identity either, but #2298 PR 3 §3c denies them too: `confined`
+// requires a real downstream confinement mechanism (ServiceScopeClass's doc
+// comment), and none of the three has one — no `deny_fleet_wide_service_scoped`
+// call, no scoped_perm_fn. Re-admission is a Phase 2 `kServiceScopeGlobalSafe`
+// entry (security-guardian sign-off, docs/adr/1006-service-scope-default-deny.md),
+// not an inferred-safe classification here.
+TEST_CASE("MCP DEX perf: list_dex_perf_devices and its unconfirmed aggregate "
+          "sibling both deny a service-scoped token, denial audited",
           "[mcp][integration][dex][perf][security]") {
     McpTestServer ts;
     ts.dex_perf_fn_for_test = mcp_perf_snapshot;
@@ -3888,14 +4050,23 @@ TEST_CASE("MCP DEX perf: list_dex_perf_devices denies a service-scoped "
     }
     CHECK(saw_denied);
 
-    // The aggregate sibling in the same shared block stays unconfined for a
-    // service-scoped token — it has no per-agent data to scope against.
+    // The aggregate sibling in the same shared block has no per-agent data,
+    // but ALSO has no downstream confinement of its own — the C8 default-deny
+    // classifies it `denied` (the unclassified default) until a Phase 2
+    // policy-table review admits it explicitly.
     auto fleet_res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":58,"params":{"name":"get_dex_perf_fleet","arguments":{}}})");
     REQUIRE(fleet_res);
-    CHECK(fleet_res->status == 200);
     auto fleet_body = nlohmann::json::parse(fleet_res->body);
-    CHECK_FALSE(fleet_body.contains("error"));
+    REQUIRE(fleet_body.contains("error"));
+    CHECK(fleet_body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    bool saw_fleet_denied = false;
+    for (const auto& a : ts.audit_log) {
+        if (a == "mcp.get_dex_perf_fleet|denied")
+            saw_fleet_denied = true;
+        CHECK(a != "mcp.get_dex_perf_fleet|success");
+    }
+    CHECK(saw_fleet_denied);
 }
 
 // Companion positive case: an ordinary (non-service-scoped) session reaches
@@ -4253,10 +4424,13 @@ TEST_CASE("MCP network: fleet stats + devices (worst-first sort + limit parity)"
 // SEC-3 sibling class (Gate 8 review): list_network_devices names an
 // agent_id + network/correlation facts per row fleet-wide, no per-agent
 // parameter to scope against — same gap as the REST sibling
-// GET /api/v1/network/devices. get_network_fleet is a genuine aggregate and
-// stays unconfined.
-TEST_CASE("MCP network: list_network_devices denies a service-scoped token, "
-          "denial audited; get_network_fleet unaffected",
+// GET /api/v1/network/devices. get_network_fleet carries no per-agent
+// identity, but #2298 PR 3 §3c denies it too — no downstream confinement
+// mechanism backs it (ServiceScopeClass's doc comment: `confined` requires
+// one). Re-admission is a Phase 2 `kServiceScopeGlobalSafe` entry, not an
+// inferred-safe classification here.
+TEST_CASE("MCP network: list_network_devices and its unconfirmed aggregate "
+          "sibling both deny a service-scoped token, denial audited",
           "[mcp][integration][network][security]") {
     McpTestServer ts;
     ts.net_perf_fn_for_test = [](const std::string&) {
@@ -4289,9 +4463,16 @@ TEST_CASE("MCP network: list_network_devices denies a service-scoped token, "
     auto fleet_res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":64,"params":{"name":"get_network_fleet","arguments":{}}})");
     REQUIRE(fleet_res);
-    CHECK(fleet_res->status == 200);
     auto fleet_body = nlohmann::json::parse(fleet_res->body);
-    CHECK_FALSE(fleet_body.contains("error"));
+    REQUIRE(fleet_body.contains("error"));
+    CHECK(fleet_body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    bool saw_fleet_denied = false;
+    for (const auto& a : ts.audit_log) {
+        if (a == "mcp.get_network_fleet|denied")
+            saw_fleet_denied = true;
+        CHECK(a != "mcp.get_network_fleet|success");
+    }
+    CHECK(saw_fleet_denied);
 }
 
 // Companion positive case: an ordinary session reaches the device list and
@@ -4393,6 +4574,13 @@ TEST_CASE("MCP Integration: tools/call unknown tool returns error", "[mcp][integ
     CHECK(body["error"]["message"].get<std::string>().find("nonexistent_tool") !=
           std::string::npos);
     CHECK(!body.contains("result"));
+
+    // #2445: client-caused (unknown tool name), audited "denied" like most
+    // other rejections on this surface — several other client-caused
+    // rejections on this surface still audit "failure" (tracked in #3176).
+    REQUIRE(ts.audit_log.size() == 1);
+    CHECK(ts.audit_log[0] == "mcp.nonexistent_tool|denied");
+    CHECK(ts.audit_details[0] == "unknown tool");
 }
 
 // ── 6. Tier denied — readonly tier blocks a read on a tool that needs stores ─
@@ -6950,6 +7138,111 @@ TEST_CASE("MCP CA: revoke_certificate full approval-ticket round-trip reaches re
     CHECK(body2["result"]["structuredContent"] == payload);
 }
 
+// #2444 item 3: yuzu_mcp_approval_burned_total{tool,reason}. revoke_certificate
+// is a deliberate pick — its "serial not found" business rejection (CaStore::
+// revoke returning false) is emitted ONLY via the domain-verb audit_fn call
+// ("ca.cert.revoked", result "denied"); the handler never calls mcp_audit for
+// this branch. That makes it a real test of the BurnGuard's design point: the
+// counter must fire from inspecting the actual JSON-RPC response, not from
+// hooking mcp_audit (which this exact branch bypasses).
+TEST_CASE("MCP 2444: yuzu_mcp_approval_burned_total fires on a post-consume handler reject, "
+          "not on schema-invalid or success",
+          "[mcp][2g][approval][metrics]") {
+    yuzu::test::TempDbFile db{std::string_view{"yuzu_test_mcp_ca_burn_"}};
+    yuzu::server::CaStore store(db.path); // deliberately empty — no cert recorded
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_burn_"}};
+    yuzu::test::SqliteHandleOwner<sqlite3> raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw.db) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.db);
+    appr.create_tables();
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.start("supervised");
+
+    const auto burned = [&]() {
+        return reg
+            .counter("yuzu_mcp_approval_burned_total",
+                     {{"tool", "revoke_certificate"}, {"reason", "handler_reject"}})
+            .value();
+    };
+    // Baseline: a fresh, request-local MetricsRegistry (not the production
+    // registry server.cpp pre-seeds) mints any never-touched series at 0.
+    CHECK(burned() == 0.0);
+
+    // 1. A schema-invalid mint attempt (serial_hex fails #2444 item 1's pattern)
+    // never mints a ticket at all (#2441) — nothing to burn, and indeed no
+    // ticket is EVER consumed for this attempt, so the guard must not fire.
+    auto bad_mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"not-hex!"}}})");
+    REQUIRE(bad_mint);
+    auto bad_mint_body = nlohmann::json::parse(bad_mint->body);
+    REQUIRE(bad_mint_body.contains("error"));
+    CHECK(bad_mint_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(appr.pending_count() == 0); // no ticket minted
+    CHECK(burned() == 0.0);
+
+    // 2. Mint a REAL ticket for a schema-valid serial that does not exist in
+    // the (empty) store.
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"BEEF"}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    CHECK(mint_body["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE_FALSE(approval_id.empty());
+    CHECK(burned() == 0.0); // mint itself never consumes — must not count yet
+
+    // 3. Approve, then recall. The ticket IS consumed (schema passed), but the
+    // handler's own store.revoke() call fails (serial not found) — the burn
+    // class #2441 left open.
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"BEEF","approval_id":")" +
+        approval_id + R"("}}})";
+    auto res = ts.call(recall);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error")); // "serial not found or already revoked"
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(burned() == 1.0);
+
+    // 4. A second, independent full success round-trip must NOT increment the
+    // burned counter — success is not a burn.
+    yuzu::server::IssuedCertRecord rec;
+    rec.serial_hex = "FACE";
+    rec.subject = "agent-burn";
+    rec.purpose = "agent";
+    rec.not_after = 4102444800;
+    REQUIRE(store.record_issued(rec));
+    auto mint2 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"FACE"}}})");
+    REQUIRE(mint2);
+    auto mint2_body = nlohmann::json::parse(mint2->body);
+    const std::string approval_id2 =
+        mint2_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id2, "reviewer-bob", "ok"));
+    std::string recall2 =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"FACE","approval_id":")" +
+        approval_id2 + R"("}}})";
+    auto res2 = ts.call(recall2);
+    REQUIRE(res2);
+    auto body2 = nlohmann::json::parse(res2->body);
+    REQUIRE(body2.contains("result")); // SUCCESS
+    CHECK(burned() == 1.0); // unchanged — the burn from step 3 stays the only one
+
+    // 5. The bounded label set: a DIFFERENT tool's series stays at its
+    // pre-seeded 0 — the burn above is attributed to revoke_certificate only.
+    CHECK(reg
+              .counter("yuzu_mcp_approval_burned_total",
+                       {{"tool", "quarantine_device"}, {"reason", "handler_reject"}})
+              .value() == 0.0);
+}
+
 // ── #2395 track D: KEK rotation MCP tools (parity with kek_routes.cpp) ────────
 // rotate_kek / rewrap_secrets / get_kek_status are the MCP twins of
 // POST/GET /api/v1/secrets/kek/*, sharing the SAME KekOps seam (kek_ops_for_test,
@@ -7773,6 +8066,46 @@ TEST_CASE("MCP operator surface: set_plugin_kill_switch actually flips PluginCon
     CHECK(ts.audit_log[4] == "plugin_config.kill_switch.set|attempted");
     CHECK(ts.audit_log[5] == "plugin_config.kill_switch.set|success");
     CHECK(ts.audit_log[6] == "mcp.set_plugin_kill_switch|success");
+}
+
+// #3265 adversarial-review K1/C2-K1: the store/dispatch-chokepoint tests in
+// test_plugin_config_store_pg.cpp prove __guard__.push_rules is
+// kill-switch-addressable, but nothing exercised this SPECIFIC operator
+// surface (the MCP tool, documented in guaranteed-state.md as an equivalent
+// way to flip the switch) with a reserved-namespace plugin name — a future
+// MCP-only regression (e.g. reverting this handler to plain
+// is_valid_identifier validation) would silently break emergency-stop access
+// to Guardian rule delivery via MCP while every other test here stayed green.
+TEST_CASE("MCP operator surface: set_plugin_kill_switch reaches the real dispatch chokepoint "
+          "for the reserved-namespace __guard__.push_rules capability, not just an ordinary "
+          "plugin.action",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_plugincfg_tpl);
+    PluginConfigPgWired w{db.dsn()};
+    McpTestServer ts;
+    ts.plugin_config_store_for_test = &w.store;
+    ts.start();
+
+    // Baseline: no row yet — the #3265 regression shape exactly (this must
+    // read allowed, not fail-closed-to-denied).
+    CHECK(w.store.action_allowed("__guard__", "push_rules"));
+
+    auto off_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"set_plugin_kill_switch",)"
+        R"("arguments":{"plugin":"__guard__","action":"push_rules","enabled":false,"reason":"incident"}}})");
+    REQUIRE(off_res);
+    auto off_payload = operator_surface_payload(off_res);
+    CHECK(off_payload["enabled"] == false);
+
+    // Proven against the real chokepoint, same as the ordinary-plugin case
+    // above — not by trusting the tool's own echoed response.
+    CHECK_FALSE(w.store.action_allowed("__guard__", "push_rules"));
+
+    auto on_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"set_plugin_kill_switch",)"
+        R"("arguments":{"plugin":"__guard__","action":"push_rules","enabled":true,"reason":"resolved"}}})");
+    REQUIRE(on_res);
+    CHECK(w.store.action_allowed("__guard__", "push_rules"));
 }
 
 TEST_CASE("MCP operator surface: mint_upload_grant writes a real UploadGrantStore row — proven "
@@ -9006,10 +9339,40 @@ nlohmann::json write_tool_structured(const std::unique_ptr<httplib::Response>& r
 }
 } // namespace
 
+TEST_CASE("MCP get_tags surfaces a degraded tag store as kInternalError, never an empty "
+          "tag list (governance qa-2)",
+          "[pg][mcp][tag][failclosed]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
+    REQUIRE(tags.set_tag("agent-1", "role", "web", "server").has_value());
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.start("readonly"); // get_tags is ReadOnly — available on every tier
+
+    // Degrade the store out from under the live handler (same mechanism as
+    // the store-level degrade suite: a QUERY failure once is_open() is true).
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(tag_bundle.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{
+            PQexec(conn.get(), "DROP TABLE tag_store.tags CASCADE")};
+        REQUIRE(r.ok());
+    }
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":300,"params":{"name":"get_tags","arguments":{"agent_id":"agent-1"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"] == "Tag store unavailable");
+}
+
 TEST_CASE("MCP set_tag operator sets the tag and fires the agent tag-push",
-          "[mcp][integration][tag]") {
-    yuzu::test::TempDbFile db{std::string_view{"mcp-tag-"}};
-    yuzu::server::TagStore store(db.path);
+          "[pg][mcp][integration][tag]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& store = *tag_bundle;
     REQUIRE(store.is_open());
 
     McpTestServer ts;
@@ -9026,7 +9389,7 @@ TEST_CASE("MCP set_tag operator sets the tag and fires the agent tag-push",
     CHECK(payload["set"] == true);
     CHECK(payload["key"] == "role");
     // The tag actually landed in the store.
-    CHECK(store.get_tag("agent-1", "role") == "web");
+    CHECK(tag_val(store, "agent-1", "role") == "web");
     // D4: the agent tag-push fired for the structured category.
     REQUIRE(ts.tag_pushes.size() == 1);
     CHECK(ts.tag_pushes[0].first == "agent-1");
@@ -9037,9 +9400,9 @@ TEST_CASE("MCP set_tag operator sets the tag and fires the agent tag-push",
     CHECK(write_tool_structured(res) == payload);
 }
 
-TEST_CASE("MCP set_tag rejects an invalid category value", "[mcp][integration][tag]") {
-    yuzu::test::TempDbFile db{std::string_view{"mcp-tag-"}};
-    yuzu::server::TagStore store(db.path);
+TEST_CASE("MCP set_tag rejects an invalid category value", "[pg][mcp][integration][tag]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& store = *tag_bundle;
 
     McpTestServer ts;
     ts.tag_store_for_test = &store;
@@ -9055,12 +9418,12 @@ TEST_CASE("MCP set_tag rejects an invalid category value", "[mcp][integration][t
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
-    CHECK(store.get_tag("agent-1", "environment").empty());
+    CHECK(tag_val(store, "agent-1", "environment").empty());
 }
 
-TEST_CASE("MCP set_tag is tier-denied on the readonly tier", "[mcp][integration][tag]") {
-    yuzu::test::TempDbFile db{std::string_view{"mcp-tag-"}};
-    yuzu::server::TagStore store(db.path);
+TEST_CASE("MCP set_tag is tier-denied on the readonly tier", "[pg][mcp][integration][tag]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& store = *tag_bundle;
     McpTestServer ts;
     ts.tag_store_for_test = &store;
     ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
@@ -9073,20 +9436,23 @@ TEST_CASE("MCP set_tag is tier-denied on the readonly tier", "[mcp][integration]
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
-    CHECK(store.get_tag("agent-1", "role").empty());
+    CHECK(tag_val(store, "agent-1", "role").empty());
 }
 
 TEST_CASE("MCP delete_tag full approval-ticket round-trip + replay is rejected",
-          "[mcp][integration][tag][approval]") {
-    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
-    yuzu::server::TagStore tags(tagdb.path);
-    tags.set_tag("agent-1", "role", "web", "server");
-    tags.set_tag("agent-1", "environment", "prod", "server");
-
+          "[pg][mcp][integration][tag][approval]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
+    REQUIRE(tags.set_tag("agent-1", "role", "web", "server").has_value());
+    REQUIRE(tags.set_tag("agent-1", "environment", "prod", "server").has_value());
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
-    sqlite3* raw = nullptr;
-    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
-    yuzu::server::ApprovalManager appr(raw);
+    // RAII handle (governance saf-F3): declared BEFORE appr so the borrowed
+    // connection outlives the manager on every exit path, including a
+    // throwing REQUIRE mid-test — the old manual sqlite3_close leaked on
+    // assert failure AND ran while appr was still alive.
+    SqliteDb raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), raw.addr()) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.get());
     appr.create_tables();
 
     McpTestServer ts;
@@ -9108,7 +9474,7 @@ TEST_CASE("MCP delete_tag full approval-ticket round-trip + replay is rejected",
     CHECK(body1["error"]["data"]["status_url"].get<std::string>() ==
           "/api/v1/approvals/" + approval_id);
     // Tag still present — not deleted.
-    CHECK(tags.get_tag("agent-1", "role") == "web");
+    CHECK(tag_val(tags, "agent-1", "role") == "web");
 
     // 2. A DIFFERENT principal approves the ticket (submitter was "test-user").
     REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
@@ -9119,7 +9485,7 @@ TEST_CASE("MCP delete_tag full approval-ticket round-trip + replay is rejected",
     auto res2 = ts.call(recall);
     auto payload2 = write_tool_payload(res2);
     CHECK(payload2["deleted"] == true);
-    CHECK(tags.get_tag("agent-1", "role").empty()); // actually deleted
+    CHECK(tag_val(tags, "agent-1", "role").empty()); // actually deleted
     // #2712: structuredContent mirrors content[0].text exactly.
     CHECK(write_tool_structured(res2) == payload2);
 
@@ -9128,12 +9494,112 @@ TEST_CASE("MCP delete_tag full approval-ticket round-trip + replay is rejected",
     auto body3 = nlohmann::json::parse(res3->body);
     REQUIRE(body3.contains("error"));
     CHECK(body3["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
-    sqlite3_close(raw);
+}
+
+// ── #3289: MCP set_tag/delete_tag must not let a service-scoped token
+// mutate its own confinement tag — same TOCTOU as the REST/legacy twins.
+
+TEST_CASE("MCP set_tag denies a service-scoped token writing the service tag (#3289)",
+          "[pg][mcp][integration][tag][security]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& store = *tag_bundle;
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.mock_token_scope_service = "printers";
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":900,"params":{"name":"set_tag","arguments":{"agent_id":"agent-1","key":"service","value":"vending"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(tag_val(store, "agent-1", "service").empty()); // no write
+    CHECK(ts.audit_log.back() == "mcp.set_tag|denied");
+    // Gate 8: pin target_type="Tag" — this is the site the #3289 Gate 4/6
+    // hardening round actually CHANGED (was "Agent"); REST v1's own pin test
+    // covers the site that didn't need fixing, not this one.
+    REQUIRE_FALSE(ts.audit_target_types.empty());
+    CHECK(ts.audit_target_types.back() == "Tag");
+}
+
+TEST_CASE("MCP set_tag admits a service-scoped token writing a NON-service key "
+          "(#3289 regression: only the service key is guarded)",
+          "[pg][mcp][integration][tag]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& store = *tag_bundle;
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.mock_token_scope_service = "printers";
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":901,"params":{"name":"set_tag","arguments":{"agent_id":"agent-1","key":"role","value":"web"}}})");
+    REQUIRE(res);
+    auto payload = write_tool_payload(res);
+    CHECK(payload["set"] == true);
+    CHECK(tag_val(store, "agent-1", "role") == "web");
+}
+
+TEST_CASE("MCP delete_tag denies a service-scoped token deleting the service "
+          "tag (#3289: tag survives the consumed-ticket recall)",
+          "[pg][mcp][integration][tag][security][approval]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
+    REQUIRE(tags.set_tag("agent-1", "service", "printers", "server").has_value());
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_3289_mcp_appr_"}};
+    SqliteDb raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), raw.addr()) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.get());
+    appr.create_tables();
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.approval_manager_for_test = &appr;
+    ts.mock_token_scope_service = "printers";
+    ts.start("operator");
+
+    // 1. Mint the ticket (approval-gating is generic — reached before the
+    // #3289 guard, same as the ordinary round-trip above).
+    auto res1 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":910,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"service"}}})");
+    auto body1 = nlohmann::json::parse(res1->body);
+    REQUIRE(body1.contains("error"));
+    CHECK(body1["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    std::string approval_id = body1["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(!approval_id.empty());
+
+    // 2. Approve it.
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    // 3. Recall with the consumed ticket → the #3289 guard denies BEFORE
+    // the actual delete, so the tag survives despite a valid, approved ticket.
+    std::string recall = R"({"jsonrpc":"2.0","method":"tools/call","id":911,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"service","approval_id":")" +
+                         approval_id + R"("}}})";
+    auto res2 = ts.call(recall);
+    auto body2 = nlohmann::json::parse(res2->body);
+    REQUIRE(body2.contains("error"));
+    CHECK(body2["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(tag_val(tags, "agent-1", "service") == "printers"); // untouched
+    CHECK(ts.audit_log.back() == "mcp.delete_tag|denied");
 }
 
 TEST_CASE("MCP approval recall refuses a ticket presented by a different principal "
           "than its submitter",
-          "[mcp][integration][tag][approval][security]") {
+          "[pg][mcp][integration][tag][approval][security]") {
     // End-to-end sibling to the store-level submitter-binding tests
     // (test_approval_manager.cpp): mints and recalls through the REAL MCP
     // handler, not directly against ApprovalManager, so this pins the
@@ -9141,14 +9607,14 @@ TEST_CASE("MCP approval recall refuses a ticket presented by a different princip
     // cannot see. The scenario this closes: operator2 read operator1's
     // approved ticket id off GET /api/approvals (Approval:Read, seeded to
     // Viewer) and also holds delete_tag's own RBAC permission.
-    yuzu::test::TempDbFile tagdb{std::string_view{"yuzu_test_2442_mcp_tag_"}};
-    yuzu::server::TagStore tags(tagdb.path);
-    tags.set_tag("agent-1", "role", "web", "server");
-
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
+    REQUIRE(tags.set_tag("agent-1", "role", "web", "server").has_value());
     yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_2442_mcp_appr_"}};
-    sqlite3* raw = nullptr;
-    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
-    yuzu::server::ApprovalManager appr(raw);
+    // RAII handle (governance saf-F3) — outlives appr on every exit path.
+    SqliteDb raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), raw.addr()) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.get());
     appr.create_tables();
 
     yuzu::MetricsRegistry reg;
@@ -9198,26 +9664,25 @@ TEST_CASE("MCP approval recall refuses a ticket presented by a different princip
     auto row = appr.get(approval_id);
     REQUIRE(row.has_value());
     CHECK(row->consumed_at == 0);
-    CHECK(tags.get_tag("agent-1", "role") == "web"); // not deleted
+    CHECK(tag_val(tags, "agent-1", "role") == "web"); // not deleted
 
     ts.mock_username = "operator1";
     auto res2 = ts.call(recall);
     auto payload2 = write_tool_payload(res2);
     CHECK(payload2["deleted"] == true);
-    CHECK(tags.get_tag("agent-1", "role").empty()); // the rightful submitter DID delete it
-    sqlite3_close(raw);
+    CHECK(tag_val(tags, "agent-1", "role").empty()); // the rightful submitter DID delete it
 }
 
 TEST_CASE("MCP delete_tag with a mismatched-args approval_id is rejected",
-          "[mcp][integration][tag][approval]") {
-    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
-    yuzu::server::TagStore tags(tagdb.path);
-    tags.set_tag("agent-1", "role", "web", "server");
-
+          "[pg][mcp][integration][tag][approval]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
+    REQUIRE(tags.set_tag("agent-1", "role", "web", "server").has_value());
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
-    sqlite3* raw = nullptr;
-    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
-    yuzu::server::ApprovalManager appr(raw);
+    // RAII handle (governance saf-F3) — outlives appr on every exit path.
+    SqliteDb raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), raw.addr()) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.get());
     appr.create_tables();
 
     McpTestServer ts;
@@ -9244,7 +9709,6 @@ TEST_CASE("MCP delete_tag with a mismatched-args approval_id is rejected",
     CHECK(body2["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
     // Nothing was consumed — the ticket is still usable for its real request.
     CHECK(appr.pending_count() == 0); // approved, not pending
-    sqlite3_close(raw);
 }
 
 // ── Gate 8 round 2: the schema-inexpressible rules must not burn a ticket ──
@@ -9368,11 +9832,11 @@ yuzu::test::PgTestTemplate mcp_quarantine_tpl{"quarantinestore", [](const std::s
 // privilege-escalation guard. Mint for delete_tag, present the (approved) id to
 // quarantine_device → denied, and the delete_tag ticket stays consumable.
 TEST_CASE("MCP approval ticket cannot be reused across tools",
-          "[mcp][integration][approval][security][pg]") {
+          "[pg][mcp][integration][approval][security]") {
     YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
-    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
-    yuzu::server::TagStore tags(tagdb.path);
-    tags.set_tag("agent-1", "role", "web", "server");
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
+    REQUIRE(tags.set_tag("agent-1", "role", "web", "server").has_value());
 
     yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
     yuzu::server::QuarantineStore quar(qpool);
@@ -9426,11 +9890,10 @@ TEST_CASE("MCP approval ticket cannot be reused across tools",
 
 TEST_CASE("MCP approval recall: a store fault at the lookup rung is a retryable "
           "store error, not a mismatch, and the ticket survives it",
-          "[mcp][integration][approval][security]") {
-    yuzu::test::TempDbFile tagdb{std::string_view{"yuzu_test_mcp_tag_"}};
-    yuzu::server::TagStore tags(tagdb.path);
-    tags.set_tag("agent-1", "role", "web", "server");
-
+          "[pg][mcp][integration][approval][security]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
+    REQUIRE(tags.set_tag("agent-1", "role", "web", "server").has_value());
     yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_"}};
     // RAII, not a trailing sqlite3_close: every REQUIRE below throws, and a
     // manual close is skipped on failure - leaking the connection and blocking
@@ -9503,12 +9966,12 @@ TEST_CASE("MCP approval recall: a store fault at the lookup rung is a retryable 
     // The ORIGINAL approved ticket, not a fresh empty one, is what consumes.
     auto recovered = ts.call(recall);
     CHECK(write_tool_payload(recovered)["deleted"] == true);
-    CHECK(tags.get_tag("agent-1", "role").empty());
+    CHECK(tag_val(tags, "agent-1", "role").empty());
 }
 
 TEST_CASE("MCP approval masked-denial counter: accumulates per refusal and stays "
           "per-tool, not a shared/latched series",
-          "[mcp][integration][approval][security][pg]") {
+          "[pg][mcp][integration][approval][security]") {
     YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
     // Governance quality-engineer finding: prior tests only ever checked the
     // masked counter at 0.0 or 1.0, which a "set to 1" mutant would survive,
@@ -9516,9 +9979,9 @@ TEST_CASE("MCP approval masked-denial counter: accumulates per refusal and stays
     // would survive. This test drives TWO refusals for the SAME tool (proving
     // accumulation, not a latch) and one refusal for a DIFFERENT tool (proving
     // the `tool` label actually separates the series rather than sharing one).
-    yuzu::test::TempDbFile tagdb{std::string_view{"yuzu_test_mcp_tag_"}};
-    yuzu::server::TagStore tags(tagdb.path);
-    tags.set_tag("agent-1", "role", "web", "server");
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
+    REQUIRE(tags.set_tag("agent-1", "role", "web", "server").has_value());
 
     yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
     yuzu::server::QuarantineStore quar(qpool);
@@ -9603,9 +10066,9 @@ TEST_CASE("MCP approval masked-denial counter: accumulates per refusal and stays
 }
 
 TEST_CASE("MCP approval recall: a genuinely absent ticket stays -32003, not -32603",
-          "[mcp][integration][approval][security]") {
-    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
-    yuzu::server::TagStore tags(tagdb.path);
+          "[pg][mcp][integration][approval][security]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
 
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
     // RAII, not a trailing sqlite3_close: every REQUIRE below throws, and a
@@ -9647,9 +10110,9 @@ TEST_CASE("MCP approval recall: a genuinely absent ticket stays -32003, not -326
 
 TEST_CASE("MCP approval recall: a store that never opened returns the permanent "
           "body through the real handler, not the transient one",
-          "[mcp][integration][approval][security]") {
-    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
-    yuzu::server::TagStore tags(tagdb.path);
+          "[pg][mcp][integration][approval][security]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
 
     yuzu::server::ApprovalManager closed(nullptr); // never opened
 
@@ -9674,11 +10137,10 @@ TEST_CASE("MCP approval recall: a store that never opened returns the permanent 
 
 TEST_CASE("MCP approval recall: a store fault at the CONSUME rung is caught too, "
           "not only at the lookup",
-          "[mcp][integration][approval][security]") {
-    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
-    yuzu::server::TagStore tags(tagdb.path);
-    tags.set_tag("agent-1", "role", "web", "server");
-
+          "[pg][mcp][integration][approval][security]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
+    REQUIRE(tags.set_tag("agent-1", "role", "web", "server").has_value());
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
     // RAII, not a trailing sqlite3_close: every REQUIRE below throws, and a
     // manual close is skipped on failure - leaking the connection and blocking
@@ -9760,7 +10222,7 @@ TEST_CASE("MCP approval recall: a store fault at the CONSUME rung is caught too,
 
 TEST_CASE("MCP approval recall: a store fault AT the origin check masks a foreign-origin "
           "ticket's kind — flagged via the masked-denial counter — until the fault clears",
-          "[mcp][integration][approval][security]") {
+          "[pg][mcp][integration][approval][security]") {
     // CH-5 (governance Gate 5 chaos design), origin-check half: fault-inject
     // the consume rung's own #2442 origin-check SELECT while redeeming a
     // NON-MCP-origin ticket, and confirm the forgery signal (masked counter +
@@ -9774,10 +10236,9 @@ TEST_CASE("MCP approval recall: a store fault AT the origin check masks a foreig
     // classifier-transient code, same as BUSY) isolates the fault to the
     // origin check specifically — see the classifier unit tests in
     // test_approval_manager.cpp for the BUSY case directly.
-    yuzu::test::TempDbFile tagdb{std::string_view{"yuzu_test_mcp_tag_"}};
-    yuzu::server::TagStore tags(tagdb.path);
-    tags.set_tag("agent-1", "role", "web", "server");
-
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
+    REQUIRE(tags.set_tag("agent-1", "role", "web", "server").has_value());
     yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_"}};
     struct Conn {
         sqlite3* h{nullptr};
@@ -9876,20 +10337,19 @@ TEST_CASE("MCP approval recall: a store fault AT the origin check masks a foreig
 
     // Untouched throughout.
     CHECK(appr.get(approval_id)->consumed_at == 0);
-    CHECK(tags.get_tag("agent-1", "role") == "web");
+    CHECK(tag_val(tags, "agent-1", "role") == "web");
 }
 
 TEST_CASE("MCP approval recall: an OPEN store failing permanently gets the escalate "
           "body, not the retry-forever one",
-          "[mcp][integration][approval][security]") {
+          "[pg][mcp][integration][approval][security]") {
     // #2786 "PR 1c": the store handle is fine, but a read against it fails in
     // a way an unchanged retry cannot clear. PRAGMA query_only is used
     // because it deterministically yields SQLITE_READONLY on the very next
     // write, without corrupting the file the test fixture needs.
-    yuzu::test::TempDbFile tagdb{std::string_view{"yuzu_test_mcp_tag_"}};
-    yuzu::server::TagStore tags(tagdb.path);
-    tags.set_tag("agent-1", "role", "web", "server");
-
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
+    REQUIRE(tags.set_tag("agent-1", "role", "web", "server").has_value());
     yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_"}};
     struct Conn {
         sqlite3* h{nullptr};
@@ -9948,11 +10408,10 @@ TEST_CASE("MCP approval recall: an OPEN store failing permanently gets the escal
 // first-calls return the SAME approval_id and leave exactly one pending row, so a
 // token cannot flood the shared pending-approval cap.
 TEST_CASE("MCP approval mint dedups identical pending requests",
-          "[mcp][integration][approval][security]") {
-    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
-    yuzu::server::TagStore tags(tagdb.path);
-    tags.set_tag("agent-1", "role", "web", "server");
-
+          "[pg][mcp][integration][approval][security]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
+    REQUIRE(tags.set_tag("agent-1", "role", "web", "server").has_value());
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
     sqlite3* raw = nullptr;
     REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
@@ -9983,9 +10442,9 @@ TEST_CASE("MCP approval mint dedups identical pending requests",
 // bounds any single principal's share of the global pending cap. The 26th
 // distinct-args mint is denied.
 TEST_CASE("MCP approval mint enforces a per-submitter pending sub-cap",
-          "[mcp][integration][approval][security]") {
-    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
-    yuzu::server::TagStore tags(tagdb.path);
+          "[pg][mcp][integration][approval][security]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
 
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
     sqlite3* raw = nullptr;
@@ -10038,15 +10497,15 @@ namespace {
 // Shared fixture bits for the gated-tool schema tests: a TagStore with one
 // tag plus a real sqlite-backed ApprovalManager (the mint/consume evidence).
 struct SchemaGateHarness {
-    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
-    yuzu::server::TagStore tags{tagdb.path};
+    yuzu::test::TagStorePg tag_bundle; // SKIPs the case when no PG DSN (ADR-0050)
+    yuzu::server::TagStore& tags = *tag_bundle;
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
     sqlite3* raw = nullptr;
     std::optional<yuzu::server::ApprovalManager> appr;
     McpTestServer ts;
 
     explicit SchemaGateHarness(const std::string& tier) {
-        tags.set_tag("agent-1", "role", "web", "server");
+        REQUIRE(tags.set_tag("agent-1", "role", "web", "server").has_value());
         REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
         appr.emplace(raw);
         appr->create_tables();
@@ -10068,7 +10527,7 @@ struct SchemaGateHarness {
 } // namespace
 
 TEST_CASE("MCP 2405: schema-invalid args cannot mint an approval ticket",
-          "[mcp][integration][approval][schema]") {
+          "[pg][mcp][integration][approval][schema]") {
     SchemaGateHarness h("operator");
 
     // delete_tag missing required `key` → -32602 with A4 data, and crucially
@@ -10090,7 +10549,7 @@ TEST_CASE("MCP 2405: schema-invalid args cannot mint an approval ticket",
 }
 
 TEST_CASE("MCP 2405: approved ticket bound to schema-invalid args is rejected and NOT consumed",
-          "[mcp][integration][approval][schema]") {
+          "[pg][mcp][integration][approval][schema]") {
     SchemaGateHarness h("operator");
 
     // Seed the pre-#2405 state directly: a ticket already minted for
@@ -10116,7 +10575,7 @@ TEST_CASE("MCP 2405: approved ticket bound to schema-invalid args is rejected an
 }
 
 TEST_CASE("MCP 2405: wrong-typed argument is rejected before the gate",
-          "[mcp][integration][approval][schema]") {
+          "[pg][mcp][integration][approval][schema]") {
     SchemaGateHarness h("supervised");
 
     auto body = h.call(
@@ -10128,7 +10587,7 @@ TEST_CASE("MCP 2405: wrong-typed argument is rejected before the gate",
 }
 
 TEST_CASE("MCP 2405: non-string approval_id is rejected on declaring and non-declaring tools",
-          "[mcp][integration][approval][schema]") {
+          "[pg][mcp][integration][approval][schema]") {
     // approval_id is control-plane: only delete_tag/quarantine_device declare
     // it in their schemas; on every other gated tool it is injected
     // undeclared. A non-string one must be rejected uniformly — stripping it
@@ -10251,6 +10710,44 @@ TEST_CASE("MCP 2405: execute_bundle step items are validated recursively",
     sqlite3_close(raw);
 }
 
+TEST_CASE("MCP 2444: execute_bundle empty step plugin/action is rejected pre-mint, not "
+          "burned post-consume (adversarial review)",
+          "[mcp][integration][approval][schema]") {
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    // Gate 3 cpp-safety (2026-08-19): the neighboring #2405 tests this was
+    // copied from manage sqlite3* by hand, which leaks on an assertion
+    // failure between open and close — RAII-wrap instead, matching the
+    // sibling #2444 burn-counter test above in this same commit.
+    yuzu::test::SqliteHandleOwner<sqlite3> raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw.db) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.db);
+    appr.create_tables();
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised");
+
+    // Before this fix, "" passed the pre-existing {"type":"string"}-only
+    // step schema, minted a ticket, and only failed post-consume in
+    // validate_bundle_steps — the exact residual burn class #2444 item 3
+    // exists to alert on. minLength:1 now rejects it at the same
+    // pre-approval gate #2405 established for the other tools.
+    auto body = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":309,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-001","steps":[{"plugin":"","action":"a"}]}}})")
+            ->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(appr.pending_count() == 0); // no ticket minted, not just none pending
+
+    auto body2 = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":310,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-001","steps":[{"plugin":"p","action":""}]}}})")
+            ->body);
+    REQUIRE(body2.contains("error"));
+    CHECK(body2["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(appr.pending_count() == 0);
+}
+
 TEST_CASE("MCP 2405: malicious argument keys never reach the envelope or audit detail",
           "[mcp][integration][approval][schema]") {
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
@@ -10279,7 +10776,7 @@ TEST_CASE("MCP 2405: malicious argument keys never reach the envelope or audit d
 }
 
 TEST_CASE("MCP 2405: non-object arguments are rejected at the root",
-          "[mcp][integration][approval][schema]") {
+          "[pg][mcp][integration][approval][schema]") {
     SchemaGateHarness h("operator");
     for (const char* args : {"42", "[]", "null", R"("s")"}) {
         auto body = h.call(
@@ -10295,7 +10792,7 @@ TEST_CASE("MCP 2405: non-object arguments are rejected at the root",
 }
 
 TEST_CASE("MCP 2405: schema failure wins before ticket lookup and pending handback",
-          "[mcp][integration][approval][schema]") {
+          "[pg][mcp][integration][approval][schema]") {
     SchemaGateHarness h("operator");
 
     // Bogus approval_id + invalid args → -32602, NOT the ticket-mismatch
@@ -10321,7 +10818,7 @@ TEST_CASE("MCP 2405: schema failure wins before ticket lookup and pending handba
 }
 
 TEST_CASE("MCP 2405: C7 read-only and tier denials still precede schema validation",
-          "[mcp][integration][approval][schema]") {
+          "[pg][mcp][integration][approval][schema]") {
     // Authz ordering is unchanged: an unauthorized caller learns nothing
     // about argument validity.
     SECTION("C7 read-only wins") {
@@ -10361,10 +10858,10 @@ TEST_CASE("MCP 2405: degraded no-approval-manager deny still precedes schema val
 }
 
 TEST_CASE("MCP 2405: schema denial carries one correlation id and a bounded counter",
-          "[mcp][integration][approval][schema]") {
+          "[pg][mcp][integration][approval][schema]") {
     yuzu::MetricsRegistry reg;
-    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
-    yuzu::server::TagStore tags(tagdb.path);
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
     sqlite3* raw = nullptr;
     REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
@@ -10723,8 +11220,12 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
          nlohmann::json::parse(R"({"principal_id":"engine:v","new_owner":"o2"})")},
         {"mint_engine_credential", nlohmann::json::parse(R"({"principal_id":"engine:v"})")},
         {"rotate_engine_credential", nlohmann::json::parse(R"({"principal_id":"engine:v"})")},
+        // #2444 item 1: token_id must satisfy the schema's ^[0-9a-f]{24}$
+        // pattern (24 lowercase hex, mirroring ApiTokenStore's
+        // sha256_hex(...).substr(0,24) token_id shape).
         {"confirm_engine_rotation",
-         nlohmann::json::parse(R"({"principal_id":"engine:v","token_id":"t1"})")},
+         nlohmann::json::parse(
+             R"({"principal_id":"engine:v","token_id":"aaaaaaaaaaaaaaaaaaaaaaaa"})")},
         {"assign_engine_role",
          nlohmann::json::parse(R"({"principal_id":"vuln-viewer","role":"Operator"})")},
         {"unassign_engine_role",
@@ -10776,6 +11277,158 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
     }
 }
 
+TEST_CASE("MCP 2444: item 1 schema tightenings reject at compile-validate on the REAL served "
+          "schemas",
+          "[mcp][2g][schema]") {
+    // Real kTools[] schemas, not synthetic ones — proves the served strings
+    // (not just the compiler's keyword logic) carry the tightened bounds.
+    using yuzu::server::mcp::compile_input_schema;
+    std::map<std::string, std::string> schemas;
+    for (const auto& row : input_schemas_for_test())
+        schemas.emplace(row.name, row.schema_json);
+
+    // revoke_certificate.serial_hex: pattern ^[0-9A-Fa-f]{1,64}$ + maxLength 64
+    // mirrors the handler's serial_ok check exactly (mcp_server.cpp).
+    {
+        auto c = compile_input_schema(schemas.at("revoke_certificate"));
+        REQUIRE(c);
+        CHECK_FALSE(c->validate(nlohmann::json::parse(R"({"serial_hex":"AB12"})")));
+        auto bad_char = c->validate(nlohmann::json::parse(R"({"serial_hex":"ZZ12"})"));
+        REQUIRE(bad_char);
+        CHECK(bad_char->path == "/serial_hex");
+        CHECK(c->validate(nlohmann::json::parse(
+            R"({"serial_hex":")" + std::string(65, 'a') + R"("})")));
+        CHECK(c->validate(nlohmann::json::parse(R"({"serial_hex":""})")));
+    }
+    // engine tools' principal_id: engine:<slug> shape, slug in [a-z0-9._-]+ —
+    // mirrors EnginePrincipalStore::create's store-side charset check. Every
+    // OTHER required field is filled in with a valid value so the "missing
+    // required property" check (which runs before per-property validation)
+    // cannot mask the principal_id pattern violation being tested here.
+    const std::map<std::string, std::string> other_required_fields = {
+        {"create_engine_principal",
+         R"("display_name":"d","owner_username":"o","justification":"j","classification":"internal")"},
+        {"get_engine_principal", ""},
+        {"revoke_engine_principal", ""},
+        {"mint_engine_credential", ""},
+        {"rotate_engine_credential", ""},
+        {"transfer_engine_principal_owner", R"("new_owner":"o2")"},
+    };
+    for (const auto& [tool, extra] : other_required_fields) {
+        INFO("tool: " << tool);
+        auto c = compile_input_schema(schemas.at(tool));
+        REQUIRE(c);
+        auto with_pid = [&](const std::string& pid) {
+            std::string body = R"({"principal_id":")" + pid + R"(")";
+            if (!extra.empty())
+                body += "," + extra;
+            body += "}";
+            return nlohmann::json::parse(body);
+        };
+        auto v = c->validate(with_pid("vuln"));
+        REQUIRE(v); // missing "engine:" prefix
+        CHECK(v->path == "/principal_id");
+        CHECK(c->validate(with_pid("engine:"))); // empty slug
+        CHECK(c->validate(with_pid("engine:Has-Upper"))); // uppercase not allowed
+        CHECK_FALSE(c->validate(with_pid("engine:vuln"))); // the valid shape passes
+    }
+    // assign_engine_role/unassign_engine_role/list_engine_roles: bare slug
+    // form (no "engine:" prefix) — same charset, different shape.
+    for (const char* tool : {"assign_engine_role", "unassign_engine_role", "list_engine_roles"}) {
+        INFO("tool: " << tool);
+        auto c = compile_input_schema(schemas.at(tool));
+        REQUIRE(c);
+        CHECK(c->validate(nlohmann::json::parse(R"({"principal_id":"engine:vuln"})")));
+        CHECK(c->validate(nlohmann::json::parse(R"({"principal_id":""})")));
+    }
+    // confirm_engine_rotation.token_id: exactly 24 lowercase hex (ApiTokenStore's
+    // sha256_hex(...).substr(0,24) shape).
+    {
+        auto c = compile_input_schema(schemas.at("confirm_engine_rotation"));
+        REQUIRE(c);
+        CHECK_FALSE(c->validate(nlohmann::json::parse(
+            R"({"principal_id":"engine:v","token_id":"aaaaaaaaaaaaaaaaaaaaaaaa"})")));
+        CHECK(c->validate(nlohmann::json::parse(
+            R"({"principal_id":"engine:v","token_id":"AAAAAAAAAAAAAAAAAAAAAAAA"})"))); // uppercase
+        CHECK(c->validate(nlohmann::json::parse(
+            R"({"principal_id":"engine:v","token_id":"aaaa"})"))); // too short
+    }
+    // quarantine_device.reason (<=1024) / whitelist (<=512, charset).
+    {
+        auto c = compile_input_schema(schemas.at("quarantine_device"));
+        REQUIRE(c);
+        CHECK_FALSE(c->validate(nlohmann::json::parse(R"({"agent_id":"a"})")));
+        CHECK(c->validate(nlohmann::json::parse(
+            R"({"agent_id":"a","reason":")" + std::string(1025, 'x') + R"("})")));
+        CHECK(c->validate(nlohmann::json::parse(
+            R"({"agent_id":"a","whitelist":")" + std::string(513, '1') + R"("})")));
+        // Charset: hex digits, '.', ':', ',', ' ' only — mirrors the handler's
+        // safe_ip per-token check (a superset, per the code comment: the
+        // token-splitting/45-char-per-token structure stays handler-side).
+        CHECK(c->validate(
+            nlohmann::json::parse(R"({"agent_id":"a","whitelist":"10.0.0.1;rm -rf /"})")));
+        CHECK_FALSE(c->validate(
+            nlohmann::json::parse(R"({"agent_id":"a","whitelist":"10.0.0.1, ::1"})")));
+    }
+}
+
+// Gate 3 quality-engineer (2026-08-19): item 2's ~30 plain `minLength:1`
+// additions had coverage only for the 5 tools item 1 also pattern-tightened
+// (above) plus execute_bundle's steps. The remaining ~27 fields had zero
+// direct empty-string-rejection assertion — the schema compiler's own tests
+// prove keyword LOGIC works, not that these specific served schemas still
+// CARRY the keyword. Data-driven, one field per distinct tool family, so a
+// silent future removal of any minLength:1 in this set fails here rather
+// than going undetected.
+TEST_CASE("MCP 2444: item 2 minLength:1 sweep — one field per tool family rejects empty "
+          "string on the REAL served schema",
+          "[mcp][2g][schema]") {
+    using yuzu::server::mcp::compile_input_schema;
+    std::map<std::string, std::string> schemas;
+    for (const auto& row : input_schemas_for_test())
+        schemas.emplace(row.name, row.schema_json);
+
+    struct Case {
+        const char* tool;
+        const char* field;
+        const char* other_required; // raw JSON fragment, no leading comma; "" if none
+    };
+    static const Case kCases[] = {
+        {"set_tag", "agent_id", R"("key":"k","value":"v")"},
+        {"delete_tag", "key", R"("agent_id":"a")"},
+        {"approve_request", "approval_id", ""},
+        {"reject_request", "approval_id", ""},
+        {"validate_scope", "expression", ""},
+        {"preview_scope_targets", "expression", ""},
+        {"get_agent_details", "agent_id", ""},
+        {"create_engine_principal", "display_name",
+         R"("principal_id":"engine:v","owner_username":"o","justification":"j","classification":"internal")"},
+        {"rotate_api_token", "token_id", ""},
+        {"confirm_api_token_rotation", "token_id", ""},
+        {"transfer_engine_principal_owner", "new_owner", R"("principal_id":"engine:v")"},
+        {"unassign_engine_role", "role", R"("principal_id":"vuln")"},
+        {"classify_operational_question", "question", ""},
+        {"open_access_review", "title", ""},
+        {"get_access_review", "campaign_id", ""},
+        {"close_access_review", "campaign_id", ""},
+        {"record_attestation", "campaign_id",
+         R"("principal_type":"user","principal_id":"p","role_name":"r","decision":"attested")"},
+    };
+    for (const auto& c : kCases) {
+        INFO("tool: " << c.tool << " field: " << c.field);
+        REQUIRE(schemas.count(c.tool) > 0);
+        auto compiled = compile_input_schema(schemas.at(c.tool));
+        REQUIRE(compiled);
+        std::string body = "{\"" + std::string(c.field) + "\":\"\"";
+        if (*c.other_required != '\0')
+            body += std::string(",") + c.other_required;
+        body += "}";
+        auto violation = compiled->validate(nlohmann::json::parse(body));
+        REQUIRE(violation); // empty string must violate minLength:1
+        CHECK(violation->path == "/" + std::string(c.field));
+    }
+}
+
 TEST_CASE("MCP 2405: real gated schemas enforce enum, bounds and maxLength at the gate",
           "[mcp][integration][approval][schema]") {
     // The pure-compiler test proves the keyword LOGIC on synthetic schemas;
@@ -10816,7 +11469,8 @@ TEST_CASE("MCP 2405: real gated schemas enforce enum, bounds and maxLength at th
         deny(
             R"({"jsonrpc":"2.0","method":"tools/call","id":321,"params":{"name":"mint_engine_credential","arguments":{"principal_id":"engine:v","ttl_days":91}}})",
             "'/ttl_days'");
-        // maxLength: confirm_engine_rotation.token_id <= 64 bytes.
+        // maxLength (#2444 item 1 tightened this to 24, alongside the new
+        // ^[0-9a-f]{24}$ pattern — a 65-char value still exceeds both).
         deny((std::string(
                   R"({"jsonrpc":"2.0","method":"tools/call","id":322,"params":{"name":"confirm_engine_rotation","arguments":{"principal_id":"engine:v","token_id":")") +
               std::string(65, 'a') + R"("}}})")
@@ -10999,7 +11653,7 @@ TEST_CASE("MCP 2405: gated additionalProperties:false without approval_id is a b
 }
 
 TEST_CASE("MCP 2405: schema failure precedes the per-submitter cap deny",
-          "[mcp][integration][approval][schema]") {
+          "[pg][mcp][integration][approval][schema]") {
     // Chaos CH-6: validation sits above the mint fork, so an AT-CAP submitter
     // with schema-invalid args gets -32602 (fix the args), not the cap's
     // kTierDenied — and the pending set is untouched either way.
@@ -11302,9 +11956,9 @@ struct ScopeGateCall {
 } // namespace
 
 TEST_CASE("MCP set_tag enforces the per-device scope gate",
-          "[mcp][integration][tag][scope]") {
-    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
-    yuzu::server::TagStore tags(tagdb.path);
+          "[pg][mcp][integration][tag][scope]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
 
     std::vector<ScopeGateCall> calls;
     McpTestServer ts;
@@ -11326,7 +11980,7 @@ TEST_CASE("MCP set_tag enforces the per-device scope gate",
     auto denied = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":260,"params":{"name":"set_tag","arguments":{"agent_id":"agent-outside","key":"role","value":"web"}}})");
     CHECK(denied->status == 403);
-    CHECK(tags.get_tag("agent-outside", "role").empty());
+    CHECK(tag_val(tags, "agent-outside", "role").empty());
     REQUIRE(calls.size() == 1);
     CHECK(calls[0].securable == "Tag");
     CHECK(calls[0].op == "Write");
@@ -11336,16 +11990,15 @@ TEST_CASE("MCP set_tag enforces the per-device scope gate",
     auto ok = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":261,"params":{"name":"set_tag","arguments":{"agent_id":"agent-inside","key":"role","value":"web"}}})");
     CHECK(write_tool_payload(ok)["set"] == true);
-    CHECK(tags.get_tag("agent-inside", "role") == "web");
+    CHECK(tag_val(tags, "agent-inside", "role") == "web");
 }
 
 TEST_CASE("MCP delete_tag enforces the per-device scope gate",
-          "[mcp][integration][tag][scope]") {
-    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
-    yuzu::server::TagStore tags(tagdb.path);
-    tags.set_tag("agent-outside", "role", "web", "server");
-    tags.set_tag("agent-inside", "role", "web", "server");
-
+          "[pg][mcp][integration][tag][scope]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
+    REQUIRE(tags.set_tag("agent-outside", "role", "web", "server").has_value());
+    REQUIRE(tags.set_tag("agent-inside", "role", "web", "server").has_value());
     std::vector<ScopeGateCall> calls;
     McpTestServer ts;
     ts.tag_store_for_test = &tags;
@@ -11365,7 +12018,7 @@ TEST_CASE("MCP delete_tag enforces the per-device scope gate",
     auto denied = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":262,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-outside","key":"role"}}})");
     CHECK(denied->status == 403);
-    CHECK(tags.get_tag("agent-outside", "role") == "web"); // still there
+    CHECK(tag_val(tags, "agent-outside", "role") == "web"); // still there
     REQUIRE(calls.size() == 1);
     CHECK(calls[0].securable == "Tag");
     CHECK(calls[0].op == "Delete");
@@ -11374,7 +12027,7 @@ TEST_CASE("MCP delete_tag enforces the per-device scope gate",
     auto ok = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":263,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-inside","key":"role"}}})");
     CHECK(write_tool_payload(ok)["deleted"] == true);
-    CHECK(tags.get_tag("agent-inside", "role").empty());
+    CHECK(tag_val(tags, "agent-inside", "role").empty());
 }
 
 TEST_CASE("MCP quarantine_device enforces the per-device scope gate",
@@ -11523,11 +12176,10 @@ TEST_CASE("MCP quarantine_device classifies store failure vs business error "
 // back as a JSON-RPC error carrying the store's rejection.
 
 TEST_CASE("MCP approve_request rejects the ticket's own submitter as reviewer",
-          "[mcp][integration][approval]") {
-    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
-    yuzu::server::TagStore tags(tagdb.path);
-    tags.set_tag("agent-1", "role", "web", "server");
-
+          "[pg][mcp][integration][approval]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
+    REQUIRE(tags.set_tag("agent-1", "role", "web", "server").has_value());
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
     sqlite3* raw = nullptr;
     REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
@@ -11605,9 +12257,9 @@ TEST_CASE("MCP approval recall executes through the real AuthRoutes::require_per
     REQUIRE(raw_token.has_value());
 
     // Real write-tool stores.
-    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
-    TagStore tags(tagdb.path);
-    tags.set_tag("agent-1", "role", "web", "server");
+    yuzu::test::TagStorePg tag_bundle;
+    TagStore& tags = *tag_bundle;
+    REQUIRE(tags.set_tag("agent-1", "role", "web", "server").has_value());
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
     sqlite3* raw_db = nullptr;
     REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw_db) == SQLITE_OK);
@@ -11669,7 +12321,7 @@ TEST_CASE("MCP approval recall executes through the real AuthRoutes::require_per
     CHECK(mint_body["error"]["code"] == mcp::kApprovalRequired);
     std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
     REQUIRE(!approval_id.empty());
-    CHECK(tags.get_tag("agent-1", "role") == "web"); // nothing executed yet
+    CHECK(tag_val(tags, "agent-1", "role") == "web"); // nothing executed yet
 
     // 2. A second principal approves.
     REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok").has_value());
@@ -11686,7 +12338,7 @@ TEST_CASE("MCP approval recall executes through the real AuthRoutes::require_per
     auto payload = nlohmann::json::parse(
         ok_body["result"]["content"][0]["text"].get<std::string>());
     CHECK(payload["deleted"] == true);
-    CHECK(tags.get_tag("agent-1", "role").empty()); // the tag is REALLY gone
+    CHECK(tag_val(tags, "agent-1", "role").empty()); // the tag is REALLY gone
 
     // 4. The consumption is attributed to the recalling principal (H3/N2).
     auto row = appr.get(approval_id);
@@ -12753,6 +13405,56 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         CHECK(bridge.record_count() == 0);  // reserved then abandoned on subscribe throw
         CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "subscribe_failed"}})
                   .value() == 1.0);
+    }
+
+    SECTION("create_execution failure degrades to the plain path, dispatch still runs, counted") {
+        // #2413: a real ExecutionTracker bound to no database. create_execution
+        // returns std::unexpected("database not open") deterministically, with
+        // no I/O and no fault-injection seam needed on the bridge side - this is
+        // the same failure class CLAUDE.md calls "a failed sqlite3_prepare".
+        yuzu::server::ExecutionTracker broken(nullptr);
+        ts.execution_tracker_for_test = &broken;
+
+        auto dispatch = [&](const std::string&, const std::string&,
+                            const std::vector<std::string>&, const std::string&,
+                            const std::unordered_map<std::string, std::string>&,
+                            const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+            return {"cmd-noexecrow", 2};
+        };
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto res = call_exec(exec_body(14, true));
+        REQUIRE(res->status == 200);
+        auto j = nlohmann::json::parse(res->body);
+        REQUIRE(j.contains("result"));  // plain success shape - degrade is silent to the caller
+        auto text = nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+        // dispatch still happened - a broken tracker must never block the
+        // operator's "stop NOW" semantic (the comment at the site this test
+        // covers).
+        CHECK(text["command_id"] == "cmd-noexecrow");
+        // create_execution never produced a row, so there is no durable fetch
+        // handle for this run - execution_id must be empty, not a fresh one
+        // silently generated some other way.
+        CHECK(text["execution_id"].get<std::string>().empty());
+        // No bridge record at all: bridge_active was cleared before the
+        // subscribe fork runs (S2/S3), so this never reaches reserve/subscribe.
+        CHECK(bridge.record_count() == 0);
+        CHECK_FALSE(bridge.phase_for(sid, nlohmann::json(14)).has_value());
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "no_execution_row"}})
+                  .value() == 1.0);
+        // Regression guard for the fix documented at the site (streamed_active +
+        // stream_lease reset before this degrade fires): no OTHER reason moved,
+        // i.e. this is not double-counted through a later fork in the same
+        // request.
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "reserve_rejected"}})
+                  .value() == 0.0);
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "reserve_threw"}})
+                  .value() == 0.0);
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "subscribe_failed"}})
+                  .value() == 0.0);
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "arm_threw"}})
+                  .value() == 0.0);
     }
 }
 

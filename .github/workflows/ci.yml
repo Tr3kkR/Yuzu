@@ -92,10 +92,11 @@ env:
   # Bumped 500M → 30G after measuring 94-97% direct-hit rate on the
   # self-hosted runners (yuzu-wsl2-linux + yuzu-local-windows). Yuzu has
   # ~700 TUs × multiple build_type/compiler matrix legs; 500M was
-  # thrashing the cache between configs. The hosted macOS leg uploads
-  # via actions/cache and gets capped at GitHub's 10 GB per-repo cache
-  # limit, so this is effectively a "self-hosted gets the full cache"
-  # bump — no risk of bloating the GitHub Actions cache budget.
+  # thrashing the cache between configs. This is a self-hosted-only budget:
+  # the macOS leg moved to the BigMags pool (#3217) and no longer uploads
+  # ccache via actions/cache, so the only job still writing to GitHub's
+  # 10 GB per-repo cache is the GHA-hosted canary, which sets its own
+  # (much smaller) ccache scope.
   CCACHE_MAXSIZE: "30G"
   CCACHE_COMPRESS: "true"
   CCACHE_COMPRESSLEVEL: "1"
@@ -271,6 +272,9 @@ jobs:
       # Exact Wee Tam pool gate matching the Windows job's runs-on labels.
       # Shulgi is an operator testbed, not a production scheduling fallback.
       weetam_pool_healthy: ${{ steps.health.outputs.weetam_pool_healthy }}
+      # Exact BigMags pool gate matching the macOS job's runs-on labels.
+      # No GitHub-hosted or Shulgi fallback can satisfy the Apple-Silicon job.
+      bigmags_pool_healthy: ${{ steps.health.outputs.bigmags_pool_healthy }}
       yuzu_wsl2_linux_healthy: ${{ steps.health.outputs.yuzu_wsl2_linux_healthy }}
       yuzu_local_windows_healthy: ${{ steps.health.outputs.yuzu_local_windows_healthy }}
       all_healthy: ${{ steps.health.outputs.all_healthy }}
@@ -352,7 +356,7 @@ jobs:
           GITHUB_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
         run: >-
           python3 scripts/ci/runner-health-check.py --mode preflight
-          --require-pool bigtam --require-pool weetam
+          --require-pool bigtam --require-pool weetam --require-pool bigmags
 
       # The checkout below is deliberately after the only step that receives
       # RUNNER_INVENTORY_TOKEN. A trusted fork may execute tests from this
@@ -1217,11 +1221,15 @@ jobs:
   macos:
     name: "macOS ${{ matrix.build_type }}"
     needs: [preflight]
-    # code_changed (issue #1978): docs-only PRs skip this required job
-    # (skipped == satisfied). No self-hosted pool gate — GitHub-hosted — so
-    # it otherwise runs on every code PR.
-    if: needs.preflight.outputs.code_changed == 'true'
-    runs-on: macos-15  # Apple Silicon, Xcode 16 / Apple Clang 16
+    # Pinned to the BigMags macOS pool: the Apple-Silicon toolchain exists only
+    # on the BigMags Mac Minis; no GitHub-hosted or Shulgi fallback can satisfy
+    # it, so gate on bigmags_pool_healthy (>=1 yuzu-bigmags-macos runner online).
+    # Fail-closed `== 'true'` (NOT `!= 'false'`) — an offline pool skips this job
+    # fast instead of queueing against an empty pool.
+    # `&& code_changed` (issue #1978): docs-only PRs skip this required job
+    # (skipped == satisfied).
+    if: needs.preflight.outputs.bigmags_pool_healthy == 'true' && needs.preflight.outputs.code_changed == 'true'
+    runs-on: [self-hosted, macOS, ARM64, yuzu-bigmags-macos]
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -1236,7 +1244,25 @@ jobs:
           repository: ${{ needs.preflight.outputs.checkout_repository }}
           ref: ${{ needs.preflight.outputs.checkout_ref }}
           submodules: recursive
+          # Deliberately NOT the linux/windows conditional clean:false — this
+          # job keeps actions/checkout's default clean:true. A fresh workspace
+          # every run is a *stronger* fork-isolation boundary; the conditional
+          # clean:false form is not adopted here because it requires the
+          # branch-switch wipe step + vcpkg sentinel companions that are not
+          # ported to macOS (cross-run incrementality is deferred). See the
+          # vcpkg-section comment below and docs/ci-architecture.md.
           persist-credentials: false
+
+      - name: Isolate trusted-fork build caches
+        if: needs.preflight.outputs.trusted_execution == 'true'
+        run: |
+          cache_root="$RUNNER_TEMP/yuzu-trusted-fork-${GITHUB_RUN_ID}-${GITHUB_JOB}"
+          mkdir -p "$cache_root/ccache"
+          echo "CCACHE_DIR=$cache_root/ccache" >> "$GITHUB_ENV"
+          # Do not read or write runner.tool_cache. The trusted review is an
+          # explicit code-execution decision, not permission to poison a
+          # cache consumed by later normal CI jobs.
+          echo "VCPKG_BINARY_SOURCES=clear" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         run: |
@@ -1257,7 +1283,11 @@ jobs:
           # cmake-method dependency lookup in the same configure. Broke macOS CI
           # fleet-wide across unrelated PRs simultaneously (e.g. #2224). Pin like
           # meson below so a future brew bump can't repeat this.
-          brew install ninja ccache pipx autoconf automake libtool
+          # pkg-config: the self-hosted BigMags box does not ship the hosted
+          # image's baked-in pkg-config, which the Configure step's
+          # PKG_CONFIG_PATH (vcpkg_installed/arm64-osx/lib/pkgconfig) assumes
+          # exists. The GitHub-hosted macos-15 image bundled it implicitly.
+          brew install ninja ccache pipx autoconf automake libtool pkg-config
           # Belt-and-suspenders: the macos-15 image pre-bakes its own cmake
           # (that's what the log line "cmake 4.4.0 is already installed and
           # up-to-date" was reporting) independent of this workflow's brew
@@ -1293,57 +1323,28 @@ jobs:
           # at meson configure time for the content embed.
           pip3 install --break-system-packages --require-hashes -r requirements-ci.txt
 
-      # Split restore + always-save: `save-always: true` is deprecated and
-      # documented as "does not work as intended" by the actions/cache
-      # maintainers (https://github.com/actions/cache/tree/main/save#always-save-cache).
-      # Pattern: restore on the way in, then a paired `actions/cache/save`
-      # at the job tail gated on `if: always() && cache-hit != 'true'`. The
-      # `always()` lets the save run even if the build step failed (which
-      # is the only behaviour `save-always` was meant to deliver); the
-      # `cache-hit != 'true'` gate skips the upload when the primary key
-      # already exists, matching the default `actions/cache` semantics.
-      - name: Restore ccache
-        id: cache-ccache-macos
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/Library/Caches/ccache
-          key: ccache-macos-${{ matrix.build_type }}-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
-          restore-keys: |
-            ccache-macos-${{ matrix.build_type }}-
-            ccache-macos-
-
+      # ccache cache lives at ~/Library/Caches/ccache on the self-hosted
+      # BigMags runner, which persists in the runner user's home between
+      # jobs by definition. No actions/cache round-trip needed — paying the
+      # GHA upload cost would just reupload data that's already on disk.
+      # Mirrors the Linux/Windows self-hosted pattern. Issue #569.
       - name: Reset ccache stats
         run: ccache -z
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+      # ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN export was previously done
+      # here for the in-process GHA cache backend that lukka/run-vcpkg used to
+      # support. We don't consume those vars anywhere on this self-hosted
+      # runner (binary cache lives in runner.tool_cache, ccache writes to the
+      # runner's HOME), so the export was dead wiring. Issue #569.
 
-      - name: Restore vcpkg installed packages
-        # Cache-key contract: vcpkg.json (ports/features) + vcpkg-configuration.json
-        # (registry/baseline) + the pinned VCPKG_COMMIT baseline (in the key
-        # prefix) catch the D3 staleness cases — a port edit or baseline bump.
-        # This leg installs the BUILTIN `arm64-osx` triplet (no
-        # `triplets/arm64-osx.cmake` overlay exists), so the repo's custom
-        # triplet descriptors (x64-linux-asan/tsan/static, x64-windows) cannot
-        # change its vcpkg output — hashing `triplets/*.cmake` only cold-starts
-        # this cache on unrelated sanitizer-triplet edits. We hash the specific
-        # `triplets/arm64-osx.cmake` instead: empty today (stable key), and
-        # auto-tracked the moment an arm64-osx overlay is ever added.
-        # Save side is the paired `actions/cache/save` step at the job tail
-        # — see comment on `Restore ccache` above for the save-always
-        # deprecation rationale.
-        id: cache-vcpkg-macos
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-arm64-osx-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'triplets/arm64-osx.cmake') }}
-          restore-keys: |
-            vcpkg-arm64-osx-${{ env.VCPKG_COMMIT }}-
-            vcpkg-arm64-osx-
+      # No actions/cache round-trip for vcpkg. This job keeps actions/checkout's
+      # default clean:true (unlike the Linux/Windows legs' PR-5 clean:false,
+      # which is safe only with their companion branch-switch wipe step + vcpkg
+      # sentinel — not yet ported here), so vcpkg_installed/ is wiped each run.
+      # That's cheap: `vcpkg install` below restores it fast from the warm
+      # binary cache in runner.tool_cache, which lives OUTSIDE the workspace and
+      # so survives the clean. ccache likewise persists in the runner's HOME.
+      # Full clean:false incrementality on macOS is a deferred follow-up.
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
@@ -1352,7 +1353,18 @@ jobs:
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
       - name: Install vcpkg packages
+        env:
+          # Persistent binary cache outside the workspace on the self-hosted
+          # BigMags runner. Without this, lukka/run-vcpkg defaults to a per-run
+          # temp dir → 0% hit rate every run → every port rebuilt from source.
+          # runner.tool_cache survives actions/checkout's default clean.
+          # A trusted fork uses a per-run temp dir instead of the shared cache
+          # so an untrusted-fork build cannot poison the pool's binary cache;
+          # trusted (non-fork) runs resolve to the shared tool_cache dir.
+          # Mirrors the Linux/Windows self-hosted pattern verbatim. Issue #569.
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-vcpkg-{1}', runner.temp, github.run_id) || format('{0}/yuzu-vcpkg-binary-cache-macos', runner.tool_cache) }}
         run: |
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           ${{ github.workspace }}/vcpkg/vcpkg install \
             --triplet arm64-osx \
             --x-manifest-root=${{ github.workspace }}
@@ -1371,7 +1383,13 @@ jobs:
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
       - name: Build
-        run: meson compile -C build-macos
+        # Bound ninja fan-out by YUZU_BUILD_JOBS (from the runner .env), like the
+        # Linux/Windows self-hosted legs. On BigMags this is load-bearing: 2 agents
+        # share 12 cores / 24 GiB, so an unbounded ninja (all cores per agent) can
+        # oversubscribe memory when both build at once. Guarded default keeps it
+        # bounded even if the var is unset (unlike the bare Linux/Windows form,
+        # because macOS is the only pool where uncontrolled -j risks OOM here).
+        run: meson compile -C build-macos -j "${YUZU_BUILD_JOBS:-6}"
 
       # Link-provenance assertion (#1331 review HIGH-2): hosted macOS images can
       # carry a system PostgreSQL, so prove the canary linked vcpkg's static
@@ -1430,10 +1448,10 @@ jobs:
           # Informational only — never fail the job from here (set +e).
           set +e
           ccache -s
-          # Mirror the Linux/Windows job-summary (P3 observability). macOS is a
-          # GHA-hosted ephemeral runner with an actions/cache-backed ccache, so
-          # a cold restore is expected on a cache-key miss — no cold-cache
-          # ::warning:: here (that signal is self-hosted-only).
+          # Mirror the Linux/Windows job-summary (P3 observability). macOS now
+          # runs on the self-hosted BigMags pool with a persistent on-disk
+          # ccache in the runner user's HOME (~/Library/Caches/ccache), so a
+          # warm cache is the steady-state expectation across runs.
           s="$(ccache --print-stats 2>/dev/null)"
           get(){ printf '%s\n' "$s" | awk -F'\t' -v k="$1" '$1==k{v=$2} END{print v+0}'; }
           hits=$(( $(get direct_cache_hit) + $(get preprocessed_cache_hit) ))
@@ -1452,24 +1470,13 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit 0
 
-      # Paired saves for the two restore-only steps above. `if: always()`
-      # is the documented replacement for `save-always: true` and lets
-      # the cache populate even when Build/Test failed. The
-      # `cache-hit != 'true'` gate skips the upload when the primary key
-      # already matched on restore (no new content to save).
-      - name: Save ccache
-        if: always() && steps.cache-ccache-macos.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/Library/Caches/ccache
-          key: ${{ steps.cache-ccache-macos.outputs.cache-primary-key }}
-
-      - name: Save vcpkg installed packages
-        if: always() && steps.cache-vcpkg-macos.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/vcpkg_installed
-          key: ${{ steps.cache-vcpkg-macos.outputs.cache-primary-key }}
+      - name: Purge trusted-fork workspace
+        if: ${{ always() && needs.preflight.outputs.trusted_execution == 'true' }}
+        run: |
+          # Keep this narrow to the Actions checkout. runner.tool_cache and
+          # the runner-local telemetry DB are deliberately outside this path.
+          git reset --hard
+          git clean -ffdx
 
   # ── Docs-only required-check stubs (issue #1978) ──────────────────────
   # The linux/windows/macos required contexts are MATRIX-expanded names
@@ -1523,19 +1530,30 @@ jobs:
   # regressions are caught against a vanilla environment BEFORE the
   # change lands on main and becomes the next CI run for everyone.
   #
-  # Cache-warming rationale for the push-to-main trigger: GHA cache scope
-  # is branch-isolated. PR runs save to `refs/pull/<N>/merge`, which
-  # sibling PRs cannot read, so without a push-to-main run the canary's
-  # vcpkg + ccache caches never land on `refs/heads/main` and every PR
-  # cold-starts (~25 min from-source vcpkg). Running on push to main
-  # populates the default-branch cache scope, which every subsequent PR
-  # inherits as its restore fallback (~10 s warm restore). Limited to
-  # main only — dev pushes are pre-merge churn, the warm canonical state
-  # we want operators to inherit is what landed on main.
+  # Cache-warming rationale: GHA cache scope is branch-isolated. A PR job
+  # can read caches from (a) its own ref, (b) the repo's default branch,
+  # and (c) the PR's BASE branch — never a sibling PR's. PR runs save to
+  # `refs/pull/<N>/merge`, so without a push-triggered run the canary's
+  # vcpkg + ccache caches land in no scope any other PR can read, and
+  # every PR cold-starts (~65-70 min from-source vcpkg).
+  #
+  # Warmed on BOTH main and dev, and dev is the one that does the work:
+  # every PR bases on dev, so a dev-scoped entry is restorable by all of
+  # them. main-only warming was the original design and it silently
+  # stopped working — main has had no ci.yml run since 2026-07-11, so the
+  # warm scope was simply empty and each PR saved its own private ~843 MB
+  # copy of a byte-identical tree (six such duplicates were live at once,
+  # against a 10 GB repo cache cap).
+  #
+  # Known gap: the canary cache key hashes vcpkg.json /
+  # vcpkg-configuration.json / triplets/x64-linux.cmake, but the
+  # `ci-infrastructure` path class does not match those files. A manifest
+  # or baseline bump merged to dev therefore does not re-warm the new key
+  # until some unrelated CI-infra push lands.
   detect-ci-changes:
     name: "Detect CI infrastructure changes"
     needs: [trusted_inputs]
-    if: github.event_name == 'pull_request' || inputs.head_sha != '' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: github.event_name == 'pull_request' || inputs.head_sha != '' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'))
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     outputs:
@@ -1551,18 +1569,52 @@ jobs:
         env:
           TRUSTED_BASE_SHA: ${{ needs.trusted_inputs.outputs.base_sha }}
           TRUSTED_HEAD_SHA: ${{ inputs.head_sha }}
+          # Read via the environment rather than interpolated into the shell
+          # body: `github.event.*` expansion inside `run:` is what zizmor's
+          # template-injection audit flags.
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
-          # PRs diff against the base ref; pushes diff against the SHA
-          # before the push (`github.event.before`). For push-to-main
-          # that's the previous main tip, which is exactly the boundary
-          # we want — anything in this push that touched CI infra needs
-          # to (re)warm the canary cache scope.
+          # Two different questions, so two different diffs.
+          #
+          # PUSH: "what did this push move" — two-dot against
+          # `github.event.before`, the previous tip. That boundary is exactly
+          # right, and a merge-base there would be wrong.
+          #
+          # PULL REQUEST: "what does this PR change" — three-dot from the fork
+          # point. `base.sha` is a LIVE branch tip, so two-dot additionally
+          # reports everything that landed on the base branch since the fork,
+          # and a PR that has merely fallen behind a dev which touched CI infra
+          # is misclassified (PR #3158 burned 1h30m of canary this way).
+          #
+          # The head object matters as much as the mode. This job checks out
+          # `refs/pull/<N>/merge` — the synthetic MERGE COMMIT — and `base.sha`
+          # is always an ancestor of it, so `merge-base(base.sha, HEAD)` is
+          # `base.sha` and three-dot collapses straight back to two-dot. Pass
+          # the PR HEAD explicitly or this whole branch is an inert no-op that
+          # still passes every test.
+          diff_mode=--git-diff-merge-base
+          diff_head="$PR_HEAD_SHA"
           if [[ -n "$TRUSTED_HEAD_SHA" ]]; then
+            # Trusted-fork review: the checkout IS the real head, and the base
+            # comes from the live PR API rather than the event payload.
             base_sha="$TRUSTED_BASE_SHA"
-          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            base_sha="${{ github.event.pull_request.base.sha }}"
+            diff_head="$TRUSTED_HEAD_SHA"
+          elif [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            base_sha="$PR_BASE_SHA"
           else
-            base_sha="${{ github.event.before }}"
+            base_sha="$PUSH_BEFORE_SHA"
+            diff_mode=--git-diff
+            diff_head=HEAD
+          fi
+          # An empty head must NOT reach the classifier: its `${3:-HEAD}`
+          # default would substitute HEAD — the merge commit — reinstating the
+          # exact no-op this branch exists to avoid, silently. Fail closed.
+          if [[ -z "$diff_head" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "No head SHA resolved for '$GITHUB_EVENT_NAME' — canary will run (fail-closed)."
+            exit 0
           fi
           # Defensive: a brand-new branch push has before = 40 zeros.
           # main is protected and never created from scratch in normal
@@ -1575,8 +1627,14 @@ jobs:
           # The shared classifier owns both diff establishment and the named
           # CI-infrastructure path class. It reports true on a bad/missing base
           # so uncertainty runs the clean-host canary instead of skipping it.
+          # Also to the step summary: detect-ci-changes is NOT a required check,
+          # so a wrongly-skipped canary renders identically to a correctly-skipped
+          # one in the Checks tab and is otherwise only diagnosable by log-diving
+          # before retention expires.
+          echo "Classifying with $diff_mode base=$base_sha head=$diff_head"
+          echo "canary classification: mode=\`$diff_mode\` base=\`$base_sha\` head=\`$diff_head\`" >> "$GITHUB_STEP_SUMMARY"
           if ! changed=$(bash scripts/ci/detect-code-change.sh \
-                --class ci-infrastructure --git-diff "$base_sha" HEAD); then
+                --class ci-infrastructure "$diff_mode" "$base_sha" "$diff_head"); then
             changed=true
             echo "Classifier errored — canary will run (fail-closed)."
           fi
@@ -1622,6 +1680,23 @@ jobs:
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+      # DELIBERATE NON-ADOPTION — do not "fix" this by pointing
+      # VCPKG_DEFAULT_BINARY_CACHE at a persisted path and caching that
+      # instead. It was measured and is worse here (#3229):
+      #   * this tree caches at 843 MB (5.2 GB on disk, compresses well);
+      #   * vcpkg's binary cache is ~1.8 GB across ~43 ALREADY-ZIPPED port
+      #     archives, so actions/cache compression buys ~nothing.
+      # That is ~2x the footprint for the same end state plus an extra
+      # 1-2 min of unpack, against a 10 GB per-repo cap we have already hit.
+      # The granularity it would buy (a manifest change rebuilding only the
+      # changed ports) is largely delivered already by the restore-keys prefix
+      # fallback below. vcpkg's native `x-gha` backend was considered too:
+      # same aggregate footprint, plus cache-service-v2 fragility against the
+      # pinned tool. Every other VCPKG_DEFAULT_BINARY_CACHE in this file is on
+      # a SELF-HOSTED runner where the dir persists for free — that pattern
+      # does not transplant to this fresh-disk GHA-hosted job, and its
+      # `needs.preflight.outputs.trusted_execution` ternary would silently
+      # evaluate empty here (this job's `needs:` has no `preflight`).
       - name: Restore vcpkg installed packages (canary)
         # Key tracks only what changes the canary's vcpkg output: the
         # manifest (vcpkg.json), the registry/baseline config
@@ -1660,7 +1735,20 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ccache
-          key: ccache-canary-x64-linux-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
+          # Scoped to the repo's own compiled source roots, NOT a bare `**/*.cpp`
+          # glob. `hashFiles` globs the whole workspace and does not honour
+          # .gitignore, and the vcpkg restore step ABOVE has already materialised
+          # thousands of vendored headers into vcpkg_installed/ by this point — so
+          # a bare glob hashes those too, and the key then differs between a
+          # vcpkg-cold and a vcpkg-warm run. Measured 2026-08-18: 8 distinct keys
+          # across 10 live entries, PR #3293 alone holding three at ~870 MB, and
+          # the dev-warmed entry sitting at a key no vcpkg-warm PR ever recomputes
+          # — i.e. the ccache half of the shared-scope warming was inert (#3270).
+          # These roots are every directory meson compiles (tools/ arrives via
+          # meson.build's `subdir('tools/capmatrix-gen')`). Missing a root would
+          # cost cache efficiency only, never correctness: ccache hashes the real
+          # preprocessed input, so a stale key cannot yield a wrong object.
+          key: ccache-canary-x64-linux-${{ hashFiles('agents/**/*.cpp', 'agents/**/*.hpp', 'agents/**/*.h', 'server/**/*.cpp', 'server/**/*.hpp', 'server/**/*.h', 'sdk/**/*.cpp', 'sdk/**/*.hpp', 'sdk/**/*.h', 'common/**/*.cpp', 'common/**/*.hpp', 'common/**/*.h', 'tests/**/*.cpp', 'tests/**/*.hpp', 'tests/**/*.h', 'tools/**/*.cpp', 'tools/**/*.hpp', 'tools/**/*.h') }}
           restore-keys: |
             ccache-canary-x64-linux-
 
@@ -1679,6 +1767,7 @@ jobs:
         run: bash scripts/ci/vcpkg-triplet-sentinel.sh x64-linux
 
       - name: Install vcpkg packages
+        id: vcpkg-install-canary
         run: |
           ${{ github.workspace }}/vcpkg/vcpkg install \
             --triplet x64-linux \
@@ -1697,6 +1786,7 @@ jobs:
             -Dbuild_tests=true
 
       - name: Build
+        id: build-canary
         run: meson compile -C build-linux
 
       # Link-provenance assertion (#1331 review HIGH-2) — same check as the
@@ -1724,15 +1814,47 @@ jobs:
       # the cache populate even when Build failed. The
       # `cache-hit != 'true'` gate skips the upload when the primary key
       # already matched on restore (no new content to save).
+      # `vcpkg_installed` is a COHERENT-ARTIFACT cache: a half-populated tree
+      # restores as though it were complete and poisons the key, and GHA cache
+      # keys are immutable so nothing can overwrite it afterwards. A canary
+      # cancelled mid-install did exactly that (run 32052590410 — cancelled at
+      # 259s, save still fired, wrote a 25 MB tree); every later run then got an
+      # exact hit, rebuilt all 12 heavy ports anyway, and skipped its own save.
+      # So gate on the INSTALL step's outcome, not the job's.
+      #
+      # The leading `always()` is load-bearing, not stylistic: an `if:` with no
+      # status function has an implicit `success()` ANDed on (CLAUDE.md standing
+      # invariant), which would also skip the save when only the *Build* step
+      # failed — even though the dependency tree is complete and worth keeping.
+      # Contrast the ccache save below, which stays on bare `always()` because a
+      # partial ccache is simply a smaller ccache.
       - name: Save vcpkg installed packages (canary)
-        if: always() && steps.cache-vcpkg-canary.outputs.cache-hit != 'true'
+        if: always() && steps.vcpkg-install-canary.outcome == 'success' && steps.cache-vcpkg-canary.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: ${{ steps.cache-vcpkg-canary.outputs.cache-primary-key }}
 
+      # ccache is ADDITIVE — every object in it is independently valid — so unlike
+      # the vcpkg tree above, a partial save is not a correctness problem. But key
+      # OCCUPANCY bites both classes: `cache-hit != 'true'` means a thin entry,
+      # once written, is exact-hit by every later same-source run, which then skips
+      # its own save. The key is immutable, so the cache stays thin until the
+      # sources change. Under `cancel-in-progress` on PRs, cancelled runs are the
+      # routine producer of thin entries, and #3270 makes the key stable enough for
+      # that to actually bite (#3269).
+      #
+      # So: save when Build RAN, pass or fail — a failed build still produced
+      # objects worth keeping, which is why this is not `== 'success'`. Skip when
+      # Build was cancelled or never started. The cost is that a run cancelled
+      # after a long compile loses its cache; that is small, because the push which
+      # superseded it has different sources and therefore a different key, so it
+      # could only ever have reached that entry by prefix fallback anyway.
       - name: Save ccache (canary)
-        if: always() && steps.cache-ccache-canary.outputs.cache-hit != 'true'
+        if: >-
+          always()
+          && (steps.build-canary.outcome == 'success' || steps.build-canary.outcome == 'failure')
+          && steps.cache-ccache-canary.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ccache

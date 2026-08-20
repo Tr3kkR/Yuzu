@@ -25,6 +25,7 @@
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "software_licensing_store.hpp"  // query_software_licenses (ADR-0024 discovery store)
 #include "rbac_store.hpp"                 // rbac_enforcement_in_effect (#1717 fail-closed SLE gate)
+#include "service_scope_policy.hpp"       // authz::kServiceScopeGlobalSafe (#2298 PR 3 §3c boot cross-check)
 // ADR-0031 operator surface (PR1.6c, p14) — mint/list/revoke_upload_grant.
 // The SAME pure validation grammar the REST route
 // (file_retrieval_routes.cpp) enforces internally, reused here so a
@@ -364,7 +365,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}}},"required":["agents"]})j"},
 
     {"get_agent_details", "Get detailed info for a single agent including tags and inventory.",
-     R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})",
+     R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"description":"Agent ID"}},"required":["agent_id"]})",
      R"j({"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"tags":{"type":"array","items":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"source":{"type":"string"}},"required":["key","value","source"]}}},"required":["agent_id","hostname","os","arch","agent_version"]})j"},
 
     {"query_audit_log",
@@ -418,7 +419,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"tables":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string"},"agent_count":{"type":"integer"},"last_collected":{"type":"integer"}},"required":["plugin","agent_count","last_collected"]}}},"required":["tables"]})j"},
 
     {"get_agent_inventory", "Get all inventory data for a specific agent.",
-     R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})",
+     R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"description":"Agent ID"}},"required":["agent_id"]})",
      R"j({"type":"object","properties":{"records":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string"},"data":{"type":"string"},"collected_at":{"type":"integer"}},"required":["plugin","data","collected_at"]}},"result_truncated_by_cap":{"type":"boolean"}},"required":["records","result_truncated_by_cap"]})j"},
 
     {"query_installed_software",
@@ -478,14 +479,14 @@ static const ToolDef kTools[] = {
 
     {"validate_scope",
      "Validate a scope expression without executing it. Returns parse errors if invalid.",
-     R"({"type":"object","properties":{"expression":{"type":"string","description":"Scope expression to validate"}},"required":["expression"]})",
+     R"({"type":"object","properties":{"expression":{"type":"string","minLength":1,"description":"Scope expression to validate"}},"required":["expression"]})",
      R"j({"oneOf":[)j"
      R"j({"type":"object","properties":{"valid":{"const":true},"expression":{"type":"string","description":"The input expression, echoed back verbatim (not canonicalized)"}},"required":["valid","expression"],"additionalProperties":false},)j"
      R"j({"type":"object","properties":{"valid":{"const":false},"error":{"type":"string","description":"Parse error message"}},"required":["valid","error"],"additionalProperties":false})j"
      R"j(]})j"},
 
     {"preview_scope_targets", "Show which agents match a scope expression.",
-     R"({"type":"object","properties":{"expression":{"type":"string","description":"Scope expression"}},"required":["expression"]})",
+     R"({"type":"object","properties":{"expression":{"type":"string","minLength":1,"description":"Scope expression"}},"required":["expression"]})",
      R"j({"type":"object","properties":{"expression":{"type":"string"},"matched_count":{"type":"integer"},"matched_agents":{"type":"array","items":{"type":"string"}},"warning":{"type":"string","description":"Present only when the match count exceeds the display threshold"}},"required":["expression","matched_count","matched_agents"]})j"},
 
     {"list_pending_approvals", "List pending approval requests.",
@@ -821,9 +822,9 @@ static const ToolDef kTools[] = {
      "(cut N round-trips to 1). Each step is {plugin, action, params?}; 1-32 steps, distinct "
      "(plugin,action). Mirrors POST /api/v1/bundles. Requires Execution:Execute.",
      R"j({"type":"object","properties":{)j"
-     R"j("agent_id":{"type":"string","description":"The single target device — a bundle targets one device"},)j"
+     R"j("agent_id":{"type":"string","minLength":1,"description":"The single target device — a bundle targets one device"},)j"
      R"j("steps":{"type":"array","minItems":1,"maxItems":32,"description":"1-32 plugin actions to fan out","items":{"type":"object","properties":{)j"
-     R"j("plugin":{"type":"string"},"action":{"type":"string"},)j"
+     R"j("plugin":{"type":"string","minLength":1},"action":{"type":"string","minLength":1},)j"
      R"j("params":{"type":"object","additionalProperties":{"type":"string"}})j"
      R"j(},"required":["plugin","action"]}})j"
      R"j(},"required":["agent_id","steps"]})j",
@@ -837,7 +838,7 @@ static const ToolDef kTools[] = {
      "succeeded=0); check succeeded==expected for success. Mirrors GET /api/v1/bundles/{id}. "
      "Requires Response:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("bundle_id":{"type":"string","description":"The bundle id (bundle-…) returned by execute_bundle"})j"
+     R"j("bundle_id":{"type":"string","minLength":1,"description":"The bundle id (bundle-…) returned by execute_bundle"})j"
      R"j(},"required":["bundle_id"]})j",
      R"j({"type":"object","properties":{)j"
      R"j("complete":{"type":"boolean","description":"True once every step is terminal - NOT a success signal, check succeeded==expected"},)j"
@@ -863,7 +864,11 @@ static const ToolDef kTools[] = {
      "POST /api/v1/ca/revoke. Destructive — requires Security:Delete (supervised MCP tier; "
      "approval-gated like every other destructive MCP op).",
      R"j({"type":"object","properties":{)j"
-     R"j("serial_hex":{"type":"string","description":"Cert serial (1-64 hex) from list_issued_certs"},)j"
+     // #2444 item 1: mirrors the handler's own serial_ok check (serial.size()<=64
+     // + hex charset) exactly, so a malformed serial_hex is refused by schema
+     // (no ticket ever minted/consumed, #2441) instead of burning an
+     // already-approved ticket at the handler below.
+     R"j("serial_hex":{"type":"string","pattern":"^[0-9A-Fa-f]{1,64}$","maxLength":64,"description":"Cert serial (1-64 hex) from list_issued_certs"},)j"
      R"j("reason":{"type":"string","description":"Optional revocation reason (audited)"})j"
      R"j(},"required":["serial_hex"]})j",
      R"j({"type":"object","properties":{"revoked":{"const":true},"serial_hex":{"type":"string"},"crl_republished":{"type":"boolean"},)j"
@@ -895,10 +900,16 @@ static const ToolDef kTools[] = {
      "MCP tier; maker-checker approval like every other privileged MCP op). Additive: creates a "
      "new identity, overwrites nothing.",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"Reserved namespace id, e.g. engine:vuln (must start with \"engine:\" + a non-empty lowercase/digit/./_/- slug)"},)j"
-     R"j("display_name":{"type":"string","description":"UI/audit label"},)j"
-     R"j("owner_username":{"type":"string","description":"Named responsible human; must reference an existing user"},)j"
-     R"j("justification":{"type":"string","description":"Grant justification captured at creation (feeds access reviews)"},)j"
+     // #2444 item 1: engine tools' principal_id shape (engine:<slug>, slug in
+     // [a-z0-9._-]+) is currently enforced ONLY in EnginePrincipalStore::create
+     // (store-side) — a malformed id passes schema, mints/consumes an approval
+     // ticket, then is rejected by the store. The pattern mirrors that store
+     // charset check exactly (never stricter — no invented length cap: neither
+     // the store nor the DB CHECK constraint bounds slug length).
+     R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"Reserved namespace id, e.g. engine:vuln (must start with \"engine:\" + a non-empty lowercase/digit/./_/- slug)"},)j"
+     R"j("display_name":{"type":"string","minLength":1,"description":"UI/audit label"},)j"
+     R"j("owner_username":{"type":"string","minLength":1,"description":"Named responsible human; must reference an existing user"},)j"
+     R"j("justification":{"type":"string","minLength":1,"description":"Grant justification captured at creation (feeds access reviews)"},)j"
      R"j("classification":{"type":"string","enum":["internal","external"],"description":"Required at creation, no default"})j"
      R"j(},"required":["principal_id","display_name","owner_username","justification","classification"]})j",
      R"j({"type":"object","properties":{"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_username":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"created_at":{"type":"integer"}},"required":["principal_id","lifecycle_state"]})j"},
@@ -915,7 +926,7 @@ static const ToolDef kTools[] = {
      "Get one engine principal's identity row plus its active-credential count. Mirrors GET "
      "/api/v1/engine-principals/{id}. Requires EnginePrincipal:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"})j"
+     R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"})j"
      R"j(},"required":["principal_id"]})j",
      R"j({"type":"object","properties":{"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_username":{"type":"string"},"justification":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"superseded_by":{"type":"string"},"created_at":{"type":"integer"},"revoked_at":{"type":"integer"},"created_by":{"type":"string"},"active_credentials":{"type":"integer"}},"required":["principal_id","lifecycle_state"]})j"},
 
@@ -928,7 +939,7 @@ static const ToolDef kTools[] = {
      "Mirrors DELETE /api/v1/engine-principals/{id}. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"},)j"
+     R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"},)j"
      R"j("reason":{"type":"string","description":"Optional revocation reason (audited)"},)j"
      R"j("superseded_by":{"type":"string","description":"Optional successor engine principal id, recorded on this row for audit trail continuity"})j"
      R"j(},"required":["principal_id"]})j",
@@ -945,7 +956,7 @@ static const ToolDef kTools[] = {
      "credential issuance; supervised MCP tier; maker-checker approval). Additive: issues the "
      "first credential, overwrites nothing.",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"},)j"
+     R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"},)j"
      R"j("name":{"type":"string","description":"Human-readable credential label"},)j"
      R"j("ttl_days":{"type":"integer","default":90,"minimum":1,"maximum":90,"description":"Credential lifetime in days (90-day ceiling, design doc §7)"})j"
      R"j(},"required":["principal_id"]})j",
@@ -963,7 +974,7 @@ static const ToolDef kTools[] = {
      "/api/v1/engine-principals/{id}/credentials/rotate. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"},)j"
+     R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"},)j"
      R"j("overlap_days":{"type":"integer","default":7,"minimum":1,"maximum":3650,"description":"Overlap window before the predecessor auto-revokes; rejected outright (never truncated) if it would fall below the 24h floor"})j"
      R"j(},"required":["principal_id"]})j",
      R"j({"type":"object","properties":{"token_id":{"type":"string"},"raw_token":{"type":"string","description":"One-time (or bounded-replay) reveal — capture now"},"principal_id":{"type":"string"},"overlap_expires_at":{"type":"integer"}},"required":["token_id","raw_token","principal_id"]})j"},
@@ -995,8 +1006,14 @@ static const ToolDef kTools[] = {
      "/api/v1/engine-principals/{id}/credentials/confirm. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"},)j"
-     R"j("token_id":{"type":"string","maxLength":64,"description":"Successor token_id returned by rotate_engine_credential (24 lowercase hex) - pins the exact rotation being confirmed"})j"
+     // #2444 item 1: token_id is minted as sha256_hex(raw).substr(0,24) —
+     // ApiTokenStore::mint/rotate (api_token_store.cpp) — always exactly 24
+     // lowercase hex chars. maxLength alone (the pre-#2444 schema) let a
+     // schema-valid-but-wrong-shape token_id mint/consume a ticket only to be
+     // rejected by confirm_rotation's own lookup; the pattern now bounds the
+     // exact shape so that rejection happens before a ticket is ever touched.
+     R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"},)j"
+     R"j("token_id":{"type":"string","pattern":"^[0-9a-f]{24}$","maxLength":24,"description":"Successor token_id returned by rotate_engine_credential (24 lowercase hex) - pins the exact rotation being confirmed"})j"
      R"j(},"required":["principal_id","token_id"]})j",
      R"j({"type":"object","properties":{"confirmed":{"type":"boolean"},"principal_id":{"type":"string"}},"required":["confirmed","principal_id"]})j"},
 
@@ -1020,7 +1037,7 @@ static const ToolDef kTools[] = {
      "PREDECESSOR's own stamp (the successor row never carries one). Mirrors POST "
      "/api/v1/tokens/{id}/rotate. Destructive — requires ApiToken:Rotate.",
      R"j({"type":"object","properties":{)j"
-     R"j("token_id":{"type":"string","maxLength":64,"description":"The token_id of the predecessor token being rotated — must be owned by the calling principal"},)j"
+     R"j("token_id":{"type":"string","minLength":1,"maxLength":64,"description":"The token_id of the predecessor token being rotated — must be owned by the calling principal"},)j"
      R"j("overlap_days":{"type":"integer","default":7,"minimum":1,"maximum":3650,"description":"Overlap window before the predecessor auto-revokes; rejected outright (never truncated) if it would fall below the 24h floor"})j"
      R"j(},"required":["token_id"]})j",
      R"j({"type":"object","properties":{"token_id":{"type":"string","description":"The successor's token_id, scoped exactly to the predecessor rotated"},"raw_token":{"type":"string","description":"One-time (or bounded-replay) reveal — capture now"},"expires_at":{"type":"integer","description":"The successor's expiry — inherited from the predecessor verbatim"},"overlap_expires_at":{"type":"integer","description":"The PREDECESSOR's own overlap-expiry stamp"}},"required":["token_id","raw_token","expires_at","overlap_expires_at"]})j"},
@@ -1043,7 +1060,7 @@ static const ToolDef kTools[] = {
      "applies. Self-service ONLY, same owner-vs-nonexistent posture as rotate_api_token. Mirrors "
      "POST /api/v1/tokens/{id}/confirm. Destructive — requires ApiToken:Rotate.",
      R"j({"type":"object","properties":{)j"
-     R"j("token_id":{"type":"string","maxLength":64,"description":"Successor token_id returned by rotate_api_token (pins the exact rotation being confirmed) — must be owned by the calling principal"})j"
+     R"j("token_id":{"type":"string","minLength":1,"maxLength":64,"description":"Successor token_id returned by rotate_api_token (pins the exact rotation being confirmed) — must be owned by the calling principal"})j"
      R"j(},"required":["token_id"]})j",
      R"j({"type":"object","properties":{"confirmed":{"type":"boolean"},"token_id":{"type":"string"}},"required":["confirmed","token_id"]})j"},
 
@@ -1055,8 +1072,8 @@ static const ToolDef kTools[] = {
      "/api/v1/engine-principals/{id}/transfer-owner. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"},)j"
-     R"j("new_owner":{"type":"string","description":"Username of the new responsible human; must reference an existing user"})j"
+     R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"},)j"
+     R"j("new_owner":{"type":"string","minLength":1,"description":"Username of the new responsible human; must reference an existing user"})j"
      R"j(},"required":["principal_id","new_owner"]})j",
      R"j({"type":"object","properties":{"transferred":{"type":"boolean"},"principal_id":{"type":"string"},"new_owner":{"type":"string"}},"required":["transferred","principal_id","new_owner"]})j"},
 
@@ -1093,8 +1110,8 @@ static const ToolDef kTools[] = {
      "Requires the operator or supervised MCP tier (Tag:Write). Fires the agent tag-push on "
      "a structured-category change, exactly like the REST path.",
      R"j({"type":"object","properties":{)j"
-     R"j("agent_id":{"type":"string","description":"Target agent id"},)j"
-     R"j("key":{"type":"string","description":"Tag key (category keys role/environment/location/service are case-normalised)"},)j"
+     R"j("agent_id":{"type":"string","minLength":1,"description":"Target agent id"},)j"
+     R"j("key":{"type":"string","minLength":1,"description":"Tag key (category keys role/environment/location/service are case-normalised)"},)j"
      R"j("value":{"type":"string","description":"Tag value; category keys validate against their allowed set"})j"
      R"j(},"required":["agent_id","key","value"]})j",
      R"j({"type":"object","properties":{"set":{"const":true},"agent_id":{"type":"string"},"key":{"type":"string"},)j"
@@ -1109,8 +1126,8 @@ static const ToolDef kTools[] = {
      "call returns an approval ticket (kApprovalRequired), re-call with the returned approval_id "
      "after an admin approves.",
      R"j({"type":"object","properties":{)j"
-     R"j("agent_id":{"type":"string","description":"Target agent id"},)j"
-     R"j("key":{"type":"string","description":"Tag key to delete"},)j"
+     R"j("agent_id":{"type":"string","minLength":1,"description":"Target agent id"},)j"
+     R"j("key":{"type":"string","minLength":1,"description":"Tag key to delete"},)j"
      R"j("approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after admin approval to execute"})j"
      R"j(},"required":["agent_id","key"]})j",
      R"j({"type":"object","properties":{"deleted":{"const":true},"agent_id":{"type":"string"},"key":{"type":"string"},)j"
@@ -1125,7 +1142,7 @@ static const ToolDef kTools[] = {
      "interchangeable response shapes). Requires Approval:Approve, supervised MCP tier. The "
      "reviewer cannot be the submitter.",
      R"j({"type":"object","properties":{)j"
-     R"j("approval_id":{"type":"string","description":"Id of the pending approval to approve"},)j"
+     R"j("approval_id":{"type":"string","minLength":1,"description":"Id of the pending approval to approve"},)j"
      R"j("comment":{"type":"string","description":"Optional reviewer comment (audited)"})j"
      R"j(},"required":["approval_id"]})j",
      R"j({"type":"object","properties":{"approved":{"const":true},"approval_id":{"type":"string"},)j"
@@ -1140,7 +1157,7 @@ static const ToolDef kTools[] = {
      "interchangeable response shapes). Requires Approval:Approve, supervised MCP tier. The "
      "reviewer cannot be the submitter.",
      R"j({"type":"object","properties":{)j"
-     R"j("approval_id":{"type":"string","description":"Id of the pending approval to reject"},)j"
+     R"j("approval_id":{"type":"string","minLength":1,"description":"Id of the pending approval to reject"},)j"
      R"j("comment":{"type":"string","description":"Optional reviewer comment (audited)"})j"
      R"j(},"required":["approval_id"]})j",
      R"j({"type":"object","properties":{"rejected":{"const":true},"approval_id":{"type":"string"},)j"
@@ -1154,9 +1171,18 @@ static const ToolDef kTools[] = {
      "approval-gated on the supervised tier — the first call returns an approval ticket, re-call "
      "with the returned approval_id after an admin approves.",
      R"j({"type":"object","properties":{)j"
-     R"j("agent_id":{"type":"string","description":"Target agent id"},)j"
-     R"j("reason":{"type":"string","description":"Optional quarantine reason (audited)"},)j"
-     R"j("whitelist":{"type":"string","description":"Comma-separated extra IPs to allow through the isolation firewall"},)j"
+     // #2444 item 1: mirror the handler's own limits so an oversized/off-charset
+     // reason or whitelist is refused by schema instead of burning an
+     // already-approved ticket. reason's bound is length-only (free text,
+     // audited verbatim); whitelist's pattern is a CHARSET superset of the
+     // handler's per-token safe_ip check (hex digits, '.', ':', separated by
+     // ',' and optional spaces) — deliberately not a byte-for-byte replica of
+     // the token-splitting/45-char-per-token logic (that stays handler-side,
+     // #2444: risk of a schema/handler mismatch false-rejecting a legal
+     // whitelist outweighs closing the last sliver of this burn class).
+     R"j("agent_id":{"type":"string","minLength":1,"description":"Target agent id"},)j"
+     R"j("reason":{"type":"string","maxLength":1024,"description":"Optional quarantine reason (audited)"},)j"
+     R"j("whitelist":{"type":"string","maxLength":512,"pattern":"^[0-9A-Fa-f.:, ]*$","description":"Comma-separated extra IPs to allow through the isolation firewall"},)j"
      R"j("approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after admin approval to execute"})j"
      R"j(},"required":["agent_id"]})j",
      R"j({"type":"object","properties":{)j"
@@ -1183,8 +1209,11 @@ static const ToolDef kTools[] = {
      "/api/v1/engine-principals/{id}/roles. Requires Security:Write (supervised MCP tier; "
      "approval-gated like every other Security:Write operation).",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"Engine principal slug WITHOUT the engine: prefix (e.g. vuln-viewer)"},)j"
-     R"j("role":{"type":"string","description":"An existing RBAC role name (see discover_permissions for the catalog); admin/Administrator/any built-in system role is rejected"})j"
+     // #2444 item 1: the bare-slug charset check (A1, [a-z0-9._-]+) runs
+     // AFTER the ticket is minted/consumed today — same handler-side pattern
+     // as the engine:<slug> form above, just without the prefix.
+     R"j("principal_id":{"type":"string","pattern":"^[a-z0-9._-]+$","description":"Engine principal slug WITHOUT the engine: prefix (e.g. vuln-viewer)"},)j"
+     R"j("role":{"type":"string","minLength":1,"description":"An existing RBAC role name (see discover_permissions for the catalog); admin/Administrator/any built-in system role is rejected"})j"
      R"j(},"required":["principal_id","role"]})j",
      R"j({"type":"object","properties":{"assigned":{"type":"boolean"},"principal_id":{"type":"string"},"role":{"type":"string"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
@@ -1197,8 +1226,8 @@ static const ToolDef kTools[] = {
      "module may be actively relying on; verify the module doesn't need this role before "
      "calling. Requires Security:Write (supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"Engine principal slug WITHOUT the engine: prefix"},)j"
-     R"j("role":{"type":"string","description":"The role name to revoke"})j"
+     R"j("principal_id":{"type":"string","pattern":"^[a-z0-9._-]+$","description":"Engine principal slug WITHOUT the engine: prefix"},)j"
+     R"j("role":{"type":"string","minLength":1,"description":"The role name to revoke"})j"
      R"j(},"required":["principal_id","role"]})j",
      R"j({"type":"object","properties":{"unassigned":{"type":"boolean"},"principal_id":{"type":"string"},"role":{"type":"string"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
@@ -1210,7 +1239,7 @@ static const ToolDef kTools[] = {
      "to audit what an autonomous module can actually do right now. Mirrors GET "
      "/api/v1/engine-principals/{id}/roles. Requires EnginePrincipal:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"Engine principal slug WITHOUT the engine: prefix"})j"
+     R"j("principal_id":{"type":"string","pattern":"^[a-z0-9._-]+$","description":"Engine principal slug WITHOUT the engine: prefix"})j"
      R"j(},"required":["principal_id"]})j",
      R"j({"type":"object","properties":{"principal_id":{"type":"string"},"count":{"type":"integer"},)j"
      R"j("roles":{"type":"array","items":{"type":"object","properties":{"principal_id":{"type":"string"},"role":{"type":"string"}},"required":["principal_id","role"]}})j"
@@ -1229,19 +1258,29 @@ static const ToolDef kTools[] = {
      "requires_external_connector, unsafe_without_approval, or outside_yuzu_scope. Use this "
      "before planning incident work, especially for OpenShift, KVM, database, and SaaS asks. "
      "Advisory classification only, not a security gate.",
-     R"({"type":"object","properties":{"question":{"type":"string","maxLength":2048}},"required":["question"]})",
-     kObjectOutputSchema},
+     R"({"type":"object","properties":{"question":{"type":"string","minLength":1,"maxLength":2048}},"required":["question"]})",
+     // #2986: shape is fully deterministic — classification is one of the 5
+     // literals the keyword classifier below can produce, requires_connector
+     // is always present (empty string when not applicable, never omitted).
+     R"j({"type":"object","properties":{"classification":{"type":"string","enum":["answerable_now","answerable_with_live_dispatch","requires_external_connector","unsafe_without_approval","outside_yuzu_scope"]},"rationale":{"type":"string"},"requires_connector":{"type":"string","description":"Empty unless classification is requires_external_connector"},"safe_first_tool":{"type":"string"},"recommended_next_tools":{"type":"array","items":{"type":"string"}},"approval_required_before_execution":{"type":"boolean"}},"required":["classification","rationale","requires_connector","safe_first_tool","recommended_next_tools","approval_required_before_execution"]})j"},
     {"get_incident_playbook",
      "Return the recommended Yuzu investigation workflow for a named incident scenario, including "
      "the first tool, safe tool path, connector gaps, and approval boundaries. Workflow guidance "
      "only.",
      R"({"type":"object","properties":{"scenario":{"type":"string","maxLength":2048,"description":"Exact scenario name, category, or curated tag (e.g. openshift, teams, crowdstrike, postgres, buildx) — matched exactly, not by substring"}},"required":["scenario"]})",
-     kObjectOutputSchema},
+     // #2986: every field of IncidentPlaybook (mcp_agentic_catalog.hpp) is a
+     // plain string, always emitted (requires_connector is "" when the
+     // scenario needs none, never omitted); steps/safety are always arrays
+     // of strings — the shape does not vary by scenario.
+     R"j({"type":"object","properties":{"scenario":{"type":"string"},"title":{"type":"string"},"category":{"type":"string"},"classification":{"type":"string"},"expected_first_tool":{"type":"string"},"requires_connector":{"type":"string","description":"Empty when the playbook needs no external connector"},"summary":{"type":"string"},"steps":{"type":"array","items":{"type":"string"}},"safety":{"type":"array","items":{"type":"string"}}},"required":["scenario","title","category","classification","expected_first_tool","requires_connector","summary","steps","safety"]})j"},
     {"summarize_working_set",
      "Summarize an agent/result-set/execution scope into a model-ready narrative with resource "
      "links and next tools instead of dumping unbounded rows. Summarization only.",
      R"({"type":"object","properties":{"kind":{"type":"string","enum":["fleet","agent","execution","result_set"],"default":"fleet"},"id":{"type":"string"},"limit":{"type":"integer","default":25,"maximum":100}}})",
-     kObjectOutputSchema},
+     // #2986: kind/id/limit echo the (possibly-defaulted) input; narrative,
+     // resource_links, and recommended_next_tools are always populated
+     // (empty id, or the fleet-fallback branch, still produce a narrative).
+     R"j({"type":"object","properties":{"kind":{"type":"string","enum":["fleet","agent","execution","result_set"]},"id":{"type":"string"},"limit":{"type":"integer"},"narrative":{"type":"string"},"resource_links":{"type":"array","items":{"type":"string"}},"recommended_next_tools":{"type":"array","items":{"type":"string"}}},"required":["kind","id","limit","narrative","resource_links","recommended_next_tools"]})j"},
 
     // ── A2 discovery tools (roadmap Issue 17.1, docs/agentic-first-principle.md
     // §A2) — mirrors of the GET /api/v1/discover/* REST family, sharing the SAME
@@ -1251,21 +1290,44 @@ static const ToolDef kTools[] = {
     {"discover_permissions",
      "RBAC permission catalog: every securable_type x operation pair the RBAC store "
      "recognizes, plus the full role -> allowed-operations grid. Read-only catalog.",
-     R"({"type":"object","properties":{}})", kObjectOutputSchema},
+     R"({"type":"object","properties":{}})",
+     // #2986: build_permissions_catalog (discover_routes.cpp) always emits
+     // version/description/securable_types/operations; the role grid is
+     // conditional on the caller's UserManagement:Read (#2376 floor) —
+     // EITHER "roles" is present OR "roles_omitted"+"roles_omitted_reason"
+     // are (never both, never neither) — so those three stay out of
+     // "required" rather than forcing a stricter oneOf this codebase's
+     // other optional-field schemas (e.g. get_kek_status) don't use either.
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"securable_types":{"type":"array","items":{"type":"string"}},"operations":{"type":"array","items":{"type":"string"}},"roles":{"type":"array","description":"Present only for a caller holding UserManagement:Read (#2376 floor); absent when roles_omitted is true","items":{"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"},"is_system":{"type":"boolean"},"permissions":{"type":"array","items":{"type":"object","properties":{"securable_type":{"type":"string"},"operation":{"type":"string"},"effect":{"type":"string"}},"required":["securable_type","operation","effect"]}}},"required":["name","description","is_system","permissions"]}},"roles_omitted":{"type":"boolean","description":"Present (true) only when the caller lacks UserManagement:Read — the grid above is withheld, stated explicitly rather than a silent empty array"},"roles_omitted_reason":{"type":"string","description":"Present in lockstep with roles_omitted"}},"required":["version","description","securable_types","operations"]})j"},
     {"discover_instructions",
      "Published (enabled) InstructionDefinition catalog with parameter_schema — the "
      "commands this worker may dispatch via execute_instruction. Read-only catalog.",
-     R"({"type":"object","properties":{}})", kObjectOutputSchema},
+     R"({"type":"object","properties":{}})",
+     // #2986: build_instructions_catalog's envelope is fixed; each entry's
+     // parameter_schema is itself an arbitrary nested JSON Schema document
+     // (or null when the stored value doesn't parse, OR parses to something
+     // other than an object — array/string/number/bool are nulled out too,
+     // discover_routes.cpp's is_object() guard) — genuinely variable BY
+     // DESIGN, so it is typed generically rather than pretending to know
+     // its shape, same idiom as get_access_review's "campaign":{"type":"object"}.
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"count":{"type":"integer"},"truncated":{"type":"boolean"},"instructions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":["object","null"],"description":"Nested JSON Schema when the stored value parses as JSON AND is itself an object, else null"},"platforms":{"type":"string","description":"Comma-separated OS list, e.g. windows,linux,darwin"},"approval_mode":{"type":"string"}},"required":["id","name","plugin","action","description","parameter_schema","platforms","approval_mode"]}}},"required":["version","description","count","truncated","instructions"]})j"},
     {"discover_routes",
      "REST route catalog — subset of the same OpenAPI document GET /api/v1/openapi.json "
      "serves. Hand-maintained source, so it can under-report an undocumented route "
      "(the response carries a caveat field). Read-only catalog.",
-     R"({"type":"object","properties":{}})", kObjectOutputSchema},
+     R"({"type":"object","properties":{}})",
+     // #2986: build_routes_catalog's per-route projection is fixed
+     // (method/path/summary/tags/description) regardless of which OpenAPI
+     // operations exist — the route COUNT varies, the shape does not.
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"source":{"type":"string"},"description":{"type":"string"},"caveat":{"type":"string"},"count":{"type":"integer"},"routes":{"type":"array","items":{"type":"object","properties":{"method":{"type":"string"},"path":{"type":"string"},"summary":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}},"description":{"type":"string"}},"required":["method","path","summary","tags","description"]}}},"required":["version","source","description","caveat","count","routes"]})j"},
     {"discover_scope_kinds",
      "Scope DSL kinds (__all__, group:<name>, from_result_set:<id>, ostype, hostname, "
      "arch, agent_version, tag:<key>, props.<key>) and comparison operators, with "
      "syntax and examples for building a `scope` expression. Read-only, static catalog.",
-     R"({"type":"object","properties":{}})", kObjectOutputSchema},
+     R"({"type":"object","properties":{}})",
+     // #2986: scope_kinds_catalog() is a fully static, build-once document
+     // (discover_routes.cpp) — the most stable of the five discover_* shapes.
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"ground_kinds":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"syntax":{"type":"string"},"example":{"type":"string"},"description":{"type":"string"}},"required":["kind","syntax","example","description"]}},"attribute_kinds":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"syntax":{"type":"string"},"example":{"type":"string"},"description":{"type":"string"}},"required":["kind","syntax","example","description"]}},"operators":{"type":"array","items":{"type":"object","properties":{"token":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"}},"required":["token","name","description"]}},"extended_forms":{"type":"array","items":{"type":"object","properties":{"form":{"type":"string"},"example":{"type":"string"},"description":{"type":"string"}},"required":["form","example","description"]}},"combinators":{"type":"array","items":{"type":"string"}}},"required":["version","description","ground_kinds","attribute_kinds","operators","extended_forms","combinators"]})j"},
     {"discover_plugins",
      "Plugin/action catalog observed across currently-connected agents. Each action carries an "
      "inline parameter_schema when it has a published InstructionDefinition (so you learn HOW to "
@@ -1273,7 +1335,13 @@ static const ToolDef kTools[] = {
      "discover_instructions is the full schema-bearing catalog. NOT a build-time manifest. New to "
      "the fleet? Read the yuzu://operating-model and yuzu://capabilities resources first to orient "
      "before acting. Read-only catalog.",
-     R"({"type":"object","properties":{}})", kObjectOutputSchema},
+     R"({"type":"object","properties":{}})",
+     // #2986: build_plugins_catalog's envelope + per-plugin/per-action keys
+     // (AgentRegistry::help_json, agent_registry.cpp) are server-computed
+     // and fixed; only actions[].parameter_schema is conditional (present
+     // only when the action has a matching published InstructionDefinition),
+     // typed generically for the same reason as discover_instructions above.
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"limitation":{"type":"string"},"actions_enriched_with_schema":{"type":"integer"},"plugins":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"version":{"type":"string"},"description":{"type":"string"},"actions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":"object","description":"Present only when the action has a matching published InstructionDefinition"}},"required":["name","description"]}}},"required":["name","version","description","actions"]}},"commands":{"type":"array","items":{"type":"string"}}},"required":["version","description","limitation","actions_enriched_with_schema","plugins","commands"]})j"},
     {"query_software_licenses",
      "Query a single agent's discovered software licences (ADR-0024 discovery plane) — the "
      "MCP twin of GET /api/v1/sle/agents/{id}. Returns each detected licence's product, "
@@ -1281,7 +1349,7 @@ static const ToolDef kTools[] = {
      "confidence. MACHINE-SCOPE FACTS ONLY: the per-user user_ref personal data (Decision "
      "11) is NOT returned here — it is served only by the audited, management-group-scoped "
      "REST drill. Requires SoftwareLicensing:Read.",
-     R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Exact agent/device id","maxLength":256}},"required":["agent_id"]})",
+     R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Exact agent/device id","minLength":1,"maxLength":256}},"required":["agent_id"]})",
      R"j({"type":"object","properties":{"agent_id":{"type":"string"},"count":{"type":"integer"},"licenses":{"type":"array","items":{"type":"object","properties":{"product":{"type":"string"},"vendor":{"type":"string"},"version":{"type":"string"},"license_type":{"type":"string"},"state":{"type":"string"},"expiry_at":{"type":"integer"},"channel":{"type":"string"},"key_hint":{"type":"string"},"detector":{"type":"string"},"confidence":{"type":"string"},"exe_hints":{"type":"string"}}}}},"required":["agent_id","count","licenses"]})j"},
 
     // ── Periodic Access Reviews (SOC 2 CC6.2) — MCP twins of
@@ -1311,7 +1379,7 @@ static const ToolDef kTools[] = {
      "evidence and does not itself change any access grant — destructiveHint:false. "
      "Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("title":{"type":"string","description":"Human-readable campaign name, e.g. 'Q3 2026 Access Review'"})j"
+     R"j("title":{"type":"string","minLength":1,"description":"Human-readable campaign name, e.g. 'Q3 2026 Access Review'"})j"
      R"j(},"required":["title"]})j",
      R"j({"type":"object","properties":{"campaign_id":{"type":"string"},"grant_count":{"type":"integer"}},"required":["campaign_id","grant_count"]})j"},
 
@@ -1328,10 +1396,10 @@ static const ToolDef kTools[] = {
      "POST /api/v1/access-reviews/{id}/attestations. Self-audited as access_review.attested "
      "or access_review.flagged (by decision). Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string"},)j"
+     R"j("campaign_id":{"type":"string","minLength":1},)j"
      R"j("principal_type":{"type":"string","enum":["user","group","engine"]},)j"
-     R"j("principal_id":{"type":"string"},)j"
-     R"j("role_name":{"type":"string"},)j"
+     R"j("principal_id":{"type":"string","minLength":1},)j"
+     R"j("role_name":{"type":"string","minLength":1},)j"
      R"j("decision":{"type":"string","enum":["attested","flagged_revoke"]},)j"
      R"j("justification":{"type":"string"})j"
      R"j(},"required":["campaign_id","principal_type","principal_id","role_name","decision"]})j",
@@ -1343,7 +1411,7 @@ static const ToolDef kTools[] = {
      "/api/v1/access-reviews/{id}. Self-audited as access_review.get. Requires "
      "AccessReview:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string"})j"
+     R"j("campaign_id":{"type":"string","minLength":1})j"
      R"j(},"required":["campaign_id"]})j",
      R"j({"type":"object","properties":{"campaign":{"type":"object"},"attestations":{"type":"array"},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
 
@@ -1365,7 +1433,7 @@ static const ToolDef kTools[] = {
      "untouched), but the campaign's own open->closed state is irreversibly transitioned. "
      "Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string"})j"
+     R"j("campaign_id":{"type":"string","minLength":1})j"
      R"j(},"required":["campaign_id"]})j",
      R"j({"type":"object","properties":{"closed":{"type":"boolean"}},"required":["closed"]})j"},
 
@@ -1500,7 +1568,11 @@ static const ToolDef kTools[] = {
      "which this display accessor deliberately does not) — this is the inspection view an "
      "operator reads before deciding whether to flip it. Absence of a prior flip reads as "
      "enabled=true with no reason/set_by. Requires PluginConfig:Read.",
-     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":64},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"}},"required":["plugin"]})j",
+     // plugin maxLength is 68, not 64: parse_kill_switch_scope also accepts a
+     // reserved-namespace plugin name (__<identifier>__, #3265), whose total
+     // length can reach kMaxIdentifierBytes (64) + 4 sentinel bytes = 68 —
+     // this schema must not reject an input the store would accept.
+     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"}},"required":["plugin"]})j",
      R"j({"type":"object","properties":{"plugin":{"type":"string"},"action":{"type":"string"},"enabled":{"type":"boolean"},"reason":{"type":"string"},"set_by":{"type":"string"},"updated_at_ms":{"type":"integer"}},"required":["plugin","action","enabled"]})j"},
 
     {"set_plugin_kill_switch",
@@ -1510,7 +1582,8 @@ static const ToolDef kTools[] = {
      "store error, so throwing this switch is a reliable emergency stop for the named "
      "plugin/action — there is no separate 'force disable' escalation beyond this call. "
      "Requires PluginConfig:Write.",
-     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":64},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"enabled":{"type":"boolean","description":"true = allowed (the default/no-row state); false = killed"},"reason":{"type":"string","maxLength":512,"description":"Operator-entered explanation, audited and displayed verbatim"}},"required":["plugin","enabled"]})j",
+     // plugin maxLength is 68 — see the identical note on get_plugin_kill_switch above.
+     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"enabled":{"type":"boolean","description":"true = allowed (the default/no-row state); false = killed"},"reason":{"type":"string","maxLength":512,"description":"Operator-entered explanation, audited and displayed verbatim"}},"required":["plugin","enabled"]})j",
      R"j({"type":"object","properties":{"plugin":{"type":"string"},"action":{"type":"string"},"enabled":{"type":"boolean"},"reason":{"type":"string"},"set_by":{"type":"string"},"updated_at_ms":{"type":"integer"}},"required":["plugin","action","enabled"]})j"},
 
     {"mint_upload_grant",
@@ -1607,12 +1680,53 @@ static const std::unordered_set<std::string> kWriteTools = [] {
     return s;
 }();
 
+// Service-scoped-token classification for the C8 chokepoint (#2298 PR 3
+// §3c). `denied` is the DEFAULT (see the member initializer below) — a tool
+// gets `confined`/`global_safe` only by explicit registration, so an
+// unclassified or newly-added row fails closed for a service-scoped caller
+// automatically, the same fail-closed-by-omission posture #2383's
+// kKnownMissingSecurity classification already gives every tool for
+// tier/approval. A genuine `enum class` (not a string like securable_type/
+// operation) because — unlike those, which are validated against an
+// EXTERNAL catalogue (rbac_store.cpp's seeded types/ops, kRbacOps/
+// kRbacSecurables below) — this is a purely internal three-way
+// classification with no external system to match strings against, so a
+// typo is better caught at compile time than by a runtime closed-catalogue
+// check. Mirrors `ToolSecurityClass`'s TU-private-enum-plus-testonly-mirror
+// shape (`ToolClassForTest`, mcp_server_testonly.hpp) rather than the
+// string-catalogue shape.
+//   - `denied`: the C8 chokepoint refuses a service-scoped caller outright,
+//     before tier/approval ever runs.
+//   - `confined`: may REACH the handler — NOT a claim the tool is
+//     functionally usable by a service-scoped caller. Under the seeded-empty
+//     `kServiceScopeGlobalSafe` table most `confined` tools still hit their
+//     OWN downstream perm_fn/scoped_perm_fn and get denied there too (e.g.
+//     execute_instruction, mcp_server.cpp's own perm_fn call); confinement
+//     via a real per-agent/service check (`confine_agent_target`-shaped) is
+//     what makes a `confined` tool genuinely usable.
+//   - `global_safe`: proceeds unconfined. Boot-validated: every `global_safe`
+//     row's (securable_type, operation) pair must appear in
+//     `authz::kServiceScopeGlobalSafe` (service_scope_policy.hpp, seeded
+//     EMPTY) — a `global_safe` row with no matching policy-table entry is a
+//     registration defect, refused at boot the same way an unregistered
+//     tool is.
+enum class ServiceScopeClass {
+    denied,
+    confined,
+    global_safe,
+};
+
 // ── Tool → (securable_type, operation) mapping for generic policy checks ──
 // Every tool declares its securable type and operation so that tier_allows()
 // and requires_approval() can be evaluated generically before dispatch.
 struct ToolSecurity {
     const char* securable_type;
     const char* operation;
+    // Default-deny (#2298 PR 3 §3c): every one of the 90+ existing 2-element
+    // `{securable_type, operation}` initializers below picks this up for
+    // free via aggregate initialization — only rows explicitly needing
+    // `confined`/`global_safe` change shape to the 3-element form.
+    ServiceScopeClass service_scope = ServiceScopeClass::denied;
 };
 
 struct ToolSecurityEntry {
@@ -1637,7 +1751,7 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"query_inventory", {"Infrastructure", "Read"}},
     {"list_inventory_tables", {"Infrastructure", "Read"}},
     {"get_agent_inventory", {"Infrastructure", "Read"}},
-    {"query_installed_software", {"Inventory", "Read"}},
+    {"query_installed_software", {"Inventory", "Read", ServiceScopeClass::confined}},
     {"get_tags", {"Tag", "Read"}},
     {"search_agents_by_tag", {"Tag", "Read"}},
     {"list_policies", {"Policy", "Read"}},
@@ -1646,31 +1760,31 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"list_management_groups", {"ManagementGroup", "Read"}},
     {"get_execution_status", {"Execution", "Read"}},
     {"list_executions", {"Execution", "Read"}},
-    {"list_schedules", {"Schedule", "Read"}},
+    {"list_schedules", {"Schedule", "Read", ServiceScopeClass::confined}},
     {"validate_scope", {"Infrastructure", "Read"}},
     {"preview_scope_targets", {"Infrastructure", "Read"}},
     {"list_pending_approvals", {"Approval", "Read"}},
     {"get_guardian_schemas", {"GuaranteedState", "Read"}},
     {"list_dex_signals", {"GuaranteedState", "Read"}},
     {"get_dex_signal_scope", {"GuaranteedState", "Read"}},
-    {"get_dex_signal_detail", {"GuaranteedState", "Read"}},
+    {"get_dex_signal_detail", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     {"get_dex_perf_fleet", {"GuaranteedState", "Read"}},
     {"get_dex_perf_cohorts", {"GuaranteedState", "Read"}},
     {"list_dex_perf_apps", {"GuaranteedState", "Read"}},
     {"get_dex_app_perf", {"GuaranteedState", "Read"}},
-    {"get_dex_group_app_perf", {"GuaranteedState", "Read"}},
-    {"compare_app_perf_versions", {"GuaranteedState", "Read"}},
+    {"get_dex_group_app_perf", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
+    {"compare_app_perf_versions", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     {"get_dex_perf_cohort_diff", {"GuaranteedState", "Read"}},
-    {"list_dex_perf_devices", {"GuaranteedState", "Read"}},
+    {"list_dex_perf_devices", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     {"get_network_fleet", {"GuaranteedState", "Read"}},
-    {"list_network_devices", {"GuaranteedState", "Read"}},
+    {"list_network_devices", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     // Implemented write tools
-    {"set_tag", {"Tag", "Write"}},
-    {"delete_tag", {"Tag", "Delete"}},
-    {"execute_instruction", {"Execution", "Execute"}},
+    {"set_tag", {"Tag", "Write", ServiceScopeClass::confined}},
+    {"delete_tag", {"Tag", "Delete", ServiceScopeClass::confined}},
+    {"execute_instruction", {"Execution", "Execute", ServiceScopeClass::confined}},
     // Live-query bundle (ADR-0011) — same securable as the underlying ops:
     // dispatch is Execution:Execute, collate is Response:Read.
-    {"execute_bundle", {"Execution", "Execute"}},
+    {"execute_bundle", {"Execution", "Execute", ServiceScopeClass::confined}},
     {"get_bundle_result", {"Response", "Read"}},
     // Write tools (#289). NOTE (governance S3/UP-3, revised for PR #1796 review
     // C2): the op here drives the C8 TIER gate (tier_allows / requires_approval),
@@ -1690,7 +1804,7 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // shares the (securable, op) pair.
     {"approve_request", {"Approval", "Write"}},
     {"reject_request", {"Approval", "Write"}},
-    {"quarantine_device", {"Security", "Execute"}},
+    {"quarantine_device", {"Security", "Execute", ServiceScopeClass::confined}},
     // PKI CA tools (PR4 B-2 — MCP/REST parity for the /api/v1/ca/* surface).
     {"list_issued_certs", {"Security", "Read"}},
     {"revoke_certificate", {"Security", "Delete"}},
@@ -1732,7 +1846,7 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"discover_routes", {"Infrastructure", "Read"}},
     {"discover_scope_kinds", {"Infrastructure", "Read"}},
     {"discover_plugins", {"Infrastructure", "Read"}},
-    {"query_software_licenses", {"SoftwareLicensing", "Read"}},
+    {"query_software_licenses", {"SoftwareLicensing", "Read", ServiceScopeClass::confined}},
     // Periodic Access Reviews (SOC 2 CC6.2) — parity with the REST twins'
     // AccessReview:Read (export/get/list) and AccessReview:Attest
     // (open/attest/close) gates — a dedicated narrow securable, NOT AuditLog,
@@ -1842,12 +1956,19 @@ ToolSecurityClass classify_tool_security(
     return ToolSecurityClass::kKnownRegistered;
 }
 
-// Borrowed (name, securable, operation) row for the registration validator.
-// Views are valid only for the duration of the call; nothing is retained.
+// Borrowed (name, securable, operation, service_scope) row for the
+// registration validator. Views are valid only for the duration of the
+// call; nothing is retained. `service_scope` carries #2298 PR 3 §3c's
+// global_safe-vs-policy-table cross-check alongside the existing RBAC
+// catalogue checks, rather than threading a 5th parallel sequence through
+// the validator the way #2405 added input_schemas — every row already
+// carries a service_scope value (default-deny), so there is no "empty means
+// skip this check" case to preserve the way input_schemas has one.
 struct ToolSecurityTuple {
     std::string_view name;
     std::string_view securable;
     std::string_view operation;
+    ServiceScopeClass service_scope;
 };
 
 // Closed RBAC operation vocabulary — mirrors rbac_store.cpp's seeded `ops[]`
@@ -2004,6 +2125,23 @@ void validate_tool_security_registration(const std::vector<std::string_view>& to
             offences.push_back("tool '" + std::string(n) + "' has securable type '" +
                                std::string(row.securable) +
                                "' outside the RBAC securable catalogue");
+        // #2298 PR 3 §3c: a `global_safe` row claims a service-scoped token
+        // may exercise this (securable, operation) pair UNCONFINED — that
+        // claim must be backed by an entry in the actual policy table, or a
+        // future edit that flips a row to `global_safe` without also
+        // clearing service_scope_policy.hpp's entry bar (proof + routed-
+        // concerns update + security-guardian sign-off) silently widens every
+        // service-scoped token in the fleet. `kServiceScopeGlobalSafe` is
+        // seeded EMPTY, so today this offence fires for ANY `global_safe`
+        // row — refused at boot, same as an unregistered tool.
+        if (row.service_scope == ServiceScopeClass::global_safe &&
+            !authz::service_scope_global_safe(row.securable, row.operation))
+            offences.push_back(
+                "tool '" + std::string(n) + "' is classified global_safe for (" +
+                std::string(row.securable) + ", " + std::string(row.operation) +
+                ") but that pair is not in kServiceScopeGlobalSafe "
+                "(service_scope_policy.hpp) — a global_safe classification must be backed "
+                "by the policy table, not asserted independently");
     }
     // kWriteTools must be EXACTLY the non-Read subset: the C7 --mcp-read-only
     // guard keys on kWriteTools, so a non-Read tool missing from it silently
@@ -2604,7 +2742,7 @@ McpServer::McpServer() {
     std::vector<ToolSecurityTuple> rows;
     rows.reserve(std::size(kToolSecurityRows));
     for (const auto& r : kToolSecurityRows)
-        rows.push_back({r.name, r.sec.securable_type, r.sec.operation});
+        rows.push_back({r.name, r.sec.securable_type, r.sec.operation, r.sec.service_scope});
     std::vector<std::string_view> writes(std::begin(kWriteToolsRaw), std::end(kWriteToolsRaw));
     // 4th raw sequence (#2405): the served input schemas, from the SAME
     // kTools[] array as `names`, so a schema the C8 gate cannot fully
@@ -3443,6 +3581,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 return *cached_agents;
             };
 
+            // #2444 item 3 (Gate 6 sre): set true ONLY after the C8 approval gate
+            // below successfully consumes a one-time ticket for THIS request. Read
+            // by the BurnGuard below (NOT by mcp_audit — see its comment for why
+            // hooking mcp_audit directly under-counts).
+            bool approval_ticket_just_consumed = false;
+
             // Audit helper. Returns the AuditFn bool so SOC 2 read/write surfaces can
             // surface a dropped evidence row (audit_persisted:false), mirroring the
             // CA-revoke handler (#1550 HIGH-2 / #1240). Existing callers that ignore
@@ -3455,6 +3599,74 @@ McpServer::HandlerFn McpServer::build_handler(
                 return yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "mcp." + tool_name, result_status, "mcp_tool", tool_name, detail);
             };
+
+            // #2444 item 3 (Gate 6 sre): yuzu_mcp_approval_burned_total{tool,reason}.
+            // Deliberately NOT wired inside mcp_audit above: not every handler's
+            // business-rejection path calls mcp_audit at all — several (e.g.
+            // revoke_certificate's "serial not found", revoke_engine_principal's
+            // "principal not found") emit ONLY their own domain-verb audit_fn call
+            // ("ca.cert.revoked"/"engine_principal.revoke", result "denied"/
+            // "failure") and return without ever touching mcp_audit, so a counter
+            // hooked there would silently under-count exactly the class this issue
+            // is about. This guard instead inspects the ACTUAL JSON-RPC response
+            // this request produced, at function-scope exit — after whichever
+            // `if (tool_name == ...)` branch below has already called
+            // res.set_content(...) — so it counts every outcome uniformly,
+            // independent of which handler ran or what it chose to audit. Declared
+            // once per request; consumed is read only at destruction, so setting it
+            // AFTER this declaration (below, once consume_ticket succeeds) still
+            // takes effect — the reference stays bound to the same bool.
+            //
+            // Scope is deliberately wider than pure ARGS-semantic rejection: by the
+            // time any tool-specific handler code runs post-recall, consume_ticket
+            // has already spent the ticket, so a store-unavailable failure counts
+            // exactly as much as a business-rule reject — both are a wasted
+            // one-time human approval. Both land under reason="handler_reject".
+            //
+            // CH-1 (recorded here per the issue's request): this counter does NOT
+            // interact with the kMcpSubmitterPendingCap 25-slot cap —
+            // pending_count_for() counts only status='pending' rows, and
+            // consume_ticket() never touches `status` (only consumed_at/
+            // consumed_by); a ticket already left the pending bucket at
+            // ADMIN-APPROVAL time, before it could ever reach this burn class. So a
+            // semantic-burn loop cannot exhaust a submitter's pending-cap through
+            // burned tickets themselves — the cap only throttles un-approved
+            // pending mints, which item 1's schema tightening already reduces (a
+            // schema-invalid mint is refused before it can occupy a pending slot
+            // at all, #2441).
+            struct BurnGuard {
+                httplib::Response& res;
+                yuzu::MetricsRegistry* metrics;
+                const std::string& tool_name;
+                const bool& consumed;
+                ~BurnGuard() noexcept {
+                    if (!consumed || metrics == nullptr)
+                        return;
+                    // A JSON-RPC error envelope (vs the "result" success shape) is
+                    // the ONE outcome-agnostic signal every handler produces —
+                    // parsed defensively (never expected to fail; res.body is
+                    // always this handler's own JSON, never caller-echoed).
+                    //
+                    // Adversarial review (2026-08-19): this destructor is
+                    // implicitly noexcept, and MetricsRegistry::counter(...)
+                    // locks + indexes a map that could in principle throw
+                    // (allocation failure) — an uncaught throw here would
+                    // terminate the process mid-teardown, matching the
+                    // count_denial precedent's own reasoning above. Wrapped for
+                    // the same "observability must never fail the dispatch"
+                    // reason, even though the response has already been built.
+                    try {
+                        auto parsed = nlohmann::json::parse(res.body, nullptr, false);
+                        if (!parsed.is_discarded() && parsed.is_object() &&
+                            parsed.contains("error"))
+                            metrics
+                                ->counter("yuzu_mcp_approval_burned_total",
+                                         {{"tool", tool_name}, {"reason", "handler_reject"}})
+                                .increment();
+                    } catch (...) { // NOLINT(bugprone-empty-catch)
+                    }
+                }
+            } burn_guard{res, metrics, tool_name, approval_ticket_just_consumed};
 
             // BR-006 second half, MCP twin of plugin_config_routes.cpp's
             // `audit_outcome`. The five plugin-config/secret/kill-switch tools
@@ -3566,6 +3778,33 @@ McpServer::HandlerFn McpServer::build_handler(
                 return true;
             };
 
+            // #3289 — MCP twin of the REST/legacy tag-mutation TOCTOU guard.
+            // set_tag/delete_tag's own scoped_perm_fn below authorizes a
+            // Tag:Write/Delete by reading the target's PRE-WRITE `service`
+            // tag, so without this it would authorize the very write that
+            // changes that tag out from under a service-scoped token's own
+            // confinement. Value-blind (see
+            // authz::service_scope_may_mutate_tag_key) — this deny does not
+            // become a membership oracle. `session` already resolved above.
+            auto deny_service_scoped_service_tag_mutation =
+                [&](const std::string& action, const std::string& agent_id,
+                    const std::string& key) -> bool {
+                if (authz::service_scope_may_mutate_tag_key(session->token_scope_service, key))
+                    return false;
+                // Gate 4/#3289 hardening round: target_type="Tag" matches
+                // REST v1's convention for this identical logical event —
+                // not "Agent", which mismatched every pre-existing tag audit
+                // row on any surface.
+                (void)yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, action, "denied", "Tag", agent_id + ":" + key,
+                    "service-scoped token blocked: cannot mutate the service tag");
+                res.set_content(
+                    a4_error(kPermissionDenied,
+                            authz::kServiceTagMutationDeniedMessage),
+                    "application/json");
+                return true;
+            };
+
             // A4 envelope that also carries the durable execution handle. Used by
             // the two streamed-POST 500s, which are the only refusals raised AFTER
             // dispatch - the work is running, so the client needs the id to find it
@@ -3638,7 +3877,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 // future orphaned handler branch would otherwise execute with
                 // no tier/approval gate. Same audit + response as the terminal
                 // "Unknown tool" backstop at the bottom of the chain.
-                mcp_audit("failure", "unknown tool");
+                //
+                // Audited "denied", not "failure" (#2445): the caller named a
+                // tool that doesn't exist — client-caused, matching most
+                // other rejections on this surface (tier/read-only/schema/
+                // bounds/cap denials all use "denied"; several other
+                // client-caused rejections on this surface are known,
+                // undischarged "failure" exceptions — not exhaustively
+                // enumerated here, tracked in #3176). "failure" is otherwise
+                // reserved for server-side faults (misconfig, store degraded,
+                // dispatch exception) — see kKnownMissingSecurity below.
+                mcp_audit("denied", "unknown tool");
                 res.set_content(
                     error_response(id, kMethodNotFound, "Unknown tool: " + tool_name),
                     "application/json");
@@ -3694,7 +3943,44 @@ McpServer::HandlerFn McpServer::build_handler(
             if (sec_class == ToolSecurityClass::kKnownRegistered) {
                 // kKnownRegistered guarantees the row exists (same map the
                 // classifier consulted).
-                const auto& [sec_type, sec_op] = kToolSecurity.find(tool_name)->second;
+                const auto& [sec_type, sec_op, sec_scope] = kToolSecurity.find(tool_name)->second;
+
+                // #2298 PR 3 §3c: service-scope default-deny, BEFORE
+                // tier/approval — a denied tool refuses a service-scoped
+                // caller here, structurally, regardless of what tier its
+                // token happens to carry. `confined` and `global_safe` both
+                // proceed to tier/approval as normal; `confined` is NOT a
+                // claim the tool is functionally usable by a service-scoped
+                // caller (see ServiceScopeClass's doc comment) — most
+                // `confined` tools still deny downstream via their own
+                // perm_fn/scoped_perm_fn under the seeded-empty allow-list.
+                if (!session->token_scope_service.empty() &&
+                    sec_scope == ServiceScopeClass::denied) {
+                    mcp_audit("denied", "service-scoped token blocked: default-deny (C8, #2298)");
+                    // sre Gate 6 (#2298 PR 3 hardening round): this C8
+                    // short-circuit returns before perm_fn/require_permission
+                    // ever runs, so that function's own increment site never
+                    // fires for `denied`-class tools — without this, the ADR's
+                    // "Phase 2 prioritized by this metric" claim would be false
+                    // for exactly the tools it names. `path_class="mcp"`
+                    // mirrors body_cap_policy.hpp's own `/mcp/` row (the
+                    // single source of truth for that label) rather than
+                    // pulling that header in for one constant string.
+                    if (metrics) {
+                        metrics
+                            ->counter("yuzu_auth_service_scope_default_denied_total",
+                                     {{"permission", std::string(sec_type) + ":" + std::string(sec_op)},
+                                      {"path_class", "mcp"}})
+                            .increment();
+                    }
+                    res.set_content(
+                        a4_error(kPermissionDenied, "service-scoped tokens cannot call this tool",
+                                 "this tool has no per-agent/service confinement; the "
+                                 "service-scope default-deny table is seeded empty — see "
+                                 "docs/adr/1006-service-scope-default-deny.md"),
+                        "application/json");
+                    return;
+                }
 
                 if (!tier_allows(tier, sec_type, sec_op)) {
                     mcp_audit("denied", "tier=" + std::string(tier));
@@ -4318,6 +4604,11 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     mcp_audit("approved", "consumed approval_id=" + supplied_id);
+                    // #2444 item 3: from here on, any mcp_audit("failure", ...) the
+                    // tool handler below emits for THIS request is a burned ticket —
+                    // set AFTER the "approved" row above so that row itself (result
+                    // "approved", not "failure") never counts.
+                    approval_ticket_just_consumed = true;
                     // Ticket consumed → fall through to the tool handler below.
                     // NOTE: the per-handler perm_fn (real RBAC op) has not run
                     // yet; a tier-allows-but-RBAC-denies token can mint→approve→
@@ -4393,11 +4684,22 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // Add tags
+                // Add tags. Degrade fails the whole tool call (ADR-0050) —
+                // an agentic caller acting on a silently-tagless agent
+                // record is the same mis-decision shape as a collapsed scope
+                // read; a null store (test/embedded config) still just omits
+                // tags.
                 if (tag_store) {
                     auto tags = tag_store->get_all_tags(agent_id);
+                    if (!tags) {
+                        mcp_audit("failure", agent_id);
+                        res.set_content(
+                            error_response(id, kInternalError, "Tag store unavailable"),
+                            "application/json");
+                        return;
+                    }
                     JArr tag_arr;
-                    for (const auto& t : tags)
+                    for (const auto& t : *tags)
                         tag_arr.add(
                             JObj().add("key", t.key).add("value", t.value).add("source", t.source));
                     agent_obj.raw("tags", tag_arr.str());
@@ -5315,8 +5617,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 auto agent_id = param_str(args, "agent_id");
                 auto tags = tag_store->get_all_tags(agent_id);
+                if (!tags) {
+                    // Degrade → tool error, never an empty tag list
+                    // (ADR-0050 / #3097 classification).
+                    mcp_audit("failure", agent_id);
+                    res.set_content(error_response(id, kInternalError, "Tag store unavailable"),
+                                    "application/json");
+                    return;
+                }
                 JArr arr;
-                for (const auto& t : tags) {
+                for (const auto& t : *tags) {
                     arr.add(JObj()
                                 .add("key", t.key)
                                 .add("value", t.value)
@@ -5351,8 +5661,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto key = param_str(args, "key");
                 auto value = param_str(args, "value");
                 auto agent_ids = tag_store->agents_with_tag(key, value);
+                if (!agent_ids) {
+                    // Degrade → tool error, never an empty agent list — the
+                    // result feeds the agentic caller's subsequent targeting
+                    // (ADR-0050 / #3097 classification).
+                    mcp_audit("failure", key);
+                    res.set_content(error_response(id, kInternalError, "Tag store unavailable"),
+                                    "application/json");
+                    return;
+                }
                 JArr arr;
-                for (const auto& aid : agent_ids)
+                for (const auto& aid : *agent_ids)
                     arr.add(aid);
                 mcp_audit("success", key);
                 res.set_content(
@@ -5689,6 +6008,34 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // Preload every tag:<key> the expression references in ONE
+                // bulk query before the agent loop (ADR-0050 — the
+                // pre-migration version called get_tag_map per agent, N
+                // network round-trips per preview against the Postgres
+                // substrate). Degrade fails the whole tool call: this tool
+                // PREVIEWS dispatch targeting, and a silently-tagless
+                // preview under/over-states the cohort exactly like a
+                // collapsed scope read (#2500 family).
+                std::unordered_map<std::string, std::unordered_map<std::string, std::string>>
+                    preview_tags;
+                {
+                    std::vector<std::string> tag_keys;
+                    yuzu::scope::collect_attribute_suffixes(*parsed_expr, "tag:", tag_keys);
+                    if (!tag_keys.empty() && tag_store) {
+                        auto preload = tag_store->get_values_for_keys(tag_keys);
+                        if (!preload) {
+                            // Target = the expression being previewed — every
+                            // sibling failure audit here carries a target
+                            // (governance cons-F2).
+                            mcp_audit("failure", expression);
+                            res.set_content(
+                                error_response(id, kInternalError, "Tag store unavailable"),
+                                "application/json");
+                            return;
+                        }
+                        preview_tags = std::move(*preload);
+                    }
+                }
                 // Evaluate against all agents
                 const auto& agents = get_agents();
                 JArr matching;
@@ -5699,9 +6046,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     attrs["arch"] = a.value("arch", "");
                     attrs["hostname"] = a.value("hostname", "");
                     attrs["agent_version"] = a.value("agent_version", "");
-                    if (tag_store) {
-                        auto tag_map = tag_store->get_tag_map(agent_id);
-                        for (const auto& [k, v] : tag_map)
+                    if (auto it = preview_tags.find(agent_id); it != preview_tags.end()) {
+                        for (const auto& [k, v] : it->second)
                             attrs["tag:" + k] = v;
                     }
                     auto resolver = [&](std::string_view attr) -> std::string {
@@ -7323,9 +7669,11 @@ McpServer::HandlerFn McpServer::build_handler(
                         execution_id = *created;
                     } else {
                         // governance R1 unhappy-UP-3: create_execution
-                        // returning nullopt is a SQLite write failure
-                        // (disk full, locked DB, schema corruption).
-                        // Silently proceeding with empty execution_id
+                        // returning an error is a tracker store failure -
+                        // database not open, statement prepare failure, or
+                        // an insert/write failure (disk full, locked DB,
+                        // schema corruption); created.error() below names
+                        // which. Silently proceeding with empty execution_id
                         // hides the tracker outage from operators. Log
                         // at warn so SREs see the failure; dispatch
                         // continues so the operator's "stop NOW"
@@ -7333,9 +7681,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         // still sees an empty execution_id and can fall
                         // back to query_responses).
                         spdlog::warn("MCP execute_instruction: execution_tracker->create_execution "
-                                     "returned nullopt; dispatching with empty execution_id "
+                                     "failed ({}); dispatching with empty execution_id "
                                      "principal={} plugin={} action={}",
-                                     session->username, plugin, action);
+                                     created.error(), session->username, plugin, action);
                     }
                 }
 
@@ -7525,8 +7873,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // added alongside this change.
                 auto result = tool_result(payload, kObjectOutputSchema);
                 // S5 (2f PR 3a): arm GET-only - the atomic flip-and-drain hands
-                // the latched mailbox to the projector, which publishes progress
-                // LIVE onto this session's GET stream. `result` is passed as the
+                // the latched progress snapshot to the projector, which publishes
+                // progress LIVE onto this session's GET stream. `result` is passed as the
                 // result_base (B5): a parked record's real final re-emits today's
                 // result object with status/agents_* added as top-level keys.
                 // The plain JSON below answers this POST either way - GET-only
@@ -8031,6 +8379,9 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // #3289: value-blind TOCTOU guard, before the scoped gate.
+                if (deny_service_scoped_service_tag_mutation("mcp.set_tag", agent_id, key))
+                    return;
                 // H1 (PR #1796): per-device scope gate — a management-group-
                 // confined operator may tag only devices inside their groups.
                 // Runs AFTER agent_id parse (the scope needs the target).
@@ -8047,8 +8398,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto set_res = tag_store->set_tag_checked(agent_id, key, value, "mcp");
                 if (!set_res) {
                     mcp_audit("failure", agent_id + ":" + key);
-                    res.set_content(error_response(id, kInvalidParams, set_res.error()),
-                                    "application/json");
+                    // #3097 classification: db_error prefix → internal
+                    // (degrade, retryable), else caller-input error.
+                    const bool db_error = set_res.error().starts_with(kTagDbErrorPrefix);
+                    res.set_content(
+                        error_response(id, db_error ? kInternalError : kInvalidParams,
+                                       db_error ? "Tag store unavailable" : set_res.error()),
+                        "application/json");
                     return;
                 }
                 // D4: fire the agent tag-push exactly like the REST path.
@@ -8089,6 +8445,9 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // #3289: value-blind TOCTOU guard, before the scoped gate.
+                if (deny_service_scoped_service_tag_mutation("mcp.delete_tag", agent_id, key))
+                    return;
                 // H1 (PR #1796): per-device scope gate (see set_tag above).
                 // K-06/CDX-R4-09: fail CLOSED when unwired, never widen to perm_fn.
                 if (!scoped_perm_fn) {
@@ -8098,10 +8457,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!scoped_perm_fn(req, res, "Tag", "Delete", agent_id))
                     return;
-                bool deleted = tag_store->delete_tag(agent_id, key);
+                auto deleted = tag_store->delete_tag(agent_id, key);
                 if (!deleted) {
+                    // Degrade → internal error (#3097) — the pre-migration
+                    // bool reported "tag not found" over a store failure.
+                    mcp_audit("failure", agent_id + ":" + key);
+                    res.set_content(error_response(id, kInternalError, "Tag store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                if (!*deleted) {
                     // 404-equivalent (mirror the REST 404 on a missing tag).
-                    mcp_audit("failure", "not found " + agent_id + ":" + key);
+                    // Outcome token matches the legacy + v1 twins' "not_found"
+                    // (governance cons-F2: one outcome vocabulary per event
+                    // across transports, and the target field carries the
+                    // target alone).
+                    mcp_audit("not_found", agent_id + ":" + key);
                     res.set_content(error_response(id, kInvalidParams, "tag not found"),
                                     "application/json");
                     return;
@@ -8785,7 +9156,31 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "summarize_working_set") {
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
-                const std::string kind = param_str(args, "kind", "fleet");
+                // Gate 4 unhappy-path (2026-08-19): this tool is ReadOnly, not
+                // approval-gated, so the input schema's `kind` enum is
+                // advertised only — never enforced server-side (this
+                // codebase's established "ungated tool schema constraints
+                // aren't enforced unless the handler re-checks" pattern). An
+                // out-of-enum caller value was echoed verbatim below,
+                // violating the #2986 output schema's own `kind` enum on a
+                // strict validating client. Normalize to the schema's stated
+                // default before it's ever read or echoed.
+                std::string kind = param_str(args, "kind", "fleet");
+                if (kind != "fleet" && kind != "agent" && kind != "execution" &&
+                    kind != "result_set") {
+                    // Gate 6 sre (2026-08-19): silent normalization is
+                    // operationally invisible — a client sending a
+                    // persistently stale/malformed kind (schema drift, an
+                    // integration bug) would otherwise be undetectable. No
+                    // audit row exists for this ReadOnly tool to piggyback
+                    // on (see the class comment above), so this debug line
+                    // is the only signal; not elevated to warn since a
+                    // single stray call is not itself operator-actionable.
+                    spdlog::debug("MCP summarize_working_set: unknown kind '{}' normalized to "
+                                  "'fleet'",
+                                  kind);
+                    kind = "fleet";
+                }
                 const std::string target_id = param_str(args, "id");
                 const int limit = std::clamp(param_int32(args, "limit", 25), 1, 100);
                 JArr links;
@@ -11812,7 +12207,16 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── Unknown tool ──────────────────────────────────────────────
-            mcp_audit("failure", "unknown tool");
+            // "denied" not "failure" (#2445) — see the pre-gate kUnknown
+            // branch above for the taxonomy rationale. NOTE (adversarial
+            // review, unfixed, tracked in #3176): the pre-gate already exits
+            // for every name the caller can actually cause to reach here, so
+            // this backstop can only fire for a SERVED, security-registered
+            // tool with no matching dispatch branch — a registration defect,
+            // not a client action. No boot-time validator proves dispatch
+            // coverage today, so this stays "denied" (matching the pre-gate)
+            // rather than "failure" until that gap is closed.
+            mcp_audit("denied", "unknown tool");
             res.set_content(error_response(id, kMethodNotFound, "Unknown tool: " + tool_name),
                             "application/json");
             return;
@@ -12092,6 +12496,35 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
     }
 }
 
+// Translate the TU-private `ServiceScopeClass` (#2298 PR 3 §3c) to/from its
+// testonly mirror `ServiceScopeClassForTest`, exhaustive switches so a 4th
+// enumerator on either side fails to compile here rather than silently
+// falling through (same discipline as classify_tool_for_test's switch
+// below).
+ServiceScopeClassForTest service_scope_to_test(ServiceScopeClass c) {
+    switch (c) {
+    case ServiceScopeClass::denied:
+        return ServiceScopeClassForTest::kDenied;
+    case ServiceScopeClass::confined:
+        return ServiceScopeClassForTest::kConfined;
+    case ServiceScopeClass::global_safe:
+        return ServiceScopeClassForTest::kGlobalSafe;
+    }
+    std::unreachable();
+}
+
+ServiceScopeClass service_scope_from_test(ServiceScopeClassForTest c) {
+    switch (c) {
+    case ServiceScopeClassForTest::kDenied:
+        return ServiceScopeClass::denied;
+    case ServiceScopeClassForTest::kConfined:
+        return ServiceScopeClass::confined;
+    case ServiceScopeClassForTest::kGlobalSafe:
+        return ServiceScopeClass::global_safe;
+    }
+    std::unreachable();
+}
+
 // Test-only accessor for the internal kToolSecurity map (decls in
 // mcp_server_testonly.hpp, #2385). The map has internal linkage in the
 // anonymous namespace above but is visible here in the same translation unit;
@@ -12101,7 +12534,8 @@ std::vector<ToolSecurityRow> tool_security_rows_for_test() {
     std::vector<ToolSecurityRow> rows;
     rows.reserve(kToolSecurity.size());
     for (const auto& [name, sec] : kToolSecurity)
-        rows.push_back({name, sec.securable_type, sec.operation});
+        rows.push_back(
+            {name, sec.securable_type, sec.operation, service_scope_to_test(sec.service_scope)});
     return rows;
 }
 
@@ -12159,7 +12593,8 @@ void validate_tool_registration_for_test(const std::vector<std::string>& tool_na
     std::vector<ToolSecurityTuple> rows;
     rows.reserve(security_rows.size());
     for (const auto& r : security_rows)
-        rows.push_back({r.name, r.securable, r.operation});
+        rows.push_back(
+            {r.name, r.securable, r.operation, service_scope_from_test(r.service_scope)});
     std::vector<std::string_view> writes(write_tools.begin(), write_tools.end());
     std::vector<ToolSchemaSource> schemas;
     schemas.reserve(input_schemas.size());

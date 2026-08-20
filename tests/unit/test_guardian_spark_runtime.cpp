@@ -1005,6 +1005,176 @@ TEST_CASE("M1 demotion: a mixed demoted/non-demoted pending set on one key keeps
     REQUIRE(rt->keys_with_pending_initial().empty()); // both demoted now -> key fully off
 }
 
+// --- F11: flood measurement, production defaults (#2298) --------------------------
+//
+// These three cases drive the F5 6b/6c mechanisms end-to-end at PRODUCTION DEFAULT
+// Config (unlike the 6b/6c tests above, which mostly override pending_demote_sweeps/ms
+// to isolate one arm) to establish the wire-flood ceiling the F11 run doc
+// (docs/spark-rebuild-baselines/f11-flood-measurement-run.md) reports, replacing the
+// stale pre-F5 ~17k/day extrapolation in docs/spark-stage2-guardian-consumer-design.md.
+// A test drives cadence by an explicit clock advance per simulated scheduler tick
+// (5s priority lane, 60s/600s type lanes) since GuardianConvergenceScheduler itself
+// received zero code change from F5 (docs/spark-stage2-guardian-consumer-design.md:283)
+// - the real per-lane tick spacing is the scheduler's job, reproduced here by hand.
+
+TEST_CASE("F11 flood: production-default demotion completes in 12 sweeps @ 5s (60s) - "
+          "before any refresh could fire (#2298)",
+          "[spark][runtime]") {
+    SettableClock sc;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt_with_clock(r, b, sc); // production defaults: 12 sweeps, 120s, 300s refresh
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+
+    r->file = read_unknown<FileSnapshot>("io");
+    rt->evaluate_key(key, EvalReason::Initial); // edge - never-Known, priority lane
+    REQUIRE(drain_all(*rt).size() == 1);
+
+    int sweeps = 0;
+    while (rt->priority_demoted() == 0) {
+        sc.advance(5'000); // the 5s priority-lane cadence (guardian_convergence_scheduler.hpp:72)
+        rt->evaluate_key(key, EvalReason::Convergence);
+        REQUIRE(drain_all(*rt).empty()); // pre-demotion: every sweep suppressed, none refresh
+        ++sweeps;
+    }
+    CHECK(sweeps == 12); // pending_demote_sweeps default (guardian_spark_runtime.hpp:178)
+    CHECK(rt->unhealthy_suppressed() == 12);
+    CHECK(rt->unhealthy_refreshed() == 0); // demotion (60s) completes well inside the 300s floor
+}
+
+TEST_CASE("F11 flood: post-demotion 60s-cadence lane (service/registry) refreshes exactly "
+          "every errored_refresh_ms, first landing at t=300s (#2298)",
+          "[spark][runtime]") {
+    SettableClock sc;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt_with_clock(r, b, sc);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+
+    r->file = read_unknown<FileSnapshot>("io");
+    rt->evaluate_key(key, EvalReason::Initial); // edge @ t=0
+    REQUIRE(drain_all(*rt).size() == 1);
+
+    while (rt->priority_demoted() == 0) { // demote at t=60s, as the prior case establishes
+        sc.advance(5'000);
+        rt->evaluate_key(key, EvalReason::Convergence);
+        drain_all(*rt);
+    }
+    REQUIRE(rt->priority_demoted() == 1);
+
+    // Now on the 60s type-lane cadence. 14 ticks reaches t=60s+14*60s=900s, spanning
+    // three 300s refresh boundaries (t=300s, 600s, 900s) - refreshed is keyed off the
+    // LAST emission (the edge at t=0 initially), not re-armed by demotion.
+    for (int i = 1; i <= 3; ++i) {
+        sc.advance(60'000);
+        rt->evaluate_key(key, EvalReason::Convergence);
+        drain_all(*rt);
+    }
+    CHECK(rt->unhealthy_refreshed() == 0); // t=240s: still short of the 300s floor
+    sc.advance(60'000); // t=300s: exactly the boundary
+    rt->evaluate_key(key, EvalReason::Convergence);
+    drain_all(*rt);
+    CHECK(rt->unhealthy_refreshed() == 1);
+    for (int i = 1; i <= 10; ++i) { // t=360s..900s: two more 300s boundaries at 600s, 900s
+        sc.advance(60'000);
+        rt->evaluate_key(key, EvalReason::Convergence);
+        drain_all(*rt);
+    }
+    CHECK(rt->unhealthy_refreshed() == 3);
+    // Steady-state projection (arithmetic on the measured 300s period, not a fresh
+    // 24h loop - 300s divides 86400s evenly): 288 refreshes/day + 1 edge = 289 total
+    // guard.unhealthy wire messages/rule/agent/day on this lane - see the F11 run doc.
+}
+
+TEST_CASE("F11 flood: post-demotion 600s-cadence lane (file) refreshes on EVERY sweep, "
+          "since its cadence already exceeds errored_refresh_ms (#2298)",
+          "[spark][runtime]") {
+    SettableClock sc;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt_with_clock(r, b, sc);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+
+    r->file = read_unknown<FileSnapshot>("io");
+    rt->evaluate_key(key, EvalReason::Initial); // edge @ t=0
+    REQUIRE(drain_all(*rt).size() == 1);
+
+    while (rt->priority_demoted() == 0) { // demote at t=60s
+        sc.advance(5'000);
+        rt->evaluate_key(key, EvalReason::Convergence);
+        drain_all(*rt);
+    }
+    REQUIRE(rt->priority_demoted() == 1);
+    REQUIRE(rt->unhealthy_refreshed() == 0);
+
+    // First post-demotion file-lane sweep: t=60s+600s=660s, already >=300s since the
+    // t=0 edge - refreshes immediately, no suppression window at all on this lane.
+    sc.advance(600'000);
+    rt->evaluate_key(key, EvalReason::Convergence);
+    CHECK(drain_all(*rt).size() == 1);
+    CHECK(rt->unhealthy_refreshed() == 1);
+    CHECK(rt->unhealthy_suppressed() == 12); // unchanged since demotion - never suppressed here
+
+    sc.advance(600'000); // t=1260s
+    rt->evaluate_key(key, EvalReason::Convergence);
+    CHECK(drain_all(*rt).size() == 1);
+    CHECK(rt->unhealthy_refreshed() == 2);
+    // At EXACT 600s cadence (no scheduler jitter): 144 refreshes/day + 1 edge = 145
+    // total wire messages/rule/agent/day on this lane (86400s/600s = 144 sweeps/day,
+    // every one refreshes). This is the NOMINAL figure, not the production ceiling -
+    // see the next case for the jittered worst-case, and the F11 run doc for both.
+}
+
+TEST_CASE("F11 flood: file lane at the scheduler-jitter floor (480s) still refreshes "
+          "every sweep - the TRUE production worst-case ceiling is 180/day, not the "
+          "144/day no-jitter figure (#2298, adversarial-review finding)",
+          "[spark][runtime]") {
+    // ConvergenceScheduler::Config defaults file_cadence_ms=600'000, jitter_pct=20
+    // (guardian_convergence_scheduler.hpp:69-73); jittered() draws base_ms +
+    // uniform(-span, +span) with span = base_ms*jitter_pct/100 = 120'000
+    // (guardian_convergence_scheduler.cpp:59-69) - a SYMMETRIC perturbation, not the
+    // later-only skew the run doc originally (incorrectly) claimed. The minimum
+    // possible single-draw interval is therefore 600'000-120'000=480'000ms: still
+    // above the 300s errored_refresh_ms floor, so every such sweep still refreshes,
+    // same as the exact-600s case - but at up to 86400/480=180 refreshes/day, not 144.
+    // This case proves that boundary empirically rather than asserting the arithmetic.
+    SettableClock sc;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt_with_clock(r, b, sc);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+
+    r->file = read_unknown<FileSnapshot>("io");
+    rt->evaluate_key(key, EvalReason::Initial); // edge @ t=0
+    REQUIRE(drain_all(*rt).size() == 1);
+
+    while (rt->priority_demoted() == 0) { // demote at t=60s
+        sc.advance(5'000);
+        rt->evaluate_key(key, EvalReason::Convergence);
+        drain_all(*rt);
+    }
+    REQUIRE(rt->priority_demoted() == 1);
+    REQUIRE(rt->unhealthy_refreshed() == 0);
+
+    // Three consecutive sweeps at the jitter-floor 480s interval: every one refreshes
+    // (480s > 300s), proving jitter cannot suppress a file-lane refresh - it can only
+    // make them MORE frequent than the no-jitter 144/day figure, up to 180/day.
+    for (std::uint64_t i = 1; i <= 3; ++i) {
+        sc.advance(480'000);
+        rt->evaluate_key(key, EvalReason::Convergence);
+        CHECK(drain_all(*rt).size() == 1);
+        CHECK(rt->unhealthy_refreshed() == i);
+    }
+    CHECK(rt->unhealthy_suppressed() == 12); // unchanged - still never suppressed on this lane
+    // Ceiling: 86'400s / 480s = 180 refreshes/day + 1 edge = 181 total wire
+    // messages/rule/agent/day - the honest production worst-case, not 144. See the
+    // F11 run doc's corrected Claims section.
+}
+
 TEST_CASE("on_event after begin_stop commits nothing", "[spark][runtime]") {
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();

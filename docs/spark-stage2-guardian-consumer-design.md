@@ -139,9 +139,19 @@ state then. Keeping the fallthrough means implementing the same outcome twice, a
 teaching the parity suite, the telemetry, and the operator model two behaviours.
 
 Verified safe to change now:
-- **Enforcement behaviour is identical.** The legacy File/Registry guards already return
-  false from `start()` off-Windows: a silent no-op, no `guards_` entry. Nothing enforces
-  either way. What changes is reporting, from silence to an explicit state.
+- **Enforcement behaviour is identical for the File/Registry case.** The legacy
+  File/Registry guards already return false from `start()` off-Windows: a silent
+  no-op, no `guards_` entry. Nothing enforces either way. What changes is reporting,
+  from silence to an explicit state. This is scoped to File/Registry, not a blanket
+  guarantee across every mechanism: the Service guard's legacy path (`guard_systemd.cpp`)
+  opens its own independent D-Bus connection, so a spark-side registration failure or
+  registered-but-inert mechanism (a containerised host with no systemd bus, per
+  `guaranteed-state.md`'s own worked example) can in principle diverge from legacy's
+  outcome on that one mechanism - see `reconcile_rule_locked`'s own comment on the
+  `Unsupported` branch (enterprise-readiness governance finding, F7/#2298; by
+  inspection, the one documented inert case shows no delta - legacy fails identically
+  there too - but the guarantee is narrower than this bullet's original wording
+  implied).
 - **Nothing server-side breaks.** The Guardian status surface is still mock/placeholder
   (§Health/status surface), so no server code validates status tokens yet. This is the
   cheapest moment to introduce one; rung 4 owns its wiring.
@@ -160,6 +170,17 @@ Verified safe to change now:
    nullptr off their platforms, so every rule on a spark-preferred macOS agent classifies
    `Unsupported`. That matches today's macOS enforcement reality, but the macOS CI leg
    must assert exactly that posture or it passes by testing nothing.
+
+**Landed (F7, #2298):** `reconcile_rule_locked` gives `RulePlacement::Unsupported` a
+distinct terminal-state branch - withdraws from both backends, tracks the rule_id in a
+new `unsupported_rules_` map (per-outcome erase/insert at every other return path, swept
+against the actual push contents on `full_sync`, cleared in `stop()`). All three
+consequences above are addressed: (1) the reconcile tests were rewritten in the same PR,
+plus a real macOS-factory test asserting the all-unsupported posture directly (not (3),
+which is a rung-10 parity-gate item, still open); (2) not yet - the intentional-delta
+registry remains rung 10's job. Also shipped in the same PR: the `mech_unsupported_total`
+per-mechanism fleet gauge and `yuzu.guardian_backend` heartbeat tag (§Platform-rejection,
+§Fleet metrics, items 8-9 below).
 
 ### R3 - I/O executor quota semantics
 
@@ -253,7 +274,9 @@ The read-failure path calls `unhealthy()` **unconditionally** on every `!read.kn
 *recovery* is edge-forced (`pack()`'s `recovered` bit). `build_entries` then pushes a
 **fresh-`event_id`** health entry on every `Unhealthy` (`guardian_spark_runtime.cpp:405-413`).
 An unhealthy rule stays in `pending_initial` (`:357`), which the priority lane re-sweeps
-every ~5 s (`guardian_convergence_scheduler.hpp:60` `priority_poll_ms{5000}`). Net: one
+every ~5 s (`ConvergenceScheduler::Config::priority_poll_ms`, default 5000 - the
+`guardian_convergence_scheduler.hpp:60` line-ref this paragraph originally cited has
+since drifted; cite the symbol, not a line number, for exactly this reason). Net: one
 mundane unreadable target (ACL-denied file, missing hive path) emits **~17 k
 `guard.unhealthy`/day/rule/agent**, each its own server-side insert transaction. Legacy
 has no health stream, so this traffic class switches on **at the flip** — a self-inflicted
@@ -262,6 +285,33 @@ guard.unhealthy" is false.** Fix (send-path, flag-gated inert → PR-1, flip uns
 without it): transition-edge health emission (emit on the false→true unknown edge + a
 slow periodic refresh only) + evict never-Known rules from the 5 s priority lane to
 their normal lane cadence.
+
+**SUPERSEDED 2026-08-18 (F11, #2298) - the fix above has since shipped, in two parts,
+and the ~17k/day figure is the PRE-fix number.** Transition-edge emission shipped first
+(`b30e93cfd`, 2026-07-20, "edge-guard into-unknown to stop unhealthy-event flood") -
+this alone removed the per-sweep flood this paragraph describes; every committed
+repeat-Unknown became silent (edge-only, `unhealthy_suppressed_`) rather than a
+fresh-`event_id` re-emission on every ~5s sweep. F5 (PR #3005, merged 2026-08-11) then
+*added back* a deliberate, bounded, nonzero steady state on top of edge-only silence:
+`errored_refresh_ms` (default 300s) re-emits a stale-but-still-errored rule so a
+lost/coalesced edge cannot leave the server's view stale forever, and
+`pending_demote_sweeps`/`pending_demote_ms` evict a never-Known rule off the 5s
+priority lane onto its normal type-lane cadence - exactly the mechanism this
+paragraph's "Fix" bullet called for. **F5 did not reduce the ~17k/day figure - edge
+emission already had, to zero steady-state wire traffic; F5 set the new nonzero
+ceiling on top of that silence, by design (a lost-edge backstop, not free).** The
+measured ceiling (fake-clock Catch2 cases at production Config defaults,
+`tests/unit/test_guardian_spark_runtime.cpp`, "F11 flood: ..." - see
+`docs/spark-rebuild-baselines/f11-flood-measurement-run.md` for the full derivation and
+a live-rig confirmation): **1 edge + 288 refreshes/day/rule/agent** on a 60s-cadence
+lane (service/registry - refresh recurs exactly every `errored_refresh_ms`, first
+landing at t=300s post-edge), **1 edge + 180 refreshes/day/rule/agent** on the 600s
+file lane, accounting for the scheduler's default +/-20% jitter (every post-demotion
+sweep refreshes, since even the jitter-minimum 480s spacing already exceeds the 300s
+floor; 144/day is the exact-no-jitter figure, 180/day is the true production ceiling
+- corrected 2026-08-18 after an adversarial review caught the original doc's false
+"jitter never shortens a sweep" claim). Both corrected figures are roughly 60-95x
+below the pre-fix ~17k/day this paragraph documents.
 
 **Landed (PARTIAL) 2026-07-20, commit `b30e93cf`:** the **transition-edge emission** + a
 **counted, sparse-heartbeat suppression signal** (`yuzu.guardian_unhealthy_suppressed`) shipped.
@@ -1217,6 +1267,9 @@ Each rung is an independently-governed PR on `dev`, run through the full
    - **8.** `mech_unsupported_total` + `yuzu_fleet_spark_unsupported` - **folded into
      7.7b PR-1** per R2 (unsupported must be loud the moment a rule can land on spark);
      current-gauge vs cumulative-counter split per §7.7b split.
+     **Landed (F7, #2298),** together with R2's terminal-state code and the
+     `yuzu.guardian_backend` heartbeat tag (#2240 item 1 - the server-side flap/dark-
+     device detector, #2240 item 2, remains open).
    - **10.** Parity + durability + integration matrix. Semantic ports land **before**
      7.7b where possible; live/equivalence after. Carries the **intentional-delta
      registry** (R2 consequence 2) so zero-tolerance parity survives the legacy-no-op

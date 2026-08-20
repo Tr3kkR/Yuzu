@@ -17,7 +17,7 @@ __declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_diag_in
 #include <yuzu/version.hpp>
 
 #include "hard_exit.hpp" // shared TerminateProcess/_exit + F3 orphan-drain poll (rung 7.6)
-#include "shutdown_watcher.hpp" // POSIX self-pipe + watcher thread (the B2 root fix)
+#include <yuzu/shutdown_watcher.hpp> // POSIX self-pipe + watcher thread (the B2 root fix; shared with the server, #3007)
 #include "service_win.hpp" // #1822: Windows SCM ServiceMain/control-handler dispatcher
 
 #include <CLI/CLI.hpp>
@@ -256,7 +256,7 @@ static void on_signal(int sig) {
     // the log is best-effort and comes after. (governance: security-guardian + unhappy-path.)
     const int wfd = g_shutdown_wfd.load(std::memory_order_acquire);
     if (wfd >= 0) {
-        const char byte = yuzu::agent::ShutdownWatcher::kSignal;
+        const char byte = yuzu::ShutdownWatcher::kSignal;
         ssize_t n = ::write(wfd, &byte, 1); // async-signal-safe, and CANNOT block (O_NONBLOCK)
         (void)n; // EAGAIN on a full pipe just means a shutdown is already pending — which is
                  // exactly what we wanted.
@@ -681,7 +681,7 @@ int main(int argc, char* argv[]) {
     // file, for the same reason. If it throws, the !ok() branch below installs the hard-exit
     // handler — NOT SIG_DFL, which pid 1 would discard.
     // (governance: cpp-expert, this PR.)
-    std::optional<yuzu::agent::ShutdownWatcher> shutdown_watcher;
+    std::optional<yuzu::ShutdownWatcher> shutdown_watcher;
     try {
         shutdown_watcher.emplace(
         g_shutdown_wfd,

@@ -10,7 +10,8 @@
 #include "guardian_form_render.hpp"
 #include "guardian_push_builder.hpp"  // guardian_enforced_on_platform / platform_display_name / os_target_matches
 #include "guardian_rule_spec.hpp"
-#include "rest_a4_envelope.hpp"
+#include "rest_a4_envelope_http.hpp" // detail::a4_denial — mints/reuses X-Correlation-Id so
+                                     // header and body always agree
 #include "secure_random.hpp"
 #include "store_errors.hpp"
 #include "web_utils.hpp"
@@ -283,7 +284,6 @@ bool GuardianRoutes::deny_service_scoped_(const httplib::Request& req,
         return true; // auth_fn_ already wrote 401/redirect; caller returns.
     if (session->token_scope_service.empty())
         return false;
-    const auto cid = detail::make_correlation_id();
     // Write the 403 FIRST, audit after: the audit call is fire-and-forget
     // (GuardianRoutes::AuditFn is void, no persist signal to route through a
     // kernel like try_persist_audit), and a THROWING audit_fn must not be able
@@ -292,10 +292,15 @@ bool GuardianRoutes::deny_service_scoped_(const httplib::Request& req,
     // uncaught throw turned the intended 403 into a bare httplib 500 with
     // no response body at all (worse than silence: it also broke the deny).
     res.status = 403;
+    // No `.permission`: `kServiceScopeGlobalSafe` is compile-time-empty, so
+    // no grant admits a service-scoped caller here — naming one is the false
+    // self-remediation claim the routed-concern MUST clause forbids (gov-fix,
+    // Gate 8, #2298 PR 3 hardening round). `a4_denial` (not a hand-built
+    // `error_json_a4` + bare cid) also fixes a second bug found in the same
+    // pass: the hand-built id never reached the X-Correlation-Id header.
     res.set_content(
-        detail::error_json_a4(
-            403, "service-scoped tokens may not read this fleet-wide Guardian view", cid,
-            detail::A4ErrorOpts{.permission = "GuaranteedState:Read"}),
+        detail::a4_denial(res, 403,
+                          "service-scoped tokens may not read this fleet-wide Guardian view"),
         "application/json");
     // One shared verb across every fragment this gate covers (data-bearing:
     // status, guards, events, guard/page, baselines, baseline/page; and the
@@ -333,14 +338,14 @@ bool GuardianRoutes::deny_service_scoped_mutation_(const httplib::Request& req,
         return true; // auth_fn_ already wrote 401/redirect; caller returns.
     if (session->token_scope_service.empty())
         return false;
-    const auto cid = detail::make_correlation_id();
     // Write the 403 FIRST, audit after — same throw-safety rationale as
     // deny_service_scoped_ above.
     res.status = 403;
+    // No `.permission`: same reasoning as deny_service_scoped_ above — the
+    // allow-list is compile-time-empty, no grant admits this caller.
     res.set_content(
-        detail::error_json_a4(
-            403, "service-scoped tokens may not modify this fleet-wide Guardian resource", cid,
-            detail::A4ErrorOpts{.permission = "GuaranteedState:" + operation}),
+        detail::a4_denial(
+            res, 403, "service-scoped tokens may not modify this fleet-wide Guardian resource"),
         "application/json");
     if (audit_fn_) {
         try {

@@ -10,7 +10,7 @@
 #include "inventory_routes.hpp"
 
 #include "http_route_sink.hpp"
-#include "rest_a4_envelope.hpp" // detail::error_json_a4, make_correlation_id
+#include "rest_a4_envelope_http.hpp" // detail::a4_denial
 #include "rest_audit.hpp" // detail::try_persist_audit — throw-safe set-and-proceed audit kernel (#1647)
 
 #include <algorithm>
@@ -165,17 +165,21 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                  // serial/system_uuid/primary_mac-bearing roster would still be
                  // fleet-wide. Same verb as the route's own success/failure audit.
                  if (!session->token_scope_service.empty()) {
-                     const auto cid = detail::make_correlation_id();
+                     // Write the 403 FIRST, audit after (normalized — #3167).
+                     // `.permission` omitted: kServiceScopeGlobalSafe is
+                     // compile-time-empty, so no grant admits a service-scoped
+                     // caller here; naming one would be a false
+                     // self-remediation claim.
+                     res.status = 403;
+                     res.set_content(
+                         detail::a4_denial(
+                             res, 403,
+                             "service-scoped tokens may not read the fleet-wide device "
+                             "inventory list"),
+                         "application/json");
                      (void)detail::try_persist_audit(
                          audit_fn_, req, "inventory.devices", "denied", "Inventory", "fleet",
                          "fleet-wide device inventory list denied to a service-scoped token");
-                     res.status = 403;
-                     res.set_content(
-                         detail::error_json_a4(
-                             403, "service-scoped tokens may not read the fleet-wide device "
-                                  "inventory list",
-                             cid, detail::A4ErrorOpts{.permission = "Inventory:Read"}),
-                         "application/json");
                      return;
                  }
                  if (!perm_fn_(req, res, "Inventory", "Read"))
@@ -298,17 +302,20 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                  // result="denied" (governance finding: this file's sibling
                  // fix two routes above closed the same class here).
                  if (!session->token_scope_service.empty()) {
-                     const auto cid = detail::make_correlation_id();
+                     // Write the 403 FIRST, audit after (normalized — #3167).
+                     // `.permission` omitted: kServiceScopeGlobalSafe is
+                     // compile-time-empty, so no grant admits a service-scoped
+                     // caller here; naming one would be a false
+                     // self-remediation claim.
+                     res.status = 403;
+                     res.set_content(
+                         detail::a4_denial(
+                             res, 403,
+                             "service-scoped tokens may not run a fleet-wide software search"),
+                         "application/json");
                      (void)detail::try_persist_audit(
                          audit_fn_, req, "inventory.software.query", "denied", "Inventory", "fleet",
                          "fleet-wide software search denied to a service-scoped token");
-                     res.status = 403;
-                     res.set_content(
-                         detail::error_json_a4(
-                             403,
-                             "service-scoped tokens may not run a fleet-wide software search",
-                             cid, detail::A4ErrorOpts{.permission = "Inventory:Read"}),
-                         "application/json");
                      return;
                  }
                  if (!perm_fn_(req, res, "Inventory", "Read"))
