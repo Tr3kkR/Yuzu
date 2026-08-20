@@ -9,10 +9,12 @@
 #include <yuzu/agent/kv_store.hpp>
 
 #include "guaranteed_state.pb.h"
+#include "guardian_convergence_scheduler.hpp" // ConvergenceScheduler (started_for_test, #2238)
 #include "guardian_journal_format.hpp" // kJournalNamespace, parse_journal_batch (item 7 PR-Ag)
 #include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (aggregate inertness)
 #include "guardian_lifecycle_journal.hpp" // GuardianLifecycleJournal (for the _for_test fault seam)
 #include "guardian_outbox.hpp" // OutboxEntry, SendResult - full definitions for the test's send_fn
+#include "guardian_outbox_drain_worker.hpp" // GuardianOutboxDrainWorker (started_for_test, #2238)
 #include "spark_engine.hpp"
 #include "spark_mechanism.hpp"
 
@@ -942,6 +944,48 @@ TEST_CASE("journal_age_stats: present on a live prefer_spark worker, nullopt whe
         CHECK(tags.empty());
         engine.stop();
         spark_engine.stop();
+    }
+}
+
+TEST_CASE("wire_spark_engine constructs the spark workers unconditionally but starts them "
+          "ONLY under prefer_spark",
+          "[spark][guardian][reconcile][boot]") {
+    // #2238 item 2 (fixes BLOCKING-2b): the convergence scheduler + drain worker are
+    // CONSTRUCTED in wire_spark_engine() regardless of prefer_spark_, but only START()ed
+    // under the flag (guardian_engine.cpp's `if (prefer_spark_) { ...->start(); ...
+    // ->start(); }`). Reverting that gate to always-start fails no other existing test
+    // (journal_age_stats() short-circuits on !prefer_spark_ before it would ever see a
+    // started-but-dormant worker). This drives both classes' started_for_test() directly.
+    {
+        // prefer_spark=false + wired: both constructed, neither started.
+        auto opened = KvStore::open(unique_kv_path());
+        REQUIRE(opened.has_value());
+        KvStore kv{std::move(*opened)};
+        SparkEngine spark_engine;
+        auto mech = std::make_unique<FakeServiceMechanism>();
+        REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
+        spark_engine.start();
+        GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/false};
+        REQUIRE(engine.start_local().has_value());
+        engine.wire_spark_engine(&spark_engine, false,
+                                 [](const OutboxEntry&) { return SendResult::Sent; });
+        REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+
+        REQUIRE(engine.drain_worker_for_test() != nullptr);
+        REQUIRE(engine.convergence_scheduler_for_test() != nullptr);
+        CHECK_FALSE(engine.drain_worker_for_test()->started_for_test());
+        CHECK_FALSE(engine.convergence_scheduler_for_test()->started_for_test());
+
+        engine.stop();
+        spark_engine.stop();
+    }
+    {
+        // prefer_spark=true (SparkReconcileFixture): both constructed AND started.
+        SparkReconcileFixture f;
+        REQUIRE(f.engine->drain_worker_for_test() != nullptr);
+        REQUIRE(f.engine->convergence_scheduler_for_test() != nullptr);
+        CHECK(f.engine->drain_worker_for_test()->started_for_test());
+        CHECK(f.engine->convergence_scheduler_for_test()->started_for_test());
     }
 }
 

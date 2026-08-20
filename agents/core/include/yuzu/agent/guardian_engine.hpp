@@ -323,6 +323,22 @@ public:
         return lifecycle_journal_.get();
     }
 
+    /// TEST-ONLY: the spark drain worker / convergence scheduler, for started-state
+    /// introspection (#2238, fixes BLOCKING-2b). wire_spark_engine() constructs both
+    /// unconditionally but starts them only under prefer_spark_ — journal_age_stats()
+    /// short-circuits on !prefer_spark_ BEFORE its stamp check, so that accessor alone
+    /// does not discriminate "constructed but never started" from "prefer_spark_
+    /// false"; reverting the start gate (always-start) fails no other test. Read-only
+    /// introspection — categorically outside the mutable-decision-setter class rev-1
+    /// review rejected (see SparkAvailability above). Null until wire_spark_engine
+    /// runs. No production caller.
+    [[nodiscard]] GuardianOutboxDrainWorker* drain_worker_for_test() {
+        return spark_drain_worker_.get();
+    }
+    [[nodiscard]] ConvergenceScheduler* convergence_scheduler_for_test() {
+        return spark_scheduler_.get();
+    }
+
     /// TEST-ONLY: override the drain worker's periodic backstop and maintenance cadences.
     /// MUST be called BEFORE wire_spark_engine(), which is what constructs the worker.
     ///
