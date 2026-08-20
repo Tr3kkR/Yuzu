@@ -78,7 +78,7 @@ The mechanism the **active–active server tier** uses to agree and signal acros
 
 ## Server tier
 
-The set of interchangeable **active–active server instances** behind the operator-plane load balancer (ADR-2002). Instances share all durable state (Postgres) and coordinate through the **coordination substrate**; any instance can serve any operator/API/MCP request. Distinct from a single server process (the historical single-server design) and from a **gateway cluster** (the agent-plane concentrator). Server-tier HA (multi-instance servers) and **storage HA** (HA Postgres) are orthogonal axes: either can exist without the other.
+The set of interchangeable **active–active instances of the API-authoritative core** — the binary that owns the public REST/MCP surface and is the sole `yuzu`-database authority (ADR-0031 INV-31-3/4) — behind the operator-plane load balancer (ADR-2002). Instances share all durable state (Postgres) and coordinate through the **coordination substrate**; any instance can serve any operator/API/MCP request. Scoped deliberately to the **core** tier, **not** a fused server+everything box: under the accepted presentation/core/engine decomposition (ADR-0031/0032/0033), presentation replicas, **gateway clusters**, and **engine replicas/jobs** (the UCE, with its own database) are *separate* replication axes, and `yuzu`-database availability is distinct from engine-database availability. Distinct from the historical single-server process. Server-tier HA (multi-instance core) and **storage HA** (HA Postgres) are orthogonal axes: either can exist without the other.
 
 ## Reachability
 

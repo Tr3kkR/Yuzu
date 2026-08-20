@@ -7,8 +7,9 @@ owner: Fraser Jarvis (@fjarvis)
 
 **Authors:** Fraser Jarvis (@fjarvis)
 **Review:** hardened after adversarial review by the `enterprise-architect` validator and
-`gpt-5.6-sol` (both read the codebase); see *Guarantees and non-guarantees* and *Review findings
-incorporated* below.
+`gpt-5.6-sol` (both read the codebase), then revised again per the PR #3320 `CHANGES_REQUESTED`
+review; see *Guarantees and non-guarantees*, *Deployment topology and replication axes*, and the two
+*Review findings incorporated* rounds below.
 
 ## Context
 
@@ -76,12 +77,43 @@ Adopt a **hybrid, on-prem-first (SaaS-capable) HA architecture**:
 - **Promise only what the protocol guarantees.** No claim of exactly-once, location-transparency, or
   monotonicity that the mechanism does not actually deliver (see *Guarantees and non-guarantees*).
 
+## Deployment topology and replication axes
+
+This ADR must serve **both** the current monolithic server **and** the accepted (design-only,
+binds-prospectively) presentation/core/engine decomposition of ADR-0031/0032/0033. **"Server tier"
+here means the API-authoritative core** — the binary that owns the public REST/MCP surface and is the
+sole database authority (ADR-0031 INV-31-3/4), *not* a fused server+everything box. HA is defined over
+**independent replication axes**, not one tier:
+
+- **Presentation replicas** — stateless dashboard/HTMX shell; scales freely once sessions are durable
+  (§4); no database access of its own (ADR-0031).
+- **Core replicas** — the active–active operator/API/MCP plane §§3–12 concern; the sole writer to the
+  `yuzu` database.
+- **Gateway replicas** — the per-zone gateway clusters (§7, §7a).
+- **Engine replicas / jobs** — use-case engine host (UCE) instances, headless, consuming core through
+  the versioned API as engine principals (ADR-1005), with their **own derived-state database** distinct
+  from `yuzu`. So **`yuzu`-database availability and engine-database availability are separate axes**,
+  and an engine outage must not take down core.
+
+**Consequence for NVD (finding 1):** NVD/CVE sync and matching are being **strangled OUT of the server
+into the UCE engine** (ADR-0023; ADR-1005 execution-plan Phase 7). Their HA is an **engine-tier**
+concern (engine replicas/jobs + the engine DB + leader-among-engines for the sync job) — **not** a
+server store leader-synced into `yuzu`. The earlier draft's "NVD leader-syncs to shared Postgres" is
+**withdrawn** (§9). The `Server tier` glossary term is scoped to the core/API tier accordingly, so it
+does not codify a two-tier model the three-binary one already supersedes.
+
 ## Guarantees and non-guarantees
 
 - **Command dispatch: effectively-once.** At-least-once delivery via a transactional outbox +
   claim-before-side-effect, made effectively-once by **receiver-side idempotency** — the gateway and
-  agent dedup on a stable `command_id`. We do **not** promise exactly-once (a crash between claim
-  commit and RPC send is unavoidable; the receiver's dedup is what closes it).
+  agent dedup on a stable `command_id`. **This depends on a receiver mechanism that does not durably
+  exist yet:** the agent's dedup is today two in-memory `std::unordered_set`s
+  (`dedup_current_`/`dedup_previous_`, `agent.cpp:3464`) **`.clear()`d on every fresh connection**
+  (`agent.cpp:2484`), so an agent reconnect or daemon restart — the most common failure mode — wipes
+  it. **Durable agent-side command idempotency is therefore a named prerequisite workstream** (WS-0),
+  not an existing property; until it lands the end-to-end guarantee degrades to at-least-once across an
+  agent bounce. We do **not** promise exactly-once (a crash between claim commit and RPC send is
+  unavoidable; durable receiver dedup is what closes it).
 - **Events/SSE: at-least-once with gap detection.** Durable monotonic event IDs; consumers replay
   from a cursor / `Last-Event-ID`; NOTIFY is a latency hint only. A consumer may see a duplicate
   event and must tolerate it.
@@ -113,11 +145,19 @@ judge it against the active-active-streams alternative with the intra-cluster co
 assumed free.
 
 ### 3. Coordination substrate — seam + Postgres default (Q3)
-Narrow interfaces — a **fenced** `LeaderElector` (advisory-lock backed, issues a fencing token) and a
-cross-instance signal/event channel (`NOTIFY`-as-hint over a durable outbox table with a **mandatory
-reconnect cursor-poll + periodic safety poll**). Ship only the Postgres implementation; a SaaS
-backend (Redis/NATS) drops in without touching call sites. Constraints this imposes (backend
-affinity, no transaction-mode pooler on coordination connections) are in §10.
+Narrow interfaces — a **fenced** `LeaderElector` and a cross-instance signal/event channel
+(`NOTIFY`-as-hint over a durable outbox table with a **mandatory reconnect cursor-poll + periodic
+safety poll**). Ship only the Postgres implementation; a SaaS backend (Redis/NATS) drops in without
+touching call sites. Constraints this imposes (backend affinity, no transaction-mode pooler on
+coordination connections) are in §10.
+
+**Fencing token, made explicit (finding 3):** the advisory lock provides mutual exclusion only while
+its owning connection lives — it says nothing about a *paused* former leader resuming work after the
+lock silently moved. So leadership carries an explicit **monotonically-increasing epoch** (a Postgres
+sequence bumped on each acquisition; the acquirer records `current_leader_epoch`). Every
+side-effecting claim (§6) checks `claim.epoch == current_leader_epoch` **in the same transaction as
+the claim**, independent of whether the actor still *believes* it holds the lock. A stale ex-leader
+therefore cannot commit a claim even in the window before it notices its lock dropped.
 
 ### 4. Operator sessions — durable in Postgres, absolute wall-clock (Q4)
 Sessions move from the in-memory map (`AuthManager::sessions_`, `steady_clock`) to durable Postgres
@@ -137,6 +177,15 @@ false "better by construction" claim):
   host is trusted operator infrastructure), which is why this is acceptable — but it is a reversal
   with a real regression, not a free win. A short-TTL cache + generation token (the `rbac_store`
   pattern) keeps sessions off the hot path. LB stickiness is a later locality optimization.
+
+  **Invariant docs superseded by this decision (finding 4)** — accepting §4 contradicts two
+  routed-concern rows as written, which must be updated in the same change: the **AuthDB row**
+  ("Sessions are in-memory-only — no durable session surface on this store") and the **clock-guarded
+  retention** row's carve-out ("NOT the `auth_db` session sweep — sessions moved out of AuthDB with
+  the Postgres migration and live in-memory on a MONOTONIC clock, immune to this hazard by
+  construction"). Once sessions are durable Postgres rows on a wall clock, the session sweep is **no
+  longer exempt** from the clock-guard rule and must adopt the guarded shape. Listed under
+  *Consequences*.
 
 ### 5. Event / SSE fan-out — durable outbox + NOTIFY-as-hint (Q5)
 `ExecutionEventBus` becomes a **local** fan-out fed by a **dedicated append-only Postgres event
@@ -169,14 +218,23 @@ claim-commit and the external send is unavoidable:
   **stable occurrence/command ID**) in the same transaction as the state transition; a claimed
   delivery loop drives `pending → sent`. A crash re-drives from `pending`.
 - **Receiver idempotency:** the gateway and agent dedup on `command_id`, so an at-least-once re-drive
-  is effectively-once at the endpoint.
+  is effectively-once at the endpoint — **contingent on WS-0** making the agent's dedup durable
+  (today's `dedup_current_`/`dedup_previous_` are in-memory and cleared on reconnect, `agent.cpp:2484`).
 - **Fencing token in the claim transaction:** every claim CAS checks the leader's fencing token, so a
   stale ex-leader cannot commit a claim even before it notices its lock dropped. A boolean "I am
   leader" cached outside the lock connection is prohibited.
 - **`PolicyEvaluator` remediation is redesigned** (it currently dispatches the fix *before* recording
   `fixing`, `policy_evaluator.cpp:421`, under process-local mutex/maps): it gets a durable occurrence
   key, claim-before-dispatch, and outbox delivery — the same shape — so two stale leaders or two
-  concurrent operator remediations cannot both fire.
+  concurrent operator remediations cannot both fire. **Two code-level obligations for WS-3 (finding
+  6a):** (i) `dispatch_instruction` currently **discards** `CommandDispatchFn`'s
+  `(execution_id, sent_count)` return (`policy_evaluator.cpp:266`) and always yields a non-empty
+  execid regardless of whether any target was reached — the redesign must thread `sent_count` through
+  so "all targets offline" is a real signal; (ii) it must **preserve the reason** the current code
+  dispatches before recording `fixing` — a *failed* dispatch must not burn a capped retry attempt, or
+  the agent eventually auto-locks to `error` with no fix ever sent. Claim-before-side-effect must
+  distinguish "occurrence claimed and delivered" from "occurrence claimed but delivery failed → retry,
+  don't consume the attempt."
 - Already-correct guards (Deployment CAS, retention/rotation advisory locks) stay as
   defense-in-depth; idempotent/read-only loops run leader-only with no claim.
 
@@ -203,6 +261,13 @@ cluster unit; intra-zone scale is more nodes.
   cluster; an undeliverable command (cluster unreachable, stale/expired lease, agent mid-migration)
   stays `pending` in the outbox (§6) and is re-driven — with receiver dedup absorbing any double
   delivery during a re-home race.
+- **`gateway_node` convergence is a first-class requirement (finding 6b).** Today an agent's
+  proxied-vs-direct routing hinges on `gateway_node` being populated by a **single `NotifyStreamStatus`
+  gRPC call** succeeding (`gateway_service_impl.cpp` ~631); if that notification is lost, dispatch
+  falls through to a **direct-stream branch that never reaches the proxied agent**. With
+  gateway-fronting mandatory, WS-4 must make this **converge, not depend on one delivery** — a periodic
+  reconcile that re-derives the fenced directory after a **gateway restart, a core restart, and a
+  dropped registration notification**, not only the re-home race.
 - **Agent-side:** agents are **pinned to their zone's cluster** (no cross-zone failover). Within a
   cluster they connect through a **cluster-front (VIP / DNS-multi / node list)** and reconnect on node
   loss. Both gateway endpoints are addressable by **VIP or node list — support both**.
@@ -236,30 +301,34 @@ Collapse CA HA into the KEK problem, with the versioning/rollout gaps review sur
 
 ### 9. SQLite tail migration (Q9)
 ADR-0006 Update already mandates every server store migrate to Postgres; HA makes the remaining tail
-mandatory and reprioritized. Rule: runtime-mutable state → Postgres; only idempotent
-external caches may stay per-instance.
+mandatory and reprioritized. Rule: runtime-mutable state → Postgres; only idempotent external caches
+may stay per-instance. **Per-store status is the live `docs/postgres-migration-ladder.md`, not this
+ADR** (finding nit 2) — a point-in-time list here drifts (several named stores have already migrated),
+and a workstream cannot start before its store's migration lands anyway, so sequencing self-enforces.
+This ADR states the *criteria* that make a store an **HA-critical prerequisite** rather than an
+enumeration:
 
-**HA-critical subset (prerequisites, sequenced first)** — revised per review to include the
-enforcement/recovery stores:
-- `execution_tracker` + command-correlation, with **atomic counter SQL** (§5)
-- `schedule_engine`/schedules with the occurrence-claim CAS and outbox (§6)
-- `ca_store` + enrollment + pending-agents (§8)
-- `instruction_store` (runtime-mutable: `create_definition()` on POST, `create/delete_definition`,
-  `create_set`) **and `product_pack_store`** — an instruction/set referencing a runtime-imported pack
-  on instance A must resolve on B, else dispatch fails (a day-one correctness bug, not divergence)
-- `policy_store`, `approval_manager`/`workflow_engine`, `concurrency_manager`
-- `device_token_store`, `tag_store`, `baseline_store`
-- **`quarantine_store`** — security-enforcement state (`Security:Read`); a device quarantined via A
-  but healthy-looking on B is a security divergence, not cosmetic
-- **`software_deployment_store`** — governs destructive/enforcement deployment actions
+**HA-critical criteria (any one qualifies a store for the front of the ladder):**
+1. **New HA machinery lives in it** — `execution_tracker` + command-correlation (with **atomic counter
+   SQL**, §5); `schedule_engine`/schedules (occurrence-claim CAS + outbox, §6); `ca_store` +
+   enrollment + pending-agents (§8). These are HA-specific and named here because they don't merely
+   migrate, they change shape.
+2. **Runtime-mutable AND cross-instance-referenced** — a write on A that must resolve on B or dispatch
+   fails: `instruction_store` (`create_definition()` on POST) **with `product_pack_store`** (an
+   instruction referencing a runtime-imported pack), `tag_store` (scope resolution),
+   `concurrency_manager` (fleet-wide limits), `device_token_store` (agent auth), `baseline_store`.
+3. **Security/enforcement state** — divergence is a *security* bug, not cosmetic: `quarantine_store`
+   (a device quarantined via A must not look healthy on B), `software_deployment_store` (destructive
+   deployment actions), `policy_store` + `approval_manager`/`workflow_engine` (an approval on A must
+   bind the executor on B).
 
-**Normal-priority (existing ladder):** `license_store`, `patch_manager`, `webhook_store`,
-`runtime_config_store`, `offload_target_store`, `update_registry`, `analytics_event_store`,
-`directory_sync`. (`runtime_config_store` / `webhook_store` affect posture and durable side effects —
-promote if a workstream shows a cross-instance correctness dependency.)
+Any store matching **none** of these three follows the ladder at normal priority (its divergence is
+tolerable until it migrates). `runtime_config_store` / `webhook_store` sit here but **promote** the
+moment a workstream shows a cross-instance correctness dependency.
 
-**NVD/CVE cache** (`nvd_db`, the sole idempotent external cache): **leader syncs to shared Postgres**,
-all instances read from PG.
+**NVD/CVE (`nvd_db`) — withdrawn from this list (finding 1).** NVD sync/matching moves OUT of the
+server into the UCE engine (ADR-0023 / ADR-1005 Phase 7), so it is **not** a `yuzu` store to
+leader-sync; its HA is an engine-tier concern (see *Deployment topology and replication axes*).
 
 ### 10. Postgres HA — agnostic server, pinned coordination connections (Q10)
 - **Server stays agnostic to *how* Postgres HA is achieved.** Failover discovery via **multi-host DSN
@@ -285,7 +354,10 @@ Yuzu ships Postgres, so HA Postgres is a delivery artifact we own.
   **both** standbys are lost (quorum lost → fail-closed by design). This replaces the earlier
   unconditional 2-node RPO=0, which stalled all writes on a single standby blip — *below* the
   single-Postgres baseline. An **async/degrade profile** (lower latency, bounded loss window) is a
-  documented opt-out.
+  documented opt-out. **"3 nodes" means 3 distinct hosts / failure domains, not 3 containers on one
+  Docker host (nit 1)** — co-located containers buy process redundancy, not host HA, and shipping the
+  co-located default would quietly void the §13 RPO=0 claim; the shipped profile pins anti-affinity and
+  the docs state the requirement.
 - **Single-PG stays the default (non-HA) profile.** All four topologies supported: BYO-single, BYO-HA,
   shipped-single, shipped-HA.
 - **Shipped operator-plane LB** in the HA profile, with **BYO-LB / VIP / DNS round-robin** supported.
@@ -294,7 +366,11 @@ Yuzu ships Postgres, so HA Postgres is a delivery artifact we own.
 - **Scope: operator/API plane incl. MCP + streaming.** MCP behind active–active pulls MCP state into
   §4/§5: the **MCP session registry → durable**, the **MCP replay ring → the durable outbox** — a
   dropped MCP stream resumes on a different instance via `Last-Event-ID`. `StreamBudget` stays a
-  per-instance cap.
+  per-instance cap. **This move inherits, not supersedes, the ADR-1005 execution-plan Decision 15
+  pre-commitments (a)–(k) (finding 5)** — principal-bound sessions, live credential revalidation on
+  resume, bounded rings, honest replay-gap signalling, pin lifecycle (incl. the open pin-lifecycle
+  item), and the shared `StreamBudget` — which the in-memory design shipped; the durable
+  implementation must carry every one of them forward.
 - **Health contract:** `/livez` (alive — restart) vs `/readyz` (ready — remove from LB). **Draining:**
   fail `/readyz`, let the LB drain, then stop.
 - **BYO-LB documentation deliverable:** no idle-timeout on held-open SSE/MCP streams; no response
@@ -323,6 +399,10 @@ duplicate** (§7). It must also cover **standby loss** (quorum-degrade behavior,
 
 This ADR records the model and principles. Each area becomes a child ADR/issue:
 
+0. **WS-0 — Durable agent-side command idempotency (prerequisite).** Replace the in-memory
+   `dedup_current_`/`dedup_previous_` (cleared on reconnect, `agent.cpp:2484`) with a durable per-agent
+   dedup keyed on `command_id`, so the effectively-once guarantee survives an agent bounce. **Gates the
+   end-to-end guarantee of WS-1/WS-3** — the server outbox is meaningless if the receiver forgets.
 1. **Server-plane state → Postgres** — sessions (§4), execution/correlation with atomic counters (§5),
    the HA-critical store subset incl. quarantine + software-deployment + product-pack (§9).
 2. **Durable event outbox + NOTIFY fan-out** (§5) and **MCP session/replay durability** (§12).
@@ -338,6 +418,13 @@ This ADR records the model and principles. Each area becomes a child ADR/issue:
    default)** + operator-plane LB (§11).
 8. **Health contract + BYO-LB doc** (§12).
 9. **Failover test harness** incl. quorum-degrade + re-home-race cases (§14).
+10. **Background-job replica-safety classification (finding 4).** Active–active means every *existing*
+    wall-clock retention/reaper pass inherits the clock-guard **SINGLE-WRITER** rule (shared reading +
+    anomaly-dedup rows under an ADR-0012 advisory lock), not just the new event outbox. Classify every
+    background job as **fenced-leader-only**, **independently replica-safe**, or **disabled-until-fixed**;
+    bring the #2508 not-yet-compliant passes (`app_perf_*`, `PreflightRunStore`, `DeploymentRunStore`)
+    to the guarded shape *before* a second replica exists. HA turns that backlog into a correctness
+    prerequisite.
 
 ## Consequences
 
@@ -350,11 +437,22 @@ This ADR records the model and principles. Each area becomes a child ADR/issue:
   default footprint.
 - We accept a **session-expiry monotonicity regression** on the DB host in exchange for shareable
   durable sessions (§4).
+- The **effectively-once** guarantee is contingent on **WS-0** (durable agent dedup); until it lands
+  the guarantee is at-least-once across an agent reconnect (§6, *Guarantees*).
+- Two **routed-concern rows are superseded** and must be edited in the same change: the AuthDB
+  "sessions in-memory only" row and the clock-guarded-retention "NOT the `auth_db` session sweep"
+  carve-out (§4). The session sweep joins the clock-guarded set.
+- **Engine-tier availability is a separate axis** from `yuzu`-database availability; NVD/CVE HA is an
+  engine concern, not a server-store concern (*Deployment topology*, §9).
 
 ## Supersedes
 
 - `docs/operations/disaster-recovery.md` (active-passive / NFS / SQLite-Litestream — pre-Postgres).
 - `docs/operations/capacity-planning.md` "Yuzu is single-server by design (SQLite)".
+- The **AuthDB routed-concern row** clause "Sessions are in-memory-only — no durable session surface
+  on this store" (§4).
+- The **clock-guarded-retention routed-concern** carve-out excluding the `auth_db` session sweep as
+  "immune by construction" — no longer true once sessions are durable wall-clock rows (§4).
 
 ## Deferred / out of scope
 
@@ -363,7 +461,7 @@ This ADR records the model and principles. Each area becomes a child ADR/issue:
 - **Cross-zone agent failover** (§7) — deliberately not offered.
 - **Finer intra-zone gateway sharding** (§7) — handled by adding nodes.
 
-## Review findings incorporated
+## Review findings incorporated — round 1 (pre-open)
 
 Both reviewers verified the ADR's factual predicates (SQLite tail, in-process maps, `crl_publish_mu_`,
 the DeploymentEngine claim-CAS, gateway replay) and the "no new SPOF" argument as **correct**, and
@@ -385,3 +483,26 @@ judged the direction sound. Blocking corrections folded in above:
 - **`quarantine_store`, `software_deployment_store`, `product_pack_store` promoted to HA-critical**;
   atomic-counter rule added — §9/§5.
 - **CRL publication state machine + KEK versioning/rollout** — §8.
+
+## Review findings incorporated — round 2 (PR #3320)
+
+The `CHANGES_REQUESTED` review (findings verified against `origin/dev`) is addressed above:
+
+1. **Topology reconciled with ADR-0031/0032/0033 + NVD pulled out of the server.** New *Deployment
+   topology and replication axes* section defines presentation / core / gateway / engine as separate
+   replication axes with distinct databases; "Server tier" scoped to the core/API tier; NVD moved to
+   the engine tier and withdrawn from §9.
+2. **Durable agent-side idempotency made an explicit prerequisite (WS-0)**, since today's agent dedup
+   is in-memory and cleared on reconnect (`agent.cpp:2484`) — the effectively-once claim no longer
+   assumes it.
+3. **Fencing token made explicit** — a monotonic leader epoch checked in the claim transaction, §3/§6.
+4. **Superseded invariant docs listed** (AuthDB in-memory-sessions row; clock-guard `auth_db`-sweep
+   carve-out), and a new **WS-10** classifies every background job for replica-safety and brings the
+   #2508 wall-clock passes to the clock-guard shape before a second replica exists.
+5. **§12 states it inherits** ADR-1005 Decision 15 pre-commitments (a)–(k), not supersedes them.
+6. **Code-level obligations wired into the workstreams** — WS-3 threads `dispatch_fn`'s discarded
+   `sent_count` and preserves the "don't burn a capped retry on a failed dispatch" reason
+   (`policy_evaluator.cpp:266`); WS-4 makes `gateway_node` *converge* rather than depend on a single
+   `NotifyStreamStatus`.
+- **Nits:** 3-node quorum pinned to distinct hosts/failure domains (§11); §9 now cites the live
+  migration ladder instead of a drifting store list.
