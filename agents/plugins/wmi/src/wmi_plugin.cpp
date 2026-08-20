@@ -102,7 +102,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
 class WmiPlugin final : public yuzu::Plugin {
 public:
     std::string_view name() const noexcept override { return "wmi"; }
-    std::string_view version() const noexcept override { return "1.0.0"; }
+    std::string_view version() const noexcept override { return "1.1.0"; }
     std::string_view description() const noexcept override {
         return "Windows Management Instrumentation — WQL queries and instance enumeration";
     }

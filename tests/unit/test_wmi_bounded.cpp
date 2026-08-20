@@ -33,6 +33,7 @@ using yuzu::shared::wmi::WmiRow;
 using yuzu::shared::wmi::detail::clamp_call_timeout_ms;
 using yuzu::shared::wmi::exec_object_method;
 using yuzu::shared::wmi::run_bounded_wmi_query;
+namespace error_tokens = yuzu::shared::wmi::error_tokens;
 
 namespace {
 
@@ -71,22 +72,28 @@ TEST_CASE("WmiRow supports the map operations callers rely on (row_get-style loo
 }
 
 TEST_CASE("Bounded WMI error tokens are stable") {
-    // Pins the documented contract (wmi_bounded.hpp's BoundedQueryResult::error
-    // comment) so a future edit to the literal strings in wmi_bounded.hpp is
-    // caught here rather than silently drifting for every downstream caller
-    // that pattern-matches on these prefixes (e.g. licensing_win.cpp's
-    // row_cap_exceeded / wmi plugin's error| passthrough).
-    static const char* const kExpectedTokens[] = {
-        "com_init_failed",          "wbem_locator_failed",
-        "wmi_connect_failed_",      "wmi_proxy_blanket_failed_",
-        "wmi_query_failed_",        "wmi_next_timeout",
-        "wmi_deadline_exceeded",    "wmi_next_failed_",
-        "wmi_put_param_failed_",
-    };
-    for (const char* tok : kExpectedTokens) {
-        REQUIRE(std::string(tok).size() > 0);
-    }
-    REQUIRE(sizeof(kExpectedTokens) / sizeof(kExpectedTokens[0]) == 9);
+    // Governance Gate 3 (quality-engineer) finding: this test previously
+    // constructed its OWN literal string array, disconnected from
+    // wmi_bounded.hpp's actual return sites -- a production token edit could
+    // drift silently and this test would still pass. It now asserts against
+    // yuzu::shared::wmi::error_tokens' named constants directly, the same
+    // symbols every production return site in wmi_bounded.hpp uses, so a
+    // rename/edit there is a compile-time rename here too, and the only way
+    // this test's literal values can go stale is if they's genuinely renamed
+    // in lockstep -- which downstream callers (licensing_win.cpp's
+    // row_cap_exceeded, wmi plugin's error| passthrough) that pattern-match
+    // on these prefixes need to know about anyway.
+    REQUIRE(std::string(error_tokens::kComInitFailed) == "com_init_failed");
+    REQUIRE(std::string(error_tokens::kWbemLocatorFailed) == "wbem_locator_failed");
+    REQUIRE(std::string(error_tokens::kWmiConnectFailedPrefix) == "wmi_connect_failed_");
+    REQUIRE(std::string(error_tokens::kWmiProxyBlanketFailedPrefix) ==
+            "wmi_proxy_blanket_failed_");
+    REQUIRE(std::string(error_tokens::kWmiQueryFailedPrefix) == "wmi_query_failed_");
+    REQUIRE(std::string(error_tokens::kWmiQueryFailedNoInSignature) ==
+            "wmi_query_failed_no_in_signature");
+    REQUIRE(std::string(error_tokens::kWmiDeadlineExceeded) == "wmi_deadline_exceeded");
+    REQUIRE(std::string(error_tokens::kWmiNextFailedPrefix) == "wmi_next_failed_");
+    REQUIRE(std::string(error_tokens::kWmiPutParamFailedPrefix) == "wmi_put_param_failed_");
 }
 
 TEST_CASE("clamp_call_timeout_ms bounds the per-call wait to what remains of the "
@@ -138,7 +145,7 @@ TEST_CASE("run_bounded_wmi_query fails fast with wmi_connect_failed_ on a bad na
     const auto result =
         run_bounded_wmi_query(L"root\\yuzu_test_nonexistent_namespace", L"SELECT * FROM Win32_BIOS", opts);
     REQUIRE(result.error.has_value());
-    REQUIRE(starts_with(*result.error, "wmi_connect_failed_"));
+    REQUIRE(starts_with(*result.error, error_tokens::kWmiConnectFailedPrefix));
     REQUIRE(result.rows.empty());
 }
 
@@ -155,8 +162,8 @@ TEST_CASE("run_bounded_wmi_query fails fast on malformed WQL") {
     opts.enumeration_deadline_ms = 5000;
     const auto result = run_bounded_wmi_query(L"root\\cimv2", L"THIS IS NOT WQL", opts);
     REQUIRE(result.error.has_value());
-    REQUIRE((starts_with(*result.error, "wmi_query_failed_") ||
-             starts_with(*result.error, "wmi_next_failed_")));
+    REQUIRE((starts_with(*result.error, error_tokens::kWmiQueryFailedPrefix) ||
+             starts_with(*result.error, error_tokens::kWmiNextFailedPrefix)));
     REQUIRE(result.rows.empty());
 }
 

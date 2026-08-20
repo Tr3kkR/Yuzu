@@ -67,13 +67,28 @@ struct BoundedQueryResult {
     std::vector<WmiRow> rows;
     bool truncated = false;  // row_cap reached — enumeration did NOT complete
     // Stable error token when the call failed; absent on success. Never a
-    // silent empty result on failure — see the token list below.
-    //   com_init_failed | wbem_locator_failed | wmi_connect_failed_<hr> |
-    //   wmi_proxy_blanket_failed_<hr> | wmi_query_failed_<hr> |
-    //   wmi_next_timeout | wmi_deadline_exceeded | wmi_next_failed_<hr> |
-    //   wmi_put_param_failed_<hr>
+    // silent empty result on failure — see the token constants below (the
+    // ones ending in "_" are prefixes, followed by hr_hex(hr)).
     std::optional<std::string> error;
 };
+
+// Named error-token constants — the single source of truth both production
+// call sites and tests reference, so a token string can never drift between
+// what's actually emitted and what a test pins (governance Gate 3
+// quality-engineer: the prior "stable tokens" test constructed its own
+// literal array, disconnected from these call sites, so a production string
+// edit here wouldn't have failed it).
+namespace error_tokens {
+inline constexpr const char* kComInitFailed = "com_init_failed";
+inline constexpr const char* kWbemLocatorFailed = "wbem_locator_failed";
+inline constexpr const char* kWmiConnectFailedPrefix = "wmi_connect_failed_";
+inline constexpr const char* kWmiProxyBlanketFailedPrefix = "wmi_proxy_blanket_failed_";
+inline constexpr const char* kWmiQueryFailedPrefix = "wmi_query_failed_";
+inline constexpr const char* kWmiQueryFailedNoInSignature = "wmi_query_failed_no_in_signature";
+inline constexpr const char* kWmiDeadlineExceeded = "wmi_deadline_exceeded";
+inline constexpr const char* kWmiNextFailedPrefix = "wmi_next_failed_";
+inline constexpr const char* kWmiPutParamFailedPrefix = "wmi_put_param_failed_";
+} // namespace error_tokens
 
 namespace detail {
 
@@ -171,23 +186,23 @@ inline std::string connect_bounded(const std::wstring& wmi_namespace,
                                    yuzu::shared::win::ComInit& com,
                                    yuzu::shared::win::ComPtr<IWbemServices>& services) {
     if (!com.ok())
-        return "com_init_failed";
+        return error_tokens::kComInitFailed;
 
     yuzu::shared::win::ComPtr<IWbemLocator> locator;
     HRESULT hr = CoCreateInstance(CLSID_WbemLocator, nullptr, CLSCTX_INPROC_SERVER,
                                   IID_IWbemLocator, reinterpret_cast<void**>(locator.put()));
     if (FAILED(hr) || !locator)
-        return "wbem_locator_failed";
+        return error_tokens::kWbemLocatorFailed;
 
     hr = locator->ConnectServer(_bstr_t(wmi_namespace.c_str()), nullptr, nullptr, nullptr,
                                 WBEM_FLAG_CONNECT_USE_MAX_WAIT, nullptr, nullptr, services.put());
     if (FAILED(hr) || !services)
-        return "wmi_connect_failed_" + hr_hex(hr);
+        return error_tokens::kWmiConnectFailedPrefix + hr_hex(hr);
 
     hr = CoSetProxyBlanket(services.get(), RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr,
                            RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE);
     if (FAILED(hr))
-        return "wmi_proxy_blanket_failed_" + hr_hex(hr);
+        return error_tokens::kWmiProxyBlanketFailedPrefix + hr_hex(hr);
     return {};
 }
 
@@ -195,8 +210,8 @@ inline std::string connect_bounded(const std::wstring& wmi_namespace,
 
 /// Run a WQL SELECT against `wmi_namespace` with bounded connect + bounded
 /// semisynchronous enumeration. Never blocks unbounded: a wedged provider
-/// surfaces as `wmi_next_timeout` / `wmi_deadline_exceeded` after the
-/// configured bounds instead of hanging the agent.
+/// surfaces as `error_tokens::kWmiDeadlineExceeded` after the configured
+/// bounds instead of hanging the agent.
 inline BoundedQueryResult run_bounded_wmi_query(const std::wstring& wmi_namespace,
                                                 const std::wstring& wql,
                                                 const BoundedQueryOptions& opts = {}) {
@@ -220,7 +235,7 @@ inline BoundedQueryResult run_bounded_wmi_query(const std::wstring& wmi_namespac
                                      WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, nullptr,
                                      enumerator.put());
     if (FAILED(hr) || !enumerator) {
-        result.error = "wmi_query_failed_" + hr_hex(hr);
+        result.error = error_tokens::kWmiQueryFailedPrefix + hr_hex(hr);
         return result;
     }
 
@@ -237,7 +252,7 @@ inline BoundedQueryResult run_bounded_wmi_query(const std::wstring& wmi_namespac
         // every iteration.
         const ULONGLONG elapsed = GetTickCount64() - start_ticks;
         if (elapsed >= opts.enumeration_deadline_ms) {
-            result.error = "wmi_deadline_exceeded";
+            result.error = error_tokens::kWmiDeadlineExceeded;
             result.rows.clear();
             return result;
         }
@@ -262,7 +277,7 @@ inline BoundedQueryResult run_bounded_wmi_query(const std::wstring& wmi_namespac
             continue;
         }
         if (FAILED(hr) || count == 0 || !raw_obj) {
-            result.error = "wmi_next_failed_" + hr_hex(hr);
+            result.error = error_tokens::kWmiNextFailedPrefix + hr_hex(hr);
             result.rows.clear();
             return result;
         }
@@ -284,6 +299,16 @@ inline BoundedQueryResult run_bounded_wmi_query(const std::wstring& wmi_namespac
 /// parameters on the method's in-signature instance. On success, `rows`
 /// holds exactly one row: the method's out-parameters (including any
 /// `ReturnValue`), stringified the same way as a query row.
+///
+/// No production caller today (governance-reviewed, dormant infrastructure).
+/// This helper performs NO namespace/method/object_path allowlisting itself
+/// -- unlike wmi_plugin.cpp's do_query/do_get_instance, which validate
+/// `namespace` against a hardcoded allowlist and `wql` against a SELECT-only
+/// gate before ever reaching run_bounded_wmi_query. Whoever wires the FIRST
+/// caller of this function MUST add an equivalent floor (allowlist the
+/// namespace and the set of callable methods) before accepting
+/// `wmi_namespace`/`method`/`in_params` from any action parameter or other
+/// untrusted input -- do not assume this helper enforces that for you.
 inline BoundedQueryResult exec_object_method(const std::wstring& wmi_namespace,
                                              const std::wstring& object_path,
                                              const std::wstring& method,
@@ -310,7 +335,7 @@ inline BoundedQueryResult exec_object_method(const std::wstring& wmi_namespace,
     ComPtr<IWbemClassObject> in_params_instance;
     HRESULT hr = services->GetObject(_bstr_t(object_path.c_str()), 0, nullptr, class_obj.put(), nullptr);
     if (FAILED(hr) || !class_obj) {
-        result.error = "wmi_query_failed_" + hr_hex(hr);
+        result.error = error_tokens::kWmiQueryFailedPrefix + hr_hex(hr);
         return result;
     }
     hr = class_obj->GetMethod(method.c_str(), 0, in_signature.put(), nullptr);
@@ -321,13 +346,13 @@ inline BoundedQueryResult exec_object_method(const std::wstring& wmi_namespace,
         // legitimately fail GetMethod depending on provider; that's only
         // safe to treat as "nothing to set" when the caller supplied no
         // parameters either — the branch below.)
-        result.error = "wmi_query_failed_" + hr_hex(hr);
+        result.error = error_tokens::kWmiQueryFailedPrefix + hr_hex(hr);
         return result;
     }
     if (SUCCEEDED(hr) && in_signature) {
         hr = in_signature->SpawnInstance(0, in_params_instance.put());
         if (FAILED(hr) || !in_params_instance) {
-            result.error = "wmi_query_failed_" + hr_hex(hr);
+            result.error = error_tokens::kWmiQueryFailedPrefix + hr_hex(hr);
             return result;
         }
         for (const auto& [name, value] : in_params) {
@@ -336,7 +361,7 @@ inline BoundedQueryResult exec_object_method(const std::wstring& wmi_namespace,
             var.v.bstrVal = SysAllocString(value.c_str());
             hr = in_params_instance->Put(name.c_str(), 0, &var.v, 0);
             if (FAILED(hr)) {
-                result.error = "wmi_put_param_failed_" + hr_hex(hr);
+                result.error = error_tokens::kWmiPutParamFailedPrefix + hr_hex(hr);
                 return result;
             }
         }
@@ -344,7 +369,7 @@ inline BoundedQueryResult exec_object_method(const std::wstring& wmi_namespace,
         // GetMethod succeeded but reported no in-signature, yet the caller
         // supplied parameters — the method doesn't take the parameters the
         // caller thinks it does.
-        result.error = "wmi_query_failed_no_in_signature";
+        result.error = error_tokens::kWmiQueryFailedNoInSignature;
         return result;
     }
 
@@ -358,7 +383,7 @@ inline BoundedQueryResult exec_object_method(const std::wstring& wmi_namespace,
                               in_params_instance ? in_params_instance.get() : nullptr, nullptr,
                               call_result.put());
     if (FAILED(hr) || !call_result) {
-        result.error = "wmi_query_failed_" + hr_hex(hr);
+        result.error = error_tokens::kWmiQueryFailedPrefix + hr_hex(hr);
         return result;
     }
 
@@ -366,7 +391,7 @@ inline BoundedQueryResult exec_object_method(const std::wstring& wmi_namespace,
     while (true) {
         const ULONGLONG elapsed = GetTickCount64() - start_ticks;
         if (elapsed >= opts.enumeration_deadline_ms) {
-            result.error = "wmi_deadline_exceeded";
+            result.error = error_tokens::kWmiDeadlineExceeded;
             return result;
         }
         const long call_timeout_ms = clamp_call_timeout_ms(opts.next_timeout_ms,
@@ -379,7 +404,7 @@ inline BoundedQueryResult exec_object_method(const std::wstring& wmi_namespace,
             continue;
         }
         if (FAILED(hr) || !out_params) {
-            result.error = "wmi_next_failed_" + hr_hex(hr);
+            result.error = error_tokens::kWmiNextFailedPrefix + hr_hex(hr);
             return result;
         }
         WmiRow row;
