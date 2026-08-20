@@ -12,12 +12,12 @@
  * spdlog's ostream sink, which most test_helpers.hpp consumers don't need.
  */
 
-#include <spdlog/sinks/ostream_sink.h>
-#include <spdlog/spdlog.h>
-
 #include <memory>
 #include <sstream>
 #include <string>
+
+#include <spdlog/sinks/ostream_sink.h>
+#include <spdlog/spdlog.h>
 
 namespace yuzu::test {
 

@@ -210,8 +210,8 @@ inline constexpr int kSpinScale =
 /// Spin on `pred` until it is true or `timeout` (sanitizer-scaled) elapses; returns the
 /// final poll of `pred`. Liveness-only — never encode a timing property in `pred`
 /// itself, only "did the thing happen".
-inline bool spin_until(std::function<bool()> pred,
-                       std::chrono::milliseconds timeout = std::chrono::seconds{5}) {
+[[nodiscard]] inline bool spin_until(std::function<bool()> pred,
+                                     std::chrono::milliseconds timeout = std::chrono::seconds{5}) {
     timeout *= kSpinScale;
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {

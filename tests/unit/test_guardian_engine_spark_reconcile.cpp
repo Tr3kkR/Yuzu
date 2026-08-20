@@ -528,6 +528,16 @@ TEST_CASE("start_local degrades per-rule when a re-arm throws: the other cached 
                                     "injected thread exhaustion");
     });
 
+    // LogCapture swaps the process-wide spdlog default logger (Gate 3 cpp-safety review,
+    // #2238): the drain worker + convergence-scheduler lanes are already live at this point
+    // (wire_spark_engine ran above, boot-order-required so spark is Available during the
+    // re-arm walk) and their firewalled catch blocks call spdlog:: free functions on an
+    // internal exception - concurrently with LogCapture's set_default_logger() that would be
+    // a genuine, spdlog-documented-unsafe registry race. LATENT here, not reachable: nothing
+    // in this deterministic fixture (FakeServiceMechanism never throws) exercises any of
+    // those firewalls during the capture window. Safe by inspection, same posture as this
+    // file's own [tsan] checkpoint - flagging for whoever next touches this test under a
+    // config where a background firewall COULD fire mid-capture.
     yuzu::test::LogCapture cap;
     REQUIRE(engine.start_local().has_value()); // degrade contract: success despite one poisoned rule
 
