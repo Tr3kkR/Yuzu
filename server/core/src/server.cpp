@@ -175,6 +175,7 @@
 #include "scope_engine.hpp"
 #include "instruction_db_pool.hpp"
 #include "tag_store.hpp"
+#include "service_scope_policy.hpp" // authz::kServiceTagKey — #3289 single confinement-key definition
 #include "update_registry.hpp"
 #include "webhook_store.hpp"
 #include "offload_target_store.hpp"
@@ -699,6 +700,20 @@ public:
                           "the shared counter because the shared counter's other kinds "
                           "(foreign-origin vs ordinary replay) still must not be",
                           "counter");
+        metrics_.describe("yuzu_mcp_approval_burned_total",
+                          "MCP approval-ticket recalls that SUCCESSFULLY consumed a one-time, "
+                          "human-approved ticket and then still failed at the tool handler "
+                          "(#2444 item 3) — args that pass the published input schema (the "
+                          "#2441 pre-consume gate) but fail the handler's own business/state "
+                          "check, plus any handler-side infra failure (e.g. a degraded store) "
+                          "discovered only after consume_ticket() has already spent the "
+                          "ticket. Distinct from the three counters above, which all fire "
+                          "BEFORE a ticket is consumed; this one only fires after. reason is a "
+                          "single literal today (handler_reject) — see the mcp_audit lambda in "
+                          "mcp_server.cpp for the exact scope. Does not interact with the "
+                          "kMcpSubmitterPendingCap 25-slot cap: a ticket leaves the pending "
+                          "bucket at admin-approval time, before it can ever reach this class",
+                          "counter");
         // Progress bridge core (2f PR 3a). Same closed-set posture: every reject/
         // degrade reason is a static literal inside the bridge, never derived
         // from caller input.
@@ -718,8 +733,20 @@ public:
                           "execution_id fetch",
                           "counter");
         metrics_.describe("yuzu_mcp_bridge_mailbox_drops_total",
-                          "Oldest-progress frames dropped from a record's bounded arming mailbox "
-                          "(terminals are never dropped)",
+                          "RETIRED by #2412 - the bounded arming mailbox was replaced with a "
+                          "single latest-wins progress slot, so there is nothing left to drop; a "
+                          "superseded snapshot now counts in yuzu_mcp_bridge_progress_suppressed_"
+                          "total instead. Kept registered at zero for scrape/dashboard continuity",
+                          "counter");
+        metrics_.describe("yuzu_mcp_bridge_progress_suppressed_total",
+                          "notifications/progress candidates that never reached the wire: the H1 "
+                          "monotonic-progress rule (#2438) dropping a duplicate or "
+                          "momentarily-decreasing snapshot, AND (since #2412) a snapshot the "
+                          "listener's latest-wins slot overwrote before the projector ever saw it. "
+                          "Correct, expected movement under normal load - it now INCREASES under a "
+                          "large fan-out by design, so do not read a rising rate as regression; "
+                          "watch instead for a sustained high rate relative to "
+                          "yuzu_mcp_bridge_projector_cycles_total as a sign of upstream event churn",
                           "counter");
         metrics_.describe("yuzu_mcp_stream_terminal_publish_failures_total",
                           "Terminal-frame publish failures seen by the bridge's "
@@ -818,14 +845,28 @@ public:
                           "counter");
         metrics_.describe("yuzu_mcp_bridge_teardown_incomplete_total",
                           "Progress-bridge teardown steps that could not complete on the "
-                          "maintenance thread, by reason. DEFENCE IN DEPTH, not the live "
-                          "out-of-memory signal: all three steps allocate nothing, so only a "
-                          "mutex failure can reach them today - use "
+                          "maintenance thread on a given ATTEMPT, by reason - fires once per "
+                          "failed step per attempt, so a record retried 3 times moves this "
+                          "counter 3 times even though it is one strand, not three. DEFENCE IN "
+                          "DEPTH, not the live out-of-memory signal: all three steps allocate "
+                          "nothing, so only a mutex failure can reach them today - use "
                           "yuzu_mcp_stream_terminal_publish_failures_total for allocation "
-                          "pressure. The claim is one-way, so a record that fails here is never "
-                          "retried and what it still owns is held until the process restarts; a "
-                          "retained record also pins that session's whole stream state, its "
-                          "replay ring and any pinned finals. Alert on > 0",
+                          "pressure. A record whose teardown fails IS RETRIED by a later sweep "
+                          "(#2513), up to Config::teardown_retry_max times, before what it still "
+                          "owns is held until the process restarts; a retained record also pins "
+                          "that session's whole stream state, its replay ring and any pinned "
+                          "finals. This counter ALONE is not yet an incident - check "
+                          "yuzu_mcp_bridge_teardown_retry_total{outcome} next, which is the one "
+                          "to alert on",
+                          "counter");
+        metrics_.describe("yuzu_mcp_bridge_teardown_retry_total",
+                          "#2513: the final disposition of a retry pass's re-entry into a "
+                          "previously-incomplete teardown, by outcome (recovered|exhausted). "
+                          "exhausted means the record failed every attempt up to "
+                          "Config::teardown_retry_max and is now retained exactly like the "
+                          "pre-#2513 posture: until the process restarts. THIS is the metric to "
+                          "alert on, not teardown_incomplete alone, which moves on every attempt "
+                          "including ones that go on to recover",
                           "counter");
         metrics_.describe("yuzu_mcp_bridge_forced_expire_total",
                           "Parked progress-bridge records force-expired by the ring-only "
@@ -924,6 +965,7 @@ public:
         metrics_.gauge("yuzu_mcp_bridge_records_active").set(0);
         metrics_.counter("yuzu_mcp_bridge_listener_failures_total");
         metrics_.counter("yuzu_mcp_bridge_mailbox_drops_total");
+        metrics_.counter("yuzu_mcp_bridge_progress_suppressed_total");
         metrics_.counter("yuzu_mcp_bridge_projector_cycles_total");
         metrics_.counter("yuzu_mcp_bridge_projection_degraded_total");
         metrics_.counter("yuzu_mcp_stream_attach_audit_failures_total");
@@ -958,6 +1000,11 @@ public:
         for (auto stage : mcp::McpStreamBridge::kTeardownStageNames) {
             metrics_.counter("yuzu_mcp_bridge_teardown_incomplete_total", {{"reason", stage}});
         }
+        // #2513: CLOSED set, derived the same way, so a third retry outcome
+        // cannot ship without this seed following it.
+        for (auto outcome : mcp::McpStreamBridge::kTeardownRetryOutcomeNames) {
+            metrics_.counter("yuzu_mcp_bridge_teardown_retry_total", {{"outcome", outcome}});
+        }
         // sre-N1 (#2489): CLOSED set, derived from TeardownFinal the same way, so a
         // fourth disposition cannot ship without this seed following it. Seeding
         // matters more here than elsewhere: an idle server force-expires nothing,
@@ -987,6 +1034,15 @@ public:
             metrics_.counter("yuzu_mcp_approval_refused_total", {{"tool", tool}});
             // Same closed set again for the #2786 masked-denial counter.
             metrics_.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", tool}});
+            // #2444 item 3: a HANDLER can only burn a ticket for a tool that is
+            // itself approval-gated in the first place, so this is the same
+            // closed `tool` set as the three counters above. `reason` is a
+            // single literal today (handler_reject — see mcp_server.cpp's
+            // mcp_audit lambda for what it covers); pre-seeded as a 1-value
+            // axis now so a future second reason slots into an already-seeded
+            // pattern instead of introducing an unseeded one.
+            metrics_.counter("yuzu_mcp_approval_burned_total",
+                             {{"tool", tool}, {"reason", "handler_reject"}});
         }
         // yuzu_mcp_approval_precondition_denied_total's reachable label set is
         // NARROWER than the two above: kPrecondition can only fire for a tool
@@ -1587,6 +1643,54 @@ public:
                           "Cooldown entries evicted at the capacity bound", "counter");
         metrics_.describe("yuzu_server_dex_alert_routed_types",
                           "Number of obs_types currently routed to alerts", "gauge");
+        // #3261 governance hardening (Gate 8 consistency-auditor) - the same
+        // parity gap DexAlertRouter's family above had before its own
+        // describe() calls were added: without this, these six counters
+        // emit no HELP/TYPE line and stay entirely absent until first
+        // incremented.
+        metrics_.describe("yuzu_server_webhook_delivery_success_total",
+                          "Webhook deliveries that completed with a 2xx response", "counter");
+        metrics_.describe("yuzu_server_webhook_delivery_failed_total",
+                          "Webhook deliveries that failed (connection error, non-2xx, exception)",
+                          "counter");
+        metrics_.describe("yuzu_server_webhook_delivery_dropped_total",
+                          "Webhook deliveries dropped because the delivery worker pool's queue "
+                          "was full or the store was quiescing",
+                          "counter");
+        metrics_.describe("yuzu_server_offload_delivery_success_total",
+                          "Offload-target deliveries that completed with a 2xx response", "counter");
+        metrics_.describe("yuzu_server_offload_delivery_failed_total",
+                          "Offload-target deliveries that failed (connection error, non-2xx, "
+                          "exception, or a tampered non-http(s) URL)",
+                          "counter");
+        metrics_.describe("yuzu_server_offload_delivery_dropped_total",
+                          "Offload-target deliveries dropped because the delivery worker pool's "
+                          "queue was full or the store was quiescing",
+                          "counter");
+        // Pre-seed all six to 0 (adversarial-review round 2, Kimi+Codex
+        // both independently confirmed) - describe() alone only writes
+        // HELP/TYPE metadata (MetricsRegistry::describe()), it does not
+        // create a series; counter(name) with no labels does. Each of
+        // these six is a no-label counter, so it has exactly one known
+        // "label combination" - itself - and the same bounded-label
+        // pre-seed rule applies (docs/observability-conventions.md
+        // "Bounded-label counters are pre-seeded to 0 at startup"),
+        // matching the yuzu_server_principal_quota_exhausted_total
+        // precedent (~line 511) and the tag_store block a few thousand
+        // lines below (cpp-safety, final targeted check: an earlier
+        // version of this comment cited tag_store as "above," which is
+        // wrong - it is well below this line).
+        // Without this, a fresh server has no series at all for any of
+        // these until the first delivery fires, so absent()-based
+        // alerting can't distinguish "not wired" from "no deliveries yet".
+        for (const char* name : {"yuzu_server_webhook_delivery_success_total",
+                                 "yuzu_server_webhook_delivery_failed_total",
+                                 "yuzu_server_webhook_delivery_dropped_total",
+                                 "yuzu_server_offload_delivery_success_total",
+                                 "yuzu_server_offload_delivery_failed_total",
+                                 "yuzu_server_offload_delivery_dropped_total"}) {
+            metrics_.counter(name);
+        }
         // ADR-0010 §Decision 3. Carried in the gauge family because the
         // authoritative cumulative count lives in SecretCodec and is exported
         // pull-model at scrape time, but it IS a monotonic counter — declared
@@ -1783,6 +1887,13 @@ public:
         metrics_.describe("yuzu_fleet_spark_slow_op",
                           "Fleet sum (per {`os`,`mechanism`}) of cumulative slow watch/unwatch ops "
                           "(a stalled watcher)", "gauge");
+        metrics_.describe("yuzu_fleet_spark_unsupported",
+                          "Fleet sum (per {`os`,`mechanism`}) of rules CURRENTLY classified "
+                          "unsupported - a known spark type with no mechanism on that host, "
+                          "enforced by neither backend (F7, #2298 rung 2). A live gauge "
+                          "recomputed every sweep, not cumulative - it can legally decrease "
+                          "(e.g. a mechanism becoming available). Routine, not page-worthy: "
+                          "distinct from armed_faulted/watch_rejected", "gauge");
         // Guardian durable lifecycle-journal fleet rollup (#2298 gate 3). Registered from
         // the SAME table AgentHealthStore::recompute_metrics clears and publishes from
         // (guardian_journal_fleet_tags.hpp), so a new signal cannot ship with a gauge but
@@ -4293,18 +4404,166 @@ public:
                 });
         }
 
-        // Initialize tag store
-        {
-            auto tag_db = cfg_.db_dir() / "tags.db";
-            tag_store_ = std::make_unique<TagStore>(tag_db);
+        // Tag store — migrated Postgres store (ADR-0006/ADR-0050, schema
+        // `tag_store`), construction fail-CLOSED per ADR-0012 §1 (same
+        // template as the sibling PG stores): a reachable database whose
+        // schema can't migrate/open is a fatal startup error, never a
+        // serve-degraded scope-resolution substrate. `migrate_from_sqlite`
+        // runs the one-time, idempotent legacy-`tags.db` backfill (ADR-0009,
+        // MANDATORY — tags are scope/dispatch-targeting input, not
+        // expendable telemetry) — a backfill failure is ALSO fatal. NOTE:
+        // constructed HERE (not down in the later PG-store section) because
+        // the "Wire up store pointers for AgentServiceImpl" block just below
+        // hands agent_service_ the raw pointer — a construction site after
+        // that block would leave the service's pointer null forever.
+        if (pg_pool_ && !startup_failed_) {
+            tag_store_ = std::make_unique<TagStore>(*pg_pool_);
+            if (!tag_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: tag store migration/open failed (database "
+                              "reachable but the tag_store schema could not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                tag_store_->set_metrics(&metrics_);
+                // Pre-seed both bounded-label families to 0 (governance
+                // arch-F2, per docs/observability-conventions.md) so
+                // absent()-based alerting stays meaningful before the first
+                // degrade/backfill event. The sibling migrated stores
+                // predate this convention being applied to store counters —
+                // a class-wide follow-up tracks them; seeding only the new
+                // store is the conventions doc's side of that divergence.
+                metrics_.describe("yuzu_server_tag_store_read_degrade_total",
+                                  "Tag-store reads that degraded instead of answering, by reason "
+                                  "(scope/dispatch callers fail closed on these)",
+                                  "counter");
+                for (auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"}) {
+                    metrics_.counter("yuzu_server_tag_store_read_degrade_total",
+                                     {{"reason", reason}});
+                }
+                metrics_.describe("yuzu_server_tag_store_backfill_total",
+                                  "One-time legacy tags.db backfill outcome (ADR-0050)",
+                                  "counter");
+                for (auto result : {"fresh", "success", "failed"}) {
+                    metrics_.counter("yuzu_server_tag_store_backfill_total",
+                                     {{"result", result}});
+                }
+                auto tag_db = cfg_.db_dir() / "tags.db";
+                if (!tag_store_->migrate_from_sqlite(tag_db)) {
+                    spdlog::error("[PG] Refusing to start: tag legacy-SQLite backfill failed "
+                                  "(see prior log lines) — tag_store feeds scope resolution and "
+                                  "dispatch targeting and must not serve partially-migrated "
+                                  "data. Operator remediation: reconcile or repair {}, or move "
+                                  "it aside to skip the backfill (tags in it will NOT carry "
+                                  "over)",
+                                  tag_db.string());
+                    startup_failed_ = true;
+                }
+            }
         }
 
-        // Initialize analytics event store
-        if (cfg_.analytics_enabled) {
-            auto analytics_db = cfg_.db_dir() / "analytics.db";
-            analytics_store_ = std::make_unique<AnalyticsEventStore>(
-                analytics_db, cfg_.analytics_drain_interval_seconds, cfg_.analytics_batch_size);
-            if (analytics_store_->is_open()) {
+        // Analytics event store — born-on-SQLite, migrated to Postgres
+        // (ADR-0006/0008/0049, schema `analytics_event_store`). NO backfill
+        // (ADR-0009 skippable class, ADR-0049): the buffer is a transient
+        // outbox spool, not authoritative state or compliance evidence, so
+        // the legacy `analytics.db` is never read on upgrade.
+        //
+        // Construction posture is a DELIBERATE, RECORDED DIVERGENCE from the
+        // playbook's default "every Postgres store construction failure is
+        // fatal" template (ADR-0049): `--no-analytics` defaults OFF (this
+        // feature is on by default), but every call site in this codebase
+        // already treats `analytics_store_` as optional-to-USE (`if
+        // (analytics_store_) { ... }`, ~15 sites) — nothing downstream is
+        // load-bearing on it existing. A migration hiccup on this expendable-
+        // telemetry table taking down auth/RBAC/every other store would
+        // contradict the store's own fail-soft-everywhere posture, so a
+        // construction failure here logs and leaves the feature degraded
+        // rather than setting startup_failed_.
+        //
+        // The object ITSELF is kept alive on a failed open — this matches
+        // the SQLite predecessor (which never dropped the object either) and
+        // is load-bearing for correctness, not just parity: every method on
+        // AnalyticsEventStore already internally guards on `is_open()` and
+        // fail-softs (emit() counts `store_not_open` and returns; reads
+        // return nullopt), so an early `.reset()` here was the ONE thing
+        // that broke that seam — it collapsed "disabled by --no-analytics"
+        // and "enabled but failed to open" into the same nullptr, which
+        // (a) made the two indistinguishable at the API (`/api/analytics/
+        // status|recent` both key off `if (analytics_store_)`) and (b) never
+        // registered the four analytics metric families at all on a failed
+        // open, so absence-based alerting couldn't tell "off" from "broken"
+        // either — contradicting this same store's "fail-soft means the
+        // caller continues, never that the failure is invisible" posture.
+        // (Fable/architect review, 2026-08-19, cross-checked against the
+        // dev tip predecessor at branch point a661cb06a: dev's construction
+        // never reset the object either, it only gated sinks/start_drain()
+        // on is_open() — this restores that contract, not a new one.)
+        if (cfg_.analytics_enabled && pg_pool_ && !startup_failed_) {
+            analytics_store_ = std::make_shared<AnalyticsEventStore>(
+                *pg_pool_, cfg_.analytics_drain_interval_seconds, cfg_.analytics_batch_size);
+            analytics_store_->set_metrics(&metrics_);
+            // Bounded-label counters (ADR-0049) — described + pre-seeded
+            // per docs/observability-conventions.md's pre-seed-to-0 rule
+            // (adversarial review finding, 2026-08-14) so the family +
+            // HELP/TYPE are present REGARDLESS of open success (Fable
+            // review, 2026-08-19 — a failed open must still report
+            // `store_not_open` via these families, not go dark) and
+            // absent() alerts stay meaningful, matching the
+            // yuzu_server_mgmt_group_read_degrade_total /
+            // yuzu_server_discovery_read_degrade_total precedent above.
+            metrics_.describe("yuzu_server_analytics_emit_dropped_total",
+                              "AnalyticsEventStore::emit() drops (fail-soft ingest, ADR-0049) "
+                              "by reason (store_not_open/pool_acquire_timeout/query_error/"
+                              "serialize_error) — never a silent swallow",
+                              "counter");
+            for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error",
+                                      "serialize_error"})
+                metrics_.counter("yuzu_server_analytics_emit_dropped_total",
+                                 {{"reason", reason}});
+            metrics_.describe("yuzu_server_analytics_read_degrade_total",
+                              "AnalyticsEventStore query_recent/pending_count reads that "
+                              "returned a degrade (nullopt) rather than a result, by method "
+                              "and reason (store_not_open/pool_acquire_timeout/query_error)",
+                              "counter");
+            for (const auto method : {"query_recent", "pending_count"})
+                for (const auto reason :
+                    {"store_not_open", "pool_acquire_timeout", "query_error"})
+                    metrics_.counter("yuzu_server_analytics_read_degrade_total",
+                                     {{"method", method}, {"reason", reason}});
+            // Drain-thread liveness (governance Gate 3 sre finding,
+            // 2026-08-16, #2037-class): the drain loop now catches every
+            // exception at the thread boundary instead of letting it
+            // std::terminate() the whole server — these two are how an
+            // operator tells "healthy but idle" from "silently dead"
+            // (mirrors yuzu_server_audit_cleanup_failed_total /
+            // yuzu_server_audit_retention_last_pass_unixtime).
+            metrics_.describe("yuzu_server_analytics_drain_pass_failed_total",
+                              "Analytics drain passes that threw an exception at the thread "
+                              "boundary and were abandoned (retried at the next interval)",
+                              "counter");
+            metrics_.counter("yuzu_server_analytics_drain_pass_failed_total");
+            metrics_.describe("yuzu_server_analytics_drain_last_pass_unixtime",
+                              "Wall-clock reading stamped at the start of every drain pass "
+                              "attempt, success or failure. Flat means the drain thread is not "
+                              "running — the one condition drain_pass_failed_total cannot "
+                              "report (a wedged/exited thread never gets to increment it)",
+                              "gauge");
+            metrics_.gauge("yuzu_server_analytics_drain_last_pass_unixtime").set(0);
+            if (!analytics_store_->is_open()) {
+                spdlog::error("[PG] analytics-event store migration/open failed — analytics "
+                              "collection degraded for this run (database reachable but the "
+                              "analytics_event_store schema could not be created/opened); "
+                              "the store stays wired so callers observe a degraded read/drop "
+                              "count rather than a silent 'disabled' state");
+            } else {
+                // info, not warn: this branch runs on EVERY successful open,
+                // i.e. every restart forever, not just the actual cutover
+                // boot (adversarial review finding, 2026-08-14) — a warn
+                // here would cry wolf on every routine restart after the
+                // real cutover already happened once. Steady-state fact,
+                // not an event.
+                spdlog::info("[PG] analytics spool on Postgres (schema analytics_event_store) — "
+                             "legacy analytics.db is not migrated (ADR-0049, skippable backfill "
+                             "class); events undrained at the original cutover were lost then, "
+                             "new events buffer normally");
                 if (!cfg_.analytics_jsonl_path.empty()) {
                     analytics_store_->add_sink(make_jsonlines_sink(cfg_.analytics_jsonl_path));
                 }
@@ -4323,7 +4582,7 @@ public:
         if (tag_store_)
             agent_service_.set_tag_store(tag_store_.get());
         if (analytics_store_)
-            agent_service_.set_analytics_store(analytics_store_.get());
+            agent_service_.set_analytics_store(analytics_store_);
         // W1.4 / #827: AuditStore for enrollment-token consume rows.
         // Direct path (AgentServiceImpl) AND gateway path
         // (GatewayUpstreamServiceImpl) both get the same store so the
@@ -4336,14 +4595,8 @@ public:
             }
         }
         if (analytics_store_ && gateway_service_) {
-            gateway_service_->set_analytics_store(analytics_store_.get());
+            gateway_service_->set_analytics_store(analytics_store_);
         }
-        if (notification_store_)
-            agent_service_.set_notification_store(notification_store_.get());
-        if (webhook_store_)
-            agent_service_.set_webhook_store(webhook_store_.get());
-        if (offload_target_store_)
-            agent_service_.set_offload_target_store(offload_target_store_.get());
 
         // Initialize instruction store (Phase 2)
         {
@@ -4991,6 +5244,10 @@ public:
                     spdlog::info("NotificationStore initialized (schema notification_store; "
                                  "legacy backfill source {})",
                                  notif_db.string());
+                    // #3261: wire the consumer immediately after construction,
+                    // inside the full-success branch - the old top-of-ctor
+                    // wiring block ran before this store existed and never fired.
+                    agent_service_.set_notification_store(notification_store_.get());
                 }
             }
         }
@@ -4998,10 +5255,14 @@ public:
         {
             auto webhook_db = cfg_.db_dir() / "webhooks.db";
             webhook_store_ = std::make_unique<WebhookStore>(webhook_db);
+            webhook_store_->set_metrics(&metrics_);
+            agent_service_.set_webhook_store(webhook_store_.get());
         }
         {
             auto offload_db = cfg_.db_dir() / "offload_targets.db";
             offload_target_store_ = std::make_unique<OffloadTargetStore>(offload_db);
+            offload_target_store_->set_metrics(&metrics_);
+            agent_service_.set_offload_target_store(offload_target_store_.get());
         }
 
         // Phase 7: Inventory Store (Issue 7.17) — generic per-source blob store,
@@ -5283,8 +5544,9 @@ public:
 
     // Destruction must guarantee every background thread is joined before its
     // captured members are torn down. stop() does that join and is idempotent
-    // (guarded by the stop_entered_ CAS), so calling it here is safe even when
-    // the normal shutdown path already ran. Without this, a destruction that
+    // (guarded by the lifecycle_mu_/teardown_complete_ completion barrier — #3007),
+    // so calling it here is safe even when the normal shutdown path already ran.
+    // Without this, a destruction that
     // skips stop() — run() early-returning on a TLS/bind failure after the
     // policy-eval / health threads were spawned, or an exception during late
     // construction — would destroy a still-joinable std::thread and call
@@ -5727,9 +5989,10 @@ public:
         // halts the process instead of serving on the gRPC ports with a
         // broken web/SCIM surface. stop() is safe to call this early — every
         // thread/store it joins or resets is joinable()/nullptr-guarded, and
-        // it also runs from ~ServerImpl (guarded against double-entry by
-        // stop_entered_), so calling it here and letting the destructor run
-        // again afterward is a deliberate no-op the second time.
+        // it also runs from ~ServerImpl (guarded against double-entry by the
+        // lifecycle_mu_/teardown_complete_ completion barrier — #3007), so calling
+        // it here and letting the destructor run again afterward is a deliberate
+        // no-op the second time (same thread, sequential — not a wait).
         if (startup_failed_) {
             spdlog::error("run(): refusing to serve — startup failed in start_web_server() "
                          "(SCIM boot failure); stopping the already-started agent/management "
@@ -5770,8 +6033,9 @@ public:
                     break;
                 // G6 SRE: the sweep body is a serial budget shared with the
                 // SECURITY-relevant revocation sweep below — a stall here (e.g.
-                // a locked tags.db inside the cohort gauge publish) delays
-                // revoked-agent teardown by the same amount. Make it visible.
+                // a slow tag_store cohort read inside the cohort gauge publish)
+                // delays revoked-agent teardown by the same amount. Make it
+                // visible.
                 const auto sweep_start = std::chrono::steady_clock::now();
                 health_store_.recompute_metrics(metrics_, std::chrono::seconds{90});
                 // PostgreSQL pool gauges (#1368): sampled on the same cadence as
@@ -6331,8 +6595,8 @@ public:
                 }
                 // G6 SRE: sweep-body duration (excludes the sleep) — the
                 // revocation sweep above shares this serial budget, so a stall
-                // (locked tags.db, slow fleet walk) is a security-relevant
-                // delay, not just stale metrics.
+                // (slow tag_store cohort read, slow fleet walk) is a
+                // security-relevant delay, not just stale metrics.
                 metrics_
                     .histogram("yuzu_server_reaper_sweep_duration_seconds")
                     .observe(std::chrono::duration<double>(std::chrono::steady_clock::now() -
@@ -6824,14 +7088,34 @@ public:
     }
 
     void stop() noexcept override {
-        // Guard against re-entrant calls from repeated signals.
-        // The signal handler calls stop() directly, so a second Ctrl+C
-        // re-enters stop() on a different thread while the first is still
-        // joining threads — causing "Resource deadlock avoided".
-        bool expected = false;
-        if (!stop_entered_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-            return; // Another thread is already running stop()
-        }
+        // COMPLETION BARRIER, not a bare re-entry flag (#3007; precedent:
+        // SparkEngine::stop(), agents/core/src/spark_engine.cpp). The old stop_entered_
+        // CAS let a losing caller (typically ~ServerImpl, on main) return IMMEDIATELY
+        // while another thread was still mid-teardown — main would then destroy
+        // pg_pool_/agent_service_/every store below while that thread was still using
+        // them, including through up to ~120s of the #3261 quiesce waits (UAF/
+        // double-free class). A second caller now BLOCKS here until the in-flight
+        // teardown has actually finished, then sees teardown_complete_ and returns
+        // having genuinely waited.
+        //
+        // Legal ONLY because stop() is no longer reachable from a real OS signal
+        // context: main.cpp's on_signal writes a self-pipe byte and a dedicated
+        // watcher thread calls stop() from ordinary thread context (mirroring
+        // agents/core/src/main.cpp), and a second SIGTERM/SIGINT hard-exits BEFORE
+        // taking any lock. Adding this barrier without that change first would
+        // recreate the double-Ctrl-C self-deadlock commit dea5bb8b5 fixed (two
+        // threads racing a blocking wait on the same non-recursive primitive).
+        //
+        // Self-join is unreachable: the only callers are the POSIX watcher thread, the
+        // Windows console-handler thread, and run()/~ServerImpl on the thread that
+        // constructed this object — never a thread this function itself joins. A
+        // same-thread re-entry (run()'s startup_failed_ early-return, later followed
+        // by ~ServerImpl) is sequential, not concurrent, so a non-recursive mutex is
+        // correct: the first call completes and sets teardown_complete_ before the
+        // second is ever reached.
+        std::lock_guard<std::mutex> life(lifecycle_mu_);
+        if (teardown_complete_)
+            return; // another call already ran stop() to completion
 
         spdlog::info("Shutting down server...");
         draining_.store(true, std::memory_order_release);
@@ -7019,6 +7303,12 @@ public:
         // StreamBudget::closing()'s doc comment) or a genuinely wedged
         // handler.
         if (web_thread_.joinable()) {
+            // #3007 governance (sre, unhappy-path UP-7/UP-8): stop() now runs off the
+            // signal handler, so this wait is silent-by-design up to 15s with no
+            // progress evidence — indistinguishable from a genuine wedge to an operator
+            // watching logs. One line here costs nothing and closes that gap.
+            spdlog::info("Shutting down server: waiting up to 15s for the web listener "
+                         "thread to finish...");
             std::unique_lock<std::mutex> lk(web_thread_done_mtx_);
             const bool finished = web_thread_done_cv_.wait_for(
                 lk, std::chrono::seconds(15), [this] { return web_thread_done_; });
@@ -7026,14 +7316,12 @@ public:
             if (finished) {
                 web_thread_.join();
             } else {
-                // `stop()` is called synchronously and directly from the SIGTERM/SIGINT
-                // OS signal handler (`on_signal()`, main.cpp) — NOT deferred to a normal
-                // thread context. spdlog::critical()/flush() allocate and take internal
-                // locks, which is undefined behaviour inside a signal handler (the same
-                // class #73 fixed for the single log line at the top of on_signal(), but
-                // never eliminated from the rest of the synchronously-invoked stop() call
-                // graph — tracked as a systemic follow-up). Use only the async-signal-safe
-                // primitive already established there: a raw write() of a fixed message.
+                // #3007: stop() now runs on an ordinary thread (main.cpp's shutdown
+                // watcher / a Windows console-handler thread), never inside a real OS
+                // signal handler, so spdlog would be legal here. The raw write() stays
+                // anyway: std::_Exit() below skips atexit handling and any buffered
+                // spdlog sink flush, so a log call here could be silently lost — this
+                // write() is guaranteed to reach stderr before the process ends.
                 const char msg[] =
                     "ServerImpl::stop: web thread did not finish within the 15s shutdown "
                     "grace bound (#2703 Gate 7 item 2) - force-exiting.\n";
@@ -7044,16 +7332,6 @@ public:
 #endif
                 std::_Exit(1);
             }
-        }
-
-        // Phase 8.3 #255 — drain offload batch buffers BEFORE the store is
-        // reset further down. Detached delivery threads continue past
-        // process exit's perspective but get a fair chance to finish
-        // before the SQLite handle goes away. flush_all() spawns a final
-        // round of detached deliveries; we don't join them, but the
-        // buffer state is consistent (RESTART-1 from Gate 6 SRE).
-        if (offload_target_store_) {
-            offload_target_store_->flush_all();
         }
 
         // Shutdown gRPC with a deadline FIRST so in-flight Subscribe and
@@ -7358,6 +7636,278 @@ public:
         // declaration order alone.
         agent_service_.set_notification_store(nullptr);
         notification_store_.reset();
+        // WebhookStore / OffloadTargetStore (#3261 governance hardening).
+        // flush_all() runs HERE, after the gRPC drain above, not before it -
+        // an earlier version ran it before Shutdown(deadline), which missed
+        // any delivery fired by a Register/Subscribe/process_gateway_response
+        // call ARRIVING OVER gRPC still in flight during the up-to-5s drain
+        // window (Gate 4 unhappy-path UP-1). Both stores now dispatch
+        // deliveries onto a bounded StoreWorkerPool (store_worker_pool.hpp)
+        // instead of a raw detached std::thread, so quiesce(60s) below gives
+        // a real, bounded guarantee that no delivery thread already
+        // SUBMITTED to the pool is still touching the store before it is
+        // reset - closing the use-after-free for every producer that
+        // dispatches through fire_event() -> pool_.submit() (every
+        // Register/Subscribe/process_gateway_response call arriving over
+        // gRPC, security-guardian/cpp-safety/sre Gate 2/3) and the
+        // unbounded-thread-creation risk on a mass-reconnect burst (Gate 4
+        // unhappy-path UP-2/UP-8), since the pool caps concurrent thread
+        // creation, not just concurrent HTTP work.
+        //
+        // KNOWN GAP, filed as #3279, NOT fixed here (Gate 8 re-review):
+        // forward_gateway_pending()'s outbound-forward thread is a
+        // separate, pre-existing, untracked std::thread(...).detach() that
+        // also eventually calls process_gateway_response -> fire_event() on
+        // agent_service_'s plain (non-atomic) webhook_store_/
+        // offload_target_store_ pointers. This diff did not modify that
+        // thread - but per this same reachability rubric applied everywhere
+        // else in this PR, the diff DID make the race live: before #3261
+        // those two pointers were wired before construction and
+        // permanently null, so fire_event() on this path was always a
+        // no-op; now that they are correctly wired, this pre-existing
+        // thread reaches the exact defect class this block exists to
+        // close, via a producer neither Shutdown(deadline) above (gRPC
+        // handler threads only) nor quiesce() below (pool-submitted work
+        // only) drains. security-guardian's Gate 8 verdict on this point
+        // was PARTIALLY RESOLVED / recommend continued BLOCK; cpp-safety,
+        // architect and sre's independent Gate 8 passes over the same site
+        // characterized it as a separate subsystem (forward_gateway_
+        // pending needs its own pooling/draining story, #3279) rather than
+        // this PR's fix surface. Both readings are in #3279 verbatim -
+        // deferred to Dave to adjudicate, not resolved by this comment.
+        //
+        // SCOPE NOTE (Fable/architect + Codex/Sol cross-review, ADR-0049,
+        // 2026-08-19; refined governance Gate 4/8, 2026-08-19, unhappy-path
+        // UP-4; analytics_store_ removed from this enumeration, PR #3350
+        // review, architect, 2026-08-20 -- see below): the same
+        // forward_gateway_pending() -> process_gateway_response() path also
+        // reaches response_store_ and notification_store_ directly - not
+        // through fire_event(), but via their own plain (non-atomic)
+        // pointers inside that function body - with the exact same lack of
+        // synchronization against this stop()'s teardown. Named here
+        // because this comment previously enumerated only
+        // webhook_store_/offload_target_store_ and undercounted #3279's
+        // actual reach; the fix (join/drain forward_gateway_pending()'s
+        // workers before any store it can touch is unwired/destroyed) is
+        // the same fix for both of them, not a per-pointer patch.
+        // analytics_store_ USED to belong in this same enumeration, with a
+        // non-uniform exposure history worth recording for the record: on
+        // a HEALTHY boot it was already live-and-wired on this exact path
+        // before the ADR-0049 migration (the SQLite predecessor was never
+        // nulled-then-reset proactively in stop() either, it just dangled
+        // less visibly) - no change there. On a FAILED-open boot, the
+        // predecessor-era `.reset()` on this store (removed by ADR-0049's
+        // construction-posture fix, which keeps the object alive instead)
+        // meant a degraded store was NEVER wired to this path at all - the
+        // pointer was permanently null, so process_gateway_response()'s
+        // guard always no-op'd. The sentinel restoration made a degraded
+        // store wired for the ENTIRE process uptime instead of never - a
+        // genuine widening of this store's exposure on that one deployment
+        // shape. PR #3350 review (fjarvis, 2026-08-20) found this made the
+        // widened exposure concretely reachable, not just theoretical;
+        // analytics_store_ is now shared_ptr/weak_ptr-locked (see the block
+        // below), which is why it no longer belongs in this enumeration -
+        // response_store_/notification_store_ remain on the raw-pointer
+        // pattern, #3279's reach set for them is unchanged.
+        // #3279 should be updated to name the (now two-store) reach set.
+        //
+        // On timeout: escalate via std::_Exit, the SAME choice web_thread_
+        // makes a few hundred lines up, and for the identical reason - NOT
+        // the nvd_sync leak-and-continue precedent (Gate 8 unhappy-path
+        // UP-9 caught this: an earlier version of this block DID leak, on
+        // the theory that db_/mtx_ staying valid-but-unreferenced was
+        // enough. It missed that both stores also borrow metrics_, a raw
+        // pointer into THIS ServerImpl's own metrics_ member - leaking the
+        // store does not extend metrics_'s lifetime, and ~ServerImpl runs
+        // moments after stop() returns. A worker that eventually finishes
+        // its delivery would then call metrics_->counter(...) against a
+        // freed object. The nvd_sync precedent is safe only when nothing
+        // else in this function touches what the leaked object references
+        // again; that does not hold here, exactly as the web_thread_
+        // comment above already warns.
+        //
+        // BOUND (Gate 8 round-2 targeted re-review, cpp-safety AND
+        // unhappy-path independently): this is NOT a per-delivery
+        // HTTP-timeout bound, and an earlier version of this comment was
+        // wrong to derive one that way. Two things disprove that framing,
+        // both verified against source: (1) quiesce() waits for pending_ to
+        // reach ZERO - the WHOLE queue (capacity 256 across 4 workers), not
+        // one delivery, so a burst of pending deliveries (the exact "mass
+        // agent-reconnect" scenario store_worker_pool.hpp's own header
+        // names as its motivating case) already exceeds any single-
+        // delivery estimate; (2) httplib's connect/read/write timeouts
+        // (deliver_single's set_*_timeout calls) reset PER CALL, not per
+        // connection (offload_target_store.cpp's destructor comment, #3017)
+        // - a slow-dribbling-but-legitimate endpoint can hold ONE delivery
+        // open indefinitely, so no finite per-delivery ceiling is even
+        // derivable from those three setters. There is no mathematically
+        // provable bound here, so this is a heuristic sized against this
+        // DEPLOYMENT's actual shutdown budget instead:
+        // docs/user-manual/upgrading.md documents the pre-existing stacked
+        // shutdown bound at ~55s (executions + NVD-sync + web_thread_ +
+        // gRPC drain), and the shipped compose/systemd grace period is 210s
+        // (deploy/docker/docker-compose*.yml stop_grace_period,
+        // deploy/systemd/yuzu-server.service TimeoutStopSec). 60s here,
+        // run CONCURRENTLY for both stores below (not sequentially, which
+        // would double the worst case), brings the documented stacked total
+        // to ~115s - comfortably inside 210s, with real headroom over the
+        // "a handful of pending deliveries" case above. Update
+        // upgrading.md's stacked-bound section if this constant changes.
+        // This bound is exactly as heuristic, and exactly as unproven, as
+        // the pre-existing web_thread_ 15s bound a few hundred lines up -
+        // an established pattern in this codebase, not a new risk class.
+        if (offload_target_store_)
+            offload_target_store_->flush_all();
+        static constexpr auto kStoreQuiesceBound = std::chrono::seconds(60);
+        // #3007 governance (sre, unhappy-path UP-7/UP-8): silent-by-design up to
+        // ~120s (worst case, sequential-fallback path) with no progress evidence
+        // otherwise — one line here is enough for an operator to tell "expected
+        // quiesce wait" from "wedged" without waiting for the timeout diagnostic.
+        if (webhook_store_ || offload_target_store_)
+            spdlog::info("Shutting down server: waiting up to 60s for webhook/offload "
+                         "store delivery to drain...");
+        bool webhook_drained = true;
+        bool offload_drained = true;
+        // Run both waits concurrently (Gate 8 round-2 targeted re-review,
+        // cpp-safety SHOULD) - sequential quiesce(60s) then quiesce(60s)
+        // would double the worst-case stall to 120s for no benefit; the two
+        // stores are otherwise fully independent.
+        std::thread offload_wait;
+        if (offload_target_store_) {
+            try {
+                offload_wait = std::thread([this, &offload_drained] {
+                    offload_drained = offload_target_store_->quiesce(kStoreQuiesceBound);
+                });
+            } catch (...) {
+                // PR review finding (important, 6-source convergence): the
+                // std::thread constructor can throw std::system_error
+                // (EAGAIN under resource exhaustion) - exactly the hazard
+                // class StoreWorkerPool's own constructor already guards
+                // against a few files over, and this stop() is itself
+                // noexcept, so an uncaught throw here would call
+                // std::terminate() immediately, bypassing the deliberate
+                // _Exit(1) escalation a few lines below entirely. Fall
+                // back to a synchronous quiesce - offload_wait stays in
+                // its default-constructed (not-joinable) state, since the
+                // move-assignment above never ran, so the join() below is
+                // a correct no-op on this path.
+                //
+                // Scoped-governance cpp-safety + sre (2-way convergence):
+                // this fallback is necessarily SEQUENTIAL, not concurrent
+                // with webhook_store_'s wait below - the ~115s headroom
+                // this file's own comment above computes assumed the
+                // concurrent case. Worst case here is ~60s (this call) +
+                // ~60s (webhook, next) = ~120s added to the pre-existing
+                // ~55s stack = ~175s, still inside the shipped 210s
+                // stop_grace_period/TimeoutStopSec - not a real risk, but
+                // only reachable by genuine thread-creation exhaustion at
+                // shutdown, which is itself already a degraded state.
+                offload_drained = offload_target_store_->quiesce(kStoreQuiesceBound);
+            }
+        }
+        if (webhook_store_)
+            webhook_drained = webhook_store_->quiesce(kStoreQuiesceBound);
+        if (offload_wait.joinable())
+            offload_wait.join();
+        if (!webhook_drained || !offload_drained) {
+            // #3007: stop() runs on an ordinary thread now (see the web_thread_ comment
+            // above), so spdlog would be legal — the raw write() stays because _Exit()
+            // below skips any buffered sink flush. A raw write() of a fixed message,
+            // then _Exit. Skips the remaining teardown below, exactly as a supervisor
+            // SIGKILL would - strictly no worse. Three fixed literals rather than one
+            // shared string (Gate 8 round-2, unhappy-path SHOULD: name which store, so
+            // an operator with only stderr in hand knows which configured endpoint to
+            // investigate).
+            if (!webhook_drained && !offload_drained) {
+                const char msg[] =
+                    "ServerImpl::stop: WebhookStore AND OffloadTargetStore did not quiesce "
+                    "within 60s (#3261 governance hardening) - force-exiting.\n";
+#ifdef _WIN32
+                _write(2, msg, sizeof(msg) - 1);
+#else
+                (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#endif
+            } else if (!webhook_drained) {
+                const char msg[] =
+                    "ServerImpl::stop: WebhookStore did not quiesce within 60s "
+                    "(#3261 governance hardening) - force-exiting.\n";
+#ifdef _WIN32
+                _write(2, msg, sizeof(msg) - 1);
+#else
+                (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#endif
+            } else {
+                const char msg[] =
+                    "ServerImpl::stop: OffloadTargetStore did not quiesce within 60s "
+                    "(#3261 governance hardening) - force-exiting.\n";
+#ifdef _WIN32
+                _write(2, msg, sizeof(msg) - 1);
+#else
+                (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#endif
+            }
+            std::_Exit(1);
+        }
+        agent_service_.set_webhook_store(nullptr);
+        agent_service_.set_offload_target_store(nullptr);
+        webhook_store_.reset();
+        offload_target_store_.reset();
+        // TagStore (ADR-0050) borrows pg_pool_ — unwire the borrowed raw
+        // pointer from agent_service_ (the Register sync_agent_tags ingest —
+        // Register-only, heartbeats do not sync tags; governance perf-F8),
+        // then drop the store, BEFORE the pool. No background thread to
+        // join — same discipline as the sibling PG stores above.
+        agent_service_.set_tag_store(nullptr);
+        tag_store_.reset();
+        // AnalyticsEventStore (ADR-0049) borrows pg_pool_ by reference and,
+        // unlike every sibling PG-backed store above, is reachable from a
+        // genuinely untracked path: forward_gateway_pending()'s per-command
+        // std::thread(...).detach() (up to ~900s lifetime across its 3
+        // retries) calls into AgentServiceImpl::process_gateway_response(),
+        // which used to hold this store via a raw, non-atomic pointer — an
+        // explicit stop()-time free at any position in this function was
+        // reachable from that thread no matter where it sat (PR #3350
+        // review, fjarvis + security-guardian, 2026-08-20; two earlier
+        // attempts here — Gate 8's reorder, then a stop_drain()-set latch
+        // alone — each closed one sub-problem but not both).
+        //
+        // Fix: analytics_store_ is now shared_ptr, and both ingest services
+        // hold it as weak_ptr, locked per-call. A detached-thread caller
+        // that successfully .lock()s keeps the object alive for exactly as
+        // long as its own call takes, regardless of what stop() does below
+        // — the object-lifetime UAF is closed structurally, not by timing
+        // margin. What .lock() alone does NOT protect is the pg::PgPool&
+        // that object still borrows: AnalyticsEventStore::stop_drain(),
+        // called well above, sets an internal shutting_down_ latch as its
+        // first statement, and emit()/query_recent()/pending_count()/
+        // start_drain() all check it before ever touching pool_ — a
+        // latch, not a rundown guard, so it refuses NEW entrants from the
+        // moment stop_drain() runs, not a caller already past the check.
+        // That residual is bounded by the multi-second span between
+        // stop_drain() (above) and pg_pool_.reset() (below) — several
+        // joins/quiesce waits sit in between — which makes it small in
+        // practice, not zero by construction (cpp-expert review, PR
+        // #3350, 2026-08-20). The detached thread itself outliving this
+        // function, generally, is the pre-existing, already-deferred
+        // #3279 class (Dave, commit 4c070b484); this fix does not extend
+        // that deferral's scope, it makes this store's own free point no
+        // longer the thing that turns #3279 into a reachable UAF.
+        //
+        // Deliberately NOT calling agent_service_.set_analytics_store({})/
+        // gateway_service_->set_analytics_store({}) here (architect review,
+        // PR #3350, 2026-08-20): that's the raw-pointer siblings'
+        // unwire-then-reset habit, and applying it to a weak_ptr member is
+        // actively unsafe — it's a concurrent, unsynchronized write to the
+        // SAME weak_ptr instance a detached-thread caller may concurrently
+        // .lock() (confirmed as a real data race under TSan on a minimal
+        // reproducer of this exact shape). A weak_ptr needs no explicit
+        // clearing: the wiring calls above are this member's only write,
+        // ever, before any concurrent reader exists, so it is write-once-
+        // before-concurrency and race-free by construction. Every .lock()
+        // from here on reads the shared control block, which IS built for
+        // concurrent access — analytics_store_.reset() below is what
+        // expires it, atomically, for every locker regardless of thread.
+        analytics_store_.reset();
         // CaStore (ADR-0053) borrows pg_pool_ — its PKI callbacks (signer/revocation
         // checker/recognizer) are already nulled above; drop the store explicitly
         // before the pool rather than relying on declaration-order destruction alone
@@ -7365,6 +7915,12 @@ public:
         // explicit-reset discipline in this function).
         ca_store_.reset();
         pg_pool_.reset();
+
+        // ONLY on full completion — a path above that escalates via std::_Exit(1)
+        // never reaches here and never marks the barrier complete (SparkEngine::stop()
+        // lesson: a flag set before a throwing/escaping teardown finishes would let a
+        // later caller wrongly believe teardown ran).
+        teardown_complete_ = true;
     }
 
 private:
@@ -8313,6 +8869,23 @@ private:
         return auth_routes_->require_list_read(req, res, securable_type, operation);
     }
 
+    /// #3290 Phase 2 — converts `AuthRoutes::require_fleet_read`'s
+    /// `std::expected<ListAuthority, GateFailure>` into the plain, fakeable
+    /// `authz::FleetReadGate` seam `RestApiV1`/`McpServer` are injected with
+    /// (see `FleetReadGate`'s doc comment, authz_gates.hpp, for why —
+    /// `ListAuthority` is move-only with an `AuthRoutes`-friend-only
+    /// constructor). On failure the gate already wrote `res`; this just
+    /// erases the `GateFailure` detail the caller must not re-decode.
+    yuzu::server::authz::FleetReadGate require_fleet_read(const httplib::Request& req,
+                                                           httplib::Response& res,
+                                                           const std::string& securable_type,
+                                                           const std::string& operation) {
+        auto result = auth_routes_->require_fleet_read(req, res, securable_type, operation);
+        if (!result)
+            return {}; // admitted=false, res already written
+        return {true, result->visible_for_query()};
+    }
+
     /// #1788: the per-caller Execution:Execute visible set (nullopt == unfiltered),
     /// extracted verbatim from the `/api/command` handler so the MCP dispatch path
     /// (execute_instruction / execute_bundle) can intersect against the SAME
@@ -8331,19 +8904,18 @@ private:
         facts.service_scoped = !sess.token_scope_service.empty();
         if (facts.service_scoped) {
             if (tag_store_) {
-                // B-2b: agents_with_tag_checked distinguishes "genuinely no
-                // agents carry this tag" (present, possibly empty) from "the
-                // tag DB is degraded" (nullopt on a missing connection or a
-                // failed prepare) — the plain agents_with_tag collapsed both
-                // to an empty vector, so a degraded read was indistinguishable
-                // from a legitimate empty answer.
-                // compose_exec_visible's own contract already treats both as
-                // deny-all (never unfiltered on a service-scoped token), so
-                // the DISPATCH outcome is unchanged; the distinction is what
-                // makes a degraded read observable instead of silently
-                // indistinguishable from "no agents" at /readyz.
-                if (auto svc = tag_store_->agents_with_tag_checked("service",
-                                                                   sess.token_scope_service)) {
+                // B-2b: agents_with_tag distinguishes "genuinely no agents
+                // carry this tag" (present, possibly empty) from "the tag DB
+                // is degraded" (`unexpected(kDegraded)` on a missing
+                // connection or a failed query) — ADR-0050 made the typed
+                // shape the ONLY accessor (the old collapsing variant is
+                // gone). compose_exec_visible's own contract already treats
+                // both as deny-all (never unfiltered on a service-scoped
+                // token), so the DISPATCH outcome is unchanged; the
+                // distinction is what makes a degraded read observable
+                // instead of silently indistinguishable from "no agents".
+                if (auto svc = tag_store_->agents_with_tag(
+                        std::string(authz::kServiceTagKey), sess.token_scope_service)) {
                     facts.service_tagged = std::unordered_set<std::string>(svc->begin(), svc->end());
                 } else {
                     spdlog::error("derive_exec_visible: tag store degraded resolving service "
@@ -8788,22 +9360,6 @@ private:
                                                                    agent_id, mgmt_group_store_.get());
     }
 
-    /// Same shape as `response_agent_in_scope`, bound to ("Inventory","Read"): the
-    /// per-device Inventory-scope predicate for GET /api/v1/inventory/software (REST)
-    /// and query_installed_software (MCP). Was two byte-identical inline lambdas
-    /// gating on the raw `!is_rbac_enabled()` accessor instead of
-    /// `rbac_enforcement_in_effect` — that accessor can read stale-false while RBAC is
-    /// durably enabled elsewhere (a degraded generation-refresh cache, ADR-0041), which
-    /// would silently disclose the whole fleet's software inventory to a confined
-    /// operator (governance re-review, #2703). Hoisted to one definition so the REST
-    /// and MCP surfaces cannot drift the way #2500's dispatch-targeting defect did.
-    bool inventory_agent_in_scope(const std::string& username, const std::string& agent_id) const {
-        if (!rbac_enforcement_in_effect(rbac_store_.get()))
-            return true; // loaded & explicitly disabled → legacy-open
-        return rbac_store_ && rbac_store_->check_scoped_permission(username, "Inventory", "Read",
-                                                                   agent_id, mgmt_group_store_.get());
-    }
-
     /// Return the agent list as JSON, filtered by RBAC visibility for the given user.
     nlohmann::json get_visible_agents_json(const std::string& username) {
         auto agents = registry_.to_json_obj();
@@ -8857,10 +9413,23 @@ private:
 
         auto result = mgmt_group_store_->create_group(g);
         if (result) {
-            // Populate with agents that have this service tag
+            // Populate with agents that have this service tag. Degrade
+            // fails CLOSED: dynamic-group membership is confinement input,
+            // so a degraded tag read must never refresh the group to empty.
+            // Prior membership is retained; there is NO automatic
+            // repopulation pass (governance UP-5 — an earlier comment here
+            // claimed one) — membership refreshes only when this ensure
+            // helper next runs, i.e. on the next `service`-tag write. The
+            // operator-facing recovery guidance lives in
+            // docs/ops-runbooks/tag-store-backfill-recovery.md.
             if (tag_store_) {
-                auto agents = tag_store_->agents_with_tag("service", service_value);
-                mgmt_group_store_->refresh_dynamic_membership(*result, agents);
+                if (auto agents = tag_store_->agents_with_tag("service", service_value)) {
+                    mgmt_group_store_->refresh_dynamic_membership(*result, *agents);
+                } else {
+                    spdlog::error("Auto-group '{}': tag store degraded resolving service '{}' — "
+                                  "skipping membership refresh (fail-closed)",
+                                  group_name, service_value);
+                }
             }
             spdlog::info("Auto-created management group '{}' for service '{}'", group_name,
                          service_value);
@@ -8929,10 +9498,21 @@ private:
             return;
 
         // Build the sync command with all 4 structured category values
+        // One bulk read instead of 4 point lookups (ADR-0050 — the store is
+        // a network substrate now). Degrade skips the push entirely: pushing
+        // empty category values over a failed read would instruct the agent
+        // to clear its cached tags.
+        auto tag_map = tag_store_->get_tag_map(agent_id);
+        if (!tag_map) {
+            spdlog::warn("push_asset_tags_to_agent({}): tag store degraded — skipping push",
+                         agent_id);
+            return;
+        }
         std::unordered_map<std::string, std::string> parameters;
         for (auto cat_key : kCategoryKeys) {
             std::string key_str{cat_key};
-            parameters[key_str] = tag_store_->get_tag(agent_id, key_str);
+            auto it = tag_map->find(key_str);
+            parameters[key_str] = it != tag_map->end() ? it->second : "";
         }
 
         const auto command_id =
@@ -10351,6 +10931,10 @@ private:
             // /api/v1/offload-targets endpoint and every fire_event call
             // silently no-ops on a migration failure (HC-1 from Gate 6).
             bool offload_target_ok = offload_target_store_ && offload_target_store_->is_open();
+            // #3261 governance hardening (Gate 6 SRE) - same HC-1 gap class
+            // as offload_target above; webhook_store was missing from this
+            // probe even though its sibling was already covered.
+            bool webhook_ok = webhook_store_ && webhook_store_->is_open();
             // #1238 B-3: ca_store is load-bearing whenever default certs are active
             // (issuance / revocation / CRL). It was wired into /readyz but missing
             // here, so /healthz could report "healthy" with a dead ca_store. Mirrors
@@ -10418,15 +11002,22 @@ private:
             // but if is_open() ever flips false post-startup, /api/v1/upload-
             // grants* would 503 while both probes still reported healthy.
             bool upload_grant_ok = upload_grant_store_ && upload_grant_store_->is_open();
+            // TagStore (ADR-0050) — born-on-PG (as of this migration), wired
+            // into both /readyz and /healthz from the start (the
+            // readyz-vs-healthz drift class the rows above document). A
+            // degraded tag store fails scope resolution and service-scoped
+            // confinement CLOSED, so a "healthy" report over it would be
+            // misleading.
+            bool tag_ok = tag_store_ && tag_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
                 pg_pool_ok && response_ok && audit_ok && instruction_ok && policy_ok &&
-                guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
+                guaranteed_state_ok && baseline_ok && offload_target_ok && webhook_ok && ca_ok &&
                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
                 approval_ok && rbac_ok && result_set_ok && mgmt_group_ok && discovery_ok &&
-                deployment_ok && quarantine_ok && notification_ok && upload_grant_ok;
+                deployment_ok && quarantine_ok && notification_ok && upload_grant_ok && tag_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -10442,6 +11033,16 @@ private:
                   {"guaranteed_state", guaranteed_state_ok ? "ok" : "error"},
                   {"baselines", baseline_ok ? "ok" : "error"},
                   {"offload_target", offload_target_ok ? "ok" : "error"},
+                  {"webhook_store", webhook_ok ? "ok" : "error"},
+                  // Scoped-governance sre + consistency-auditor (2-way
+                  // convergence): approval_ok already gated all_stores_ok
+                  // below but had no entry here — the mirror of the
+                  // webhook_ok bug this same commit fixes. A degraded
+                  // approval_manager_ flipped top-level status to
+                  // "degraded" with no per-store detail to explain why.
+                  // /readyz already names it "approval_manager" (its own
+                  // StoreCheck vector); matching that name here.
+                  {"approval_manager", approval_ok ? "ok" : "error"},
                   {"ca", ca_ok ? "ok" : "error"},
                   {"offline_endpoint_store", offline_endpoint_ok ? "ok" : "error"},
                   {"software_inventory_store", software_inventory_ok ? "ok" : "error"},
@@ -10457,7 +11058,8 @@ private:
                   {"deployment_store", deployment_ok ? "ok" : "error"},
                   {"quarantine_store", quarantine_ok ? "ok" : "error"},
                   {"notification_store", notification_ok ? "ok" : "error"},
-                  {"upload_grant_store", upload_grant_ok ? "ok" : "error"}}},
+                  {"upload_grant_store", upload_grant_ok ? "ok" : "error"},
+                  {"tag_store", tag_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -10584,6 +11186,13 @@ private:
                 // would silently no-op all offload deliveries while the
                 // probe reported "ready" (HC-1 gap from Gate 6 SRE).
                 {"offload_target_store", offload_target_store_ && offload_target_store_->is_open()},
+                // #3261 governance hardening (Gate 6 SRE) - WebhookStore is
+                // load-bearing for /api/webhooks and the same AgentService
+                // fan-out path as offload_target_store above, but was
+                // missing from this probe (its two siblings,
+                // offload_target_store and notification_store below, were
+                // already covered) - same HC-1 gap class.
+                {"webhook_store", webhook_store_ && webhook_store_->is_open()},
                 // Governance UAT 2026-05-06 SRE-1: ExecutionTracker became
                 // load-bearing in this batch — AgentServiceImpl's
                 // notify_exec_tracker calls update_agent_status on every
@@ -10737,6 +11346,19 @@ private:
                  upload_grant_store_ && upload_grant_store_->is_open()},
             };
 
+            // Non-gating (governance Gate 2, 2026-08-16): ADR-0049's own construction
+            // posture is deliberately NOT fatal for this one store (analytics is a
+            // non-critical telemetry spool, on by default, every caller null-guards
+            // it) — folding it into `checks` above would flip /readyz to 503 for the
+            // WHOLE node on a transient migration hiccup here, directly contradicting
+            // that posture and the comment that used to sit on this row. Reported
+            // separately so on-call can still tell feature-off from feature-on-but-
+            // dead without pulling a healthy node out of LB/orchestrator rotation.
+            std::vector<StoreCheck> notices = {
+                {"analytics_event_store",
+                 !cfg_.analytics_enabled || (analytics_store_ && analytics_store_->is_open())},
+            };
+
             std::string failed_list;
             for (const auto& c : checks) {
                 if (!c.ok) {
@@ -10747,20 +11369,42 @@ private:
                     failed_list += "\"";
                 }
             }
+            std::string degraded_list;
+            for (const auto& c : notices) {
+                if (!c.ok) {
+                    if (!degraded_list.empty())
+                        degraded_list += ",";
+                    degraded_list += "\"";
+                    degraded_list += c.name;
+                    degraded_list += "\"";
+                }
+            }
 
             if (failed_list.empty()) {
-                res.set_content(R"({"status":"ready"})", "application/json");
+                res.set_content(degraded_list.empty()
+                                    ? R"({"status":"ready"})"
+                                    : "{\"status\":\"ready\",\"degraded\":[" + degraded_list + "]}",
+                                "application/json");
             } else {
                 res.status = 503;
-                res.set_content("{\"status\":\"not ready\",\"failed_stores\":[" + failed_list +
-                                    "]}",
-                                "application/json");
+                std::string body = "{\"status\":\"not ready\",\"failed_stores\":[" + failed_list + "]";
+                if (!degraded_list.empty())
+                    body += ",\"degraded\":[" + degraded_list + "]";
+                body += "}";
+                res.set_content(body, "application/json");
             }
         });
 
         // -- Health summary dashboard fragment (7.2) ----------------------------
+        // guardian-confinement-2298 PR3 §3e: require_auth-only, no
+        // per-target parameter — reports agent count, in-flight execution
+        // count, and store health fleet-wide.
         web_server_->Get("/fragments/health/summary", [this](const httplib::Request& req,
                                                              httplib::Response& res) {
+            if (auth_routes_->deny_service_scoped_session(
+                    req, res, "health.fragment.access_denied",
+                    "service-scoped tokens may not read the fleet-wide health summary"))
+                return;
             auto session = require_auth(req, res);
             if (!session)
                 return;
@@ -11515,6 +12159,19 @@ private:
             // route is the missing per-connection queue cap (`/api/v1/events` opts into
             // `kPerConnectionQueueCapDefault`; this one does not), which the lease does
             // NOT address — see ADR-0034 Decision 1.
+            // guardian-confinement-2298 PR3 §3e: this legacy stream has NO
+            // in-handler auth at all beyond the pre-routing 401 (see the
+            // block comment above) — `event_bus_.subscribe` below fans out
+            // raw agent ids, pending-agent ids, live command result rows,
+            // and command status/timing with no per-agent scoping. Deny a
+            // service-scoped session BEFORE the admission-control lease and
+            // BEFORE subscribe, so a denied caller never pins a worker or a
+            // bus subscription slot.
+            if (auth_routes_->deny_service_scoped_session(
+                    req, res, "events.stream.access_denied",
+                    "service-scoped tokens may not open the fleet-wide legacy event stream"))
+                return;
+
             std::string principal = "anonymous";
             std::size_t per_principal = detail::kPerPrincipalAnonymous;
             if (auth_routes_) {
@@ -12826,8 +13483,16 @@ private:
             }
 
             auto tags = tag_store_->get_all_tags(agent_id);
+            if (!tags) {
+                // Degrade → 503, never an empty list (#3097 classification).
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"tag store unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& t : tags) {
+            for (const auto& t : *tags) {
                 arr.push_back({{"key", t.key},
                                {"value", t.value},
                                {"source", t.source},
@@ -12870,6 +13535,41 @@ private:
                 return;
             }
 
+            // #3289 hardening-round follow-up: normalize category keys to
+            // lowercase BEFORE anything downstream compares against them —
+            // mirrors the REST v1 twin (rest_api_v1.cpp), which already did
+            // this. Without it, a caller writing `key="Service"` (capital)
+            // stored the tag under the wrong case and silently skipped the
+            // `ensure_service_management_group` side effect below (a
+            // case-sensitive literal comparison), even though it isn't a
+            // security issue — the #3289 guard's own key check is already
+            // case-insensitive regardless of this normalization. Uses
+            // `kCategoryKeys` (the same constant the tag-push block 40 lines
+            // below already reads) rather than a second hardcoded literal
+            // list.
+            {
+                std::string lower_key = key;
+                std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                for (auto cat_key : kCategoryKeys) {
+                    if (cat_key == lower_key) {
+                        key = lower_key;
+                        break;
+                    }
+                }
+            }
+
+            // #3289: a service-scoped token authorizing this write via
+            // require_scoped_permission below reads the PRE-WRITE `service`
+            // tag to decide admission — so without this guard it could
+            // authorize the very write that changes that tag out from under
+            // its own confinement. Value-blind, checked before the scoped
+            // gate. See deny_service_scoped_service_tag_mutation's doc
+            // comment (auth_routes.hpp).
+            if (auth_routes_->deny_service_scoped_service_tag_mutation(req, res, "tag.set",
+                                                                       agent_id, key))
+                return;
+
             // K-04/CDX-R4-08: per-TARGET authorization -- NOT a global Tag:Write
             // gate. The old require_permission("Tag","Write") admitted a
             // service-scoped token on its ITServiceOwner grant with no target
@@ -12881,7 +13581,23 @@ private:
             if (!require_scoped_permission(req, res, "Tag", "Write", agent_id))
                 return;
 
-            tag_store_->set_tag(agent_id, key, value, "api");
+            // Surface the write result (#3097 classification): db_error →
+            // 503, caller/validation error → 400 — a swallowed failed write
+            // used to report "Tag updated" over nothing written.
+            if (auto set_res = tag_store_->set_tag(agent_id, key, value, "api"); !set_res) {
+                const bool db_error = set_res.error().starts_with(kTagDbErrorPrefix);
+                (void)audit_log(req, "tag.set", "failure", "tag", agent_id + ":" + key,
+                                set_res.error());
+                res.status = db_error ? 503 : 400;
+                res.set_content(nlohmann::json{{"error",
+                                                {{"code", res.status},
+                                                 {"message", db_error ? "tag store unavailable"
+                                                                      : set_res.error()}}},
+                                               {"meta", {{"api_version", "v1"}}}}
+                                    .dump(),
+                                "application/json");
+                return;
+            }
             if (key == "service")
                 ensure_service_management_group(value);
             // Push updated tags to agent if a structured category changed
@@ -12927,6 +13643,31 @@ private:
                 return;
             }
 
+            // Gate 4/#3289 hardening round: normalize category keys to
+            // lowercase, matching the /api/tags/set twin above — without
+            // this, deleting a key by the same case a caller just set it
+            // with (e.g. "Service") silently no-ops (TagStore::delete_tag
+            // finds no row stored under that exact case) instead of removing
+            // the tag, since /api/tags/set now stores the normalized form.
+            {
+                std::string lower_key = key;
+                std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                for (auto cat_key : kCategoryKeys) {
+                    if (cat_key == lower_key) {
+                        key = lower_key;
+                        break;
+                    }
+                }
+            }
+
+            // #3289: same TOCTOU guard as /api/tags/set — a service-scoped
+            // token must not delete its own confinement key. See
+            // deny_service_scoped_service_tag_mutation's doc comment.
+            if (auth_routes_->deny_service_scoped_service_tag_mutation(req, res, "tag.delete",
+                                                                       agent_id, key))
+                return;
+
             // K-04/CDX-R4-08: per-TARGET authorization (see /api/tags/set) --
             // a service-scoped token must not delete a tag on an out-of-scope
             // agent, and a group-scoped operator must be admitted on in-scope
@@ -12934,14 +13675,24 @@ private:
             if (!require_scoped_permission(req, res, "Tag", "Delete", agent_id))
                 return;
 
-            bool deleted = tag_store_->delete_tag(agent_id, key);
-            (void)audit_log(req, "tag.delete", deleted ? "success" : "not_found", "tag",
+            auto deleted = tag_store_->delete_tag(agent_id, key);
+            if (!deleted) {
+                // Degrade → 503, never "not deleted" (#3097 classification;
+                // the pre-migration bool conflated failure with not-found).
+                (void)audit_log(req, "tag.delete", "failure", "tag", agent_id + ":" + key);
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"tag store unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            (void)audit_log(req, "tag.delete", *deleted ? "success" : "not_found", "tag",
                             agent_id + ":" + key);
-            if (deleted) {
+            if (*deleted) {
                 res.set_header("HX-Trigger",
                                R"({"showToast":{"message":"Tag deleted","level":"success"}})");
             }
-            res.set_content(nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
+            res.set_content(nlohmann::json({{"deleted", *deleted}}).dump(), "application/json");
         });
 
         web_server_->Post("/api/tags/query", [this](const httplib::Request& req,
@@ -12968,8 +13719,17 @@ private:
             }
 
             auto agents = tag_store_->agents_with_tag(key, value);
+            if (!agents) {
+                // Degrade → 503, never an empty agent list — this result
+                // feeds operator targeting decisions (#3097 classification).
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"tag store unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& a : agents)
+            for (const auto& a : *agents)
                 arr.push_back(a);
             res.set_content(nlohmann::json({{"agents", arr}, {"count", arr.size()}}).dump(),
                             "application/json");
@@ -13010,9 +13770,23 @@ private:
                          });
 
         // Owner-scoped sidebar list.
+        //
+        // guardian-confinement-2298 PR3 §3e: every result-set fragment below
+        // is require_auth-only, keyed on `session->username` — but that
+        // username is the MINTING principal's, not the individual token's
+        // own service scope. A service-scoped token therefore reaches every
+        // result set the minter (or any OTHER service token that same
+        // minter holds) has created/pinned — cross-service reach beyond
+        // this token's own intended cohort. Denied all six (one read here,
+        // detail below, plus pin/unpin/delete/create).
         web_server_->Get(
             "/fragments/result-sets/sidebar",
             [this](const httplib::Request& req, httplib::Response& res) {
+                if (auth_routes_->deny_service_scoped_session(
+                        req, res, "result_set.sidebar.access_denied",
+                        "service-scoped tokens may not read the result-set sidebar",
+                        "ResultSet"))
+                    return;
                 auto session = require_auth(req, res);
                 if (!session)
                     return;
@@ -13049,6 +13823,11 @@ private:
         web_server_->Get(
             R"(/fragments/result-sets/(rs_[0-9a-f]+)/detail)",
             [this, rs_get_owned](const httplib::Request& req, httplib::Response& res) {
+                if (auth_routes_->deny_service_scoped_session(
+                        req, res, "result_set.detail.access_denied",
+                        "service-scoped tokens may not read result-set detail", "ResultSet",
+                        req.matches[1].str()))
+                    return;
                 auto session = require_auth(req, res);
                 if (!session)
                     return;
@@ -13082,6 +13861,11 @@ private:
             R"(/fragments/result-sets/(rs_[0-9a-f]+)/pin)",
             [this, rs_detail_after, rs_get_owned](const httplib::Request& req,
                                                   httplib::Response& res) {
+                if (auth_routes_->deny_service_scoped_session(
+                        req, res, "result_set.pin.access_denied",
+                        "service-scoped tokens may not pin result sets", "ResultSet",
+                        req.matches[1].str()))
+                    return;
                 auto session = require_auth(req, res);
                 if (!session || !result_set_store_)
                     return;
@@ -13117,6 +13901,11 @@ private:
             R"(/fragments/result-sets/(rs_[0-9a-f]+)/unpin)",
             [this, rs_detail_after, rs_get_owned](const httplib::Request& req,
                                                   httplib::Response& res) {
+                if (auth_routes_->deny_service_scoped_session(
+                        req, res, "result_set.unpin.access_denied",
+                        "service-scoped tokens may not unpin result sets", "ResultSet",
+                        req.matches[1].str()))
+                    return;
                 auto session = require_auth(req, res);
                 if (!session || !result_set_store_)
                     return;
@@ -13147,6 +13936,11 @@ private:
         web_server_->Post(
             R"(/fragments/result-sets/(rs_[0-9a-f]+)/delete)",
             [this, rs_get_owned](const httplib::Request& req, httplib::Response& res) {
+                if (auth_routes_->deny_service_scoped_session(
+                        req, res, "result_set.delete.access_denied",
+                        "service-scoped tokens may not delete result sets", "ResultSet",
+                        req.matches[1].str()))
+                    return;
                 auto session = require_auth(req, res);
                 if (!session || !result_set_store_)
                     return;
@@ -13174,6 +13968,10 @@ private:
         web_server_->Post(
             "/fragments/result-sets/create",
             [this](const httplib::Request& req, httplib::Response& res) {
+                if (auth_routes_->deny_service_scoped_session(
+                        req, res, "result_set.create.access_denied",
+                        "service-scoped tokens may not create result sets", "ResultSet"))
+                    return;
                 auto session = require_auth(req, res);
                 if (!session || !result_set_store_)
                     return;
@@ -14097,8 +14895,7 @@ private:
             // its creating principal's username (ApiToken::principal_id) —
             // without this it could delete a fleet-wide schedule its own
             // principal created interactively.
-            if (deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.delete", id,
-                                             "Schedule:Delete"))
+            if (deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.delete", id))
                 return;
             // M-01 (#1806): owner-scoped delete — a Schedule:Delete grant
             // deletes only schedules the caller created, not the whole
@@ -14150,7 +14947,7 @@ private:
             // service-scoped token keeps its kill-switch (H-01's own
             // rationale for gating disable on Schedule:Write alone).
             if (enabled && deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.enable",
-                                                        id, "Schedule:Write"))
+                                                        id))
                 return;
 
             // M-01 (#1806): owner-scoped enable/disable, same as delete above.
@@ -14320,8 +15117,23 @@ private:
 
                              nlohmann::json j;
                              if (analytics_store_) {
+                                 // Degrade-distinguishable seam (ADR-0049): a
+                                 // transient PG blip 503s rather than
+                                 // rendering pending_count=0, which would be
+                                 // indistinguishable from a genuinely empty
+                                 // buffer.
+                                 auto pending = analytics_store_->pending_count();
+                                 if (!pending) {
+                                     res.status = 503;
+                                     res.set_content(
+                                         R"({"error":{"code":503,"message":)"
+                                         R"("analytics store degraded"},)"
+                                         R"("meta":{"api_version":"v1"}})",
+                                         "application/json");
+                                     return;
+                                 }
                                  j["enabled"] = true;
-                                 j["pending_count"] = analytics_store_->pending_count();
+                                 j["pending_count"] = *pending;
                                  j["total_emitted"] = analytics_store_->total_emitted();
                              } else {
                                  j["enabled"] = false;
@@ -14342,13 +15154,33 @@ private:
                         limit = std::stoi(req.get_param_value("limit"));
                     } catch (...) {}
                 }
+                // A non-positive limit isn't a client-error worth a 400 (this
+                // route has always silently ignored a malformed value), but
+                // unlike SQLite's LIMIT -1 = "unlimited" idiom the old store
+                // relied on, Postgres's LIMIT REJECTS a negative bind
+                // outright — which query_recent() below can only report as
+                // nullopt (degraded), and this route would then 503
+                // "analytics store degraded" for a client-supplied bad
+                // parameter, not an actual store problem (governance Gate 4
+                // unhappy-path finding, 2026-08-16, following up on the
+                // happy-path reviewer's flagged lead). Clamp instead.
+                if (limit <= 0)
+                    limit = 50;
                 if (!analytics_store_) {
                     res.set_content(R"({"events":[],"count":0})", "application/json");
                     return;
                 }
                 auto events = analytics_store_->query_recent(limit);
+                if (!events) {
+                    res.status = 503;
+                    res.set_content(R"({"error":{"code":503,"message":)"
+                                    R"("analytics store degraded"},)"
+                                    R"("meta":{"api_version":"v1"}})",
+                                    "application/json");
+                    return;
+                }
                 nlohmann::json arr = nlohmann::json::array();
-                for (const auto& e : events) {
+                for (const auto& e : *events) {
                     arr.push_back(e);
                 }
                 res.set_content(nlohmann::json({{"events", arr}, {"count", arr.size()}}).dump(),
@@ -14359,6 +15191,14 @@ private:
 
         web_server_->Get(
             "/fragments/instructions", [this](const httplib::Request& req, httplib::Response& res) {
+                // guardian-confinement-2298 PR3 §3e: require_auth-only; the
+                // role check below (`can_author`) gates only the New/Edit
+                // buttons, not the definitions list itself.
+                if (auth_routes_->deny_service_scoped_session(
+                        req, res, "instructions.fragment.access_denied",
+                        "service-scoped tokens may not read the fleet-wide instruction "
+                        "definitions list"))
+                    return;
                 auto session = require_auth(req, res);
                 if (!session)
                     return;
@@ -14977,6 +15817,17 @@ private:
                                    const std::string& op) -> yuzu::server::ListReadGate {
             return require_list_read(req, res, type, op);
         };
+        // #3290 Phase 2 admit-then-filter fleet-read gate (wraps
+        // require_fleet_read). GET /api/v1/inventory/software's SOLE
+        // authorization gate — never stacked with perm_fn (see
+        // rest_api_v1.cpp's route comment; same BLOCKING rule as list_read_fn
+        // above). Shared, byte-identical, with the MCP query_installed_software
+        // twin's set_fleet_read_fn wiring below — one conversion, two surfaces.
+        auto fleet_read_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                    const std::string& type,
+                                    const std::string& op) -> yuzu::server::authz::FleetReadGate {
+            return require_fleet_read(req, res, type, op);
+        };
         // Visible-agent SET resolver for filtering device-id-rendering lists (DEX
         // device drills). SAME policy as get_visible_agents_json / the /devices list:
         // nullopt = caller sees the whole fleet (global Infrastructure:Read OR RBAC
@@ -15516,8 +16367,16 @@ private:
                 // REST response — both always pass a key. Key-less callers
                 // (the pollable fleet endpoint, the disabled gauge sweep)
                 // don't pay the extra query (grill NFR fix).
-                snap.available_keys = tag_store_->get_distinct_keys();
-                cohort_values = tag_store_->get_values_for_key(cohort_key);
+                //
+                // Render/telemetry caller (ADR-0036/ADR-0050): a degraded
+                // read renders the picker empty and every device
+                // "(untagged)" rather than failing the fragment — it feeds
+                // no grant/target/enforce decision. The store logs + counts
+                // the degrade (yuzu_server_tag_store_read_degrade_total).
+                snap.available_keys =
+                    tag_store_->get_distinct_keys().value_or(std::vector<std::string>{});
+                cohort_values = tag_store_->get_values_for_key(cohort_key)
+                                    .value_or(std::unordered_map<std::string, std::string>{});
             }
             // Same staleness the recompute_metrics sweep prunes by — the tab and
             // the yuzu_fleet_perf_* gauges see the same population. perf_snapshot
@@ -15849,8 +16708,12 @@ private:
             snap.cohort_key = cohort_key;
             std::unordered_map<std::string, std::string> cohort_values;
             if (tag_store_ && !cohort_key.empty()) {
-                snap.available_keys = tag_store_->get_distinct_keys();
-                cohort_values = tag_store_->get_values_for_key(cohort_key);
+                // Render/telemetry caller — same degrade posture as
+                // dex_perf_uncached above (ADR-0036/ADR-0050).
+                snap.available_keys =
+                    tag_store_->get_distinct_keys().value_or(std::vector<std::string>{});
+                cohort_values = tag_store_->get_values_for_key(cohort_key)
+                                    .value_or(std::unordered_map<std::string, std::string>{});
             }
             const auto health = health_store_.net_snapshot(std::chrono::seconds{90});
             std::unordered_map<std::string, const detail::AgentHealthSnapshot*> by_id;
@@ -17719,17 +18582,11 @@ private:
             // agentic-first /api/v1/dex/devices/* endpoints use, so a REST worker is
             // held to the same per-device scope (defined once above, not re-inlined).
             scoped_perm_fn,
-            // ADR-0016: the typed daily-sync software store + its per-device
-            // Inventory-scope predicate for GET /api/v1/inventory/software. SAME
-            // management-group chokepoint (check_scoped_permission) as the MCP
-            // query_installed_software tool, bound to ("Inventory","Read"), so a
-            // REST worker's fleet-wide software query returns only devices inside
-            // their groups (cross-operator isolation). MUST be wired here; the
-            // param defaults to {} = no filter (unscoped fleet read).
+            // ADR-0016: the typed daily-sync software store for
+            // GET /api/v1/inventory/software. Its per-agent scope predicate is
+            // fleet_read_fn below (#3290 Phase 2) — the route's own
+            // require_fleet_read gate replaced the retired InventoryScopeFn.
             software_inventory_store_.get(),
-            [this](const std::string& username, const std::string& agent_id) -> bool {
-                return inventory_agent_in_scope(username, agent_id);
-            },
             // #1634: per-agent Response-scope predicate for the fan-out response
             // readers (GET /api/v1/executions/{id}/visualization). Routes through the
             // single response_agent_in_scope helper so the REST, MCP and legacy
@@ -17766,7 +18623,11 @@ private:
             // ADR-0017: the fleet guaranteed-state status route's SOLE
             // authorization gate — see rest_api_v1.cpp's route comment for why
             // it must never be stacked with perm_fn.
-            list_read_fn);
+            list_read_fn,
+            // #3290 Phase 2: GET /api/v1/inventory/software's SOLE
+            // authorization gate — see rest_api_v1.cpp's route comment for
+            // why it must never be stacked with perm_fn.
+            fleet_read_fn);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -17851,6 +18712,12 @@ private:
             // was null while the REST twins worked fine — two surfaces
             // disagreeing about whether the same capability exists (ADR-1005 A1).
             mcp_server_->set_kek_ops(kek_ops_); // same seam instance as the REST twins
+            // #3290 Phase 2 — the SAME fleet_read_fn lambda wired into the REST
+            // registration's trailing fleet_read_fn param below, so the REST and MCP
+            // query_installed_software twins cannot observe a different admit
+            // decision for the same caller (same conversion, same underlying
+            // require_fleet_read call).
+            mcp_server_->set_fleet_read_fn(fleet_read_fn);
             // PR1.5c/1.6c (p14) — ADR-0031 operator surface MCP twins,
             // wired UNCONDITIONALLY exactly like kek_ops above (never
             // gated behind an unrelated conditional — see the KEK comment
@@ -17959,16 +18826,11 @@ private:
                 [this](const std::string& username, const std::string& agent_id) -> bool {
                     return response_agent_in_scope(username, agent_id);
                 },
-                // ADR-0016: the typed daily-sync software store + its per-device
-                // Inventory-scope predicate for query_installed_software. SAME
-                // management-group chokepoint as the response predicate above, but
-                // bound to ("Inventory","Read") — so an operator's fleet-wide software
-                // query returns only devices inside their groups (cross-operator
-                // isolation). MUST be wired here; the param defaults to {} = no filter.
+                // ADR-0016: the typed daily-sync software store for
+                // query_installed_software. Its per-agent scope predicate is
+                // fleet_read_fn_ (set_fleet_read_fn, #3290 Phase 2) — the tool's
+                // own require_fleet_read gate replaced the retired InventoryScopeFn.
                 software_inventory_store_.get(),
-                [this](const std::string& username, const std::string& agent_id) -> bool {
-                    return inventory_agent_in_scope(username, agent_id);
-                },
                 // ADR-0011: metrics sink for the MCP-surface bundle orchestrator
                 // (yuzu_bundle_*{surface="mcp"}). REST passes its own registry.
                 &metrics_,
@@ -18399,7 +19261,7 @@ private:
     std::unique_ptr<UpdateRegistry> update_registry_;
 
     // Analytics
-    std::unique_ptr<AnalyticsEventStore> analytics_store_;
+    std::shared_ptr<AnalyticsEventStore> analytics_store_;
 
     // Phase 1: Data infrastructure
     std::unique_ptr<ResponseStore> response_store_;
@@ -18824,7 +19686,11 @@ private:
     std::thread engine_rotation_sweep_thread_;
 
     std::atomic<bool> stop_requested_{false};
-    std::atomic<bool> stop_entered_{false};
+    // Completion barrier for stop() (#3007) — see stop()'s own comment for why this
+    // replaced a bare stop_entered_ CAS and why the mutex is safe to hold across the
+    // whole ~700-line teardown body.
+    std::mutex lifecycle_mu_;
+    bool teardown_complete_ = false; // guarded by lifecycle_mu_
     std::atomic<bool> draining_{false};
 
     // Rate limiting

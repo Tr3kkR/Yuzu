@@ -120,6 +120,10 @@ struct AsyncHarness {
     /// Execution:Execute. Set false to model an authenticated caller who
     /// holds no such grant — the case that previously reached the fleet.
     static inline bool permit_exec{true};
+    /// guardian-confinement-2298 PR3 §3e: empty ⇒ an ordinary session; a test
+    /// sets this to prove a service-scoped token is denied fleet-wide result-
+    /// set reach (session->username-keyed, i.e. the MINTER's identity).
+    std::string mock_token_scope_service;
 
     /// #1788: the VisibleSet the wired `exec_visible_fn` returns.
     ///
@@ -149,11 +153,12 @@ struct AsyncHarness {
         instr = std::make_unique<InstructionStore>(":memory:");
         REQUIRE(instr->is_open());
 
-        auto auth_fn = [](const httplib::Request&,
-                          httplib::Response&) -> std::optional<auth::Session> {
+        auto auth_fn = [this](const httplib::Request&,
+                              httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
             s.username = "operator-1";
             s.role = auth::Role::admin;
+            s.token_scope_service = mock_token_scope_service;
             return s;
         };
         auto perm_fn = [](const httplib::Request&, httplib::Response& r, const std::string&,
@@ -209,7 +214,7 @@ struct AsyncHarness {
                             /*step_up_fn=*/{}, /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{},
                             /*net_perf_fn=*/{}, /*lockout_clear_fn=*/{},
                             /*baseline_store=*/nullptr, /*scoped_perm_fn=*/{},
-                            /*software_inventory_store=*/nullptr, /*inventory_scope_fn=*/{},
+                            /*software_inventory_store=*/nullptr,
                             /*response_scope_fn=*/{}, /*app_perf_providers=*/{},
                             /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
                             /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
@@ -868,4 +873,110 @@ TEST_CASE("async producers: an unfiltered (nullopt) VisibleSet still dispatches 
     // wiring a callback that RETURNS nullopt is an answer; leaving the callback
     // empty is a missing gate.
     CHECK_FALSE(h.calls[0].exec_visible.has_value());
+}
+
+// ---------------------------------------------------------------------------
+// guardian-confinement-2298 PR3 §3e residual sweep findings.
+//
+// (1) POST /api/v1/result-sets/from-inventory-query had NO authorization
+//     check at all (not even the CWE-862 Execution:Execute gate its three
+//     DISPATCH siblings already carry — it is a synchronous READ, not a
+//     dispatch, so it was never in scope for that fix and was missed). Now
+//     gated on Inventory:Read via perm_fn. This harness's mock perm_fn
+//     doesn't distinguish securable/operation — it proves the gate is
+//     CALLED at all (previously it never was); the real RBAC-vs-service-
+//     scope distinction is covered by AuthRoutes's own require_permission
+//     tests in test_auth_routes.cpp.
+//
+// (2) The 8 owner-scoped `/api/v1/result-sets*` routes (list, create,
+//     detail, members, lineage, pin, unpin, delete) were session->username-
+//     keyed with no service-scope check — the identical gap already fixed
+//     for the HTMX twin (/fragments/result-sets/*) this session. Extended
+//     the file's own deny_fleet_wide_service_scoped chokepoint. A dummy
+//     but regex-valid `rs_`-prefixed id is enough: the deny runs before
+//     `load_owned`, so no real result set needs to exist.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("from-inventory-query: an authenticated caller lacking Inventory:Read "
+          "is denied (CWE-862 — previously unauthorized entirely)",
+          "[pg][result_set][async][inventory][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    AsyncHarness::permit_exec = false;
+    int status = 0;
+    h.post("/api/v1/result-sets/from-inventory-query", R"({"name":"x"})", status);
+    CHECK(status == 403);
+}
+
+TEST_CASE("from-inventory-query: an ordinary authorized caller still reaches the "
+          "handler (regression)",
+          "[pg][result_set][async][inventory][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    // No inventory store wired — proceeds past the new gate to the existing
+    // "inventory store not available" 503, proving the new perm_fn check
+    // does not itself block a legitimately-authorized caller.
+    h.post("/api/v1/result-sets/from-inventory-query", R"({"name":"x"})", status);
+    CHECK(status == 503);
+}
+
+TEST_CASE("owner-scoped result-set routes: a service-scoped token is denied on all 8",
+          "[pg][result_set][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    h.mock_token_scope_service = "printers";
+    const std::string id = "rs_deadbeef00000000000000000000";
+
+    auto get = [&](const std::string& path) {
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        return res->status;
+    };
+    auto post = [&](const std::string& path, const std::string& body) {
+        auto res = h.sink.Post(path, body);
+        REQUIRE(res);
+        return res->status;
+    };
+    auto del = [&](const std::string& path) {
+        auto res = h.sink.dispatch("DELETE", path);
+        REQUIRE(res);
+        return res->status;
+    };
+
+    CHECK(get("/api/v1/result-sets") == 403);
+    CHECK(post("/api/v1/result-sets", R"({"name":"x"})") == 403);
+    CHECK(get("/api/v1/result-sets/" + id) == 403);
+    CHECK(get("/api/v1/result-sets/" + id + "/members") == 403);
+    CHECK(get("/api/v1/result-sets/" + id + "/lineage") == 403);
+    CHECK(post("/api/v1/result-sets/" + id + "/pin", "{}") == 403);
+    CHECK(post("/api/v1/result-sets/" + id + "/unpin", "{}") == 403);
+    CHECK(del("/api/v1/result-sets/" + id) == 403);
+
+    bool saw_list_denied = false;
+    for (const auto& a : h.audits)
+        if (a.action == "result_set.list.access_denied" && a.result == "denied")
+            saw_list_denied = true;
+    CHECK(saw_list_denied);
+}
+
+TEST_CASE("owner-scoped result-set routes: an ordinary session is unaffected "
+          "(regression)",
+          "[pg][result_set][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+
+    auto res = h.sink.Get("/api/v1/result-sets");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    for (const auto& a : h.audits)
+        CHECK(a.action != "result_set.list.access_denied");
 }

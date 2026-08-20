@@ -712,11 +712,48 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
 Service-scoped tokens:
 - Cannot access any `/api/v1/admin/*` routes (403 Forbidden)
 - Require RBAC to be enabled; rejected if RBAC is disabled (403 Forbidden)
-- Must have `ITServiceOwner` role permission for the target operation
-- Are scoped to agents tagged with the matching `service` tag
 - Carry a session role floored to the base `user` level regardless of the
   minting principal's own role — an `ITServiceOwner` RBAC grant is the sole
   authority ceiling for a service-scoped token, never the minter's role
+
+**Default-deny (guardian-confinement-2298 PR 3 — "the flip").** Holding
+`ITServiceOwner` for a given `securable:operation` is necessary but no
+longer sufficient. A service-scoped token is denied fleet-wide access by
+default — the operation must also appear on a server-side allow-list that
+ships **empty**, so today a fresh install denies every fleet-wide
+operation to every service-scoped token, full stop. This is the deliberate
+opposite of the token's `service` tag acting as an automatic per-service
+filter: there is no such filter today. A small, explicitly-reviewed set of
+routes have their own real per-request confinement instead (checked
+against a matching `service` tag on the target device) — the response
+body's `error.permission` field, when present, names the missing grant;
+its absence on a `403` means the route has no grant that would help at
+all, and reaching it as a service-scoped token is not currently possible
+by design. Widening what a service-scoped token can reach is a
+security-reviewed change to the server, not a per-token configuration
+option.
+
+**A service-scoped token may never write or delete the `service` tag
+itself (#3289)**, on any target device — in or out of its own scope. The
+`service` tag is the confinement boundary the token is checked against, so
+without this restriction a token could rewrite or delete its own cohort's
+`service` tag and move a device out of (or a different device into) its
+own confinement. Writing or deleting any OTHER tag key on an in-scope
+device is unaffected — only the `service` key is restricted, and the
+restriction applies regardless of the value being written (even
+re-asserting the token's own current value is denied). This does not
+affect a plain, non-service-scoped session's `Tag:Write`/`Tag:Delete`
+grant, which remains sufficient to set or move any device's `service` tag.
+
+**Bootstrap note.** A brand-new service token, on a brand-new install, has
+no other credential to fall back on — it cannot use itself to discover or
+claim a `service` tag for its own agents, or to widen its own reach. As of
+#3289, an agent cannot self-claim a `service` tag on its own behalf either
+(its gRPC `Register` sync silently drops any `service` value it reports).
+Stand up a new service's automation using an interactive session (or a
+plain, unscoped API token) for the one-time setup, and mint the
+service-scoped token only once the agents it should reach already carry
+the matching, operator-or-API-assigned `service` tag.
 
 ### Revoking a Token
 
@@ -1117,7 +1154,7 @@ All authentication and authorization errors use the standard JSON envelope:
 {
   "error": {
     "code": 403,
-    "message": "service-scoped token does not grant Agent:Execute (ITServiceOwner permission required)"
+    "message": "service-scoped token does not grant Agent:Execute (requires ITServiceOwner AND an explicit service-scope allow-list entry)"
   },
   "meta": {
     "api_version": "v1"

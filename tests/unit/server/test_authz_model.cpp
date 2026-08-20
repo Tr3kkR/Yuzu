@@ -32,6 +32,7 @@
 #include "../test_helpers.hpp"
 #include "test_mgmt_group_pg_helper.hpp" // PG-backed ManagementGroupStore (ADR-0042)
 #include "test_rbac_store_pg_helper.hpp" // PG-backed RbacStore (ADR-0041)
+#include "test_tag_store_pg_helper.hpp"  // PG-backed TagStore (ADR-0050)
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -322,8 +323,10 @@ VisibleSet resolve_and_compose(const yuzu::server::RbacStore& rbac, const std::s
     f.service_scoped = !token_scope_service.empty();
     if (f.service_scoped) {
         if (tags) {
-            auto svc = tags->agents_with_tag("service", token_scope_service);
-            f.service_tagged = std::unordered_set<std::string>(svc.begin(), svc.end());
+            // ADR-0050 typed read: a degraded store leaves service_tagged
+            // nullopt (deny-all), same as the production seam.
+            if (auto svc = tags->agents_with_tag("service", token_scope_service))
+                f.service_tagged = std::unordered_set<std::string>(svc->begin(), svc->end());
         }
         // tags == nullptr -> service_tagged stays nullopt -> fail closed.
         return yuzu::server::authz::compose_exec_visible(f);
@@ -385,11 +388,11 @@ TEST_CASE("authz_model #1788: a service-scoped token is narrowed even when the m
 TEST_CASE("authz_model #1788: a service-scoped token narrows to its service, over a global grant "
           "(CDX-001, live arm)",
           "[pg][authz_model][1788][service]") {
-    yuzu::test::TempDbFile tag_db{"yuzu_test_authzmodel_tags-"};
-    yuzu::server::TagStore tags{tag_db.path};
-    tags.set_tag("a_svcA1", "service", "serviceA");
-    tags.set_tag("a_svcA2", "service", "serviceA");
-    tags.set_tag("a_svcB1", "service", "serviceB");
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
+    REQUIRE(tags.set_tag("a_svcA1", "service", "serviceA").has_value());
+    REQUIRE(tags.set_tag("a_svcA2", "service", "serviceA").has_value());
+    REQUIRE(tags.set_tag("a_svcB1", "service", "serviceB").has_value());
 
     // THE CDX-001 VECTOR, and the reason this needs a REAL RbacStore rather
     // than a tag store alone: the minting principal holds a GLOBAL
@@ -565,4 +568,83 @@ TEST_CASE("authz_model #1788: in_scope agrees with filter_to_scope per id",
         INFO("id=" << id);
         CHECK(in_scope(visible, id) == contains(filtered, id));
     }
+}
+
+// ── meet(): the new list-read gate's composition primitive ─────────────────
+//
+// Store-free, deliberately UNTAGGED so it runs everywhere — meet() is pure
+// set algebra with no store dependency at all, and this is the only place
+// its lattice properties are pinned. These pin out the exact BR-001 bug
+// shape `deny_all()`'s own comment warns about: a naive
+// `if (!a || !b) return nullopt;` would make TOP contagious through a meet
+// with a deny-all set, instead of deny-all correctly absorbing.
+
+TEST_CASE("authz_model meet: nullopt (TOP) is the identity on either side",
+          "[authz_model][meet]") {
+    using yuzu::server::authz::meet;
+    yuzu::server::authz::VisibleSet s{std::unordered_set<std::string>{"a_1", "a_2"}};
+
+    auto left_top = meet(std::nullopt, s);
+    REQUIRE(left_top.has_value());
+    CHECK(*left_top == *s);
+
+    auto right_top = meet(s, std::nullopt);
+    REQUIRE(right_top.has_value());
+    CHECK(*right_top == *s);
+
+    // both TOP -> TOP
+    CHECK_FALSE(meet(std::nullopt, std::nullopt).has_value());
+}
+
+TEST_CASE("authz_model meet: deny_all() absorbs — never resurrected to TOP",
+          "[authz_model][meet]") {
+    using yuzu::server::authz::deny_all;
+    using yuzu::server::authz::meet;
+    yuzu::server::authz::VisibleSet s{std::unordered_set<std::string>{"a_1", "a_2"}};
+
+    auto with_top = meet(deny_all(), std::nullopt);
+    REQUIRE(with_top.has_value());
+    CHECK(with_top->empty()); // the load-bearing case: TOP must NOT win here
+
+    auto with_set = meet(deny_all(), s);
+    REQUIRE(with_set.has_value());
+    CHECK(with_set->empty());
+}
+
+TEST_CASE("authz_model meet: two present sets intersect", "[authz_model][meet]") {
+    using yuzu::server::authz::meet;
+    yuzu::server::authz::VisibleSet a{std::unordered_set<std::string>{"a_1", "a_2", "a_3"}};
+    yuzu::server::authz::VisibleSet b{std::unordered_set<std::string>{"a_2", "a_3", "a_4"}};
+
+    auto result = meet(a, b);
+    REQUIRE(result.has_value());
+    CHECK(result->size() == 2);
+    CHECK(result->contains("a_2"));
+    CHECK(result->contains("a_3"));
+    CHECK_FALSE(result->contains("a_1"));
+    CHECK_FALSE(result->contains("a_4"));
+
+    SECTION("disjoint sets meet to present-but-empty, never nullopt") {
+        yuzu::server::authz::VisibleSet c{std::unordered_set<std::string>{"a_9"}};
+        auto disjoint = meet(a, c);
+        REQUIRE(disjoint.has_value());
+        CHECK(disjoint->empty());
+    }
+}
+
+TEST_CASE("authz_model meet: commutative and associative", "[authz_model][meet]") {
+    using yuzu::server::authz::meet;
+    yuzu::server::authz::VisibleSet a{std::unordered_set<std::string>{"a_1", "a_2", "a_3"}};
+    yuzu::server::authz::VisibleSet b{std::unordered_set<std::string>{"a_2", "a_3", "a_4"}};
+    yuzu::server::authz::VisibleSet c{std::unordered_set<std::string>{"a_3", "a_4", "a_5"}};
+
+    CHECK(meet(a, b) == meet(b, a)); // commutative
+
+    auto left_assoc = meet(meet(a, b), c);
+    auto right_assoc = meet(a, meet(b, c));
+    REQUIRE(left_assoc.has_value());
+    REQUIRE(right_assoc.has_value());
+    CHECK(*left_assoc == *right_assoc); // associative
+    CHECK(left_assoc->size() == 1);
+    CHECK(left_assoc->contains("a_3"));
 }

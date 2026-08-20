@@ -240,6 +240,15 @@ TEST_CASE("preflight routes: /fragments/auto/run denies a service-scoped "
     // enumeration and no dispatch reach a service-scoped token at all.
     CHECK(devices_fn_calls == 0);
     CHECK(dispatched == 0);
+    // #3167: no `.permission` (no grant admits a service-scoped caller here —
+    // naming one is a false self-remediation claim), and header/body
+    // correlation-id parity.
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body["error"].contains("permission"));
+    CHECK_FALSE(body["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(res->get_header_value("X-Correlation-Id") ==
+         body["error"]["correlation_id"].get<std::string>());
     REQUIRE(audit_log.size() == 1);
     CHECK(audit_log[0] == "preflight.run|denied");
 }
@@ -348,12 +357,27 @@ TEST_CASE("preflight routes: rail/result/delete deny a service-scoped token "
     CHECK(rail->status == 403);
     CHECK(rail->body.find(run_id) == std::string::npos);
     CHECK(rail->body.find(run.name) == std::string::npos);
+    // #3167: no `.permission` (no grant admits a service-scoped caller here —
+    // naming one is a false self-remediation claim), and header/body
+    // correlation-id parity (a hand-built id used to land in the body only).
+    auto rail_body = nlohmann::json::parse(rail->body, nullptr, false);
+    REQUIRE_FALSE(rail_body.is_discarded());
+    CHECK_FALSE(rail_body["error"].contains("permission"));
+    CHECK_FALSE(rail_body["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(rail->get_header_value("X-Correlation-Id") ==
+         rail_body["error"]["correlation_id"].get<std::string>());
 
     auto result = sink.Get("/fragments/auto/result?run=" + run_id);
     REQUIRE(result);
     CHECK(result->status == 403);
     CHECK(result->body.find(run.scope_label) == std::string::npos);
     CHECK(result->body.find("host-1") == std::string::npos); // no device identity leaked
+    auto result_body = nlohmann::json::parse(result->body, nullptr, false);
+    REQUIRE_FALSE(result_body.is_discarded());
+    CHECK_FALSE(result_body["error"].contains("permission"));
+    CHECK_FALSE(result_body["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(result->get_header_value("X-Correlation-Id") ==
+         result_body["error"]["correlation_id"].get<std::string>());
 
     auto del = sink.Post("/fragments/auto/delete?run=" + run_id, "",
                          "application/x-www-form-urlencoded");
@@ -361,12 +385,17 @@ TEST_CASE("preflight routes: rail/result/delete deny a service-scoped token "
     CHECK(del->status == 403);
     // The run survives — the deny fires before delete_run is ever called.
     REQUIRE(run_store.get_run(run_id, "alice").has_value());
-    // Gate 8 (GC-7): delete is gated on Execution:Execute in production, not
-    // Infrastructure:Read (deny_service_scoped_'s default) — the A4
-    // .permission hint must name the grant actually missing, not a sibling's.
+    // #3167 (supersedes the prior GC-7 fix this test pinned): `.permission`
+    // is now omitted entirely, not renamed to the "correct" grant —
+    // kServiceScopeGlobalSafe is compile-time-empty, so no grant,
+    // correctly-named or not, actually admits a service-scoped caller here
+    // (routed-concern MUST clause 5).
     auto del_body = nlohmann::json::parse(del->body, nullptr, false);
     REQUIRE_FALSE(del_body.is_discarded());
-    CHECK(del_body["error"]["permission"] == "Execution:Execute");
+    CHECK_FALSE(del_body["error"].contains("permission"));
+    CHECK_FALSE(del_body["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(del->get_header_value("X-Correlation-Id") ==
+         del_body["error"]["correlation_id"].get<std::string>());
 
     REQUIRE(audit_log.size() == 3);
     CHECK(audit_log[0] == "preflight.run|denied");         // rail

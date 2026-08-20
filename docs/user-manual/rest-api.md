@@ -199,7 +199,7 @@ HTTP status codes follow standard conventions: `200` for success, `201` for reso
 | `correlation_id` | yes | A `req-<hex-ms>-<hex-seq>` token, also echoed on the `X-Correlation-Id` response header — join the response to server logs / audit rows by grepping this token. |
 | `retry_after_ms` | yes (nullable) | `null` unless the condition is retryable, in which case it advises how many milliseconds to back off (e.g. a `503` warm-up returns `5000`). |
 | `remediation` | when a hint exists | Natural-language self-recovery hint. Key is **omitted** when there is no hint (absence carries the same "no recovery available" meaning). |
-| `permission` | on permission denials | The `"SecurableType:Operation"` the caller was denied (e.g. `"Tag:Write"`) — the §A4 *kPermissionDenied* specialisation. Absent on whole-route admin gates that are not tied to a single securable. |
+| `permission` | on permission denials | The `"SecurableType:Operation"` the caller was denied (e.g. `"Tag:Write"`) — the §A4 *kPermissionDenied* specialisation. Absent on whole-route admin gates that are not tied to a single securable, and absent on most service-scoped-token confinement denials even where the route IS tied to one — the caller is denied regardless of grant, so naming one would be a false self-remediation claim (`docs/adr/1006-service-scope-default-deny.md`). One documented exception: a confinement denial that fires *after* the route's own permission gate already confirmed the caller holds that exact grant still names it — there `.permission` is informational, not a remediation hint (`.claude/routed-concerns-access-control.md`, "Service-scoped API token confinement" clause 5(a)). `GET /api/v1/inventory/software` no longer illustrates this — its after-gate deny was retired (#3290, provably dead: it fired after `perm_fn`, and the route migrated onto `require_fleet_read` entirely). No live example currently exists: an exhaustive check of every remaining `deny_fleet_wide_service_scoped` call site (20 in `rest_api_v1.cpp`, 6 in `mcp_server.cpp`) plus `deny_service_scoped_schedule`'s 4 sites found none currently match this exception's shape (`.claude/routed-concerns-access-control.md`, "Service-scoped API token confinement" clause 5) — the exception clause still governs the next one that appears. |
 | `approval_id` + `status_url` | reserved | The §A4 *kApprovalRequired* specialisation. Reserved for the Phase-2 approval re-dispatch flow; not populated by current denials (an approval-gated operation is denied with `permission` + `remediation` today, because no pollable approval exists yet). `status_url` points at `GET /api/v1/approvals/{id}`. |
 
 The R2 A4 completion (2026-07) routed the RBAC/tier denial gates (`require_admin`, `require_permission`, and the service-scope denials in the auth layer) and the ~156 legacy `error_json` sites in `rest_api_v1.cpp` through this one envelope. It does **not** yet cover literally every path — `compliance_routes.cpp` and several `auth_routes.cpp` MFA-flow branches still emit legacy shapes (tracked as #1552) — so automation crossing surfaces should treat the enrichment fields as present-when-available.
@@ -619,7 +619,16 @@ Remove an agent from a management group.
 
 List role assignments scoped to this management group.
 
-**Permission:** `ManagementGroup:Read`
+**Permission:** `ManagementGroup:Read`. This response is authorization
+topology (who holds what role), so the fleet-wide arm actually authorizing
+it is the floored `UserManagement:Read` (#2376), not `ManagementGroup:Read`
+itself — see [the authorization topology floor](../security-reviews/authz-topology-floor-2026-08-05.md).
+A caller lacking that also succeeds if they are `ITServiceOwner` **of this
+specific group** (a scoped fallback, not the fleet-wide grant) — but a
+service-scoped API token cannot use that fallback (guardian-confinement-2298
+PR 3): the fallback checks group membership only, never the token's own
+service-tag scope, and a service-scoped token is denied outright rather
+than risk it reaching a group outside its own service.
 
 **Response:**
 
@@ -649,7 +658,7 @@ List role assignments scoped to this management group.
 
 Assign a role to a principal within this management group. Only the `Operator` and `Viewer` roles can be delegated. The caller must be a global Administrator or hold the `ITServiceOwner` role on this group.
 
-**Permission:** Global `ManagementGroup:Write` or `ITServiceOwner` on this group.
+**Permission:** Global `ManagementGroup:Write` or `ITServiceOwner` on this group. A service-scoped API token is denied outright, even one whose minter holds `ITServiceOwner` on this exact group (guardian-confinement-2298 PR 3) — the group-scoped fallback checks membership only, never the token's own service-tag scope.
 
 **Request body:**
 
@@ -691,7 +700,7 @@ Assign a role to a principal within this management group. Only the `Operator` a
 
 Remove a role assignment from this management group.
 
-**Permission:** Global `ManagementGroup:Write` or `ITServiceOwner` on this group.
+**Permission:** Global `ManagementGroup:Write` or `ITServiceOwner` on this group. Same service-scoped-token denial as `POST` above.
 
 **Request body:**
 
@@ -772,7 +781,7 @@ Create a new API token. The raw token is returned in the response and is never s
 | `expires_at` | integer | No | Unix epoch seconds. `0` or omitted = never expires. **Required** for MCP tokens (max 90 days). |
 | `mcp_tier` | string | No | MCP authorization tier: `"readonly"`, `"operator"`, or `"supervised"`. Omit for standard API tokens. When set, `expires_at` is mandatory. |
 
-`mcp_tier` is honored at mint time (a value outside `readonly`/`operator`/`supervised` is rejected). A tiered (`mcp_tier` set) or service-scoped token also requires a valid `expires_at` within the 90-day cap.
+`mcp_tier` is honored at mint time (a value outside `readonly`/`operator`/`supervised` is rejected). A tiered (`mcp_tier` set) or service-scoped token also requires a valid `expires_at` within the 90-day cap. Setting `scope_service` requires RBAC to be enabled and either a global `ManagementGroup:Write` grant or `ITServiceOwner` on the `"Service: <scope_service>"` management group — see [Service-Scoped Tokens](authentication.md#service-scoped-tokens).
 
 **Validation errors (`400`):**
 
@@ -2253,6 +2262,11 @@ Set a tag on an agent. Creates the tag if it does not exist, or updates the valu
 }
 ```
 
+**Service-scoped tokens:** a service-scoped token can never set the `service` key on any agent, in
+or out of its own scope, regardless of the value being written -- `403`, no `Tag:Write` grant
+admits it (#3289). The `service` tag defines the token's own confinement boundary; see
+[Service-Scoped Tokens](authentication.md#service-scoped-tokens).
+
 ---
 
 #### `DELETE /api/v1/tags/{agent_id}/{key}`
@@ -2260,6 +2274,9 @@ Set a tag on an agent. Creates the tag if it does not exist, or updates the valu
 Delete a tag from an agent.
 
 **Permission:** `Tag:Delete`
+
+**Service-scoped tokens:** cannot delete the `service` key on any agent, for the same reason as
+`PUT` above -- `403`, no `Tag:Delete` grant admits it (#3289).
 
 **Response:**
 
@@ -2269,6 +2286,14 @@ Delete a tag from an agent.
   "meta": { "api_version": "v1" }
 }
 ```
+
+**Storage failure (all tag endpoints that read or write stored tags — `GET /api/v1/tag-categories` is compile-time static and exempt):** a degraded tag store returns `503 tag store
+unavailable` (A4 envelope, `retry_after_ms: 5000`) — never an empty tag map, a `404`, or a
+false success. Tags feed scope resolution and dispatch targeting, so a silently-empty answer
+would mis-resolve decisions built on them (ADR-0050); retry a `503` once `/readyz` reports
+`tag_store` healthy. `DELETE` returns `404 tag not found` only after a successful read found
+no such tag. Failed and not-found mutations leave `tag.set`/`tag.delete` audit rows
+(`failure`/`not_found`), matching the legacy and MCP twins.
 
 ---
 
@@ -3744,6 +3769,8 @@ Create a new webhook subscription.
 | `dex.blast_radius` | N distinct devices report the same DEX signal `(obs_type, subject)` within the window — thresholds are operator-tunable under Settings → DEX alerts (defaults 5 devices / 15 min; see [DEX fleet incident alerts](dex.md#fleet-incident-alerts-blast-radius)) | `obs_type`, `subject`, `device_count`, `window_seconds` |
 | `dex.signal` | A device reports a DEX signal type the operator routed to alerts (Settings → DEX alerts; once per device per hour — see [Routing signals to alerts](dex.md#routing-signals-to-alerts)) | `obs_type`, `subject`, `agent_id` |
 
+`agent.registered` fires on *every* gRPC reconnect, not only first enrollment — a server restart, a network blip, or a gateway bounce that strands and reconnects a fleet produces one delivery per reconnecting agent, not one per genuinely new device. A target wired to a low-tolerance channel (e.g. a Slack alert intended for "new device joined the fleet") should filter or debounce on the receiving end if reconnect noise matters; the dashboard's own "Agent Enrolled" notification does not have this problem (it fires once, on first enrollment only).
+
 If a `secret` is provided, each delivery includes an `X-Yuzu-Signature` header containing the HMAC-SHA256 hex digest of the request body.
 
 #### `DELETE /api/webhooks/{id}`
@@ -3765,9 +3792,11 @@ List recent delivery attempts for a webhook. Includes HTTP status code, response
 
 ### Offload Targets
 
-Response-offload control plane (issue #255, Phase 8.3). Targets are named external HTTP endpoints that receive a copy of `agent.registered` and `execution.completed` events as they fire — heavier-duty than webhooks: typed auth (none / bearer / basic / hmac) and server-side batching for SIEM / data-warehouse ingestion that prefers fewer, larger requests.
+Response-offload control plane (issue #255, Phase 8.3). Targets are named external HTTP endpoints that receive a copy of the same events webhooks do (see the event-types table in the Webhooks section above) as they fire — heavier-duty than webhooks: typed auth (none / bearer / basic / hmac) and server-side batching for SIEM / data-warehouse ingestion that prefers fewer, larger requests.
 
 A target is identified by a unique `name` so a definition can reference it via `spec.offload.targets` in YAML (see [yaml-dsl-spec.md](../yaml-dsl-spec.md#specoffload)).
+
+`agent.registered` fires on *every* gRPC reconnect, not only first enrollment — same caveat as the Webhooks section above, and the same event-type table, since both sinks fire off the identical set of events. A target wired to a low-tolerance channel should filter or debounce on the receiving end if reconnect noise matters.
 
 All five endpoints require the `Infrastructure` securable type — `Read` for `GET`, `Write` for `POST`/`DELETE`. The `auth_credential` is **never** returned in any response (redacted from `list()` and from `get()`); only the auth_type and shape leak. Audit events: `offload_target.create` (success or denied) and `offload_target.delete`.
 
@@ -4103,7 +4132,7 @@ Published (`enabled_only=true`) `InstructionDefinition` catalog — the commands
 }
 ```
 
-`parameter_schema` is a nested JSON Schema **object** (not a string) when the stored value parses as JSON; `null` on a stored value that fails to parse (a defensive branch — the authoring path always stores at least `{}`).
+`parameter_schema` is a nested JSON Schema **object** (not a string) when the stored value parses as JSON *and* is itself a JSON object; `null` when the stored value fails to parse (the authoring path always stores at least `{}`, so this case needs a non-standard write to reach), or when it parses to something other than an object — e.g. an array or string (reachable via the ordinary create/update/import paths, which don't validate the stored value's shape). Same rule `GET /api/v1/discover/plugins` already follows for its inline `parameter_schema`.
 
 #### `GET /api/v1/discover/routes`
 
@@ -4227,6 +4256,19 @@ the server row cap or 8 MiB aggregate payload cap, the route returns **503**
 ("inventory query truncated ... refusing to materialise a partial result set") rather than
 persisting a silently-incomplete set — a fleet-targeting set is never silently
 narrowed.
+
+**Permission:** `Inventory:Read` (guardian-confinement-2298 PR 3 — this
+route had NO authorization check of any kind before this fix, CWE-862: any
+authenticated session could query up to 5000 fleet-wide inventory records
+with zero scoping. Unlike the async producers below, it is a synchronous
+read, not a dispatch, so it gates on the same securable as `GET
+/api/v1/inventory/software` rather than `Execution:Execute`; a
+service-scoped API token is denied by the same gate). The owner-scoped
+result-set row it creates is only readable/mutable by its own creator
+through the routes below, which — like their HTMX dashboard twins — also
+deny a service-scoped token outright: `session->username` is the *minting*
+principal's identity, not the token's own service tag, so without this a
+service token could reach any other token the same minter held.
 
 #### `POST /api/v1/result-sets/from-tar-query`<br>`POST /api/v1/result-sets/from-instruction-result`<br>`POST /api/v1/result-sets/{id}/re-eval`
 
@@ -4375,7 +4417,7 @@ flag inside `data` — placement alignment is tracked with #2633.)
 
 Fleet-wide read of the typed installed-software inventory (ADR-0016, `SoftwareInventoryStore`). **Distinct** from the generic `/inventory/*` routes above, which read the generic per-source blob store (`InventoryStore`, also Postgres-backed as of ADR-0037, but a separate schema/table). This is the REST sibling of the `query_installed_software` MCP tool — same data, same scope contract.
 
-**Permission:** `Inventory:Read`. A service-scoped API token (bound to one IT service's agents) is denied outright (`inventory.software.query`, `result=denied`) — the management-group scope filter below is a separate, orthogonal confinement axis and does not narrow results for a service-scoped token.
+**Permission:** `Inventory:Read`, gated SOLELY by `AuthRoutes::require_fleet_read` (#3290 Phase 2 — never stacked with a separate permission check). A service-scoped API token (bound to one IT service's agents) is no longer denied outright: it gets a real filtered `200` scoped to its service-tagged agents, intersected with any management-group confinement that also applies (`meet(management-group, service-scope)`). A management-group-confined operator (no global grant) also now gets a genuinely filtered `200` instead of the fleet-wide/denied split of earlier releases.
 
 **Query parameters:**
 
@@ -4413,7 +4455,7 @@ Every row carries the **blob-v2 package fields** (`kind`, `ecosystem`, `epoch`, 
 
 `devices_omitted` is always present (0 when no scope filtering occurred). `result_truncated_by_cap` is present only when `count == limit` and more rows may exist past the cap (keyset pagination is a follow-up, #1634). `audit_persisted: false` is present only when the audit row could not be persisted (set-and-proceed posture — the data is still served, the lost-evidence flag is surfaced honestly).
 
-Results carry a **per-agent management-group drop filter**: out-of-scope devices are dropped and their distinct count returned in `devices_omitted`. A positive `devices_omitted` means matching software exists **outside** your scope — an empty or short result does **not** mean the software is absent fleet-wide. **Scope caveat (ADR-0017):** this confinement is **not yet verified effective** — the endpoint gates on the *global* `Inventory:Read` permission, under which the filter does not narrow results (a confined operator is denied at the gate; a global operator sees all). List-view management-group confinement becomes effective only once the ADR-0017 admit-then-filter gate lands (#1713/#1676 UAT to confirm); until then operator isolation on this surface holds for **per-device** routes only.
+Results carry a **per-agent scope drop filter** — the `require_fleet_read` gate's own composed `meet(management-group, service-scope)` visibility set (#3290): out-of-scope devices are dropped and their distinct count returned in `devices_omitted`. A positive `devices_omitted` means matching software exists **outside** your scope — an empty or short result does **not** mean the software is absent fleet-wide. This confinement is now **effective**, not a foundation: a management-group-confined operator and a correctly-confined service-scoped token both see a genuinely narrowed result, matching the ADR-0017 admit-then-filter model this route was the first to adopt in Phase 2.
 
 **Error responses:**
 
@@ -4421,10 +4463,10 @@ Results carry a **per-agent management-group drop filter**: out-of-scope devices
 |---|---|
 | 400 | `limit` is not a valid integer |
 | 401 | Unauthenticated |
-| 403 | Caller lacks `Inventory:Read` |
-| 503 | Store unavailable or degraded (A4 envelope with `correlation_id`, `retry_after_ms: 5000`) — **never an empty 200** |
+| 403 | No management-group grant for `Inventory:Read`; or a service-scoped token whose RBAC/ITServiceOwner grant is missing, or whose RBAC enforcement is disabled fleet-wide (a service-scoped token always hard-denies when RBAC is off) |
+| 503 | The gate's own RBAC/tag-store lookup is unavailable or degraded, the software inventory store is unavailable or degraded, or the `require_fleet_read` gate itself is unwired (server misconfiguration) — all A4 envelope with `correlation_id`, `retry_after_ms: 5000` where retryable — **never an empty 200** |
 
-On a `503` the store could not be read; do **not** treat it as "not installed anywhere" (ADR-0016 §7 authoritative reads). A genuine empty result is `200` with `count: 0`.
+On a `503` the store (or the confinement check itself) could not be read; do **not** treat it as "not installed anywhere" (ADR-0016 §7 authoritative reads). A genuine empty result is `200` with `count: 0`.
 
 ---
 
@@ -6717,15 +6759,26 @@ Get tags for an agent. Requires `agent_id` query parameter. Returns tags as an a
 
 #### `POST /api/tags/set`
 
-Set a tag on an agent. Request body: `{"agent_id": "...", "key": "...", "value": "..."}`.
+Set a tag on an agent. Request body: `{"agent_id": "...", "key": "...", "value": "..."}`. A
+service-scoped token cannot set the `service` key on any agent -- `403` (#3289); see
+[Service-Scoped Tokens](authentication.md#service-scoped-tokens).
 
 #### `POST /api/tags/delete`
 
-Delete a tag from an agent. Request body: `{"agent_id": "...", "key": "..."}`.
+Delete a tag from an agent. Request body: `{"agent_id": "...", "key": "..."}`. A service-scoped
+token cannot delete the `service` key on any agent -- `403` (#3289).
 
 #### `POST /api/tags/query`
 
 Query agents that have a specific tag. Request body: `{"key": "...", "value": "..."}`. Returns `{"agents": [...], "count": N}`.
+
+**Storage failure (all four legacy routes):** a degraded tag store returns `503`
+(`{"error":{"code":503,"message":"tag store unavailable"}}`) instead of an empty
+result or a false success (ADR-0050). Unlike the v1 `DELETE`, `POST /api/tags/delete`
+has **no 404** — a not-found tag remains `200 {"deleted": false}`; only the
+store-degrade path is new. `POST /api/tags/set` previously returned `200
+{"status":"ok"}` even when the write failed; it now returns `400` (validation) or
+`503` (store degrade) honestly.
 
 ---
 
@@ -6737,11 +6790,19 @@ Returns current user info (legacy version; prefer `/api/v1/me`).
 
 #### `GET /api/analytics/status`
 
-Returns the status of the analytics event pipeline.
+Requires `Infrastructure:Read`. Returns the status of the analytics event pipeline:
+`{"enabled":true,"pending_count":N,"total_emitted":N}`, or `{"enabled":false,"pending_count":0,"total_emitted":0}`
+when analytics collection is disabled (`--no-analytics`). Degrade-distinguishable (ADR-0049): a
+Postgres read failure returns `503` — `{"error":{"code":503,"message":"analytics store degraded"},"meta":{"api_version":"v1"}}`
+— rather than a possibly-inaccurate `200`.
 
 #### `GET /api/analytics/recent`
 
-Returns recent analytics events. Accepts `limit` as a query parameter (default 50).
+Requires `Infrastructure:Read`. Returns recent analytics events. Accepts `limit` as a query
+parameter (default 50). `{"events":[...],"count":N}` on success, `{"events":[],"count":0}` when
+analytics collection is disabled. Degrade-distinguishable (ADR-0049): a Postgres read failure
+returns `503` with the same envelope shape as `/api/analytics/status` above, rather than a
+possibly-inaccurate `200`.
 
 #### `GET /api/nvd/status`
 

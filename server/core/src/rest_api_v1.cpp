@@ -25,6 +25,7 @@
 #include "rest_a4_envelope.hpp"
 #include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
 #include "rest_a4_envelope_http.hpp" // detail::a4_error/a4_denial — #1470 error_json migration
+#include "service_scope_policy.hpp" // authz::service_scope_may_mutate_tag_key — #3289
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 #include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric
 #include "web_utils.hpp"  // audit_token (H1 — neutralise k=v audit-field forgery)
@@ -902,7 +903,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Query inventory across agents with filter expression", "tags": ["Inventory"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string", "description": "Filter by agent ID"}, "plugin": {"type": "string", "description": "Filter by plugin name"}, "since": {"type": "integer", "description": "Only records after this epoch"}, "until": {"type": "integer", "description": "Only records before this epoch"}, "limit": {"type": "integer", "default": 100}}}}}}, "responses": {"200": {"description": "Matching inventory records"}}}
     },
     "/inventory/software": {
-      "get": {"summary": "Fleet-wide installed-software inventory (typed daily-sync store, ADR-0016)", "tags": ["Inventory"], "description": "Installed-software rows across the fleet from the typed SoftwareInventoryStore (DISTINCT from the generic /inventory/* routes, which read the generic blob store). Rows carry name, version, publisher, install_date plus the blob-v2 package fields: kind (package|app), ecosystem (rpm|deb|apk|pacman|windows|macos|homebrew), epoch, release, arch, signature_status (rpm stored-tag), distro_id, distro_version — fields an ecosystem does not store are empty, never synthesised. Requires Inventory:Read. Results are scoped to the caller's management groups; out-of-scope devices are dropped and counted in devices_omitted (a positive value means matching software exists outside your scope — an empty/short result does NOT mean the software is absent fleet-wide). Capped at limit rows (max 1000); result_truncated_by_cap=true means more exist past the cap (keyset pagination is a follow-up). On store degradation the endpoint returns 503 (never an empty 200) so a vulnerability query cannot read a transient outage as 'installed nowhere'.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Exact software-name filter (optional)"}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}, "description": "Exact agent filter (optional)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "{data:{software[], count, devices_omitted, result_truncated_by_cap?, audit_persisted?}}"}, "400": {"description": "Non-integer limit"}, "401": {"description": "Unauthenticated"}, "403": {"description": "Requires Inventory:Read"}, "503": {"description": "Software inventory store unavailable or degraded"}}}
+      "get": {"summary": "Fleet-wide installed-software inventory (typed daily-sync store, ADR-0016)", "tags": ["Inventory"], "description": "Installed-software rows across the fleet from the typed SoftwareInventoryStore (DISTINCT from the generic /inventory/* routes, which read the generic blob store). Rows carry name, version, publisher, install_date plus the blob-v2 package fields: kind (package|app), ecosystem (rpm|deb|apk|pacman|windows|macos|homebrew), epoch, release, arch, signature_status (rpm stored-tag), distro_id, distro_version — fields an ecosystem does not store are empty, never synthesised. Requires Inventory:Read (#3290 Phase 2: the SOLE gate is the ADR-0017 admit-then-filter fleet-read gate, never stacked with a separate permission check). Results are scoped to the caller's management groups AND, for a service-scoped API token, to that token's service-tagged agents (the intersection of both when both apply); out-of-scope devices are dropped and counted in devices_omitted (a positive value means matching software exists outside your scope — an empty/short result does NOT mean the software is absent fleet-wide). A correctly-confined service-scoped token now gets a real filtered read here rather than an outright 403. Capped at limit rows (max 1000); result_truncated_by_cap=true means more exist past the cap (keyset pagination is a follow-up). On store degradation, or the caller's tag-scope lookup degrading, the endpoint returns 503 (never an empty 200) so a vulnerability query cannot read a transient outage as 'installed nowhere'.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Exact software-name filter (optional)"}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}, "description": "Exact agent filter (optional)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "{data:{software[], count, devices_omitted, result_truncated_by_cap?, audit_persisted?}}"}, "400": {"description": "Non-integer limit"}, "401": {"description": "Unauthenticated"}, "403": {"description": "No management-group grant for Inventory:Read (or a service-scoped token whose RBAC/ITServiceOwner grant is missing/RBAC disabled)"}, "503": {"description": "Software inventory store unavailable/degraded, RBAC/management-group/tag store unavailable, or the fleet-read gate unwired"}}}
     },)json"
         // SLE (Software Licensing & Entitlements, ADR-0024) — /api/v1/sle/* read
         // surface, gated on the SoftwareLicensing securable (DISTINCT from `License`,
@@ -1075,7 +1076,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "RBAC permission catalog (A2 discovery)", "tags": ["Discovery"], "description": "Requires Infrastructure:Read. Agentic-first (A1/A2, docs/agentic-first-principle.md) — every securable_type x operation pair the RbacStore recognizes, plus the full role -> allowed-operations grid (RbacStore::list_roles + get_role_permissions). Cheap pass-through over in-memory RBAC state; ETag + Cache-Control:max-age=300 + 304 revalidation, same contract as GET /guaranteed-state/schemas.", "responses": {"200": {"description": "{version, description, securable_types[], operations[], roles[].{name, description, is_system, permissions[].{securable_type, operation, effect}}}"}, "304": {"description": "Not Modified (If-None-Match matched)"}, "503": {"description": "RBAC store unavailable"}}}
     },
     "/discover/instructions": {
-      "get": {"summary": "Published InstructionDefinition catalog (A2 discovery)", "tags": ["Discovery"], "description": "Requires InstructionDefinition:Read. Agentic-first (A1/A2) subset of InstructionStore::query_definitions (enabled_only=true — only invokable definitions are published) carrying id/name/plugin/action/description/parameter_schema/platforms/approval_mode. parameter_schema is parsed into a nested JSON Schema object when the stored value is valid JSON, else null. Same ETag/Cache-Control/304 contract as GET /guaranteed-state/schemas, computed per-request over the live definition set.", "responses": {"200": {"description": "{version, description, instructions[].{id, name, plugin, action, description, parameter_schema, platforms, approval_mode}}"}, "304": {"description": "Not Modified"}, "503": {"description": "Instruction store unavailable"}}}
+      "get": {"summary": "Published InstructionDefinition catalog (A2 discovery)", "tags": ["Discovery"], "description": "Requires InstructionDefinition:Read. Agentic-first (A1/A2) subset of InstructionStore::query_definitions (enabled_only=true — only invokable definitions are published) carrying id/name/plugin/action/description/parameter_schema/platforms/approval_mode. parameter_schema is parsed into a nested JSON Schema object when the stored value is valid JSON AND parses to an object, else null (a non-object JSON value, e.g. an array or string, is treated the same as unparseable — matches GET /discover/plugins' precedent). Same ETag/Cache-Control/304 contract as GET /guaranteed-state/schemas, computed per-request over the live definition set.", "responses": {"200": {"description": "{version, description, instructions[].{id, name, plugin, action, description, parameter_schema, platforms, approval_mode}}"}, "304": {"description": "Not Modified"}, "503": {"description": "Instruction store unavailable"}}}
     },
     "/discover/routes": {
       "get": {"summary": "REST route catalog (A2 discovery)", "tags": ["Discovery"], "description": "Requires Infrastructure:Read. Subsets the SAME hand-maintained OpenAPI document GET /api/v1/openapi.json serves (openapi_spec_json(), so the two can never show different data), so it inherits that document's known limitation: it is NOT generated from the live route table and can under-report a route that exists but was never documented. The response therefore carries \"source\":\"openapi\" plus a caveat string. RBAC requirement per route is embedded in each route's free-text description (no structured field yet), same as the source document.", "responses": {"200": {"description": "{version, source:\"openapi\", caveat, routes[].{method, path, summary, tags[], description}}"}, "304": {"description": "Not Modified"}}}
@@ -1387,11 +1388,11 @@ void RestApiV1::register_routes(
     ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
     GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
     LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn,
-    SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
+    SoftwareInventoryStore* software_inventory_store,
     ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
-    ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn) {
+    ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -1403,10 +1404,10 @@ void RestApiV1::register_routes(
                     std::move(step_up_fn), std::move(guardian_push_fn), std::move(dex_perf_fn),
                     std::move(net_perf_fn), std::move(lockout_clear_fn), baseline_store,
                     std::move(scoped_perm_fn), software_inventory_store,
-                    std::move(inventory_scope_fn), std::move(response_scope_fn),
+                    std::move(response_scope_fn),
                     std::move(app_perf_providers), engine_principal_store, access_review_store,
                     auth_db, directory_sync, stream_budget, std::move(exec_visible_fn),
-                    std::move(list_read_fn));
+                    std::move(list_read_fn), std::move(fleet_read_fn));
 }
 
 void RestApiV1::register_routes(
@@ -1423,11 +1424,11 @@ void RestApiV1::register_routes(
     ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
     GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
     LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn,
-    SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
+    SoftwareInventoryStore* software_inventory_store,
     ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
-    ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn) {
+    ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -2266,11 +2267,23 @@ void RestApiV1::register_routes(
                      auto session = auth_fn(req, res);
                      if (!session)
                          return;
-                     for (const auto& gr : mgmt_store->get_group_roles(group_id)) {
-                         if (gr.principal_type == "user" && gr.principal_id == session->username &&
-                             gr.role_name == "ITServiceOwner") {
-                             authorized = true;
-                             break;
+                     // guardian-confinement-2298 PR3 §3e: the ITServiceOwner-of-
+                     // this-group fallback below checks GROUP MEMBERSHIP only —
+                     // it never consults token_scope_service, so a service-scoped
+                     // token whose minter is ITServiceOwner of ANY group would
+                     // otherwise read that group's role graph regardless of the
+                     // token's own service tag. The fleet-wide arm above already
+                     // gets the §3a flip's service-scope handling (via perm_fn);
+                     // a service-scoped token must go through THAT arm only —
+                     // never this membership fallback.
+                     if (session->token_scope_service.empty()) {
+                         for (const auto& gr : mgmt_store->get_group_roles(group_id)) {
+                             if (gr.principal_type == "user" &&
+                                 gr.principal_id == session->username &&
+                                 gr.role_name == "ITServiceOwner") {
+                                 authorized = true;
+                                 break;
+                             }
                          }
                      }
                  }
@@ -2330,9 +2343,18 @@ void RestApiV1::register_routes(
                       return;
                   }
 
-                  bool authorized =
-                      rbac_store->check_permission(session->username, "ManagementGroup", "Write");
-                  if (!authorized) {
+                  // guardian-confinement-2298 PR3 §3e: was a direct
+                  // rbac_store->check_permission call, bypassing
+                  // require_permission (and therefore the §3a flip) entirely —
+                  // routed through perm_fn's probe-response form (matches the
+                  // GET handler above) so a service-scoped token gets the
+                  // flip's default-deny instead of an unfiltered role check.
+                  httplib::Response probe; // throwaway: the fleet-wide arm, never sent
+                  bool authorized = perm_fn(req, probe, "ManagementGroup", "Write");
+                  // The ITServiceOwner-of-this-group fallback checks GROUP
+                  // MEMBERSHIP only, never token_scope_service — same reasoning
+                  // as the GET handler's identical guard above.
+                  if (!authorized && session->token_scope_service.empty()) {
                       auto group_roles = mgmt_store->get_group_roles(group_id);
                       for (const auto& gr : group_roles) {
                           if (gr.principal_type == "user" && gr.principal_id == session->username &&
@@ -2391,9 +2413,13 @@ void RestApiV1::register_routes(
             auto principal_id = body.value("principal_id", "");
             auto role_name = body.value("role_name", "");
 
-            bool authorized =
-                rbac_store->check_permission(session->username, "ManagementGroup", "Write");
-            if (!authorized) {
+            // guardian-confinement-2298 PR3 §3e: same fix as the POST handler
+            // above — routed through perm_fn instead of a direct
+            // rbac_store->check_permission call, and the ITServiceOwner
+            // membership fallback is skipped for a service-scoped token.
+            httplib::Response probe; // throwaway: the fleet-wide arm, never sent
+            bool authorized = perm_fn(req, probe, "ManagementGroup", "Write");
+            if (!authorized && session->token_scope_service.empty()) {
                 auto group_roles = mgmt_store->get_group_roles(group_id);
                 for (const auto& gr : group_roles) {
                     if (gr.principal_type == "user" && gr.principal_id == session->username &&
@@ -2763,9 +2789,30 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
-            bool authorized =
-                rbac_store->check_permission(session->username, "ManagementGroup", "Write");
-            if (!authorized && mgmt_store) {
+            // guardian-confinement-2298 PR3 §3e sweep finding, DEFENSE-IN-
+            // DEPTH (verified NOT reachable by a service-scoped token today
+            // — do not describe this as closing a live gap): this whole
+            // `!scope_service.empty()` block is RBAC-on-only (see the guard
+            // just above), and the route's own top-of-handler
+            // `perm_fn(req, res, "ApiToken", "Write")` already denies every
+            // service-scoped session before it ever reaches here — the §3a
+            // flip's ceiling check is pinned to the ITServiceOwner ROLE's
+            // own grants regardless of the minter's other roles, and that
+            // role's seed list (rbac_store.cpp) carries no ApiToken entry.
+            // Was a direct rbac_store->check_permission call, bypassing
+            // require_permission entirely; swapped for perm_fn's probe-
+            // response form (same shape as the /management-groups/{id}/roles
+            // fix above) for MCP-tier + engine-principal correctness and
+            // consistency — behavior-identical to the old call for an
+            // ordinary RBAC-on caller, since both resolve to the same
+            // rbac_store->check_permission under require_permission's
+            // RBAC-enforced branch. The token_scope_service.empty() guard on
+            // the fallback below costs nothing and matches the roles fix's
+            // shape, guarding against a future change that grants
+            // ITServiceOwner an ApiToken permission.
+            httplib::Response probe; // throwaway: the fleet-wide arm, never sent
+            bool authorized = perm_fn(req, probe, "ManagementGroup", "Write");
+            if (!authorized && mgmt_store && session->token_scope_service.empty()) {
                 auto svc_group = mgmt_store->find_group_by_name("Service: " + scope_service);
                 if (svc_group) {
                     auto group_roles = mgmt_store->get_group_roles(svc_group->id);
@@ -4683,8 +4730,18 @@ void RestApiV1::register_routes(
                  }
 
                  auto gaps = tag_store->get_compliance_gaps();
+                 if (!gaps) {
+                     // Degrade → 503, never an empty (fully-compliant-looking)
+                     // report (#3097 classification); retryable (cons-F1).
+                     res.status = 503;
+                     res.set_content(
+                         detail::a4_error(res, "tag store unavailable",
+                                          detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                         "application/json");
+                     return;
+                 }
                  JArr arr;
-                 for (const auto& [agent_id, missing] : gaps) {
+                 for (const auto& [agent_id, missing] : *gaps) {
                      JArr m;
                      for (const auto& k : missing)
                          m.add(k);
@@ -4712,9 +4769,19 @@ void RestApiV1::register_routes(
                      return;
                  }
                  auto tags = tag_store->get_all_tags(agent_id);
+                 if (!tags) {
+                     // Degrade → 503, never an empty tag map (#3097);
+                     // retryable (cons-F1).
+                     res.status = 503;
+                     res.set_content(
+                         detail::a4_error(res, "tag store unavailable",
+                                          detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                         "application/json");
+                     return;
+                 }
                  JObj obj;
-                 for (size_t i = 0; i < tags.size(); ++i)
-                     obj.add(tags[i].key, tags[i].value);
+                 for (size_t i = 0; i < tags->size(); ++i)
+                     obj.add((*tags)[i].key, (*tags)[i].value);
                  res.set_content(ok_json(obj.str()), "application/json");
              });
 
@@ -4722,7 +4789,8 @@ void RestApiV1::register_routes(
                               tag_push_fn](const httplib::Request& req, httplib::Response& res) {
         // CDX-R4-02: authenticate BEFORE any store/body work (401 first, never a
         // 503/400 to an unauthenticated caller).
-        if (!auth_fn(req, res))
+        auto session = auth_fn(req, res);
+        if (!session)
             return;
         // CDX-R2-003/CDX-03: authorization is the per-target scoped gate ALONE
         // (below, once agent_id is parsed) — no global Tag:Write pre-gate. The
@@ -4765,6 +4833,22 @@ void RestApiV1::register_routes(
             return;
         }
 
+        // #3289: a service-scoped token authorizing this write via
+        // scoped_perm_fn below reads the PRE-WRITE `service` tag to decide
+        // admission — without this guard it could authorize the very write
+        // that changes that tag out from under its own confinement.
+        // Value-blind, checked before the scoped gate. No `.permission` — no
+        // grant admits a service-scoped session past this rule.
+        if (!authz::service_scope_may_mutate_tag_key(session->token_scope_service, key)) {
+            audit_fn(req, "tag.set", "denied", "Tag", agent_id + ":" + key,
+                    "service-scoped token blocked: cannot mutate the service tag");
+            res.status = 403;
+            res.set_content(
+                detail::a4_error(res, authz::kServiceTagMutationDeniedMessage),
+                "application/json");
+            return;
+        }
+
         // H1 / CDX-P2-003 / K-01: the SOLE per-target authorization, applied
         // once agent_id is known (the scope needs the target). It enforces
         // Tag:Write scoped to the target: a service-A token may tag only
@@ -4785,8 +4869,26 @@ void RestApiV1::register_routes(
 
         auto result = tag_store->set_tag_checked(agent_id, key, value, "api");
         if (!result) {
-            res.status = 400;
-            res.set_content(detail::a4_error(res, result.error()), "application/json");
+            // #3097 classification: db_error prefix → 503 (degrade,
+            // retryable — retry_after_ms per the rest-api.md contract and
+            // the quarantine-route precedent; governance cons-F1), anything
+            // else → 400 (caller/validation error) — never one catch-all.
+            // set_tag_checked now also propagates a FAILED WRITE (the
+            // pre-migration contract validated, then swallowed it and
+            // reported success over nothing written). Failed attempts leave
+            // an audit row (governance cmp-F1/cons-F2 — the MCP twin already
+            // audited its failure branches; an auditor querying tag.set must
+            // see the failed attempt on this transport too).
+            const bool db_error = result.error().starts_with(kTagDbErrorPrefix);
+            audit_fn(req, "tag.set", "failure", "Tag", agent_id + ":" + key, result.error());
+            res.status = db_error ? 503 : 400;
+            if (db_error) {
+                res.set_content(detail::a4_error(res, "tag store unavailable",
+                                                 detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                                "application/json");
+            } else {
+                res.set_content(detail::a4_error(res, result.error()), "application/json");
+            }
             return;
         }
         if (key == "service" && service_group_fn)
@@ -4802,7 +4904,8 @@ void RestApiV1::register_routes(
         [auth_fn, scoped_perm_fn, audit_fn, tag_store](const httplib::Request& req,
                                                        httplib::Response& res) {
             // CDX-R4-02: authenticate BEFORE any store/body work (401 first).
-            if (!auth_fn(req, res))
+            auto session = auth_fn(req, res);
+            if (!session)
                 return;
             // CDX-R2-003/CDX-03: scoped gate ALONE (no global Tag:Delete
             // pre-gate that would 403 a management-group-scoped operator before
@@ -4815,6 +4918,17 @@ void RestApiV1::register_routes(
 
             auto agent_id = req.matches[1].str();
             auto key = req.matches[2].str();
+            // #3289: same TOCTOU guard as PUT above — a service-scoped
+            // token must not delete its own confinement key.
+            if (!authz::service_scope_may_mutate_tag_key(session->token_scope_service, key)) {
+                audit_fn(req, "tag.delete", "denied", "Tag", agent_id + ":" + key,
+                        "service-scoped token blocked: cannot mutate the service tag");
+                res.status = 403;
+                res.set_content(
+                    detail::a4_error(res, authz::kServiceTagMutationDeniedMessage),
+                    "application/json");
+                return;
+            }
             // H1 / CDX-P2-003 / K-01: the SOLE per-target authorization — same
             // tag-boundary confinement as the PUT twin above. A service-scoped
             // token must not delete a tag (e.g. `service`) on an agent outside
@@ -4828,8 +4942,23 @@ void RestApiV1::register_routes(
             }
             if (!scoped_perm_fn(req, res, "Tag", "Delete", agent_id))
                 return;
-            bool deleted = tag_store->delete_tag(agent_id, key);
+            auto deleted = tag_store->delete_tag(agent_id, key);
             if (!deleted) {
+                // Degrade → 503 (#3097), retryable (cons-F1) — the
+                // pre-migration bool answered 404 for a store failure,
+                // telling the caller the tag was gone when nothing was
+                // checked. Audited (cmp-F1/cons-F2): a failed delete attempt
+                // must be visible to an auditor on this transport, as it
+                // already is on the legacy and MCP twins.
+                audit_fn(req, "tag.delete", "failure", "Tag", agent_id + ":" + key, "");
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "tag store unavailable",
+                                                 detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                                "application/json");
+                return;
+            }
+            if (!*deleted) {
+                audit_fn(req, "tag.delete", "not_found", "Tag", agent_id + ":" + key, "");
                 res.status = 404;
                 res.set_content(detail::a4_error(res, "tag not found"), "application/json");
                 return;
@@ -6162,22 +6291,29 @@ void RestApiV1::register_routes(
 
     // GET /api/v1/inventory/software — typed daily-sync installed-software FLEET read
     // (ADR-0016). The REST sibling of the governed MCP query_installed_software tool;
-    // mirrors it 1:1 (Inventory:Read → store → cap → management-group scope filter →
-    // audit). DISTINCT from the generic /api/v1/inventory/* routes above, which read
-    // the generic blob InventoryStore — this reads the typed SoftwareInventoryStore
-    // (normalized rows). Single path segment, so it does not collide with the
-    // two-segment /api/v1/inventory/{agent}/{plugin} regex.
+    // mirrors it 1:1 (require_fleet_read → store → cap → meet(mgmt, service) scope
+    // filter → audit). DISTINCT from the generic /api/v1/inventory/* routes above,
+    // which read the generic blob InventoryStore — this reads the typed
+    // SoftwareInventoryStore (normalized rows). Single path segment, so it does not
+    // collide with the two-segment /api/v1/inventory/{agent}/{plugin} regex.
     //
-    // CONSISTENCY NOTE: the sibling generic routes share this securable (Inventory:Read)
-    // but apply no per-agent filter at all. This endpoint carries the per-agent drop
-    // filter as a FOUNDATION — but per ADR-0017 the filter is INERT under the global
-    // Inventory:Read gate (a confined operator is denied at the gate before it runs; a
-    // global operator's filter is a no-op), so this endpoint is NOT yet a working
-    // scoped reference. The convergence target is the ADR-0017 admit-then-filter list
-    // gate (#1716), not this endpoint as-is. Until then, list-view management-group
-    // confinement under /inventory is not effective — a known, ticketed gap.
-    // Agentic-first A1: a fleet software dashboard + a /device drill-down section
-    // (planned follow-ons) sit on this same data + scope contract.
+    // #3290 Phase 2 — first live route migrated onto `require_fleet_read` (via the
+    // injected fleet_read_fn). SOLE authorization gate — never stacked with perm_fn
+    // (require_fleet_read's own doc comment has the BLOCKING falsifier: perm_fn's
+    // ordinary RBAC branch never consults ManagementGroupStore, so pairing the two
+    // makes the AdmitScoped branch permanently unreachable). The per-agent scope
+    // filter below is the gate's OWN composed meet(management-group, service-scope)
+    // VisibleSet — no longer a separate predicate layered under a global perm_fn, so
+    // it is now EFFECTIVE, not inert (ADR-0017's former "World A gap" for this
+    // route): a management-group-confined operator and a correctly-confined
+    // service-scoped token both get a real, working, filtered read here, where
+    // previously the former saw an unfiltered fleet and the latter was denied
+    // outright by #2298 PR 3's default-deny flip. CONSISTENCY NOTE: the sibling
+    // generic /api/v1/inventory/* routes above share the Inventory:Read securable
+    // but are not yet migrated onto this pattern — they still apply no per-agent
+    // filter at all. Agentic-first A1: a fleet software dashboard + a /device
+    // drill-down section (planned follow-ons) sit on this same data + scope
+    // contract.
     //
     // Audit posture is deliberately SET-AND-PROCEED (plain audit_fn), NOT the
     // fail-closed emit_behavioral_audit the per-device DEX/device routes use:
@@ -6189,40 +6325,25 @@ void RestApiV1::register_routes(
     // sink → false, not a 500 with no trail) — full parity with the MCP sibling's
     // mcp_audit (which wraps the same kernel), not just the bool-surfacing half.
     sink.Get("/api/v1/inventory/software",
-             [auth_fn, perm_fn, audit_fn, software_inventory_store, inventory_scope_fn,
-              deny_fleet_wide_service_scoped](const httplib::Request& req,
-                                              httplib::Response& res) {
+             [fleet_read_fn, audit_fn, software_inventory_store](const httplib::Request& req,
+                                                                  httplib::Response& res) {
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid); // echo on every path (A3)
 
-                 // Resolve the principal first — the per-row scope predicate below needs
-                 // the username (the flat Inventory:Read gate is not a per-device check).
-                 auto session = auth_fn(req, res);
-                 if (!session)
-                     return; // auth_fn wrote 401
-                 if (!perm_fn(req, res, "Inventory", "Read"))
-                     return; // perm_fn wrote 401/403
-                 // Governance finding: the management-group scope filter further down
-                 // is INERT under the global Inventory:Read gate (see its own comment)
-                 // — neither axis it (or perm_fn above) checks is the token's own
-                 // service-tag scope, and this route has no scoped_perm_fn wired for a
-                 // per-target check even when agent_id is supplied. Blanket deny via the
-                 // file's own shared deny_fleet_wide_service_scoped chokepoint (Gate 8
-                 // hardening review: an earlier round hand-rolled this instead of
-                 // extending it, forking the very pattern the routed-concerns row warns
-                 // against) — matching the dashboard fragment twin
-                 // (inventory_routes.cpp's /fragments/inventory/find/results) and the
-                 // MCP twin (query_installed_software), both target_id="fleet".
-                 // Note: the shared helper mints its OWN X-Correlation-Id on the deny
-                 // path (matching its other call sites) and erases the outer `cid`
-                 // header set above before writing it, so the response carries exactly
-                 // one value; it also appends that same id to the audit_detail string
-                 // below internally, so the outer `cid` here is not baked in twice.
-                 if (deny_fleet_wide_service_scoped(
-                         req, res, "inventory.software.query", "Inventory",
-                         "fleet-wide software search denied to a service-scoped token",
-                         "service-scoped tokens may not run a fleet-wide software search", "fleet",
-                         "Inventory:Read"))
+                 if (!fleet_read_fn) {
+                     spdlog::error("inventory.software.query: fleet_read_fn unwired — "
+                                   "misconfigured call site; failing closed; cid={}",
+                                   cid);
+                     res.status = 503;
+                     res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                     "application/json");
+                     return;
+                 }
+                 // require_fleet_read is the SOLE gate — see the comment above the
+                 // route registration for why it must never be stacked with perm_fn.
+                 // It renders 401/403/503 itself and returns !admitted on denial.
+                 auto gate = fleet_read_fn(req, res, "Inventory", "Read");
+                 if (!gate.admitted)
                      return;
                  // Null-store ONLY (not `!is_open()`): a constructed-but-closed store
                  // deliberately falls through to query_software(), which returns nullopt →
@@ -6294,38 +6415,34 @@ void RestApiV1::register_routes(
                  // shrinks `rows`. As with the MCP sibling, an empty-filter call is an unbounded
                  // fleet scan capped at q.limit on a global ORDER BY *before* the per-agent scope
                  // filter, so a narrow-scope operator may see few of their own rows in one page
-                 // (signalled by result_truncated_by_cap). NOTE (ADR-0017): the per-agent filter
-                 // here is INERT under the global Inventory:Read gate, so it does not actually
-                 // narrow by management group today — do not read "ISOLATION holds" as effective
-                 // list-view confinement (that is the ADR-0017 gate, #1716). Narrow-scope
-                 // completeness over a wide fleet is the keyset follow-up (#1634).
+                 // (signalled by result_truncated_by_cap). Narrow-scope completeness over a wide
+                 // fleet is the keyset follow-up (#1634).
                  const bool hit_cap = rows.size() == static_cast<std::size_t>(q.limit);
 
-                 // Management-group scope filter (mirrors the MCP tool / query_responses #1550).
-                 // The flat Inventory:Read gate is not a per-device ownership check, so without
-                 // this an operator could read other operators' devices' software fleet-wide by
-                 // name. Filter per-agent through the injected predicate, memoised per distinct
-                 // agent_id. Unwired (RBAC-off / test) → no filter (legacy-open), matching the
-                 // MCP default + require_scoped_permission.
+                 // Scope filter — the gate's own composed meet(management-group,
+                 // service-scope) VisibleSet (#3290, replaces the retired per-row
+                 // inventory_scope_fn predicate; mirrors the MCP tool /
+                 // query_responses #1550's per-agent-ownership intent, now on the
+                 // real ADR-0017 admit-then-filter mechanism instead of a filter
+                 // layered under a global gate). nullopt (TOP) ⇒ unfiltered — a
+                 // global grant or RBAC-off, byte-identical to the pre-#3290 no-op
+                 // filter path for that caller class.
                  bool scope_filtered = false;
                  std::size_t dropped_agents = 0;
-                 if (inventory_scope_fn) {
-                     std::unordered_map<std::string, bool> memo;
+                 if (gate.scope) {
+                     std::unordered_set<std::string> dropped_ids;
                      std::vector<SoftwareFleetRow> visible;
                      visible.reserve(rows.size());
                      for (auto& r : rows) {
-                         auto [m, inserted] = memo.try_emplace(r.agent_id, false);
-                         if (inserted)
-                             m->second = inventory_scope_fn(session->username, r.agent_id);
-                         if (m->second) {
+                         if (authz::in_scope(gate.scope, r.agent_id)) {
                              visible.push_back(std::move(r));
                          } else {
                              scope_filtered = true;
-                             if (inserted) // count each DISTINCT dropped device once
-                                 ++dropped_agents;
+                             dropped_ids.insert(r.agent_id); // count each DISTINCT dropped device once
                          }
                      }
                      rows.swap(visible);
+                     dropped_agents = dropped_ids.size();
                  }
 
                  JArr arr;
@@ -6362,7 +6479,9 @@ void RestApiV1::register_routes(
                      denied_ok = detail::try_persist_audit(
                          audit_fn, req, "inventory.software.query", "denied", "Inventory", audit_key,
                          "scope: filtered " + std::to_string(dropped_agents) +
-                             " out-of-management-group device(s); cid=" + cid);
+                             " out-of-scope device(s) (management-group and/or service-tag "
+                             "axis); cid=" +
+                             cid);
                  const bool audit_ok =
                      detail::try_persist_audit(audit_fn, req, "inventory.software.query", "success",
                                                "Inventory", audit_key,
@@ -7217,8 +7336,25 @@ void RestApiV1::register_routes(
         };
 
         // GET /api/v1/result-sets — owner-scoped list.
-        sink.Get("/api/v1/result-sets", [auth_fn, result_set_store, rs_to_json](
+        sink.Get("/api/v1/result-sets", [auth_fn, result_set_store, rs_to_json,
+                                         deny_fleet_wide_service_scoped](
                                             const httplib::Request& req, httplib::Response& res) {
+            // guardian-confinement-2298 PR3 §3e sweep finding: owner-scoped via
+            // session->username — which for a service-scoped token is the
+            // MINTER's username, not the token's own service tag. Any OTHER
+            // service token the same minter holds (or the minter's own
+            // interactive session) shares the identical result-set cohort —
+            // cross-service reach beyond this token's own intended scope. Same
+            // gap class as the HTMX twin (/fragments/result-sets/sidebar).
+            // No `.permission` label (explicit "" overrides the helper's
+            // GuaranteedState:Read default): ResultSet is not a seeded RBAC
+            // securable and this is a blanket deny with no grant that would
+            // help — naming one would be a false self-remediation claim.
+            if (deny_fleet_wide_service_scoped(
+                    req, res, "result_set.list.access_denied", "ResultSet",
+                    "fleet-wide result-set list denied to a service-scoped token",
+                    "service-scoped tokens may not list result sets", "", ""))
+                return;
             auto session = auth_fn(req, res);
             if (!session)
                 return;
@@ -7245,7 +7381,19 @@ void RestApiV1::register_routes(
         // (e.g. dashboard "I have a CSV"). Synchronous → lands materialized.
         sink.Post("/api/v1/result-sets",
                   [auth_fn, audit_fn, result_set_store, metrics_registry, rs_to_json, rs_err,
-                   load_owned](const httplib::Request& req, httplib::Response& res) {
+                   load_owned, deny_fleet_wide_service_scoped](const httplib::Request& req,
+                                                               httplib::Response& res) {
+            // guardian-confinement-2298 PR3 §3e sweep finding — same cross-
+            // service reach as the GET list above (session->username-keyed,
+            // not token-scope-keyed): a service-scoped token could create
+            // result sets under the minter's identity, reachable by any
+            // OTHER token the same minter holds.
+            // No `.permission` label — see the GET list handler above.
+            if (deny_fleet_wide_service_scoped(
+                    req, res, "result_set.create.access_denied", "ResultSet",
+                    "result-set create denied to a service-scoped token",
+                    "service-scoped tokens may not create result sets", "", ""))
+                return;
             auto session = auth_fn(req, res);
             if (!session)
                 return;
@@ -7309,11 +7457,27 @@ void RestApiV1::register_routes(
         // agent that matched. When parent_id is given, the candidate set is
         // narrowed to that set's current members.
         sink.Post("/api/v1/result-sets/from-inventory-query",
-                  [auth_fn, audit_fn, result_set_store, inventory_store, metrics_registry,
-                   rs_to_json, rs_err,
+                  [auth_fn, perm_fn, audit_fn, result_set_store, inventory_store,
+                   metrics_registry, rs_to_json, rs_err,
                    load_owned](const httplib::Request& req, httplib::Response& res) {
                       auto session = auth_fn(req, res);
                       if (!session)
+                          return;
+                      // SECURITY (CWE-862, missing authorization) — guardian-
+                      // confinement-2298 PR3 §3e residual sweep finding. This
+                      // producer is a SYNCHRONOUS READ (queries inventory_store
+                      // directly, no command dispatch), not one of the three
+                      // DISPATCH producers the e7b47ca3/#2500 fix already gated
+                      // just below (from-tar-query, from-instruction-result,
+                      // re-eval) — it was never covered by that fix and has been
+                      // reachable by ANY authenticated session (service-scoped or
+                      // not) with no authorization check at all: up to 5000
+                      // fleet-wide inventory records queried and evaluated with
+                      // zero scoping. Gated on Inventory:Read (the same
+                      // securable/operation GET /api/v1/inventory/software uses
+                      // for the identical data class), not Execution:Execute —
+                      // there is no dispatch here to authorize.
+                      if (!perm_fn(req, res, "Inventory", "Read"))
                           return;
                       const auto audit_failure = [&](std::string_view reason) {
                           bool ok = true;
@@ -7672,8 +7836,17 @@ void RestApiV1::register_routes(
 
         // GET /api/v1/result-sets/{id}
         sink.Get(R"(/api/v1/result-sets/(rs_[0-9a-f]+))",
-                 [auth_fn, rs_to_json, load_owned](const httplib::Request& req,
-                                                   httplib::Response& res) {
+                 [auth_fn, rs_to_json, load_owned,
+                  deny_fleet_wide_service_scoped](const httplib::Request& req,
+                                                  httplib::Response& res) {
+                     // guardian-confinement-2298 PR3 §3e sweep finding: see the
+                     // GET list handler above for the cross-service-reach reasoning.
+                     if (deny_fleet_wide_service_scoped(
+                             req, res, "result_set.detail.access_denied", "ResultSet",
+                             "result-set detail denied to a service-scoped token",
+                             "service-scoped tokens may not read result-set detail",
+                             req.matches[1].str(), ""))
+                         return;
                      auto session = auth_fn(req, res);
                      if (!session)
                          return;
@@ -7685,8 +7858,17 @@ void RestApiV1::register_routes(
 
         // GET /api/v1/result-sets/{id}/members
         sink.Get(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/members)",
-                 [auth_fn, result_set_store, load_owned](const httplib::Request& req,
-                                                         httplib::Response& res) {
+                 [auth_fn, result_set_store, load_owned,
+                  deny_fleet_wide_service_scoped](const httplib::Request& req,
+                                                  httplib::Response& res) {
+                     // guardian-confinement-2298 PR3 §3e sweep finding: see the
+                     // GET list handler above for the cross-service-reach reasoning.
+                     if (deny_fleet_wide_service_scoped(
+                             req, res, "result_set.members.access_denied", "ResultSet",
+                             "result-set members denied to a service-scoped token",
+                             "service-scoped tokens may not read result-set members",
+                             req.matches[1].str(), ""))
+                         return;
                      auto session = auth_fn(req, res);
                      if (!session)
                          return;
@@ -7716,8 +7898,17 @@ void RestApiV1::register_routes(
 
         // GET /api/v1/result-sets/{id}/lineage
         sink.Get(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/lineage)",
-                 [auth_fn, result_set_store, load_owned](const httplib::Request& req,
-                                                         httplib::Response& res) {
+                 [auth_fn, result_set_store, load_owned,
+                  deny_fleet_wide_service_scoped](const httplib::Request& req,
+                                                  httplib::Response& res) {
+                     // guardian-confinement-2298 PR3 §3e sweep finding: see the
+                     // GET list handler above for the cross-service-reach reasoning.
+                     if (deny_fleet_wide_service_scoped(
+                             req, res, "result_set.lineage.access_denied", "ResultSet",
+                             "result-set lineage denied to a service-scoped token",
+                             "service-scoped tokens may not read result-set lineage",
+                             req.matches[1].str(), ""))
+                         return;
                      auto session = auth_fn(req, res);
                      if (!session)
                          return;
@@ -7739,8 +7930,17 @@ void RestApiV1::register_routes(
 
         // POST /api/v1/result-sets/{id}/pin
         sink.Post(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/pin)",
-                  [auth_fn, audit_fn, result_set_store, rs_to_json, rs_err,
-                   load_owned](const httplib::Request& req, httplib::Response& res) {
+                  [auth_fn, audit_fn, result_set_store, rs_to_json, rs_err, load_owned,
+                   deny_fleet_wide_service_scoped](const httplib::Request& req,
+                                                   httplib::Response& res) {
+                      // guardian-confinement-2298 PR3 §3e sweep finding: see the
+                      // GET list handler above for the cross-service-reach reasoning.
+                      if (deny_fleet_wide_service_scoped(
+                              req, res, "result_set.pin.access_denied", "ResultSet",
+                              "result-set pin denied to a service-scoped token",
+                              "service-scoped tokens may not pin result sets",
+                              req.matches[1].str(), ""))
+                          return;
                       auto session = auth_fn(req, res);
                       if (!session)
                           return;
@@ -7760,8 +7960,17 @@ void RestApiV1::register_routes(
 
         // POST /api/v1/result-sets/{id}/unpin
         sink.Post(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/unpin)",
-                  [auth_fn, audit_fn, result_set_store, rs_to_json, rs_err,
-                   load_owned](const httplib::Request& req, httplib::Response& res) {
+                  [auth_fn, audit_fn, result_set_store, rs_to_json, rs_err, load_owned,
+                   deny_fleet_wide_service_scoped](const httplib::Request& req,
+                                                   httplib::Response& res) {
+                      // guardian-confinement-2298 PR3 §3e sweep finding: see the
+                      // GET list handler above for the cross-service-reach reasoning.
+                      if (deny_fleet_wide_service_scoped(
+                              req, res, "result_set.unpin.access_denied", "ResultSet",
+                              "result-set unpin denied to a service-scoped token",
+                              "service-scoped tokens may not unpin result sets",
+                              req.matches[1].str(), ""))
+                          return;
                       auto session = auth_fn(req, res);
                       if (!session)
                           return;
@@ -7780,8 +7989,17 @@ void RestApiV1::register_routes(
 
         // DELETE /api/v1/result-sets/{id}
         sink.Delete(R"(/api/v1/result-sets/(rs_[0-9a-f]+))",
-                    [auth_fn, audit_fn, result_set_store, rs_err,
-                     load_owned](const httplib::Request& req, httplib::Response& res) {
+                    [auth_fn, audit_fn, result_set_store, rs_err, load_owned,
+                     deny_fleet_wide_service_scoped](const httplib::Request& req,
+                                                     httplib::Response& res) {
+                        // guardian-confinement-2298 PR3 §3e sweep finding: see the
+                        // GET list handler above for the cross-service-reach reasoning.
+                        if (deny_fleet_wide_service_scoped(
+                                req, res, "result_set.delete.access_denied", "ResultSet",
+                                "result-set delete denied to a service-scoped token",
+                                "service-scoped tokens may not delete result sets",
+                                req.matches[1].str(), ""))
+                            return;
                         auto session = auth_fn(req, res);
                         if (!session)
                             return;

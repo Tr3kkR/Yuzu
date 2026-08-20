@@ -80,38 +80,11 @@ struct CollectingSink {
     }
 };
 
-/// Deadlines here bound "a background worker should have got to this by now". They are a
-/// liveness backstop so a stuck worker fails the suite instead of hanging it - never the
-/// property under test - so stretching them cannot weaken an assertion.
-///
-/// Under a sanitizer they must stretch. Instrumented builds run several times slower and the
-/// whole agent suite shares one process, so a deadline sized for a normal build turns into an
-/// unexplained failure that reproduces nowhere: twice in this file already, both times with
-/// ZERO ThreadSanitizer warnings and a clean 3/3 in isolation. Scaling once here beats
-/// discovering the next one in a nightly run.
-constexpr int kSpinScale =
-#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
-    6;
-#elif defined(__has_feature)
-#if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
-    6;
-#else
-    1;
-#endif
-#else
-    1;
-#endif
-
-bool spin_until(std::function<bool()> pred, std::chrono::milliseconds timeout = 5s) {
-    timeout *= kSpinScale;
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (pred())
-            return true;
-        std::this_thread::sleep_for(1ms);
-    }
-    return pred();
-}
+// spin_until / kSpinScale promoted to yuzu::test (test_helpers.hpp) — #2238, CON-S4
+// promote-at-second-user. Brought into this anonymous namespace's lookup so every
+// unqualified call site below keeps working unchanged.
+using yuzu::test::kSpinScale;
+using yuzu::test::spin_until;
 
 // A real KvStore + durable journal alongside the runtime, for the C0 (#2298)
 // maintenance-on-the-worker cases: prune + page now run HERE, not on the
@@ -1841,11 +1814,20 @@ TEST_CASE("CH-5: a forward clock step does not delete the whole journal in one p
     const auto paged = rig.journal->page_into_window(*rig.rt, kT + kThirtyDays);
     CHECK(paged.records_paged == 6);
 
-    // ...and the guard is ONE pass, not a permanent disabling of retention: having now observed
-    // the new clock, later passes age the batches out normally.
-    const auto after = rig.journal->prune(kT + kThirtyDays + 1000);
+    // The pass right after the jump no longer LOOKS like a step (last_prune_now_ms_ has already
+    // re-anchored to the jumped value), but the journal is still fully expired under the new
+    // clock - a fact set (wipe, no step) `jumped` never recorded. It must decline again on its
+    // own merits (#2573 GJ half) rather than ride `jumped`'s still-set latch into a silent
+    // eviction.
+    const auto settling = rig.journal->prune(kT + kThirtyDays + 1000);
+    CHECK(settling.evicted == 0);
+    CHECK(rig.journal->clock_jump_skips() == 2);
+
+    // ...and the guard is not a permanent disabling of retention: the SAME fact shape recurring
+    // is a suppressed repeat, so this pass finally proceeds.
+    const auto after = rig.journal->prune(kT + kThirtyDays + 2000);
     CHECK(after.evicted == 3);
-    CHECK(rig.journal->clock_jump_skips() == 1); // not re-counted: the clock is stable again
+    CHECK(rig.journal->clock_jump_skips() == 2); // not re-counted a third time
 }
 
 TEST_CASE("CH-5b: one retention pass cannot age out the whole journal",
@@ -1863,12 +1845,15 @@ TEST_CASE("CH-5b: one retention pass cannot age out the whole journal",
         rig.persist_batch("b" + std::to_string(i), 1);
 
     constexpr std::int64_t kThirtyDays = 30LL * 86400 * 1000;
-    REQUIRE(rig.journal->prune(kT).evicted == 0);           // baseline
-    REQUIRE(rig.journal->prune(kT + kThirtyDays).evicted == 0); // the jump itself: declined
+    REQUIRE(rig.journal->prune(kT).evicted == 0);                // baseline
+    REQUIRE(rig.journal->prune(kT + kThirtyDays).evicted == 0);  // the jump itself: declined
+    // As in CH-5: the pass right after the jump presents a DISTINCT fact set (wipe, no step)
+    // and declines again on its own merits before the cap-paced drain proceeds (#2573 GJ half).
+    REQUIRE(rig.journal->prune(kT + kThirtyDays + 1000).evicted == 0);
 
-    const auto accepted = rig.journal->prune(kT + kThirtyDays + 1000);
+    const auto accepted = rig.journal->prune(kT + kThirtyDays + 2000);
     CHECK(accepted.evicted == kMaxAgeEvictionsPerPass); // paced, not wholesale
-    const auto rest = rig.journal->prune(kT + kThirtyDays + 2000);
+    const auto rest = rig.journal->prune(kT + kThirtyDays + 3000);
     CHECK(rest.evicted == 10); // and the remainder follows on the next pass
 }
 

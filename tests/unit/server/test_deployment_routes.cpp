@@ -184,12 +184,14 @@ TEST_CASE("deployment routes: config/result/delete deny a service-scoped "
     CHECK(del->status == 403);
     // The deployment survives — the deny fires before delete_deployment.
     REQUIRE(deploy_store.get_deployment(dep_id, "alice").has_value());
-    // Gate 8 (GC-7): delete is gated on SoftwareDeployment:Execute in
-    // production, not the helper's :Read default — the A4 .permission hint
-    // must name the grant actually missing.
+    // Gate 8 (#2298 PR 3 hardening round, supersedes the prior GC-7 fix
+    // this test pinned): `.permission` is now omitted entirely, not
+    // renamed to the "correct" grant — `kServiceScopeGlobalSafe` is
+    // compile-time-empty, so no grant, correctly-named or not, actually
+    // admits a service-scoped caller here (routed-concern MUST clause 5).
     auto del_body = nlohmann::json::parse(del->body, nullptr, false);
     REQUIRE_FALSE(del_body.is_discarded());
-    CHECK(del_body["error"]["permission"] == "SoftwareDeployment:Execute");
+    CHECK_FALSE(del_body["error"].contains("permission"));
 
     // Important finding from external review (PR #3156): the create route
     // itself - the first fleet-wide dispatch, not just the config/poll/
@@ -201,7 +203,7 @@ TEST_CASE("deployment routes: config/result/delete deny a service-scoped "
     CHECK(dispatched == 0); // still zero - create never reached advance() either
     auto create_body = nlohmann::json::parse(create->body, nullptr, false);
     REQUIRE_FALSE(create_body.is_discarded());
-    CHECK(create_body["error"]["permission"] == "SoftwareDeployment:Execute");
+    CHECK_FALSE(create_body["error"].contains("permission"));
     // No second deployment was created for this run - the run's only
     // running deployment is still the pre-existing fixture, unchanged.
     auto still_running = deploy_store.find_running_for_run(run_id, "alice");

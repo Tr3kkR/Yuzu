@@ -4,6 +4,7 @@ users_cpp_args = []
 if host_machine.system() == 'windows'
   users_deps += cxx.find_library('wtsapi32')
   users_deps += cxx.find_library('netapi32')
+  users_deps += cxx.find_library('wevtapi')
 elif host_machine.system() == 'darwin'
   # Console/GUI-login user (agents/shared/macos_console_user.hpp) via
   # SCDynamicStoreCopyConsoleUser. SystemConfiguration ships with the CLT SDK,
@@ -20,7 +21,7 @@ elif host_machine.system() == 'darwin'
   endif
 endif
 
-shared_library(
+users_plugin_lib = shared_library(
   'users',
   files('src/users_plugin.cpp'),
   name_prefix: '',

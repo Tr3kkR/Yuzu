@@ -401,6 +401,15 @@ TEST_CASE("network devices fragment: service-scoped token denied, denial audited
     REQUIRE(drill);
     CHECK(drill->status == 403);
     CHECK(drill->body.find("deg-dev") == std::string::npos); // no identity leaked
+    // #3167: no `.permission` (no grant admits a service-scoped caller here —
+    // naming one is a false self-remediation claim), and header/body
+    // correlation-id parity.
+    auto body = nlohmann::json::parse(drill->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body["error"].contains("permission"));
+    CHECK_FALSE(body["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(drill->get_header_value("X-Correlation-Id") ==
+         body["error"]["correlation_id"].get<std::string>());
     REQUIRE(auditLog.size() == 1);
     CHECK(auditLog[0] == "network.device.view:denied");
 }

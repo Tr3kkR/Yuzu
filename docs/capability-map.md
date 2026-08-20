@@ -230,7 +230,7 @@ Not implemented. Enumerate connected printers for asset tracking.
 
 ### 3.10 Device Tagging (Key-Value Metadata) :white_check_mark: `T2`
 
-`TagStore` with SQLite backend. Full CRUD: set, get, get_all, delete, check, clear, count. Agent-side `tags` plugin with server-side sync via heartbeat. Validation: key max 64 chars, value max 448 bytes. `agents_with_tag()` for scope queries.
+`TagStore` on the PostgreSQL substrate (ADR-0050, schema `tag_store`). Full CRUD: set, get, get_all, delete, check, clear, count. Agent-side `tags` plugin with server-side sync on Register. Validation: key max 64 chars, value max 448 bytes. `agents_with_tag()` for scope queries; typed degrade-distinguishable reads (a store failure never reads as "no tags").
 
 ---
 
@@ -264,7 +264,7 @@ Not implemented. Enumerate connected printers for asset tracking.
 
 ### 4.7 Wake-on-LAN :white_check_mark: `T2`
 
-`wol` plugin (cross-platform). `wake` sends magic packet (UDP broadcast, 6×0xFF + 16×MAC) to a target MAC address. `check` pings the host to verify wake. Windows: Winsock2, Linux/macOS: POSIX sockets.
+`wol` plugin (cross-platform). `wake` sends magic packet (UDP broadcast, 6×0xFF + 16×MAC) to a target MAC address. `check` verifies reachability natively — unprivileged ICMP echo (`IcmpSendEcho` on Windows, an unprivileged ICMP socket on Linux/macOS) with a TCP-connect fallback on port 443 for hosts/kernels that drop or deny ICMP (Wave 2, ADR-3002) — no subprocess spawn on any platform.
 
 ### 4.8 Network Diagnostics :white_check_mark: `T1`
 
@@ -276,7 +276,7 @@ Not implemented. Legacy reverse lookup on IP addresses.
 
 ### 4.10 ARP Scanning (Subnet Discovery) :white_check_mark: `T3`
 
-`discovery` plugin with `scan_subnet` action. ARP scan + ping sweep of a CIDR subnet to find hosts. Returns IP, MAC address, hostname, and managed/unmanaged status. Cross-platform: arp table parsing + ping sweep via subprocess. Input validation prevents command injection on CIDR parameter.
+`discovery` plugin with `scan_subnet` action. ARP scan + ping sweep of a CIDR subnet to find hosts. Returns IP, MAC address, hostname, and managed/unmanaged status. Cross-platform: native ARP-table acquisition (`GetIpNetTable2` on Windows, `/proc/net/arp` on Linux, the routing-socket `sysctl` on macOS) + an unprivileged ICMP ping sweep — no subprocess spawn on any platform (Wave 2, ADR-3002). Input validation prevents command injection on CIDR parameter.
 
 ### 4.11 Port Scanning :x: `T3`
 
@@ -473,7 +473,7 @@ collisions possible; vendor precision pending ADR-0018). See
 
 ### 9.8 Certificate Inventory (Get/Delete) :white_check_mark: `T2`
 
-`certificates` plugin with `list`, `details`, and `delete` actions. Enumerates certificates in system stores with thumbprint, subject, issuer, expiry, and key usage. Windows: CryptoAPI (CertOpenStore, CertEnumCertificatesInStore). Linux: PEM files in /etc/ssl/certs/. macOS: `security find-certificate` over System.keychain and SystemRootCertificates.keychain, plus the current console user's login keychain via a `launchctl asuser <uid> sudo -n -u <user> security` hop (selectable per query with the `store` param: `System`/`root`/`login`/`all`; the LaunchDaemon has no login keychain of its own). Delete on macOS verifies the certificate is actually absent from the target keychain afterward before reporting success (a tri-state safe delete — command failure, still-present, and an unreadable re-enumeration each block a false "deleted"); `store=root` is rejected as unsupported because SystemRootCertificates.keychain is sealed by System Integrity Protection and cannot be modified.
+`certificates` plugin with `list`, `details`, and `delete` actions. Enumerates certificates in system stores with thumbprint, subject, issuer, expiry, and key usage. Windows: CryptoAPI (CertOpenStore, CertEnumCertificatesInStore). Linux: PEM files in /etc/ssl/certs/, parsed in-process via libcrypto (no `openssl` shell-out). macOS: System.keychain and SystemRootCertificates.keychain are read natively via SecItem (`SecItemCopyMatching`, no shell-out); the current console user's login keychain still goes through the `launchctl asuser <uid> sudo -n -u <user> security` hop (selectable per query with the `store` param: `System`/`root`/`login`/`all`; the LaunchDaemon has no login keychain of its own). Delete on macOS verifies the certificate is actually absent from the target keychain afterward before reporting success (a tri-state safe delete — command failure, still-present, and an unreadable re-enumeration each block a false "deleted"); `store=root` is rejected as unsupported because SystemRootCertificates.keychain is sealed by System Integrity Protection and cannot be modified.
 
 ### 9.9 Quarantine Status Tracking :white_check_mark: `T2`
 
