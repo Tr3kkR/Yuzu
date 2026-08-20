@@ -324,13 +324,21 @@ void cleanup_finished() {
 // once either condition is met; does not itself decide what "still
 // nonzero after grace" means -- the caller (shutdown(), below) simply lets
 // a not-yet-finished cleanup keep running detached rather than blocking.
-void join_all_detached_cleanups() {
+// Returns the number still outstanding when this returns (0 if every
+// cleanup finished within the grace). The caller (shutdown(), below) logs
+// this when nonzero -- otherwise a sustained wedge or a post-dlclose crash
+// report has no breadcrumb at all pointing at this mechanism (governance
+// Gate 6 sre finding; same shape as mcp_stream_bridge.cpp's
+// "mcp.bridge.shutdown_reap" reaped/abandoned-count logging).
+int join_all_detached_cleanups() {
     const auto deadline = std::chrono::steady_clock::now() + kCleanupJoinGrace;
-    while (g_outstanding_cleanups.load(std::memory_order_relaxed) > 0) {
+    int remaining = 0;
+    while ((remaining = g_outstanding_cleanups.load(std::memory_order_relaxed)) > 0) {
         if (std::chrono::steady_clock::now() >= deadline)
-            return;
+            break;
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
+    return remaining;
 }
 #endif // _WIN32
 
@@ -1280,7 +1288,15 @@ public:
         // crash into unmapped memory. NOT an unconditional join: a wedged
         // CleanUp() must not be able to hang shutdown() itself, since this
         // runs synchronously inside the agent's own final-teardown path.
-        join_all_detached_cleanups();
+        if (const int remaining = join_all_detached_cleanups(); remaining > 0) {
+            // The only breadcrumb an operator/SRE has for diagnosing a
+            // sustained WSUS wedge, or correlating a post-dlclose crash
+            // report against it -- this thread is about to keep running
+            // detached past this module potentially being unloaded.
+            spdlog::warn("windows_updates: shutdown() proceeding with {} WUA cleanup "
+                         "thread(s) still outstanding after the {}s grace",
+                         remaining, kCleanupJoinGrace.count());
+        }
 #endif
     }
 
