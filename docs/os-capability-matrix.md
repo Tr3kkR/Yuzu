@@ -193,15 +193,15 @@ implementation is.
 | agent_logging | get_key_files | linux | supported | 1 | /proc/self/exe symlink + std::filesystem metadata | - |
 | agent_logging | get_key_files | macos | supported | 1 | _NSGetExecutablePath + realpath(3) + std::filesystem metadata | - |
 | agent_logging | get_key_files | windows | supported | 1 | GetModuleFileNameA + std::filesystem metadata | - |
-| antivirus | products | linux | supported | 2 | runner argv `pgrep` + filesystem_probe | - |
-| antivirus | products | macos | supported | 2 | runner argv `plistbuddy`+`systemextensionsctl`+`pgrep` | - |
-| antivirus | products | windows | supported | 1 | wmi_securitycenter2 (in-process, bounded) | - |
-| antivirus | status | linux | supported | 2 | runner argv `pgrep` + rung-1 `stat()` on daily.cvd | ClamAV liveness+definitions mtime; CrowdStrike/Sophos presence-only |
-| antivirus | status | macos | supported | 2 | runner argv `plistbuddy`+`stat` | - |
-| antivirus | status | windows | supported | 1 | wmi_defender_status (in-process, bounded) | - |
+| antivirus | products | linux | supported | 2 | pgrep+filesystem_probe | - |
+| antivirus | products | macos | supported | 2 | plistbuddy+systemextensionsctl+pgrep | - |
+| antivirus | products | windows | supported | 1 | wmi_securitycenter2 | - |
+| antivirus | status | linux | supported | 2 | pgrep+stat | ClamAV liveness+definitions mtime; CrowdStrike/Sophos presence-only |
+| antivirus | status | macos | supported | 2 | plistbuddy+stat | - |
+| antivirus | status | windows | supported | 1 | wmi_defender_status | - |
 | antivirus | av_exclusions | linux | unsupported | - | - | Windows-only concept |
 | antivirus | av_exclusions | macos | unsupported | - | - | Windows-only concept |
-| antivirus | av_exclusions | windows | supported | 1 | win32_registry (Exclusions\Paths/Processes/Extensions value-name enumeration) | permission_denied sentinel on ACL'd key, never a silent empty list |
+| antivirus | av_exclusions | windows | supported | 1 | win32_registry | permission_denied sentinel on ACL'd key, never a silent empty list |
 | asset_tags | sync | linux | supported | 1 | local_json_store | - |
 | asset_tags | sync | macos | supported | 1 | local_json_store | - |
 | asset_tags | sync | windows | supported | 1 | local_json_store | - |
@@ -214,9 +214,9 @@ implementation is.
 | asset_tags | changes | linux | supported | 1 | local_json_store | - |
 | asset_tags | changes | macos | supported | 1 | local_json_store | - |
 | asset_tags | changes | windows | supported | 1 | local_json_store | - |
-| bitlocker | state | linux | supported | 1 | libblkid + /sys/class/block/dm-*/dm/uuid (in-process) | - |
-| bitlocker | state | macos | supported | 2 | fdesetup+diskutil (direct argv, bounded runner) | - |
-| bitlocker | state | windows | supported | 1 | Win32_EncryptableVolume WMI query + GetConversionStatus() (in-process) | - |
+| bitlocker | state | linux | supported | 1 | libblkid+sysfs | - |
+| bitlocker | state | macos | supported | 2 | fdesetup+diskutil | - |
+| bitlocker | state | windows | supported | 1 | wmi_encryptable_volume | - |
 | certificates | list | linux | supported | 1 | libcrypto X509 (in-process PEM parse) | - |
 | certificates | list | macos | supported | 3 | SecItem (System/root, in-process) + security find-certificate via governed shell (login) | System.keychain and SystemRootCertificates.keychain are read natively via SecItemCopyMatching (rung 1); the login keychain still requires the launchctl/sudo ~user hop (Decision-7 governed-shell exception) |
 | certificates | list | windows | supported | 1 | CryptoAPI (CertEnumCertificatesInStore) | - |

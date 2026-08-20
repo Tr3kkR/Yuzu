@@ -121,6 +121,12 @@ jobs:
             echo "::error::libsystemd-dev (pkg-config 'libsystemd') missing on self-hosted runner — sudo apt-get install -y libsystemd-dev"
             exit 1
           fi
+          # libblkid-dev — bitlocker's Linux LUKS-detection leg links it;
+          # without the .pc file `meson setup` fails the agent configure.
+          if ! pkg-config --exists blkid; then
+            echo "::error::libblkid-dev (pkg-config 'blkid') missing on self-hosted runner — sudo apt-get install -y libblkid-dev"
+            exit 1
+          fi
 
       - name: Clean stale build directory (preserve vcpkg_installed)
         run: rm -rf build-linux

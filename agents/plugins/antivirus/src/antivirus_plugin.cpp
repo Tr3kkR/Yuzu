@@ -480,13 +480,15 @@ const YuzuActionDescriptor kActionDescriptors[] = {
      /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 2, "plistbuddy+systemextensionsctl+pgrep", nullptr},
      /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "wmi_securitycenter2", nullptr}},
     {"status",
-     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 2, "pgrep+stat", nullptr},
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 2, "pgrep+stat",
+                       "ClamAV liveness+definitions mtime; CrowdStrike/Sophos presence-only"},
      /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 2, "plistbuddy+stat", nullptr},
      /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "wmi_defender_status", nullptr}},
     {"av_exclusions",
-     /* linux   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
-     /* macos   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
-     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr}},
+     /* linux   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, "Windows-only concept"},
+     /* macos   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, "Windows-only concept"},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry",
+                       "permission_denied sentinel on ACL'd key, never a silent empty list"}},
 };
 
 } // namespace
