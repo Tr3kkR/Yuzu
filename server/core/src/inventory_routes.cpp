@@ -294,13 +294,16 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                      return;
                  // Same fleet-wide GDPR-adjacent confinement gap as
                  // /fragments/inventory/devices above: the per-agent scope_fn_
-                 // filter below is management-group-only (mirrors the REST/MCP
-                 // twins), so it never confines a service-scoped API token —
-                 // this route would still return every device fleet-wide
-                 // running a named piece of software. Same verb the route's
-                 // own scope-drop/success rows already use, reused with
-                 // result="denied" (governance finding: this file's sibling
-                 // fix two routes above closed the same class here).
+                 // filter below is management-group-only, so it never confines
+                 // a service-scoped API token — this route would still return
+                 // every device fleet-wide running a named piece of software.
+                 // The REST/MCP twins migrated onto real confinement (#3290
+                 // Phase 2); this dashboard fragment deliberately keeps this
+                 // blanket deny for now — a follow-up, not an oversight. Same
+                 // verb the route's own scope-drop/success rows already use,
+                 // reused with result="denied" (governance finding: this
+                 // file's sibling fix two routes above closed the same class
+                 // here).
                  if (!session->token_scope_service.empty()) {
                      // Write the 403 FIRST, audit after (normalized — #3167).
                      // `.permission` omitted: kServiceScopeGlobalSafe is
