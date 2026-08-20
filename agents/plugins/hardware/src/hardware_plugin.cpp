@@ -338,7 +338,7 @@ int do_bios(yuzu::CommandContext& ctx) {
     // tool_ran=true with partial/garbled text (SubprocessResult's own
     // contract: "callers MUST check timed_out before trusting ... output").
     // Treat either as no better than a failed run, same as tool_ran=false.
-    auto rom = (res.tool_ran && !res.timed_out && !res.output_truncated)
+    auto rom = (res.tool_ran && !res.timed_out && !res.output_truncated && res.exit_code == 0)
                    ? yuzu::hardware::macos::parse_boot_rom_version(res.output)
                    : std::string{};
     ctx.write_output("bios_vendor|Apple");
@@ -550,7 +550,7 @@ int do_memory(yuzu::CommandContext& ctx) {
         // stream can leave tool_ran=true over a partial device list -- treat
         // that the same as a failed run (falls through to /proc/meminfo)
         // rather than silently accepting a reduced RAM total.
-        if (res.tool_ran && !res.timed_out && !res.output_truncated)
+        if (res.tool_ran && !res.timed_out && !res.output_truncated && res.exit_code == 0)
             dimm_rows = yuzu::hardware::linuxutil::parse_dmidecode_memory(res.output);
     }
     if (!dimm_rows.empty()) {
@@ -676,8 +676,10 @@ int do_disks(yuzu::CommandContext& ctx) {
     // JSON parsing anyway (macos_disk_rows_or_sentinel() already falls back
     // to the sentinel on any parse error), but reject it explicitly here
     // too rather than relying on that as the only safety net.
-    auto sp_json =
-        (res.tool_ran && !res.timed_out && !res.output_truncated) ? res.output : std::string{};
+    auto sp_json = (res.tool_ran && !res.timed_out && !res.output_truncated &&
+                    res.exit_code == 0)
+                       ? res.output
+                       : std::string{};
     for (const auto& row : yuzu::hardware::macos::macos_disk_rows_or_sentinel(sp_json)) {
         ctx.write_output(row);
     }

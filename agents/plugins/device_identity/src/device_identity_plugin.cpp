@@ -315,7 +315,7 @@ int do_domain(yuzu::CommandContext& ctx) {
     // partial/garbled text; treat that the same as a failed run (falls
     // through to the hostname-suffix fallback below) rather than trusting a
     // truncated dsconfigad parse.
-    if (res.tool_ran && !res.timed_out && !res.output_truncated) {
+    if (res.tool_ran && !res.timed_out && !res.output_truncated && res.exit_code == 0) {
         auto info = yuzu::device_identity::macos::parse_dsconfigad_show(res.output);
         if (info.ad_bound) {
             ctx.write_output(std::format("domain|{}", info.domain));
@@ -437,7 +437,7 @@ int do_ou(yuzu::CommandContext& ctx) {
         {"/usr/sbin/dsconfigad", "-show"},
         yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(10)});
     // Same completeness gate as do_domain's dsconfigad call above.
-    if (res.tool_ran && !res.timed_out && !res.output_truncated) {
+    if (res.tool_ran && !res.timed_out && !res.output_truncated && res.exit_code == 0) {
         auto info = yuzu::device_identity::macos::parse_dsconfigad_show(res.output);
         if (!info.ou.empty()) {
             ctx.write_output(std::format("ou|{}", info.ou));
