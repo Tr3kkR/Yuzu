@@ -432,11 +432,15 @@ static const ToolDef kTools[] = {
      "store are empty strings, never synthesised. Filter by software `name` and/or `agent_id`. "
      "This is DISTINCT from "
      "query_inventory/get_agent_inventory, which read the generic per-source blob store on "
-     "Infrastructure:Read. Requires Inventory:Read. Returns up to `limit` rows (max 1000); when "
-     "result_truncated_by_cap is true more rows exist past the cap (keyset pagination is a "
-     "follow-up). A per-agent management-group drop filter is applied (devices_omitted reports the "
-     "count) but is NOT yet effective under the global Inventory:Read gate, so results are not "
-     "narrowed by management group today (ADR-0017); treat scope as global read until that gate lands.",
+     "Infrastructure:Read. Requires Inventory:Read (#3290 Phase 2: the sole gate is the ADR-0017 "
+     "admit-then-filter fleet-read gate). Results are scoped to the caller's management groups "
+     "AND, for a service-scoped API token, to that token's service-tagged agents (the intersection "
+     "of both when both apply); out-of-scope devices are dropped and counted in devices_omitted "
+     "(a positive value means matching software exists outside your scope — a short result does "
+     "NOT mean the software is absent fleet-wide). A correctly-confined service-scoped token now "
+     "gets a real filtered read here rather than an outright denial. Returns up to `limit` rows "
+     "(max 1000); when result_truncated_by_cap is true more rows exist past the cap (keyset "
+     "pagination is a follow-up).",
      R"j({"type":"object","properties":{"name":{"type":"string","description":"Exact software name filter; omit for all"},"agent_id":{"type":"string","description":"Exact agent/device filter; omit for fleet-wide"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}}})j",
      R"j({"type":"object","properties":{"software":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"publisher":{"type":"string"},"install_date":{"type":"string"},"kind":{"type":"string"},"ecosystem":{"type":"string"},"epoch":{"type":"string"},"release":{"type":"string"},"arch":{"type":"string"},"signature_status":{"type":"string"},"distro_id":{"type":"string"},"distro_version":{"type":"string"}},"required":["agent_id","name","version","publisher","install_date","kind","ecosystem","epoch","release","arch","signature_status","distro_id","distro_version"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when more rows exist past the limit cap"},"devices_omitted":{"type":"integer","description":"Count of devices dropped by the management-group filter"}},"required":["software","devices_omitted"]})j"},
 
