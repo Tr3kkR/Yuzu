@@ -7873,8 +7873,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // added alongside this change.
                 auto result = tool_result(payload, kObjectOutputSchema);
                 // S5 (2f PR 3a): arm GET-only - the atomic flip-and-drain hands
-                // the latched mailbox to the projector, which publishes progress
-                // LIVE onto this session's GET stream. `result` is passed as the
+                // the latched progress snapshot to the projector, which publishes
+                // progress LIVE onto this session's GET stream. `result` is passed as the
                 // result_base (B5): a parked record's real final re-emits today's
                 // result object with status/agents_* added as top-level keys.
                 // The plain JSON below answers this POST either way - GET-only
