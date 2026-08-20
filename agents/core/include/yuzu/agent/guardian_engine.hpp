@@ -405,14 +405,12 @@ public:
     /// same cross-image-state class as the #501 abseil hash-seed split
     /// guardian_dispatch_push_bytes_for_test works around). Plain object-member
     /// state has no such hazard: it lives in the GuardianEngine instance regardless
-    /// of which image the writing method's code was compiled into.
-    /// UNGUARDED (does not take mtx_, unlike rule_count()/spark_armed_rule_count()):
-    /// safe to call only after start_local() has returned on the calling thread, not
-    /// concurrently with a start_local() call in flight on another thread. No
+    /// of which image the writing method's code was compiled into. Locked (like
+    /// rule_count()/spark_armed_rule_count()) and returned BY VALUE, not by
+    /// reference - a reference into mtx_-protected state would keep aliasing it
+    /// after the lock_guard released, defeating the point of taking the lock. No
     /// production caller.
-    [[nodiscard]] const std::string& last_rearm_degrade_message_for_test() const {
-        return last_rearm_degrade_message_for_test_;
-    }
+    [[nodiscard]] std::string last_rearm_degrade_message_for_test() const;
 
     /// Live bounded-I/O worker count on the spark reader (0 if never wired) -
     /// the F3 orphan-exit obligation's plumbing (rung 7.6 is the enforcement).

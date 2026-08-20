@@ -855,6 +855,11 @@ std::size_t GuardianEngine::spark_armed_rule_count() const {
     return spark_runtime_ ? spark_runtime_->rule_count() : 0;
 }
 
+std::string GuardianEngine::last_rearm_degrade_message_for_test() const {
+    std::lock_guard lock(mtx_);
+    return last_rearm_degrade_message_for_test_;
+}
+
 std::uint64_t GuardianEngine::policy_generation() const {
     std::lock_guard lock(mtx_);
     return policy_generation_;
