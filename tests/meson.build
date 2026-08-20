@@ -1174,6 +1174,37 @@ if build_server
        args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]'],
        suite: 'server', timeout: 600)
 
+  # 2026-08-20 (ADR-0056, PolicyStore, batch-6): PolicyStore moved off SQLite
+  # onto Postgres, and test_policy_store.cpp / test_policy_evaluator.cpp went
+  # from carrying zero [pg]-tagged cases to 57 ([policy_store][pg], one
+  # holdout case tests an unreachable-pool failure path and stays untagged
+  # on purpose — 58 [policy_store] cases total) + 11 ([pg][policy][evaluator])
+  # = 68 new [pg] cases. Neither tag appears outside its one file (grep -rl
+  # checked). No shard's tag list names [policy_store]/[policy]/[evaluator],
+  # so — unlike every prior addition recorded above — this needed no
+  # meson.build edit to land correctly: the 68 cases fall into shard C by the
+  # catch-all's own exclusion list, automatically, same as any tag never
+  # added to A/B/D/E/F/G.
+  #
+  # Measured whether that default placement was SAFE rather than assuming it
+  # (per this file's own house rule) — isolated, live Postgres, this box:
+  # [policy_store] 58 cases (57 [pg] + the 1 untagged) 2.9s; [pg][policy]
+  # [evaluator] 11 cases 2.1s — cheap, ~0.07s/case, nothing like [rbac_store]'s
+  # per-case outlier rate. Shard C itself, before vs after (--list-tests
+  # case counts, then a full live-PG run of each): 336 cases/88.0s ->
+  # 404 cases/92.7s (meson test: 92.69s) — a ~4.7s/5% shift tracking the
+  # isolated measurement almost exactly. 92.69/600s is ~15% of budget, nowhere
+  # near the ceiling that drove the [license_store]/[software_deployment]
+  # dedicated-shard-D precedent (both of those reacted to a shard already AT
+  # or OVER 600s) — so a dedicated [policy_store] tag on D was considered and
+  # NOT taken; leaving both files' cases in shard C is correct as-is, no
+  # rebalance needed. Revisit if shard C's own growth later pushes it toward
+  # budget and this population no longer looks cheap in isolation.
+  #
+  # Partition reverified after the merge: A 559 / B 93 / D 410 / E 404 /
+  # F 193 / G 351 / C 404, summing to the current whole-binary [pg] total of
+  # 2414 exactly — zero double-counted, zero missing.
+
   # ── #2519 MCP bridge teardown allocation-budget probe (separate binary) ────
   # Same rationale as the #2270 spark probe above: a global operator new/delete
   # replacement is process-wide, so it cannot share the multi-thousand-case
