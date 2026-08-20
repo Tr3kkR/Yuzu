@@ -700,6 +700,20 @@ public:
                           "the shared counter because the shared counter's other kinds "
                           "(foreign-origin vs ordinary replay) still must not be",
                           "counter");
+        metrics_.describe("yuzu_mcp_approval_burned_total",
+                          "MCP approval-ticket recalls that SUCCESSFULLY consumed a one-time, "
+                          "human-approved ticket and then still failed at the tool handler "
+                          "(#2444 item 3) — args that pass the published input schema (the "
+                          "#2441 pre-consume gate) but fail the handler's own business/state "
+                          "check, plus any handler-side infra failure (e.g. a degraded store) "
+                          "discovered only after consume_ticket() has already spent the "
+                          "ticket. Distinct from the three counters above, which all fire "
+                          "BEFORE a ticket is consumed; this one only fires after. reason is a "
+                          "single literal today (handler_reject) — see the mcp_audit lambda in "
+                          "mcp_server.cpp for the exact scope. Does not interact with the "
+                          "kMcpSubmitterPendingCap 25-slot cap: a ticket leaves the pending "
+                          "bucket at admin-approval time, before it can ever reach this class",
+                          "counter");
         // Progress bridge core (2f PR 3a). Same closed-set posture: every reject/
         // degrade reason is a static literal inside the bridge, never derived
         // from caller input.
@@ -1015,6 +1029,15 @@ public:
             metrics_.counter("yuzu_mcp_approval_refused_total", {{"tool", tool}});
             // Same closed set again for the #2786 masked-denial counter.
             metrics_.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", tool}});
+            // #2444 item 3: a HANDLER can only burn a ticket for a tool that is
+            // itself approval-gated in the first place, so this is the same
+            // closed `tool` set as the three counters above. `reason` is a
+            // single literal today (handler_reject — see mcp_server.cpp's
+            // mcp_audit lambda for what it covers); pre-seeded as a 1-value
+            // axis now so a future second reason slots into an already-seeded
+            // pattern instead of introducing an unseeded one.
+            metrics_.counter("yuzu_mcp_approval_burned_total",
+                             {{"tool", tool}, {"reason", "handler_reject"}});
         }
         // yuzu_mcp_approval_precondition_denied_total's reachable label set is
         // NARROWER than the two above: kPrecondition can only fire for a tool
