@@ -97,6 +97,7 @@ std::optional<std::vector<std::string>> sssd_list_domains_via_sdbus() {
     // here).
     struct BusGuard {
         sd_bus* b;
+        explicit BusGuard(sd_bus* bus_ptr) : b(bus_ptr) {}
         ~BusGuard() {
             if (b)
                 sd_bus_flush_close_unref(b);
@@ -110,6 +111,7 @@ std::optional<std::vector<std::string>> sssd_list_domains_via_sdbus() {
     sd_bus_error err = SD_BUS_ERROR_NULL;
     struct ErrGuard {
         sd_bus_error* e;
+        explicit ErrGuard(sd_bus_error* err_ptr) : e(err_ptr) {}
         ~ErrGuard() { sd_bus_error_free(e); }
         ErrGuard(const ErrGuard&) = delete;
         ErrGuard& operator=(const ErrGuard&) = delete;
@@ -119,6 +121,7 @@ std::optional<std::vector<std::string>> sssd_list_domains_via_sdbus() {
                            "ListDomains", &err, &reply, "");
     struct MsgGuard {
         sd_bus_message* m;
+        explicit MsgGuard(sd_bus_message* msg_ptr) : m(msg_ptr) {}
         ~MsgGuard() {
             if (m)
                 sd_bus_message_unref(m);
