@@ -1583,14 +1583,20 @@ void McpStreamBridge::run_projector() {
                     // site above. Under a PERSISTENT fault this spins
                     // visit->throw->re-mark - the same accepted risk class as the
                     // outer catch's re-arm below and the listener catch site
-                    // (tracked, with this site added, at #3331). execution_id,
-                    // not rec->key, in the log line - key embeds a literal
-                    // '\n' plus client-supplied jsonrpc_id (see make_key()).
+                    // (tracked, with this site added, at #3331). Re-mark BEFORE
+                    // logging, matching the listener catch site's ordering: the
+                    // mark_dirty call itself is verified noexcept end-to-end,
+                    // but spdlog's format/sink path is not, so this ordering
+                    // means the recovery action never depends on a third-party
+                    // library's internal exception containment holding across
+                    // a future spdlog upgrade. execution_id, not rec->key, in
+                    // the log line - key embeds a literal '\n' plus
+                    // client-supplied jsonrpc_id (see make_key()).
+                    mark_dirty(*core_, rec->key);
                     spdlog::warn(
                         "MCP bridge projector: projection pass failed (contained) "
                         "[execution_id={}]",
                         rec->execution_id);
-                    mark_dirty(*core_, rec->key);
                 }
                 flush_record_obs(*rec);
             }
