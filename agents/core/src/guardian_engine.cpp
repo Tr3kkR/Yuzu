@@ -288,11 +288,26 @@ std::expected<void, std::string> GuardianEngine::start_local() {
             // version/overload resolution - the version-proof safe idiom for logging arbitrary
             // (here, exception-supplied) text, not a workaround for a throw this specific
             // vendored version happens not to have.
-            const std::string degrade_msg =
-                "Guardian: rule '" + rule.rule_id() + "' failed to re-arm (" + e.what() +
-                ") - NOT enforcing this rule; agent continues with the remaining rules";
-            spdlog::error("{}", degrade_msg);
-            last_rearm_degrade_message_for_test_ = degrade_msg;
+            //
+            // Nested try/catch (Gate 4 unhappy-path review, #2238): spdlog::error() firewalls
+            // its OWN allocation internally (SPDLOG_TRY/SPDLOG_LOGGER_CATCH - never rethrows),
+            // but the raw string concatenation building degrade_msg runs OUTSIDE that firewall,
+            // in a catch block whose entire purpose is to survive exactly the resource-exhaustion
+            // class (thread/handle exhaustion often correlates with memory pressure) that could
+            // also make this concatenation throw bad_alloc. An uncaught throw here would escape
+            // start_local() and terminate the agent - precisely the failure this outer catch
+            // exists to prevent. Degrade further on a secondary failure rather than risk that.
+            try {
+                const std::string degrade_msg =
+                    "Guardian: rule '" + rule.rule_id() + "' failed to re-arm (" + e.what() +
+                    ") - NOT enforcing this rule; agent continues with the remaining rules";
+                spdlog::error("{}", degrade_msg);
+                last_rearm_degrade_message_for_test_ = degrade_msg;
+            } catch (...) {
+                spdlog::error("Guardian: a rule failed to re-arm and the degrade message itself "
+                              "could not be built (secondary allocation failure) - NOT enforcing "
+                              "this rule; agent continues with the remaining rules");
+            }
         }
     }
 

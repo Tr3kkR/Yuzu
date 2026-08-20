@@ -18,12 +18,13 @@
  * libyuzu_agent_core, so that test's own LogCapture use likely has the SAME
  * exposure; its assertions are negative (logs.find(key) == npos), so an
  * empty/unreachable capture would pass it vacuously rather than fail loudly.
- * Not yet verified or fixed — flagged for a follow-up, not addressed here.
+ * Not yet verified or fixed — tracked as issue #3355.
  *
  * For code compiled into a separate shared library, prefer recording the
  * observable directly as a plain object member with a `_for_test` accessor
  * at the point of emission (see GuardianEngine::last_rearm_degrade_message_for_test
- * for the pattern this replaced) — object state has no cross-image hazard.
+ * for the pattern this class was replaced by, for that use case) — object
+ * state has no cross-image hazard.
  *
  * A separate header rather than folding into test_helpers.hpp: this pulls in
  * spdlog's ostream sink, which most test_helpers.hpp consumers don't need.
