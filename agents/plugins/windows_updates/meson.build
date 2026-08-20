@@ -10,7 +10,7 @@ if host_machine.system() == 'windows'
   ]
 endif
 
-shared_library(
+windows_updates_plugin_lib = shared_library(
   'windows_updates',
   files(
     'src/windows_updates_plugin.cpp',

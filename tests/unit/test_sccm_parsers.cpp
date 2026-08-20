@@ -2,23 +2,23 @@
  * test_sccm_parsers.cpp — pure decision-logic tests for the sccm plugin
  * (agents/plugins/sccm/src/sccm_plugin.cpp).
  *
- * The plugin's own copies of this logic are Windows-typed (DWORD/IID) and
- * live inside its `#ifdef _WIN32` block, so they cannot be included directly
- * into this cross-platform TU. These are MIRRORS — kept in sync, not shared
- * — using plain types instead, the same pattern test_new_plugins.cpp uses
- * for rdp_control_plugin.cpp's is_valid_rdp_state / classify_fw_hr (see
- * Section 7b there). Three functions are mirrored:
+ * classify_service_status's own copy is Windows-typed (DWORD) and lives
+ * inside the plugin's `#ifdef _WIN32` block, so it cannot be included
+ * directly into this cross-platform TU. It is a MIRROR — kept in sync, not
+ * shared — using plain types instead, the same pattern test_new_plugins.cpp
+ * uses for rdp_control_plugin.cpp's is_valid_rdp_state / classify_fw_hr (see
+ * Section 7b there).
  *
- *   - classify_service_status: the client_version action's native SCM query
- *     outcome -> service_status|<value> mapping.
- *   - select_authority_subkey: the site action's Authority-subkey picker —
- *     the fix for the dead literal "SMS:{}" registry fallback.
- *   - interpret_sms_invoke: the site action's late-bound
- *     IDispatch::Invoke result interpretation for the Microsoft.SMS.Client
- *     GetAssignedSite / GetCurrentManagementPoint calls.
+ * select_authority_subkey and interpret_sms_invoke have no such Windows-type
+ * dependency, so they are NOT mirrored: this file includes the real
+ * agents/plugins/sccm/src/sccm_parsers.hpp and calls the production
+ * functions directly, the same windows_updates_parsers.hpp pattern this
+ * migration established for the sibling plugin.
  */
 
 #include <catch2/catch_test_macros.hpp>
+
+#include "sccm_parsers.hpp"
 
 #include <optional>
 #include <string>
@@ -51,41 +51,6 @@ std::string_view test_classify_service_status(TestSvcOpenResult open_result, boo
     if (state == 1) // SERVICE_STOPPED
         return "stopped";
     return "exists";
-}
-
-// Mirror of sccm_plugin.cpp: select_authority_subkey — keep in sync.
-std::optional<std::string> test_select_authority_subkey(const std::vector<std::string>& subkeys,
-                                                         std::string_view site_code) {
-    if (!site_code.empty()) {
-        const std::string exact = "SMS:" + std::string(site_code);
-        for (const auto& k : subkeys) {
-            if (k == exact)
-                return k;
-        }
-    }
-    for (const auto& k : subkeys) {
-        if (k.rfind("SMS:", 0) == 0)
-            return k;
-    }
-    return std::nullopt;
-}
-
-// Mirror of sccm_plugin.cpp: SmsInvokeOutcome / SmsInvokeResult /
-// interpret_sms_invoke — keep in sync.
-enum class TestSmsInvokeOutcome { Ok, Failed, WrongType };
-
-struct TestSmsInvokeResult {
-    TestSmsInvokeOutcome outcome = TestSmsInvokeOutcome::Failed;
-    std::string value;
-};
-
-TestSmsInvokeResult test_interpret_sms_invoke(bool succeeded, bool is_bstr,
-                                              std::string bstr_utf8) {
-    if (!succeeded)
-        return {TestSmsInvokeOutcome::Failed, {}};
-    if (!is_bstr)
-        return {TestSmsInvokeOutcome::WrongType, {}};
-    return {TestSmsInvokeOutcome::Ok, std::move(bstr_utf8)};
 }
 
 } // namespace
@@ -134,7 +99,7 @@ TEST_CASE("sccm: service_status unavailable for every other failure mode "
 TEST_CASE("sccm: authority subkey — exact site-code match preferred",
           "[plugins][sccm][validation]") {
     std::vector<std::string> subkeys{"SMS:ABC", "SomeOtherKey"};
-    auto picked = test_select_authority_subkey(subkeys, "ABC");
+    auto picked = yuzu::sccm::select_authority_subkey(subkeys, "ABC");
     REQUIRE(picked.has_value());
     CHECK(*picked == "SMS:ABC");
 }
@@ -143,7 +108,7 @@ TEST_CASE("sccm: authority subkey — falls back to the first SMS:-prefixed "
           "subkey when the site code is unknown",
           "[plugins][sccm][validation]") {
     std::vector<std::string> subkeys{"SMS:ABC", "SomeOtherKey"};
-    auto picked = test_select_authority_subkey(subkeys, "");
+    auto picked = yuzu::sccm::select_authority_subkey(subkeys, "");
     REQUIRE(picked.has_value());
     CHECK(*picked == "SMS:ABC");
 }
@@ -152,7 +117,7 @@ TEST_CASE("sccm: authority subkey — exact match wins over first-found "
           "when multiple SMS:* subkeys exist",
           "[plugins][sccm][validation]") {
     std::vector<std::string> subkeys{"SMS:XYZ", "SMS:ABC"};
-    auto picked = test_select_authority_subkey(subkeys, "ABC");
+    auto picked = yuzu::sccm::select_authority_subkey(subkeys, "ABC");
     REQUIRE(picked.has_value());
     CHECK(*picked == "SMS:ABC"); // not SMS:XYZ, despite being first
 }
@@ -161,7 +126,7 @@ TEST_CASE("sccm: authority subkey — first-found wins among multiple SMS:* "
           "matches when no site code is available",
           "[plugins][sccm][validation]") {
     std::vector<std::string> subkeys{"SMS:XYZ", "SMS:ABC"};
-    auto picked = test_select_authority_subkey(subkeys, "");
+    auto picked = yuzu::sccm::select_authority_subkey(subkeys, "");
     REQUIRE(picked.has_value());
     CHECK(*picked == "SMS:XYZ"); // deterministic: first encountered
 }
@@ -170,7 +135,7 @@ TEST_CASE("sccm: authority subkey — a mismatched site code falls back to "
           "first-found rather than failing closed",
           "[plugins][sccm][validation]") {
     std::vector<std::string> subkeys{"SMS:XYZ", "SMS:ABC"};
-    auto picked = test_select_authority_subkey(subkeys, "QQQ");
+    auto picked = yuzu::sccm::select_authority_subkey(subkeys, "QQQ");
     REQUIRE(picked.has_value());
     CHECK(*picked == "SMS:XYZ");
 }
@@ -178,8 +143,8 @@ TEST_CASE("sccm: authority subkey — a mismatched site code falls back to "
 TEST_CASE("sccm: authority subkey — zero matches returns nullopt",
           "[plugins][sccm][validation]") {
     std::vector<std::string> subkeys{"Foo", "Bar"};
-    CHECK_FALSE(test_select_authority_subkey(subkeys, "ABC").has_value());
-    CHECK_FALSE(test_select_authority_subkey({}, "ABC").has_value());
+    CHECK_FALSE(yuzu::sccm::select_authority_subkey(subkeys, "ABC").has_value());
+    CHECK_FALSE(yuzu::sccm::select_authority_subkey({}, "ABC").has_value());
 }
 
 // ============================================================================
@@ -188,8 +153,8 @@ TEST_CASE("sccm: authority subkey — zero matches returns nullopt",
 
 TEST_CASE("sccm: sms invoke — a successful BSTR result is passed through",
           "[plugins][sccm][validation]") {
-    auto r = test_interpret_sms_invoke(true, true, "ABC");
-    CHECK(r.outcome == TestSmsInvokeOutcome::Ok);
+    auto r = yuzu::sccm::interpret_sms_invoke(true, true, "ABC");
+    CHECK(r.outcome == yuzu::sccm::SmsInvokeOutcome::ok);
     CHECK(r.value == "ABC");
 }
 
@@ -198,19 +163,19 @@ TEST_CASE("sccm: sms invoke — any failed HRESULT in the chain is 'failed', "
           "[plugins][sccm][validation]") {
     // CLSIDFromProgID / CoCreateInstance / GetIDsOfNames / Invoke all funnel
     // through the same succeeded=false path in the plugin.
-    auto r = test_interpret_sms_invoke(false, false, {});
-    CHECK(r.outcome == TestSmsInvokeOutcome::Failed);
+    auto r = yuzu::sccm::interpret_sms_invoke(false, false, {});
+    CHECK(r.outcome == yuzu::sccm::SmsInvokeOutcome::failed);
     CHECK(r.value.empty());
     // A stray true is_bstr must not override a failed round trip.
-    auto r2 = test_interpret_sms_invoke(false, true, "should be ignored");
-    CHECK(r2.outcome == TestSmsInvokeOutcome::Failed);
+    auto r2 = yuzu::sccm::interpret_sms_invoke(false, true, "should be ignored");
+    CHECK(r2.outcome == yuzu::sccm::SmsInvokeOutcome::failed);
     CHECK(r2.value.empty());
 }
 
 TEST_CASE("sccm: sms invoke — a successful call with a non-BSTR VARIANT is "
           "'wrong_type', not silently treated as success",
           "[plugins][sccm][validation]") {
-    auto r = test_interpret_sms_invoke(true, false, {});
-    CHECK(r.outcome == TestSmsInvokeOutcome::WrongType);
+    auto r = yuzu::sccm::interpret_sms_invoke(true, false, {});
+    CHECK(r.outcome == yuzu::sccm::SmsInvokeOutcome::wrong_type);
     CHECK(r.value.empty());
 }

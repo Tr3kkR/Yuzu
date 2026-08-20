@@ -28,6 +28,7 @@
 #include <filesystem>
 #include <fstream>
 #include <format>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -180,6 +181,34 @@ public:
 private:
     std::atomic<ULONG> ref_{1};
 };
+
+// Outstanding best-effort ISearchJob::CleanUp() threads from a deadline-
+// exceeded search (see do_missing() below). CleanUp() genuinely blocks, so
+// these run detached during normal operation -- but the host's reconnect/
+// shutdown path does dlclose()/FreeLibrary() this plugin on a live process
+// (see agents/core/include/yuzu/agent/subprocess_runner.hpp's header
+// comment), and a thread still executing this translation unit's code when
+// that happens crashes into unmapped memory. Tracked here so shutdown() can
+// join every outstanding one before the host is allowed to unload us.
+std::mutex g_cleanup_threads_mu;
+std::vector<std::thread> g_cleanup_threads;
+
+void track_detached_cleanup(std::thread t) {
+    std::lock_guard<std::mutex> lock(g_cleanup_threads_mu);
+    g_cleanup_threads.push_back(std::move(t));
+}
+
+void join_all_detached_cleanups() {
+    std::vector<std::thread> threads;
+    {
+        std::lock_guard<std::mutex> lock(g_cleanup_threads_mu);
+        threads.swap(g_cleanup_threads);
+    }
+    for (auto& t : threads) {
+        if (t.joinable())
+            t.join();
+    }
+}
 #endif // _WIN32
 
 // ── installed action ───────────────────────────────────────────────────────
@@ -240,6 +269,8 @@ int do_installed(yuzu::CommandContext& ctx) {
     // Try rpm first, then apt -- direct argv via the bounded runner (ADR-3002
     // rung 2), replacing the old `| head -50` shell pipeline (max_lines=50,
     // stop_after_max_lines=true is the in-process equivalent).
+    // sink: windows_updates/do_installed#1 -- rpm -qa --last, no rung-1 API
+    // for this data on Linux (see docs/agent-spawn-sink-manifest.md)
     auto rpm = run_tool({"/usr/bin/rpm", "-qa", "--last"}, 50);
     if (!rpm.lines.empty()) {
         // Forward rpm's own outcome (e.g. the 50-line cap truncating a
@@ -249,6 +280,8 @@ int do_installed(yuzu::CommandContext& ctx) {
             ctx.write_output(line);
         }
     } else {
+        // sink: windows_updates/do_installed#2 -- apt list --installed
+        // fallback when rpm produces no output, no rung-1 API on Linux
         auto apt = run_tool({"/usr/bin/apt", "list", "--installed"}, 50);
         yuzu::agent::forward_runner_failure(ctx, apt.res);
         if (apt.lines.empty()) {
@@ -267,6 +300,8 @@ int do_installed(yuzu::CommandContext& ctx) {
     // generous RAW-output safety cap only; the real 100-MATCHED-line cap is
     // enforced by the pure parser, matching the old pipeline's semantics
     // (head -100 acted on the already-grepped stream, not the raw one).
+    // sink: windows_updates/do_installed#3 -- system_profiler
+    // SPInstallHistoryDataType, no rung-1 API for this data on macOS
     auto sp = run_tool({"/usr/sbin/system_profiler", "SPInstallHistoryDataType"}, 2000);
     // Forward sp's outcome before branching on its output -- a deadline-cut
     // run can still have produced some (incomplete) rows.
@@ -388,19 +423,19 @@ int do_missing(yuzu::CommandContext& ctx) {
         // unbounded wait from Search() to CleanUp(), defeating the point of
         // this whole bounded-poll design. Request the abort, then hand the
         // job off (via an extra COM ref, not a move -- ComPtr is neither
-        // copyable nor movable) to a detached thread that blocks in
+        // copyable nor movable) to a background thread that blocks in
         // CleanUp() on its own time; this call returns the honest
-        // CONSTRAINED result immediately either way. Known limitation: this
-        // thread isn't tracked or joined at plugin shutdown -- acceptable
-        // for a short-lived best-effort cleanup after an already-120s-late
-        // abort, not a resource anyone waits on.
+        // CONSTRAINED result immediately either way. The thread is tracked
+        // (not detached) and joined in shutdown() before the host is
+        // allowed to dlclose()/FreeLibrary() this plugin -- see
+        // track_detached_cleanup/join_all_detached_cleanups above.
         job->RequestAbort();
         ISearchJob* raw_job = job.get();
         raw_job->AddRef();
-        std::thread([raw_job]() {
+        track_detached_cleanup(std::thread([raw_job]() {
             raw_job->CleanUp();
             raw_job->Release();
-        }).detach();
+        }));
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               "windows_updates:search_deadline_exceeded");
         ctx.write_output("available|none|Update search did not complete within the time budget");
@@ -497,6 +532,8 @@ int do_missing(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(__linux__)
+    // sink: windows_updates/do_missing#1 -- apt list --upgradable, no
+    // rung-1 API for this data on Linux
     auto apt = run_tool({"/usr/bin/apt", "list", "--upgradable"});
     auto avail = yuzu::windows_updates::parse_apt_upgradable(apt.lines);
     // apt genuinely finding nothing to upgrade (a clean exit, not a spawn/
@@ -517,6 +554,8 @@ int do_missing(yuzu::CommandContext& ctx) {
     } else if (apt_complete) {
         ctx.write_output("available|none|System is up to date");
     } else {
+        // sink: windows_updates/do_missing#2 -- yum check-update, fallback
+        // when apt produces no matching rows, no rung-1 API on Linux
         auto yum = run_tool({"/usr/bin/yum", "check-update"});
         auto yum_lines = yuzu::windows_updates::parse_yum_checkupdate(yum.lines);
         if (yum_lines.empty()) {
@@ -536,6 +575,8 @@ int do_missing(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(__APPLE__)
+    // sink: windows_updates/do_missing#3 -- softwareupdate -l, no rung-1
+    // API for this data on macOS
     auto su = run_tool({"/usr/sbin/softwareupdate", "-l"});
     // Forward su's outcome before branching on its output -- a truncated or
     // deadline-cut run can still have produced some lines.
@@ -673,6 +714,8 @@ int do_pending_reboot(yuzu::CommandContext& ctx) {
     // normal contacts-Apple-servers latency while still bounding a
     // wedged/offline check instead of hanging forever.
     {
+        // sink: windows_updates/do_pending_reboot#1 -- softwareupdate -l,
+        // no rung-1 API for this data on macOS
         constexpr std::chrono::seconds kSoftwareUpdateDeadline{60};
         auto res = yuzu::agent::run_bounded_subprocess(
             {"/usr/sbin/softwareupdate", "-l"},
@@ -1051,7 +1094,16 @@ public:
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
 
-    void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
+    void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {
+#ifdef _WIN32
+        // Join every background ISearchJob::CleanUp() thread left running by
+        // an aborted do_missing() search before returning -- the host
+        // dlcloses/FreeLibrary()s this module right after shutdown() on its
+        // reconnect/shutdown path, and a thread still executing this
+        // module's code at that point would crash into unmapped memory.
+        join_all_detached_cleanups();
+#endif
+    }
 
     int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params params) override {
