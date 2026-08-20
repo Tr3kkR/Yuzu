@@ -151,9 +151,12 @@ TEST_CASE("antivirus plugin: products/status/av_exclusions execute via "
 
         // Some typed line must be present -- av_exclusions_win always emits
         // at least one of these (falls back to "exclusion_count|0" only when
-        // NOTHING else was written and no status was forwarded).
-        CHECK((saw_exclusion || saw_zero || saw_permission_denied || saw_not_available ||
-              saw_partial));
+        // NOTHING else was written and no status was forwarded). Computed
+        // into a local bool first -- Catch2's expression decomposition
+        // rejects operator|| directly inside CHECK(), even parenthesized.
+        const bool saw_any_typed_line = saw_exclusion || saw_zero || saw_permission_denied ||
+                                        saw_not_available || saw_partial;
+        CHECK(saw_any_typed_line);
 
         // The regression this test exists to pin: "exclusion_count|0" is
         // av_exclusions_win's total-silence fallback (total == 0 &&
@@ -164,8 +167,11 @@ TEST_CASE("antivirus plugin: products/status/av_exclusions execute via "
         // by the existing status_forwarded guard; this test pins the
         // observable contract end-to-end rather than trusting the guard by
         // reading the source.
-        if (saw_zero)
-            CHECK_FALSE(saw_permission_denied || saw_not_available || saw_partial);
+        if (saw_zero) {
+            const bool saw_conflicting_failure =
+                saw_permission_denied || saw_not_available || saw_partial;
+            CHECK_FALSE(saw_conflicting_failure);
+        }
     }
 }
 
