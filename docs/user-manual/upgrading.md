@@ -389,6 +389,15 @@ simply drops out of the cohort the operator-set value defines.
 **Verify:** audit the `source` column — `GET /api/v1/tags?agent_id=<id>` shows whether
 each key is `server`- (operator/API) or `agent`-sourced.
 
+**Read-side completion (#3295):** #1411 closed the write-time overwrite; scope-DSL
+`tag:<key>` evaluation (dispatch targeting, management-group membership) had its own,
+separate precedence — a currently-connected agent's live self-report answered before the
+store was even consulted. That is now also store-first: an operator/API-set row always
+wins for scope-DSL purposes too. **Who this affects:** an operator who deliberately relied
+on a live agent's tag value overriding an operator/API-set tag specifically for dispatch
+targeting or cohort membership while that agent stayed connected. See
+`docs/asset-tagging-guide.md` "Tag source precedence (read time, scope-DSL, #3295)".
+
 **Remediate:** if an agent-reported value was the *intended* one, re-set it explicitly
 via the REST API or MCP `set_tag` (which writes `source=server`, authoritative). Keys
 the agent reports that the operator never set are unaffected.

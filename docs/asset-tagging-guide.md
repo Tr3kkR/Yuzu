@@ -28,11 +28,12 @@ Structured categories are enforced at the API layer:
 
 ## Setting Tags
 
-> **Tag source precedence.** Every tag carries a `source` field — `"api"` for REST/dashboard
-> writes (`PUT /api/v1/tags`), `"mcp"` for MCP `set_tag`, `"server"` for server-internal
-> writes, and `"agent"` for tags an agent self-reports via its heartbeat `scopable_tags`. An
-> agent-reported tag is written only when the stored row is itself `"agent"`-sourced or absent;
-> any non-`"agent"`-sourced tag for the same `(agent_id, key)` is **authoritative and cannot be
+> **Tag source precedence (write time).** Every tag carries a `source` field — `"api"` for
+> REST/dashboard writes (`PUT /api/v1/tags`), `"mcp"` for MCP `set_tag`, `"server"` for
+> server-internal writes, and `"agent"` for tags an agent self-reports at registration
+> (`scopable_tags`, synced to the store on gRPC `Register`). An agent-reported tag is
+> written only when the stored row is itself `"agent"`-sourced or absent; any
+> non-`"agent"`-sourced tag for the same `(agent_id, key)` is **authoritative and cannot be
 > overwritten by the agent**. This prevents a rogue or misconfigured agent from self-assigning
 > into an operator-declared benchmark cohort. To force a value regardless of the current
 > source, write it via the REST API or MCP `set_tag`.
@@ -45,6 +46,17 @@ Structured categories are enforced at the API layer:
 > restriction existed) is purged on the agent's next sync. A service-scoped token is also
 > denied writing or deleting its OWN `service` tag on any target, regardless of source — see
 > "Service-Scoped Tokens" under `docs/user-manual/authentication.md`.
+>
+> **Tag source precedence (read time, scope-DSL, #3295).** A `tag:<key>` expression in a
+> Scope (dispatch targeting, management-group membership, any `tag:` atom you write) resolves
+> the TagStore first — the same source-precedence rules above apply, so an operator-set row
+> always wins if present. A connected agent's live self-reported value answers a `tag:<key>`
+> lookup ONLY when the store has no row at all for that `(agent, key)` — e.g. a gateway-proxied
+> agent, whose tags are never synced to the store, or a tag not yet synced. `service` never
+> answers from the self-report at this stage either — it is dropped from the agent's live
+> session at registration, not just filtered from the store. An agent reporting an empty-string
+> value cannot mask an operator's non-empty stored value: the store row, when present, is
+> always used regardless of the agent's own claim.
 
 ### Via the REST API
 

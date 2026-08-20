@@ -250,3 +250,37 @@ drift class the health block's own comments document). Backfill failure is fatal
   live agent's self-report shadows an operator store row during scope evaluation, opposite of
   the store-first cohort reads): out of scope for a substrate migration; preserved exactly and
   pinned by a test. If it is to change, that is its own reviewed decision.
+
+## Amendment — 2026-08-20: resolver precedence flips to store-first (#3295)
+
+The "Considered and rejected" entry above ("Changing the resolver's
+scopable_tags-first precedence... out of scope for a substrate migration...
+If it is to change, that is its own reviewed decision") named exactly this
+change and deferred it. #3295 is that reviewed decision: `evaluate_scope`'s
+`tag:<key>` resolver is now **store-first** — a TagStore row of any source
+wins over a connected agent's live `scopable_tags` claim; the in-memory
+value answers only when the store has no row at all for that `(agent,
+key)` (a gateway-proxied agent, whose tags never reach the store via
+`ProxyRegister` — tracked as a follow-up; or a tag not yet synced).
+Additionally, `register_agent` now drops an agent-claimed `service` key
+from the session entirely at ingest, mirroring the store-side purge
+`sync_agent_tags` already performed (#3289).
+
+This does NOT reopen the "Aborting scope evaluation on a NULL tag store"
+rejection above — a NULL store with no row to check still falls through to
+the in-memory value, matching a real test/embedded configuration with no
+store to distrust. It also does not disturb the DEGRADED-store fail-closed
+contract (a store/pool/query error still aborts the whole evaluation).
+
+The one accepted behavior change from the flip: if an agent's most recent
+`sync_agent_tags` write failed (`agent_service_impl.cpp` logs "prior tag
+set retained, agent re-syncs on next Register"), the store can briefly hold
+a stale agent-authored value while the live session holds a fresher one —
+store-first now returns the stale value where session-first would have
+returned the fresh one. Accepted: the store remains the single source of
+truth for `tag:` scope-DSL evaluation, and the row self-heals on the
+agent's next successful sync.
+
+Full precedence rule: `docs/asset-tagging-guide.md` "Tag source precedence
+(read time, scope-DSL, #3295)"; cross-references: `docs/adr/1006-service-scope-default-deny.md`,
+`docs/auth-architecture.md`.
