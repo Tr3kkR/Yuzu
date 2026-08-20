@@ -50,6 +50,8 @@
 #include <string>
 #include <vector>
 
+#include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field
+
 namespace yuzu::bitlocker::windows {
 
 using WmiRow = std::map<std::string, std::string>;
@@ -220,7 +222,13 @@ inline std::string parse_encryption_method(const WmiRow& row) {
 /// <protection>`).
 inline std::string format_volume_row(const EncryptableVolume& vol, const ConversionState& conv,
                                      const std::string& method) {
-    std::string drive = vol.drive_letter.empty() ? "unknown" : vol.drive_letter;
+    // drive_letter is WMI-sourced like every other dynamic field on this
+    // row -- sanitized for consistency with them (plg-L1), even though
+    // Win32_EncryptableVolume's DriveLetter is OS-constrained to a single
+    // letter + ':' in practice.
+    std::string drive = vol.drive_letter.empty()
+                            ? "unknown"
+                            : yuzu::util::safe_output_field(vol.drive_letter);
     return "volume|" + drive + "|" + conv.conversion_text + "|" + conv.percent_text +
            "|" + method + "|" + protection_status_text(vol.protection_status_raw);
 }

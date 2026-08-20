@@ -126,6 +126,16 @@ bool report_bitlocker_status(yuzu::CommandContext& ctx) {
         ctx.write_output("volume|none|no_encryptable_volumes");
         return true;
     }
+    if (query.truncated) {
+        // A host with more encryptable volumes than the shared WMI helper's
+        // row cap silently dropped the rest -- signal partial completeness
+        // rather than let a truncated volume list read as the full picture
+        // on this compliance-verification surface (mirrors
+        // list_av_products_win's identical handling of the same shared
+        // helper's truncation flag; security-guardian gate-2 finding).
+        ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "bitlocker:volume_enumeration_truncated");
+    }
 
     for (const auto& vol : volumes) {
         // sink: bitlocker/report_bitlocker_status#2 and #3 — rung 1,

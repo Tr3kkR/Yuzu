@@ -3,9 +3,9 @@
 ## Plugin: bitlocker | Actions: state
 ##
 ## Sources by platform:
-##   Windows: manage-bde -status (BitLocker)
-##   Linux:   lsblk + cryptsetup status (LUKS)
-##   macOS:   fdesetup status (FileVault)
+##   Windows: Win32_EncryptableVolume WMI, in-process (BitLocker)
+##   Linux:   libblkid + /sys/class/block/dm-* (LUKS)
+##   macOS:   fdesetup status + diskutil apfs list, bounded subprocess (FileVault)
 
 ---
 apiVersion: yuzu.io/v1alpha1

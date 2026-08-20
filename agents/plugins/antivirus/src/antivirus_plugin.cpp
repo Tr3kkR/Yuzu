@@ -27,6 +27,7 @@
 
 #include "antivirus_parsers.hpp"
 
+#include <algorithm>
 #include <format>
 #include <string>
 #include <string_view>
@@ -130,42 +131,43 @@ void defender_status_win(yuzu::CommandContext& ctx) {
         ctx.write_output(line);
 }
 
+// Ordered worst-to-best so a plain `std::max` across all six subkey reads
+// (3 kinds x 2 hives) picks the single worst outcome to forward, rather than
+// whichever happened to be seen first (adversarial-review gate-2 finding:
+// a later, worse failure must not be masked by an earlier, milder one).
+enum class ExclusionReadOutcome {
+    kOk = 0,
+    kEnumerationIncomplete = 1,
+    kUnavailable = 2,
+    kPermissionDenied = 3,
+};
+
 // Attempts to open+enumerate one exclusion subkey (either the local
 // operator-editable hive or the GPO/MDM policy hive). Returns the value
 // names on success; ERROR_FILE_NOT_FOUND is folded into a genuinely-empty
 // result (the subkey never existing means no exclusion of this kind was
 // ever configured through this source), NOT a failure. Any other non-
-// success open outcome is reported via `write_output`/`set_result_status`
-// exactly once per call site (never silently swallowed into a fabricated
-// zero) and signalled back via the returned bool.
-bool read_exclusion_subkey(yuzu::CommandContext& ctx, const wchar_t* path, const char* kind,
-                           bool& status_forwarded, std::vector<std::string>& out_names) {
+// success open outcome is reported via `write_output` exactly once per call
+// site (never silently swallowed into a fabricated zero) and signalled back
+// via the returned outcome, for the caller to aggregate across all calls.
+ExclusionReadOutcome read_exclusion_subkey(yuzu::CommandContext& ctx, const wchar_t* path,
+                                           const char* kind,
+                                           std::vector<std::string>& out_names) {
     yuzu::win::RegKey key;
     const LSTATUS rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, KEY_READ, key.put());
     if (rc == ERROR_FILE_NOT_FOUND)
-        return true; // a real "zero" for this source, not a lie
+        return ExclusionReadOutcome::kOk; // a real "zero" for this source, not a lie
     if (rc == ERROR_ACCESS_DENIED) {
         // Current Windows builds ACL this key against non-admin readers.
         // Reported as its own typed status, never collapsed into a silent
         // "no exclusions" -- that would be a false negative that looks
         // like a clean posture.
         ctx.write_output(std::format("permission_denied|exclusions {} access denied", kind));
-        if (!status_forwarded) {
-            ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED,
-                                  YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                  "antivirus:av_exclusions_access_denied");
-            status_forwarded = true;
-        }
-        return false;
+        return ExclusionReadOutcome::kPermissionDenied;
     }
     if (rc != ERROR_SUCCESS) {
         ctx.write_output(std::format("not_available|exclusions {} read failed", kind));
-        if (!status_forwarded) {
-            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                  "antivirus:av_exclusions_open_failed");
-            status_forwarded = true;
-        }
-        return false;
+        return ExclusionReadOutcome::kUnavailable;
     }
     auto enumeration = yuzu::win::enumerate_value_names(key.get());
     out_names = std::move(enumeration.names);
@@ -176,13 +178,9 @@ bool read_exclusion_subkey(yuzu::CommandContext& ctx, const wchar_t* path, const
         // typed status -- never silently presented as a verified-complete,
         // possibly-clean exclusion list.
         ctx.write_output(std::format("partial|exclusions {} enumeration incomplete", kind));
-        if (!status_forwarded) {
-            ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                  "antivirus:av_exclusions_enumeration_incomplete");
-            status_forwarded = true;
-        }
+        return ExclusionReadOutcome::kEnumerationIncomplete;
     }
-    return true;
+    return ExclusionReadOutcome::kOk;
 }
 
 void av_exclusions_win(yuzu::CommandContext& ctx) {
@@ -207,16 +205,17 @@ void av_exclusions_win(yuzu::CommandContext& ctx) {
          L"SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Exclusions\\Extensions", "extension"},
     };
 
-    bool status_forwarded = false;
+    auto worst = ExclusionReadOutcome::kOk;
     std::size_t total = 0;
     for (const auto& sk : kSubkeys) {
         std::vector<std::string> local_names;
         std::vector<std::string> policy_names;
         // Both reads are attempted even if one fails -- an admin-blocked
         // local hive must not hide a still-readable policy hive, and vice
-        // versa; each failure is reported once via status_forwarded.
-        read_exclusion_subkey(ctx, sk.local_path, sk.kind, status_forwarded, local_names);
-        read_exclusion_subkey(ctx, sk.policy_path, sk.kind, status_forwarded, policy_names);
+        // versa; every call's outcome feeds the worst-across-all-six
+        // aggregate below, not just the first one seen.
+        worst = std::max(worst, read_exclusion_subkey(ctx, sk.local_path, sk.kind, local_names));
+        worst = std::max(worst, read_exclusion_subkey(ctx, sk.policy_path, sk.kind, policy_names));
 
         auto merged = yuzu::antivirus::merge_exclusion_sources(local_names, policy_names);
         for (const auto& line : yuzu::antivirus::render_exclusion_lines(merged, sk.kind)) {
@@ -224,8 +223,24 @@ void av_exclusions_win(yuzu::CommandContext& ctx) {
             ++total;
         }
     }
-    if (total == 0 && !status_forwarded) {
-        ctx.write_output("exclusion_count|0");
+    switch (worst) {
+    case ExclusionReadOutcome::kPermissionDenied:
+        ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED,
+                              YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "antivirus:av_exclusions_access_denied");
+        break;
+    case ExclusionReadOutcome::kUnavailable:
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "antivirus:av_exclusions_open_failed");
+        break;
+    case ExclusionReadOutcome::kEnumerationIncomplete:
+        ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "antivirus:av_exclusions_enumeration_incomplete");
+        break;
+    case ExclusionReadOutcome::kOk:
+        if (total == 0)
+            ctx.write_output("exclusion_count|0");
+        break;
     }
 }
 
