@@ -160,9 +160,13 @@ DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store) {
 
     json arr = json::array();
     for (const auto& d : defs) {
-        json param_schema; // null unless the stored value parses as JSON
+        json param_schema; // null unless the stored value parses as a JSON object
         auto parsed = json::parse(d.parameter_schema, nullptr, /*allow_exceptions=*/false);
-        if (!parsed.is_discarded())
+        // Attach only an OBJECT schema — a stored value that parses to
+        // null/number/array/string is not a usable JSON Schema (UP-9), and
+        // the #2986 typed outputSchema for this field advertises only
+        // object/null (mcp_server.cpp). Mirrors discover_plugins below.
+        if (!parsed.is_discarded() && parsed.is_object())
             param_schema = std::move(parsed);
 
         arr.push_back({
