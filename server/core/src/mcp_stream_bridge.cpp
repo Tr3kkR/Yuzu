@@ -304,7 +304,7 @@ void McpStreamBridge::mark_dirty(WakeCore& core, const std::string& key) noexcep
                 // Allocation failure growing the set: degrade to a full scan
                 // next cycle rather than lose track of which records have
                 // pending work - see WakeCore::scan_all.
-                core.scan_all = true;
+                core.scan_all.store(true, std::memory_order_relaxed);
                 signal = true;
             }
             core.work_pending = true;  // UNCONDITIONAL - see the invariant above
@@ -312,7 +312,15 @@ void McpStreamBridge::mark_dirty(WakeCore& core, const std::string& key) noexcep
         if (signal) {
             core.cv.notify_one();
         }
-    } catch (...) {  // NOLINT(bugprone-empty-catch) - a wake must never escape a listener
+    } catch (...) {
+        // The outer try wraps the `lock_guard` CONSTRUCTION, not just the
+        // block inside it, and the inner try/catch above is exhaustive (it
+        // never rethrows) - so the only realistic path here is `core.mu`
+        // itself failing to lock. `work_pending` is unreachable in that case
+        // (it is only ever set under `mu`), so there is no mu-held section
+        // left to record intent in - hence the lock-free write below (see
+        // WakeCore::scan_all's comment). A wake must never escape a listener.
+        core.scan_all.store(true, std::memory_order_relaxed);
     }
 }
 
@@ -1502,8 +1510,8 @@ void McpStreamBridge::run_projector() {
             keys.swap(core_->dirty);  // `keys` is guaranteed empty here (the
                                       // clear above), so this ALSO empties
                                       // core_->dirty unconditionally
-            full_scan = core_->scan_all;
-            core_->scan_all = false;
+            full_scan = core_->scan_all.load(std::memory_order_relaxed);
+            core_->scan_all.store(false, std::memory_order_relaxed);
         }
         // BARE-THREAD BOUNDARY: run_projector is a std::thread entry with no
         // caller try/catch, so ANY escaped exception is std::terminate (#2037
@@ -1558,8 +1566,19 @@ void McpStreamBridge::run_projector() {
                 } catch (...) {
                     // project_record's claim guard restored any unsettled terminal;
                     // this is a true should-not-happen backstop (all interior throw
-                    // sites are individually caught).
+                    // sites are individually caught). Pre-#2411, this record was
+                    // retried for free on the next full-table scan; under dirty-set
+                    // gating its key was already consumed from this cycle's `keys`,
+                    // so without a re-mark a record whose OWN listener will never
+                    // fire again (e.g. one already past D2's terminal_accepted
+                    // short-circuit) would strand here until an unrelated scan_all
+                    // degrade rescued it. Re-mark, mirroring the listener catch
+                    // site above. Under a PERSISTENT fault this spins
+                    // visit->throw->re-mark - the same accepted risk class as the
+                    // outer catch's re-arm below and the listener catch site
+                    // (tracked, with this site added, at #3331).
                     spdlog::warn("MCP bridge projector: projection pass failed (contained)");
+                    mark_dirty(*core_, rec->key);
                 }
                 flush_record_obs(*rec);
             }
@@ -1577,7 +1596,7 @@ void McpStreamBridge::run_projector() {
             // marked afterward. Re-arm a full scan instead, restoring it.
             try {
                 std::lock_guard<std::mutex> lk(core_->mu);
-                core_->scan_all = true;
+                core_->scan_all.store(true, std::memory_order_relaxed);
                 core_->work_pending = true;
             } catch (...) {  // NOLINT(bugprone-empty-catch)
             }

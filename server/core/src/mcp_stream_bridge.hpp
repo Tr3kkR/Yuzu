@@ -863,20 +863,37 @@ private:
         /// across cycles - see run_projector). Bounded by live-record-count-ish
         /// churn between drains, never larger, because insertion dedupes.
         ///
-        /// INVARIANT (the lost-wakeup proof mark_dirty's comment states in
-        /// full): `!dirty.empty() || scan_all ⇒ work_pending`. Both the insert
-        /// and the `work_pending = true` store happen in the SAME `mu` critical
-        /// section, and `work_pending` is cleared only in the SAME critical
-        /// section that swaps `dirty` out empty - so the invariant can never be
-        /// observed false by a projector that just re-acquired `mu`.
+        /// INVARIANT, split by how each half gets set:
+        ///   - `!dirty.empty() ⇒ work_pending`, and any `mu`-HELD write of
+        ///     `scan_all` (the insert-alloc-failure path, run_projector's
+        ///     outer-catch re-arm) ⇒ `work_pending` - because those three
+        ///     writers set `work_pending = true` in the SAME `mu` critical
+        ///     section, and `work_pending` clears only in the SAME section
+        ///     that swaps `dirty` out empty and reads `scan_all` false. This
+        ///     half is what the lost-wakeup proof on mark_dirty depends on,
+        ///     and it can never be observed false by a projector that just
+        ///     re-acquired `mu`.
+        ///   - the LOCK-FREE `scan_all` store (mark_dirty's outer catch, for
+        ///     a fault in acquiring `mu` itself) is deliberately NOT paired
+        ///     with `work_pending`: it cannot be, since it runs precisely
+        ///     when taking `mu` is not possible. It is a latent breadcrumb,
+        ///     consumed by whichever wake next reaches `mu` from ANY source -
+        ///     correct because the wake this write would have accompanied is
+        ///     already lost by hypothesis (the mutex fault ate it), so there
+        ///     is nothing here for the invariant's "same critical section" to
+        ///     protect.
         std::unordered_set<std::string> dirty;
-        /// Degrade valve: a dirty-key insert hit an allocation failure, or a
+        /// Degrade valve: a dirty-key insert hit an allocation failure, a
         /// prior cycle's body threw after already swapping its keys out (see
-        /// run_projector's outer catch) - either way, the swapped-away keys are
-        /// not trustworthy as the FULL set of records with pending work, so the
-        /// next cycle falls back to the pre-#2411 full-table scan instead of
-        /// trusting a possibly-incomplete dirty set.
-        bool scan_all = false;
+        /// run_projector's outer catch), or mark_dirty could not even acquire
+        /// `mu` - any of these leaves the swapped-away keys untrustworthy as
+        /// the FULL set of records with pending work, so the next cycle falls
+        /// back to the pre-#2411 full-table scan instead. Lock-free: the
+        /// third writer above (mark_dirty's outer catch) fires exactly when
+        /// `mu` may be unavailable, so this cannot be `mu`-guarded like
+        /// `dirty` is; relaxed suffices because nothing is ordered around it,
+        /// only the flag's own eventual visibility to the next reader.
+        std::atomic<bool> scan_all{false};
     };
 
     /// Which rung of the publish ladder actually committed. The committed id alone
