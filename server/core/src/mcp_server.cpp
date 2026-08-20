@@ -3571,13 +3571,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
             // 2g PR 4 (specs-as-resources): yuzu://openapi and yuzu://scope-dsl reuse the
-            // SAME builder as their REST /discover/* and MCP discover_* tool twins (A2
-            // shared-builder principle — three projections, one builder). Tier-gated
-            // (unlike the 9 legacy resources above, which predate the annotation/tier sweep
-            // and are perm_fn-only — #2713 tracks closing that gap for them separately),
-            // matching discover_routes/discover_scope_kinds's tier_allows-then-perm_fn
-            // order. Deliberately NOT unauthenticated like /api/v1/openapi.json — that
-            // posture is a tracked pre-existing gap (#2057), not a precedent to follow.
+            // SAME source builder as their REST /discover/* and MCP discover_* tool twins
+            // (A2 shared-builder principle). yuzu://openapi serves openapi_spec_json() raw —
+            // byte-identical to REST GET /api/v1/openapi.json's body, NOT to discover_routes'
+            // output, which wraps the same source in build_routes_catalog() as a distinct
+            // projection ({"source":"openapi", routes:[...]}). yuzu://scope-dsl serves
+            // scope_kinds_catalog().json raw, which IS byte-identical to both
+            // GET /api/v1/discover/scope-kinds and discover_scope_kinds (that builder has
+            // only one projection). Tier-gated (unlike the 9 legacy resources above, which
+            // predate the annotation/tier sweep and are perm_fn-only — #2713 tracks closing
+            // that gap for them separately), matching discover_routes/discover_scope_kinds's
+            // tier_allows-then-perm_fn order. This resources/read branch, like every other
+            // branch in this method, emits no audit row on tier denial (unlike tools/call's
+            // mcp_audit("denied", ...)) — the whole resources/read surface predates
+            // per-call audit, tracked by the same #2713 follow-up. Deliberately NOT
+            // unauthenticated like /api/v1/openapi.json — that posture is a tracked
+            // pre-existing gap (#2057), not a precedent to follow.
             if (uri == "yuzu://openapi") {
                 if (!tier_allows(session->mcp_tier, "Infrastructure", "Read")) {
                     res.set_content(
@@ -3591,8 +3600,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
-                // Compiled-in — no store dependency, same builder as REST
-                // /api/v1/openapi.json and discover_routes.
+                // Compiled-in — no store dependency. Raw openapi_spec_json(): byte-identical
+                // to REST GET /api/v1/openapi.json, a different projection than
+                // discover_routes (see the block comment above).
                 JArr contents;
                 contents.add(JObj()
                                  .add("uri", uri)
