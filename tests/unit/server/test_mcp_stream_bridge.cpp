@@ -711,8 +711,8 @@ TEST_CASE("bridge second-thread terminal vs park (TSan)", "[mcp][bridge][2f]") {
     REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
     auto frames = ring_frames(*s.stream, "alice");
     CHECK(count_results(frames) == 1);
-    // The final is last on the ring, whatever subset of the flood survived the
-    // bounded mailbox.
+    // The final is last on the ring, whatever the flood's latest-wins progress
+    // slot happened to still hold when it was drained.
     CHECK(json::parse(frames.back().data).contains("result"));
 }
 
@@ -4001,9 +4001,9 @@ TEST_CASE("bridge take_post_batch - an expired cap settles one drain pass later,
           "never at execution pace (#2739)",
           "[mcp][bridge][2f][ch23]") {
     // Before this fix, cap arbitration was reached only on a pass with neither
-    // progress nor terminal pending - so a mailbox that refilled every tick held
-    // the response open for the WHOLE execution, and every operator statement
-    // derived from the 120 s cap was wrong. The contract that killed the naive
+    // progress nor terminal pending - so a progress slot that refilled every
+    // tick held the response open for the WHOLE execution, and every operator
+    // statement derived from the 120 s cap was wrong. The contract that killed the naive
     // fix still holds: the drain pass DELIVERS latched work and stays open; only
     // the pass after it settles.
     Fx fx;
@@ -4017,8 +4017,8 @@ TEST_CASE("bridge take_post_batch - an expired cap settles one drain pass later,
 
     SECTION("continuous progress cannot hold the response open past the drain pass") {
         // publish() fans out to the bridge listener synchronously (under
-        // Channel::mu), so every take below sees exactly the mailbox its
-        // preceding publish latched - no polling needed on this path.
+        // Channel::mu), so every take below sees exactly what its preceding
+        // publish latched into the progress slot - no polling needed on this path.
         fx.bus.publish("exec-drain", "execution-progress", prog(1, 5));
         auto drain = fx.bridge->take_post_batch(*key, /*cap_expired=*/true);
         REQUIRE(drain.progress.size() == 1);  // latched work is DELIVERED (C7)...

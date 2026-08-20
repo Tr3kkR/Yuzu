@@ -4,7 +4,8 @@
 //
 // The consumer-side projection of ExecutionEventBus events onto a session's MCP
 // stream surfaces: per-request correlation records, the bus subscription, the
-// arming mailbox, one projector thread, and ring/final publication. The G1
+// latest-wins progress slot (#2412), one projector thread, and ring/final
+// publication. The G1
 // core/presentation split is structural - this header knows NOTHING of httplib,
 // revalidation, or wire writes (those live in McpPostPump, PR 3b). In-memory,
 // non-durable, no new store.
@@ -30,10 +31,10 @@
 //
 //   The two edges out of kArming on a FAILURE differ by whether dispatch happened:
 //   abandon() is pre-dispatch (unsubscribe + discard; nothing is running), while
-//   park_after_dispatch_failure() is post-dispatch (subscription and mailbox
-//   RETAINED, because the execution is running and its terminal is still owed).
+//   park_after_dispatch_failure() is post-dispatch (subscription and the progress
+//   slot RETAINED, because the execution is running and its terminal is still owed).
 //
-//   kArming        reserved, pre-dispatch; mailbox latches events, nothing projects.
+//   kArming        reserved, pre-dispatch; the progress slot latches events, nothing projects.
 //   kStreaming     POST pump owns projection (3b). In 3a nothing arms this in
 //                  production; a test-driven kStreaming record latches until parked.
 //   kArmedGetOnly  plain JSON already answered the POST. Progress goes LIVE on the
@@ -176,7 +177,10 @@
 //
 //   WakeCore::mu             - wake-only LEAF. Taken (briefly, to flip
 //       work_pending_/stop and notify) from under Channel::mu + record mu
-//       (listener wake) and from under record mu (arm()'s handoff wake).
+//       (listener wake), from under record mu (arm()'s handoff wake and every
+//       other mark_dirty call site, #2411), and from under bridge_mu_ → record
+//       mu (sweep()'s pressure mark-clearing walk, #2411 - the one call site
+//       that reaches WakeCore::mu with bridge_mu_ still held above it).
 //       NOTHING is ever acquired while holding it.
 //   McpSessionRegistry::mu_  - isolated leaf (stream_for/exists acquire nothing
 //       beneath; the bridge never calls the registry while holding bridge_mu_).
@@ -544,7 +548,7 @@ public:
                                  std::string_view principal = {});
 
     /// Pre-dispatch failure unwind: kArming → kAborted, unsubscribe (waits out
-    /// in-flight listeners), discard mailbox, release charge, erase. The caller
+    /// in-flight listeners), discard the progress slot, release charge, erase. The caller
     /// owns lease release / mark_cancelled / the byte-identical error path (G1).
     bool abandon(const std::string& session_id, const nlohmann::json& jsonrpc_id);
 
@@ -626,7 +630,7 @@ public:
     bool on_final_written(const std::string& key);
 
     /// POST-DISPATCH failure unwind: kArming → kRingOnly, retaining the bus
-    /// subscription, the mailbox and any latched terminal. PARK, NOT abandon -
+    /// subscription, the progress slot and any latched terminal. PARK, NOT abandon -
     /// the work is already running, so the record must stay able to receive and
     /// publish its real terminal for GET resume; abandon() would unsubscribe and
     /// discard a result the client can still legitimately collect. The caller
@@ -1068,7 +1072,7 @@ private:
         /// publish loop, so a mid-pass throw leaves it set and the record still
         /// settles). Once set, the next cap-expired pass with no pending terminal
         /// arbitrates the cap instead of starting another progress batch, bounding
-        /// the response at cap + at most two pump ticks + one mailbox drain. A
+        /// the response at cap + at most two pump ticks + one progress drain. A
         /// pending terminal bypasses the suppression entirely: the terminal pass
         /// drains intervening progress with it (progress-before-final ordering),
         /// so nothing latched is stranded when the record settles kDone. Frames

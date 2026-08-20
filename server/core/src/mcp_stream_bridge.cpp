@@ -285,11 +285,12 @@ void McpStreamBridge::mark_dirty(WakeCore& core, const std::string& key) noexcep
     //     invariant stated on WakeCore::dirty) `work_pending` was already
     //     true - a cycle that will visit `key` is already owed, and skipping
     //     the redundant notify is correct, not a lost wakeup.
-    // This IS "wake only on a real edge" (the issue's phrasing), expressed at
-    // drain granularity (per dirty-set-empty→non-empty transition) rather
-    // than per mailbox-empty→non-empty transition - provable here, and
-    // equivalent for the projector's purposes, since the projector only ever
-    // cares whether a cycle is owed, not how many events landed.
+    // This IS "wake only on a real edge" (the issue's phrasing, from when the
+    // progress mailbox #2412 later replaced still existed), expressed at drain
+    // granularity (per dirty-set-empty→non-empty transition) rather than per
+    // mailbox-empty→non-empty transition - provable here, and equivalent for
+    // the projector's purposes, since the projector only ever cares whether a
+    // cycle is owed, not how many events landed.
     try {
         bool signal = false;
         {
@@ -1195,8 +1196,9 @@ bool McpStreamBridge::park_after_dispatch_failure(const std::string& session_id,
         rec->parked_seq = parked_seq;
         exec_id = rec->execution_id;
     }
-    // The mailbox and any latched terminal survived the transition, so hand the
-    // record to the projector now rather than waiting for the next bus event.
+    // The progress slot and any latched terminal survived the transition, so
+    // hand the record to the projector now rather than waiting for the next bus
+    // event.
     mark_dirty(*core_, rec->key);
     audit_contained("mcp.bridge.dispatch_failure", exec_id,
                     "parked after a post-dispatch failure: the execution continues and its "
@@ -1408,9 +1410,9 @@ bool McpStreamBridge::has_pending_work_locked(const BridgeRecord& rec) {
     // "Latched work worth waking the pump for". This was the SAME predicate
     // project_record uses to decide there is a batch worth claiming until #2739
     // made the pump path context-dependent (cap_expired + cap_progress_drained);
-    // the divergence is deliberate - a mailbox deliberately held back by the cap
-    // drain must STILL count as pending here, because that wake is what lets the
-    // settle pass run immediately instead of a tick later.
+    // the divergence is deliberate - a progress snapshot deliberately held back
+    // by the cap drain must STILL count as pending here, because that wake is
+    // what lets the settle pass run immediately instead of a tick later.
     const bool progress = rec.progress_pending && !rec.pressure_requested;
     const bool terminal = rec.terminal_accepted &&
                           !rec.terminal_projected.load(std::memory_order_acquire) &&
@@ -1626,9 +1628,9 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
                                    !rec->terminal_projected.load(std::memory_order_acquire) &&
                                    rec->terminal_slot.has_value();
         // #2739: once the one post-expiry drain pass has run, a cap-expired pump
-        // pass starts no further progress batch - otherwise a mailbox that refills
-        // every tick keeps the response open for the whole execution. A pending
-        // terminal bypasses the suppression: that pass ends the response anyway,
+        // pass starts no further progress batch - otherwise a progress slot that
+        // refills every tick keeps the response open for the whole execution. A
+        // pending terminal bypasses the suppression: that pass ends the response anyway,
         // and it must carry the intervening progress ahead of the final
         // (progress-before-final ordering) rather than strand it in a record about
         // to settle kDone.
