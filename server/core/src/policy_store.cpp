@@ -1199,7 +1199,12 @@ PolicyStore::claim_due_policies(int64_t now, int64_t default_interval_seconds,
         // Stranded-`fixing` staleness sweep (supersedes the old evaluator-
         // constructor reset — runs every winning tick, gated by age rather
         // than "every process restart", so it never stomps another
-        // replica's live remediation).
+        // replica's live remediation). NOT a #2360 clock-guarded-retention
+        // pass: it UPDATEs (never deletes — no data loss on a false
+        // positive), the affected state (`status`) is re-derived by the
+        // very next real check, and a wrongly-swept row just costs one
+        // extra dispatch cycle — none of the irrecoverable-on-clock-skew
+        // stakes that rule exists for.
         pg::PgResult sweep = pg::exec_params(
             conn,
             "UPDATE policy_store.policy_status SET status = 'unknown' "
@@ -1220,7 +1225,8 @@ PolicyStore::claim_due_policies(int64_t now, int64_t default_interval_seconds,
             "SELECT p.id, t.config_json FROM policy_store.policies p "
             "LEFT JOIN policy_store.policy_triggers t "
             "  ON t.policy_id = p.id AND t.trigger_type = 'interval' "
-            "WHERE p.enabled = TRUE",
+            "WHERE p.enabled = TRUE "
+            "ORDER BY p.id, t.id", // deterministic first-by-insertion tie-break below
             std::vector<std::string>{});
         if (due.status() != PGRES_TUPLES_OK) {
             failure = std::string("due-policy read failed: ") + PQerrorMessage(conn);

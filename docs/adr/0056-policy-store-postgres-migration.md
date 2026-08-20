@@ -347,8 +347,15 @@ Postgres.
    even though the interval had not elapsed. Fixed with a new store method,
    `PolicyStore::record_dispatch(policy_id, now)` — an unconditional upsert of
    `last_dispatched_at` with no lock and no `WHERE` guard (this is a single explicit dispatch
-   action, not a competing claim) — called from `evaluate_now()` immediately after a successful
-   `kickoff_check`.
+   action, not a competing claim). Stamped from `evaluate_now()` **before** calling
+   `kickoff_check`, not after — `kickoff_check`'s `dispatch_fn` is blocking gRPC/gateway I/O, and
+   a real network-duration window existed between "check dispatched" and "claim recorded" during
+   which a concurrent tick (this replica's own background thread, or a sibling replica) could still
+   observe no row and duplicate-dispatch before the manual call's network round-trip even returned.
+   Stamping unconditionally before dispatch, regardless of whether `kickoff_check` itself succeeds,
+   matches the original `last_eval_` semantics: a failed manual check still consumed the interval
+   slot in the pre-ADR-0056 code, by the same claim-before-dispatch ordering `claim_due_policies`
+   already uses for the automatic path.
 
 Both gaps were caught by the two-instance regression test this ADR's Consequences section
 promises, not by code review — the first surfaced as a claim-staleness test flipping a `fixing`

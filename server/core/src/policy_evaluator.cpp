@@ -335,20 +335,21 @@ std::string PolicyEvaluator::evaluate_now(const std::string& policy_id) {
     // dies before its own collect_ready() matures this check, it strands —
     // an accepted, narrow residual (ADR-0056 Follow-ups): the operator has
     // a natural retry action.
+    //
+    // Stamp the durable claim record BEFORE dispatch (claim-before-dispatch,
+    // matching claim_due_policies' own claim-then-dispatch order and the
+    // pre-ADR-0056 last_eval_ ordering) — kickoff_check's dispatch_fn is
+    // blocking gRPC/gateway I/O; stamping after it leaves a real window
+    // where a concurrent tick (this replica's background thread, or a
+    // sibling replica) sees no row yet and re-dispatches before this
+    // manual check's network call even returns. Stamping unconditionally,
+    // even if dispatch below ends up failing, matches the original: a
+    // failed manual check still consumed the interval slot.
+    auto r = d_.policy_store->record_dispatch(policy_id, now());
+    if (!r)
+        spdlog::warn("policy_evaluator: evaluate_now: record_dispatch failed for {}: {}",
+                    policy_id, r.error());
     auto execid = kickoff_check(**p_res); // dispatch runs without mu_ held
-    if (!execid.empty()) {
-        // Stamp the durable claim record too — found in testing: without
-        // this, the very next automatic tick's claim_due_policies sees NO
-        // row for this policy (evaluate_now never touched
-        // policy_dispatch_state), takes the fresh-INSERT branch (always
-        // succeeds, no WHERE guard applies), and re-dispatches immediately —
-        // a duplicate check seconds after this manual one, even though the
-        // interval has not elapsed.
-        auto r = d_.policy_store->record_dispatch(policy_id, now());
-        if (!r)
-            spdlog::warn("policy_evaluator: evaluate_now: record_dispatch failed for {}: {}",
-                        policy_id, r.error());
-    }
     return execid;
 }
 
