@@ -174,8 +174,9 @@ Device tags are key-value pairs assigned to agents. Tags can be set by the agent
 > persistent tag store first; a connected agent's own live self-reported value answers
 > only when the store has no row at all for that key. `service` (used in the examples
 > below) is special-cased further — it never answers from a live agent self-report at
-> all, even as a fallback. See `docs/asset-tagging-guide.md` "Tag source precedence" for
-> the full write-time and read-time rules.
+> all, even as a fallback. See `docs/asset-tagging-guide.md`'s "Tag source precedence (write
+> time)" and "Tag source precedence (read time, scope-DSL, #3295)" blockquotes for the full
+> write-time and read-time rules, respectively.
 
 ### Syntax
 

@@ -288,12 +288,22 @@ agent's next successful sync.
 
 A second, narrower residual window (pre-existing, not introduced by this
 flip): the bulk store preload snapshots `tag_values` before `mu_` is
-taken, per ADR-0045's "never a per-agent store query while holding
-`AgentRegistry::mu_`" constraint. A concurrent operator write that commits
-after the snapshot but before the per-agent loop reaches that agent is
-invisible to that ONE `evaluate_scope` call, which then answers from the
-in-memory fallback for that call only — indistinguishable, for that single
-call, from the pre-#3295 behavior. It self-corrects on the very next
+taken — a single bulk query rather than a per-agent round-trip while
+holding the lock, the same "N sequential blocking Postgres calls held
+under `AgentRegistry::mu_` is both a fail-open surface and a
+lock-hold-during-network-I/O violation of ADR-0012 §2(b)" reasoning
+ADR-0045 states for `props.<key>`. A concurrent operator write that
+commits after the snapshot but before the per-agent loop reaches that
+agent is invisible to that ONE `evaluate_scope` call — but what the
+resolver returns for it depends on whether a row for that `(agent, key)`
+already existed at snapshot time. If it did not (the write is a fresh
+INSERT), the lookup misses and the call answers from the in-memory
+fallback, indistinguishable from the pre-#3295 behavior for that one call.
+If a row already existed (the write is an UPDATE, or a DELETE), the lookup
+still hits — the call returns the pre-race, now-stale store value, never
+the fallback; this collapses into the same stale-value shape as the
+failed-resync trade-off above, not into session-first behavior. Either
+way the window is bounded to one call and self-corrects on the very next
 `evaluate_scope` call (a fresh preload). This shape already existed for
 `props.<key>` before this PR; it is now also true for `tag:<key>`.
 

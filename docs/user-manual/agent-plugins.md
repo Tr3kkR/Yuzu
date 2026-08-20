@@ -622,9 +622,9 @@ Plugins for running arbitrary commands, managing device tags, and structured ass
 > and dropped from the agent's live session at registration too. A device's `service` tag must
 > always be assigned by an operator (dashboard/REST) or an API integration, never by a
 > `tags.json` entry shipped with the agent. Every OTHER key in `tags.json` still reaches
-> `scope-DSL` `tag:<key>` evaluation and the server tag store normally — see
-> `docs/asset-tagging-guide.md` "Tag source precedence" for the full precedence rules (which
-> source wins when an operator has also set the same key).
+> scope-DSL `tag:<key>` evaluation and the server tag store normally — see
+> `docs/asset-tagging-guide.md` "Tag source precedence (write time)" for the full precedence
+> rules (which source wins when an operator has also set the same key).
 
 ### asset_tags
 

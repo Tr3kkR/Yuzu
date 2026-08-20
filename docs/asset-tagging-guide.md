@@ -69,6 +69,14 @@ Structured categories are enforced at the API layer:
 > store row until the agent's next successful sync. This is deliberate: the store remains the
 > single source of truth for scope-DSL reads, and the row self-heals automatically. See
 > `docs/adr/0050-tag-store-postgres-migration.md`'s 2026-08-20 amendment for the full rationale.
+>
+> **Two "preview" surfaces resolve `tag:<key>` differently.** MCP `preview_scope_targets`
+> resolves `tag:<key>` from the TagStore ONLY, with no live-agent fallback — for a
+> gateway-proxied or not-yet-synced agent it can under-report relative to what an actual
+> dispatch will match. REST `POST /api/scope/estimate` has no such gap: it resolves through
+> the same store-first-with-fallback path real dispatch uses, so it matches dispatch exactly.
+> Prefer `/api/scope/estimate` when previewing a scope for a fleet that may include
+> gateway-proxied or not-yet-synced agents.
 
 ### Via the REST API
 
