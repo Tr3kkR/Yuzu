@@ -298,10 +298,10 @@ done
 log ""
 
 # ══════════════════════════════════════════════════════════════════════
-# 3. RESOURCES LIST — verify all 3 resources
+# 3. RESOURCES LIST — verify all 11 resources
 # ══════════════════════════════════════════════════════════════════════
 log "═══════════════════════════════════════════"
-log "  3. resources/list — Verify All 3 Resources"
+log "  3. resources/list — Verify All 11 Resources"
 log "═══════════════════════════════════════════"
 
 mcp_call "resources/list" "{}"
@@ -315,7 +315,8 @@ if isinstance(r, str):
     r = json.loads(r)
 print(len(r.get('resources', [])))
 " 2>/dev/null || echo "0")
-assert_eq "resources/list returns 9 resources" "9" "$RES_COUNT"
+# 9 pre-existing + yuzu://openapi + yuzu://scope-dsl (2g PR4).
+assert_eq "resources/list returns 11 resources" "11" "$RES_COUNT"
 
 for uri in "yuzu://server/health" "yuzu://compliance/fleet" "yuzu://audit/recent"; do
     if echo "$MCP_BODY" | grep -q "$uri"; then
