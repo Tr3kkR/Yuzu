@@ -1511,7 +1511,7 @@ void McpStreamBridge::run_projector() {
                                       // clear above), so this ALSO empties
                                       // core_->dirty unconditionally
             // A separate load+store here would race the ONE writer that does
-            // not hold core_->mu (mark_dirty's outer catch, below) - its
+            // not hold core_->mu (mark_dirty's outer catch, above) - its
             // store(true) could land between the two and get silently
             // clobbered by the store(false), losing the only recorded trace
             // of the wake it was standing in for. exchange() closes that
@@ -1585,7 +1585,7 @@ void McpStreamBridge::run_projector() {
                     // outer catch's re-arm below and the listener catch site
                     // (tracked, with this site added, at #3331). execution_id,
                     // not rec->key, in the log line - key embeds a literal
-                    // '\n' plus client-supplied jsonrpc_id (cpp:942).
+                    // '\n' plus client-supplied jsonrpc_id (see make_key()).
                     spdlog::warn(
                         "MCP bridge projector: projection pass failed (contained) "
                         "[execution_id={}]",
