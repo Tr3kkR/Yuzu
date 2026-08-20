@@ -629,6 +629,13 @@ bool try_iptables_rules(yuzu::CommandContext& ctx) {
     if (!res.tool_ran)
         return false;
     ctx.write_output("backend|iptables");
+    // Same reasoning as try_iptables_state above: a nonzero exit (commonly
+    // EPERM) means the read did not actually happen -- report an honest
+    // unknown, never a false-safe empty rule set from unparsed empty output.
+    if (res.exit_code != 0) {
+        ctx.write_output("rules|unknown");
+        return true;
+    }
     for (const auto& r : yuzu::firewall::parse_iptables_save(res.output)) {
         const char* type_s = r.type == yuzu::firewall::IptablesEntryType::policy      ? "policy"
                              : r.type == yuzu::firewall::IptablesEntryType::new_chain ? "new_chain"
