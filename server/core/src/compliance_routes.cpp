@@ -48,27 +48,52 @@ std::string ComplianceRoutes::render_compliance_summary_fragment() {
     };
 
     std::vector<PolicyRow> policies;
+    // ADR-0056: a degraded read must render distinctly from "genuinely no
+    // policies" — collapsing them would show a false "0 policies, nothing to
+    // see" state when the real answer is "could not ask the store".
+    bool degraded = false;
 
     if (policy_store_ && policy_store_->is_open()) {
         auto all_policies = policy_store_->query_policies();
-        for (const auto& p : all_policies) {
-            auto cs = policy_store_->get_compliance_summary(p.id);
-            PolicyRow row;
-            row.id = p.id;
-            row.name = p.name;
-            row.scope = p.scope_expression;
-            row.total = static_cast<int>(cs.total);
-            row.compliant = static_cast<int>(cs.compliant);
-            row.pct = (cs.total > 0) ? static_cast<int>(cs.compliant * 100 / cs.total) : 0;
-            row.enabled = p.enabled;
-            policies.push_back(std::move(row));
+        if (!all_policies) {
+            degraded = true;
+        } else {
+            for (const auto& p : *all_policies) {
+                auto cs = policy_store_->get_compliance_summary(p.id);
+                if (!cs) {
+                    degraded = true;
+                    continue;
+                }
+                PolicyRow row;
+                row.id = p.id;
+                row.name = p.name;
+                row.scope = p.scope_expression;
+                row.total = static_cast<int>(cs->total);
+                row.compliant = static_cast<int>(cs->compliant);
+                row.pct = (cs->total > 0) ? static_cast<int>(cs->compliant * 100 / cs->total) : 0;
+                row.enabled = p.enabled;
+                policies.push_back(std::move(row));
+            }
         }
     }
 
+    if (degraded) {
+        return "<div class=\"detail-panel\"><div class=\"empty-state\">"
+               "Policy data temporarily unavailable (store degraded) — try again shortly."
+               "</div></div>";
+    }
+
     // Fleet-level compliance from PolicyStore
-    auto fc = (policy_store_ && policy_store_->is_open())
-                  ? policy_store_->get_fleet_compliance()
-                  : FleetCompliance{};
+    FleetCompliance fc;
+    if (policy_store_ && policy_store_->is_open()) {
+        auto fc_res = policy_store_->get_fleet_compliance();
+        if (!fc_res) {
+            return "<div class=\"detail-panel\"><div class=\"empty-state\">"
+                   "Fleet compliance temporarily unavailable (store degraded) — try again "
+                   "shortly.</div></div>";
+        }
+        fc = *fc_res;
+    }
     int fleet_pct = static_cast<int>(fc.compliance_pct);
 
     std::string html;
@@ -133,12 +158,14 @@ std::string ComplianceRoutes::render_compliance_summary_fragment() {
 }
 
 std::string ComplianceRoutes::render_compliance_detail_fragment(const std::string& policy_id) {
-    // Look up the policy from the PolicyStore
+    // Look up the policy from the PolicyStore. Low-stakes (page-title
+    // fallback only) — a degraded read just keeps the id as the displayed
+    // name, same as "not found" would; not worth a distinct error state here.
     std::string policy_name = policy_id;
     if (policy_store_ && policy_store_->is_open()) {
         auto policy = policy_store_->get_policy(policy_id);
-        if (policy)
-            policy_name = policy->name;
+        if (policy && *policy)
+            policy_name = (*policy)->name;
     }
 
     // Get real compliance statuses from the store
@@ -152,9 +179,14 @@ std::string ComplianceRoutes::render_compliance_detail_fragment(const std::strin
     };
 
     std::vector<AgentRow> agents;
+    bool degraded = false;
     if (policy_store_ && policy_store_->is_open()) {
         auto statuses = policy_store_->get_policy_agent_statuses(policy_id);
-        for (const auto& s : statuses) {
+        if (!statuses) {
+            degraded = true;
+            statuses = std::vector<PolicyAgentStatus>{};
+        }
+        for (const auto& s : *statuses) {
             AgentRow row;
             row.agent_id = s.agent_id;
             row.status = s.status;
@@ -192,6 +224,17 @@ std::string ComplianceRoutes::render_compliance_detail_fragment(const std::strin
         }
     }
 
+    if (degraded) {
+        // ADR-0056: must not read the same as "no compliance data yet" —
+        // that phrasing tells an operator to wait, when the real answer is
+        // "the store could not be asked".
+        return "<div class=\"detail-panel\">"
+               "<h3>" + html_escape(policy_name) +
+               " <span style=\"font-size:0.7rem;font-weight:400;color:var(--muted)\">"
+               "(" + html_escape(policy_id) + ")</span></h3>"
+               "<div class=\"empty-state\">Compliance data temporarily unavailable (store "
+               "degraded) — try again shortly.</div></div>";
+    }
     if (agents.empty()) {
         return "<div class=\"detail-panel\">"
                "<h3>" + html_escape(policy_name) +
@@ -401,8 +444,13 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             }
 
             auto frags = policy_store_->query_fragments(q);
+            if (!frags) {
+                res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"policy store degraded"},"meta":{"api_version":"v1"}})", "application/json");
+                return;
+            }
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& f : frags) {
+            for (const auto& f : *frags) {
                 arr.push_back({{"id", f.id},
                                {"name", f.name},
                                {"description", f.description},
@@ -524,8 +572,13 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             }
 
             auto policies = policy_store_->query_policies(q);
+            if (!policies) {
+                res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"policy store degraded"},"meta":{"api_version":"v1"}})", "application/json");
+                return;
+            }
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& p : policies) {
+            for (const auto& p : *policies) {
                 nlohmann::json inputs_obj = nlohmann::json::object();
                 for (const auto& inp : p.inputs)
                     inputs_obj[inp.key] = inp.value;
@@ -606,19 +659,25 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             }
 
             auto id = req.matches[1].str();
-            auto policy = policy_store_->get_policy(id);
-            if (!policy) {
+            auto policy_res = policy_store_->get_policy(id);
+            if (!policy_res) {
+                res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"policy store degraded"},"meta":{"api_version":"v1"}})", "application/json");
+                return;
+            }
+            if (!*policy_res) {
                 res.status = 404;
                 res.set_content(R"({"error":{"code":404,"message":"policy not found"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
+            const Policy& policy = **policy_res;
 
             nlohmann::json inputs_obj = nlohmann::json::object();
-            for (const auto& inp : policy->inputs)
+            for (const auto& inp : policy.inputs)
                 inputs_obj[inp.key] = inp.value;
 
             nlohmann::json triggers_arr = nlohmann::json::array();
-            for (const auto& t : policy->triggers) {
+            for (const auto& t : policy.triggers) {
                 triggers_arr.push_back({{"id", t.id},
                                         {"type", t.trigger_type},
                                         {"config", nlohmann::json::parse(t.config_json, nullptr, false)}});
@@ -626,33 +685,42 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
 
             // Also fetch compliance summary
             auto cs = policy_store_->get_compliance_summary(id);
+            if (!cs) {
+                res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"policy store degraded"},"meta":{"api_version":"v1"}})", "application/json");
+                return;
+            }
 
             // Remediation is only offered where the bound fragment defines a
-            // fix_instruction — the "would you like to remediate?" gate.
+            // fix_instruction — the "would you like to remediate?" gate. A
+            // degraded fragment read is treated the same as "not found" here
+            // (false, not offered) — this only gates a UI affordance, not a
+            // grant/enforce decision, so fail-soft is acceptable.
             bool remediation_available = false;
-            if (auto frag = policy_store_->get_fragment(policy->fragment_id))
-                remediation_available = !frag->fix_instruction.empty();
+            auto frag = policy_store_->get_fragment(policy.fragment_id);
+            if (frag && *frag)
+                remediation_available = !(*frag)->fix_instruction.empty();
 
             res.set_content(
-                nlohmann::json({{"id", policy->id},
-                                {"name", policy->name},
-                                {"description", policy->description},
-                                {"yaml_source", policy->yaml_source},
-                                {"fragment_id", policy->fragment_id},
-                                {"scope_expression", policy->scope_expression},
-                                {"enabled", policy->enabled},
+                nlohmann::json({{"id", policy.id},
+                                {"name", policy.name},
+                                {"description", policy.description},
+                                {"yaml_source", policy.yaml_source},
+                                {"fragment_id", policy.fragment_id},
+                                {"scope_expression", policy.scope_expression},
+                                {"enabled", policy.enabled},
                                 {"remediation_available", remediation_available},
                                 {"inputs", inputs_obj},
                                 {"triggers", triggers_arr},
-                                {"management_groups", policy->management_groups},
-                                {"created_at", policy->created_at},
-                                {"updated_at", policy->updated_at},
-                                {"compliance", {{"compliant", cs.compliant},
-                                                 {"non_compliant", cs.non_compliant},
-                                                 {"unknown", cs.unknown},
-                                                 {"fixing", cs.fixing},
-                                                 {"error", cs.error},
-                                                 {"total", cs.total}}}})
+                                {"management_groups", policy.management_groups},
+                                {"created_at", policy.created_at},
+                                {"updated_at", policy.updated_at},
+                                {"compliance", {{"compliant", cs->compliant},
+                                                 {"non_compliant", cs->non_compliant},
+                                                 {"unknown", cs->unknown},
+                                                 {"fixing", cs->fixing},
+                                                 {"error", cs->error},
+                                                 {"total", cs->total}}}})
                     .dump(),
                 "application/json");
         });
@@ -794,7 +862,13 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
                 return;
             }
             auto id = req.matches[1].str();
-            if (!policy_store_->get_policy(id)) {
+            auto policy_check = policy_store_->get_policy(id);
+            if (!policy_check) {
+                res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"policy store degraded"},"meta":{"api_version":"v1"}})", "application/json");
+                return;
+            }
+            if (!*policy_check) {
                 res.status = 404;
                 res.set_content(R"({"error":{"code":404,"message":"policy not found"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
@@ -950,14 +1024,19 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             }
 
             auto fc = policy_store_->get_fleet_compliance();
+            if (!fc) {
+                res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"policy store degraded"},"meta":{"api_version":"v1"}})", "application/json");
+                return;
+            }
             res.set_content(
-                nlohmann::json({{"compliance_pct", fc.compliance_pct},
-                                {"total_checks", fc.total_checks},
-                                {"compliant", fc.compliant},
-                                {"non_compliant", fc.non_compliant},
-                                {"unknown", fc.unknown},
-                                {"fixing", fc.fixing},
-                                {"error", fc.error}})
+                nlohmann::json({{"compliance_pct", fc->compliance_pct},
+                                {"total_checks", fc->total_checks},
+                                {"compliant", fc->compliant},
+                                {"non_compliant", fc->non_compliant},
+                                {"unknown", fc->unknown},
+                                {"fixing", fc->fixing},
+                                {"error", fc->error}})
                     .dump(),
                 "application/json");
         });
@@ -976,9 +1055,14 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             auto policy_id = req.matches[1].str();
             auto summary = policy_store_->get_compliance_summary(policy_id);
             auto statuses = policy_store_->get_policy_agent_statuses(policy_id);
+            if (!summary || !statuses) {
+                res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"policy store degraded"},"meta":{"api_version":"v1"}})", "application/json");
+                return;
+            }
 
             nlohmann::json agents_arr = nlohmann::json::array();
-            for (const auto& s : statuses) {
+            for (const auto& s : *statuses) {
                 agents_arr.push_back({{"agent_id", s.agent_id},
                                       {"status", s.status},
                                       {"last_check_at", s.last_check_at},
@@ -988,12 +1072,12 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
 
             res.set_content(
                 nlohmann::json({{"policy_id", policy_id},
-                                {"summary", {{"compliant", summary.compliant},
-                                              {"non_compliant", summary.non_compliant},
-                                              {"unknown", summary.unknown},
-                                              {"fixing", summary.fixing},
-                                              {"error", summary.error},
-                                              {"total", summary.total}}},
+                                {"summary", {{"compliant", summary->compliant},
+                                              {"non_compliant", summary->non_compliant},
+                                              {"unknown", summary->unknown},
+                                              {"fixing", summary->fixing},
+                                              {"error", summary->error},
+                                              {"total", summary->total}}},
                                 {"agents", agents_arr}})
                     .dump(),
                 "application/json");
