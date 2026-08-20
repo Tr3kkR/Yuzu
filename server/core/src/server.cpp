@@ -733,14 +733,19 @@ public:
                           "execution_id fetch",
                           "counter");
         metrics_.describe("yuzu_mcp_bridge_mailbox_drops_total",
-                          "Oldest-progress frames dropped from a record's bounded arming mailbox "
-                          "(terminals are never dropped)",
+                          "RETIRED by #2412 - the bounded arming mailbox was replaced with a "
+                          "single latest-wins progress slot, so there is nothing left to drop; a "
+                          "superseded snapshot now counts in yuzu_mcp_bridge_progress_suppressed_"
+                          "total instead. Kept registered at zero for scrape/dashboard continuity",
                           "counter");
         metrics_.describe("yuzu_mcp_bridge_progress_suppressed_total",
-                          "notifications/progress candidates dropped by the H1 monotonic-progress "
-                          "rule (#2438) - a duplicate or momentarily-decreasing snapshot from the "
-                          "bus, never forwarded to the client. Correct, expected movement under "
-                          "normal load; watch for a sustained high rate relative to "
+                          "notifications/progress candidates that never reached the wire: the H1 "
+                          "monotonic-progress rule (#2438) dropping a duplicate or "
+                          "momentarily-decreasing snapshot, AND (since #2412) a snapshot the "
+                          "listener's latest-wins slot overwrote before the projector ever saw it. "
+                          "Correct, expected movement under normal load - it now INCREASES under a "
+                          "large fan-out by design, so do not read a rising rate as regression; "
+                          "watch instead for a sustained high rate relative to "
                           "yuzu_mcp_bridge_projector_cycles_total as a sign of upstream event churn",
                           "counter");
         metrics_.describe("yuzu_mcp_stream_terminal_publish_failures_total",
