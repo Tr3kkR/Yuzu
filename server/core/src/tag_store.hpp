@@ -180,7 +180,7 @@ public:
 
     /// Sync tags from agent registration (gRPC Register only — there is no
     /// heartbeat sync path, and ProxyRegister/gateway-proxied agents do not
-    /// call this at all, #3295 follow-up) — sets source="agent".
+    /// call this at all, tracked as #3372) — sets source="agent".
     /// One transaction: delete all agent-sourced tags, re-insert the
     /// reported set (operator/API rows survive per #1411; the precedence
     /// no-op on a per-row conflict is success, not failure). Malformed

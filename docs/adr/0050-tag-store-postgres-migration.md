@@ -261,7 +261,7 @@ change and deferred it. #3295 is that reviewed decision: `evaluate_scope`'s
 wins over a connected agent's live `scopable_tags` claim; the in-memory
 value answers only when the store has no row at all for that `(agent,
 key)` (a gateway-proxied agent, whose tags never reach the store via
-`ProxyRegister` — tracked as a follow-up; or a tag not yet synced).
+`ProxyRegister` — tracked as #3372; or a tag not yet synced).
 Additionally, `register_agent` now drops an agent-claimed `service` key
 from the session entirely at ingest, mirroring the store-side purge
 `sync_agent_tags` already performed (#3289) — and, separately, drops any

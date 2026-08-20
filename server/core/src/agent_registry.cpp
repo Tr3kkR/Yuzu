@@ -1468,8 +1468,8 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
             // must not self-assign" — same rationale here for dispatch
             // targeting). in-memory scopable_tags is a FALLBACK only, for
             // agents the store has no row for at all (gateway-proxied agents
-            // never sync — ProxyRegister has no TagStore call; #3295
-            // follow-up tracks closing that gap). scopable_tags is validated
+            // never sync — ProxyRegister has no TagStore call; tracked as
+            // #3372). scopable_tags is validated
             // and 'service'-filtered at register_agent ingest, so no
             // additional validation is needed here.
             if (key.starts_with("tag:")) {
