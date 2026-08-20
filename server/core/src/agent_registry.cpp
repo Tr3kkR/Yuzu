@@ -74,8 +74,21 @@ void AgentRegistry::register_agent(const pb::AgentInfo& info) {
             // registrations skip the revoke (agents_ has no entry), which
             // preserves the operator workflow of pre-issuing a token for an
             // agent_id that has not registered yet.
-            if (device_token_store_)
-                device_token_store_->revoke_by_principal(info.agent_id());
+            if (device_token_store_) {
+                // ADR-0052: revoke_by_principal is now type-distinguishable (a genuine DB error
+                // is not the same as "nothing to revoke") — log a failure rather than silently
+                // swallowing it. Re-wiring this store's construction (and deciding whether a
+                // revoke failure should instead block the registration) is out of scope for the
+                // migration; this call site has no live caller today (device_token_store_ is
+                // never non-null in production).
+                auto revoked = device_token_store_->revoke_by_principal(info.agent_id());
+                if (!revoked) {
+                    spdlog::error(
+                        "AgentRegistry::register_agent: device token revoke-by-principal "
+                        "failed for '{}': {}",
+                        info.agent_id(), revoked.error());
+                }
+            }
             if (!old->second->session_id.empty())
                 session_to_agent_.erase(old->second->session_id);
         }

@@ -393,6 +393,31 @@ static int license_error_status(const std::string& err) {
     return 400;
 }
 
+// DeviceTokenStore (docs/adr/0052-...md) error mapping — same three-way shape as
+// license_error_status: `not_found: ` (revoke_token's missing-id case) -> 404,
+// `kDeviceTokenDbErrorPrefix` (a genuine DB/lease failure) -> 503, anything else
+// (create_token's validation errors) -> 400. Preserves the pre-migration DELETE route's 404 for
+// a missing token_id, which a binary (prefix-only) classifier would have regressed to 400.
+static int device_token_error_status(const std::string& err) {
+    if (err.starts_with("not_found:"))
+        return 404;
+    if (err.starts_with(yuzu::server::kDeviceTokenDbErrorPrefix))
+        return 503;
+    return 400;
+}
+
+// Never echoes a genuine DB/lease failure's raw text to the client (mirrors
+// sw_deploy_client_message — see its comment for the full rationale: PQerrorMessage() fragments
+// are internal implementation detail, not caller-actionable feedback). A not_found/validation
+// error (never carries the prefix) is safe to echo verbatim.
+static std::string device_token_client_message(const char* op, const std::string& err) {
+    if (err.starts_with(yuzu::server::kDeviceTokenDbErrorPrefix)) {
+        spdlog::error("{}: {}", op, err);
+        return "service unavailable";
+    }
+    return err;
+}
+
 // A present-but-wrong-typed JSON body field (e.g. {"title": 5}) must degrade
 // to the default rather than throw nlohmann's type_error.302 out of
 // `body.value(key, default)` (-> uncaught -> 500). Mirrors MCP's
@@ -7814,8 +7839,16 @@ void RestApiV1::register_routes(
             if (!session)
                 return;
             auto tokens = device_token_store->list_tokens();
+            if (!tokens) {
+                res.status = device_token_error_status(tokens.error());
+                res.set_content(
+                    detail::a4_error(res, device_token_client_message(
+                                              "GET /api/v1/device-tokens", tokens.error())),
+                    "application/json");
+                return;
+            }
             JArr arr;
-            for (const auto& t : tokens) {
+            for (const auto& t : *tokens) {
                 arr.add(JObj()
                             .add("token_id", t.token_id)
                             .add("name", t.name)
@@ -7827,7 +7860,7 @@ void RestApiV1::register_routes(
                             .add("last_used_at", t.last_used_at)
                             .add("revoked", t.revoked));
             }
-            res.set_content(list_json(arr.str(), static_cast<int64_t>(tokens.size())),
+            res.set_content(list_json(arr.str(), static_cast<int64_t>(tokens->size())),
                             "application/json");
         });
 
@@ -7879,6 +7912,38 @@ void RestApiV1::register_routes(
             auto result = device_token_store->create_token(name, session->username, device_id,
                                                            definition_id, expires_at);
             if (!result) {
+                // ADR-0052: a genuine DB/lease failure (kDeviceTokenDbErrorPrefix) is not a
+                // CSPRNG failure — the pre-migration store could only fail this way, but the
+                // migrated store can also fail on a Postgres blip. Classify before assuming
+                // "entropy exhausted": mislabeling a DB fault as csprng_unavailable would both
+                // misinform SIEM and increment the wrong Prometheus counter.
+                if (result.error().starts_with(yuzu::server::kDeviceTokenDbErrorPrefix)) {
+                    bool audit_emitted = false;
+                    try {
+                        audit_emitted = audit_fn(req, "device_token.create", "failure",
+                                                 "DeviceToken", device_id,
+                                                 device_token_client_message(
+                                                     "POST /api/v1/device-tokens", result.error()));
+                    } catch (const std::exception& ex) {
+                        spdlog::error("device_token.create audit emission threw: {}", ex.what());
+                        audit_emitted = false;
+                    } catch (...) {
+                        spdlog::error("device_token.create audit emission threw unknown");
+                        audit_emitted = false;
+                    }
+                    res.status = 503;
+                    res.set_header("Retry-After", "5");
+                    if (!audit_emitted)
+                        res.set_header("Sec-Audit-Failed", "true");
+                    JObj envelope_err;
+                    envelope_err.add("code", 503).add("message", "service unavailable");
+                    JObj envelope;
+                    envelope.raw("error", envelope_err.str())
+                        .add("audit_emitted", audit_emitted)
+                        .raw("meta", R"({"api_version":"v1"})");
+                    res.set_content(envelope.str(), "application/json");
+                    return;
+                }
                 // sre-1: Prometheus signal for CSPRNG failure (see
                 // /api/v1/tokens comment for full rationale).
                 if (metrics_registry) {
@@ -7943,12 +8008,18 @@ void RestApiV1::register_routes(
                 if (!perm_fn(req, res, "DeviceToken", "Delete"))
                     return;
                 auto token_id = req.matches[1].str();
-                if (device_token_store->revoke_token(token_id)) {
+                auto result = device_token_store->revoke_token(token_id);
+                if (result) {
                     audit_fn(req, "device_token.revoke", "success", "DeviceToken", token_id, "");
                     res.set_content(ok_json(JObj().add("revoked", true).str()), "application/json");
                 } else {
-                    res.status = 404;
-                    res.set_content(detail::a4_error(res, "token not found"), "application/json");
+                    res.status = device_token_error_status(result.error());
+                    res.set_content(
+                        detail::a4_error(res, res.status == 404
+                                                  ? "token not found"
+                                                  : device_token_client_message(
+                                                        "DELETE /api/v1/device-tokens", result.error())),
+                        "application/json");
                 }
             });
     }

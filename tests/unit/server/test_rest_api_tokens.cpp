@@ -36,13 +36,11 @@
 #include <chrono>
 #include "../test_helpers.hpp"
 
-#include <filesystem>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-namespace fs = std::filesystem;
 using namespace yuzu::server;
 
 namespace {
@@ -54,15 +52,19 @@ struct AuditRecord {
     std::string detail;
 };
 
+// Shares the "devicetokenstore" key with test_device_token_store.cpp's and
+// test_rest_api_t2.cpp's own templates (identical setup, replay-verified per
+// docs/postgres-store-playbook.md step 7).
+yuzu::test::PgTestTemplate device_token_store_tpl{
+    "devicetokenstore", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        DeviceTokenStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("device_token_store template: store failed to migrate");
+    }};
+
 struct RestTokensHarness {
     yuzu::server::test::TestRouteSink sink;
-
-    // TempDbFile member sits ABOVE the store unique_ptrs (reverse-order
-    // destruction closes each store before its file + -wal/-shm are removed)
-    // — replaces the old manual dtor, which never removed the WAL/SHM
-    // companions (DeviceTokenStore runs journal_mode=WAL) and never ran at
-    // all if a ctor REQUIRE threw (#486 / qe-B1).
-    yuzu::test::TempDbFile device_db_file{"yuzu_test_rest_api_device_tokens-"};
 
     // ApiTokenStore ported to Postgres (PR 4.1). The happy-path arm clones an
     // ephemeral database via the shared ApiTokenStorePg helper (SKIPs when
@@ -71,6 +73,16 @@ struct RestTokensHarness {
     std::unique_ptr<yuzu::server::pg::PgPool> broken_pool;
     std::optional<yuzu::test::ApiTokenStorePg> token_store_pg;
     std::unique_ptr<ApiTokenStore> token_store_broken;
+
+    // DeviceTokenStore (ADR-0052) is Postgres-backed too, unconditionally —
+    // there is no "broken" arm for it (only ApiTokenStore's brokenness is
+    // under test in that arm); construction always needs a real reachable
+    // Postgres now, the same SKIP-if-unset/FAIL-if-broken posture as
+    // ApiTokenStorePg. Members declared in destruction-safe order (store
+    // closes before the pool, the pool closes before the ephemeral database
+    // is dropped) — mirrors ApiTokenStorePg's own private member order.
+    std::optional<yuzu::test::PostgresTestDb> device_token_db_;
+    std::optional<yuzu::server::pg::PgPool> device_token_pool_;
     std::unique_ptr<DeviceTokenStore> device_token_store;
 
     /// Returns the ApiTokenStore under test regardless of which arm
@@ -120,7 +132,24 @@ struct RestTokensHarness {
         } else {
             token_store_pg.emplace();
         }
-        device_token_store = std::make_unique<DeviceTokenStore>(device_db_file.path);
+
+        // ADR-0052: DeviceTokenStore has no SQLite fallback any more — every
+        // fixture that needs a real, functional store now needs real
+        // Postgres, unconditionally (including the broken_token_db arm,
+        // which only fakes ApiTokenStore's own brokenness). Same
+        // SKIP-if-unset / FAIL-if-broken posture as ApiTokenStorePg's own
+        // ctor.
+        if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+            SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+        }
+        device_token_db_.emplace(device_token_store_tpl);
+        INFO("[RestTokensHarness] device_token_db status (blank == came up OK): "
+             << device_token_db_->error());
+        REQUIRE(device_token_db_->available());
+        device_token_pool_.emplace(
+            yuzu::server::pg::PgPool::Options{.conninfo = device_token_db_->dsn(), .size = 4});
+        REQUIRE(device_token_pool_->valid());
+        device_token_store = std::make_unique<DeviceTokenStore>(*device_token_pool_);
         REQUIRE(device_token_store->is_open());
 
         auto auth_fn = [this](const httplib::Request&,
@@ -400,7 +429,8 @@ TEST_CASE("REST POST /api/v1/device-tokens: CSPRNG failure emits failure audit (
 
     // Store leak check.
     auto listing = h.device_token_store->list_tokens();
-    CHECK(listing.empty());
+    REQUIRE(listing.has_value());
+    CHECK(listing->empty());
 }
 
 TEST_CASE("HTMX POST /api/settings/api-tokens: CSPRNG failure persists failure "
@@ -740,7 +770,10 @@ TEST_CASE("REST POST /api/v1/tokens: CSPRNG failure returns 503 + Retry-After: 5
 // all store outages); the CH-3 signal is the 503-vs-404 status split.
 
 TEST_CASE("REST tokens: unopened token DB returns 503 on every route, never 404",
-          "[rest][token][issue347][ch3]") {
+          "[pg][rest][token][issue347][ch3]") {
+    // ADR-0052: [pg] added — this test's ApiTokenStore arm is still a fake
+    // unreachable pool (no real Postgres needed for THAT), but the harness's
+    // DeviceTokenStore member now needs a real one unconditionally.
     RestTokensHarness h(/*broken_token_db=*/true);
     h.session_user = "admin";
     h.session_role = auth::Role::admin;
