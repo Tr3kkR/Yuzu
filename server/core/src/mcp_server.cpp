@@ -6734,19 +6734,22 @@ McpServer::HandlerFn McpServer::build_handler(
                                   .raw("points", points.str())
                                   .str();
                 } else { // get_dex_group_app_perf
-                    // REST twin of this gap (GET /api/v1/dex/perf/group) was
-                    // found by this branch's own governance review (PR
-                    // #3156), while re-verifying the external review's
-                    // separate findings on this same file: perm_fn's global
-                    // GuaranteedState:Read check doesn't confine a
-                    // service-scoped token to its own service's management
-                    // groups, so it could otherwise supply any group_id.
-                    if (deny_fleet_wide_service_scoped(
-                            "dex.perf.group.view", "GuaranteedState",
-                            "management-group app-perf trend denied to a service-scoped token",
-                            "service-scoped tokens may not read a management group's app-perf "
-                            "trend"))
-                        return;
+                    // An interim deny_fleet_wide_service_scoped() call used to
+                    // sit here (perm_fn's global GuaranteedState:Read check
+                    // doesn't confine a service-scoped token to its own
+                    // service's management groups, so it could otherwise
+                    // supply any group_id — PR #3156). guardian-confinement-
+                    // 2298 PR 3 ("the flip") made it provably dead: perm_fn
+                    // above (shared by all three tool_name branches in this
+                    // block) already denies any service-scoped token
+                    // outright for (GuaranteedState, Read), before this
+                    // tool-specific branch is ever reached. Retired here,
+                    // #3290 Phase 2 bucket 1a. Its REST twin
+                    // (GET /api/v1/dex/perf/group) has the OPPOSITE call
+                    // order — its deny fires BEFORE perm_fn, so it is live
+                    // (redundant-but-reachable, not dead) and is deliberately
+                    // NOT touched here — see
+                    // docs/security-reviews/service-scope-phase2-migrations-2026-08.md.
                     if (!app_perf_providers.group) {
                         res.set_content(
                             error_response(id, kInternalError, "app-perf store provider unavailable",

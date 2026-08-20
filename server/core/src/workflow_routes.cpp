@@ -917,12 +917,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // schedule from every other service. Runs BEFORE perm_fn (independent
     // of RBAC on/off branch ordering) — matches the GuardianRoutes/DexRoutes/
     // NetworkRoutes family of fragment/REST denies with no single per-target
-    // to scope against. The schedule feature's OWN shared REST helper,
-    // deny_service_scoped_schedule (schedule_routes.hpp), deliberately runs
-    // the OPPOSITE order — AFTER its route's permission gate(s) — because
-    // its resolve_session doesn't write a response on failure the way this
-    // lambda's auth_fn does; both orderings are correct for their own
-    // callback contract, this is not one universal rule.
+    // to scope against: this fragment has no permission gate of its own to
+    // run after, unlike the now-retired REST `/api/schedules` family's
+    // interim deny (#3290 Phase 2 bucket 1a — that one ran AFTER its route's
+    // permission gate(s) and was made provably dead by the flip; this
+    // lambda's own route has no such gate, so it is NOT dead and stays).
     auto deny_service_scoped_schedule_list = [auth_fn, audit_fn](const httplib::Request& req,
                                                                   httplib::Response& res) -> bool {
         auto session = auth_fn(req, res);
