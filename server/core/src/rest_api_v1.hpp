@@ -142,6 +142,19 @@ public:
         std::function<ListReadGate(const httplib::Request&, httplib::Response&,
                                    const std::string& securable_type,
                                    const std::string& operation)>;
+    /// #3290 Phase 2 — the injected-callback twin of `AuthRoutes::require_fleet_read`
+    /// (see `authz::FleetReadGate`'s doc comment, authz_gates.hpp, for why this is a
+    /// plain fakeable aggregate rather than `ListAuthority` itself). MUST be the
+    /// route's SOLE authorization gate — never stacked with `PermFn` for the same
+    /// `(securable_type, operation)` (the identical BLOCKING defect `ListReadFn`
+    /// above exists to avoid; `require_fleet_read`'s own doc comment has the
+    /// falsifier). The empty/default `{}` exists ONLY for source-stability of
+    /// unrelated call sites — a route that requires this gate treats an unwired fn
+    /// as misconfiguration and FAILS CLOSED (503), mirroring `ListReadFn`'s contract.
+    using FleetReadFn =
+        std::function<authz::FleetReadGate(const httplib::Request&, httplib::Response&,
+                                           const std::string& securable_type,
+                                           const std::string& operation)>;
     /// Per-device Inventory-scope predicate for the fleet-wide installed-software
     /// read (GET /api/v1/inventory/software). Returns true iff `username` may see
     /// `agent_id`'s rows via a management group. A FILTER, not a gate: unlike
@@ -393,7 +406,11 @@ public:
         // gate (see ListReadFn's doc comment above). Trailing optional dep; `{}`
         // makes the route FAIL CLOSED (503) rather than silently fall back to
         // perm_fn — an unwired gate is misconfiguration, not "no filter".
-        ListReadFn list_read_fn = {});
+        ListReadFn list_read_fn = {},
+        // #3290 Phase 2: GET /api/v1/inventory/software's SOLE authorization gate
+        // (see FleetReadFn's doc comment above). Trailing optional dep; `{}` makes
+        // the route FAIL CLOSED (503), same contract as list_read_fn.
+        FleetReadFn fleet_read_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -458,7 +475,10 @@ public:
         ExecVisibleFn exec_visible_fn = {},
         // ADR-0017: see the production overload's doc comment above; identical
         // trailing-optional-dep, fail-closed-when-unwired contract.
-        ListReadFn list_read_fn = {});
+        ListReadFn list_read_fn = {},
+        // #3290 Phase 2: see the production overload's doc comment above; identical
+        // trailing-optional-dep, fail-closed-when-unwired contract.
+        FleetReadFn fleet_read_fn = {});
 
     /// PR 4.3 — engine-principal lifecycle store backing
     /// `/api/v1/engine-principals`, threaded post-construction. (During the

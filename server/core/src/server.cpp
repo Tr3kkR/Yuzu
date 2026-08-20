@@ -8535,6 +8535,23 @@ private:
         return auth_routes_->require_list_read(req, res, securable_type, operation);
     }
 
+    /// #3290 Phase 2 — converts `AuthRoutes::require_fleet_read`'s
+    /// `std::expected<ListAuthority, GateFailure>` into the plain, fakeable
+    /// `authz::FleetReadGate` seam `RestApiV1`/`McpServer` are injected with
+    /// (see `FleetReadGate`'s doc comment, authz_gates.hpp, for why —
+    /// `ListAuthority` is move-only with an `AuthRoutes`-friend-only
+    /// constructor). On failure the gate already wrote `res`; this just
+    /// erases the `GateFailure` detail the caller must not re-decode.
+    yuzu::server::authz::FleetReadGate require_fleet_read(const httplib::Request& req,
+                                                           httplib::Response& res,
+                                                           const std::string& securable_type,
+                                                           const std::string& operation) {
+        auto result = auth_routes_->require_fleet_read(req, res, securable_type, operation);
+        if (!result)
+            return {}; // admitted=false, res already written
+        return {true, result->visible_for_query()};
+    }
+
     /// #1788: the per-caller Execution:Execute visible set (nullopt == unfiltered),
     /// extracted verbatim from the `/api/command` handler so the MCP dispatch path
     /// (execute_instruction / execute_bundle) can intersect against the SAME
@@ -15419,6 +15436,17 @@ private:
                                    const std::string& op) -> yuzu::server::ListReadGate {
             return require_list_read(req, res, type, op);
         };
+        // #3290 Phase 2 admit-then-filter fleet-read gate (wraps
+        // require_fleet_read). GET /api/v1/inventory/software's SOLE
+        // authorization gate — never stacked with perm_fn (see
+        // rest_api_v1.cpp's route comment; same BLOCKING rule as list_read_fn
+        // above). Shared, byte-identical, with the MCP query_installed_software
+        // twin's set_fleet_read_fn wiring below — one conversion, two surfaces.
+        auto fleet_read_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                    const std::string& type,
+                                    const std::string& op) -> yuzu::server::authz::FleetReadGate {
+            return require_fleet_read(req, res, type, op);
+        };
         // Visible-agent SET resolver for filtering device-id-rendering lists (DEX
         // device drills). SAME policy as get_visible_agents_json / the /devices list:
         // nullopt = caller sees the whole fleet (global Infrastructure:Read OR RBAC
@@ -18220,7 +18248,11 @@ private:
             // ADR-0017: the fleet guaranteed-state status route's SOLE
             // authorization gate — see rest_api_v1.cpp's route comment for why
             // it must never be stacked with perm_fn.
-            list_read_fn);
+            list_read_fn,
+            // #3290 Phase 2: GET /api/v1/inventory/software's SOLE
+            // authorization gate — see rest_api_v1.cpp's route comment for
+            // why it must never be stacked with perm_fn.
+            fleet_read_fn);
 
         // -- Register MCP server routes ----------------------------------------
 

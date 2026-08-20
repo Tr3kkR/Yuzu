@@ -1392,7 +1392,7 @@ void RestApiV1::register_routes(
     ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
-    ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn) {
+    ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -1407,7 +1407,7 @@ void RestApiV1::register_routes(
                     std::move(inventory_scope_fn), std::move(response_scope_fn),
                     std::move(app_perf_providers), engine_principal_store, access_review_store,
                     auth_db, directory_sync, stream_budget, std::move(exec_visible_fn),
-                    std::move(list_read_fn));
+                    std::move(list_read_fn), std::move(fleet_read_fn));
 }
 
 void RestApiV1::register_routes(
@@ -1428,7 +1428,7 @@ void RestApiV1::register_routes(
     ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
-    ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn) {
+    ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
