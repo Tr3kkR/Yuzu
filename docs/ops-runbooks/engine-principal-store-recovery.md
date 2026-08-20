@@ -168,7 +168,17 @@ was answered `StoreUnreachable` from the failure backoff — i.e. the store was
 already found unreachable moments earlier, and the server is deliberately not
 re-asking on every stream tick. It cannot move while the store is healthy, so
 this is a true-positive signal about store reachability, not a cache-tuning
-metric.
+metric. The backoff arms only on CONFIRMED unreachability — the store closed,
+a query actually ran and failed, or PgPool's own connect-failure breaker is
+open (`connect_breaker_open()`, armed only by recent connect failures, never
+by pool saturation alone) — so **this alert firing already rules out ordinary
+pool saturation with a healthy database**; a bare lease-acquire timeout under
+those conditions does not move this counter. One residual edge: if the
+transport hangs rather than refusing (a silent firewall drop, a blackholed
+route), the breaker only arms once a connect attempt actually times out
+(bounded by `--postgres-connect-timeout`, default 10s) — so the very first
+~10s of that specific failure mode can still be ambiguous and not arm the
+backoff; it self-corrects once that first connect attempt fails.
 
 **What is happening to streams meanwhile.** Held-open MCP/SSE streams
 authenticated by an engine principal are being told "indeterminate", which is
@@ -183,11 +193,14 @@ particular signal.
    conjunction includes `engine_principal_store`. If `/readyz` is failing, this
    is a store-availability incident: go to "Detection signal" above and to
    `docs/postgres-store-playbook.md`.
-2. Is it the pool rather than the database? Check
-   `yuzu_pg_acquire_wait_seconds` and `yuzu_pg_pool_in_use`. Saturation with a
-   healthy database means lease starvation, not an outage — see the
-   pool-sizing guidance in `docs/user-manual/server-admin.md` and note the
-   boot warning about SSE stream capacity versus `--postgres-pool-size`.
+2. Check `yuzu_pg_acquire_wait_seconds` and `yuzu_pg_pool_in_use` for
+   corroborating detail — but note this alert firing already means the
+   confirmed-unreachable path was taken (store closed, a query ran and
+   failed, or the connect-failure breaker is open), not ordinary pool
+   saturation with a healthy database; see the pool-sizing guidance in
+   `docs/user-manual/server-admin.md` and the boot warning about SSE stream
+   capacity versus `--postgres-pool-size` if you want to rule out contention
+   as a contributing factor regardless.
 3. How much damage? `yuzu_mcp_stream_closes_total{reason="auth_unavailable"}`
    counts streams that already exhausted their grace window. A flat count
    means the backoff is absorbing the incident without killing sessions.
@@ -199,8 +212,14 @@ particular signal.
 
 **Recovery.** No operator action restores the streams directly — clients
 reconnect and resume via `Last-Event-ID`, and durable results remain fetchable
-by `execution_id`. Fix the underlying store or pool problem; the backoff
-re-probes within seconds of recovery, so streams re-establish on their own.
+by `execution_id`. For a transient connectivity problem (network blip, a
+restart), fix it and the backoff re-probes within seconds, so streams
+re-establish on their own. **This does NOT apply to a permanent condition** —
+check the server log for the `get_for_auth denied` warn line: one naming a
+SQLSTATE class-42 error ("NOT a transient PG-availability condition... schema
+or access-rule problem") means a missing table or a revoked grant, which will
+retry-fail indefinitely until an operator actually fixes the schema/grant; the
+backoff re-probing changes nothing for that case.
 
 **Do NOT** reflexively raise `--postgres-pool-size` in response to this alert.
 Adding connections to an already-struggling database makes matters worse;
