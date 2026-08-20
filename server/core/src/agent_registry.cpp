@@ -82,8 +82,13 @@ void AgentRegistry::register_agent(const pb::AgentInfo& info) {
                 // migration; this call site has no live caller today (device_token_store_ is
                 // never non-null in production).
                 //
-                // gov cpp-safety: this call now runs a blocking Postgres round-trip (up to
-                // kWriteTimeout, currently 4s) INSIDE the `mu_` critical section above — the
+                // gov cpp-safety + Gate 8 security-guardian: this call now runs a blocking
+                // Postgres round-trip INSIDE the `mu_` critical section above — up to
+                // kWriteTimeout (4s pool-acquire), PLUS a possible additional lock-wait up to
+                // lock_timeout_ms (10s default, server/core/src/pg/pg_pool.hpp) if a concurrent
+                // `validate_token` holds this row's `FOR UPDATE` lock — the same
+                // acquire-vs-lock-wait distinction ADR-0052's own "Capacity note" documents for
+                // `kValidateTimeout`, applying here too. The
                 // install-then-revoke atomicity W1.5/#823 requires is deliberate, but it means a
                 // future re-wiring serializes every `register_agent` caller behind this store's
                 // pool-acquire latency, the same lock-discipline shape `sweep_revoked` in this

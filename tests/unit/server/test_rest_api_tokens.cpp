@@ -730,7 +730,11 @@ TEST_CASE("REST device-token routes answer correct status on a genuine store fai
     h.session_user = "alice";
     h.session_role = auth::Role::admin;
 
-    // Seed one token before dropping the schema, so DELETE has a real id to target.
+    // Seed one token before dropping the schema — a pre-drop baseline confirming the store
+    // works normally, so the post-drop failures below are attributable to the schema drop, not
+    // to a fixture that was already broken. (DELETE's SECTION deliberately targets a HARDCODED
+    // id, not this seeded one — a genuine DB failure must preempt even a well-formed-looking
+    // request, and POST's own raw_token response never surfaces the seeded token_id to extract.)
     auto seeded = h.sink.Post("/api/v1/device-tokens",
                               R"({"name":"seed","device_id":"dev-seed","definition_id":""})");
     REQUIRE(seeded);
@@ -768,6 +772,17 @@ TEST_CASE("REST device-token routes answer correct status on a genuine store fai
         CHECK(res->body.find("device_token_store") == std::string::npos);
         yuzu::Labels labels{{"reason", "prng_failure"}, {"site", "device_token"}};
         CHECK(h.metrics.counter("yuzu_secure_random_failure_total", labels).value() == 0.0);
+        // gov Gate 8 quality-engineer: unlike the software-packages precedent (whose route never
+        // audits a store failure), this route's db_error branch DOES call audit_fn
+        // (rest_api_v1.cpp) — exercise its own Sec-Audit-Failed/audit_emitted try/catch, which
+        // was otherwise untested (only its CSPRNG twin had coverage, via audit_should_fail).
+        REQUIRE(h.audit_log.size() == 1);
+        CHECK(h.audit_log[0].action == "device_token.create");
+        CHECK(h.audit_log[0].result == "failure");
+        CHECK(h.audit_log[0].target_id == "dev-002");
+        CHECK(h.audit_log[0].detail.find("service unavailable") != std::string::npos);
+        CHECK(h.audit_log[0].detail.find("csprng_unavailable") == std::string::npos);
+        CHECK(res->get_header_value("Sec-Audit-Failed").empty()); // audit_fn succeeded here
     }
 
     SECTION("DELETE /api/v1/device-tokens/{id}: genuine failure is 503, distinct from 404") {

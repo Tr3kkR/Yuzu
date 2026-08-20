@@ -137,10 +137,10 @@ auth-credential store, not durability-on-top:
   ... a concurrent revoke_token could slip through between the read and the write"). A concurrent
   `revoke_token`/`revoke_by_principal` on the same row blocks until the transaction commits,
   rather than racing it.
-- **Capacity note for the future wiring PR (gov Gate 6 sre)** — `kValidateTimeout` (2000ms)
+- **Capacity note for the future wiring PR (gov Gate 6 sre)** — `kValidateTimeout` (`device_token_store.cpp`, 2000ms)
   bounds only the pool-acquire wait; the `SELECT ... FOR UPDATE` lock-wait inside `with_txn_for`
-  runs to `lock_timeout_ms` (10000ms default), a real worst case well past the 2s figure this ADR
-  otherwise documents as the budget. Once wired, `validate_token` is a genuine per-request
+  runs to `lock_timeout_ms` (10000ms default), a real worst case well past the 2s figure the
+  constant's name suggests. Once wired, `validate_token` is a genuine per-request
   bearer-credential hot path on httplib's thread-per-connection model, so a lease blocked on a
   contended row pins an HTTP worker, not just one slow response — pool saturation converts
   directly into worker starvation. The wiring PR should revisit `kValidateTimeout` toward a
@@ -301,13 +301,15 @@ migration follows the sharing one since all four files' setup is byte-identical)
   already distinguished 404 (not found) from a generic failure, and a blanket binary classifier
   would regress that to 400 for a dormant route with zero behavioral cost today but a needless
   regression the moment the route is ever re-wired live.
-- **Treating `revoked`/`last_used_at` with the same generic rank-based direction check as
-  `DeploymentStore`'s `status` enum.** Rejected — `revoked` is a two-value monotone flag with a
-  security consequence on one specific direction, not a multi-value lifecycle enum; forcing it
-  through a rank abstraction built for `{pending, running, completed, failed, cancelled}` would
-  either lose the security-relevant asymmetry (treating both directions identically) or require
-  inventing a rank scheme with no other purpose. A direct two-branch check states the actual
-  invariant more plainly than a rank number would.
+- **Computing an explicit `DeploymentStore`-style rank for `revoked`/`last_used_at`.** Rejected —
+  not because the sibling rank template's own direction rule differs (gov Gate 8 architect,
+  corrected: `DeploymentStore`/`LicenseStore`'s rank check is ALREADY direction-asymmetric —
+  fail-closed on legacy-ahead, benign WARN on stored-ahead — so reusing it on a boolean would
+  PRESERVE that asymmetry, not lose it, the same point the Backfill section above makes). The
+  actual reason is simpler: `revoked` is a two-value monotone flag with no terminal-tie case a
+  multi-value status enum has to resolve, so a rank computation has no other purpose here — a
+  direct two-branch check states the identical fail-closed-on-legacy-ahead invariant more plainly
+  than inventing a rank scheme just to immediately collapse it back to two outcomes would.
 - **Sharing `kDeviceTokenDbErrorPrefix` with an existing constant.** Rejected on the same grounds
   ADR-0048 rejected it for `LicenseStore` — different file, no existing coupling, no reason to
   risk one store's rename silently reclassifying another's routes.
