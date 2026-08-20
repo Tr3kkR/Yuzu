@@ -1510,8 +1510,14 @@ void McpStreamBridge::run_projector() {
             keys.swap(core_->dirty);  // `keys` is guaranteed empty here (the
                                       // clear above), so this ALSO empties
                                       // core_->dirty unconditionally
-            full_scan = core_->scan_all.load(std::memory_order_relaxed);
-            core_->scan_all.store(false, std::memory_order_relaxed);
+            // A separate load+store here would race the ONE writer that does
+            // not hold core_->mu (mark_dirty's outer catch, below) - its
+            // store(true) could land between the two and get silently
+            // clobbered by the store(false), losing the only recorded trace
+            // of the wake it was standing in for. exchange() closes that
+            // window: whichever side the race lands on, the flag is atomic
+            // as a single read-clear, not two.
+            full_scan = core_->scan_all.exchange(false, std::memory_order_relaxed);
         }
         // BARE-THREAD BOUNDARY: run_projector is a std::thread entry with no
         // caller try/catch, so ANY escaped exception is std::terminate (#2037
@@ -1526,12 +1532,13 @@ void McpStreamBridge::run_projector() {
                 std::lock_guard<std::mutex> lk(bridge_mu_);
                 if (full_scan) {
                     // Degraded-cycle fallback (WakeCore::scan_all): a dirty-key
-                    // insert hit an allocation failure in mark_dirty, or a
-                    // PRIOR cycle's body threw after its keys were already
-                    // swapped out (see the outer catch below) - either way
-                    // `keys` cannot be trusted as the full set of records with
-                    // pending work, so fall back to the pre-#2411 full-table
-                    // scan for this one cycle.
+                    // insert hit an allocation failure in mark_dirty, a PRIOR
+                    // cycle's body threw after its keys were already swapped
+                    // out (see the outer catch below), or mark_dirty could not
+                    // even acquire WakeCore::mu (its own outer catch) - any of
+                    // these leaves `keys` untrustworthy as the full set of
+                    // records with pending work, so fall back to the
+                    // pre-#2411 full-table scan for this one cycle.
                     snap.reserve(records_.size());
                     for (const auto& [key, rec] : records_) {
                         snap.push_back(rec);
@@ -1576,8 +1583,13 @@ void McpStreamBridge::run_projector() {
                     // site above. Under a PERSISTENT fault this spins
                     // visit->throw->re-mark - the same accepted risk class as the
                     // outer catch's re-arm below and the listener catch site
-                    // (tracked, with this site added, at #3331).
-                    spdlog::warn("MCP bridge projector: projection pass failed (contained)");
+                    // (tracked, with this site added, at #3331). execution_id,
+                    // not rec->key, in the log line - key embeds a literal
+                    // '\n' plus client-supplied jsonrpc_id (cpp:942).
+                    spdlog::warn(
+                        "MCP bridge projector: projection pass failed (contained) "
+                        "[execution_id={}]",
+                        rec->execution_id);
                     mark_dirty(*core_, rec->key);
                 }
                 flush_record_obs(*rec);

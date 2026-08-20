@@ -182,10 +182,14 @@
 //       listener's success and catch paths both call it after their
 //       record-mu scope has already closed; park_after_dispatch_failure,
 //       on_post_closed_keyed, take_post_batch's park-vs-claim fence, and
-//       sweep's per-victim defer call it with nothing held; and sweep's
+//       sweep's per-victim defer call it with nothing held; sweep's
 //       pressure mark-clearing walk's own record-mu hold closes BEFORE its
 //       mark_dirty call, so that site reaches WakeCore::mu under bridge_mu_
-//       alone, not bridge_mu_ → record mu. NOTHING is ever acquired while
+//       alone, not bridge_mu_ → record mu; and run_projector's per-record
+//       catch (the projection-failure re-mark, #3331) calls it with nothing
+//       held either - its bridge_mu_ scope has already closed before the
+//       per-record loop, and project_record's own lock, if any, is released
+//       by RAII unwind before the catch runs. NOTHING is ever acquired while
 //       holding it.
 //   McpSessionRegistry::mu_  - isolated leaf (stream_for/exists acquire nothing
 //       beneath; the bridge never calls the registry while holding bridge_mu_).
@@ -867,10 +871,12 @@ private:
         ///   - `!dirty.empty() ⇒ work_pending`, and any `mu`-HELD write of
         ///     `scan_all` (the insert-alloc-failure path, run_projector's
         ///     outer-catch re-arm) ⇒ `work_pending` - because those three
-        ///     writers set `work_pending = true` in the SAME `mu` critical
-        ///     section, and `work_pending` clears only in the SAME section
-        ///     that swaps `dirty` out empty and reads `scan_all` false. This
-        ///     half is what the lost-wakeup proof on mark_dirty depends on,
+        ///     writers - the ordinary dirty-key insert, the alloc-failure
+        ///     degrade, and the outer-catch re-arm - set `work_pending = true`
+        ///     in the SAME `mu` critical section, and `work_pending` clears
+        ///     only in the SAME section that swaps `dirty` out empty and
+        ///     exchanges `scan_all` for false. This half is what the
+        ///     lost-wakeup proof on mark_dirty depends on,
         ///     and it can never be observed false by a projector that just
         ///     re-acquired `mu`.
         ///   - the LOCK-FREE `scan_all` store (mark_dirty's outer catch, for
@@ -881,7 +887,13 @@ private:
         ///     correct because the wake this write would have accompanied is
         ///     already lost by hypothesis (the mutex fault ate it), so there
         ///     is nothing here for the invariant's "same critical section" to
-        ///     protect.
+        ///     protect. "Consumed" is load-bearing on run_projector's read
+        ///     being a SINGLE atomic exchange, not a separate load then
+        ///     store: a racing lock-free store(true) then lands either
+        ///     before the exchange (captured this cycle) or after (survives
+        ///     intact for the next) - a split load/store would let it land
+        ///     BETWEEN the two and be silently overwritten by the store,
+        ///     losing the breadcrumb this whole path exists to preserve.
         std::unordered_set<std::string> dirty;
         /// Degrade valve: a dirty-key insert hit an allocation failure, a
         /// prior cycle's body threw after already swapping its keys out (see
@@ -891,8 +903,10 @@ private:
         /// back to the pre-#2411 full-table scan instead. Lock-free: the
         /// third writer above (mark_dirty's outer catch) fires exactly when
         /// `mu` may be unavailable, so this cannot be `mu`-guarded like
-        /// `dirty` is; relaxed suffices because nothing is ordered around it,
-        /// only the flag's own eventual visibility to the next reader.
+        /// `dirty` is; relaxed suffices because nothing is ordered around it
+        /// - only the flag's own eventual visibility to the next reader,
+        /// which must consume it via a single exchange (see above), not a
+        /// load followed by a separate store.
         std::atomic<bool> scan_all{false};
     };
 

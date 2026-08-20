@@ -10,7 +10,8 @@
   pressure sweep) and drained by the projector each cycle: a wake visits only
   the record(s) it actually names, cutting the projector to O(dirty) rescans
   and `bridge_mu_` acquisitions per wake. Degrades safely to the old full-table
-  scan on a dirty-set allocation failure or a cycle that threw before
-  finishing, so no wake source can be silently starved. No observable behavior
+  scan on a dirty-set allocation failure, a cycle that threw before finishing,
+  or a fault acquiring the wake lock itself, so no wake source can be silently
+  starved. No observable behavior
   change — the same records get projected, just without visiting every other
   live record to do it. (#2411)
