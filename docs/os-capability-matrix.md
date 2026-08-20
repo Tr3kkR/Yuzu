@@ -395,7 +395,7 @@ implementation is.
 | interaction | set_dnd | macos | supported | 1 | local_kv_store | - |
 | interaction | set_dnd | windows | supported | 1 | local_kv_store | - |
 | ioc | check | linux | supported | 1 | procfs | - |
-| ioc | check | macos | supported | 3 | lsof | - |
+| ioc | check | macos | supported | 1 | libproc | UDP rows carry an empty state (no fabricated "LISTEN") — a real UDP listener still matches a port check, but its detail text differs from a TCP match; a port shared by more than one process (SO_REUSEPORT, prefork) reports the pid of one arbitrarily-chosen owner in its match detail, not every owner |
 | ioc | check | windows | supported | 1 | iphlpapi_dnsapi | - |
 | license_scan | list | linux | supported | 3 | popen(rpm/dpkg-query/openssl) | - |
 | license_scan | list | macos | constrained | 1 | filesystem_probe(glob+plist) | binary (bplist00) Info.plist files are not parsed; falls back to the bundle name with an empty version |
@@ -446,19 +446,19 @@ implementation is.
 | network_config | arp | macos | unsupported | - | - | - |
 | network_config | arp | windows | supported | 1 | GetIpNetTable2 | - |
 | network_diag | listening | linux | supported | 1 | /proc/net/tcp[6] | - |
-| network_diag | listening | macos | supported | 3 | lsof via popen | - |
+| network_diag | listening | macos | supported | 1 | libproc | a socket shared by more than one process (SO_REUSEPORT, prefork) surfaces under one arbitrarily-chosen owning PID, not one row per owner |
 | network_diag | listening | windows | supported | 1 | GetExtendedTcpTable | - |
 | network_diag | connections | linux | supported | 1 | /proc/net/tcp[6] | - |
-| network_diag | connections | macos | supported | 3 | lsof via popen | - |
+| network_diag | connections | macos | supported | 1 | libproc | a socket shared by more than one process (SO_REUSEPORT, prefork) surfaces under one arbitrarily-chosen owning PID, not one row per owner |
 | network_diag | connections | windows | supported | 1 | GetExtendedTcpTable | - |
 | os_info | os_name | linux | supported | 1 | /etc/os-release | - |
-| os_info | os_name | macos | supported | 3 | popen(sw_vers -productName/-productVersion) | - |
+| os_info | os_name | macos | supported | 1 | SystemVersion.plist + sysctlbyname | - |
 | os_info | os_name | windows | supported | 1 | Reg*W CurrentVersion\\ProductName + build-number correction | - |
 | os_info | os_version | linux | supported | 1 | uname(2) | - |
-| os_info | os_version | macos | supported | 3 | uname(2) + popen(sw_vers -productVersion) | - |
+| os_info | os_version | macos | supported | 1 | uname(2) + SystemVersion.plist + sysctlbyname | - |
 | os_info | os_version | windows | supported | 1 | RtlGetVersion (ntdll) | - |
 | os_info | os_build | linux | supported | 1 | /proc/version | - |
-| os_info | os_build | macos | supported | 3 | popen(sw_vers -buildVersion) | - |
+| os_info | os_build | macos | supported | 1 | SystemVersion.plist + sysctlbyname | - |
 | os_info | os_build | windows | supported | 1 | Reg*W CurrentBuildNumber + UBR | - |
 | os_info | os_arch | linux | supported | 1 | uname(2) | - |
 | os_info | os_arch | macos | supported | 1 | uname(2) | - |
@@ -467,16 +467,16 @@ implementation is.
 | os_info | uptime | macos | supported | 1 | sysctl(2) KERN_BOOTTIME | - |
 | os_info | uptime | windows | supported | 1 | GetTickCount64 | - |
 | processes | list | linux | supported | 1 | /proc enumeration | - |
-| processes | list | macos | supported | 3 | popen(ps -axo pid,ppid,comm) | - |
+| processes | list | macos | supported | 1 | sysctl(KERN_PROC_ALL) | - |
 | processes | list | windows | supported | 1 | CreateToolhelp32Snapshot | - |
 | processes | list_hashed | linux | supported | 1 | /proc enumeration + readlink(/proc/<pid>/exe) + SHA-256 | - |
-| processes | list_hashed | macos | supported | 3 | popen(ps -axo pid,ppid,comm) + proc_pidpath + SHA-256 | - |
+| processes | list_hashed | macos | supported | 1 | sysctl(KERN_PROC_ALL) + proc_pidpath + SHA-256 | - |
 | processes | list_hashed | windows | supported | 1 | CreateToolhelp32Snapshot + QueryFullProcessImageNameW + SHA-256 | - |
 | processes | list_tree | linux | supported | 1 | /proc enumeration + readlink(/proc/<pid>/exe) + SHA-256 | - |
-| processes | list_tree | macos | supported | 3 | popen(ps -axo pid,ppid,comm) + proc_pidpath + SHA-256 | - |
+| processes | list_tree | macos | supported | 1 | sysctl(KERN_PROC_ALL) + proc_pidpath + SHA-256 | - |
 | processes | list_tree | windows | supported | 1 | CreateToolhelp32Snapshot + QueryFullProcessImageNameW + SHA-256 | - |
 | processes | query | linux | supported | 1 | /proc enumeration | - |
-| processes | query | macos | supported | 3 | popen(ps -axo pid,ppid,comm) | - |
+| processes | query | macos | supported | 1 | sysctl(KERN_PROC_ALL) | - |
 | processes | query | windows | supported | 1 | CreateToolhelp32Snapshot | - |
 | procfetch | procfetch_fetch | linux | supported | 1 | /proc enumeration + OpenSSL EVP SHA-1 | - |
 | procfetch | procfetch_fetch | macos | supported | 1 | libproc (proc_listpids/proc_pidpath) + OpenSSL EVP SHA-1 | - |

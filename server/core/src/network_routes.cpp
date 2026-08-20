@@ -7,7 +7,7 @@
 #include "network_routes.hpp"
 
 #include "http_route_sink.hpp"
-#include "rest_a4_envelope.hpp"
+#include "rest_a4_envelope_http.hpp" // detail::a4_denial
 #include "rest_audit.hpp"
 
 #include <algorithm>
@@ -104,17 +104,21 @@ void NetworkRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         // already returns application/json on its 403 here).
         if (auto session = auth_fn_(req, res)) {
             if (!session->token_scope_service.empty()) {
+                // Write the 403 FIRST, audit after (normalized — #3167).
+                // `.permission` omitted: kServiceScopeGlobalSafe is
+                // compile-time-empty, so no grant admits a service-scoped
+                // caller here; naming one would be a false self-remediation
+                // claim.
+                res.status = 403;
+                res.set_content(
+                    detail::a4_denial(
+                        res, 403,
+                        "service-scoped tokens may not read this fleet-wide network view"),
+                    "application/json");
                 (void)detail::try_persist_audit(
                     audit_fn_, req, "network.device.view", "denied", "GuaranteedState", "",
                     "fleet-wide network device list denied to a service-scoped token "
                     "(dashboard fragment)");
-                const auto cid = detail::make_correlation_id();
-                res.status = 403;
-                res.set_content(
-                    detail::error_json_a4(
-                        403, "service-scoped tokens may not read this fleet-wide network view",
-                        cid, detail::A4ErrorOpts{.permission = "GuaranteedState:Read"}),
-                    "application/json");
                 return;
             }
         } else {

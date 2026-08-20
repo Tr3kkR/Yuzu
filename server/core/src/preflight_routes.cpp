@@ -19,7 +19,7 @@
 #include "preflight_parse.hpp"      // kPreflightChecks, compute_device_results, bucket_from_token
 #include "preflight_run_store.hpp"  // PreflightRunStore + rows
 #include "http_route_sink.hpp"
-#include "rest_a4_envelope.hpp"     // detail::error_json_a4, make_correlation_id
+#include "rest_a4_envelope_http.hpp" // detail::a4_denial (deny_service_scoped_)
 #include "rest_audit.hpp"           // detail::try_persist_audit
 #include "web_utils.hpp"            // html_escape
 
@@ -217,13 +217,17 @@ bool PreflightRoutes::deny_service_scoped_(const httplib::Request& req, httplib:
         return true; // auth_fn_ already wrote the response (401/etc).
     if (session->token_scope_service.empty())
         return false;
-    const auto cid = detail::make_correlation_id();
     // Write the 403 FIRST, audit after (mirrors DexRoutes/GuardianRoutes'
     // deny_service_scoped_): a throwing audit_fn_ must not suppress the 403.
+    // `permission` defaults empty (see header) — a caller passing a non-empty
+    // override is now itself a bug, since no grant admits a service-scoped
+    // caller here. `a4_denial` also fixes a second bug found in the same
+    // pass (#3167): the hand-built cid never reached the X-Correlation-Id
+    // header.
     res.status = 403;
     res.set_content(
-        detail::error_json_a4(
-            403, "service-scoped tokens may not access this fleet-wide pre-flight surface", cid,
+        detail::a4_denial(
+            res, 403, "service-scoped tokens may not access this fleet-wide pre-flight surface",
             detail::A4ErrorOpts{.permission = permission}),
         "application/json");
     (void)detail::try_persist_audit(audit_fn_, req, action, "denied", "Scope", "", audit_detail);
@@ -304,8 +308,7 @@ void PreflightRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
         // delete evidence for a fleet-wide run outside its own service
         // (SEC-2/SEC-3 class).
         if (deny_service_scoped_(req, res, "preflight.run.delete",
-                                 "pre-flight run delete denied to a service-scoped token",
-                                 "Execution:Execute"))
+                                 "pre-flight run delete denied to a service-scoped token"))
             return;
         // A destructive mutation → the Execute tier (you needed Execute to create
         // the run), not a read tier (#governance least-privilege).
@@ -351,16 +354,19 @@ void PreflightRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
         // though every dispatched check is itself read-only per the /auto
         // Pre-flight routed-concern's own safety invariant).
         if (!session->token_scope_service.empty()) {
-            const auto cid = detail::make_correlation_id();
+            // Write the 403 FIRST, audit after (normalized to match this
+            // file's shared deny_service_scoped_ helper — #3167). `.permission`
+            // omitted: kServiceScopeGlobalSafe is compile-time-empty, so no
+            // grant admits a service-scoped caller here; naming one would be a
+            // false self-remediation claim.
+            res.status = 403;
+            res.set_content(
+                detail::a4_denial(
+                    res, 403, "service-scoped tokens may not start a fleet-wide pre-flight run"),
+                "application/json");
             (void)detail::try_persist_audit(
                 audit_fn_, req, "preflight.run", "denied", "Scope", "",
                 "fleet-wide pre-flight dispatch denied to a service-scoped token");
-            res.status = 403;
-            res.set_content(
-                detail::error_json_a4(
-                    403, "service-scoped tokens may not start a fleet-wide pre-flight run", cid,
-                    detail::A4ErrorOpts{.permission = "Infrastructure:Read"}),
-                "application/json");
             return;
         }
         // Run dispatches AND renders the (Infrastructure:Read) result grid +
