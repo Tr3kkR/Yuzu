@@ -17,9 +17,11 @@
 #include "spark_mechanism.hpp"
 
 #include "test_helpers.hpp"
+#include "test_log_capture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
@@ -30,6 +32,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <system_error>
 #include <atomic>
 #include <condition_variable>
 #include <thread>
@@ -109,6 +112,10 @@ public:
         std::lock_guard<std::mutex> lk{mu_};
         return watched_.size();
     }
+    std::set<std::string> watched_snapshot() {
+        std::lock_guard<std::mutex> lk{mu_};
+        return watched_;
+    }
 
 private:
     std::mutex mu_;
@@ -117,7 +124,12 @@ private:
 };
 
 // Service: the ONE type with a mechanism registered in this fixture -> Arm.
-gpb::GuaranteedStateRule make_service_rule(const std::string& id, bool enabled = true) {
+// `service` defaults to "Spooler" so every existing call site is unaffected;
+// tests that need to distinguish which of several rules armed pass a distinct
+// name (#2238 item 1 - three rules sharing one service name would all derive
+// the same spark key and be indistinguishable in the mechanism's watch set).
+gpb::GuaranteedStateRule make_service_rule(const std::string& id, bool enabled = true,
+                                           const std::string& service = "Spooler") {
     gpb::GuaranteedStateRule r;
     r.set_rule_id(id);
     r.set_name(id);
@@ -126,7 +138,7 @@ gpb::GuaranteedStateRule make_service_rule(const std::string& id, bool enabled =
     r.mutable_spark()->set_type("service-status-change");
     auto* a = r.mutable_assertion();
     a->set_type("service-running");
-    (*a->mutable_params())["service_name"] = "Spooler";
+    (*a->mutable_params())["service_name"] = service;
     return r;
 }
 
@@ -449,6 +461,102 @@ TEST_CASE("a production-order restart reconstructs unsupported_rules_ from cache
 
     engine.stop();
     spark_engine.stop();
+}
+
+TEST_CASE("start_local degrades per-rule when a re-arm throws: the other cached rules "
+          "still arm",
+          "[spark][guardian][reconcile][boot]") {
+    // #2238 item 1 (fixes BLOCKING-2a): guardian_engine.cpp's start_local() catches a
+    // std::system_error thrown while re-arming a single cached rule (modelling a legacy
+    // guard's std::thread ctor throwing under thread/handle exhaustion) and continues to
+    // the next rule instead of letting the throw escape and terminate the agent. Nothing
+    // in production can force that throw deterministically (see the handover's survey of
+    // guard_systemd.cpp / guard_file.cpp / guard_registry.cpp), so this drives it via
+    // set_rearm_fault_hook_for_test, aimed at exactly one rule by id, and proves: (a)
+    // start_local() still returns success, (b) the OTHER cached rules still arm, and (c)
+    // an error is logged naming the failed rule.
+    const auto kv_path = unique_kv_path();
+    yuzu::test::TempDbFile db{kv_path};
+
+    // Phase 1: seed three rules with distinct service names, all armable via spark.
+    {
+        auto opened = KvStore::open(kv_path);
+        REQUIRE(opened.has_value());
+        KvStore kv{std::move(*opened)};
+        SparkEngine spark_engine;
+        auto mech = std::make_unique<FakeServiceMechanism>();
+        REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
+        spark_engine.start();
+        GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+        REQUIRE(engine.start_local().has_value());
+        engine.wire_spark_engine(&spark_engine, false,
+                                 [](const OutboxEntry&) { return SendResult::Sent; });
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        *p.add_rules() = make_service_rule("r1", true, "SvcA");
+        *p.add_rules() = make_service_rule("r2", true, "SvcB");
+        *p.add_rules() = make_service_rule("r3", true, "SvcC");
+        REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString())
+                    .exit_code == 0);
+        REQUIRE(engine.spark_armed_rule_count() == 3);
+        engine.stop();
+        spark_engine.stop();
+    }
+
+    // Phase 2: production order (wire_spark_engine before start_local), so spark is
+    // Available during the re-arm walk and the un-poisoned rules can actually arm on
+    // Linux (legacy guard start() stubs return false here - only the spark backend can
+    // demonstrate "other rules still arm").
+    auto opened = KvStore::open(kv_path);
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    auto mech = std::make_unique<FakeServiceMechanism>();
+    FakeServiceMechanism* mechanism = mech.get();
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
+    spark_engine.start();
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+    engine.wire_spark_engine(&spark_engine, false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+
+    engine.set_rearm_fault_hook_for_test([](const std::string& rule_id) {
+        if (rule_id == "r2")
+            throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again),
+                                    "injected thread exhaustion");
+    });
+
+    yuzu::test::LogCapture cap;
+    REQUIRE(engine.start_local().has_value()); // degrade contract: success despite one poisoned rule
+
+    // Assert BEFORE stop() - stop() unwinds spark watch state.
+    CHECK(engine.rule_count() == 3);           // cache intact, including the poisoned rule
+    CHECK(engine.spark_armed_rule_count() == 2); // r1 + r3 only
+    const auto watched = mechanism->watched_snapshot();
+    const bool has_a =
+        std::any_of(watched.begin(), watched.end(), [](const std::string& k) { return k.find("SvcA") != std::string::npos; });
+    const bool has_b =
+        std::any_of(watched.begin(), watched.end(), [](const std::string& k) { return k.find("SvcB") != std::string::npos; });
+    const bool has_c =
+        std::any_of(watched.begin(), watched.end(), [](const std::string& k) { return k.find("SvcC") != std::string::npos; });
+    CHECK(has_a);
+    CHECK_FALSE(has_b); // the poisoned rule never armed
+    CHECK(has_c);
+    CHECK(mechanism->watching_count() == 2);
+
+    // Quiesce every thread that can still log before reading the capture (LogCapture's
+    // documented ordering contract).
+    engine.set_rearm_fault_hook_for_test(nullptr);
+    cap.stop();
+    engine.stop();
+    spark_engine.stop();
+
+    const std::string logs = cap.text();
+    CHECK(logs.find("r2") != std::string::npos);
+    CHECK(logs.find("failed to re-arm") != std::string::npos);
+    CHECK(logs.find("NOT enforcing") != std::string::npos);
+    CHECK(logs.find("injected thread exhaustion") != std::string::npos);
+    CHECK(logs.find("re-armed=2") != std::string::npos);
 }
 
 TEST_CASE("prefer_spark=false never populates unsupported_rules_, even for a type "

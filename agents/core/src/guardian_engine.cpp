@@ -276,6 +276,8 @@ std::expected<void, std::string> GuardianEngine::start_local() {
         // Degrade per-rule (LOUD error, this rule does not enforce) so the agent survives
         // to arm the rest, rather than terminating the whole process.
         try {
+            if (rearm_fault_hook_for_test_)
+                rearm_fault_hook_for_test_(rule.rule_id());
             if (reconcile_rule_locked(rule)) // count only rules that actually armed (either backend)
                 ++rearmed;
         } catch (const std::exception& e) {

@@ -351,6 +351,26 @@ public:
     /// pass rather than a failure (Sol review).
     void set_maintenance_jitter(bool on) { maintenance_jitter_ = on; }
 
+    /// TEST-ONLY: if set, invoked inside start_local()'s re-arm walk once per cached
+    /// enabled rule, immediately BEFORE reconcile_rule_locked() — so a throw from the
+    /// hook simulates the failure class the surrounding catch exists for (a legacy
+    /// guard's std::thread ctor throwing std::system_error under thread/handle
+    /// exhaustion), aimed at exactly one rule by rule_id. Deliberately NOT fired from
+    /// inside reconcile_rule_locked() itself, which would also fire on the apply_rules
+    /// path this seam is not meant to touch.
+    ///
+    /// This is fault INJECTION into an existing degrade handler, not the mutable
+    /// spark-vs-legacy DECISION setter rev-1 review rejected (see SparkAvailability
+    /// above) — same class of seam as SparkEngine::set_arm_fault_hook_for_test (#2270).
+    ///
+    /// CONTRACT: fires with mtx_ HELD (start_local() holds it for the whole re-arm
+    /// walk) — throw or observe only; re-entering the engine from the hook
+    /// self-deadlocks. MUST be set BEFORE start_local() runs (set-then-use). No
+    /// production caller.
+    void set_rearm_fault_hook_for_test(std::function<void(const std::string& rule_id)> hook) {
+        rearm_fault_hook_for_test_ = std::move(hook);
+    }
+
     /// Live bounded-I/O worker count on the spark reader (0 if never wired) -
     /// the F3 orphan-exit obligation's plumbing (rung 7.6 is the enforcement).
     [[nodiscard]] std::size_t active_io_workers() const;
@@ -495,6 +515,8 @@ private:
     /// Maintenance phase/forced-page jitter (see set_maintenance_jitter). OFF unless the
     /// production wiring turns it on, so every test's cadence stays deterministic.
     bool maintenance_jitter_{false};
+    /// TEST-ONLY re-arm fault injector (see set_rearm_fault_hook_for_test); null = no-op.
+    std::function<void(const std::string&)> rearm_fault_hook_for_test_;
     std::unordered_map<std::string, std::unique_ptr<IGuard>> guards_;
 
     /// rule_id -> SparkType for every rule CURRENTLY classified RulePlacement::Unsupported
