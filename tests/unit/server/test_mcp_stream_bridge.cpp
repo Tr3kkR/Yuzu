@@ -656,29 +656,37 @@ TEST_CASE("bridge #2411 - a wake dirty-marks only ITS OWN record, not every reco
         return fx.reg.counter("yuzu_mcp_bridge_projector_cycles_total").value() >=
                cycles_before + 1.0;
     }));
-    // QUARANTINED (#3357) - deliberately NOT a CHECK. Read this before "fixing" it.
+    // QUARANTINED (#3357) - deliberately NOT a CHECK, and NOT because it is flaky.
+    // Read this before "fixing" it: the assertion is wrong, the code is right.
     //
-    // B still gets poked here, and it is NOT a timing artifact of the old 100 ms
-    // window: with the deterministic barrier above and no wall-clock window at
-    // all, it still reproduces. Measured on Linux over 80 runs each - original
-    // 5 failures, barrier version 2. It was never macOS-specific; the move to the
-    // self-hosted BigMags pool (3fed7c64) only raised the hit rate enough to be
-    // noticed.
+    // What this asserts - "A's wake must never poke B" - is something the design
+    // deliberately does NOT provide. The projector's snapshot iterates ALL of
+    // records_, not a dirty set, and project_record's kStreaming arm then pokes
+    // ANY record it visits whose has_pending_work_locked() is true, on purpose:
+    // "its whole job there is to FORWARD THE WAKE ... the pump would otherwise
+    // sleep out its tick on work already latched" (mcp_stream_bridge.cpp, the
+    // `ph == Phase::kStreaming && out == nullptr` arm). So a wake on ANY record
+    // pokes every streaming record that has latched work. B is one.
     //
-    // Mechanism: project_record()'s kStreaming arm pokes ANY record it visits
-    // whose has_pending_work_locked() is true, and B's stays true for the rest of
-    // the test (nothing drains it). So this assertion holds only if B is never
-    // VISITED - and sometimes it is. That is the #2411 O(dirty) invariant itself,
-    // which makes this a product question, not a test one.
+    // The comment above claiming B's pending work "stays true for the rest of B's
+    // life" is also wrong: has_pending_work_locked is `mb_count > 0 &&
+    // !pressure_requested` (or an unprojected terminal), and B's mailbox is
+    // normally drained before A's wake triggers a pass. That is the whole story of
+    // the ~6% - in most runs B has no pending work when the pass lands, so no poke;
+    // in the rest it does, and the design forwards the wake exactly as documented.
+    // Measured on Linux over 80 runs each: 5 failures with the original 100 ms
+    // window, 2 with a deterministic barrier and no window at all. It was never
+    // macOS-specific - the BigMags move (3fed7c64) only raised the hit rate.
     //
-    // Quarantined as a WARN so a ~3% flake stops reddening dev and unrelated PRs.
-    // The cost is real and is the reason #3357 stays open: while this is a WARN,
-    // a genuine pre-#2411 full-table-scan regression would NOT fail CI here. The
-    // surrounding CHECKs still hold (they are deterministic); only the
-    // wake-isolation claim is unguarded.
+    // #2411's O(dirty) guarantee is real, but it lives in project_record's cheap
+    // early-return for records with nothing to do - NOT in which records get
+    // visited. A correct test for it asserts that A's wake does no WORK on B (its
+    // mailbox is not drained, no frames emitted), not that B is not poked.
+    // Re-expressing it that way is #3357; until then this stays an observation.
     if (sink->poked.load(std::memory_order_acquire)) {
-        WARN("#3357: A's wake poked B's sink - the #2411 O(dirty) invariant did not "
-             "hold on this run. Quarantined, not a failure. See #3357.");
+        WARN("#3357: A's wake poked B's sink. This is EXPECTED under the current "
+             "wake-forwarding design and is not a defect - the assertion here is "
+             "the thing that needs re-expressing. Recorded, not a failure.");
     }
 }
 
