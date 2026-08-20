@@ -201,7 +201,6 @@ struct RestEventsHarness {
                             /*baseline_store=*/nullptr,
                             /*scoped_perm_fn=*/{},
                             /*software_inventory_store=*/nullptr,
-                            /*inventory_scope_fn=*/{},
                             /*response_scope_fn=*/{},
                             /*app_perf_providers=*/{},
                             /*engine_principal_store=*/nullptr,

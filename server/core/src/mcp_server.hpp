@@ -191,22 +191,6 @@ public:
     using ResponseScopeFn =
         std::function<bool(const std::string& username, const std::string& agent_id)>;
 
-    /// Per-agent INVENTORY-scope predicate — same shape as ResponseScopeFn but
-    /// bound to ("Inventory","Read"), so `query_installed_software` filters its
-    /// fleet rows to the caller's management groups (INTENDED cross-operator
-    /// isolation, mirrors the #1550 query_responses filter — same inert-under-the-
-    /// global-gate class, NOT achieved isolation). NOTE (ADR-0017): this
-    /// filter is INERT under the global Inventory:Read gate — a confined operator
-    /// is denied at the gate before it runs, a global operator's filter is a no-op —
-    /// so it does not yet narrow list reads; it is the foundation the ADR-0017
-    /// admit-then-filter list gate builds on (#1716). Same fail-open-when-unwired
-    /// contract: an unset predicate (`= {}`) applies NO filter (legacy-open /
-    /// RBAC-off). The SOLE production caller (server.cpp) MUST wire it to
-    /// rbac_store->check_scoped_permission(username,"Inventory","Read",agent_id,
-    /// mgmt_store). Do NOT add a new production registration without wiring it.
-    using InventoryScopeFn =
-        std::function<bool(const std::string& username, const std::string& agent_id)>;
-
     /// Send command callback — dispatches a command and returns (command_id, agents_reached).
     ///
     /// `execution_id` is the pre-created `ExecutionTracker` row id, threaded
@@ -261,8 +245,8 @@ public:
     /// unavailable"), never silently admitted — mirrors
     /// `ApiTokenStore::set_engine_referent_check`'s fail-closed-when-unwired
     /// posture, not the FAIL-OPEN-WHEN-UNWIRED contract used by
-    /// ResponseScopeFn/InventoryScopeFn above (those are defense-in-depth
-    /// filters over an already-gated read; this is the sole check standing
+    /// ResponseScopeFn above (a defense-in-depth filter over an already-gated
+    /// read; this is the sole check standing
     /// between an MCP write and a dangling owner reference).
     using OwnerExistsFn = std::function<bool(const std::string& username)>;
 
@@ -327,8 +311,8 @@ public:
     /// upload-grant tool answers "unavailable"; unset (default-constructed)
     /// `list_read_fn` fails CLOSED (kDenyAll), matching the REST twin's own
     /// unwired default (file_retrieval_routes.hpp's Deps doc comment) — NOT
-    /// the fail-open-when-unwired contract ResponseScopeFn/InventoryScopeFn
-    /// above use, because this is the sole admit decision for the route, not
+    /// the fail-open-when-unwired contract ResponseScopeFn above uses,
+    /// because this is the sole admit decision for the route, not
     /// a defense-in-depth filter over an already-gated read.
     using UploadGrantListReadFn =
         std::function<UploadGrantListAuthorization(const std::string& username)>;
@@ -391,7 +375,6 @@ public:
                             DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
                             ResponseScopeFn response_scope_fn = {},
                             SoftwareInventoryStore* software_inventory_store = nullptr,
-                            InventoryScopeFn inventory_scope_fn = {},
                             yuzu::MetricsRegistry* metrics = nullptr,
                             AppPerfProviders app_perf_providers = {},
                             QuarantineStore* quarantine_store = nullptr,
@@ -508,7 +491,6 @@ public:
                          DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
                          ResponseScopeFn response_scope_fn = {},
                          SoftwareInventoryStore* software_inventory_store = nullptr,
-                         InventoryScopeFn inventory_scope_fn = {},
                          yuzu::MetricsRegistry* metrics = nullptr,
                          AppPerfProviders app_perf_providers = {},
                          QuarantineStore* quarantine_store = nullptr,

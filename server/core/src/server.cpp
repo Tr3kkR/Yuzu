@@ -9026,22 +9026,6 @@ private:
                                                                    agent_id, mgmt_group_store_.get());
     }
 
-    /// Same shape as `response_agent_in_scope`, bound to ("Inventory","Read"): the
-    /// per-device Inventory-scope predicate for GET /api/v1/inventory/software (REST)
-    /// and query_installed_software (MCP). Was two byte-identical inline lambdas
-    /// gating on the raw `!is_rbac_enabled()` accessor instead of
-    /// `rbac_enforcement_in_effect` — that accessor can read stale-false while RBAC is
-    /// durably enabled elsewhere (a degraded generation-refresh cache, ADR-0041), which
-    /// would silently disclose the whole fleet's software inventory to a confined
-    /// operator (governance re-review, #2703). Hoisted to one definition so the REST
-    /// and MCP surfaces cannot drift the way #2500's dispatch-targeting defect did.
-    bool inventory_agent_in_scope(const std::string& username, const std::string& agent_id) const {
-        if (!rbac_enforcement_in_effect(rbac_store_.get()))
-            return true; // loaded & explicitly disabled → legacy-open
-        return rbac_store_ && rbac_store_->check_scoped_permission(username, "Inventory", "Read",
-                                                                   agent_id, mgmt_group_store_.get());
-    }
-
     /// Return the agent list as JSON, filtered by RBAC visibility for the given user.
     nlohmann::json get_visible_agents_json(const std::string& username) {
         auto agents = registry_.to_json_obj();
@@ -18201,17 +18185,11 @@ private:
             // agentic-first /api/v1/dex/devices/* endpoints use, so a REST worker is
             // held to the same per-device scope (defined once above, not re-inlined).
             scoped_perm_fn,
-            // ADR-0016: the typed daily-sync software store + its per-device
-            // Inventory-scope predicate for GET /api/v1/inventory/software. SAME
-            // management-group chokepoint (check_scoped_permission) as the MCP
-            // query_installed_software tool, bound to ("Inventory","Read"), so a
-            // REST worker's fleet-wide software query returns only devices inside
-            // their groups (cross-operator isolation). MUST be wired here; the
-            // param defaults to {} = no filter (unscoped fleet read).
+            // ADR-0016: the typed daily-sync software store for
+            // GET /api/v1/inventory/software. Its per-agent scope predicate is
+            // fleet_read_fn below (#3290 Phase 2) — the route's own
+            // require_fleet_read gate replaced the retired InventoryScopeFn.
             software_inventory_store_.get(),
-            [this](const std::string& username, const std::string& agent_id) -> bool {
-                return inventory_agent_in_scope(username, agent_id);
-            },
             // #1634: per-agent Response-scope predicate for the fan-out response
             // readers (GET /api/v1/executions/{id}/visualization). Routes through the
             // single response_agent_in_scope helper so the REST, MCP and legacy
@@ -18451,16 +18429,11 @@ private:
                 [this](const std::string& username, const std::string& agent_id) -> bool {
                     return response_agent_in_scope(username, agent_id);
                 },
-                // ADR-0016: the typed daily-sync software store + its per-device
-                // Inventory-scope predicate for query_installed_software. SAME
-                // management-group chokepoint as the response predicate above, but
-                // bound to ("Inventory","Read") — so an operator's fleet-wide software
-                // query returns only devices inside their groups (cross-operator
-                // isolation). MUST be wired here; the param defaults to {} = no filter.
+                // ADR-0016: the typed daily-sync software store for
+                // query_installed_software. Its per-agent scope predicate is
+                // fleet_read_fn_ (set_fleet_read_fn, #3290 Phase 2) — the tool's
+                // own require_fleet_read gate replaced the retired InventoryScopeFn.
                 software_inventory_store_.get(),
-                [this](const std::string& username, const std::string& agent_id) -> bool {
-                    return inventory_agent_in_scope(username, agent_id);
-                },
                 // ADR-0011: metrics sink for the MCP-surface bundle orchestrator
                 // (yuzu_bundle_*{surface="mcp"}). REST passes its own registry.
                 &metrics_,

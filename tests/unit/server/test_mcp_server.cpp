@@ -826,12 +826,20 @@ struct McpTestServer {
     std::function<bool(const std::string& securable, const std::string& op)>
         perm_override_for_test{};
 
-    /// ADR-0016: optionally wire a typed SoftwareInventoryStore + an Inventory-scope
-    /// predicate so query_installed_software is exercised end-to-end, including the
-    /// management-group drop path. Default nullptr/{} keeps existing tests on the
-    /// "Software inventory store unavailable" path with no filter.
+    /// ADR-0016: optionally wire a typed SoftwareInventoryStore so
+    /// query_installed_software is exercised end-to-end. Default nullptr keeps
+    /// existing tests on the "Software inventory store unavailable" path.
     yuzu::server::SoftwareInventoryStore* software_inventory_store_for_test{nullptr};
-    yuzu::server::mcp::McpServer::InventoryScopeFn inventory_scope_fn_for_test{};
+    /// #3290 Phase 2 — the fake twin of require_fleet_read (fixture-side, not
+    /// production's fail-closed-when-unwired default): admits unfiltered
+    /// unless a test overrides it, matching the old inventory_scope_fn's
+    /// "legacy-open" default so existing tests keep reaching the store/degrade
+    /// paths below this gate without having to opt in.
+    yuzu::server::mcp::McpServer::FleetReadFn fleet_read_fn_for_test =
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+           const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, std::nullopt};
+    };
 
     /// ADR-0024 (SLE discovery): optionally wire a typed SoftwareLicensingStore so
     /// query_software_licenses (the MCP twin of the GET /sle/agents/{id} drill) is
@@ -1058,6 +1066,13 @@ private:
         // this is a no-op for every pre-existing test.
         mcp.set_kek_ops(kek_ops_for_test);
 
+        // #3290 Phase 2: fleet_read_fn ALSO rides a setter, same pattern as
+        // the KEK ops seam above — wire before the handlers are built.
+        // Unconditional: the fixture default above already mirrors the old
+        // predicate's "legacy-open" posture, so this is a no-op change of
+        // shape for every pre-existing test that never touches it.
+        mcp.set_fleet_read_fn(fleet_read_fn_for_test);
+
         // M5 remediation: the plugin-config/upload-grant stores ALSO ride
         // setters, same pattern as the two above — wire before the handlers
         // are built.
@@ -1102,7 +1117,6 @@ private:
             /*net_perf_fn=*/net_perf_fn_for_test,
             /*response_scope_fn=*/response_scope_fn_for_test,
             /*software_inventory_store=*/software_inventory_store_for_test,
-            /*inventory_scope_fn=*/inventory_scope_fn_for_test,
             /*metrics=*/metrics_for_test,
             /*app_perf_providers=*/app_perf_providers_for_test,
             /*quarantine_store=*/quarantine_store_for_test,
@@ -3565,14 +3579,21 @@ TEST_CASE("MCP: list_schedules denies a service-scoped token, denial audited",
     CHECK(saw_denied);
 }
 
-// Governance finding (guardian-confinement-2298 Gate 2/4/6): the management-
-// group scope filter on query_installed_software is INERT under the global
-// Inventory:Read gate (same class as query_responses/query_inventory), and
-// this tool has no per-target scoped check even when agent_id is supplied.
-// The deny fires BEFORE the `!software_inventory_store` null-check (mirrors
-// list_schedules' ordering above), so this needs no real store wired to
-// prove — software_inventory_store_for_test stays nullptr.
-TEST_CASE("MCP: query_installed_software denies a service-scoped token, denial audited",
+// #3290 Phase 2: query_installed_software's per-tool blanket
+// deny_fleet_wide_service_scoped call (the guardian-confinement-2298 Gate
+// 2/4/6 finding this test used to pin) is RETIRED — confinement is now
+// entirely the injected fleet_read_fn_'s job (production:
+// AuthRoutes::require_fleet_read's own meet(management-group, service-scope)
+// composition). This fake-gate unit doesn't model real RBAC, so it cannot
+// assert a real admit/deny outcome for a service-scoped caller — what it
+// CAN and must still assert is that a service-scoped token is no longer
+// short-circuited to kPermissionDenied by tool-local code before the gate
+// even runs: it reaches the identical path a non-service caller does (here,
+// the store-unavailable branch, since software_inventory_store_for_test
+// stays nullptr) via the SAME fixture-default fleet_read_fn_for_test every
+// other caller class uses.
+TEST_CASE("MCP: query_installed_software no longer blanket-denies a "
+          "service-scoped token — confinement is the injected gate's job",
           "[mcp][integration][inventory][security]") {
     McpTestServer ts;
     ts.mock_token_scope_service = "printers";
@@ -3583,22 +3604,16 @@ TEST_CASE("MCP: query_installed_software denies a service-scoped token, denial a
     REQUIRE(res);
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
-    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    // NOT kPermissionDenied — the tool-local blanket deny is gone. The fake
+    // fixture's default-admitting fleet_read_fn_for_test lets the call
+    // through to the (unwired-in-this-test) store, same as any other caller.
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(res->body.find("Software inventory store unavailable") != std::string::npos);
 
-    bool saw_denied = false;
-    for (size_t i = 0; i < ts.audit_log.size(); ++i) {
-        const auto& a = ts.audit_log[i];
-        if (a == "inventory.software.query|denied") {
-            saw_denied = true;
-            // Gate 8 finding: this MCP denial once left target_id empty while
-            // its REST/dashboard siblings recorded "fleet" — audit-log.md
-            // documents target_id=fleet uniformly across all three surfaces.
-            CHECK(ts.audit_target_ids.at(i) == "fleet");
-        }
+    for (const auto& a : ts.audit_log) {
+        CHECK(a != "inventory.software.query|denied");
         CHECK(a != "inventory.software.query|success");
-        CHECK(a != "mcp.query_installed_software|success");
     }
-    CHECK(saw_denied);
 }
 
 // ── F2a: DEX fleet-perf tools ────────────────────────────────────────────────
@@ -8653,9 +8668,13 @@ TEST_CASE("MCP query_installed_software: fleet rows scoped to the caller's group
 
     McpTestServer ts;
     ts.software_inventory_store_for_test = &store;
-    // Caller may see agent-in, never agent-out (the management-group drop path).
-    ts.inventory_scope_fn_for_test = [](const std::string& /*user*/, const std::string& agent_id) {
-        return agent_id == "agent-in";
+    // Caller may see agent-in, never agent-out (the gate's own composed
+    // meet(management-group, service-scope) VisibleSet, #3290 — fake twin of
+    // require_fleet_read admitting a scoped, not unfiltered, witness).
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, std::unordered_set<std::string>{"agent-in"}};
     };
     ts.start();
 
@@ -12229,7 +12248,7 @@ TEST_CASE("MCP approval recall executes through the real AuthRoutes::require_per
         /*dispatch_fn=*/nullptr, /*ca_store=*/nullptr, /*publish_crl_fn=*/{},
         /*guaranteed_state_store=*/nullptr, /*dex_perf_fn=*/{}, /*net_perf_fn=*/{},
         /*response_scope_fn=*/{}, /*software_inventory_store=*/nullptr,
-        /*inventory_scope_fn=*/{}, /*metrics=*/nullptr, /*app_perf_providers=*/{},
+        /*metrics=*/nullptr, /*app_perf_providers=*/{},
         /*quarantine_store=*/nullptr, /*tag_push_fn=*/{}, /*agent_registry=*/nullptr,
         // K-06/CDX-R4-09: delete_tag now FAILS CLOSED when the per-device scope
         // gate is unwired, so this integration test must wire it exactly as
