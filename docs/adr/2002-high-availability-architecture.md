@@ -80,40 +80,71 @@ Adopt a **hybrid, on-prem-first (SaaS-capable) HA architecture**:
 ## Deployment topology and replication axes
 
 This ADR must serve **both** the current monolithic server **and** the accepted (design-only,
-binds-prospectively) presentation/core/engine decomposition of ADR-0031/0032/0033. **"Server tier"
-here means the API-authoritative core** — the binary that owns the public REST/MCP surface and is the
-sole database authority (ADR-0031 INV-31-3/4), *not* a fused server+everything box. HA is defined over
-**independent replication axes**, not one tier:
+binds-prospectively) presentation/core/engine decomposition of ADR-0031/0032/0033. Today all these
+roles are **one binary**, so "behind the LB" trivially means the whole server; prospectively they
+split and HA is defined over **independent replication axes**. Crucially, **the operator-plane load
+balancer fronts _presentation_, not core** (ADR-0031: presentation "terminates HTTP, SSE and MCP" and
+is "inside the bearer-credential trust boundary"; sessions/replay "move behind the core boundary"
+precisely so **presentation** can scale horizontally). "Server tier" in this ADR is the collective
+replicated server-role set — **presentation + core as two distinct axes** — *not* a fused
+server+everything box, and *not* core alone:
 
-- **Presentation replicas** — stateless dashboard/HTMX shell; scales freely once sessions are durable
-  (§4); no database access of its own (ADR-0031).
-- **Core replicas** — the active–active operator/API/MCP plane §§3–12 concern; the sole writer to the
-  `yuzu` database.
+- **Presentation replicas** — **terminate HTTP/SSE/MCP and front the operator-plane LB**, inside the
+  bearer-credential trust boundary (ADR-0031); dashboard/HTMX render + protocol framing; **no `yuzu`
+  database access of their own**; scale horizontally once sessions are durable (§4). SSE/MCP client
+  streams are terminated here and **relayed from core's event spine** — presentation never reads the
+  `yuzu` outbox directly (§5).
+- **Core replicas** — the **API authority and sole `yuzu`-database writer**, and the owner of
+  coordination (leader lock, transactional outbox, background workers; §§3/5/6). Sits **behind
+  presentation**, not directly on the LB; `/readyz` gates presentation→core routing (ADR-0031: an LB
+  must never be routed to a surface that can't serve while core is down). §§3–12's "operator plane"
+  spans both roles — presentation terminates, core adjudicates.
 - **Gateway replicas** — the per-zone gateway clusters (§7, §7a).
 - **Engine replicas / jobs** — use-case engine host (UCE) instances, headless, consuming core through
   the versioned API as engine principals (ADR-1005), with their **own derived-state database** distinct
   from `yuzu`. So **`yuzu`-database availability and engine-database availability are separate axes**,
   and an engine outage must not take down core.
 
+**Boundary rule (ADR-0031 INV-31-3, no cross-component DB access) — governs every section below.**
+Only **core** touches `yuzu`: all reads/writes, `LISTEN`/`NOTIFY`, advisory locks, the event outbox,
+and **session validation** are core's. **Presentation holds no `yuzu` handle** — it terminates the
+client protocol, forwards credentials, and reaches durable state *exclusively through core's versioned
+API*; it receives events over a **core→presentation event spine** (a resumable SSE/gRPC stream core
+exposes, cursor-owned by core). The southbound **gateway gRPC** likewise terminates on **core**, on a
+core service endpoint distinct from the operator-plane LB. Therefore, wherever a section below says
+"every server," "any instance," or "server tier" *does* DB or coordination work, read **"every core
+replica"**; presentation's role is protocol termination + relay, never direct durable-state access.
+
 **Consequence for NVD (finding 1):** NVD/CVE sync and matching are being **strangled OUT of the server
 into the UCE engine** (ADR-0023; ADR-1005 execution-plan Phase 7). Their HA is an **engine-tier**
 concern (engine replicas/jobs + the engine DB + leader-among-engines for the sync job) — **not** a
 server store leader-synced into `yuzu`. The earlier draft's "NVD leader-syncs to shared Postgres" is
-**withdrawn** (§9). The `Server tier` glossary term is scoped to the core/API tier accordingly, so it
-does not codify a two-tier model the three-binary one already supersedes.
+**withdrawn** (§9). The `Server tier` glossary term spans **presentation + core** accordingly (the LB
+fronts presentation; core is the API authority behind it), so it does not codify a fused
+server+everything model.
 
 ## Guarantees and non-guarantees
 
 - **Command dispatch: effectively-once.** At-least-once delivery via a transactional outbox +
-  claim-before-side-effect, made effectively-once by **receiver-side idempotency** — the gateway and
-  agent dedup on a stable `command_id`. **This depends on a receiver mechanism that does not durably
-  exist yet:** the agent's dedup is today two in-memory `std::unordered_set`s
+  claim-before-side-effect, made effectively-once by **receiver-side idempotency** — the **agent**
+  dedups on a stable `command_id` at the true endpoint. (The gateway forwards **transparently
+  (unconditionally)** and does **not** itself dedup today — verified in `yuzu_gw_agent.erl`, which
+  overwrites its `command_id`-keyed correlation entry; agent-side dedup alone is sufficient at the
+  endpoint, so a gateway-side check is an optional future optimization, not a correctness dependency.)
+  **This depends on a receiver mechanism that does not durably exist yet:** the agent's dedup is today
+  two in-memory `std::unordered_set`s
   (`dedup_current_`/`dedup_previous_`, `agent.cpp:3464`) **`.clear()`d on every fresh connection**
   (`agent.cpp:2484`), so an agent reconnect or daemon restart — the most common failure mode — wipes
   it. **Durable agent-side command idempotency is therefore a named prerequisite workstream** (WS-0),
   not an existing property; until it lands the end-to-end guarantee degrades to at-least-once across an
-  agent bounce. We do **not** promise exactly-once (a crash between claim commit and RPC send is
-  unavoidable; durable receiver dedup is what closes it).
+  agent bounce. **WS-0 must also durably retain and _replay the terminal outcome_, not merely suppress
+  the duplicate:** today a duplicate returns a bare `REJECTED` (`agent.cpp:2497`), which correctly
+  stops re-execution but **loses the original success result** when the *first* acknowledgement was the
+  thing that got lost (execute → succeed → ack dropped → re-drive → `REJECTED`, original outcome gone).
+  So the durable store must return the *stored original outcome* on a duplicate — otherwise the honest
+  guarantee is only **"effect-once, result-maybe-lost,"** which the ADR would then have to state. We do
+  **not** promise exactly-once (a crash between claim commit and RPC send is unavoidable; durable
+  receiver dedup **plus outcome-replay** is what closes it).
 - **Events/SSE: at-least-once with gap detection.** Durable monotonic event IDs; consumers replay
   from a cursor / `Last-Event-ID`; NOTIFY is a latency hint only. A consumer may see a duplicate
   event and must tolerate it.
@@ -161,7 +192,10 @@ therefore cannot commit a claim even in the window before it notices its lock dr
 
 ### 4. Operator sessions — durable in Postgres, absolute wall-clock (Q4)
 Sessions move from the in-memory map (`AuthManager::sessions_`, `steady_clock`) to durable Postgres
-rows any instance can validate, executing the ADR-0031 direction. **This ADR explicitly reverses the
+rows **core validates**, executing the ADR-0031 direction. Presentation terminates the request and
+**forwards the credential**; **core owns** validation, the short-TTL cache, the generation token, and
+live revalidation (ADR-0031: presentation is inside the bearer-credential trust boundary but is not a
+`yuzu` reader) — any core replica can validate any session. **This ADR explicitly reverses the
 as-built in-memory-monotonic decision** (chosen for NTP-step resistance of `expires_at` /
 `elevated_until` / MFA step-up, `auth.hpp`). The trade, stated honestly (correcting an earlier draft's
 false "better by construction" claim):
@@ -194,10 +228,12 @@ outbox** with **durable monotonic event IDs** (replacing the per-process channel
 - **Atomic outbox write:** the source-state mutation and the event-row insert commit in **one
   transaction**; `NOTIFY` fires after commit. A crash therefore never leaves state without its event
   or vice versa.
-- **Delivery:** every server `LISTEN`s and, **on every (re)connect to the promoted primary, polls the
-  outbox forward from its last-seen cursor**, plus a periodic safety poll — NOTIFYs issued around a
-  failover are lost and must not be relied on. Consumers replay via `Last-Event-ID` / `?since=` and
-  **tolerate duplicates** (at-least-once).
+- **Delivery:** every **core** replica `LISTEN`s and, **on every (re)connect to the promoted primary,
+  polls the outbox forward from its last-seen cursor**, plus a periodic safety poll — NOTIFYs issued
+  around a failover are lost and must not be relied on. Core re-publishes onto the **core→presentation
+  event spine**; presentation-terminated SSE/MCP consumers replay via `Last-Event-ID` / `?since=`
+  against **core's spine API** (never the `yuzu` outbox directly) and **tolerate duplicates**
+  (at-least-once). Cursor ownership: the client cursor is core's; presentation is a stateless relay.
 - The outbox inherits the **clock-guarded retention** rules (routed concern).
 
 **Load-bearing prerequisite:** cross-instance correlation requires execution state in Postgres.
@@ -208,7 +244,7 @@ CLAUDE.md already flags for `sqlite3_changes()` (concurrent responses now land o
 instances).
 
 ### 6. Background workers — fenced leader + transactional outbox (Q6)
-A single instance holds the **fenced** leader lock and runs the singleton loops. The correctness
+A single **core** instance holds the **fenced** leader lock and runs the singleton loops. The correctness
 model, corrected per review — a claim alone does **not** give exactly-once, because a crash between
 claim-commit and the external send is unavoidable:
 - **Claim-before-side-effect is the invariant** (as `DeploymentEngine` already does,
@@ -217,9 +253,10 @@ claim-commit and the external send is unavoidable:
 - **Transactional outbox:** a side-effecting dispatch commits a `pending` outbound-command row (with a
   **stable occurrence/command ID**) in the same transaction as the state transition; a claimed
   delivery loop drives `pending → sent`. A crash re-drives from `pending`.
-- **Receiver idempotency:** the gateway and agent dedup on `command_id`, so an at-least-once re-drive
-  is effectively-once at the endpoint — **contingent on WS-0** making the agent's dedup durable
-  (today's `dedup_current_`/`dedup_previous_` are in-memory and cleared on reconnect, `agent.cpp:2484`).
+- **Receiver idempotency:** the **agent** dedups on `command_id` at the true endpoint (the gateway
+  forwards transparently, no gateway-side dedup today), so an at-least-once re-drive is effectively-once
+  — **contingent on WS-0** making the agent's dedup durable (today's `dedup_current_`/`dedup_previous_`
+  are in-memory and cleared on reconnect, `agent.cpp` `dedup_current_.clear()`).
 - **Fencing token in the claim transaction:** every claim CAS checks the leader's fencing token, so a
   stale ex-leader cannot commit a claim even before it notices its lock dropped. A boolean "I am
   leader" cached outside the lock connection is prohibited.
@@ -228,7 +265,8 @@ claim-commit and the external send is unavoidable:
   key, claim-before-dispatch, and outbox delivery — the same shape — so two stale leaders or two
   concurrent operator remediations cannot both fire. **Two code-level obligations for WS-3 (finding
   6a):** (i) `dispatch_instruction` currently **discards** `CommandDispatchFn`'s
-  `(execution_id, sent_count)` return (`policy_evaluator.cpp:266`) and always yields a non-empty
+  `(execution_id, sent_count)` return (`PolicyEvaluator::dispatch_instruction`,
+  `policy_evaluator.cpp:281`) and always yields a non-empty
   execid regardless of whether any target was reached — the redesign must thread `sent_count` through
   so "all targets offline" is a real signal; (ii) it must **preserve the reason** the current code
   dispatches before recording `fixing` — a *failed* dispatch must not burn a capped retry attempt, or
@@ -255,15 +293,18 @@ cluster unit; intra-zone scale is more nodes.
   the stream. **`pg` provides broadcast groups, not per-agent location transparency.** So each cluster
   needs a distributed agent→node lookup (a per-agent `pg` group, a global registry, or fan-and-filter)
   — explicit net-new work in workstream 4, **not** an existing property.
-- **Southbound (gateway→server):** each cluster's upstream targets the **server tier** (VIP or node
-  list), generalizing the existing single-upstream + circuit-breaker + `ProxyRegister`-replay path.
+- **Southbound (gateway→core):** each cluster's upstream targets **core** on a dedicated **core
+  service endpoint (its own VIP or node list), distinct from the operator-plane LB** — the gateway
+  gRPC surface is core's (B7), not presentation's and not the operator LB's. Generalizes the existing
+  single-upstream + circuit-breaker + `ProxyRegister`-replay path from one address to the core tier.
 - **Northbound (server→gateway):** the minting server reads the directory and dials the owning
   cluster; an undeliverable command (cluster unreachable, stale/expired lease, agent mid-migration)
   stays `pending` in the outbox (§6) and is re-driven — with receiver dedup absorbing any double
   delivery during a re-home race.
 - **`gateway_node` convergence is a first-class requirement (finding 6b).** Today an agent's
   proxied-vs-direct routing hinges on `gateway_node` being populated by a **single `NotifyStreamStatus`
-  gRPC call** succeeding (`gateway_service_impl.cpp` ~631); if that notification is lost, dispatch
+  gRPC call** succeeding (`GatewayUpstreamServiceImpl::NotifyStreamStatus`, which calls
+  `registry_.set_gateway_node`, `gateway_service_impl.cpp:637`/`:660`); if that notification is lost, dispatch
   falls through to a **direct-stream branch that never reaches the proxied agent**. With
   gateway-fronting mandatory, WS-4 must make this **converge, not depend on one delivery** — a periodic
   reconcile that re-derives the fenced directory after a **gateway restart, a core restart, and a
@@ -280,8 +321,9 @@ gateway-fronting a gateway replays only to its *currently-selected* upstream, so
 server would otherwise see a partial fleet and **mis-target scopes / under-report health**. Therefore
 HA requires **shared agent presence**: liveness, per-agent plugin capability, and the scope-evaluation
 population become **cross-instance state** (Postgres presence/health tables fed by gateway
-registration/heartbeat, read by every server), so scope resolution and the `yuzu_agents_connected`
-gauge are coherent across the tier rather than per-instance. This is its own workstream, not a
+registration/heartbeat, **read by every core replica**; presentation obtains it through core's API),
+so scope resolution and the `yuzu_agents_connected` gauge are coherent across the core tier rather
+than per-instance. This is its own workstream, not a
 side-effect of the routing directory.
 
 ### 8. PKI / CA high availability (Q8)
@@ -331,7 +373,8 @@ server into the UCE engine (ADR-0023 / ADR-1005 Phase 7), so it is **not** a `yu
 leader-sync; its HA is an engine-tier concern (see *Deployment topology and replication axes*).
 
 ### 10. Postgres HA — agnostic server, pinned coordination connections (Q10)
-- **Server stays agnostic to *how* Postgres HA is achieved.** Failover discovery via **multi-host DSN
+- **Core stays agnostic to *how* Postgres HA is achieved** (core is the only `yuzu` client; the
+  coordination connections below are core's). Failover discovery via **multi-host DSN
   + `target_session_attrs=read-write`**; also works behind a Patroni VIP / primary-following router.
   Patroni (self-managed) / managed service (SaaS) recommended, not mandated.
 - **Pooler collision.** `LISTEN`/`NOTIFY` and **session-scoped** advisory locks (KEK op,
@@ -354,33 +397,48 @@ Yuzu ships Postgres, so HA Postgres is a delivery artifact we own.
   **both** standbys are lost (quorum lost → fail-closed by design). This replaces the earlier
   unconditional 2-node RPO=0, which stalled all writes on a single standby blip — *below* the
   single-Postgres baseline. An **async/degrade profile** (lower latency, bounded loss window) is a
-  documented opt-out. **"3 nodes" means 3 distinct hosts / failure domains, not 3 containers on one
-  Docker host (nit 1)** — co-located containers buy process redundancy, not host HA, and shipping the
-  co-located default would quietly void the §13 RPO=0 claim; the shipped profile pins anti-affinity and
-  the docs state the requirement.
+  documented opt-out. **"3 nodes" means 3 distinct hosts / failure domains (finding 2).** Vanilla
+  Docker Compose has **no cross-host placement primitive** — it cannot pin anti-affinity across
+  physical hosts — so the **single-host Compose profile delivers container/process redundancy only,
+  NOT host-level HA**, and co-locating all three would quietly void the §13 RPO=0-across-host-failure
+  claim. Host-level HA requires **multi-host placement** (Docker **Swarm** mode, **Kubernetes**, or
+  manual multi-host provisioning); that placement is an **operator responsibility, documented
+  separately** in the delivery runbook — the Compose profile alone must not be presented as
+  host-HA.
 - **Single-PG stays the default (non-HA) profile.** All four topologies supported: BYO-single, BYO-HA,
   shipped-single, shipped-HA.
 - **Shipped operator-plane LB** in the HA profile, with **BYO-LB / VIP / DNS round-robin** supported.
 
 ### 12. Ingress / LB + health contract + MCP (Q11)
 - **Scope: operator/API plane incl. MCP + streaming.** MCP behind active–active pulls MCP state into
-  §4/§5: the **MCP session registry → durable**, the **MCP replay ring → the durable outbox** — a
-  dropped MCP stream resumes on a different instance via `Last-Event-ID`. `StreamBudget` stays a
-  per-instance cap. **This move inherits, not supersedes, the ADR-1005 execution-plan Decision 15
+  §4/§5, **held as core-owned durable state**: the **MCP session registry → durable (core)** and the
+  **MCP replay ring → the durable outbox (core)**, exposed to presentation through a **core replay/
+  session API + the core→presentation event spine** (cursor owned by core). A presentation-terminated
+  MCP stream that drops resumes on a different presentation replica by re-attaching to core via
+  `Last-Event-ID` — presentation never touches the Postgres ring directly. `StreamBudget` stays a
+  per-**presentation-replica** cap (it bounds held-open connections at the termination point). **This
+  move inherits, not supersedes, the ADR-1005 execution-plan Decision 15
   pre-commitments (a)–(k) (finding 5)** — principal-bound sessions, live credential revalidation on
   resume, bounded rings, honest replay-gap signalling, pin lifecycle (incl. the open pin-lifecycle
   item), and the shared `StreamBudget` — which the in-memory design shipped; the durable
   implementation must carry every one of them forward.
-- **Health contract:** `/livez` (alive — restart) vs `/readyz` (ready — remove from LB). **Draining:**
-  fail `/readyz`, let the LB drain, then stop.
+- **Health contract, per tier:** `/livez` (alive — restart) vs `/readyz` (ready — stop routing to me).
+  **Presentation `/readyz`** gates the **operator LB**; **core `/readyz`** gates **presentation→core
+  routing** and must go red when core cannot reach `yuzu` (ADR-0031: an LB/router must never be green
+  while core is down, or it routes to a surface that cannot serve). **Draining:** fail `/readyz`, let
+  the fronting layer drain, then stop.
 - **BYO-LB documentation deliverable:** no idle-timeout on held-open SSE/MCP streams; no response
   buffering; health targets `/readyz`; draining; optional stickiness (locality only); TLS stance.
   Owned by `docs-writer` + `release-deploy`.
 
 ### 13. HA guarantees — RTO/RPO (Q12)
 Proposed targets for the team to ratify:
-- **Server-instance loss:** RTO ≈ 0 for the tier (LB removes the dead instance; sessions/events/
-  commands durable and resume elsewhere; in-flight commands re-drive from the outbox).
+- **Presentation-replica loss:** RTO ≈ 0 (operator LB removes it on `/readyz`; sessions/streams are
+  durable/relayed, so a client reconnects to a surviving presentation replica).
+- **Core-replica loss:** RTO ≈ 0 for request-serving (presentation→core routing drops the dead core
+  replica on core `/readyz`) plus the leadership re-election gap for background work (§6); in-flight
+  commands re-drive from the outbox. Note the operator LB removing a *presentation* replica does **not**
+  repair a *core* outage — those are distinct readiness signals.
 - **Postgres-primary failover:** RTO = failover time (Patroni ~10–30s). **RPO = 0 while the
   synchronous-commit quorum holds** (default 3-node profile, §11); the guarantee is
   "no acknowledged-write loss while quorum exists," **not** "writes always available" — quorum loss
@@ -399,13 +457,18 @@ duplicate** (§7). It must also cover **standby loss** (quorum-degrade behavior,
 
 This ADR records the model and principles. Each area becomes a child ADR/issue:
 
-0. **WS-0 — Durable agent-side command idempotency (prerequisite).** Replace the in-memory
-   `dedup_current_`/`dedup_previous_` (cleared on reconnect, `agent.cpp:2484`) with a durable per-agent
-   dedup keyed on `command_id`, so the effectively-once guarantee survives an agent bounce. **Gates the
-   end-to-end guarantee of WS-1/WS-3** — the server outbox is meaningless if the receiver forgets.
+0. **WS-0 — Durable agent-side command idempotency + outcome replay (prerequisite).** Replace the
+   in-memory `dedup_current_`/`dedup_previous_` (cleared on reconnect, `agent.cpp:2484`) with a durable
+   per-agent store keyed on `command_id` that **both** suppresses re-execution **and replays the stored
+   terminal outcome** on a duplicate (today a dup returns a bare `REJECTED`, `agent.cpp:2497`, losing
+   the original result when the first ack was lost). **Gates the end-to-end guarantee of WS-1/WS-3** —
+   the server outbox is meaningless if the receiver forgets, and effectively-once is only "effect-once,
+   result-maybe-lost" without outcome replay.
 1. **Server-plane state → Postgres** — sessions (§4), execution/correlation with atomic counters (§5),
    the HA-critical store subset incl. quarantine + software-deployment + product-pack (§9).
-2. **Durable event outbox + NOTIFY fan-out** (§5) and **MCP session/replay durability** (§12).
+2. **Durable event outbox + NOTIFY fan-out** (§5), the **core→presentation event spine** (a versioned,
+   resumable SSE/gRPC stream core exposes so DB-less presentation can relay events — an ADR-0031
+   prerequisite, not optional), and **MCP session/replay durability** (§12).
 3. **Coordination seam** — fenced `LeaderElector` + signal channel with reconnect cursor-poll (§3);
    the **leader + transactional-outbox + receiver-idempotency** worker refactor incl. policy
    remediation (§6).
@@ -424,7 +487,10 @@ This ADR records the model and principles. Each area becomes a child ADR/issue:
     background job as **fenced-leader-only**, **independently replica-safe**, or **disabled-until-fixed**;
     bring the #2508 not-yet-compliant passes (`app_perf_*`, `PreflightRunStore`, `DeploymentRunStore`)
     to the guarded shape *before* a second replica exists. HA turns that backlog into a correctness
-    prerequisite.
+    prerequisite. **Deliverable is a checked-in, exhaustive background-job table** (job → one of
+    fenced-leader-only / independently-replica-safe / disabled-until-fixed) kept in the tree and
+    CI-auditable — not just the classifying principle, so a newly-added job cannot silently escape
+    classification (nit).
 
 ## Consequences
 
@@ -490,8 +556,8 @@ The `CHANGES_REQUESTED` review (findings verified against `origin/dev`) is addre
 
 1. **Topology reconciled with ADR-0031/0032/0033 + NVD pulled out of the server.** New *Deployment
    topology and replication axes* section defines presentation / core / gateway / engine as separate
-   replication axes with distinct databases; "Server tier" scoped to the core/API tier; NVD moved to
-   the engine tier and withdrawn from §9.
+   replication axes with distinct databases; "Server tier" reconciled with the three-binary model
+   (LB-vs-tier boundary refined further in round 3); NVD moved to the engine tier and withdrawn from §9.
 2. **Durable agent-side idempotency made an explicit prerequisite (WS-0)**, since today's agent dedup
    is in-memory and cleared on reconnect (`agent.cpp:2484`) — the effectively-once claim no longer
    assumes it.
@@ -502,7 +568,56 @@ The `CHANGES_REQUESTED` review (findings verified against `origin/dev`) is addre
 5. **§12 states it inherits** ADR-1005 Decision 15 pre-commitments (a)–(k), not supersedes them.
 6. **Code-level obligations wired into the workstreams** — WS-3 threads `dispatch_fn`'s discarded
    `sent_count` and preserves the "don't burn a capped retry on a failed dispatch" reason
-   (`policy_evaluator.cpp:266`); WS-4 makes `gateway_node` *converge* rather than depend on a single
+   (`policy_evaluator.cpp:281`); WS-4 makes `gateway_node` *converge* rather than depend on a single
    `NotifyStreamStatus`.
 - **Nits:** 3-node quorum pinned to distinct hosts/failure domains (§11); §9 now cites the live
   migration ladder instead of a drifting store list.
+
+## Review findings incorporated — round 3 (PR #3320)
+
+Second `CHANGES_REQUESTED` pass, tightly scoped; all four + the nit addressed:
+
+1. **LB fronts presentation, not core.** The topology section and the `Server tier` glossary term are
+   corrected: presentation terminates HTTP/SSE/MCP and fronts the operator-plane LB (ADR-0031); core
+   is the API authority / sole `yuzu`-writer / coordination owner **behind** presentation. "Server
+   tier" = presentation + core as two axes. This also reconciles with Context §2 ("presentation scales
+   horizontally").
+2. **Compose ≠ host HA.** §11 no longer claims the Compose profile "pins anti-affinity" — plain
+   Compose has no cross-host placement; the single-host profile gives container/process redundancy
+   only, and host-level HA requires Swarm/Kubernetes/manual multi-host placement, an operator
+   responsibility documented separately.
+3. **Gateway does not dedup.** *Guarantees* and §6 now say the **agent** dedups at the true endpoint
+   (verified `yuzu_gw_agent.erl` forwards unconditionally); gateway-side dedup is an optional future
+   optimization, not a claimed property.
+4. **Citations corrected at this commit:** discarded dispatch return is
+   `PolicyEvaluator::dispatch_instruction` (`policy_evaluator.cpp:281`); the `gateway_node` populate is
+   `GatewayUpstreamServiceImpl::NotifyStreamStatus` → `set_gateway_node` (`:637`/`:660`) — cited by
+   symbol to resist drift.
+- **Nit:** WS-10's deliverable is now an explicit **checked-in, CI-auditable background-job table**, not
+  just the classifying principle.
+
+## Review findings incorporated — round 4 (self-review before push)
+
+A `gpt-5.6-sol` adversarial pass on the round-3 edits (run before pushing) caught that the
+LB-fronts-presentation correction had not been *propagated* — several sections still assigned
+core-only work to the DB-less presentation tier. Fixed:
+
+- **Boundary rule added** to the topology section: only **core** touches `yuzu` (reads/writes,
+  `LISTEN`/`NOTIFY`, locks, outbox, **session validation**); **presentation is DB-less** and reaches
+  durable state only through core's API + a **core→presentation event spine**. This governs every
+  section.
+- **§5** — the outbox is `LISTEN`ed/polled by **core**, which re-publishes onto the event spine;
+  presentation relays, never reads `yuzu`. **§4** — core validates sessions; presentation forwards the
+  credential. **§12** — MCP session/replay is core-owned durable state exposed via a core replay API;
+  cursor owned by core; `StreamBudget` is a per-presentation-replica cap. **§7a** — presence read by
+  every core replica. **§7 southbound** — gateway gRPC terminates on a **core** service endpoint,
+  distinct from the operator LB.
+- **Effectively-once deepened (new finding):** a duplicate returns bare `REJECTED` (`agent.cpp:2497`),
+  which suppresses re-execution but **loses the original result** if the first ack was lost — so **WS-0
+  must retain and replay the terminal outcome**, else the honest guarantee is "effect-once,
+  result-maybe-lost." Reflected in *Guarantees*, §6, WS-0.
+- **Health split by tier** (§12/§13): presentation `/readyz` gates the operator LB; core `/readyz`
+  gates presentation→core routing; a presentation removal does not repair a core outage.
+- **WS-2** now names the **core→presentation event spine** as an ADR-0031 prerequisite.
+- Wording: "gateway forwards **transparently (unconditionally)**" (not "idempotently"); coordination
+  language qualified to **core** (§6/§10, `CONTEXT.md`); stale round-2 citation/phrasing corrected.
