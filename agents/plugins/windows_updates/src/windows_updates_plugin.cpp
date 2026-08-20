@@ -29,6 +29,7 @@
 #include <fstream>
 #include <format>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -254,7 +255,6 @@ using BStrGuard = std::unique_ptr<std::remove_pointer_t<BSTR>, decltype(&::SysFr
 // mechanism cannot fully close without an agent-core-owned killable
 // broker boundary -- a larger change than this migration's scope.
 constexpr std::chrono::seconds kCleanupJoinGrace{3}; // matches hard_exit.hpp's kOrphanDrainGrace
-std::atomic<int> g_outstanding_cleanups{0};
 
 // Well above realistic legitimate concurrency (a sustained WSUS wedge with
 // periodic dispatch could otherwise pile up one thread per timed-out
@@ -263,73 +263,122 @@ std::atomic<int> g_outstanding_cleanups{0};
 // agents/plugins/discovery/src/bounded_wait.hpp's kMaxOutstandingBoundedCalls
 // (governance Gate 4 unhappy-path finding).
 constexpr int kMaxOutstandingCleanups = 64;
+std::atomic<int> g_outstanding_cleanups{0};
 
-// Takes the cleanup work itself (not an already-constructed std::thread):
-// a std::thread starts running the instant it's constructed, so incrementing
-// the counter AFTER construction (as an earlier version of this function
-// did, taking `std::thread t` by value) has a real race -- if the new
-// thread's work finishes fast enough to reach cleanup_finished()'s
-// fetch_sub() before this function's fetch_add() runs, a concurrent
-// join_all_detached_cleanups() can observe zero outstanding and return
-// while a cleanup thread is still starting up, letting shutdown() proceed
-// (and the host dlclose the plugin) while that thread is about to touch
-// this module's code -- reintroducing the exact race this whole mechanism
-// exists to close. Incrementing BEFORE construction closes it: no code in
-// the new thread can run before this function's caller has already
-// registered it as outstanding.
-//
-// Returns false (no thread spawned) if the outstanding-cleanup ceiling is
-// already reached, or if std::thread's constructor itself throws (e.g.
-// EAGAIN under resource exhaustion) -- either way cleanup_work() never
-// ran, so cleanup_finished() never will either; the caller is responsible
+// Move-only RAII guard for a claimed slot on kMaxOutstandingCleanups --
+// mirrors agents/plugins/discovery/src/bounded_wait.hpp's
+// OutstandingCallGuard exactly (governance Gate 8 re-review finding: an
+// earlier version of this file used manual load()-then-fetch_add()
+// bookkeeping instead of this guard, which had two real gaps this closes
+// at once):
+//  - TOCTOU. A separate load() followed by a separate fetch_add() is a
+//    classic check-then-act: two concurrent do_missing() calls near the
+//    ceiling could both observe "below ceiling" and both increment past
+//    it. try_acquire() below makes the increment itself the check --
+//    whichever fetch_add() lands second sees the already-incremented
+//    value and backs off; no window exists where two callers can both
+//    pass.
+//  - Exception-type-specific catches leak the counter. A prior version
+//    only caught `std::system_error` around std::thread's constructor,
+//    which the standard does not guarantee is the only exception type
+//    (e.g. std::bad_alloc from internal control-block allocation is
+//    plausible under exactly the resource-pressure scenario this whole
+//    mechanism exists to survive) -- an uncaught type would leak the
+//    slot forever. Moving the guard INTO the lambda passed to
+//    std::thread means its destructor releases the slot on ANY unwind,
+//    regardless of exception type, whether that unwind is std::thread's
+//    constructor throwing (the guard, still local to the caller at that
+//    point, is destroyed as the throwing expression unwinds) or the
+//    cleanup work itself throwing inside the detached thread (guarded
+//    separately by the try/catch(...) around cleanup_work() below).
+class OutstandingCleanupGuard {
+public:
+    OutstandingCleanupGuard(const OutstandingCleanupGuard&) = delete;
+    OutstandingCleanupGuard& operator=(const OutstandingCleanupGuard&) = delete;
+
+    OutstandingCleanupGuard(OutstandingCleanupGuard&& other) noexcept : held_{other.held_} {
+        other.held_ = false;
+    }
+    OutstandingCleanupGuard& operator=(OutstandingCleanupGuard&& other) noexcept {
+        if (this != &other) {
+            release();
+            held_ = other.held_;
+            other.held_ = false;
+        }
+        return *this;
+    }
+
+    ~OutstandingCleanupGuard() { release(); }
+
+    static std::optional<OutstandingCleanupGuard> try_acquire() {
+        if (g_outstanding_cleanups.fetch_add(1, std::memory_order_relaxed) + 1 >
+            kMaxOutstandingCleanups) {
+            g_outstanding_cleanups.fetch_sub(1, std::memory_order_relaxed);
+            // A sustained wedge already has this many searches stuck in
+            // cleanup -- spawning yet another thread risks exhausting the
+            // whole agent's OS thread budget, not just this plugin's.
+            spdlog::warn("windows_updates: outstanding WUA cleanup ceiling ({}) reached, "
+                         "not spawning another cleanup thread (sustained wedge?)",
+                         kMaxOutstandingCleanups);
+            return std::nullopt;
+        }
+        return OutstandingCleanupGuard{};
+    }
+
+private:
+    OutstandingCleanupGuard() = default;
+
+    void release() noexcept {
+        if (held_) {
+            g_outstanding_cleanups.fetch_sub(1, std::memory_order_relaxed);
+            held_ = false;
+        }
+    }
+
+    bool held_ = true;
+};
+
+// Attempts to spawn cleanup_work() on a detached thread, having already
+// claimed a ceiling slot via OutstandingCleanupGuard::try_acquire(). The
+// guard is moved into the thread's lambda (not kept by the caller), so its
+// lifetime spans the whole detached call: releases on normal completion,
+// on cleanup_work() throwing (caught here, never propagated), or on
+// std::thread's own constructor throwing (the not-yet-moved-away lambda
+// temporary, and the guard it holds, unwind normally). Returns false only
+// when the ceiling was already at capacity -- the caller is responsible
 // for its own bounded fallback (see do_missing()'s call site).
 template <typename Fn>
 bool track_detached_cleanup(Fn&& cleanup_work) {
-    if (g_outstanding_cleanups.load(std::memory_order_relaxed) >= kMaxOutstandingCleanups) {
-        // A sustained wedge already has this many searches stuck in
-        // cleanup -- spawning yet another thread risks exhausting the
-        // whole agent's OS thread budget, not just this plugin's. Refuse
-        // rather than either grow unbounded or run cleanup_work() inline
-        // here (which would move CleanUp()'s unbounded wait onto THIS
-        // command thread -- exactly what the whole detached-thread design
-        // exists to avoid).
-        spdlog::warn("windows_updates: outstanding WUA cleanup ceiling ({}) reached, "
-                     "not spawning another cleanup thread (sustained wedge?)",
-                     kMaxOutstandingCleanups);
+    auto guard = OutstandingCleanupGuard::try_acquire();
+    if (!guard)
         return false;
-    }
-    g_outstanding_cleanups.fetch_add(1, std::memory_order_relaxed);
-    try {
-        std::thread(std::forward<Fn>(cleanup_work)).detach();
-        return true;
-    } catch (const std::system_error&) {
-        // Undo the increment here so a future join_all_detached_cleanups()
-        // doesn't wait out its full grace for a cleanup that was never
-        // actually started.
-        g_outstanding_cleanups.fetch_sub(1, std::memory_order_relaxed);
-        return false;
-    }
-}
-
-// Called by a cleanup thread itself, as its last action, once CleanUp()/
-// Release() have actually returned.
-void cleanup_finished() {
-    g_outstanding_cleanups.fetch_sub(1, std::memory_order_relaxed);
+    std::thread([cleanup_work = std::forward<Fn>(cleanup_work),
+                 guard = std::move(*guard)]() mutable {
+        try {
+            cleanup_work();
+        } catch (...) {
+            // cleanup_work() throwing must not std::terminate() a
+            // detached thread (mirrors bounded_wait.hpp's identical
+            // guard around its own fn() call).
+        }
+        // `guard` releases its ceiling slot here, at end of scope --
+        // whether cleanup_work() returned normally or threw above.
+    }).detach();
+    return true;
 }
 
 // Polls g_outstanding_cleanups until it reaches zero or kCleanupJoinGrace
 // elapses -- the same bounded-poll shape as hard_exit.hpp's
 // wait_for_workers_to_drain(), reimplemented locally (see the header
 // comment above for why that utility isn't included directly). Returns
-// once either condition is met; does not itself decide what "still
-// nonzero after grace" means -- the caller (shutdown(), below) simply lets
+// the number still outstanding when this returns (0 if every cleanup
+// finished within the grace) -- the caller (shutdown(), below) logs this
+// when nonzero, otherwise a sustained wedge or a post-dlclose crash report
+// has no breadcrumb at all pointing at this mechanism (governance Gate 6
+// sre finding; same shape as mcp_stream_bridge.cpp's
+// "mcp.bridge.shutdown_reap" reaped/abandoned-count logging). Does not
+// itself decide what "still nonzero after grace" means -- shutdown() lets
 // a not-yet-finished cleanup keep running detached rather than blocking.
-// Returns the number still outstanding when this returns (0 if every
-// cleanup finished within the grace). The caller (shutdown(), below) logs
-// this when nonzero -- otherwise a sustained wedge or a post-dlclose crash
-// report has no breadcrumb at all pointing at this mechanism (governance
-// Gate 6 sre finding; same shape as mcp_stream_bridge.cpp's
-// "mcp.bridge.shutdown_reap" reaped/abandoned-count logging).
 int join_all_detached_cleanups() {
     const auto deadline = std::chrono::steady_clock::now() + kCleanupJoinGrace;
     int remaining = 0;
@@ -577,27 +626,21 @@ int do_missing(yuzu::CommandContext& ctx) {
             // still needs to run: not calling it leaks the AddRef'd
             // reference outright, which is worse than a degraded call).
             //
-            // try/catch: this lambda is a std::thread entry function, not
-            // covered by any pool-level exception firewall. CleanUp()/
-            // Release() are ordinary HRESULT-returning COM calls and don't
-            // throw C++ exceptions by contract, but an SEH-to-C++
-            // translator (if enabled anywhere in this process) or a
-            // provider-side corruption could still surface one here --
-            // uncaught, that would escape a detached thread's entry
-            // function and std::terminate() the WHOLE AGENT, not just
-            // this search (governance Gate 4 unhappy-path finding; mirrors
+            // No try/catch needed here: track_detached_cleanup wraps this
+            // callable in its own catch(...), so a throw from either
+            // CleanUp() or Release() -- neither is expected to throw by
+            // contract, but an SEH-to-C++ translator or provider-side
+            // corruption could still surface one -- is swallowed there
+            // rather than escaping this detached thread's entry function
+            // and std::terminate()-ing the whole agent. If CleanUp() or
+            // Release() itself is what throws, the AddRef'd reference
+            // leaks; that's the accepted cost of surviving rather than
+            // terminating (governance Gate 4 unhappy-path finding; mirrors
             // discovery/bounded_wait.hpp's identical guard on its own
             // detached-thread body).
-            try {
-                yuzu::shared::win::ComInit cleanup_com_init;
-                raw_job->CleanUp();
-                raw_job->Release();
-            } catch (...) {
-                // Nothing else can react from here; the AddRef'd reference
-                // may leak if Release() itself is what threw, which is the
-                // accepted cost of surviving rather than terminating.
-            }
-            cleanup_finished();
+            yuzu::shared::win::ComInit cleanup_com_init;
+            raw_job->CleanUp();
+            raw_job->Release();
         });
         if (!spawned) {
             // Ceiling reached, or std::thread's constructor itself threw:
