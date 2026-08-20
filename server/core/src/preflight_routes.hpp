@@ -143,8 +143,17 @@ private:
     [[nodiscard]] bool deny_service_scoped_(const httplib::Request& req, httplib::Response& res,
                                             const std::string& action,
                                             const std::string& audit_detail,
-                                            const std::string& permission =
-                                                "Infrastructure:Read") const;
+                                            // `permission` defaults EMPTY (#3167
+                                            // — gov-fix, Gate 8, #2298 PR 3
+                                            // hardening round's clause):
+                                            // kServiceScopeGlobalSafe is
+                                            // compile-time-empty, so no grant
+                                            // admits a service-scoped caller on
+                                            // this surface — naming one is a
+                                            // false self-remediation claim the
+                                            // routed-concern MUST clause
+                                            // forbids. Do not reintroduce one.
+                                            const std::string& permission = "") const;
 
     AuthFn auth_fn_;
     PermFn perm_fn_;

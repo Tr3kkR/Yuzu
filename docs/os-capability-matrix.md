@@ -118,7 +118,7 @@ duplicates.
 | os_info | ✅ | ✅ | ✅ | linux/apple/win branches |
 | processes | ✅ | ✅ | ✅ | win/linux/apple branches (point-in-time enum; streaming capture is under TAR `process`) |
 | procfetch | ✅ | ✅ | ✅ | linux/apple/win branches |
-| quarantine | ✅ | ✅ | ✅ | full per-OS blocks |
+| quarantine | ✅ | ⚠️ | ⚠️ | full per-OS blocks, but containment is not yet complete on Linux/macOS: Linux only filters IPv4 (`ip6tables` never called, #3282); macOS's status check doesn't verify pf is actually enabled, only that the ruleset was loaded (#3283); status checks on all three platforms verify partial/existence, not full containment (#3285) |
 | rdp_control | ✅ | ⛔ | ⛔ | Windows-only. Off-Windows returns an honest `rdp_control\|unsupported` sentinel (macOS names Screen Sharing); state-changing `set_state` reports terminal FAILURE, read-only `status` rc=0 — `rdp_control_plugin.cpp` `#ifndef _WIN32` branch |
 | registry | ✅ | ⛔ | ⛔ | Windows-only (advapi32). Off-Windows returns an honest `registry\|unsupported` sentinel (reads rc=0; mutating `set_value`/`delete_*` report terminal FAILURE — no false success) — `registry_plugin.cpp` `#ifndef _WIN32` branch. `list_profiles` (PR1.7) enumerates local profiles via ProfileList/HKEY_USERS. `get_user_value` resolves the target profile via ProfileList and reads the live `HKEY_USERS\<SID>` hive when the user is logged in, falling back to an offline `RegLoadKey` mount (SeBackup/SeRestore privileges, required only for that fallback) when not. The ladder lives in `agents/shared/win_profiles.hpp` and is shared with `installed_apps.list_per_user`, `license_scan`'s per-user surfaces and `tar`'s mapdrive history (#2771) |
 | sccm | ✅ | ⛔ | ⛔ | Windows-only. macOS returns an honest `sccm\|unsupported` (points at Jamf/MDM); Linux `installed\|false` + "platform not supported" — `sccm_plugin.cpp` `__APPLE__` branch |
@@ -395,7 +395,7 @@ implementation is.
 | interaction | set_dnd | macos | supported | 1 | local_kv_store | - |
 | interaction | set_dnd | windows | supported | 1 | local_kv_store | - |
 | ioc | check | linux | supported | 1 | procfs | - |
-| ioc | check | macos | supported | 3 | lsof | - |
+| ioc | check | macos | supported | 1 | libproc | UDP rows carry an empty state (no fabricated "LISTEN") — a real UDP listener still matches a port check, but its detail text differs from a TCP match; a port shared by more than one process (SO_REUSEPORT, prefork) reports the pid of one arbitrarily-chosen owner in its match detail, not every owner |
 | ioc | check | windows | supported | 1 | iphlpapi_dnsapi | - |
 | license_scan | list | linux | supported | 3 | popen(rpm/dpkg-query/openssl) | - |
 | license_scan | list | macos | constrained | 1 | filesystem_probe(glob+plist) | binary (bplist00) Info.plist files are not parsed; falls back to the bundle name with an empty version |
@@ -446,19 +446,19 @@ implementation is.
 | network_config | arp | macos | unsupported | - | - | - |
 | network_config | arp | windows | supported | 1 | GetIpNetTable2 | - |
 | network_diag | listening | linux | supported | 1 | /proc/net/tcp[6] | - |
-| network_diag | listening | macos | supported | 3 | lsof via popen | - |
+| network_diag | listening | macos | supported | 1 | libproc | a socket shared by more than one process (SO_REUSEPORT, prefork) surfaces under one arbitrarily-chosen owning PID, not one row per owner |
 | network_diag | listening | windows | supported | 1 | GetExtendedTcpTable | - |
 | network_diag | connections | linux | supported | 1 | /proc/net/tcp[6] | - |
-| network_diag | connections | macos | supported | 3 | lsof via popen | - |
+| network_diag | connections | macos | supported | 1 | libproc | a socket shared by more than one process (SO_REUSEPORT, prefork) surfaces under one arbitrarily-chosen owning PID, not one row per owner |
 | network_diag | connections | windows | supported | 1 | GetExtendedTcpTable | - |
 | os_info | os_name | linux | supported | 1 | /etc/os-release | - |
-| os_info | os_name | macos | supported | 3 | popen(sw_vers -productName/-productVersion) | - |
+| os_info | os_name | macos | supported | 1 | SystemVersion.plist + sysctlbyname | - |
 | os_info | os_name | windows | supported | 1 | Reg*W CurrentVersion\\ProductName + build-number correction | - |
 | os_info | os_version | linux | supported | 1 | uname(2) | - |
-| os_info | os_version | macos | supported | 3 | uname(2) + popen(sw_vers -productVersion) | - |
+| os_info | os_version | macos | supported | 1 | uname(2) + SystemVersion.plist + sysctlbyname | - |
 | os_info | os_version | windows | supported | 1 | RtlGetVersion (ntdll) | - |
 | os_info | os_build | linux | supported | 1 | /proc/version | - |
-| os_info | os_build | macos | supported | 3 | popen(sw_vers -buildVersion) | - |
+| os_info | os_build | macos | supported | 1 | SystemVersion.plist + sysctlbyname | - |
 | os_info | os_build | windows | supported | 1 | Reg*W CurrentBuildNumber + UBR | - |
 | os_info | os_arch | linux | supported | 1 | uname(2) | - |
 | os_info | os_arch | macos | supported | 1 | uname(2) | - |
@@ -467,32 +467,32 @@ implementation is.
 | os_info | uptime | macos | supported | 1 | sysctl(2) KERN_BOOTTIME | - |
 | os_info | uptime | windows | supported | 1 | GetTickCount64 | - |
 | processes | list | linux | supported | 1 | /proc enumeration | - |
-| processes | list | macos | supported | 3 | popen(ps -axo pid,ppid,comm) | - |
+| processes | list | macos | supported | 1 | sysctl(KERN_PROC_ALL) | - |
 | processes | list | windows | supported | 1 | CreateToolhelp32Snapshot | - |
 | processes | list_hashed | linux | supported | 1 | /proc enumeration + readlink(/proc/<pid>/exe) + SHA-256 | - |
-| processes | list_hashed | macos | supported | 3 | popen(ps -axo pid,ppid,comm) + proc_pidpath + SHA-256 | - |
+| processes | list_hashed | macos | supported | 1 | sysctl(KERN_PROC_ALL) + proc_pidpath + SHA-256 | - |
 | processes | list_hashed | windows | supported | 1 | CreateToolhelp32Snapshot + QueryFullProcessImageNameW + SHA-256 | - |
 | processes | list_tree | linux | supported | 1 | /proc enumeration + readlink(/proc/<pid>/exe) + SHA-256 | - |
-| processes | list_tree | macos | supported | 3 | popen(ps -axo pid,ppid,comm) + proc_pidpath + SHA-256 | - |
+| processes | list_tree | macos | supported | 1 | sysctl(KERN_PROC_ALL) + proc_pidpath + SHA-256 | - |
 | processes | list_tree | windows | supported | 1 | CreateToolhelp32Snapshot + QueryFullProcessImageNameW + SHA-256 | - |
 | processes | query | linux | supported | 1 | /proc enumeration | - |
-| processes | query | macos | supported | 3 | popen(ps -axo pid,ppid,comm) | - |
+| processes | query | macos | supported | 1 | sysctl(KERN_PROC_ALL) | - |
 | processes | query | windows | supported | 1 | CreateToolhelp32Snapshot | - |
 | procfetch | procfetch_fetch | linux | supported | 1 | /proc enumeration + OpenSSL EVP SHA-1 | - |
 | procfetch | procfetch_fetch | macos | supported | 1 | libproc (proc_listpids/proc_pidpath) + OpenSSL EVP SHA-1 | - |
 | procfetch | procfetch_fetch | windows | supported | 1 | CreateToolhelp32Snapshot + BCrypt SHA-1 | - |
-| quarantine | quarantine | linux | supported | 3 | sudo iptables via popen | - |
-| quarantine | quarantine | macos | supported | 3 | sudo pfctl via popen | - |
-| quarantine | quarantine | windows | supported | 3 | netsh via popen | - |
-| quarantine | unquarantine | linux | supported | 3 | sudo iptables via popen | - |
-| quarantine | unquarantine | macos | supported | 3 | sudo pfctl via popen | - |
-| quarantine | unquarantine | windows | supported | 3 | netsh via popen | - |
-| quarantine | status | linux | supported | 3 | sudo iptables via popen | - |
-| quarantine | status | macos | supported | 3 | sudo pfctl via popen | - |
-| quarantine | status | windows | supported | 3 | netsh via popen | - |
-| quarantine | whitelist | linux | supported | 3 | sudo iptables via popen | - |
-| quarantine | whitelist | macos | supported | 3 | sudo pfctl via popen | - |
-| quarantine | whitelist | windows | supported | 3 | netsh via popen | - |
+| quarantine | quarantine | linux | supported | 2 | sudo-governed iptables via bounded runner argv | - |
+| quarantine | quarantine | macos | supported | 2 | sudo-governed pfctl via bounded runner argv | - |
+| quarantine | quarantine | windows | supported | 2 | netsh via bounded runner argv (service-account privilege, no sudo) | - |
+| quarantine | unquarantine | linux | supported | 2 | sudo-governed iptables via bounded runner argv | - |
+| quarantine | unquarantine | macos | supported | 2 | sudo-governed pfctl via bounded runner argv | - |
+| quarantine | unquarantine | windows | supported | 2 | netsh via bounded runner argv (service-account privilege, no sudo) | - |
+| quarantine | status | linux | supported | 2 | sudo-governed iptables via bounded runner argv | - |
+| quarantine | status | macos | supported | 2 | sudo-governed pfctl via bounded runner argv | - |
+| quarantine | status | windows | supported | 2 | netsh via bounded runner argv (service-account privilege, no sudo) | - |
+| quarantine | whitelist | linux | supported | 2 | sudo-governed iptables via bounded runner argv | - |
+| quarantine | whitelist | macos | supported | 2 | sudo-governed pfctl via bounded runner argv | - |
+| quarantine | whitelist | windows | supported | 2 | netsh via bounded runner argv (service-account privilege, no sudo) | - |
 | rdp_control | set_state | linux | unsupported | - | - | - |
 | rdp_control | set_state | macos | unsupported | - | - | - |
 | rdp_control | set_state | windows | supported | 1 | Win32 registry + INetFwPolicy2 COM + SCM | - |

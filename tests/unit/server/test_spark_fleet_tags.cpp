@@ -15,6 +15,7 @@
  */
 #include "spark_fleet_tags.hpp"
 
+#include "guardian_unsupported_heartbeat.hpp" // agent emitter for the F7 unsupported gauge
 #include "spark_heartbeat.hpp"  // agent emitter — bind its ACTUAL emitted keys to the reader
 #include <yuzu/agent/spark.hpp> // spark_type_token — the agent's canonical tokens
 
@@ -59,15 +60,21 @@ static_assert(std::string_view(detail::kSparkMechService) ==
 static_assert(std::string_view(detail::kSparkMetricWatchRejected) == "watch_rejected");
 static_assert(std::string_view(detail::kSparkMetricQuarantined) == "quarantined");
 static_assert(std::string_view(detail::kSparkMetricSlowOp) == "slow_op");
+// F7 (#2298 rung 2): NOT a SparkMechanismStats counter like its three siblings above -
+// its data source is GuardianEngine::unsupported_counts_by_type(). See the header note.
+static_assert(std::string_view(detail::kSparkMetricUnsupported) == "unsupported");
 
 TEST_CASE("spark_type_metric_tag composes yuzu.spark_<type>_<metric>", "[spark][fleet]") {
     using detail::spark_type_metric_tag;
     CHECK(spark_type_metric_tag("file", "watch_rejected") == "yuzu.spark_file_watch_rejected");
     CHECK(spark_type_metric_tag("registry", "quarantined") == "yuzu.spark_registry_quarantined");
     CHECK(spark_type_metric_tag("service", "slow_op") == "yuzu.spark_service_slow_op");
+    CHECK(spark_type_metric_tag("file", "unsupported") == "yuzu.spark_file_unsupported");
     // Composed from the token + metric arrays must round-trip identically.
     CHECK(spark_type_metric_tag(detail::kSparkMechFile, detail::kSparkMetricSlowOp) ==
           "yuzu.spark_file_slow_op");
+    CHECK(spark_type_metric_tag(detail::kSparkMechFile, detail::kSparkMetricUnsupported) ==
+          "yuzu.spark_file_unsupported");
 }
 
 TEST_CASE("spark_mechs_from_csv keeps recognised tokens and drops the rest", "[spark][fleet]") {
@@ -152,6 +159,38 @@ TEST_CASE("agent emit keys bind exactly to the server tag constants", "[spark][f
     CHECK(tags.count(detail::kSparkTagConsumerErrors) == 1);
     CHECK(tags.count(detail::kSparkTagArmRaceUnwatchFailures) == 1);
     CHECK(tags.count(detail::spark_type_metric_tag("registry", "quarantined")) == 1);
+}
+
+// F7 (#2298 rung 2) WRITER<->READER BIND for the unsupported gauge - a SEPARATE case
+// from the one above, deliberately: emit_guardian_unsupported_heartbeat_tags's data
+// source is GuardianEngine::unsupported_counts_by_type(), not SparkEngineStats/
+// SparkMechanismStats, so it cannot be folded into emit_spark_heartbeat_tags's own
+// bind without pretending the two share an input shape. Same discipline as its
+// sibling: emit through the REAL agent function, assert every produced key is
+// recognised via the SAME kSparkMechTokens x kSparkMetricTokens closed set, so a
+// rename on either side is caught here rather than shipping silent zero-reporting.
+TEST_CASE("guardian unsupported-gauge emit keys bind exactly to the server tag "
+          "constants",
+          "[spark][fleet][guardian]") {
+    using yuzu::agent::emit_guardian_unsupported_heartbeat_tags;
+
+    std::set<std::string> reader_keys;
+    for (const char* mech : detail::kSparkMechTokens)
+        for (const char* metric : detail::kSparkMetricTokens)
+            reader_keys.insert(detail::spark_type_metric_tag(mech, metric));
+
+    std::map<SparkType, std::uint64_t> counts = {
+        {SparkType::File, 1}, {SparkType::Registry, 2}, {SparkType::Service, 3}};
+    std::map<std::string, std::string> tags;
+    emit_guardian_unsupported_heartbeat_tags(tags, counts);
+
+    REQUIRE(tags.size() == 3); // every mechanism was set non-zero above
+    for (const auto& [key, val] : tags) {
+        INFO("emitted key not recognised by the server reader: " << key);
+        CHECK(reader_keys.count(key) == 1);
+    }
+    CHECK(tags.count(detail::spark_type_metric_tag("file", "unsupported")) == 1);
+    CHECK(tags.at(detail::spark_type_metric_tag("registry", "unsupported")) == "2");
 }
 
 TEST_CASE("parse_spark_count enforces the forged-value posture", "[spark][fleet]") {

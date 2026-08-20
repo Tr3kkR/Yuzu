@@ -124,6 +124,46 @@ An MCP approval-ticket recall that hits a store fault has always returned `-3260
 
 **What to do:** if you have automation that blindly retries on `-32603` without checking `retry_after_ms`, it now stops retrying sooner in this specific case — which is the correct behavior (the old retries were futile). If your automation already honors `retry_after_ms` per [invariant A5](../agentic-first-principle.md), no change is needed. See [`mcp.md`](mcp.md) "`-32603`: Approval store unavailable" for the full response-body reference.
 
+## Behaviour change: four MCP tool input schemas got stricter (#2444)
+
+`revoke_certificate.serial_hex`, `confirm_engine_rotation.token_id`, `quarantine_device.reason`/`whitelist`, and the eight *approval-gated* engine-principal tools' `principal_id` (`create`/`revoke_engine_principal`, `mint`/`rotate_engine_credential`, `transfer_engine_principal_owner`, `assign`/`unassign_engine_role`) now carry `pattern`/`maxLength` bounds mirroring their handlers' own checks (previously enforced only at the handler, after an approval ticket was already consumed). `get_engine_principal` and `list_engine_roles` also gained the same `principal_id` pattern, but per this codebase's standing rule that input-schema validation runs only on the approval-gated path (`mcp-server.md`'s "Pre-approval input-schema validation"), those two are Read-tier and never approval-gated — the pattern is advertised metadata on `tools/list` only, not server-enforced; a malformed `principal_id` still reaches the handler and is rejected there exactly as before.
+
+**Who this affects:** any operator or automation with an outstanding (pending or
+approved-but-unconsumed) approval ticket for one of these ten tools —
+`revoke_certificate`, `confirm_engine_rotation`, `quarantine_device`,
+`create_engine_principal`, `revoke_engine_principal`, `mint_engine_credential`,
+`rotate_engine_credential`, `transfer_engine_principal_owner`,
+`assign_engine_role`, `unassign_engine_role` — whose arguments don't match the
+new bound: `serial_hex` must be `^[0-9A-Fa-f]{1,64}$`; `token_id` must be
+`^[0-9a-f]{24}$`; `quarantine_device.reason`/`whitelist` must be ≤1024/≤512
+bytes (whitelist additionally charset-restricted); `principal_id` must match
+`^engine:[a-z0-9._-]+$` (or the bare-slug form on `assign`/`unassign_engine_role`).
+Full patterns: `mcp-server.md`'s "Pre-approval input-schema validation" section.
+
+**What to do:** such a ticket becomes unrecallable fail-closed once the new
+server is running — the recall fails pre-consume just like any other
+schema-invalid call, and the ticket is never burned, but it also can't be
+redeemed as originally minted. It stays valid until its normal 7-day expiry
+(pending or approved-unconsumed), then ages out and must be re-requested. To
+check exposure before upgrading, list your outstanding tickets for these ten
+tools (`list_pending_approvals` MCP tool or `GET /api/v1/approvals`) and
+compare each one's arguments against the patterns above; no action is needed
+for a ticket that already matches, or if you have none outstanding.
+
+**Verify:** re-request any ticket the check above flagged, confirm the new
+recall succeeds under the same tier, and confirm a deliberately malformed
+value (e.g. a non-hex `serial_hex`) is now rejected at mint time — `-32602`,
+no approval created — rather than being accepted and only failing later at
+the handler.
+
+## Behaviour change: `discover_instructions`/`GET /api/v1/discover/instructions` null out a non-object stored `parameter_schema` (#2986)
+
+Both surfaces share one builder (`build_instructions_catalog`) that parses each `InstructionDefinition`'s stored `parameter_schema` text. It previously forwarded any value that parsed as JSON, even a non-object (an array, string, number, or boolean). It now forwards it only when the parsed value is itself a JSON object — a non-object value is reported as `null` instead, matching `GET /api/v1/discover/plugins`' existing behavior for the same field.
+
+**Who this affects:** an operator or integration that authored an `InstructionDefinition` with a non-object `parameter_schema` — reachable via the ordinary `create`/`update`/`import` paths, which don't validate the field's shape on write. No shipped content sets `parameter_schema` to anything but an object or leaves it unset (defaults to `{}`), so this affects only a deliberately or accidentally malformed definition.
+
+**What to do:** if you have such a definition and relied on the old raw-forwarding behavior, re-author `parameter_schema` as a JSON Schema object. No action is required otherwise.
+
 ## Behaviour change: webhook and offload-target deliveries, and enrollment/execution-failure notifications, now actually fire (#3261)
 
 A boot-ordering bug wired `NotificationStore`/`WebhookStore`/`OffloadTargetStore` into
@@ -2584,6 +2624,12 @@ Three operator-visible behaviour changes ship in the v0.12.0 A3 ladder. None req
 **2. `/api/health` is restored as an alias of `/health` (#620).** The pre-#401 endpoint path is back. Monitoring integrations that point at `/api/health` work without reconfiguration; both URLs serve identical JSON. Both are exempt from rate limiting (a follow-up hardening over the bare `/health` behaviour). For load-balancer probes that should drain in-flight traffic before stopping, continue using `/readyz` — `/health` and `/api/health` are intentionally not draining-aware (Kubernetes pattern: liveness/health probes are not draining-aware).
 
 **3. File-logger boot messages are now quieter (#624).** The previous `WARN: Could not create log directory /var/log/yuzu` + `ERROR: file logger setup failed` pair on every container boot is replaced by a single INFO-level line when the default path cannot be created. The Docker server image now pre-creates `/var/log/yuzu` (mode 0750, owned by `yuzu`) so the path is writable out of the box. **If your monitoring previously alerted on the WARN/ERROR lines as a misconfig signal, those signals will no longer fire** — the failure mode is now a single INFO line. Operators who require explicit on-disk logs should pass `--log-file <path>`; explicit-path failures still log at ERROR and are not silently degraded.
+
+### `quarantine` plugin: reporting is now more conservative (Wave-2 argv migration)
+
+The `quarantine` plugin's Windows/Linux/macOS `netsh`/`iptables`/`pfctl` invocations were migrated off shell-outs onto a bounded argv runner. Alongside the mechanism change, two reporting bugs were fixed: a Linux chain-flush could previously be miscounted as an applied containment rule (`status|quarantined|rules_applied|1` reported with zero rules actually installed), and macOS whitelist mutations could silently proceed on a failed prerequisite read or report success despite `pfctl -e` failing to enable pf.
+
+**If your automation alerts on `status|failed`/`status|release_uncertain`/`status|update_uncertain` from `quarantine` actions, you may see these fire more often after upgrading** — this is expected. Nothing got more broken; the plugin's failure reporting simply got more honest about cases it previously reported as clean success. No action is required beyond expecting the change.
 
 ## Rollback
 

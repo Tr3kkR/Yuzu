@@ -2942,6 +2942,19 @@ groups:
   #           or contended watcher. Sustained slow ops can delay detection. Inspect the
   #           mechanism's OS facility (IOCP / TP_WAIT pool / sd-bus / SCM) on the OS.
   #         runbook_url: "https://docs.yuzu.io/runbooks/spark-slow-op"
+  #     # No YuzuSparkUnsupported rule (F7, #2298 rung 2 - governance finding, sre Gate 3):
+  #     # yuzu_fleet_spark_unsupported is a ROUTINE signal, not a fault - a known spark type
+  #     # with no mechanism on that host (every rule reads unsupported on macOS today, since
+  #     # macOS registers none of file/registry/service) is expected, not a regression. A
+  #     # bare `> 0` would page on every legitimate cross-platform deploy. It is NOT
+  #     # universally safe to ignore, though: classify() keys off the registered-AND-
+  #     # non-inert capability set (guardian_engine.cpp), so a registration failure or a
+  #     # registered-but-inert mechanism can also land a rule here on a platform where it
+  #     # should have worked - see docs/user-manual/guaranteed-state.md's on-call note for
+  #     # how to tell the two apart. Revisit at rung 11 (docs/spark-stage2-guardian-
+  #     # consumer-design.md's deferred server-side fleet-signal alert work - flap
+  #     # detector + SparkFailed-prevalence) once real per-platform baselines exist to
+  #     # alert against.
   #     - alert: YuzuSparkQueuedDropped
   #       expr: |
   #         increase(yuzu_fleet_spark_queued_dropped[15m]) > 0

@@ -10,11 +10,53 @@
  *
  * Firewall rules are prefixed with "YuzuQuarantine_" for easy identification.
  * Output is pipe-delimited via write_output().
+ *
+ * ── Wave-2 ADR-3002 acquisition-ladder migration ─────────────────────────
+ *
+ * Every spawn site in this file goes through yuzu::agent::run_bounded_subprocess
+ * with clean, pre-split argv (no shell, no popen/_popen, no PATH search —
+ * argv[0] is always an absolute path). Linux/macOS privilege escalation is
+ * yuzu::shared::sudo_wrap's canonical `sudo -n -- <tool> <args>` form;
+ * Windows needs none (the YuzuAgent service account's own privilege covers
+ * netsh). Every mutating call's real termination reason is forwarded
+ * through the ABI4 result-status seam via yuzu::agent::forward_runner_failure
+ * — a quarantine/unquarantine/status read never silently reports success
+ * when the underlying tool did not genuinely run and exit as expected. This
+ * is deliberately careful: an incorrectly-reported quarantine or
+ * unquarantine is a containment/availability failure, not a cosmetic one.
+ *
+ * ── macOS: DO NOT reintroduce a pf anchor ─────────────────────────────────
+ *
+ * `macos_load_ruleset` writes the ENTIRE main pf ruleset (never an anchor)
+ * and loads it with ONE atomic `pfctl -f` call, with `set skip on lo0` as
+ * the first line. This is a deliberate fix for a real production incident
+ * (commit 672896112, `git log -1 672896112` for the full account): an
+ * earlier design used a named anchor (`pfctl -a yuzu-quarantine -f tmp`
+ * then a second `pfctl -f -` to attach the anchor to the main ruleset) —
+ * that second call REPLACED the whole main ruleset with just the anchor
+ * reference, evicting macOS's default rules, and 29 seconds later the
+ * agent⇄gateway⇄server loopback TCP connection died mid-flight because the
+ * anchor design's rule reload did not preserve pf's loopback connection
+ * state. This migration changes ONLY the spawn mechanism (popen → bounded
+ * subprocess argv, sudo prefix → yuzu::shared::sudo_wrap) — the ruleset
+ * content, the single-atomic-`pfctl -f`-call strategy, and `set skip on
+ * lo0` are byte-for-byte unchanged. If you find yourself adding `pfctl -a`
+ * anywhere in this file, stop — that is the reverted design.
  */
 
 #include <yuzu/plugin.hpp>
+#include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field — escape attacker/environment-influenced diagnostic text before it reaches a pipe-delimited output row
+#include <yuzu/agent/runner_status.hpp>     // yuzu::agent::forward_runner_failure (ABI4 result seam)
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (ADR-3002 rung 2)
 
-#include <array>
+#ifndef _WIN32
+#include <spdlog/spdlog.h>
+#include "sudo_argv.hpp" // yuzu::shared::sudo_wrap — canonical sudo -n -- <tool> <args> form (agents/shared)
+#endif
+
+#include "quarantine_parsers.hpp" // yuzu::quarantine:: pure netsh/iptables/pfctl output parsers
+
+#include <chrono>
 #include <cstdio>
 #include <format>
 #include <sstream>
@@ -22,57 +64,41 @@
 #include <string_view>
 #include <vector>
 
-#ifndef _WIN32
-#include <sys/wait.h> // WIFEXITED / WEXITSTATUS — interpret popen()'s return value
-#include <unistd.h>   // geteuid() — privilege detection for sudo prefix
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include "win_str.hpp" // yuzu::win::from_wide (agents/shared, #1681)
 #endif
 
 namespace {
 
-// ── Privilege escalation helper (Unix only) ──────────────────────────────────
-//
-// The agent runs as a dedicated unprivileged account (`_yuzu` on macOS,
-// `yuzu` on Linux — see docs/agent-privilege-model.md). Plugins that need
-// privileged operations shell out via narrow `sudo NOPASSWD` entries
-// installed by scripts/install-agent-user.sh. This helper returns the
-// prefix to glue in front of the binary path.
-//
-//   - When EUID is 0 (test/dev runs that launched the agent as root):
-//     returns "" so we don't have a useless sudo round-trip.
-//   - Otherwise (production / properly-installed dev): returns "sudo -n ".
-//     The `-n` is critical: non-interactive mode makes sudo fail
-//     immediately with a useful error if the sudoers grant is missing,
-//     rather than blocking the daemon waiting on a password prompt
-//     it can't answer.
-//
-// The result is cached on first call — EUID can't change during the
-// agent's lifetime, so this is a const for all practical purposes.
-//
-// Windows takes a different path entirely: the YuzuAgent service account
-// carries SeAssignPrimaryTokenPrivilege + Administrators membership,
-// granted at install time via LsaAddAccountRights. The Windows code
-// blocks below shell out to `netsh` directly — no sudo equivalent.
+using yuzu::quarantine::is_safe_ip;
+using yuzu::quarantine::kRulePrefix;
 
-#ifndef _WIN32
-const char* sudo_prefix() {
-    static const char* prefix = (geteuid() == 0) ? "" : "sudo -n ";
-    return prefix;
-}
-#endif
-
-// Absolute paths to firewall binaries. These MUST match the paths in
-// the sudoers grants — see scripts/install-agent-user.sh
-// generate_sudoers_content(). PATH-injection bypass would be possible
-// with bare names: an attacker who got code execution as the agent
-// could prepend a directory to $PATH containing a malicious `iptables`,
-// and the sudoers entry `/usr/sbin/iptables` would happily run that
-// instead. Absolute paths in the shell-out close that gap.
+// ── Bounded-execution deadlines (ADR-3002 runner-idiom ceiling) ────────────
 //
-// If a future distro ships these binaries somewhere else (`/sbin/iptables`
-// on a few older Linuxes, `/opt/homebrew/sbin/pfctl` on a developer's
-// custom box), update both sides — the constant here AND the sudoers
-// entry generator.
+// 15s for mutating firewall-rule changes (task-set convention shared with
+// the sibling users/certificates Wave-2 packages); 10s for the read-only
+// status/whitelist queries, which should return near-instantly. Both are
+// generous enough never to fire in normal operation and short enough that a
+// wedged netsh/iptables/pfctl invocation cannot pin the instruction worker
+// indefinitely (the popen()-based predecessor had NO bound at all).
+constexpr std::chrono::milliseconds kQuarantineMutateDeadline{15000};
+constexpr std::chrono::milliseconds kQuarantineReadDeadline{10000};
 
+// Absolute paths to firewall binaries. These MUST match the paths in the
+// sudoers grants — see scripts/install-agent-user.sh
+// generate_sudoers_content(). PATH-injection bypass would be possible with
+// bare names: an attacker who got code execution as the agent could prepend
+// a directory to $PATH containing a malicious `iptables`, and a sudoers
+// entry keyed on `/usr/sbin/iptables` would happily run that instead —
+// moot now that run_bounded_subprocess never PATH-searches argv[0] at all,
+// but the absolute path is also what the sudoers grant itself matches.
 #ifdef __APPLE__
 constexpr const char* kPfctl = "/sbin/pfctl";
 #endif
@@ -80,66 +106,68 @@ constexpr const char* kPfctl = "/sbin/pfctl";
 constexpr const char* kIptables = "/usr/sbin/iptables";
 #endif
 
-// ── Subprocess helpers ───────────────────────────────────────────────────────
+// ── Subprocess helper ────────────────────────────────────────────────────
 
-std::string run_command(const char* cmd) {
-    std::string result;
-    std::array<char, 256> buf{};
-#ifdef _WIN32
-    FILE* pipe = _popen(cmd, "r");
-#else
-    FILE* pipe = popen(cmd, "r");
-#endif
-    if (!pipe)
-        return result;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        result += buf.data();
+/// Outcome of run_tool(): the captured output PLUS the raw runner result, so
+/// a caller can forward the latter through the ABI4 result seam
+/// (report_runner_result / yuzu::agent::forward_runner_failure) itself.
+struct ToolOutcome {
+    std::string output;
+    yuzu::agent::SubprocessResult res;
+};
+
+/// Direct-argv replacement for the popen()/_popen() shell-string hop that
+/// used to run every command here through a shell (ADR-3002 rung 2): the
+/// same bounded runner, but exec'd straight to argv[0] with no shell in
+/// between — no shell-quoting/injection surface. `merge_stderr=false`
+/// matches this file's old `2>/dev/null` redirections; `merge_stderr=true`
+/// matches a call site that used to have no redirection at all (stderr
+/// simply wasn't captured) but where capturing it now gives the honest
+/// failure message a real diagnostic to quote (the established
+/// mutating-action convention — see users_plugin.cpp/certificates_plugin.cpp).
+ToolOutcome run_tool(const std::vector<std::string>& argv, std::chrono::milliseconds deadline,
+                     bool merge_stderr) {
+    auto res = yuzu::agent::run_bounded_subprocess(
+        argv, yuzu::agent::SubprocessOptions{.deadline = deadline, .merge_stderr = merge_stderr});
+#ifndef _WIN32
+    // A cut-short/failed tool call can parse as "not quarantined" / "0 rules
+    // applied" — a silent false-negative for a security-critical action.
+    // Warn so an operator can distinguish a degraded run from a genuinely
+    // clean one. spdlog isn't linked on the Windows leg of this plugin
+    // today (no other call site here needed it); the ABI4 result-status
+    // forward below is the cross-platform channel.
+    if (res.timed_out || !res.tool_ran || res.output_truncated) {
+        spdlog::warn("quarantine: degraded run (timed_out={}, tool_ran={}, truncated={}): {}",
+                     res.timed_out, res.tool_ran, res.output_truncated,
+                     argv.empty() ? std::string{} : argv.front());
     }
-#ifdef _WIN32
-    _pclose(pipe);
-#else
-    pclose(pipe);
 #endif
-    while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
-        result.pop_back();
-    return result;
+    std::string output = res.output;
+    while (!output.empty() && (output.back() == '\n' || output.back() == '\r'))
+        output.pop_back();
+    return ToolOutcome{std::move(output), std::move(res)};
 }
 
-int run_command_rc(const char* cmd) {
-#ifdef _WIN32
-    FILE* pipe = _popen(cmd, "r");
-#else
-    FILE* pipe = popen(cmd, "r");
-#endif
-    if (!pipe)
-        return -1;
-    std::array<char, 256> buf{};
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {}
-#ifdef _WIN32
-    return _pclose(pipe);
-#else
-    return pclose(pipe);
-#endif
+/// Forwards a genuine runner failure (spawn_error/deadline/cancelled/
+/// signaled — see runner_status.hpp) through the ABI4 result seam AT MOST
+/// ONCE per action: `status_forwarded` is a local guard threaded through
+/// every call in one do_*/leaf-function entry point so a later, less-
+/// specific failure never overwrites an earlier one (mirrors
+/// users_plugin.cpp's run_tool/status_forwarded convention). Returns true
+/// iff the tool positively ran and exited zero — the mutating call sites
+/// that need that (the old `run_command_rc(...) == 0` rules_applied
+/// counters) use the return value; read-only call sites (status/whitelist
+/// parses, which must not gate on a query command's exit code — a
+/// nonexistent chain/rule set is a normal "not quarantined" outcome, not a
+/// failure) ignore it and rely solely on the forwarding side effect.
+bool report_runner_result(yuzu::CommandContext& ctx, bool& status_forwarded,
+                          const yuzu::agent::SubprocessResult& res) {
+    if (!status_forwarded && yuzu::agent::forward_runner_failure(ctx, res))
+        status_forwarded = true;
+    return res.tool_ran && res.exit_code == 0;
 }
 
-// ── IP validation ────────────────────────────────────────────────────────────
-
-bool is_valid_ip_char(char c) {
-    return (c >= '0' && c <= '9') || c == '.' || c == ':' || (c >= 'a' && c <= 'f') ||
-           (c >= 'A' && c <= 'F');
-}
-
-bool is_safe_ip(std::string_view ip) {
-    if (ip.empty() || ip.size() > 45)
-        return false;
-    for (char c : ip) {
-        if (!is_valid_ip_char(c))
-            return false;
-    }
-    return true;
-}
-
-// ── String splitting ─────────────────────────────────────────────────────────
+// ── String splitting ─────────────────────────────────────────────────────
 
 std::vector<std::string> split_ips(std::string_view csv) {
     std::vector<std::string> ips;
@@ -168,58 +196,94 @@ std::string join_ips(const std::vector<std::string>& ips) {
     return result;
 }
 
-// ── Rule name prefix ─────────────────────────────────────────────────────────
-
-constexpr const char* kRulePrefix = "YuzuQuarantine_";
-
 // ── Windows implementation ───────────────────────────────────────────────────
 
 #ifdef _WIN32
 
+/// Absolute path to netsh.exe, resolved via GetSystemDirectoryW so this
+/// never depends on PATH (same PATH-hijack rationale as
+/// tar_mapdrive_collector.cpp's system32_path — that helper returns a
+/// shell-quoted string for its own popen()-based caller; run_bounded_subprocess
+/// execs argv[0] directly with no shell, so this returns UNQUOTED). Cached
+/// on first call — the system directory can't change during the agent's
+/// lifetime.
+const std::string& netsh_path() {
+    static const std::string path = [] {
+        wchar_t dir[MAX_PATH]{};
+        UINT n = GetSystemDirectoryW(dir, MAX_PATH);
+        if (n == 0 || n >= MAX_PATH)
+            return std::string{}; // honest empty -> run_bounded_subprocess's
+                                   // own empty-argv[0] spawn_error reject
+        return yuzu::win::from_wide(dir) + "\\netsh.exe";
+    }();
+    return path;
+}
+
+struct StatusReadResult {
+    bool active = false;
+    yuzu::agent::SubprocessResult res;
+};
+struct WhitelistRead {
+    std::vector<std::string> ips;
+    yuzu::agent::SubprocessResult res;
+};
+
 int win_quarantine(yuzu::CommandContext& ctx, const std::vector<std::string>& whitelist_ips) {
     int rules_applied = 0;
+    bool status_forwarded = false;
 
-    // Block all inbound traffic
-    auto cmd = std::format("netsh advfirewall firewall add rule name=\"{}BlockAllInbound\" "
-                           "dir=in action=block enable=yes protocol=any",
-                           kRulePrefix);
-    if (run_command_rc(cmd.c_str()) == 0)
-        ++rules_applied;
+    auto apply = [&](std::vector<std::string> argv) {
+        auto out = run_tool(argv, kQuarantineMutateDeadline, /*merge_stderr=*/true);
+        if (report_runner_result(ctx, status_forwarded, out.res))
+            ++rules_applied;
+    };
 
-    // Block all outbound traffic
-    cmd = std::format("netsh advfirewall firewall add rule name=\"{}BlockAllOutbound\" "
-                      "dir=out action=block enable=yes protocol=any",
-                      kRulePrefix);
-    if (run_command_rc(cmd.c_str()) == 0)
-        ++rules_applied;
+    // sink: quarantine/win_quarantine#1 — rung-2 runner argv, MUTATING
+    apply({netsh_path(), "advfirewall", "firewall", "add", "rule",
+          std::format("name={}BlockAllInbound", kRulePrefix), "dir=in", "action=block",
+          "enable=yes", "protocol=any"});
 
-    // Allow loopback inbound
-    cmd = std::format("netsh advfirewall firewall add rule name=\"{}AllowLoopbackIn\" "
-                      "dir=in action=allow enable=yes remoteip=127.0.0.1",
-                      kRulePrefix);
-    if (run_command_rc(cmd.c_str()) == 0)
-        ++rules_applied;
+    // sink: quarantine/win_quarantine#2 — rung-2 runner argv, MUTATING
+    apply({netsh_path(), "advfirewall", "firewall", "add", "rule",
+          std::format("name={}BlockAllOutbound", kRulePrefix), "dir=out", "action=block",
+          "enable=yes", "protocol=any"});
 
-    // Allow loopback outbound
-    cmd = std::format("netsh advfirewall firewall add rule name=\"{}AllowLoopbackOut\" "
-                      "dir=out action=allow enable=yes remoteip=127.0.0.1",
-                      kRulePrefix);
-    if (run_command_rc(cmd.c_str()) == 0)
-        ++rules_applied;
+    // sink: quarantine/win_quarantine#3 — rung-2 runner argv, MUTATING
+    apply({netsh_path(), "advfirewall", "firewall", "add", "rule",
+          std::format("name={}AllowLoopbackIn", kRulePrefix), "dir=in", "action=allow",
+          "enable=yes", "remoteip=127.0.0.1"});
 
-    // Allow each whitelisted IP (inbound + outbound)
+    // sink: quarantine/win_quarantine#4 — rung-2 runner argv, MUTATING
+    apply({netsh_path(), "advfirewall", "firewall", "add", "rule",
+          std::format("name={}AllowLoopbackOut", kRulePrefix), "dir=out", "action=allow",
+          "enable=yes", "remoteip=127.0.0.1"});
+
     for (const auto& ip : whitelist_ips) {
-        cmd = std::format("netsh advfirewall firewall add rule name=\"{}AllowIn_{}\" "
-                          "dir=in action=allow enable=yes remoteip={}",
-                          kRulePrefix, ip, ip);
-        if (run_command_rc(cmd.c_str()) == 0)
-            ++rules_applied;
+        // sink: quarantine/win_quarantine#5 — rung-2 runner argv, MUTATING,
+        // operator-supplied IP validated by is_safe_ip before reaching here.
+        // Argv construction lives in netsh_allow_in_rule_argv
+        // (quarantine_parsers.hpp) — pure and unit-tested (FN-03).
+        apply(yuzu::quarantine::netsh_allow_in_rule_argv(netsh_path(), ip));
 
-        cmd = std::format("netsh advfirewall firewall add rule name=\"{}AllowOut_{}\" "
-                          "dir=out action=allow enable=yes remoteip={}",
-                          kRulePrefix, ip, ip);
-        if (run_command_rc(cmd.c_str()) == 0)
-            ++rules_applied;
+        // sink: quarantine/win_quarantine#6 — rung-2 runner argv, MUTATING,
+        // operator-supplied IP validated by is_safe_ip before reaching here
+        apply({netsh_path(), "advfirewall", "firewall", "add", "rule",
+              std::format("name={}AllowOut_{}", kRulePrefix, ip), "dir=out", "action=allow",
+              "enable=yes", std::format("remoteip={}", ip)});
+    }
+
+    if (rules_applied == 0) {
+        // Every single netsh call failed to apply — the device is NOT
+        // quarantined. Reporting "quarantined" here regardless of
+        // rules_applied was the pre-migration behaviour; a security-critical
+        // action that silently isolates nothing is exactly the failure mode
+        // this migration must close.
+        if (!status_forwarded) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "quarantine:win_quarantine all rules failed to apply");
+        }
+        ctx.write_output("status|failed|rules_applied|0");
+        return 1;
     }
 
     ctx.write_output(std::format("status|quarantined|rules_applied|{}", rules_applied));
@@ -227,97 +291,82 @@ int win_quarantine(yuzu::CommandContext& ctx, const std::vector<std::string>& wh
 }
 
 int win_unquarantine(yuzu::CommandContext& ctx) {
-    // Delete all rules whose name starts with the prefix
+    bool status_forwarded = false;
+    // Tracks a CLEAN failure (tool ran, exited nonzero) on one of the rule
+    // deletions below — distinct from status_forwarded, which only covers a
+    // genuine runner-level failure (spawn/deadline/cancel/signal). Every
+    // rule in rules_to_delete was just observed present in the show-rule
+    // capture, so a delete that runs and refuses is a real signal the
+    // release did not fully complete, not routine idempotency noise —
+    // discarding it (the pre-fix behaviour) let a partially-failed release
+    // still report "released".
+    bool delete_failed = false;
+
     // netsh does not support wildcards, so we list rules and delete matches.
-    auto output = run_command("netsh advfirewall firewall show rule name=all dir=in");
-    // Also grab outbound rules
-    auto output_out = run_command("netsh advfirewall firewall show rule name=all dir=out");
-    output += "\n" + output_out;
+    // sink: quarantine/win_unquarantine#1 — rung-2 runner argv, read-only
+    auto out_in = run_tool({netsh_path(), "advfirewall", "firewall", "show", "rule", "name=all",
+                            "dir=in"},
+                           kQuarantineReadDeadline, /*merge_stderr=*/false);
+    report_runner_result(ctx, status_forwarded, out_in.res);
 
-    std::istringstream iss(output);
-    std::string line;
-    std::vector<std::string> rules_to_delete;
+    // sink: quarantine/win_unquarantine#2 — rung-2 runner argv, read-only
+    auto out_out = run_tool({netsh_path(), "advfirewall", "firewall", "show", "rule", "name=all",
+                             "dir=out"},
+                            kQuarantineReadDeadline, /*merge_stderr=*/false);
+    report_runner_result(ctx, status_forwarded, out_out.res);
 
-    while (std::getline(iss, line)) {
-        auto colon = line.find(':');
-        if (colon == std::string::npos)
-            continue;
-        auto key = line.substr(0, colon);
-        while (!key.empty() && key.back() == ' ')
-            key.pop_back();
-        if (key != "Rule Name")
-            continue;
-        auto val = line.substr(colon + 1);
-        while (!val.empty() && val.front() == ' ')
-            val.erase(val.begin());
-        if (val.starts_with(kRulePrefix)) {
-            // Avoid duplicates
-            bool found = false;
-            for (const auto& r : rules_to_delete) {
-                if (r == val) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found)
-                rules_to_delete.push_back(val);
-        }
-    }
+    std::string combined = out_in.output + "\n" + out_out.output;
+    auto rules_to_delete = yuzu::quarantine::netsh_matching_rule_names(combined);
 
     for (const auto& rule : rules_to_delete) {
-        auto cmd = std::format("netsh advfirewall firewall delete rule name=\"{}\"", rule);
-        run_command_rc(cmd.c_str());
+        // sink: quarantine/win_unquarantine#3 — rung-2 runner argv, MUTATING
+        auto del = run_tool({netsh_path(), "advfirewall", "firewall", "delete", "rule",
+                             std::format("name={}", rule)},
+                            kQuarantineMutateDeadline, /*merge_stderr=*/true);
+        if (!report_runner_result(ctx, status_forwarded, del.res))
+            delete_failed = true;
+    }
+
+    if (status_forwarded || delete_failed) {
+        // A genuine runner failure (spawn/deadline/cancel/signal), OR a
+        // clean failure on one of the rule deletions themselves, occurred
+        // somewhere in the release sequence — do NOT claim the device is
+        // released when the release commands themselves may not have run to
+        // completion. This is the unquarantine-side mirror of the invariant
+        // the macOS incident this migration must not reintroduce: a
+        // firewalled host must never be silently reported as recovered.
+        if (!status_forwarded) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "quarantine:win_unquarantine one or more rule deletions failed");
+        }
+        ctx.write_output("status|release_uncertain");
+        return 1;
     }
 
     ctx.write_output("status|released");
     return 0;
 }
 
-bool win_is_quarantined() {
-    auto output = run_command("netsh advfirewall firewall show rule name=all dir=in");
-    return output.find(kRulePrefix) != std::string::npos;
+StatusReadResult win_is_quarantined() {
+    // sink: quarantine/win_is_quarantined#1 — rung-2 runner argv, read-only
+    auto out = run_tool({netsh_path(), "advfirewall", "firewall", "show", "rule", "name=all",
+                        "dir=in"},
+                       kQuarantineReadDeadline, /*merge_stderr=*/false);
+    StatusReadResult result;
+    result.active = yuzu::quarantine::netsh_rules_present(out.output);
+    result.res = std::move(out.res);
+    return result;
 }
 
-std::vector<std::string> win_get_whitelist() {
-    std::vector<std::string> ips;
-    auto output = run_command("netsh advfirewall firewall show rule name=all dir=in");
-    std::istringstream iss(output);
-    std::string line;
-    std::string current_rule;
-
-    while (std::getline(iss, line)) {
-        auto colon = line.find(':');
-        if (colon == std::string::npos)
-            continue;
-        auto key = line.substr(0, colon);
-        while (!key.empty() && key.back() == ' ')
-            key.pop_back();
-        auto val = line.substr(colon + 1);
-        while (!val.empty() && val.front() == ' ')
-            val.erase(val.begin());
-
-        if (key == "Rule Name") {
-            current_rule = val;
-        } else if (key == "RemoteIP" && current_rule.starts_with(kRulePrefix) &&
-                   current_rule.find("Allow") != std::string::npos) {
-            if (val != "127.0.0.1" && val != "Any") {
-                // Remove CIDR suffix if present (e.g., "1.2.3.4/32")
-                auto slash = val.find('/');
-                if (slash != std::string::npos)
-                    val = val.substr(0, slash);
-                bool found = false;
-                for (const auto& existing : ips) {
-                    if (existing == val) {
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found && is_safe_ip(val))
-                    ips.push_back(val);
-            }
-        }
-    }
-    return ips;
+WhitelistRead win_get_whitelist() {
+    // sink: quarantine/win_get_whitelist#1 — rung-2 runner argv, read-only
+    auto out = run_tool({netsh_path(), "advfirewall", "firewall", "show", "rule", "name=all",
+                        "dir=in"},
+                       kQuarantineReadDeadline, /*merge_stderr=*/false);
+    WhitelistRead result;
+    result.ips = yuzu::quarantine::netsh_whitelist_ips(out.output);
+    result.res = std::move(out.res);
+    return result;
 }
 
 #endif // _WIN32
@@ -326,137 +375,172 @@ std::vector<std::string> win_get_whitelist() {
 
 #ifdef __linux__
 
+struct StatusReadResult {
+    bool active = false;
+    yuzu::agent::SubprocessResult res;
+};
+struct WhitelistRead {
+    std::vector<std::string> ips;
+    yuzu::agent::SubprocessResult res;
+};
+
 int linux_quarantine(yuzu::CommandContext& ctx, const std::vector<std::string>& whitelist_ips) {
     int rules_applied = 0;
-    const auto* pfx = sudo_prefix();
+    bool status_forwarded = false;
+
+    auto apply = [&](std::vector<std::string> tool_argv) {
+        auto argv = yuzu::shared::sudo_wrap(std::move(tool_argv));
+        auto out = run_tool(argv, kQuarantineMutateDeadline, /*merge_stderr=*/true);
+        if (report_runner_result(ctx, status_forwarded, out.res))
+            ++rules_applied;
+    };
+    auto apply_ignore_result = [&](std::vector<std::string> tool_argv) {
+        auto argv = yuzu::shared::sudo_wrap(std::move(tool_argv));
+        auto out = run_tool(argv, kQuarantineMutateDeadline, /*merge_stderr=*/true);
+        // Best-effort/idempotent step (create-if-absent, remove-stale-jump)
+        // — a nonzero exit here is expected on a fresh chain and was never
+        // checked pre-migration. A genuine runner failure is still
+        // forwarded so a broken sudoers grant surfaces on the FIRST call
+        // that hits it, not silently on a later one.
+        report_runner_result(ctx, status_forwarded, out.res);
+    };
 
     // Create the yuzu-quarantine chain (ignore error if it already exists)
-    auto cmd = std::format("{}{} -N yuzu-quarantine 2>/dev/null", pfx, kIptables);
-    run_command_rc(cmd.c_str());
-    // Flush the chain to start fresh
-    cmd = std::format("{}{} -F yuzu-quarantine", pfx, kIptables);
-    run_command_rc(cmd.c_str());
+    // sink: quarantine/linux_quarantine#1 — rung-2 sudo-governed runner argv, MUTATING (idempotent)
+    apply_ignore_result({kIptables, "-N", "yuzu-quarantine"});
+    // Flush the chain to start fresh. Best-effort/non-counting like `-N`
+    // above (pre-migration behaviour, `git show 313031966:...` at the
+    // merge-base): a flush that succeeds installs zero containment rules by
+    // itself, so it must never contribute to rules_applied — otherwise a
+    // flush-only success with every subsequent ACCEPT/DROP/jump rule failing
+    // would report `status|quarantined|rules_applied|1`, a false-positive
+    // quarantine with zero real rules in place.
+    // sink: quarantine/linux_quarantine#2 — rung-2 sudo-governed runner argv, MUTATING (non-counting)
+    apply_ignore_result({kIptables, "-F", "yuzu-quarantine"});
 
     // Allow loopback
-    cmd = std::format("{}{} -A yuzu-quarantine -i lo -j ACCEPT", pfx, kIptables);
-    if (run_command_rc(cmd.c_str()) == 0)
-        ++rules_applied;
-    cmd = std::format("{}{} -A yuzu-quarantine -o lo -j ACCEPT", pfx, kIptables);
-    if (run_command_rc(cmd.c_str()) == 0)
-        ++rules_applied;
+    // sink: quarantine/linux_quarantine#3 — rung-2 sudo-governed runner argv, MUTATING
+    apply({kIptables, "-A", "yuzu-quarantine", "-i", "lo", "-j", "ACCEPT"});
+    // sink: quarantine/linux_quarantine#4 — rung-2 sudo-governed runner argv, MUTATING
+    apply({kIptables, "-A", "yuzu-quarantine", "-o", "lo", "-j", "ACCEPT"});
 
     // Allow established/related connections (keeps management connection alive)
-    cmd = std::format("{}{} -A yuzu-quarantine -m state --state ESTABLISHED,RELATED -j ACCEPT", pfx,
-                      kIptables);
-    if (run_command_rc(cmd.c_str()) == 0)
-        ++rules_applied;
+    // sink: quarantine/linux_quarantine#5 — rung-2 sudo-governed runner argv, MUTATING
+    apply({kIptables, "-A", "yuzu-quarantine", "-m", "state", "--state", "ESTABLISHED,RELATED",
+          "-j", "ACCEPT"});
 
     // Allow each whitelisted IP
     for (const auto& ip : whitelist_ips) {
-        cmd = std::format("{}{} -A yuzu-quarantine -s {} -j ACCEPT", pfx, kIptables, ip);
-        if (run_command_rc(cmd.c_str()) == 0)
-            ++rules_applied;
-
-        cmd = std::format("{}{} -A yuzu-quarantine -d {} -j ACCEPT", pfx, kIptables, ip);
-        if (run_command_rc(cmd.c_str()) == 0)
-            ++rules_applied;
+        // sink: quarantine/linux_quarantine#6 — rung-2 sudo-governed runner
+        // argv, MUTATING, operator-supplied IP validated by is_safe_ip.
+        // Argv construction lives in iptables_accept_source_argv
+        // (quarantine_parsers.hpp) — pure and unit-tested (FN-03).
+        apply(yuzu::quarantine::iptables_accept_source_argv(kIptables, ip));
+        // sink: quarantine/linux_quarantine#7 — rung-2 sudo-governed runner
+        // argv, MUTATING, operator-supplied IP validated by is_safe_ip
+        apply({kIptables, "-A", "yuzu-quarantine", "-d", ip, "-j", "ACCEPT"});
     }
 
     // Drop everything else
-    cmd = std::format("{}{} -A yuzu-quarantine -j DROP", pfx, kIptables);
-    if (run_command_rc(cmd.c_str()) == 0)
-        ++rules_applied;
+    // sink: quarantine/linux_quarantine#8 — rung-2 sudo-governed runner argv, MUTATING
+    apply({kIptables, "-A", "yuzu-quarantine", "-j", "DROP"});
 
     // Insert jump to our chain at the top of INPUT and OUTPUT
     // Remove any existing jumps first to avoid duplicates
-    cmd = std::format("{}{} -D INPUT -j yuzu-quarantine 2>/dev/null", pfx, kIptables);
-    run_command_rc(cmd.c_str());
-    cmd = std::format("{}{} -D OUTPUT -j yuzu-quarantine 2>/dev/null", pfx, kIptables);
-    run_command_rc(cmd.c_str());
-    cmd = std::format("{}{} -I INPUT 1 -j yuzu-quarantine", pfx, kIptables);
-    if (run_command_rc(cmd.c_str()) == 0)
-        ++rules_applied;
-    cmd = std::format("{}{} -I OUTPUT 1 -j yuzu-quarantine", pfx, kIptables);
-    if (run_command_rc(cmd.c_str()) == 0)
-        ++rules_applied;
+    // sink: quarantine/linux_quarantine#9 — rung-2 sudo-governed runner argv, MUTATING (idempotent)
+    apply_ignore_result({kIptables, "-D", "INPUT", "-j", "yuzu-quarantine"});
+    // sink: quarantine/linux_quarantine#10 — rung-2 sudo-governed runner argv, MUTATING (idempotent)
+    apply_ignore_result({kIptables, "-D", "OUTPUT", "-j", "yuzu-quarantine"});
+    // sink: quarantine/linux_quarantine#11 — rung-2 sudo-governed runner argv, MUTATING
+    apply({kIptables, "-I", "INPUT", "1", "-j", "yuzu-quarantine"});
+    // sink: quarantine/linux_quarantine#12 — rung-2 sudo-governed runner argv, MUTATING
+    apply({kIptables, "-I", "OUTPUT", "1", "-j", "yuzu-quarantine"});
+
+    if (rules_applied == 0) {
+        if (!status_forwarded) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "quarantine:linux_quarantine all rules failed to apply");
+        }
+        ctx.write_output("status|failed|rules_applied|0");
+        return 1;
+    }
 
     ctx.write_output(std::format("status|quarantined|rules_applied|{}", rules_applied));
     return 0;
 }
 
 int linux_unquarantine(yuzu::CommandContext& ctx) {
-    const auto* pfx = sudo_prefix();
-    // Remove jumps from INPUT and OUTPUT
-    auto cmd = std::format("{}{} -D INPUT -j yuzu-quarantine 2>/dev/null", pfx, kIptables);
-    run_command_rc(cmd.c_str());
-    cmd = std::format("{}{} -D OUTPUT -j yuzu-quarantine 2>/dev/null", pfx, kIptables);
-    run_command_rc(cmd.c_str());
-    // Flush and delete the chain
-    cmd = std::format("{}{} -F yuzu-quarantine 2>/dev/null", pfx, kIptables);
-    run_command_rc(cmd.c_str());
-    cmd = std::format("{}{} -X yuzu-quarantine 2>/dev/null", pfx, kIptables);
-    run_command_rc(cmd.c_str());
+    bool status_forwarded = false;
+    // Clean-failure tracker for the genuine teardown steps (flush + delete
+    // chain) — see win_unquarantine's identical-purpose comment. Distinct
+    // from the two -D jump removals below, which stay best-effort/ignored:
+    // they are idempotent the same way linux_quarantine's own -D calls are
+    // (a jump that's already absent, e.g. on a repeat unquarantine, is not a
+    // failure). Flushing/deleting the chain is the actual release action,
+    // so a clean (tool-ran, nonzero-exit) failure there must surface.
+    bool teardown_failed = false;
+
+    auto apply_ignore_result = [&](std::vector<std::string> tool_argv) {
+        auto argv = yuzu::shared::sudo_wrap(std::move(tool_argv));
+        auto out = run_tool(argv, kQuarantineMutateDeadline, /*merge_stderr=*/true);
+        report_runner_result(ctx, status_forwarded, out.res);
+    };
+    auto apply = [&](std::vector<std::string> tool_argv) {
+        auto argv = yuzu::shared::sudo_wrap(std::move(tool_argv));
+        auto out = run_tool(argv, kQuarantineMutateDeadline, /*merge_stderr=*/true);
+        if (!report_runner_result(ctx, status_forwarded, out.res))
+            teardown_failed = true;
+    };
+
+    // Remove jumps from INPUT and OUTPUT — best-effort/idempotent
+    // sink: quarantine/linux_unquarantine#1 — rung-2 sudo-governed runner argv, MUTATING (idempotent)
+    apply_ignore_result({kIptables, "-D", "INPUT", "-j", "yuzu-quarantine"});
+    // sink: quarantine/linux_unquarantine#2 — rung-2 sudo-governed runner argv, MUTATING (idempotent)
+    apply_ignore_result({kIptables, "-D", "OUTPUT", "-j", "yuzu-quarantine"});
+    // Flush and delete the chain — the genuine release steps
+    // sink: quarantine/linux_unquarantine#3 — rung-2 sudo-governed runner argv, MUTATING
+    apply({kIptables, "-F", "yuzu-quarantine"});
+    // sink: quarantine/linux_unquarantine#4 — rung-2 sudo-governed runner argv, MUTATING
+    apply({kIptables, "-X", "yuzu-quarantine"});
+
+    if (status_forwarded || teardown_failed) {
+        // See win_unquarantine's identical comment: a genuine runner
+        // failure, OR a clean failure to flush/delete the chain, must never
+        // be reported as "released".
+        if (!status_forwarded) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "quarantine:linux_unquarantine chain flush/delete failed");
+        }
+        ctx.write_output("status|release_uncertain");
+        return 1;
+    }
 
     ctx.write_output("status|released");
     return 0;
 }
 
-bool linux_is_quarantined() {
+StatusReadResult linux_is_quarantined() {
     // -L is a read-only list operation; depending on the distro and kernel
     // build, iptables will refuse the operation without root even for
     // listing because /proc/net/ip_tables_names is root-readable. So we
     // also use sudo for the read path.
-    auto cmd = std::format("{}{} -L INPUT -n 2>/dev/null", sudo_prefix(), kIptables);
-    auto output = run_command(cmd.c_str());
-    return output.find("yuzu-quarantine") != std::string::npos;
+    // sink: quarantine/linux_is_quarantined#1 — rung-2 sudo-governed runner argv, read-only
+    auto argv = yuzu::shared::sudo_wrap({kIptables, "-L", "INPUT", "-n"});
+    auto out = run_tool(argv, kQuarantineReadDeadline, /*merge_stderr=*/false);
+    StatusReadResult result;
+    result.active = yuzu::quarantine::iptables_chain_referenced(out.output);
+    result.res = std::move(out.res);
+    return result;
 }
 
-std::vector<std::string> linux_get_whitelist() {
-    std::vector<std::string> ips;
-    auto cmd = std::format("{}{} -L yuzu-quarantine -n 2>/dev/null", sudo_prefix(), kIptables);
-    auto output = run_command(cmd.c_str());
-    std::istringstream iss(output);
-    std::string line;
-
-    while (std::getline(iss, line)) {
-        // Skip header lines and DROP/loopback rules
-        if (line.find("ACCEPT") == std::string::npos)
-            continue;
-        if (line.find("lo") != std::string::npos)
-            continue;
-        if (line.find("state") != std::string::npos)
-            continue;
-
-        // Parse source/destination from iptables output
-        // Typical line: "ACCEPT  all  --  1.2.3.4  0.0.0.0/0"
-        std::istringstream lss(line);
-        std::string target, prot, opt, source, dest;
-        lss >> target >> prot >> opt >> source >> dest;
-
-        if (!source.empty() && source != "0.0.0.0/0" && is_safe_ip(source)) {
-            bool found = false;
-            for (const auto& existing : ips) {
-                if (existing == source) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found)
-                ips.push_back(source);
-        }
-        if (!dest.empty() && dest != "0.0.0.0/0" && is_safe_ip(dest)) {
-            bool found = false;
-            for (const auto& existing : ips) {
-                if (existing == dest) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found)
-                ips.push_back(dest);
-        }
-    }
-    return ips;
+WhitelistRead linux_get_whitelist() {
+    // sink: quarantine/linux_get_whitelist#1 — rung-2 sudo-governed runner argv, read-only
+    auto argv = yuzu::shared::sudo_wrap({kIptables, "-L", "yuzu-quarantine", "-n"});
+    auto out = run_tool(argv, kQuarantineReadDeadline, /*merge_stderr=*/false);
+    WhitelistRead result;
+    result.ips = yuzu::quarantine::iptables_whitelist_ips(out.output);
+    result.res = std::move(out.res);
+    return result;
 }
 
 #endif // __linux__
@@ -464,6 +548,15 @@ std::vector<std::string> linux_get_whitelist() {
 // ── macOS implementation ─────────────────────────────────────────────────────
 
 #ifdef __APPLE__
+
+struct StatusReadResult {
+    bool active = false;
+    yuzu::agent::SubprocessResult res;
+};
+struct WhitelistRead {
+    std::vector<std::string> ips;
+    yuzu::agent::SubprocessResult res;
+};
 
 // Compose-and-load the complete pf ruleset for a quarantine state.
 //
@@ -474,10 +567,12 @@ std::vector<std::string> linux_get_whitelist() {
 // Returns 0 on success, non-zero on failure. Used by both
 // macos_quarantine() and the macOS branch of do_whitelist() so the
 // "rebuild the ruleset and atomically load it" logic lives in one
-// place. See the rationale comment inside about set-skip-on-lo0.
-int macos_load_ruleset(const std::vector<std::string>& whitelist_ips, int* rules_written_out,
-                       std::string* error_out) {
-    const auto* pfx = sudo_prefix();
+// place. See the header comment above (and `git log -1 672896112`) for
+// why this MUST stay ONE atomic `pfctl -f` call against the main
+// ruleset with `set skip on lo0` — never a named anchor.
+int macos_load_ruleset(yuzu::CommandContext& ctx, const std::vector<std::string>& whitelist_ips,
+                       int* rules_written_out, std::string* error_out,
+                       bool* pf_enable_failed_out = nullptr) {
     int rules_written = 0;
     std::string rules;
 
@@ -515,21 +610,70 @@ int macos_load_ruleset(const std::vector<std::string>& whitelist_ips, int* rules
         fclose(f);
     }
 
-    auto cmd = std::format("{}{} -f {}", pfx, kPfctl, tmp_file.path());
-    int load_rc = run_command_rc(cmd.c_str());
-    if (load_rc != 0) {
-        int exit_code = WIFEXITED(load_rc) ? WEXITSTATUS(load_rc) : load_rc;
+    // sink: quarantine/macos_load_ruleset#1 — rung-2 sudo-governed runner
+    // argv, MUTATING, single atomic full-ruleset reload
+    // (`sudo -n -- /sbin/pfctl -f <tmpfile>`). THE call this migration is
+    // bound not to change the shape of — see the header comment on the
+    // 672896112 incident: never split this into a named-anchor `pfctl -a`
+    // plus a second attach call. Argv construction lives in
+    // pfctl_load_ruleset_argv (quarantine_parsers.hpp) — pure and
+    // unit-tested (FN-03).
+    auto argv = yuzu::shared::sudo_wrap(
+        yuzu::quarantine::pfctl_load_ruleset_argv(kPfctl, tmp_file.path()));
+    auto load_out = run_tool(argv, kQuarantineMutateDeadline, /*merge_stderr=*/true);
+    if (!(load_out.res.tool_ran && load_out.res.exit_code == 0)) {
+        // A quarantine that silently fails to apply is the single most
+        // safety-critical failure mode in this file — always mark the ABI4
+        // result seam, whether the failure is a genuine runner-level event
+        // (spawn/deadline/etc, forwarded below) or a clean exit with a
+        // nonzero rc (e.g. a missing sudoers grant, which exits normally
+        // from sudo's own perspective — exit-code semantics are the
+        // caller's domain per runner_status.hpp, so classify_runner_failure
+        // alone would miss this case).
+        if (!yuzu::agent::forward_runner_failure(ctx, load_out.res)) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "quarantine:macos_load_ruleset pfctl exited non-zero");
+        }
+        int exit_code = load_out.res.tool_ran ? load_out.res.exit_code : -1;
+        std::string diag = load_out.output.empty()
+                               ? std::string{}
+                               : std::format(" pfctl said: {}",
+                                             yuzu::util::safe_output_field(load_out.output));
         *error_out = std::format("pfctl load failed (rc={}). Likely the agent account "
                                  "is not in /etc/sudoers.d/yuzu-agent — run "
-                                 "`sudo bash scripts/install-agent-user.sh --check` to verify.",
-                                 exit_code);
+                                 "`sudo bash scripts/install-agent-user.sh --check` to verify.{}",
+                                 exit_code, diag);
         return 1;
     }
 
-    // Enable pf if not already enabled. Idempotent — the kernel returns
-    // a harmless warning to stderr when called on an already-enabled pf.
-    cmd = std::format("{}{} -e 2>/dev/null", pfx, kPfctl);
-    run_command_rc(cmd.c_str());
+    // Enable pf if not already enabled. Idempotent — the kernel returns a
+    // harmless warning to stderr when called on an already-enabled pf.
+    // Best-effort in the sense that a failure here does not unwind the
+    // ruleset load that just succeeded above — but the failure is still
+    // forwarded through the ABI4 result-status seam (genuine runner
+    // failure via forward_runner_failure, or a clean nonzero exit via
+    // set_result_status) so a caller can never mistake "ruleset loaded"
+    // for "pf actually enabled". On stock macOS pf ships disabled, so a
+    // silently swallowed failure here would mean the quarantine reports
+    // success while blocking nothing.
+    // sink: quarantine/macos_load_ruleset#2 — rung-2 sudo-governed runner
+    // argv, MUTATING (idempotent enable; failure forwarded, not ignored)
+    auto enable_argv = yuzu::shared::sudo_wrap({kPfctl, "-e"});
+    auto enable_out = run_tool(enable_argv, kQuarantineMutateDeadline, /*merge_stderr=*/false);
+    if (!(enable_out.res.tool_ran && enable_out.res.exit_code == 0)) {
+        if (!yuzu::agent::forward_runner_failure(ctx, enable_out.res)) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "quarantine:macos_load_ruleset pfctl -e failed to enable pf");
+        }
+        // The ABI4 result seam above is the durable, server-persisted signal
+        // -- but it isn't the channel most customer-facing tooling parses
+        // (docs/user-manual/agent-plugins.md documents write_output's
+        // pipe-delimited fields as the contract). Surface it there too, via
+        // the out-param, so a caller that only reads stdout still learns
+        // the ruleset loaded but pf may not be enforcing it.
+        if (pf_enable_failed_out)
+            *pf_enable_failed_out = true;
+    }
 
     *rules_written_out = rules_written;
     return 0;
@@ -538,19 +682,27 @@ int macos_load_ruleset(const std::vector<std::string>& whitelist_ips, int* rules
 int macos_quarantine(yuzu::CommandContext& ctx, const std::vector<std::string>& whitelist_ips) {
     // rules_written counts the lines we hand to pfctl. The actual number
     // of rules installed in pf is reported back to the operator only if
-    // pfctl's load succeeds (see the rc check after run_command_rc below).
+    // pfctl's load succeeds (see the rc check inside macos_load_ruleset).
     int rules_written = 0;
     std::string error;
-    if (macos_load_ruleset(whitelist_ips, &rules_written, &error) != 0) {
+    bool pf_enable_failed = false;
+    if (macos_load_ruleset(ctx, whitelist_ips, &rules_written, &error, &pf_enable_failed) != 0) {
         ctx.write_output(std::format("error|{}", error));
         return 1;
     }
-    ctx.write_output(std::format("status|quarantined|rules_applied|{}", rules_written));
+    if (pf_enable_failed) {
+        ctx.write_output(std::format(
+            "status|quarantined|rules_applied|{}|note|ruleset loaded but pf failed to enable "
+            "-- traffic may not actually be blocked, check agent logs",
+            rules_written));
+    } else {
+        ctx.write_output(std::format("status|quarantined|rules_applied|{}", rules_written));
+    }
     return 0;
 }
 
 int macos_unquarantine(yuzu::CommandContext& ctx) {
-    const auto* pfx = sudo_prefix();
+    bool status_forwarded = false;
 
     // Restore the system default ruleset by reloading /etc/pf.conf.
     // macOS ships /etc/pf.conf with the platform's default anchors
@@ -558,15 +710,40 @@ int macos_unquarantine(yuzu::CommandContext& ctx) {
     // ruleset, this is the cleanest way to get back to "what the OS
     // started with" without trying to remember and replay the prior
     // state ourselves.
-    auto cmd = std::format("{}{} -f /etc/pf.conf 2>/dev/null", pfx, kPfctl);
-    int rc = run_command_rc(cmd.c_str());
-    if (rc != 0) {
+    // sink: quarantine/macos_unquarantine#1 — rung-2 sudo-governed runner argv, MUTATING
+    auto restore_argv = yuzu::shared::sudo_wrap({kPfctl, "-f", "/etc/pf.conf"});
+    auto restore_out = run_tool(restore_argv, kQuarantineMutateDeadline, /*merge_stderr=*/false);
+    bool restore_ok = report_runner_result(ctx, status_forwarded, restore_out.res);
+
+    if (!restore_ok) {
         // /etc/pf.conf might not exist or might fail to parse on a
         // non-default OS install. Fall back to disabling pf entirely —
         // strictly more permissive than what the user wants, but at
         // least the box is reachable for the operator to clean up.
-        cmd = std::format("{}{} -d 2>/dev/null", pfx, kPfctl);
-        run_command_rc(cmd.c_str());
+        // sink: quarantine/macos_unquarantine#2 — rung-2 sudo-governed runner argv, MUTATING
+        auto disable_argv = yuzu::shared::sudo_wrap({kPfctl, "-d"});
+        auto disable_out = run_tool(disable_argv, kQuarantineMutateDeadline, /*merge_stderr=*/false);
+        bool disable_ok = report_runner_result(ctx, status_forwarded, disable_out.res);
+
+        if (!disable_ok) {
+            // Neither restoring /etc/pf.conf NOR disabling pf outright
+            // succeeded — the host may still be firewalled. Reporting
+            // "released" here unconditionally (the pre-migration behaviour
+            // — this fallback call's return value was previously discarded
+            // entirely) is exactly the silent-failure class this migration
+            // must not reintroduce; see the 672896112 incident note at the
+            // top of this file.
+            if (!status_forwarded) {
+                ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
+                                      YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                      "quarantine:macos_unquarantine restore and disable both failed");
+            }
+            ctx.write_output(
+                "error|failed to restore /etc/pf.conf and failed to disable pf — host may "
+                "still be firewalled, manual `pfctl -F all` may be required");
+            return 1;
+        }
+
         ctx.write_output("status|released|note|pf disabled (could not restore /etc/pf.conf)");
         return 0;
     }
@@ -575,82 +752,45 @@ int macos_unquarantine(yuzu::CommandContext& ctx) {
     return 0;
 }
 
-bool macos_is_quarantined() {
+StatusReadResult macos_is_quarantined() {
     // We're quarantined iff the active main ruleset has our `block all`
-    // rule (the load-bearing default-deny). Pre-patch this looked at
-    // the yuzu-quarantine anchor; the new design writes the rules
-    // directly into the main ruleset so we check there instead.
-    auto cmd = std::format("{}{} -s rules 2>/dev/null", sudo_prefix(), kPfctl);
-    auto output = run_command(cmd.c_str());
-    return output.find("block drop all") != std::string::npos ||
-           output.find("block all") != std::string::npos;
+    // rule (the load-bearing default-deny). Pre-patch this looked at the
+    // yuzu-quarantine anchor; the new design writes the rules directly into
+    // the main ruleset so we check there instead.
+    // sink: quarantine/macos_is_quarantined#1 — rung-2 sudo-governed runner argv, read-only
+    auto argv = yuzu::shared::sudo_wrap({kPfctl, "-s", "rules"});
+    auto out = run_tool(argv, kQuarantineReadDeadline, /*merge_stderr=*/false);
+    StatusReadResult result;
+    result.active = yuzu::quarantine::pfctl_rules_blocked(out.output);
+    result.res = std::move(out.res);
+    return result;
 }
 
-std::vector<std::string> macos_get_whitelist() {
-    std::vector<std::string> ips;
-    auto cmd = std::format("{}{} -s rules 2>/dev/null", sudo_prefix(), kPfctl);
-    auto output = run_command(cmd.c_str());
-    std::istringstream iss(output);
-    std::string line;
-
-    while (std::getline(iss, line)) {
-        if (line.find("pass") == std::string::npos)
-            continue;
-        if (line.find("lo0") != std::string::npos)
-            continue;
-
-        // Parse IP from "pass quick from <ip> to any" or "pass quick from any to <ip>"
-        auto from_pos = line.find("from ");
-        auto to_pos = line.find("to ");
-        if (from_pos != std::string::npos) {
-            auto start = from_pos + 5;
-            auto end = line.find(' ', start);
-            auto ip = line.substr(start, end - start);
-            if (ip != "any" && is_safe_ip(ip)) {
-                bool found = false;
-                for (const auto& existing : ips) {
-                    if (existing == ip) {
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found)
-                    ips.push_back(ip);
-            }
-        }
-        if (to_pos != std::string::npos) {
-            auto start = to_pos + 3;
-            auto end = line.find(' ', start);
-            if (end == std::string::npos)
-                end = line.size();
-            auto ip = line.substr(start, end - start);
-            if (ip != "any" && is_safe_ip(ip)) {
-                bool found = false;
-                for (const auto& existing : ips) {
-                    if (existing == ip) {
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found)
-                    ips.push_back(ip);
-            }
-        }
-    }
-    return ips;
+WhitelistRead macos_get_whitelist() {
+    // sink: quarantine/macos_get_whitelist#1 — rung-2 sudo-governed runner argv, read-only
+    auto argv = yuzu::shared::sudo_wrap({kPfctl, "-s", "rules"});
+    auto out = run_tool(argv, kQuarantineReadDeadline, /*merge_stderr=*/false);
+    WhitelistRead result;
+    result.ips = yuzu::quarantine::pfctl_whitelist_ips(out.output);
+    result.res = std::move(out.res);
+    return result;
 }
 
 #endif // __APPLE__
 
 // ── ABI4 capability declarations (#2204) ────────────────────────────────────
 //
-// Every leg on every platform shells out via a raw popen()/_popen()
-// (run_command/run_command_rc above — never the bounded subprocess
-// runner): netsh on Windows, sudo-prefixed iptables on Linux, a
-// sudo-prefixed pfctl ruleset load on macOS. That is rung 3 throughout —
-// a shell/interpreter payload, whether or not it is sudo-governed, is
-// never rung 1 or 2 (sudo changes the privilege boundary, not the
-// acquisition mechanism). quarantine is the endpoint's most disruptive
+// Wave-2 ADR-3002 migration: every leg on every platform now shells out
+// through yuzu::agent::run_bounded_subprocess with clean, pre-split argv —
+// never popen()/_popen(), never a shell. Linux (sudo-governed iptables) and
+// macOS (sudo-governed pfctl) go through yuzu::shared::sudo_wrap's `sudo -n
+// -- <tool> <args>` form; Windows (netsh) needs no sudo-equivalent, since
+// the YuzuAgent service account's own privilege already covers it. That is
+// rung 2 throughout — a bounded direct-argv tool invocation, whether or not
+// sudo-governed, is not rung 1 (no native OS API is used; Windows in
+// particular has a native COM firewall-rule API — INetFwPolicy2/
+// INetFwRule — that this migration deliberately did not evaluate, since the
+// task was mechanism-only). quarantine is the endpoint's most disruptive
 // action here — it blocks essentially all traffic except the whitelist —
 // so it is classified Destructive AND Irreversible. `unquarantine` restores
 // reachability — scripts/test/instructions_quarantine_survivor.py verifies
@@ -665,27 +805,27 @@ std::vector<std::string> macos_get_whitelist() {
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "quarantine",
-        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "sudo iptables via popen", nullptr},
-        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "sudo pfctl via popen", nullptr},
-        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 3, "netsh via popen", nullptr},
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 2, "sudo-governed iptables via bounded runner argv", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 2, "sudo-governed pfctl via bounded runner argv", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 2, "netsh via bounded runner argv (service-account privilege, no sudo)", nullptr},
     },
     {
         /* .action      = */ "unquarantine",
-        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "sudo iptables via popen", nullptr},
-        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "sudo pfctl via popen", nullptr},
-        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 3, "netsh via popen", nullptr},
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 2, "sudo-governed iptables via bounded runner argv", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 2, "sudo-governed pfctl via bounded runner argv", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 2, "netsh via bounded runner argv (service-account privilege, no sudo)", nullptr},
     },
     {
         /* .action      = */ "status",
-        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "sudo iptables via popen", nullptr},
-        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "sudo pfctl via popen", nullptr},
-        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 3, "netsh via popen", nullptr},
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 2, "sudo-governed iptables via bounded runner argv", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 2, "sudo-governed pfctl via bounded runner argv", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 2, "netsh via bounded runner argv (service-account privilege, no sudo)", nullptr},
     },
     {
         /* .action      = */ "whitelist",
-        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "sudo iptables via popen", nullptr},
-        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "sudo pfctl via popen", nullptr},
-        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 3, "netsh via popen", nullptr},
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 2, "sudo-governed iptables via bounded runner argv", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 2, "sudo-governed pfctl via bounded runner argv", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 2, "netsh via bounded runner argv (service-account privilege, no sudo)", nullptr},
     },
 };
 
@@ -796,27 +936,34 @@ private:
     // ── status action ────────────────────────────────────────────────────────
 
     int do_status(yuzu::CommandContext& ctx) {
+        bool status_forwarded = false;
 #ifdef _WIN32
-        bool active = win_is_quarantined();
+        auto check = win_is_quarantined();
 #elif defined(__linux__)
-        bool active = linux_is_quarantined();
+        auto check = linux_is_quarantined();
 #elif defined(__APPLE__)
-        bool active = macos_is_quarantined();
+        auto check = macos_is_quarantined();
 #else
         ctx.write_output("error|unsupported platform");
         return 1;
 #endif
-        ctx.write_output(std::format("state|{}", active ? "active" : "inactive"));
+        // Ignore the return value: a nonzero/failed exit from a status
+        // query is not itself an error (an absent chain/rule is a normal
+        // "not quarantined" outcome) — only a genuine runner-level failure
+        // (forwarded here) should mark the ABI4 result seam degraded.
+        report_runner_result(ctx, status_forwarded, check.res);
+        ctx.write_output(std::format("state|{}", check.active ? "active" : "inactive"));
 
-        if (active) {
+        if (check.active) {
 #ifdef _WIN32
-            auto ips = win_get_whitelist();
+            auto wl = win_get_whitelist();
 #elif defined(__linux__)
-            auto ips = linux_get_whitelist();
+            auto wl = linux_get_whitelist();
 #elif defined(__APPLE__)
-            auto ips = macos_get_whitelist();
+            auto wl = macos_get_whitelist();
 #endif
-            ctx.write_output(std::format("whitelist|{}", join_ips(ips)));
+            report_runner_result(ctx, status_forwarded, wl.res);
+            ctx.write_output(std::format("whitelist|{}", join_ips(wl.ips)));
         }
 
         return 0;
@@ -843,29 +990,56 @@ private:
             return 1;
         }
 
+        bool status_forwarded = false;
+        // Tracks a CLEAN failure (tool ran, exited nonzero) on any Windows/
+        // Linux add/remove mutation below — distinct from status_forwarded,
+        // which only covers a genuine runner-level failure. Discarding this
+        // (the pre-fix behaviour) let a whitelist add/remove that the
+        // underlying tool refused still report "status|updated". macOS's
+        // add/remove branches don't need this: macos_load_ruleset already
+        // checks its own pfctl exit code and returns early on failure.
+        bool mutation_failed = false;
+
         if (action_param == "add") {
 #ifdef _WIN32
             for (const auto& ip : new_ips) {
-                auto cmd = std::format("netsh advfirewall firewall add rule name=\"{}AllowIn_{}\" "
-                                       "dir=in action=allow enable=yes remoteip={}",
-                                       kRulePrefix, ip, ip);
-                run_command_rc(cmd.c_str());
-                cmd = std::format("netsh advfirewall firewall add rule name=\"{}AllowOut_{}\" "
-                                  "dir=out action=allow enable=yes remoteip={}",
-                                  kRulePrefix, ip, ip);
-                run_command_rc(cmd.c_str());
+                // sink: quarantine/do_whitelist#1 — rung-2 runner argv,
+                // MUTATING, operator-supplied IP validated by is_safe_ip.
+                // Argv construction lives in netsh_allow_in_rule_argv
+                // (quarantine_parsers.hpp) — pure and unit-tested (FN-03).
+                auto out1 = run_tool(yuzu::quarantine::netsh_allow_in_rule_argv(netsh_path(), ip),
+                                    kQuarantineMutateDeadline, /*merge_stderr=*/true);
+                if (!report_runner_result(ctx, status_forwarded, out1.res))
+                    mutation_failed = true;
+                // sink: quarantine/do_whitelist#2 — rung-2 runner argv,
+                // MUTATING, operator-supplied IP validated by is_safe_ip
+                auto out2 = run_tool({netsh_path(), "advfirewall", "firewall", "add", "rule",
+                                     std::format("name={}AllowOut_{}", kRulePrefix, ip), "dir=out",
+                                     "action=allow", "enable=yes", std::format("remoteip={}", ip)},
+                                    kQuarantineMutateDeadline, /*merge_stderr=*/true);
+                if (!report_runner_result(ctx, status_forwarded, out2.res))
+                    mutation_failed = true;
             }
 #elif defined(__linux__)
             {
-                const auto* pfx = sudo_prefix();
                 for (const auto& ip : new_ips) {
                     // Insert before the DROP rule (second-to-last position)
-                    auto cmd =
-                        std::format("{}{} -I yuzu-quarantine -s {} -j ACCEPT", pfx, kIptables, ip);
-                    run_command_rc(cmd.c_str());
-                    cmd =
-                        std::format("{}{} -I yuzu-quarantine -d {} -j ACCEPT", pfx, kIptables, ip);
-                    run_command_rc(cmd.c_str());
+                    // sink: quarantine/do_whitelist#5 — rung-2 sudo-governed
+                    // runner argv, MUTATING, operator-supplied IP validated
+                    // by is_safe_ip
+                    auto argv1 = yuzu::shared::sudo_wrap(
+                        {kIptables, "-I", "yuzu-quarantine", "-s", ip, "-j", "ACCEPT"});
+                    auto out1 = run_tool(argv1, kQuarantineMutateDeadline, /*merge_stderr=*/true);
+                    if (!report_runner_result(ctx, status_forwarded, out1.res))
+                        mutation_failed = true;
+                    // sink: quarantine/do_whitelist#6 — rung-2 sudo-governed
+                    // runner argv, MUTATING, operator-supplied IP validated
+                    // by is_safe_ip
+                    auto argv2 = yuzu::shared::sudo_wrap(
+                        {kIptables, "-I", "yuzu-quarantine", "-d", ip, "-j", "ACCEPT"});
+                    auto out2 = run_tool(argv2, kQuarantineMutateDeadline, /*merge_stderr=*/true);
+                    if (!report_runner_result(ctx, status_forwarded, out2.res))
+                        mutation_failed = true;
                 }
             }
 #elif defined(__APPLE__)
@@ -875,20 +1049,39 @@ private:
                 // current whitelist + new IPs". We get the current
                 // whitelist via macos_get_whitelist() and merge.
                 auto current = macos_get_whitelist();
+                if (!report_runner_result(ctx, status_forwarded, current.res)) {
+                    // The prerequisite whitelist read failed — either a
+                    // genuine runner failure (already forwarded above) or a
+                    // clean nonzero exit (tool ran, refused). Either way
+                    // current.ips cannot be trusted as the whitelist
+                    // baseline: rebuilding the entire main pf ruleset from
+                    // an empty/wrong set would silently drop any real
+                    // whitelisted entries (including a possible
+                    // management-server IP) — the same impact class as the
+                    // 672896112 incident this migration exists to prevent.
+                    // Abort instead of rebuilding from an unproven read.
+                    if (!status_forwarded) {
+                        ctx.set_result_status(
+                            YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                            "quarantine:do_whitelist macOS whitelist read failed before add");
+                    }
+                    ctx.write_output("error|whitelist read failed, ruleset not rewritten");
+                    return 1;
+                }
                 for (const auto& ip : new_ips) {
                     bool dup = false;
-                    for (const auto& existing : current) {
+                    for (const auto& existing : current.ips) {
                         if (existing == ip) {
                             dup = true;
                             break;
                         }
                     }
                     if (!dup)
-                        current.push_back(ip);
+                        current.ips.push_back(ip);
                 }
                 int rules_written = 0;
                 std::string err;
-                if (macos_load_ruleset(current, &rules_written, &err) != 0) {
+                if (macos_load_ruleset(ctx, current.ips, &rules_written, &err) != 0) {
                     ctx.write_output(std::format("error|{}", err));
                     return 1;
                 }
@@ -900,24 +1093,38 @@ private:
         } else if (action_param == "remove") {
 #ifdef _WIN32
             for (const auto& ip : new_ips) {
-                auto cmd =
-                    std::format("netsh advfirewall firewall delete rule name=\"{}AllowIn_{}\"",
-                                kRulePrefix, ip);
-                run_command_rc(cmd.c_str());
-                cmd = std::format("netsh advfirewall firewall delete rule name=\"{}AllowOut_{}\"",
-                                  kRulePrefix, ip);
-                run_command_rc(cmd.c_str());
+                // sink: quarantine/do_whitelist#3 — rung-2 runner argv, MUTATING
+                auto out1 =
+                    run_tool({netsh_path(), "advfirewall", "firewall", "delete", "rule",
+                             std::format("name={}AllowIn_{}", kRulePrefix, ip)},
+                            kQuarantineMutateDeadline, /*merge_stderr=*/true);
+                if (!report_runner_result(ctx, status_forwarded, out1.res))
+                    mutation_failed = true;
+                // sink: quarantine/do_whitelist#4 — rung-2 runner argv, MUTATING
+                auto out2 =
+                    run_tool({netsh_path(), "advfirewall", "firewall", "delete", "rule",
+                             std::format("name={}AllowOut_{}", kRulePrefix, ip)},
+                            kQuarantineMutateDeadline, /*merge_stderr=*/true);
+                if (!report_runner_result(ctx, status_forwarded, out2.res))
+                    mutation_failed = true;
             }
 #elif defined(__linux__)
             {
-                const auto* pfx = sudo_prefix();
                 for (const auto& ip : new_ips) {
-                    auto cmd = std::format("{}{} -D yuzu-quarantine -s {} -j ACCEPT 2>/dev/null",
-                                           pfx, kIptables, ip);
-                    run_command_rc(cmd.c_str());
-                    cmd = std::format("{}{} -D yuzu-quarantine -d {} -j ACCEPT 2>/dev/null", pfx,
-                                      kIptables, ip);
-                    run_command_rc(cmd.c_str());
+                    // sink: quarantine/do_whitelist#7 — rung-2 sudo-governed
+                    // runner argv, MUTATING
+                    auto argv1 = yuzu::shared::sudo_wrap(
+                        {kIptables, "-D", "yuzu-quarantine", "-s", ip, "-j", "ACCEPT"});
+                    auto out1 = run_tool(argv1, kQuarantineMutateDeadline, /*merge_stderr=*/true);
+                    if (!report_runner_result(ctx, status_forwarded, out1.res))
+                        mutation_failed = true;
+                    // sink: quarantine/do_whitelist#8 — rung-2 sudo-governed
+                    // runner argv, MUTATING
+                    auto argv2 = yuzu::shared::sudo_wrap(
+                        {kIptables, "-D", "yuzu-quarantine", "-d", ip, "-j", "ACCEPT"});
+                    auto out2 = run_tool(argv2, kQuarantineMutateDeadline, /*merge_stderr=*/true);
+                    if (!report_runner_result(ctx, status_forwarded, out2.res))
+                        mutation_failed = true;
                 }
             }
 #elif defined(__APPLE__)
@@ -928,8 +1135,22 @@ private:
                 // (which the old anchor design tried to do via string
                 // matching, with the well-known false-match risk).
                 auto current = macos_get_whitelist();
+                if (!report_runner_result(ctx, status_forwarded, current.res)) {
+                    // Same rationale as the "add" branch above: a failed
+                    // prerequisite read (runner failure OR clean nonzero
+                    // exit) must not be treated as an empty whitelist —
+                    // that would rebuild the ruleset with nothing
+                    // whitelisted at all. Abort rather than rebuild.
+                    if (!status_forwarded) {
+                        ctx.set_result_status(
+                            YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                            "quarantine:do_whitelist macOS whitelist read failed before remove");
+                    }
+                    ctx.write_output("error|whitelist read failed, ruleset not rewritten");
+                    return 1;
+                }
                 std::vector<std::string> filtered;
-                for (const auto& ip : current) {
+                for (const auto& ip : current.ips) {
                     bool removed = false;
                     for (const auto& rm : new_ips) {
                         if (ip == rm) {
@@ -942,7 +1163,7 @@ private:
                 }
                 int rules_written = 0;
                 std::string err;
-                if (macos_load_ruleset(filtered, &rules_written, &err) != 0) {
+                if (macos_load_ruleset(ctx, filtered, &rules_written, &err) != 0) {
                     ctx.write_output(std::format("error|{}", err));
                     return 1;
                 }
@@ -959,15 +1180,31 @@ private:
 
         // Report current whitelist
 #ifdef _WIN32
-        auto current_ips = win_get_whitelist();
+        auto current_read = win_get_whitelist();
 #elif defined(__linux__)
-        auto current_ips = linux_get_whitelist();
+        auto current_read = linux_get_whitelist();
 #elif defined(__APPLE__)
-        auto current_ips = macos_get_whitelist();
+        auto current_read = macos_get_whitelist();
 #else
-        std::vector<std::string> current_ips;
+        struct { std::vector<std::string> ips; } current_read;
 #endif
-        ctx.write_output(std::format("status|updated|whitelist|{}", join_ips(current_ips)));
+#if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
+        report_runner_result(ctx, status_forwarded, current_read.res);
+#endif
+        if (status_forwarded || mutation_failed) {
+            // A genuine runner failure, OR a clean failure on one of the
+            // add/remove mutations themselves, occurred — do NOT claim the
+            // whitelist is updated when the underlying tool may not have
+            // applied every change.
+            if (!status_forwarded) {
+                ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                      "quarantine:do_whitelist one or more rule mutations failed");
+            }
+            ctx.write_output(
+                std::format("status|update_uncertain|whitelist|{}", join_ips(current_read.ips)));
+            return 1;
+        }
+        ctx.write_output(std::format("status|updated|whitelist|{}", join_ips(current_read.ips)));
         return 0;
     }
 };
