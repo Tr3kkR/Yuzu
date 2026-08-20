@@ -1590,10 +1590,11 @@ TEST_CASE("a production-order restart into each degraded spark posture: cached r
         CHECK(std::string_view{yuzu::agent::guardian_backend_label(
                   yuzu::agent::guardian_backend_from_state(true, engine.spark_availability()))} ==
               "spark_failed");
-        // The durable journal records from phase 1 (seed_armed_rules never called
-        // wire_spark_engine, so no journal existed - nothing to check here) are moot for
-        // this leg; the durability-survives-restart assertion lives in the extended
-        // "PRODUCTION boot order" test above.
+        // Phase 1 DID wire spark (seed_armed_rules), so a durable journal was written -
+        // but this leg's phase-2 engine never constructs its own lifecycle_journal_ (the
+        // null-engine branch returns first, see the CHECK above), so there is nothing to
+        // page here. The raw-KV durability-survives-restart assertion lives in the
+        // extended "PRODUCTION boot order" test above.
         engine.stop();
     }
 
