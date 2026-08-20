@@ -12,8 +12,9 @@ This guide covers hardening Yuzu for production enterprise deployments.
 > or root the built-in CA in your enterprise CA (subordinate mode, roadmap). The
 > server warns loudly while on default certs (startup banner, audit
 > `server.default_certs_in_use`, the `yuzu_server_default_certs_active` gauge).
-> Back up `--ca-dir` (esp. `default-ca.key`) and `ca.db` — losing the CA key
-> forces a full fleet re-enrollment.
+> Back up `--ca-dir` (esp. `default-ca.key`) and the `ca_store` Postgres
+> schema (`pg_dump`/`pg_restore`, ADR-0053) — losing the CA key forces a full
+> fleet re-enrollment.
 
 All agent-to-server communication should use mutual TLS. Create a private CA, server certificate, and per-agent certificates.
 

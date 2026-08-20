@@ -658,9 +658,37 @@ What to expect / do:
   Agents that previously connected over plaintext must switch to TLS — point them
   at the CA with `--ca-cert <ca-dir>/default-ca.pem`.
 - **To keep the legacy refuse-to-start behaviour**, pass `--no-default-certs`.
-- **Back up `<ca-dir>/default-ca.key` (0600) and the new `ca.db`** in `--data-dir`
-  — losing the CA key forces a full fleet re-enrollment.
+- **Back up `<ca-dir>/default-ca.key` (0600) and the `ca_store` Postgres schema**
+  (`pg_dump`/`pg_restore`, ADR-0053) — losing the CA key forces a full fleet
+  re-enrollment.
 - Relocate the cert directory with `--ca-dir` (e.g. a dedicated container volume).
+
+## ⚠️ Behaviour change: internal-CA store moves to Postgres (ADR-0053)
+
+`CaStore` (internal-CA root metadata, issued-certificate inventory, CRL version
+history — everything the mTLS-accept revocation gate and `GET /api/v1/ca/*`
+read) moves from the SQLite `ca.db` file to the server's PostgreSQL substrate
+in this release (schema `ca_store`). The private CA root key is unaffected —
+it was never in `ca.db` and stays a local file behind `KeyProvider` (`--ca-dir`).
+
+- **Mandatory, automatic backfill on first boot.** The legacy `ca.db` (if
+  present) is read once at startup and its full issued-cert inventory + CRL
+  history is copied into `ca_store`, fingerprint-verified. The legacy file is
+  left in place, read-only, for one release as a rollback reference — it is
+  never deleted or written to.
+- **New fail-closed-at-boot behaviour.** A genuine Postgres error while wiring
+  the per-agent mTLS revocation checker at boot now refuses to start the
+  server, rather than starting with revocation enforcement silently unwired.
+  If the server previously started cleanly on a working Postgres connection,
+  this changes nothing observable; it only changes what happens during a
+  Postgres outage at exactly that boot step, from "starts degraded" to
+  "refuses to start."
+- **`GET`/`POST /api/v1/ca/*` and the CA MCP tools now return a `503`/internal
+  error on a genuine database error**, instead of a silently-empty or
+  silently-false result.
+- Every other CA behavior — revocation semantics, CRL numbering, the single
+  `sign_agent_csr` chokepoint — is unchanged. Detail: `docs/pki-architecture.md`,
+  `docs/adr/0053-ca-store-postgres-migration.md`.
 
 ## ⚠️ Behaviour change: response history resets on Postgres cutover (ADR-0039)
 
