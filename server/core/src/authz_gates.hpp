@@ -27,14 +27,19 @@
 ///
 /// PHASE 0 (PR #3216): wired, tested, called by NO route at that point. The
 /// default-deny flip (#2298 PR 3, `require_permission`'s service branch)
-/// landed separately and does not call these either — it is the OTHER gate
-/// this file's `require_fleet_read` was deliberately left uninvolved in (see
-/// its own doc comment's "SELF-SUFFICIENT" / "does NOT cover" paragraphs and
-/// #3218). Migrating a route onto `require_fleet_read`/`confine_agent_target`
-/// so it actually serves confined service-scoped tokens instead of the
-/// flip's blanket deny is Phase 2, metric-prioritized, still not done as of
-/// this comment — `grep -rl "require_fleet_read\|confine_agent_target"` to
-/// check the current caller count before trusting "still zero" here.
+/// landed separately and never calls these either — `require_fleet_read`
+/// REPLACES the `require_permission` call on a route it migrates, it is
+/// never paired with it (see its own doc comment's "SELF-SUFFICIENT"
+/// paragraph and #3218).
+///
+/// PHASE 2 (#3290): first live caller landed — `GET /api/v1/inventory/software`
+/// + its MCP twin `query_installed_software` migrated onto `require_fleet_read`,
+/// which also gained the elevated/engine/mcp_tier caller-class branches it
+/// was missing at Phase 0 (see `require_fleet_read`'s own doc comment).
+/// `grep -rl "require_fleet_read\|confine_agent_target"` to check the
+/// current caller count before trusting this as exhaustive — more routes
+/// migrate incrementally per the Phase-2 backlog
+/// (`docs/security-reviews/service-scope-phase2-migrations-2026-08.md`).
 namespace yuzu::server {
 class AuthRoutes;
 }

@@ -177,9 +177,10 @@ public:
     /// (#2298 PR 3 §3f, closes #3218): this method is the sole gate on
     /// fleet-wide ROLLUP routes — it refuses a service-scoped session
     /// outright, since a rollup has no per-service slice to narrow to.
-    /// `require_fleet_read` (`authz_gates.hpp`) is meant to be paired with
-    /// `require_permission` on routes migrating toward real per-request
-    /// service-scope confinement (Phase 2). They are not interchangeable.
+    /// `require_fleet_read` (`authz_gates.hpp`) REPLACES `require_permission`
+    /// (never pairs with it — see its own doc comment's BLOCKING note) on
+    /// routes migrating toward real per-request service-scope confinement
+    /// (#3290 Phase 2). They are not interchangeable.
     ///
     /// An engine principal is special-cased (RBAC-only, never legacy-open)
     /// rather than delegated to `authorize_list_read` directly:
@@ -199,30 +200,29 @@ public:
                                    const std::string& operation);
 
     // -- Phase 0 confinement primitives (service-scope-confinement design doc
-    //    §7.2/§8) — wired here, called by NO route yet. See authz_gates.hpp
-    //    for `ListAuthority`/`GateFailure`, authz_gates.cpp for bodies.
-    //    RELATED BUT DISTINCT from `require_list_read` above: both compose
-    //    `RbacStore::authorize_list_read`, but for different purposes
-    //    (general ADR-0017 confinement vs. service-scope confinement) and
-    //    with different return shapes. #3218 (this shared-name-prefix
-    //    confusability) is CLOSED as of #2298 PR 3, ADR-1006 "Decision 2 —
-    //    closes #3218": the two gates stay deliberately separate, not
-    //    merged — see `require_list_read`'s own doc comment above
-    //    ("Route-class distinction") and
+    //    §7.2/§8) — wired here; first live caller landed #3290 Phase 2
+    //    (GET /api/v1/inventory/software + its MCP twin). See
+    //    authz_gates.hpp for `ListAuthority`/`GateFailure`, authz_gates.cpp
+    //    for bodies. RELATED BUT DISTINCT from `require_list_read` above:
+    //    both compose `RbacStore::authorize_list_read`, but for different
+    //    purposes (general ADR-0017 confinement vs. service-scope
+    //    confinement) and with different return shapes. #3218 (this
+    //    shared-name-prefix confusability) is CLOSED as of #2298 PR 3,
+    //    ADR-1006 "Decision 2 — closes #3218": the two gates stay
+    //    deliberately separate, not merged — see `require_list_read`'s own
+    //    doc comment above ("Route-class distinction") and
     //    `docs/adr/1006-service-scope-default-deny.md` for the resolution.
     //    The rename below (authorize_* -> require_*/confine_*, fjarvis/Kimi
     //    K2.7 follow-up review) moved `require_fleet_read` into the same
     //    `require_*` family as `require_list_read` — a naming proximity
     //    that is safe only because the closed #3218 discussion already
-    //    settled the two gates are not interchangeable: unlike
-    //    `require_list_read`, `require_fleet_read` calls
-    //    `authorize_list_read` directly with no JIT-elevation or
-    //    engine-principal special-casing — see its own doc comment's "does
-    //    NOT cover" paragraph. A route wiring `require_fleet_read` for a
-    //    caller class that can be elevated or an engine principal must still
-    //    account for that gap explicitly — #3218 closing means the TWO GATES
-    //    are settled as separate, not that this per-caller-class gap is
-    //    resolved. ------------------------------------------------------
+    //    settled the two gates are not interchangeable. #3290 Phase 2
+    //    closed the remaining per-caller-class gap this comment used to
+    //    warn about: `require_fleet_read` now carries its own
+    //    elevated/engine/mcp_tier branches (mirroring
+    //    `require_list_read`'s, not `require_permission`'s — see its own
+    //    doc comment) rather than calling `authorize_list_read` directly
+    //    with no caller-class handling. ------------------------------------
 
     /// The two-axis list-read gate. Named `require_*`, not `authorize_*`
     /// (renamed post-#3216, fjarvis/Kimi K2.7 follow-up review): it is a
@@ -259,27 +259,32 @@ public:
     /// test for the falsifier (the broken sequence denies a management-group-
     /// scoped-only caller; this gate alone, correctly, does not).
     ///
-    /// What this gate genuinely does NOT cover — a caller needing either must
-    /// check it WITHOUT re-deciding the RBAC/mgmt-group axis (i.e. not via
-    /// `require_permission`'s full branch chain): `mcp_tier` enforcement
-    /// (`mcp::tier_allows`/`requires_approval`). The RBAC-enabled requirement
-    /// for service-scoped sessions IS now covered (#2298 PR 3, decision 1 —
-    /// corrected from an earlier version of this comment that said the
-    /// opposite): a disabled-RBAC service-scoped session hard-403s here too,
-    /// same predicate (`rbac_enforcement_in_effect`) and same outcome as
-    /// `require_permission`'s service branch, so the two gates cannot
-    /// disagree on this axis. Also NOT covered: unlike
-    /// `require_list_read` above, this gate calls `authorize_list_read`
-    /// directly with no JIT-elevation branch (an elevated session gets no
-    /// special unfiltered treatment here) and no engine-principal branch (an
-    /// engine principal is not routed to RBAC-only resolution here the way
-    /// `require_list_read` routes it). #3218 (the shared-name-prefix
-    /// confusability between these two gates) is CLOSED — see the "Phase 0
-    /// confinement primitives" comment above: the two gates stay
-    /// deliberately separate. Closing #3218 settled THAT question; it did
-    /// NOT resolve THIS per-caller-class gap — a route reachable by either
-    /// caller class must still not assume `require_fleet_read` alone
-    /// reproduces `require_list_read`'s posture for them.
+    /// Caller-class coverage (#3290 Phase 2 — this paragraph previously
+    /// listed several gaps here; all are now closed, mirroring
+    /// `require_list_read`'s ladder, not `require_permission`'s): a JIT-
+    /// elevated non-service session is admitted unfiltered (TOP) without
+    /// consulting `authorize_list_read` at all, same rationale as
+    /// `require_list_read` — the regression the first #3038 fix attempt
+    /// shipped. An engine principal is resolved RBAC-only (never the
+    /// legacy-open branch, which would otherwise hand it a fleet-wide read
+    /// the moment RBAC is disabled) and, on a grant, gets a TOP admit —
+    /// engine authority has no per-tag scoping concept, so it is never
+    /// routed through the meet(mgmt, service) composition below. `mcp_tier`
+    /// enforcement (`mcp::tier_allows`) denies-or-falls-through before the
+    /// management-group axis, same as `require_permission`/
+    /// `require_list_read`; `mcp::requires_approval` is moot here, same as
+    /// `require_list_read`, because this gate is structurally Read-only
+    /// (approval gating exists only for destructive operations). The
+    /// RBAC-enabled requirement for service-scoped sessions remains covered
+    /// (#2298 PR 3, decision 1): a disabled-RBAC service-scoped session
+    /// hard-403s here too, same predicate (`rbac_enforcement_in_effect`) and
+    /// same outcome as `require_permission`'s service branch, so the two
+    /// gates cannot disagree on this axis. #3218 (the shared-name-prefix
+    /// confusability between these two gates) stays CLOSED — see the
+    /// "Phase 0 confinement primitives" comment above: the two gates remain
+    /// deliberately separate types serving different route classes (rollup
+    /// vs. per-agent list), even though their caller-class ladders are now
+    /// the same shape.
     [[nodiscard]] std::expected<authz::ListAuthority, authz::GateFailure>
     require_fleet_read(const httplib::Request& req, httplib::Response& res,
                        const std::string& securable_type, const std::string& operation);
@@ -312,12 +317,13 @@ public:
     /// target inside the token's service scope," never "is this caller
     /// authorized at all."
     ///
-    /// Empty `agent_id` is a 400, never an admit — the fix for
-    /// `require_scoped_permission`'s existing bug (auth_routes.cpp, service
-    /// branch: an empty `agent_id` today skips the only comparison that
-    /// could deny and falls through to `return true`). Fail-closed 503 on a
-    /// null or degraded tag store, matching that same function's tag-store-
-    /// unavailable case.
+    /// Empty `agent_id` is a 400, never an admit — the shape
+    /// `require_scoped_permission`'s service branch had before #2298 PR 3
+    /// §3b closed it there (an empty `agent_id` used to skip the only
+    /// comparison that could deny and fall through to `return true`); this
+    /// gate was built to not repeat that degenerate shape, not to fix a bug
+    /// still live in that function. Fail-closed 503 on a null or degraded
+    /// tag store, matching that same function's tag-store-unavailable case.
     [[nodiscard]] bool confine_agent_target(const httplib::Request& req, httplib::Response& res,
                                             const std::string& securable_type,
                                             const std::string& operation,
