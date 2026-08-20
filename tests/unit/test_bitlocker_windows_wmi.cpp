@@ -1,8 +1,8 @@
 /**
  * test_bitlocker_windows_wmi.cpp — bitlocker_windows_wmi.hpp (Wave-3
  * native-acquisition migration: Win32_EncryptableVolume WMI query +
- * GetConversionStatus() method call, replacing the raw `manage-bde
- * -status` popen).
+ * GetConversionStatus()/GetEncryptionMethod() method calls, replacing the
+ * raw `manage-bde -status` popen).
  *
  * Portable and unguarded — the header takes plain
  * std::map<std::string, std::string> rows with no COM/<windows.h>
@@ -124,20 +124,57 @@ TEST_CASE("parse_conversion_status rejects a non-zero method ReturnValue",
     CHECK(state.percent_text == "unknown");
 }
 
-TEST_CASE("format_volume_row assembles the frozen 5-field shape, method always unknown",
+TEST_CASE("format_volume_row assembles the frozen 5-field shape with the real method",
           "[agent][bitlocker_windows_wmi]") {
     EncryptableVolume vol;
     vol.drive_letter = "C:";
     vol.protection_status_raw = "1";
     ConversionState conv{"Fully Encrypted", "100%"};
-    CHECK(format_volume_row(vol, conv) == "volume|C:|Fully Encrypted|100%|unknown|Protection On");
+    CHECK(format_volume_row(vol, conv, "XTS-AES 128") ==
+          "volume|C:|Fully Encrypted|100%|XTS-AES 128|Protection On");
 }
 
 TEST_CASE("format_volume_row falls back to unknown for a missing drive letter",
           "[agent][bitlocker_windows_wmi]") {
     EncryptableVolume vol; // drive_letter left empty
     ConversionState conv{"Unknown", "unknown"};
-    CHECK(format_volume_row(vol, conv) == "volume|unknown|Unknown|unknown|unknown|Protection Unknown");
+    CHECK(format_volume_row(vol, conv, "Unknown") ==
+          "volume|unknown|Unknown|unknown|Unknown|Protection Unknown");
+}
+
+TEST_CASE("encryption_method_text maps the documented EncryptionMethod enum",
+          "[agent][bitlocker_windows_wmi]") {
+    CHECK(encryption_method_text("0") == "None");
+    CHECK(encryption_method_text("1") == "AES 128 with Diffuser");
+    CHECK(encryption_method_text("2") == "AES 256 with Diffuser");
+    CHECK(encryption_method_text("3") == "AES 128");
+    CHECK(encryption_method_text("4") == "AES 256");
+    CHECK(encryption_method_text("5") == "Hardware Encryption");
+    CHECK(encryption_method_text("6") == "XTS-AES 128");
+    CHECK(encryption_method_text("7") == "XTS-AES 256");
+    CHECK(encryption_method_text("8") == "Unknown");
+    CHECK(encryption_method_text("") == "Unknown");
+    CHECK(encryption_method_text("garbage") == "Unknown");
+}
+
+TEST_CASE("parse_encryption_method decodes a full method-call result row",
+          "[agent][bitlocker_windows_wmi]") {
+    WmiRow row = {{"ReturnValue", "0"}, {"EncryptionMethod", "6"}};
+    CHECK(parse_encryption_method(row) == "XTS-AES 128");
+}
+
+TEST_CASE("parse_encryption_method degrades honestly when fields are absent",
+          "[agent][bitlocker_windows_wmi]") {
+    WmiRow empty_row;
+    CHECK(parse_encryption_method(empty_row) == "Unknown");
+}
+
+TEST_CASE("parse_encryption_method rejects a non-zero method ReturnValue",
+          "[agent][bitlocker_windows_wmi]") {
+    // Transported fine (COM layer OK) but BitLocker's own method failed —
+    // EncryptionMethod must not be trusted even though present and well-formed.
+    WmiRow row = {{"ReturnValue", "2150694912"}, {"EncryptionMethod", "6"}};
+    CHECK(parse_encryption_method(row) == "Unknown");
 }
 
 TEST_CASE("is_permission_denied recognizes the E_ACCESSDENIED phrasings",

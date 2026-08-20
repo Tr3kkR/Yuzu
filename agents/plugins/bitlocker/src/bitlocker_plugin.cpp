@@ -146,7 +146,23 @@ bool report_bitlocker_status(yuzu::CommandContext& ctx) {
             state.conversion_text = "Unknown";
             state.percent_text = "unknown";
         }
-        ctx.write_output(yuzu::bitlocker::windows::format_volume_row(vol, state));
+
+        // sink: bitlocker/report_bitlocker_status#3 — rung 1, in-process WMI
+        // method call (GetEncryptionMethod), one per enumerated volume.
+        // Independent of the GetConversionStatus call above: a failure here
+        // degrades only the method field, never the conversion/percentage
+        // fields already collected.
+        auto method_call = yuzu::shared::wmi::exec_object_method(
+            kBitlockerWmiNamespace, yuzu::win::to_wide(object_path), L"GetEncryptionMethod", {});
+        std::string method = "Unknown";
+        if (!method_call.error.has_value() && !method_call.rows.empty()) {
+            method = yuzu::bitlocker::windows::parse_encryption_method(method_call.rows.front());
+        } else if (method_call.error.has_value()) {
+            spdlog::warn("bitlocker: GetEncryptionMethod failed for {}: {}", vol.device_id,
+                         *method_call.error);
+        }
+
+        ctx.write_output(yuzu::bitlocker::windows::format_volume_row(vol, state, method));
     }
     return true;
 }

@@ -1,9 +1,10 @@
 ## Antivirus Product Detection Definitions
 ## Detects installed antivirus products and queries Windows Defender status.
-## Plugin: antivirus | Actions: products, status
+## Plugin: antivirus | Actions: products, status, av_exclusions
 ##
 ## Sources by platform:
-##   Windows: WMI SecurityCenter2 (products), Get-MpComputerStatus (Defender)
+##   Windows: WMI SecurityCenter2 (products), Get-MpComputerStatus (Defender),
+##            registry (av_exclusions — Defender exclusion lists)
 ##   Linux:   Process detection for ClamAV, CrowdStrike Falcon, Sophos
 ##   macOS:   products: XProtect.bundle version probe + endpoint-security
 ##            system extensions (systemextensionsctl), process fallback;
@@ -205,6 +206,69 @@ spec:
     # (0.2.0, AntivirusPlugin::version()) — no minPluginVersion mechanism
     # exists today. An agent running plugin <0.2.0 degrades to
     # status|not_available rather than being gated out here.
+    minAgentVersion: 0.1.0
+    requiredPlugins: [antivirus]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.antivirus.av_exclusions
+  displayName: Windows Defender Exclusions
+  version: 1.0.0
+  description: >
+    List Windows Defender's configured exclusions (paths, processes, and
+    file extensions) on a Windows endpoint. Reads both the operator-editable
+    local hive and the GPO/MDM-managed policy hive, merged with provenance
+    so an operator can tell which plane an exclusion came from. This list
+    is itself a map of where AV coverage has gaps on an endpoint, which is
+    more sensitive than presence/status alone. A row's key is always
+    "exclusion"; the value carries kind (path/process/extension), source
+    (local/policy/both), and the excluded value itself, pipe-delimited. A
+    "partial" row means the enumeration could not be confirmed complete
+    (a registry read was truncated or transiently failed) — the exclusions
+    returned are real, but there may be more that weren't collected.
+    Windows-only; other platforms report "unsupported".
+  tags: [security, antivirus, defender, exclusions, compliance, windows]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: antivirus
+    action: av_exclusions
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: kind
+        type: string
+      - name: source
+        type: string
+      - name: value
+        type: string
+
+  readablePayload: "List Windows Defender exclusions"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
     minAgentVersion: 0.1.0
     requiredPlugins: [antivirus]
 

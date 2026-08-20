@@ -312,6 +312,12 @@ agent_test_exe = executable(
                                                 # via the file's own #if defined(__APPLE__) guard)
     'unit/test_bitlocker_windows_wmi.cpp',    # Wave 3: pure WMI-row -> BitLocker output-row mapping
     'unit/test_bitlocker_linux_parsers.cpp',  # Wave 3: pure dm-crypt uuid / LUKS state parser
+    'unit/test_antivirus_local_dispatcher.cpp', # Wave 3 gate remediation: real antivirus.dll driven
+                                                # end to end via LocalDispatcher (Windows-only; a no-op
+                                                # TU elsewhere via the file's own #ifdef _WIN32 guard)
+    'unit/test_bitlocker_local_dispatcher.cpp', # Wave 3 gate remediation: real bitlocker.dll driven
+                                                # end to end via LocalDispatcher (Windows-only; a no-op
+                                                # TU elsewhere via the file's own #ifdef _WIN32 guard)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp

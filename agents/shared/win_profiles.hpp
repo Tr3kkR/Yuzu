@@ -235,14 +235,30 @@ inline std::vector<std::string> enumerate_hku_subkeys() {
     return out;
 }
 
+// Result of enumerate_value_names(): the names actually collected, plus
+// whether the enumeration is known to be the COMPLETE set. `complete` is
+// false when a value name exists but could not be confirmed collected --
+// RegQueryInfoKeyW itself failed on an already-open key, the safety cap
+// (kMaxEnumeratedValueNames) cut the walk short, or RegEnumValueW failed
+// mid-enumeration. `names` is never fabricated: whatever is present is
+// real data, `complete=false` is purely an "there may be more" signal so a
+// caller doesn't present a possibly-truncated list as a verified-clean one
+// (security-relevant for callers like Defender exclusion enumeration,
+// where an under-reported list reads as a healthier posture than reality).
+struct ValueNameEnumeration {
+    std::vector<std::string> names;
+    bool complete = true;
+};
+
 // Enumerates every VALUE NAME directly under `key` (not the values'
 // data — some registry-driven configuration, e.g. Windows Defender's
 // exclusion lists, stores each entry AS the value name itself, with the
-// data unused). Returns an empty vector both when `key` genuinely has no
-// values and when `key` is null — callers that need to distinguish "empty
-// key" from "key could not be opened at all" check the RegOpenKeyExW result
-// themselves before calling this (this function only ever sees an already-
-// open key).
+// data unused). Returns an empty, complete result both when `key`
+// genuinely has no values and when `key` is null — callers that need to
+// distinguish "empty key" from "key could not be opened at all" check the
+// RegOpenKeyExW result themselves before calling this (this function only
+// ever sees an already-open key; a null `key` is therefore never itself a
+// completeness failure of THIS function).
 //
 // Two-pass, same spirit as read_reg_value()'s size-then-fill idiom: first
 // RegQueryInfoKeyW sizes the longest value name actually present so the
@@ -252,19 +268,22 @@ inline std::vector<std::string> enumerate_hku_subkeys() {
 // unbounded allocation (kMaxValueNameChars caps it regardless of what the
 // key reports). Enumeration itself is bounded at kMaxEnumeratedValueNames
 // entries so a key stuffed with an unbounded number of values cannot pin
-// this call indefinitely.
-inline std::vector<std::string> enumerate_value_names(HKEY key) {
-    std::vector<std::string> out;
+// this call indefinitely -- that cap, and any other short-collection, is
+// reported via `complete`, never silently.
+inline ValueNameEnumeration enumerate_value_names(HKEY key) {
+    ValueNameEnumeration result;
     if (!key)
-        return out;
+        return result;
 
     DWORD value_count = 0;
     DWORD max_name_len = 0; // WCHARs, NOT including the terminating NUL
     if (RegQueryInfoKeyW(key, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &value_count,
-                         &max_name_len, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
-        return out;
+                         &max_name_len, nullptr, nullptr, nullptr) != ERROR_SUCCESS) {
+        result.complete = false;
+        return result;
+    }
     if (value_count == 0)
-        return out;
+        return result;
 
     if (max_name_len >= kMaxValueNameChars)
         max_name_len = kMaxValueNameChars - 1;
@@ -272,7 +291,9 @@ inline std::vector<std::string> enumerate_value_names(HKEY key) {
 
     const DWORD cap = value_count < kMaxEnumeratedValueNames ? value_count
                                                              : kMaxEnumeratedValueNames;
-    out.reserve(cap);
+    if (cap < value_count)
+        result.complete = false; // safety cap cut off real entries
+    result.names.reserve(cap);
     for (DWORD idx = 0; idx < cap; ++idx) {
         // RegEnumValueW's lpcchValueName is WCHAR count and MUST include
         // room for the terminator on input, even though the count it writes
@@ -285,12 +306,14 @@ inline std::vector<std::string> enumerate_value_names(HKEY key) {
         if (rc != ERROR_SUCCESS) {
             // A value deleted mid-enumeration (index shifts under us) or any
             // other transient failure -- stop rather than loop past what the
-            // key actually still has; whatever was collected so far is real.
+            // key actually still has; whatever was collected so far is real,
+            // but the walk did not reach `value_count`, so it is not complete.
+            result.complete = false;
             break;
         }
-        out.push_back(from_wide(name_buf.data(), static_cast<int>(name_len)));
+        result.names.push_back(from_wide(name_buf.data(), static_cast<int>(name_len)));
     }
-    return out;
+    return result;
 }
 
 // RAII scope that enables a token privilege the service account holds but

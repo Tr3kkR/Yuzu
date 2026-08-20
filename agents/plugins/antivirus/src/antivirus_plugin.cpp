@@ -167,7 +167,21 @@ bool read_exclusion_subkey(yuzu::CommandContext& ctx, const wchar_t* path, const
         }
         return false;
     }
-    out_names = yuzu::win::enumerate_value_names(key.get());
+    auto enumeration = yuzu::win::enumerate_value_names(key.get());
+    out_names = std::move(enumeration.names);
+    if (!enumeration.complete) {
+        // The key opened fine but enumerate_value_names() could not confirm
+        // it collected every value name (a transient RegQueryInfoKeyW/
+        // RegEnumValueW failure, or the safety cap). Reported as its own
+        // typed status -- never silently presented as a verified-complete,
+        // possibly-clean exclusion list.
+        ctx.write_output(std::format("partial|exclusions {} enumeration incomplete", kind));
+        if (!status_forwarded) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "antivirus:av_exclusions_enumeration_incomplete");
+            status_forwarded = true;
+        }
+    }
     return true;
 }
 

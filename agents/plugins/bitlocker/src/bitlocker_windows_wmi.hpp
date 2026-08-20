@@ -22,11 +22,12 @@
  * Output shape is frozen to the pre-migration `manage-bde -status` text
  * parser's 5-field row: `volume|<drive>|<conversion>|<pct_encrypted>|
  * <method>|<protection>`. `method` (BitLocker's "Encryption Method", e.g.
- * "XTS-AES 128") has no equivalent among the properties this migration's
- * query selects — Win32_EncryptableVolume::EncryptionMethod was
- * deliberately left out so the query stays the exact small surface this
- * migration specified — so it is honestly reported "unknown" rather than
- * fabricated, the same "never guess" convention bitlocker_macos_apfs.hpp
+ * "XTS-AES 128") is NOT a plain Win32_EncryptableVolume property — like
+ * ConversionStatus/EncryptionPercentage it is only available via a
+ * per-volume method call (GetEncryptionMethod), so the acquisition side
+ * makes that call alongside GetConversionStatus. A failed call, or a
+ * non-zero method ReturnValue, is reported "Unknown" rather than
+ * fabricated — the same "never guess" convention bitlocker_macos_apfs.hpp
  * already follows for FileVault fields diskutil doesn't supply.
  */
 #pragma once
@@ -165,13 +166,51 @@ inline ConversionState parse_conversion_status(const WmiRow& row) {
     return state;
 }
 
+/// Win32_EncryptableVolume::GetEncryptionMethod's EncryptionMethod out
+/// param (MS docs): 0=NONE, 1=AES_128_WITH_DIFFUSER, 2=AES_256_WITH_DIFFUSER,
+/// 3=AES_128, 4=AES_256, 5=HARDWARE_ENCRYPTION, 6=XTS_AES_128,
+/// 7=XTS_AES_256, 8=UNKNOWN. Mapped to manage-bde's own "Encryption Method"
+/// text (mirrors conversion_status_text's enum-to-manage-bde-text shape).
+inline std::string encryption_method_text(const std::string& raw) {
+    if (raw == "0")
+        return "None";
+    if (raw == "1")
+        return "AES 128 with Diffuser";
+    if (raw == "2")
+        return "AES 256 with Diffuser";
+    if (raw == "3")
+        return "AES 128";
+    if (raw == "4")
+        return "AES 256";
+    if (raw == "5")
+        return "Hardware Encryption";
+    if (raw == "6")
+        return "XTS-AES 128";
+    if (raw == "7")
+        return "XTS-AES 256";
+    return "Unknown"; // covers documented value 8 (UNKNOWN) and anything unrecognized
+}
+
+/// A GetEncryptionMethod() method-call result missing EncryptionMethod, OR
+/// carrying a non-zero ReturnValue (transported fine but BitLocker's own
+/// method failed), is reported "Unknown" — never fabricated. Same
+/// ReturnValue-first convention as parse_conversion_status.
+inline std::string parse_encryption_method(const WmiRow& row) {
+    if (auto it = row.find("ReturnValue"); it == row.end() || it->second != "0")
+        return "Unknown";
+    if (auto it = row.find("EncryptionMethod"); it != row.end())
+        return encryption_method_text(it->second);
+    return "Unknown";
+}
+
 /// Format one volume's output row, frozen to the pre-migration 5-field
 /// shape (`volume|<drive>|<conversion>|<pct_encrypted>|<method>|
-/// <protection>`); `method` is always "unknown" — see file header comment.
-inline std::string format_volume_row(const EncryptableVolume& vol, const ConversionState& conv) {
+/// <protection>`).
+inline std::string format_volume_row(const EncryptableVolume& vol, const ConversionState& conv,
+                                     const std::string& method) {
     std::string drive = vol.drive_letter.empty() ? "unknown" : vol.drive_letter;
     return "volume|" + drive + "|" + conv.conversion_text + "|" + conv.percent_text +
-           "|unknown|" + protection_status_text(vol.protection_status_raw);
+           "|" + method + "|" + protection_status_text(vol.protection_status_raw);
 }
 
 /// Whether a WMI query/method-call error string indicates the caller lacks
