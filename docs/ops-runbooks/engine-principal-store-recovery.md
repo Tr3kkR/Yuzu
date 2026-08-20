@@ -160,7 +160,7 @@ step, not a routine failure mode.
    one-shot migration flag — so a clean pass confirms the collision is
    fully resolved.
 
-## Alert: `EngineRevalidateStoreUnreachable` (#2367)
+## Alert: `YuzuMcpEngineRevalidateStoreUnreachable` (#2367)
 
 **What fired.** `yuzu_server_engine_revalidate_backoff_suppressed_total` moved.
 That counter increments ONLY when a liveness re-check for an engine principal

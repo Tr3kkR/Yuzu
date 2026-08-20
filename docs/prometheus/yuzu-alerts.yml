@@ -782,6 +782,22 @@ groups:
             Denials are audited as mcp.<tool>|denied with detail
             "input bound exceeded: <reason>"; correlate there for the principal.
 
+      - alert: YuzuMcpEngineRevalidateStoreUnreachable
+        expr: |
+          increase(yuzu_server_engine_revalidate_backoff_suppressed_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Engine-principal liveness re-checks are being answered from the failure backoff - the principal store is unreachable and engine streams are riding their grace windows"
+          description: >-
+            This counter only moves while the store cannot be reached. First
+            rule out real impact: a flat
+            yuzu_mcp_stream_closes_total{reason="auth_unavailable"} means the
+            backoff is absorbing the blip and no streams have ended. Then
+            correlate with yuzu_pg_acquire_wait_seconds and
+            yuzu_pg_pool_in_use for pool exhaustion.
+          runbook_url: "https://docs.yuzu.io/runbooks/engine-principal-store-recovery"
+
   - name: yuzu-dispatch
     rules:
       - alert: YuzuDispatchTargetRejected
