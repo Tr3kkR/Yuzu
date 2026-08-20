@@ -7181,9 +7181,10 @@ TEST_CASE("MCP CA: revoke_certificate full approval-ticket round-trip reaches re
 // hooking mcp_audit (which this exact branch bypasses).
 TEST_CASE("MCP 2444: yuzu_mcp_approval_burned_total fires on a post-consume handler reject, "
           "not on schema-invalid or success",
-          "[mcp][2g][approval][metrics]") {
-    yuzu::test::TempDbFile db{std::string_view{"yuzu_test_mcp_ca_burn_"}};
-    yuzu::server::CaStore store(db.path); // deliberately empty — no cert recorded
+          "[mcp][2g][approval][metrics][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool}; // deliberately empty — no cert recorded
     yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_burn_"}};
     yuzu::test::SqliteHandleOwner<sqlite3> raw;
     REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw.db) == SQLITE_OK);
