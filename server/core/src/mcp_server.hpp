@@ -5,6 +5,7 @@
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
+#include "authz_gates.hpp" // #3290 Phase 2: authz::FleetReadGate — query_installed_software's real confinement seam
 #include "authz_model.hpp" // #1788: VisibleSet — MCP dispatch confinement (in_scope/filter_to_scope)
 #include "ca_store.hpp"
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
@@ -336,6 +337,26 @@ public:
         upload_grant_list_read_fn_ = std::move(list_read_fn);
     }
 
+    /// #3290 Phase 2 — the injected-callback twin of
+    /// `AuthRoutes::require_fleet_read`, backing `query_installed_software`'s
+    /// real per-agent/service confinement (see `authz::FleetReadGate`'s doc
+    /// comment, authz_gates.hpp, and `RestApiV1::FleetReadFn`,
+    /// rest_api_v1.hpp, for the shared shape — server.cpp wires the SAME
+    /// conversion lambda into both surfaces so REST and MCP cannot drift).
+    /// Same setter idiom as `set_upload_grant_ops` above (the handler's
+    /// `[=]` lambda captures `this`, so the injection is a live read on the
+    /// next request). MUST be this tool's SOLE authorization gate — never
+    /// stacked with `perm_fn` for the same `(securable_type, operation)`
+    /// (the identical BLOCKING defect `require_fleet_read`'s own doc
+    /// comment warns against). Unset (default-constructed) ⇒ the tool fails
+    /// CLOSED (503 "unwired"), mirroring `RestApiV1`'s own unwired contract
+    /// for the identical seam.
+    using FleetReadFn =
+        std::function<authz::FleetReadGate(const httplib::Request&, httplib::Response&,
+                                           const std::string& securable_type,
+                                           const std::string& operation)>;
+    void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
+
     /// Republish-CRL callback (PR4 B-2): mirrors `CaRoutes::PublishCrlFn` so the
     /// MCP `revoke_certificate` tool republishes the CRL after a revoke exactly as
     /// the REST `/api/v1/ca/revoke` handler does. Returns the new CRL DER, or
@@ -554,6 +575,8 @@ private:
     PluginConfigStore* plugin_config_store_{nullptr};
     UploadGrantStore* upload_grant_store_{nullptr};
     UploadGrantListReadFn upload_grant_list_read_fn_;
+    // #3290 Phase 2 — see set_fleet_read_fn above.
+    FleetReadFn fleet_read_fn_;
 };
 
 // The (tool, securable, operation) test-only accessors that formerly lived here

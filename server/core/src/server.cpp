@@ -18337,6 +18337,12 @@ private:
             // was null while the REST twins worked fine — two surfaces
             // disagreeing about whether the same capability exists (ADR-1005 A1).
             mcp_server_->set_kek_ops(kek_ops_); // same seam instance as the REST twins
+            // #3290 Phase 2 — the SAME fleet_read_fn lambda wired into the REST
+            // registration's trailing fleet_read_fn param below, so the REST and MCP
+            // query_installed_software twins cannot observe a different admit
+            // decision for the same caller (same conversion, same underlying
+            // require_fleet_read call).
+            mcp_server_->set_fleet_read_fn(fleet_read_fn);
             // PR1.5c/1.6c (p14) — ADR-0031 operator surface MCP twins,
             // wired UNCONDITIONALLY exactly like kek_ops above (never
             // gated behind an unrelated conditional — see the KEK comment

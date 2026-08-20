@@ -5003,29 +5003,25 @@ McpServer::HandlerFn McpServer::build_handler(
 
             // ── query_installed_software ──────────────────────────────────
             // Typed daily-sync software store (ADR-0016), DISTINCT from the generic
-            // query_inventory above. Mirrors query_responses: tier → RBAC → store →
-            // cap → management-group scope filter → audit (success + distinct denied).
+            // query_inventory above. #3290 Phase 2 — migrated onto require_fleet_read
+            // (fleet_read_fn_, set via set_fleet_read_fn): store → cap →
+            // meet(management-group, service-scope) filter → audit (success +
+            // distinct denied). fleet_read_fn_ is now the SOLE gate — it already
+            // covers mcp_tier (require_fleet_read's own caller-class ladder,
+            // #3290 D1) and RBAC, so no separate tier_allows/perm_fn call here
+            // (stacking either would be the BLOCKING defect require_fleet_read's
+            // doc comment warns against).
             if (tool_name == "query_installed_software") {
-                if (!tier_allows(tier, "Inventory", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
+                if (!fleet_read_fn_) {
+                    spdlog::error("query_installed_software: fleet_read_fn_ unwired — "
+                                  "misconfigured call site; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
                                     "application/json");
                     return;
                 }
-                // Governance finding: the management-group scope filter further down
-                // is INERT under the global Inventory:Read gate (same class as
-                // query_responses/query_inventory), and this tool has no per-target
-                // scoped check even when agent_id is supplied. Blanket deny, matching
-                // the REST/dashboard twins (rest_api_v1.cpp, inventory_routes.cpp).
-                if (deny_fleet_wide_service_scoped(
-                        "inventory.software.query", "Inventory",
-                        "fleet-wide software search denied to a service-scoped token (MCP "
-                        "query_installed_software)",
-                        "service-scoped tokens may not run a fleet-wide software search",
-                        "fleet"))
-                    return;
-                if (!perm_fn(req, res, "Inventory", "Read"))
-                    return;
+                auto gate = fleet_read_fn_(req, res, "Inventory", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the JSON-RPC error response
                 if (!software_inventory_store) {
                     res.set_content(
                         error_response(id, kInternalError, "Software inventory store unavailable"),
@@ -5069,40 +5065,32 @@ McpServer::HandlerFn McpServer::build_handler(
                 // instruction_id), an empty-filter call here is an unbounded fleet-wide
                 // scan capped at q.limit on a global ORDER BY *before* the per-agent scope
                 // filter — so a narrow-scope operator may see few of their own rows in one
-                // page, signalled by result_truncated_by_cap. NOTE (ADR-0017): the
-                // per-agent filter here is INERT under the global Inventory:Read gate, so
-                // it does not actually narrow by management group today — do not read
-                // "ISOLATION holds" as effective list-view confinement (that is the
-                // ADR-0017 admit-then-filter gate, #1716). Completeness for a narrow scope
-                // over a wide fleet is the keyset follow-up (#1634).
+                // page, signalled by result_truncated_by_cap. Completeness for a narrow
+                // scope over a wide fleet is the keyset follow-up (#1634).
                 const bool hit_cap = rows.size() == static_cast<std::size_t>(q.limit);
 
-                // Management-group scope (mirrors query_responses #1550 HIGH-1). The flat
-                // Inventory:Read gate above is not a per-device ownership check, so without
-                // this an operator could read other operators' devices' software fleet-wide
-                // by name. Filter per-agent through the injected Inventory-scoped predicate
-                // (production: check_scoped_permission), memoised per distinct agent_id,
-                // passing the already-resolved principal. Unwired/RBAC-off → no filter
-                // (legacy-open), matching require_scoped_permission.
+                // Scope filter — the gate's own composed meet(management-group,
+                // service-scope) VisibleSet (#3290, replaces the retired per-row
+                // inventory_scope_fn predicate; mirrors the REST twin exactly,
+                // rest_api_v1.cpp). nullopt (TOP) ⇒ unfiltered — a global grant or
+                // RBAC-off, byte-identical to the pre-#3290 no-op filter path for
+                // that caller class.
                 bool scope_filtered = false;
                 std::size_t dropped_agents = 0;
-                if (inventory_scope_fn) {
-                    std::unordered_map<std::string, bool> memo;
+                if (gate.scope) {
+                    std::unordered_set<std::string> dropped_ids;
                     std::vector<SoftwareFleetRow> visible;
                     visible.reserve(rows.size());
                     for (auto& r : rows) {
-                        auto [m, inserted] = memo.try_emplace(r.agent_id, false);
-                        if (inserted)
-                            m->second = inventory_scope_fn(session->username, r.agent_id);
-                        if (m->second) {
+                        if (authz::in_scope(gate.scope, r.agent_id)) {
                             visible.push_back(std::move(r));
                         } else {
                             scope_filtered = true;
-                            if (inserted) // count each DISTINCT dropped device once
-                                ++dropped_agents;
+                            dropped_ids.insert(r.agent_id); // count each DISTINCT dropped device once
                         }
                     }
                     rows.swap(visible);
+                    dropped_agents = dropped_ids.size();
                 }
 
                 JArr arr;
@@ -5130,10 +5118,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 // security-relevant gap).
                 bool denied_ok = true;
                 if (scope_filtered)
-                    denied_ok = mcp_audit("denied", "scope: filtered " +
-                                                        std::to_string(dropped_agents) +
-                                                        " out-of-management-group device(s) for " +
-                                                        audit_key);
+                    denied_ok = mcp_audit(
+                        "denied", "scope: filtered " + std::to_string(dropped_agents) +
+                                      " out-of-scope device(s) (management-group and/or "
+                                      "service-tag axis) for " +
+                                      audit_key);
                 const bool audit_ok = mcp_audit("success", audit_key) && denied_ok;
                 JObj result_obj;
                 result_obj.raw("content",
