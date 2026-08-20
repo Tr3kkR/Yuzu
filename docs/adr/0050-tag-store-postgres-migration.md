@@ -264,7 +264,12 @@ key)` (a gateway-proxied agent, whose tags never reach the store via
 `ProxyRegister` — tracked as a follow-up; or a tag not yet synced).
 Additionally, `register_agent` now drops an agent-claimed `service` key
 from the session entirely at ingest, mirroring the store-side purge
-`sync_agent_tags` already performed (#3289).
+`sync_agent_tags` already performed (#3289) — and, separately, drops any
+key/value pair failing `TagStore::validate_key`/`validate_value` (charset,
+length) before it can reach the in-memory fallback either, so an
+oversized or malformed self-report can never answer a `tag:` lookup for a
+store-miss agent, matching the validation `sync_agent_tags` already
+applies on the store side.
 
 This does NOT reopen the "Aborting scope evaluation on a NULL tag store"
 rejection above — a NULL store with no row to check still falls through to
@@ -280,6 +285,17 @@ store-first now returns the stale value where session-first would have
 returned the fresh one. Accepted: the store remains the single source of
 truth for `tag:` scope-DSL evaluation, and the row self-heals on the
 agent's next successful sync.
+
+A second, narrower residual window (pre-existing, not introduced by this
+flip): the bulk store preload snapshots `tag_values` before `mu_` is
+taken, per ADR-0045's "never a per-agent store query while holding
+`AgentRegistry::mu_`" constraint. A concurrent operator write that commits
+after the snapshot but before the per-agent loop reaches that agent is
+invisible to that ONE `evaluate_scope` call, which then answers from the
+in-memory fallback for that call only — indistinguishable, for that single
+call, from the pre-#3295 behavior. It self-corrects on the very next
+`evaluate_scope` call (a fresh preload). This shape already existed for
+`props.<key>` before this PR; it is now also true for `tag:<key>`.
 
 Full precedence rule: `docs/asset-tagging-guide.md` "Tag source precedence
 (read time, scope-DSL, #3295)"; cross-references: `docs/adr/1006-service-scope-default-deny.md`,

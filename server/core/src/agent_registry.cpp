@@ -55,6 +55,13 @@ void AgentRegistry::register_agent(const pb::AgentInfo& info) {
             spdlog::info("AgentRegistry::register_agent({}): dropping self-reported "
                          "'service' tag from session scopable_tags (#3295)",
                          info.agent_id());
+            // Gate 6 hardening: the store-side purge (tag_store.cpp,
+            // sync_agent_tags) has yuzu_server_tag_store_agent_service_purge_total;
+            // this session-level drop is the ONLY signal for a gateway-proxied
+            // agent (ProxyRegister never calls sync_agent_tags, so the store-side
+            // counter never fires for that population).
+            metrics_.counter("yuzu_server_agent_registry_service_tag_dropped_total")
+                .increment();
             continue;
         }
         if (!TagStore::validate_key(k) || !TagStore::validate_value(v)) {

@@ -188,6 +188,29 @@ TEST_CASE("evaluate_scope: tag:<key> resolves preloaded store values",
         CHECK(has(*eq_matched, "agent-empty"));
     }
 
+    SECTION("an empty STORE value is never masked by a non-empty in-memory claim (#3295, "
+            "the inverse of the empty-in-memory case above)") {
+        auto claim = info("agent-empty-store");
+        (*claim.mutable_scopable_tags())["env"] = "prod";
+        registry.register_agent(claim);
+        REQUIRE(store.set_tag("agent-empty-store", "env", "").has_value());
+
+        // The store row (even empty) is found first and short-circuits before
+        // the in-memory fallback is even consulted — the empty store value
+        // must win, not the agent's own non-empty claim.
+        auto exists_expr = yuzu::scope::parse(R"(EXISTS tag:env)");
+        REQUIRE(exists_expr.has_value());
+        auto exists_matched = registry.evaluate_scope(*exists_expr, &store, nullptr);
+        REQUIRE(exists_matched.has_value());
+        CHECK_FALSE(has(*exists_matched, "agent-empty-store"));
+
+        auto eq_expr = yuzu::scope::parse(R"(tag:env == "prod")");
+        REQUIRE(eq_expr.has_value());
+        auto eq_matched = registry.evaluate_scope(*eq_expr, &store, nullptr);
+        REQUIRE(eq_matched.has_value());
+        CHECK_FALSE(has(*eq_matched, "agent-empty-store"));
+    }
+
     SECTION("an agent-authored store row from a failed re-sync still beats a fresher "
             "in-memory claim — store stays authoritative, self-heals on next sync (#3295)") {
         auto stale = info("agent-stale-sync");
@@ -330,6 +353,11 @@ TEST_CASE("register_agent: ingest filter drops invalid/service scopable_tags",
     CHECK(session->scopable_tags.find(std::string(65, 'a')) == session->scopable_tags.end());
     CHECK(session->scopable_tags.find("bad key!") == session->scopable_tags.end());
     CHECK(session->scopable_tags.find("oversized") == session->scopable_tags.end());
+    // Two service-key drops ("service" + "Service") — the ONLY signal for a
+    // gateway-proxied agent, which never reaches TagStore::sync_agent_tags's
+    // own counter (#3295 Gate 6 hardening).
+    CHECK(metrics.counter("yuzu_server_agent_registry_service_tag_dropped_total").value() ==
+          2.0);
 }
 
 // ── collect_attribute_suffixes: synthetic-attribute decoding (governance

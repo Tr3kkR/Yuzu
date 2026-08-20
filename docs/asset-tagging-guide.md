@@ -48,15 +48,27 @@ Structured categories are enforced at the API layer:
 > "Service-Scoped Tokens" under `docs/user-manual/authentication.md`.
 >
 > **Tag source precedence (read time, scope-DSL, #3295).** A `tag:<key>` expression in a
-> Scope (dispatch targeting, management-group membership, any `tag:` atom you write) resolves
-> the TagStore first — the same source-precedence rules above apply, so an operator-set row
-> always wins if present. A connected agent's live self-reported value answers a `tag:<key>`
-> lookup ONLY when the store has no row at all for that `(agent, key)` — e.g. a gateway-proxied
+> Scope (dispatch targeting, management-group membership, any `tag:` atom you write, including
+> `EXISTS`/`LEN`/`STARTSWITH` forms) resolves the TagStore row for that `(agent, key)` FIRST,
+> by presence alone — this is a separate rule from the write-time source precedence above, not
+> derived from it: the store row wins regardless of which source wrote it (even an
+> agent-sourced row beats a live, fresher in-memory claim from the same agent — see the
+> stale-sync note below). A connected agent's live self-reported value answers a `tag:<key>`
+> lookup ONLY when the store has NO row at all for that `(agent, key)` — e.g. a gateway-proxied
 > agent, whose tags are never synced to the store, or a tag not yet synced. `service` never
 > answers from the self-report at this stage either — it is dropped from the agent's live
 > session at registration, not just filtered from the store. An agent reporting an empty-string
-> value cannot mask an operator's non-empty stored value: the store row, when present, is
-> always used regardless of the agent's own claim.
+> value cannot mask an operator's non-empty stored value, and conversely an empty STORE value
+> is never masked by a non-empty in-memory claim: the store row, when present — even an empty
+> one — is always used regardless of the agent's own claim.
+>
+> **Accepted trade-off: a stale agent-sourced row can briefly outlast a fresher live claim.**
+> If an agent's most recent tag sync fails (a transient DB error, or exceeding the sync batch
+> limit), the store retains its PRIOR agent-sourced row for that agent while the agent's live
+> session already holds a newer value — read-time precedence still honors the (now stale)
+> store row until the agent's next successful sync. This is deliberate: the store remains the
+> single source of truth for scope-DSL reads, and the row self-heals automatically. See
+> `docs/adr/0050-tag-store-postgres-migration.md`'s 2026-08-20 amendment for the full rationale.
 
 ### Via the REST API
 

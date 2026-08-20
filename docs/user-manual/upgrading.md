@@ -393,10 +393,19 @@ each key is `server`- (operator/API) or `agent`-sourced.
 `tag:<key>` evaluation (dispatch targeting, management-group membership) had its own,
 separate precedence — a currently-connected agent's live self-report answered before the
 store was even consulted. That is now also store-first: an operator/API-set row always
-wins for scope-DSL purposes too. **Who this affects:** an operator who deliberately relied
-on a live agent's tag value overriding an operator/API-set tag specifically for dispatch
-targeting or cohort membership while that agent stayed connected. See
-`docs/asset-tagging-guide.md` "Tag source precedence (read time, scope-DSL, #3295)".
+wins for scope-DSL purposes too, and an agent-claimed `service` value never answers from
+the live self-report at all (it is dropped at registration, not just at store sync).
+**Who this affects:** an operator who deliberately relied on a live agent's tag value
+overriding an operator/API-set tag specifically for dispatch targeting or cohort
+membership while that agent stayed connected. See `docs/asset-tagging-guide.md` "Tag
+source precedence (read time, scope-DSL, #3295)".
+
+**Caution — the `/devices` tag-chip display is unaffected by this change and can now
+visibly disagree with what actually governs targeting:** it renders only the agent's live
+self-report, never the TagStore row, so an operator-set value that now wins for dispatch
+purposes may not be what the dashboard chip shows. Use `GET /api/v1/tags?agent_id=<id>`
+(its `source` column) as the source of truth for what governs a device's scope-DSL
+matching, not the dashboard.
 
 **Remediate:** if an agent-reported value was the *intended* one, re-set it explicitly
 via the REST API or MCP `set_tag` (which writes `source=server`, authoritative). Keys
