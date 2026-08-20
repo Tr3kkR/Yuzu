@@ -5,7 +5,7 @@
 #include "tar_tree_routes.hpp"
 
 #include "http_route_sink.hpp"
-#include "rest_a4_envelope.hpp" // detail::error_json_a4, make_correlation_id
+#include "rest_a4_envelope_http.hpp" // detail::a4_denial
 #include "rest_audit.hpp"     // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 #include "secure_random.hpp" // random_hex (CSPRNG cache token, #801)
 #include "web_utils.hpp"      // html_escape, audit_token, now_epoch_seconds
@@ -338,17 +338,19 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         // and does not confine a service-scoped API token whose principal
         // resolves to an unscoped grant.
         if (!session->token_scope_service.empty()) {
-            const auto cid = detail::make_correlation_id();
+            // Write the 403 FIRST, audit after (normalized — #3167).
+            // `.permission` omitted: kServiceScopeGlobalSafe is
+            // compile-time-empty, so no grant admits a service-scoped caller
+            // here; naming one would be a false self-remediation claim.
+            res.status = 403;
+            res.set_content(
+                detail::a4_denial(
+                    res, 403, "service-scoped tokens may not read the fleet-wide device list"),
+                "application/json");
             (void)detail::try_persist_audit(
                 audit_fn_, req, "tar.device_picker.view", "denied", "Infrastructure", "",
                 "fleet-wide TAR device picker denied to a service-scoped token "
                 "(path=" + req.path + ")");
-            res.status = 403;
-            res.set_content(
-                detail::error_json_a4(
-                    403, "service-scoped tokens may not read the fleet-wide device list", cid,
-                    detail::A4ErrorOpts{.permission = "Infrastructure:Read"}),
-                "application/json");
             return;
         }
         if (!perm_fn_(req, res, "Infrastructure", "Read"))
@@ -679,17 +681,19 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         // devices_fn_ is username-keyed and does not confine a service-scoped
         // API token whose principal resolves to an unscoped grant.
         if (!session->token_scope_service.empty()) {
-            const auto cid = detail::make_correlation_id();
+            // Write the 403 FIRST, audit after (normalized — #3167).
+            // `.permission` omitted: kServiceScopeGlobalSafe is
+            // compile-time-empty, so no grant admits a service-scoped caller
+            // here; naming one would be a false self-remediation claim.
+            res.status = 403;
+            res.set_content(
+                detail::a4_denial(
+                    res, 403, "service-scoped tokens may not read the fleet-wide device list"),
+                "application/json");
             (void)detail::try_persist_audit(
                 audit_fn_, req, "tar.device_picker.view", "denied", "Infrastructure", "",
                 "fleet-wide TAR device picker denied to a service-scoped token "
                 "(path=" + req.path + ")");
-            res.status = 403;
-            res.set_content(
-                detail::error_json_a4(
-                    403, "service-scoped tokens may not read the fleet-wide device list", cid,
-                    detail::A4ErrorOpts{.permission = "Infrastructure:Read"}),
-                "application/json");
             return;
         }
         if (!perm_fn_(req, res, "Infrastructure", "Read"))
