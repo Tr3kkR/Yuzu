@@ -1983,6 +1983,13 @@ public:
                           "Engine-principal liveness re-checks answered StoreUnreachable from the "
                           "failure backoff without taking a connection lease",
                           "counter");
+        metrics_.describe("yuzu_server_engine_revalidate_generation_capacity_fallback_total",
+                          "#2454: the per-principal poisoning-guard map was full and a NEW "
+                          "principal's invalidate fell back to the coarse global epoch. Not "
+                          "expected under ordinary load (max_entries_ defaults to 1024 distinct "
+                          "ever-revoked principals); a climbing value means the per-principal "
+                          "guard is running at reduced precision for new invalidations.",
+                          "counter");
         metrics_.describe("yuzu_server_audit_events_total",
                           "Audit events written, bucketed by result", "counter");
         // gov PR-E OBS-2: a from_result_set: scope ref resolved to an
@@ -6226,6 +6233,11 @@ public:
                     metrics_.gauge("yuzu_server_engine_revalidate_backoff_suppressed_total")
                         .set(static_cast<double>(
                             engine_principal_store_->revalidate_backoff_suppressed()));
+                    // #2454: the per-principal poisoning-guard map's capacity-exhaustion
+                    // fallback rate.
+                    metrics_.gauge("yuzu_server_engine_revalidate_generation_capacity_fallback_total")
+                        .set(static_cast<double>(
+                            engine_principal_store_->revoke_generation_capacity_fallback()));
                 }
                 // Publish FleetTopologyStore internals so the 256 MiB store-
                 // level oversize cap and single-flight refill timeouts are

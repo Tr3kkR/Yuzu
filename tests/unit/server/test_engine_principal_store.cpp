@@ -11,6 +11,7 @@
 
 #include "engine_principal_store.hpp"
 
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 
@@ -34,6 +35,7 @@ using yuzu::server::EnginePrincipalStore;
 using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
 using yuzu::server::pg::PgResult;
+namespace pg = yuzu::server::pg;
 
 namespace {
 
@@ -733,6 +735,193 @@ TEST_CASE("an unreachable store is rate-limited, not re-asked on every tick",
     CHECK(EngineLivenessTestAccess::revalidate(store, "engine:brownout").status ==
           EngineLookupStatus::StoreUnreachable);
     CHECK(store.revalidate_cache_misses() == 2);
+}
+
+TEST_CASE("a bare lease-acquire timeout does not arm the failure backoff (#2456 UP-4)",
+          "[pg][engine_principal][store][cache]") {
+    // The store is OPEN and the database is HEALTHY - the only thing wrong is
+    // that this test itself is squatting on the pool's one connection, which
+    // is exactly the "briefly saturated by unrelated traffic" scenario #2456
+    // distinguishes from a real outage. Confirms it is distinguished: the
+    // backoff must NOT be armed on this evidence alone, so a second read
+    // immediately after asks again rather than replaying a cached denial.
+    YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    EnginePrincipalStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create("Vuln Sync", "alice", "j", "internal", "admin", "engine:lease-busy")
+               .has_value());
+
+    // Hold the pool's ONLY connection for the duration of this block, so the
+    // store's own try_acquire_for(kReadTimeout) inside get_for_auth has
+    // nothing to acquire and times out at its 1500ms ceiling - a real wait,
+    // not a fake-clock skip, since kReadTimeout is not on the injectable
+    // clock seam.
+    {
+        auto held = pool.try_acquire_for(std::chrono::milliseconds{500});
+        REQUIRE(held);
+
+        const auto r1 = EngineLivenessTestAccess::revalidate(store, "engine:lease-busy");
+        CHECK(r1.status == EngineLookupStatus::StoreUnreachable);
+        CHECK(store.revalidate_backoff_suppressed() == 0); // nothing armed yet
+
+        // If the ambiguous lease-timeout had armed the backoff, this second
+        // call would be answered from the backoff map (suppressed++, no
+        // second acquire attempt) rather than asking again. It must ask
+        // again - the healthy database deserves another real probe, not a
+        // suppressed denial, on evidence this weak.
+        const auto r2 = EngineLivenessTestAccess::revalidate(store, "engine:lease-busy");
+        CHECK(r2.status == EngineLookupStatus::StoreUnreachable);
+        CHECK(store.revalidate_backoff_suppressed() == 0); // still nothing armed
+    }
+
+    // Connection released - a real read now succeeds, proving the store was
+    // never actually unreachable, only momentarily out of connections.
+    const auto after = EngineLivenessTestAccess::revalidate(store, "engine:lease-busy");
+    CHECK(after.status == EngineLookupStatus::Active);
+}
+
+TEST_CASE("a write to principal A does not defeat a concurrent cache-write for principal B "
+          "(#2454)",
+          "[pg][engine_principal][store][cache]") {
+    // The regression #2454 exists for: a SINGLE GLOBAL revoke_generation_
+    // meant ANY write, to ANY principal, defeated EVERY concurrent reader's
+    // cache-insert - so a revoke burst silently disabled the whole liveness
+    // cache process-wide for its duration. Per-principal generation must
+    // isolate the two.
+    YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    EnginePrincipalStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create("A", "alice", "j", "internal", "admin", "engine:gen-a").has_value());
+    REQUIRE(store.create("B", "alice", "j", "internal", "admin", "engine:gen-b").has_value());
+
+    // Deterministic interleave, same technique as the #2367 TOCTOU test above:
+    // fire mid-read of B, and from there revoke A - a DIFFERENT principal.
+    bool fired = false;
+    store.test_hook_after_revalidate_read_ = [&] {
+        if (fired)
+            return;
+        fired = true;
+        auto revoked = store.revoke("engine:gen-a");
+        REQUIRE(revoked.has_value());
+        REQUIRE(*revoked);
+    };
+
+    const auto b_result = EngineLivenessTestAccess::revalidate(store, "engine:gen-b");
+    store.test_hook_after_revalidate_read_ = nullptr;
+    REQUIRE(fired);
+    REQUIRE(b_result.status == EngineLookupStatus::Active);
+
+    // The bug under test: with a global counter this would be 0 (B's insert
+    // defeated by A's unrelated revoke). With per-principal generation, B's
+    // own generation never moved, so its cache-write must have survived.
+    CHECK(store.revalidate_cache_size() == 1);
+    CHECK(EngineLivenessTestAccess::revalidate(store, "engine:gen-b").from_cache);
+
+    // And A's own revoke is unaffected by any of this - it is still terminal.
+    CHECK(EngineLivenessTestAccess::revalidate(store, "engine:gen-a").status ==
+          EngineLookupStatus::MissingOrRevoked);
+}
+
+TEST_CASE("the per-principal generation map falls back to the global epoch at capacity, "
+          "never silently declines (#2454 Gate 3 fold)",
+          "[pg][engine_principal][store][cache]") {
+    // Gate 3 finding (security-guardian + cpp-safety + quality-engineer +
+    // architect, independently, same round): a generation counter has no
+    // TTL, so "decline past the cap" is not a single skipped race the way it
+    // is for the cache/backoff maps - it is PERMANENT disablement for every
+    // principal that never got a slot. The fix falls back to the coarse
+    // global epoch instead. This proves the fallback actually engages, and
+    // that it actually still poisons a reader racing an over-capacity
+    // principal (the property the whole mechanism exists for).
+    YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    EnginePrincipalStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_max_entries_for_test(2);
+
+    REQUIRE(store.create("A", "alice", "j", "internal", "admin", "engine:cap-a").has_value());
+    REQUIRE(store.create("B", "alice", "j", "internal", "admin", "engine:cap-b").has_value());
+    REQUIRE(store.create("C", "alice", "j", "internal", "admin", "engine:cap-c").has_value());
+
+    // Fill the 2-slot generation map with A and B.
+    REQUIRE(store.revoke("engine:cap-a").value());
+    REQUIRE(store.revoke("engine:cap-b").value());
+    CHECK(store.revoke_generation_resident_for_test() == 2);
+    CHECK(store.revoke_generation_capacity_fallback() == 0);
+
+    // C has never been in the map. Deterministic interleave (same #2367
+    // technique): fire mid-read of C, and from there revoke C's OWN self
+    // is not what races here - what races is a DIFFERENT principal's write
+    // landing while C's cache-write is in flight, exactly like the #2454
+    // write-isolation test above, except now the map is already full when
+    // the write for C itself happens.
+    bool fired = false;
+    store.test_hook_after_revalidate_read_ = [&] {
+        if (fired)
+            return;
+        fired = true;
+        // C itself is the one being invalidated here - this is the capacity
+        // path under test: C has no existing slot, and the map is full.
+        auto revoked = store.revoke("engine:cap-c");
+        REQUIRE(revoked.has_value());
+        REQUIRE(*revoked);
+    };
+
+    const auto c_result = EngineLivenessTestAccess::revalidate(store, "engine:cap-c");
+    store.test_hook_after_revalidate_read_ = nullptr;
+    REQUIRE(fired);
+    REQUIRE(c_result.status == EngineLookupStatus::Active); // read an Active row before the revoke
+
+    // The property under test: even though C could not get its OWN slot
+    // (map was full), the fallback to the global epoch must still have
+    // poisoned this cache-write - a stale Active must NOT survive.
+    CHECK(store.revoke_generation_capacity_fallback() == 1);
+    CHECK(EngineLivenessTestAccess::revalidate(store, "engine:cap-c").status ==
+          EngineLookupStatus::MissingOrRevoked);
+}
+
+TEST_CASE("a permanent PG error (dropped table) is confirmed unreachable, not ambiguous "
+          "(#2456 UP-17)",
+          "[pg][engine_principal][store][cache]") {
+    // Forces a REAL PGRES_FATAL_ERROR with SQLSTATE 42P01 (undefined_table)
+    // through get_for_auth's actual query, proving the SQLSTATE-extraction
+    // path (PQresultErrorField/is_permanent_sqlstate) runs cleanly against a
+    // genuine error result rather than only the happy path. Exact log
+    // wording is not asserted (no log-capture harness in this file) - what's
+    // pinned is the caller-visible contract: status stays StoreUnreachable
+    // and, per UP-17's "a query that ran and failed IS confirmed evidence"
+    // rule, confirmed_unreachable stays true regardless of which SQLSTATE
+    // class it falls into.
+    YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    {
+        auto lease = pool.try_acquire_for(std::chrono::milliseconds{2000});
+        REQUIRE(lease);
+        auto res = pg::exec_params(
+            lease.get(), "DROP TABLE engine_principal_store.engine_principals CASCADE",
+            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    EnginePrincipalStore store{pool};
+    REQUIRE(store.is_open()); // migration already ran; dropping post-construction
+
+    const auto result = EngineLivenessTestAccess::revalidate(store, "engine:no-such-table");
+    CHECK(result.status == EngineLookupStatus::StoreUnreachable);
+    // Confirmed, not ambiguous: this is the query-failure branch, and
+    // UP-17's own rule is that a query that ran and failed is confirmed
+    // evidence regardless of SQLSTATE class - only the log line's wording
+    // differs between permanent and transient.
+    CHECK(store.revalidate_backoff_suppressed() == 0); // nothing suppressed yet
+    CHECK(EngineLivenessTestAccess::revalidate(store, "engine:no-such-table").status ==
+          EngineLookupStatus::StoreUnreachable);
+    CHECK(store.revalidate_backoff_suppressed() == 1); // armed and used on the 2nd call
 }
 
 TEST_CASE("the revalidate cache is physically bounded, not just filtered",
