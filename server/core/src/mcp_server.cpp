@@ -2422,8 +2422,9 @@ static const ResourceDef kResources[] = {
     {"yuzu://golden-prompts/enterprise-it-v1", "Enterprise IT Golden Prompts v1",
      "Versioned prompt/eval catalogue for enterprise incident workflows", "application/json"},
     {"yuzu://openapi", "OpenAPI Specification",
-     "REST API v1 OpenAPI spec — same builder as GET /api/v1/discover/routes and the "
-     "discover_routes tool",
+     "REST API v1 OpenAPI spec, raw — byte-identical to GET /api/v1/openapi.json; the "
+     "discover_routes tool serves the same source wrapped in a distinct routes-catalog "
+     "projection, not this shape",
      "application/json"},
     {"yuzu://scope-dsl", "Scope DSL Reference",
      "Scope-kind and comparison-operator catalog — same builder as GET "
@@ -3587,14 +3588,20 @@ McpServer::HandlerFn McpServer::build_handler(
             // per-call audit, tracked by the same #2713 follow-up. Deliberately NOT
             // unauthenticated like /api/v1/openapi.json — that posture is a tracked
             // pre-existing gap (#2057), not a precedent to follow.
+            //
+            // Shared tier-denial remediation text for these two branches only — NOT the
+            // same scope as tools/call's kTierRemediation (declared later, inside that
+            // block), so not reused here; hoisting it across the ~40 tools/call call sites
+            // is out of scope for this PR.
+            constexpr std::string_view kResourceTierRemediation =
+                "this MCP token's tier does not permit the operation; use a higher-tier "
+                "MCP token (operator or supervised), or the REST API / dashboard";
             if (uri == "yuzu://openapi") {
                 if (!tier_allows(session->mcp_tier, "Infrastructure", "Read")) {
                     res.set_content(
                         error_response_a4(id, kTierDenied, "MCP tier does not allow this operation",
                                           yuzu::server::detail::make_correlation_id(),
-                                          "this MCP token's tier does not permit the operation; use "
-                                          "a higher-tier MCP token (operator or supervised), or the "
-                                          "REST API / dashboard"),
+                                          kResourceTierRemediation),
                         "application/json");
                     return;
                 }
@@ -3617,9 +3624,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     res.set_content(
                         error_response_a4(id, kTierDenied, "MCP tier does not allow this operation",
                                           yuzu::server::detail::make_correlation_id(),
-                                          "this MCP token's tier does not permit the operation; use "
-                                          "a higher-tier MCP token (operator or supervised), or the "
-                                          "REST API / dashboard"),
+                                          kResourceTierRemediation),
                         "application/json");
                     return;
                 }

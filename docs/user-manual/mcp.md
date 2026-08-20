@@ -705,7 +705,7 @@ URI.
 | `yuzu://operating-model` | Agentic Operating Model | Recommended classify-plan-read-scope-approve-execute-monitor workflow. | `Infrastructure:Read` |
 | `yuzu://demo/playbooks` | Demo Playbooks | Deterministic CEO demo scenarios and live-fleet variants. | `Infrastructure:Read` |
 | `yuzu://golden-prompts/enterprise-it-v1` | Enterprise IT Golden Prompts v1 | Versioned prompt/eval catalogue for enterprise incident workflows. | `Infrastructure:Read` |
-| `yuzu://openapi` | OpenAPI Specification | REST API v1 OpenAPI spec -- same builder as `discover_routes` / `GET /api/v1/discover/routes`. | `Infrastructure:Read` (tier- and RBAC-gated, matching `discover_routes`) |
+| `yuzu://openapi` | OpenAPI Specification | REST API v1 OpenAPI spec, raw -- byte-identical to `GET /api/v1/openapi.json`; `discover_routes` wraps the same source in a distinct routes-catalog projection, not this shape. | `Infrastructure:Read` (tier- and RBAC-gated, matching `discover_routes`) |
 | `yuzu://scope-dsl` | Scope DSL Reference | Scope-kind and comparison-operator catalog -- same builder as `discover_scope_kinds` / `GET /api/v1/discover/scope-kinds`. | `Infrastructure:Read` (tier- and RBAC-gated, matching `discover_scope_kinds`) |
 
 ### Example: reading a resource

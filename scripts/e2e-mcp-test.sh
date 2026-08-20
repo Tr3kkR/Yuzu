@@ -315,8 +315,14 @@ if isinstance(r, str):
     r = json.loads(r)
 print(len(r.get('resources', [])))
 " 2>/dev/null || echo "0")
-# 9 pre-existing + yuzu://openapi + yuzu://scope-dsl (2g PR4).
-assert_eq "resources/list returns 11 resources" "11" "$RES_COUNT"
+# 9 pre-existing + yuzu://openapi + yuzu://scope-dsl (2g PR4). Floor, not exact
+# equality, matching the tools/list -ge check above -- an exact-equality
+# assertion here is exactly what went stale when this PR added 2 resources.
+if [ "$RES_COUNT" -ge 11 ]; then
+    pass "resources/list returns at least 11 resources (got $RES_COUNT)"
+else
+    fail "resources/list returns at least 11 resources (got $RES_COUNT)"
+fi
 
 for uri in "yuzu://server/health" "yuzu://compliance/fleet" "yuzu://audit/recent"; do
     if echo "$MCP_BODY" | grep -q "$uri"; then
