@@ -21,11 +21,12 @@ namespace {
 constexpr const char* kMetricRecordsActive = "yuzu_mcp_bridge_records_active";
 constexpr const char* kMetricRejects = "yuzu_mcp_bridge_reject_total";
 constexpr const char* kMetricListenerFailures = "yuzu_mcp_bridge_listener_failures_total";
-constexpr const char* kMetricMailboxDrops = "yuzu_mcp_bridge_mailbox_drops_total";
 // #2438: H1's suppress-non-strictly-increasing-progress rule fires silently -
 // nothing counted a suppression, so a regression that stopped suppressing
 // (re-admitting equal/decreasing progress onto the wire) was only catchable by
-// unit tests, never production alerting.
+// unit tests, never production alerting. WIDENED by #2412: also counts a
+// progress snapshot the listener overwrote (latest-wins) before the projector
+// ever saw it - see the field comment on BridgeRecord::progress_suppressed_delta.
 constexpr const char* kMetricProgressSuppressed = "yuzu_mcp_bridge_progress_suppressed_total";
 constexpr const char* kMetricProjectorCycles = "yuzu_mcp_bridge_projector_cycles_total";
 constexpr const char* kMetricProjectionDegraded = "yuzu_mcp_bridge_projection_degraded_total";
@@ -261,17 +262,65 @@ McpStreamBridge::find_locked(const std::string& key) const {
 
 // ── Wake path ──────────────────────────────────────────────────────────────
 
-void McpStreamBridge::wake(WakeCore& core) noexcept {
+void McpStreamBridge::mark_dirty(WakeCore& core, const std::string& key) noexcept {
+    // #2411: replaces the old bare wake(core). The projector used to rescan
+    // EVERY live record on every wake, regardless of which one had new work;
+    // it now scans only the keys pushed here.
+    //
+    // LOST-WAKEUP PROOF (do not weaken this without re-deriving it - it is
+    // what a TSan run and an adversarial review are meant to catch). The
+    // insert and `work_pending = true` happen in ONE `core.mu` critical
+    // section here; the projector clears `work_pending` and swaps `dirty` out
+    // empty in ONE `core.mu` section of its own (run_projector). Three cases:
+    //   - This insert lands BEFORE the projector's swap: `key` is in the set
+    //     the swap takes, so this cycle visits it.
+    //   - This insert lands AFTER the swap: `dirty` was empty at the swap, so
+    //     insert() returns true here, notify_one() fires, and `work_pending`
+    //     is set true in the SAME critical section as the insert - even if
+    //     the notify races the projector's re-entry into cv.wait, the
+    //     predicate (`stop || work_pending`) is already satisfied by the time
+    //     it re-checks.
+    //   - insert() returns FALSE: `key` was already in the CURRENT `dirty`
+    //     set, so the set was non-empty when this insert ran, so (by the
+    //     invariant stated on WakeCore::dirty) `work_pending` was already
+    //     true - a cycle that will visit `key` is already owed, and skipping
+    //     the redundant notify is correct, not a lost wakeup.
+    // This IS "wake only on a real edge" (the issue's phrasing, from when the
+    // progress mailbox that #2412 later replaced still existed), expressed at drain
+    // granularity (per dirty-set-empty→non-empty transition) rather than per
+    // mailbox-empty→non-empty transition - provable here, and equivalent for
+    // the projector's purposes, since the projector only ever cares whether a
+    // cycle is owed, not how many events landed.
     try {
+        bool signal = false;
         {
             // The flag flips under the SAME mutex the projector's wait predicate
             // reads - a notify can never slot between predicate-check and sleep
             // (the lost-wakeup killer). WakeCore::mu is a strict leaf.
             std::lock_guard<std::mutex> lk(core.mu);
-            core.work_pending = true;
+            try {
+                signal = core.dirty.insert(key).second;
+            } catch (...) {
+                // Allocation failure growing the set: degrade to a full scan
+                // next cycle rather than lose track of which records have
+                // pending work - see WakeCore::scan_all.
+                core.scan_all.store(true, std::memory_order_relaxed);
+                signal = true;
+            }
+            core.work_pending = true;  // UNCONDITIONAL - see the invariant above
         }
-        core.cv.notify_one();
-    } catch (...) {  // NOLINT(bugprone-empty-catch) - a wake must never escape a listener
+        if (signal) {
+            core.cv.notify_one();
+        }
+    } catch (...) {
+        // The outer try wraps the `lock_guard` CONSTRUCTION, not just the
+        // block inside it, and the inner try/catch above is exhaustive (it
+        // never rethrows) - so the only realistic path here is `core.mu`
+        // itself failing to lock. `work_pending` is unreachable in that case
+        // (it is only ever set under `mu`), so there is no mu-held section
+        // left to record intent in - hence the lock-free write below (see
+        // WakeCore::scan_all's comment). A wake must never escape a listener.
+        core.scan_all.store(true, std::memory_order_relaxed);
     }
 }
 
@@ -308,23 +357,37 @@ ExecutionEventBus::Listener McpStreamBridge::make_listener(std::shared_ptr<Bridg
                     rec->terminal_slot = std::move(tmp);
                     rec->terminal_accepted = true;  // sticky from here on
                 } else {
-                    if (rec->mb_count == kBridgeMailboxCap) {
-                        // Drop-oldest-progress; counted record-locally (C5 - the
-                        // listener never touches a metrics mutex).
-                        rec->mb_head = (rec->mb_head + 1) % kBridgeMailboxCap;
-                        --rec->mb_count;
-                        rec->mailbox_drop_delta.fetch_add(1, std::memory_order_relaxed);
+                    // #2412: latest-wins - assign the newest snapshot into the
+                    // spare buffer (may throw on allocation growth; a throw here
+                    // leaves progress_slot untouched - strong guarantee, better
+                    // than the old ring's drop-oldest under the same fault),
+                    // then commit with a noexcept swap (MailboxEntry's nothrow
+                    // move, see the static_assert above). The slot and spare
+                    // flip-flop between listener and projector, so once each
+                    // has grown to its steady-state payload size neither swap
+                    // allocates again.
+                    rec->listener_spare.data.assign(ev.data);
+                    rec->listener_spare.bus_id = ev.id;
+                    std::swap(rec->progress_slot, rec->listener_spare);
+                    if (rec->progress_pending) {
+                        // A prior snapshot was still unprojected - it is the one
+                        // just overwritten by the swap above. Counted AFTER the
+                        // swap commits, so a throw from `assign` (caught below)
+                        // never double-counts a supersede that didn't happen.
+                        rec->progress_suppressed_delta.fetch_add(1, std::memory_order_relaxed);
                     }
-                    MailboxEntry tmp{ev.id, ev.data};
-                    rec->mailbox[(rec->mb_head + rec->mb_count) % kBridgeMailboxCap] =
-                        std::move(tmp);
-                    ++rec->mb_count;
+                    rec->progress_pending = true;
                 }
             }
-            wake(*core);
+            mark_dirty(*core, rec->key);
         } catch (...) {
             // Counted record-locally; the projector flushes it to the registry.
+            // #2411: mark dirty too - without this, a dirty-set drain that
+            // never otherwise visits this record (its OWN wake is what just
+            // failed) would strand this delta until some other event on the
+            // same record eventually marks it.
             rec->listener_failure_delta.fetch_add(1, std::memory_order_relaxed);
+            mark_dirty(*core, rec->key);
         }
     };
 }
@@ -912,7 +975,7 @@ McpStreamBridge::ArmOutcome McpStreamBridge::arm(const std::string& session_id,
             (mode == ArmMode::kStreaming && !degraded) ? Phase::kStreaming : Phase::kArmedGetOnly;
         rec->phase.store(target, std::memory_order_release);
         outcome = degraded ? ArmOutcome::kDegradedGetOnly : ArmOutcome::kArmed;
-        wake(*core_);  // the handoff - same hold
+        mark_dirty(*core_, rec->key);  // the handoff - same hold
     }
     if (degraded) {
         // #2529: the degraded record follows the GET-only lifecycle and can never
@@ -1082,8 +1145,7 @@ bool McpStreamBridge::abandon(const std::string& session_id, const nlohmann::jso
             }
             rec->phase.store(Phase::kAborted, std::memory_order_release);
             rec->cancel_pending = false;  // discarded, never audited (C1)
-            rec->mb_head = 0;
-            rec->mb_count = 0;
+            rec->progress_pending = false;
             rec->terminal_slot.reset();
             if (rec->streamed_charge_held) {
                 rec->streamed_charge_held = false;
@@ -1142,9 +1204,10 @@ bool McpStreamBridge::park_after_dispatch_failure(const std::string& session_id,
         rec->parked_seq = parked_seq;
         exec_id = rec->execution_id;
     }
-    // The mailbox and any latched terminal survived the transition, so hand the
-    // record to the projector now rather than waiting for the next bus event.
-    wake(*core_);
+    // The progress slot and any latched terminal survived the transition, so
+    // hand the record to the projector now rather than waiting for the next bus
+    // event.
+    mark_dirty(*core_, rec->key);
     audit_contained("mcp.bridge.dispatch_failure", exec_id,
                     "parked after a post-dispatch failure: the execution continues and its "
                     "result stays fetchable by execution_id",
@@ -1207,7 +1270,7 @@ bool McpStreamBridge::on_post_closed_keyed(const std::string& key) {
     }
     // A1: a terminal latched while the pump was dying must not wait for the next
     // bus event or sweep - hand the record to the projector now.
-    wake(*core_);
+    mark_dirty(*core_, rec->key);
     return true;
 }
 
@@ -1324,7 +1387,7 @@ McpStreamBridge::PostBatch McpStreamBridge::take_post_batch(const std::string& k
     // Re-waking here closes that window. A spurious wake costs one projector pass
     // over a record with no work; a missed one costs a stalled result.
     if (rec->phase.load(std::memory_order_acquire) != Phase::kStreaming) {
-        wake(*core_);
+        mark_dirty(*core_, rec->key);
     }
     // COMMIT THE ENDING HERE, at the DECISION, not later at the close. Once the
     // bridge has handed back a final or settled the cap, this response IS ending -
@@ -1355,10 +1418,10 @@ bool McpStreamBridge::has_pending_work_locked(const BridgeRecord& rec) {
     // "Latched work worth waking the pump for". This was the SAME predicate
     // project_record uses to decide there is a batch worth claiming until #2739
     // made the pump path context-dependent (cap_expired + cap_progress_drained);
-    // the divergence is deliberate - a mailbox deliberately held back by the cap
-    // drain must STILL count as pending here, because that wake is what lets the
-    // settle pass run immediately instead of a tick later.
-    const bool progress = rec.mb_count > 0 && !rec.pressure_requested;
+    // the divergence is deliberate - a progress snapshot deliberately held back
+    // by the cap drain must STILL count as pending here, because that wake is
+    // what lets the settle pass run immediately instead of a tick later.
+    const bool progress = rec.progress_pending && !rec.pressure_requested;
     const bool terminal = rec.terminal_accepted &&
                           !rec.terminal_projected.load(std::memory_order_acquire) &&
                           rec.terminal_slot.has_value();
@@ -1413,7 +1476,28 @@ void McpStreamBridge::poke_post_sink(
 // ── Projector ──────────────────────────────────────────────────────────────
 
 void McpStreamBridge::run_projector() {
+    // #2411: keys with possibly-unprojected work, swapped out of core_->dirty
+    // each cycle. Declared OUTSIDE the loop and `clear()`ed (not
+    // reconstructed) per cycle so its bucket storage is reused across the
+    // projector's whole lifetime rather than reallocated on every wake.
+    std::unordered_set<std::string> keys;
     for (;;) {
+        // MUST run before the swap below, unconditionally - not after using
+        // `keys`, and not only on the no-throw path. `keys` needs to be
+        // GUARANTEED empty at the swap regardless of how the PREVIOUS
+        // iteration ended, including via the outer catch below (whose throw
+        // sites - snap.reserve/push_back - run before the post-extraction
+        // clear this replaced). A stale non-empty `keys` swapped into
+        // core_->dirty here would corrupt it with keys no mark_dirty call
+        // ever inserted: a LATER mark_dirty on one of those keys would then
+        // see insert() return false (already present) and skip its notify,
+        // stranding that record's next event with no live source left to
+        // wake the projector - the very lost-wakeup mark_dirty's own proof
+        // depends on `dirty` only ever holding what a real mark put there.
+        // Harmless no-op when the previous iteration exits normally, since
+        // the swap below already leaves `keys` empty for next time.
+        keys.clear();
+        bool full_scan = false;
         {
             std::unique_lock<std::mutex> lk(core_->mu);
             core_->cv.wait(lk, [&] { return core_->stop || core_->work_pending; });
@@ -1423,6 +1507,17 @@ void McpStreamBridge::run_projector() {
                          // obligation (terminals are durable-fetchable)
             }
             core_->work_pending = false;
+            keys.swap(core_->dirty);  // `keys` is guaranteed empty here (the
+                                      // clear above), so this ALSO empties
+                                      // core_->dirty unconditionally
+            // A separate load+store here would race the ONE writer that does
+            // not hold core_->mu (mark_dirty's outer catch, above) - its
+            // store(true) could land between the two and get silently
+            // clobbered by the store(false), losing the only recorded trace
+            // of the wake it was standing in for. exchange() closes that
+            // window: whichever side the race lands on, the flag is atomic
+            // as a single read-clear, not two.
+            full_scan = core_->scan_all.exchange(false, std::memory_order_relaxed);
         }
         // BARE-THREAD BOUNDARY: run_projector is a std::thread entry with no
         // caller try/catch, so ANY escaped exception is std::terminate (#2037
@@ -1435,9 +1530,41 @@ void McpStreamBridge::run_projector() {
             std::vector<std::shared_ptr<BridgeRecord>> snap;
             {
                 std::lock_guard<std::mutex> lk(bridge_mu_);
-                snap.reserve(records_.size());
-                for (const auto& [key, rec] : records_) {
-                    snap.push_back(rec);
+                if (full_scan) {
+                    // Degraded-cycle fallback (WakeCore::scan_all): a dirty-key
+                    // insert hit an allocation failure in mark_dirty, a PRIOR
+                    // cycle's body threw after its keys were already swapped
+                    // out (see the outer catch below), or mark_dirty could not
+                    // even acquire WakeCore::mu (its own outer catch) - any of
+                    // these leaves `keys` untrustworthy as the full set of
+                    // records with pending work, so fall back to the
+                    // pre-#2411 full-table scan for this one cycle.
+                    snap.reserve(records_.size());
+                    for (const auto& [key, rec] : records_) {
+                        snap.push_back(rec);
+                    }
+                } else {
+                    // #2411: O(dirty) per cycle, not O(records_). A key that no
+                    // longer resolves (erased since it was marked) is simply
+                    // skipped, and a key that resolves to a DIFFERENT, freshly
+                    // reserved record at the same key (keys are reused after
+                    // erase - see BridgeRecord::key's contract) is visited
+                    // anyway: a spurious project_record visit on a fresh
+                    // same-key record is benign, because every action inside
+                    // it self-gates under rec->mu (the phase check, the
+                    // projection_in_flight claim, the want_progress/
+                    // want_terminal gates) - unlike the CLAIM paths (Pass R
+                    // and its siblings), which compare map-slot IDENTITY
+                    // because acting on the wrong record there would corrupt
+                    // exactly-once teardown arbitration. Projection has no
+                    // such hazard, so a plain key lookup is sufficient here.
+                    snap.reserve(keys.size());
+                    for (const auto& key : keys) {
+                        auto it = records_.find(key);
+                        if (it != records_.end()) {
+                            snap.push_back(it->second);
+                        }
+                    }
                 }
             }
             for (const auto& rec : snap) {
@@ -1446,8 +1573,30 @@ void McpStreamBridge::run_projector() {
                 } catch (...) {
                     // project_record's claim guard restored any unsettled terminal;
                     // this is a true should-not-happen backstop (all interior throw
-                    // sites are individually caught).
-                    spdlog::warn("MCP bridge projector: projection pass failed (contained)");
+                    // sites are individually caught). Pre-#2411, this record was
+                    // retried for free on the next full-table scan; under dirty-set
+                    // gating its key was already consumed from this cycle's `keys`,
+                    // so without a re-mark a record whose OWN listener will never
+                    // fire again (e.g. one already past D2's terminal_accepted
+                    // short-circuit) would strand here until an unrelated scan_all
+                    // degrade rescued it. Re-mark, mirroring the listener catch
+                    // site above. Under a PERSISTENT fault this spins
+                    // visit->throw->re-mark - the same accepted risk class as the
+                    // outer catch's re-arm below and the listener catch site
+                    // (tracked, with this site added, at #3331). Re-mark BEFORE
+                    // logging, matching the listener catch site's ordering: the
+                    // mark_dirty call itself is verified noexcept end-to-end,
+                    // but spdlog's format/sink path is not, so this ordering
+                    // means the recovery action never depends on a third-party
+                    // library's internal exception containment holding across
+                    // a future spdlog upgrade. execution_id, not rec->key, in
+                    // the log line - key embeds a literal '\n' plus
+                    // client-supplied jsonrpc_id (see make_key()).
+                    mark_dirty(*core_, rec->key);
+                    spdlog::warn(
+                        "MCP bridge projector: projection pass failed (contained) "
+                        "[execution_id={}]",
+                        rec->execution_id);
                 }
                 flush_record_obs(*rec);
             }
@@ -1458,6 +1607,18 @@ void McpStreamBridge::run_projector() {
                 obs_guard([&] { metrics_->counter(kMetricProjectorCycles).increment(); });
             }
         } catch (...) {  // NOLINT(bugprone-empty-catch) - see the boundary note above
+            // #2411: this cycle's dirty keys were already swapped out of
+            // core_->dirty above and its snapshot never got visited, so the
+            // pre-#2411 guarantee ("the next wake retries") would otherwise
+            // silently narrow to only whichever records happen to get freshly
+            // marked afterward. Re-arm a full scan instead, restoring it.
+            try {
+                std::lock_guard<std::mutex> lk(core_->mu);
+                core_->scan_all.store(true, std::memory_order_relaxed);
+                core_->work_pending = true;
+            } catch (...) {  // NOLINT(bugprone-empty-catch)
+            }
+            core_->cv.notify_one();
         }
     }
 }
@@ -1465,8 +1626,7 @@ void McpStreamBridge::run_projector() {
 void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, PostBatch* out,
                                      bool cap_expired) {
     Phase ph;
-    std::array<MailboxEntry, kBridgeMailboxCap> batch{};
-    std::size_t batch_n = 0;
+    bool have_progress = false;  ///< #2412: rec->projection_spare holds a latched snapshot
     std::optional<MailboxEntry> term;
     {
         std::lock_guard<std::mutex> rlk(rec->mu);
@@ -1505,16 +1665,16 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
                                    !rec->terminal_projected.load(std::memory_order_acquire) &&
                                    rec->terminal_slot.has_value();
         // #2739: once the one post-expiry drain pass has run, a cap-expired pump
-        // pass starts no further progress batch - otherwise a mailbox that refills
-        // every tick keeps the response open for the whole execution. A pending
-        // terminal bypasses the suppression: that pass ends the response anyway,
+        // pass starts no further progress batch - otherwise a progress slot that
+        // refills every tick keeps the response open for the whole execution. A
+        // pending terminal bypasses the suppression: that pass ends the response anyway,
         // and it must carry the intervening progress ahead of the final
         // (progress-before-final ordering) rather than strand it in a record about
         // to settle kDone.
         const bool settling_cap =
             out != nullptr && cap_expired && rec->cap_progress_drained && !want_terminal;
         const bool want_progress =
-            rec->mb_count > 0 && !rec->pressure_requested && !settling_cap;
+            rec->progress_pending && !rec->pressure_requested && !settling_cap;
         if (!want_progress && !want_terminal) {
             // CAP ARBITRATION, decided INSIDE the record lock alongside the
             // terminal check rather than by the pump beforehand: a terminal that
@@ -1531,12 +1691,12 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
         // lock-free clear (#2528 protocol, stated on the field).
         rec->projection_in_flight.store(true, std::memory_order_relaxed);
         if (want_progress) {
-            for (std::size_t i = 0; i < rec->mb_count; ++i) {
-                batch[i] = std::move(rec->mailbox[(rec->mb_head + i) % kBridgeMailboxCap]);
-            }
-            batch_n = rec->mb_count;
-            rec->mb_head = 0;
-            rec->mb_count = 0;
+            // #2412: extraction is a swap, not a copy-out - allocation-free once
+            // both buffers have grown to their steady-state payload size (see
+            // the field comment on progress_slot).
+            std::swap(rec->progress_slot, rec->projection_spare);
+            rec->progress_pending = false;
+            have_progress = true;
             if (out != nullptr && cap_expired) {
                 // #2739: this IS the drain pass. Marked before the publish loop
                 // (see the field comment for why a mid-pass throw must leave it
@@ -1645,13 +1805,17 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
     // jsonrpc_id) are safe to read lock-free from here.
     const bool get_only = ph == Phase::kArmedGetOnly;
 
-    // Progress first - the final must be last on the wire.
-    if (batch_n > 0 && rec->progress_token.has_value()) {
-        for (std::size_t i = 0; i < batch_n; ++i) {
+    // Progress first - the final must be last on the wire. #2412: at most one
+    // latched snapshot now (latest-wins in the listener), so there is nothing
+    // left to iterate - this stays a `do { } while (false)` so every early
+    // exit (`break`) reads the same as the old per-entry loop's `continue`/
+    // `break`: "nothing more to do with this snapshot", not "stop the loop".
+    if (have_progress && rec->progress_token.has_value()) {
+        do {
             std::uint64_t responded = 0;
             std::uint64_t targeted = 0;
             try {
-                const auto counts = parse_progress(batch[i].data);
+                const auto counts = parse_progress(rec->projection_spare.data);
                 // UP-4: skip a frame with no meaningful denominator. An
                 // execution-progress event published BEFORE set_agents_targeted
                 // (an agent responding during dispatch) carries agents_targeted=0;
@@ -1659,7 +1823,7 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
                 // `total:0` progress notification, which a strict MCP client can
                 // reject. `total` is monotone-meaningful only once targeted>0.
                 if (counts.targeted == 0) {
-                    continue;
+                    break;
                 }
                 targeted = counts.targeted;
                 // Defensive clamp: responded must never exceed targeted on the
@@ -1667,10 +1831,9 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
                 // must not surface as progress>total).
                 responded = std::min(counts.responded, counts.targeted);
             } catch (...) {
-                // C4: drop this batch's remainder, keep going to terminal
-                // settlement. A malformed/unbuildable progress delta is
-                // fire-and-forget by contract.
-                spdlog::warn("MCP bridge: progress frame build failed; dropping batch remainder");
+                // C4: a malformed/unbuildable progress delta is fire-and-forget
+                // by contract - drop it, keep going to terminal settlement.
+                spdlog::warn("MCP bridge: progress frame build failed; dropping latched snapshot");
                 break;
             }
             // H1 (governance adversarial review): both supported MCP revisions say
@@ -1684,9 +1847,13 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
             // committed to the wire for this record (the first frame is always
             // allowed, so an initial 0/N is fine as the starting point). Same
             // "a strict client can reject" rationale as the UP-4 total:0 skip.
+            // #2412: this now ALSO catches a snapshot the listener superseded
+            // before the projector ever saw it (see progress_suppressed_delta's
+            // field comment) - both are "a candidate that never reached the
+            // wire", so they share one counter.
             if (rec->progress_sent_any && responded <= rec->last_progress_sent) {
                 rec->progress_suppressed_delta.fetch_add(1, std::memory_order_relaxed);
-                continue;
+                break;
             }
             std::string frame;
             try {
@@ -1695,7 +1862,7 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
                 frame = progress_notification(*rec->progress_token, responded, targeted,
                                               msg, rec->execution_id);
             } catch (...) {
-                spdlog::warn("MCP bridge: progress frame build failed; dropping batch remainder");
+                spdlog::warn("MCP bridge: progress frame build failed; dropping latched snapshot");
                 break;
             }
             const std::uint64_t id = get_only
@@ -1721,7 +1888,7 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
                     }
                 }
             }
-        }
+        } while (false);
     }
 
     if (!term.has_value()) {
@@ -2119,8 +2286,6 @@ void McpStreamBridge::sweep() {
     // GET-only bridge. Fixed by scanning ONCE to build a parked_seq-sorted
     // candidate list, then iterating it with per-visit re-validation instead of
     // per-visit re-scanning.
-    bool wake_projector = false;  // a defer left a secured terminal to settle
-
     // ONE scan: ring_only count, mark count, and the full candidate list, sorted
     // oldest-first. Every kRingOnly record is a candidate - no floor to apply,
     // since each is visited at most once by construction below.
@@ -2382,10 +2547,12 @@ void McpStreamBridge::sweep() {
         // rather than ending the pass (UP-5, #2489): iterating the pre-sorted list
         // once, never revisiting an entry, is what now carries FA-4's
         // no-tight-re-visit property, so a defer costs this victim its turn this
-        // sweep instead of costing every newer victim theirs. The projector is
-        // woken ONCE at the exit - a defer means work was left for it (a secured
-        // terminal to settle), and one wake covers every deferral.
-        wake_projector = true;
+        // sweep instead of costing every newer victim theirs. #2411: mark THIS
+        // victim dirty - a defer means work was left for it (a secured terminal
+        // to settle), and mark_dirty's own dedupe (see its lost-wakeup proof)
+        // means marking every deferral costs nothing extra over the old single
+        // end-of-pass wake.
+        mark_dirty(*core_, oldest->key);
     }
 
     // FRESH final scan (Doomgoose + Fable plan review): both the mark-clearing
@@ -2425,10 +2592,20 @@ void McpStreamBridge::sweep() {
                 if (rec->phase.load(std::memory_order_acquire) != Phase::kRingOnly) {
                     continue;
                 }
-                std::lock_guard<std::mutex> rlk(rec->mu);
-                rec->pressure_requested = false;
+                bool was_marked = false;
+                {
+                    std::lock_guard<std::mutex> rlk(rec->mu);
+                    was_marked = rec->pressure_requested;
+                    rec->pressure_requested = false;
+                }
+                if (was_marked) {
+                    // #2411: only a record that WAS quiesced needs re-waking -
+                    // progress may have been frozen mid-execution on it, and
+                    // that freeze just lifted. An already-unmarked record has
+                    // nothing new for this walk to have unfrozen.
+                    mark_dirty(*core_, key);
+                }
             }
-            wake_projector = true;  // progress may have been frozen mid-execution
         }
         if (still_parked > cfg_.ring_only_pressure_cap) {
             // NOT a silent cap: the hatch disengaged with the cap still exceeded
@@ -2438,9 +2615,6 @@ void McpStreamBridge::sweep() {
             // are parking at least as fast as they are being expired.
             count_pressure_budget_exhausted();
         }
-    }
-    if (wake_projector) {
-        wake(*core_);
     }
 }
 
@@ -3110,15 +3284,6 @@ void McpStreamBridge::flush_record_obs(BridgeRecord& rec) noexcept {
     // D3: exchange-then-restore. A transiently failing registry never loses the
     // accumulated delta - it is put back (or parked on the shared core) for a
     // later flush; only final process shutdown may drop it.
-    const auto drops = rec.mailbox_drop_delta.exchange(0, std::memory_order_relaxed);
-    if (drops != 0) {
-        if (metrics_ == nullptr ||
-            !obs_guard([&] {
-                metrics_->counter(kMetricMailboxDrops).increment(static_cast<double>(drops));
-            })) {
-            core_->pending_mailbox_drops.fetch_add(drops, std::memory_order_relaxed);
-        }
-    }
     const auto fails = rec.listener_failure_delta.exchange(0, std::memory_order_relaxed);
     if (fails != 0) {
         if (metrics_ == nullptr ||
@@ -3154,13 +3319,6 @@ void McpStreamBridge::flush_core_obs() noexcept {
     if (metrics_ == nullptr) {
         return;  // keep pending - a registry may never appear, but losing the
                  // count is worse than holding an int
-    }
-    const auto drops = core_->pending_mailbox_drops.exchange(0, std::memory_order_relaxed);
-    if (drops != 0 &&
-        !obs_guard([&] {
-            metrics_->counter(kMetricMailboxDrops).increment(static_cast<double>(drops));
-        })) {
-        core_->pending_mailbox_drops.fetch_add(drops, std::memory_order_relaxed);
     }
     const auto fails = core_->pending_listener_failures.exchange(0, std::memory_order_relaxed);
     if (fails != 0 &&

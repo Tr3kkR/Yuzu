@@ -1263,18 +1263,28 @@ static const ToolDef kTools[] = {
      "before planning incident work, especially for OpenShift, KVM, database, and SaaS asks. "
      "Advisory classification only, not a security gate.",
      R"({"type":"object","properties":{"question":{"type":"string","minLength":1,"maxLength":2048}},"required":["question"]})",
-     kObjectOutputSchema},
+     // #2986: shape is fully deterministic — classification is one of the 5
+     // literals the keyword classifier below can produce, requires_connector
+     // is always present (empty string when not applicable, never omitted).
+     R"j({"type":"object","properties":{"classification":{"type":"string","enum":["answerable_now","answerable_with_live_dispatch","requires_external_connector","unsafe_without_approval","outside_yuzu_scope"]},"rationale":{"type":"string"},"requires_connector":{"type":"string","description":"Empty unless classification is requires_external_connector"},"safe_first_tool":{"type":"string"},"recommended_next_tools":{"type":"array","items":{"type":"string"}},"approval_required_before_execution":{"type":"boolean"}},"required":["classification","rationale","requires_connector","safe_first_tool","recommended_next_tools","approval_required_before_execution"]})j"},
     {"get_incident_playbook",
      "Return the recommended Yuzu investigation workflow for a named incident scenario, including "
      "the first tool, safe tool path, connector gaps, and approval boundaries. Workflow guidance "
      "only.",
      R"({"type":"object","properties":{"scenario":{"type":"string","maxLength":2048,"description":"Exact scenario name, category, or curated tag (e.g. openshift, teams, crowdstrike, postgres, buildx) — matched exactly, not by substring"}},"required":["scenario"]})",
-     kObjectOutputSchema},
+     // #2986: every field of IncidentPlaybook (mcp_agentic_catalog.hpp) is a
+     // plain string, always emitted (requires_connector is "" when the
+     // scenario needs none, never omitted); steps/safety are always arrays
+     // of strings — the shape does not vary by scenario.
+     R"j({"type":"object","properties":{"scenario":{"type":"string"},"title":{"type":"string"},"category":{"type":"string"},"classification":{"type":"string"},"expected_first_tool":{"type":"string"},"requires_connector":{"type":"string","description":"Empty when the playbook needs no external connector"},"summary":{"type":"string"},"steps":{"type":"array","items":{"type":"string"}},"safety":{"type":"array","items":{"type":"string"}}},"required":["scenario","title","category","classification","expected_first_tool","requires_connector","summary","steps","safety"]})j"},
     {"summarize_working_set",
      "Summarize an agent/result-set/execution scope into a model-ready narrative with resource "
      "links and next tools instead of dumping unbounded rows. Summarization only.",
      R"({"type":"object","properties":{"kind":{"type":"string","enum":["fleet","agent","execution","result_set"],"default":"fleet"},"id":{"type":"string"},"limit":{"type":"integer","default":25,"maximum":100}}})",
-     kObjectOutputSchema},
+     // #2986: kind/id/limit echo the (possibly-defaulted) input; narrative,
+     // resource_links, and recommended_next_tools are always populated
+     // (empty id, or the fleet-fallback branch, still produce a narrative).
+     R"j({"type":"object","properties":{"kind":{"type":"string","enum":["fleet","agent","execution","result_set"]},"id":{"type":"string"},"limit":{"type":"integer"},"narrative":{"type":"string"},"resource_links":{"type":"array","items":{"type":"string"}},"recommended_next_tools":{"type":"array","items":{"type":"string"}}},"required":["kind","id","limit","narrative","resource_links","recommended_next_tools"]})j"},
 
     // ── A2 discovery tools (roadmap Issue 17.1, docs/agentic-first-principle.md
     // §A2) — mirrors of the GET /api/v1/discover/* REST family, sharing the SAME
@@ -1284,21 +1294,44 @@ static const ToolDef kTools[] = {
     {"discover_permissions",
      "RBAC permission catalog: every securable_type x operation pair the RBAC store "
      "recognizes, plus the full role -> allowed-operations grid. Read-only catalog.",
-     R"({"type":"object","properties":{}})", kObjectOutputSchema},
+     R"({"type":"object","properties":{}})",
+     // #2986: build_permissions_catalog (discover_routes.cpp) always emits
+     // version/description/securable_types/operations; the role grid is
+     // conditional on the caller's UserManagement:Read (#2376 floor) —
+     // EITHER "roles" is present OR "roles_omitted"+"roles_omitted_reason"
+     // are (never both, never neither) — so those three stay out of
+     // "required" rather than forcing a stricter oneOf this codebase's
+     // other optional-field schemas (e.g. get_kek_status) don't use either.
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"securable_types":{"type":"array","items":{"type":"string"}},"operations":{"type":"array","items":{"type":"string"}},"roles":{"type":"array","description":"Present only for a caller holding UserManagement:Read (#2376 floor); absent when roles_omitted is true","items":{"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"},"is_system":{"type":"boolean"},"permissions":{"type":"array","items":{"type":"object","properties":{"securable_type":{"type":"string"},"operation":{"type":"string"},"effect":{"type":"string"}},"required":["securable_type","operation","effect"]}}},"required":["name","description","is_system","permissions"]}},"roles_omitted":{"type":"boolean","description":"Present (true) only when the caller lacks UserManagement:Read — the grid above is withheld, stated explicitly rather than a silent empty array"},"roles_omitted_reason":{"type":"string","description":"Present in lockstep with roles_omitted"}},"required":["version","description","securable_types","operations"]})j"},
     {"discover_instructions",
      "Published (enabled) InstructionDefinition catalog with parameter_schema — the "
      "commands this worker may dispatch via execute_instruction. Read-only catalog.",
-     R"({"type":"object","properties":{}})", kObjectOutputSchema},
+     R"({"type":"object","properties":{}})",
+     // #2986: build_instructions_catalog's envelope is fixed; each entry's
+     // parameter_schema is itself an arbitrary nested JSON Schema document
+     // (or null when the stored value doesn't parse, OR parses to something
+     // other than an object — array/string/number/bool are nulled out too,
+     // discover_routes.cpp's is_object() guard) — genuinely variable BY
+     // DESIGN, so it is typed generically rather than pretending to know
+     // its shape, same idiom as get_access_review's "campaign":{"type":"object"}.
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"count":{"type":"integer"},"truncated":{"type":"boolean"},"instructions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":["object","null"],"description":"Nested JSON Schema when the stored value parses as JSON AND is itself an object, else null"},"platforms":{"type":"string","description":"Comma-separated OS list, e.g. windows,linux,darwin"},"approval_mode":{"type":"string"}},"required":["id","name","plugin","action","description","parameter_schema","platforms","approval_mode"]}}},"required":["version","description","count","truncated","instructions"]})j"},
     {"discover_routes",
      "REST route catalog — subset of the same OpenAPI document GET /api/v1/openapi.json "
      "serves. Hand-maintained source, so it can under-report an undocumented route "
      "(the response carries a caveat field). Read-only catalog.",
-     R"({"type":"object","properties":{}})", kObjectOutputSchema},
+     R"({"type":"object","properties":{}})",
+     // #2986: build_routes_catalog's per-route projection is fixed
+     // (method/path/summary/tags/description) regardless of which OpenAPI
+     // operations exist — the route COUNT varies, the shape does not.
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"source":{"type":"string"},"description":{"type":"string"},"caveat":{"type":"string"},"count":{"type":"integer"},"routes":{"type":"array","items":{"type":"object","properties":{"method":{"type":"string"},"path":{"type":"string"},"summary":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}},"description":{"type":"string"}},"required":["method","path","summary","tags","description"]}}},"required":["version","source","description","caveat","count","routes"]})j"},
     {"discover_scope_kinds",
      "Scope DSL kinds (__all__, group:<name>, from_result_set:<id>, ostype, hostname, "
      "arch, agent_version, tag:<key>, props.<key>) and comparison operators, with "
      "syntax and examples for building a `scope` expression. Read-only, static catalog.",
-     R"({"type":"object","properties":{}})", kObjectOutputSchema},
+     R"({"type":"object","properties":{}})",
+     // #2986: scope_kinds_catalog() is a fully static, build-once document
+     // (discover_routes.cpp) — the most stable of the five discover_* shapes.
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"ground_kinds":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"syntax":{"type":"string"},"example":{"type":"string"},"description":{"type":"string"}},"required":["kind","syntax","example","description"]}},"attribute_kinds":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"syntax":{"type":"string"},"example":{"type":"string"},"description":{"type":"string"}},"required":["kind","syntax","example","description"]}},"operators":{"type":"array","items":{"type":"object","properties":{"token":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"}},"required":["token","name","description"]}},"extended_forms":{"type":"array","items":{"type":"object","properties":{"form":{"type":"string"},"example":{"type":"string"},"description":{"type":"string"}},"required":["form","example","description"]}},"combinators":{"type":"array","items":{"type":"string"}}},"required":["version","description","ground_kinds","attribute_kinds","operators","extended_forms","combinators"]})j"},
     {"discover_plugins",
      "Plugin/action catalog observed across currently-connected agents. Each action carries an "
      "inline parameter_schema when it has a published InstructionDefinition (so you learn HOW to "
@@ -1306,7 +1339,13 @@ static const ToolDef kTools[] = {
      "discover_instructions is the full schema-bearing catalog. NOT a build-time manifest. New to "
      "the fleet? Read the yuzu://operating-model and yuzu://capabilities resources first to orient "
      "before acting. Read-only catalog.",
-     R"({"type":"object","properties":{}})", kObjectOutputSchema},
+     R"({"type":"object","properties":{}})",
+     // #2986: build_plugins_catalog's envelope + per-plugin/per-action keys
+     // (AgentRegistry::help_json, agent_registry.cpp) are server-computed
+     // and fixed; only actions[].parameter_schema is conditional (present
+     // only when the action has a matching published InstructionDefinition),
+     // typed generically for the same reason as discover_instructions above.
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"limitation":{"type":"string"},"actions_enriched_with_schema":{"type":"integer"},"plugins":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"version":{"type":"string"},"description":{"type":"string"},"actions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":"object","description":"Present only when the action has a matching published InstructionDefinition"}},"required":["name","description"]}}},"required":["name","version","description","actions"]}},"commands":{"type":"array","items":{"type":"string"}}},"required":["version","description","limitation","actions_enriched_with_schema","plugins","commands"]})j"},
     {"query_software_licenses",
      "Query a single agent's discovered software licences (ADR-0024 discovery plane) — the "
      "MCP twin of GET /api/v1/sle/agents/{id}. Returns each detected licence's product, "
@@ -7830,8 +7869,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // added alongside this change.
                 auto result = tool_result(payload, kObjectOutputSchema);
                 // S5 (2f PR 3a): arm GET-only - the atomic flip-and-drain hands
-                // the latched mailbox to the projector, which publishes progress
-                // LIVE onto this session's GET stream. `result` is passed as the
+                // the latched progress snapshot to the projector, which publishes
+                // progress LIVE onto this session's GET stream. `result` is passed as the
                 // result_base (B5): a parked record's real final re-emits today's
                 // result object with status/agents_* added as top-level keys.
                 // The plain JSON below answers this POST either way - GET-only
@@ -9113,7 +9152,31 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "summarize_working_set") {
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
-                const std::string kind = param_str(args, "kind", "fleet");
+                // Gate 4 unhappy-path (2026-08-19): this tool is ReadOnly, not
+                // approval-gated, so the input schema's `kind` enum is
+                // advertised only — never enforced server-side (this
+                // codebase's established "ungated tool schema constraints
+                // aren't enforced unless the handler re-checks" pattern). An
+                // out-of-enum caller value was echoed verbatim below,
+                // violating the #2986 output schema's own `kind` enum on a
+                // strict validating client. Normalize to the schema's stated
+                // default before it's ever read or echoed.
+                std::string kind = param_str(args, "kind", "fleet");
+                if (kind != "fleet" && kind != "agent" && kind != "execution" &&
+                    kind != "result_set") {
+                    // Gate 6 sre (2026-08-19): silent normalization is
+                    // operationally invisible — a client sending a
+                    // persistently stale/malformed kind (schema drift, an
+                    // integration bug) would otherwise be undetectable. No
+                    // audit row exists for this ReadOnly tool to piggyback
+                    // on (see the class comment above), so this debug line
+                    // is the only signal; not elevated to warn since a
+                    // single stray call is not itself operator-actionable.
+                    spdlog::debug("MCP summarize_working_set: unknown kind '{}' normalized to "
+                                  "'fleet'",
+                                  kind);
+                    kind = "fleet";
+                }
                 const std::string target_id = param_str(args, "id");
                 const int limit = std::clamp(param_int32(args, "limit", 25), 1, 100);
                 JArr links;

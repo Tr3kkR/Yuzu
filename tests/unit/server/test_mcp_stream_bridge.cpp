@@ -351,23 +351,47 @@ TEST_CASE("bridge progress is strictly monotonic on the wire (H1)", "[mcp][bridg
     // MCP MUST: notifications/progress `progress` increases with each frame.
     // Feed duplicate and DECREASING bus snapshots; only the strictly-increasing
     // subsequence may reach the wire.
+    //
+    // #2412: progress is now a single latest-wins slot, not a 16-entry ring -
+    // a value published before the projector drains the previous one is
+    // coalesced away by the LISTENER, before H1 ever runs. Publishing this
+    // whole sequence in a tight loop (the old test's shape) would therefore
+    // fold {1, 1, 3, 2, 3, 5, 4} down to whatever the last publish happened
+    // to be, not the intended {1, 3, 5}. Step-synchronize: wait for each
+    // value's expected effect (a new wire frame, or a suppressed-counter
+    // tick) before publishing the next, so every value is drained on its own
+    // - this isolates H1's projector-side suppression from listener-side
+    // coalescing, which the flip-and-drain (H2) test below exercises instead.
     Fx fx;
     auto s = fx.make_session();
     REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), false).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-mono"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kGetOnly) == Bridge::ArmOutcome::kArmed);
     // Sequence: 1, 1(dup), 3, 2(decrease), 3(dup), 5, 4(decrease) / total 5.
-    for (auto r : {1u, 1u, 3u, 2u, 3u, 5u, 4u}) {
-        fx.bus.publish("exec-mono", "execution-progress", prog(r, 5));
-    }
-    // Expect exactly the increasing subsequence 1, 3, 5.
-    REQUIRE(poll_until([&] {
-        std::uint64_t last = 0;
-        for (const auto& f : ring_frames(*s.stream, "alice")) {
-            last = json::parse(f.data)["params"]["progress"].get<std::uint64_t>();
+    // `frame` says whether publishing that value should produce a NEW wire
+    // frame (true) or a suppressed-counter tick (false).
+    const std::vector<std::pair<unsigned, bool>> steps = {
+        {1u, true}, {1u, false}, {3u, true}, {2u, false},
+        {3u, false}, {5u, true}, {4u, false},
+    };
+    std::size_t frames_before = 0;
+    double suppressed_before = 0.0;
+    for (const auto& [value, frame] : steps) {
+        fx.bus.publish("exec-mono", "execution-progress", prog(value, 5));
+        if (frame) {
+            REQUIRE(poll_until([&] {
+                return count_method(ring_frames(*s.stream, "alice"), "notifications/progress") >
+                       frames_before;
+            }));
+            ++frames_before;
+        } else {
+            REQUIRE(poll_until([&] {
+                return fx.reg.counter("yuzu_mcp_bridge_progress_suppressed_total").value() >
+                       suppressed_before;
+            }));
+            suppressed_before += 1.0;
         }
-        return last == 5;  // wait until the 5-frame lands
-    }));
+    }
     auto frames = ring_frames(*s.stream, "alice");
     std::vector<std::uint64_t> got;
     std::uint64_t prev = 0;
@@ -478,13 +502,26 @@ TEST_CASE("bridge flip-and-drain - no frame strands across arm (H2)", "[mcp][bri
     auto s = fx.make_session();
     REQUIRE(fx.bridge->reserve(s.id, "alice", json(2), json("t"), false).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(2), "exec-h"));
-    // DISTINCT strictly-increasing counts (1/12 .. 12/12) so H1's monotonic
-    // suppression keeps every frame - the point here is no frame STRANDS across
-    // the arm flip, so each drained event must be a distinct wire frame.
-    // The ==12 count is NOT flaky under H1's out-of-order suppression: the
-    // mailbox is a FIFO and events are latched in bus-publish order (pre-arm ids
-    // 1-4 before concurrent ids 5-12), so the single projector always drains
-    // ascending - a lower value can never arrive after a higher one.
+    // DISTINCT strictly-increasing counts (1/12 .. 12/12), published pre-arm
+    // (1-4, latched while kArming - project_record never visits a kArming
+    // record, so nothing can drain) and concurrently with arm (5-12, racing
+    // the flip).
+    //
+    // #2412: progress is now a single latest-wins slot, not a 16-entry ring -
+    // a value overwritten before the projector drains it never reaches the
+    // wire; it is counted as suppressed instead (same counter H1 uses, see
+    // the field comment on progress_suppressed_delta). The pre-arm run of
+    // 1-4 is GUARANTEED to coalesce to a single pending value (nothing can
+    // drain during kArming), and the race against the concurrent publisher
+    // means the post-arm count of distinct wire frames is genuinely
+    // nondeterministic - anywhere from 1 (everything coalesces into the
+    // final 12/12) to 9 (the pre-arm batch, plus each of 5-12 individually,
+    // if the projector wins every race). What IS deterministic, and what
+    // this test asserts, is CONSERVATION: every one of the 12 published
+    // values is accounted for exactly once, as either a wire frame or a
+    // suppression - never lost, never double-counted - the wire stays
+    // strictly increasing, and the LAST published value (12) always survives
+    // to be the final frame, because nothing publishes after it.
     for (std::uint64_t i = 1; i <= 4; ++i) {
         fx.bus.publish("exec-h", "execution-progress", prog(i, 12));  // latched pre-arm
     }
@@ -500,21 +537,29 @@ TEST_CASE("bridge flip-and-drain - no frame strands across arm (H2)", "[mcp][bri
     }
     REQUIRE(fx.bridge->arm(s.id, json(2), Bridge::ArmMode::kGetOnly) == Bridge::ArmOutcome::kArmed);
     publisher.get();
-    // Eventual totality: every one of the 12 frames reaches the ring - whether it
-    // landed pre-flip (drained by the handoff wake) or post-flip (listener wake).
-    REQUIRE(poll_until([&] { return s.stream->next_event_id() == 13; }));
+    // Conservation, not an exact frame count (see the comment above for why a
+    // count is not deterministic under latest-wins coalescing): this is what
+    // proves nothing strands across the arm flip.
+    REQUIRE(poll_until([&] {
+        return static_cast<double>(
+                   count_method(ring_frames(*s.stream, "alice"), "notifications/progress")) +
+                   fx.reg.counter("yuzu_mcp_bridge_progress_suppressed_total").value() ==
+               12.0;
+    }));
     auto frames = ring_frames(*s.stream, "alice");
-    CHECK(count_method(frames, "notifications/progress") == 12);
-    // …and the wire sequence is strictly increasing (H1).
+    const auto frame_count = count_method(frames, "notifications/progress");
+    CHECK(frame_count >= 1);
+    CHECK(frame_count <= 12);
+    // …the wire sequence is strictly increasing (H1) …
     std::uint64_t prev = 0;
     for (const auto& f : frames) {
         auto j = json::parse(f.data);
         CHECK(j["params"]["progress"].get<std::uint64_t>() > prev);
         prev = j["params"]["progress"].get<std::uint64_t>();
     }
-    // #2438: distinct increasing counts by construction (see comment above) -
-    // H1 suppresses nothing here, so the counter must stay at zero.
-    CHECK(fx.reg.counter("yuzu_mcp_bridge_progress_suppressed_total").value() == 0.0);
+    // …and ends on the last published value - nothing arrives after it, so it
+    // always survives to eventually be drained.
+    CHECK(prev == 12);
 }
 
 TEST_CASE("bridge listener fault - contained, counted, one-shot", "[mcp][bridge][2f]") {
@@ -531,6 +576,102 @@ TEST_CASE("bridge listener fault - contained, counted, one-shot", "[mcp][bridge]
     REQUIRE(poll_until([&] { return s.stream->next_event_id() > 1; }));
     CHECK(ring_frames(*s.stream, "alice").size() == 1);  // exactly one frame - one was eaten
     // The failure is counted record-locally and flushed by the projector.
+    REQUIRE(poll_until(
+        [&] { return fx.reg.counter("yuzu_mcp_bridge_listener_failures_total").value() == 1.0; }));
+}
+
+TEST_CASE("bridge #2411 - a wake dirty-marks only ITS OWN record, not every record",
+          "[mcp][bridge][2f][2411]") {
+    // Direct proof the projector visits O(dirty), not O(records_): a wake on
+    // record A must not re-poke record B's bound sink, even though B's own
+    // work is still pending (has_pending_work_locked(B) stays true forever
+    // here - nothing ever drains it via take_post_batch). Under the
+    // pre-#2411 full-table-scan projector, EVERY wake re-visits EVERY
+    // record, so A's wake would re-poke B every time - that asymmetry is the
+    // whole assertion, and it is RED on the unfixed tree.
+    Fx fx;
+    auto a = fx.make_session("alice");
+    REQUIRE(fx.bridge->reserve(a.id, "alice", json(1), json("t"), false).ok);
+    REQUIRE(fx.bridge->subscribe(a.id, json(1), "exec-2411-a"));
+    REQUIRE(fx.bridge->arm(a.id, json(1), Bridge::ArmMode::kGetOnly) ==
+            Bridge::ArmOutcome::kArmed);
+
+    auto b = fx.make_session("bob");
+    REQUIRE(fx.bridge->reserve(b.id, "bob", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(b.id, json(1), "exec-2411-b"));
+    REQUIRE(fx.bridge->arm(b.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    REQUIRE(fx.bridge->bind_post_sink(b.id, json(1), sink).has_value());
+
+    // B's own event: latches, marks B dirty, the projector visits B and
+    // pokes the bound sink (has_pending_work_locked is true - nothing ever
+    // drains it via take_post_batch in this test, so it stays true for the
+    // rest of B's life).
+    fx.bus.publish("exec-2411-b", "execution-progress", prog(1, 3));
+    REQUIRE(poll_until([&] { return sink->poked.load(std::memory_order_acquire); }));
+    {
+        // Reset under sink->mu, the same lock poke_post_sink takes - the
+        // established isolation pattern (see CH-16 above) for separating a
+        // LATER poke from this setup one.
+        std::lock_guard<std::mutex> lk(sink->mu);
+        sink->poked.store(false, std::memory_order_release);
+    }
+
+    // A's event: marks only A dirty. A's frame reaching the wire proves A's
+    // own wake WAS processed - the test isn't vacuous.
+    fx.bus.publish("exec-2411-a", "execution-progress", prog(1, 3));
+    REQUIRE(poll_until([&] {
+        return count_method(ring_frames(*a.stream, "alice"), "notifications/progress") == 1;
+    }));
+
+    // B was NOT re-visited as a side effect of A's wake.
+    CHECK_FALSE(poll_until([&] { return sink->poked.load(std::memory_order_acquire); },
+                           std::chrono::milliseconds(100)));
+}
+
+TEST_CASE("bridge #2411 - a listener fault on one record still flushes via that record's "
+          "own dirty mark",
+          "[mcp][bridge][2f][2411]") {
+    // The dirty-set drain only visits a record whose OWN key is in
+    // core_->dirty - so the listener's catch path needs its OWN mark_dirty
+    // call (the one call site #2411 ADDS over the pre-existing wake()), or a
+    // fault-eaten event's listener_failure_delta strands forever on a record
+    // nothing else ever touches again. The existing "listener fault"
+    // test above cannot catch a regression here - its second publish is on
+    // the SAME record, so that record's own ordinary activity would flush
+    // the delta regardless of whether the catch path marks it dirty.
+    Fx fx;
+    auto a = fx.make_session("alice");
+    REQUIRE(fx.bridge->reserve(a.id, "alice", json(1), json("t"), false).ok);
+    REQUIRE(fx.bridge->subscribe(a.id, json(1), "exec-2411-flush-a"));
+    REQUIRE(fx.bridge->arm(a.id, json(1), Bridge::ArmMode::kGetOnly) ==
+            Bridge::ArmOutcome::kArmed);
+
+    // A harmless first event, drained to the wire before the fault: proves A
+    // is fully out of the dirty set (including its arm()-time handoff mark)
+    // before the fault-eaten event below, so the ONLY thing that can put A
+    // back into the dirty set afterward is the catch path under test - not a
+    // stale mark left over from setup.
+    fx.bus.publish("exec-2411-flush-a", "execution-progress", prog(1, 3));
+    REQUIRE(poll_until([&] {
+        return count_method(ring_frames(*a.stream, "alice"), "notifications/progress") == 1;
+    }));
+
+    auto b = fx.make_session("bob");
+    REQUIRE(fx.bridge->reserve(b.id, "bob", json(1), json("t"), false).ok);
+    REQUIRE(fx.bridge->subscribe(b.id, json(1), "exec-2411-flush-b"));
+    REQUIRE(fx.bridge->arm(b.id, json(1), Bridge::ArmMode::kGetOnly) ==
+            Bridge::ArmOutcome::kArmed);
+
+    fx.bridge->inject_listener_fault_for_test();  // one-shot, shared WakeCore
+    fx.bus.publish("exec-2411-flush-a", "execution-progress", prog(2, 3));  // eaten
+
+    // B only, never A again. The pre-#2411 full-table-scan projector would
+    // have flushed A's delta as a side effect of visiting every record on
+    // B's wake; a dirty-set without the catch-path mark_dirty call strands
+    // it, because nothing ever puts A's key back into core_->dirty.
+    fx.bus.publish("exec-2411-flush-b", "execution-progress", prog(1, 3));
     REQUIRE(poll_until(
         [&] { return fx.reg.counter("yuzu_mcp_bridge_listener_failures_total").value() == 1.0; }));
 }
@@ -570,8 +711,8 @@ TEST_CASE("bridge second-thread terminal vs park (TSan)", "[mcp][bridge][2f]") {
     REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
     auto frames = ring_frames(*s.stream, "alice");
     CHECK(count_results(frames) == 1);
-    // The final is last on the ring, whatever subset of the flood survived the
-    // bounded mailbox.
+    // The final is last on the ring, whatever the flood's latest-wins progress
+    // slot happened to still hold when it was drained.
     CHECK(json::parse(frames.back().data).contains("result"));
 }
 
@@ -1168,7 +1309,8 @@ TEST_CASE("bridge pressure - a deferred victim no longer blocks relief for the n
     CHECK(fx.bridge->record_count() == 1);
 }
 
-TEST_CASE("bridge pressure - a mark does not outlive the pressure that raised it (#2489 UP-4)",
+TEST_CASE("bridge pressure - a mark does not outlive the pressure that raised it "
+          "(#2489 UP-4, TSan)",
           "[mcp][bridge][2f][2489]") {
     // pressure_requested tells the projector to start no NEW progress batch for a
     // victim. Nothing cleared it, so a victim that was marked and then survived -
@@ -2610,14 +2752,22 @@ TEST_CASE("McpSessionRegistry::exists - non-touching, non-erasing, no oracle",
     CHECK(sessions.active_count() == 0);
 }
 
-TEST_CASE("bridge mailbox bounds - drop-oldest progress, terminal never dropped",
+TEST_CASE("bridge progress slot - latest-wins, terminal never dropped",
           "[mcp][bridge][2f]") {
+    // #2412: this test used to bound the 16-slot progress ring's drop-oldest
+    // behaviour; the ring is gone, replaced by a single latest-wins slot, so
+    // it now bounds THAT instead.
     Fx fx;
     auto s = fx.make_session();
     REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), false).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-m"));
-    // 20 progress frames latch during kArming into the 16-slot ring; the 4
-    // OLDEST are dropped. Stamp each with a distinct agents_responded.
+    // 20 progress events latch during kArming, synchronously (bus.publish
+    // invokes the listener inline, and nothing can drain until arm - see
+    // has_pending_work_locked's comment) - so the slot deterministically
+    // coalesces all 20 down to the LAST one published, superseding the other
+    // 19 (counted as suppressed - there is nothing left to "drop", the ring
+    // this test used to bound is gone). Stamp each with a distinct
+    // agents_responded so the survivor is unambiguous.
     for (int i = 1; i <= 20; ++i) {
         fx.bus.publish("exec-m", "execution-progress",
                        R"({"agents_responded":)" + std::to_string(i) +
@@ -2630,11 +2780,15 @@ TEST_CASE("bridge mailbox bounds - drop-oldest progress, terminal never dropped"
         return ph.has_value() && *ph == Bridge::Phase::kDone;  // terminal survived the deluge
     }));
     auto frames = ring_frames(*s.stream, "alice");
-    REQUIRE(frames.size() == 16);  // newest 16, in order; GET-only ⇒ no final frame
-    CHECK(json::parse(frames.front().data)["params"]["progress"] == 5);
-    CHECK(json::parse(frames.back().data)["params"]["progress"] == 20);
-    REQUIRE(poll_until(
-        [&] { return fx.reg.counter("yuzu_mcp_bridge_mailbox_drops_total").value() == 4.0; }));
+    // Exactly ONE progress frame - the latched survivor; GET-only ⇒ no final frame.
+    REQUIRE(frames.size() == 1);
+    CHECK(json::parse(frames.front().data)["params"]["progress"] == 20);
+    REQUIRE(poll_until([&] {
+        return fx.reg.counter("yuzu_mcp_bridge_progress_suppressed_total").value() == 19.0;
+    }));
+    // Retired by #2412: stays registered (scrape/dashboard continuity) but is
+    // never incremented again - there is no longer a ring to drop from.
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_mailbox_drops_total").value() == 0.0);
 }
 
 TEST_CASE("bridge shutdown - idempotent, dtor-safe, gates every mutator", "[mcp][bridge][2f]") {
@@ -2813,27 +2967,36 @@ TEST_CASE("bridge observability faults - outcomes unchanged, deltas restored (D3
                   .value() == 0.0);  // the increment failed - silently, by design
     }
     SECTION("a transiently failing flush restores the delta for a later pass") {
+        // #2412: this used to drive the restore machinery through the
+        // 16-slot ring's drop-oldest delta; the ring is gone, so it drives
+        // the SAME machinery (exchange-then-restore-then-flush,
+        // flush_record_obs/flush_core_obs, D3/C5) through the latest-wins
+        // slot's supersede delta instead - a different source, identical
+        // restore path.
         REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), false).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-o"));
-        // Latch 20 progress frames during kArming so the 16-slot mailbox
-        // genuinely overflows (4 drops) - arming AFTER would let the projector
-        // keep pace and never drop. DISTINCT increasing counts so H1 keeps the
-        // 16 survivors (the drop happens at the LISTENER before the projector's
-        // monotonic suppression, so the 4-drop delta is what we're testing).
+        // Latch 20 progress events during kArming so the slot genuinely
+        // coalesces (19 supersedes) - arming AFTER would let the projector
+        // keep pace and drain each individually, never superseding anything.
+        // Distinct increasing counts so the single survivor is unambiguous.
         for (std::uint64_t i = 1; i <= 20; ++i) {
             fx.bus.publish("exec-o", "execution-progress", prog(i, 20));
         }
-        // Fault every observability call across the drain: the 4-drop delta must
-        // NOT be lost - it parks (restored) and lands once the fault clears.
+        // Fault every observability call across the drain: the 19-supersede
+        // delta must NOT be lost - it parks (restored) and lands once the
+        // fault clears.
         fx.bridge->inject_observability_fault_for_test(1000);
         REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kGetOnly) ==
                 Bridge::ArmOutcome::kArmed);
-        REQUIRE(poll_until([&] { return s.stream->next_event_id() > 16; }));
+        // The one surviving snapshot (20/20) still reaches the wire - frame
+        // delivery does not depend on the observability registry.
+        REQUIRE(poll_until([&] { return s.stream->next_event_id() > 1; }));
         fx.bridge->inject_observability_fault_for_test(0);  // heal
         // Another wake flushes the restored/pending delta.
         fx.bus.publish("exec-o", "execution-progress", prog(21, 21));
-        REQUIRE(poll_until(
-            [&] { return fx.reg.counter("yuzu_mcp_bridge_mailbox_drops_total").value() >= 4.0; }));
+        REQUIRE(poll_until([&] {
+            return fx.reg.counter("yuzu_mcp_bridge_progress_suppressed_total").value() >= 19.0;
+        }));
     }
 }
 
@@ -3839,9 +4002,9 @@ TEST_CASE("bridge take_post_batch - an expired cap settles one drain pass later,
           "never at execution pace (#2739)",
           "[mcp][bridge][2f][ch23]") {
     // Before this fix, cap arbitration was reached only on a pass with neither
-    // progress nor terminal pending - so a mailbox that refilled every tick held
-    // the response open for the WHOLE execution, and every operator statement
-    // derived from the 120 s cap was wrong. The contract that killed the naive
+    // progress nor terminal pending - so a progress slot that refilled every
+    // tick held the response open for the WHOLE execution, and every operator
+    // statement derived from the 120 s cap was wrong. The contract that killed the naive
     // fix still holds: the drain pass DELIVERS latched work and stays open; only
     // the pass after it settles.
     Fx fx;
@@ -3855,8 +4018,8 @@ TEST_CASE("bridge take_post_batch - an expired cap settles one drain pass later,
 
     SECTION("continuous progress cannot hold the response open past the drain pass") {
         // publish() fans out to the bridge listener synchronously (under
-        // Channel::mu), so every take below sees exactly the mailbox its
-        // preceding publish latched - no polling needed on this path.
+        // Channel::mu), so every take below sees exactly what its preceding
+        // publish latched into the progress slot - no polling needed on this path.
         fx.bus.publish("exec-drain", "execution-progress", prog(1, 5));
         auto drain = fx.bridge->take_post_batch(*key, /*cap_expired=*/true);
         REQUIRE(drain.progress.size() == 1);  // latched work is DELIVERED (C7)...
@@ -4517,9 +4680,17 @@ TEST_CASE("CH-2: a parked streamed record survives a ring wrap - the pinned fina
         const auto stale_cursor = s.stream->next_event_id() - 1;
 
         REQUIRE(fx.bridge->on_post_closed_keyed(*key));
-        // Comfortably more frames than the ring holds, so the cursor is outrun.
+        // Comfortably more frames than the ring holds, so the cursor is
+        // outrun. #2412: progress is now a single latest-wins slot, so a
+        // tight publish loop (the old shape here) would coalesce all 15
+        // events into whichever one the projector happened to still find
+        // pending, never reliably wrapping the ring - step-synchronize so
+        // each is individually drained (a new ring frame lands) before the
+        // next is published.
         for (int i = 2; i <= 16; ++i) {
+            const auto before = s.stream->next_event_id();
             fx.bus.publish("exec-ch2b", "execution-progress", prog(i, 20));
+            REQUIRE(poll_until([&] { return s.stream->next_event_id() > before; }));
         }
         fx.bus.publish("exec-ch2b", "execution-completed", kCompleted);
         REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));

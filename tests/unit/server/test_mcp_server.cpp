@@ -2776,11 +2776,14 @@ TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integrati
     // "additionalProperties":true}) for a non-exempt tool whose result shape
     // is actually stable, per docs/agentic-first-principle.md A5 item 4's
     // own text. assign_engine_role/unassign_engine_role/list_engine_roles
-    // were typed properly as a result of that review; a handful of other
-    // non-exempt tools (the discover_* family, classify_operational_
-    // question, get_incident_playbook, summarize_working_set) still ship
-    // the placeholder and pass this gate anyway - tracked as #2986, not
-    // silently ignored.
+    // were typed properly as a result of that review; #2986 (2026-08-19)
+    // closed the remaining known gap the same way - the discover_* family
+    // and classify_operational_question/get_incident_playbook/
+    // summarize_working_set now carry real typed outputSchemas too (see the
+    // A5 ledger's now-CLOSED #2986 row in docs/agentic-first-principle.md
+    // for why these turned out stable rather than still-settling). This
+    // caveat comment stays: the gate itself is still presence-only, so a
+    // FUTURE tool can still slip through it the same way these did.
     static const std::set<std::string> kOutputSchemaExempt = {};
     for (const auto& tool : tools) {
         const auto name = tool["name"].get<std::string>();
@@ -3151,6 +3154,58 @@ TEST_CASE("MCP: all five discover_* tools are advertised in tools/list",
     for (const char* n : {"discover_permissions", "discover_instructions", "discover_routes",
                           "discover_scope_kinds", "discover_plugins"})
         CHECK(names.count(n) == 1);
+}
+
+// #2986: the 8 tools this fixed (the A2 discovery family + the agentic-demo/
+// incident-response family) previously advertised the generic
+// `kObjectOutputSchema` placeholder ({"type":"object","additionalProperties":
+// true}) as their outputSchema — invisible to the #2972 completeness gate
+// above because that gate only checks PRESENCE, not typed-ness (see its own
+// comment block). This regression guard checks each schema actually carries
+// its real per-field properties now, so a future revert back to the
+// placeholder (which would still pass #2972) fails HERE instead.
+TEST_CASE("MCP: #2986 tools carry real typed outputSchema, not the kObjectOutputSchema "
+          "placeholder",
+          "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":29})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+
+    std::map<std::string, std::vector<std::string>> expected_props = {
+        {"discover_permissions", {"securable_types", "operations", "roles_omitted"}},
+        {"discover_instructions", {"count", "truncated", "instructions"}},
+        {"discover_routes", {"source", "count", "routes"}},
+        {"discover_scope_kinds", {"ground_kinds", "attribute_kinds", "operators", "combinators"}},
+        {"discover_plugins", {"limitation", "actions_enriched_with_schema", "plugins", "commands"}},
+        {"classify_operational_question",
+         {"classification", "rationale", "recommended_next_tools"}},
+        {"get_incident_playbook", {"scenario", "expected_first_tool", "steps", "safety"}},
+        {"summarize_working_set", {"narrative", "resource_links", "recommended_next_tools"}},
+    };
+
+    std::set<std::string> seen;
+    for (const auto& t : body["result"]["tools"]) {
+        const auto name = t["name"].get<std::string>();
+        auto it = expected_props.find(name);
+        if (it == expected_props.end())
+            continue;
+        seen.insert(name);
+        INFO("tool = " << name);
+        REQUIRE(t.contains("outputSchema"));
+        const auto& schema = t["outputSchema"];
+        // The placeholder never has a "properties" object with real keys —
+        // it is exactly {"type":"object","additionalProperties":true}.
+        REQUIRE(schema.contains("properties"));
+        CHECK_FALSE((schema.value("additionalProperties", false) &&
+                     schema["properties"].empty()));
+        for (const auto& prop : it->second) {
+            INFO("property = " << prop);
+            CHECK(schema["properties"].contains(prop));
+        }
+    }
+    CHECK(seen.size() == expected_props.size());
 }
 
 // ── DEX read tools (parity with /api/v1/dex/*; ar-S1) ───────────────────────
