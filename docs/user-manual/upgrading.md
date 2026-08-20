@@ -386,8 +386,9 @@ values winning over an operator/API-set tag for the same key. After upgrade thos
 agent values stop overriding — silently (no error, no log line); an affected device
 simply drops out of the cohort the operator-set value defines.
 
-**Verify:** audit the `source` column — `GET /api/v1/tags?agent_id=<id>` shows whether
-each key is `server`- (operator/API) or `agent`-sourced.
+**Verify:** audit the `source` field via MCP `get_tags` — `GET /api/v1/tags` does not
+expose `source`, only `key`/`value` pairs (see the read-side note below) — to see whether
+each key is `api`/`mcp`-sourced (operator/API) or `agent`-sourced.
 
 **Read-side completion (#3295):** #1411 closed the write-time overwrite; scope-DSL
 `tag:<key>` evaluation (dispatch targeting, management-group membership) had its own,
@@ -413,8 +414,9 @@ gateway-proxied or not-yet-synced agent with no store row at all, the live self-
 /api/v1/tags` result for a key means the live claim decides, not that nothing does.
 
 **Remediate:** if an agent-reported value was the *intended* one, re-set it explicitly
-via the REST API or MCP `set_tag` (which writes `source=server`, authoritative). Keys
-the agent reports that the operator never set are unaffected.
+via the REST API (writes `source=api`) or MCP `set_tag` (writes `source=mcp`) — either is
+authoritative over an agent-sourced row. Keys the agent reports that the operator never
+set are unaffected.
 
 ## Behaviour change: MCP approval-gated calls use ticket-then-recall (-32006) (#289)
 
