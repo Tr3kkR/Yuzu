@@ -72,7 +72,18 @@ void handle_create_schedule(AuthRoutes& auth_routes, ScheduleEngine* schedule_en
                                                 httplib::Response& res,
                                                 const std::string& action,
                                                 const std::string& audit_detail,
-                                                const std::string& permission = "Schedule:Read");
+                                                // `permission` defaults EMPTY
+                                                // (#3167 — gov-fix, Gate 8, #2298
+                                                // PR 3 hardening round's clause):
+                                                // kServiceScopeGlobalSafe is
+                                                // compile-time-empty, so no grant
+                                                // admits a service-scoped caller
+                                                // on this surface — naming one
+                                                // (even a correctly-typed one) is
+                                                // a false self-remediation claim
+                                                // the routed-concern MUST clause
+                                                // forbids. Do not reintroduce one.
+                                                const std::string& permission = "");
 
 /// Parses the `enabled` field of a `POST /api/schedules/{id}/enable` body.
 /// Extracted from the inline server.cpp lambda (guardian-confinement-2298
