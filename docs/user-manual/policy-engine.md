@@ -31,9 +31,12 @@ Policies are defined in YAML using the `yuzu.io/v1alpha1` DSL (the same schema
 used for instruction definitions) and are managed through the REST API and the
 compliance dashboard.
 
-The implementation is backed by `PolicyStore` (SQLite WAL), which stores
-fragments, policies, triggers, group bindings, input parameters, and per-agent
-compliance status. A mutex protects the database handle for thread-safe access.
+The implementation is backed by `PolicyStore` (PostgreSQL, schema
+`policy_store`, ADR-0056), which stores fragments, policies, triggers, group
+bindings, input parameters, and per-agent compliance status. Dispatch is
+coordinated fleet-wide across server replicas via a durable claim, so exactly
+one replica dispatches a given policy's check per interval regardless of how
+many replicas are running.
 
 ---
 
