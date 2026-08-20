@@ -1546,3 +1546,71 @@ TEST_CASE("prefer_spark=true: pending records are durable BEFORE stop() joins th
     stopper.join();
     spark_engine.stop();
 }
+
+TEST_CASE("start-drain-then-stop: the this-capturing send races stop()'s join (TSan "
+          "checkpoint)",
+          "[spark][guardian][reconcile][drain][tsan]") {
+    // #2238 item 3: no test started the drain worker with a REAL this-capturing send and
+    // raced a stop()/teardown against an in-flight send. The literal production callback
+    // (AgentImpl::send_guardian_outbox_entry, agent.cpp) is unlinkable from unit tests -
+    // AgentImpl is file-local to agent.cpp with zero test references - so this drives the
+    // fixture-level this-capturing send instead: SparkReconcileFixture's send lambda
+    // captures `this` and writes through a mutex-guarded vector, the same shape as
+    // production's stream_write_mu_-guarded write (agent.cpp's send_guardian_outbox_entry).
+    // Licensed by the drain contract (guardian_outbox_drain_worker.hpp): send MAY capture
+    // `this` because stop() always synchronously joins the worker before the callback's
+    // captures can dangle.
+    //
+    // Asserts liveness only - no timing upper bound, no exact send count (standing flake
+    // doctrine; see the drain-worker file's jitter-race test). This exists so nightly TSan
+    // actually DRIVES the start-drain-then-stop race, "safe by inspection" being the same
+    // posture the drain-worker file's own [tsan] checkpoints take for worker-vs-reader and
+    // worker-vs-persister races.
+    SparkReconcileFixture f{/*periodic_bound_ms=*/1};
+
+    // Two independent dispatch threads contend against the live drain worker + 4
+    // convergence-scheduler lanes. The pusher thread must NOT use Catch2 assertion
+    // macros (REQUIRE/CHECK) - those are main-thread-only - so it records raw exit codes
+    // for the main thread to assert after joining it.
+    std::mutex pusher_mu;
+    std::vector<int> pusher_exit_codes;
+    std::thread pusher{[&] {
+        for (int i = 0; i < 6; ++i) {
+            gpb::GuaranteedStatePush p;
+            p.set_full_sync(false);
+            *p.add_rules() = make_service_rule("p" + std::to_string(i), true,
+                                               "SvcP" + std::to_string(i));
+            auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine,
+                                                                         p.SerializeAsString());
+            std::lock_guard<std::mutex> lk{pusher_mu};
+            pusher_exit_codes.push_back(dr.exit_code);
+        }
+    }};
+    for (int i = 0; i < 6; ++i)
+        f.apply(make_service_rule("m" + std::to_string(i), true, "SvcM" + std::to_string(i)),
+                /*full_sync=*/false);
+
+    // Test-side lifetime only: the pusher thread dereferences f.engine, so it must finish
+    // before anything tears that down - not a production ordering constraint.
+    pusher.join();
+    {
+        std::lock_guard<std::mutex> lk{pusher_mu};
+        for (int code : pusher_exit_codes)
+            CHECK(code == 0);
+    }
+
+    REQUIRE(yuzu::test::spin_until([&] {
+        std::lock_guard<std::mutex> lk{f.sent_mu};
+        return !f.sent.empty();
+    }));
+
+    // Immediately tear down while sends may be in flight: ~GuardianEngine's stop() holds
+    // mtx_ across scheduler stop + the drain worker's join, racing whatever send is
+    // mid-callback right now. This is the race under test.
+    f.engine.reset();
+
+    std::lock_guard<std::mutex> lk{f.sent_mu};
+    CHECK(!f.sent.empty());
+    for (const auto& e : f.sent)
+        CHECK(!e.event_id.empty());
+}
