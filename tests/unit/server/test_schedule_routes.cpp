@@ -358,6 +358,40 @@ TEST_CASE("deny_service_scoped_schedule: denies a service-scoped session, writes
         CHECK(denied);
         CHECK(res.status == 403);
         CHECK(res.body.find("service-scoped") != std::string::npos);
+        // #3167: no `.permission` (no grant admits a service-scoped caller
+        // here — a caller passing a non-empty override would itself be a
+        // bug), and header/body correlation-id parity.
+        auto body = nlohmann::json::parse(res.body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        CHECK_FALSE(body["error"].contains("permission"));
+        CHECK_FALSE(body["error"]["correlation_id"].get<std::string>().empty());
+        CHECK(res.get_header_value("X-Correlation-Id") ==
+             body["error"]["correlation_id"].get<std::string>());
+    }
+
+    SECTION("service-scoped token, an upstream gate already minted a "
+            "correlation id -> reused, not overwritten") {
+        // Pre-#3167, this call site set X-Correlation-Id unconditionally via
+        // res.set_header, which emplaces into httplib's header multimap
+        // rather than replacing in place — an earlier gate's minted id would
+        // have gained a second entry rather than being overwritten, both of
+        // which reach the wire (unlike every sibling deny_service_scoped_*
+        // helper, which reuses via ensure_correlation_id). Pin the fixed
+        // behavior directly:
+        // empirically, this SECTION fails against the pre-#3167 code
+        // (get_header_value returns the freshly-minted id, not the upstream
+        // one), confirming it's a genuine, non-vacuous regression test.
+        auto req = h.service_scoped_request_for("svc-enabler", "ServiceExecute",
+                                                 {{"Execution", "Execute"}}, "printers");
+        httplib::Response res;
+        res.set_header("X-Correlation-Id", "req-upstream-cid");
+        bool denied = deny_service_scoped_schedule(*h.auth_routes, req, res, "schedule.enable",
+                                                    "sched-123");
+        CHECK(denied);
+        CHECK(res.get_header_value("X-Correlation-Id") == "req-upstream-cid");
+        auto body = nlohmann::json::parse(res.body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        CHECK(body["error"]["correlation_id"] == "req-upstream-cid");
     }
 
     SECTION("ordinary session -> not denied, response left untouched") {

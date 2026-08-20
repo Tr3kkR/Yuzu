@@ -5,6 +5,9 @@
 
 #include "guardian_journal_heartbeat.hpp"
 
+#include "guardian_backend.hpp"           // F7, #2298: doc/emitter cross-check union
+#include "guardian_health_heartbeat.hpp"  // F7, #2298: doc/emitter cross-check union
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <filesystem>
@@ -170,6 +173,31 @@ TEST_CASE("every documented Guardian heartbeat tag is one the emitter actually e
     GuardianJournalAgeStats ages;
     ages.page_stale_seconds = ages.prune_stale_seconds = ages.headroom_blocked_seconds = 1;
     emit_guardian_journal_age_tags(emitted, std::optional{ages});
+    // Union in the other yuzu.guardian_* heartbeat emitters too (governance finding,
+    // F7/#2298): this TEST_CASE's own name promises "every documented Guardian
+    // heartbeat tag", not "every documented Guardian JOURNAL heartbeat tag" - despite
+    // living in this journal-focused file. Before F7, metrics.md never mentioned a
+    // non-journal yuzu.guardian_* tag, so this gap was latent, never exercised; F7's
+    // metrics.md edit (a yuzu.guardian_backend cross-reference in the unsupported
+    // gauge's row) is what first tripped it. Closing it for the other existing
+    // yuzu.guardian_*-namespaced family too, not just the one that happened to fail,
+    // so a future doc edit referencing yuzu.guardian_unhealthy_* doesn't rediscover
+    // the same gap.
+    //
+    // emit_guardian_unsupported_heartbeat_tags is deliberately NOT unioned here (Gate
+    // 8 finding, F7/#2298): its wire keys are yuzu.spark_<mechanism>_unsupported, not
+    // yuzu.guardian_* - this regex can never match anything it produces, so unioning
+    // it would be dead code asserting a coverage claim this test cannot make. Its
+    // emitter<->reader agreement is proven separately (test_spark_fleet_tags.cpp's
+    // writer<->reader bind + test_guardian_unsupported_heartbeat.cpp's key pins); no
+    // doc-scrape exists for yuzu.spark_* since metrics.md contains no yuzu.-prefixed
+    // spark wire-key literal for a scrape to match (only the yuzu.spark_* family
+    // glob; prose mentions like spark_running are unprefixed).
+    emit_guardian_health_heartbeat_tags(
+        emitted, GuardianHealthStats{
+                     .unhealthy_suppressed = 1, .unhealthy_refreshed = 1, .priority_demoted = 1});
+    emit_guardian_backend_heartbeat_tag(emitted, /*prefer_spark=*/true,
+                                        GuardianEngine::SparkAvailability::SparkFailed);
     REQUIRE(emitted.size() > 10); // the emitters really did populate
 
     std::ifstream in(doc);

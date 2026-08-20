@@ -2763,11 +2763,14 @@ TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integrati
     // "additionalProperties":true}) for a non-exempt tool whose result shape
     // is actually stable, per docs/agentic-first-principle.md A5 item 4's
     // own text. assign_engine_role/unassign_engine_role/list_engine_roles
-    // were typed properly as a result of that review; a handful of other
-    // non-exempt tools (the discover_* family, classify_operational_
-    // question, get_incident_playbook, summarize_working_set) still ship
-    // the placeholder and pass this gate anyway - tracked as #2986, not
-    // silently ignored.
+    // were typed properly as a result of that review; #2986 (2026-08-19)
+    // closed the remaining known gap the same way - the discover_* family
+    // and classify_operational_question/get_incident_playbook/
+    // summarize_working_set now carry real typed outputSchemas too (see the
+    // A5 ledger's now-CLOSED #2986 row in docs/agentic-first-principle.md
+    // for why these turned out stable rather than still-settling). This
+    // caveat comment stays: the gate itself is still presence-only, so a
+    // FUTURE tool can still slip through it the same way these did.
     static const std::set<std::string> kOutputSchemaExempt = {};
     for (const auto& tool : tools) {
         const auto name = tool["name"].get<std::string>();
@@ -3138,6 +3141,58 @@ TEST_CASE("MCP: all five discover_* tools are advertised in tools/list",
     for (const char* n : {"discover_permissions", "discover_instructions", "discover_routes",
                           "discover_scope_kinds", "discover_plugins"})
         CHECK(names.count(n) == 1);
+}
+
+// #2986: the 8 tools this fixed (the A2 discovery family + the agentic-demo/
+// incident-response family) previously advertised the generic
+// `kObjectOutputSchema` placeholder ({"type":"object","additionalProperties":
+// true}) as their outputSchema — invisible to the #2972 completeness gate
+// above because that gate only checks PRESENCE, not typed-ness (see its own
+// comment block). This regression guard checks each schema actually carries
+// its real per-field properties now, so a future revert back to the
+// placeholder (which would still pass #2972) fails HERE instead.
+TEST_CASE("MCP: #2986 tools carry real typed outputSchema, not the kObjectOutputSchema "
+          "placeholder",
+          "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":29})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+
+    std::map<std::string, std::vector<std::string>> expected_props = {
+        {"discover_permissions", {"securable_types", "operations", "roles_omitted"}},
+        {"discover_instructions", {"count", "truncated", "instructions"}},
+        {"discover_routes", {"source", "count", "routes"}},
+        {"discover_scope_kinds", {"ground_kinds", "attribute_kinds", "operators", "combinators"}},
+        {"discover_plugins", {"limitation", "actions_enriched_with_schema", "plugins", "commands"}},
+        {"classify_operational_question",
+         {"classification", "rationale", "recommended_next_tools"}},
+        {"get_incident_playbook", {"scenario", "expected_first_tool", "steps", "safety"}},
+        {"summarize_working_set", {"narrative", "resource_links", "recommended_next_tools"}},
+    };
+
+    std::set<std::string> seen;
+    for (const auto& t : body["result"]["tools"]) {
+        const auto name = t["name"].get<std::string>();
+        auto it = expected_props.find(name);
+        if (it == expected_props.end())
+            continue;
+        seen.insert(name);
+        INFO("tool = " << name);
+        REQUIRE(t.contains("outputSchema"));
+        const auto& schema = t["outputSchema"];
+        // The placeholder never has a "properties" object with real keys —
+        // it is exactly {"type":"object","additionalProperties":true}.
+        REQUIRE(schema.contains("properties"));
+        CHECK_FALSE((schema.value("additionalProperties", false) &&
+                     schema["properties"].empty()));
+        for (const auto& prop : it->second) {
+            INFO("property = " << prop);
+            CHECK(schema["properties"].contains(prop));
+        }
+    }
+    CHECK(seen.size() == expected_props.size());
 }
 
 // ── DEX read tools (parity with /api/v1/dex/*; ar-S1) ───────────────────────
@@ -7084,6 +7139,111 @@ TEST_CASE("MCP CA: revoke_certificate full approval-ticket round-trip reaches re
     CHECK(body2["result"]["structuredContent"] == payload);
 }
 
+// #2444 item 3: yuzu_mcp_approval_burned_total{tool,reason}. revoke_certificate
+// is a deliberate pick — its "serial not found" business rejection (CaStore::
+// revoke returning false) is emitted ONLY via the domain-verb audit_fn call
+// ("ca.cert.revoked", result "denied"); the handler never calls mcp_audit for
+// this branch. That makes it a real test of the BurnGuard's design point: the
+// counter must fire from inspecting the actual JSON-RPC response, not from
+// hooking mcp_audit (which this exact branch bypasses).
+TEST_CASE("MCP 2444: yuzu_mcp_approval_burned_total fires on a post-consume handler reject, "
+          "not on schema-invalid or success",
+          "[mcp][2g][approval][metrics]") {
+    yuzu::test::TempDbFile db{std::string_view{"yuzu_test_mcp_ca_burn_"}};
+    yuzu::server::CaStore store(db.path); // deliberately empty — no cert recorded
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_burn_"}};
+    yuzu::test::SqliteHandleOwner<sqlite3> raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw.db) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.db);
+    appr.create_tables();
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.start("supervised");
+
+    const auto burned = [&]() {
+        return reg
+            .counter("yuzu_mcp_approval_burned_total",
+                     {{"tool", "revoke_certificate"}, {"reason", "handler_reject"}})
+            .value();
+    };
+    // Baseline: a fresh, request-local MetricsRegistry (not the production
+    // registry server.cpp pre-seeds) mints any never-touched series at 0.
+    CHECK(burned() == 0.0);
+
+    // 1. A schema-invalid mint attempt (serial_hex fails #2444 item 1's pattern)
+    // never mints a ticket at all (#2441) — nothing to burn, and indeed no
+    // ticket is EVER consumed for this attempt, so the guard must not fire.
+    auto bad_mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"not-hex!"}}})");
+    REQUIRE(bad_mint);
+    auto bad_mint_body = nlohmann::json::parse(bad_mint->body);
+    REQUIRE(bad_mint_body.contains("error"));
+    CHECK(bad_mint_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(appr.pending_count() == 0); // no ticket minted
+    CHECK(burned() == 0.0);
+
+    // 2. Mint a REAL ticket for a schema-valid serial that does not exist in
+    // the (empty) store.
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"BEEF"}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    CHECK(mint_body["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE_FALSE(approval_id.empty());
+    CHECK(burned() == 0.0); // mint itself never consumes — must not count yet
+
+    // 3. Approve, then recall. The ticket IS consumed (schema passed), but the
+    // handler's own store.revoke() call fails (serial not found) — the burn
+    // class #2441 left open.
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"BEEF","approval_id":")" +
+        approval_id + R"("}}})";
+    auto res = ts.call(recall);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error")); // "serial not found or already revoked"
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(burned() == 1.0);
+
+    // 4. A second, independent full success round-trip must NOT increment the
+    // burned counter — success is not a burn.
+    yuzu::server::IssuedCertRecord rec;
+    rec.serial_hex = "FACE";
+    rec.subject = "agent-burn";
+    rec.purpose = "agent";
+    rec.not_after = 4102444800;
+    REQUIRE(store.record_issued(rec));
+    auto mint2 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"FACE"}}})");
+    REQUIRE(mint2);
+    auto mint2_body = nlohmann::json::parse(mint2->body);
+    const std::string approval_id2 =
+        mint2_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id2, "reviewer-bob", "ok"));
+    std::string recall2 =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"FACE","approval_id":")" +
+        approval_id2 + R"("}}})";
+    auto res2 = ts.call(recall2);
+    REQUIRE(res2);
+    auto body2 = nlohmann::json::parse(res2->body);
+    REQUIRE(body2.contains("result")); // SUCCESS
+    CHECK(burned() == 1.0); // unchanged — the burn from step 3 stays the only one
+
+    // 5. The bounded label set: a DIFFERENT tool's series stays at its
+    // pre-seeded 0 — the burn above is attributed to revoke_certificate only.
+    CHECK(reg
+              .counter("yuzu_mcp_approval_burned_total",
+                       {{"tool", "quarantine_device"}, {"reason", "handler_reject"}})
+              .value() == 0.0);
+}
+
 // ── #2395 track D: KEK rotation MCP tools (parity with kek_routes.cpp) ────────
 // rotate_kek / rewrap_secrets / get_kek_status are the MCP twins of
 // POST/GET /api/v1/secrets/kek/*, sharing the SAME KekOps seam (kek_ops_for_test,
@@ -10551,6 +10711,44 @@ TEST_CASE("MCP 2405: execute_bundle step items are validated recursively",
     sqlite3_close(raw);
 }
 
+TEST_CASE("MCP 2444: execute_bundle empty step plugin/action is rejected pre-mint, not "
+          "burned post-consume (adversarial review)",
+          "[mcp][integration][approval][schema]") {
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    // Gate 3 cpp-safety (2026-08-19): the neighboring #2405 tests this was
+    // copied from manage sqlite3* by hand, which leaks on an assertion
+    // failure between open and close — RAII-wrap instead, matching the
+    // sibling #2444 burn-counter test above in this same commit.
+    yuzu::test::SqliteHandleOwner<sqlite3> raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw.db) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.db);
+    appr.create_tables();
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised");
+
+    // Before this fix, "" passed the pre-existing {"type":"string"}-only
+    // step schema, minted a ticket, and only failed post-consume in
+    // validate_bundle_steps — the exact residual burn class #2444 item 3
+    // exists to alert on. minLength:1 now rejects it at the same
+    // pre-approval gate #2405 established for the other tools.
+    auto body = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":309,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-001","steps":[{"plugin":"","action":"a"}]}}})")
+            ->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(appr.pending_count() == 0); // no ticket minted, not just none pending
+
+    auto body2 = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":310,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-001","steps":[{"plugin":"p","action":""}]}}})")
+            ->body);
+    REQUIRE(body2.contains("error"));
+    CHECK(body2["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(appr.pending_count() == 0);
+}
+
 TEST_CASE("MCP 2405: malicious argument keys never reach the envelope or audit detail",
           "[mcp][integration][approval][schema]") {
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
@@ -11023,8 +11221,12 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
          nlohmann::json::parse(R"({"principal_id":"engine:v","new_owner":"o2"})")},
         {"mint_engine_credential", nlohmann::json::parse(R"({"principal_id":"engine:v"})")},
         {"rotate_engine_credential", nlohmann::json::parse(R"({"principal_id":"engine:v"})")},
+        // #2444 item 1: token_id must satisfy the schema's ^[0-9a-f]{24}$
+        // pattern (24 lowercase hex, mirroring ApiTokenStore's
+        // sha256_hex(...).substr(0,24) token_id shape).
         {"confirm_engine_rotation",
-         nlohmann::json::parse(R"({"principal_id":"engine:v","token_id":"t1"})")},
+         nlohmann::json::parse(
+             R"({"principal_id":"engine:v","token_id":"aaaaaaaaaaaaaaaaaaaaaaaa"})")},
         {"assign_engine_role",
          nlohmann::json::parse(R"({"principal_id":"vuln-viewer","role":"Operator"})")},
         {"unassign_engine_role",
@@ -11076,6 +11278,158 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
     }
 }
 
+TEST_CASE("MCP 2444: item 1 schema tightenings reject at compile-validate on the REAL served "
+          "schemas",
+          "[mcp][2g][schema]") {
+    // Real kTools[] schemas, not synthetic ones — proves the served strings
+    // (not just the compiler's keyword logic) carry the tightened bounds.
+    using yuzu::server::mcp::compile_input_schema;
+    std::map<std::string, std::string> schemas;
+    for (const auto& row : input_schemas_for_test())
+        schemas.emplace(row.name, row.schema_json);
+
+    // revoke_certificate.serial_hex: pattern ^[0-9A-Fa-f]{1,64}$ + maxLength 64
+    // mirrors the handler's serial_ok check exactly (mcp_server.cpp).
+    {
+        auto c = compile_input_schema(schemas.at("revoke_certificate"));
+        REQUIRE(c);
+        CHECK_FALSE(c->validate(nlohmann::json::parse(R"({"serial_hex":"AB12"})")));
+        auto bad_char = c->validate(nlohmann::json::parse(R"({"serial_hex":"ZZ12"})"));
+        REQUIRE(bad_char);
+        CHECK(bad_char->path == "/serial_hex");
+        CHECK(c->validate(nlohmann::json::parse(
+            R"({"serial_hex":")" + std::string(65, 'a') + R"("})")));
+        CHECK(c->validate(nlohmann::json::parse(R"({"serial_hex":""})")));
+    }
+    // engine tools' principal_id: engine:<slug> shape, slug in [a-z0-9._-]+ —
+    // mirrors EnginePrincipalStore::create's store-side charset check. Every
+    // OTHER required field is filled in with a valid value so the "missing
+    // required property" check (which runs before per-property validation)
+    // cannot mask the principal_id pattern violation being tested here.
+    const std::map<std::string, std::string> other_required_fields = {
+        {"create_engine_principal",
+         R"("display_name":"d","owner_username":"o","justification":"j","classification":"internal")"},
+        {"get_engine_principal", ""},
+        {"revoke_engine_principal", ""},
+        {"mint_engine_credential", ""},
+        {"rotate_engine_credential", ""},
+        {"transfer_engine_principal_owner", R"("new_owner":"o2")"},
+    };
+    for (const auto& [tool, extra] : other_required_fields) {
+        INFO("tool: " << tool);
+        auto c = compile_input_schema(schemas.at(tool));
+        REQUIRE(c);
+        auto with_pid = [&](const std::string& pid) {
+            std::string body = R"({"principal_id":")" + pid + R"(")";
+            if (!extra.empty())
+                body += "," + extra;
+            body += "}";
+            return nlohmann::json::parse(body);
+        };
+        auto v = c->validate(with_pid("vuln"));
+        REQUIRE(v); // missing "engine:" prefix
+        CHECK(v->path == "/principal_id");
+        CHECK(c->validate(with_pid("engine:"))); // empty slug
+        CHECK(c->validate(with_pid("engine:Has-Upper"))); // uppercase not allowed
+        CHECK_FALSE(c->validate(with_pid("engine:vuln"))); // the valid shape passes
+    }
+    // assign_engine_role/unassign_engine_role/list_engine_roles: bare slug
+    // form (no "engine:" prefix) — same charset, different shape.
+    for (const char* tool : {"assign_engine_role", "unassign_engine_role", "list_engine_roles"}) {
+        INFO("tool: " << tool);
+        auto c = compile_input_schema(schemas.at(tool));
+        REQUIRE(c);
+        CHECK(c->validate(nlohmann::json::parse(R"({"principal_id":"engine:vuln"})")));
+        CHECK(c->validate(nlohmann::json::parse(R"({"principal_id":""})")));
+    }
+    // confirm_engine_rotation.token_id: exactly 24 lowercase hex (ApiTokenStore's
+    // sha256_hex(...).substr(0,24) shape).
+    {
+        auto c = compile_input_schema(schemas.at("confirm_engine_rotation"));
+        REQUIRE(c);
+        CHECK_FALSE(c->validate(nlohmann::json::parse(
+            R"({"principal_id":"engine:v","token_id":"aaaaaaaaaaaaaaaaaaaaaaaa"})")));
+        CHECK(c->validate(nlohmann::json::parse(
+            R"({"principal_id":"engine:v","token_id":"AAAAAAAAAAAAAAAAAAAAAAAA"})"))); // uppercase
+        CHECK(c->validate(nlohmann::json::parse(
+            R"({"principal_id":"engine:v","token_id":"aaaa"})"))); // too short
+    }
+    // quarantine_device.reason (<=1024) / whitelist (<=512, charset).
+    {
+        auto c = compile_input_schema(schemas.at("quarantine_device"));
+        REQUIRE(c);
+        CHECK_FALSE(c->validate(nlohmann::json::parse(R"({"agent_id":"a"})")));
+        CHECK(c->validate(nlohmann::json::parse(
+            R"({"agent_id":"a","reason":")" + std::string(1025, 'x') + R"("})")));
+        CHECK(c->validate(nlohmann::json::parse(
+            R"({"agent_id":"a","whitelist":")" + std::string(513, '1') + R"("})")));
+        // Charset: hex digits, '.', ':', ',', ' ' only — mirrors the handler's
+        // safe_ip per-token check (a superset, per the code comment: the
+        // token-splitting/45-char-per-token structure stays handler-side).
+        CHECK(c->validate(
+            nlohmann::json::parse(R"({"agent_id":"a","whitelist":"10.0.0.1;rm -rf /"})")));
+        CHECK_FALSE(c->validate(
+            nlohmann::json::parse(R"({"agent_id":"a","whitelist":"10.0.0.1, ::1"})")));
+    }
+}
+
+// Gate 3 quality-engineer (2026-08-19): item 2's ~30 plain `minLength:1`
+// additions had coverage only for the 5 tools item 1 also pattern-tightened
+// (above) plus execute_bundle's steps. The remaining ~27 fields had zero
+// direct empty-string-rejection assertion — the schema compiler's own tests
+// prove keyword LOGIC works, not that these specific served schemas still
+// CARRY the keyword. Data-driven, one field per distinct tool family, so a
+// silent future removal of any minLength:1 in this set fails here rather
+// than going undetected.
+TEST_CASE("MCP 2444: item 2 minLength:1 sweep — one field per tool family rejects empty "
+          "string on the REAL served schema",
+          "[mcp][2g][schema]") {
+    using yuzu::server::mcp::compile_input_schema;
+    std::map<std::string, std::string> schemas;
+    for (const auto& row : input_schemas_for_test())
+        schemas.emplace(row.name, row.schema_json);
+
+    struct Case {
+        const char* tool;
+        const char* field;
+        const char* other_required; // raw JSON fragment, no leading comma; "" if none
+    };
+    static const Case kCases[] = {
+        {"set_tag", "agent_id", R"("key":"k","value":"v")"},
+        {"delete_tag", "key", R"("agent_id":"a")"},
+        {"approve_request", "approval_id", ""},
+        {"reject_request", "approval_id", ""},
+        {"validate_scope", "expression", ""},
+        {"preview_scope_targets", "expression", ""},
+        {"get_agent_details", "agent_id", ""},
+        {"create_engine_principal", "display_name",
+         R"("principal_id":"engine:v","owner_username":"o","justification":"j","classification":"internal")"},
+        {"rotate_api_token", "token_id", ""},
+        {"confirm_api_token_rotation", "token_id", ""},
+        {"transfer_engine_principal_owner", "new_owner", R"("principal_id":"engine:v")"},
+        {"unassign_engine_role", "role", R"("principal_id":"vuln")"},
+        {"classify_operational_question", "question", ""},
+        {"open_access_review", "title", ""},
+        {"get_access_review", "campaign_id", ""},
+        {"close_access_review", "campaign_id", ""},
+        {"record_attestation", "campaign_id",
+         R"("principal_type":"user","principal_id":"p","role_name":"r","decision":"attested")"},
+    };
+    for (const auto& c : kCases) {
+        INFO("tool: " << c.tool << " field: " << c.field);
+        REQUIRE(schemas.count(c.tool) > 0);
+        auto compiled = compile_input_schema(schemas.at(c.tool));
+        REQUIRE(compiled);
+        std::string body = "{\"" + std::string(c.field) + "\":\"\"";
+        if (*c.other_required != '\0')
+            body += std::string(",") + c.other_required;
+        body += "}";
+        auto violation = compiled->validate(nlohmann::json::parse(body));
+        REQUIRE(violation); // empty string must violate minLength:1
+        CHECK(violation->path == "/" + std::string(c.field));
+    }
+}
+
 TEST_CASE("MCP 2405: real gated schemas enforce enum, bounds and maxLength at the gate",
           "[mcp][integration][approval][schema]") {
     // The pure-compiler test proves the keyword LOGIC on synthetic schemas;
@@ -11116,7 +11470,8 @@ TEST_CASE("MCP 2405: real gated schemas enforce enum, bounds and maxLength at th
         deny(
             R"({"jsonrpc":"2.0","method":"tools/call","id":321,"params":{"name":"mint_engine_credential","arguments":{"principal_id":"engine:v","ttl_days":91}}})",
             "'/ttl_days'");
-        // maxLength: confirm_engine_rotation.token_id <= 64 bytes.
+        // maxLength (#2444 item 1 tightened this to 24, alongside the new
+        // ^[0-9a-f]{24}$ pattern — a 65-char value still exceeds both).
         deny((std::string(
                   R"({"jsonrpc":"2.0","method":"tools/call","id":322,"params":{"name":"confirm_engine_rotation","arguments":{"principal_id":"engine:v","token_id":")") +
               std::string(65, 'a') + R"("}}})")
@@ -13052,6 +13407,56 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         CHECK(bridge.record_count() == 0);  // reserved then abandoned on subscribe throw
         CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "subscribe_failed"}})
                   .value() == 1.0);
+    }
+
+    SECTION("create_execution failure degrades to the plain path, dispatch still runs, counted") {
+        // #2413: a real ExecutionTracker bound to no database. create_execution
+        // returns std::unexpected("database not open") deterministically, with
+        // no I/O and no fault-injection seam needed on the bridge side - this is
+        // the same failure class CLAUDE.md calls "a failed sqlite3_prepare".
+        yuzu::server::ExecutionTracker broken(nullptr);
+        ts.execution_tracker_for_test = &broken;
+
+        auto dispatch = [&](const std::string&, const std::string&,
+                            const std::vector<std::string>&, const std::string&,
+                            const std::unordered_map<std::string, std::string>&,
+                            const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+            return {"cmd-noexecrow", 2};
+        };
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto res = call_exec(exec_body(14, true));
+        REQUIRE(res->status == 200);
+        auto j = nlohmann::json::parse(res->body);
+        REQUIRE(j.contains("result"));  // plain success shape - degrade is silent to the caller
+        auto text = nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+        // dispatch still happened - a broken tracker must never block the
+        // operator's "stop NOW" semantic (the comment at the site this test
+        // covers).
+        CHECK(text["command_id"] == "cmd-noexecrow");
+        // create_execution never produced a row, so there is no durable fetch
+        // handle for this run - execution_id must be empty, not a fresh one
+        // silently generated some other way.
+        CHECK(text["execution_id"].get<std::string>().empty());
+        // No bridge record at all: bridge_active was cleared before the
+        // subscribe fork runs (S2/S3), so this never reaches reserve/subscribe.
+        CHECK(bridge.record_count() == 0);
+        CHECK_FALSE(bridge.phase_for(sid, nlohmann::json(14)).has_value());
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "no_execution_row"}})
+                  .value() == 1.0);
+        // Regression guard for the fix documented at the site (streamed_active +
+        // stream_lease reset before this degrade fires): no OTHER reason moved,
+        // i.e. this is not double-counted through a later fork in the same
+        // request.
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "reserve_rejected"}})
+                  .value() == 0.0);
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "reserve_threw"}})
+                  .value() == 0.0);
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "subscribe_failed"}})
+                  .value() == 0.0);
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "arm_threw"}})
+                  .value() == 0.0);
     }
 }
 

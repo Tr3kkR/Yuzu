@@ -365,7 +365,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}}},"required":["agents"]})j"},
 
     {"get_agent_details", "Get detailed info for a single agent including tags and inventory.",
-     R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})",
+     R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"description":"Agent ID"}},"required":["agent_id"]})",
      R"j({"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"tags":{"type":"array","items":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"source":{"type":"string"}},"required":["key","value","source"]}}},"required":["agent_id","hostname","os","arch","agent_version"]})j"},
 
     {"query_audit_log",
@@ -419,7 +419,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"tables":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string"},"agent_count":{"type":"integer"},"last_collected":{"type":"integer"}},"required":["plugin","agent_count","last_collected"]}}},"required":["tables"]})j"},
 
     {"get_agent_inventory", "Get all inventory data for a specific agent.",
-     R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})",
+     R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"description":"Agent ID"}},"required":["agent_id"]})",
      R"j({"type":"object","properties":{"records":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string"},"data":{"type":"string"},"collected_at":{"type":"integer"}},"required":["plugin","data","collected_at"]}},"result_truncated_by_cap":{"type":"boolean"}},"required":["records","result_truncated_by_cap"]})j"},
 
     {"query_installed_software",
@@ -479,14 +479,14 @@ static const ToolDef kTools[] = {
 
     {"validate_scope",
      "Validate a scope expression without executing it. Returns parse errors if invalid.",
-     R"({"type":"object","properties":{"expression":{"type":"string","description":"Scope expression to validate"}},"required":["expression"]})",
+     R"({"type":"object","properties":{"expression":{"type":"string","minLength":1,"description":"Scope expression to validate"}},"required":["expression"]})",
      R"j({"oneOf":[)j"
      R"j({"type":"object","properties":{"valid":{"const":true},"expression":{"type":"string","description":"The input expression, echoed back verbatim (not canonicalized)"}},"required":["valid","expression"],"additionalProperties":false},)j"
      R"j({"type":"object","properties":{"valid":{"const":false},"error":{"type":"string","description":"Parse error message"}},"required":["valid","error"],"additionalProperties":false})j"
      R"j(]})j"},
 
     {"preview_scope_targets", "Show which agents match a scope expression.",
-     R"({"type":"object","properties":{"expression":{"type":"string","description":"Scope expression"}},"required":["expression"]})",
+     R"({"type":"object","properties":{"expression":{"type":"string","minLength":1,"description":"Scope expression"}},"required":["expression"]})",
      R"j({"type":"object","properties":{"expression":{"type":"string"},"matched_count":{"type":"integer"},"matched_agents":{"type":"array","items":{"type":"string"}},"warning":{"type":"string","description":"Present only when the match count exceeds the display threshold"}},"required":["expression","matched_count","matched_agents"]})j"},
 
     {"list_pending_approvals", "List pending approval requests.",
@@ -822,9 +822,9 @@ static const ToolDef kTools[] = {
      "(cut N round-trips to 1). Each step is {plugin, action, params?}; 1-32 steps, distinct "
      "(plugin,action). Mirrors POST /api/v1/bundles. Requires Execution:Execute.",
      R"j({"type":"object","properties":{)j"
-     R"j("agent_id":{"type":"string","description":"The single target device — a bundle targets one device"},)j"
+     R"j("agent_id":{"type":"string","minLength":1,"description":"The single target device — a bundle targets one device"},)j"
      R"j("steps":{"type":"array","minItems":1,"maxItems":32,"description":"1-32 plugin actions to fan out","items":{"type":"object","properties":{)j"
-     R"j("plugin":{"type":"string"},"action":{"type":"string"},)j"
+     R"j("plugin":{"type":"string","minLength":1},"action":{"type":"string","minLength":1},)j"
      R"j("params":{"type":"object","additionalProperties":{"type":"string"}})j"
      R"j(},"required":["plugin","action"]}})j"
      R"j(},"required":["agent_id","steps"]})j",
@@ -838,7 +838,7 @@ static const ToolDef kTools[] = {
      "succeeded=0); check succeeded==expected for success. Mirrors GET /api/v1/bundles/{id}. "
      "Requires Response:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("bundle_id":{"type":"string","description":"The bundle id (bundle-…) returned by execute_bundle"})j"
+     R"j("bundle_id":{"type":"string","minLength":1,"description":"The bundle id (bundle-…) returned by execute_bundle"})j"
      R"j(},"required":["bundle_id"]})j",
      R"j({"type":"object","properties":{)j"
      R"j("complete":{"type":"boolean","description":"True once every step is terminal - NOT a success signal, check succeeded==expected"},)j"
@@ -864,7 +864,11 @@ static const ToolDef kTools[] = {
      "POST /api/v1/ca/revoke. Destructive — requires Security:Delete (supervised MCP tier; "
      "approval-gated like every other destructive MCP op).",
      R"j({"type":"object","properties":{)j"
-     R"j("serial_hex":{"type":"string","description":"Cert serial (1-64 hex) from list_issued_certs"},)j"
+     // #2444 item 1: mirrors the handler's own serial_ok check (serial.size()<=64
+     // + hex charset) exactly, so a malformed serial_hex is refused by schema
+     // (no ticket ever minted/consumed, #2441) instead of burning an
+     // already-approved ticket at the handler below.
+     R"j("serial_hex":{"type":"string","pattern":"^[0-9A-Fa-f]{1,64}$","maxLength":64,"description":"Cert serial (1-64 hex) from list_issued_certs"},)j"
      R"j("reason":{"type":"string","description":"Optional revocation reason (audited)"})j"
      R"j(},"required":["serial_hex"]})j",
      R"j({"type":"object","properties":{"revoked":{"const":true},"serial_hex":{"type":"string"},"crl_republished":{"type":"boolean"},)j"
@@ -896,10 +900,16 @@ static const ToolDef kTools[] = {
      "MCP tier; maker-checker approval like every other privileged MCP op). Additive: creates a "
      "new identity, overwrites nothing.",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"Reserved namespace id, e.g. engine:vuln (must start with \"engine:\" + a non-empty lowercase/digit/./_/- slug)"},)j"
-     R"j("display_name":{"type":"string","description":"UI/audit label"},)j"
-     R"j("owner_username":{"type":"string","description":"Named responsible human; must reference an existing user"},)j"
-     R"j("justification":{"type":"string","description":"Grant justification captured at creation (feeds access reviews)"},)j"
+     // #2444 item 1: engine tools' principal_id shape (engine:<slug>, slug in
+     // [a-z0-9._-]+) is currently enforced ONLY in EnginePrincipalStore::create
+     // (store-side) — a malformed id passes schema, mints/consumes an approval
+     // ticket, then is rejected by the store. The pattern mirrors that store
+     // charset check exactly (never stricter — no invented length cap: neither
+     // the store nor the DB CHECK constraint bounds slug length).
+     R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"Reserved namespace id, e.g. engine:vuln (must start with \"engine:\" + a non-empty lowercase/digit/./_/- slug)"},)j"
+     R"j("display_name":{"type":"string","minLength":1,"description":"UI/audit label"},)j"
+     R"j("owner_username":{"type":"string","minLength":1,"description":"Named responsible human; must reference an existing user"},)j"
+     R"j("justification":{"type":"string","minLength":1,"description":"Grant justification captured at creation (feeds access reviews)"},)j"
      R"j("classification":{"type":"string","enum":["internal","external"],"description":"Required at creation, no default"})j"
      R"j(},"required":["principal_id","display_name","owner_username","justification","classification"]})j",
      R"j({"type":"object","properties":{"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_username":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"created_at":{"type":"integer"}},"required":["principal_id","lifecycle_state"]})j"},
@@ -916,7 +926,7 @@ static const ToolDef kTools[] = {
      "Get one engine principal's identity row plus its active-credential count. Mirrors GET "
      "/api/v1/engine-principals/{id}. Requires EnginePrincipal:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"})j"
+     R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"})j"
      R"j(},"required":["principal_id"]})j",
      R"j({"type":"object","properties":{"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_username":{"type":"string"},"justification":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"superseded_by":{"type":"string"},"created_at":{"type":"integer"},"revoked_at":{"type":"integer"},"created_by":{"type":"string"},"active_credentials":{"type":"integer"}},"required":["principal_id","lifecycle_state"]})j"},
 
@@ -929,7 +939,7 @@ static const ToolDef kTools[] = {
      "Mirrors DELETE /api/v1/engine-principals/{id}. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"},)j"
+     R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"},)j"
      R"j("reason":{"type":"string","description":"Optional revocation reason (audited)"},)j"
      R"j("superseded_by":{"type":"string","description":"Optional successor engine principal id, recorded on this row for audit trail continuity"})j"
      R"j(},"required":["principal_id"]})j",
@@ -946,7 +956,7 @@ static const ToolDef kTools[] = {
      "credential issuance; supervised MCP tier; maker-checker approval). Additive: issues the "
      "first credential, overwrites nothing.",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"},)j"
+     R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"},)j"
      R"j("name":{"type":"string","description":"Human-readable credential label"},)j"
      R"j("ttl_days":{"type":"integer","default":90,"minimum":1,"maximum":90,"description":"Credential lifetime in days (90-day ceiling, design doc §7)"})j"
      R"j(},"required":["principal_id"]})j",
@@ -964,7 +974,7 @@ static const ToolDef kTools[] = {
      "/api/v1/engine-principals/{id}/credentials/rotate. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"},)j"
+     R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"},)j"
      R"j("overlap_days":{"type":"integer","default":7,"minimum":1,"maximum":3650,"description":"Overlap window before the predecessor auto-revokes; rejected outright (never truncated) if it would fall below the 24h floor"})j"
      R"j(},"required":["principal_id"]})j",
      R"j({"type":"object","properties":{"token_id":{"type":"string"},"raw_token":{"type":"string","description":"One-time (or bounded-replay) reveal — capture now"},"principal_id":{"type":"string"},"overlap_expires_at":{"type":"integer"}},"required":["token_id","raw_token","principal_id"]})j"},
@@ -996,8 +1006,14 @@ static const ToolDef kTools[] = {
      "/api/v1/engine-principals/{id}/credentials/confirm. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"},)j"
-     R"j("token_id":{"type":"string","maxLength":64,"description":"Successor token_id returned by rotate_engine_credential (24 lowercase hex) - pins the exact rotation being confirmed"})j"
+     // #2444 item 1: token_id is minted as sha256_hex(raw).substr(0,24) —
+     // ApiTokenStore::mint/rotate (api_token_store.cpp) — always exactly 24
+     // lowercase hex chars. maxLength alone (the pre-#2444 schema) let a
+     // schema-valid-but-wrong-shape token_id mint/consume a ticket only to be
+     // rejected by confirm_rotation's own lookup; the pattern now bounds the
+     // exact shape so that rejection happens before a ticket is ever touched.
+     R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"},)j"
+     R"j("token_id":{"type":"string","pattern":"^[0-9a-f]{24}$","maxLength":24,"description":"Successor token_id returned by rotate_engine_credential (24 lowercase hex) - pins the exact rotation being confirmed"})j"
      R"j(},"required":["principal_id","token_id"]})j",
      R"j({"type":"object","properties":{"confirmed":{"type":"boolean"},"principal_id":{"type":"string"}},"required":["confirmed","principal_id"]})j"},
 
@@ -1021,7 +1037,7 @@ static const ToolDef kTools[] = {
      "PREDECESSOR's own stamp (the successor row never carries one). Mirrors POST "
      "/api/v1/tokens/{id}/rotate. Destructive — requires ApiToken:Rotate.",
      R"j({"type":"object","properties":{)j"
-     R"j("token_id":{"type":"string","maxLength":64,"description":"The token_id of the predecessor token being rotated — must be owned by the calling principal"},)j"
+     R"j("token_id":{"type":"string","minLength":1,"maxLength":64,"description":"The token_id of the predecessor token being rotated — must be owned by the calling principal"},)j"
      R"j("overlap_days":{"type":"integer","default":7,"minimum":1,"maximum":3650,"description":"Overlap window before the predecessor auto-revokes; rejected outright (never truncated) if it would fall below the 24h floor"})j"
      R"j(},"required":["token_id"]})j",
      R"j({"type":"object","properties":{"token_id":{"type":"string","description":"The successor's token_id, scoped exactly to the predecessor rotated"},"raw_token":{"type":"string","description":"One-time (or bounded-replay) reveal — capture now"},"expires_at":{"type":"integer","description":"The successor's expiry — inherited from the predecessor verbatim"},"overlap_expires_at":{"type":"integer","description":"The PREDECESSOR's own overlap-expiry stamp"}},"required":["token_id","raw_token","expires_at","overlap_expires_at"]})j"},
@@ -1044,7 +1060,7 @@ static const ToolDef kTools[] = {
      "applies. Self-service ONLY, same owner-vs-nonexistent posture as rotate_api_token. Mirrors "
      "POST /api/v1/tokens/{id}/confirm. Destructive — requires ApiToken:Rotate.",
      R"j({"type":"object","properties":{)j"
-     R"j("token_id":{"type":"string","maxLength":64,"description":"Successor token_id returned by rotate_api_token (pins the exact rotation being confirmed) — must be owned by the calling principal"})j"
+     R"j("token_id":{"type":"string","minLength":1,"maxLength":64,"description":"Successor token_id returned by rotate_api_token (pins the exact rotation being confirmed) — must be owned by the calling principal"})j"
      R"j(},"required":["token_id"]})j",
      R"j({"type":"object","properties":{"confirmed":{"type":"boolean"},"token_id":{"type":"string"}},"required":["confirmed","token_id"]})j"},
 
@@ -1056,8 +1072,8 @@ static const ToolDef kTools[] = {
      "/api/v1/engine-principals/{id}/transfer-owner. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"},)j"
-     R"j("new_owner":{"type":"string","description":"Username of the new responsible human; must reference an existing user"})j"
+     R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"},)j"
+     R"j("new_owner":{"type":"string","minLength":1,"description":"Username of the new responsible human; must reference an existing user"})j"
      R"j(},"required":["principal_id","new_owner"]})j",
      R"j({"type":"object","properties":{"transferred":{"type":"boolean"},"principal_id":{"type":"string"},"new_owner":{"type":"string"}},"required":["transferred","principal_id","new_owner"]})j"},
 
@@ -1094,8 +1110,8 @@ static const ToolDef kTools[] = {
      "Requires the operator or supervised MCP tier (Tag:Write). Fires the agent tag-push on "
      "a structured-category change, exactly like the REST path.",
      R"j({"type":"object","properties":{)j"
-     R"j("agent_id":{"type":"string","description":"Target agent id"},)j"
-     R"j("key":{"type":"string","description":"Tag key (category keys role/environment/location/service are case-normalised)"},)j"
+     R"j("agent_id":{"type":"string","minLength":1,"description":"Target agent id"},)j"
+     R"j("key":{"type":"string","minLength":1,"description":"Tag key (category keys role/environment/location/service are case-normalised)"},)j"
      R"j("value":{"type":"string","description":"Tag value; category keys validate against their allowed set"})j"
      R"j(},"required":["agent_id","key","value"]})j",
      R"j({"type":"object","properties":{"set":{"const":true},"agent_id":{"type":"string"},"key":{"type":"string"},)j"
@@ -1110,8 +1126,8 @@ static const ToolDef kTools[] = {
      "call returns an approval ticket (kApprovalRequired), re-call with the returned approval_id "
      "after an admin approves.",
      R"j({"type":"object","properties":{)j"
-     R"j("agent_id":{"type":"string","description":"Target agent id"},)j"
-     R"j("key":{"type":"string","description":"Tag key to delete"},)j"
+     R"j("agent_id":{"type":"string","minLength":1,"description":"Target agent id"},)j"
+     R"j("key":{"type":"string","minLength":1,"description":"Tag key to delete"},)j"
      R"j("approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after admin approval to execute"})j"
      R"j(},"required":["agent_id","key"]})j",
      R"j({"type":"object","properties":{"deleted":{"const":true},"agent_id":{"type":"string"},"key":{"type":"string"},)j"
@@ -1126,7 +1142,7 @@ static const ToolDef kTools[] = {
      "interchangeable response shapes). Requires Approval:Approve, supervised MCP tier. The "
      "reviewer cannot be the submitter.",
      R"j({"type":"object","properties":{)j"
-     R"j("approval_id":{"type":"string","description":"Id of the pending approval to approve"},)j"
+     R"j("approval_id":{"type":"string","minLength":1,"description":"Id of the pending approval to approve"},)j"
      R"j("comment":{"type":"string","description":"Optional reviewer comment (audited)"})j"
      R"j(},"required":["approval_id"]})j",
      R"j({"type":"object","properties":{"approved":{"const":true},"approval_id":{"type":"string"},)j"
@@ -1141,7 +1157,7 @@ static const ToolDef kTools[] = {
      "interchangeable response shapes). Requires Approval:Approve, supervised MCP tier. The "
      "reviewer cannot be the submitter.",
      R"j({"type":"object","properties":{)j"
-     R"j("approval_id":{"type":"string","description":"Id of the pending approval to reject"},)j"
+     R"j("approval_id":{"type":"string","minLength":1,"description":"Id of the pending approval to reject"},)j"
      R"j("comment":{"type":"string","description":"Optional reviewer comment (audited)"})j"
      R"j(},"required":["approval_id"]})j",
      R"j({"type":"object","properties":{"rejected":{"const":true},"approval_id":{"type":"string"},)j"
@@ -1155,9 +1171,18 @@ static const ToolDef kTools[] = {
      "approval-gated on the supervised tier — the first call returns an approval ticket, re-call "
      "with the returned approval_id after an admin approves.",
      R"j({"type":"object","properties":{)j"
-     R"j("agent_id":{"type":"string","description":"Target agent id"},)j"
-     R"j("reason":{"type":"string","description":"Optional quarantine reason (audited)"},)j"
-     R"j("whitelist":{"type":"string","description":"Comma-separated extra IPs to allow through the isolation firewall"},)j"
+     // #2444 item 1: mirror the handler's own limits so an oversized/off-charset
+     // reason or whitelist is refused by schema instead of burning an
+     // already-approved ticket. reason's bound is length-only (free text,
+     // audited verbatim); whitelist's pattern is a CHARSET superset of the
+     // handler's per-token safe_ip check (hex digits, '.', ':', separated by
+     // ',' and optional spaces) — deliberately not a byte-for-byte replica of
+     // the token-splitting/45-char-per-token logic (that stays handler-side,
+     // #2444: risk of a schema/handler mismatch false-rejecting a legal
+     // whitelist outweighs closing the last sliver of this burn class).
+     R"j("agent_id":{"type":"string","minLength":1,"description":"Target agent id"},)j"
+     R"j("reason":{"type":"string","maxLength":1024,"description":"Optional quarantine reason (audited)"},)j"
+     R"j("whitelist":{"type":"string","maxLength":512,"pattern":"^[0-9A-Fa-f.:, ]*$","description":"Comma-separated extra IPs to allow through the isolation firewall"},)j"
      R"j("approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after admin approval to execute"})j"
      R"j(},"required":["agent_id"]})j",
      R"j({"type":"object","properties":{)j"
@@ -1184,8 +1209,11 @@ static const ToolDef kTools[] = {
      "/api/v1/engine-principals/{id}/roles. Requires Security:Write (supervised MCP tier; "
      "approval-gated like every other Security:Write operation).",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"Engine principal slug WITHOUT the engine: prefix (e.g. vuln-viewer)"},)j"
-     R"j("role":{"type":"string","description":"An existing RBAC role name (see discover_permissions for the catalog); admin/Administrator/any built-in system role is rejected"})j"
+     // #2444 item 1: the bare-slug charset check (A1, [a-z0-9._-]+) runs
+     // AFTER the ticket is minted/consumed today — same handler-side pattern
+     // as the engine:<slug> form above, just without the prefix.
+     R"j("principal_id":{"type":"string","pattern":"^[a-z0-9._-]+$","description":"Engine principal slug WITHOUT the engine: prefix (e.g. vuln-viewer)"},)j"
+     R"j("role":{"type":"string","minLength":1,"description":"An existing RBAC role name (see discover_permissions for the catalog); admin/Administrator/any built-in system role is rejected"})j"
      R"j(},"required":["principal_id","role"]})j",
      R"j({"type":"object","properties":{"assigned":{"type":"boolean"},"principal_id":{"type":"string"},"role":{"type":"string"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
@@ -1198,8 +1226,8 @@ static const ToolDef kTools[] = {
      "module may be actively relying on; verify the module doesn't need this role before "
      "calling. Requires Security:Write (supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"Engine principal slug WITHOUT the engine: prefix"},)j"
-     R"j("role":{"type":"string","description":"The role name to revoke"})j"
+     R"j("principal_id":{"type":"string","pattern":"^[a-z0-9._-]+$","description":"Engine principal slug WITHOUT the engine: prefix"},)j"
+     R"j("role":{"type":"string","minLength":1,"description":"The role name to revoke"})j"
      R"j(},"required":["principal_id","role"]})j",
      R"j({"type":"object","properties":{"unassigned":{"type":"boolean"},"principal_id":{"type":"string"},"role":{"type":"string"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
@@ -1211,7 +1239,7 @@ static const ToolDef kTools[] = {
      "to audit what an autonomous module can actually do right now. Mirrors GET "
      "/api/v1/engine-principals/{id}/roles. Requires EnginePrincipal:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"Engine principal slug WITHOUT the engine: prefix"})j"
+     R"j("principal_id":{"type":"string","pattern":"^[a-z0-9._-]+$","description":"Engine principal slug WITHOUT the engine: prefix"})j"
      R"j(},"required":["principal_id"]})j",
      R"j({"type":"object","properties":{"principal_id":{"type":"string"},"count":{"type":"integer"},)j"
      R"j("roles":{"type":"array","items":{"type":"object","properties":{"principal_id":{"type":"string"},"role":{"type":"string"}},"required":["principal_id","role"]}})j"
@@ -1230,19 +1258,29 @@ static const ToolDef kTools[] = {
      "requires_external_connector, unsafe_without_approval, or outside_yuzu_scope. Use this "
      "before planning incident work, especially for OpenShift, KVM, database, and SaaS asks. "
      "Advisory classification only, not a security gate.",
-     R"({"type":"object","properties":{"question":{"type":"string","maxLength":2048}},"required":["question"]})",
-     kObjectOutputSchema},
+     R"({"type":"object","properties":{"question":{"type":"string","minLength":1,"maxLength":2048}},"required":["question"]})",
+     // #2986: shape is fully deterministic — classification is one of the 5
+     // literals the keyword classifier below can produce, requires_connector
+     // is always present (empty string when not applicable, never omitted).
+     R"j({"type":"object","properties":{"classification":{"type":"string","enum":["answerable_now","answerable_with_live_dispatch","requires_external_connector","unsafe_without_approval","outside_yuzu_scope"]},"rationale":{"type":"string"},"requires_connector":{"type":"string","description":"Empty unless classification is requires_external_connector"},"safe_first_tool":{"type":"string"},"recommended_next_tools":{"type":"array","items":{"type":"string"}},"approval_required_before_execution":{"type":"boolean"}},"required":["classification","rationale","requires_connector","safe_first_tool","recommended_next_tools","approval_required_before_execution"]})j"},
     {"get_incident_playbook",
      "Return the recommended Yuzu investigation workflow for a named incident scenario, including "
      "the first tool, safe tool path, connector gaps, and approval boundaries. Workflow guidance "
      "only.",
      R"({"type":"object","properties":{"scenario":{"type":"string","maxLength":2048,"description":"Exact scenario name, category, or curated tag (e.g. openshift, teams, crowdstrike, postgres, buildx) — matched exactly, not by substring"}},"required":["scenario"]})",
-     kObjectOutputSchema},
+     // #2986: every field of IncidentPlaybook (mcp_agentic_catalog.hpp) is a
+     // plain string, always emitted (requires_connector is "" when the
+     // scenario needs none, never omitted); steps/safety are always arrays
+     // of strings — the shape does not vary by scenario.
+     R"j({"type":"object","properties":{"scenario":{"type":"string"},"title":{"type":"string"},"category":{"type":"string"},"classification":{"type":"string"},"expected_first_tool":{"type":"string"},"requires_connector":{"type":"string","description":"Empty when the playbook needs no external connector"},"summary":{"type":"string"},"steps":{"type":"array","items":{"type":"string"}},"safety":{"type":"array","items":{"type":"string"}}},"required":["scenario","title","category","classification","expected_first_tool","requires_connector","summary","steps","safety"]})j"},
     {"summarize_working_set",
      "Summarize an agent/result-set/execution scope into a model-ready narrative with resource "
      "links and next tools instead of dumping unbounded rows. Summarization only.",
      R"({"type":"object","properties":{"kind":{"type":"string","enum":["fleet","agent","execution","result_set"],"default":"fleet"},"id":{"type":"string"},"limit":{"type":"integer","default":25,"maximum":100}}})",
-     kObjectOutputSchema},
+     // #2986: kind/id/limit echo the (possibly-defaulted) input; narrative,
+     // resource_links, and recommended_next_tools are always populated
+     // (empty id, or the fleet-fallback branch, still produce a narrative).
+     R"j({"type":"object","properties":{"kind":{"type":"string","enum":["fleet","agent","execution","result_set"]},"id":{"type":"string"},"limit":{"type":"integer"},"narrative":{"type":"string"},"resource_links":{"type":"array","items":{"type":"string"}},"recommended_next_tools":{"type":"array","items":{"type":"string"}}},"required":["kind","id","limit","narrative","resource_links","recommended_next_tools"]})j"},
 
     // ── A2 discovery tools (roadmap Issue 17.1, docs/agentic-first-principle.md
     // §A2) — mirrors of the GET /api/v1/discover/* REST family, sharing the SAME
@@ -1252,21 +1290,44 @@ static const ToolDef kTools[] = {
     {"discover_permissions",
      "RBAC permission catalog: every securable_type x operation pair the RBAC store "
      "recognizes, plus the full role -> allowed-operations grid. Read-only catalog.",
-     R"({"type":"object","properties":{}})", kObjectOutputSchema},
+     R"({"type":"object","properties":{}})",
+     // #2986: build_permissions_catalog (discover_routes.cpp) always emits
+     // version/description/securable_types/operations; the role grid is
+     // conditional on the caller's UserManagement:Read (#2376 floor) —
+     // EITHER "roles" is present OR "roles_omitted"+"roles_omitted_reason"
+     // are (never both, never neither) — so those three stay out of
+     // "required" rather than forcing a stricter oneOf this codebase's
+     // other optional-field schemas (e.g. get_kek_status) don't use either.
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"securable_types":{"type":"array","items":{"type":"string"}},"operations":{"type":"array","items":{"type":"string"}},"roles":{"type":"array","description":"Present only for a caller holding UserManagement:Read (#2376 floor); absent when roles_omitted is true","items":{"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"},"is_system":{"type":"boolean"},"permissions":{"type":"array","items":{"type":"object","properties":{"securable_type":{"type":"string"},"operation":{"type":"string"},"effect":{"type":"string"}},"required":["securable_type","operation","effect"]}}},"required":["name","description","is_system","permissions"]}},"roles_omitted":{"type":"boolean","description":"Present (true) only when the caller lacks UserManagement:Read — the grid above is withheld, stated explicitly rather than a silent empty array"},"roles_omitted_reason":{"type":"string","description":"Present in lockstep with roles_omitted"}},"required":["version","description","securable_types","operations"]})j"},
     {"discover_instructions",
      "Published (enabled) InstructionDefinition catalog with parameter_schema — the "
      "commands this worker may dispatch via execute_instruction. Read-only catalog.",
-     R"({"type":"object","properties":{}})", kObjectOutputSchema},
+     R"({"type":"object","properties":{}})",
+     // #2986: build_instructions_catalog's envelope is fixed; each entry's
+     // parameter_schema is itself an arbitrary nested JSON Schema document
+     // (or null when the stored value doesn't parse, OR parses to something
+     // other than an object — array/string/number/bool are nulled out too,
+     // discover_routes.cpp's is_object() guard) — genuinely variable BY
+     // DESIGN, so it is typed generically rather than pretending to know
+     // its shape, same idiom as get_access_review's "campaign":{"type":"object"}.
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"count":{"type":"integer"},"truncated":{"type":"boolean"},"instructions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":["object","null"],"description":"Nested JSON Schema when the stored value parses as JSON AND is itself an object, else null"},"platforms":{"type":"string","description":"Comma-separated OS list, e.g. windows,linux,darwin"},"approval_mode":{"type":"string"}},"required":["id","name","plugin","action","description","parameter_schema","platforms","approval_mode"]}}},"required":["version","description","count","truncated","instructions"]})j"},
     {"discover_routes",
      "REST route catalog — subset of the same OpenAPI document GET /api/v1/openapi.json "
      "serves. Hand-maintained source, so it can under-report an undocumented route "
      "(the response carries a caveat field). Read-only catalog.",
-     R"({"type":"object","properties":{}})", kObjectOutputSchema},
+     R"({"type":"object","properties":{}})",
+     // #2986: build_routes_catalog's per-route projection is fixed
+     // (method/path/summary/tags/description) regardless of which OpenAPI
+     // operations exist — the route COUNT varies, the shape does not.
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"source":{"type":"string"},"description":{"type":"string"},"caveat":{"type":"string"},"count":{"type":"integer"},"routes":{"type":"array","items":{"type":"object","properties":{"method":{"type":"string"},"path":{"type":"string"},"summary":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}},"description":{"type":"string"}},"required":["method","path","summary","tags","description"]}}},"required":["version","source","description","caveat","count","routes"]})j"},
     {"discover_scope_kinds",
      "Scope DSL kinds (__all__, group:<name>, from_result_set:<id>, ostype, hostname, "
      "arch, agent_version, tag:<key>, props.<key>) and comparison operators, with "
      "syntax and examples for building a `scope` expression. Read-only, static catalog.",
-     R"({"type":"object","properties":{}})", kObjectOutputSchema},
+     R"({"type":"object","properties":{}})",
+     // #2986: scope_kinds_catalog() is a fully static, build-once document
+     // (discover_routes.cpp) — the most stable of the five discover_* shapes.
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"ground_kinds":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"syntax":{"type":"string"},"example":{"type":"string"},"description":{"type":"string"}},"required":["kind","syntax","example","description"]}},"attribute_kinds":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"syntax":{"type":"string"},"example":{"type":"string"},"description":{"type":"string"}},"required":["kind","syntax","example","description"]}},"operators":{"type":"array","items":{"type":"object","properties":{"token":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"}},"required":["token","name","description"]}},"extended_forms":{"type":"array","items":{"type":"object","properties":{"form":{"type":"string"},"example":{"type":"string"},"description":{"type":"string"}},"required":["form","example","description"]}},"combinators":{"type":"array","items":{"type":"string"}}},"required":["version","description","ground_kinds","attribute_kinds","operators","extended_forms","combinators"]})j"},
     {"discover_plugins",
      "Plugin/action catalog observed across currently-connected agents. Each action carries an "
      "inline parameter_schema when it has a published InstructionDefinition (so you learn HOW to "
@@ -1274,7 +1335,13 @@ static const ToolDef kTools[] = {
      "discover_instructions is the full schema-bearing catalog. NOT a build-time manifest. New to "
      "the fleet? Read the yuzu://operating-model and yuzu://capabilities resources first to orient "
      "before acting. Read-only catalog.",
-     R"({"type":"object","properties":{}})", kObjectOutputSchema},
+     R"({"type":"object","properties":{}})",
+     // #2986: build_plugins_catalog's envelope + per-plugin/per-action keys
+     // (AgentRegistry::help_json, agent_registry.cpp) are server-computed
+     // and fixed; only actions[].parameter_schema is conditional (present
+     // only when the action has a matching published InstructionDefinition),
+     // typed generically for the same reason as discover_instructions above.
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"limitation":{"type":"string"},"actions_enriched_with_schema":{"type":"integer"},"plugins":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"version":{"type":"string"},"description":{"type":"string"},"actions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":"object","description":"Present only when the action has a matching published InstructionDefinition"}},"required":["name","description"]}}},"required":["name","version","description","actions"]}},"commands":{"type":"array","items":{"type":"string"}}},"required":["version","description","limitation","actions_enriched_with_schema","plugins","commands"]})j"},
     {"query_software_licenses",
      "Query a single agent's discovered software licences (ADR-0024 discovery plane) — the "
      "MCP twin of GET /api/v1/sle/agents/{id}. Returns each detected licence's product, "
@@ -1282,7 +1349,7 @@ static const ToolDef kTools[] = {
      "confidence. MACHINE-SCOPE FACTS ONLY: the per-user user_ref personal data (Decision "
      "11) is NOT returned here — it is served only by the audited, management-group-scoped "
      "REST drill. Requires SoftwareLicensing:Read.",
-     R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Exact agent/device id","maxLength":256}},"required":["agent_id"]})",
+     R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Exact agent/device id","minLength":1,"maxLength":256}},"required":["agent_id"]})",
      R"j({"type":"object","properties":{"agent_id":{"type":"string"},"count":{"type":"integer"},"licenses":{"type":"array","items":{"type":"object","properties":{"product":{"type":"string"},"vendor":{"type":"string"},"version":{"type":"string"},"license_type":{"type":"string"},"state":{"type":"string"},"expiry_at":{"type":"integer"},"channel":{"type":"string"},"key_hint":{"type":"string"},"detector":{"type":"string"},"confidence":{"type":"string"},"exe_hints":{"type":"string"}}}}},"required":["agent_id","count","licenses"]})j"},
 
     // ── Periodic Access Reviews (SOC 2 CC6.2) — MCP twins of
@@ -1312,7 +1379,7 @@ static const ToolDef kTools[] = {
      "evidence and does not itself change any access grant — destructiveHint:false. "
      "Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("title":{"type":"string","description":"Human-readable campaign name, e.g. 'Q3 2026 Access Review'"})j"
+     R"j("title":{"type":"string","minLength":1,"description":"Human-readable campaign name, e.g. 'Q3 2026 Access Review'"})j"
      R"j(},"required":["title"]})j",
      R"j({"type":"object","properties":{"campaign_id":{"type":"string"},"grant_count":{"type":"integer"}},"required":["campaign_id","grant_count"]})j"},
 
@@ -1329,10 +1396,10 @@ static const ToolDef kTools[] = {
      "POST /api/v1/access-reviews/{id}/attestations. Self-audited as access_review.attested "
      "or access_review.flagged (by decision). Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string"},)j"
+     R"j("campaign_id":{"type":"string","minLength":1},)j"
      R"j("principal_type":{"type":"string","enum":["user","group","engine"]},)j"
-     R"j("principal_id":{"type":"string"},)j"
-     R"j("role_name":{"type":"string"},)j"
+     R"j("principal_id":{"type":"string","minLength":1},)j"
+     R"j("role_name":{"type":"string","minLength":1},)j"
      R"j("decision":{"type":"string","enum":["attested","flagged_revoke"]},)j"
      R"j("justification":{"type":"string"})j"
      R"j(},"required":["campaign_id","principal_type","principal_id","role_name","decision"]})j",
@@ -1344,7 +1411,7 @@ static const ToolDef kTools[] = {
      "/api/v1/access-reviews/{id}. Self-audited as access_review.get. Requires "
      "AccessReview:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string"})j"
+     R"j("campaign_id":{"type":"string","minLength":1})j"
      R"j(},"required":["campaign_id"]})j",
      R"j({"type":"object","properties":{"campaign":{"type":"object"},"attestations":{"type":"array"},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
 
@@ -1366,7 +1433,7 @@ static const ToolDef kTools[] = {
      "untouched), but the campaign's own open->closed state is irreversibly transitioned. "
      "Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string"})j"
+     R"j("campaign_id":{"type":"string","minLength":1})j"
      R"j(},"required":["campaign_id"]})j",
      R"j({"type":"object","properties":{"closed":{"type":"boolean"}},"required":["closed"]})j"},
 
@@ -3514,6 +3581,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 return *cached_agents;
             };
 
+            // #2444 item 3 (Gate 6 sre): set true ONLY after the C8 approval gate
+            // below successfully consumes a one-time ticket for THIS request. Read
+            // by the BurnGuard below (NOT by mcp_audit — see its comment for why
+            // hooking mcp_audit directly under-counts).
+            bool approval_ticket_just_consumed = false;
+
             // Audit helper. Returns the AuditFn bool so SOC 2 read/write surfaces can
             // surface a dropped evidence row (audit_persisted:false), mirroring the
             // CA-revoke handler (#1550 HIGH-2 / #1240). Existing callers that ignore
@@ -3526,6 +3599,74 @@ McpServer::HandlerFn McpServer::build_handler(
                 return yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "mcp." + tool_name, result_status, "mcp_tool", tool_name, detail);
             };
+
+            // #2444 item 3 (Gate 6 sre): yuzu_mcp_approval_burned_total{tool,reason}.
+            // Deliberately NOT wired inside mcp_audit above: not every handler's
+            // business-rejection path calls mcp_audit at all — several (e.g.
+            // revoke_certificate's "serial not found", revoke_engine_principal's
+            // "principal not found") emit ONLY their own domain-verb audit_fn call
+            // ("ca.cert.revoked"/"engine_principal.revoke", result "denied"/
+            // "failure") and return without ever touching mcp_audit, so a counter
+            // hooked there would silently under-count exactly the class this issue
+            // is about. This guard instead inspects the ACTUAL JSON-RPC response
+            // this request produced, at function-scope exit — after whichever
+            // `if (tool_name == ...)` branch below has already called
+            // res.set_content(...) — so it counts every outcome uniformly,
+            // independent of which handler ran or what it chose to audit. Declared
+            // once per request; consumed is read only at destruction, so setting it
+            // AFTER this declaration (below, once consume_ticket succeeds) still
+            // takes effect — the reference stays bound to the same bool.
+            //
+            // Scope is deliberately wider than pure ARGS-semantic rejection: by the
+            // time any tool-specific handler code runs post-recall, consume_ticket
+            // has already spent the ticket, so a store-unavailable failure counts
+            // exactly as much as a business-rule reject — both are a wasted
+            // one-time human approval. Both land under reason="handler_reject".
+            //
+            // CH-1 (recorded here per the issue's request): this counter does NOT
+            // interact with the kMcpSubmitterPendingCap 25-slot cap —
+            // pending_count_for() counts only status='pending' rows, and
+            // consume_ticket() never touches `status` (only consumed_at/
+            // consumed_by); a ticket already left the pending bucket at
+            // ADMIN-APPROVAL time, before it could ever reach this burn class. So a
+            // semantic-burn loop cannot exhaust a submitter's pending-cap through
+            // burned tickets themselves — the cap only throttles un-approved
+            // pending mints, which item 1's schema tightening already reduces (a
+            // schema-invalid mint is refused before it can occupy a pending slot
+            // at all, #2441).
+            struct BurnGuard {
+                httplib::Response& res;
+                yuzu::MetricsRegistry* metrics;
+                const std::string& tool_name;
+                const bool& consumed;
+                ~BurnGuard() noexcept {
+                    if (!consumed || metrics == nullptr)
+                        return;
+                    // A JSON-RPC error envelope (vs the "result" success shape) is
+                    // the ONE outcome-agnostic signal every handler produces —
+                    // parsed defensively (never expected to fail; res.body is
+                    // always this handler's own JSON, never caller-echoed).
+                    //
+                    // Adversarial review (2026-08-19): this destructor is
+                    // implicitly noexcept, and MetricsRegistry::counter(...)
+                    // locks + indexes a map that could in principle throw
+                    // (allocation failure) — an uncaught throw here would
+                    // terminate the process mid-teardown, matching the
+                    // count_denial precedent's own reasoning above. Wrapped for
+                    // the same "observability must never fail the dispatch"
+                    // reason, even though the response has already been built.
+                    try {
+                        auto parsed = nlohmann::json::parse(res.body, nullptr, false);
+                        if (!parsed.is_discarded() && parsed.is_object() &&
+                            parsed.contains("error"))
+                            metrics
+                                ->counter("yuzu_mcp_approval_burned_total",
+                                         {{"tool", tool_name}, {"reason", "handler_reject"}})
+                                .increment();
+                    } catch (...) { // NOLINT(bugprone-empty-catch)
+                    }
+                }
+            } burn_guard{res, metrics, tool_name, approval_ticket_just_consumed};
 
             // BR-006 second half, MCP twin of plugin_config_routes.cpp's
             // `audit_outcome`. The five plugin-config/secret/kill-switch tools
@@ -4463,6 +4604,11 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     mcp_audit("approved", "consumed approval_id=" + supplied_id);
+                    // #2444 item 3: from here on, any mcp_audit("failure", ...) the
+                    // tool handler below emits for THIS request is a burned ticket —
+                    // set AFTER the "approved" row above so that row itself (result
+                    // "approved", not "failure") never counts.
+                    approval_ticket_just_consumed = true;
                     // Ticket consumed → fall through to the tool handler below.
                     // NOTE: the per-handler perm_fn (real RBAC op) has not run
                     // yet; a tier-allows-but-RBAC-denies token can mint→approve→
@@ -7523,9 +7669,11 @@ McpServer::HandlerFn McpServer::build_handler(
                         execution_id = *created;
                     } else {
                         // governance R1 unhappy-UP-3: create_execution
-                        // returning nullopt is a SQLite write failure
-                        // (disk full, locked DB, schema corruption).
-                        // Silently proceeding with empty execution_id
+                        // returning an error is a tracker store failure -
+                        // database not open, statement prepare failure, or
+                        // an insert/write failure (disk full, locked DB,
+                        // schema corruption); created.error() below names
+                        // which. Silently proceeding with empty execution_id
                         // hides the tracker outage from operators. Log
                         // at warn so SREs see the failure; dispatch
                         // continues so the operator's "stop NOW"
@@ -7533,9 +7681,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         // still sees an empty execution_id and can fall
                         // back to query_responses).
                         spdlog::warn("MCP execute_instruction: execution_tracker->create_execution "
-                                     "returned nullopt; dispatching with empty execution_id "
+                                     "failed ({}); dispatching with empty execution_id "
                                      "principal={} plugin={} action={}",
-                                     session->username, plugin, action);
+                                     created.error(), session->username, plugin, action);
                     }
                 }
 
@@ -9008,7 +9156,31 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "summarize_working_set") {
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
-                const std::string kind = param_str(args, "kind", "fleet");
+                // Gate 4 unhappy-path (2026-08-19): this tool is ReadOnly, not
+                // approval-gated, so the input schema's `kind` enum is
+                // advertised only — never enforced server-side (this
+                // codebase's established "ungated tool schema constraints
+                // aren't enforced unless the handler re-checks" pattern). An
+                // out-of-enum caller value was echoed verbatim below,
+                // violating the #2986 output schema's own `kind` enum on a
+                // strict validating client. Normalize to the schema's stated
+                // default before it's ever read or echoed.
+                std::string kind = param_str(args, "kind", "fleet");
+                if (kind != "fleet" && kind != "agent" && kind != "execution" &&
+                    kind != "result_set") {
+                    // Gate 6 sre (2026-08-19): silent normalization is
+                    // operationally invisible — a client sending a
+                    // persistently stale/malformed kind (schema drift, an
+                    // integration bug) would otherwise be undetectable. No
+                    // audit row exists for this ReadOnly tool to piggyback
+                    // on (see the class comment above), so this debug line
+                    // is the only signal; not elevated to warn since a
+                    // single stray call is not itself operator-actionable.
+                    spdlog::debug("MCP summarize_working_set: unknown kind '{}' normalized to "
+                                  "'fleet'",
+                                  kind);
+                    kind = "fleet";
+                }
                 const std::string target_id = param_str(args, "id");
                 const int limit = std::clamp(param_int32(args, "limit", 25), 1, 100);
                 JArr links;

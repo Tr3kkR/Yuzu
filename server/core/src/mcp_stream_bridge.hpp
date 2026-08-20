@@ -132,10 +132,13 @@
 // release it). Never evicts a newer record.
 //
 // Teardown ownership is THREE things - the records_ entry, the streamed charge, and
-// the bus subscription - and the claim is ONE-WAY (torn_down excludes the record
-// from every later sweep), so nothing retries what teardown leaves unfinished;
-// shutdown() is the only reclaimer. Each step is therefore contained separately and
-// counted by yuzu_mcp_bridge_teardown_incomplete_total{reason} (#2487). The ORDER is
+// the bus subscription. `torn_down` (set once, NEVER cleared) excludes the record
+// from every ORDINARY sweep claim - but an incomplete teardown IS retried, from a
+// later sweep tick, up to Config::teardown_retry_max times via the record's own
+// `teardown_retry_claimable` flag (#2513); shutdown() remains the reclaimer of last
+// resort, for a record whose retry budget is exhausted or that shutdown races before
+// a retry pass gets to it. Each step is therefore contained separately and counted
+// by yuzu_mcp_bridge_teardown_incomplete_total{reason} (#2487). The ORDER is
 // load-bearing rather than uniform, so be precise about what each failure retains:
 //
 //   0. PUBLISH the decided terminal FIRST. A later step failing must never lose a
@@ -149,8 +152,9 @@
 //      the bus channel can never be collected (GC needs listeners.empty()). The
 //      terminal from step 0 is already committed, so this is "everything except the
 //      publish".
-//   2. charge fails -> the record is STILL erased; a per-session admission slot
-//      leaks instead.
+//   2. charge fails -> return, record left in the map, its per-session admission
+//      slot still held (#2513: erasing here made sense only when nothing could
+//      retry - under retry the record is the only handle back to the leaked charge).
 //   3. erase fails -> the subscription is settled and the charge MAY be (steps 2 and
 //      3 fail independently); the record and one global slot leak.
 //
@@ -259,6 +263,21 @@ public:
         /// parked out from under its own pump - this fires only when a close was
         /// swallowed or never delivered.
         std::chrono::seconds streaming_park_after{600};
+        /// #2513: retries a sweep gives a teardown whose contained steps did not
+        /// all complete, beyond the first attempt (so `teardown_retry_max = 3`
+        /// means 4 total attempts). Each retry runs on a LATER sweep tick (real
+        /// spacing - never the same tick that failed), so a fault surviving every
+        /// attempt has had multiple ticks to self-heal and is effectively
+        /// permanent; retrying it forever would re-run the same audit/log/metric
+        /// work every tick for a record that is never coming back. `0` restores
+        /// the pre-#2513 one-way RETENTION posture (still retained until
+        /// shutdown, never retried) - it does NOT restore pre-#2513
+        /// observability: the first bail still fires `teardown_retry_total{
+        /// outcome="exhausted"}`, the exhaustion error log, and the "(retry
+        /// budget exhausted...)" audit suffix, all of which are new. A
+        /// code-constant default only, deliberately not exposed as a CLI
+        /// flag/env var: this is a fault-recovery bound, not an operator dial.
+        std::size_t teardown_retry_max = 3;
     };
 
     /// Injectable steady clock for the kArming reaper (deterministic tests).
@@ -406,6 +425,20 @@ public:
     static constexpr const char* stage_name(TeardownStage s) {
         const auto idx = static_cast<std::size_t>(s);
         return idx < kTeardownStageCount ? kTeardownStageNames[idx] : "unknown";
+    }
+
+    /// #2513: the final disposition of a teardown retry, pre-seeded in server.cpp
+    /// the same both-or-neither way as kTeardownStageNames above. `attempted` is
+    /// deliberately NOT a member - it is inferable from teardown_incomplete's own
+    /// movement plus the mcp.bridge.teardown_retry audit rows, and `exhausted` is
+    /// the one value worth alerting on.
+    enum class TeardownRetryOutcome { kRecovered, kExhausted };
+    static constexpr std::size_t kTeardownRetryOutcomeCount = 2;
+    static constexpr std::array<const char*, kTeardownRetryOutcomeCount>
+        kTeardownRetryOutcomeNames{"recovered", "exhausted"};
+    static constexpr const char* retry_outcome_name(TeardownRetryOutcome o) {
+        const auto idx = static_cast<std::size_t>(o);
+        return idx < kTeardownRetryOutcomeCount ? kTeardownRetryOutcomeNames[idx] : "unknown";
     }
 
     /// What was actually holding this session's streamed slots when a `pin_slots`
@@ -686,6 +719,16 @@ public:
     /// arms nothing on an out-of-range `stage` cast (#2523) - a mistyped stage must
     /// fail the test loudly rather than pass vacuously against an unfaulted teardown.
     [[nodiscard]] bool inject_teardown_step_fault_for_test(TeardownStage stage, int times = 1);
+    /// #2519: invoked synchronously on the teardown thread immediately before
+    /// (`entering=true`) and after (`entering=false`) each CONTAINED step of
+    /// teardown_claimed (unsubscribe / release_charge / erase), OUTSIDE every
+    /// lock the step itself takes. Lets a test bracket exactly one step's
+    /// allocation footprint, or - for #3095 - block the teardown thread at a
+    /// known point to force a deterministic interleave. Must not throw; not
+    /// thread-safe to set while a sweep may be running concurrently (arm it
+    /// before the first sweep, like set_clock_for_test).
+    void set_teardown_step_probe_for_test(
+        std::function<void(TeardownStage, bool entering)> probe);
     /// The NEXT `times` ~ClaimGuard record-lock acquisitions throw, modelling the
     /// mutex failure this file's fault model already treats as real. Drives the
     /// #2528 DEGRADED SETTLE: the claim must still be released (else the record is
@@ -717,6 +760,14 @@ public:
     /// so a later release repairs it. The split version cleared the flag first,
     /// and a throw then stranded streamed_unpinned_[session] forever.
     void inject_charge_lock_fault_for_test(int times = 1);
+    /// The NEXT `times` calls into teardown_claimed() throw at its entry lock
+    /// (attempt bookkeeping / Step-1 idempotence read) - the same modelled mutex
+    /// failure as the claim/charge seams above, at the one lock every retry
+    /// attempt takes first. Proves the entry lock is CONTAINED rather than
+    /// escaping teardown_claimed's noexcept boundary (which would terminate the
+    /// process): a hit here must leave attempts NOT incremented and the record
+    /// untouched - this call never happened as far as its bookkeeping goes.
+    void inject_record_entry_lock_fault_for_test(int times = 1);
     /// Override the reaper clock for deterministic age tests (default:
     /// steady_clock::now). Only the difference between calls matters.
     void set_clock_for_test(ClockFn clock);
@@ -797,7 +848,31 @@ private:
         std::atomic<std::uint64_t> pending_listener_failures{0};
         std::atomic<std::uint64_t> pending_mailbox_drops{0};
         std::atomic<std::uint64_t> pending_projection_degraded{0};
+        std::atomic<std::uint64_t> pending_progress_suppressed{0};
     };
+
+    /// Which rung of the publish ladder actually committed. The committed id alone
+    /// cannot answer this - a nonzero id from the retry looks identical to one from
+    /// the primary frame - and teardown's audit must not claim the caller's frame
+    /// was delivered when the fallback was (#2506 F4).
+    /// kNotAttempted is NOT a ladder result - it means the ladder was never reached
+    /// (the caller's own frame-build failed before the ladder was ever called; see
+    /// the callers' `built` guard). It is a distinct state on purpose: kPoisoned
+    /// asserts poison_terminal() ran, and an audit row must never claim a session
+    /// was poisoned when it was not.
+    ///
+    /// There used to be a third non-ladder state, kPublishThrew, for a throw
+    /// escaping the ladder itself - retired once publish_terminal_ladder became
+    /// noexcept (#2531 made poison_terminal() noexcept, which was the ladder's
+    /// only remaining throw source; #2523 closed the enum value it left
+    /// permanently untestable). See the static_assert at publish_terminal_ladder's
+    /// definition, which is what makes this enum's shape a compile-time fact
+    /// rather than a comment someone has to remember to update.
+    ///
+    /// Declared here, ahead of BridgeRecord, because BridgeRecord's #2513 retry
+    /// fields (`teardown_last_rung`) persist a TerminalRung and a nested struct's
+    /// member cannot reference a sibling enum declared later in the same class.
+    enum class TerminalRung { kNotAttempted, kPrimary, kFallback, kPoisoned };
 
     struct BridgeRecord {
         // Immutable after reserve()/subscribe()/arm() hand-off points (each field
@@ -925,6 +1000,32 @@ private:
         /// deliberately narrow enough to avoid. shutdown()'s walk reads this to find
         /// a claimed-but-terminal-unresolved record a raced sweep abandoned (#2517).
         bool teardown_terminal_handled = false;
+        /// #2513: retry state for a teardown a PRIOR attempt could not complete.
+        /// All four guarded by mu. `teardown_retry_claimable` is the retry claim,
+        /// distinct from `torn_down` above - `torn_down` is set once and NEVER
+        /// cleared (shutdown()'s should_poison depends on that), so retry
+        /// eligibility needs its own flag rather than reopening that gate. Set
+        /// ONLY at a teardown_claimed bail site, so it cannot be true while any
+        /// teardown_claimed for this record is running - single-flight without
+        /// touching torn_down's own claim sites.
+        bool teardown_retry_claimable = false;
+        /// Attempts consumed so far; 0 before the first entry to teardown_claimed,
+        /// bounded by Config::teardown_retry_max beyond the first. std::size_t,
+        /// not a narrower counter: it is compared directly against
+        /// Config::teardown_retry_max (also std::size_t, test-settable), and a
+        /// narrower type wrapping at its max would silently re-open eligibility
+        /// forever - the exact unbounded-retry outcome this bound exists to
+        /// prevent.
+        std::size_t teardown_attempts = 0;
+        /// The `decision` teardown_claimed's Step 1 ran (or will run) with,
+        /// persisted so a retry pass can replay the SAME decision without
+        /// independently re-arbitrating what to publish.
+        TeardownFinal teardown_decision = TeardownFinal::kNone;
+        /// The TerminalRung Step 1 resolved to, persisted alongside
+        /// `teardown_terminal_handled` so a retry whose terminal is already
+        /// handled can replay disposition_phrase()/terminal_delivered exactly as
+        /// the resolving attempt computed them, without re-running the publish.
+        TerminalRung teardown_last_rung = TerminalRung::kNotAttempted;
         std::uint64_t pinned_event_id = 0;
         std::uint64_t parked_seq = 0;      ///< assigned on entry to kRingOnly
         /// The live streamed-POST wake channel, bound while phase == kStreaming.
@@ -958,6 +1059,11 @@ private:
         // itself never touches a metrics mutex.
         std::atomic<std::uint64_t> mailbox_drop_delta{0};
         std::atomic<std::uint64_t> listener_failure_delta{0};
+        /// #2438: H1 progress-monotonicity suppressions. Written on the
+        /// projector thread (no `mu` held from the emission loop onward) but
+        /// flushed from other threads (shutdown/teardown), so it stays atomic
+        /// like its C5 siblings even though there is only one writer.
+        std::atomic<std::uint64_t> progress_suppressed_delta{0};
         /// #2528: ~ClaimGuard released the claim without `mu` and therefore could
         /// not run the settle bookkeeping normally. "Should never happen" - it
         /// needs a genuinely broken platform mutex - so any nonzero value is a
@@ -1013,24 +1119,10 @@ private:
     /// must stay the only place its bytes are composed.
     static std::string build_fallback_final(const nlohmann::json& jsonrpc_id,
                                             const std::string& execution_id);
-    /// Which rung of the publish ladder actually committed. The committed id alone
-    /// cannot answer this - a nonzero id from the retry looks identical to one from
-    /// the primary frame - and teardown's audit must not claim the caller's frame
-    /// was delivered when the fallback was (#2506 F4).
-    /// kNotAttempted is NOT a ladder result - it means the ladder was never reached
-    /// (the caller's own frame-build failed before the ladder was ever called; see
-    /// the callers' `built` guard). It is a distinct state on purpose: kPoisoned
-    /// asserts poison_terminal() ran, and an audit row must never claim a session
-    /// was poisoned when it was not.
-    ///
-    /// There used to be a third non-ladder state, kPublishThrew, for a throw
-    /// escaping the ladder itself - retired once publish_terminal_ladder became
-    /// noexcept (#2531 made poison_terminal() noexcept, which was the ladder's
-    /// only remaining throw source; #2523 closed the enum value it left
-    /// permanently untestable). See the static_assert at publish_terminal_ladder's
-    /// definition, which is what makes this enum's shape a compile-time fact
-    /// rather than a comment someone has to remember to update.
-    enum class TerminalRung { kNotAttempted, kPrimary, kFallback, kPoisoned };
+    /// Which rung of the publish ladder actually committed - see TerminalRung's
+    /// own doc comment above BridgeRecord for what each value means. Declared
+    /// there (ahead of member-function declarations that would otherwise need
+    /// it) because BridgeRecord's #2513 retry fields persist a TerminalRung.
     struct LadderResult {
         std::uint64_t id = 0;  ///< committed event id; 0 ⇔ kPoisoned
         /// NOT kPoisoned: a defaulted result must not assert a poisoning either.
@@ -1077,6 +1169,9 @@ private:
     /// #2487: a teardown step that could not complete on the maintenance thread.
     /// `stage` is a CLOSED literal set - unsubscribe | release_charge | erase.
     void count_teardown_incomplete(TeardownStage stage) noexcept;
+    /// #2513: a retry pass's teardown_claimed re-entry settled (`kRecovered`) or
+    /// the record hit `Config::teardown_retry_max` (`kExhausted`).
+    void count_teardown_retry(TeardownRetryOutcome outcome) noexcept;
     /// #2529: a charge release deferred to teardown because its lock failed.
     void count_charge_release_deferred() noexcept;
     /// sre-N1 (#2489): one pressure-sweep forced expiry, by the disposition it
@@ -1234,8 +1329,13 @@ private:
     /// Remaining injected throws per teardown stage (test seam), indexed by
     /// TeardownStage.
     std::array<std::atomic<int>, kTeardownStageCount> teardown_step_fault_{};
+    /// #2519/#3095 test seam: fired around each contained teardown step. Empty
+    /// (default-constructed std::function) in production - never checked on a
+    /// hot path beyond the bool test an empty std::function already supports.
+    std::function<void(TeardownStage, bool)> teardown_step_probe_for_test_;
     std::atomic<int> terminal_build_fault_{0}; ///< remaining teardown frame-build throws (test seam)
     std::atomic<int> charge_lock_fault_{0};    ///< remaining release_charge lock throws (#2529 seam)
+    std::atomic<int> record_entry_lock_fault_{0}; ///< remaining teardown_claimed entry-lock throws (test seam)
     ClockFn clock_;                            ///< reaper clock (default steady_clock::now)
     /// #2791 test seam: the post-ladder-publish, pre-pin-stamp stall. Distinct
     /// mutex from `bridge_mu_`/`BridgeRecord::mu` on purpose - the whole point of

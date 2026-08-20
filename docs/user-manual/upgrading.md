@@ -124,6 +124,46 @@ An MCP approval-ticket recall that hits a store fault has always returned `-3260
 
 **What to do:** if you have automation that blindly retries on `-32603` without checking `retry_after_ms`, it now stops retrying sooner in this specific case — which is the correct behavior (the old retries were futile). If your automation already honors `retry_after_ms` per [invariant A5](../agentic-first-principle.md), no change is needed. See [`mcp.md`](mcp.md) "`-32603`: Approval store unavailable" for the full response-body reference.
 
+## Behaviour change: four MCP tool input schemas got stricter (#2444)
+
+`revoke_certificate.serial_hex`, `confirm_engine_rotation.token_id`, `quarantine_device.reason`/`whitelist`, and the eight *approval-gated* engine-principal tools' `principal_id` (`create`/`revoke_engine_principal`, `mint`/`rotate_engine_credential`, `transfer_engine_principal_owner`, `assign`/`unassign_engine_role`) now carry `pattern`/`maxLength` bounds mirroring their handlers' own checks (previously enforced only at the handler, after an approval ticket was already consumed). `get_engine_principal` and `list_engine_roles` also gained the same `principal_id` pattern, but per this codebase's standing rule that input-schema validation runs only on the approval-gated path (`mcp-server.md`'s "Pre-approval input-schema validation"), those two are Read-tier and never approval-gated — the pattern is advertised metadata on `tools/list` only, not server-enforced; a malformed `principal_id` still reaches the handler and is rejected there exactly as before.
+
+**Who this affects:** any operator or automation with an outstanding (pending or
+approved-but-unconsumed) approval ticket for one of these ten tools —
+`revoke_certificate`, `confirm_engine_rotation`, `quarantine_device`,
+`create_engine_principal`, `revoke_engine_principal`, `mint_engine_credential`,
+`rotate_engine_credential`, `transfer_engine_principal_owner`,
+`assign_engine_role`, `unassign_engine_role` — whose arguments don't match the
+new bound: `serial_hex` must be `^[0-9A-Fa-f]{1,64}$`; `token_id` must be
+`^[0-9a-f]{24}$`; `quarantine_device.reason`/`whitelist` must be ≤1024/≤512
+bytes (whitelist additionally charset-restricted); `principal_id` must match
+`^engine:[a-z0-9._-]+$` (or the bare-slug form on `assign`/`unassign_engine_role`).
+Full patterns: `mcp-server.md`'s "Pre-approval input-schema validation" section.
+
+**What to do:** such a ticket becomes unrecallable fail-closed once the new
+server is running — the recall fails pre-consume just like any other
+schema-invalid call, and the ticket is never burned, but it also can't be
+redeemed as originally minted. It stays valid until its normal 7-day expiry
+(pending or approved-unconsumed), then ages out and must be re-requested. To
+check exposure before upgrading, list your outstanding tickets for these ten
+tools (`list_pending_approvals` MCP tool or `GET /api/v1/approvals`) and
+compare each one's arguments against the patterns above; no action is needed
+for a ticket that already matches, or if you have none outstanding.
+
+**Verify:** re-request any ticket the check above flagged, confirm the new
+recall succeeds under the same tier, and confirm a deliberately malformed
+value (e.g. a non-hex `serial_hex`) is now rejected at mint time — `-32602`,
+no approval created — rather than being accepted and only failing later at
+the handler.
+
+## Behaviour change: `discover_instructions`/`GET /api/v1/discover/instructions` null out a non-object stored `parameter_schema` (#2986)
+
+Both surfaces share one builder (`build_instructions_catalog`) that parses each `InstructionDefinition`'s stored `parameter_schema` text. It previously forwarded any value that parsed as JSON, even a non-object (an array, string, number, or boolean). It now forwards it only when the parsed value is itself a JSON object — a non-object value is reported as `null` instead, matching `GET /api/v1/discover/plugins`' existing behavior for the same field.
+
+**Who this affects:** an operator or integration that authored an `InstructionDefinition` with a non-object `parameter_schema` — reachable via the ordinary `create`/`update`/`import` paths, which don't validate the field's shape on write. No shipped content sets `parameter_schema` to anything but an object or leaves it unset (defaults to `{}`), so this affects only a deliberately or accidentally malformed definition.
+
+**What to do:** if you have such a definition and relied on the old raw-forwarding behavior, re-author `parameter_schema` as a JSON Schema object. No action is required otherwise.
+
 ## Behaviour change: webhook and offload-target deliveries, and enrollment/execution-failure notifications, now actually fire (#3261)
 
 A boot-ordering bug wired `NotificationStore`/`WebhookStore`/`OffloadTargetStore` into
@@ -167,6 +207,14 @@ These rows are background-actor events (`principal=system`), not operator action
 An MCP `tools/call` request naming a tool that doesn't exist has always returned `-32601` (`kMethodNotFound`) with the same error message. The audit row for that rejection previously carried `result=failure` - the token this codebase reserves for server-side faults - while every sibling denial on the surface (tier, read-only, schema, input-bounds, per-submitter-cap) uses `result=denied`. It now audits `result=denied` too, matching those siblings. Nothing about the JSON-RPC response changed.
 
 **What to do:** if you have a SIEM rule, dashboard or evidence query that classifies `mcp.<tool_name>` rows by filtering on `result=failure` to catch unknown-tool probes, re-point it at `result=denied` before upgrading, or it will stop matching. A rule that already filters on `result != "success"` sees both and needs no change. Note `result=failure` was never a clean isolator for unknown-tool probes specifically - it is also emitted for genuine server-side faults on *known* tools (store degraded, dispatch exception, etc.) and for several other client-caused-but-mislabeled rejections on the same surface (still open, tracked in #3176), so a rule that wants unknown-tool rows specifically should filter on `detail="unknown tool"`, which this change does not touch. See [`audit-log.md`](audit-log.md) "Result vocabulary" for the surface's current token usage.
+
+## Behaviour change: a failed MCP progress-bridge teardown is now retried instead of being permanently retained (#2513)
+
+A `mcp.bridge.*` teardown step (unsubscribe, releasing the streamed admission charge, or erasing the correlation record) that failed used to strand the record - and the bus channel, replay buffer, and per-session admission slot it held - for the rest of the process's life. It now gets up to `Config::teardown_retry_max` retries beyond the first attempt (4 total attempts by default), one per later sweep tick, before falling back to the old permanent-retention behavior. New `yuzu_mcp_bridge_teardown_retry_total{outcome="recovered"|"exhausted"}` metric and `mcp.bridge.teardown_retry` audit action evidence which happened; see [`audit-log.md`](audit-log.md) and [`../ops-runbooks/mcp-bridge-teardown-recovery.md`](../ops-runbooks/mcp-bridge-teardown-recovery.md).
+
+**What to do:** the shipped `YuzuMcpBridgeTeardownIncomplete` alert changed from a raw counter test (fires and never clears, since the underlying series is monotonic) to a windowed `increase(...[15m]) > 0` test, because most of its movement now self-heals via retry within a few sweep ticks. If you copied the old rule into your own alerting config instead of re-importing `docs/prometheus/yuzu-alerts.yml`, update it the same way or it will stay permanently firing on transient, already-recovered blips. The new `YuzuMcpBridgeTeardownRetryExhausted` alert is now the actual permanent-retention signal - add it if you track these alerts individually rather than loading the bundled rules file wholesale.
+
+If you have dashboard or SIEM logic reading the pre-existing `yuzu_mcp_bridge_teardown_incomplete_total` counter directly rather than through the bundled alert - it is unchanged in name and label shape, but its increment semantics changed: previously one increment per stranded record (ever), now up to `Config::teardown_retry_max` + 1 increments for the SAME record (once per failed step, per attempt) before it either recovers or exhausts. Arithmetic that read the counter as "count of stranded records" will now overcount under retry; read `yuzu_mcp_bridge_teardown_retry_total{outcome="exhausted"}` for that instead. `Config::teardown_retry_max` is a code-constant default, not an operator-configurable flag or env var - there is nothing to tune here.
 
 ## Behaviour change: an MCP maintenance failure degrades instead of aborting the server (#2487)
 
@@ -904,10 +952,11 @@ server `PgPool`).
   delivery. If any of these bounds is exceeded, the diagnostic line is
   written directly to **stderr** (not through the configured logger,
   and naming which store timed out for the webhook/offload case) before the
-  process force-exits — an
-  async-signal-safety requirement, since `stop()` runs synchronously inside
-  the SIGTERM handler (see #3007). If you rely on the log file or a
-  structured log sink rather than captured stderr, this one line will not
+  process force-exits. `stop()` now runs on an ordinary thread, not inside
+  the SIGTERM handler (#3007), so `spdlog` would be legal here — the raw
+  write stays anyway because `std::_Exit()` skips any buffered sink flush,
+  and this line must reach the operator regardless. If you rely on the log
+  file or a structured log sink rather than captured stderr, this one line will not
   appear there; check container/service stderr capture for it instead.
 - Confirm on first boot: the backfill completion log line, no `RbacStore`
   open/migrate errors, and that RBAC is still enabled if you had enabled it
@@ -1760,6 +1809,23 @@ Before upgrading any component:
   wedged". Stop scripts that deliberately double-signal agents will now
   force-kill them; send one signal and wait instead. On Windows a second Ctrl-C
   also terminates promptly. See *Stopping a wedged agent* in
+  [Server Administration](server-admin.md).
+- [ ] **Changed server signal handling (Linux/macOS, #3007):** the identical fix
+  as above, now applied to the server — graceful shutdown runs on a dedicated
+  watcher thread (fixes the same abort/hang class on `SIGTERM`, previously
+  reproducible as a debug-build `SIGABRT` from a deadlock detector), and a
+  **second** `SIGTERM`/`SIGINT` immediately hard-exits the server (exit 1) with
+  **no grace window**. Also new: a `SIGTERM`/`SIGINT` arriving before the server
+  finishes starting up now exits promptly with code 1, instead of being
+  silently ignored — a boot-time signal genuinely cannot be handled gracefully,
+  so this is a fail-visible improvement, but it means a very-early stop attempt
+  during a fast redeploy or a mistuned `livenessProbe.initialDelaySeconds`
+  (a failing *readiness* probe only pulls a pod from Service endpoints — it
+  never sends a stop signal; a failing *liveness* probe is what triggers a
+  kill-and-restart) will now observably exit rather than continue booting.
+  Stop scripts that
+  deliberately double-signal the server will now force-kill it; send one
+  signal and wait instead. See *Stopping a wedged server* in
   [Server Administration](server-admin.md).
 - **Non-English fleets — additional plugins (#1682).** The same `Reg*A` → `Reg*W`
   encoding fix was extended to four more Windows plugins: `vuln_scan` (app
@@ -2617,6 +2683,12 @@ Three operator-visible behaviour changes ship in the v0.12.0 A3 ladder. None req
 **2. `/api/health` is restored as an alias of `/health` (#620).** The pre-#401 endpoint path is back. Monitoring integrations that point at `/api/health` work without reconfiguration; both URLs serve identical JSON. Both are exempt from rate limiting (a follow-up hardening over the bare `/health` behaviour). For load-balancer probes that should drain in-flight traffic before stopping, continue using `/readyz` — `/health` and `/api/health` are intentionally not draining-aware (Kubernetes pattern: liveness/health probes are not draining-aware).
 
 **3. File-logger boot messages are now quieter (#624).** The previous `WARN: Could not create log directory /var/log/yuzu` + `ERROR: file logger setup failed` pair on every container boot is replaced by a single INFO-level line when the default path cannot be created. The Docker server image now pre-creates `/var/log/yuzu` (mode 0750, owned by `yuzu`) so the path is writable out of the box. **If your monitoring previously alerted on the WARN/ERROR lines as a misconfig signal, those signals will no longer fire** — the failure mode is now a single INFO line. Operators who require explicit on-disk logs should pass `--log-file <path>`; explicit-path failures still log at ERROR and are not silently degraded.
+
+### `quarantine` plugin: reporting is now more conservative (Wave-2 argv migration)
+
+The `quarantine` plugin's Windows/Linux/macOS `netsh`/`iptables`/`pfctl` invocations were migrated off shell-outs onto a bounded argv runner. Alongside the mechanism change, two reporting bugs were fixed: a Linux chain-flush could previously be miscounted as an applied containment rule (`status|quarantined|rules_applied|1` reported with zero rules actually installed), and macOS whitelist mutations could silently proceed on a failed prerequisite read or report success despite `pfctl -e` failing to enable pf.
+
+**If your automation alerts on `status|failed`/`status|release_uncertain`/`status|update_uncertain` from `quarantine` actions, you may see these fire more often after upgrading** — this is expected. Nothing got more broken; the plugin's failure reporting simply got more honest about cases it previously reported as clean success. No action is required beyond expecting the change.
 
 ## Rollback
 

@@ -49,6 +49,9 @@ namespace gpb = ::yuzu::guardian::v1;
 using yuzu::agent::GuardianEngine;
 using yuzu::agent::ISparkMechanism;
 using yuzu::agent::KvStore;
+using yuzu::agent::make_file_mechanism;
+using yuzu::agent::make_registry_mechanism;
+using yuzu::agent::make_service_mechanism;
 using yuzu::agent::OutboxEntry;
 using yuzu::agent::SendResult;
 using yuzu::agent::SparkData;
@@ -138,6 +141,26 @@ gpb::GuaranteedStateRule make_file_rule(const std::string& id, bool enabled = tr
     auto* a = r.mutable_assertion();
     a->set_type("file-exists");
     (*a->mutable_params())["path"] = "/tmp/yuzu-reconcile-test-target";
+    return r;
+}
+
+// Registry: also NO mechanism registered in this fixture -> also a routine
+// Unsupported gap (F7). Field shape mirrors test_guardian_engine.cpp's
+// make_registry_rule() so validation/spec derivation succeeds identically.
+gpb::GuaranteedStateRule make_registry_rule(const std::string& id, bool enabled = true) {
+    gpb::GuaranteedStateRule r;
+    r.set_rule_id(id);
+    r.set_name(id);
+    r.set_enabled(enabled);
+    r.set_enforcement_mode("audit");
+    r.mutable_spark()->set_type("registry-change");
+    auto* a = r.mutable_assertion();
+    a->set_type("registry-value-equals");
+    (*a->mutable_params())["hive"] = "HKCU";
+    (*a->mutable_params())["key"] = "SOFTWARE\\YuzuTest\\GuardStatusTest";
+    (*a->mutable_params())["value_name"] = "Flag";
+    (*a->mutable_params())["value_type"] = "REG_DWORD";
+    (*a->mutable_params())["expected"] = "1";
     return r;
 }
 
@@ -232,16 +255,312 @@ TEST_CASE("a supported type arms via spark, never in legacy guards_",
     CHECK(f.mechanism->watching_count() == 1);
 }
 
-TEST_CASE("an unsupported type falls through to legacy, never attempted on spark",
+TEST_CASE("an unsupported type arms neither backend - a distinct terminal state, "
+          "never a legacy fallback",
           "[spark][guardian][reconcile]") {
     SparkReconcileFixture f;
     f.apply(make_file_rule("r1"));
 
-    // File has no mechanism registered in this fixture - a ROUTINE gap, not a
-    // failure: legacy arms it (on non-Windows the legacy FileGuard also
-    // no-ops, so this just needs to prove spark never claims it).
+    // File has no mechanism registered in this fixture - a ROUTINE gap, terminal
+    // per F7/#2298 rung 2: enforced by NEITHER backend (previously this test only
+    // proved spark never claimed it and never checked armed_guard_count(), so it
+    // passed identically under the old legacy-fallback behavior too).
     CHECK(f.engine->spark_armed_rule_count() == 0);
+    CHECK(f.engine->armed_guard_count() == 0);
     CHECK(f.mechanism->watching_count() == 0);
+    const auto counts = f.engine->unsupported_counts_by_type();
+    REQUIRE(counts.count(SparkType::File) == 1);
+    CHECK(counts.at(SparkType::File) == 1);
+}
+
+TEST_CASE("repeating the same unsupported rule keeps the count at one",
+          "[spark][guardian][reconcile]") {
+    SparkReconcileFixture f;
+    f.apply(make_file_rule("r1"));
+    REQUIRE(f.engine->unsupported_counts_by_type().at(SparkType::File) == 1);
+
+    f.apply(make_file_rule("r1"), /*full_sync=*/false); // re-push, unchanged content
+    CHECK(f.engine->unsupported_counts_by_type().at(SparkType::File) == 1); // still 1, not 2
+}
+
+TEST_CASE("two unsupported rules of the same type aggregate to two",
+          "[spark][guardian][reconcile]") {
+    SparkReconcileFixture f;
+    f.apply(make_file_rule("r1"));
+    f.apply(make_file_rule("r2"), /*full_sync=*/false);
+    CHECK(f.engine->unsupported_counts_by_type().at(SparkType::File) == 2);
+}
+
+TEST_CASE("an unsupported rule's type change moves the count between buckets, "
+          "never double-counts",
+          "[spark][guardian][reconcile]") {
+    SparkReconcileFixture f;
+    f.apply(make_file_rule("r1"));
+    REQUIRE(f.engine->unsupported_counts_by_type().at(SparkType::File) == 1);
+
+    // Same rule_id, spark type edited to a different (also-unsupported) type.
+    // Registry has no mechanism registered in this fixture either.
+    f.apply(make_registry_rule("r1"), /*full_sync=*/false);
+    const auto counts = f.engine->unsupported_counts_by_type();
+    CHECK(counts.count(SparkType::File) == 0);
+    REQUIRE(counts.count(SparkType::Registry) == 1);
+    CHECK(counts.at(SparkType::Registry) == 1);
+}
+
+TEST_CASE("unsupported -> Arm (mechanism becomes available) clears the count",
+          "[spark][guardian][reconcile]") {
+    SparkReconcileFixture f;
+    f.apply(make_file_rule("r1"));
+    REQUIRE(f.engine->unsupported_counts_by_type().at(SparkType::File) == 1);
+
+    // Same rule_id, now a type WITH a mechanism registered in this fixture.
+    f.apply(make_service_rule("r1"), /*full_sync=*/false);
+    CHECK(f.engine->unsupported_counts_by_type().count(SparkType::File) == 0);
+    CHECK(f.engine->spark_armed_rule_count() == 1);
+}
+
+TEST_CASE("unsupported -> disabled clears the count", "[spark][guardian][reconcile]") {
+    SparkReconcileFixture f;
+    f.apply(make_file_rule("r1"));
+    REQUIRE(f.engine->unsupported_counts_by_type().at(SparkType::File) == 1);
+
+    f.apply(make_file_rule("r1", /*enabled=*/false), /*full_sync=*/false);
+    CHECK(f.engine->unsupported_counts_by_type().count(SparkType::File) == 0);
+}
+
+TEST_CASE("unsupported -> invalid (unrecognized spark type) clears the count",
+          "[spark][guardian][reconcile]") {
+    SparkReconcileFixture f;
+    f.apply(make_file_rule("r1"));
+    REQUIRE(f.engine->unsupported_counts_by_type().at(SparkType::File) == 1);
+
+    f.apply(make_invalid_rule("r1"), /*full_sync=*/false);
+    CHECK(f.engine->unsupported_counts_by_type().count(SparkType::File) == 0);
+}
+
+TEST_CASE("full_sync omitting a previously-unsupported rule clears its count",
+          "[spark][guardian][reconcile]") {
+    SparkReconcileFixture f;
+    f.apply(make_file_rule("r1"));
+    REQUIRE(f.engine->unsupported_counts_by_type().at(SparkType::File) == 1);
+
+    // A full_sync naming only a DIFFERENT rule must forget r1's unsupported
+    // bookkeeping too, exactly like it withdraws a spark-armed rule the new
+    // push omits (see the sibling full_sync test below).
+    f.apply(make_service_rule("r2"), /*full_sync=*/true);
+    CHECK(f.engine->unsupported_counts_by_type().count(SparkType::File) == 0);
+}
+
+TEST_CASE("full_sync retaining a still-unsupported rule stays idempotent",
+          "[spark][guardian][reconcile]") {
+    SparkReconcileFixture f;
+    f.apply(make_file_rule("r1")); // full_sync #1
+    REQUIRE(f.engine->unsupported_counts_by_type().at(SparkType::File) == 1);
+
+    // A second full_sync retaining r1 unchanged: the count must stay exactly 1,
+    // not double-count or drop it. NOTE what this does NOT verify: a blanket
+    // unsupported_rules_.clear() before the per-rule loop (instead of the
+    // precise post-loop sweep apply_rules actually uses) would make r1 look
+    // "newly" unsupported and spuriously re-log on every full_sync, but it
+    // converges to the SAME final count this asserts - the two designs are
+    // indistinguishable by count alone. The log-edge-detection design (erase-
+    // then-reinsert per outcome, sweep-not-blanket-clear on full_sync) is
+    // verified by code inspection, not a runtime assertion here - this
+    // codebase has no log-capture test seam to assert on spdlog output.
+    f.apply(make_file_rule("r1"), /*full_sync=*/true);
+    CHECK(f.engine->unsupported_counts_by_type().at(SparkType::File) == 1);
+}
+
+// Governance finding (quality-engineer, F7 #2298): the interaction between the new
+// Unsupported branch and the pre-existing policy_generation hold-on-failure logic
+// (apply_rules only advances policy_generation_ when reconcile_failures == 0) was
+// previously asserted only in a code comment, never at runtime. An Unsupported
+// classification returns false WITHOUT throwing, so it must never increment
+// reconcile_failures and must never block generation advancement - holding the
+// generation on an all-Unsupported push (e.g. every rule on macOS) would make that
+// agent re-push forever.
+TEST_CASE("an all-unsupported push still advances policy_generation, never holds it",
+          "[spark][guardian][reconcile]") {
+    SparkReconcileFixture f;
+    REQUIRE(f.engine->policy_generation() == 0);
+
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    p.set_policy_generation(5);
+    *p.add_rules() = make_file_rule("r1"); // unsupported: no mechanism in this fixture
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
+
+    CHECK(f.engine->unsupported_counts_by_type().at(SparkType::File) == 1);
+    CHECK(f.engine->policy_generation() == 5); // advanced, not held
+}
+
+TEST_CASE("a production-order restart reconstructs unsupported_rules_ from cached KV",
+          "[spark][guardian][reconcile][boot]") {
+    // Mirrors "PRODUCTION boot order: wire_spark_engine before start_local" below -
+    // unsupported_rules_ has no persisted representation of its own (it is derived
+    // purely from re-running classify() against each cached rule during the
+    // start_local() re-arm walk), so a restart must rebuild it correctly, in the
+    // real wire-then-start_local order, not just the fixture's simplified order.
+    const auto kv_path = unique_kv_path();
+    yuzu::test::TempDbFile db{kv_path};
+
+    // Phase 1: persist a rule that is unsupported in THIS process, then go away.
+    {
+        auto opened = KvStore::open(kv_path);
+        REQUIRE(opened.has_value());
+        KvStore kv{std::move(*opened)};
+        SparkEngine spark_engine; // no mechanism registered - file-change is unsupported
+        spark_engine.start();
+        GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+        REQUIRE(engine.start_local().has_value());
+        engine.wire_spark_engine(&spark_engine, false,
+                                 [](const OutboxEntry&) { return SendResult::Sent; });
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        *p.add_rules() = make_file_rule("r1");
+        REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString())
+                    .exit_code == 0);
+        REQUIRE(engine.unsupported_counts_by_type().at(SparkType::File) == 1);
+        engine.stop();
+        spark_engine.stop();
+    }
+
+    // Phase 2: a fresh boot in PRODUCTION order (wire_spark_engine before start_local)
+    // over that same store - no push this time, unsupported_rules_ must come back
+    // purely from the start_local() re-arm walk over the cached rule.
+    auto opened = KvStore::open(kv_path);
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    spark_engine.start();
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+    engine.wire_spark_engine(&spark_engine, false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+    REQUIRE(engine.start_local().has_value());
+
+    CHECK(engine.rule_count() == 1);
+    CHECK(engine.spark_armed_rule_count() == 0);
+    CHECK(engine.armed_guard_count() == 0);
+    const auto counts = engine.unsupported_counts_by_type();
+    REQUIRE(counts.count(SparkType::File) == 1);
+    CHECK(counts.at(SparkType::File) == 1);
+
+    engine.stop();
+    spark_engine.stop();
+}
+
+TEST_CASE("prefer_spark=false never populates unsupported_rules_, even for a type "
+          "with no mechanism",
+          "[spark][guardian][reconcile]") {
+    auto opened = KvStore::open(unique_kv_path());
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine; // no mechanism registered - file-change would be
+                              // unsupported IF spark were consulted at all
+    spark_engine.start();
+
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/false}; // the production default
+    REQUIRE(engine.start_local().has_value());
+    engine.wire_spark_engine(&spark_engine, false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = make_file_rule("r1");
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
+
+    // try_spark is false unconditionally when prefer_spark_ is false - classify()
+    // is never even called, so this can never be "Unsupported" (a per-rule spark
+    // classification outcome), it goes straight to the legacy-selected path.
+    CHECK(engine.unsupported_counts_by_type().empty());
+
+    engine.stop();
+    spark_engine.stop();
+}
+
+#if defined(__APPLE__)
+TEST_CASE("macOS: every mechanism is unsupported under spark preference - the real "
+          "platform posture, not a fixture artifact",
+          "[spark][guardian][reconcile][darwin]") {
+    // Built WITHOUT SparkReconcileFixture (which always injects a FakeServiceMechanism
+    // regardless of platform) - the whole point here is to prove the REAL platform
+    // factories, exactly as agent.cpp's production try_register does at boot, all
+    // three of which return nullptr on macOS (design doc §R2 consequence 3 / #2298).
+    yuzu::test::TempDbFile db{unique_kv_path()};
+    auto opened = KvStore::open(db.path);
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+
+    SparkEngine spark_engine;
+    const auto try_register = [&](SparkType type, std::unique_ptr<ISparkMechanism> mech) {
+        if (mech)
+            REQUIRE(spark_engine.register_mechanism(type, std::move(mech)).has_value());
+    };
+    try_register(SparkType::File, make_file_mechanism());
+    try_register(SparkType::Registry, make_registry_mechanism());
+    try_register(SparkType::Service, make_service_mechanism());
+    spark_engine.start(); // all three factories return nullptr on macOS, so nothing
+                          // actually got registered above - that IS the thing under test
+
+    GuardianEngine engine{&kv, "agent-test-macos", /*prefer_spark=*/true};
+    REQUIRE(engine.start_local().has_value());
+    engine.wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = make_file_rule("f1");
+    *p.add_rules() = make_service_rule("s1");
+    *p.add_rules() = make_registry_rule("r1");
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
+
+    CHECK(engine.spark_armed_rule_count() == 0);
+    CHECK(engine.armed_guard_count() == 0);
+    const auto counts = engine.unsupported_counts_by_type();
+    CHECK(counts.at(SparkType::File) == 1);
+    CHECK(counts.at(SparkType::Registry) == 1);
+    CHECK(counts.at(SparkType::Service) == 1);
+    // No explicit stop() calls: engine/spark_engine are plain stack locals declared
+    // spark_engine-then-engine, so scope-exit destroys engine first, spark_engine
+    // second - the exact order SparkReconcileFixture's own dtor comment documents as
+    // required (Guardian's spark teardown must finish before the SparkEngine it
+    // borrowed from is torn down), for free via normal RAII reverse-order destruction.
+}
+#endif // defined(__APPLE__)
+
+TEST_CASE("SparkDisabled never populates unsupported_rules_ either",
+          "[spark][guardian][reconcile]") {
+    auto opened = KvStore::open(unique_kv_path());
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    spark_engine.start();
+
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+    REQUIRE(engine.start_local().has_value());
+    engine.wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/true,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::SparkDisabled);
+
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = make_file_rule("r1");
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
+
+    // try_spark requires spark_availability_ == Available; SparkDisabled is not
+    // Available regardless of prefer_spark_, so classify() is never reached here
+    // either - the same code path as prefer_spark=false above.
+    CHECK(engine.unsupported_counts_by_type().empty());
+
+    engine.stop();
+    spark_engine.stop();
 }
 
 TEST_CASE("an invalid rule (unrecognized spark type) arms nowhere",
@@ -290,32 +609,48 @@ TEST_CASE("a same-id replace while spark-armed swaps generations, never double-a
     CHECK(f.engine->spark_armed_rule_count() == 1); // still 1, not 2
 }
 
-TEST_CASE("a same-id replace from spark-armed to legacy-armed withdraws spark first",
+TEST_CASE("a same-id replace from spark-armed to unsupported withdraws spark, "
+          "lands in neither backend",
           "[spark][guardian][reconcile]") {
     SparkReconcileFixture f;
     f.apply(make_service_rule("r1")); // spark-armed (service mechanism registered)
     REQUIRE(f.engine->spark_armed_rule_count() == 1);
     REQUIRE(f.engine->armed_guard_count() == 0);
 
-    // Same rule_id, now a type with no mechanism registered - must land ONLY
-    // in legacy, with the prior spark attachment fully withdrawn, never both.
+    // Same rule_id, now a type with no mechanism registered - F7/#2298 rung 2:
+    // a distinct terminal state, enforced by NEITHER backend, with the prior
+    // spark attachment fully withdrawn. (Previously this test's name/premise
+    // said "must land ONLY in legacy" and its assertions passed vacuously -
+    // neither checked armed_guard_count(), so "neither" and "legacy" were
+    // indistinguishable to it.)
     f.apply(make_file_rule("r1"), /*full_sync=*/false);
     CHECK(f.engine->spark_armed_rule_count() == 0);
+    CHECK(f.engine->armed_guard_count() == 0); // proves "neither", not "legacy"
     CHECK(f.mechanism->watching_count() == 0);
+    CHECK(f.engine->unsupported_counts_by_type().at(SparkType::File) == 1);
 }
 
-TEST_CASE("a same-id replace from legacy-armed to spark-armed withdraws legacy first",
+TEST_CASE("a same-id replace from unsupported to spark-armed arms cleanly, no "
+          "stale state",
           "[spark][guardian][reconcile]") {
     SparkReconcileFixture f;
-    f.apply(make_file_rule("r1")); // legacy-armed (no mechanism for file-change)
+    f.apply(make_file_rule("r1")); // unsupported (no mechanism for file-change);
+                                   // this fixture is permanently prefer_spark_=true
+                                   // + Available, so a file rule here can only ever
+                                   // land Unsupported post-F7, never legacy-armed -
+                                   // the scenario this test used to exercise no
+                                   // longer occurs on this fixture.
     REQUIRE(f.engine->spark_armed_rule_count() == 0);
+    REQUIRE(f.engine->armed_guard_count() == 0);
+    REQUIRE(f.engine->unsupported_counts_by_type().at(SparkType::File) == 1);
 
     // Same rule_id, now a spark-supported type - must land ONLY in spark, with
-    // withdraw_legacy_guard_locked having retired the prior legacy guard.
+    // the prior unsupported bookkeeping cleared too.
     f.apply(make_service_rule("r1"), /*full_sync=*/false);
     CHECK(f.engine->spark_armed_rule_count() == 1);
     CHECK(f.engine->armed_guard_count() == 0);
     CHECK(f.mechanism->watching_count() == 1);
+    CHECK(f.engine->unsupported_counts_by_type().count(SparkType::File) == 0);
 }
 
 TEST_CASE("full_sync withdraws a spark-armed rule the new push omits",
@@ -335,12 +670,18 @@ TEST_CASE("mutual exclusion holds across a full transition matrix (never both, "
           "exactly one for an armed rule)",
           "[spark][guardian][reconcile]") {
     SparkReconcileFixture f;
+    auto unsupported_count = [&] {
+        std::uint64_t n = 0;
+        for (const auto& [type, c] : f.engine->unsupported_counts_by_type()) n += c;
+        return n;
+    };
     auto invariant_holds = [&] {
-        // Never both: no rule_id can be simultaneously spark- and legacy-armed.
-        // (armed_guard_count()/spark_armed_rule_count() are aggregate counts -
-        // per-rule cross-checking isn't exposed, but with exactly one rule_id
-        // active at a time in this test the aggregate sum bounds it directly.)
-        return (f.engine->armed_guard_count() + f.engine->spark_armed_rule_count()) <= 1;
+        // Never more than one of {legacy-armed, spark-armed, unsupported} (F7 adds
+        // the third state to the pre-existing mutual-exclusion invariant). Aggregate
+        // counts - per-rule cross-checking isn't exposed, but with exactly one
+        // rule_id active at a time in this test the aggregate sum bounds it directly.
+        return (f.engine->armed_guard_count() + f.engine->spark_armed_rule_count() +
+                unsupported_count()) <= 1;
     };
 
     f.apply(make_service_rule("r1"));                                   // -> spark
@@ -361,9 +702,16 @@ TEST_CASE("mutual exclusion holds across a full transition matrix (never both, "
     CHECK(f.engine->armed_guard_count() == 0);
     CHECK(f.engine->spark_armed_rule_count() == 0);
 
+    f.apply(make_file_rule("r1"), /*full_sync=*/false);                 // -> unsupported (F7)
+    CHECK(invariant_holds());
+    CHECK(f.engine->armed_guard_count() == 0);
+    CHECK(f.engine->spark_armed_rule_count() == 0);
+    CHECK(unsupported_count() == 1);
+
     f.apply(make_service_rule("r1"), /*full_sync=*/false);              // -> re-armed OK
     CHECK(invariant_holds());
     CHECK(f.engine->spark_armed_rule_count() == 1);
+    CHECK(unsupported_count() == 0);
 }
 
 TEST_CASE("wire_spark_engine reports Available; --spark-disable reports SparkDisabled; "

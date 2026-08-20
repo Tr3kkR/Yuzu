@@ -700,6 +700,20 @@ public:
                           "the shared counter because the shared counter's other kinds "
                           "(foreign-origin vs ordinary replay) still must not be",
                           "counter");
+        metrics_.describe("yuzu_mcp_approval_burned_total",
+                          "MCP approval-ticket recalls that SUCCESSFULLY consumed a one-time, "
+                          "human-approved ticket and then still failed at the tool handler "
+                          "(#2444 item 3) — args that pass the published input schema (the "
+                          "#2441 pre-consume gate) but fail the handler's own business/state "
+                          "check, plus any handler-side infra failure (e.g. a degraded store) "
+                          "discovered only after consume_ticket() has already spent the "
+                          "ticket. Distinct from the three counters above, which all fire "
+                          "BEFORE a ticket is consumed; this one only fires after. reason is a "
+                          "single literal today (handler_reject) — see the mcp_audit lambda in "
+                          "mcp_server.cpp for the exact scope. Does not interact with the "
+                          "kMcpSubmitterPendingCap 25-slot cap: a ticket leaves the pending "
+                          "bucket at admin-approval time, before it can ever reach this class",
+                          "counter");
         // Progress bridge core (2f PR 3a). Same closed-set posture: every reject/
         // degrade reason is a static literal inside the bridge, never derived
         // from caller input.
@@ -721,6 +735,13 @@ public:
         metrics_.describe("yuzu_mcp_bridge_mailbox_drops_total",
                           "Oldest-progress frames dropped from a record's bounded arming mailbox "
                           "(terminals are never dropped)",
+                          "counter");
+        metrics_.describe("yuzu_mcp_bridge_progress_suppressed_total",
+                          "notifications/progress candidates dropped by the H1 monotonic-progress "
+                          "rule (#2438) - a duplicate or momentarily-decreasing snapshot from the "
+                          "bus, never forwarded to the client. Correct, expected movement under "
+                          "normal load; watch for a sustained high rate relative to "
+                          "yuzu_mcp_bridge_projector_cycles_total as a sign of upstream event churn",
                           "counter");
         metrics_.describe("yuzu_mcp_stream_terminal_publish_failures_total",
                           "Terminal-frame publish failures seen by the bridge's "
@@ -819,14 +840,28 @@ public:
                           "counter");
         metrics_.describe("yuzu_mcp_bridge_teardown_incomplete_total",
                           "Progress-bridge teardown steps that could not complete on the "
-                          "maintenance thread, by reason. DEFENCE IN DEPTH, not the live "
-                          "out-of-memory signal: all three steps allocate nothing, so only a "
-                          "mutex failure can reach them today - use "
+                          "maintenance thread on a given ATTEMPT, by reason - fires once per "
+                          "failed step per attempt, so a record retried 3 times moves this "
+                          "counter 3 times even though it is one strand, not three. DEFENCE IN "
+                          "DEPTH, not the live out-of-memory signal: all three steps allocate "
+                          "nothing, so only a mutex failure can reach them today - use "
                           "yuzu_mcp_stream_terminal_publish_failures_total for allocation "
-                          "pressure. The claim is one-way, so a record that fails here is never "
-                          "retried and what it still owns is held until the process restarts; a "
-                          "retained record also pins that session's whole stream state, its "
-                          "replay ring and any pinned finals. Alert on > 0",
+                          "pressure. A record whose teardown fails IS RETRIED by a later sweep "
+                          "(#2513), up to Config::teardown_retry_max times, before what it still "
+                          "owns is held until the process restarts; a retained record also pins "
+                          "that session's whole stream state, its replay ring and any pinned "
+                          "finals. This counter ALONE is not yet an incident - check "
+                          "yuzu_mcp_bridge_teardown_retry_total{outcome} next, which is the one "
+                          "to alert on",
+                          "counter");
+        metrics_.describe("yuzu_mcp_bridge_teardown_retry_total",
+                          "#2513: the final disposition of a retry pass's re-entry into a "
+                          "previously-incomplete teardown, by outcome (recovered|exhausted). "
+                          "exhausted means the record failed every attempt up to "
+                          "Config::teardown_retry_max and is now retained exactly like the "
+                          "pre-#2513 posture: until the process restarts. THIS is the metric to "
+                          "alert on, not teardown_incomplete alone, which moves on every attempt "
+                          "including ones that go on to recover",
                           "counter");
         metrics_.describe("yuzu_mcp_bridge_forced_expire_total",
                           "Parked progress-bridge records force-expired by the ring-only "
@@ -925,6 +960,7 @@ public:
         metrics_.gauge("yuzu_mcp_bridge_records_active").set(0);
         metrics_.counter("yuzu_mcp_bridge_listener_failures_total");
         metrics_.counter("yuzu_mcp_bridge_mailbox_drops_total");
+        metrics_.counter("yuzu_mcp_bridge_progress_suppressed_total");
         metrics_.counter("yuzu_mcp_bridge_projector_cycles_total");
         metrics_.counter("yuzu_mcp_bridge_projection_degraded_total");
         metrics_.counter("yuzu_mcp_stream_attach_audit_failures_total");
@@ -959,6 +995,11 @@ public:
         for (auto stage : mcp::McpStreamBridge::kTeardownStageNames) {
             metrics_.counter("yuzu_mcp_bridge_teardown_incomplete_total", {{"reason", stage}});
         }
+        // #2513: CLOSED set, derived the same way, so a third retry outcome
+        // cannot ship without this seed following it.
+        for (auto outcome : mcp::McpStreamBridge::kTeardownRetryOutcomeNames) {
+            metrics_.counter("yuzu_mcp_bridge_teardown_retry_total", {{"outcome", outcome}});
+        }
         // sre-N1 (#2489): CLOSED set, derived from TeardownFinal the same way, so a
         // fourth disposition cannot ship without this seed following it. Seeding
         // matters more here than elsewhere: an idle server force-expires nothing,
@@ -988,6 +1029,15 @@ public:
             metrics_.counter("yuzu_mcp_approval_refused_total", {{"tool", tool}});
             // Same closed set again for the #2786 masked-denial counter.
             metrics_.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", tool}});
+            // #2444 item 3: a HANDLER can only burn a ticket for a tool that is
+            // itself approval-gated in the first place, so this is the same
+            // closed `tool` set as the three counters above. `reason` is a
+            // single literal today (handler_reject — see mcp_server.cpp's
+            // mcp_audit lambda for what it covers); pre-seeded as a 1-value
+            // axis now so a future second reason slots into an already-seeded
+            // pattern instead of introducing an unseeded one.
+            metrics_.counter("yuzu_mcp_approval_burned_total",
+                             {{"tool", tool}, {"reason", "handler_reject"}});
         }
         // yuzu_mcp_approval_precondition_denied_total's reachable label set is
         // NARROWER than the two above: kPrecondition can only fire for a tool
@@ -1832,6 +1882,13 @@ public:
         metrics_.describe("yuzu_fleet_spark_slow_op",
                           "Fleet sum (per {`os`,`mechanism`}) of cumulative slow watch/unwatch ops "
                           "(a stalled watcher)", "gauge");
+        metrics_.describe("yuzu_fleet_spark_unsupported",
+                          "Fleet sum (per {`os`,`mechanism`}) of rules CURRENTLY classified "
+                          "unsupported - a known spark type with no mechanism on that host, "
+                          "enforced by neither backend (F7, #2298 rung 2). A live gauge "
+                          "recomputed every sweep, not cumulative - it can legally decrease "
+                          "(e.g. a mechanism becoming available). Routine, not page-worthy: "
+                          "distinct from armed_faulted/watch_rejected", "gauge");
         // Guardian durable lifecycle-journal fleet rollup (#2298 gate 3). Registered from
         // the SAME table AgentHealthStore::recompute_metrics clears and publishes from
         // (guardian_journal_fleet_tags.hpp), so a new signal cannot ship with a gauge but
@@ -5459,8 +5516,9 @@ public:
 
     // Destruction must guarantee every background thread is joined before its
     // captured members are torn down. stop() does that join and is idempotent
-    // (guarded by the stop_entered_ CAS), so calling it here is safe even when
-    // the normal shutdown path already ran. Without this, a destruction that
+    // (guarded by the lifecycle_mu_/teardown_complete_ completion barrier — #3007),
+    // so calling it here is safe even when the normal shutdown path already ran.
+    // Without this, a destruction that
     // skips stop() — run() early-returning on a TLS/bind failure after the
     // policy-eval / health threads were spawned, or an exception during late
     // construction — would destroy a still-joinable std::thread and call
@@ -5876,9 +5934,10 @@ public:
         // halts the process instead of serving on the gRPC ports with a
         // broken web/SCIM surface. stop() is safe to call this early — every
         // thread/store it joins or resets is joinable()/nullptr-guarded, and
-        // it also runs from ~ServerImpl (guarded against double-entry by
-        // stop_entered_), so calling it here and letting the destructor run
-        // again afterward is a deliberate no-op the second time.
+        // it also runs from ~ServerImpl (guarded against double-entry by the
+        // lifecycle_mu_/teardown_complete_ completion barrier — #3007), so calling
+        // it here and letting the destructor run again afterward is a deliberate
+        // no-op the second time (same thread, sequential — not a wait).
         if (startup_failed_) {
             spdlog::error("run(): refusing to serve — startup failed in start_web_server() "
                          "(SCIM boot failure); stopping the already-started agent/management "
@@ -6974,14 +7033,34 @@ public:
     }
 
     void stop() noexcept override {
-        // Guard against re-entrant calls from repeated signals.
-        // The signal handler calls stop() directly, so a second Ctrl+C
-        // re-enters stop() on a different thread while the first is still
-        // joining threads — causing "Resource deadlock avoided".
-        bool expected = false;
-        if (!stop_entered_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-            return; // Another thread is already running stop()
-        }
+        // COMPLETION BARRIER, not a bare re-entry flag (#3007; precedent:
+        // SparkEngine::stop(), agents/core/src/spark_engine.cpp). The old stop_entered_
+        // CAS let a losing caller (typically ~ServerImpl, on main) return IMMEDIATELY
+        // while another thread was still mid-teardown — main would then destroy
+        // pg_pool_/agent_service_/every store below while that thread was still using
+        // them, including through up to ~120s of the #3261 quiesce waits (UAF/
+        // double-free class). A second caller now BLOCKS here until the in-flight
+        // teardown has actually finished, then sees teardown_complete_ and returns
+        // having genuinely waited.
+        //
+        // Legal ONLY because stop() is no longer reachable from a real OS signal
+        // context: main.cpp's on_signal writes a self-pipe byte and a dedicated
+        // watcher thread calls stop() from ordinary thread context (mirroring
+        // agents/core/src/main.cpp), and a second SIGTERM/SIGINT hard-exits BEFORE
+        // taking any lock. Adding this barrier without that change first would
+        // recreate the double-Ctrl-C self-deadlock commit dea5bb8b5 fixed (two
+        // threads racing a blocking wait on the same non-recursive primitive).
+        //
+        // Self-join is unreachable: the only callers are the POSIX watcher thread, the
+        // Windows console-handler thread, and run()/~ServerImpl on the thread that
+        // constructed this object — never a thread this function itself joins. A
+        // same-thread re-entry (run()'s startup_failed_ early-return, later followed
+        // by ~ServerImpl) is sequential, not concurrent, so a non-recursive mutex is
+        // correct: the first call completes and sets teardown_complete_ before the
+        // second is ever reached.
+        std::lock_guard<std::mutex> life(lifecycle_mu_);
+        if (teardown_complete_)
+            return; // another call already ran stop() to completion
 
         spdlog::info("Shutting down server...");
         draining_.store(true, std::memory_order_release);
@@ -7169,6 +7248,12 @@ public:
         // StreamBudget::closing()'s doc comment) or a genuinely wedged
         // handler.
         if (web_thread_.joinable()) {
+            // #3007 governance (sre, unhappy-path UP-7/UP-8): stop() now runs off the
+            // signal handler, so this wait is silent-by-design up to 15s with no
+            // progress evidence — indistinguishable from a genuine wedge to an operator
+            // watching logs. One line here costs nothing and closes that gap.
+            spdlog::info("Shutting down server: waiting up to 15s for the web listener "
+                         "thread to finish...");
             std::unique_lock<std::mutex> lk(web_thread_done_mtx_);
             const bool finished = web_thread_done_cv_.wait_for(
                 lk, std::chrono::seconds(15), [this] { return web_thread_done_; });
@@ -7176,14 +7261,12 @@ public:
             if (finished) {
                 web_thread_.join();
             } else {
-                // `stop()` is called synchronously and directly from the SIGTERM/SIGINT
-                // OS signal handler (`on_signal()`, main.cpp) — NOT deferred to a normal
-                // thread context. spdlog::critical()/flush() allocate and take internal
-                // locks, which is undefined behaviour inside a signal handler (the same
-                // class #73 fixed for the single log line at the top of on_signal(), but
-                // never eliminated from the rest of the synchronously-invoked stop() call
-                // graph — tracked as a systemic follow-up). Use only the async-signal-safe
-                // primitive already established there: a raw write() of a fixed message.
+                // #3007: stop() now runs on an ordinary thread (main.cpp's shutdown
+                // watcher / a Windows console-handler thread), never inside a real OS
+                // signal handler, so spdlog would be legal here. The raw write() stays
+                // anyway: std::_Exit() below skips atexit handling and any buffered
+                // spdlog sink flush, so a log call here could be silently lost — this
+                // write() is guaranteed to reach stderr before the process ends.
                 const char msg[] =
                     "ServerImpl::stop: web thread did not finish within the 15s shutdown "
                     "grace bound (#2703 Gate 7 item 2) - force-exiting.\n";
@@ -7614,6 +7697,13 @@ public:
         if (offload_target_store_)
             offload_target_store_->flush_all();
         static constexpr auto kStoreQuiesceBound = std::chrono::seconds(60);
+        // #3007 governance (sre, unhappy-path UP-7/UP-8): silent-by-design up to
+        // ~120s (worst case, sequential-fallback path) with no progress evidence
+        // otherwise — one line here is enough for an operator to tell "expected
+        // quiesce wait" from "wedged" without waiting for the timeout diagnostic.
+        if (webhook_store_ || offload_target_store_)
+            spdlog::info("Shutting down server: waiting up to 60s for webhook/offload "
+                         "store delivery to drain...");
         bool webhook_drained = true;
         bool offload_drained = true;
         // Run both waits concurrently (Gate 8 round-2 targeted re-review,
@@ -7658,16 +7748,14 @@ public:
         if (offload_wait.joinable())
             offload_wait.join();
         if (!webhook_drained || !offload_drained) {
-            // Async-signal-safe only (see the web_thread_ comment above for
-            // why spdlog is not used here): a raw write() of a fixed
-            // message, then _Exit. Skips the remaining teardown below,
-            // exactly as a supervisor SIGKILL would - strictly no worse.
-            // Three fixed literals rather than one shared string (Gate 8
-            // round-2, unhappy-path SHOULD: name which store, so an
-            // operator with only stderr in hand knows which configured
-            // endpoint to investigate) - still async-signal-safe, since
-            // selecting among fixed literals is a branch, not a format/
-            // allocation.
+            // #3007: stop() runs on an ordinary thread now (see the web_thread_ comment
+            // above), so spdlog would be legal — the raw write() stays because _Exit()
+            // below skips any buffered sink flush. A raw write() of a fixed message,
+            // then _Exit. Skips the remaining teardown below, exactly as a supervisor
+            // SIGKILL would - strictly no worse. Three fixed literals rather than one
+            // shared string (Gate 8 round-2, unhappy-path SHOULD: name which store, so
+            // an operator with only stderr in hand knows which configured endpoint to
+            // investigate).
             if (!webhook_drained && !offload_drained) {
                 const char msg[] =
                     "ServerImpl::stop: WebhookStore AND OffloadTargetStore did not quiesce "
@@ -7731,6 +7819,12 @@ public:
             gateway_service_->set_analytics_store(nullptr);
         analytics_store_.reset();
         pg_pool_.reset();
+
+        // ONLY on full completion — a path above that escalates via std::_Exit(1)
+        // never reaches here and never marks the barrier complete (SparkEngine::stop()
+        // lesson: a flag set before a throwing/escaping teardown finishes would let a
+        // later caller wrongly believe teardown ran).
+        teardown_complete_ = true;
     }
 
 private:
@@ -14650,8 +14744,7 @@ private:
             // its creating principal's username (ApiToken::principal_id) —
             // without this it could delete a fleet-wide schedule its own
             // principal created interactively.
-            if (deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.delete", id,
-                                             "Schedule:Delete"))
+            if (deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.delete", id))
                 return;
             // M-01 (#1806): owner-scoped delete — a Schedule:Delete grant
             // deletes only schedules the caller created, not the whole
@@ -14703,7 +14796,7 @@ private:
             // service-scoped token keeps its kill-switch (H-01's own
             // rationale for gating disable on Schedule:Write alone).
             if (enabled && deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.enable",
-                                                        id, "Schedule:Write"))
+                                                        id))
                 return;
 
             // M-01 (#1806): owner-scoped enable/disable, same as delete above.
@@ -19432,7 +19525,11 @@ private:
     std::thread engine_rotation_sweep_thread_;
 
     std::atomic<bool> stop_requested_{false};
-    std::atomic<bool> stop_entered_{false};
+    // Completion barrier for stop() (#3007) — see stop()'s own comment for why this
+    // replaced a bare stop_entered_ CAS and why the mutex is safe to hold across the
+    // whole ~700-line teardown body.
+    std::mutex lifecycle_mu_;
+    bool teardown_complete_ = false; // guarded by lifecycle_mu_
     std::atomic<bool> draining_{false};
 
     // Rate limiting
