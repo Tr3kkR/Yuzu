@@ -176,12 +176,17 @@
 //              → McpStreamState::mu_ → SseSinkState::mu
 //
 //   WakeCore::mu             - wake-only LEAF. Taken (briefly, to flip
-//       work_pending_/stop and notify) from under Channel::mu + record mu
-//       (listener wake), from under record mu (arm()'s handoff wake and every
-//       other mark_dirty call site, #2411), and from under bridge_mu_ → record
-//       mu (sweep()'s pressure mark-clearing walk, #2411 - the one call site
-//       that reaches WakeCore::mu with bridge_mu_ still held above it).
-//       NOTHING is ever acquired while holding it.
+//       work_pending_/stop and notify) from under record mu at exactly ONE
+//       call site - arm()'s flip handoff - and with NO record mu or
+//       bridge_mu_ held at every other mark_dirty call site (#2411): the
+//       listener's success and catch paths both call it after their
+//       record-mu scope has already closed; park_after_dispatch_failure,
+//       on_post_closed_keyed, take_post_batch's park-vs-claim fence, and
+//       sweep's per-victim defer call it with nothing held; and sweep's
+//       pressure mark-clearing walk's own record-mu hold closes BEFORE its
+//       mark_dirty call, so that site reaches WakeCore::mu under bridge_mu_
+//       alone, not bridge_mu_ → record mu. NOTHING is ever acquired while
+//       holding it.
 //   McpSessionRegistry::mu_  - isolated leaf (stream_for/exists acquire nothing
 //       beneath; the bridge never calls the registry while holding bridge_mu_).
 //
@@ -834,8 +839,10 @@ private:
         std::string data;
     };
     static_assert(std::is_nothrow_move_assignable_v<MailboxEntry> &&
-                      std::is_nothrow_move_constructible_v<MailboxEntry>,
-                  "projector extraction and listener commit rely on nothrow moves");
+                      std::is_nothrow_move_constructible_v<MailboxEntry> &&
+                      std::is_nothrow_swappable_v<MailboxEntry>,
+                  "projector extraction and listener commit rely on nothrow moves; "
+                  "#2412's progress-slot swaps rely on nothrow swap directly");
 
     /// Listener-reachable state, shared_ptr-owned so a leaked listener can never
     /// touch a destroyed bridge (C7 - the listener captures {record, wake core}

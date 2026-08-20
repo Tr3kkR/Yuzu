@@ -1309,7 +1309,8 @@ TEST_CASE("bridge pressure - a deferred victim no longer blocks relief for the n
     CHECK(fx.bridge->record_count() == 1);
 }
 
-TEST_CASE("bridge pressure - a mark does not outlive the pressure that raised it (#2489 UP-4)",
+TEST_CASE("bridge pressure - a mark does not outlive the pressure that raised it "
+          "(#2489 UP-4, TSan)",
           "[mcp][bridge][2f][2489]") {
     // pressure_requested tells the projector to start no NEW progress batch for a
     // victim. Nothing cleared it, so a victim that was marked and then survived -

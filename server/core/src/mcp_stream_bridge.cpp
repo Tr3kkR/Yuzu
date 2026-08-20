@@ -286,7 +286,7 @@ void McpStreamBridge::mark_dirty(WakeCore& core, const std::string& key) noexcep
     //     true - a cycle that will visit `key` is already owed, and skipping
     //     the redundant notify is correct, not a lost wakeup.
     // This IS "wake only on a real edge" (the issue's phrasing, from when the
-    // progress mailbox #2412 later replaced still existed), expressed at drain
+    // progress mailbox that #2412 later replaced still existed), expressed at drain
     // granularity (per dirty-set-empty→non-empty transition) rather than per
     // mailbox-empty→non-empty transition - provable here, and equivalent for
     // the projector's purposes, since the projector only ever cares whether a
