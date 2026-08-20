@@ -1400,6 +1400,74 @@ TEST_CASE("migrate_from_sqlite copies a populated legacy snapshot across all tab
     CHECK(frags->size() == 1);
 }
 
+TEST_CASE("migrate_from_sqlite never rewinds a status Postgres has already advanced past",
+          "[policy_store][pg][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    PolicyFragment frag;
+    frag.id = "bfrag-guard-1";
+    frag.name = "Guard Fragment";
+    frag.yaml_source = "kind: PolicyFragment";
+    frag.check_instruction = "get_service_status";
+    frag.check_compliance = "result.status == 'running'";
+    frag.check_parameters = "{}";
+    frag.fix_parameters = "{}";
+    frag.post_check_parameters = "{}";
+    frag.created_at = 1000;
+    frag.updated_at = 1000;
+
+    Policy pol;
+    pol.id = "bpol-guard-1";
+    pol.name = "Guard Policy";
+    pol.yaml_source = "kind: Policy";
+    pol.fragment_id = frag.id;
+    pol.scope_expression = "ostype == \"windows\"";
+    pol.enabled = true;
+    pol.created_at = 1001;
+    pol.updated_at = 1001;
+
+    LegacyStatusRow status;
+    status.policy_id = pol.id;
+    status.agent_id = "agent-1";
+    status.status = "compliant";
+    status.last_check_at = 1002; // fake, far-past epoch
+    status.check_result = "{}";
+    status.fix_attempt_count = 0;
+
+    auto legacy_path =
+        yuzu::test::unique_temp_path("yuzu_test_polstore_guard") / "policies.db";
+    std::filesystem::create_directories(legacy_path.parent_path());
+    write_legacy_policy_sqlite_db(legacy_path, {frag}, {pol}, {}, {}, {}, {status});
+
+    REQUIRE(store.migrate_from_sqlite(legacy_path));
+    auto got = store.get_agent_status(pol.id, "agent-1");
+    REQUIRE(got.has_value());
+    REQUIRE(got->has_value());
+    CHECK((*got)->status == "compliant");
+
+    // Postgres advances past the legacy snapshot via ordinary live traffic
+    // (real wall-clock last_check_at, far later than the legacy 1002).
+    REQUIRE(store.update_agent_status(pol.id, "agent-1", "non_compliant"));
+    auto advanced = store.get_agent_status(pol.id, "agent-1");
+    REQUIRE(advanced.has_value());
+    REQUIRE(advanced->has_value());
+    CHECK((*advanced)->status == "non_compliant");
+    int64_t advanced_last_check = (*advanced)->last_check_at;
+
+    // Re-running the SAME legacy backfill (e.g. a restart while the legacy
+    // file is still present) must NOT rewind live compliance data back to
+    // the stale snapshot — the direction-aware WHERE guard
+    // (last_check_at < EXCLUDED.last_check_at) makes this a no-op.
+    REQUIRE(store.migrate_from_sqlite(legacy_path));
+    auto after = store.get_agent_status(pol.id, "agent-1");
+    REQUIRE(after.has_value());
+    REQUIRE(after->has_value());
+    CHECK((*after)->status == "non_compliant");
+    CHECK((*after)->last_check_at == advanced_last_check);
+}
+
 TEST_CASE("migrate_from_sqlite tolerates a legacy file predating the fix_attempt_count "
           "ALTER-wart column (G4-UHP-POL-003)",
           "[policy_store][pg][backfill]") {
