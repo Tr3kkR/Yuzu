@@ -900,11 +900,22 @@ PolicyStore::update_agent_status(const std::string& policy_id, const std::string
     // the row's value as of THIS UPDATE's lock acquisition — concurrent
     // UPSERTs on the same key serialize, so the second one sees the first
     // one's already-committed count, never a stale pre-fetched value.
+    // last_fix_at on the fresh-INSERT branch: CASE, not a bare 0 (found in
+    // testing — the ADR-0056 staleness sweep is the first consumer that ever
+    // relied on last_fix_at being meaningful for a 'fixing' row; the SQLite
+    // original always wrote 0 here unconditionally, harmless there since the
+    // old stranded-fixing reset was unconditional too). Without this, a
+    // 'fixing' status landing as the very FIRST-ever write for a
+    // (policy,agent) pair (reachable: an operator remediate() naming an
+    // agent never checked before) gets last_fix_at=0 — the very next
+    // claim_due_policies staleness sweep would immediately read that as
+    // ancient and un-fix it before the FixWait's own grace window ever runs.
     const std::string sql =
         "INSERT INTO policy_store.policy_status "
         "(policy_id, agent_id, status, last_check_at, last_fix_at, check_result, "
         " fix_attempt_count) "
-        "VALUES ($1,$2,$3,$4,0,$5,0) "
+        "VALUES ($1,$2,$3,$4::bigint,CASE WHEN $3 = 'fixing' THEN $4::bigint ELSE 0::bigint END,"
+        "$5,0) "
         "ON CONFLICT (policy_id, agent_id) DO UPDATE SET "
         "  status = CASE WHEN EXCLUDED.status = 'fixing' "
         "                  AND policy_status.fix_attempt_count >= " +
@@ -1267,6 +1278,30 @@ PolicyStore::claim_due_policies(int64_t now, int64_t default_interval_seconds,
         return std::unexpected(std::string(kPolicyDbErrorPrefix) + "claim transaction failed");
     }
     return claimed;
+}
+
+std::expected<void, std::string> PolicyStore::record_dispatch(const std::string& policy_id,
+                                                               int64_t now) {
+    if (!open_)
+        return std::unexpected(std::string(kPolicyDbErrorPrefix) + "database not open");
+    auto lease = pool_.try_acquire_for(kAcquireTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kPolicyDbErrorPrefix) +
+                               "database unavailable — try again");
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "INSERT INTO policy_store.policy_dispatch_state (policy_id, last_dispatched_at) "
+        "VALUES ($1,$2) "
+        "ON CONFLICT (policy_id) DO UPDATE SET last_dispatched_at = EXCLUDED.last_dispatched_at "
+        "RETURNING policy_id",
+        std::vector<std::string>{policy_id, std::to_string(now)});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0) {
+        spdlog::error("PolicyStore: record_dispatch failed for policy {}: {}", policy_id,
+                     PQerrorMessage(lease.get()));
+        return std::unexpected(std::string(kPolicyDbErrorPrefix) + "failed to record dispatch");
+    }
+    return {};
 }
 
 // ── Backfill (ADR-0009 / ADR-0056) ───────────────────────────────────────────

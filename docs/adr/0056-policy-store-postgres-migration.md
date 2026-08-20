@@ -317,6 +317,46 @@ SET` clause, reading `policy_status.fix_attempt_count` (the row's pre-update val
 resolves under the conflicting row's lock — concurrent UPSERTs on the same key serialize, so the
 second one's CASE sees the first one's already-committed count, never a stale pre-fetched value).
 
+**Correction (found running the multi-instance regression test, 2026-08-20):** two gaps in the
+first cut of `update_agent_status`/`evaluate_now`, both caught before merge, neither visible from
+reading the SQL — only from running the actual claim/staleness-sweep sequence against live
+Postgres.
+
+1. **`last_fix_at` on the fresh-INSERT branch was a bare `0`**, ported unchanged from the SQLite
+   original (`VALUES (?, ?, ?, ?, 0, ?, 0)`) — harmless there, because the old stranded-`fixing`
+   reset was unconditional and never read `last_fix_at` to decide anything. It is not harmless
+   here: `claim_due_policies`'s staleness sweep is the first consumer that relies on `last_fix_at`
+   meaning "when did this row last become `fixing`." A `fixing` status landing as the very
+   first-ever write for a `(policy_id, agent_id)` pair — reachable via `remediate()` naming an
+   agent never checked before — got `last_fix_at = 0`, which the very next staleness sweep read as
+   infinitely stale and immediately reset to `unknown`, before the FixWait's own grace window ever
+   ran. Fixed: the VALUES clause now computes `last_fix_at` the same way the `ON CONFLICT`
+   branch's own `CASE` does — `CASE WHEN $3 = 'fixing' THEN $4::bigint ELSE 0::bigint END` (the
+   explicit `::bigint` casts are load-bearing: Postgres could not otherwise unify `$4`'s type
+   between this CASE and its other use as the plain `last_check_at` value in the same statement —
+   "inconsistent types deduced for parameter" — since the bare literal `0` on its own defaults to
+   `integer`, not `bigint`).
+2. **`evaluate_now()` never touched `policy_dispatch_state`.** The SQLite original stamped
+   `last_eval_[policy_id] = now()` in-memory on every manual dispatch specifically so the
+   *following* automatic tick's throttle check would see it and skip re-dispatching within the
+   interval. Deleting `last_eval_` (superseded by the durable claim, per the Decision above)
+   silently dropped that side effect too — `evaluate_now()` still dispatched correctly on its own,
+   but left no record in `policy_dispatch_state`, so the next `claim_due_policies` call found no
+   row for that policy (the fresh-INSERT branch, which always succeeds regardless of the `WHERE`
+   guard) and re-claimed it immediately, producing a duplicate check seconds after the manual one
+   even though the interval had not elapsed. Fixed with a new store method,
+   `PolicyStore::record_dispatch(policy_id, now)` — an unconditional upsert of
+   `last_dispatched_at` with no lock and no `WHERE` guard (this is a single explicit dispatch
+   action, not a competing claim) — called from `evaluate_now()` immediately after a successful
+   `kickoff_check`.
+
+Both gaps were caught by the two-instance regression test this ADR's Consequences section
+promises, not by code review — the first surfaced as a claim-staleness test flipping a `fixing`
+row to `unknown` inside its own "within window" assertion; the second as a flaky-looking
+dispatch-count mismatch that turned out to be fully deterministic once traced (a pre-existing
+`evaluate_now()` + immediate-tick sequence in the *unrelated* `interval throttles re-dispatch`
+test, not the new test itself).
+
 ### Construction — fail-closed (this store lacked it even on SQLite)
 
 `server.cpp:4979-4986` constructs `PolicyStore` and only logs on failure today — unlike

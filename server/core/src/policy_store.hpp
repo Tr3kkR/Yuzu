@@ -237,6 +237,19 @@ public:
     claim_due_policies(int64_t now, int64_t default_interval_seconds,
                        int64_t fixing_stale_seconds);
 
+    /// Unconditionally stamps `policy_dispatch_state.last_dispatched_at` for
+    /// a manual, operator-triggered dispatch (`PolicyEvaluator::evaluate_now`)
+    /// — no advisory lock, no WHERE-guard, no interval check (evaluate_now
+    /// deliberately bypasses the interval). Without this, a manual dispatch
+    /// leaves no durable record, so the very next automatic tick's
+    /// claim_due_policies sees an unclaimed policy (no row = the fresh-INSERT
+    /// branch, which always succeeds regardless of the WHERE guard) and
+    /// re-dispatches immediately — a duplicate check within seconds of the
+    /// manual one, found in testing (the interval-throttle regression
+    /// ADR-0056's removal of the in-memory last_eval_ would otherwise cause).
+    [[nodiscard]] std::expected<void, std::string> record_dispatch(const std::string& policy_id,
+                                                                    int64_t now);
+
 private:
     pg::PgPool& pool_;
     bool open_{false};
