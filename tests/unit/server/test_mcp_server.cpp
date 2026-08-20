@@ -8731,6 +8731,40 @@ TEST_CASE("MCP query_installed_software: fleet rows scoped to the caller's group
     CHECK_FALSE(sc.contains("audit_persisted")); // fake test audit_fn succeeds
 }
 
+// require_fleet_read's own doc comment: unwired = misconfiguration, FAILS
+// CLOSED (503) — never silently falls back to an unfiltered read. REST's twin
+// of this test already exists (test_rest_inventory_software.cpp "unwired
+// fleet_read_fn -> 503"); this one had no MCP-side equivalent — the fixture
+// default (fleet_read_fn_for_test) always admits unfiltered, so no prior
+// test exercised production's genuinely-empty McpServer::fleet_read_fn_
+// branch (quality-engineer, governance run 2026-08-20 — confirmed a real
+// gap, not covered by composition with the REST e2e proof).
+TEST_CASE("MCP query_installed_software: unwired fleet_read_fn_ -> fail-closed, "
+          "never a fallback admit",
+          "[mcp][inventory]") {
+    McpTestServer ts; // software_inventory_store_for_test stays nullptr — never
+                       // reached, the gate denies first
+    ts.fleet_read_fn_for_test = {}; // genuinely empty std::function, matches
+                                     // production's unwired state
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":79,)"
+                       R"("params":{"name":"query_installed_software","arguments":{}}})");
+    REQUIRE(res->status == 200); // JSON-RPC transport-level 200; the error is in the body
+    auto envelope = nlohmann::json::parse(res->body);
+    REQUIRE(envelope.contains("error"));
+    CHECK_FALSE(envelope.contains("result"));
+    // Distinguishes the unwired-gate branch from the very next branch
+    // ("Software inventory store unavailable", which this test would ALSO
+    // hit since software_inventory_store_for_test stays null) — a softened
+    // guard that falls through instead of returning would pass every other
+    // assertion here unnoticed (quality-engineer, governance run 2026-08-20).
+    CHECK(envelope["error"]["message"].get<std::string>() == "service unavailable");
+
+    for (const auto& a : ts.audit_log)
+        CHECK(a != "mcp.query_installed_software|success");
+}
+
 TEST_CASE("MCP query_installed_software: a degraded store errors, never success+[] "
           "(ADR-0016 §7 / fjarvis HIGH)",
           "[mcp][pg][inventory]") {

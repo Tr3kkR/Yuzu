@@ -212,6 +212,47 @@ TEST_CASE("require_fleet_read: Deny × absent service ⇒ Forbidden",
     CHECK(res.status == 403);
 }
 
+TEST_CASE("require_fleet_read: null management-group store ⇒ Degraded, never a "
+          "permanent-looking Forbidden",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    // Same "no grant at all" caller shape as the sibling Deny test above, but
+    // with mgmt_group_store_=nullptr — rbac_store_/tag_store_ each get an
+    // explicit pre-check (line ~117/196) that turns "store unavailable" into
+    // 503 Degraded before a real authorization decision is even attempted;
+    // this axis had none, so a null store silently fell through into
+    // authorize_list_read -> resolve_perm_groups, which itself already
+    // null-checks mgmt_store and returns unexpected("management group store
+    // unavailable") -> DenyAll -> a 403 indistinguishable from "you genuinely
+    // have no grant" (unhappy-path finding UP-1, governance run 2026-08-20).
+    Config cfg{};
+    auth::AuthManager auth_mgr{};
+    yuzu::test::ApiTokenStorePg api_tokens;
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    PgPool pool{{.conninfo = rbac_db_.dsn(), .size = 4}};
+    RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+    rbac.set_rbac_enabled(true);
+    REQUIRE(auth_mgr.upsert_user("minter", "correct-horse-battery-staple", auth::Role::admin));
+
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider;
+    AuthRoutes ar(cfg, auth_mgr, &rbac, api_tokens.get(), /*audit_store=*/nullptr,
+                  /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                  /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
+
+    auto raw = api_tokens->create_token("gates-test", "minter", now_epoch() + 3600);
+    REQUIRE(raw.has_value());
+    auto req = bearer_request(*raw);
+    httplib::Response res;
+
+    auto result = ar.require_fleet_read(req, res, "Response", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == authz::GateFailure::Degraded);
+    CHECK(res.status == 503);
+    auto j = nlohmann::json::parse(res.body);
+    CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() == 5000);
+}
+
 TEST_CASE("require_fleet_read: Deny × service S ⇒ Forbidden (mgmt axis is decisive)",
           "[pg][auth_routes][authz_gates][service_scope]") {
     YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);

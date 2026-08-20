@@ -210,7 +210,11 @@ curl -H "Authorization: Bearer $TOKEN" \
   `correlation_id`), **never** an empty `200` — so a vulnerability query cannot read a
   transient Postgres outage as "installed nowhere" (ADR-0016 §7 authoritative reads).
   Distinct from a genuinely empty result (`200` with `count: 0`), which means the query
-  succeeded and matched nothing in your scope.
+  succeeded and matched nothing in your scope. An unexpected `503` here for a
+  management-group-scoped-only caller (no global grant) correlates with the
+  `YuzuMgmtGroupReadDegraded` Prometheus alert firing — a management-group store
+  degrade, not an authorization problem; retry once it clears (sre, governance run
+  2026-08-20).
 
 **Narrow scope on a large fleet (applies to *both* the MCP tool and the REST
 endpoint).** The 1000-row cap is applied by the store *before* the management-group
@@ -268,12 +272,15 @@ same data, with three tabs:
   doesn't collect them (a future operator-set CMDB enrichment). A large device list is
   rendered first-N with the total shown; use the filter to narrow.
 - **Find software** — type an exact title to see **which devices run it** and at which
-  versions. Like the REST/MCP siblings, Find is gated on the **global `Inventory:Read`**
-  and returns **fleet-wide** results: management-group confinement is **not yet effective**
-  on this list view (the per-row scope filter is a foundation for the ADR-0017
-  admit-then-filter gate, #1716, not effective list-confinement today — only the
-  per-device drill is scoped). 1000-row cap; a short/zero result under a narrow scope is
-  *incomplete*, not *absent* (keyset paging is the #1634 follow-up).
+  versions. **Unlike the REST/MCP siblings** (migrated onto `require_fleet_read`, #3290
+  Phase 2, with real management-group + service-scope confinement), Find is still gated on
+  the **global `Inventory:Read`** and returns **fleet-wide** results: management-group
+  confinement is **not yet effective** on this list view (the per-row scope filter is a
+  foundation for the ADR-0017 admit-then-filter gate, not effective list-confinement today
+  on this surface — only the per-device drill is scoped; migrating this tab is tracked in
+  `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`). 1000-row cap; a
+  short/zero result under a narrow scope is *incomplete*, not *absent* (keyset paging is the
+  #1634 follow-up).
 
 **On store degradation** the **Software**, **Find**, and **per-device-software** views —
 the *authoritative* reads — show an explicit **"unavailable"** banner rather than an

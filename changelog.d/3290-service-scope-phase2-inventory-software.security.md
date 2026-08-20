@@ -7,4 +7,6 @@
   `require_fleet_read` itself gains the elevated/engine/`mcp_tier` caller-class handling it was
   missing since its Phase 0 introduction — closing a real regression the bare primitive would
   otherwise have shipped (an engine principal under RBAC-off falling through to an unfiltered
-  fleet-wide read).
+  fleet-wide read). It also now fails closed (503, retryable) rather than 403 (indistinguishable
+  from "no grant") when the management-group store is null or not yet open, matching the
+  existing hardening already in place for the RBAC and tag stores.

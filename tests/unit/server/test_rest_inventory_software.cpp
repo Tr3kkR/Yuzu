@@ -33,6 +33,7 @@
 // thread, no TSan risk) from test_rest_software_packages.cpp.
 
 #include "rest_api_v1.hpp"
+#include "audit_store.hpp"
 #include "auth_routes.hpp"
 #include "authz_gates.hpp"
 #include "management_group_store.hpp"
@@ -647,20 +648,35 @@ struct InvE2ERig {
     yuzu::test::ApiTokenStorePg api_tokens;
     TagStore tags;
     SoftwareInventoryStore sw;
+    // Real AuditStore (shares the rig's database via a second pool, its own
+    // `audit_store` schema — same pattern as GatesRig in test_authz_gates.cpp)
+    // so a gate-deny's audit_log call is regression-testable, not silently
+    // discarded by a null store (quality-engineer, governance run 2026-08-20).
+    PgPool audit_pool;
+    AuditStore audit_store;
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider;
     std::unique_ptr<AuthRoutes> ar;
-    yuzu::server::test::TestRouteSink sink;
     yuzu::MetricsRegistry metrics;
     RestApiV1 api;
+    // Declared AFTER its route owner (`api`) per the fixture convention this
+    // file's own test_route_sink_harness.cpp pins: the sink holds the
+    // registered handler closures, so it must destruct BEFORE the owner
+    // whose `this` those handlers might capture (cpp-safety, governance run
+    // 2026-08-20 — non-exploitable today since RestApiV1::register_routes
+    // never captures `this`, but the declaration order should not rely on
+    // that staying true).
+    yuzu::server::test::TestRouteSink sink;
     std::string gP, gC1, gC2, gS;
 
     explicit InvE2ERig(const std::string& dsn)
-        : pool{{.conninfo = dsn, .size = 4}}, rbac{pool}, tags{pool}, sw{pool} {
+        : pool{{.conninfo = dsn, .size = 4}}, rbac{pool}, tags{pool}, sw{pool},
+          audit_pool{{.conninfo = dsn, .size = 2}}, audit_store{audit_pool} {
         REQUIRE(pool.valid());
         REQUIRE(rbac.is_open());
         REQUIRE(tags.is_open());
         REQUIRE(sw.is_open());
+        REQUIRE(audit_store.is_open());
         rbac.set_rbac_enabled(true);
 
         REQUIRE(rbac.create_role({"InvReader", "", false, 0}).has_value());
@@ -684,7 +700,7 @@ struct InvE2ERig {
         REQUIRE(auth_mgr.upsert_user("minter", "correct-horse-battery-staple", auth::Role::admin));
 
         ar = std::make_unique<AuthRoutes>(cfg, auth_mgr, &rbac, api_tokens.get(),
-                                          /*audit_store=*/nullptr, &mgmt, &tags,
+                                          &audit_store, &mgmt, &tags,
                                           /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
 
         // The SAME conversion ServerImpl::require_fleet_read performs
@@ -867,4 +883,45 @@ TEST_CASE("REST inventory/software [e2e]: service-scoped token, RBAC genuinely "
     auto res = r.sink.Get("/api/v1/inventory/software", bearer(token));
     REQUIRE(res);
     CHECK(res->status == 403);
+}
+
+TEST_CASE("REST inventory/software [e2e]: a genuine gate deny gets exactly one "
+          "X-Correlation-Id header and audits under the gate's own taxonomy, "
+          "not the retired route-specific fleet target",
+          "[pg][rest][inventory_software]") {
+    // Restores the class of coverage quality-engineer flagged as dropped
+    // (governance run 2026-08-20) — but for the CURRENT taxonomy, not the
+    // pre-#3290 one: the old blanket-deny path (deny_fleet_wide_service_
+    // scoped) audited as inventory.software.query/target_id=fleet with a
+    // cid embedded in its detail string; require_fleet_read's own deny
+    // branches audit as auth.fleet_read_required with EMPTY target_type/
+    // target_id (matching require_permission's/require_list_read's
+    // convention, authdb-confirmed Gate 3) and do not embed a cid in the
+    // audit detail at all — a4_denial mints its own cid for the header
+    // independently. Asserting the old cid-embedded-in-detail shape here
+    // would pin a property this gate's convention does not provide, not a
+    // regression; this test proves the property that DOES hold instead.
+    YUZU_REQUIRE_PG_DB_TPL(db, inv_e2e_tpl);
+    InvE2ERig r{db.dsn()};
+    // "minter" holds no Inventory:Read grant at all ⇒ authorize_list_read
+    // DenyAll ⇒ require_fleet_read's own 403 branch.
+    auto token = r.mint();
+    auto res = r.sink.Get("/api/v1/inventory/software", bearer(token));
+    REQUIRE(res);
+    CHECK(res->status == 403);
+
+    // Exactly one value, not duplicated (the httplib multimap-append class
+    // of bug: set_header appends rather than overwrites if called twice).
+    auto cids = res->get_header_value_count("X-Correlation-Id");
+    CHECK(cids == 1);
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+
+    auto rows = r.audit_store.query({});
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    const auto& row = (*rows)[0];
+    CHECK(row.action == "auth.fleet_read_required");
+    CHECK(row.result == "denied");
+    CHECK(row.target_type.empty());
+    CHECK(row.target_id.empty());
 }

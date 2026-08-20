@@ -164,6 +164,35 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
         return std::unexpected(authz::GateFailure::Forbidden);
     }
 
+    // Null/not-yet-open management-group store: rbac_store_/tag_store_ each
+    // get an explicit pre-check turning "store unavailable" into a retryable
+    // 503 before any real decision is attempted; this axis had none.
+    // authorize_list_read's own helpers (resolve_perm_groups/
+    // expand_visible_set) already null-check mgmt_group_store_ internally
+    // and fail closed to DenyAll — never a crash, never a partial admit —
+    // but DenyAll renders as 403 below, indistinguishable from "this caller
+    // genuinely has no grant." A caller doing exponential backoff on 503
+    // would never retry a transient store-construction gap that looks like a
+    // permanent deny (unhappy-path finding UP-1, governance run 2026-08-20).
+    // NOTE: this closes only the null/not-open half — a mid-query degrade
+    // (the store opens fine but a later read fails) still renders as 403
+    // here, because it is indistinguishable from a real DenyAll inside
+    // authorize_list_read's own return value; that is the SAME deliberate
+    // weakening implementation plan §2c accepts for every other
+    // authorize_list_read caller (plugin_config_routes.cpp, the upload-grants
+    // resolver in server.cpp), not a new gap this gate introduces, and fixing
+    // it is a separate, larger change to the shared primitive.
+    if (!mgmt_group_store_ || !mgmt_group_store_->is_open()) {
+        audit_log(req, "auth.fleet_read_required", "denied", "", "",
+                  "fleet read blocked: management-group store unavailable");
+        res.status = 503;
+        res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
+                                          detail::A4ErrorOpts{.retry_after_ms = 5000,
+                                                              .permission = perm}),
+                        "application/json");
+        return std::unexpected(authz::GateFailure::Degraded);
+    }
+
     // Spelled via deny_all() rather than relying on the switch below to
     // always overwrite the implicit nullopt(TOP) default — defense-in-depth
     // against a future non-exhaustive edit to ListReadDecision's cases

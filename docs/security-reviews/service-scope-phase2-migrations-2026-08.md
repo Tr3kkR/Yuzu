@@ -61,14 +61,42 @@ twin to prove the pattern on both transports in one PR.
 | Caller class | Before | After |
 |---|---|---|
 | Service-scoped token, RBAC on, correctly confined | 403 (the flip) | 200, filtered to `meet(management-group, service-scope)` — the point of this PR |
-| Service-scoped token, RBAC off | 403 | 403 (unchanged) |
+| Service-scoped token, RBAC genuinely disabled (store open, `is_rbac_enabled()` false) | 403 | 403 (unchanged) |
+| Service-scoped token, RBAC store null/not-open | 403 (indistinguishable from the row above) | 503 Degraded — a DISTINCT sub-case from "RBAC disabled": the null-store check fires before the RBAC-off check, so this reads as a retryable infra gap, not the same permanent posture (consistency-auditor finding, governance run 2026-08-20) |
 | Management-group-scoped-only operator (no global grant) | 403 (`check_permission` is global-only, never consulted `ManagementGroupStore`) | 200, filtered (`AdmitScoped`) — closes ADR-0017's "World A" gap for this route |
 | Global-grant operator / RBAC-disabled non-service caller | 200 unfiltered | unchanged |
 | RBAC store null/not-open, non-service caller | 200 unfiltered (legacy fallback) | 503 Degraded — fail-closed hardening, called out explicitly |
+| Management-group store null/not-open, non-service caller with no global grant | 403 (indistinguishable from "no grant") | 503 Degraded — closed in this same governance round (unhappy-path finding UP-1); the mid-query-degrade half of this same store (store opens fine, a later read fails) is NOT closed and still renders 403, the same deliberate weakening `authorize_list_read`'s other callers (`plugin_config_routes.cpp`, the upload-grants resolver) already accept — tracked, not fixed here |
 | JIT-elevated operator | 200 unfiltered | 200 unfiltered (new caller-class branch) |
 | Engine principal, RBAC on + grant | 200 unfiltered | 200 unfiltered (new caller-class branch) |
 | Engine principal, RBAC off | 403 | 403 (new caller-class branch — the regression this migration would otherwise have shipped) |
 | Tag store null/degraded, service-scoped caller | 403 (never reached the tag store) | 503 Degraded (retryable) |
+| MCP-tier token, tier disallows this Read | N/A — no production caller existed pre-migration for this branch to apply to | 403 (new caller-class branch, deny-or-fall-through ONLY per routed-concern clause 2 — never self-admits; a tier-allowed token falls through unaffected into the rest of the ladder). Added to this table per docs-writer's Gate 8 finding (governance run 2026-08-20): the migration checklist below names `mcp_tier` as a required row and this table did not have one, despite the branch being real and tested (`test_authz_gates.cpp`'s "mcp_tier='readonly' token, Read op" case) |
+
+### ACCEPTED — `devices_omitted` as a bounded existence signal (UP-2, ruled at Gate 8)
+
+A service-scoped token can now (correctly) see `devices_omitted > 0` when a `name`-filtered
+query matches software outside its own scope. Repeated queries by name let a confined caller
+determine WHETHER a title exists fleet-wide, without seeing WHERE. This is the same shape of
+signal `authorize_list_read`'s other confined callers already expose (a drop count, never the
+dropped identities) and is openly documented in the route/tool schema text — it is not a new
+class of leak this migration introduces, but it IS the first time a **service-scoped** (as
+opposed to management-group-scoped) caller gets it, since the caller class was previously
+denied outright.
+
+**Ruling: ACCEPT** (security-guardian, Gate 8 re-review, governance run 2026-08-20, not
+self-adjudicated by the author). Derivation: TRIGGER — a service-scoped token repeating a
+`name`-filtered query against this route. IMPACT — bounded information disclosure: existence
+only, never identity or location (`target_id`/`audit_key` is computed purely from the query
+params, unaffected by scope narrowing) — base MEDIUM. EXPOSURE — requires an already-
+authenticated caller holding `Inventory:Read` (not `E0`), so no raise applies. EPISTEMIC —
+confirmed from code, not speculative. Two independent reasons: (1) suppressing the field for
+this caller class would recreate the exact false-negative this route's own design forbids
+elsewhere — an empty/short result under a confined scope must read as *incomplete*, never
+*absent*, and a suppressed `devices_omitted` on a genuine existence-elsewhere case would do
+exactly that; (2) every probe is individually audited (`inventory.software.query`,
+`target_id=name=<title>`), so a dictionary-enumeration pattern is detectable after the fact —
+a real, load-bearing compensating control, not merely an assertion that one could exist.
 
 ### Tests
 
@@ -77,17 +105,59 @@ gate-deny/401/unwired-503 tests replace the old RBAC-deny/service-scoped-deny te
 route no longer has its own auth to fake); scope-filter tests drive `fleet_scope` directly.
 `test_mcp_server.cpp` similarly — `fleet_read_fn_for_test` replaces
 `inventory_scope_fn_for_test`; the old "service-scoped token denied" test is rewritten to
-assert the blanket deny is *gone*.
+assert the blanket deny is *gone*. An MCP-side unwired-`fleet_read_fn_`-fails-closed test was
+added in the Gate 8 fix round (quality-engineer flagged the prior asymmetry: REST had a
+dedicated test for this branch, MCP's fixture default always admits, so nothing exercised
+production's genuinely-empty `McpServer::fleet_read_fn_` state on that transport).
 
 New `[pg]` end-to-end tests (`InvE2ERig`, real `AuthRoutes`, the same conversion lambda
 production wires) prove the actual `meet()` composition against a real `RbacStore`/
 `TagStore`/`ManagementGroupStore` — coverage that existed nowhere at the route level before:
 service-scoped token → real filtered 200; management-group-confined operator → real filtered
 200 (the `AdmitScoped` case, previously untestable at this route since it always 403'd);
-unscoped operator → unchanged; tag-store degraded → 503; RBAC-off + service token → 403.
+unscoped operator → unchanged; tag-store degraded → 503; RBAC-off + service token → 403; a
+genuine gate deny → exactly one `X-Correlation-Id` header and the correct
+`auth.fleet_read_required`/empty-target audit shape (added in the Gate 8 fix round — the OLD
+blanket-deny path audited under `inventory.software.query`/`target_id=fleet` with a cid
+embedded in the detail string; `require_fleet_read`'s own deny branches use a DIFFERENT
+taxonomy, so re-asserting the old shape would have pinned a property this gate does not
+provide).
 
-Primitive-level caller-class coverage (elevated/engine/mcp_tier branches):
+Primitive-level caller-class coverage (elevated/engine/mcp_tier branches, plus the new
+null-management-group-store branch added in the Gate 8 fix round):
 `test_authz_gates.cpp` and `test_engine_principal_integration.cpp` §6c.
+
+### Migration checklist (for whoever picks up the next backlog item)
+
+Distilled from Migration 1's own "What changed"/"Tests" sections above — follow this shape,
+not the numbers:
+
+1. Confirm the route's REST deny fires AFTER its existing `perm_fn`/`tier_allows` call (dead
+   code, zero-behavior-change retirement) vs is genuinely LIVE (a real behavior change to
+   document) — check both transports independently, they can differ (this migration's REST
+   deny was dead, its MCP deny was live).
+2. Replace the permission check with the gate as the SOLE authorization call — never stack the
+   two (`require_fleet_read`'s own doc comment states the BLOCKING falsifier).
+3. Retire the route's old per-row scope predicate (if any) once the gate's composed
+   `VisibleSet` fully replaces it — check for dangling references in tests, not just
+   production code.
+4. Write the behavior-change table FIRST, one row per caller class from the shared preamble
+   (elevated / engine / mcp_tier / service-RBAC-on-confined / service-RBAC-off /
+   service-store-null / mgmt-scoped-only / global-grant / RBAC-store-null / mgmt-store-null /
+   tag-store-degraded) — this migration shipped with two of these rows missing or conflated on
+   the first pass and needed a governance round to catch it.
+5. Add unit-level fake-gate tests for the route's OWN reaction to the gate's decision, plus
+   `[pg]` end-to-end tests proving the real `meet()` composition against live stores — on BOTH
+   transports if both exist; a fake-gate-only proof on one transport is a real, not merely
+   theoretical, coverage gap (this migration shipped with exactly that MCP-side gap).
+6. Grep the WHOLE repo for stale prose the migration falsifies — not just the file you're
+   editing. `grep -rln "<tool_or_route_name>" docs/` once for a mechanical sweep, but expect it
+   to still miss instances phrased with different terms (the audit verb name, an ADR's own
+   tracking checklist, a customer-facing upgrade note) — this migration needed TWO governance
+   rounds to find everything a single grep missed.
+7. Update the routed-concern row's own illustrating examples if your migration retires the one
+   it was citing — an example that goes stale silently is worse than no example, because it
+   reads as still-current.
 
 ## Ranked backlog for subsequent migrations
 
@@ -113,9 +183,12 @@ Primitive-level caller-class coverage (elevated/engine/mcp_tier branches):
 
 Known open items this migration surfaced but did not resolve:
 
-- `docs/auth-architecture.md:2458` vs `docs/mcp-server.md:22` disagree on whether a bare
-  `perm_fn` (no `deny_fleet_wide_service_scoped`/`scoped_perm_fn`/`exec_visible` check)
-  qualifies an MCP tool's `confined` label — resolve when retiring the remaining 7 MCP denies.
+- ~~`docs/auth-architecture.md:2458` vs `docs/mcp-server.md:22` disagree on whether a bare
+  `perm_fn` ... qualifies an MCP tool's `confined` label~~ — **resolved in this migration's own
+  Gate 8 fix round**: both now list `fleet_read_fn_`/`require_fleet_read`'s `meet()`
+  composition as a qualifying real-confinement mechanism, since this migration made it one.
+  Still open for the remaining 7 MCP denies: whether a bare `perm_fn`/`scoped_perm_fn` alone
+  (no `fleet_read_fn_`-class mechanism) is enough, resolve when retiring those.
 - `docs/auth-architecture.md:2464`'s "Dispatch's supersede→intersect migration" sentence
   conflates `authz::meet`'s dispatch-confinement use (ADR-0033, `compose_exec_visible` —
   genuinely supersede, zero `authorize_list_read` callers) with the actual §3d targets (4
