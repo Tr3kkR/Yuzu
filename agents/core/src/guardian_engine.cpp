@@ -276,12 +276,38 @@ std::expected<void, std::string> GuardianEngine::start_local() {
         // Degrade per-rule (LOUD error, this rule does not enforce) so the agent survives
         // to arm the rest, rather than terminating the whole process.
         try {
+            if (rearm_fault_hook_for_test_)
+                rearm_fault_hook_for_test_(rule.rule_id());
             if (reconcile_rule_locked(rule)) // count only rules that actually armed (either backend)
                 ++rearmed;
         } catch (const std::exception& e) {
-            spdlog::error("Guardian: rule '{}' failed to re-arm ({}) - NOT enforcing this rule; "
-                          "agent continues with the remaining rules",
-                          rule.rule_id(), e.what());
+            // Build once, log, and record for last_rearm_degrade_message_for_test - a single
+            // source of truth rather than a second copy of this text. spdlog::error("{}", msg),
+            // a literal one-placeholder format string with msg as the substituted argument,
+            // never reparses msg's own content as format syntax regardless of vendored spdlog
+            // version/overload resolution - the version-proof safe idiom for logging arbitrary
+            // (here, exception-supplied) text, not a workaround for a throw this specific
+            // vendored version happens not to have.
+            //
+            // Nested try/catch (Gate 4 unhappy-path review, #2238): spdlog::error() firewalls
+            // its OWN allocation internally (SPDLOG_TRY/SPDLOG_LOGGER_CATCH - never rethrows),
+            // but the raw string concatenation building degrade_msg runs OUTSIDE that firewall,
+            // in a catch block whose entire purpose is to survive exactly the resource-exhaustion
+            // class (thread/handle exhaustion often correlates with memory pressure) that could
+            // also make this concatenation throw bad_alloc. An uncaught throw here would escape
+            // start_local() and terminate the agent - precisely the failure this outer catch
+            // exists to prevent. Degrade further on a secondary failure rather than risk that.
+            try {
+                const std::string degrade_msg =
+                    "Guardian: rule '" + rule.rule_id() + "' failed to re-arm (" + e.what() +
+                    ") - NOT enforcing this rule; agent continues with the remaining rules";
+                spdlog::error("{}", degrade_msg);
+                last_rearm_degrade_message_for_test_ = degrade_msg;
+            } catch (...) {
+                spdlog::error("Guardian: a rule failed to re-arm and the degrade message itself "
+                              "could not be built (secondary allocation failure) - NOT enforcing "
+                              "this rule; agent continues with the remaining rules");
+            }
         }
     }
 
@@ -842,6 +868,11 @@ std::size_t GuardianEngine::armed_guard_count() const {
 std::size_t GuardianEngine::spark_armed_rule_count() const {
     std::lock_guard lock(mtx_);
     return spark_runtime_ ? spark_runtime_->rule_count() : 0;
+}
+
+std::string GuardianEngine::last_rearm_degrade_message_for_test() const {
+    std::lock_guard lock(mtx_);
+    return last_rearm_degrade_message_for_test_;
 }
 
 std::uint64_t GuardianEngine::policy_generation() const {
