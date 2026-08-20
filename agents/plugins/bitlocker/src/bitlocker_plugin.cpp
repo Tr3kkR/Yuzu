@@ -352,7 +352,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
 class BitlockerPlugin final : public yuzu::Plugin {
 public:
     std::string_view name() const noexcept override { return "bitlocker"; }
-    std::string_view version() const noexcept override { return "0.1.0"; }
+    std::string_view version() const noexcept override { return "0.2.0"; }
     std::string_view description() const noexcept override {
         return "Disk encryption status — BitLocker, LUKS, FileVault";
     }
