@@ -5,8 +5,17 @@
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
+#include "authz_gates.hpp" // #3290 Phase 2: authz::FleetReadGate — query_installed_software's real confinement seam
 #include "authz_model.hpp" // #1788: VisibleSet — MCP dispatch confinement (in_scope/filter_to_scope)
 #include "ca_store.hpp"
+#include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
+// ADR-0031 operator surface (PR1.6c) — MCP twins of the operator
+// mint/list/revoke upload-grant routes. Reuses UploadGrantListAuthorization/
+// UploadGrantListDecision verbatim (not redefined) so the REST list-admit
+// gate (GET /api/v1/upload-grants) and this MCP twin cannot drift — same
+// reuse discipline as kek_routes.hpp above. Also brings in UploadGrantStore
+// fully defined, so no separate include is needed for that.
+#include "file_retrieval_routes.hpp"
 #include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
 #include "network_perf_model.hpp"
@@ -15,6 +24,12 @@
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
 #include "kek_routes.hpp" // KekOps / KekOpResult (#2395 track C): reused, not redefined
+// ADR-0031 operator surface (PR1.5c/1.6c, p14): reuses
+// UploadGrantListAuthorization/UploadGrantListDecision verbatim (not
+// redefined) so the REST list-admit gate (GET /api/v1/upload-grants) and its
+// MCP twin (list_upload_grants) cannot drift — same reuse discipline as
+// kek_routes.hpp above.
+#include "file_retrieval_routes.hpp"
 #include "management_group_store.hpp"
 #include "mcp_session.hpp"
 #include "mcp_stream.hpp" // GET SSE channel: StreamRevalidateFn, handle_get_tail (2f PR 2)
@@ -53,6 +68,12 @@ class EnginePrincipalStore;
 // directory_sync.hpp. AuthDB is already forward-declared via <yuzu/server/auth.hpp>.
 class AccessReviewStore;
 class DirectorySync;
+// ADR-0031 operator surface (PR1.5c, p14) — backs the plugin config/secret/
+// kill-switch MCP twins. Forward-declared (pointer-only in the setter
+// below); the .cpp includes plugin_config_store.hpp for the definition.
+// UploadGrantStore itself is NOT forward-declared here — it arrives fully
+// defined via file_retrieval_routes.hpp's own include above.
+class PluginConfigStore;
 }
 
 namespace yuzu::server::detail {
@@ -170,22 +191,6 @@ public:
     using ResponseScopeFn =
         std::function<bool(const std::string& username, const std::string& agent_id)>;
 
-    /// Per-agent INVENTORY-scope predicate — same shape as ResponseScopeFn but
-    /// bound to ("Inventory","Read"), so `query_installed_software` filters its
-    /// fleet rows to the caller's management groups (INTENDED cross-operator
-    /// isolation, mirrors the #1550 query_responses filter — same inert-under-the-
-    /// global-gate class, NOT achieved isolation). NOTE (ADR-0017): this
-    /// filter is INERT under the global Inventory:Read gate — a confined operator
-    /// is denied at the gate before it runs, a global operator's filter is a no-op —
-    /// so it does not yet narrow list reads; it is the foundation the ADR-0017
-    /// admit-then-filter list gate builds on (#1716). Same fail-open-when-unwired
-    /// contract: an unset predicate (`= {}`) applies NO filter (legacy-open /
-    /// RBAC-off). The SOLE production caller (server.cpp) MUST wire it to
-    /// rbac_store->check_scoped_permission(username,"Inventory","Read",agent_id,
-    /// mgmt_store). Do NOT add a new production registration without wiring it.
-    using InventoryScopeFn =
-        std::function<bool(const std::string& username, const std::string& agent_id)>;
-
     /// Send command callback — dispatches a command and returns (command_id, agents_reached).
     ///
     /// `execution_id` is the pre-created `ExecutionTracker` row id, threaded
@@ -201,24 +206,33 @@ public:
     /// `WorkflowRoutes::CommandDispatchFn` (the REST sibling). Added for
     /// issue #1088 so MCP `execute_instruction` can return `execution_id`
     /// in its response and let agentic workers bridge to `/api/v1/events`.
+    ///
+    /// PLAN-006: the trailing param carries the caller's IDENTITY as well as
+    /// its `exec_visible` filter (`yuzu::server::DispatchCaller`, formerly a
+    /// bare `VisibleSet`) so the shared `dispatch_confined` seam has a
+    /// principal to work with, not only a visibility filter.
     using DispatchFn = std::function<std::pair<std::string, int>(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters,
         const std::string& execution_id,
-        // #1788: the caller's Execution:Execute visible set (nullopt == unfiltered).
-        // Every dispatch arm intersects against it, mirroring /api/command.
-        const yuzu::server::authz::VisibleSet& exec_visible)>;
+        // #1788 / PLAN-006: every dispatch arm intersects `caller.exec_visible`
+        // against its targets, mirroring /api/command; `caller.principal`
+        // identifies who asked.
+        const yuzu::server::DispatchCaller& caller)>;
 
-    /// #1788: derives the per-request Execution:Execute visible set the DispatchFn
-    /// intersects against. Injected because the handler has the session but the
-    /// dispatch lambda (server.cpp) does not. When this std::function is UNSET,
-    /// the execute_instruction / execute_bundle handlers substitute a PRESENT-EMPTY
-    /// VisibleSet (deny-all), NOT nullopt — an unwired derivation fails CLOSED
-    /// (ADR-0033 §1: a missing applicable filter denies; CDX-R6-02). A caller that
-    /// genuinely wants full-fleet dispatch must wire a callback returning
-    /// std::nullopt; production wires server.cpp's derive_exec_visible.
-    using ExecVisibleFn = std::function<yuzu::server::authz::VisibleSet(const auth::Session&)>;
+    /// #1788 / PLAN-006: derives the per-request DispatchCaller (identity +
+    /// Execution:Execute visible set) the DispatchFn consults. Injected because
+    /// the handler has the session but the dispatch lambda (server.cpp) does
+    /// not. When this std::function is UNSET, the execute_instruction /
+    /// execute_bundle handlers substitute an EMPTY principal alongside a
+    /// PRESENT-EMPTY `exec_visible` (deny-all), NOT nullopt — an unwired
+    /// derivation fails CLOSED on visibility exactly as before this struct
+    /// existed (ADR-0033 §1: a missing applicable filter denies; CDX-R6-02). A
+    /// caller that genuinely wants full-fleet dispatch must wire a callback
+    /// whose `exec_visible` is std::nullopt; production wires server.cpp's
+    /// derive_dispatch_caller (which wraps derive_exec_visible).
+    using CallerFn = std::function<yuzu::server::DispatchCaller(const auth::Session&)>;
 
     /// Owner-FK existence check for engine-principal create/transfer-owner
     /// (design doc `docs/auth-engine-principals-design.md` §3.1:
@@ -231,8 +245,8 @@ public:
     /// unavailable"), never silently admitted — mirrors
     /// `ApiTokenStore::set_engine_referent_check`'s fail-closed-when-unwired
     /// posture, not the FAIL-OPEN-WHEN-UNWIRED contract used by
-    /// ResponseScopeFn/InventoryScopeFn above (those are defense-in-depth
-    /// filters over an already-gated read; this is the sole check standing
+    /// ResponseScopeFn above (a defense-in-depth filter over an already-gated
+    /// read; this is the sole check standing
     /// between an MCP write and a dangling owner reference).
     using OwnerExistsFn = std::function<bool(const std::string& username)>;
 
@@ -278,6 +292,55 @@ public:
     /// to KekRoutes::register_routes.
     void set_kek_ops(KekOps ops) { kek_ops_ = std::move(ops); }
 
+    /// ADR-0031 operator surface (PR1.5c) — plugin config/secret/kill-switch
+    /// store, backing get/set/delete_plugin_config, set/delete_plugin_secret,
+    /// get/set_plugin_kill_switch. Same setter idiom as
+    /// set_engine_principal_store above (the handler's `[=]` lambda captures
+    /// `this`, so the injection is a live read on the next request). Unset
+    /// (`nullptr`, the default) ⇒ every one of those tools answers
+    /// "unavailable" rather than crashing or silently no-op'ing.
+    void set_plugin_config_store(PluginConfigStore* store) { plugin_config_store_ = store; }
+
+    /// ADR-0031 operator surface (PR1.6c) — upload-grant store + the
+    /// ADR-0017 list-admit resolver for list_upload_grants, backing
+    /// mint/list/revoke_upload_grant. `list_read_fn` is the SAME shape as
+    /// `yuzu::server::Deps::ListReadFn` (file_retrieval_routes.hpp) reused
+    /// verbatim, not redefined, so the REST GET /api/v1/upload-grants list
+    /// gate and this MCP twin cannot drift — server.cpp wires both from the
+    /// identical `RbacStore::authorize_list_read` call. Unset store ⇒ every
+    /// upload-grant tool answers "unavailable"; unset (default-constructed)
+    /// `list_read_fn` fails CLOSED (kDenyAll), matching the REST twin's own
+    /// unwired default (file_retrieval_routes.hpp's Deps doc comment) — NOT
+    /// the fail-open-when-unwired contract ResponseScopeFn above uses,
+    /// because this is the sole admit decision for the route, not
+    /// a defense-in-depth filter over an already-gated read.
+    using UploadGrantListReadFn =
+        std::function<UploadGrantListAuthorization(const std::string& username)>;
+    void set_upload_grant_ops(UploadGrantStore* store, UploadGrantListReadFn list_read_fn) {
+        upload_grant_store_ = store;
+        upload_grant_list_read_fn_ = std::move(list_read_fn);
+    }
+
+    /// #3290 Phase 2 — the injected-callback twin of
+    /// `AuthRoutes::require_fleet_read`, backing `query_installed_software`'s
+    /// real per-agent/service confinement (see `authz::FleetReadGate`'s doc
+    /// comment, authz_gates.hpp, and `RestApiV1::FleetReadFn`,
+    /// rest_api_v1.hpp, for the shared shape — server.cpp wires the SAME
+    /// conversion lambda into both surfaces so REST and MCP cannot drift).
+    /// Same setter idiom as `set_upload_grant_ops` above (the handler's
+    /// `[=]` lambda captures `this`, so the injection is a live read on the
+    /// next request). MUST be this tool's SOLE authorization gate — never
+    /// stacked with `perm_fn` for the same `(securable_type, operation)`
+    /// (the identical BLOCKING defect `require_fleet_read`'s own doc
+    /// comment warns against). Unset (default-constructed) ⇒ the tool fails
+    /// CLOSED (503 "unwired"), mirroring `RestApiV1`'s own unwired contract
+    /// for the identical seam.
+    using FleetReadFn =
+        std::function<authz::FleetReadGate(const httplib::Request&, httplib::Response&,
+                                           const std::string& securable_type,
+                                           const std::string& operation)>;
+    void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
+
     /// Republish-CRL callback (PR4 B-2): mirrors `CaRoutes::PublishCrlFn` so the
     /// MCP `revoke_certificate` tool republishes the CRL after a revoke exactly as
     /// the REST `/api/v1/ca/revoke` handler does. Returns the new CRL DER, or
@@ -312,7 +375,6 @@ public:
                             DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
                             ResponseScopeFn response_scope_fn = {},
                             SoftwareInventoryStore* software_inventory_store = nullptr,
-                            InventoryScopeFn inventory_scope_fn = {},
                             yuzu::MetricsRegistry* metrics = nullptr,
                             AppPerfProviders app_perf_providers = {},
                             QuarantineStore* quarantine_store = nullptr,
@@ -356,13 +418,20 @@ public:
                             // whole access-review tool family answering "unavailable".
                             AccessReviewStore* access_review_store = nullptr,
                             AuthDB* auth_db = nullptr, DirectorySync* directory_sync = nullptr,
-                            // #1788: derives the per-request Execution:Execute visible
-                            // set for the execute_instruction / execute_bundle dispatch
-                            // confinement. Trailing optional, but UNSET fails CLOSED —
-                            // the handlers substitute a present-empty (deny-all) VisibleSet,
-                            // not unfiltered (CDX-R6-02); a test seam wanting full fleet
-                            // wires a callback returning std::nullopt.
-                            ExecVisibleFn exec_visible_fn = {},
+                            // #1788 / PLAN-006: derives the per-request DispatchCaller
+                            // (identity + Execution:Execute visible set) for the
+                            // execute_instruction / execute_bundle dispatch confinement.
+                            // Trailing optional, but UNSET fails CLOSED on exec_visible —
+                            // the handlers substitute an empty principal alongside a
+                            // present-empty (deny-all) VisibleSet, not unfiltered
+                            // (CDX-R6-02); a test seam wanting full fleet wires a callback
+                            // whose exec_visible is std::nullopt.
+                            //
+                            // ORDER (merge with 2f PR 3b): this parameter occupies the
+                            // slot #2689's positional call sites use — it REPLACES the
+                            // former ExecVisibleFn, whose visible set DispatchCaller now
+                            // carries — so the streaming trio still appends after it.
+                            CallerFn caller_fn = {},
                             // 2f PR 3b (streamed POST): the SAME shared held-open
                             // budget the GET channel leases from - a streamed POST
                             // pins an HTTP worker exactly as a GET SSE stream does,
@@ -377,10 +446,6 @@ public:
                             // already be gone. Absent any of them the POST simply
                             // never streams - it answers plain JSON, byte-identical
                             // to today, which is the correct degradation.
-                            //
-                            // ORDER: exec_visible_fn stays FIRST so #2689's positional
-                            // call sites are untouched by this branch; the streaming
-                            // trio is appended after it.
                             yuzu::server::detail::StreamBudget* stream_budget = nullptr,
                             StreamRevalidateFn revalidate_fn = {},
                             StreamPrincipalAuditFn principal_audit_fn = {});
@@ -426,7 +491,6 @@ public:
                          DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
                          ResponseScopeFn response_scope_fn = {},
                          SoftwareInventoryStore* software_inventory_store = nullptr,
-                         InventoryScopeFn inventory_scope_fn = {},
                          yuzu::MetricsRegistry* metrics = nullptr,
                          AppPerfProviders app_perf_providers = {},
                          QuarantineStore* quarantine_store = nullptr,
@@ -467,9 +531,9 @@ public:
                          // Explicit-principal audit sink for mcp.stream.close (see
                          // StreamPrincipalAuditFn). Empty falls back to the generic sink.
                          StreamPrincipalAuditFn principal_audit_fn = {},
-                         // #1788: per-request Execution:Execute visible-set deriver,
+                         // #1788 / PLAN-006: per-request DispatchCaller deriver,
                          // forwarded to build_handler for MCP dispatch confinement.
-                         ExecVisibleFn exec_visible_fn = {});
+                         CallerFn caller_fn = {});
 
 private:
     // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──
@@ -486,6 +550,15 @@ private:
     // KEK rotation seam (#2395 track C) - see set_kek_ops above. Default-
     // constructed (all three std::functions empty) until server.cpp wires it.
     KekOps kek_ops_;
+    // ADR-0031 operator surface (PR1.5c/1.6c, p14) - see set_plugin_config_store
+    // / set_upload_grant_ops above. Nullable; every backed tool checks before
+    // use and answers a clean "unavailable" error, matching
+    // engine_principal_store_'s contract above.
+    PluginConfigStore* plugin_config_store_{nullptr};
+    UploadGrantStore* upload_grant_store_{nullptr};
+    UploadGrantListReadFn upload_grant_list_read_fn_;
+    // #3290 Phase 2 — see set_fleet_read_fn above.
+    FleetReadFn fleet_read_fn_;
 };
 
 // The (tool, securable, operation) test-only accessors that formerly lived here

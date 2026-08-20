@@ -510,27 +510,56 @@ groups:
             bus-buffer sizing question.
       - alert: YuzuMcpBridgeTeardownIncomplete
         expr: |
-          sum by (reason) (yuzu_mcp_bridge_teardown_incomplete_total) > 0
+          sum by (reason) (increase(yuzu_mcp_bridge_teardown_incomplete_total[15m])) > 0
+        for: 15m
         labels:
           severity: warning
         annotations:
-          summary: "MCP progress-bridge teardown could not complete (resource retained)"
+          summary: "MCP progress-bridge teardown attempt failed (may self-heal via retry)"
           description: >-
-            reason={{ $labels.reason }}. A claimed teardown could not finish on the
-            maintenance thread. The sweep's claim is one-way, so the record is
-            NEVER retried: whatever it still owns is held until the server
-            restarts - unsubscribe = its event-bus subscription (which also
-            blocks that execution's channel and replay buffer from being
-            collected), release_charge = a per-session admission slot,
-            erase = the correlation record and a global slot. A retained record
-            also pins that session's whole stream state and any pinned finals.
-            Client results stay durably fetchable by execution_id. NOTE this is a
-            defence-in-depth counter: on current code only a mutex failure can
-            reach these steps, so for allocation pressure watch
+            reason={{ $labels.reason }}. A teardown ATTEMPT could not finish on the
+            maintenance thread - unsubscribe = its event-bus subscription (which
+            also blocks that execution's channel and replay buffer from being
+            collected), release_charge = a per-session admission slot AND the
+            record itself, erase = the correlation record and a global slot
+            (reaching erase means the subscription and charge already settled).
+            A retained record also pins that session's whole stream state and
+            any pinned finals. Client results stay durably fetchable by
+            execution_id. NOT yet a strand: a LATER sweep (15s cadence) retries
+            the same record (#2513, up to Config::teardown_retry_max beyond
+            this attempt - a few sweep ticks, well inside this alert's window),
+            so this counter alone can recover on its own. INCREASE OVER A
+            WINDOW ON PURPOSE, unlike its sibling below: a raw counter test
+            would never clear after the first-ever transient blip, since the
+            underlying series is monotonic and most of its movement recovers.
+            Check yuzu_mcp_bridge_teardown_retry_total next: outcome="recovered"
+            means it did, outcome="exhausted" means it did not and retention is
+            now permanent (see YuzuMcpBridgeTeardownRetryExhausted, the alert
+            that actually pages). NOTE this is a defence-in-depth counter: on
+            current code only a mutex failure can reach these steps, so for
+            allocation pressure watch
             yuzu_mcp_stream_terminal_publish_failures_total instead.
-            DELIBERATELY a raw counter test, not increase() over a window: the
-            retention lasts until the process restarts, so an alert that cleared
-            after 15 minutes would contradict the contract it exists to report.
+            Runbook: docs/ops-runbooks/mcp-bridge-teardown-recovery.md
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
+      - alert: YuzuMcpBridgeTeardownRetryExhausted
+        expr: |
+          sum (yuzu_mcp_bridge_teardown_retry_total{outcome="exhausted"}) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP progress-bridge teardown exhausted its retry budget (resource retained until restart)"
+          description: >-
+            A record's teardown failed on every attempt up to
+            Config::teardown_retry_max (4 total attempts by default) and will
+            not be reattempted. This IS the permanent-retention signal -
+            yuzu_mcp_bridge_teardown_incomplete_total moving alone is not,
+            since most of its movement recovers via retry. See
+            yuzu_mcp_bridge_teardown_incomplete_total{reason} for which
+            resource(s) are held, and the mcp.bridge.teardown_retry audit row
+            for this record's execution_id. DELIBERATELY a raw counter test,
+            not increase() over a window: the retention lasts until the
+            process restarts, so an alert that cleared after 15 minutes would
+            contradict the contract it exists to report.
             Runbook: docs/ops-runbooks/mcp-bridge-teardown-recovery.md
           runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
       - alert: YuzuMcpStreamedPinSlotsWedged
@@ -675,12 +704,15 @@ groups:
             exception aborted the whole process, so a firing here is strictly
             better than the alternative - but a sustained rate means that class of
             maintenance is not running at all. Correlate with host memory pressure.
-            DELIBERATELY increase() over a window, unlike the teardown-incomplete
-            rule next to it: a skipped tick is retried on the next cycle, so this
-            condition is self-healing and the alert must clear when it stops. The
-            raw-counter form is correct ONLY where the retention it reports is
-            permanent until restart, which is true of teardown_incomplete and not
-            of this.
+            DELIBERATELY increase() over a window, same shape as
+            YuzuMcpBridgeTeardownIncomplete (#2513 rewrote that one to match, since
+            teardown is now retried too - see that alert's own annotation): a
+            skipped tick is retried on the next cycle, so this condition is
+            self-healing and the alert must clear when it stops. The raw-counter
+            form is correct ONLY where the retention it reports is permanent until
+            restart - that is now YuzuMcpBridgeTeardownRetryExhausted, not
+            teardown_incomplete, which moved to this same windowed shape for the
+            identical reason.
             Runbook: docs/ops-runbooks/mcp-bridge-teardown-recovery.md
           runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
       - alert: YuzuMcpBridgeRecordsNearCap
@@ -1539,7 +1571,8 @@ groups:
           description: >-
             yuzu_server_audit_emit_failed_total is rising. Every REST route that uses
             fail-closed audit-on-open (guardian.device.view, dex.device.view,
-            dex.signal.view) is returning 503 and withholding PII, so a ServiceNow /
+            dex.signal.view, dex.perf.device.view, network.device.view) is returning
+            503 and withholding PII, so a ServiceNow /
             CMDB poll blackouts fleet-wide. Check audit_store health (/healthz
             stores.audit) and free disk / connection saturation on the PostgreSQL
             server (ADR-0040 — audit is Postgres-backed, not a local file). Note: a bad_alloc-class
@@ -2609,6 +2642,81 @@ groups:
             legacy file) — it carries the remediation. See the runbook for
             what each reason means and how to resolve it.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#notification-feed-moves-to-postgresql--history-preserved-notificationstore-adr-0046"
+      - alert: YuzuTagStoreReadDegraded
+        # A tag_store read degraded and the caller failed CLOSED (ADR-0050):
+        # tags are DISPATCH-CRITICAL scope input, so evaluate_scope ABORTS the
+        # whole evaluation, tag:-scoped dispatch/policy targeting resolves to
+        # ZERO agents, service-scoped-token authz 503s, and the REST/MCP tag
+        # surfaces answer 503/-32603 — never a silently-empty result. While
+        # this fires, do NOT read a tag:-scoped rule's empty match as
+        # authoritative, and note the policy evaluator's tick collapses the
+        # abort to "no targets" (verdicts freeze at their prior values;
+        # PolicyStore.last_check_at stops advancing — governance UP-4).
+        # /readyz stays green under pure pool saturation (latched is_open),
+        # so PAIR this with yuzu_pg_pool_waiters / yuzu_pg_acquire_* when
+        # triaging: pool_acquire_timeout/query_error correlate with substrate
+        # saturation or outage; store_not_open means the store failed at boot.
+        # reason = store_not_open | pool_acquire_timeout | query_error.
+        expr: |
+          sum(rate(yuzu_server_tag_store_read_degrade_total[5m])) by (reason) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tag-store reads degrading ({{ $labels.reason }}) — tag-scoped targeting is failing closed"
+          description: >-
+            yuzu_server_tag_store_read_degrade_total{reason="{{ $labels.reason }}"}
+            is non-zero: a tag read that feeds scope resolution, service-token
+            confinement, or the tag REST/MCP surfaces degraded and the caller
+            failed closed. tag:-scoped dispatch reaches zero agents and the
+            policy evaluator silently skips tag-scoped checks while this
+            fires (last_check_at stops advancing). Pair with yuzu_pg_pool_*
+            saturation signals; /readyz does not reflect this state.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/tag-store-backfill-recovery.md"
+      - alert: YuzuTagStoreBackfillNotCompleted
+        # Mirrors YuzuNotificationBackfillFailing's absent-success shape (NOT
+        # the custom-properties result="failed" shape): the one-time legacy
+        # tags.db -> tag_store backfill (ADR-0050) runs during server
+        # CONSTRUCTION, and a failure sets startup_failed_ so the HTTP
+        # listener never starts — /metrics is never served and a
+        # result="failed" sample is never scraped, making a failed-keyed
+        # expression unfireable (governance sre-1). What IS observable is the
+        # ABSENCE of a success outcome. THIS RULE DEPENDS ON THE PRE-SEED in
+        # server.cpp's tag-store construction block (describe() + zero-loop
+        # over fresh/success/failed) — that is what makes "series absent"
+        # mean "no server is serving" rather than "metric not registered".
+        # THREE-WAY result split: fresh | success | failed; expr matches the
+        # two good outcomes. LIMITS: multi-replica — one wedged replica among
+        # healthy ones shows as up == 0, not this; a legitimately long first
+        # boot on a huge tags.db can trip it during the upgrade window
+        # (silence for the window). The BOOT LOG carries the actual
+        # remediation (holder-side fingerprint mismatch / direction-aware
+        # row-conflict refusal / unreadable legacy file). An oversized legacy
+        # file does NOT time out server-side — it makes a LONG boot that an
+        # orchestrator's startup budget may kill mid-backfill (safe, retried
+        # whole) — so also check for a kill loop, not only a refusal line.
+        # This is the outside-in backstop, not the primary signal.
+        expr: |
+          absent_over_time(yuzu_server_tag_store_backfill_total{result=~"success|fresh"}[15m])
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No server is reporting a completed tag-store backfill (possible boot refusal)"
+          description: >-
+            No scraped Yuzu server has reported a successful one-time legacy
+            tags.db -> PostgreSQL tag_store backfill (ADR-0050) in the last
+            15 minutes. After an upgrade the usual cause is a server that
+            FAILED the backfill: it fails CLOSED, refuses to serve, and
+            retries on the next start — a restart loop with the whole server
+            down. A DIRECTION-AWARE row-conflict refusal additionally means
+            the currently-served tag data may be the WRONG SIDE of an
+            operator-authored-data race — treat it as a data-integrity
+            incident, not just an availability one (verify which side is
+            authoritative before clearing anything). Read the server BOOT
+            log for the specific refusal; the runbook maps each message to
+            its recovery.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/tag-store-backfill-recovery.md"
       - alert: YuzuInventoryIngestSlow
         # Leading indicator for ingest transaction-hold saturation: full-payload
         # ingests taking >10s. Distinct from the yuzu_pg_acquire_* family, which
@@ -2834,6 +2942,19 @@ groups:
   #           or contended watcher. Sustained slow ops can delay detection. Inspect the
   #           mechanism's OS facility (IOCP / TP_WAIT pool / sd-bus / SCM) on the OS.
   #         runbook_url: "https://docs.yuzu.io/runbooks/spark-slow-op"
+  #     # No YuzuSparkUnsupported rule (F7, #2298 rung 2 - governance finding, sre Gate 3):
+  #     # yuzu_fleet_spark_unsupported is a ROUTINE signal, not a fault - a known spark type
+  #     # with no mechanism on that host (every rule reads unsupported on macOS today, since
+  #     # macOS registers none of file/registry/service) is expected, not a regression. A
+  #     # bare `> 0` would page on every legitimate cross-platform deploy. It is NOT
+  #     # universally safe to ignore, though: classify() keys off the registered-AND-
+  #     # non-inert capability set (guardian_engine.cpp), so a registration failure or a
+  #     # registered-but-inert mechanism can also land a rule here on a platform where it
+  #     # should have worked - see docs/user-manual/guaranteed-state.md's on-call note for
+  #     # how to tell the two apart. Revisit at rung 11 (docs/spark-stage2-guardian-
+  #     # consumer-design.md's deferred server-side fleet-signal alert work - flap
+  #     # detector + SparkFailed-prevalence) once real per-platform baselines exist to
+  #     # alert against.
   #     - alert: YuzuSparkQueuedDropped
   #       expr: |
   #         increase(yuzu_fleet_spark_queued_dropped[15m]) > 0

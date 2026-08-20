@@ -185,6 +185,29 @@ message CommandRequest {
   // nonetheless copies `payload` now so it cannot become a strip point if reused.)
   // See docs/guardian-mvp-contract.md G2/G12.
   bytes payload = 8;
+
+  // Dispatch classification tag for this command, computed and frozen by
+  // command_capability_parsers.hpp (server/core/src/command_capability_parsers.hpp):
+  // encode_dispatch_tag/decode_dispatch_tag produce and parse EXACTLY
+  //   v1|<class>|<mutability>|<plan_hash_hex>
+  // with class in {ro, mut, dest} and mutability in {none, rev, irrev}. One
+  // opaque string, not three fields, so a future dispatch class costs no
+  // proto churn — this grammar is frozen; do not encode/decode it anywhere
+  // else with a different format.
+  // GATEWAY: this field IS mirrored into the gateway's vendored agent.proto
+  // (gateway/priv/proto/agent.proto AND
+  // gateway/priv/proto/yuzu/agent/v1/agent.proto, agent_pb.erl regenerated)
+  // and the gateway forwards the decoded CommandRequest straight through
+  // gpb. gpb 4.21.7 has no preserve_unknown_fields — it DROPS any field
+  // absent from its own copy of the message, so a missing mirror silently
+  // strips the tag and the server-side dispatch chokepoint sees an
+  // agent-side default-empty string instead of the real classification.
+  // CC-03: the server refuses to route a tagged CommandRequest through a
+  // gateway whose most recent StreamStatusNotification.wire_capabilities
+  // (proto/yuzu/gateway/v1/gateway.proto) does not advertise the literal
+  // "command_dispatch_tag_v1" — that capability is this gateway's proof it
+  // carries this field end-to-end.
+  string dispatch_tag = 9;
 }
 
 message CommandResponse {

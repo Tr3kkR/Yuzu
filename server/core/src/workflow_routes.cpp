@@ -6,7 +6,11 @@
 #include "execution_event_bus.hpp"
 #include "http_route_sink.hpp"
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
+#include "rest_a4_envelope.hpp"     // detail::error_json_a4, make_correlation_id
+#include "rest_a4_envelope_http.hpp" // detail::a4_denial (deny_service_scoped_scope_estimate) —
+                                     // mints/reuses X-Correlation-Id so header and body agree
 #include "scope_engine.hpp"
+#include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
 #include "web_utils.hpp"
 
 #include <nlohmann/json.hpp>
@@ -65,9 +69,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     auto* execution_event_bus = deps.execution_event_bus;
     auto* metrics = deps.metrics;
     auto cmd_dispatch = std::move(deps.command_dispatch_fn);
-    // K-R7-02: per-request Execution:Execute visible-set derivation. A missing
-    // callback fails CLOSED at each dispatch site (present-empty set, deny all).
-    auto exec_visible_fn = std::move(deps.exec_visible_fn);
+    // K-R7-02 / PLAN-006: per-request DispatchCaller derivation. A missing
+    // callback fails CLOSED on visibility at each dispatch site (empty
+    // principal, present-empty set, deny all).
+    auto caller_fn = std::move(deps.caller_fn);
 
     // -- HTMX fragments --------------------------------------------------------
 
@@ -904,11 +909,68 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                          }));
              });
 
-    // GET /fragments/schedules -- schedule list HTMX fragment
-    sink.Get("/fragments/schedules", [auth_fn, schedule_engine](const httplib::Request& req,
-                                                                httplib::Response& res) {
+    // guardian-confinement-2298: fleet-wide schedule list has no single
+    // schedule/agent to confine per-target, mirrors GuardianRoutes'/
+    // RestApiV1's blanket service-scoped deny for the identical reason —
+    // ITServiceOwner grants full CRUD on Schedule, so a bare Schedule:Read
+    // gate alone would still let a service-scoped token enumerate every
+    // schedule from every other service. Runs BEFORE perm_fn (independent
+    // of RBAC on/off branch ordering) — matches the GuardianRoutes/DexRoutes/
+    // NetworkRoutes family of fragment/REST denies with no single per-target
+    // to scope against. The schedule feature's OWN shared REST helper,
+    // deny_service_scoped_schedule (schedule_routes.hpp), deliberately runs
+    // the OPPOSITE order — AFTER its route's permission gate(s) — because
+    // its resolve_session doesn't write a response on failure the way this
+    // lambda's auth_fn does; both orderings are correct for their own
+    // callback contract, this is not one universal rule.
+    auto deny_service_scoped_schedule_list = [auth_fn, audit_fn](const httplib::Request& req,
+                                                                  httplib::Response& res) -> bool {
         auto session = auth_fn(req, res);
         if (!session)
+            return true; // auth_fn already wrote 401/redirect; caller returns.
+        if (session->token_scope_service.empty())
+            return false;
+        // Write the 403 FIRST, audit after (mirrors GuardianRoutes'
+        // deny_service_scoped_): a throwing audit_fn must not suppress the 403.
+        res.status = 403;
+        // No `.permission`: `kServiceScopeGlobalSafe` is compile-time-empty,
+        // so no grant admits a service-scoped caller here (gov-fix, Gate 8,
+        // #2298 PR 3 hardening round — routed-concern MUST clause).
+        // `a4_denial` also fixes a second bug found in the same pass: the
+        // hand-built cid never reached the X-Correlation-Id header.
+        res.set_content(
+            detail::a4_denial(res, 403,
+                              "service-scoped tokens may not read the fleet-wide schedule list"),
+            "application/json");
+        if (audit_fn) {
+            try {
+                audit_fn(req, "schedule.list.access_denied", "denied", "schedule", "",
+                         "fleet-wide schedule list denied to a service-scoped token");
+            } catch (const std::exception& e) {
+                spdlog::warn("schedule.list.access_denied: audit_fn threw: {}", e.what());
+            } catch (...) {
+                spdlog::warn("schedule.list.access_denied: audit_fn threw (non-std)");
+            }
+        }
+        return true;
+    };
+
+    // GET /fragments/schedules -- schedule list HTMX fragment
+    sink.Get("/fragments/schedules", [perm_fn, schedule_engine,
+                                      deny_service_scoped_schedule_list](
+                                         const httplib::Request& req, httplib::Response& res) {
+        // deny_service_scoped_schedule_list already resolved (and validated)
+        // the session via auth_fn — a second auth_fn call here would be
+        // redundant, matching the original handler's only use of `session`
+        // (the existence check; the body never read the session itself).
+        if (deny_service_scoped_schedule_list(req, res))
+            return;
+        // sec-M1-style gate (mirrors /fragments/executions immediately above):
+        // the LIST exposes every schedule's name/frequency/enabled state/
+        // execution count fleet-wide — previously reachable by ANY
+        // authenticated session with no RBAC check at all (guardian-
+        // confinement-2298 hardening sweep).
+        if (!perm_fn(req, res, "Schedule", "Read"))
             return;
         if (!schedule_engine) {
             res.set_content("<div class=\"empty-state\">Not available</div>", "text/html");
@@ -951,9 +1013,54 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
     // -- Scope estimate API ----------------------------------------------------
 
+    // guardian-confinement-2298 PR3 §3e: /api/scope/estimate is auth_fn-only
+    // (no perm_fn at all) and probes an arbitrary caller-supplied scope
+    // expression against `scope_fn(expression, session->username)` — the
+    // minter's OWN visible fleet, which for a service-scoped token is still
+    // ITServiceOwner's full-CRUD-visible set (the route never consults
+    // token_scope_service). No per-target parameter to scope against, same
+    // gap class as deny_service_scoped_schedule_list above.
+    auto deny_service_scoped_scope_estimate = [auth_fn, audit_fn](const httplib::Request& req,
+                                                                   httplib::Response& res) -> bool {
+        auto session = auth_fn(req, res);
+        if (!session)
+            return true; // auth_fn already wrote 401/redirect; caller returns.
+        if (session->token_scope_service.empty())
+            return false;
+        res.status = 403;
+        // No `.permission` label: this route has no perm_fn gate at all — a
+        // blanket deny with no grant that would admit a service-scoped
+        // token, so naming one would be a false self-remediation claim.
+        //
+        // `a4_denial` (not a hand-built `error_json_a4` + bare correlation
+        // id): it mints/reuses the id via `ensure_correlation_id`, which
+        // ALSO sets the X-Correlation-Id response header — a hand-built id
+        // embeds a correlation_id in the body the header never carries,
+        // breaking the header/body-must-agree contract (consistency-auditor,
+        // Gate 4).
+        res.set_content(
+            detail::a4_denial(
+                res, 403,
+                "service-scoped tokens may not estimate scope expressions against the fleet"),
+            "application/json");
+        if (audit_fn) {
+            try {
+                audit_fn(req, "scope.estimate.access_denied", "denied", "ScopeExpression", "",
+                         "fleet-wide scope estimate denied to a service-scoped token");
+            } catch (const std::exception& e) {
+                spdlog::warn("scope.estimate.access_denied: audit_fn threw: {}", e.what());
+            } catch (...) {
+                spdlog::warn("scope.estimate.access_denied: audit_fn threw (non-std)");
+            }
+        }
+        return true;
+    };
+
     // POST /api/scope/estimate -- scope expression target count
-    sink.Post("/api/scope/estimate", [auth_fn, scope_fn](const httplib::Request& req,
-                                                         httplib::Response& res) {
+    sink.Post("/api/scope/estimate", [auth_fn, scope_fn, deny_service_scoped_scope_estimate](
+                                          const httplib::Request& req, httplib::Response& res) {
+        if (deny_service_scoped_scope_estimate(req, res))
+            return;
         auto session = auth_fn(req, res);
         if (!session)
             return;
@@ -1158,7 +1265,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // POST /api/workflows/:id/execute -- execute workflow against agents
     sink.Post(R"(/api/workflows/([^/]+)/execute)", [auth_fn, perm_fn, audit_fn, emit_fn,
                                                     workflow_engine, instruction_store,
-                                                    cmd_dispatch, exec_visible_fn,
+                                                    cmd_dispatch, caller_fn,
                                                     approval_manager](const httplib::Request& req,
                                                                       httplib::Response& res) {
         if (!perm_fn(req, res, "Workflow", "Execute"))
@@ -1197,13 +1304,15 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        // K-R7-02: derive the operator's Execution:Execute visible set ONCE for
-        // this request and thread it into every step dispatch below, so a
-        // workflow step is confined exactly as /api/command and MCP are. An
-        // UNWIRED derivation fails CLOSED (present-empty set → reaches nobody).
-        const yuzu::server::authz::VisibleSet exec_visible =
-            exec_visible_fn ? exec_visible_fn(req)
-                            : yuzu::server::authz::deny_all();
+        // K-R7-02 / PLAN-006: derive the operator's DispatchCaller ONCE for this
+        // request and thread it into every step dispatch below, so a workflow
+        // step is confined AND identified exactly as /api/command and MCP are.
+        // An UNWIRED derivation fails CLOSED on visibility (present-empty set →
+        // reaches nobody).
+        const yuzu::server::DispatchCaller caller =
+            caller_fn ? caller_fn(req)
+                      : yuzu::server::DispatchCaller{
+                            .exec_visible = yuzu::server::authz::deny_all()};
 
         // --- Pre-validate approval gates on all workflow steps ---------------
         // If any instruction in the workflow requires approval, reject the
@@ -1262,11 +1371,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         // Create a dispatch function that uses the real command dispatch.
-        // exec_visible is captured by value (workflow_engine->execute invokes
-        // this synchronously below, but a value capture is lifetime-safe
-        // regardless) so every step narrows to the operator's visible set.
+        // caller is captured by value (workflow_engine->execute invokes this
+        // synchronously below, but a value capture is lifetime-safe
+        // regardless) so every step narrows to AND identifies the operator.
         auto dispatch_fn =
-            [instruction_store, &cmd_dispatch, exec_visible](
+            [instruction_store, &cmd_dispatch, caller](
                 const std::string& instruction_id, const std::string& agent_ids_json,
                 const std::string& parameters_json) -> std::expected<std::string, std::string> {
             // Look up the instruction definition to get plugin + action
@@ -1325,7 +1434,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // the legacy sentinel (legacy fallback in detail handler
             // covers the rendering).
             auto [command_id, sent] = cmd_dispatch(def->plugin, def->action, target_ids, "", params,
-                                                   /*execution_id=*/"", exec_visible);
+                                                   /*execution_id=*/"", caller);
 
             if (sent == 0)
                 return std::unexpected<std::string>("no agents reached for " + instruction_id);
@@ -1413,7 +1522,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // POST /api/instructions/:id/execute — dispatch a single instruction definition
     sink.Post(R"(/api/instructions/([^/]+)/execute)", [auth_fn, perm_fn, audit_fn, emit_fn,
                                                        instruction_store, cmd_dispatch,
-                                                       exec_visible_fn, execution_tracker,
+                                                       caller_fn, execution_tracker,
                                                        approval_manager,
                                                        metrics](const httplib::Request& req,
                                                                 httplib::Response& res) {
@@ -1626,7 +1735,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             exec.definition_id = def_id;
             exec.status = "running";
             exec.scope_expression = scope_expr;
-            exec.parameter_values = nlohmann::json(params).dump();
+            // #3136 blocker: persist a REDACTED copy — the live dispatch
+            // below still uses the raw `params` map. See
+            // sensitive_instruction_params.hpp.
+            exec.parameter_values =
+                nlohmann::json(redact_sensitive_instruction_params(params)).dump();
             exec.dispatched_by = session->username;
             if (auto created = execution_tracker->create_execution(exec); created.has_value()) {
                 execution_id = *created;
@@ -1646,16 +1759,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             const std::string dispatch_scope = (agent_ids.empty() && scope_expr.empty())
                                                    ? std::string(kBroadcastScope)
                                                    : scope_expr;
-            // K-R7-02: confine to the operator's Execution:Execute visible set
-            // via the shared dispatch_confined seam. `session` is already
-            // resolved above; re-derive from the request (fail CLOSED if the
-            // callback is unwired — present-empty set → reaches nobody).
-            const yuzu::server::authz::VisibleSet exec_visible =
-                exec_visible_fn ? exec_visible_fn(req)
-                                : yuzu::server::authz::deny_all();
+            // K-R7-02 / PLAN-006: confine to AND identify the operator via the
+            // shared dispatch_confined seam. `session` is already resolved
+            // above; re-derive from the request (fail CLOSED on visibility if
+            // the callback is unwired — present-empty set → reaches nobody).
+            const yuzu::server::DispatchCaller caller =
+                caller_fn ? caller_fn(req)
+                          : yuzu::server::DispatchCaller{
+                                .exec_visible = yuzu::server::authz::deny_all()};
             std::tie(command_id, sent) = cmd_dispatch(def->plugin, def->action, agent_ids,
                                                       dispatch_scope, params, execution_id,
-                                                      exec_visible);
+                                                      caller);
         } catch (const std::exception& e) {
             spdlog::error("instruction dispatch failed: {}", e.what());
             // Pattern C / hardening regression close: the pre-created

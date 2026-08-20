@@ -272,6 +272,26 @@ def _cmd_without_test_specs(cmd):
     return [cmd[0]] + [a for a in cmd[1:] if not CATCH2_TAG_SPEC.match(a)]
 
 
+def _cmd_for_case_retry(cmd):
+    """cmd minus tag-filter specs AND --allow-running-no-tests.
+
+    That flag (pg shard D, #2092) survives _cmd_without_test_specs — it
+    doesn't match CATCH2_TAG_SPEC — so it would otherwise carry straight into
+    an isolated single-case retry. Catch2 ORs a comma inside a positional
+    name spec into multiple sub-filters, so a case whose own name contains a
+    literal comma (real example: ADR-0051's "...missing ONLY
+    software_packages, with real deployment data in the other two tables")
+    legitimately zero-matches both halves. On a whole-shard run that
+    zero-match is the DSN-less-platform all-skip the flag exists for; on a
+    single already-known case name it is always an error, never a
+    legitimate skip — left in, that zero-match still exits 0 and
+    retry_case() reports a case that never ran as recovered."""
+    stripped = _cmd_without_test_specs(cmd)
+    if not stripped:
+        return stripped
+    return [stripped[0]] + [a for a in stripped[1:] if a != "--allow-running-no-tests"]
+
+
 def _run(cmd, env, workdir, extra=None, timeout=None):
     e = dict(os.environ)
     e.update(env or {})
@@ -315,10 +335,10 @@ def catch2_failed_cases(test, this_os):
 
 def retry_case(test, case, retries):
     """Return the 1-based retry attempt that passed, or 0 if none passed."""
+    cmd = _cmd_for_case_retry(test.get("cmd") or [])
     for attempt in range(1, retries + 1):
         try:
-            result = _run(_cmd_without_test_specs(test.get("cmd") or []),
-                          test.get("env"), test.get("workdir"), extra=[case],
+            result = _run(cmd, test.get("env"), test.get("workdir"), extra=[case],
                           timeout=test.get("timeout") or None)
         except subprocess.TimeoutExpired:
             continue
@@ -691,6 +711,23 @@ def _selftest():
     check(_cmd_without_test_specs(["x", "[.]"]) == ["x"], "strips hidden-tag spec")
     check(_cmd_without_test_specs(["x", ""]) == ["x", ""], "empty arg kept (not a spec)")
 
+    # _cmd_for_case_retry (2026-08-17, found reviewing PR #3174's pg-shard-D
+    # routing): --allow-running-no-tests must NOT survive into an isolated
+    # single-case retry. It doesn't match CATCH2_TAG_SPEC, so
+    # _cmd_without_test_specs() alone keeps it — and a case name with a
+    # literal comma (Catch2 ORs a comma inside a positional spec) then
+    # legitimately zero-matches, which the flag turns into a silent exit 0.
+    check(_cmd_for_case_retry(["x", "[pg][audit_store]~[routes]~[store]~[token],"
+                               "[pg][software_deployment]~[routes]~[store]~[token]",
+                               "--allow-running-no-tests"]) == ["x"],
+          "strips both the pg-shard-D tag spec and --allow-running-no-tests")
+    check(_cmd_for_case_retry(["x", "--allow-running-no-tests", "[pg]"]) == ["x"],
+          "strips the flag regardless of its position relative to the tag spec")
+    check(_cmd_for_case_retry(["x", "--foo"]) == ["x", "--foo"],
+          "an unrelated option flag is not mistaken for --allow-running-no-tests")
+    check(_cmd_for_case_retry(["--allow-running-no-tests"]) == ["--allow-running-no-tests"],
+          "argv[0] untouched even when it equals the flag")
+
     # Repo-hygiene guard (#2092): every positional arg on the server test()
     # entries in tests/meson.build must be a Catch2 tag-filter spec — the
     # invariant the retry surgery relies on. A future case-name or comma-list
@@ -707,7 +744,7 @@ def _selftest():
     # or the guard fails loudly instead of silently inspecting half the
     # surface.
     _entries = re.findall(r"test\(\s*'[^']*',\s*server_test_exe\b(.*?)\)", _src, re.S)
-    check(len(_entries) >= 4, "meson.build: all four server shard entries located")
+    check(len(_entries) >= 8, "meson.build: all eight server shard entries located")
     _shard_specs = []
     for _body in _entries:
         # Quote-aware list match: a naive [(.*?)] truncates at the tag spec's
@@ -719,10 +756,31 @@ def _selftest():
             continue  # an args-less entry has no positional specs to strip
         _args = re.findall(r"'([^']*)'", _m.group(1))
         check(bool(_args), "meson.build: args-carrying server entry extracted non-empty")
-        for _arg in _args:
+        # Positional tag-filter specs vs Catch2 OPTION flags. A shard whose
+        # cases ALL skip on a DSN-less platform (macOS: shard D, every case
+        # gated on YUZU_TEST_POSTGRES_DSN) needs `--allow-running-no-tests`, or
+        # Catch2 exits 4 on an all-skipped run and reds the leg (#2092). Option
+        # flags are exempt from the tag-spec hygiene guard and from the shard
+        # pin below (which keys on the positional specs). The whole-shard
+        # enumeration re-run (catch2_failed_cases) preserves options, including
+        # this one — it still needs to survive a DSN-less all-skip. The
+        # isolated SINGLE-CASE retry (_cmd_for_case_retry) does NOT preserve
+        # --allow-running-no-tests specifically: a comma-containing case name
+        # would otherwise zero-match (Catch2 ORs a comma in a positional name
+        # spec) and the flag would turn that into a silent false "recovered"
+        # instead of the honest failure a single-case retry should never
+        # tolerate zero matches on (found reviewing PR #3174's pg-shard-D
+        # routing, 2026-08-17 — see _cmd_for_case_retry's own docstring).
+        _specs = [a for a in _args if not a.startswith("-")]
+        _opts = [a for a in _args if a.startswith("-")]
+        check(bool(_specs), "meson.build: server entry has at least one positional spec")
+        for _arg in _specs:
             check(CATCH2_TAG_SPEC.match(_arg) is not None,
                   f"meson.build server test arg {_arg!r} is not a tag-filter spec")
-        _shard_specs.append(tuple(_args))
+        for _opt in _opts:
+            check(_opt.startswith("--"),
+                  f"meson.build server test option {_opt!r} is not a --long flag")
+        _shard_specs.append(tuple(_specs))
     # Positive pin so hollow extraction can never pass again: the shard filters
     # must come back verbatim. A shard add or rebalance updates this line
     # consciously. #2394 split the single '[pg]' entry into two balanced halves
@@ -734,11 +792,78 @@ def _selftest():
     # (not projected) at ~3% of shard B's runtime, moving it to shard A instead
     # of leaving every newly `[pg]`-tagged audit case to land there by default
     # (tests/meson.build's own comment on this pair has the measurement).
+    # 2026-08-15 rebalance added [rbac_store]/[guaranteed_state_store]/
+    # [response_store] to both PG specs the same way: measured 793 (A) / 1154
+    # (B) at the time of the change, moving 207 cases off shard B after it had
+    # drifted to 2.3x shard A's size and started TIMEOUT-ing at 600s on Linux
+    # and Windows (tests/meson.build's own comment on this pair has the
+    # measurement). PR1.6a review remediation (same day) additionally added
+    # [operator_surface]: 3 new PG-backed MCP integration tests, untagged,
+    # all landed in shard B and tipped it over its 600s CI budget (killed by
+    # TIMEOUT at 600.57s).
+    # 2026-08-16 (PR #3156 review-response round, cherry-picked as 3f0796777,
+    # now also merged to dev via #3156 itself): B TIMEOUT-ed again the day
+    # after the rebalance above. A same-day two-shard fix was reviewed and
+    # rejected before merge — it would have concentrated more cases into
+    # shard A, whose own prior per-case rate was already HIGHER than shard
+    # B's (0.616s/case at 84% of budget), likely relocating the timeout
+    # rather than fixing it. Split into THREE pg shards instead: the
+    # store-heavy tag set (expensive per case — real Postgres template-clone
+    # cost, unlike lighter route/handler tests) is itself split across two
+    # shards (A, B) instead of concentrated in one; shard C holds everything
+    # else. Verified by running all three filters through the built binary,
+    # not projection. [license_store] folded into shard B on the cherry-pick
+    # (tests/meson.build's own comment on this trio has the reasoning and
+    # re-verified counts).
+    # 2026-08-16 (#2092/#2093): the combined store-tag pg shard B TIMEOUT-ed at
+    # 600/600s again (blocking PR #3159). Split B into B+D balanced by measured
+    # TIME, not case count: [rbac_store] alone was ~57s (~54% of the store-tag
+    # runtime), so shard B = [rbac_store] alone and new shard D = the other eight
+    # store tags (~48s). Deliberately count-lopsided (93 vs 335) because time is
+    # what blows the ceiling. shard C UNCHANGED. Local isolated: B 58s / D 49s.
+    # 2026-08-16 (ADR-0051, SoftwareDeploymentStore, PR #3174) followed the
+    # recipe from the comment above for its new [software_deployment] tag (66
+    # cases): measured in isolation — 4.0s, vs. B ([rbac_store]) 55.2s and D
+    # (the other eight tags) 31.5s on the same container — D is the lighter
+    # destination, so [software_deployment] joins D; also added to shard C's
+    # exclusion list per the same instruction (tests/meson.build's own
+    # comment on this pair has the measurement).
+    # 2026-08-17: shard C still TIMEOUT-ed at 600.07/600s on real CI after the
+    # move above (run 32004956605) — the local-measurement projection
+    # undersold real contention. Added a fifth shard E, carving a further
+    # 22-tag block out of C (A 554 / B 93 / D 401 / E 812 / C 271, summing to
+    # the unchanged 2131-case [pg] total; tests/meson.build's own comment on
+    # this quintet has the full reasoning).
+    # 2026-08-17 (PR #3216): shard E itself TIMEOUT-ed at 600.11/600s on dev's
+    # 2026-08-19 (#3322) -- shard E TIMEOUT-ed at 600.5-600.6s with Fail: 0 on 10
+    # of 14 consecutive Linux gcc-15 runs, reddening dev itself. E held 608 of the
+    # 1876 [pg] cases (32%) at ~1.0 s/case, i.e. exactly the ceiling. It had already
+    # been split twice that week and returned each time, because each split carved
+    # off a small piece and left E oversized; this halves it into E=329 / G=278.
+    # G defers to E by additionally excluding each of E's ten remaining tags --
+    # without that, 32 cases carrying a tag from each half would run in BOTH
+    # entries. Coverage verified identical (607 distinct before and after, 0
+    # missing, 0 added, 0 in both halves, 0 overlap with C).
+    #
+    # OWN CI with zero PR-specific tests (run 32047363814) -- carved [dex] and
+    # [mcp] out into a sixth shard F (A 554 / B 93 / D 407 / E 705 / F 159 /
+    # C 271 on this branch's 2189-case [pg] total; tests/meson.build's own
+    # comment on this sextet has the full reasoning and measurements).
     check(("~[pg][auth],~[pg][mcp]",) in _shard_specs
           and ("~[pg]~[auth]~[mcp]",) in _shard_specs
-          and ("[pg][routes],[pg][store],[pg][token],[pg][audit_store]",) in _shard_specs
-          and ("[pg]~[routes]~[store]~[token]~[audit_store]",) in _shard_specs,
-          "meson.build: all four shard tag filters extracted verbatim")
+          and ("[pg][routes],[pg][store],[pg][token]",) in _shard_specs
+          and ("[pg][rbac_store]~[routes]~[store]~[token]",) in _shard_specs
+          and ("[pg][audit_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token],[pg][software_deployment]~[routes]~[store]~[token]",)
+          in _shard_specs
+          and ("[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]",)
+          in _shard_specs
+          and ("[pg][engine_principal]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][scim]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][oidc]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][management_group]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][rbac]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][quarantine]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][custom_props]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][guaranteed_state]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][notification_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][software_inventory]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]",)
+          in _shard_specs
+          and ("[pg][auth_routes]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][saml]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][access_review]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][audit]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][authz]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][secrets]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][agent_service]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][discovery]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][result_set]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][tar]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine]",)
+          in _shard_specs
+          and ("[pg][dex]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment],[pg][mcp]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]",)
+          in _shard_specs,
+          "meson.build: all nine shard tag filters extracted verbatim")
 
     if failures:
         print("SELFTEST FAILURES:", *failures, sep="\n  ")

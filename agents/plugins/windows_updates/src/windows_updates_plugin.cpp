@@ -689,6 +689,41 @@ int do_patch_connectivity(yuzu::CommandContext& ctx, yuzu::Params params) {
     return 0;
 }
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// installed/missing: shell out everywhere (powershell via _popen on Windows
+// = rung 3, interpreter payload; rpm/apt or apt/yum via popen on Linux =
+// rung 3; system_profiler/softwareupdate via popen on macOS = rung 3).
+// pending_reboot: Windows is pure Reg*A presence checks (rung 1); Linux
+// combines a filesystem::exists probe with uname/ls/needs-restarting shell
+// calls (rung 3, the worse of the two exercised); macOS shells out to
+// softwareupdate -l (rung 3) -- CONSTRAINED there per the file's own TODO:
+// "contacts Apple servers and may take 30-120s... may block on
+// headless/offline Macs" with no timeout wrapper yet.
+// patch_connectivity: pure BSD/Winsock sockets (getaddrinfo/connect/poll or
+// select) on all three OSes -- rung 1 everywhere.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {"installed",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "rpm+apt", nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 3, "system_profiler", nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 3, "powershell_gethotfix", nullptr}},
+    {"missing",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "apt+yum", nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 3, "softwareupdate", nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 3, "powershell_update_session", nullptr}},
+    {"pending_reboot",
+     /* linux   = */
+     {YUZU_SUPPORT_SUPPORTED, 3, "filesystem+uname+needs_restarting", nullptr},
+     /* macos   = */
+     {YUZU_SUPPORT_CONSTRAINED, 3, "softwareupdate",
+      "unbounded network call -- may take 30-120s or hang on an offline/headless Mac"},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "registry", nullptr}},
+    {"patch_connectivity",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 1, "raw_sockets", nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 1, "raw_sockets", nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "raw_sockets", nullptr}},
+};
+
 } // namespace
 
 class WindowsUpdatesPlugin final : public yuzu::Plugin {
@@ -703,6 +738,13 @@ public:
         static const char* acts[] = {"installed", "missing", "pending_reboot",
                                      "patch_connectivity", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

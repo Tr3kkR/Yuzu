@@ -5,14 +5,13 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
+#include <yuzu/metrics.hpp>
 
 #include <algorithm>
 #include <chrono>
 #include <iomanip>
-#include <semaphore>
 #include <shared_mutex>
 #include <sstream>
-#include <thread>
 
 #ifdef _WIN32
 // clang-format off
@@ -164,20 +163,70 @@ OffloadTargetStore::OffloadTargetStore(const std::filesystem::path& db_path) {
 }
 
 OffloadTargetStore::~OffloadTargetStore() {
-    // Intentionally NOT calling flush_all() here. flush_all() spawns
-    // detached worker threads that capture `this` and reach back into
-    // `mtx_` / `db_` via record_delivery — those references would dangle
-    // once the destructor returns. WebhookStore (the sibling) follows the
-    // same pattern: pending fire-and-forget deliveries are lost on
-    // shutdown. Operators that need at-least-once semantics should set
-    // batch_size=1 (immediate dispatch, no buffer) or build a queue
-    // upstream of the offload receiver.
-    if (db_)
-        sqlite3_close(db_);
+    // Intentionally NOT calling flush_all() here - buffered (batch_size>1)
+    // events not yet flushed are dropped on destruction; that's a
+    // lost-on-shutdown data-completeness tradeoff, not a safety one.
+    // Operators needing at-least-once semantics should set batch_size=1
+    // (immediate dispatch, no buffer) or call flush_all() on a graceful
+    // shutdown path before this destructs.
+    //
+    // #3261 governance hardening: drain the pool explicitly before
+    // touching db_ - a destructor's body runs BEFORE its members'
+    // destructors, so pool_ being the last-declared member does not, by
+    // itself, stop this line from closing db_ while a worker is still
+    // touching it. See webhook_store.cpp's identical destructor for the
+    // full rationale.
+    //
+    // gov Gate 8 cpp-safety (re-review): the RETURN VALUE matters, not
+    // just the call - an earlier version of this destructor discarded it
+    // and closed db_ unconditionally, silently reintroducing the exact
+    // use-after-free this pool exists to prevent on the one path (a
+    // caller destroying this store without going through
+    // ServerImpl::stop()'s escalate-on-timeout first) this defensive call
+    // is supposed to cover. httplib's read/write timeouts reset PER CALL,
+    // not per connection (see the codebase's own httplib-write-timeout
+    // note), so a slow-dribbling remote endpoint can hold a delivery open
+    // well past ServerImpl::stop()'s own 60s quiesce bound in practice -
+    // this is not a purely theoretical path (see server.cpp's stop()
+    // comment on that bound for the full derivation).
+    //
+    // spdlog is safe from an ASYNC-SIGNAL-SAFETY standpoint here (an
+    // ordinary destructor call stack, not the signal-handler context
+    // ServerImpl::stop() runs in), but this destructor is implicitly
+    // noexcept, and spdlog's own SPDLOG_LOGGER_CATCH rethrows a non-
+    // std::exception from a custom sink/formatter (gov Gate 8 round-2,
+    // cpp-safety) - this codebase has none today, so the risk is
+    // theoretical, but wrap it anyway rather than leave a noexcept
+    // function one custom-sink-throw away from std::terminate().
+    if (pool_.quiesce(std::chrono::hours(24))) {
+        if (db_)
+            sqlite3_close(db_);
+    } else {
+        try {
+            spdlog::critical("OffloadTargetStore::~OffloadTargetStore: pool did not quiesce "
+                              "within 24h - leaking the SQLite handle rather than risking a "
+                              "use-after-free against an in-flight delivery");
+        } catch (...) {
+        }
+    }
 }
 
 bool OffloadTargetStore::is_open() const {
     return db_ != nullptr;
+}
+
+void OffloadTargetStore::set_metrics(yuzu::MetricsRegistry* metrics) { metrics_ = metrics; }
+
+void OffloadTargetStore::log_dropped_delivery(const std::string& target_url) {
+    spdlog::warn("OffloadTargetStore: dropped delivery to {} - worker pool queue full or "
+                 "server shutting down",
+                 target_url);
+    if (metrics_)
+        metrics_->counter("yuzu_server_offload_delivery_dropped_total").increment();
+}
+
+bool OffloadTargetStore::quiesce(std::chrono::milliseconds timeout) {
+    return pool_.quiesce(timeout);
 }
 
 void OffloadTargetStore::create_tables() {
@@ -493,28 +542,7 @@ void OffloadTargetStore::record_delivery(int64_t target_id, const std::string& e
     sqlite3_finalize(stmt);
 }
 
-// ── Concurrency limiter for async delivery ──────────────────────────────────
-
-/// Counting semaphore limiting concurrent offload deliveries to 10 threads.
-/// Mirrors WebhookStore — both stores share the dispatch shape but each
-/// maintains its own quota (operator can run a ten-target SIEM fleet
-/// without it crowding webhook delivery slots).
-static std::counting_semaphore<10> offload_semaphore{10};
-
-namespace {
-/// RAII guard for the delivery semaphore — ensures release on every exit
-/// path including throw / unhandled exception. The hand-paired
-/// acquire/release was a slot-leak risk (sec-L7) if any delivery step
-/// threw between acquire and release.
-struct SemaGuard {
-    SemaGuard() { offload_semaphore.acquire(); }
-    ~SemaGuard() { offload_semaphore.release(); }
-    SemaGuard(const SemaGuard&) = delete;
-    SemaGuard& operator=(const SemaGuard&) = delete;
-};
-} // namespace
-
-// ── Single delivery (runs on a worker thread) ───────────────────────────────
+// ── Single delivery (runs on a worker pool thread) ──────────────────────────
 
 std::string OffloadTargetStore::build_batch_body(const std::vector<BufferedEvent>& events) {
     nlohmann::json arr = nlohmann::json::array();
@@ -541,10 +569,10 @@ void OffloadTargetStore::deliver_single(const OffloadTarget& tgt, const std::str
     if (!tgt.url.starts_with("http://") && !tgt.url.starts_with("https://")) {
         record_delivery(tgt.id, event_type, event_count, payload_body, 0, "invalid_scheme");
         spdlog::warn("OffloadTargetStore: refused dispatch with non-http(s) URL: {}", tgt.url);
+        if (metrics_)
+            metrics_->counter("yuzu_server_offload_delivery_failed_total").increment();
         return;
     }
-
-    SemaGuard guard;
 
     int status_code = 0;
     std::string error;
@@ -611,8 +639,13 @@ void OffloadTargetStore::deliver_single(const OffloadTarget& tgt, const std::str
         spdlog::warn("OffloadTargetStore: delivery to {} failed: {}", tgt.url, error);
     }
 
+    if (metrics_) {
+        const bool ok = error.empty() && status_code >= 200 && status_code < 300;
+        metrics_->counter(ok ? "yuzu_server_offload_delivery_success_total"
+                              : "yuzu_server_offload_delivery_failed_total")
+            .increment();
+    }
     record_delivery(tgt.id, event_type, event_count, payload_body, status_code, error);
-    // SemaGuard releases on scope exit.
 }
 
 // ── Event firing (async — returns immediately) ──────────────────────────────
@@ -667,12 +700,18 @@ void OffloadTargetStore::fire_event(const std::string& event_type,
     }
 
     // Per-target dispatch: batch_size==1 → fire immediately; otherwise
-    // append to buffer and flush on threshold.
+    // append to buffer and flush on threshold. Deliveries run on the
+    // bounded pool (#3261 governance hardening - was a raw detached
+    // std::thread per delivery; see store_worker_pool.hpp). A full queue
+    // drops the delivery (logged + counted) rather than spawning an
+    // unbounded thread.
     for (auto& tgt : matching) {
         if (tgt.batch_size <= 1) {
-            std::thread([this, tgt, event_type, payload_json]() {
+            const bool queued = pool_.submit([this, tgt, event_type, payload_json]() {
                 deliver_single(tgt, event_type, /*event_count=*/1, payload_json);
-            }).detach();
+            });
+            if (!queued)
+                log_dropped_delivery(tgt.url);
             continue;
         }
 
@@ -690,9 +729,10 @@ void OffloadTargetStore::fire_event(const std::string& event_type,
         if (!to_flush.empty()) {
             auto body = build_batch_body(to_flush);
             int count = static_cast<int>(to_flush.size());
-            std::thread([this, tgt, event_type, count, body]() {
-                deliver_single(tgt, event_type, count, body);
-            }).detach();
+            const bool queued = pool_.submit(
+                [this, tgt, event_type, count, body]() { deliver_single(tgt, event_type, count, body); });
+            if (!queued)
+                log_dropped_delivery(tgt.url);
         }
     }
 }
@@ -740,9 +780,10 @@ void OffloadTargetStore::flush_all() {
         auto event_type = events.front().event_type; // representative
         auto body = build_batch_body(events);
         int count = static_cast<int>(events.size());
-        std::thread([this, tgt, event_type, count, body]() {
-            deliver_single(tgt, event_type, count, body);
-        }).detach();
+        const bool queued = pool_.submit(
+            [this, tgt, event_type, count, body]() { deliver_single(tgt, event_type, count, body); });
+        if (!queued)
+            log_dropped_delivery(tgt.url);
     }
 }
 

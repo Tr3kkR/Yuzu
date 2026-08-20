@@ -11,6 +11,7 @@
 #include "live_kinds.hpp"             // shared live-read kind table + parser (S2)
 #include "guaranteed_state_store.hpp" // dex_device_signal_summary, agent_rule_statuses, list_rules
 #include "http_route_sink.hpp"
+#include "rest_a4_envelope_http.hpp"  // detail::a4_denial
 #include "rest_audit.hpp"             // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 #include "web_utils.hpp"              // html_escape
 
@@ -499,6 +500,26 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                                                httplib::Response& res) {
         auto session = auth_fn_(req, res);
         if (!session) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
+        // Fleet-wide identity/inventory disclosure (SEC-2/SEC-3 confinement-gap
+        // class, found during a docs sweep): devices_fn_ below is username-keyed
+        // (DevicesFn) and does not confine a service-scoped API token whose
+        // principal resolves to an unscoped grant — the full device roster
+        // (hostname, agent_id, OS, online state) would still be fleet-wide.
+        if (!session->token_scope_service.empty()) {
+            // Write the 403 FIRST, audit after (normalized — #3167).
+            // `.permission` omitted: kServiceScopeGlobalSafe is
+            // compile-time-empty, so no grant admits a service-scoped caller
+            // here; naming one would be a false self-remediation claim.
+            res.status = 403;
+            res.set_content(
+                detail::a4_denial(
+                    res, 403, "service-scoped tokens may not read the fleet-wide device list"),
+                "application/json");
+            (void)detail::try_persist_audit(
+                audit_fn_, req, "device.list.view", "denied", "Infrastructure", "",
+                "fleet-wide device list denied to a service-scoped token");
+            return;
+        }
         if (!perm_fn_(req, res, "Infrastructure", "Read")) return;
         std::vector<DeviceRow> all =
             devices_fn_ ? devices_fn_(session->username) : std::vector<DeviceRow>{};

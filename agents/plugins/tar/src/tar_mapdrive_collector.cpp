@@ -32,7 +32,9 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib> // std::strtol — timestamp/event-field parsing (no scanf family)
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -49,6 +51,11 @@
 #include <winnetwk.h> // WNetOpenEnumW / WNetEnumResourceW / WNetGetUserW (mpr)
 #include <lm.h>       // NetSessionEnum / NetApiBufferFree (netapi32)
 #include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
+// Shared per-user profile/hive ladder (#2771) — replaces this file's private
+// ProfileList walk, system-SID filter and mount/unload guards.
+#include <user_profile_model.hpp>
+#include <win_profiles.hpp>
+#include <win_reg_handle.hpp>
 #include <cwchar>      // wcslen
 #endif
 
@@ -117,16 +124,63 @@ int64_t ymd_hms_to_epoch(int y, int mo, int d, int h, int mi, int s) {
            h * 3600 + mi * 60 + s;
 }
 
+// Faithful stand-in for sscanf's "%Nd" (glibc 2.38's __isoc23_sscanf redirect
+// breaks older-glibc hosts, so no scanf family): skip leading whitespace (as %d
+// does, uncounted against the width), then let strtol consume the longest valid
+// prefix of the next `width` characters (sign included, as scanf counts it).
+// Advances `p` past the consumed characters; nullopt = no conversion.
+std::optional<int> scan_int(const char*& p, int width) {
+    char buf[8]{};
+    if (width <= 0 || width > 7) // callers pass 2 or 4; guard the buffer bound
+        return std::nullopt;     // (before any side effect on the cursor)
+    while (std::isspace(static_cast<unsigned char>(*p)))
+        ++p;
+    for (int i = 0; i < width && p[i]; ++i)
+        buf[i] = p[i];
+    char* end{};
+    const long v = std::strtol(buf, &end, 10);
+    if (end == buf)
+        return std::nullopt;
+    p += end - buf;
+    return static_cast<int>(v); // width <= 4 → |v| <= 9999, cast exact
+}
+
 // Parse a flexible timestamp starting at `pos`: "YYYY-MM-DD[T| ]HH:MM:SS" or the
 // Samba "YYYY/MM/DD HH:MM:SS" form. Returns epoch seconds or 0 if not matched.
+// Same shapes the former sscanf triple matched:
+//   "%4d-%2d-%2dT%2d:%2d:%2d" | "%4d-%2d-%2d %2d:%2d:%2d" | "%4d/%2d/%2d %2d:%2d:%2d"
+// Preserved quirks: a format ' ' matches ZERO or more whitespace (each %d also
+// skips leading whitespace), and 'T' only follows a '-' date.
 int64_t parse_flexible_ts(const std::string& s, std::size_t pos = 0) {
-    int y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0;
-    // Accept '-' or '/' date separators and 'T' or ' ' between date and time.
-    if (std::sscanf(s.c_str() + pos, "%4d-%2d-%2dT%2d:%2d:%2d", &y, &mo, &d, &h, &mi, &se) == 6 ||
-        std::sscanf(s.c_str() + pos, "%4d-%2d-%2d %2d:%2d:%2d", &y, &mo, &d, &h, &mi, &se) == 6 ||
-        std::sscanf(s.c_str() + pos, "%4d/%2d/%2d %2d:%2d:%2d", &y, &mo, &d, &h, &mi, &se) == 6)
-        return ymd_hms_to_epoch(y, mo, d, h, mi, se);
-    return 0;
+    const char* p = s.c_str() + pos;
+    const auto y = scan_int(p, 4);
+    if (!y)
+        return 0;
+    const char sep = *p;
+    if (sep != '-' && sep != '/')
+        return 0;
+    ++p;
+    const auto mo = scan_int(p, 2);
+    if (!mo || *p != sep)
+        return 0;
+    ++p;
+    const auto d = scan_int(p, 2);
+    if (!d)
+        return 0;
+    if (sep == '-' && *p == 'T')
+        ++p;
+    const auto h = scan_int(p, 2);
+    if (!h || *p != ':')
+        return 0;
+    ++p;
+    const auto mi = scan_int(p, 2);
+    if (!mi || *p != ':')
+        return 0;
+    ++p;
+    const auto se = scan_int(p, 2);
+    if (!se)
+        return 0;
+    return ymd_hms_to_epoch(*y, *mo, *d, *h, *mi, *se);
 }
 
 // Decode the kernel's octal escapes in /proc/mounts and /etc/fstab fields
@@ -434,8 +488,13 @@ std::vector<MapDriveHistoryRow> parse_win_security_logons(const std::string& tex
         int event_id = 0;
         {
             auto p = block.find("Event ID:");
-            if (p != std::string::npos)
-                std::sscanf(block.c_str() + p + 9, "%d", &event_id);
+            if (p != std::string::npos) {
+                const char* q = block.c_str() + p + 9;
+                char* end{};
+                const long v = std::strtol(q, &end, 10);
+                if (end != q) // parse failure keeps the 0 initializer (≠ 4624 → skipped)
+                    event_id = static_cast<int>(v);
+            }
         }
         if (event_id != 4624)
             continue;
@@ -444,8 +503,13 @@ std::vector<MapDriveHistoryRow> parse_win_security_logons(const std::string& tex
         int logon_type = -1;
         {
             auto p = block.find("Logon Type:");
-            if (p != std::string::npos)
-                std::sscanf(block.c_str() + p + 11, "%d", &logon_type);
+            if (p != std::string::npos) {
+                const char* q = block.c_str() + p + 11;
+                char* end{};
+                const long v = std::strtol(q, &end, 10);
+                if (end != q) // parse failure keeps the -1 initializer (≠ 3 → skipped)
+                    logon_type = static_cast<int>(v);
+            }
         }
         if (logon_type != 3)
             continue;
@@ -544,7 +608,8 @@ void warn_capped(std::atomic<bool>& flag, const char* what, std::size_t cap) {
 // ownership: manual cleanup between a throwing acquire/use and release is a
 // governance finding). from_wide / vector::push_back below can throw, so the
 // handle/buffer must free on every exit including an exceptional unwind. Same
-// shape as this file's RegKeyGuard/HiveUnloadGuard and the in-repo HandleGuard
+// shape as this file's RegKeyGuard, agents/shared/win_reg_handle.hpp's
+// ScopedUserHive, and the in-repo HandleGuard
 // (processes_plugin.cpp) / MibTableGuard (network_config_plugin.cpp).
 struct WNetEnumGuard {
     HANDLE h{nullptr};
@@ -712,18 +777,9 @@ struct RegKeyGuard {
     }
 };
 
-// RAII unload for a RegLoadKeyW-mounted offline hive. Construct it BEFORE the
-// RegKeyGuard for the mounted root so destruction order (reverse of
-// construction) closes the root key first, then unloads — and the unload runs on
-// EVERY exit including an exception (e.g. std::bad_alloc from a string/vector
-// grow while reading the hive). A leaked mount locks NTUSER.DAT until reboot.
-struct HiveUnloadGuard {
-    std::wstring mount;
-    ~HiveUnloadGuard() {
-        if (!mount.empty())
-            RegUnLoadKeyW(HKEY_USERS, mount.c_str());
-    }
-};
+// This file's HiveUnloadGuard is retired (#2771) — agents/shared/
+// win_reg_handle.hpp's ScopedUserHive owns the mount lifetime now, and unlike
+// the copy it replaces it REPORTS a failed unload rather than discarding it.
 
 int64_t filetime_to_epoch(const FILETIME& ft) {
     ULARGE_INTEGER u;
@@ -869,69 +925,59 @@ void read_user_outbound_history(HKEY user_root, const std::string& profile_user,
     }
 }
 
-bool is_system_sid(const std::wstring& sid) {
-    return sid == L"S-1-5-18" || sid == L"S-1-5-19" || sid == L"S-1-5-20";
-}
-
 // Walk every profile in ProfileList; read the outbound artifacts from the live
 // HKU\<SID> hive, or load NTUSER.DAT for offline users (RAII-unloaded).
+//
+// #2771: the ProfileList walk, the system-SID filter, the REG_EXPAND_SZ
+// expansion and the mount/unload ladder were all private copies here — the
+// third of three in the tree. They now come from
+// agents/shared/win_profiles.hpp, which additionally enables
+// SeBackup/SeRestore for the offline mount (this collector enabled neither,
+// so logged-out profiles were silently unreadable on a hardened install) and
+// reports a failed unload instead of swallowing it.
 void enum_registry_outbound_history(std::vector<MapDriveHistoryRow>& out) {
-    RegKeyGuard pl;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-                      L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList", 0, KEY_READ,
-                      &pl.h) != ERROR_SUCCESS)
+    bool profiles_ok = false;
+    bool profiles_truncated = false;
+    const auto raw_profiles = yuzu::win::enumerate_profile_records(profiles_ok, &profiles_truncated);
+    if (!profiles_ok)
         return;
+    // #2771 code-review Standards S5: the shared ladder caps the walk at
+    // kMaxProfiles, where this collector's own pre-migration walk was
+    // unbounded; the other two migrated consumers (registry, installed_apps)
+    // already surface the cap via profile_list_truncated. This collector has
+    // no per-row diagnostic channel either, so it rides the log, same as the
+    // unload-failure warning below.
+    if (profiles_truncated) {
+        spdlog::warn("TAR mapdrive: profile list truncated at {} entries — outbound history for "
+                     "profiles beyond that is not collected this cycle",
+                     yuzu::win::kMaxProfiles);
+    }
+    const auto profiles =
+        yuzu::profiles::build_profile_list(raw_profiles, yuzu::win::enumerate_hku_subkeys());
 
-    wchar_t sid[256];
-    DWORD idx = 0, len = 256;
-    while (RegEnumKeyExW(pl.h, idx, sid, &len, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
-        idx++;
-        std::wstring sid_str(sid);
-        len = 256; // reset the name-length in/out param for the next enum call
-        if (is_system_sid(sid_str))
-            continue;
+    for (const auto& profile : profiles) {
+        yuzu::win::HiveAccessReport report;
+        yuzu::win::with_user_hive(
+            profile.sid, profile.profile_path,
+            [&](HKEY root) { read_user_outbound_history(root, profile.profile_name, out); },
+            &report);
 
-        RegKeyGuard prof;
-        std::string profile_user;
-        std::wstring ntuser;
-        if (RegOpenKeyExW(pl.h, sid_str.c_str(), 0, KEY_READ, &prof.h) == ERROR_SUCCESS) {
-            std::string img = reg_read_sz(prof.h, L"ProfileImagePath");
-            if (!img.empty()) {
-                auto slash = img.find_last_of("\\/");
-                profile_user = (slash == std::string::npos) ? img : img.substr(slash + 1);
-                // ProfileImagePath is REG_EXPAND_SZ and reg_read_sz does NOT expand
-                // it; a literal token (e.g. %SystemDrive%\Users\name on some
-                // provisioning setups) would make RegLoadKeyW fail and silently drop
-                // that profile. Expand it, matching installed_apps::do_list_per_user.
-                std::wstring imgw = yuzu::win::to_wide(img);
-                wchar_t expanded[1024]{};
-                DWORD en = ExpandEnvironmentStringsW(imgw.c_str(), expanded,
-                                                     static_cast<DWORD>(std::size(expanded)));
-                std::wstring base = (en > 0 && en <= std::size(expanded)) ? std::wstring(expanded)
-                                                                          : imgw;
-                ntuser = base + L"\\NTUSER.DAT";
-            }
+        // A leaked mount is system-wide and locks NTUSER.DAT until something
+        // releases it. This collector has no per-row diagnostic channel, so it
+        // rides the log — once per process, matching the NetSessionEnum
+        // access-denied warning above. Silently dropping it (the previous
+        // behaviour) is what #2771 up-S1 objects to.
+        if (report.unload_failed) {
+            static std::atomic<bool> s_unload_warned{false};
+            if (!s_unload_warned.exchange(true))
+                spdlog::warn("TAR mapdrive: hive unload failed for HKU\\{} — the profile's "
+                             "NTUSER.DAT stays locked until a holder releases it; retry "
+                             "`reg unload HKU\\{}` (repeats suppressed)",
+                             report.mount_name, report.mount_name);
         }
-
-        // Prefer the already-loaded hive.
-        RegKeyGuard live;
-        if (RegOpenKeyExW(HKEY_USERS, sid_str.c_str(), 0, KEY_READ, &live.h) == ERROR_SUCCESS) {
-            read_user_outbound_history(live.h, profile_user, out);
-        } else if (!ntuser.empty()) {
-            std::wstring mount = L"YUZU_TAR_" + sid_str;
-            LONG lr = RegLoadKeyW(HKEY_USERS, mount.c_str(), ntuser.c_str());
-            if (lr == ERROR_SUCCESS) {
-                // unload constructed FIRST so it destructs LAST (after `mounted`
-                // closes the root key). Both run on an exceptional unwind too, so
-                // the hive is always unloaded — no NTUSER.DAT lock-until-reboot.
-                HiveUnloadGuard unload{mount};
-                RegKeyGuard mounted;
-                if (RegOpenKeyExW(HKEY_USERS, mount.c_str(), 0, KEY_READ, &mounted.h) ==
-                    ERROR_SUCCESS)
-                    read_user_outbound_history(mounted.h, profile_user, out);
-            }
-            // ERROR_PRIVILEGE_NOT_HELD / sharing violation -> skip this offline user.
-        }
+        // A per-profile access failure (hive corrupt, locked, or privileges
+        // stripped) skips that profile, as before — outbound history is
+        // best-effort.
         if (out.size() >= kMapDriveHistoryCap)
             return;
     }

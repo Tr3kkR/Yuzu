@@ -1,8 +1,13 @@
 #pragma once
 
 /// @file shutdown_watcher.hpp
-/// The agent's POSIX shutdown self-pipe: a signal handler writes ONE byte; a dedicated
-/// watcher thread wakes and runs the real teardown.
+/// POSIX shutdown self-pipe shared by the agent and server binaries (#3007): a signal
+/// handler writes ONE byte; a dedicated watcher thread wakes and runs the real teardown.
+///
+/// This is the one named `common/include` I/O exception — see CLAUDE.md "Project layout"
+/// (#2549). The exception is this file specifically, not an open door for I/O generally: a
+/// new I/O-bearing file placed here must be named in that annotation (amend it), not merely
+/// pass ordinary review.
 ///
 /// WHY IT IS IN A HEADER, not buried in main.cpp. An earlier version of this lived in
 /// main.cpp, so the unit test could only RE-IMPLEMENT the pipe ("build it the same way the
@@ -80,7 +85,7 @@
 
 #include <spdlog/spdlog.h>
 
-namespace yuzu::agent {
+namespace yuzu {
 
 class ShutdownWatcher {
 public:
@@ -390,6 +395,6 @@ private:
     std::shared_ptr<WatcherState> state_;
 };
 
-} // namespace yuzu::agent
+} // namespace yuzu
 
 #endif // !_WIN32

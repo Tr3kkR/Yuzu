@@ -47,7 +47,11 @@ cadences.
 - **No end-user profiles / personal data.** We do **not** use the plugin's
   per-user enumeration (`list_per_user`), so no logged-in-user profiles and no
   usernames are collected — no end-user PII. (The only `HKCU` read is the agent's
-  own service-account hive, which is benign.) It carries **lower behavioral
+  own service-account hive, which is benign: the agent runs outside any
+  interactive login session, so `HKCU` is that service account's profile. Note
+  the account is **LocalSystem** today, not the intended `NT SERVICE\YuzuAgent`
+  — a tracked deviation, #1442. The conclusion is unaffected; LocalSystem's
+  profile is no more an end user's than the virtual account's would be.) It carries **lower behavioral
   sensitivity** than the process/performance tiers (no run-time, no resource
   attribution). **Note for works-council jurisdictions:** the data is still
   device-attributable, and on personally-assigned devices installed-software
@@ -144,20 +148,20 @@ active" filter.)
 ### MCP (for agentic workers)
 
 The **`query_installed_software`** MCP tool exposes the same data to agentic
-workers (gated on `Inventory:Read`):
+workers, gated SOLELY by `AuthRoutes::require_fleet_read` (#3290 Phase 2):
 
 - Filter by software `name` and/or `agent_id`; omit both for a fleet-wide scan.
 - Returns up to `limit` rows (max 1000). When `result_truncated_by_cap` is
   `true`, more rows exist past the cap (keyset pagination is a follow-up).
-- **A per-agent management-group drop filter is applied** — out-of-scope
-  devices are dropped (and the omission audited), with the count returned as
-  `devices_omitted` (absent when zero). **Caveat (ADR-0017): this confinement is
-  not yet verified effective.** The tool gates on the *global* `Inventory:Read`
-  permission, under which the filter does not narrow results (a confined operator
-  is denied at the gate; a global operator sees all) — list-view management-group
-  confinement becomes effective only once the ADR-0017 admit-then-filter gate lands
-  and the #1713/#1676 UAT confirms it. When present, a positive `devices_omitted`
-  means matching software exists outside your scope — an empty or short result does
+- **A per-agent scope drop filter is applied** — out-of-scope devices are
+  dropped (and the omission audited), with the count returned as
+  `devices_omitted` (absent when zero). This confinement is **effective**: the
+  gate composes management-group visibility with the caller's service-scope tag
+  (`meet(management-group, service-scope)`), so a management-group-confined
+  operator and a correctly-confined service-scoped API token both get a real
+  filtered result — a service-scoped token is no longer denied outright as it
+  was before #3290. When present, a positive `devices_omitted` means matching
+  software exists outside your scope — an empty or short result does
   **not** mean the software is absent fleet-wide. This is distinct from the generic
   `query_inventory` / `get_agent_inventory` tools, which read a *separate*
   generic blob store on `Infrastructure:Read` and do **not** surface this typed
@@ -171,8 +175,9 @@ workers (gated on `Inventory:Read`):
 
 ### REST (for automation / scripts)
 
-The same data is exposed over REST at **`GET /api/v1/inventory/software`** (gated on
-`Inventory:Read`), the agentic-first sibling of the MCP tool:
+The same data is exposed over REST at **`GET /api/v1/inventory/software`**, gated
+SOLELY by `AuthRoutes::require_fleet_read` (#3290 Phase 2) — the agentic-first
+sibling of the MCP tool:
 
 ```bash
 # Which devices run Google Chrome (fleet-wide, within your scope)?
@@ -192,19 +197,24 @@ curl -H "Authorization: Bearer $TOKEN" \
   release, arch, signature_status, distro_id, distro_version}` — the v2 fields
   are `""` where the ecosystem does not store them (see the availability matrix
   above). The MCP tool's rows carry the identical field set.
-- **Carries the same per-agent management-group drop filter as the MCP tool**
+- **Carries the same per-agent scope drop filter as the MCP tool**
   (out-of-scope devices dropped, omission audited, `devices_omitted` reports the
-  count) — and the same **ADR-0017 caveat: not yet verified effective** under the
-  global `Inventory:Read` gate (see the MCP note above; #1713/#1676). When present, a
-  positive `devices_omitted` means matching software exists outside your scope — an
-  empty or short result does **not** mean the software is absent fleet-wide.
+  count) — the SAME `require_fleet_read` gate, so REST and MCP cannot observe a
+  different admit/filter decision for the same caller (see the MCP note above).
+  When present, a positive `devices_omitted` means matching software exists
+  outside your scope — an empty or short result does **not** mean the software
+  is absent fleet-wide.
 - `result_truncated_by_cap: true` (present only when set) means more rows exist past
   `limit` (keyset pagination is a follow-up, #1634).
 - **On store degradation** the endpoint returns **`503`** (an A4 error envelope with a
   `correlation_id`), **never** an empty `200` — so a vulnerability query cannot read a
   transient Postgres outage as "installed nowhere" (ADR-0016 §7 authoritative reads).
   Distinct from a genuinely empty result (`200` with `count: 0`), which means the query
-  succeeded and matched nothing in your scope.
+  succeeded and matched nothing in your scope. An unexpected `503` here for a
+  management-group-scoped-only caller (no global grant) correlates with the
+  `YuzuMgmtGroupReadDegraded` Prometheus alert firing — a management-group store
+  degrade, not an authorization problem; retry once it clears (sre, governance run
+  2026-08-20).
 
 **Narrow scope on a large fleet (applies to *both* the MCP tool and the REST
 endpoint).** The 1000-row cap is applied by the store *before* the management-group
@@ -262,12 +272,15 @@ same data, with three tabs:
   doesn't collect them (a future operator-set CMDB enrichment). A large device list is
   rendered first-N with the total shown; use the filter to narrow.
 - **Find software** — type an exact title to see **which devices run it** and at which
-  versions. Like the REST/MCP siblings, Find is gated on the **global `Inventory:Read`**
-  and returns **fleet-wide** results: management-group confinement is **not yet effective**
-  on this list view (the per-row scope filter is a foundation for the ADR-0017
-  admit-then-filter gate, #1716, not effective list-confinement today — only the
-  per-device drill is scoped). 1000-row cap; a short/zero result under a narrow scope is
-  *incomplete*, not *absent* (keyset paging is the #1634 follow-up).
+  versions. **Unlike the REST/MCP siblings** (migrated onto `require_fleet_read`, #3290
+  Phase 2, with real management-group + service-scope confinement), Find is still gated on
+  the **global `Inventory:Read`** and returns **fleet-wide** results: management-group
+  confinement is **not yet effective** on this list view (the per-row scope filter is a
+  foundation for the ADR-0017 admit-then-filter gate, not effective list-confinement today
+  on this surface — only the per-device drill is scoped; migrating this tab is tracked in
+  `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`). 1000-row cap; a
+  short/zero result under a narrow scope is *incomplete*, not *absent* (keyset paging is the
+  #1634 follow-up).
 
 **On store degradation** the **Software**, **Find**, and **per-device-software** views —
 the *authoritative* reads — show an explicit **"unavailable"** banner rather than an

@@ -669,6 +669,75 @@ int do_proxy(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// Windows reads every leg through native, in-process Win32 APIs (rung 1).
+// Linux/macOS route through the bounded subprocess runner, but run_command
+// (above) hands the assembled command line to `/bin/sh -c` rather than an
+// argv array — a governed shell payload, ADR-3002 rung 3 — except
+// dns_servers on Linux, which reads /etc/resolv.conf directly (native file
+// I/O, zero processes, rung 1), and proxy on Linux, which reads environment
+// variables in-process (rung 1). macOS adapters/ip_addresses run
+// ifconfig/route through that same run_command rung-3 shell-out;
+// do_adapters additionally enriches link speed via the native SIOCGIFMEDIA
+// ioctl, but ifconfig itself remains the leg's defining mechanism. arp is
+// only implemented on Windows (GetIpNetTable2, rung 1) — Linux/macOS have
+// no arp leg at all today (do_arp's #else branch), so both are
+// UNDECLARED-free UNSUPPORTED, never a fabricated rung.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "adapters",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "ip(8) via governed shell runner", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "ifconfig via governed shell runner", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetAdaptersAddresses", nullptr},
+    },
+    {
+        /* .action      = */ "ip_addresses",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "ip(8) via governed shell runner", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "ifconfig/route via governed shell runner", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetAdaptersAddresses", nullptr},
+    },
+    {
+        /* .action      = */ "dns_servers",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/etc/resolv.conf read", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "scutil via governed shell runner", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetAdaptersAddresses", nullptr},
+    },
+    {
+        /* .action      = */ "proxy",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "environment variables", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 3, "networksetup via governed shell runner",
+         "only the Wi-Fi network service is queried; other interfaces are not checked"},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "WinHttpGetIEProxyConfigForCurrentUser", nullptr},
+    },
+    {
+        /* .action      = */ "dns_cache",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 3, "resolvectl via governed shell runner",
+         "falls back to systemd-resolve statistics, or reports unavailable, when resolvectl is "
+         "absent"},
+        // macOS: no shell-out is even attempted — dscacheutil -cachedump was
+        // gutted upstream and can only fail, a permanent OS capability gap
+        // (do_dns_cache's own comment), never a transient failure.
+        /* .macos_leg   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "DnsGetCacheDataTable (dnsapi.dll)", nullptr},
+    },
+    {
+        /* .action      = */ "arp",
+        // Linux/macOS: do_arp's non-Windows branch always emits the
+        // `arp|not_available` sentinel — there is no arp leg here today.
+        /* .linux_leg   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetIpNetTable2", nullptr},
+    },
+};
+
 } // namespace
 
 class NetworkConfigPlugin final : public yuzu::Plugin {
@@ -684,6 +753,13 @@ public:
         static const char* acts[] = {"adapters", "ip_addresses", "dns_servers", "proxy",
                                      "dns_cache", "arp",         nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

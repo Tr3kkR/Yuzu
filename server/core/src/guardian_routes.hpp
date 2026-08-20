@@ -92,6 +92,50 @@ public:
                          PushFn push_fn);
 
 private:
+    /// Reject a service-scoped API token on a fleet-wide/identity-bearing
+    /// Guardian fragment. `require_permission`'s service-token branch checks
+    /// only the ITServiceOwner ROLE (never the token's own service-tag scope —
+    /// unlike `require_scoped_permission`), so `perm_fn_` alone lets a token
+    /// scoped to one service read every reporting agent's identity, hostname,
+    /// and state fleet-wide. These fragments have no single agent_id to scope
+    /// a per-target check against (mirrors the fleet /guaranteed-state/events
+    /// deny), so the deny is a blanket one. A parallel deny is pending on the
+    /// fleet /guaranteed-state/status REST route on a separate, unmerged
+    /// branch — this fragment's deny does not depend on it. Sets a 403 A4
+    /// body and returns true when the response has already been written —
+    /// either a 401/redirect from an unauthenticated `auth_fn_` call, or the
+    /// 403 service-scope deny itself; callers `return` immediately in both
+    /// cases. Resolves its own session via `auth_fn_` — safe to call before
+    /// or after `perm_fn_`. `[[nodiscard]]`: a call site that drops the
+    /// return value would silently keep rendering after a written 401/403.
+    [[nodiscard]] bool deny_service_scoped_(const httplib::Request& req,
+                                            httplib::Response& res) const;
+
+    /// Reject a service-scoped API token on a MUTATING Guardian fragment
+    /// (guard create/enable, baseline create/deploy/update/delete). Same root
+    /// cause as `deny_service_scoped_` above (`perm_fn_`'s service-token
+    /// branch checks only the ITServiceOwner ROLE, never the token's own
+    /// service-tag scope), but worse: `deploy_baseline`'s fleet-wide
+    /// `full_sync` push means a service-scoped token could change what every
+    /// OTHER service's agents enforce, not just read it. Reuses the SAME
+    /// audit verb each mutation's own success path already emits
+    /// (`result="denied"`), matching this file's established
+    /// one-verb-many-results convention — deliberately NOT the read
+    /// fragments' shared generic verb, since these six actions already have
+    /// real per-action verbs (`guaranteed_state.rule.create`, `.rule.update`,
+    /// `.baseline.create`, `.baseline.deploy`, `.baseline.update`,
+    /// `.baseline.delete`) to extend rather than fork a seventh. `operation`
+    /// is the RBAC operation this specific route actually gates on
+    /// ("Write"/"Push"/"Delete") so the A4 `.permission` hint matches the
+    /// real gate rather than a copy-pasted placeholder — governance found
+    /// that mismatch on several sibling helpers elsewhere in this branch.
+    /// Same call/return contract as `deny_service_scoped_` otherwise.
+    [[nodiscard]] bool deny_service_scoped_mutation_(const httplib::Request& req,
+                                                      httplib::Response& res,
+                                                      const std::string& operation,
+                                                      const std::string& audit_action,
+                                                      const std::string& target_id) const;
+
     // -- Fragment renderers (called by route handlers) -------------------------
     std::string render_status_fragment(const std::string& view) const;
     std::string render_guards_fragment(const std::string& status_filter) const;

@@ -599,9 +599,23 @@ Implementation: `RbacStore::reconcile_idp_memberships` /
 `auth_routes.cpp` `/auth/callback`; the claim parsing + gating decision in
 `oidc_provider.{hpp,cpp}` (`IdTokenClaims::groups_claim_present` /
 `groups_overage`, `groups_claim_reconcilable`). Tests:
-`tests/unit/server/test_rbac_store.cpp`, `test_oidc_provider.cpp`. SAML group
-sync is out of scope here (dropped in #1827; will ride this same reconcile
-path once #1826 merges).
+`tests/unit/server/test_rbac_store.cpp`, `test_oidc_provider.cpp`.
+
+**SAML now rides this same reconcile path (source `"saml"`).** The
+`/saml/acs` handler reconciles `--saml-group-attribute`'s asserted values
+the same way, before minting the session — see
+`docs/user-manual/authentication.md` "SAML Fine-Grained RBAC" for the
+operator-facing detail. Two SAML-specific differences from the OIDC shape
+above: (1) SAML has no `groups_claim_present`/`groups_overage` equivalent —
+it cannot distinguish "attribute absent" from "attribute present, zero
+values" — so an EMPTY asserted set skips reconciliation unconditionally
+(never reconciles zero groups), rather than gating on a presence signal;
+(2) the cap is enforced by the SAML verifier itself
+(`saml::kMaxGroupValues`, 200 — aligned with, and independent of,
+`RbacStore::kMaxIdpGroupsPerLogin`) via a `group_cap_truncated` flag on the
+parsed assertion, and a truncated assertion denies the login before
+`reconcile_idp_memberships` is ever called (never a partial/truncated
+reconcile).
 
 ## Stable principal vs. display name (#1837)
 
@@ -683,9 +697,10 @@ as dead code in the #1837 governance hardening round.
 **SAML was unaffected this slice; since resolved (ADR-2001 PR4a).** At the
 time of the #1837 hardening round documented above, `create_saml_session`
 still keyed `username` on the raw NameID (`display_name` set to the same
-value, purely for render-site parity) — SAML does not sync to `rbac_store`
-yet (dropped in #1827), so the collision risk this fix closes was dormant
-there. ADR-2001 PR4a has since closed the SAML side of the same gap:
+value, purely for render-site parity) — SAML did not sync to `rbac_store`
+yet (dropped in #1827; it now does, under source `"saml"`, see #1832
+above), so the collision risk this fix closes was dormant there. ADR-2001
+PR4a has since closed the SAML side of the same gap:
 `create_saml_session` now keys `username` on the stable
 `saml_principal_id(entity_id, name_id)` (`"saml:" + entity_id + "#" +
 name_id`, `saml_principal.hpp`), mirroring the OIDC split above
@@ -929,6 +944,7 @@ mapping below).
 | `--saml-sp-acs-url` | `YUZU_SAML_SP_ACS_URL` | Full URL of this server's Assertion Consumer Service (`POST /saml/acs`) |
 | `--saml-group-attribute` *(optional)* | `YUZU_SAML_GROUP_ATTRIBUTE` | `<Attribute Name="...">` in the assertion's `<AttributeStatement>` whose `<AttributeValue>`s are group identifiers (e.g. Entra's `http://schemas.microsoft.com/ws/2008/06/identity/claims/groups`) |
 | `--saml-admin-group` *(optional)* | `YUZU_SAML_ADMIN_GROUP` | Group value (from `--saml-group-attribute`) that grants `role=admin` |
+| `--saml-sp-key` *(optional)* | `YUZU_SAML_SP_KEY` | Filesystem path to an SP AuthnRequest signing private key (PEM, **RSA only**); when set, AuthnRequests are signed (see AuthnRequest signing below) |
 
 Example startup:
 
@@ -959,8 +975,10 @@ binding.
 2. The server builds a `<samlp:AuthnRequest>` (SP entity ID, ACS URL,
    `ID`=random, `IssueInstant`, `ForceAuthn=false`) and redirects the browser
    to the IdP's SSO URL via HTTP-Redirect binding (deflate-compressed,
-   URL-encoded `SAMLRequest` query parameter). **AuthnRequest signing is not
-   implemented in this slice** — the request is unsigned.
+   URL-encoded `SAMLRequest` query parameter). When `--saml-sp-key` is
+   configured, the request is signed (see AuthnRequest signing below);
+   otherwise it is unsigned — the IdP must be configured to accept unsigned
+   requests in that case.
 3. The user authenticates at the IdP.
 4. The IdP POSTs a `<samlp:Response>` containing a signed `<saml:Assertion>`
    to the ACS endpoint (`POST /saml/acs`).
@@ -1102,13 +1120,40 @@ its in-process PKCE state.
 Update `--saml-idp-cert` and **restart the server** — there is no hot-reload
 for the IdP cert in this release.
 
+### AuthnRequest signing
+
+Optional and independent of the five-flag enable gate: `--saml-sp-key`
+points at a filesystem PEM containing the SP's AuthnRequest signing private
+key. Design:
+
+- **Binding and algorithm.** Signs over the **HTTP-Redirect binding** only
+  (the only binding the SP uses for AuthnRequest) with **RSA PKCS#1 v1.5 +
+  SHA-256** (`SigAlg` `http://www.w3.org/2001/04/xmldsig-more#rsa-sha256`),
+  carried as the `SigAlg`/`Signature` query parameters alongside
+  `SAMLRequest` — per the standard query-string signing scheme for this
+  binding.
+- **RSA only.** EC and RSA-PSS keys are rejected; only a plain RSA key
+  parses.
+- **Pinned single signing key, parsed once at boot.** `server.cpp` reads the
+  key file, and `SamlProvider`'s constructor parses it once into an owned
+  `EVP_PKEY`, retained for the process lifetime — mirrors the IdP cert's
+  pinned-at-boot posture (N1 above), applied here to the SP's own key
+  instead of the IdP's — the key is not re-read per request.
+- **Fail-closed, never a silent downgrade.** The key file passes the same
+  private-key permission check used for the HTTPS/gateway TLS keys (not
+  group/other-readable), then the same 64 KiB read-and-cap the IdP cert PEM
+  uses. A permission failure, unreadable file, oversize file, malformed PEM,
+  or non-RSA key disables SAML **entirely** at startup (the provider is not
+  constructed / is reset) rather than silently falling back to unsigned
+  AuthnRequests. A per-request signing failure fails `/auth/saml/start`
+  rather than emitting an unsigned redirect.
+- **Backward-compatible default.** Left unset, AuthnRequests remain
+  unsigned, same as prior releases.
+
 ### Deferred items (not in this slice)
 
 - **Login-page SSO button.** There is no "Sign in with SAML" button on the
   login page; users must navigate directly to `GET /auth/saml/start`.
-- **AuthnRequest signing.** The SP does not sign its `<samlp:AuthnRequest>`; the
-  IdP must be configured to accept unsigned requests. If the IdP requires signed
-  AuthnRequests, use OIDC.
 - **`--auth-mode=sso-only` for SAML.** A SAML-only deployment cannot disable
   local-password login. Compliance impact: CC6.3 (local-password fallback
   remains active). OIDC is the path to `sso-only`.
@@ -2398,6 +2443,32 @@ header, so these names stay rejected on client ingress permanently.
 - **API tokens** — Bearer token and `X-Yuzu-Token` header auth for automation. MCP tokens (see `docs/mcp-server.md`) use the same table with mandatory expiration (max 90 days).
 - **Ownership-scoped revocation** — `DELETE /api/v1/tokens/{id}` and `DELETE /api/settings/api-tokens/{id}` both require the caller to own the token; the global `admin` role is the sole bypass. Cross-user revoke returns `404 token not found` (identical to unknown-id, to prevent enumeration). Denied attempts are recorded with `result=denied`, `detail=owner=<principal>`. See #222 and `docs/user-manual/server-admin.md` "Upgrade Notes".
 
+### Service-scoped token fleet-wide confinement — durable default-deny (guardian-confinement-2298 PR 3, "the flip")
+
+A **service-scoped API token** is bound to one IT service's agents (`session->token_scope_service` non-empty on the resolved session) — created so an integration's credential reaches only the devices tagged to its own service, not the whole fleet. A recurring gap closed across several earlier branches: a confinement check keyed on username, role, or resource ownership never actually consulted the token's *own* service-tag scope, so a service-scoped token could reach fleet-wide data or, on a few mutating surfaces, fleet-wide actions. Those earlier fixes (PR 1 role cap, PR 2 Phase 0 primitives, PR 2 gate renames) capped the blast radius and built the primitives; **this PR flips the underlying security posture from admit-by-default to deny-by-default**, closing the pattern structurally rather than instance-by-instance.
+
+**Two authority axes compose, never supersede.** Management-group visibility (`RbacStore::authorize_list_read`, ADR-0017) and service-scope visibility are independent — a session's effective reach is the **intersection**, via `authz::meet`, never one axis overriding the other. Service scope is never left unfiltered because "some other axis already checked."
+
+**The default-deny flip, `AuthRoutes::require_permission`'s service-scoped branch:** ITServiceOwner remains the **authority ceiling** — a service token can never exceed what that role grants — but is no longer the sole gate. A `(securable_type, operation)` pair must *also* clear the seeded-**empty** `kServiceScopeGlobalSafe` allow-list (`service_scope_policy.hpp`) to be exercised fleet-wide/unconfined; everything else `403`s by default now. Branch order is fixed and load-bearing — `elevated → engine → mcp_tier → service → RBAC-enforced-legacy → legacy` — and **must not be reordered**: the elevated branch is guarded (`is_elevated && token_scope_service.empty()`) so an elevated service-scoped session can't bypass the flip; the engine branch gets its own belt-and-braces default-deny consult (mint already rejects a non-empty `scope_service` on an engine token — this guards a corrupted row only); and the `mcp_tier` branch never `return true`s on its own — it only denies or falls through into the service branch below it, so a token carrying *both* `mcp_tier` and `scope_service` still hits the same default-deny check (verified during PR 3 review — see the commit history on this file for the specific trace). A small testonly override seam (`AuthRoutes::set_service_scope_global_safe_override_for_test`) exists because the allow-list ships empty, which would otherwise leave the admit branch of both this check and MCP's mirror (below) untestable dead code.
+
+`AuthRoutes::require_scoped_permission`'s service branch and `AuthRoutes::require_fleet_read` both apply the same standardized `rbac_enforcement_in_effect` predicate (not raw `is_rbac_enabled()`) and the same RBAC-off hard-`403` posture for a service-scoped session — **`require_fleet_read` deliberately does NOT narrow to a tag-scoped view when RBAC is off; it denies outright**, matching `require_permission`'s posture rather than diverging from it.
+
+**Two deliberately separate route classes (closes #3218 — do not merge these gates):** `require_list_read` is the sole gate on fleet-wide rollup routes and refuses a service-scoped session outright (no per-service slice to narrow a rollup to). `require_fleet_read` **REPLACES** `require_permission` (never pairs with it — see its own doc comment's BLOCKING falsifier) on routes migrating toward real per-request confinement (Phase 2 — see below); its own doc comment and `require_list_read`'s cross-reference each other's route class so a future reader doesn't reach for the wrong one. `require_fleet_read` never consults `kServiceScopeGlobalSafe` — a migrated route serves confined service-scoped tokens directly through the gate's own `meet(management-group, service-scope)` composition, instead of the flip's allow-list route.
+
+**MCP's mirror: the C8 `ServiceScopeClass` chokepoint (§3c).** Every `tools/call` dispatch consults a third field on the tool's `kToolSecurity` row — `denied` (the default), `confined` (a real downstream confinement mechanism exists — `deny_fleet_wide_service_scoped`, a `scoped_perm_fn` check, a fail-closed `exec_visible` derivation, or (as of #3290) `fleet_read_fn_`/`require_fleet_read`'s `meet(management-group, service-scope)` composition), or `global_safe` (boot-validated against the same `kServiceScopeGlobalSafe` table `require_permission` reads). `confined` is **not** a claim that the tool is actually usable by a service-scoped caller — most `confined` tools still deny downstream via their own `perm_fn`/`scoped_perm_fn` under the seeded-empty allow-list; it only means the C8 layer itself doesn't short-circuit before the tool's own (pre-existing) confinement runs. `query_installed_software` is the first tool where `confined` means real usability, not just a non-short-circuiting label — see the Phase 2 progress note below. `resources/read` bypasses C8 structurally but calls `perm_fn` directly, so it is covered by the flip the same way any REST route is.
+
+**Explicit denies for gate-less routes (§3e).** A route that never calls `require_permission`/`require_scoped_permission`/C8 at all is untouched by the flip regardless of how the flip itself is tuned — these needed their own deny. `AuthRoutes::deny_service_scoped_session` is `server.cpp`'s shared gate for this shape (health-summary fragment, the legacy `/events` SSE stream, the instructions-list fragment, and the six result-set HTMX fragments); `ComplianceRoutes` and `WorkflowRoutes` carry their own file-local equivalents for the same reason every other route-owner class in this list does (below). A residual grep sweep of every `auth_fn`/`perm_fn` call site in `rest_api_v1.cpp` (74 sites) and `mcp_server.cpp` (3 sites) found four more real instances — three sharing one shape (`management-groups/{id}/roles` GET/POST/DELETE, plus the `POST /api/v1/tokens` service-scope minting check, all bypassing `require_permission` via a **direct** `rbac_store->check_permission` call) and the eight-route `/api/v1/result-sets*` REST family (the twin of the HTMX fragments above) — plus one **distinct, more severe, not service-scope-specific** bug in the same pass: `POST /api/v1/result-sets/from-inventory-query` had no authorization check of any kind (CWE-862), missed by an earlier fix that gated its three dispatch siblings. Full inventory, including document-only dispositions and the sweep's own accounting: `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md`.
+
+**The per-file `deny_service_scoped_*`/`deny_fleet_wide_service_scoped` helpers are now a SECOND, largely-redundant layer, not the primary defense.** For any route that also calls `require_permission`/`require_scoped_permission` (the vast majority), the flip above already denies a service-scoped token structurally — six of the seven original in-handler deny sites (`list_schedules`, `get_dex_signal_detail`, `list_dex_perf_devices`, `get_dex_group_app_perf`, `compare_app_perf_versions`, `list_network_devices`) are still double-denies, kept for now and scheduled for Phase 2 retirement — `query_installed_software`'s was retired in the first Phase 2 migration (below) alongside the ~15 REST `deny_service_scoped_*` per-file helpers, once the routes migrate onto `require_fleet_read`/`confine_agent_target`. They remain load-bearing **only** for routes with no other RBAC gate call at all (the §3e class above) — `EXTEND the pattern, do not fork a new copy` still applies to *that* subset. Current call sites, including this PR's additions: `deny_service_scoped_`/`deny_service_scoped_mutation_` (`guardian_routes.{hpp,cpp}`), `deny_service_scoped_` (`dex_routes.{hpp,cpp}`, `deployment_routes.{hpp,cpp}`, `preflight_routes.{hpp,cpp}`, and the new `compliance_routes.{hpp,cpp}`), `deny_service_scoped_schedule` (`schedule_routes.{hpp,cpp}`), `deny_service_scoped_schedule_list` + the new `deny_service_scoped_scope_estimate` (both local lambdas in `workflow_routes.cpp`), the shared `deny_fleet_wide_service_scoped` lambda in `rest_api_v1.cpp` (now covering the result-set REST family too) and `mcp_server.cpp`, the new `AuthRoutes::deny_service_scoped_session` (`server.cpp`'s shared gate for its own gate-less routes), plus inline checks in `device_routes.cpp` / `network_routes.cpp` / `inventory_routes.cpp` / `tar_tree_routes.cpp`.
+
+**Phase 2 progress (#3290).** The first migration landed: `GET /api/v1/inventory/software` + its MCP twin `query_installed_software` are now on `require_fleet_read` — both surfaces' `deny_fleet_wide_service_scoped`/blanket-deny call sites are retired for this tool pair (the REST call was already provably dead, firing after `perm_fn`; the MCP call was live and is now gone). `require_fleet_read` itself gained the elevated/engine/mcp_tier caller-class branches it was missing at Phase 0 (mirroring `require_list_read`'s ladder — see its own doc comment). Prioritization for this and future migrations is **documented reasoning, not the metric** — no production fleet exists yet, so `yuzu_auth_service_scope_default_denied_total` has no real traffic to rank by; the criterion-1 substitute and the ranked backlog live in `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`. The §3d `authorize_list_read` supersede→intersect migration (below) is a separate, not-yet-started stream.
+
+**Consequences accepted for v1 (recorded, not oversights):** fleet-wide aggregates with no per-agent identity (e.g. `get_dex_perf_fleet`, `get_network_fleet`) stay `denied` at C8 — a `confined` label with no real downstream mechanism would be an unenforced claim; re-admission is a Phase 2 `kServiceScopeGlobalSafe` entry with security-guardian sign-off, not an inferred-safe classification during a routine change. Service-tag writes (whoever sets an agent's `service` tag moves scope) are hardened as of #3289 — a service-scoped session is denied, value-blind, before writing/deleting the `service` key at every REST/legacy-dashboard/MCP tag-mutation site, and the agent's own gRPC `Register` sync path no longer accepts an agent-claimed `service` value at all; plain `Tag:Write`/`Tag:Delete` remains sufficient for non-service-scoped (already fleet-scoped) holders. A related but distinct gap — a live agent's in-memory self-reported tags shadowing the store during scope-DSL evaluation — is tracked separately (#3295). No cached derived confinement sets. Dispatch's supersede→intersect migration (§3d, four `authorize_list_read` callers) is deferred, not part of this PR. **Bootstrap note:** an empty-cohort service token cannot bootstrap its own scope via any route — and since #3289, neither can an agent via its own Register sync; onboarding a brand-new service still needs an interactive/unscoped path; see `docs/user-manual/authentication.md`.
+
+**Known-but-unfixed instances predating this PR** were tracked as GitHub issues #3123 (device discovery), #3124 (response/execution data), #3125 (inventory data) — this PR proposes closing them as fixed-by-flip (every instance they list reaches `require_permission`/`require_scoped_permission`, which now denies by default), pending review; per the issue-standard, automation does not close a `security`-labelled issue unilaterally. Check each issue's current body before citing an instance count from it historically — issues were edited down as fixes landed elsewhere.
+
+**ADR:** `docs/adr/1006-service-scope-default-deny.md` records the design-of-record — the two-axis composition, the branch-order rule and the two rejected hoists, the two enforcement shapes behind one composer, why `RbacStore` stays single-axis, and the four decisions above (RBAC-off hard-`403`, the two-gate split, explicit-deny for §3e, ADR-in-same-PR).
+
 ## Engine principals & delegation (ADR-1005 — design)
 
 **Stream liveness is cached; authorization is not** (#2367). The per-tick
@@ -2429,7 +2500,10 @@ resulting latency bounds.
   tokens are referentially checked against `EnginePrincipalStore` at mint
   time, always `mcp_tier=readonly`, and always carry a ≤90-day expiry.
 - **Session-authorization semantics — RBAC-only, no fallback (PR 4.2 fix
-  round).** `AuthRoutes::require_permission`/`require_scoped_permission`
+  round).** `AuthRoutes::require_permission`/`require_scoped_permission`/
+  `require_list_read` (the last is the ADR-0017 admit-then-filter list-read
+  gate, #3038 — see the Authentication/RBAC row in
+  `.claude/routed-concerns-access-control.md`) all
   branch on `session->principal_kind == "engine"` **before** falling through
   to the legacy pre-RBAC path or the MCP-tier/service-scoped resolution used
   for human and agent sessions. An engine session's authority is resolved

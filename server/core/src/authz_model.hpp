@@ -301,7 +301,7 @@ struct CapabilitySeed {
 }
 
 /// A small, representative seed catalogue — NOT a full mirror of
-/// `RbacStore`'s 23 securables × 8 operations catalogue. It exists so PR1.9 has real
+/// `RbacStore`'s 26 securables × 8 operations catalogue. It exists so PR1.9 has real
 /// rows to migrate and so this header's own tests exercise `is_valid`, not
 /// to be the registry itself (that is explicitly out of scope here). Covers
 /// an ordinary CRUD securable (`Response:Read`), a Tag write (mirrors
@@ -311,7 +311,21 @@ struct CapabilitySeed {
 /// securable with its `Attest` narrow op (Periodic Access Reviews, SOC 2
 /// CC6.2), deliberately outside every CRUD loop, exactly as seeded in
 /// `rbac_store.cpp`.
-inline constexpr std::array<CapabilitySeed, 5> kSeedCatalogue{{
+///
+/// PR1.9a (peer finding PLAN-001) adds three more rows for the three
+/// securables that same PR appends to `rbac_store.cpp`'s `seed_defaults()`
+/// `types[]` — `PluginConfig`, `PluginSecret`, `UploadGrant` — reusing only
+/// EXISTING `Operation` enumerators, per that PR's explicit "no new
+/// Operation" constraint: `PluginConfig:Write` (a plugin kill-switch flip),
+/// `PluginSecret:Write` (setting/rotating a plugin secret value — `Delete`
+/// removes it, `Read` reveals whether one is set, both role-gated the same
+/// way in `rbac_store.cpp`, only `Write` illustrated here), and
+/// `UploadGrant:Write` (minting an upload grant; `Delete` revokes one). None
+/// of the three needs a `FileRetrieval`-shaped op of its own — actual file
+/// retrieval after a grant is minted stays under the existing
+/// `FileRetrieval` securable, so `UploadGrant` only ever governs the
+/// grant's own lifecycle.
+inline constexpr std::array<CapabilitySeed, 8> kSeedCatalogue{{
     {"Response", Operation::Read, RiskTier::Low, "listResponses", "device_operational",
      "response.list"},
     {"Tag", Operation::Write, RiskTier::Medium, "setTag", "device_operational", "tag.set"},
@@ -321,6 +335,12 @@ inline constexpr std::array<CapabilitySeed, 5> kSeedCatalogue{{
      "device_operational", "guardian.push"},
     {"AccessReview", Operation::Attest, RiskTier::Medium, "attestAccessReview",
      "grant_evidence", "access_review.attested"},
+    {"PluginConfig", Operation::Write, RiskTier::Medium, "setPluginConfig",
+     "device_operational", "plugin_config.write"},
+    {"PluginSecret", Operation::Write, RiskTier::High, "setPluginSecret", "secret_material",
+     "plugin_secret.write"},
+    {"UploadGrant", Operation::Write, RiskTier::Medium, "mintUploadGrant", "device_operational",
+     "upload_grant.mint"},
 }};
 
 // ── #1788: the shared per-device visibility primitive ───────────────────
@@ -376,6 +396,33 @@ template <class Ids>
     for (const auto& id : ids)
         if (visible->contains(id))
             out.push_back(id);
+    return out;
+}
+
+/// Lattice intersection of two `VisibleSet`s: `std::nullopt` is TOP
+/// (unfiltered), so it is the identity — `meet(nullopt, b) == b` and
+/// `meet(a, nullopt) == a`. A present set is a filter; the meet of two
+/// present sets is their set intersection, always present (never collapsed
+/// back to `nullopt`, even when the result is empty — `deny_all()` above is
+/// exactly that present-but-empty case, and it must survive a meet with
+/// TOP unchanged: `meet(deny_all(), b) == deny_all()`, the lattice bottom
+/// absorbing). Commutative and associative — composing more than two axes
+/// in any order is safe.
+///
+/// This is the primitive the new list-read gate uses to combine the
+/// management-group axis (`RbacStore::authorize_list_read`) with the
+/// service-scope axis: never a reuse of, and never a rewrite of,
+/// `compose_exec_visible` below — that function's *supersede* semantics for
+/// dispatch are a deliberately separate, unchanged decision.
+[[nodiscard]] inline VisibleSet meet(const VisibleSet& a, const VisibleSet& b) {
+    if (!a)
+        return b;
+    if (!b)
+        return a;
+    std::unordered_set<std::string> out;
+    for (const auto& id : *a)
+        if (b->contains(id))
+            out.insert(id);
     return out;
 }
 

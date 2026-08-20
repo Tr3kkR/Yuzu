@@ -86,6 +86,7 @@ std::string render_auto_note(const std::string& message);
 
 class PreflightRunStore; // server/core/src/preflight_run_store.hpp
 struct PreflightRunRow;  //   "
+class HttpRouteSink;     // server/core/src/http_route_sink.hpp
 
 /// `/auto` routes — page shell + config/rail fragment + run creation + result
 /// poll. Runs persist (PreflightRunStore); a running run renders live, a complete
@@ -118,7 +119,42 @@ public:
                          GroupsFn groups_fn, GroupMembersFn group_members_fn, DispatchFn dispatch_fn,
                          CollectFn collect_fn, AuditFn audit_fn, PreflightRunStore* run_store);
 
+    /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
+    /// acceptor; the #438 TSan trap). The httplib::Server& overload wraps + delegates.
+    void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, DevicesFn devices_fn,
+                         GroupsFn groups_fn, GroupMembersFn group_members_fn, DispatchFn dispatch_fn,
+                         CollectFn collect_fn, AuditFn audit_fn, PreflightRunStore* run_store);
+
 private:
+    /// Deny a service-scoped API token on an `/auto` Pre-flight surface that
+    /// scopes by `session->username` alone (the run rail, result poll, and
+    /// delete) — SEC-2/SEC-3 confinement-gap class: `ApiToken::principal_id`
+    /// ("username... who created it") means a service-scoped token shares its
+    /// creating human's username, so username-only owner-scoping does not
+    /// confine it to its OWN service the way `token_scope_service` requires.
+    /// A token scoped to e.g. "printers" would otherwise read/delete/enumerate
+    /// a fleet-wide run its own principal created interactively. Writes the
+    /// 403 FIRST, audits after via the shared try_persist_audit kernel, under
+    /// `action` (gov Gate 6 enterprise-readiness: the delete route's denial
+    /// must land under its own `preflight.run.delete` verb, not the generic
+    /// `preflight.run` — a SIEM rule keyed on the delete verb would otherwise
+    /// see zero denials while they were actually occurring). Returns true iff
+    /// denied (caller returns immediately).
+    [[nodiscard]] bool deny_service_scoped_(const httplib::Request& req, httplib::Response& res,
+                                            const std::string& action,
+                                            const std::string& audit_detail,
+                                            // `permission` defaults EMPTY (#3167
+                                            // — gov-fix, Gate 8, #2298 PR 3
+                                            // hardening round's clause):
+                                            // kServiceScopeGlobalSafe is
+                                            // compile-time-empty, so no grant
+                                            // admits a service-scoped caller on
+                                            // this surface — naming one is a
+                                            // false self-remediation claim the
+                                            // routed-concern MUST clause
+                                            // forbids. Do not reintroduce one.
+                                            const std::string& permission = "") const;
+
     AuthFn auth_fn_;
     PermFn perm_fn_;
     DevicesFn devices_fn_;

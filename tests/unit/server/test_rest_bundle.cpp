@@ -50,6 +50,7 @@ yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::stri
 struct DispatchCall {
     std::string plugin, action, scope_expr, execution_id;
     std::vector<std::string> agent_ids;
+    yuzu::server::DispatchCaller caller;
 };
 
 struct AuditRow {
@@ -115,9 +116,9 @@ struct BundleHarness {
                                  const std::string& scope_expr,
                                  const std::unordered_map<std::string, std::string>&,
                                  const std::string& exec_id,
-                                 const yuzu::server::authz::VisibleSet&)
+                                 const yuzu::server::DispatchCaller& caller)
                 -> std::pair<std::string, int> {
-                calls.push_back({plugin, action, scope_expr, exec_id, agent_ids});
+                calls.push_back({plugin, action, scope_expr, exec_id, agent_ids, caller});
                 return {"cmd-" + plugin + "-" + action, dispatch_sent};
             };
         }
@@ -149,7 +150,7 @@ struct BundleHarness {
                             dispatch_fn, /*step_up_fn=*/{}, /*guardian_push_fn=*/{},
                             /*dex_perf_fn=*/{}, /*net_perf_fn=*/{}, /*lockout_clear_fn=*/{},
                             /*baseline_store=*/nullptr, /*scoped_perm_fn=*/scoped_perm_fn,
-                            /*software_inventory_store=*/nullptr, /*inventory_scope_fn=*/{},
+                            /*software_inventory_store=*/nullptr,
                             /*response_scope_fn=*/{}, /*app_perf_providers=*/{},
                             /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
                             /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
@@ -197,7 +198,8 @@ bool has_audit(const std::vector<AuditRow>& a, const std::string& verb, const st
 
 } // namespace
 
-TEST_CASE("POST /api/v1/bundles dispatches each step and returns 202 + execution_id",
+TEST_CASE("POST /api/v1/bundles dispatches each step and returns 202 + execution_id, "
+          "carrying the caller's principal (PLAN-006 parity)",
           "[pg][bundle][rest]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -218,6 +220,18 @@ TEST_CASE("POST /api/v1/bundles dispatches each step and returns 202 + execution
     CHECK(h.calls[0].agent_ids == std::vector<std::string>{"agent-1"});
     CHECK(h.calls[0].execution_id == exec_id); // all steps share the correlation id
     CHECK(h.calls[1].execution_id == exec_id);
+
+    // M11 (review finding, post-merge round): sibling dispatch surfaces
+    // (workflow, dashboard, REST purge) each have an explicit PLAN-006 case
+    // asserting the authenticated caller's PRINCIPAL reaches dispatch — the
+    // bundle surface, one of the two paths the original CRITICAL fix
+    // repaired, did not. The harness's dispatch_fn now captures `caller`
+    // (was previously an unnamed, ignored parameter), so a future
+    // regression that silently drops the principal on this surface fails
+    // here.
+    CHECK(h.calls[0].caller.principal == h.principal);
+    CHECK_FALSE(h.calls[0].caller.system);
+    CHECK(h.calls[1].caller.principal == h.principal);
 
     // Per-step audit verbs, device-scoped (governance F1), + the dispatch envelope.
     CHECK(has_audit(h.audits, "bundle.os_info.uptime", "Agent"));

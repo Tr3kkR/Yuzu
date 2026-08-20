@@ -291,6 +291,13 @@ TEST_CASE("network routes: perm gating + provider degradation", "[network][route
         res.status = 403;
         return false;
     };
+    std::vector<std::string> auditLog;
+    auto okAudit = [&](const httplib::Request&, const std::string& action,
+                       const std::string& result, const std::string&, const std::string&,
+                       const std::string&) {
+        auditLog.push_back(action + ":" + result);
+        return true;
+    };
     NetworkRoutes::PerfFn perf = [](const std::string&) {
         NetPerfSnapshot snap;
         snap.devices.push_back(degraded("deg-dev", 95.0, false)); // degraded + pressure
@@ -301,7 +308,7 @@ TEST_CASE("network routes: perm gating + provider degradation", "[network][route
     SECTION("permitted: overview + devices render through the provider") {
         yuzu::server::test::TestRouteSink sink;
         NetworkRoutes routes;
-        routes.register_routes(sink, okAuth, okPerm, perf);
+        routes.register_routes(sink, okAuth, okPerm, okAudit, perf);
         auto ov = sink.Get("/fragments/network/overview");
         REQUIRE(ov);
         CHECK(ov->status == 200);
@@ -318,7 +325,7 @@ TEST_CASE("network routes: perm gating + provider degradation", "[network][route
     SECTION("denied without GuaranteedState:Read") {
         yuzu::server::test::TestRouteSink sink;
         NetworkRoutes routes;
-        routes.register_routes(sink, okAuth, noPerm, perf);
+        routes.register_routes(sink, okAuth, noPerm, okAudit, perf);
         auto ov = sink.Get("/fragments/network/overview");
         REQUIRE(ov);
         CHECK(ov->status == 403);
@@ -327,7 +334,7 @@ TEST_CASE("network routes: perm gating + provider degradation", "[network][route
     SECTION("no provider wired → honest unavailable placeholder") {
         yuzu::server::test::TestRouteSink sink;
         NetworkRoutes routes;
-        routes.register_routes(sink, okAuth, okPerm);
+        routes.register_routes(sink, okAuth, okPerm, okAudit);
         auto ov = sink.Get("/fragments/network/overview");
         REQUIRE(ov);
         CHECK(ov->status == 200);
@@ -337,7 +344,7 @@ TEST_CASE("network routes: perm gating + provider degradation", "[network][route
     SECTION("page shell loads the overview fragment") {
         yuzu::server::test::TestRouteSink sink;
         NetworkRoutes routes;
-        routes.register_routes(sink, okAuth, okPerm, perf);
+        routes.register_routes(sink, okAuth, okPerm, okAudit, perf);
         auto page = sink.Get("/network");
         REQUIRE(page);
         CHECK(page->status == 200);
@@ -350,6 +357,93 @@ TEST_CASE("network routes: perm gating + provider degradation", "[network][route
         CHECK(page->body.find("class=\"nav-link active\">DEX</a>") != std::string::npos);
         CHECK(page->body.find("href=\"/network\"") == std::string::npos);
     }
+}
+
+// ── SEC-3 sibling-gap coverage: /fragments/network/devices previously had NO
+// service-token confinement and NO audit capability at all — this fragment
+// names every reporting agent's identity fleet-wide. Gate 8 governance review
+// found this as a 4th instance of the same vulnerability class already fixed
+// on GET /api/v1/network/devices and 5 other surfaces on this branch. ────────
+
+TEST_CASE("network devices fragment: service-scoped token denied, denial audited",
+          "[network][routes][rbac][security]") {
+    auto serviceScopedAuth = [](const httplib::Request&, httplib::Response&) {
+        auth::Session s;
+        s.token_scope_service = "printers";
+        return std::optional<auth::Session>(s);
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    std::vector<std::string> auditLog;
+    auto recordingAudit = [&](const httplib::Request&, const std::string& action,
+                              const std::string& result, const std::string&, const std::string&,
+                              const std::string&) {
+        auditLog.push_back(action + ":" + result);
+        return true;
+    };
+    NetworkRoutes::PerfFn perf = [](const std::string&) {
+        NetPerfSnapshot snap;
+        snap.devices.push_back(degraded("deg-dev", 95.0, false));
+        return snap;
+    };
+
+    NetworkRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, serviceScopedAuth, okPerm, recordingAudit, perf);
+
+    // The overview fragment (aggregate, no agent_id) is UNAFFECTED — only the
+    // devices drill (identity-linked) gets the new deny.
+    auto ov = sink.Get("/fragments/network/overview");
+    REQUIRE(ov);
+    CHECK(ov->status == 200);
+
+    auto drill = sink.Get("/fragments/network/devices");
+    REQUIRE(drill);
+    CHECK(drill->status == 403);
+    CHECK(drill->body.find("deg-dev") == std::string::npos); // no identity leaked
+    // #3167: no `.permission` (no grant admits a service-scoped caller here —
+    // naming one is a false self-remediation claim), and header/body
+    // correlation-id parity.
+    auto body = nlohmann::json::parse(drill->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body["error"].contains("permission"));
+    CHECK_FALSE(body["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(drill->get_header_value("X-Correlation-Id") ==
+         body["error"]["correlation_id"].get<std::string>());
+    REQUIRE(auditLog.size() == 1);
+    CHECK(auditLog[0] == "network.device.view:denied");
+}
+
+TEST_CASE("network devices fragment: ordinary session reaches the route, audited success",
+          "[network][routes][security]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    std::vector<std::string> auditLog;
+    auto recordingAudit = [&](const httplib::Request&, const std::string& action,
+                              const std::string& result, const std::string&, const std::string&,
+                              const std::string&) {
+        auditLog.push_back(action + ":" + result);
+        return true;
+    };
+    NetworkRoutes::PerfFn perf = [](const std::string&) {
+        NetPerfSnapshot snap;
+        snap.devices.push_back(degraded("deg-dev", 95.0, false));
+        return snap;
+    };
+
+    NetworkRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, okAuth, okPerm, recordingAudit, perf);
+
+    auto drill = sink.Get("/fragments/network/devices");
+    REQUIRE(drill);
+    CHECK(drill->status == 200);
+    CHECK(drill->body.find("deg-dev") != std::string::npos);
+    REQUIRE(auditLog.size() == 1);
+    CHECK(auditLog[0] == "network.device.view:success");
 }
 
 TEST_CASE("devices render: hostile agent_id is HTML-escaped", "[network][ui]") {

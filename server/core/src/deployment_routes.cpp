@@ -10,8 +10,12 @@
 #include "deployment_engine.hpp"
 #include "deployment_parse.hpp"
 #include "deployment_run_store.hpp"
+#include "http_route_sink.hpp"
 #include "preflight_parse.hpp"      // bucket_from_token, PreflightTarget
 #include "preflight_run_store.hpp"  // PreflightRunStore (source go-cohort)
+#include "rest_a4_envelope_http.hpp" // detail::a4_denial (deny_service_scoped_) — mints/reuses
+                                     // X-Correlation-Id so header and body always agree
+#include "rest_audit.hpp"           // detail::try_persist_audit
 
 #include <yuzu/server/auth.hpp> // AuthManager (id bytes)
 
@@ -87,8 +91,19 @@ deployment::DeploymentConfig config_from_row(const DeploymentRow& r) {
 
 } // namespace
 
+yuzu::server::DispatchCaller
+DeploymentRoutes::caller_from_session(const auth::Session& session) const {
+    return yuzu::server::DispatchCaller{
+        .principal = session.username,
+        .principal_role = auth::role_to_string(session.role),
+        .exec_visible = exec_visible_fn_ ? exec_visible_fn_(session)
+                                         : yuzu::server::authz::deny_all()};
+}
+
 std::string DeploymentRoutes::advance_and_render(const std::string& deployment_id,
-                                                 const std::string& viewer, int attempt) {
+                                                 const yuzu::server::DispatchCaller& caller,
+                                                 int attempt) {
+    const std::string& viewer = caller.principal;
     if (!deploy_store_)
         return render_deploy_note("Deployment store is unavailable on this server.");
     // OWNER-SCOPED read at the seam: a not-yours deployment reads as not-found.
@@ -99,14 +114,17 @@ std::string DeploymentRoutes::advance_and_render(const std::string& deployment_i
     // Re-authorization boundary: the engine may dispatch the MUTATING execute step,
     // so it only ever acts on devices the operator CURRENTLY sees. Build the live
     // visible set from devices_fn(viewer); the engine intersects it with the frozen
-    // cohort, skips the rest, and dispatches execute once per device.
+    // cohort, skips the rest, and dispatches execute once per device. This is
+    // TARGETING confinement — a separate question from `caller`, which is the
+    // DISPATCH identity the chokepoint authorizes against (see `DispatchFn`'s
+    // doc comment, deployment_engine.hpp).
     std::unordered_set<std::string> authorized;
     if (devices_fn_)
         for (const auto& d : devices_fn_(viewer))
             authorized.insert(d.agent_id);
 
     const auto cfg = config_from_row(*dep);
-    deployment::advance(engine_, deployment_id, cfg, authorized);
+    deployment::advance(engine_, deployment_id, cfg, authorized, caller);
 
     // Re-read fresh state for the render.
     dep = deploy_store_->get_deployment(deployment_id, viewer);
@@ -121,7 +139,48 @@ std::string DeploymentRoutes::advance_and_render(const std::string& deployment_i
     return render_deploy_results(*dep, devices, repoll);
 }
 
+bool DeploymentRoutes::deny_service_scoped_(const httplib::Request& req, httplib::Response& res,
+                                            const std::string& action,
+                                            const std::string& audit_detail,
+                                            const std::string& target_type,
+                                            const std::string& permission) const {
+    auto session = auth_fn_(req, res);
+    if (!session)
+        return true; // auth_fn_ already wrote the response (401/etc).
+    if (session->token_scope_service.empty())
+        return false;
+    // Write the 403 FIRST, audit after (mirrors PreflightRoutes/DexRoutes/
+    // GuardianRoutes' deny_service_scoped_): a throwing audit_fn_ must not
+    // suppress the 403.
+    res.status = 403;
+    // `permission` defaults empty (see header) — a caller passing a
+    // non-empty override is now itself a bug, since no grant admits a
+    // service-scoped caller here. `a4_denial` also fixes a second bug found
+    // in the same pass: the hand-built cid never reached the
+    // X-Correlation-Id header.
+    res.set_content(
+        detail::a4_denial(
+            res, 403, "service-scoped tokens may not access this fleet-wide deployment surface",
+            detail::A4ErrorOpts{.permission = permission}),
+        "application/json");
+    (void)detail::try_persist_audit(audit_fn_, req, action, "denied", target_type, "",
+                                    audit_detail);
+    return true;
+}
+
 void DeploymentRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
+                                       DevicesFn devices_fn, DispatchFn dispatch_fn, PollFn poll_fn,
+                                       AuditFn audit_fn, PreflightRunStore* preflight_store,
+                                       DeploymentRunStore* deploy_store,
+                                       ExecVisibleFn exec_visible_fn) {
+    HttplibRouteSink sink(svr);
+    exec_visible_fn_ = std::move(exec_visible_fn);
+    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(devices_fn),
+                    std::move(dispatch_fn), std::move(poll_fn), std::move(audit_fn),
+                    preflight_store, deploy_store);
+}
+
+void DeploymentRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                                        DevicesFn devices_fn, DispatchFn dispatch_fn, PollFn poll_fn,
                                        AuditFn audit_fn, PreflightRunStore* preflight_store,
                                        DeploymentRunStore* deploy_store) {
@@ -136,13 +195,21 @@ void DeploymentRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Per
     engine_.dispatch_fn = std::move(dispatch_fn);
 
     // ── Deploy config fragment for a pre-flight run ──────────────────────────
-    svr.Get("/fragments/auto/deploy", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/fragments/auto/deploy", [this](const httplib::Request& req, httplib::Response& res) {
         auto session = auth_fn_ ? auth_fn_(req, res) : std::optional<auth::Session>{};
         if (!session) {
             res.status = 401;
             res.set_content("auth required", "text/plain");
             return;
         }
+        // Owner-scoped by username below (get_run), and a service-scoped
+        // token shares its creating principal's username — it would
+        // otherwise read back the go/warn counts for a fleet-wide run
+        // outside its own service (SEC-2/SEC-3 class). Own verb, not
+        // deployment.create: no deployment is created by this GET.
+        if (deny_service_scoped_(req, res, "deployment.config.view",
+                                 "deploy config form denied to a service-scoped token", "Scope"))
+            return;
         if (!perm_fn_ || !perm_fn_(req, res, "SoftwareDeployment", "Read"))
             return;
         if (!preflight_store_) {
@@ -163,7 +230,7 @@ void DeploymentRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Per
     });
 
     // ── Create the deployment from the run's go-cohort + first advance ───────
-    svr.Post("/fragments/auto/deploy/run", [this](const httplib::Request& req,
+    sink.Post("/fragments/auto/deploy/run", [this](const httplib::Request& req,
                                                   httplib::Response& res) {
         auto session = auth_fn_ ? auth_fn_(req, res) : std::optional<auth::Session>{};
         if (!session) {
@@ -171,6 +238,16 @@ void DeploymentRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Per
             res.set_content("auth required", "text/plain");
             return;
         }
+        // Important finding from external review (PR #3156): this is the
+        // deployment CREATION route itself (the first fleet-wide dispatch),
+        // not just the config-view/result-poll/delete siblings already
+        // fixed elsewhere in this file - a service-scoped token could
+        // otherwise stage + dispatch an installer to devices outside its
+        // own service.
+        if (deny_service_scoped_(req, res, "deployment.create",
+                                 "deployment create denied to a service-scoped token",
+                                 "SoftwareDeployment"))
+            return;
         // Mutating fleet action: Execute tier; + Infrastructure:Read for the device
         // resolution + the result render it returns (so the repoll isn't 403-walled).
         if (!perm_fn_ || !perm_fn_(req, res, "Infrastructure", "Read"))
@@ -217,7 +294,8 @@ void DeploymentRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Per
             if (audit_fn_)
                 audit_fn_(req, "deployment.create", "resumed", "SoftwareDeployment", *existing,
                           "run=" + run_id);
-            res.set_content(advance_and_render(*existing, session->username, /*attempt=*/0),
+            res.set_content(advance_and_render(*existing, caller_from_session(*session),
+                                                /*attempt=*/0),
                             "text/html; charset=utf-8");
             return;
         }
@@ -270,7 +348,8 @@ void DeploymentRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Per
             // A concurrent create won the partial unique index race — resume the
             // winner rather than error (#governance security HIGH-1 backstop).
             if (auto existing = deploy_store_->find_running_for_run(run_id, session->username)) {
-                res.set_content(advance_and_render(*existing, session->username, /*attempt=*/0),
+                res.set_content(advance_and_render(*existing, caller_from_session(*session),
+                                                    /*attempt=*/0),
                                 "text/html; charset=utf-8");
                 return;
             }
@@ -287,12 +366,13 @@ void DeploymentRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Per
 
         // First advance (stage dispatch) + render — advance_and_render re-resolves
         // the live authorized set and ticks the engine once.
-        res.set_content(advance_and_render(dep.deployment_id, session->username, /*attempt=*/0),
-                        "text/html; charset=utf-8");
+        res.set_content(
+            advance_and_render(dep.deployment_id, caller_from_session(*session), /*attempt=*/0),
+            "text/html; charset=utf-8");
     });
 
     // ── Result poll: advance one tick, render (owner-scoped) ─────────────────
-    svr.Get("/fragments/auto/deploy/result", [this](const httplib::Request& req,
+    sink.Get("/fragments/auto/deploy/result", [this](const httplib::Request& req,
                                                     httplib::Response& res) {
         auto session = auth_fn_ ? auth_fn_(req, res) : std::optional<auth::Session>{};
         if (!session) {
@@ -300,6 +380,17 @@ void DeploymentRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Per
             res.set_content("auth required", "text/plain");
             return;
         }
+        // Owner-scoped by username (advance_and_render -> get_deployment), and
+        // a service-scoped token shares its creating principal's username -
+        // it would otherwise re-authorize + advance the mutating engine tick
+        // for a deployment outside its own service (SEC-2/SEC-3 class). This
+        // narrows exposure (stops further devices being admitted on later
+        // ticks); the fleet-wide creation gap on POST
+        // /fragments/auto/deploy/run is closed separately, by its own
+        // deny_service_scoped_ call site below.
+        if (deny_service_scoped_(req, res, "deployment.advance",
+                                 "deployment result poll denied to a service-scoped token"))
+            return;
         // The poll BOTH renders (Read) AND advances the mutating engine (Execute) —
         // require both so an Execute-less principal can't drive a deployment, and a
         // Read-less one isn't 403-walled mid-run.
@@ -317,12 +408,12 @@ void DeploymentRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Per
         }
         if (audit_fn_)
             audit_fn_(req, "deployment.advance", "success", "SoftwareDeployment", dep_id, "");
-        res.set_content(advance_and_render(dep_id, session->username, attempt),
+        res.set_content(advance_and_render(dep_id, caller_from_session(*session), attempt),
                         "text/html; charset=utf-8");
     });
 
     // ── Delete a deployment (owner-scoped, confirm-guarded on the client) ────
-    svr.Post("/fragments/auto/deploy/delete", [this](const httplib::Request& req,
+    sink.Post("/fragments/auto/deploy/delete", [this](const httplib::Request& req,
                                                      httplib::Response& res) {
         auto session = auth_fn_ ? auth_fn_(req, res) : std::optional<auth::Session>{};
         if (!session) {
@@ -330,6 +421,14 @@ void DeploymentRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Per
             res.set_content("auth required", "text/plain");
             return;
         }
+        // Owner-scoped by username (delete_deployment below), and a
+        // service-scoped token shares its creating principal's username —
+        // it could otherwise delete evidence for a fleet-wide deployment
+        // outside its own service (SEC-2/SEC-3 class).
+        if (deny_service_scoped_(req, res, "deployment.delete",
+                                 "deployment delete denied to a service-scoped token",
+                                 "SoftwareDeployment"))
+            return;
         if (!perm_fn_ || !perm_fn_(req, res, "SoftwareDeployment", "Execute"))
             return;
         const std::string dep_id = param(req, "dep");

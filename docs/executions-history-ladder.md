@@ -224,17 +224,21 @@ latched. Three invariants a successor PR must not break:
   **not** recover a later buffered `execution-completed`, which could be a
   spurious `mark_cancelled` terminal (#2409 UP-1).
 
-- **The claimed teardown owns THREE resources and its claim is one-way.**
-  A claimed record must settle its `records_` entry, its streamed admission
-  charge, **and** its bus subscription. Erasing the map entry while the
-  subscription survives strands the listener permanently: the listener holds
-  a `shared_ptr` to the record, so the erase frees nothing, `shutdown()` can
-  no longer reach it, and channel GC never reaps the channel because it
-  requires `listeners.empty()`. `torn_down` also excludes the record from
-  every later sweep, so nothing retries what a teardown leaves unfinished -
-  a step that cannot complete must leave the record reachable by
-  `shutdown()` and say so, rather than erase around a live listener
-  (#2487).
+- **The claimed teardown owns THREE resources.** A claimed record must
+  settle its `records_` entry, its streamed admission charge, **and** its
+  bus subscription. Erasing the map entry while the subscription survives
+  strands the listener permanently: the listener holds a `shared_ptr` to
+  the record, so the erase frees nothing, `shutdown()` can no longer reach
+  it, and channel GC never reaps the channel because it requires
+  `listeners.empty()`. `torn_down` (set once, never cleared) excludes the
+  record from every *ordinary* sweep claim - but an incomplete teardown
+  IS retried, from a later sweep tick, up to `Config::teardown_retry_max`
+  times via the record's own `teardown_retry_claimable` flag (#2513);
+  `shutdown()` remains the reclaimer of last resort, for a record whose
+  retry budget is exhausted or that shutdown races before a retry pass
+  gets to it. A step that cannot complete must leave the record reachable
+  by a later retry (or, failing that, `shutdown()`) and say so, rather
+  than erase around a live listener (#2487).
 - **`f` runs under `ch->mu` and must never call back into the bus** (a bus
   call taking `map_mu_` would invert the `map_mu_` → `ch->mu` order above)
   and must be erase-only-on-claim: every *defer* keeps the listener, so a

@@ -179,6 +179,68 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `docs/user-manual/software-licensing.md`; wire reference: the
        OpenAPI document (`/sle/agents/{agent_id}`).
 
+   - **2026-08-15 — upload-grant agent session routes (`POST
+     /api/v1/uploads`, `PUT .../{upload_id}/chunk`, `GET .../{upload_id}`,
+     `POST .../{upload_id}/commit`, `DELETE .../{upload_id}`, PR #3135, CC-06
+     authenticated chunked-receive protocol / ADR-3004).** REST-only, no MCP
+     twin — a "no" on Decision 1's both-surfaces requirement. Recorded as a
+     **permanent** exception, not a tracked follow-up, because:
+     - **The gap is structural, not an oversight.** These five routes
+       authenticate on a grant/session BEARER CREDENTIAL
+       (`X-Yuzu-Upload-Grant` / `X-Yuzu-Upload-Session`) minted by
+       `mint_upload_grant`, never an operator session — but every MCP tool
+       call authenticates as an OPERATOR (`auth_fn`/`perm_fn`,
+       `tier_allows`/`requires_approval`). There is no operator identity to
+       authenticate an MCP call AS on this surface; exposing these routes as
+       MCP tools would mean either minting a second, parallel non-operator
+       credential path into the MCP transport (the exact securable-asymmetry
+       ADR-0031 exists to forbid, just inverted), or silently laundering the
+       agent's session credential through an operator-authenticated call —
+       both wrong for different reasons.
+     - **The capability's operator half has its twin from day one.** The
+       actual operator-facing action — mint a grant so an agent can push a
+       file — ships with `mint_upload_grant`/`list_upload_grants`/
+       `revoke_upload_grant` (this same PR). The exempted routes are the
+       agent's OWN redemption of that grant, a mechanism step with no
+       operator identity in the loop, not a second capability an operator
+       is denied a twin for.
+     - **The exception relaxes no control.** Each of the five routes still
+       authenticates via `UploadGrantStore::authenticate_session`
+       (constant-time secret compare against a stored SHA-256 hash) before
+       any mutation, and the pre-auth body-cap table's `upload_session` row
+       still bounds the chunk route before httplib buffers the body — MCP
+       twin-or-not changes nothing about how these routes are gated.
+     - Design record: `docs/adr/3004-artifact-blob-storage.md`; wire
+       reference: `docs/user-manual/rest-api.md`'s upload-grant section.
+
+   - **2026-08-15 — `GET /api/v1/guaranteed-state/status` fleet rollup
+     (#2298 item 6d / #3038).** REST-only, no MCP twin — a "no" on
+     Decision 1's both-surfaces requirement, already recorded in-code as
+     "GRANDFATHERED" (`rest_api_v1.cpp`) since the route's `errored_rules`
+     field was first made real, but not previously entered here. Recorded
+     now rather than fixed, because:
+     - **Pre-existing placeholder, not new capability.** The route existed
+       pre-ADR-1005 returning a hardcoded `errored_rules: 0`; this ladder's
+       #2298/item-6d work only made that one field real and, separately
+       (#3038), fixed its authorization gate from a bare global permission
+       check to the ADR-0017 admit-then-filter `AuthRoutes::require_list_read`
+       chokepoint. Neither change adds a NEW capability — both are
+       maintenance on an existing grandfathered surface (this ADR's own
+       "modifying one in place is maintenance, not a violation" rule,
+       "Prospective, not retroactive" section above).
+     - **No MCP tool reads `errored_rules`/`total_rules`/`compliant_rules`/
+       `drifted_rules` today** — the twin obligation has not yet attached in
+       the sense the fleet-gauge-family entry above describes ("attaches
+       when an operator-facing feature is built OVER the same data").
+     - **The authorization fix (#3038) does not itself trigger re-evaluation
+       against Decision 1/4** — it hardens the EXISTING REST surface's
+       access control, it does not add a capability or a new consumer.
+     - Design record: `docs/adr/0017-management-group-confinement-list-reads.md`;
+       operator-facing behavior: `docs/user-manual/guaranteed-state.md`
+       ("Fleet rollup" section), `docs/user-manual/server-admin.md` ("What a
+       client sees"); wire reference: `docs/user-manual/rest-api.md` (`GET
+       /api/v1/guaranteed-state/status`).
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.

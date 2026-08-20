@@ -270,7 +270,7 @@ so the push hits BuildKit's own solver cache and rebuilds nothing.
 |---|---|---|
 | `yuzu-bigtam-linux-{0..3}` | Big Tam Threadripper 9970X, native Ubuntu **26.04** (gcc-15/clang-21) — 4 L3/CCD-pinned runners (`0-7,32-39`; `8-15,40-47`; `16-23,48-55`; `24-31,56-63`), Ninja capped at `-j16` | **all self-hosted Linux** (shared label `yuzu-bigtam-linux`): ci.yml `linux` matrix, `proto-compat`, sanitizer-tests (asan/tsan), nightly (asan/tsan/coverage), codeql Linux leg, **release.yml** (build-linux, build-gateway, docker-publish\*), cache-prune-linux. 4 runners on one host. Provisioned from [`deploy/linux/`](../deploy/linux/README.md). |
 | `yuzu-weetam-windows-{0..3}` | Wee Tam 9970X native Windows 11 — 4 CCD-pinned runners, shared label `yuzu-weetam-windows` | **all self-hosted Windows**: ci.yml `windows`, nightly `windows-asan`, codeql Windows leg, release `build-windows`, instructions-windows-validate, cache-prune-windows. Provisioned from [`deploy/windows/`](../deploy/windows/README.md). |
-| `macos-15` | GitHub-hosted | macos matrix |
+| `yuzu-bigmags-macos-{0,1}` | BigMags Mac Mini (Apple M4 Pro, 24 GiB, macOS 26) — 2 runners as headless LaunchDaemons, shared label `yuzu-bigmags-macos` | **self-hosted macOS**: ci.yml `macos` matrix. `release.yml` build-macos + pre-release install-macos deliberately stay GitHub-hosted (`macos-15`/`macos-14`) until on-box signing. Provisioned from [`deploy/macos/`](../deploy/macos/README.md). |
 
 **Retired 2026-06-21:** `yuzu-wsl2-linux` (Shulgi WSL2 Ubuntu 24.04, label
 `yuzu-shulgi`) and `yuzu-local-windows` (Shulgi native Windows) — superseded by
@@ -396,8 +396,12 @@ bash scripts/test/test-db-query.sh ci-suite-stats --since 30d
 bash scripts/test/test-db-query.sh ci-flakes --since 30d
 ```
 
-GitHub-hosted macOS agents are ephemeral and cannot meet this runner-local
-persistence contract; their test logs remain retained Actions artifacts.
+macOS now runs on the self-hosted **BigMags** pool ([`deploy/macos/`](../deploy/macos/README.md)):
+ccache persists in the runner user's HOME and the vcpkg binary cache in
+`runner.tool_cache`, like Big Tam/Wee Tam. Per-agent `test-runs.db` telemetry is
+NOT yet wired into the `macos` job (Phase 4 to-do), so the DB queries above have
+no macOS data yet. The `release.yml`/`pre-release.yml` macOS legs stay on
+GitHub-hosted `macos-15`/`macos-14`, which are ephemeral.
 
 Inventory declared in `.github/runner-inventory.json`. The sentinel at
 `runner-inventory-sentinel.yml` (every 30 min) compares actual to expected
@@ -607,9 +611,9 @@ short-circuit to "already installed" and then fail post-install
 pkgconfig validation; this was #741.) Never touches `$WS/vcpkg/` (the
 sibling vcpkg tool root, owned by lukka/run-vcpkg), never
 `runner.tool_cache`, never ccache. Persistence: self-hosted in
-`${runner.tool_cache}/yuzu-vcpkg-binary-cache-{linux,asan,windows}`
-(per-triplet, outside workspace). macOS uses `actions/cache@v5` keyed on
-the same invariant.
+`${runner.tool_cache}/yuzu-vcpkg-binary-cache-{linux,asan,windows,macos}`
+(per-triplet, outside workspace). macOS joined this model with the BigMags
+cutover; its former `actions/cache@v5` round-trip was removed.
 
 The script must run cleanly under MSYS2 bash on Windows. **Do NOT use
 `set -e` + `[[ test ]] && cmd` short-circuits** — they silently exit under
@@ -695,13 +699,46 @@ one file is one PG-instance event, not a test bug.
 
 ## Workflow-PR canary
 
-`ci.yml`'s `detect-ci-changes` + `canary` jobs run when a PR or main push
-touches `.github/workflows/`, `.github/actions/`, or `scripts/ci/`. The named
-`ci-infrastructure` class in `scripts/ci/detect-code-change.sh` owns both the
-path rules and `git diff` error handling. If the diff cannot be established,
-it returns changed=true so the canary runs fail-closed. Canary mirrors the
-linux build on a fresh-disk GHA-hosted `ubuntu-24.04` with `actions/cache` for
-vcpkg — catches workflow regressions before main.
+`ci.yml`'s `detect-ci-changes` + `canary` jobs run when a PR, or a push to
+`main` or `dev`, touches `.github/workflows/`, `.github/actions/`, or
+`scripts/ci/`. The named `ci-infrastructure` class in
+`scripts/ci/detect-code-change.sh` owns both the path rules and `git diff`
+error handling. If the diff cannot be established, it returns changed=true so
+the canary runs fail-closed. Canary mirrors the linux build on a fresh-disk
+GHA-hosted `ubuntu-24.04` with `actions/cache` for vcpkg + ccache — catches
+workflow regressions before main.
+
+**Diff semantics differ by event, deliberately.** A push asks "what did this
+push move", so it diffs two-dot against `github.event.before`. A pull request
+asks "what does this PR change", so it diffs from the merge base — its
+`base.sha` is a live branch tip, and two-dot there additionally reports every
+commit the base branch gained since the fork point, which misclassified any PR
+that had merely fallen behind a CI-touching `dev` (#3232). The merge-base diff
+must be given the **PR head**, never the checked-out `refs/pull/<N>/merge`
+commit: `base.sha` is always an ancestor of that merge commit, so the merge
+base *is* `base.sha` and three-dot silently collapses back to two-dot. That
+no-op is pinned by cases in `tests/shell/test_detect_code_change.sh`, which
+also assert the caller passes a resolved head.
+
+**Cache keys must not be reachable by an earlier restore step.** The canary's
+ccache key is scoped to the source roots meson compiles rather than a
+workspace-wide glob: `hashFiles` does not honour `.gitignore`, and the vcpkg
+restore runs first, so a bare glob also hashed the vendored dependency headers and
+the key differed between a cold and a warm run — splitting the namespace and
+leaving the dev-warmed ccache entry at a key no warm PR recomputes (#3270). The
+ccache save is gated on the Build step having run, pass or fail, so a cancelled
+run cannot leave a thin entry that later same-source runs exact-hit and decline to
+replace (#3269); the vcpkg save is gated more strictly, on its install step
+succeeding, because a partial tree is a correctness problem rather than a slow one.
+
+**Pushes to `dev` are what keep the cache warm.** GHA cache scope lets a PR job
+read its own ref, the default branch, and its base branch — never a sibling
+PR's. Every PR bases on `dev`, so a dev-scoped entry serves all of them; main-only
+warming left the scope empty for five weeks and each PR saved a private ~843 MB
+duplicate (#3233). Note the canary key hashes `vcpkg.json` /
+`vcpkg-configuration.json` / `triplets/x64-linux.cmake`, which the
+`ci-infrastructure` class does not match, so a manifest bump on `dev` does not
+itself re-warm the new key.
 
 ## Cache pruning + weekly maintenance
 
