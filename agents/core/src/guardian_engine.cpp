@@ -282,9 +282,12 @@ std::expected<void, std::string> GuardianEngine::start_local() {
                 ++rearmed;
         } catch (const std::exception& e) {
             // Build once, log, and record for last_rearm_degrade_message_for_test - a single
-            // source of truth rather than a second copy of this text. spdlog::error("{}", msg)
-            // (not spdlog::error(msg)) so an e.what() containing '{'/'}' is never reinterpreted
-            // as format syntax, which would throw out of this degrade handler.
+            // source of truth rather than a second copy of this text. spdlog::error("{}", msg),
+            // a literal one-placeholder format string with msg as the substituted argument,
+            // never reparses msg's own content as format syntax regardless of vendored spdlog
+            // version/overload resolution - the version-proof safe idiom for logging arbitrary
+            // (here, exception-supplied) text, not a workaround for a throw this specific
+            // vendored version happens not to have.
             const std::string degrade_msg =
                 "Guardian: rule '" + rule.rule_id() + "' failed to re-arm (" + e.what() +
                 ") - NOT enforcing this rule; agent continues with the remaining rules";

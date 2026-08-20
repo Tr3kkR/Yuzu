@@ -405,8 +405,11 @@ public:
     /// same cross-image-state class as the #501 abseil hash-seed split
     /// guardian_dispatch_push_bytes_for_test works around). Plain object-member
     /// state has no such hazard: it lives in the GuardianEngine instance regardless
-    /// of which image the writing method's code was compiled into. No production
-    /// caller.
+    /// of which image the writing method's code was compiled into.
+    /// UNGUARDED (does not take mtx_, unlike rule_count()/spark_armed_rule_count()):
+    /// safe to call only after start_local() has returned on the calling thread, not
+    /// concurrently with a start_local() call in flight on another thread. No
+    /// production caller.
     [[nodiscard]] const std::string& last_rearm_degrade_message_for_test() const {
         return last_rearm_degrade_message_for_test_;
     }

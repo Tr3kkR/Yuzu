@@ -5,8 +5,25 @@
  *
  * Promoted from the inline block in test_licensing_sync.cpp's
  * "k_agent never appears in the blob or in captured logs" test (governance
- * CON-S4 — promote-at-second-user; second user:
- * test_guardian_engine_spark_reconcile.cpp #2238).
+ * CON-S4 — promote-at-second-user). The #2238 second user
+ * (test_guardian_engine_spark_reconcile.cpp) was removed after a macOS CI
+ * failure showed this class's swap does not reach spdlog:: calls made from
+ * code compiled into a separate shared library (libyuzu_agent_core is a
+ * .dylib there) — the swap happens in the TEST BINARY's image, and that
+ * image apparently does not share spdlog's default-logger/registry state
+ * with the library's own image on every supported toolchain. This class is
+ * therefore reliable ONLY for logging done by code compiled directly into
+ * the same test binary (which is exactly test_licensing_sync.cpp's case —
+ * sync_source_software_licensing.cpp is, however, ALSO compiled into
+ * libyuzu_agent_core, so that test's own LogCapture use likely has the SAME
+ * exposure; its assertions are negative (logs.find(key) == npos), so an
+ * empty/unreachable capture would pass it vacuously rather than fail loudly.
+ * Not yet verified or fixed — flagged for a follow-up, not addressed here.
+ *
+ * For code compiled into a separate shared library, prefer recording the
+ * observable directly as a plain object member with a `_for_test` accessor
+ * at the point of emission (see GuardianEngine::last_rearm_degrade_message_for_test
+ * for the pattern this replaced) — object state has no cross-image hazard.
  *
  * A separate header rather than folding into test_helpers.hpp: this pulls in
  * spdlog's ostream sink, which most test_helpers.hpp consumers don't need.
