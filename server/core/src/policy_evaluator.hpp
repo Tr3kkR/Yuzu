@@ -10,20 +10,33 @@
 /// 0%. This component closes that gap.
 ///
 /// Model (two-phase, async): a background thread `tick()`s on a cadence.
-///   * dispatch_due(): find enabled policies whose interval has elapsed,
-///     resolve scope -> agents, dispatch the fragment's check_instruction with
-///     a generated execution_id, and record an in-flight check.
+///   * dispatch_due(): claims due policies via `PolicyStore::claim_due_policies`
+///     (ADR-0056 — a durable, fleet-wide single-sweeper claim; see that store's
+///     header for why due-ness can no longer live in this class's own
+///     memory), resolves scope -> agents, dispatches the fragment's
+///     check_instruction with a generated execution_id, and records an
+///     in-flight check.
 ///   * collect_ready(): for in-flight checks past a grace window (or once all
 ///     targets have responded), read each agent's result via
 ///     ResponseStore::query_by_execution, evaluate the CEL against the parsed
 ///     result fields, and write compliant / non_compliant / unknown / error
-///     via PolicyStore::update_agent_status (one row per agent).
+///     via PolicyStore::update_agent_status (one row per agent). Stays
+///     per-replica and in-memory: only the replica that dispatched a check
+///     ever holds its in-flight entry, so there is nothing to coordinate here
+///     — `update_agent_status`'s UPSERT is naturally idempotent against a
+///     racing manual evaluate_now()/remediate() call on another replica.
 ///
 /// Remediation is MANUAL and opt-in (operator-gated) and only available when
 /// the fragment defines a fix_instruction: `remediate()` marks targets
 /// `fixing`, dispatches the fix, then (on a later tick) dispatches the
 /// post-check / check instruction and writes the true post-fix verdict. There
 /// is no automatic non_compliant -> fix loop.
+///
+/// Multi-replica note (ADR-0056): a stranded `fixing` row (the dispatching
+/// replica died mid-FixWait) is swept back to `unknown` by
+/// `claim_due_policies`'s per-tick staleness check, not by this class's
+/// constructor — the old unconditional every-restart reset would stomp
+/// another replica's still-live remediation under N replicas.
 
 #include <cstdint>
 #include <functional>
@@ -80,6 +93,14 @@ public:
         NowFn now_fn;                          // defaults to system clock if unset
         int64_t default_interval_seconds{3600}; // when a policy has no interval trigger
         int64_t grace_seconds{15};             // wait before scoring non-responders
+        // ADR-0056: how long a 'fixing' status may sit before
+        // claim_due_policies' staleness sweep resets it to 'unknown' (the
+        // dispatching replica died/restarted mid-remediation and no one will
+        // ever collect its FixWait). Long enough that a genuinely slow fix
+        // instruction (e.g. a content_dist software install, which can run
+        // minutes) is not false-positive reset mid-flight; short enough that
+        // a truly stranded fix does not sit invisible indefinitely.
+        int64_t fixing_stale_seconds{1800};
     };
 
     explicit PolicyEvaluator(Deps deps);
@@ -125,9 +146,8 @@ private:
     };
 
     Deps d_;
-    std::mutex mu_;                                   // guards in_flight_ + last_eval_
+    std::mutex mu_;                                   // guards in_flight_
     std::vector<InFlight> in_flight_;
-    std::unordered_map<std::string, int64_t> last_eval_;
 
     void dispatch_due();
     void collect_ready();
