@@ -276,7 +276,8 @@ int do_domain(yuzu::CommandContext& ctx) {
             auto res = yuzu::agent::run_bounded_subprocess(
                 {realm_path, "list"},
                 yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(10)});
-            if (res.tool_ran && !res.timed_out && !res.output_truncated && !res.output.empty()) {
+            if (res.tool_ran && !res.timed_out && !res.output_truncated &&
+                res.exit_code == 0 && !res.output.empty()) {
                 joined = true;
                 resolved = true;
             }
@@ -376,8 +377,12 @@ int do_ou(yuzu::CommandContext& ctx) {
         // A killed-at-deadline or truncated capture can leave tool_ran=true
         // over partial/garbled text; treat that the same as a failed run
         // (falls through to the sssd.conf fallback below) rather than
-        // risking a truncated OU match.
-        if (res.tool_ran && !res.timed_out && !res.output_truncated)
+        // risking a truncated OU match. A nonzero exit is rejected too
+        // (found in /governance Gate 4, unhappy-path): `realm list` prints
+        // diagnostics to stdout on some degraded/error states, so a bare
+        // tool_ran/timed_out/output_truncated gate could read that text as
+        // a real OU match.
+        if (res.tool_ran && !res.timed_out && !res.output_truncated && res.exit_code == 0)
             realm_out = res.output;
     }
     // Try realm list for OU
