@@ -29,6 +29,18 @@
  * non-zero method ReturnValue, is reported "Unknown" rather than
  * fabricated — the same "never guess" convention bitlocker_macos_apfs.hpp
  * already follows for FileVault fields diskutil doesn't supply.
+ *
+ * acquire_volume_row() (below) is the injectable seam an adversarial-review
+ * finding (gate 2, PR3.3-b) asked for: test_bitlocker_local_dispatcher.cpp's
+ * only pin on the GetEncryptionMethod wiring was `method != "unknown"`
+ * (lowercase), which production satisfies unconditionally by initializing
+ * `method = "Unknown"` (capitalized) before the call and keeping that value
+ * on ANY failure — so deleting the GetEncryptionMethod call entirely, or
+ * breaking its method name/object path, still passed. acquire_volume_row
+ * takes the two WMI method calls as an injected executor, so a fixture test
+ * can prove the wiring end to end (a canned non-"Unknown" EncryptionMethod
+ * response must reach the output row's method field) without a live WMI
+ * provider.
  */
 #pragma once
 
@@ -211,6 +223,39 @@ inline std::string format_volume_row(const EncryptableVolume& vol, const Convers
     std::string drive = vol.drive_letter.empty() ? "unknown" : vol.drive_letter;
     return "volume|" + drive + "|" + conv.conversion_text + "|" + conv.percent_text +
            "|" + method + "|" + protection_status_text(vol.protection_status_raw);
+}
+
+/// Acquires and formats one volume's output row, given an injected method
+/// EXECUTOR rather than calling WMI directly -- the seam that makes the
+/// GetConversionStatus/GetEncryptionMethod wiring itself fixture-testable
+/// (see the file header comment). `exec_method(object_path, method_name)`
+/// returns the method call's single out-parameter row on success, or
+/// std::nullopt on any transport/call failure (the real Windows call site
+/// is responsible for logging that failure; this function only decides
+/// what to DO with success-vs-absence, matching parse_conversion_status/
+/// parse_encryption_method's own "never fabricate" contract). Calls BOTH
+/// methods unconditionally, mirroring bitlocker_plugin.cpp's real
+/// acquisition: a GetEncryptionMethod failure never suppresses the
+/// GetConversionStatus fields already gathered, and vice versa.
+template <typename MethodExecutor>
+[[nodiscard]] inline std::string acquire_volume_row(const EncryptableVolume& vol,
+                                                     MethodExecutor&& exec_method) {
+    const auto object_path = build_volume_object_path(vol.device_id);
+
+    const auto conversion_row = exec_method(object_path, std::string("GetConversionStatus"));
+    ConversionState state;
+    if (conversion_row.has_value()) {
+        state = parse_conversion_status(*conversion_row);
+    } else {
+        state.conversion_text = "Unknown";
+        state.percent_text = "unknown";
+    }
+
+    const auto method_row = exec_method(object_path, std::string("GetEncryptionMethod"));
+    const std::string method =
+        method_row.has_value() ? parse_encryption_method(*method_row) : std::string("Unknown");
+
+    return format_volume_row(vol, state, method);
 }
 
 /// Whether a WMI query/method-call error string indicates the caller lacks

@@ -33,6 +33,7 @@
 #include <windows.h>
 
 #include "user_profile_model.hpp"
+#include "value_enumeration.hpp"
 #include "win_reg_handle.hpp"
 #include "win_str.hpp"
 
@@ -291,10 +292,9 @@ inline ValueNameEnumeration enumerate_value_names(HKEY key) {
 
     const DWORD cap = value_count < kMaxEnumeratedValueNames ? value_count
                                                              : kMaxEnumeratedValueNames;
-    if (cap < value_count)
-        result.complete = false; // safety cap cut off real entries
     result.names.reserve(cap);
-    for (DWORD idx = 0; idx < cap; ++idx) {
+    DWORD idx = 0;
+    for (; idx < cap; ++idx) {
         // RegEnumValueW's lpcchValueName is WCHAR count and MUST include
         // room for the terminator on input, even though the count it writes
         // back on success does not include it (mirrors RegEnumKeyExW's
@@ -306,13 +306,20 @@ inline ValueNameEnumeration enumerate_value_names(HKEY key) {
         if (rc != ERROR_SUCCESS) {
             // A value deleted mid-enumeration (index shifts under us) or any
             // other transient failure -- stop rather than loop past what the
-            // key actually still has; whatever was collected so far is real,
-            // but the walk did not reach `value_count`, so it is not complete.
-            result.complete = false;
+            // key actually still has; whatever was collected so far is real.
             break;
         }
         result.names.push_back(from_wide(name_buf.data(), static_cast<int>(name_len)));
     }
+    // The DECISION (cap reached AND the walk reached it, vs cut short by
+    // either the cap or a mid-enumeration failure) is
+    // yuzu::win::value_enumeration_is_complete, extracted pure so it is
+    // unit-tested without a real registry (adversarial-review gate 2
+    // finding: the prior inline `complete = false` assignments above were
+    // never fixture-reachable). This Win32 shell's job is only to gather
+    // the three input facts: the provider's reported count, the cap we
+    // applied, and how far the walk actually got (`idx`).
+    result.complete = value_enumeration_is_complete(value_count, cap, idx);
     return result;
 }
 

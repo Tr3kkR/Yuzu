@@ -19,6 +19,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <functional>
+#include <map>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
 using namespace yuzu::bitlocker::windows;
 
 TEST_CASE("protection_status_text maps the documented ProtectionStatus enum",
@@ -188,4 +195,111 @@ TEST_CASE("is_permission_denied is false for an unrelated error or no error",
           "[agent][bitlocker_windows_wmi]") {
     CHECK_FALSE(is_permission_denied(std::optional<std::string>{"RPC server unavailable"}));
     CHECK_FALSE(is_permission_denied(std::nullopt));
+}
+
+// --- acquire_volume_row: injected-executor wiring proof ---------------------
+//
+// Adversarial-review finding (gate 2, PR3.3-b): test_bitlocker_local_
+// dispatcher.cpp's only pin on the GetEncryptionMethod wiring was
+// `method != "unknown"` (lowercase) -- production initializes
+// `method = "Unknown"` (capitalized) before the call and keeps it on ANY
+// failure, so deleting the GetEncryptionMethod call entirely still passed
+// that test. These fixtures inject a fake executor and assert the exact
+// method NAMES called and the exact VALUES threaded through -- a deleted
+// or mis-wired call fails these directly, no live host or real WMI
+// provider required.
+
+namespace {
+
+// Records every (object_path, method_name) call it receives and returns a
+// canned row per method name, or std::nullopt for a name with no entry.
+struct RecordingExecutor {
+    std::vector<std::pair<std::string, std::string>> calls;
+    std::map<std::string, WmiRow> responses;
+
+    std::optional<WmiRow> operator()(const std::string& object_path,
+                                     const std::string& method_name) {
+        calls.emplace_back(object_path, method_name);
+        auto it = responses.find(method_name);
+        if (it == responses.end())
+            return std::nullopt;
+        return it->second;
+    }
+};
+
+} // namespace
+
+TEST_CASE("acquire_volume_row: calls both methods by their documented names",
+          "[agent][bitlocker_windows_wmi]") {
+    EncryptableVolume vol;
+    vol.device_id = R"(\\?\Volume{aaaaaaaa-0000-0000-0000-000000000000}\)";
+    vol.drive_letter = "C:";
+    vol.protection_status_raw = "1";
+
+    RecordingExecutor exec;
+    exec.responses["GetConversionStatus"] = {
+        {"ReturnValue", "0"}, {"ConversionStatus", "1"}, {"EncryptionPercentage", "100"}};
+    exec.responses["GetEncryptionMethod"] = {{"ReturnValue", "0"}, {"EncryptionMethod", "6"}};
+
+    acquire_volume_row(vol, std::ref(exec));
+
+    REQUIRE(exec.calls.size() == 2);
+    CHECK(exec.calls[0].second == "GetConversionStatus");
+    CHECK(exec.calls[1].second == "GetEncryptionMethod");
+}
+
+TEST_CASE("acquire_volume_row: a real (non-Unknown) EncryptionMethod response reaches the "
+          "output row -- the regression pin for a deleted/broken GetEncryptionMethod call",
+          "[agent][bitlocker_windows_wmi]") {
+    EncryptableVolume vol;
+    vol.device_id = R"(\\?\Volume{bbbbbbbb-0000-0000-0000-000000000000}\)";
+    vol.drive_letter = "D:";
+    vol.protection_status_raw = "1";
+
+    RecordingExecutor exec;
+    exec.responses["GetConversionStatus"] = {
+        {"ReturnValue", "0"}, {"ConversionStatus", "1"}, {"EncryptionPercentage", "100"}};
+    exec.responses["GetEncryptionMethod"] = {{"ReturnValue", "0"}, {"EncryptionMethod", "7"}};
+
+    auto row = acquire_volume_row(vol, std::ref(exec));
+
+    // If GetEncryptionMethod were never called (or its object_path/method
+    // name were wrong so the fixture map missed), method would stay
+    // "Unknown" -- this fixture's injected value (XTS-AES 256, enum "7")
+    // is deliberately distinct from that fallback so the assertion fails
+    // on exactly that regression.
+    CHECK(row == "volume|D:|Fully Encrypted|100%|XTS-AES 256|Protection On");
+}
+
+TEST_CASE("acquire_volume_row: GetEncryptionMethod failure degrades only the method field, "
+          "conversion fields survive",
+          "[agent][bitlocker_windows_wmi]") {
+    EncryptableVolume vol;
+    vol.device_id = R"(\\?\Volume{cccccccc-0000-0000-0000-000000000000}\)";
+    vol.drive_letter = "E:";
+    vol.protection_status_raw = "1";
+
+    RecordingExecutor exec;
+    exec.responses["GetConversionStatus"] = {
+        {"ReturnValue", "0"}, {"ConversionStatus", "1"}, {"EncryptionPercentage", "100"}};
+    // No "GetEncryptionMethod" entry -- operator() returns std::nullopt for it.
+
+    auto row = acquire_volume_row(vol, std::ref(exec));
+    CHECK(row == "volume|E:|Fully Encrypted|100%|Unknown|Protection On");
+}
+
+TEST_CASE("acquire_volume_row: GetConversionStatus failure degrades only conversion fields, "
+          "method survives",
+          "[agent][bitlocker_windows_wmi]") {
+    EncryptableVolume vol;
+    vol.device_id = R"(\\?\Volume{dddddddd-0000-0000-0000-000000000000}\)";
+    vol.drive_letter = "F:";
+    vol.protection_status_raw = "0";
+
+    RecordingExecutor exec;
+    // No "GetConversionStatus" entry.
+    exec.responses["GetEncryptionMethod"] = {{"ReturnValue", "0"}, {"EncryptionMethod", "6"}};
+
+    auto row = acquire_volume_row(vol, std::ref(exec));
+    CHECK(row == "volume|F:|Unknown|unknown|XTS-AES 128|Protection Off");
 }

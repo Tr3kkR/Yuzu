@@ -25,13 +25,15 @@
 #include <spdlog/spdlog.h>
 
 #include <format>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #ifdef __linux__
-#include <cstdlib> // std::free — blkid_get_tag_value's returned string ownership
-#include <memory>  // std::unique_ptr
+#include <cstdlib>     // std::free — blkid_get_tag_value's returned string ownership
+#include <memory>      // std::unique_ptr
+#include <type_traits> // std::remove_pointer_t — blkid_cache/blkid_dev_iterate RAII wrappers
 #endif
 
 #ifdef _WIN32
@@ -126,43 +128,36 @@ bool report_bitlocker_status(yuzu::CommandContext& ctx) {
     }
 
     for (const auto& vol : volumes) {
-        auto object_path = yuzu::bitlocker::windows::build_volume_object_path(vol.device_id);
-        // sink: bitlocker/report_bitlocker_status#2 — rung 1, in-process WMI
-        // method call (GetConversionStatus), one per enumerated volume.
-        auto conv = yuzu::shared::wmi::exec_object_method(
-            kBitlockerWmiNamespace, yuzu::win::to_wide(object_path), L"GetConversionStatus", {});
-
-        yuzu::bitlocker::windows::ConversionState state;
-        if (!conv.error.has_value() && !conv.rows.empty()) {
-            state = yuzu::bitlocker::windows::parse_conversion_status(conv.rows.front());
-        } else {
-            // A per-volume method-call failure degrades that one row to an
-            // honest "Unknown" rather than aborting the whole scan or
-            // fabricating a conversion state.
-            if (conv.error.has_value()) {
-                spdlog::warn("bitlocker: GetConversionStatus failed for {}: {}", vol.device_id,
-                             *conv.error);
-            }
-            state.conversion_text = "Unknown";
-            state.percent_text = "unknown";
-        }
-
-        // sink: bitlocker/report_bitlocker_status#3 — rung 1, in-process WMI
-        // method call (GetEncryptionMethod), one per enumerated volume.
-        // Independent of the GetConversionStatus call above: a failure here
-        // degrades only the method field, never the conversion/percentage
-        // fields already collected.
-        auto method_call = yuzu::shared::wmi::exec_object_method(
-            kBitlockerWmiNamespace, yuzu::win::to_wide(object_path), L"GetEncryptionMethod", {});
-        std::string method = "Unknown";
-        if (!method_call.error.has_value() && !method_call.rows.empty()) {
-            method = yuzu::bitlocker::windows::parse_encryption_method(method_call.rows.front());
-        } else if (method_call.error.has_value()) {
-            spdlog::warn("bitlocker: GetEncryptionMethod failed for {}: {}", vol.device_id,
-                         *method_call.error);
-        }
-
-        ctx.write_output(yuzu::bitlocker::windows::format_volume_row(vol, state, method));
+        // sink: bitlocker/report_bitlocker_status#2 and #3 — rung 1,
+        // in-process WMI method calls (GetConversionStatus,
+        // GetEncryptionMethod), one of each per enumerated volume. Routed
+        // through acquire_volume_row's injected-executor seam
+        // (bitlocker_windows_wmi.hpp) rather than inlined here, so the
+        // wiring itself — does GetEncryptionMethod's result actually reach
+        // the output row — is fixture-testable without a live WMI provider
+        // (adversarial-review gate 2 finding, PR3.3-b).
+        auto row = yuzu::bitlocker::windows::acquire_volume_row(
+            vol, [&](const std::string& object_path,
+                     const std::string& method_name) -> std::optional<yuzu::bitlocker::windows::WmiRow> {
+                auto call = yuzu::shared::wmi::exec_object_method(
+                    kBitlockerWmiNamespace, yuzu::win::to_wide(object_path),
+                    yuzu::win::to_wide(method_name), {});
+                if (call.error.has_value()) {
+                    // A per-volume method-call failure degrades only that
+                    // one field to an honest "Unknown" rather than
+                    // aborting the whole scan or fabricating a value — the
+                    // GetConversionStatus and GetEncryptionMethod calls are
+                    // independent, so a failure in one never suppresses
+                    // the other's already-collected fields.
+                    spdlog::warn("bitlocker: {} failed for {}: {}", method_name, vol.device_id,
+                                 *call.error);
+                    return std::nullopt;
+                }
+                if (call.rows.empty())
+                    return std::nullopt;
+                return call.rows.front();
+            });
+        ctx.write_output(row);
     }
     return true;
 }
@@ -178,40 +173,51 @@ bool report_bitlocker_status(yuzu::CommandContext& ctx) {
 std::vector<yuzu::bitlocker::linux_dm::LuksBlockDevice> enumerate_luks_devices() {
     std::vector<yuzu::bitlocker::linux_dm::LuksBlockDevice> devices;
 
-    blkid_cache cache = nullptr;
-    if (blkid_get_cache(&cache, nullptr) != 0 || !cache)
+    blkid_cache raw_cache = nullptr;
+    if (blkid_get_cache(&raw_cache, nullptr) != 0 || !raw_cache)
         return devices;
-    blkid_probe_all(cache);
+    // RAII from the moment of acquisition -- mirrors the `uuid` unique_ptr
+    // below (adversarial-review gate 2 finding: this cache/iterator pair
+    // was released only via ordinary fall-through to the manual
+    // blkid_put_cache()/blkid_dev_iterate_end() calls at the bottom of the
+    // function, reached only after intervening std::string construction
+    // and vector::push_back calls per iteration -- either can throw
+    // std::bad_alloc and leak both handles; the RAII-wrapped `uuid` three
+    // lines below is proof the pattern was known and applied selectively).
+    std::unique_ptr<std::remove_pointer_t<blkid_cache>, decltype(&blkid_put_cache)> cache{
+        raw_cache, &blkid_put_cache};
+    blkid_probe_all(cache.get());
 
-    blkid_dev_iterate iter = blkid_dev_iterate_begin(cache);
-    if (iter) {
-        blkid_dev_set_search(iter, "TYPE", "crypto_LUKS");
-        blkid_dev dev = nullptr;
-        while (blkid_dev_next(iter, &dev) == 0) {
-            dev = blkid_verify(cache, dev);
-            if (!dev)
-                continue;
-            const char* devname = blkid_dev_devname(dev);
-            if (!devname)
-                continue;
-            // blkid_get_tag_value returns a heap-allocated string the caller
-            // owns (util-linux convention — same as g_strdup) — adopt it
-            // into a unique_ptr immediately so every path (including the
-            // loop's next iteration) frees it; this is a long-lived agent
-            // daemon process, so a per-call leak here is cumulative.
-            std::unique_ptr<char, decltype(&std::free)> uuid{
-                blkid_get_tag_value(cache, "UUID", devname), &std::free};
-            if (!uuid)
-                continue;
+    blkid_dev_iterate raw_iter = blkid_dev_iterate_begin(cache.get());
+    if (!raw_iter)
+        return devices;
+    std::unique_ptr<std::remove_pointer_t<blkid_dev_iterate>, decltype(&blkid_dev_iterate_end)>
+        iter{raw_iter, &blkid_dev_iterate_end};
 
-            std::string full{devname};
-            auto slash = full.rfind('/');
-            std::string base = (slash == std::string::npos) ? full : full.substr(slash + 1);
-            devices.push_back({std::move(base), std::string(uuid.get())});
-        }
-        blkid_dev_iterate_end(iter);
+    blkid_dev_set_search(iter.get(), "TYPE", "crypto_LUKS");
+    blkid_dev dev = nullptr;
+    while (blkid_dev_next(iter.get(), &dev) == 0) {
+        dev = blkid_verify(cache.get(), dev);
+        if (!dev)
+            continue;
+        const char* devname = blkid_dev_devname(dev);
+        if (!devname)
+            continue;
+        // blkid_get_tag_value returns a heap-allocated string the caller
+        // owns (util-linux convention — same as g_strdup) — adopt it
+        // into a unique_ptr immediately so every path (including the
+        // loop's next iteration) frees it; this is a long-lived agent
+        // daemon process, so a per-call leak here is cumulative.
+        std::unique_ptr<char, decltype(&std::free)> uuid{
+            blkid_get_tag_value(cache.get(), "UUID", devname), &std::free};
+        if (!uuid)
+            continue;
+
+        std::string full{devname};
+        auto slash = full.rfind('/');
+        std::string base = (slash == std::string::npos) ? full : full.substr(slash + 1);
+        devices.push_back({std::move(base), std::string(uuid.get())});
     }
-    blkid_put_cache(cache);
     return devices;
 }
 
