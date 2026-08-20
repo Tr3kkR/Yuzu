@@ -118,7 +118,7 @@ duplicates.
 | os_info | ✅ | ✅ | ✅ | linux/apple/win branches |
 | processes | ✅ | ✅ | ✅ | win/linux/apple branches (point-in-time enum; streaming capture is under TAR `process`) |
 | procfetch | ✅ | ✅ | ✅ | linux/apple/win branches |
-| quarantine | ✅ | ✅ | ✅ | full per-OS blocks |
+| quarantine | ✅ | ⚠️ | ⚠️ | full per-OS blocks, but containment is not yet complete on Linux/macOS: Linux only filters IPv4 (`ip6tables` never called, #3282); macOS's status check doesn't verify pf is actually enabled, only that the ruleset was loaded (#3283); status checks on all three platforms verify partial/existence, not full containment (#3285) |
 | rdp_control | ✅ | ⛔ | ⛔ | Windows-only. Off-Windows returns an honest `rdp_control\|unsupported` sentinel (macOS names Screen Sharing); state-changing `set_state` reports terminal FAILURE, read-only `status` rc=0 — `rdp_control_plugin.cpp` `#ifndef _WIN32` branch |
 | registry | ✅ | ⛔ | ⛔ | Windows-only (advapi32). Off-Windows returns an honest `registry\|unsupported` sentinel (reads rc=0; mutating `set_value`/`delete_*` report terminal FAILURE — no false success) — `registry_plugin.cpp` `#ifndef _WIN32` branch. `list_profiles` (PR1.7) enumerates local profiles via ProfileList/HKEY_USERS. `get_user_value` resolves the target profile via ProfileList and reads the live `HKEY_USERS\<SID>` hive when the user is logged in, falling back to an offline `RegLoadKey` mount (SeBackup/SeRestore privileges, required only for that fallback) when not. The ladder lives in `agents/shared/win_profiles.hpp` and is shared with `installed_apps.list_per_user`, `license_scan`'s per-user surfaces and `tar`'s mapdrive history (#2771) |
 | sccm | ✅ | ⛔ | ⛔ | Windows-only. macOS returns an honest `sccm\|unsupported` (points at Jamf/MDM); Linux `installed\|false` + "platform not supported" — `sccm_plugin.cpp` `__APPLE__` branch |
@@ -481,18 +481,18 @@ implementation is.
 | procfetch | procfetch_fetch | linux | supported | 1 | /proc enumeration + OpenSSL EVP SHA-1 | - |
 | procfetch | procfetch_fetch | macos | supported | 1 | libproc (proc_listpids/proc_pidpath) + OpenSSL EVP SHA-1 | - |
 | procfetch | procfetch_fetch | windows | supported | 1 | CreateToolhelp32Snapshot + BCrypt SHA-1 | - |
-| quarantine | quarantine | linux | supported | 3 | sudo iptables via popen | - |
-| quarantine | quarantine | macos | supported | 3 | sudo pfctl via popen | - |
-| quarantine | quarantine | windows | supported | 3 | netsh via popen | - |
-| quarantine | unquarantine | linux | supported | 3 | sudo iptables via popen | - |
-| quarantine | unquarantine | macos | supported | 3 | sudo pfctl via popen | - |
-| quarantine | unquarantine | windows | supported | 3 | netsh via popen | - |
-| quarantine | status | linux | supported | 3 | sudo iptables via popen | - |
-| quarantine | status | macos | supported | 3 | sudo pfctl via popen | - |
-| quarantine | status | windows | supported | 3 | netsh via popen | - |
-| quarantine | whitelist | linux | supported | 3 | sudo iptables via popen | - |
-| quarantine | whitelist | macos | supported | 3 | sudo pfctl via popen | - |
-| quarantine | whitelist | windows | supported | 3 | netsh via popen | - |
+| quarantine | quarantine | linux | supported | 2 | sudo-governed iptables via bounded runner argv | - |
+| quarantine | quarantine | macos | supported | 2 | sudo-governed pfctl via bounded runner argv | - |
+| quarantine | quarantine | windows | supported | 2 | netsh via bounded runner argv (service-account privilege, no sudo) | - |
+| quarantine | unquarantine | linux | supported | 2 | sudo-governed iptables via bounded runner argv | - |
+| quarantine | unquarantine | macos | supported | 2 | sudo-governed pfctl via bounded runner argv | - |
+| quarantine | unquarantine | windows | supported | 2 | netsh via bounded runner argv (service-account privilege, no sudo) | - |
+| quarantine | status | linux | supported | 2 | sudo-governed iptables via bounded runner argv | - |
+| quarantine | status | macos | supported | 2 | sudo-governed pfctl via bounded runner argv | - |
+| quarantine | status | windows | supported | 2 | netsh via bounded runner argv (service-account privilege, no sudo) | - |
+| quarantine | whitelist | linux | supported | 2 | sudo-governed iptables via bounded runner argv | - |
+| quarantine | whitelist | macos | supported | 2 | sudo-governed pfctl via bounded runner argv | - |
+| quarantine | whitelist | windows | supported | 2 | netsh via bounded runner argv (service-account privilege, no sudo) | - |
 | rdp_control | set_state | linux | unsupported | - | - | - |
 | rdp_control | set_state | macos | unsupported | - | - | - |
 | rdp_control | set_state | windows | supported | 1 | Win32 registry + INetFwPolicy2 COM + SCM | - |
