@@ -2986,6 +2986,35 @@ on the FIRST signal, ungracefully — no plugin shutdown, no clean store close.
 (A default signal disposition would be discarded by PID 1 in a container, so
 the handler is the posture that stays killable.)
 
+**Stopping a wedged server (Linux/macOS, #3007).** Identical mechanism to the
+agent above, applied to the server. If a stop appears to hang: **send the
+signal a second time** (`kill -TERM <pid>` again, or a second Ctrl-C) and the
+server immediately hard-exits with code 1, no grace window — exactly like the
+agent. SQLite/Postgres state is crash-safe across the hard exit. On Windows, a
+second Ctrl-C also terminates promptly.
+
+Mechanism: `SIGTERM`/`SIGINT` (`systemctl stop`, `docker stop`, Ctrl-C)
+triggers a graceful stop on a dedicated watcher thread — HTTP admission stop,
+background thread joins, up to ~115s of stacked waits including webhook/
+offload store quiesce (see the stacked-shutdown-bound section in
+[Upgrading](upgrading.md); a rare thread-creation-exhaustion fallback path can
+push the quiesce portion alone to ~120s, worst case ~175s total, still inside
+the shipped 210s grace period), then store teardown. **A long-seeming wait can
+be completely normal, not evidence of a wedge**: each stage logs a
+`Shutting down server: waiting up to Ns for ...` line at its start, but
+nothing further until it completes or times out — so a silent gap of up to a
+minute or so between progress lines is expected, not a hang by itself. If the
+server logs `shutdown watcher unavailable` at boot, it falls back to a
+hard-exit handler: a `SIGTERM`/`SIGINT` then exits the process promptly on the
+FIRST signal, ungracefully (no store flush, no clean close) — the server keeps
+running normally until a signal actually arrives, this only changes how it
+responds once one does. Separately, a `SIGTERM`/`SIGINT` arriving before the
+server has finished starting up (`Server::create()` — TLS cert bootstrap, gRPC
+listener setup) also exits promptly with code 1 instead of attempting a
+graceful stop — a boot-time signal cannot be handled gracefully, so the server
+fails visibly rather than silently continuing to boot (or, before #3007, being
+silently ignored).
+
 **Crash-loop backstop (systemd).** The `yuzu-agent` unit sets `Restart=always` +
 `RestartSec=10`, but also `StartLimitIntervalSec=300` + `StartLimitBurst=5` (ADR-0021
 rung 7.7a). A Guardian I/O worker wedged past its grace period triggers a `hard_exit()`;
