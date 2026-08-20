@@ -48,6 +48,10 @@
 #include <objbase.h>       // CoInitializeEx/CoCreateInstance/IID_IUnknown -- WIN32_LEAN_AND_MEAN
                            // drops these from windows.h's own includes (ole2.h), so pull them in
                            // explicitly rather than relying on a transitive include elsewhere
+#include <oleauto.h>       // SysFreeString (BStrGuard's deleter) -- same reasoning as objbase.h
+                           // above; currently reachable transitively via win_com.hpp, but this
+                           // TU calls SysFreeString directly (via BStrGuard) so it should not
+                           // depend on staying reachable through another header's own includes
 #include <win_com.hpp>     // shared yuzu::shared::win ComInit/ComPtr<T>/BStr
 #include <win_str.hpp>     // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #include <wmi_bounded.hpp> // shared yuzu::shared::wmi::run_bounded_wmi_query (bounded, never WBEM_INFINITE)
@@ -102,10 +106,19 @@ std::string run_command(const char* cmd) {
 
 #ifndef _WIN32
 // Per-call wall-clock bound for the installed/missing tool probes (rpm/apt/
-// yum/system_profiler/softwareupdate). Generous enough never to fire in
-// practice, short enough that a wedged tool cannot pin the instruction
-// worker indefinitely -- same ceiling as the users plugin's kUsersCmdDeadline.
+// yum/system_profiler). Generous enough never to fire in practice, short
+// enough that a wedged tool cannot pin the instruction worker indefinitely
+// -- same ceiling as the users plugin's kUsersCmdDeadline.
 constexpr std::chrono::seconds kUpdatesCmdDeadline{10};
+
+// macOS `softwareupdate -l` specifically contacts Apple's servers (unlike
+// the local-only probes above) and can legitimately take 30-120s -- shared
+// by every call site that runs this exact command (do_missing,
+// do_pending_reboot) so the bound can't drift out of sync between them
+// (governance Gate 3 cross-platform finding: do_missing used to fall
+// through to the generic 10s kUpdatesCmdDeadline for this call, which a
+// real softwareupdate invocation would very likely exceed).
+constexpr std::chrono::seconds kSoftwareUpdateDeadline{60};
 
 /// Outcome of run_tool(): the captured lines PLUS the raw runner result, so
 /// a caller can forward the latter through the ABI4 result seam
@@ -121,23 +134,28 @@ struct ToolOutcome {
 /// argv[0] with no shell in between -- no shell-quoting/injection surface,
 /// and a `2>/dev/null` suffix an old shell string carried is simply this
 /// call's default merge_stderr=false. `max_lines` (0 = unlimited) maps to
-/// what used to be a `| head -N` pipe. Mirrors users_plugin.cpp's run_tool
+/// what used to be a `| head -N` pipe. `deadline` defaults to
+/// kUpdatesCmdDeadline (10s, right for the local/fast package-manager
+/// probes this helper mostly serves) but is overridable -- macOS
+/// `softwareupdate -l` contacts Apple's servers and needs the same longer
+/// bound do_pending_reboot's own direct run_bounded_subprocess call already
+/// uses for the identical command. Mirrors users_plugin.cpp's run_tool
 /// (users/src/users_plugin.cpp) exactly -- same calling convention, same
 /// degraded-run warning shape.
-ToolOutcome run_tool(std::vector<std::string> argv, std::size_t max_lines = 0) {
+ToolOutcome run_tool(std::vector<std::string> argv, std::size_t max_lines = 0,
+                     std::chrono::seconds deadline = kUpdatesCmdDeadline) {
     if (argv.empty() || argv.front().empty()) {
         return ToolOutcome{{}, yuzu::agent::SubprocessResult{}};
     }
     auto res = yuzu::agent::run_bounded_subprocess(
-        argv, yuzu::agent::SubprocessOptions{.deadline = kUpdatesCmdDeadline,
+        argv, yuzu::agent::SubprocessOptions{.deadline = deadline,
                                              .max_lines = max_lines,
                                              .stop_after_max_lines = max_lines != 0});
     if (res.timed_out || !res.tool_ran || res.output_truncated) {
         spdlog::warn("windows_updates: degraded run (timed_out={}, tool_ran={}, truncated={}): {}",
                      res.timed_out, res.tool_ran, res.output_truncated, argv.front());
     }
-    auto lines = res.lines;
-    return ToolOutcome{std::move(lines), std::move(res)};
+    return ToolOutcome{std::move(res.lines), std::move(res)};
 }
 #endif // !_WIN32
 
@@ -251,7 +269,20 @@ std::atomic<int> g_outstanding_cleanups{0};
 template <typename Fn>
 void track_detached_cleanup(Fn&& cleanup_work) {
     g_outstanding_cleanups.fetch_add(1, std::memory_order_relaxed);
-    std::thread(std::forward<Fn>(cleanup_work)).detach();
+    try {
+        std::thread(std::forward<Fn>(cleanup_work)).detach();
+    } catch (const std::system_error&) {
+        // std::thread's constructor can throw (e.g. EAGAIN under resource
+        // exhaustion) -- if it does, cleanup_work() never runs, so
+        // cleanup_finished() never runs either. Undo the increment here so
+        // a future join_all_detached_cleanups() doesn't wait out its full
+        // grace for a cleanup that was never actually started. The COM
+        // reference this specific caller AddRef'd is leaked on this path
+        // (nothing else can release it once the thread failed to start) --
+        // an accepted, narrow, resource-exhaustion-only cost against
+        // permanently wedging every future shutdown instead.
+        g_outstanding_cleanups.fetch_sub(1, std::memory_order_relaxed);
+    }
 }
 
 // Called by a cleanup thread itself, as its last action, once CleanUp()/
@@ -500,6 +531,18 @@ int do_missing(yuzu::CommandContext& ctx) {
         ISearchJob* raw_job = job.get();
         raw_job->AddRef();
         track_detached_cleanup([raw_job]() {
+            // COM apartment state is per-thread: the ComInit further up
+            // do_missing() only covers the calling thread, which returns
+            // (destroying that ComInit) right after this lambda is handed
+            // off. CleanUp()/Release() are COM interface calls, so this
+            // brand-new thread needs its own -- joining the same MTA the
+            // rest of this file uses, so the in-process WUA object can be
+            // called directly with no marshaling. Best-effort even if
+            // CoInitializeEx somehow fails here (RPC_E_CHANGED_MODE is
+            // already tolerated by ComInit::ok(), and either way Release()
+            // still needs to run: not calling it leaks the AddRef'd
+            // reference outright, which is worse than a degraded call).
+            yuzu::shared::win::ComInit cleanup_com_init;
             raw_job->CleanUp();
             raw_job->Release();
             cleanup_finished();
@@ -649,8 +692,11 @@ int do_missing(yuzu::CommandContext& ctx) {
 
 #elif defined(__APPLE__)
     // sink: windows_updates/do_missing#3 -- softwareupdate -l, no rung-1
-    // API for this data on macOS
-    auto su = run_tool({"/usr/sbin/softwareupdate", "-l"});
+    // API for this data on macOS. kSoftwareUpdateDeadline (60s), not the
+    // generic kUpdatesCmdDeadline (10s) this helper defaults to -- this
+    // call contacts Apple's servers and can legitimately take much longer
+    // than a local package-manager probe.
+    auto su = run_tool({"/usr/sbin/softwareupdate", "-l"}, 0, kSoftwareUpdateDeadline);
     // Forward su's outcome before branching on its output -- a truncated or
     // deadline-cut run can still have produced some lines.
     yuzu::agent::forward_runner_failure(ctx, su.res);
@@ -788,8 +834,8 @@ int do_pending_reboot(yuzu::CommandContext& ctx) {
     // wedged/offline check instead of hanging forever.
     {
         // sink: windows_updates/do_pending_reboot#1 -- softwareupdate -l,
-        // no rung-1 API for this data on macOS
-        constexpr std::chrono::seconds kSoftwareUpdateDeadline{60};
+        // no rung-1 API for this data on macOS. kSoftwareUpdateDeadline is
+        // file-scoped (shared with do_missing's identical call, above).
         auto res = yuzu::agent::run_bounded_subprocess(
             {"/usr/sbin/softwareupdate", "-l"},
             yuzu::agent::SubprocessOptions{.deadline = kSoftwareUpdateDeadline});

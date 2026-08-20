@@ -239,7 +239,15 @@ public:
     virtual Result<void> init(PluginContext& ctx) = 0;
 
     /**
-     * Called once before the shared library is unloaded.
+     * Called once before the shared library is unloaded. Runs synchronously
+     * on the host's own teardown path (Agent::Run()'s final-teardown loop)
+     * -- an implementation that blocks indefinitely here hangs the whole
+     * agent's shutdown, not just this plugin's unload. A short, explicitly
+     * BOUNDED wait (e.g. a few seconds, with a documented fallback for the
+     * timeout case) is an accepted pattern for a plugin that owns
+     * background work it must not race against dlclose/FreeLibrary --
+     * see windows_updates_plugin.cpp's join_all_detached_cleanups() for a
+     * worked example. Never an unbounded wait/join.
      */
     virtual void shutdown(PluginContext& ctx) noexcept = 0;
 
