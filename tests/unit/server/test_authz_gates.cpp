@@ -212,6 +212,47 @@ TEST_CASE("require_fleet_read: Deny × absent service ⇒ Forbidden",
     CHECK(res.status == 403);
 }
 
+TEST_CASE("require_fleet_read: null management-group store ⇒ Degraded, never a "
+          "permanent-looking Forbidden",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    // Same "no grant at all" caller shape as the sibling Deny test above, but
+    // with mgmt_group_store_=nullptr — rbac_store_/tag_store_ each get an
+    // explicit pre-check (line ~117/196) that turns "store unavailable" into
+    // 503 Degraded before a real authorization decision is even attempted;
+    // this axis had none, so a null store silently fell through into
+    // authorize_list_read -> resolve_perm_groups, which itself already
+    // null-checks mgmt_store and returns unexpected("management group store
+    // unavailable") -> DenyAll -> a 403 indistinguishable from "you genuinely
+    // have no grant" (unhappy-path finding UP-1, governance run 2026-08-20).
+    Config cfg{};
+    auth::AuthManager auth_mgr{};
+    yuzu::test::ApiTokenStorePg api_tokens;
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    PgPool pool{{.conninfo = rbac_db_.dsn(), .size = 4}};
+    RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+    rbac.set_rbac_enabled(true);
+    REQUIRE(auth_mgr.upsert_user("minter", "correct-horse-battery-staple", auth::Role::admin));
+
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider;
+    AuthRoutes ar(cfg, auth_mgr, &rbac, api_tokens.get(), /*audit_store=*/nullptr,
+                  /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                  /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
+
+    auto raw = api_tokens->create_token("gates-test", "minter", now_epoch() + 3600);
+    REQUIRE(raw.has_value());
+    auto req = bearer_request(*raw);
+    httplib::Response res;
+
+    auto result = ar.require_fleet_read(req, res, "Response", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == authz::GateFailure::Degraded);
+    CHECK(res.status == 503);
+    auto j = nlohmann::json::parse(res.body);
+    CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() == 5000);
+}
+
 TEST_CASE("require_fleet_read: Deny × service S ⇒ Forbidden (mgmt axis is decisive)",
           "[pg][auth_routes][authz_gates][service_scope]") {
     YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
@@ -346,6 +387,68 @@ TEST_CASE("require_fleet_read: documented pairing — require_permission-then-th
     CHECK_FALSE(result->unfiltered());
     CHECK(result->in_scope("a_p"));       // exactly this group's witness
     CHECK_FALSE(result->in_scope("a_s")); // NOT the whole fleet — a_s is outside group P
+}
+
+// ── Caller-class ladder (#3290 D1 — elevated/mcp_tier; engine coverage lives
+// in test_engine_principal_integration.cpp §6c, alongside require_permission/
+// require_list_read's own engine-branch tests) ──────────────────────────────
+
+TEST_CASE("require_fleet_read: non-Read operation ⇒ Forbidden (structurally "
+          "Read-only, mirrors require_list_read)",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value()); // GLOBAL allow
+    auto token = r.mint();                                                    // non-service
+    auto req = bearer_request(token);
+    httplib::Response res;
+
+    // Even a global RBAC grant does not admit a non-Read operation through
+    // this gate — the legacy-open AdmitAll branch never applies to a
+    // mutation here.
+    auto result = r.ar->require_fleet_read(req, res, "Response", "Write");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == authz::GateFailure::Forbidden);
+    CHECK(res.status == 403);
+}
+
+TEST_CASE("require_fleet_read: JIT-elevated non-service session ⇒ TOP, no "
+          "underlying RBAC grant needed (the #3038 regression class)",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    // "minter" holds NO Response:Read grant of any kind — elevation alone
+    // must still admit, and require_fleet_read must NOT call
+    // authorize_list_read for an elevated session (which would deny a
+    // grant-less caller).
+    auto cookie_token = r.auth_mgr.create_local_session("minter", auth::Role::user,
+                                                        /*mfa_verified=*/true);
+    REQUIRE(r.auth_mgr.elevate_session(cookie_token, std::chrono::seconds(300)).has_value());
+    httplib::Request req;
+    req.headers.emplace("Cookie", "yuzu_session=" + cookie_token);
+    httplib::Response res;
+
+    auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
+    REQUIRE(result.has_value());
+    CHECK(result->unfiltered()); // TOP — elevation alone, no meet(mgmt, service)
+}
+
+TEST_CASE("require_fleet_read: mcp_tier='readonly' token, Read op ⇒ tier "
+          "falls through to the RBAC axis (does not itself deny a tier that "
+          "allows Read)",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value()); // GLOBAL allow
+    auto raw = r.api_tokens->create_token("gates-test-tier", "minter", now_epoch() + 3600,
+                                          /*scope_service=*/"", /*mcp_tier=*/"readonly");
+    REQUIRE(raw.has_value());
+    auto req = bearer_request(*raw);
+    httplib::Response res;
+
+    auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
+    REQUIRE(result.has_value());
+    CHECK(result->unfiltered());
 }
 
 // ── Degradation and store-unavailable failure modes ─────────────────────────
