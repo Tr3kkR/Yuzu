@@ -56,6 +56,9 @@
 #include <win_str.hpp>     // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #include <wmi_bounded.hpp> // shared yuzu::shared::wmi::run_bounded_wmi_query (bounded, never WBEM_INFINITE)
 #include <wuapi.h>         // IUpdateSession/IUpdateSearcher/ISearchJob (Windows Update Agent COM API)
+#include <spdlog/spdlog.h> // track_detached_cleanup's ceiling-reached warning (this file's #else
+                           // branch already includes this for its own spdlog::warn call, but
+                           // that include is POSIX-only -- unreachable from here)
 #pragma comment(lib, "ws2_32.lib")
 #else
 #include <sys/types.h>
