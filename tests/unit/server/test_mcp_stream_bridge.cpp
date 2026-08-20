@@ -3917,13 +3917,13 @@ TEST_CASE("McpPostPump: the wait is bounded by the next credential check, not a 
 
 TEST_CASE("McpPostPump/CH-4: a revoked credential kills the streamed-POST within one tick",
           "[mcp][bridge][2f][ch4]") {
-    // The GET pump has this exact test (test_mcp_stream.cpp, "McpStreamPump/CH-4: a
-    // revoked credential kills the stream within one tick"); McpPostPump shares its
-    // verdict-handling switch byte-for-byte (mcp_stream.cpp:1554-1562) but had no
-    // dedicated test proving the OUTCOME, only CH-22's proof that the wait/check
-    // TIMING is bounded correctly. Timing being right says nothing about the verdict
-    // actually being acted on - this is the missing other half of CH-4's own success
-    // criterion ("revoked principal's streams terminate within one heartbeat tick").
+    // "McpPostPump: revocation and session death close the response (C7)" above (landed
+    // PR 3b, f268d78d) already proves the WIRE-level outcome for this exact scenario.
+    // This test adds the same proof at the close_reason() ACCESSOR level - the state a
+    // caller outside the wire (e.g. the bridge's own audit path) actually reads - as a
+    // second, independent angle on the same verdict rather than a gap-fill; a bug that
+    // latched the wrong reason into close_reason_ while still writing the right string
+    // to the wire (or vice versa) would pass the C7 SECTION and fail this one.
     Fx fx;
     auto s = fx.make_session();
     REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
