@@ -22,6 +22,7 @@
 #include <fstream>
 #include <unistd.h>
 
+#include <spdlog/spdlog.h>
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess/probe_tool_path (Wave 3, ADR-3002)
 #endif
 
@@ -280,6 +281,12 @@ int do_domain(yuzu::CommandContext& ctx) {
                 res.exit_code == 0 && !res.output.empty()) {
                 joined = true;
                 resolved = true;
+            } else if (!res.tool_ran || res.timed_out || res.output_truncated ||
+                       res.exit_code != 0) {
+                spdlog::warn("device_identity: degraded shell-out (timed_out={}, "
+                             "tool_ran={}, truncated={}, exit_code={}): {} list",
+                             res.timed_out, res.tool_ran, res.output_truncated,
+                             res.exit_code, realm_path);
             }
         }
     }
@@ -315,6 +322,12 @@ int do_domain(yuzu::CommandContext& ctx) {
     // partial/garbled text; treat that the same as a failed run (falls
     // through to the hostname-suffix fallback below) rather than trusting a
     // truncated dsconfigad parse.
+    if (!res.tool_ran || res.timed_out || res.output_truncated || res.exit_code != 0) {
+        spdlog::warn("device_identity: degraded shell-out (timed_out={}, tool_ran={}, "
+                     "truncated={}, exit_code={}): {}",
+                     res.timed_out, res.tool_ran, res.output_truncated, res.exit_code,
+                     "/usr/sbin/dsconfigad -show");
+    }
     if (res.tool_ran && !res.timed_out && !res.output_truncated && res.exit_code == 0) {
         auto info = yuzu::device_identity::macos::parse_dsconfigad_show(res.output);
         if (info.ad_bound) {
@@ -382,8 +395,14 @@ int do_ou(yuzu::CommandContext& ctx) {
         // diagnostics to stdout on some degraded/error states, so a bare
         // tool_ran/timed_out/output_truncated gate could read that text as
         // a real OU match.
-        if (res.tool_ran && !res.timed_out && !res.output_truncated && res.exit_code == 0)
+        if (res.tool_ran && !res.timed_out && !res.output_truncated && res.exit_code == 0) {
             realm_out = res.output;
+        } else {
+            spdlog::warn("device_identity: degraded shell-out (timed_out={}, tool_ran={}, "
+                         "truncated={}, exit_code={}): {} list",
+                         res.timed_out, res.tool_ran, res.output_truncated, res.exit_code,
+                         realm_path);
+        }
     }
     // Try realm list for OU
     if (!realm_out.empty()) {
@@ -437,6 +456,12 @@ int do_ou(yuzu::CommandContext& ctx) {
         {"/usr/sbin/dsconfigad", "-show"},
         yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(10)});
     // Same completeness gate as do_domain's dsconfigad call above.
+    if (!res.tool_ran || res.timed_out || res.output_truncated || res.exit_code != 0) {
+        spdlog::warn("device_identity: degraded shell-out (timed_out={}, tool_ran={}, "
+                     "truncated={}, exit_code={}): {}",
+                     res.timed_out, res.tool_ran, res.output_truncated, res.exit_code,
+                     "/usr/sbin/dsconfigad -show");
+    }
     if (res.tool_ran && !res.timed_out && !res.output_truncated && res.exit_code == 0) {
         auto info = yuzu::device_identity::macos::parse_dsconfigad_show(res.output);
         if (!info.ou.empty()) {

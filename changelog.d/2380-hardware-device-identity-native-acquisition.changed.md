@@ -7,6 +7,8 @@
   D-Bus InfoPipe first, falling back to `realm list` (unchanged, unprivileged) when InfoPipe
   is unreachable under the agent's own service account -- the common case on a default SSSD
   configuration. Linux disk rows now report a real media type
-  (SSD/HDD/Removable) instead of a placeholder, and macOS BIOS reporting now recognizes
+  (SSD/HDD/Removable) instead of a placeholder, and their size is now a plain integer
+  (matching the shipped `size_gb` schema) instead of `lsblk`'s unit-suffixed string (e.g.
+  `"465.8G"`) -- a correctness fix, not new data drift. macOS BIOS reporting now recognizes
   Apple Silicon's "System Firmware Version" label (previously reported "unknown" on every
   Apple Silicon Mac).

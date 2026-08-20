@@ -1,4 +1,4 @@
-device_identity_deps = [yuzu_sdk_dep, yuzu_agent_core_dep]
+device_identity_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, spdlog_dep]
 device_identity_args = []
 
 if host_machine.system() == 'windows'

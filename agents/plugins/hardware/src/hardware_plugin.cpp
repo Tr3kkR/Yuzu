@@ -26,6 +26,8 @@
 #include <string_view>
 #include <vector>
 
+#include <spdlog/spdlog.h>
+
 #if defined(__linux__)
 #include <filesystem>
 #include <fstream>
@@ -338,6 +340,12 @@ int do_bios(yuzu::CommandContext& ctx) {
     // tool_ran=true with partial/garbled text (SubprocessResult's own
     // contract: "callers MUST check timed_out before trusting ... output").
     // Treat either as no better than a failed run, same as tool_ran=false.
+    if (!res.tool_ran || res.timed_out || res.output_truncated || res.exit_code != 0) {
+        spdlog::warn("hardware: degraded shell-out (timed_out={}, tool_ran={}, truncated={}, "
+                     "exit_code={}): {}",
+                     res.timed_out, res.tool_ran, res.output_truncated, res.exit_code,
+                     "/usr/sbin/system_profiler SPHardwareDataType");
+    }
     auto rom = (res.tool_ran && !res.timed_out && !res.output_truncated && res.exit_code == 0)
                    ? yuzu::hardware::macos::parse_boot_rom_version(res.output)
                    : std::string{};
@@ -550,8 +558,14 @@ int do_memory(yuzu::CommandContext& ctx) {
         // stream can leave tool_ran=true over a partial device list -- treat
         // that the same as a failed run (falls through to /proc/meminfo)
         // rather than silently accepting a reduced RAM total.
-        if (res.tool_ran && !res.timed_out && !res.output_truncated && res.exit_code == 0)
+        if (res.tool_ran && !res.timed_out && !res.output_truncated && res.exit_code == 0) {
             dimm_rows = yuzu::hardware::linuxutil::parse_dmidecode_memory(res.output);
+        } else {
+            spdlog::warn("hardware: degraded shell-out (timed_out={}, tool_ran={}, "
+                         "truncated={}, exit_code={}): {} -t memory",
+                         res.timed_out, res.tool_ran, res.output_truncated, res.exit_code,
+                         dmidecode_path);
+        }
     }
     if (!dimm_rows.empty()) {
         for (const auto& row : dimm_rows)
@@ -676,6 +690,13 @@ int do_disks(yuzu::CommandContext& ctx) {
     // JSON parsing anyway (macos_disk_rows_or_sentinel() already falls back
     // to the sentinel on any parse error), but reject it explicitly here
     // too rather than relying on that as the only safety net.
+    if (!res.tool_ran || res.timed_out || res.output_truncated || res.exit_code != 0) {
+        spdlog::warn("hardware: degraded shell-out (timed_out={}, tool_ran={}, truncated={}, "
+                     "exit_code={}): {}",
+                     res.timed_out, res.tool_ran, res.output_truncated, res.exit_code,
+                     "/usr/sbin/system_profiler SPStorageDataType SPNVMeDataType "
+                     "SPSerialATADataType -json");
+    }
     auto sp_json = (res.tool_ran && !res.timed_out && !res.output_truncated &&
                     res.exit_code == 0)
                        ? res.output
