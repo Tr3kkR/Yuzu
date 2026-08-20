@@ -853,10 +853,11 @@ server `PgPool`).
   delivery. If any of these bounds is exceeded, the diagnostic line is
   written directly to **stderr** (not through the configured logger,
   and naming which store timed out for the webhook/offload case) before the
-  process force-exits — an
-  async-signal-safety requirement, since `stop()` runs synchronously inside
-  the SIGTERM handler (see #3007). If you rely on the log file or a
-  structured log sink rather than captured stderr, this one line will not
+  process force-exits. `stop()` now runs on an ordinary thread, not inside
+  the SIGTERM handler (#3007), so `spdlog` would be legal here — the raw
+  write stays anyway because `std::_Exit()` skips any buffered sink flush,
+  and this line must reach the operator regardless. If you rely on the log
+  file or a structured log sink rather than captured stderr, this one line will not
   appear there; check container/service stderr capture for it instead.
 - Confirm on first boot: the backfill completion log line, no `RbacStore`
   open/migrate errors, and that RBAC is still enabled if you had enabled it
@@ -1709,6 +1710,23 @@ Before upgrading any component:
   wedged". Stop scripts that deliberately double-signal agents will now
   force-kill them; send one signal and wait instead. On Windows a second Ctrl-C
   also terminates promptly. See *Stopping a wedged agent* in
+  [Server Administration](server-admin.md).
+- [ ] **Changed server signal handling (Linux/macOS, #3007):** the identical fix
+  as above, now applied to the server — graceful shutdown runs on a dedicated
+  watcher thread (fixes the same abort/hang class on `SIGTERM`, previously
+  reproducible as a debug-build `SIGABRT` from a deadlock detector), and a
+  **second** `SIGTERM`/`SIGINT` immediately hard-exits the server (exit 1) with
+  **no grace window**. Also new: a `SIGTERM`/`SIGINT` arriving before the server
+  finishes starting up now exits promptly with code 1, instead of being
+  silently ignored — a boot-time signal genuinely cannot be handled gracefully,
+  so this is a fail-visible improvement, but it means a very-early stop attempt
+  during a fast redeploy or a mistuned `livenessProbe.initialDelaySeconds`
+  (a failing *readiness* probe only pulls a pod from Service endpoints — it
+  never sends a stop signal; a failing *liveness* probe is what triggers a
+  kill-and-restart) will now observably exit rather than continue booting.
+  Stop scripts that
+  deliberately double-signal the server will now force-kill it; send one
+  signal and wait instead. See *Stopping a wedged server* in
   [Server Administration](server-admin.md).
 - **Non-English fleets — additional plugins (#1682).** The same `Reg*A` → `Reg*W`
   encoding fix was extended to four more Windows plugins: `vuln_scan` (app

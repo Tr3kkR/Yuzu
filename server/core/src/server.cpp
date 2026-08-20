@@ -7120,6 +7120,12 @@ public:
         // StreamBudget::closing()'s doc comment) or a genuinely wedged
         // handler.
         if (web_thread_.joinable()) {
+            // #3007 governance (sre, unhappy-path UP-7/UP-8): stop() now runs off the
+            // signal handler, so this wait is silent-by-design up to 15s with no
+            // progress evidence — indistinguishable from a genuine wedge to an operator
+            // watching logs. One line here costs nothing and closes that gap.
+            spdlog::info("Shutting down server: waiting up to 15s for the web listener "
+                         "thread to finish...");
             std::unique_lock<std::mutex> lk(web_thread_done_mtx_);
             const bool finished = web_thread_done_cv_.wait_for(
                 lk, std::chrono::seconds(15), [this] { return web_thread_done_; });
@@ -7535,6 +7541,13 @@ public:
         if (offload_target_store_)
             offload_target_store_->flush_all();
         static constexpr auto kStoreQuiesceBound = std::chrono::seconds(60);
+        // #3007 governance (sre, unhappy-path UP-7/UP-8): silent-by-design up to
+        // ~120s (worst case, sequential-fallback path) with no progress evidence
+        // otherwise — one line here is enough for an operator to tell "expected
+        // quiesce wait" from "wedged" without waiting for the timeout diagnostic.
+        if (webhook_store_ || offload_target_store_)
+            spdlog::info("Shutting down server: waiting up to 60s for webhook/offload "
+                         "store delivery to drain...");
         bool webhook_drained = true;
         bool offload_drained = true;
         // Run both waits concurrently (Gate 8 round-2 targeted re-review,

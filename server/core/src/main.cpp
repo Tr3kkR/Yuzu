@@ -96,9 +96,14 @@ static_assert(std::atomic<int>::is_always_lock_free);
 /// a container, where the kernel discards a default-disposition signal entirely.
 /// Async-signal-safe: no locks, no stdio, no spdlog (which allocates and RETHROWS non-std
 /// exceptions — a throw here has no enclosing handler and std::terminate()s WITHOUT
-/// unwinding). See agents/core/src/hard_exit.hpp for why TerminateProcess, not ::_exit(),
-/// on Windows (no DllMain, no loader lock) and ::_exit(), not std::exit(), on POSIX
-/// (async-signal-safe, cannot block).
+/// unwinding). Body is a deliberate 2-line duplicate of agents/core/src/hard_exit.hpp's
+/// hard_exit(), not a reuse — that header lives under agents/core/src, outside the server's
+/// include graph (server/core/meson.build only exposes include/ + ../../common/include),
+/// and pulling it in for a two-line function isn't worth the cross-binary header dependency.
+/// If a THIRD call site ever needs this, hoist it to common/include/yuzu/ alongside
+/// shutdown_watcher.hpp instead of adding a fourth copy. See that header anyway for why
+/// TerminateProcess, not ::_exit(), on Windows (no DllMain, no loader lock) and ::_exit(),
+/// not std::exit(), on POSIX (async-signal-safe, cannot block) — the rationale, not the code.
 static void on_signal_hard_exit(int sig) noexcept {
     (void)sig;
 #ifdef _WIN32
@@ -1756,9 +1761,15 @@ int main(int argc, char* argv[]) {
         // the redundant, sequential, same-thread re-entry from run()'s
         // startup_failed_ early return.
         //
-        // CONSTRUCTED INSIDE A TRY: its own construction can throw on exactly the host
-        // it exists to survive (std::thread's ctor under EAGAIN). If it throws, the
-        // hard-exit handler installed above is simply left in place.
+        // CONSTRUCTED INSIDE A TRY. ShutdownWatcher's constructor body firewalls
+        // std::thread's ctor itself (catches std::system_error under EAGAIN internally,
+        // calls degrade(), never rethrows) — so this try is NOT for that. It's for
+        // `state_{std::make_shared<WatcherState>(...)}` in the ctor's mem-init-list,
+        // which runs BEFORE the body's try block and so is NOT firewalled: a bad_alloc
+        // there escapes to here. (#3007 governance cpp-expert LOW — corrected from an
+        // earlier version of this comment that misattributed the throw source.) Either
+        // way: if it throws, the hard-exit handler installed above is simply left in
+        // place.
         std::optional<yuzu::ShutdownWatcher> shutdown_watcher;
         try {
             shutdown_watcher.emplace(
@@ -1799,8 +1810,21 @@ int main(int argc, char* argv[]) {
         // console-handler stop() to return before nulling g_server, closing the same
         // race the POSIX side closes structurally via ~ShutdownWatcher's join(). Mirrors
         // agents/core/src/main.cpp's AgentUnpublisher (#1822 / Gate-8 round 8 UP8-1).
+        //
+        // #3007 governance (cpp-expert LOW, unhappy-path UP-1): also reinstalls the
+        // hard-exit handlers, unconditionally. The explicit reinstall a few lines below
+        // `server->run();` only runs on NORMAL return — if run() itself throws, that
+        // line is skipped by the unwind, and the still-installed graceful `on_signal`
+        // would find a retracted/about-to-retract pipe for the whole span of
+        // `~ShutdownWatcher`'s join + `~ServerImpl`'s (first-time, synchronous) teardown,
+        // silently swallowing a signal there instead of leaving. This destructor runs
+        // FIRST on every exit path including that one, so putting the reinstall here
+        // covers both — redundant-but-harmless on the normal path (the explicit call
+        // already ran), and the only reinstall on the unwind path.
         struct ServerUnpublisher {
             ~ServerUnpublisher() {
+                std::signal(SIGINT, on_signal_hard_exit);
+                std::signal(SIGTERM, on_signal_hard_exit);
 #ifdef _WIN32
                 std::lock_guard<std::mutex> lock(g_server_mu);
 #endif
