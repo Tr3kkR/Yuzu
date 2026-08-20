@@ -13,6 +13,7 @@
  */
 
 #include <yuzu/plugin.hpp>
+#include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field (BR-07)
 
 #include "sccm_parsers.hpp" // pure select_authority_subkey/interpret_sms_invoke helpers
 
@@ -333,7 +334,7 @@ int do_site(yuzu::CommandContext& ctx) {
     };
 
     if (!site_code.empty()) {
-        ctx.write_output(std::format("site_code|{}", site_code));
+        ctx.write_output(std::format("site_code|{}", yuzu::util::safe_output_field(site_code)));
     } else {
         // Native late-bound COM (rung 1) replaces the retired PowerShell
         // `(New-Object -ComObject Microsoft.SMS.Client).GetAssignedSite()`.
@@ -344,7 +345,7 @@ int do_site(yuzu::CommandContext& ctx) {
             // lookup's value (was silently discarded, so selection always
             // fell back to whichever SMS:* subkey enumerated first).
             site_code = std::move(r.value);
-            ctx.write_output(std::format("site_code|{}", site_code));
+            ctx.write_output(std::format("site_code|{}", yuzu::util::safe_output_field(site_code)));
         } else {
             ctx.write_output("site_code|not_configured");
         }
@@ -373,7 +374,7 @@ int do_site(yuzu::CommandContext& ctx) {
             mp = r.value;
     }
     if (!mp.empty()) {
-        ctx.write_output(std::format("management_point|{}", mp));
+        ctx.write_output(std::format("management_point|{}", yuzu::util::safe_output_field(mp)));
     } else {
         ctx.write_output("management_point|unknown");
     }
