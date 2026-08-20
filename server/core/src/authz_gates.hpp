@@ -27,14 +27,19 @@
 ///
 /// PHASE 0 (PR #3216): wired, tested, called by NO route at that point. The
 /// default-deny flip (#2298 PR 3, `require_permission`'s service branch)
-/// landed separately and does not call these either — it is the OTHER gate
-/// this file's `require_fleet_read` was deliberately left uninvolved in (see
-/// its own doc comment's "SELF-SUFFICIENT" / "does NOT cover" paragraphs and
-/// #3218). Migrating a route onto `require_fleet_read`/`confine_agent_target`
-/// so it actually serves confined service-scoped tokens instead of the
-/// flip's blanket deny is Phase 2, metric-prioritized, still not done as of
-/// this comment — `grep -rl "require_fleet_read\|confine_agent_target"` to
-/// check the current caller count before trusting "still zero" here.
+/// landed separately and never calls these either — `require_fleet_read`
+/// REPLACES the `require_permission` call on a route it migrates, it is
+/// never paired with it (see its own doc comment's "SELF-SUFFICIENT"
+/// paragraph and #3218).
+///
+/// PHASE 2 (#3290): first live caller landed — `GET /api/v1/inventory/software`
+/// + its MCP twin `query_installed_software` migrated onto `require_fleet_read`,
+/// which also gained the elevated/engine/mcp_tier caller-class branches it
+/// was missing at Phase 0 (see `require_fleet_read`'s own doc comment).
+/// `grep -rl "require_fleet_read\|confine_agent_target"` to check the
+/// current caller count before trusting this as exhaustive — more routes
+/// migrate incrementally per the Phase-2 backlog
+/// (`docs/security-reviews/service-scope-phase2-migrations-2026-08.md`).
 namespace yuzu::server {
 class AuthRoutes;
 }
@@ -102,6 +107,32 @@ private:
     explicit ListAuthority(VisibleSet visible) : visible_(std::move(visible)) {}
 
     VisibleSet visible_;
+};
+
+/// The REST/MCP transport-layer seam for `AuthRoutes::require_fleet_read`
+/// (#3290 Phase 2) — the injected-callback twin of `ListReadGate`
+/// (auth_routes.hpp), not `ListAuthority` above. `ListAuthority` is
+/// move-only with an `AuthRoutes`-friend-only constructor specifically so
+/// only "call the gate" can produce one; that is the right shape for a
+/// direct in-process caller but the wrong shape for `RestApiV1`/`McpServer`,
+/// which receive authorization as an injected `std::function` (same pattern
+/// as `RestApiV1::ListReadFn`/`ListReadGate`) — a test fixture needs to be
+/// able to FAKE an admit without a real RbacStore, and `RbacStore` is
+/// Postgres-only (ADR-0041), so no unit fixture can drive a real
+/// `ListAuthority` to an admit without a live PG instance. A plain,
+/// copyable, fail-closed-by-default aggregate is the seam; production code
+/// builds one from a real `ListAuthority` at the wiring site in server.cpp.
+struct FleetReadGate {
+    /// false ⇒ the response is already fully rendered (401/403/503) by
+    /// `require_fleet_read` itself — same bool-means-"res already written"
+    /// contract as `ListReadGate::admitted`.
+    bool admitted{false};
+    /// The composed `meet(mgmt, service)` scope — nullopt = unfiltered
+    /// (TOP); engaged (including empty) = filter to exactly these agents.
+    /// Fails closed to `deny_all()` (engaged-empty), not TOP, so a caller
+    /// that forgets to overwrite this on the admitted path filters
+    /// everything out rather than leaking the whole fleet.
+    VisibleSet scope{deny_all()};
 };
 
 } // namespace yuzu::server::authz

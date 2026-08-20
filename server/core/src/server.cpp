@@ -8577,6 +8577,23 @@ private:
         return auth_routes_->require_list_read(req, res, securable_type, operation);
     }
 
+    /// #3290 Phase 2 — converts `AuthRoutes::require_fleet_read`'s
+    /// `std::expected<ListAuthority, GateFailure>` into the plain, fakeable
+    /// `authz::FleetReadGate` seam `RestApiV1`/`McpServer` are injected with
+    /// (see `FleetReadGate`'s doc comment, authz_gates.hpp, for why —
+    /// `ListAuthority` is move-only with an `AuthRoutes`-friend-only
+    /// constructor). On failure the gate already wrote `res`; this just
+    /// erases the `GateFailure` detail the caller must not re-decode.
+    yuzu::server::authz::FleetReadGate require_fleet_read(const httplib::Request& req,
+                                                           httplib::Response& res,
+                                                           const std::string& securable_type,
+                                                           const std::string& operation) {
+        auto result = auth_routes_->require_fleet_read(req, res, securable_type, operation);
+        if (!result)
+            return {}; // admitted=false, res already written
+        return {true, result->visible_for_query()};
+    }
+
     /// #1788: the per-caller Execution:Execute visible set (nullopt == unfiltered),
     /// extracted verbatim from the `/api/command` handler so the MCP dispatch path
     /// (execute_instruction / execute_bundle) can intersect against the SAME
@@ -9048,22 +9065,6 @@ private:
         if (!rbac_enforcement_in_effect(rbac_store_.get()))
             return true; // loaded & explicitly disabled → legacy-open
         return rbac_store_ && rbac_store_->check_scoped_permission(username, "Response", "Read",
-                                                                   agent_id, mgmt_group_store_.get());
-    }
-
-    /// Same shape as `response_agent_in_scope`, bound to ("Inventory","Read"): the
-    /// per-device Inventory-scope predicate for GET /api/v1/inventory/software (REST)
-    /// and query_installed_software (MCP). Was two byte-identical inline lambdas
-    /// gating on the raw `!is_rbac_enabled()` accessor instead of
-    /// `rbac_enforcement_in_effect` — that accessor can read stale-false while RBAC is
-    /// durably enabled elsewhere (a degraded generation-refresh cache, ADR-0041), which
-    /// would silently disclose the whole fleet's software inventory to a confined
-    /// operator (governance re-review, #2703). Hoisted to one definition so the REST
-    /// and MCP surfaces cannot drift the way #2500's dispatch-targeting defect did.
-    bool inventory_agent_in_scope(const std::string& username, const std::string& agent_id) const {
-        if (!rbac_enforcement_in_effect(rbac_store_.get()))
-            return true; // loaded & explicitly disabled → legacy-open
-        return rbac_store_ && rbac_store_->check_scoped_permission(username, "Inventory", "Read",
                                                                    agent_id, mgmt_group_store_.get());
     }
 
@@ -15461,6 +15462,17 @@ private:
                                    const std::string& op) -> yuzu::server::ListReadGate {
             return require_list_read(req, res, type, op);
         };
+        // #3290 Phase 2 admit-then-filter fleet-read gate (wraps
+        // require_fleet_read). GET /api/v1/inventory/software's SOLE
+        // authorization gate — never stacked with perm_fn (see
+        // rest_api_v1.cpp's route comment; same BLOCKING rule as list_read_fn
+        // above). Shared, byte-identical, with the MCP query_installed_software
+        // twin's set_fleet_read_fn wiring below — one conversion, two surfaces.
+        auto fleet_read_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                    const std::string& type,
+                                    const std::string& op) -> yuzu::server::authz::FleetReadGate {
+            return require_fleet_read(req, res, type, op);
+        };
         // Visible-agent SET resolver for filtering device-id-rendering lists (DEX
         // device drills). SAME policy as get_visible_agents_json / the /devices list:
         // nullopt = caller sees the whole fleet (global Infrastructure:Read OR RBAC
@@ -18215,17 +18227,11 @@ private:
             // agentic-first /api/v1/dex/devices/* endpoints use, so a REST worker is
             // held to the same per-device scope (defined once above, not re-inlined).
             scoped_perm_fn,
-            // ADR-0016: the typed daily-sync software store + its per-device
-            // Inventory-scope predicate for GET /api/v1/inventory/software. SAME
-            // management-group chokepoint (check_scoped_permission) as the MCP
-            // query_installed_software tool, bound to ("Inventory","Read"), so a
-            // REST worker's fleet-wide software query returns only devices inside
-            // their groups (cross-operator isolation). MUST be wired here; the
-            // param defaults to {} = no filter (unscoped fleet read).
+            // ADR-0016: the typed daily-sync software store for
+            // GET /api/v1/inventory/software. Its per-agent scope predicate is
+            // fleet_read_fn below (#3290 Phase 2) — the route's own
+            // require_fleet_read gate replaced the retired InventoryScopeFn.
             software_inventory_store_.get(),
-            [this](const std::string& username, const std::string& agent_id) -> bool {
-                return inventory_agent_in_scope(username, agent_id);
-            },
             // #1634: per-agent Response-scope predicate for the fan-out response
             // readers (GET /api/v1/executions/{id}/visualization). Routes through the
             // single response_agent_in_scope helper so the REST, MCP and legacy
@@ -18262,7 +18268,11 @@ private:
             // ADR-0017: the fleet guaranteed-state status route's SOLE
             // authorization gate — see rest_api_v1.cpp's route comment for why
             // it must never be stacked with perm_fn.
-            list_read_fn);
+            list_read_fn,
+            // #3290 Phase 2: GET /api/v1/inventory/software's SOLE
+            // authorization gate — see rest_api_v1.cpp's route comment for
+            // why it must never be stacked with perm_fn.
+            fleet_read_fn);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -18347,6 +18357,12 @@ private:
             // was null while the REST twins worked fine — two surfaces
             // disagreeing about whether the same capability exists (ADR-1005 A1).
             mcp_server_->set_kek_ops(kek_ops_); // same seam instance as the REST twins
+            // #3290 Phase 2 — the SAME fleet_read_fn lambda wired into the REST
+            // registration's trailing fleet_read_fn param below, so the REST and MCP
+            // query_installed_software twins cannot observe a different admit
+            // decision for the same caller (same conversion, same underlying
+            // require_fleet_read call).
+            mcp_server_->set_fleet_read_fn(fleet_read_fn);
             // PR1.5c/1.6c (p14) — ADR-0031 operator surface MCP twins,
             // wired UNCONDITIONALLY exactly like kek_ops above (never
             // gated behind an unrelated conditional — see the KEK comment
@@ -18455,16 +18471,11 @@ private:
                 [this](const std::string& username, const std::string& agent_id) -> bool {
                     return response_agent_in_scope(username, agent_id);
                 },
-                // ADR-0016: the typed daily-sync software store + its per-device
-                // Inventory-scope predicate for query_installed_software. SAME
-                // management-group chokepoint as the response predicate above, but
-                // bound to ("Inventory","Read") — so an operator's fleet-wide software
-                // query returns only devices inside their groups (cross-operator
-                // isolation). MUST be wired here; the param defaults to {} = no filter.
+                // ADR-0016: the typed daily-sync software store for
+                // query_installed_software. Its per-agent scope predicate is
+                // fleet_read_fn_ (set_fleet_read_fn, #3290 Phase 2) — the tool's
+                // own require_fleet_read gate replaced the retired InventoryScopeFn.
                 software_inventory_store_.get(),
-                [this](const std::string& username, const std::string& agent_id) -> bool {
-                    return inventory_agent_in_scope(username, agent_id);
-                },
                 // ADR-0011: metrics sink for the MCP-surface bundle orchestrator
                 // (yuzu_bundle_*{surface="mcp"}). REST passes its own registry.
                 &metrics_,
