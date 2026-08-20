@@ -17,6 +17,14 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifndef NOMINMAX
+#define NOMINMAX // <windows.h>'s function-like max(a,b)/min(a,b) macros otherwise swallow the
+                 // std::max() call in validate_token below (MSVC C2589/C3878/C2760: the macro
+                 // rewrite mangles the qualified name into invalid syntax) — matches
+                 // key_provider.cpp/process_health.hpp's guard, not api_token_store.cpp's
+                 // parenthesized-callee workaround (this file has exactly one call site; the
+                 // blanket guard is simpler and closes the door on any future one).
+#endif
 // clang-format off
 #include <windows.h>  // must precede bcrypt.h (defines NTSTATUS)
 // clang-format on
