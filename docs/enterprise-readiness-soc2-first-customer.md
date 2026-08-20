@@ -498,6 +498,7 @@ The DEX read model (`guardian_observations` + the `/dex` dashboard) is the first
 - DPA/security addendum templates.
 - Shared responsibility matrix (vendor vs customer responsibilities).
 - Forward pointer: the MCP surface gains a session concept (in-memory only, principal-bound ≥128-bit ids, TTL/caps, revocation cuts live streams) via ADR-1005 execution-plan Decision 15 / track 2f — fold its security pre-commitments into the questionnaire/whitepaper once 2f ships.
+- Forward pointer: track 2g (ADR-1005 Decision 16, `docs/agentic-first-principle.md` A5) delivers a fully self-describing MCP tool/resource surface — typed schemas, truthful safety annotations, a handshake orientation blob, and OpenAPI/scope-DSL specs discoverable via `resources/list` rather than tool-by-tool. Cite this in the security whitepaper / CAIQ responses as evidence of a machine-verifiable, not merely documented, agentic contract — a differentiator against peers whose AI integrations (if any) are undocumented or prose-only.
 
 ### First-Customer Readiness Milestones
 

@@ -1,0 +1,1 @@
+- MCP `resources/list` now advertises `yuzu://openapi` and `yuzu://scope-dsl`, sharing the same builder as their `/api/v1/discover/routes` and `/api/v1/discover/scope-kinds` REST twins and the `discover_routes`/`discover_scope_kinds` MCP tools (track 2g PR4, ADR-1005 Decision 16 / invariant A5 item 7). Both are gated `Infrastructure:Read` at both tier and RBAC layers.

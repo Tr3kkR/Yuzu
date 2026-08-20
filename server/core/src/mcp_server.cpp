@@ -2421,6 +2421,14 @@ static const ResourceDef kResources[] = {
      "Deterministic CEO demo scenarios and live-fleet variants", "application/json"},
     {"yuzu://golden-prompts/enterprise-it-v1", "Enterprise IT Golden Prompts v1",
      "Versioned prompt/eval catalogue for enterprise incident workflows", "application/json"},
+    {"yuzu://openapi", "OpenAPI Specification",
+     "REST API v1 OpenAPI spec — same builder as GET /api/v1/discover/routes and the "
+     "discover_routes tool",
+     "application/json"},
+    {"yuzu://scope-dsl", "Scope DSL Reference",
+     "Scope-kind and comparison-operator catalog — same builder as GET "
+     "/api/v1/discover/scope-kinds and the discover_scope_kinds tool",
+     "application/json"},
 };
 
 static constexpr int kResourceCount = sizeof(kResources) / sizeof(kResources[0]);
@@ -3558,6 +3566,61 @@ McpServer::HandlerFn McpServer::build_handler(
                                  .add("uri", uri)
                                  .add("mimeType", "application/json")
                                  .add("text", content));
+                res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
+                                "application/json");
+                return;
+            }
+            // 2g PR 4 (specs-as-resources): yuzu://openapi and yuzu://scope-dsl reuse the
+            // SAME builder as their REST /discover/* and MCP discover_* tool twins (A2
+            // shared-builder principle — three projections, one builder). Tier-gated
+            // (unlike the 9 legacy resources above, which predate the annotation/tier sweep
+            // and are perm_fn-only — #2713 tracks closing that gap for them separately),
+            // matching discover_routes/discover_scope_kinds's tier_allows-then-perm_fn
+            // order. Deliberately NOT unauthenticated like /api/v1/openapi.json — that
+            // posture is a tracked pre-existing gap (#2057), not a precedent to follow.
+            if (uri == "yuzu://openapi") {
+                if (!tier_allows(session->mcp_tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        error_response_a4(id, kTierDenied, "MCP tier does not allow this operation",
+                                          yuzu::server::detail::make_correlation_id(),
+                                          "this MCP token's tier does not permit the operation; use "
+                                          "a higher-tier MCP token (operator or supervised), or the "
+                                          "REST API / dashboard"),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                // Compiled-in — no store dependency, same builder as REST
+                // /api/v1/openapi.json and discover_routes.
+                JArr contents;
+                contents.add(JObj()
+                                 .add("uri", uri)
+                                 .add("mimeType", "application/json")
+                                 .add("text", yuzu::server::openapi_spec_json()));
+                res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
+                                "application/json");
+                return;
+            }
+            if (uri == "yuzu://scope-dsl") {
+                if (!tier_allows(session->mcp_tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        error_response_a4(id, kTierDenied, "MCP tier does not allow this operation",
+                                          yuzu::server::detail::make_correlation_id(),
+                                          "this MCP token's tier does not permit the operation; use "
+                                          "a higher-tier MCP token (operator or supervised), or the "
+                                          "REST API / dashboard"),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                // Compiled-in — no store dependency, same builder as REST
+                // /api/v1/discover/scope-kinds and discover_scope_kinds.
+                const auto& doc = yuzu::server::scope_kinds_catalog();
+                JArr contents;
+                contents.add(
+                    JObj().add("uri", uri).add("mimeType", "application/json").add("text", doc.json));
                 res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
                                 "application/json");
                 return;
