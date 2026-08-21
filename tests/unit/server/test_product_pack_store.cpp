@@ -852,10 +852,16 @@ namespace {
 /// command_dispatch_fn/caller_fn are never invoked by the GET/POST/DELETE product-pack handlers
 /// (only by this file's other registered routes, none of which this harness dispatches to).
 struct ProductPackRestHarness {
+    // Declaration order matters (gov Gate 8 round-3, cpp-safety): `sink` stores the
+    // registered handlers, one of which captures `this` to append into `audit_rows` — so
+    // `audit_rows` must outlive `sink` and therefore be declared BEFORE it (destroyed
+    // after it, per reverse-declaration-order teardown). `metrics` is unreferenced by any
+    // product-pack handler but is declared first regardless, matching
+    // test_route_sink.hpp's own "declare the sink after the route owner" invariant.
     yuzu::MetricsRegistry metrics;
-    yuzu::server::test::TestRouteSink sink;
     std::vector<std::tuple<std::string, std::string, std::string, std::string, std::string>>
         audit_rows; // (action, result, target_type, target_id, detail)
+    yuzu::server::test::TestRouteSink sink;
 
     explicit ProductPackRestHarness(ProductPackStore* store) {
         WorkflowRoutes routes;

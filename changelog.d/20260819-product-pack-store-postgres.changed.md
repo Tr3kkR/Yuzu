@@ -20,11 +20,19 @@
   `POST /api/product-packs` or `DELETE /api/product-packs/{id}` is now the same A4 envelope**
   instead of the previous flat `{"error": "<message>"}` those two routes actually shipped with —
   a client parsing that old flat shape must switch to reading `error.message`; a genuine
-  database error no longer echoes raw driver text to the caller on any of the four routes
-  (logged server-side instead). Installing a bundle whose documents assign the same item
+  `ProductPackStore`-internal database error no longer echoes raw driver text to the caller
+  (logged server-side instead) on any of the four routes. **Known gap, not closed by this
+  migration:** `POST /api/product-packs`'s per-item install failures are relayed verbatim from
+  the delegate store (`InstructionStore`/`PolicyStore`/`WorkflowEngine`, all still SQLite) — a
+  genuine SQLite-level failure there (lock contention, disk full) still reaches the caller and
+  the audit trail as raw `sqlite3_errmsg()` text, since it never carries `ProductPackStore`'s own
+  DB-error marker and so isn't classified as one; tracked as a follow-up. Installing a bundle
+  whose documents assign the same item
   id twice now fails the whole install with a database error instead of silently discarding the
   duplicate item (a pre-migration bug, not a preserved behavior). No change to the `#802`/W7.4
   signed-pack enforcement default, the Ed25519 signature verification path, or the
   `--allow-unsigned-packs` / `YUZU_ALLOW_UNSIGNED_PACKS` operator escape hatch. A legacy
   `product-packs.db` written before 7.13 (predating the `verified` column) backfills correctly,
-  defaulting `verified=false` for that vintage.
+  defaulting `verified=false` for that vintage. The new
+  `yuzu_server_product_pack_{read_degrade,backfill}_total` metrics ship with paired alert rules
+  (`YuzuProductPackReadDegraded`, `YuzuProductPackBackfillNotCompleted`).
