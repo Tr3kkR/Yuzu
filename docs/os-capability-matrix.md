@@ -197,7 +197,7 @@ implementation is.
 | antivirus | products | macos | supported | 2 | plistbuddy+systemextensionsctl+pgrep | - |
 | antivirus | products | windows | supported | 1 | wmi_securitycenter2 | - |
 | antivirus | status | linux | supported | 2 | pgrep+stat | ClamAV liveness+definitions mtime; CrowdStrike/Sophos presence-only |
-| antivirus | status | macos | supported | 2 | plistbuddy | definitions mtime via in-process stat() |
+| antivirus | status | macos | supported | 2 | plistbuddy+stat | - |
 | antivirus | status | windows | supported | 1 | wmi_defender_status | - |
 | antivirus | av_exclusions | linux | unsupported | - | - | Windows-only concept |
 | antivirus | av_exclusions | macos | unsupported | - | - | Windows-only concept |
