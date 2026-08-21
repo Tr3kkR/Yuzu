@@ -699,6 +699,14 @@ URI.
 | `yuzu://server/health` | Server Health | Server health status and count of connected agents. | (none -- always allowed) |
 | `yuzu://compliance/fleet` | Fleet Compliance | Fleet-wide compliance overview (total checks, compliant, non-compliant, unknown, percentage). | `Policy:Read` |
 | `yuzu://audit/recent` | Recent Audit | Last 50 audit events with timestamp, principal, action, target, and result. | `AuditLog:Read` |
+| `yuzu://guardian/schemas` | Guardian Schemas | Guardian (Guaranteed State) Guard authoring schema catalog -- same builder as `GET /api/v1/guaranteed-state/schemas`. | `GuaranteedState:Read` |
+| `yuzu://about` | About Yuzu | Product primer, glossary, and safe operating rules for agentic workers. | `Infrastructure:Read` |
+| `yuzu://capabilities` | MCP Capabilities | What MCP can answer now, what needs live read-only dispatch, what requires external connectors, what is unsafe without approval. | `Infrastructure:Read` |
+| `yuzu://operating-model` | Agentic Operating Model | Recommended classify-plan-read-scope-approve-execute-monitor workflow. | `Infrastructure:Read` |
+| `yuzu://demo/playbooks` | Demo Playbooks | Deterministic CEO demo scenarios and live-fleet variants. | `Infrastructure:Read` |
+| `yuzu://golden-prompts/enterprise-it-v1` | Enterprise IT Golden Prompts v1 | Versioned prompt/eval catalogue for enterprise incident workflows. | `Infrastructure:Read` |
+| `yuzu://openapi` | OpenAPI Specification | REST API v1 OpenAPI spec, raw -- byte-identical to `GET /api/v1/openapi.json`; `discover_routes` wraps the same source in a distinct routes-catalog projection, not this shape. | `Infrastructure:Read` (tier- and RBAC-gated, matching `discover_routes`) |
+| `yuzu://scope-dsl` | Scope DSL Reference | Scope-kind and comparison-operator catalog -- same builder as `discover_scope_kinds` / `GET /api/v1/discover/scope-kinds`. | `Infrastructure:Read` (tier- and RBAC-gated, matching `discover_scope_kinds`) |
 
 ### Example: reading a resource
 
