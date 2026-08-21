@@ -414,7 +414,20 @@ class AgentRegistry {
 public:
     explicit AgentRegistry(EventBus& bus, yuzu::MetricsRegistry& metrics);
 
-    void register_agent(const pb::AgentInfo& info);
+    /// Register (or re-register) an agent. On re-registration, first revokes any device tokens
+    /// bound to this agent_id (W1.5 / #823, corrected by #3401 — see `revoke_by_device`) BEFORE
+    /// installing the new session, so a briefly-impersonated agent (mTLS-disabled flow, #779)
+    /// cannot keep replaying a token issued to the legitimate agent. First-time registrations
+    /// (no prior entry) skip the revoke, preserving the operator workflow of pre-issuing a token
+    /// for an agent_id that has not registered yet.
+    ///
+    /// Fails closed (ADR-0012 §1): if a wired device-token store reports a genuine revoke
+    /// failure, the registration is REFUSED — `unexpected(msg)` — and nothing changes (no
+    /// session installed, no management-group membership, no topology invalidation). A caller
+    /// MUST NOT install a session after a refusal. The revoke runs OFF the registry mutex (see
+    /// the .cpp for the two-phase structure, precedent `sweep_revoked`) — only the map
+    /// read/write is held under `mu_`, not the blocking Postgres round-trip.
+    [[nodiscard]] std::expected<void, std::string> register_agent(const pb::AgentInfo& info);
 
     void set_stream(const std::string& agent_id,
                     grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream,
@@ -542,9 +555,9 @@ public:
     void expire_trusted_gateway_for_test(std::chrono::seconds offset);
 
     /// W1.5 / #823: install the device-token store so `register_agent`
-    /// revokes any device tokens issued under a previous incarnation of
-    /// the same agent_id whenever a re-registration is detected. Optional
-    /// — if never called, register_agent behaves as before and stale
+    /// revokes any device tokens bound to a previous incarnation of the
+    /// same agent_id whenever a re-registration is detected. Optional —
+    /// if never called, register_agent behaves as before and stale
     /// tokens survive re-registration. Wiring lives behind a setter rather
     /// than the constructor to avoid disturbing the existing AgentRegistry
     /// construction sites, and because production `server.cpp` does not
@@ -555,7 +568,9 @@ public:
     /// Thread contract: holds the registry mutex so a concurrent
     /// `register_agent` cannot observe a partially-installed pointer.
     /// In practice the only caller is the startup wiring path, but the
-    /// lock costs nothing and removes a footgun.
+    /// lock costs nothing and removes a footgun. `register_agent` itself
+    /// only reads this pointer under `mu_` — the revoke call it makes
+    /// through it runs OFF the lock (#3401; see the .cpp).
     void set_device_token_store(DeviceTokenStore* store);
 
     // PLAN item 3 (provenance not syntax): only a `ClassifiedCommand` — mintable

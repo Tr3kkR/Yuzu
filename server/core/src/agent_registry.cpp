@@ -39,7 +39,7 @@ void AgentRegistry::set_device_token_store(DeviceTokenStore* store) {
     device_token_store_ = store;
 }
 
-void AgentRegistry::register_agent(const pb::AgentInfo& info) {
+std::expected<void, std::string> AgentRegistry::register_agent(const pb::AgentInfo& info) {
     auto session = std::make_shared<AgentSession>();
     session->agent_id = info.agent_id();
     session->hostname = info.hostname();
@@ -84,53 +84,65 @@ void AgentRegistry::register_agent(const pb::AgentInfo& info) {
         session->plugin_meta.push_back(std::move(pm));
     }
 
+    // Phase 1 (under mu_): snapshot whether a prior entry exists and the current device-token
+    // store pointer. Only this read is guarded by mu_ (matches set_device_token_store's "guarded
+    // by mu_" contract) — the revoke call itself, a blocking Postgres round-trip, runs OFF the
+    // lock below.
+    bool prior_exists = false;
+    DeviceTokenStore* store = nullptr;
     {
         std::lock_guard lock(mu_);
-        // Clean up stale session_to_agent_ entry from a prior connection
-        auto old = agents_.find(info.agent_id());
-        if (old != agents_.end()) {
-            // W1.5 / #823: re-registration revokes any device tokens still
-            // bound to this agent_id BEFORE the new session is installed. An
-            // attacker who briefly held this identity (mTLS-disabled flow,
-            // #779) could otherwise replay tokens previously issued to it
-            // indefinitely. Done under `mu_` so the install and the revoke
-            // are observed atomically by any concurrent reader. First-time
-            // registrations skip the revoke (agents_ has no entry), which
-            // preserves the operator workflow of pre-issuing a token for an
-            // agent_id that has not registered yet.
-            if (device_token_store_) {
-                // ADR-0052: revoke_by_principal is now type-distinguishable (a genuine DB error
-                // is not the same as "nothing to revoke") — log a failure rather than silently
-                // swallowing it. Re-wiring this store's construction (and deciding whether a
-                // revoke failure should instead block the registration) is out of scope for the
-                // migration; this call site has no live caller today (device_token_store_ is
-                // never non-null in production).
-                //
-                // gov cpp-safety + Gate 8 security-guardian: this call now runs a blocking
-                // Postgres round-trip INSIDE the `mu_` critical section above — up to
-                // kWriteTimeout (4s pool-acquire), PLUS a possible additional lock-wait up to
-                // lock_timeout_ms (10s default, server/core/src/pg/pg_pool.hpp) if a concurrent
-                // `validate_token` holds this row's `FOR UPDATE` lock — the same
-                // acquire-vs-lock-wait distinction ADR-0052's own "Capacity note" documents for
-                // `kValidateTimeout`, applying here too. The
-                // install-then-revoke atomicity W1.5/#823 requires is deliberate, but it means a
-                // future re-wiring serializes every `register_agent` caller behind this store's
-                // pool-acquire latency, the same lock-discipline shape `sweep_revoked` in this
-                // file documents as forbidden (gov #1117) for a cross-store query. The wiring PR
-                // must resolve this tension (e.g. `sweep_revoked`'s snapshot-off-lock,
-                // re-verify-under-lock pattern) rather than inherit "hold mu_ across the call" by
-                // default — do not copy this shape unexamined once the store goes live.
-                auto revoked = device_token_store_->revoke_by_principal(info.agent_id());
-                if (!revoked) {
-                    spdlog::error(
-                        "AgentRegistry::register_agent: device token revoke-by-principal "
-                        "failed for '{}': {}",
-                        info.agent_id(), revoked.error());
-                }
-            }
-            if (!old->second->session_id.empty())
-                session_to_agent_.erase(old->second->session_id);
+        prior_exists = agents_.contains(info.agent_id());
+        store = device_token_store_;
+    }
+
+    // W1.5 / #823, corrected by #3401: re-registration revokes any device tokens bound to this
+    // agent_id BEFORE the new session is installed, so an attacker who briefly held this
+    // identity (mTLS-disabled flow, #779) cannot keep replaying a token issued to the legitimate
+    // agent. First-time registrations (no prior entry above) skip the revoke, preserving the
+    // operator workflow of pre-issuing a token for an agent_id that has not registered yet.
+    // `revoke_by_device` (not `revoke_by_principal` — #3401: REST issuance never writes the
+    // agent_id into `principal_id`) is the sweep bound to the column `validate_token` actually
+    // enforces the presenter against.
+    //
+    // Runs OFF `mu_` — precedent `sweep_revoked` below. The invariant #823 needs is "the revoke
+    // commits before the new session is installed", which holds here regardless of lock
+    // discipline (phase 2 below only runs after this call returns); holding `mu_` across the
+    // call bought nothing (nothing else in this class reads `device_auth_tokens`) while
+    // serializing every unrelated `register_agent` / `send_to` / `evaluate_scope` / `get_session`
+    // caller behind this store's pool-acquire latency (up to kWriteTimeout=4s) plus a possible
+    // additional FOR-UPDATE lock-wait (lock_timeout_ms, 10s default) if a concurrent
+    // `validate_token` holds the row lock — the same acquire-vs-lock-wait distinction ADR-0052's
+    // "Capacity note" documents for kValidateTimeout.
+    //
+    // Fails CLOSED (ADR-0012 §1, #3401 Gap 2): a genuine revoke failure REFUSES the registration
+    // — no session installed, no management-group membership, no topology invalidation — rather
+    // than installing a session the sweep could not clear stale tokens for. Both gRPC callers
+    // (agent_service_impl.cpp, gateway_service_impl.cpp) must surface this as a retryable
+    // grpc::Status, never `accepted=false` (the latter is the agent's PERMANENT give-up signal).
+    if (prior_exists && store) {
+        auto revoked = store->revoke_by_device(info.agent_id());
+        if (!revoked) {
+            spdlog::error("AgentRegistry::register_agent: device token revoke-by-device failed "
+                          "for '{}', refusing registration: {}",
+                          info.agent_id(), revoked.error());
+            metrics_
+                .counter("yuzu_agent_registration_refused_total",
+                         {{"reason", "device_token_revoke_failed"}})
+                .increment();
+            return std::unexpected("device token revoke failed: " + revoked.error());
         }
+    }
+
+    // Phase 2 (under mu_): install the new session. Re-fetches the CURRENT prior entry rather
+    // than reusing phase 1's snapshot — a concurrent register_agent for the same agent_id may
+    // have already run to completion in between (its own revoke already committed under its own
+    // call); erasing against fresh state here is correct even if phase 1's snapshot is now stale.
+    {
+        std::lock_guard lock(mu_);
+        auto old = agents_.find(info.agent_id());
+        if (old != agents_.end() && !old->second->session_id.empty())
+            session_to_agent_.erase(old->second->session_id);
         agents_[info.agent_id()] = session;
     }
     metrics_.counter("yuzu_agents_registered_total").increment();
@@ -138,6 +150,7 @@ void AgentRegistry::register_agent(const pb::AgentInfo& info) {
     bus_.publish("agent-online", info.agent_id());
     spdlog::info("Agent registered: id={}, hostname={}, plugins={}", info.agent_id(),
                  info.hostname(), info.plugins_size());
+    return {};
 }
 
 void AgentRegistry::set_stream(

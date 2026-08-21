@@ -984,4 +984,35 @@ DeviceTokenStore::revoke_by_principal(const std::string& principal_id) {
     return revoked;
 }
 
+std::expected<std::int64_t, std::string>
+DeviceTokenStore::revoke_by_device(const std::string& device_id) {
+    // Empty device_id is a no-op: create_token permits an empty device_id (an intentionally
+    // unbound token), and a buggy caller passing the empty default must not sweep that
+    // population. See header doc.
+    if (!open_)
+        return std::unexpected(std::string(kDeviceTokenDbErrorPrefix) + "database not open");
+    if (device_id.empty())
+        return std::int64_t{0};
+
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kDeviceTokenDbErrorPrefix) +
+                               "database unavailable — try again");
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE device_token_store.device_auth_tokens SET revoked = true "
+        "WHERE device_id = $1 AND revoked = false RETURNING token_id",
+        std::vector<std::string>{device_id});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kDeviceTokenDbErrorPrefix) +
+                               "revoke_by_device failed: " + PQerrorMessage(lease.get()));
+
+    const std::int64_t revoked = PQntuples(res.get());
+    if (revoked > 0)
+        spdlog::info("DeviceTokenStore: revoked {} device token(s) for device '{}'", revoked,
+                     device_id);
+    return revoked;
+}
+
 } // namespace yuzu::server

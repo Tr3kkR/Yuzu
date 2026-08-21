@@ -241,6 +241,10 @@ TEST_CASE(
     CHECK_FALSE(revoke_by_res.has_value());
     CHECK(revoke_by_res.error().starts_with(yuzu::server::kDeviceTokenDbErrorPrefix));
 
+    auto revoke_by_device_res = store.revoke_by_device("endpoint-99");
+    CHECK_FALSE(revoke_by_device_res.has_value());
+    CHECK(revoke_by_device_res.error().starts_with(yuzu::server::kDeviceTokenDbErrorPrefix));
+
     CHECK_FALSE(store.migrate_from_sqlite("/nonexistent/does/not/matter"));
 }
 
@@ -466,6 +470,98 @@ TEST_CASE("DeviceTokenStore: revoke_by_principal is idempotent and skips already
     auto empty = store.revoke_by_principal("");
     REQUIRE(empty.has_value());
     CHECK(*empty == 0);
+}
+
+// ── #3401 — revoke_by_device (the actual #823 sweep; discriminates from revoke_by_principal) ──
+
+TEST_CASE("DeviceTokenStore: revoke_by_device revokes every still-valid token for the device, "
+          "across different operators, and leaves other devices' tokens alone",
+          "[device_token][823][3401][crud][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_token_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Two tokens for the SAME device, minted by DIFFERENT operators — the shape a
+    // principal-keyed sweep can never revoke together, and the shape revoke_by_device must.
+    auto a1 = store.create_token("alice-tok", "alice", "endpoint-99", "", 0);
+    auto a2 = store.create_token("bob-tok", "bob", "endpoint-99", "", 0);
+    // A token for a DIFFERENT device, same operator as one of the above — must survive.
+    auto other = store.create_token("alice-other", "alice", "endpoint-7", "", 0);
+    REQUIRE(a1.has_value());
+    REQUIRE(a2.has_value());
+    REQUIRE(other.has_value());
+
+    REQUIRE(store.validate_token(*a1, "endpoint-99").has_value());
+    REQUIRE(store.validate_token(*a2, "endpoint-99").has_value());
+    REQUIRE(store.validate_token(*other, "endpoint-7").has_value());
+
+    auto revoked = store.revoke_by_device("endpoint-99");
+    REQUIRE(revoked.has_value());
+    CHECK(*revoked == 2);
+
+    auto v1 = store.validate_token(*a1, "endpoint-99");
+    REQUIRE(!v1.has_value());
+    CHECK(v1.error().error == DeviceTokenValidateError::revoked);
+    CHECK(v1.error().bound_principal_id == "alice");
+
+    auto v2 = store.validate_token(*a2, "endpoint-99");
+    REQUIRE(!v2.has_value());
+    CHECK(v2.error().error == DeviceTokenValidateError::revoked);
+    CHECK(v2.error().bound_principal_id == "bob");
+
+    // Untouched: same operator (alice) as a revoked token, but a different device.
+    auto v3 = store.validate_token(*other, "endpoint-7");
+    REQUIRE(v3.has_value());
+
+    // The pre-#3401 bug, pinned as a regression check: sweeping by principal_id (an agent_id in
+    // production) must NOT touch these rows — they were minted with principal_id="alice"/"bob",
+    // never "endpoint-99".
+    auto by_principal = store.revoke_by_principal("endpoint-99");
+    REQUIRE(by_principal.has_value());
+    CHECK(*by_principal == 0);
+}
+
+TEST_CASE("DeviceTokenStore: revoke_by_device is idempotent, skips already-revoked rows, and "
+          "empty device_id is a no-op that never sweeps unbound tokens",
+          "[device_token][823][3401][crud][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_token_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto t = store.create_token("only", "alice", "endpoint-99", "", 0);
+    REQUIRE(t.has_value());
+    // An intentionally unbound token (empty device_id) — must never be swept by an empty input.
+    auto unbound = store.create_token("unbound", "alice", "", "", 0);
+    REQUIRE(unbound.has_value());
+
+    auto first = store.revoke_by_device("endpoint-99");
+    REQUIRE(first.has_value());
+    CHECK(*first == 1);
+    auto second = store.revoke_by_device("endpoint-99");
+    REQUIRE(second.has_value());
+    CHECK(*second == 0);
+
+    auto nobody = store.revoke_by_device("no-such-device");
+    REQUIRE(nobody.has_value());
+    CHECK(*nobody == 0);
+
+    auto empty = store.revoke_by_device("");
+    REQUIRE(empty.has_value());
+    CHECK(*empty == 0);
+
+    // The unbound token must have survived every call above, including the empty-string sweep.
+    auto list = store.list_tokens();
+    REQUIRE(list.has_value());
+    bool unbound_still_present = false;
+    for (const auto& tok : *list) {
+        if (tok.name == "unbound") {
+            unbound_still_present = true;
+            CHECK_FALSE(tok.revoked);
+        }
+    }
+    CHECK(unbound_still_present);
 }
 
 // ── Validate updates last_used_at ────────────────────────────────────────────

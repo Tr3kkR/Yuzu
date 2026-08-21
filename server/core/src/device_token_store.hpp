@@ -224,23 +224,34 @@ public:
     /// to a bare `false`.
     [[nodiscard]] std::expected<void, std::string> revoke_token(const std::string& token_id);
 
-    /// W1.5 / #823: revoke every still-valid token whose `principal_id`
-    /// matches. Called from `AgentRegistry::register_agent` so a
-    /// re-registration invalidates any device tokens issued under the
-    /// previous incarnation of the same agent_id — an attacker who briefly
-    /// impersonated the agent (mTLS-disabled flow, #779) could otherwise
-    /// replay the previously issued token indefinitely. Returns the number
-    /// of rows newly revoked (0 = no matching tokens or all were already
-    /// revoked; idempotent) on success. `unexpected(msg)` (prefixed
-    /// `kDeviceTokenDbErrorPrefix`) is a genuine write failure — distinct from a
-    /// successful "0 revoked" so a caller that DOES gate on this later cannot
-    /// silently treat "the revoke sweep failed" as "there was nothing to revoke"
-    /// (ADR-0036 — the store exposes the type regardless of today's caller,
-    /// which currently only logs on failure since re-wiring is out of scope).
-    /// Empty `principal_id` is a no-op (returns 0) so a forgotten id can't
-    /// accidentally match the empty-string default a buggy caller might pass.
+    /// Owner-scoped bulk revoke: every still-valid token whose `principal_id` (the operator who
+    /// issued it — see `DeviceAuthToken::principal_id`) matches. This is NOT the #823
+    /// re-registration defence — that is `revoke_by_device` below, keyed on the column
+    /// `validate_token` actually binds a presenter against. `principal_id` and `device_id` are
+    /// distinct identities (issuer vs. bearer; #3401): a REST-issued token has `principal_id` =
+    /// the operator's username, never an agent_id, so sweeping this method by an agent_id (the
+    /// pre-#3401 bug) matches zero rows. No production caller today. Returns the number of rows
+    /// newly revoked (0 = no matching tokens or all were already revoked; idempotent) on success.
+    /// `unexpected(msg)` (prefixed `kDeviceTokenDbErrorPrefix`) is a genuine write failure.
+    /// Empty `principal_id` is a no-op (returns 0) so a forgotten id can't accidentally match the
+    /// empty-string default a buggy caller might pass.
     [[nodiscard]] std::expected<int64_t, std::string>
     revoke_by_principal(const std::string& principal_id);
+
+    /// W1.5 / #823, corrected by #3401: revoke every still-valid token bound to `device_id` —
+    /// the column `validate_token` actually enforces the presenter against (`presenting_agent_id
+    /// != t.device_id`). Called from `AgentRegistry::register_agent` so a re-registration
+    /// invalidates any device tokens bound to the previous incarnation of the same agent_id — an
+    /// attacker who briefly impersonated the agent (mTLS-disabled flow, #779) could otherwise
+    /// replay a previously issued token indefinitely. `revoke_by_principal` above cannot serve
+    /// this purpose: REST issuance never writes the agent_id into `principal_id`. Returns the
+    /// number of rows newly revoked (0 = no matching tokens or all were already revoked;
+    /// idempotent) on success. `unexpected(msg)` (prefixed `kDeviceTokenDbErrorPrefix`) is a
+    /// genuine write failure — distinct from a successful "0 revoked" so a caller that gates on
+    /// this cannot silently treat "the revoke sweep failed" as "there was nothing to revoke"
+    /// (ADR-0036). Empty `device_id` is a no-op (returns 0) — `create_token` permits an empty
+    /// `device_id` (unbound token), and this must never sweep the unbound-token population.
+    [[nodiscard]] std::expected<int64_t, std::string> revoke_by_device(const std::string& device_id);
 
 private:
     pg::PgPool& pool_;

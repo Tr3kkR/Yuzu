@@ -462,6 +462,13 @@ public:
                           "gauge");
         metrics_.describe("yuzu_agents_registered_total", "Total number of agent registrations",
                           "counter");
+        // #3401: a re-registration was refused because the W1.5/#823 device-token
+        // revoke-by-device sweep itself failed (fail-closed, ADR-0012 §1) — the agent retries on
+        // its normal reconnect backoff. Dormant today (device_token_store_ is never wired live).
+        metrics_.describe("yuzu_agent_registration_refused_total",
+                          "Agent registration refused because a required pre-install step "
+                          "failed. Labelled reason.",
+                          "counter");
         metrics_.describe("yuzu_commands_dispatched_total",
                           "Total number of commands dispatched to agents", "counter");
         metrics_.describe("yuzu_commands_completed_total",
