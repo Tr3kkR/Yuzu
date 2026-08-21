@@ -457,7 +457,13 @@ both fixed in this round:
   scoping is what keeps this fail-closed for the genuine danger case: a different instance/host/
   directory has no local key file at another instance's absolute `key_ref` path, so it still hits
   the original refusal unchanged — verified by a dedicated test (two separate `TempDir`s against
-  one shared `CaStore`). The purge + leaf-generation + marker-write tail was factored into a
+  one shared `CaStore`).
+  **Superseded — see "Governance Gate 8 findings" below.** This proof establishes DIRECTORY
+  ACCESS to the material that minted the root, not INSTANCE IDENTITY — every process sharing the
+  same cert directory (e.g. two HA replicas against one shared volume) passes it identically, and
+  as originally shipped in this commit nothing serialized two such processes both reaching the
+  purge-and-regenerate work below concurrently. Gate 8 added the missing mutual exclusion.
+  The purge + leaf-generation + marker-write tail was factored into a
   shared `complete_default_cert_set()` helper so both the normal winning-the-race path and this
   self-heal path run identical code. Regression tests (`test_default_certs.cpp`): the pre-existing
   B-2 test ("refuses to re-root a populated ca.db") encoded exactly the old, now-superseded
@@ -515,6 +521,17 @@ well-evidenced:
   state; asserts both succeed, exactly 3 issued rows survive, and every on-disk cert/key pair still
   cryptographically matches (`pki::cert_matches_key`) — the specific corruption class this finding
   identified.
+  **Closure evidence caveat (advisor-flagged, verified 2026-08-21):** this test does NOT reliably
+  reproduce the pre-fix corruption — run 60x against the pre-lock commit (`f4631a78a`) in a
+  throwaway worktree, it passed 60/60. The vulnerable window (two threads' `fs::rename()` calls to
+  the same cert/key paths landing in an interleaved, mismatched order) is real — confirmed by three
+  independent code readings (security-guardian, unhappy-path, cpp-safety), none of which found a
+  serialization mechanism before this fix — but too narrow for ordinary OS thread scheduling to hit
+  reliably in a two-thread, same-process test. Closure for this finding rests on the by-construction
+  verification of the lock's mutual exclusion (lease/guard destruction ordering, confirmed correct
+  by cpp-safety against every early-return path), not on the test having been shown red; the test
+  still catches a fully-broken/absent lock and is retained for that value plus its correctness
+  assertions, but is not cited as red/green closure evidence on its own.
 - **HIGH (fixed, unhappy-path):** the UP-1 fix's revocation-sweep tick read the full
   `list_revoked()` (returns `cert_pem` blobs, `ORDER BY revoked_at`, no row cap, and nothing prunes
   `ca_issued` — so the query gets more expensive over an install's life) while the per-request

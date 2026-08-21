@@ -889,11 +889,23 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
             // state — see the "Store the CA private key LOCALLY" comment
             // below), so if a key still resolves at that exact path AND its
             // private half cryptographically pairs with the stored root cert,
-            // no other instance could be the true owner — a wiped persistent
-            // volume or a botched restore leaves no local key, or a mismatched
-            // one, and falls through to the refusal unchanged. Resume
-            // completing the SAME root rather than a heavyweight clean re-root
-            // for a fresh install that never finished, not a lost one.
+            // this instance has DIRECTORY ACCESS to the material that minted
+            // the root — a wiped persistent volume or a botched restore leaves
+            // no local key, or a mismatched one, and falls through to the
+            // refusal unchanged. Resume completing the SAME root rather than a
+            // heavyweight clean re-root for a fresh install that never
+            // finished, not a lost one.
+            //
+            // CORRECTED (Gate 8, 2026-08-21): this is directory access, NOT
+            // instance identity — every process sharing this exact cert
+            // directory passes the check identically, which is exactly why
+            // complete_default_cert_set_locked() below serializes entry with a
+            // Postgres advisory lock rather than treating this check alone as
+            // sufficient mutual exclusion (unhappy-path Finding A named this
+            // comment's original "no other instance could be the true owner"
+            // phrasing specifically — that claim was false for the
+            // shared-cert-volume HA topology this fix round's own
+            // upgrading.md HA note describes as supported).
             FileKeyProvider self_heal_kp(dir);
             if (self_heal_kp.has_key(root.key_ref)) {
                 auto key_pem = self_heal_kp.load_key(root.key_ref);

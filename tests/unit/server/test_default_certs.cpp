@@ -468,6 +468,26 @@ TEST_CASE("default_certs: two concurrent self-heal resumes on ONE shared cert di
     //
     // ONE shared TempDir (not two, unlike the fresh-root race test above) — this
     // is the multi-process-same-volume topology the bug required.
+    //
+    // HONEST LIMITATION (advisor-flagged, verified empirically 2026-08-21):
+    // this test does NOT reliably reproduce the pre-fix corruption — run 60x
+    // against the pre-lock commit (f4631a78a) in a throwaway worktree, it
+    // passed 60/60. The vulnerable window (two threads' fs::rename() calls to
+    // the SAME cert/key paths landing in an interleaved, mismatched order) is
+    // narrow enough that ordinary OS thread scheduling for two threads doing a
+    // short burst of synchronous file I/O essentially never lands there in
+    // practice, even though the race is real (confirmed by three independent
+    // code readings: security-guardian, unhappy-path, cpp-safety — plain
+    // rename() has no O_EXCL-equivalent collision detection, and nothing
+    // serialized entry before this fix). This test still asserts genuinely
+    // useful correctness properties (exactly 3 issued rows, every on-disk
+    // cert/key pair cryptographically matched) and DOES catch a
+    // fully-broken/absent lock (e.g. a lock that never actually blocks), but
+    // is NOT proof the specific corruption class is closed — that closure
+    // rests on the by-construction verification of the lock's mutual
+    // exclusion (lease/guard destruction ordering), not on this test having
+    // been shown red. Do not cite this test alone as red/green closure
+    // evidence for Finding A in a governance ledger.
     TempDir dir;
     YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 6}};
