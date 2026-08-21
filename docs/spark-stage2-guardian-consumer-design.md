@@ -314,6 +314,12 @@ floor; 144/day is the exact-no-jitter figure, 180/day is the true production cei
 "jitter never shortens a sweep" claim). Both corrected figures are roughly 60-95x
 below the pre-fix ~17k/day this paragraph documents.
 
+**M1's fix covers the health (Unknown) stream only.** This paragraph's flood analysis and
+fix scope never mention the Known/drift path - `guardian_emit_decider.hpp`'s `decide_emit`
+has no equivalent terminal-state dedup on the Drift branch, so a persistently-drifted rule
+still re-emits `drift.detected` on every convergence sweep (no fix landed for it here).
+Tracked as delta-registry row D3 and issue #3388 (F12, #3386) - not yet ruled.
+
 **Landed (PARTIAL) 2026-07-20, commit `b30e93cf`:** the **transition-edge emission** + a
 **counted, sparse-heartbeat suppression signal** (`yuzu.guardian_unhealthy_suppressed`) shipped.
 

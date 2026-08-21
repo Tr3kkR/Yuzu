@@ -161,6 +161,18 @@ never invent a rationale for what isn't ruled yet.
 | **Verify at** | `guardian_emit_decider.hpp::decide_emit` (no `last_compliant`-driven terminal dedup on the Drift branch); `guardian_rule_eval.cpp`'s sole `decide_emit` call site (passes `a.debounce_ms`); `guardian_rule_eval.hpp` (`debounce_ms{1000}` default on `RuleAssertion`); `guard_systemd.cpp` `systemd_decide_emit` (contrast: has terminal-state dedup). |
 | **Epistemic** | **open-question, verified 7b449e589** — this row documents a finding from this pass, not a pre-existing ruling. Tracked in **#3388**; update this row once that issue resolves. |
 
+**Possible tension with the parity gate's own zero-tolerance clause (flagged during Gate 3
+architect review, not yet resolved):** the design doc states event-stream equivalence
+checks use tolerance bands "**only for observe/debounce noise**"; "enforce-class and
+dangerous-drift `event_type`s require zero-tolerance exact match — a tolerance band would
+let a real enforce divergence pass." D3's per-sweep re-emission is a genuine event-*count*
+divergence, not timing noise — and if a rule can be both dangerous-classified and
+persistently drifted (nothing in B1/C1 rules that combination out), a scripted parity
+capture on such a rule would show exactly the count mismatch that clause exists to catch.
+Whether "dangerous-drift" is scoped to cover count/frequency, and if so whether D3 blocks
+F14 on those rules specifically, is an open question for #3388 to resolve — not decided
+here.
+
 ### D4 — Compliant-edge emission is unified across types (a spark-side legacy-parity fix)
 
 | | |
@@ -226,6 +238,17 @@ never invent a rationale for what isn't ruled yet.
 | **Operator symptom** | Under sustained overload, legacy silently loses pre-Register events with no signal; spark surfaces the same class of loss as a counted, observable metric. Not a regression — an observability improvement — but a real behavioral difference in what "the agent tried to send N events" means on each backend. |
 | **Verify at** | `guardian_engine.cpp::emit_guard_event` (sink-not-wired drop, no counter); `guardian_outbox.hpp` `GuardianOutbox` capacity check + `backpressure_drops_`. |
 | **Epistemic** | verified 7b449e589 |
+
+### D10 — Spark reads go through a bounded, bulkheaded I/O admission layer; legacy reads have none
+
+| | |
+|---|---|
+| **Legacy** | Each guard runs its own read on its own thread, unbounded — no admission control, no per-class concurrency cap, no deadline. A wedged read (a stalled network/FUSE mount, a hung SCM call, a wedged sd-bus broker) blocks that guard's thread indefinitely; there is no shared quota across guards to protect one type from starving another. |
+| **Spark** | Every read is dispatched through `GuardianIoExecutor`, a per-type bulkhead with a process-wide ceiling. Default class quotas: File 4, Registry 3, Service 3 (`kMaxProcessIoWorkers = 10`, derived as the exact sum so no class can starve another — a class cap always binds before the process bound can). Each class also carries its own absolute deadline (file-hash ~15s, file-metadata-only/registry/service 5s). A read that can't get an admission slot (`CapacityExhausted`), that's already in flight for the same key (`AlreadyRunning`, single-flighted), or that exceeds its deadline (`Timeout`) degrades to Unknown rather than blocking or hanging — the wedged worker is decoupled (a D-state syscall can't be cancelled or joined), not force-killed, and its liveness feeds the F3 orphan-exit obligation (see E2). |
+| **Why deliberate** | R3 (design doc rung-9a decision record): a bulkhead is necessary once reads are dispatched from a shared scheduler across many rules/keys concurrently, which legacy's one-guard-one-thread model never needed. The derived-ceiling design specifically replaced an earlier independent `total_quota{8} < sum(10)` that let File+Registry starve Service down to 1 of its 3 slots with nothing wedged-looking in the metrics — the current design makes starvation structurally impossible instead of just less likely. |
+| **Operator symptom** | Under read contention (many rules, a slow mechanism, a stalled filesystem) spark can produce `guard.unhealthy` traffic (via the Unknown→health-stream path, D1/D6) that has no legacy analog — a purely spark-introduced fault *source*, not just a different classification of a fault legacy would also have hit. Counted via `GuardianIoExecutor::Counters` (`timed_out`, `rejected_capacity`, `rejected_key`, `launch_failures`, `worker_exceptions`) per class — not yet routed to a heartbeat tag or fleet gauge as of this writing; verify current wiring before relying on fleet-level visibility into this specific fault class. |
+| **Verify at** | `guardian_io_executor.hpp` (`GuardianIoExecutor::Config` defaults, `kMaxProcessIoWorkers`, `IoFailure` enum); `guardian_state_reader.hpp` header comment (per-class deadlines, single-flight, decouple-not-cancel contract) confirming production wiring. |
+| **Epistemic** | verified 7b449e589 — added post-Gate-3 architect review, which is the correct process working as intended: this category was missing from the first two drafting passes. |
 
 ---
 
