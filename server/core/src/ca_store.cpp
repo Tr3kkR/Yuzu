@@ -1354,8 +1354,11 @@ std::expected<std::vector<std::string>, std::string> CaStore::list_revoked_seria
     const int serial_rows = PQntuples(res.get());
     std::vector<std::string> serials;
     serials.reserve(static_cast<std::size_t>(serial_rows));
+    // text_col(), not raw PQgetvalue — serial_hex is PRIMARY KEY (NOT NULL) today
+    // so this is idiom consistency (matches read_issued_row's use of the same
+    // helper for the identical column) rather than a live defect, cpp-safety NICE.
     for (int i = 0; i < serial_rows; ++i)
-        serials.emplace_back(PQgetvalue(res.get(), i, 0));
+        serials.push_back(text_col(res.get(), i, 0));
     return serials;
 }
 

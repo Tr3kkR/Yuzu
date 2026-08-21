@@ -688,6 +688,25 @@ bool try_use_existing_complete_set(const fs::path& dir, const fs::path& marker,
 // (bounded) instead of KEK's immediate-Conflict-report, since this is a
 // one-shot boot-time operation where briefly waiting for a sibling to finish
 // is preferable to failing the boot outright.
+//
+// cpp-safety NOTE (Gate 8, 2026-08-21): complete_default_cert_set_locked()
+// holds its own pool::Lease for the ENTIRE critical section, while
+// complete_default_cert_set() (called from inside it) makes its OWN nested
+// try_acquire_for calls via CaStore's per-call leasing on the SAME pool
+// (delete_issued_by + up to 3x record_issued). A single racing instance needs
+// 2 simultaneous connections (its own outer lease + one nested call at a
+// time); an N-way race needs N outer leases (one per racer, held idle by
+// every non-lock-holder while it retries) + 1 more for whichever racer
+// currently holds the lock and is doing nested work. --postgres-pool-size
+// must stay comfortably above the realistic number of instances that could
+// share one --ca-dir + ca_store concurrently (2-3 for ordinary HA topologies
+// → pool size >= 4-5 with margin) — the default (16) is nowhere near this
+// floor, but an operator running with a tightly-sized pool (down to the
+// allowed minimum of 1) will see this self-contend. It fails CLOSED and
+// LOUDLY when it does (a nested acquire timeout surfaces as a normal
+// record_issued/delete_issued_by failure → "Refusing to start"), never a
+// hang or silent corruption — so this is a documented constraint, not a
+// defect requiring a code fix.
 constexpr std::chrono::milliseconds kBootstrapLockAcquireTimeout{5000};
 constexpr std::chrono::milliseconds kBootstrapLockRetryInterval{100};
 
@@ -726,6 +745,16 @@ public:
     // (releases) BEFORE the lease returns the connection to the pool: a
     // session advisory lock outlives the statement, so releasing it here is
     // the only way to unlock at all.
+    //
+    // Deliberately NOT `noexcept` — same reason as KekOpLockGuard's identical
+    // constructor (`kek_op_lock.hpp`): `inner_`'s mem-initializer heap-allocates
+    // a fresh unlock-SQL string, so this can throw `bad_alloc`. Cpp-safety
+    // review (Gate 8, 2026-08-21) confirmed the resulting window — the lock is
+    // genuinely held at the DB before this constructor finishes, so a throw
+    // here leaks the session lock until the pooled connection is eventually
+    // discarded — already exists identically in the shipped `KekOpLockGuard`;
+    // this is a faithful mirror of that accepted precedent, not a new gap. If
+    // this is ever hardened, harden both consumers together.
     explicit DefaultCertsBootstrapLockGuard(PGconn* conn)
         : inner_(conn, default_certs_bootstrap_lock_key(), "default_certs bootstrap") {}
     DefaultCertsBootstrapLockGuard(const DefaultCertsBootstrapLockGuard&) = delete;

@@ -541,6 +541,27 @@ well-evidenced:
   existing "still refuses" test never reached `load_key()` at all, since `has_key()` short-circuits
   for an absent file).
 
+**cpp-safety domain-trigger re-review (2026-08-21).** The Gate 8 fix above introduced a new
+concurrency primitive (a Postgres session advisory lock in `default_certs.cpp`) — routed-concerns
+mandates cpp-safety on any C++ source change, and the prior Gate 8 pair (security-guardian +
+unhappy-path) reviewed for security/availability properties, not C++ resource-ownership/lifetime
+idioms specifically. **PASSES — no BLOCKING findings.** The lease/guard destruction-ordering claim
+(the diff's central safety property: `PgSessionAdvisoryLockGuard`'s destructor, which runs
+`pg_advisory_unlock`, must fire before the `pg::PgPool::Lease` returns the connection to the pool)
+was verified correct by construction and against every early-return path. One SHOULD, fixed in the
+same round: `complete_default_cert_set_locked()` holds its own pool lease for the whole critical
+section while the function it calls makes its own nested per-call leases on the SAME pool — an
+N-way race needs roughly `N + 1` simultaneous connections, so a tightly-sized
+`--postgres-pool-size` (down to the allowed minimum of 1) self-contends. Fails CLOSED and LOUDLY
+when it does (a nested-acquire timeout surfaces as an ordinary `record_issued` failure → refuse to
+start), never a hang or silent corruption, so this is now a documented constraint (comment at
+`kBootstrapLockAcquireTimeout`) rather than a code fix. Two NICE items also fixed: the new guard's
+constructor comment now carries the same "deliberately NOT noexcept" rationale
+`KekOpLockGuard`'s does (the identical, already-accepted, OOM-only leaked-lock window this diff
+mirrors, not a new one); `list_revoked_serials()` now routes through the file's shared `text_col()`
+helper for idiom consistency with `list_revoked()`'s identical column (the raw `PQgetvalue` it
+replaced was never actually reachable — `serial_hex` is `PRIMARY KEY`/`NOT NULL` today).
+
 Full agent reports: this run's governance transcript (session-local, not committed).
 
 ## Consequences
