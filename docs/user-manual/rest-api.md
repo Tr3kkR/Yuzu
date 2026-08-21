@@ -4837,6 +4837,20 @@ Management](#license-management), `docs/adr/0052-device-token-store-postgres-mig
 Context), so these routes do not register today; documented for when a future change re-wires
 them.
 
+**`principal_id` vs `device_id`.** These are two different identities. `principal_id` is the
+**issuing operator's** username — set from the authenticated session at creation time, never
+supplied in the request body. `device_id` is the **agent** the token is bound to (set from the
+request body's `device_id` field) — this is the identity a presenting agent is validated against
+when the token is used, and the identity the re-registration revoke below acts on.
+
+**Re-registration revoke (#823/#3401).** When the agent named by a token's `device_id` re-registers
+with the server, every still-valid token bound to that `device_id` is revoked before the new
+session is installed — closing the window where a briefly-impersonated agent (an mTLS-disabled
+registration) could otherwise replay a token issued to the legitimate agent. This is independent
+of who issued the token (`principal_id`). If the revoke sweep itself fails (a database fault), the
+registration is refused rather than proceeding with stale tokens left live; the agent's normal
+reconnect/retry behavior applies.
+
 #### `GET /api/v1/device-tokens`
 
 List all device tokens.
@@ -4901,7 +4915,7 @@ Create a device-scoped token. The raw token value is returned exactly once at cr
 | Malformed JSON body | `400` — `invalid JSON` |
 | `name`/`device_id`/`definition_id` exceeds 256 chars | `400` — `invalid_input_length: ...` |
 | CSPRNG entropy exhaustion | `503` + `Retry-After: 5` — `CSPRNG unavailable: ...` |
-| A genuine database write failure | `503` + `Retry-After: 5` — `service unavailable` |
+| A genuine database write or token-hashing failure | `503` + `Retry-After: 5` — `service unavailable` |
 
 #### `DELETE /api/v1/device-tokens/{id}`
 

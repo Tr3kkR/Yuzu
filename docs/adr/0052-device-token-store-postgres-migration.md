@@ -338,3 +338,59 @@ migration follows the sharing one since all four files' setup is byte-identical)
   commit with `LicenseStore`/`SoftwareDeploymentStore` — is now a recorded, verified fact (this
   ADR + the ladder row) rather than a kickoff-doc guess a future reader would have to
   re-archaeology or, worse, propagate uncorrected.
+
+## Amendment — 2026-08-21: `revoke_by_device` closes the #823 gap (#3401); input bound + checked hashing (#3351)
+
+`revoke_by_principal` was never the #823 re-registration sweep it was documented as; registration
+now fails closed on a revoke failure; and #3351's activation-gating hardening lands alongside it.
+
+Doomgoose's external review of this migration (round 3) surfaced `#3401`: `revoke_by_principal`'s
+own doc comment above (and this ADR's own "closed by typing it" bullet) describes it as *"the
+#823 re-registration defence"* — that description was wrong from the day #823 shipped, not
+introduced by this migration. `AgentRegistry::register_agent` calls it with `info.agent_id()`, but
+`principal_id` is the *issuing operator's username* (`DeviceAuthToken::principal_id`, "Username who
+created it") on every production issuance path (`rest_api_v1.cpp`'s `POST /api/v1/device-tokens`
+writes `session->username` there) — never an agent_id. The sweep therefore matched zero rows on
+every real re-registration; the existing test suite masked this because its fixtures set
+`principal_id == device_id == agent_id`, a shape no production path produces.
+
+The fix adds `revoke_by_device(device_id)` — same shape as `revoke_by_principal`
+(`std::expected<int64_t, std::string>`, empty-input no-op, `WHERE device_id = $1 AND revoked =
+false RETURNING token_id`), no schema change (the existing `idx_device_token_device` index gets
+its first query consumer) — and retargets `AgentRegistry::register_agent`'s call site to it.
+`revoke_by_principal` is kept: it is a legitimate owner-scoped bulk revoke ("every token I,
+personally, issued"), just never the #823 mechanism; its doc comment is corrected rather than the
+method removed.
+
+`register_agent` also now fails CLOSED on a genuine revoke failure (ADR-0012 §1) — refusing the
+registration rather than installing a session the sweep could not clear stale tokens for — and the
+revoke call moves OFF the registry mutex (two-phase: snapshot prior-entry-exists + the store
+pointer under `mu_`, revoke off-lock, re-verify and install under `mu_` again), following
+`sweep_revoked`'s snapshot-off-lock precedent in the same file. The prior comment's claim that
+holding `mu_` across the call gave an "atomicity" guarantee was itself overstated — nothing else in
+`AgentRegistry` reads `device_auth_tokens`, so the lock never actually serialized anything against
+it; the real invariant (`revoke commits before install`) holds under the two-phase structure
+without the lock. Both gRPC callers (`agent_service_impl.cpp` `Register`, `gateway_service_impl.cpp`
+`ProxyRegister`) surface a refusal as `grpc::Status(UNAVAILABLE, ...)`, never `accepted=false` —
+the agent's reconnect loop (`agents/core/src/agent.cpp`) treats the latter as a **permanent**
+rejection, not a retryable one.
+
+Bundled in the same PR, `#3351` (filed alongside `#3401` during this migration's original
+governance round, same activation-gating posture): `sanitize_pg_text` was rewritten to the linear
+reserve-and-append shape (`#2691` precedent, `response_store.cpp`) rather than its prior O(n²)
+find+replace loop; `create_token` and `migrate_from_sqlite`'s legacy-field reads now reject (never
+silently clamp) any free-text field exceeding 256 raw bytes, measured before sanitization can grow
+the string; the legacy SQLite read switched from a NUL-truncating C-string read to a length-aware
+`sqlite3_column_bytes` read (mirrors `audit_store.cpp`) so an embedded NUL is defanged to U+FFFD
+rather than silently dropping everything after it; and `hash_token`'s Windows-only, four-call,
+entirely unchecked BCrypt branch (a failure anywhere in that chain silently produced the hex of 32
+zero bytes — a constant hash for every input) is removed outright in favor of the file's existing
+checked EVP SHA-256 path (`sha256_hex`, already used unconditionally for backfill fingerprinting)
+on every platform — OpenSSL is a required dependency on Windows regardless of linkage (see this
+repo's vcpkg notes), so the platform split no longer has a reason to exist. Output bytes are
+identical (both were SHA-256), so no previously-hashed token is invalidated.
+
+All of the above remains dormant-store defence-in-depth: `server.cpp` still passes
+`/*device_token_store=*/nullptr`, so none of this is reachable in production today. It closes
+before the wiring PR, per this ADR's original dormancy record above and `#3422`'s still-open
+question of what mechanically enforces that ordering.
