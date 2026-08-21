@@ -366,7 +366,7 @@ The per-session peer-IP binding for the agent `Subscribe` RPC (#826/#1058/#1059,
     severity: warning
   annotations:
     summary: "Engine-principal liveness re-checks are being answered from the failure backoff - the principal store is unreachable and engine streams are riding their grace windows"
-    description: "This counter only moves while the store cannot be reached. First rule out real impact: a flat yuzu_mcp_stream_closes_total{reason=\"auth_unavailable\"} means the backoff is absorbing the blip and no streams have ended. Then correlate with yuzu_pg_acquire_wait_seconds and yuzu_pg_pool_in_use for pool exhaustion. Runbook: docs/ops-runbooks/engine-principal-store-recovery.md."
+    description: "This counter only moves on CONFIRMED unreachability (the store closed, or a query actually ran and failed, or PgPool's own connect-failure breaker is open) - a bare pool-lease-acquire timeout under a healthy database does not arm this backoff, so firing already rules out ordinary pool saturation. First rule out real impact: a flat yuzu_mcp_stream_closes_total{reason=\"auth_unavailable\"} means the backoff is absorbing the blip and no streams have ended. Then correlate with yuzu_pg_acquire_wait_seconds and yuzu_pg_pool_in_use for genuine connection exhaustion vs. a connect-level failure. Runbook: docs/ops-runbooks/engine-principal-store-recovery.md."
 
 - alert: VizFleetPushedMapNearCap
   expr: yuzu_viz_pushed_map_size > 80000

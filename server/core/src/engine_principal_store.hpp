@@ -96,10 +96,16 @@
 /// Only `Active` is cached. `MissingOrRevoked` is not (terminal and rare — the
 /// alerting path — and negative-caching it would need `create()` invalidation
 /// to avoid masking a fresh principal). `StoreUnreachable` is not cached
-/// either, but it IS rate-limited: a short jittered backoff repeats that
-/// answer without taking a lease, because otherwise the positive cache fixes
-/// only the warm steady state and the per-tick amplifier returns intact the
-/// moment entries age out during a sustained brownout.
+/// either, but a CONFIRMED one (#2456: the store was never open, or a query
+/// actually ran and failed, or `PgPool`'s own connect-failure breaker is
+/// open — see `EngineLookup::confirmed_unreachable`) IS rate-limited: a short
+/// jittered backoff repeats that answer without taking a lease, because
+/// otherwise the positive cache fixes only the warm steady state and the
+/// per-tick amplifier returns intact the moment entries age out during a
+/// sustained brownout. An AMBIGUOUS `StoreUnreachable` (a bare lease-acquire
+/// timeout with the breaker still closed — a pool briefly saturated by
+/// unrelated load, not a confirmed outage) does NOT arm the backoff — arming
+/// it there would suppress probing a perfectly healthy database.
 ///
 /// Revocation latency on the cached path: the writing replica invalidates
 /// synchronously in `revoke()`/`transfer_owner()`, so a single-server
@@ -161,15 +167,19 @@ enum class EngineLookupStatus : int {
 /// `confirmed_unreachable` (#2456) is a hint for `get_for_auth_revalidate`'s
 /// failure-backoff decision ONLY — every other consumer of `get_for_auth`
 /// ignores it and the three-state `status` contract above is unchanged for
-/// all of them. A `StoreUnreachable` result carries `false` when it came from
-/// a bare lease-acquire timeout (`try_acquire_for` returning nothing within
-/// `kReadTimeout`), which is ambiguous evidence — a briefly-saturated pool
-/// under unrelated load looks identical to a real outage at that point — and
-/// `true` when the store was confirmed unreachable more strongly (closed, or
-/// a query actually ran and failed), which is not ambiguous. Arming a 5-10 s
-/// backoff on the ambiguous case suppresses probing a perfectly healthy
-/// database; arming it on the confirmed case is the whole point of the
-/// backoff.
+/// all of them. A `StoreUnreachable` result carries `true` from THREE
+/// sources: the store was never open; a query actually ran and failed; or a
+/// bare lease-acquire timeout (`try_acquire_for` returning nothing within
+/// `kReadTimeout`) where `PgPool`'s own connect-failure breaker
+/// (`connect_breaker_open()`) is open — the breaker fires only on recent
+/// CONNECT failures, never on pool saturation alone, so an open breaker at
+/// that point IS confirmed evidence of a real outage. It carries `false`
+/// ONLY for a bare lease-acquire timeout with the breaker still CLOSED, which
+/// is genuinely ambiguous — a briefly-saturated pool under unrelated load
+/// looks identical to a real outage at that exact point, and the breaker
+/// hasn't (yet) confirmed either way. Arming a 5-10 s backoff on the
+/// ambiguous case suppresses probing a perfectly healthy database; arming it
+/// on any of the three confirmed cases is the whole point of the backoff.
 struct EngineLookup {
     EngineLookupStatus status = EngineLookupStatus::StoreUnreachable;
     std::optional<EnginePrincipalRow> row;
@@ -442,21 +452,27 @@ private:
     /// says it is.
     static constexpr auto kAuthCacheTtlJitter = std::chrono::milliseconds{3750};
 
-    /// After a read-through that could not reach the store, further reads for
-    /// that principal are suppressed and answered `StoreUnreachable` without
-    /// touching the pool. Jitter is ADDITIVE here (unlike the TTL's, which is
-    /// subtractive), so the real window is `kAuthFailureBackoff` to twice it —
-    /// 5 s to 10 s. Extending a backoff is safe; shortening a positive TTL is
-    /// the direction that must never overshoot, hence the opposite signs.
+    /// After a read-through that CONFIRMED the store unreachable (#2456: the
+    /// store was never open, or a query actually ran and failed, or the
+    /// connect-failure breaker is open — never a bare, ambiguous lease-acquire
+    /// timeout with the breaker closed), further reads for that principal are
+    /// suppressed and answered `StoreUnreachable` without touching the pool.
+    /// Jitter is ADDITIVE here (unlike the TTL's, which is subtractive), so
+    /// the real window is `kAuthFailureBackoff` to twice it — 5 s to 10 s.
+    /// Extending a backoff is safe; shortening a positive TTL is the direction
+    /// that must never overshoot, hence the opposite signs.
     ///
-    /// This is a RATE LIMITER, not a negative cache. The distinction matters:
-    /// it repeats an answer we obtained moments ago from the authoritative
-    /// store, for a window far shorter than the positive TTL, and it re-probes
-    /// promptly so recovery is detected fast. Without it the positive cache
-    /// fixes only the warm steady state: once entries expire during a sustained
-    /// brownout, every stream reads through on every ~3 s tick, each blocking
-    /// up to the 1500 ms lease timeout — which is precisely the amplifier
-    /// #2367 exists to remove, merely postponed by one TTL.
+    /// This is a RATE LIMITER for CONFIRMED failures, not a negative cache and
+    /// not armed on ambiguous ones. The distinction matters: it repeats an
+    /// answer we obtained moments ago from the authoritative store, for a
+    /// window far shorter than the positive TTL, and it re-probes promptly so
+    /// recovery is detected fast. Without it a sustained, CONFIRMED brownout
+    /// would have every stream read through on every ~3 s tick once positive
+    /// entries expire, each blocking up to the 1500 ms lease timeout — which
+    /// is precisely the amplifier #2367 exists to remove, merely postponed by
+    /// one TTL. Arming it on an AMBIGUOUS failure instead would suppress
+    /// probing a perfectly healthy, merely-busy database — the gap #2456
+    /// found and closed.
     static constexpr auto kAuthFailureBackoff = std::chrono::seconds(5);
 
     /// Hard ceiling on resident entries. Engine principals are created through
@@ -468,8 +484,10 @@ private:
     /// is slower, never wrong.
     static constexpr std::size_t kAuthCacheMaxEntries = 1024;
     /// Effective ceiling; `kAuthCacheMaxEntries` unless a test shrinks it.
-    /// Applies to BOTH maps — the backoff map is filled precisely when the
-    /// positive map is not, so bounding only one of them bounds neither.
+    /// Applies to all THREE maps below — the backoff map is filled precisely
+    /// when the positive map is not, so bounding only one of them bounds
+    /// neither; the per-principal generation map (#2454) shares the same
+    /// ceiling but a different eviction story (see its own field comment).
     std::size_t max_entries_{kAuthCacheMaxEntries};
 
     mutable std::mutex revalidate_cache_mu_;
@@ -517,9 +535,12 @@ private:
     /// critical section instead of two separately-ordered steps.
     ///
     /// Ceiling-capped at `max_entries_`, but UNLIKE the cache/backoff maps
-    /// this one has no TTL and nothing ever erases an entry from it — a
-    /// generation counter does not go stale the way a cached VALUE does, so
-    /// it is cumulative-over-process-lifetime, not windowed. That makes
+    /// this one has no TTL — no per-tick sweep ever reclaims an entry from
+    /// it on ordinary operation (a full clear, `invalidate_revalidate_cache`
+    /// with an empty principal_id, does erase everything, but nothing in
+    /// production reaches that path — see #3385). A generation counter does
+    /// not go stale the way a cached VALUE does, so absent that clear it is
+    /// cumulative-over-process-lifetime, not windowed. That makes
     /// "decline past the cap" the WRONG degradation here (Gate 3, security-
     /// guardian + cpp-safety + quality-engineer, independently, same round):
     /// declining does not skip one race for one principal, it PERMANENTLY

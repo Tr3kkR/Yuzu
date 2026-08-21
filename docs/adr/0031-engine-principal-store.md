@@ -231,3 +231,20 @@ request without needing to consult the other two.
   if a pre-existing `engine:`-named local user or RBAC group predates the reservation — see
   `docs/ops-runbooks/engine-principal-store-recovery.md` for the pre-upgrade check and recovery
   procedure, and the `## ⚠️ Breaking` section of `docs/user-manual/upgrading.md`.
+
+## Update (2026-08-21) — the failure backoff no longer arms unconditionally (#2456)
+
+The Consequences section above ("A read that could not reach the store instead arms a short
+jittered backoff") described the original #2367 behavior: every `StoreUnreachable` outcome armed
+the backoff, regardless of cause. #2456 (PR #3362) narrowed this: `get_for_auth` now distinguishes
+a CONFIRMED failure (the store was never open, or a query actually ran and returned an error) from
+an AMBIGUOUS one (a bare connection-pool lease-acquire timeout with `PgPool`'s own connect-failure
+breaker still closed) via a new `EngineLookup::confirmed_unreachable` field, and the backoff arms
+only on the confirmed case. A pool briefly saturated by unrelated load — with the database itself
+reachable — no longer arms it; that scenario used to suppress probing for the same 5-10 s window a
+real outage does, which #2456 found and fixed.
+
+The rate-limiting property itself is unchanged for what it exists to prevent: a *sustained,
+confirmed* outage still arms the backoff on its very first tick and keeps re-arming it, so the
+O(streams × tick) amplifier the original design worried about is still bounded. What changed is
+which failures count as evidence of that outage, not whether a confirmed one is rate-limited.

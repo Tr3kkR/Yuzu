@@ -854,12 +854,11 @@ TEST_CASE("the per-principal generation map falls back to the global epoch at ca
     CHECK(store.revoke_generation_resident_for_test() == 2);
     CHECK(store.revoke_generation_capacity_fallback() == 0);
 
-    // C has never been in the map. Deterministic interleave (same #2367
-    // technique): fire mid-read of C, and from there revoke C's OWN self
-    // is not what races here - what races is a DIFFERENT principal's write
-    // landing while C's cache-write is in flight, exactly like the #2454
-    // write-isolation test above, except now the map is already full when
-    // the write for C itself happens.
+    // C has never been in the map, and the map is already full (A, B). This
+    // is deliberately NOT the write-isolation shape (a DIFFERENT principal's
+    // write racing C's read) - it is C's OWN revoke racing C's OWN in-flight
+    // read, which is exactly the scenario the capacity fallback exists to
+    // still catch even though C can never get its own per-principal slot.
     bool fired = false;
     store.test_hook_after_revalidate_read_ = [&] {
         if (fired)
@@ -910,7 +909,11 @@ TEST_CASE("a permanent PG error (dropped table) is confirmed unreachable, not am
     }
 
     EnginePrincipalStore store{pool};
-    REQUIRE(store.is_open()); // migration already ran; dropping post-construction
+    // The table was dropped BEFORE this construction, not after - is_open()
+    // still reports true because migration tracking only checks
+    // schema_meta's recorded version, never the target table's actual
+    // physical existence.
+    REQUIRE(store.is_open());
 
     const auto result = EngineLivenessTestAccess::revalidate(store, "engine:no-such-table");
     CHECK(result.status == EngineLookupStatus::StoreUnreachable);

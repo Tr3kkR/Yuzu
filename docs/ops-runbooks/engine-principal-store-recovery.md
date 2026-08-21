@@ -176,9 +176,11 @@ pool saturation with a healthy database**; a bare lease-acquire timeout under
 those conditions does not move this counter. One residual edge: if the
 transport hangs rather than refusing (a silent firewall drop, a blackholed
 route), the breaker only arms once a connect attempt actually times out
-(bounded by `--postgres-connect-timeout`, default 10s) — so the very first
-~10s of that specific failure mode can still be ambiguous and not arm the
-backoff; it self-corrects once that first connect attempt fails.
+(bounded by the pool's `connect_timeout`, default 10s — set per-deployment
+with a `connect_timeout=<seconds>` keyword in the `--postgres-dsn` connection
+string, NOT a separate flag) — so the very first ~10s of that specific
+failure mode can still be ambiguous and not arm the backoff; it self-corrects
+once that first connect attempt fails.
 
 **What is happening to streams meanwhile.** Held-open MCP/SSE streams
 authenticated by an engine principal are being told "indeterminate", which is
