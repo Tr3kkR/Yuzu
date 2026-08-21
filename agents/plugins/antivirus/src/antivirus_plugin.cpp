@@ -19,7 +19,8 @@
  * exclusion lists directly from the registry (rung 1). Linux/macOS acquire
  * via yuzu::agent::run_bounded_subprocess — direct argv, no shell, bounded
  * deadline (rung 2; no native replacement exists for `pgrep`/PlistBuddy/
- * `systemextensionsctl`/`stat` in this plugin). See
+ * `systemextensionsctl` in this plugin), except the two definitions-
+ * freshness reads, which are plain `stat()` calls (rung 1). See
  * docs/agent-spawn-sink-manifest.md for the per-site evidence rows.
  */
 
@@ -38,10 +39,12 @@
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess
 #endif
 
+#if defined(__linux__) || defined(__APPLE__)
+#include <ctime>       // std::tm / strftime — definitions-freshness mtime render
+#include <sys/stat.h>  // ::stat() (rung 1) — ClamAV daily.cvd / XProtect bundle mtime
+#endif
 #if defined(__linux__)
-#include <ctime>
 #include <filesystem>
-#include <sys/stat.h>
 #endif
 
 #ifdef _WIN32
@@ -61,7 +64,7 @@ namespace {
 
 #ifndef _WIN32
 // Per-call wall-clock bound for the POSIX acquisition tools (pgrep/
-// PlistBuddy/systemextensionsctl/stat). Generous enough never to fire in
+// PlistBuddy/systemextensionsctl). Generous enough never to fire in
 // practice, short enough that a wedged tool cannot pin the instruction
 // worker indefinitely — matches the users/certificates migration precedent's
 // kUsersCmdDeadline.
@@ -336,7 +339,7 @@ void list_status_linux(yuzu::CommandContext& ctx) {
 
 #elif defined(__APPLE__)
 
-// ── macOS: PlistBuddy/systemextensionsctl/pgrep/stat via the bounded runner ─
+// ── macOS: PlistBuddy/systemextensionsctl/pgrep via the bounded runner ──────
 
 constexpr const char* kXProtectInfoPlist =
     "/Library/Apple/System/Library/CoreServices/XProtect.bundle/Contents/Info.plist";
@@ -443,22 +446,27 @@ void xprotect_status_macos(yuzu::CommandContext& ctx) {
     }
     ctx.write_output(std::format("definition_version|{}", ver));
 
-    // sink: antivirus/xprotect_status_macos#2
-    auto mtime_res = yuzu::agent::run_bounded_subprocess(
-        {"/usr/bin/stat", "-f", "%Sm", "-t", "%Y-%m-%dT%H:%M:%S", kXProtectInfoPlist},
-        yuzu::agent::SubprocessOptions{.deadline = kAvCmdDeadline});
-    if (!status_forwarded)
-        status_forwarded = yuzu::agent::forward_runner_failure(ctx, mtime_res);
-    if (!mtime_res.output.empty() && mtime_res.output.find(' ') == std::string::npos) {
-        ctx.write_output(std::format("last_update|{}", mtime_res.output));
+    // Definitions freshness: a plain stat() on the bundle's Info.plist —
+    // rung 1, no subprocess (replaces the `/usr/bin/stat -f %Sm -t …` spawn
+    // this used to run). Same `%Y-%m-%dT%H:%M:%S` local-time render BSD
+    // stat's %Sm produced, so the operator-facing value is byte-identical.
+    // sink: no manifest row — in-process stat() (rung 1), not a spawn.
+    struct stat st{};
+    if (::stat(kXProtectInfoPlist, &st) == 0) {
+        char buf[32];
+        std::tm tm_buf{};
+        if (::localtime_r(&st.st_mtime, &tm_buf) != nullptr &&
+            std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm_buf) > 0) {
+            ctx.write_output(std::format("last_update|{}", buf));
+        }
     }
 
-    // sink: antivirus/xprotect_status_macos#3
+    // sink: antivirus/xprotect_status_macos#2
     auto remediator = read_plist_version(ctx, status_forwarded, kXProtectAppInfoPlist);
     if (!remediator.empty())
         ctx.write_output(std::format("remediator_version|{}", remediator));
 
-    // sink: antivirus/xprotect_status_macos#4
+    // sink: antivirus/xprotect_status_macos#3
     auto mrt = read_plist_version(ctx, status_forwarded, kMrtAppInfoPlist);
     if (!mrt.empty())
         ctx.write_output(std::format("mrt_version|{}", mrt));

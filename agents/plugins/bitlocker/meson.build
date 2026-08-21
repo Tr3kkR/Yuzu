@@ -5,14 +5,11 @@ bitlocker_include_dirs = []
 if host_machine.system() == 'windows'
   # Win32_EncryptableVolume WMI query + a per-volume GetConversionStatus()
   # method call (root\CIMV2\Security\MicrosoftVolumeEncryption) replace the
-  # raw `manage-bde -status` popen this plugin used to run. wmi_bounded.hpp
-  # (+.cpp) and win_com.hpp live in agents/shared/ and are being authored in
-  # parallel on PR3.3a -- not yet on this branch. This plugin is coded
-  # against their agreed API surface (bitlocker_windows_wmi.hpp) and will
-  # link once that PR lands; wmi_bounded.cpp compiles directly into this
-  # plugin's DLL, same as every other agents/shared consumer that isn't
-  # header-only (each plugin is its own shared_library target).
-  bitlocker_sources += files('../../shared/wmi_bounded.cpp')
+  # raw `manage-bde -status` popen this plugin used to run. The bounded
+  # helper is the header-only agents/shared/wmi_bounded.hpp (+ win_com.hpp):
+  # this plugin compiles its own private inline copy, so there is no shared
+  # .cpp to list (agents/shared/ is header-only leaves ONLY,
+  # docs/cpp-conventions.md) -- only the COM/WMI link deps below.
   bitlocker_include_dirs += include_directories('../../shared')  # wmi_bounded.hpp, win_com.hpp, win_str.hpp
   bitlocker_deps += cxx.find_library('wbemuuid')
   bitlocker_deps += cxx.find_library('ole32')

@@ -1,24 +1,11 @@
 // wmi_bounded.hpp -- shared bounded WMI query/method-call helpers.
 //
 // Hoisted from agents/plugins/license_scan/src/licensing_wmi.{hpp,cpp}
-// (roadmap C-8) — that header's own comment said it was "shaped for
 // (roadmap C-8) -- that header's own comment said it was "shaped for
 // extraction... ZERO plugin-specific dependencies", anticipating this move.
 //
 // Two unbounded `enumerator->Next(WBEM_INFINITE, ...)` call sites exist
 // elsewhere in the tree (hardware_plugin.cpp's file-private WmiQuery, and
-// the wmi plugin) — this helper exists to stop that pattern propagating.
-// NEVER call Next(WBEM_INFINITE, ...); always bound both the per-Next wait
-// and the overall enumeration under BoundedQueryOptions.
-//
-// Windows-only by construction (#ifdef _WIN32); the header is empty
-// elsewhere.
-
-#ifndef YUZU_SHARED_WMI_BOUNDED_HPP
-#define YUZU_SHARED_WMI_BOUNDED_HPP
-
-#ifdef _WIN32
-
 // the wmi plugin) -- this helper exists to stop that pattern propagating.
 // NEVER call Next(WBEM_INFINITE, ...); always bound both the per-Next wait
 // and the overall enumeration under BoundedQueryOptions.
@@ -57,8 +44,6 @@
 #include <map>
 #include <optional>
 #include <string>
-#include <vector>
-
 #include <utility>
 #include <vector>
 
@@ -82,19 +67,6 @@ struct BoundedQueryResult {
     std::vector<WmiRow> rows;
     bool truncated = false;  // row_cap reached — enumeration did NOT complete
     // Stable error token when the call failed; absent on success. Never a
-    // silent empty result on failure — see the token list below.
-    //   com_init_failed | wbem_locator_failed | wmi_connect_failed_<hr> |
-    //   wmi_query_failed_<hr> | wmi_next_timeout | wmi_deadline_exceeded |
-    //   wmi_next_failed_<hr>
-    std::optional<std::string> error;
-};
-
-/// Run a WQL SELECT against `wmi_namespace` with bounded connect + bounded
-/// semisynchronous enumeration. Never blocks unbounded: a wedged provider
-/// surfaces as `wmi_next_timeout` / `wmi_deadline_exceeded` after the
-/// configured bounds instead of hanging the agent.
-BoundedQueryResult run_bounded_wmi_query(const std::wstring& wmi_namespace, const std::wstring& wql,
-                                         const BoundedQueryOptions& opts = {});
     // silent empty result on failure — see the token constants below (the
     // ones ending in "_" are prefixes, followed by hr_hex(hr)).
     std::optional<std::string> error;
@@ -327,10 +299,6 @@ inline BoundedQueryResult run_bounded_wmi_query(const std::wstring& wmi_namespac
 /// parameters on the method's in-signature instance. On success, `rows`
 /// holds exactly one row: the method's out-parameters (including any
 /// `ReturnValue`), stringified the same way as a query row.
-BoundedQueryResult exec_object_method(const std::wstring& wmi_namespace,
-                                      const std::wstring& object_path, const std::wstring& method,
-                                      const std::map<std::wstring, std::wstring>& in_params,
-                                      const BoundedQueryOptions& opts = {});
 ///
 /// No production caller today (governance-reviewed, dormant infrastructure).
 /// This helper performs NO namespace/method/object_path allowlisting itself
@@ -451,5 +419,3 @@ inline BoundedQueryResult exec_object_method(const std::wstring& wmi_namespace,
 } // namespace yuzu::shared::wmi
 
 #endif // _WIN32
-
-#endif // YUZU_SHARED_WMI_BOUNDED_HPP

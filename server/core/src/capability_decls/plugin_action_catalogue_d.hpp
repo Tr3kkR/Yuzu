@@ -453,8 +453,9 @@ inline constexpr std::array<CommandCapability, 42> kPluginActionCatalogueD{{
     },
 
     // ── bitlocker (agents/plugins/bitlocker/src/bitlocker_plugin.cpp) ──────
-    // Single action, a status query (manage-bde/lsblk+cryptsetup/fdesetup+
-    // diskutil) — no encrypt/decrypt/enable action exists. Conservatively
+    // Single action, a status query (Win32_EncryptableVolume WMI / libblkid+
+    // sysfs / fdesetup+diskutil) — no encrypt/decrypt/enable action exists.
+    // Conservatively
     // above the Read floor given the sensitivity of encryption-status data.
     {
         .plugin = "bitlocker",

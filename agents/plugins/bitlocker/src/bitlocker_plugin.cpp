@@ -237,17 +237,21 @@ std::vector<yuzu::bitlocker::linux_dm::DmCryptMapping> enumerate_dm_mappings() {
     std::vector<yuzu::bitlocker::linux_dm::DmCryptMapping> mappings;
 
     namespace fs = std::filesystem;
+    // Error-code form throughout: construction AND every increment take the
+    // error_code, so an I/O or permission error mid-walk (hardened/sandboxed
+    // host) ends the walk with what was collected so far instead of throwing
+    // std::filesystem::filesystem_error out of execute(). Same shape as
+    // dex_linux_collector.cpp's /sys/devices/system/cpu walk. No
+    // /sys/class/block at all (non-Linux kernel, container without sysfs
+    // mounted) fails construction and yields the same honest empty result.
     std::error_code ec;
-    fs::directory_iterator it{"/sys/class/block", ec};
-    if (ec)
-        return mappings; // no /sys/class/block (non-Linux kernel, container
-                          // without sysfs mounted, etc) — honest empty result
-    for (const auto& entry : it) {
-        auto name = entry.path().filename().string();
+    for (fs::directory_iterator it{"/sys/class/block", ec}, end; !ec && it != end;
+         it.increment(ec)) {
+        auto name = it->path().filename().string();
         if (name.rfind("dm-", 0) != 0)
             continue;
 
-        std::ifstream f(entry.path() / "dm" / "uuid");
+        std::ifstream f(it->path() / "dm" / "uuid");
         if (!f)
             continue;
         std::string content{std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};

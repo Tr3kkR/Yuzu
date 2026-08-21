@@ -16,20 +16,23 @@ kind: InstructionDefinition
 metadata:
   id: security.antivirus.products
   displayName: List Antivirus Products
-  version: 1.1.0
+  version: 1.2.0
   description: >
     Enumerate installed antivirus products on the endpoint. On Windows,
-    queries WMI SecurityCenter2 for registered AV products and their
-    productState. On Linux, checks for running ClamAV (clamd),
-    CrowdStrike Falcon (falcon-sensor), and Sophos processes or
-    installation directories. On macOS, probes the XProtect definition
-    bundle (an xprotect_version row rides alongside; state reads unknown
-    when the bundle is unreadable, never assumed active) and enumerates
-    endpoint-security system extensions for third-party EDR/AV (an edr
-    row carries bundle id and version), with process detection as a
-    fallback. Older agents report XProtect as unconditionally active and
-    detect third parties by process only, so a mixed fleet shows both
-    shapes until fully upgraded.
+    queries WMI SecurityCenter2 for registered AV products and decodes
+    each productState into a protection state (enabled, snoozed, or
+    disabled) plus a definitions-freshness field (current or stale) —
+    the Windows-only third column below; older agents passed the raw
+    productState code through as the state. On Linux, checks for
+    running ClamAV (clamd), CrowdStrike Falcon (falcon-sensor), and
+    Sophos processes or installation directories. On macOS, probes the
+    XProtect definition bundle (an xprotect_version row rides alongside;
+    state reads unknown when the bundle is unreadable, never assumed
+    active) and enumerates endpoint-security system extensions for
+    third-party EDR/AV (an edr row carries bundle id and version), with
+    process detection as a fallback. Older agents report XProtect as
+    unconditionally active and detect third parties by process only, so
+    a mixed fleet shows both shapes until fully upgraded.
   tags: [security, antivirus, compliance, inventory]
 
 spec:
@@ -50,7 +53,14 @@ spec:
       - name: name
         type: string
       - name: state
-        type: string
+        type: string # Windows: enabled | snoozed | disabled (decoded
+                      # productState). Linux/macOS: presence/liveness tokens
+                      # (running, installed, active, unknown), as before.
+      - name: definitions
+        type: string # Windows-only: current | stale (productState low
+                      # byte). Linux/macOS rows carry only name+state — a
+                      # 3-field `av|<name>|<state>` line — so this column is
+                      # absent (not blank) off Windows.
     aggregation:
       groupBy: [name]
       operations: [count]
@@ -181,7 +191,7 @@ spec:
       - name: definition_version
         type: string
       - name: last_update
-        type: string # ISO-8601 (macOS `stat`); the Windows defender_status
+        type: string # ISO-8601 (bundle mtime, local time); the Windows defender_status
                       # last_update is a locale-dependent PowerShell render —
                       # do not treat the two as interchangeably formatted
       - name: remediator_version
