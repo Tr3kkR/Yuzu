@@ -178,7 +178,12 @@ not the numbers:
    fake `perm_fn` defaults to "always allow" (unlike production's real
    `require_permission`), so the test needed an explicit `perm_override_for_test` to keep
    proving the tool still denies a service-scoped token post-retirement — without it, the
-   test would have silently started asserting nothing.
+   test would have silently started asserting nothing. Governance's own Gate 3
+   quality-engineer pass surfaced a second, related gap this PR does not fix: only
+   `POST /api/schedules` (create) has real route-level end-to-end test coverage — list,
+   delete, and enable never did (their only prior "coverage" was the now-deleted direct
+   unit test of the retired helper, which never went through the real routes at all).
+   This is the exact shape that let #3378 go undetected — filed as #3390.
 2. **Read-only fleet reads, by plausible ITServiceOwner value** (this migration's own
    reasoning, applied forward): device/network lists (`list_dex_perf_devices`,
    `list_network_devices` + REST twins) → `list_schedules` → DEX/Guardian reads.
