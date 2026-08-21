@@ -192,7 +192,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     .counter("yuzu_enrollment_token_rejected_total",
                              {{"variant", "invalid_input_length"}})
                     .increment();
-                if (analytics_store_) {
+                if (auto analytics_store = analytics_store_.lock()) {
                     AnalyticsEvent ae;
                     ae.event_type = "agent.enrollment_denied";
                     ae.agent_id = info.agent_id();
@@ -202,7 +202,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     ae.severity = Severity::kWarn;
                     ae.attributes = {{"reason", "invalid_input_length"},
                                      {"token_length", enrollment_token.size()}};
-                    analytics_store_->emit(std::move(ae));
+                    analytics_store->emit(std::move(ae));
                 }
                 response->set_accepted(false);
                 response->set_reject_reason(
@@ -288,7 +288,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                 if (!audit_ok)
                     signal_grpc_audit_failed(context);
 
-                if (analytics_store_) {
+                if (auto analytics_store = analytics_store_.lock()) {
                     AnalyticsEvent ae;
                     ae.event_type = "agent.enrollment_denied";
                     ae.agent_id = info.agent_id();
@@ -311,7 +311,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                         attrs["already_consumed_by"] = already_consumed_by;
                     }
                     ae.attributes = std::move(attrs);
-                    analytics_store_->emit(std::move(ae));
+                    analytics_store->emit(std::move(ae));
                 }
 
                 response->set_accepted(false);
@@ -357,7 +357,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
             // mirroring the denial path's audit_ok handling. SOC 2 CC7.2.
             if (!enroll_audit_ok) {
                 signal_grpc_audit_failed(context);
-                if (analytics_store_) {
+                if (auto analytics_store = analytics_store_.lock()) {
                     AnalyticsEvent ae;
                     ae.event_type = "agent.enrollment_audit_dropped";
                     ae.agent_id = info.agent_id();
@@ -367,7 +367,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     ae.severity = Severity::kError;
                     ae.attributes = {
                         {"result", "success"}, {"audit_emitted", false}, {"source", "direct"}};
-                    analytics_store_->emit(std::move(ae));
+                    analytics_store->emit(std::move(ae));
                 }
             }
 
@@ -423,14 +423,14 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     response->set_enrollment_status("pending");
                     bus_.publish("pending-agent", info.agent_id());
                     spdlog::info("Agent {} placed in pending approval queue", info.agent_id());
-                    if (analytics_store_) {
+                    if (auto analytics_store = analytics_store_.lock()) {
                         AnalyticsEvent ae;
                         ae.event_type = "agent.enrollment_pending";
                         ae.agent_id = info.agent_id();
                         ae.hostname = info.hostname();
                         ae.os = info.platform().os();
                         ae.arch = info.platform().arch();
-                        analytics_store_->emit(std::move(ae));
+                        analytics_store->emit(std::move(ae));
                     }
                     return grpc::Status::OK;
                 }
@@ -446,7 +446,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     response->set_accepted(false);
                     response->set_reject_reason("enrollment denied by administrator");
                     response->set_enrollment_status("denied");
-                    if (analytics_store_) {
+                    if (auto analytics_store = analytics_store_.lock()) {
                         AnalyticsEvent ae;
                         ae.event_type = "agent.enrollment_denied";
                         ae.agent_id = info.agent_id();
@@ -455,7 +455,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                         ae.arch = info.platform().arch();
                         ae.severity = Severity::kWarn;
                         ae.attributes = {{"reason", "admin_denied"}};
-                        analytics_store_->emit(std::move(ae));
+                        analytics_store->emit(std::move(ae));
                     }
                     return grpc::Status::OK;
 
@@ -483,7 +483,7 @@ enrolled:
     if (fleet_topology_store_)
         fleet_topology_store_->invalidate();
 
-    if (analytics_store_) {
+    if (auto analytics_store = analytics_store_.lock()) {
         AnalyticsEvent ae;
         ae.event_type = "agent.registered";
         ae.agent_id = info.agent_id();
@@ -499,7 +499,7 @@ enrolled:
             plugins_list.push_back(p.name());
         }
         ae.payload = {{"plugins", plugins_list}};
-        analytics_store_->emit(std::move(ae));
+        analytics_store->emit(std::move(ae));
     }
 
     // Create notification for FIRST enrollment only (#3261 governance
@@ -1158,13 +1158,13 @@ grpc::Status AgentServiceImpl::Subscribe(
     registry_.map_session(session_id, agent_id);
 
     auto subscribe_start = std::chrono::steady_clock::now();
-    if (analytics_store_) {
+    if (auto analytics_store = analytics_store_.lock()) {
         AnalyticsEvent ae;
         ae.event_type = "agent.connected";
         ae.agent_id = agent_id;
         ae.session_id = session_id;
         ae.attributes = {{"via", "direct"}};
-        analytics_store_->emit(std::move(ae));
+        analytics_store->emit(std::move(ae));
     }
 
     // Read loop -- process responses from the agent
@@ -1264,14 +1264,14 @@ grpc::Status AgentServiceImpl::Subscribe(
             // `agent-transition` event fires for live updates.
             notify_exec_tracker(resp.command_id(), agent_id, resp);
 
-            if (analytics_store_) {
+            if (auto analytics_store = analytics_store_.lock()) {
                 AnalyticsEvent ae;
                 ae.event_type = "command.response";
                 ae.agent_id = agent_id;
                 ae.plugin = plugin;
                 ae.correlation_id = resp.command_id();
                 ae.payload = {{"output_bytes", resp.output().size()}};
-                analytics_store_->emit(std::move(ae));
+                analytics_store->emit(std::move(ae));
             }
 
         } else {
@@ -1351,7 +1351,7 @@ grpc::Status AgentServiceImpl::Subscribe(
                                                    "</span>");
             }
 
-            if (analytics_store_) {
+            if (auto analytics_store = analytics_store_.lock()) {
                 AnalyticsEvent ae;
                 ae.event_type = "command.completed";
                 ae.agent_id = agent_id;
@@ -1363,7 +1363,7 @@ grpc::Status AgentServiceImpl::Subscribe(
                 if (resp.has_error()) {
                     ae.payload["error_message"] = resp.error().message();
                 }
-                analytics_store_->emit(std::move(ae));
+                analytics_store->emit(std::move(ae));
             }
 
             // Create notification on execution failure
@@ -1427,7 +1427,7 @@ grpc::Status AgentServiceImpl::Subscribe(
         fleet_topology_store_->evict_pushed(agent_id);
     spdlog::info("Agent subscribe stream closed for {} (session={})", agent_id, session_id);
 
-    if (analytics_store_) {
+    if (auto analytics_store = analytics_store_.lock()) {
         auto session_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
                                     std::chrono::steady_clock::now() - subscribe_start)
                                     .count();
@@ -1436,7 +1436,7 @@ grpc::Status AgentServiceImpl::Subscribe(
         ae.agent_id = agent_id;
         ae.session_id = session_id;
         ae.payload = {{"session_duration_ms", session_duration}};
-        analytics_store_->emit(std::move(ae));
+        analytics_store->emit(std::move(ae));
     }
 
     return grpc::Status::OK;
@@ -1518,14 +1518,14 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         // UAT 2026-05-06 #8: gateway-streamed RUNNING — notify tracker.
         notify_exec_tracker(resp.command_id(), agent_id, resp);
 
-        if (analytics_store_) {
+        if (auto analytics_store = analytics_store_.lock()) {
             AnalyticsEvent ae;
             ae.event_type = "command.response";
             ae.agent_id = agent_id;
             ae.plugin = plugin;
             ae.correlation_id = resp.command_id();
             ae.payload = {{"output_bytes", resp.output().size()}};
-            analytics_store_->emit(std::move(ae));
+            analytics_store->emit(std::move(ae));
         }
     } else {
         spdlog::info("[gateway] Command {} completed: status={}, exit_code={}", resp.command_id(),
@@ -1588,7 +1588,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
                                                "</span>");
         }
 
-        if (analytics_store_) {
+        if (auto analytics_store = analytics_store_.lock()) {
             AnalyticsEvent ae;
             ae.event_type = "command.completed";
             ae.agent_id = agent_id;
@@ -1600,7 +1600,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             if (resp.has_error()) {
                 ae.payload["error_message"] = resp.error().message();
             }
-            analytics_store_->emit(std::move(ae));
+            analytics_store->emit(std::move(ae));
         }
 
         if (resp.status() != pb::CommandResponse::SUCCESS && notification_store_ &&

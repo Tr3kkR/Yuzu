@@ -3915,6 +3915,37 @@ TEST_CASE("McpPostPump: the wait is bounded by the next credential check, not a 
     CHECK(std::chrono::steady_clock::now() - spin_start >= std::chrono::microseconds(500));
 }
 
+TEST_CASE("McpPostPump/CH-4: a revoked credential kills the streamed-POST within one tick",
+          "[mcp][bridge][2f][ch4]") {
+    // "McpPostPump: revocation and session death close the response (C7)" above (landed
+    // PR 3b, f268d78d) already proves the WIRE-level outcome for this exact scenario.
+    // This test adds the same proof at the close_reason() ACCESSOR level - the state a
+    // caller outside the wire (e.g. the bridge's own audit path) actually reads - as a
+    // second, independent angle on the same verdict rather than a gap-fill; a bug that
+    // latched the wrong reason into close_reason_ while still writing the right string
+    // to the wire (or vice versa) would pass the C7 SECTION and fail this one.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-ch4"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+
+    mcp::McpPostPump pump(
+        sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); }, {},
+        [] { return mcp::StreamRevalidate::kRevoked; }, [] { return true; }, fast_post_cfg());
+
+    PostWire wire;
+    // next_check_ defaults to the epoch (never seeded in the ctor, per CH-22 above),
+    // so the credential check is due on the very first tick.
+    CHECK_FALSE(pump.pump_once(wire.writer())); // provider ends
+    CHECK(pump.close_reason() == mcp::McpStreamClose::kCredentialRevoked);
+    CHECK(wire.contains(R"("reason":"credential_revoked")"));
+}
+
 TEST_CASE("bridge take_post_batch - ring-commits and hands the same frames to the wire (C7)",
           "[mcp][bridge][2f]") {
     // The ring copy is the durable one (GET resume); the returned frames are the

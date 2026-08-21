@@ -152,7 +152,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                                   {{"variant", "invalid_input_length"}})
                         .increment();
                 }
-                if (analytics_store_) {
+                if (auto analytics_store = analytics_store_.lock()) {
                     AnalyticsEvent ae;
                     ae.event_type = "agent.enrollment_denied";
                     ae.agent_id = info.agent_id();
@@ -163,7 +163,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                     ae.attributes = {{"reason", "invalid_input_length"},
                                      {"token_length", enrollment_token.size()},
                                      {"source", "gateway_proxy"}};
-                    analytics_store_->emit(std::move(ae));
+                    analytics_store->emit(std::move(ae));
                 }
                 response->set_accepted(false);
                 response->set_reject_reason(
@@ -229,7 +229,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                 if (!audit_ok)
                     signal_grpc_audit_failed(context);
 
-                if (analytics_store_) {
+                if (auto analytics_store = analytics_store_.lock()) {
                     AnalyticsEvent ae;
                     ae.event_type = "agent.enrollment_denied";
                     ae.agent_id = info.agent_id();
@@ -248,7 +248,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                         attrs["already_consumed_by"] = already_consumed_by;
                     }
                     ae.attributes = std::move(attrs);
-                    analytics_store_->emit(std::move(ae));
+                    analytics_store->emit(std::move(ae));
                 }
 
                 response->set_accepted(false);
@@ -291,7 +291,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
             // mirroring the denial path's audit_ok handling. SOC 2 CC7.2.
             if (!enroll_audit_ok) {
                 signal_grpc_audit_failed(context);
-                if (analytics_store_) {
+                if (auto analytics_store = analytics_store_.lock()) {
                     AnalyticsEvent ae;
                     ae.event_type = "agent.enrollment_audit_dropped";
                     ae.agent_id = info.agent_id();
@@ -302,7 +302,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                     ae.attributes = {{"result", "success"},
                                      {"audit_emitted", false},
                                      {"source", "gateway_proxy"}};
-                    analytics_store_->emit(std::move(ae));
+                    analytics_store->emit(std::move(ae));
                 }
             }
 
