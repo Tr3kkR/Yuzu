@@ -161,7 +161,12 @@ writes its own material as though it were authoritative, and never silently oper
 overwrites, a root it doesn't recognise. Multi-replica HA over one shared `ca_store` Postgres +
 one shared `--ca-dir` volume is **not an officially supported deployment topology today** (see
 "Self-heal" below); a single-instance-per-directory deployment never reaches this branch at all,
-since `try_insert_root` only ever contends against itself in that shape.
+since `try_insert_root` only ever contends against itself in that shape. The real fix is tracked,
+not this migration's job: `docs/adr/2002-high-availability-architecture.md` WS-6 ("PKI/CA HA")
+plans moving the CA key off local disk entirely (a `SecretCodec` blob in Postgres) plus a durable
+CRL-publication state machine — status `planned`, `docs/ha-delivery-matrix.md`. The self-heal
+mechanism below is a stopgap that keeps a shared-directory topology safe in the meantime, not the
+eventual architecture.
 
 **Tested** (`try_insert_root — a losing caller reads back the winner, never clobbers it`,
 `[ca_store][pg][root][security]`): two `try_insert_root` calls with distinct root material against
