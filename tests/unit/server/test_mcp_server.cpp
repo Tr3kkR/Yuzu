@@ -4269,6 +4269,15 @@ TEST_CASE("MCP get_dex_group_app_perf: still denies a service-scoped token "
         R"({"jsonrpc":"2.0","method":"tools/call","id":94,"params":{"name":"get_dex_group_app_perf","arguments":{"group_id":"g1","app":"chrome.exe"}}})");
     REQUIRE(res);
     CHECK(res->status == 403); // denied at the GuaranteedState:Read gate
+    // NOT the JSON-RPC kPermissionDenied error-code shape other tool-specific
+    // denial tests in this file assert on — this test's denial comes from the
+    // fake perm_fn (McpTestServer harness, ~line 1018), which mimics
+    // require_permission's real REST-style 403 body, not an MCP JSON-RPC
+    // envelope (the tool-specific branch that would construct one is never
+    // reached, matching production's own perm_fn gate ordering).
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"] == "forbidden");
 
     for (const auto& a : ts.audit_log)
         CHECK(a != "dex.perf.group.view|success");
