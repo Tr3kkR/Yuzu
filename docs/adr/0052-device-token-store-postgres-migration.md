@@ -259,6 +259,40 @@ has to guard against.
 - The mid-scan-corruption guard is the same shape as `DeploymentStore`'s/`LicenseStore`'s: the
   terminal SQLite step code must be `SQLITE_DONE`, never merely "loop exited", so a corrupt page
   is never silently treated as an empty/complete table.
+- **Memory is bounded; the legacy table is never materialized (#3399).** The fingerprint is a
+  streaming SHA-256 over the `token_id ASC` scan — one encoded row resident at a time, not the
+  whole table — byte-identical to the sorted-canonical-form hash a naive materialize-then-sort
+  implementation would produce, because every encoded row starts `<32>:<token_id>` and `token_id`
+  is the table's PK, so sorting the encodings and scanning in PK order produce the same sequence
+  (pinned by a golden-fingerprint regression test). The copy pass re-reads the same SQLite
+  snapshot and inserts in `kBackfillBatchRows` (500) row batches, each one
+  `INSERT ... SELECT FROM unnest(...) ON CONFLICT (token_id) DO NOTHING RETURNING token_id`
+  (`software_inventory_store.cpp`'s batched-insert pattern, ADR-0016/#1664) — conflicts are the
+  batch rows `RETURNING` did not cover, and go through the same IDENTITY/LIFECYCLE classification
+  above.
+  Resident state is therefore O(500 rows) regardless of legacy table size, closing the gap
+  `QuarantineStore`'s post-materialization row cap (ADR-0047, itself flagged as a gap in that
+  ADR's own UP-6) would otherwise reintroduce here. **Deliberately no row cap**: unlike
+  `QuarantineStore`, a cap would convert ordinary fleet growth into a boot refusal with no
+  data-integrity justification — device tokens plausibly scale with device count, and streaming
+  removes the reason a cap existed in the first place.
+- **Retry contract is fail-closed and all-or-nothing.** Every legacy read, every batch insert,
+  every conflict read-back, and the marker `INSERT` run inside ONE Postgres transaction (the
+  SQLite snapshot transaction closes inside it too, immediately before the marker stamp). Any
+  failure at any stage — a mid-scan read error, a hex-validation failure, a batch statement error,
+  an IDENTITY/LIFECYCLE fail-closed classification, a pass-1/pass-2 row-count mismatch, or a
+  failure to close the SQLite snapshot — leaves the marker unstamped, so the NEXT BOOT
+  re-fingerprints and retries the WHOLE file from scratch; a partial prior attempt never leaves
+  partial rows (a fault-injection regression test proves this for a multi-batch failure
+  specifically, not just a single-row one). This is the same contract the pre-#3399 per-row loop
+  had — restructuring the copy pass into batches did not change it.
+- **Legacy read discipline (#3398).** The read-only SQLite connection sets
+  `PRAGMA busy_timeout=5000` (restoring the pre-migration store's setting, dropped by the initial
+  rewrite; matches `SoftwareDeploymentStore`'s measured A/B precedent) and wraps the schema probe
+  and both backfill passes in one deferred `BEGIN` snapshot transaction, so a legacy file merely
+  held by a concurrent writer's lock is waited out — rather than surfaced immediately as a
+  corruption-flavoured "scan aborted mid-read" — and both passes are guaranteed to see identical
+  bytes.
 - Legacy files are read READ-ONLY and never deleted/moved — retained for the ADR-0009
   one-release rollback window.
 
