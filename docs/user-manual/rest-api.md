@@ -4833,7 +4833,11 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ### Device Tokens
 
-Device tokens are scoped authentication tokens that restrict execution to a specific device and instruction definition. Used for unattended agent operations.
+Device tokens are scoped authentication tokens that restrict execution to a specific device and instruction definition. Used for unattended agent operations. `DeviceTokenStore` is currently not
+constructed by the server (capability 18.8 is deliberately shelved — same family as [License
+Management](#license-management), `docs/adr/0052-device-token-store-postgres-migration.md`
+Context), so these routes do not register today; documented for when a future change re-wires
+them.
 
 #### `GET /api/v1/device-tokens`
 
@@ -4862,6 +4866,12 @@ List all device tokens.
 }
 ```
 
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| A genuine database read failure | `503` |
+
 #### `POST /api/v1/device-tokens`
 
 Create a device-scoped token. The raw token value is returned exactly once at creation time.
@@ -4886,6 +4896,15 @@ Create a device-scoped token. The raw token value is returned exactly once at cr
 }
 ```
 
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| Malformed JSON body | `400` — `invalid JSON` |
+| `name`/`device_id`/`definition_id` exceeds 256 chars | `400` — `invalid_input_length: ...` |
+| CSPRNG entropy exhaustion | `503` + `Retry-After: 5` — `CSPRNG unavailable: ...` |
+| A genuine database write failure | `503` + `Retry-After: 5` — `service unavailable` |
+
 #### `DELETE /api/v1/device-tokens/{id}`
 
 Revoke a device token.
@@ -4900,6 +4919,13 @@ Revoke a device token.
   "meta": { "api_version": "v1" }
 }
 ```
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| No token with this id | `404` — `token not found` |
+| A genuine database write failure | `503` — `service unavailable` |
 
 ---
 
