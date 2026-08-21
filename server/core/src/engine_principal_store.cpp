@@ -509,11 +509,13 @@ void EnginePrincipalStore::invalidate_revalidate_cache(const std::string& princi
         // No per-key identity to target, so the only sound guard is the
         // coarse global epoch — every in-flight reader, for every principal,
         // must be invalidated (this is not on any production call path
-        // today; see the hpp field comment). Also reclaims the per-principal
-        // map: the epoch bump already invalidates every pre-clear snapshot
-        // regardless of per-principal state, so clearing the map here is
-        // sound and gives an operator a capacity-reset lever, on top of the
-        // TTL sweep (#3385) that now reclaims it on its own.
+        // today; see the hpp field comment -- no operator-facing route
+        // reaches this branch, so it is NOT a wired capacity-reset lever,
+        // only a sound-if-it-were-called one). Also reclaims the
+        // per-principal map: the epoch bump already invalidates every
+        // pre-clear snapshot regardless of per-principal state, so clearing
+        // the map here is sound, on top of the TTL sweep (#3385) that now
+        // reclaims it on its own without needing this path at all.
         ++revoke_generation_global_epoch_;
         revoke_generation_by_principal_.clear();
         revalidate_cache_.clear();
