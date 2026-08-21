@@ -70,6 +70,10 @@ namespace yuzu::server::pg {
 class PgPool;
 }
 
+namespace yuzu {
+class MetricsRegistry;
+}
+
 namespace yuzu::server {
 
 /// Machine-checkable prefix on every `ProductPackStore` `unexpected()` that represents a genuine
@@ -128,6 +132,16 @@ public:
     ProductPackStore& operator=(const ProductPackStore&) = delete;
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
+
+    /// Wire a metrics registry for the backfill-result counter
+    /// (`yuzu_server_product_pack_backfill_total{result}`) and `list`/`get`'s read-degrade
+    /// counter (`yuzu_server_product_pack_read_degrade_total{reason}`), matching
+    /// `CustomPropertiesStore`/`DiscoveryStore`'s #1675 convention. Set ONCE during
+    /// single-threaded startup — BEFORE `migrate_from_sqlite()`, so the backfill counter is
+    /// live on the one pass that matters (the #3261/#3294 wiring-order class; see the
+    /// construction-site comment in server.cpp). A null registry (the default, e.g. in unit
+    /// tests) disables emission.
+    void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
 
     /// Legacy-SQLite backfill (ADR-0009/0054). Call once at server startup, before serving, after
     /// construction has proven the Postgres schema is open. Idempotent PER DISTINCT LEGACY-FILE
@@ -215,6 +229,7 @@ private:
     bool open_{false};
     /// Security-by-default since #802 (W7.4): see the setter doc above.
     std::atomic<bool> require_signed_packs_{true};
+    yuzu::MetricsRegistry* metrics_{nullptr};
 
     // Split multi-document YAML on "---" boundaries
     static std::vector<std::string> split_yaml_documents(const std::string& bundle);

@@ -586,6 +586,169 @@ TEST_CASE("ProductPackStore::migrate_from_sqlite: half-schema legacy file fails 
     CHECK_FALSE(store.migrate_from_sqlite(legacy_db.path));
 }
 
+// Regression net for the item-conflict read-back bind bug (found in W7.4/ADR-0054 governance):
+// the read-back that decides whether a conflicting `product_pack_items` row is a benign replay
+// bound the RAW `item_id`, while every write path (including the very INSERT that lost the
+// race) binds `sanitize_pg_text(item_id)`. For an item_id that sanitizes to something
+// DIFFERENT from its raw bytes (invalid UTF-8, here — an embedded NUL hits the identical class
+// but is awkward to author through `legacy_exec`'s C-string API), the read-back's WHERE clause
+// never matched the row that is actually there, and a byte-identical replay was misreported as
+// "could not be read back for comparison" — failing the ENTIRE backfill transaction closed,
+// including the unrelated pack this same legacy file also carried. Exercises both the
+// pack-level AND item-level "identical content is a benign no-op" contract the file header
+// claims (undocumented before this test — see governance finding).
+TEST_CASE("ProductPackStore::migrate_from_sqlite: identical-content conflict (incl. a "
+          "non-UTF8 item_id) is a benign no-op, not a fail-closed error",
+          "[product_pack_store][pg]") {
+    yuzu::test::TempDbFile legacy_a{std::string_view{"pack-legacy-conflict-a-"}};
+    {
+        SqliteDb db;
+        REQUIRE(sqlite3_open_v2(legacy_a.path.string().c_str(), db.addr(),
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+        legacy_exec(db.get(),
+                    "CREATE TABLE product_packs (id TEXT PRIMARY KEY, name TEXT NOT NULL, "
+                    "version TEXT NOT NULL DEFAULT '1.0.0', description TEXT NOT NULL DEFAULT "
+                    "'', yaml_source TEXT NOT NULL, installed_at INTEGER NOT NULL DEFAULT 0, "
+                    "verified INTEGER NOT NULL DEFAULT 0);");
+        legacy_exec(db.get(),
+                    "CREATE TABLE product_pack_items (pack_id TEXT NOT NULL, kind TEXT NOT "
+                    "NULL, item_id TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', yaml_source "
+                    "TEXT NOT NULL DEFAULT '', PRIMARY KEY (pack_id, item_id));");
+        legacy_exec(db.get(),
+                    "INSERT INTO product_packs VALUES ('conflict-pack-shared', 'Shared Pack', "
+                    "'1.0.0', 'replayed across two legacy files', 'kind: ProductPack', "
+                    "1700000000, 0);");
+        // Raw byte 0xFF is not valid UTF-8 on its own — sanitize_pg_text() replaces it with
+        // U+FFFD on write, so the STORED item_id differs from this raw one.
+        legacy_exec(db.get(),
+                    "INSERT INTO product_pack_items VALUES ('conflict-pack-shared', "
+                    "'InstructionDefinition', 'item-\xFF-bad', 'Shared Item', "
+                    "'kind: InstructionDefinition');");
+    }
+    yuzu::test::TempDbFile legacy_b{std::string_view{"pack-legacy-conflict-b-"}};
+    {
+        SqliteDb db;
+        REQUIRE(sqlite3_open_v2(legacy_b.path.string().c_str(), db.addr(),
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+        legacy_exec(db.get(),
+                    "CREATE TABLE product_packs (id TEXT PRIMARY KEY, name TEXT NOT NULL, "
+                    "version TEXT NOT NULL DEFAULT '1.0.0', description TEXT NOT NULL DEFAULT "
+                    "'', yaml_source TEXT NOT NULL, installed_at INTEGER NOT NULL DEFAULT 0, "
+                    "verified INTEGER NOT NULL DEFAULT 0);");
+        legacy_exec(db.get(),
+                    "CREATE TABLE product_pack_items (pack_id TEXT NOT NULL, kind TEXT NOT "
+                    "NULL, item_id TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', yaml_source "
+                    "TEXT NOT NULL DEFAULT '', PRIMARY KEY (pack_id, item_id));");
+        // Byte-identical shared pack + item (forces the conflict path on replay)...
+        legacy_exec(db.get(),
+                    "INSERT INTO product_packs VALUES ('conflict-pack-shared', 'Shared Pack', "
+                    "'1.0.0', 'replayed across two legacy files', 'kind: ProductPack', "
+                    "1700000000, 0);");
+        legacy_exec(db.get(),
+                    "INSERT INTO product_pack_items VALUES ('conflict-pack-shared', "
+                    "'InstructionDefinition', 'item-\xFF-bad', 'Shared Item', "
+                    "'kind: InstructionDefinition');");
+        // ...plus an unrelated pack so this file's overall fingerprint differs from legacy_a's
+        // (otherwise fingerprint dedup would skip the whole file before ever reaching the
+        // per-row conflict-resolution code this test targets).
+        legacy_exec(db.get(),
+                    "INSERT INTO product_packs VALUES ('conflict-pack-b-only', 'B-Only Pack', "
+                    "'1.0.0', 'only in legacy file B', 'kind: ProductPack', 1700000001, 0);");
+    }
+
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.migrate_from_sqlite(legacy_a.path));
+    // legacy_b replays the identical shared pack+item (conflict, but content-identical) and
+    // introduces one new pack. Pre-fix, the item read-back's raw-vs-sanitized bind mismatch
+    // made this return false and roll back the ENTIRE transaction, including the new pack.
+    REQUIRE(store.migrate_from_sqlite(legacy_b.path));
+
+    auto shared = store.get("conflict-pack-shared");
+    REQUIRE(shared.has_value());
+    REQUIRE(shared->has_value());
+    REQUIRE((*shared)->items.size() == 1);
+    CHECK((*shared)->items[0].name == "Shared Item");
+
+    auto b_only = store.get("conflict-pack-b-only");
+    REQUIRE(b_only.has_value());
+    REQUIRE(b_only->has_value());
+    CHECK((*b_only)->name == "B-Only Pack");
+}
+
+// Companion to the identical-content case above: a conflicting row whose content genuinely
+// DIFFERS must fail the backfill closed (every product_packs/product_pack_items column is
+// write-once — see product_pack_store.hpp file header) rather than silently keep whichever
+// value happened to insert first, and must not partially apply the rest of that legacy file's
+// content (one transaction).
+TEST_CASE("ProductPackStore::migrate_from_sqlite: differently-valued conflict fails closed "
+          "and does not partially apply the rest of the file",
+          "[product_pack_store][pg]") {
+    yuzu::test::TempDbFile legacy_a{std::string_view{"pack-legacy-diffconflict-a-"}};
+    {
+        SqliteDb db;
+        REQUIRE(sqlite3_open_v2(legacy_a.path.string().c_str(), db.addr(),
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+        legacy_exec(db.get(),
+                    "CREATE TABLE product_packs (id TEXT PRIMARY KEY, name TEXT NOT NULL, "
+                    "version TEXT NOT NULL DEFAULT '1.0.0', description TEXT NOT NULL DEFAULT "
+                    "'', yaml_source TEXT NOT NULL, installed_at INTEGER NOT NULL DEFAULT 0, "
+                    "verified INTEGER NOT NULL DEFAULT 0);");
+        legacy_exec(db.get(),
+                    "CREATE TABLE product_pack_items (pack_id TEXT NOT NULL, kind TEXT NOT "
+                    "NULL, item_id TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', yaml_source "
+                    "TEXT NOT NULL DEFAULT '', PRIMARY KEY (pack_id, item_id));");
+        legacy_exec(db.get(),
+                    "INSERT INTO product_packs VALUES ('diffconflict-pack', 'Original Pack', "
+                    "'1.0.0', 'original description', 'kind: ProductPack', 1700000000, 0);");
+    }
+    yuzu::test::TempDbFile legacy_c{std::string_view{"pack-legacy-diffconflict-c-"}};
+    {
+        SqliteDb db;
+        REQUIRE(sqlite3_open_v2(legacy_c.path.string().c_str(), db.addr(),
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+        legacy_exec(db.get(),
+                    "CREATE TABLE product_packs (id TEXT PRIMARY KEY, name TEXT NOT NULL, "
+                    "version TEXT NOT NULL DEFAULT '1.0.0', description TEXT NOT NULL DEFAULT "
+                    "'', yaml_source TEXT NOT NULL, installed_at INTEGER NOT NULL DEFAULT 0, "
+                    "verified INTEGER NOT NULL DEFAULT 0);");
+        legacy_exec(db.get(),
+                    "CREATE TABLE product_pack_items (pack_id TEXT NOT NULL, kind TEXT NOT "
+                    "NULL, item_id TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', yaml_source "
+                    "TEXT NOT NULL DEFAULT '', PRIMARY KEY (pack_id, item_id));");
+        // Same id, DIFFERENT version — the write-once-column violation this test targets.
+        legacy_exec(db.get(),
+                    "INSERT INTO product_packs VALUES ('diffconflict-pack', 'Original Pack', "
+                    "'2.0.0', 'original description', 'kind: ProductPack', 1700000000, 0);");
+        legacy_exec(db.get(),
+                    "INSERT INTO product_packs VALUES ('diffconflict-pack-c-only', "
+                    "'C-Only Pack', '1.0.0', 'only in legacy file C', 'kind: ProductPack', "
+                    "1700000002, 0);");
+    }
+
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.migrate_from_sqlite(legacy_a.path));
+    CHECK_FALSE(store.migrate_from_sqlite(legacy_c.path));
+
+    // Write-once: the original row is untouched by the failed/rolled-back replay.
+    auto pack = store.get("diffconflict-pack");
+    REQUIRE(pack.has_value());
+    REQUIRE(pack->has_value());
+    CHECK((*pack)->version == "1.0.0");
+
+    // The unrelated new pack in the same (failed) transaction was NOT partially applied.
+    auto c_only = store.get("diffconflict-pack-c-only");
+    REQUIRE(c_only.has_value());
+    CHECK_FALSE(c_only->has_value());
+}
+
 // H2 net (governance-pattern regression, matches ResultSetStore/LicenseStore's own mid-scan
 // tests): a legacy SQLite file that dies MID-SCAN (a corrupt page / short read, not simply "file
 // absent" or "well-formed and empty") must abort the backfill without stamping the marker.

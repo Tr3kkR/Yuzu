@@ -7,11 +7,14 @@
 #include "sqlite_raii.hpp"
 #include "utf8_sanitize.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <format>
@@ -55,6 +58,36 @@ constexpr int kDefaultListLimit = 100;
 constexpr int kMaxListLimit = 10000;
 
 constexpr const char* kSourcelessFingerprint = "sourceless";
+
+// ── Read-degrade observability (#1675 convention, mirrors CustomPropertiesStore) ──
+constexpr const char* kReasonStoreNotOpen = "store_not_open";
+constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
+constexpr const char* kReasonQueryError = "query_error";
+constexpr std::uint64_t kReadDegradeLogSample = 100;
+constexpr std::int64_t kDegradeEpisodeGapSecs = 60;
+
+struct DegradeSampler {
+    std::atomic<std::uint64_t> count{0};
+    std::atomic<std::int64_t> last_ts{0};
+};
+
+bool note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason, DegradeSampler& s) {
+    if (metrics)
+        metrics->counter("yuzu_server_product_pack_read_degrade_total", {{"reason", reason}})
+            .increment();
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                                  std::chrono::system_clock::now().time_since_epoch())
+                                  .count();
+    const std::int64_t prev = s.last_ts.exchange(now, std::memory_order_relaxed);
+    const std::uint64_t n = s.count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool new_episode = prev == 0 || (now - prev) > kDegradeEpisodeGapSecs;
+    return new_episode || (n % kReadDegradeLogSample) == 0;
+}
+
+// One sampler per distinct read call site (a shared sampler would let a hot `list()` degrade
+// mask a cold `get()` one from ever logging).
+DegradeSampler g_list_sampler;
+DegradeSampler g_get_sampler;
 
 int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -520,11 +553,21 @@ bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
     if (!open_)
         return false;
 
+    // Mirrors CustomPropertiesStore's #1675 convention: "failed"/"fresh"/"success" only — the
+    // already-processed fast-skip path (below) emits no metric at all, matching that precedent
+    // exactly (a boot that does nothing new to the backfill state has nothing to count).
+    const auto backfill_metric = [this](const char* result) {
+        if (metrics_)
+            metrics_->counter("yuzu_server_product_pack_backfill_total", {{"result", result}})
+                .increment();
+    };
+
     std::error_code ec;
     const bool legacy_exists = std::filesystem::exists(legacy_db_path, ec);
     if (ec) {
         spdlog::error("ProductPackStore::migrate_from_sqlite: cannot stat legacy path {}: {}",
                       legacy_db_path.string(), ec.message());
+        backfill_metric("failed");
         return false;
     }
 
@@ -543,6 +586,7 @@ bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
             spdlog::error("ProductPackStore::migrate_from_sqlite: failed to open legacy {}: {}",
                           legacy_db_path.string(),
                           legacy ? sqlite3_errmsg(legacy.get()) : "open failed");
+            backfill_metric("failed");
             return false;
         }
 
@@ -552,6 +596,7 @@ bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
             spdlog::error("ProductPackStore::migrate_from_sqlite: schema probe failed on legacy "
                           "{}: {}",
                           legacy_db_path.string(), sqlite3_errmsg(legacy.get()));
+            backfill_metric("failed");
             return false;
         }
         const bool has_packs = *packs_probe;
@@ -570,6 +615,7 @@ bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
                 "product_pack_items={}) — refusing (fail-closed): the shipped binary always "
                 "creates both together, this looks like a corrupt or hand-edited file",
                 legacy_db_path.string(), has_packs, has_items);
+            backfill_metric("failed");
             return false;
         } else {
             // Pre-7.13 vintage check: a legacy file written before 7.13 has no `verified`
@@ -582,6 +628,7 @@ bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
                 spdlog::error("ProductPackStore::migrate_from_sqlite: column probe failed on "
                               "legacy {}: {}",
                               legacy_db_path.string(), sqlite3_errmsg(legacy.get()));
+                backfill_metric("failed");
                 return false;
             }
             const bool has_verified_col = *verified_col_probe;
@@ -598,6 +645,7 @@ bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
                     spdlog::error("ProductPackStore::migrate_from_sqlite: legacy product_packs "
                                   "query failed: {}",
                                   sqlite3_errmsg(legacy.get()));
+                    backfill_metric("failed");
                     return false;
                 }
                 int step_rc = SQLITE_OK;
@@ -624,6 +672,7 @@ bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
                                   "scan aborted mid-read (rc={} {}): refusing to stamp a "
                                   "partial backfill",
                                   step_rc, sqlite3_errmsg(legacy.get()));
+                    backfill_metric("failed");
                     return false;
                 }
             }
@@ -635,6 +684,7 @@ bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
                     spdlog::error("ProductPackStore::migrate_from_sqlite: legacy "
                                   "product_pack_items query failed: {}",
                                   sqlite3_errmsg(legacy.get()));
+                    backfill_metric("failed");
                     return false;
                 }
                 int step_rc = SQLITE_OK;
@@ -655,6 +705,7 @@ bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
                                   "product_pack_items scan aborted mid-read (rc={} {}): "
                                   "refusing to stamp a partial backfill",
                                   step_rc, sqlite3_errmsg(legacy.get()));
+                    backfill_metric("failed");
                     return false;
                 }
             }
@@ -667,6 +718,7 @@ bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
                     spdlog::error("ProductPackStore::migrate_from_sqlite: SHA-256 hashing "
                                   "failed for legacy content at {} — refusing (fail-closed)",
                                   legacy_db_path.string());
+                    backfill_metric("failed");
                     return false;
                 }
             }
@@ -680,6 +732,7 @@ bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
         auto lease = pool_.acquire();
         if (!lease) {
             spdlog::error("ProductPackStore::migrate_from_sqlite: no database connection");
+            backfill_metric("failed");
             return false;
         }
         pg::PgResult marker = pg::exec_params(
@@ -690,6 +743,7 @@ bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
             spdlog::error("ProductPackStore::migrate_from_sqlite: backfill-marker check failed: "
                           "{}",
                           PQerrorMessage(lease.get()));
+            backfill_metric("failed");
             return false;
         }
         if (PQntuples(marker.get()) > 0) {
@@ -703,6 +757,7 @@ bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
         auto lease = pool_.acquire();
         if (!lease) {
             spdlog::error("ProductPackStore::migrate_from_sqlite: no connection to stamp marker");
+            backfill_metric("failed");
             return false;
         }
         pg::PgResult r = pg::exec_params(
@@ -713,11 +768,13 @@ bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
         if (r.status() != PGRES_COMMAND_OK) {
             spdlog::error("ProductPackStore::migrate_from_sqlite: failed to stamp marker: {}",
                           PQerrorMessage(lease.get()));
+            backfill_metric("failed");
             return false;
         }
         spdlog::info("ProductPackStore::migrate_from_sqlite: no legacy product pack data at {} "
                      "— nothing to backfill",
                      legacy_db_path.string());
+        backfill_metric("fresh");
         return true;
     }
 
@@ -817,7 +874,7 @@ bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
                 conn,
                 "SELECT kind, item_id, name, yaml_source FROM product_pack_store."
                 "product_pack_items WHERE pack_id=$1 AND item_id=$2",
-                std::vector<std::string>{it.pack_id, it.item_id});
+                std::vector<std::string>{it.pack_id, sanitize_pg_text(it.item_id)});
             if (existing.status() != PGRES_TUPLES_OK || PQntuples(existing.get()) == 0) {
                 failure_detail = std::format(
                     "legacy product_pack_items row (pack_id='{}', item_id='{}'): conflicted on "
@@ -862,9 +919,11 @@ bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
             "backfill marker was NOT stamped, so the next boot retries the whole backfill.",
             failure_detail.empty() ? "unknown (see the specific-row error above)" : failure_detail,
             legacy_db_path.string(), legacy_db_path.string());
+        backfill_metric("failed");
         return false;
     }
     spdlog::info("ProductPackStore::migrate_from_sqlite: backfill complete");
+    backfill_metric("success");
     return true;
 }
 
@@ -1068,13 +1127,20 @@ std::expected<std::string, std::string> ProductPackStore::install(const std::str
 
 std::expected<std::vector<ProductPack>, std::string> ProductPackStore::list(
     const ProductPackQuery& q) {
-    if (!open_)
+    if (!open_) {
+        if (note_read_degrade(metrics_, kReasonStoreNotOpen, g_list_sampler))
+            spdlog::warn("ProductPackStore::list: store not open");
         return std::unexpected(std::string(kProductPackDbErrorPrefix) + "database not open");
+    }
 
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
+    if (!lease) {
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, g_list_sampler))
+            spdlog::warn("ProductPackStore::list: no connection in time ({})",
+                        pool_.last_error());
         return std::unexpected(std::string(kProductPackDbErrorPrefix) +
                                "database unavailable — try again");
+    }
 
     int limit = q.limit;
     if (limit <= 0)
@@ -1093,9 +1159,12 @@ std::expected<std::vector<ProductPack>, std::string> ProductPackStore::list(
     binds.push_back(std::to_string(limit));
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), binds);
-    if (res.status() != PGRES_TUPLES_OK)
+    if (res.status() != PGRES_TUPLES_OK) {
+        if (note_read_degrade(metrics_, kReasonQueryError, g_list_sampler))
+            spdlog::warn("ProductPackStore::list: query failed: {}", PQerrorMessage(lease.get()));
         return std::unexpected(std::string(kProductPackDbErrorPrefix) +
                                "list failed: " + PQerrorMessage(lease.get()));
+    }
 
     const int rows = PQntuples(res.get());
     std::vector<ProductPack> out;
@@ -1113,20 +1182,30 @@ std::expected<std::vector<ProductPack>, std::string> ProductPackStore::list(
 
 std::expected<std::optional<ProductPack>, std::string> ProductPackStore::get(
     const std::string& id) {
-    if (!open_)
+    if (!open_) {
+        if (note_read_degrade(metrics_, kReasonStoreNotOpen, g_get_sampler))
+            spdlog::warn("ProductPackStore::get: store not open");
         return std::unexpected(std::string(kProductPackDbErrorPrefix) + "database not open");
+    }
 
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
+    if (!lease) {
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, g_get_sampler))
+            spdlog::warn("ProductPackStore::get: no connection in time ({})",
+                        pool_.last_error());
         return std::unexpected(std::string(kProductPackDbErrorPrefix) +
                                "database unavailable — try again");
+    }
 
     std::string sql =
         std::string("SELECT ") + kPackCols + " FROM product_pack_store.product_packs WHERE id=$1";
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{id});
-    if (res.status() != PGRES_TUPLES_OK)
+    if (res.status() != PGRES_TUPLES_OK) {
+        if (note_read_degrade(metrics_, kReasonQueryError, g_get_sampler))
+            spdlog::warn("ProductPackStore::get: query failed: {}", PQerrorMessage(lease.get()));
         return std::unexpected(std::string(kProductPackDbErrorPrefix) +
                                "get failed: " + PQerrorMessage(lease.get()));
+    }
     if (PQntuples(res.get()) == 0)
         return std::optional<ProductPack>{std::nullopt};
 

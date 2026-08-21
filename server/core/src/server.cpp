@@ -5193,6 +5193,11 @@ public:
                 startup_failed_ = true;
             } else {
                 spdlog::info("ProductPackStore initialized (schema product_pack_store)");
+                // #3261/#3294 class: set_metrics BEFORE migrate_from_sqlite, so the
+                // backfill-result counter is live on the one pass that matters — a
+                // registry wired only after the (one-shot, idempotent) backfill call
+                // would leave that specific pass permanently uncounted.
+                product_pack_store_->set_metrics(&metrics_);
                 auto pack_db = cfg_.db_dir() / "product-packs.db";
                 if (!product_pack_store_->migrate_from_sqlite(pack_db)) {
                     spdlog::error(
