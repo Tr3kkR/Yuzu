@@ -8139,7 +8139,13 @@ void RestApiV1::register_routes(
                 // migrated store can also fail on a Postgres blip. Classify before assuming
                 // "entropy exhausted": mislabeling a DB fault as csprng_unavailable would both
                 // misinform SIEM and increment the wrong Prometheus counter.
-                if (result.error().starts_with(yuzu::server::kDeviceTokenDbErrorPrefix)) {
+                //
+                // #3351: "internal_error: " (hash_token's checked-EVP failure path) joins this
+                // same non-CSPRNG arm — a hashing fault is exactly as much "not entropy
+                // exhaustion" as a DB fault is, and must not increment
+                // yuzu_secure_random_failure_total either.
+                if (result.error().starts_with(yuzu::server::kDeviceTokenDbErrorPrefix) ||
+                    result.error().starts_with("internal_error: ")) {
                     bool audit_emitted = false;
                     try {
                         audit_emitted = audit_fn(req, "device_token.create", "failure",

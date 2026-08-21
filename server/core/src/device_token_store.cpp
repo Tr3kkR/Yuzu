@@ -9,30 +9,12 @@
 #include "utf8_sanitize.hpp"
 
 #include <libpq-fe.h>
-#include <openssl/evp.h> // sha256_hex's EVP_Digest — needed unconditionally (backfill fingerprinting runs on every platform), never gated behind _WIN32 like the SHA256-vs-BCrypt hash_token() split below
+// #3351: EVP_Digest is the SOLE hashing path now (both sha256_hex's backfill fingerprinting AND
+// hash_token below) — the prior _WIN32/BCrypt split is gone, so this include is simply
+// unconditional rather than the split-with-a-comment it used to need.
+#include <openssl/evp.h>
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
-
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX // <windows.h>'s function-like max(a,b)/min(a,b) macros otherwise swallow the
-                 // std::max() call in validate_token below (MSVC C2589/C3878/C2760: the macro
-                 // rewrite mangles the qualified name into invalid syntax) — matches
-                 // key_provider.cpp/process_health.hpp's guard, not api_token_store.cpp's
-                 // parenthesized-callee workaround (this file has exactly one call site; the
-                 // blanket guard is simpler and closes the door on any future one).
-#endif
-// clang-format off
-#include <windows.h>  // must precede bcrypt.h (defines NTSTATUS)
-// clang-format on
-#include <bcrypt.h>
-#pragma comment(lib, "bcrypt.lib")
-#else
-#include <openssl/sha.h>
-#endif
 
 #include <algorithm>
 #include <chrono>
@@ -97,15 +79,41 @@ const char* safe(const char* p) {
 // legacy device-tokens.db must not brick the mandatory backfill, and an operator-supplied
 // name/device_id/definition_id over REST is equally untrusted (already length-clamped at the
 // route, but not UTF-8-validated there).
+//
+// #3351: single reserve-and-append pass (#2691 precedent, response_store.cpp — Doomgoose finding
+// #8), not the naive find+replace loop copied into every OTHER store's sanitize_pg_text (still
+// quadratic there; out of scope here — see #3351's follow-up). The prior loop shifted every
+// trailing byte on each NUL hit (1 byte -> 3), an O(k*n) rebuild in NUL count x length for a
+// NUL-dense string. Count once, reserve the final size, then copy the segments between NULs
+// directly — no in-place shifting.
 std::string sanitize_pg_text(std::string_view s) {
-    std::string out = sanitize_utf8_strict(s);
-    std::size_t pos = 0;
-    while ((pos = out.find('\0', pos)) != std::string::npos) {
-        out.replace(pos, 1, "\xEF\xBF\xBD");
-        pos += 3;
+    std::string scrubbed = sanitize_utf8_strict(s);
+    const std::size_t nul_count =
+        static_cast<std::size_t>(std::count(scrubbed.begin(), scrubbed.end(), '\0'));
+    if (nul_count == 0)
+        return scrubbed;
+    std::string out;
+    out.reserve(scrubbed.size() + nul_count * 2); // each NUL grows 1 byte -> 3
+    std::size_t start = 0;
+    for (std::size_t i = 0; i < scrubbed.size(); ++i) {
+        if (scrubbed[i] == '\0') {
+            out.append(scrubbed, start, i - start);
+            out.append("\xEF\xBF\xBD");
+            start = i + 1;
+        }
     }
+    out.append(scrubbed, start, scrubbed.size() - start);
     return out;
 }
+
+// #3351: store-level bound on every free-text field, matching the REST route's own 256-char
+// clamp (rest_api_v1.cpp) for name/device_id/definition_id — principal_id has NO route-level
+// clamp (it comes from session->username, itself bounded to 64 by auth_db.cpp) so this is the
+// only bound it gets. Applied on RAW byte length, BEFORE sanitize_pg_text (which can only grow a
+// string, never shrink it — utf8_sanitize.hpp's ordering contract), so this is the first, not
+// last, gate a caller's input passes through. Defence-in-depth for any future non-REST caller
+// (e.g. an MCP twin) — unreachable via the REST route today given its own clamp.
+constexpr std::size_t kMaxTextFieldLength = 256;
 
 // token_id (generate_token_id(), 32 lowercase hex chars) and token_hash (hash_token(), 64
 // lowercase hex chars) are both deterministically hex-formatted by every write path this store
@@ -220,35 +228,21 @@ const std::vector<pg::PgMigration>& migrations() {
 
 // ── Token hashing (kept cross-platform-identical to the pre-migration store) ───────────────
 
-std::string hash_token(const std::string& raw) {
-    unsigned char hash[32]{};
-
-#ifdef _WIN32
-    BCRYPT_ALG_HANDLE alg = nullptr;
-    BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
-    if (alg) {
-        BCRYPT_HASH_HANDLE h = nullptr;
-        BCryptCreateHash(alg, &h, nullptr, 0, nullptr, 0, 0);
-        if (h) {
-            BCryptHashData(h, reinterpret_cast<PUCHAR>(const_cast<char*>(raw.data())),
-                           static_cast<ULONG>(raw.size()), 0);
-            BCryptFinishHash(h, hash, 32, 0);
-            BCryptDestroyHash(h);
-        }
-        BCryptCloseAlgorithmProvider(alg, 0);
-    }
-#else
-    SHA256(reinterpret_cast<const unsigned char*>(raw.data()), raw.size(), hash);
-#endif
-
-    static constexpr char hex[] = "0123456789abcdef";
-    std::string result;
-    result.reserve(64);
-    for (unsigned char c : hash) {
-        result += hex[c >> 4];
-        result += hex[c & 0x0f];
-    }
-    return result;
+// #3351: was a hand-rolled _WIN32-BCrypt-vs-OpenSSL-SHA256 split with FOUR unchecked BCrypt
+// calls on the Windows branch — a failure anywhere in that chain (alg/hash handle never
+// allocated, BCryptHashData/BCryptFinishHash erroring) fell through the zero-initialized
+// `hash[32]` and silently returned the hex of 32 zero bytes: a constant hash for every input,
+// which is an auth-bypass shape on a bearer-credential path (create_token would persist it,
+// validate_token would recompute the same constant for ANY raw token). Now a single checked path
+// on every platform via the file's existing sha256_hex (already used, unconditionally, for
+// backfill fingerprinting) — OpenSSL is required on Windows regardless of linkage (CLAUDE.md
+// vcpkg section), so there is no cross-platform reason left for a BCrypt branch. Output bytes are
+// identical to the old BCrypt branch (both are SHA-256), so no legacy hash is invalidated.
+std::expected<std::string, std::string> hash_token(const std::string& raw) {
+    auto h = sha256_hex(raw);
+    if (h.empty())
+        return std::unexpected("internal_error: token hash computation failed");
+    return h;
 }
 
 // Cryptographic PRNG required — mt19937 is predictable from its outputs (#801).
@@ -393,18 +387,31 @@ bool DeviceTokenStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
                     sqlite3_errmsg(legacy.get()));
                 return false;
             }
+            // #3351: length-aware, not C-string — std::string(const char*) stops at the first
+            // embedded NUL, which would drop the remainder BEFORE sanitize_pg_text can turn that
+            // NUL into U+FFFD, truncating rather than defanging (ADR-0040 requires the latter).
+            // Yuzu's own legacy writer always bound with -1, so no row it wrote can carry bytes
+            // past a NUL; this is robustness against anything else that wrote the file.
+            // audit_store.cpp uses the same sqlite3_column_bytes pattern. token_id/token_hash
+            // below deliberately keep the plain safe()/sqlite3_column_text read: a NUL-truncated
+            // hex string is already shorter than the required 32/64 chars, so the hex-format
+            // check a few lines down catches it without needing the length-aware read too.
+            const auto col_text = [&](int i) {
+                const auto* v = sqlite3_column_text(s.get(), i);
+                const int n = sqlite3_column_bytes(s.get(), i);
+                return v ? std::string(reinterpret_cast<const char*>(v), static_cast<std::size_t>(n))
+                         : std::string{};
+            };
             int step_rc = SQLITE_OK;
             while ((step_rc = sqlite3_step(s.get())) == SQLITE_ROW) {
                 LegacyDeviceTokenRow r;
                 r.token_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0)));
                 r.token_hash =
                     safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1)));
-                r.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 2)));
-                r.principal_id =
-                    safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 3)));
-                r.device_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 4)));
-                r.definition_id =
-                    safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 5)));
+                r.name = col_text(2);
+                r.principal_id = col_text(3);
+                r.device_id = col_text(4);
+                r.definition_id = col_text(5);
                 r.created_at = sqlite3_column_int64(s.get(), 6);
                 r.expires_at = sqlite3_column_int64(s.get(), 7);
                 r.last_used_at = sqlite3_column_int64(s.get(), 8);
@@ -429,6 +436,22 @@ bool DeviceTokenStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
                         "{} has an invalid token_hash (expected 64 lowercase hex chars) — "
                         "refusing to stamp a backfill containing it",
                         r.token_id);
+                    return false;
+                }
+                // #3351: reject (never clamp) an oversized legacy free-text field, on the RAW
+                // read, before sanitize_pg_text/fingerprinting see it. Rejecting — not clamping —
+                // keeps the raw-row fingerprint (canonicalize_legacy_tokens, below) and the
+                // sanitize-both-sides IDENTITY comparison (further below) symmetric: a clamp
+                // applied on one side but not the other would turn a benign re-run into a
+                // spurious "refusing to stamp a backfill" abort.
+                if (r.name.size() > kMaxTextFieldLength || r.principal_id.size() > kMaxTextFieldLength ||
+                    r.device_id.size() > kMaxTextFieldLength ||
+                    r.definition_id.size() > kMaxTextFieldLength) {
+                    spdlog::error(
+                        "DeviceTokenStore::migrate_from_sqlite: legacy device_auth_tokens row {} "
+                        "has a free-text field exceeding {} bytes — refusing to stamp a backfill "
+                        "containing it",
+                        r.token_id, kMaxTextFieldLength);
                     return false;
                 }
                 legacy_rows.push_back(std::move(r));
@@ -711,6 +734,16 @@ DeviceTokenStore::create_token(const std::string& name, const std::string& princ
         return std::unexpected(std::string(kDeviceTokenDbErrorPrefix) + "database not open");
     if (principal_id.empty())
         return std::unexpected("principal_id cannot be empty");
+    // #3351: reject (not clamp) on RAW byte length, before sanitize_pg_text can grow the field —
+    // see kMaxTextFieldLength's doc comment.
+    if (name.size() > kMaxTextFieldLength)
+        return std::unexpected("invalid_input_length: name exceeds 256 chars");
+    if (principal_id.size() > kMaxTextFieldLength)
+        return std::unexpected("invalid_input_length: principal_id exceeds 256 chars");
+    if (device_id.size() > kMaxTextFieldLength)
+        return std::unexpected("invalid_input_length: device_id exceeds 256 chars");
+    if (definition_id.size() > kMaxTextFieldLength)
+        return std::unexpected("invalid_input_length: definition_id exceeds 256 chars");
 
     auto raw_result = generate_raw_device_token();
     if (!raw_result.has_value())
@@ -725,7 +758,10 @@ DeviceTokenStore::create_token(const std::string& name, const std::string& princ
                                "database unavailable — try again");
 
     auto raw = std::move(*raw_result);
-    auto hashed = hash_token(raw);
+    auto hashed_result = hash_token(raw);
+    if (!hashed_result)
+        return std::unexpected(hashed_result.error());
+    auto hashed = std::move(*hashed_result);
     auto token_id = std::move(*token_id_result);
     auto now = now_epoch();
 
@@ -770,7 +806,17 @@ DeviceTokenStore::validate_token(const std::string& raw_token,
     if (!open_ || raw_token.empty())
         return std::unexpected(reject_input());
 
-    auto hashed = hash_token(raw_token);
+    auto hashed_result = hash_token(raw_token);
+    if (!hashed_result) {
+        // #3351: a hash-computation fault is a store-internal failure, never a benign rejection
+        // reason — same posture as the #1056 lookup-failure handling below (internal_fault),
+        // which this mirrors before the transaction even starts.
+        spdlog::error("DeviceTokenStore::validate_token: {}", hashed_result.error());
+        RejectedToken r;
+        r.error = DeviceTokenValidateError::internal_error;
+        return std::unexpected(r);
+    }
+    auto hashed = std::move(*hashed_result);
 
     DeviceAuthToken t;
     RejectedToken rejected;
