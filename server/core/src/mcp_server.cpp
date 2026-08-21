@@ -489,7 +489,13 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"valid":{"const":false},"error":{"type":"string","description":"Parse error message"}},"required":["valid","error"],"additionalProperties":false})j"
      R"j(]})j"},
 
-    {"preview_scope_targets", "Show which agents match a scope expression.",
+    {"preview_scope_targets",
+     "Show which agents match a scope expression. NOTE: tag:<key> atoms resolve from the "
+     "persistent tag store ONLY (unlike an actual dispatch, which also falls back to a "
+     "connected agent's own live self-reported value when the store has no row for that "
+     "agent) - a gateway-proxied or not-yet-synced agent whose only claim to a key is its "
+     "own live report may be previewed as excluded here but still be targeted by the real "
+     "dispatch. See docs/asset-tagging-guide.md \"Tag source precedence\".",
      R"({"type":"object","properties":{"expression":{"type":"string","minLength":1,"description":"Scope expression"}},"required":["expression"]})",
      R"j({"type":"object","properties":{"expression":{"type":"string"},"matched_count":{"type":"integer"},"matched_agents":{"type":"array","items":{"type":"string"}},"warning":{"type":"string","description":"Present only when the match count exceeds the display threshold"}},"required":["expression","matched_count","matched_agents"]})j"},
 
