@@ -179,7 +179,7 @@ against the actual push contents on `full_sync`, cleared in `stop()`). All three
 consequences above are addressed: (1) the reconcile tests were rewritten in the same PR,
 plus a real macOS-factory test asserting the all-unsupported posture directly (not (3),
 which is a rung-10 parity-gate item, still open); (2) **shipped (F12, #3386)** -
-`docs/spark-legacy-delta-registry.md`. Also shipped in the same PR: the `mech_unsupported_total`
+`docs/spark-legacy-delta-registry.md`. Also shipped in **the F7 PR**: the `mech_unsupported_total`
 per-mechanism fleet gauge and `yuzu.guardian_backend` heartbeat tag (§Platform-rejection,
 §Fleet metrics, items 8-9 below).
 

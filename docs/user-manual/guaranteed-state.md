@@ -419,7 +419,7 @@ At rung 1 the mechanism- and consumer-health counters (`armed_faulted`, `watch_r
 
 - [Design v1.1](../yuzu-guardian-design-v1.1.md) — the authoritative architecture document (engineering reference).
 - [Windows implementation plan](../yuzu-guardian-windows-implementation-plan.md) — PR-by-PR delivery plan.
-- [Spark/legacy delta registry](../spark-legacy-delta-registry.md) — every deliberate behavioral difference between the legacy `IGuard` detection path and the SparkEngine path (F12, #3386).
+- [Spark/legacy delta registry](../spark-legacy-delta-registry.md) — every deliberate behavioral difference between the legacy `IGuard` detection path and the SparkEngine path.
 - [Policy Engine](policy-engine.md) — server-side desired-state rules and compliance checks (complementary to Guardian, not replaced by it).
 - [Scope Engine](scope-engine.md) — expression language used by `scope_expr`.
 - [RBAC](rbac.md) — role seeds and the `Push` operation.
