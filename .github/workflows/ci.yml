@@ -1428,7 +1428,16 @@ jobs:
           echo "The Yuzu server is Linux-only (ADR-0035); Linux + Windows CI legs run the full [pg] suite."
 
       - name: Test
-        run: python3 scripts/ci/flake-retry.py --builddir build-macos -- --print-errorlogs
+        # --timeout-multiplier 2: BigMags is a shared box (2 runner agents, and
+        # the release+LTO build is co-resident after #3348), so give each test 2x
+        # meson's kill-timeout to absorb CPU/memory contention. Per tests/meson.build's
+        # own guidance, multiply for a slower environment rather than raising
+        # individual test `timeout:` kwargs. This ONLY covers a slow test being
+        # KILLED before it finishes — it does NOT help in-test wall-clock
+        # assertions (CHECK(elapsed < N), CHECK_FALSE(poll_until(...))), which flake
+        # on a loaded box and are fixed per-test (#3357, #2372, and the
+        # elapsed-ceiling issue).
+        run: python3 scripts/ci/flake-retry.py --builddir build-macos -- --print-errorlogs --timeout-multiplier 2
 
       # Same rationale as the linux + windows upload steps: keep test
       # failures diagnosable when meson's `--print-errorlogs` truncation

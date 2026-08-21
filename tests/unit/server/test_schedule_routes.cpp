@@ -132,7 +132,11 @@ struct ScheduleRouteHarness {
         // tries to open a file underneath it.
         std::filesystem::create_directories(tmp.path);
 
-        analytics = std::make_unique<AnalyticsEventStore>(tmp.path / "analytics.db");
+        // AnalyticsEventStore ported to Postgres (ADR-0049): schema-per-store
+        // on the same shared pool as rbac above (ADR-0008's production model)
+        // rather than a second ephemeral database.
+        analytics = std::make_unique<AnalyticsEventStore>(*rbac_pool);
+        REQUIRE(analytics->is_open());
 
         auth_routes = std::make_unique<AuthRoutes>(
             cfg, auth_mgr, &*rbac, api_tokens.get(),

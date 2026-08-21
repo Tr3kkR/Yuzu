@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -83,7 +84,9 @@ public:
     /// path). Without this set, the proxied-enrollment surface had no
     /// audit/analytics emission at all — a gap relative to direct
     /// connections that #827 closes alongside the race fix.
-    void set_analytics_store(AnalyticsEventStore* store) { analytics_store_ = store; }
+    void set_analytics_store(std::weak_ptr<AnalyticsEventStore> store) {
+        analytics_store_ = std::move(store);
+    }
 
     /// W1.4 / #827: AuditStore wired for enrollment-token consume rows
     /// on the gateway-proxied path. See AgentServiceImpl::set_audit_store
@@ -158,7 +161,7 @@ private:
     SoftwareLicensingStore* software_licensing_store_{nullptr};
     FleetTopologyStore* fleet_topology_store_{nullptr};
     HeartbeatIngestion* heartbeat_ingestion_{nullptr};
-    AnalyticsEventStore* analytics_store_{nullptr};
+    std::weak_ptr<AnalyticsEventStore> analytics_store_;
     AuditStore* audit_store_{nullptr};
     GuaranteedStateStore* guaranteed_state_store_{nullptr};
     BlastRadiusDetector* blast_radius_detector_{nullptr};

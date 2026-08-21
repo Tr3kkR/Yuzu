@@ -23,6 +23,7 @@
 #include "analytics_event_store.hpp" // real-AuthRoutes integration test (C1)
 #include "api_token_store.hpp"
 #include "engine_principal_store.hpp"   // EngineLookupStatus — #2384 MCP pin test
+#include "test_analytics_pg_helper.hpp" // AnalyticsEventStorePg — ADR-0049 PG port
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "test_tag_store_pg_helper.hpp"  // TagStorePg — ADR-0050 PG port
 #include "approval_manager.hpp"
@@ -12295,13 +12296,14 @@ TEST_CASE("MCP approval recall executes through the real AuthRoutes::require_per
     // via the shared ApiTokenStorePg helper (SKIPs when YUZU_TEST_POSTGRES_DSN
     // is unset, FAILs when set but broken).
     yuzu::test::ApiTokenStorePg api_tokens;
-    AnalyticsEventStore analytics(tmp_dir / "analytics.db");
-    REQUIRE(analytics.is_open());
+    // AnalyticsEventStore ported to Postgres (ADR-0049) — own ephemeral
+    // clone via the shared helper, mirroring api_tokens above.
+    yuzu::test::AnalyticsEventStorePg analytics;
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
     AuthRoutes ar(cfg, auth_mgr, /*rbac_store=*/nullptr, api_tokens.get(),
                   /*audit_store=*/nullptr, /*mgmt_group_store=*/nullptr,
-                  /*tag_store=*/nullptr, &analytics, oidc_mu, oidc_provider);
+                  /*tag_store=*/nullptr, analytics.get(), oidc_mu, oidc_provider);
 
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                    std::chrono::system_clock::now().time_since_epoch()).count();
