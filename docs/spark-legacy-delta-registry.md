@@ -70,10 +70,10 @@ combined with a verification stamp, e.g. `open-question, verified <SHA>`, when t
 
 Placement: pick the lettered section (A backend selection, B enforcement, C
 placement/platform, D event streams, E cadence/resource) whose description above fits;
-IDs are sequential within that letter (the next File row after D9 is D10, not D1a or
-E-something). Insert the new `### <ID> — ...` block, with its own `---` separator
-immediately after it, right after the last existing row in that section and before that
-section's closing `---`.
+IDs are sequential within that letter (the next row after D9 is D10, not D1a or
+E-something). Insert the new `### <ID> — ...` block right after the last existing row in
+that section, ahead of that section's one closing `---` — there is a single `---` per
+section, not one between every row, so do not add a separator between rows.
 
 Two permitted variants: a row gating on a still-open flip-ladder decision (e.g. D4) may
 add an 8th **Ruling** field instead of leaving "Why deliberate" empty; a row describing a
