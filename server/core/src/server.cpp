@@ -16271,10 +16271,10 @@ private:
         // perf tags (validated through the SAME dex_perf_rules the Prometheus
         // gauges use), AgentRegistry sessions (OS + agent-reported tags) and the
         // TagStore (operator tags, ONE bulk query per render — not N point
-        // lookups). Cohort precedence mirrors evaluate_scope: agent scopable_tags
-        // first, then the tag store. Shared by the /dex Performance fragments,
-        // the /api/v1/dex/perf/* REST surface and the MCP perf tools so all
-        // three can never disagree.
+        // lookups). Cohort precedence mirrors evaluate_scope: the tag store
+        // first, then agent scopable_tags (#3295 — both are store-first now).
+        // Shared by the /dex Performance fragments, the /api/v1/dex/perf/*
+        // REST surface and the MCP perf tools so all three can never disagree.
         auto dex_perf_uncached = [this](const std::string& cohort_key) -> DexPerfSnapshot {
             DexPerfSnapshot snap;
             snap.cohort_key = cohort_key;
@@ -16330,16 +16330,16 @@ private:
                         detail::parse_perf_disk_lat_ms(get(detail::kPerfTagDiskLatMs));
                 }
                 if (!cohort_key.empty()) {
-                    // STORE-FIRST precedence — deliberately the OPPOSITE of
-                    // evaluate_scope's agent-first order: a benchmark cohort is
-                    // an operator-declared comparison population, so a rogue
-                    // agent must not self-assign into "executive-laptops" and
-                    // drag its p90 (G4 UP-5). The store already carries honest
-                    // agents' tags via sync_agent_tags, so store-first loses
-                    // nothing; the in-memory fallback only covers a tag not yet
-                    // synced, and it is value-validated (G2 sec-L2: scopable_tags
-                    // are unvalidated at session ingest) so oversized/garbage
-                    // bytes never become a cohort label.
+                    // STORE-FIRST precedence — the SAME order evaluate_scope's
+                    // tag: resolver uses since #3295 (previously the opposite):
+                    // a benchmark cohort is an operator-declared comparison
+                    // population, so a rogue agent must not self-assign into
+                    // "executive-laptops" and drag its p90 (G4 UP-5). The store
+                    // already carries honest agents' tags via sync_agent_tags,
+                    // so store-first loses nothing; the in-memory fallback only
+                    // covers a tag not yet synced. scopable_tags is validated
+                    // and 'service'-filtered at session ingest (register_agent,
+                    // #3295); this re-validates on top as defense-in-depth.
                     if (auto cv = cohort_values.find(id); cv != cohort_values.end()) {
                         d.cohort = cv->second;
                     } else if (auto it = s->scopable_tags.find(cohort_key);
