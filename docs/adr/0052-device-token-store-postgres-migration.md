@@ -148,6 +148,12 @@ auth-credential store, not durability-on-top:
   `PgPool`'s `Options` are shared cross-store today, no per-store knob). Mitigating factor: distinct
   tokens hash to distinct rows, so lock contention serializes per-device, not globally — a chatty
   single device only ever serializes against itself.
+- **ADR-1005 note for the future wiring PR (gov Gate 4, round 3)** — wiring this store live makes
+  its capability reachable for the first time, which triggers ADR-1005's REST+MCP parity
+  requirement: every device-token behavior must be reachable via versioned REST *and* MCP, or
+  carry a recorded exception in ADR-1005's exception ledger. No MCP twin exists today (correctly —
+  a dormant, unreachable capability has no reachability claim to except), so the wiring PR is the
+  one that must either add an MCP twin or record the exception, not this one.
 - **`revoke_by_principal`'s #823 security-shaped hazard, closed by typing it.** This method is
   the re-registration-time defence against a briefly-impersonated agent (#779) replaying a
   previously issued token. The pre-migration signature (`int64_t`, 0 on both "nothing to revoke"
