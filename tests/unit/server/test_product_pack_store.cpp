@@ -30,6 +30,10 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "sqlite_raii.hpp"
+#include "test_route_sink.hpp"
+#include "workflow_routes.hpp"
+
+#include <yuzu/metrics.hpp>
 
 #include "../test_helpers.hpp"
 
@@ -44,6 +48,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using yuzu::server::ItemInstallFn;
@@ -52,6 +57,7 @@ using yuzu::server::ProductPackQuery;
 using yuzu::server::ProductPackStore;
 using yuzu::server::SqliteDb;
 using yuzu::server::SqliteStmt;
+using yuzu::server::WorkflowRoutes;
 using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
 using yuzu::server::pg::PgResult;
@@ -827,4 +833,119 @@ TEST_CASE("ProductPackStore::migrate_from_sqlite: mid-scan corruption fails clos
     auto got = store.get("intact-pack");
     REQUIRE(got.has_value());
     CHECK(got->has_value());
+}
+
+// ── REST-level regression net (Gate 8 round-2: quality-engineer + unhappy-path, twice-flagged)
+// ──
+//
+// The store-level tests above prove the backend contract; nothing before this point drives an
+// actual HTTP request through WorkflowRoutes' four product-pack handlers, so the genericization
+// split (workflow_routes.cpp's product_pack_client_message — response body only, never the
+// audit trail) and the DELETE-denied audit_fn addition (56fbd3580) were previously verified only
+// by direct code reading. These two cases close that gap. No new test FILE — same
+// [product_pack_store] tag family, inherits the existing shard placement, no meson.build change.
+
+namespace {
+
+/// Minimal WorkflowRoutes harness scoped to the product-pack routes only. Every other Deps
+/// field stays default (nullptr/empty std::function) — safe, because auth_fn/scope_fn/
+/// command_dispatch_fn/caller_fn are never invoked by the GET/POST/DELETE product-pack handlers
+/// (only by this file's other registered routes, none of which this harness dispatches to).
+struct ProductPackRestHarness {
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::test::TestRouteSink sink;
+    std::vector<std::tuple<std::string, std::string, std::string, std::string, std::string>>
+        audit_rows; // (action, result, target_type, target_id, detail)
+
+    explicit ProductPackRestHarness(ProductPackStore* store) {
+        WorkflowRoutes routes;
+        WorkflowRoutes::Deps deps;
+        deps.perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                          const std::string&) { return true; };
+        deps.audit_fn = [this](const httplib::Request&, const std::string& action,
+                               const std::string& result, const std::string& target_type,
+                               const std::string& target_id, const std::string& detail) {
+            audit_rows.emplace_back(action, result, target_type, target_id, detail);
+        };
+        deps.emit_fn = [](const std::string&, const httplib::Request&) {};
+        deps.product_pack_store = store;
+        deps.metrics = &metrics;
+        routes.register_routes(sink, std::move(deps));
+    }
+};
+
+} // namespace
+
+TEST_CASE("REST: a genuine DB error never reaches the response body or the audit trail as raw "
+          "driver text",
+          "[product_pack_store]") {
+    // Unreachable pool (same fixture as the store-level "!is_open" test above) — every
+    // ProductPackStore method deterministically returns a kProductPackDbErrorPrefix error, with
+    // no live Postgres required. This is the classifier's PREFIX check, not its content, so it
+    // exercises the same genericization path a real PQerrorMessage() leak would hit.
+    PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 2}};
+    REQUIRE_FALSE(pool.valid());
+    ProductPackStore store{pool};
+    REQUIRE_FALSE(store.is_open());
+
+    ProductPackRestHarness h{&store};
+
+    // GET /api/product-packs has its OWN pre-existing `!is_open()` early guard (unrelated to
+    // this fix round — it short-circuits before list() is ever called, so it never reaches
+    // product_pack_client_message()'s genericization path at all) with its own hardcoded,
+    // already-generic message. Different string than the genericizer's, same "no internals
+    // leaked" property — assert that property, not byte-identical wording across routes.
+    auto list_res = h.sink.dispatch("GET", "/api/product-packs");
+    REQUIRE(list_res);
+    CHECK(list_res->status == 503);
+    CHECK(list_res->body.find("db_error") == std::string::npos);
+    CHECK(list_res->body.find("not open") == std::string::npos);
+
+    auto del_res = h.sink.dispatch("DELETE", "/api/product-packs/some-id");
+    REQUIRE(del_res);
+    CHECK(del_res->status == 503);
+    CHECK(del_res->body.find("service unavailable") != std::string::npos);
+    CHECK(del_res->body.find("db_error") == std::string::npos);
+    CHECK(del_res->body.find("not open") == std::string::npos);
+
+    // Regression net for 56fbd3580: the audit `detail` must be genericized identically to the
+    // response body, not the raw "db_error: database not open" the store returned.
+    REQUIRE(h.audit_rows.size() == 1);
+    const auto& [action, result, target_type, target_id, detail] = h.audit_rows[0];
+    CHECK(action == "product_pack.uninstall");
+    CHECK(result == "denied");
+    CHECK(target_type == "ProductPack");
+    CHECK(target_id == "some-id");
+    CHECK(detail == "service unavailable");
+    CHECK(detail.find("db_error") == std::string::npos);
+    CHECK(detail.find("not open") == std::string::npos);
+}
+
+TEST_CASE("REST: a not-found rejection is echoed verbatim in both the response and the audit "
+          "trail",
+          "[product_pack_store][pg]") {
+    // Live store: not_found never carries kProductPackDbErrorPrefix, so it must pass through
+    // product_pack_client_message() unchanged in both the response body and the audit detail —
+    // the positive-path counterpart to the genericization test above.
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+
+    ProductPackRestHarness h{&store};
+
+    auto del_res = h.sink.dispatch("DELETE", "/api/product-packs/does-not-exist");
+    REQUIRE(del_res);
+    CHECK(del_res->status == 404);
+    CHECK((del_res->body.find("not_found") != std::string::npos ||
+          del_res->body.find("does-not-exist") != std::string::npos));
+
+    REQUIRE(h.audit_rows.size() == 1);
+    const auto& [action, result, target_type, target_id, detail] = h.audit_rows[0];
+    CHECK(action == "product_pack.uninstall");
+    CHECK(result == "denied");
+    CHECK(target_type == "ProductPack");
+    CHECK(target_id == "does-not-exist");
+    CHECK(detail.starts_with("not_found:"));
+    CHECK(detail.find("does-not-exist") != std::string::npos);
 }

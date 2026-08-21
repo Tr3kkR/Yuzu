@@ -1783,7 +1783,12 @@ mandatory and fails closed rather than degrading silently — same posture class
 
 - `GET /api/product-packs`, `GET /api/product-packs/{id}`, and
   `DELETE /api/product-packs/{id}` now return **HTTP 503** on a genuine database outage
-  instead of a misleadingly-empty pack list or a false "not found".
+  instead of a misleadingly-empty pack list or a false "not found". Watch the new
+  `yuzu_server_product_pack_read_degrade_total{reason}` counter (alert
+  `YuzuProductPackReadDegraded`) — while it fires, `GET /api/product-packs`/
+  `GET /api/product-packs/{id}` are failing closed rather than returning a
+  silently-wrong result; see `docs/user-manual/metrics.md`'s "Product pack store
+  metrics" section for the `reason` label vocabulary.
 - **`DELETE /api/product-packs/{id}` on a missing id now returns 404** (previously 400).
 - **Breaking — the error body on a rejected `POST /api/product-packs` or
   `DELETE /api/product-packs/{id}` is now the standard A4 envelope**
@@ -1802,10 +1807,15 @@ mandatory and fails closed rather than degrading silently — same posture class
 **Verify:** after the server reports ready, `GET /api/product-packs` shows the same
 packs as before the upgrade, and `SELECT count(*) FROM product_pack_store.product_packs;`
 against Postgres matches `sqlite3 product-packs.db "SELECT count(*) FROM
-product_packs;"`. `yuzu_server_product_pack_backfill_total{result="success"}` (or
-`"fresh"` on an install with no legacy data) confirms the backfill outcome — a refused
-boot never serves `/metrics` at all, so the absence of either sample after an expected
-boot window is itself the signal.
+product_packs;"`. `yuzu_server_product_pack_backfill_total{result="success"}` advancing
+(or `"fresh"` on an install with no legacy data) confirms this boot's backfill outcome —
+both label values are pre-seeded to 0 at construction, so the series exists on every
+healthy boot; a genuinely fast-skipped restart (fingerprint already processed) leaves
+both at 0 too, which is expected and not a failure signal. The actual alerting
+shape (`YuzuProductPackBackfillNotCompleted`) keys on the ABSENCE of any
+`success`/`fresh` sample across a 15-minute window, not on any single value — a
+refused boot never serves `/metrics` at all, so no server in the window reporting
+either outcome is itself the signal of a fail-closed boot-refusal loop.
 
 ## Upgrade Order
 
