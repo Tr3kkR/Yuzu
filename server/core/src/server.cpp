@@ -8590,10 +8590,10 @@ private:
 
     /// Set-membership variant for the revocation sweep tick (UP-1, Gate 4
     /// unhappy-path, 2026-08-21): checks against a revoked-serial set read ONCE
-    /// per tick via the typed list_revoked(), instead of calling the fail-closed
-    /// is_peer_cert_revoked() once per live agent — see the sweep-tick comment
-    /// in run() for why. Never touches ca_store_ directly, so it has no
-    /// degraded-read behavior of its own to get wrong.
+    /// per tick via the typed list_revoked_serials(), instead of calling the
+    /// fail-closed is_peer_cert_revoked() once per live agent — see the
+    /// sweep-tick comment in run() for why. Never touches ca_store_ directly, so
+    /// it has no degraded-read behavior of its own to get wrong.
     bool is_peer_cert_revoked_in(const std::string& peer_cert_pem,
                                   const std::unordered_set<std::string>& revoked_serials) {
         const std::string serial = resolve_yuzu_peer_serial(peer_cert_pem);

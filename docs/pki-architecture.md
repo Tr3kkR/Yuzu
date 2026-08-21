@@ -544,6 +544,16 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
   root); a full fleet re-enrollment follows, same as a root-key loss. Prefer `POST /ca/import-chain`
   (Subordinate-CA, PR6) when the
   goal is re-keying under a new authority without an enrollment outage.
+- **A bootstrap that seems permanently stuck** (multi-replica default-cert self-heal, ADR-0053
+  C5-1/Gate 8 — an unsupported topology, `docs/user-manual/upgrading.md`'s HA note): check
+  `pg_locks` for a lingering `yuzu:default_certs_bootstrap` session advisory lock —
+  `SELECT pid, granted FROM pg_locks WHERE locktype = 'advisory' AND objid = <key>` (the lock key is
+  `default_certs_bootstrap_lock_key()`'s fixed classid/objid pair). A host crash or network
+  partition can leave the lock held with no live backend behind it until Postgres itself notices
+  the dead session (TCP keepalive timeout, `idle_session_timeout` if set) — `SELECT
+  pg_terminate_backend(pid)` on that `pid` releases it immediately rather than waiting. Every other
+  replica's retry loop (`kBootstrapLockAcquireTimeout`/`kBootstrapLockRetryInterval`,
+  `default_certs.cpp`) picks the now-free lock up on its own next attempt — no restart required.
 
 ## Roadmap
 

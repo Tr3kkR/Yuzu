@@ -480,14 +480,14 @@ void warn_on_san_drift(const fs::path& representative_leaf,
 // see lock_connection_alive()'s doc comment for why (chaos-injector C5-1,
 // Gate 5, 2026-08-21): a dead lock-holding connection releases the session
 // lock silently, and nothing else on this path would ever notice.
-bool complete_default_cert_set(const fs::path& dir, const std::string& hostname,
-                               const std::vector<std::string>& extra_sans,
-                               const std::string& cert_group, CaStore* ca_store,
-                               FileKeyProvider& kp, const std::string& ca_cert_pem,
-                               const std::string& ca_key_pem, const std::string& ca_fp,
-                               const std::string& ca_key_id, const pki::CertDetails& ca_info,
-                               const fs::path& marker, DefaultCertSet& out,
-                               PGconn* lock_conn = nullptr) {
+[[nodiscard]] bool complete_default_cert_set(const fs::path& dir, const std::string& hostname,
+                                             const std::vector<std::string>& extra_sans,
+                                             const std::string& cert_group, CaStore* ca_store,
+                                             FileKeyProvider& kp, const std::string& ca_cert_pem,
+                                             const std::string& ca_key_pem, const std::string& ca_fp,
+                                             const std::string& ca_key_id, const pki::CertDetails& ca_info,
+                                             const fs::path& marker, DefaultCertSet& out,
+                                             PGconn* lock_conn = nullptr) {
     if (ca_store) {
         // Best-effort / non-fatal: a failed purge leaves stale rows, not a
         // security or correctness defect (#1238 should-fix: don't silently
@@ -639,10 +639,10 @@ bool complete_default_cert_set(const fs::path& dir, const std::string& hostname,
 // re-minting over a sibling's just-completed, now-live set. Returns true
 // (and populates `out`) iff a complete, currently-valid set already exists on
 // disk; false means the caller should proceed to generate.
-bool try_use_existing_complete_set(const fs::path& dir, const fs::path& marker,
-                                   const std::string& hostname,
-                                   const std::vector<std::string>& extra_sans,
-                                   const std::string& cert_group, DefaultCertSet& out) {
+[[nodiscard]] bool try_use_existing_complete_set(const fs::path& dir, const fs::path& marker,
+                                                 const std::string& hostname,
+                                                 const std::vector<std::string>& extra_sans,
+                                                 const std::string& cert_group, DefaultCertSet& out) {
     if (!(file_present(marker) && all_files_present(out)))
         return false;
     const std::string marker_text = read_text_file(marker);
@@ -856,14 +856,15 @@ private:
 // `pool` is the SAME pg::PgPool `ca_store` borrows (CaStore::pool()) — a
 // SEPARATE lease from ca_store's own per-call leasing, held for exactly the
 // duration of the critical section, matching KekOpLockGuard's precedent.
-bool complete_default_cert_set_locked(pg::PgPool& pool, const fs::path& dir, const fs::path& marker,
-                                      const std::string& hostname,
-                                      const std::vector<std::string>& extra_sans,
-                                      const std::string& cert_group, CaStore* ca_store,
-                                      FileKeyProvider& kp, const std::string& ca_cert_pem,
-                                      const std::string& ca_key_pem, const std::string& ca_fp,
-                                      const std::string& ca_key_id, const pki::CertDetails& ca_info,
-                                      DefaultCertSet& out) {
+[[nodiscard]] bool complete_default_cert_set_locked(pg::PgPool& pool, const fs::path& dir,
+                                                    const fs::path& marker,
+                                                    const std::string& hostname,
+                                                    const std::vector<std::string>& extra_sans,
+                                                    const std::string& cert_group, CaStore* ca_store,
+                                                    FileKeyProvider& kp, const std::string& ca_cert_pem,
+                                                    const std::string& ca_key_pem, const std::string& ca_fp,
+                                                    const std::string& ca_key_id, const pki::CertDetails& ca_info,
+                                                    DefaultCertSet& out) {
     auto lease = pool.try_acquire_for(kBootstrapLockAcquireTimeout);
     if (!lease) {
         spdlog::error("default_certs: could not acquire a database connection to take the "

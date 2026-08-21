@@ -615,11 +615,23 @@ code (not the diff, not the commit message) and confirmed their own original fin
 
 Full agent reports: this run's governance transcript (session-local, not committed).
 
-## Resource Ledger — C5-1 fencing-check fix (commit `63cc22610`)
+## Resource Ledger — advisory-lock fix chain (commits `e4c4d7cfc`, `63cc22610`)
 
-cpp-safety's Gate 8 domain re-review of the fencing-check fix (below) flagged this round as
-missing a committed Resource Ledger — a policy floor independent of code correctness. Recorded
-here for that commit's new/changed resource-acquiring code:
+cpp-safety's Gate 8 domain re-review of the fencing-check fix flagged the chain as missing a
+committed Resource Ledger — a policy floor independent of code correctness, and one that applies
+to the whole fix chain that introduced the lock machinery, not only its last commit. Recorded here
+for both rounds' new/changed resource-acquiring code.
+
+### `e4c4d7cfc` — the bootstrap advisory-lock guard itself
+
+| Resource | Owner | Acquire | Release | Failure path |
+|---|---|---|---|---|
+| `auto lease` (`pg::PgPool::Lease`, `complete_default_cert_set_locked()`) | Local, RAII (existing `Lease` type) | `pool.try_acquire_for(kBootstrapLockAcquireTimeout)` against `ca_store->pool()` — a SEPARATE lease from `CaStore`'s own per-call leasing | Automatic, returns the connection to the pool at end of function scope | `!lease` (pool exhausted / timeout) logs and returns `false` before any lock attempt — no dangling lease, no lock ever requested |
+| `DefaultCertsBootstrapLockGuard guard{lease.get()}` (wraps `pg::PgSessionAdvisoryLockGuard inner_`) | Local, RAII, non-copyable/non-movable (deleted ctors, mirrors `KekOpLockGuard`) | Constructed ONLY after `try_lock_default_certs_bootstrap()` returns `kAcquired` — never constructed on `kConflict`/`kError` | `pg_advisory_unlock` in `inner_`'s destructor; declared AFTER `lease` in the same scope so it destructs (releases the lock) BEFORE `lease`'s destructor returns the connection to the pool — releasing a lock on an already-recycled connection would be silently wrong | The bounded retry loop against `kBootstrapLockAcquireTimeout`/`kBootstrapLockRetryInterval` treats persistent `kConflict` as "another instance is completing its own bootstrap" (fails closed to "wait or bail", never proceeds unlocked); `kError` logs and returns `false` |
+| `pg::PgResult res{PQexec(conn, sql.c_str())}` inside `try_lock_default_certs_bootstrap()` | Local, RAII (`PQclear` on destruction) | `PQexec` running the `pg_try_advisory_lock` SQL | Automatic, end of function scope | Guards the row read by construction (mirrors `try_lock_kek_op`'s own defensive shape) — `PQgetvalue`'s return is checked, not assumed non-null, before dereferencing `[0]` |
+| `pg::PgPool& pool()` (`CaStore`, new `noexcept` const accessor) | Not owned — returns a reference to `CaStore`'s existing `pool_` member, whose lifetime is `CaStore`'s own | N/A — no acquisition, a plain reference return | N/A — `CaStore` owns `pool_` for its own lifetime, unaffected by callers reading the reference | `noexcept` is justified: the body is a single reference-returning member access, no allocation, no throwing operation reachable in it |
+
+### `63cc22610` — the fencing check added on top
 
 | Resource | Owner | Acquire | Release | Failure path |
 |---|---|---|---|---|
@@ -666,7 +678,10 @@ self-heals on the very next boot instead of validating forever. Regression test
 (`test_default_certs.cpp`): directly plants a mismatched key at a leaf's path (bypassing the need
 to actually win a race) and asserts the next boot detects it and regenerates, rather than accepting
 it as intact — this scenario, unlike Finding A's original race, is deterministically reproducible
-without timing dependence, so red/green is legitimate closure evidence here.
+without timing dependence: verified red against the pre-fix commit (`63cc22610~1`) in a throwaway
+worktree (`REQUIRE(healed.freshly_generated)` failed — the pre-fix fast path logged the
+`cert_matches_key` mismatch but still reported the corrupted set as intact) and green against the
+fix, so red/green is legitimate closure evidence here.
 - **Not separately fixed (chaos-injector C5-1's success criterion #3):** a fully deterministic
   end-to-end repro (capture the lock connection's real backend PID, `pg_terminate_backend` it
   mid-flight, assert the race then manifests) was considered and deliberately not built — it would
@@ -749,6 +764,44 @@ candidate), but this migration inherited rather than introduced that duplication
 follow-up issues, not fixed in this branch.
 
 Full agent reports: this run's governance transcript (session-local, not committed).
+
+## cpp-expert gap-filling review (2026-08-21)
+
+Routed-concerns mandates cpp-expert on "any C++ source change" unconditionally; it had reviewed
+the original migration and the Gate 3 first-boot-race fix but not the six subsequent fix-round
+commits (`f4631a78a`..`9e778d3da`, ~500 new lines). Ran as a coverage-matrix gap fill, not a
+correctness re-litigation (security/ownership/lifetime were explicitly out of scope, already
+covered by security-guardian/cpp-safety/architect above). **PASSES — no BLOCKING findings, all
+NICE.** Verified sound rather than merely unreviewed: the `9e778d3da` const/UB fix is correct
+(`KeyZeroGuard` takes `std::string&`, the prior `const_cast`-through-write was genuine UB);
+`PGconn* lock_conn = nullptr` matches this codebase's own house style for an optional borrowed
+resource (grepped — `std::optional<std::reference_wrapper<...>>` appears nowhere in this repo for
+this purpose); the `for(;;)` retry loop mirrors `pg_pool.cpp`'s `acquire_internal()` and a
+pre-existing pattern already in this file; `BootstrapLockAttempt`/`try_lock_default_certs_bootstrap`/
+`DefaultCertsBootstrapLockGuard` are deliberate structural mirrors of `kek_op_lock.hpp`'s
+`KekOpLockAttempt`/`try_lock_kek_op`/`KekOpLockGuard`, as the comments claim; `CaStore::pool()`'s
+`noexcept` is justified (a bare reference return, no throwing operation reachable); destruction
+order and function-local-static init are standard-guaranteed identically across all four supported
+compilers; no C++23 feature in this diff (`std::format`, `clock_cast`, deducing-`this`, aggregate
+CTAD) risks compiler divergence — net portability risk assessed LOW, with the residual ask for
+`cross-platform` being a routine compile-and-test confirmation (this branch has only built on
+Linux/GCC so far) rather than a risk-driven one.
+
+Three NICE findings, all fixed in this round: (1) `is_peer_cert_revoked_in()`'s doc comment said
+the sweep reads the revoked set via `list_revoked()`, but the actual `run()` caller uses the
+cheaper `list_revoked_serials()` (Gate 8 Finding B's own fix) — a comment/code truth mismatch,
+corrected to name the right function; (2) `BootstrapLockAttempt attempt;` in
+`complete_default_cert_set_locked()` was declared without an initializer immediately before the
+loop that unconditionally assigns it — not UB (always definitely-assigned before read), but this
+repo's `.clang-tidy` flags exactly this pattern (`cppcoreguidelines-init-variables`); initialized
+to `BootstrapLockAttempt::kError` as a fail-safe default; (3) `[[nodiscard]]` was applied to
+`lock_connection_alive()`/`try_lock_default_certs_bootstrap()` but not the equally
+must-not-discard `complete_default_cert_set()`/`try_use_existing_complete_set()`/
+`complete_default_cert_set_locked()` (all `bool`, all "false means don't trust this result," every
+current call site already correctly uses the return value) — added for forward-looking
+consistency.
+
+Full agent report: this run's governance transcript (session-local, not committed).
 
 ## Consequences
 
