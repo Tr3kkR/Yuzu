@@ -1533,8 +1533,9 @@ TEST_CASE("a production-order restart into each degraded spark posture: cached r
     { // SparkDisabled: --spark-disable at boot. Legacy is the CORRECT path here, not a
       // fallback (guardian_engine.hpp's SparkDisabled doc), so armed_guard_count() is
       // deliberately NOT asserted - Linux's legacy guard start() stubs return false
-      // (this file's other SparkDisabled-adjacent tests hit the same trap), so the only
-      // portable assertion is that spark itself was never touched.
+      // regardless of correctness (the same trap documented at lines ~511 and ~889-891
+      // for other availability values), so the only portable assertion is that spark
+      // itself was never touched.
         const auto kv_path = unique_kv_path();
         yuzu::test::TempDbFile db{kv_path};
         seed_armed_rules(kv_path);
@@ -1581,7 +1582,15 @@ TEST_CASE("a production-order restart into each degraded spark posture: cached r
         CHECK(engine.spark_availability() == GuardianEngine::SparkAvailability::SparkFailed);
         CHECK(engine.rule_count() == 3); // cache intact
         CHECK(engine.spark_armed_rule_count() == 0);
-        CHECK(engine.armed_guard_count() == 0); // withdrawn from BOTH backends, never legacy fallback
+        // 0 today because reconcile_rule_locked's mutual-exclusion guard withdraws
+        // BEFORE ever calling start_guard_for_rule_locked - never a legacy fallback.
+        // Same D-Bus/Linux-stub caveat as the SparkDisabled leg still applies to a
+        // REGRESSED guard, though: start_guard_for_rule_locked's own
+        // ServiceGuard::start() independently returns false on this host (no system
+        // bus), so a deleted mutual-exclusion guard would ALSO produce 0 here on
+        // Linux CI - this assertion is a real, deterministic proof against today's
+        // code, not proof against every possible regression on every host.
+        CHECK(engine.armed_guard_count() == 0);
         CHECK(engine.unsupported_counts_by_type().empty());
         CHECK(engine.drain_worker_for_test() == nullptr);
         CHECK(engine.convergence_scheduler_for_test() == nullptr);
@@ -1615,7 +1624,8 @@ TEST_CASE("a production-order restart into each degraded spark posture: cached r
         CHECK(engine.spark_availability() == GuardianEngine::SparkAvailability::Unwired);
         CHECK(engine.rule_count() == 3); // the walk ran and loaded the cache
         CHECK(engine.spark_armed_rule_count() == 0);
-        CHECK(engine.armed_guard_count() == 0);
+        CHECK(engine.armed_guard_count() == 0); // see the SparkFailed leg's comment above -
+                                                 // same mutual-exclusion-guard-vs-D-Bus-stub caveat
         CHECK(engine.unsupported_counts_by_type().empty());
         CHECK(engine.drain_worker_for_test() == nullptr);
         CHECK(engine.convergence_scheduler_for_test() == nullptr);
@@ -1649,7 +1659,7 @@ TEST_CASE("a production-order restart into each degraded spark posture: cached r
         engine.stop(); // SIGTERM beat boot; sets the sticky stopped_ flag
         engine.wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
                                  [](const OutboxEntry&) { return SendResult::Sent; });
-        CHECK(engine.spark_availability() == GuardianEngine::SparkAvailability::Unwired); // no-oped
+        REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Unwired); // no-oped
 
         REQUIRE(engine.start_local().has_value()); // sticky-stop early return: SUCCESS, not an error
 
