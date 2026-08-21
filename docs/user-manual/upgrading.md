@@ -689,13 +689,40 @@ it was never in `ca.db` and stays a local file behind `KeyProvider` (`--ca-dir`)
 - Every other CA behavior — revocation semantics, CRL numbering, the single
   `sign_agent_csr` chokepoint — is unchanged. Detail: `docs/pki-architecture.md`,
   `docs/adr/0053-ca-store-postgres-migration.md`.
-- **HA note: a losing first-boot replica does not self-heal on its own.** If two
-  server instances start against the same fresh `ca_store` at once, exactly one
-  wins the root race and generates the live default certs; the other discards
-  its own freshly-generated material and does not start serving with it. That
-  losing instance does not retry in the background — restart it (or let your
-  orchestrator's normal restart-on-unready policy do so) once the winner's
-  certs are in place, so it picks them up from disk on the next boot.
+- **New: an established, already-running default-cert install can now self-heal
+  its own listener leaves without operator action.** This is not limited to a
+  first-boot crash window — any boot where the on-disk `--ca-dir` default
+  leaves are missing, corrupt, or a leaf was later lost (a bad partial restore,
+  a lost volume file) hits the same path, as long as `ca_store` already holds
+  a root and this instance's local CA key file still matches it. When that
+  holds, the server automatically **re-mints its own https/server/gateway
+  leaves with fresh private keys** under the existing root and resumes,
+  instead of refusing to start. It never touches the CA root itself or any
+  agent-issued certificate. Every occurrence logs a `spdlog::warn` line, but
+  there is currently no dedicated audit-log row for it (unlike enrollment-time
+  `ca.cert.issued`) — tracked as a follow-up, not fixed in this release.
+- **HA note: a losing first-boot replica does not self-heal on its own.** Multiple
+  server instances sharing one `--ca-dir` cert volume and one `ca_store` Postgres
+  substrate is not an officially supported deployment topology today (see
+  ADR-0053's Decision section) — this note describes what happens if it's done
+  anyway, safely, not a recommendation to do it. If two instances start against
+  the same fresh `ca_store` at once, exactly one wins the root race and
+  generates the live default certs; the other **exits** (refuses to start,
+  non-zero) rather than serving with its own discarded material — it does not
+  reach a running-but-unready state, so a readiness-probe-driven restart never
+  applies here. Recovery is a plain process-supervisor restart (systemd
+  `Restart=on-failure`, Kubernetes `restartPolicy`) once the winner's certs are
+  in place, so the losing instance picks them up from disk on its next boot. On
+  systemd specifically, a slow winner (e.g. Postgres itself under load) can
+  interact with the crash-loop guard (`StartLimitBurst`/`StartLimitIntervalSec`)
+  — a losing replica that exhausts its restart budget first lands in the
+  service's "failed" state and needs a manual `systemctl reset-failed` once the
+  winner has actually finished, rather than retrying forever on its own.
+  Diagnosing a bootstrap that seems permanently stuck (neither replica ever
+  finishes): check `pg_locks` for a lingering `yuzu:default_certs_bootstrap`
+  session advisory lock with no live backend behind it (a host crash or network
+  partition can leave one held until Postgres notices the dead session) and
+  `pg_terminate_backend` it — see `docs/pki-architecture.md`'s operator runbook.
 
 ## ⚠️ Behaviour change: response history resets on Postgres cutover (ADR-0039)
 

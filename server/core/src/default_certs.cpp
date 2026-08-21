@@ -460,6 +460,10 @@ void warn_on_san_drift(const fs::path& representative_leaf,
                  joined);
 }
 
+// Forward-declared: defined further down alongside the rest of the bootstrap
+// advisory-lock machinery it belongs with; referenced here first.
+[[nodiscard]] bool lock_connection_alive(PGconn* conn);
+
 // Shared tail for ensure_default_certs: purge stale default-cert inventory, mint
 // the 3 default leaves under an ALREADY-ESTABLISHED root, and write the
 // completion marker LAST (its presence is the "set is complete" signal). Two
@@ -470,13 +474,20 @@ void warn_on_san_drift(const fs::path& representative_leaf,
 // that THIS instance minted the root ca_store already holds. The purge below is
 // safe in both cases for the same reason: whoever calls this function is the
 // confirmed sole legitimate writer for "system:default-certs" going forward.
+// `lock_conn`: the SAME connection holding the bootstrap advisory lock (null
+// when there is no lock to verify — the no-ca_store local-only fallback).
+// Re-checked with a real round-trip immediately before the marker write —
+// see lock_connection_alive()'s doc comment for why (chaos-injector C5-1,
+// Gate 5, 2026-08-21): a dead lock-holding connection releases the session
+// lock silently, and nothing else on this path would ever notice.
 bool complete_default_cert_set(const fs::path& dir, const std::string& hostname,
                                const std::vector<std::string>& extra_sans,
                                const std::string& cert_group, CaStore* ca_store,
                                FileKeyProvider& kp, const std::string& ca_cert_pem,
                                const std::string& ca_key_pem, const std::string& ca_fp,
                                const std::string& ca_key_id, const pki::CertDetails& ca_info,
-                               const fs::path& marker, DefaultCertSet& out) {
+                               const fs::path& marker, DefaultCertSet& out,
+                               PGconn* lock_conn = nullptr) {
     if (ca_store) {
         // Best-effort / non-fatal: a failed purge leaves stale rows, not a
         // security or correctness defect (#1238 should-fix: don't silently
@@ -579,6 +590,25 @@ bool complete_default_cert_set(const fs::path& dir, const std::string& hostname,
         return false;
     }
 
+    // Fencing check (chaos-injector C5-1, Gate 5, 2026-08-21): every write
+    // above is done, but if THIS lock-holding connection died partway through
+    // (pg_terminate_backend, an idle-session reap, a network blackhole to
+    // just this socket) Postgres already released the session advisory lock
+    // — silently, with no error from any of the calls above, since they each
+    // draw their OWN fresh per-call lease from the pool rather than reusing
+    // this connection. A sibling racer could already be mid-flight on its own
+    // concurrent attempt right now. Refuse to write the marker (the "this set
+    // is trustworthy" signal) if we can no longer prove we still hold the
+    // lock — the next boot (or the sibling that's likely already running)
+    // retries cleanly; writing the marker here would falsely vouch for a
+    // possibly-torn result.
+    if (lock_conn && !lock_connection_alive(lock_conn)) {
+        spdlog::error("default_certs: lock-holding connection died mid-critical-section — this "
+                      "attempt's result cannot be trusted, leaving no marker (will retry next "
+                      "boot)");
+        return false;
+    }
+
     // Marker LAST — its presence is the "set is complete" signal.
     nlohmann::json j;
     j["version"] = kMarkerVersion;
@@ -636,14 +666,36 @@ bool try_use_existing_complete_set(const fs::path& dir, const fs::path& marker,
         const bool leaves_ok = pki::verify_chain(read_text_file(out.https_cert), ca_pem) &&
                                pki::verify_chain(read_text_file(out.server_cert), ca_pem) &&
                                pki::verify_chain(read_text_file(out.gateway_cert), ca_pem);
+        // Chain-verify alone does NOT catch a cert paired with the WRONG key
+        // for its own purpose — a corrupted-pairing class the chain check is
+        // blind to (chaos-injector C5-1, Gate 5, 2026-08-21): if the bootstrap
+        // advisory lock's holding connection ever died mid-critical-section
+        // (mitigated, not made impossible, by the fencing check in
+        // complete_default_cert_set()) a sibling racer could interleave
+        // writes and leave one purpose's cert from one racer paired with its
+        // key from the other — both individually valid, chaining fine, but
+        // mismatched. This is the ONLY thing standing between that corruption
+        // and it validating as intact forever, so it must self-heal on the
+        // very next boot rather than depend solely on prevention.
+        const auto https_key = read_text_file(out.https_key);
+        const auto server_key = read_text_file(out.server_key);
+        const auto gateway_key = read_text_file(out.gateway_key);
+        KeyZeroGuard https_key_zero{const_cast<std::string&>(https_key)};
+        KeyZeroGuard server_key_zero{const_cast<std::string&>(server_key)};
+        KeyZeroGuard gateway_key_zero{const_cast<std::string&>(gateway_key)};
+        const bool keys_paired =
+            pki::cert_matches_key(read_text_file(out.https_cert), https_key) &&
+            pki::cert_matches_key(read_text_file(out.server_cert), server_key) &&
+            pki::cert_matches_key(read_text_file(out.gateway_cert), gateway_key);
         auto ca_info = pki::parse_certificate(ca_pem);
         const auto now = std::chrono::system_clock::now();
         const bool ca_valid_now =
             ca_info && ca_info->not_before <= now && now < ca_info->not_after;
-        if (!leaves_ok || !ca_valid_now) {
+        if (!leaves_ok || !keys_paired || !ca_valid_now) {
             spdlog::warn("default_certs: existing default certs unusable ({}) — regenerating",
-                         !leaves_ok ? "a leaf no longer chains to the CA"
-                                    : "CA not currently valid (clock skew?)");
+                         !leaves_ok  ? "a leaf no longer chains to the CA"
+                         : !keys_paired ? "a leaf cert/key pair no longer matches"
+                                        : "CA not currently valid (clock skew?)");
             return false;
         }
         out.ca_fingerprint_sha256 = *fp;
@@ -701,9 +753,12 @@ bool try_use_existing_complete_set(const fs::path& dir, const fs::path& marker,
 // must stay comfortably above the realistic number of instances that could
 // share one --ca-dir + ca_store concurrently (2-3 for ordinary HA topologies
 // → pool size >= 4-5 with margin) — the default (16) is nowhere near this
-// floor, but an operator running with a tightly-sized pool (down to the
-// allowed minimum of 1) will see this self-contend. It fails CLOSED and
-// LOUDLY when it does (a nested acquire timeout surfaces as a normal
+// floor. At --postgres-pool-size=1 specifically this is NOT merely "self-
+// contends under a race": the outer lease permanently holds the pool's only
+// connection, so EVERY nested call must time out — a deterministic failure
+// on every boot that needs default-cert generation, with zero racers
+// required (unhappy-path, Gate 8 narrow re-verify, 2026-08-21). It fails
+// CLOSED and LOUDLY either way (a nested acquire timeout surfaces as a normal
 // record_issued/delete_issued_by failure → "Refusing to start"), never a
 // hang or silent corruption — so this is a documented constraint, not a
 // defect requiring a code fix.
@@ -736,6 +791,28 @@ enum class BootstrapLockAttempt { kAcquired, kConflict, kError };
     }
     return (PQgetvalue(res.get(), 0, 0)[0] == 't') ? BootstrapLockAttempt::kAcquired
                                                     : BootstrapLockAttempt::kConflict;
+}
+
+// Fencing-token gap (chaos-injector, Gate 5, 2026-08-21): holding the
+// bootstrap advisory lock is only as good as the SESSION it's held on still
+// being alive. Postgres releases a session advisory lock the moment that
+// session ends — if THIS connection dies mid-critical-section
+// (pg_terminate_backend, an idle_session_timeout, a network blackhole to
+// just this one socket) while the rest of the process keeps running on its
+// other, healthy per-call leases, nothing before this point would notice: a
+// sibling racer's retry loop acquires the now-free lock and starts its own
+// purge-and-regenerate concurrently with THIS attempt's still-in-flight
+// writes — reopening the exact corruption Finding A's lock exists to
+// prevent, via a broader trigger than "two processes racing at boot." A real
+// round-trip, not PQstatus alone (stale until the next I/O) and not
+// re-issuing pg_try_advisory_lock (re-entrant on the same connection — would
+// falsely reconfirm exclusivity while silently incrementing the hold count,
+// never proving liveness).
+[[nodiscard]] bool lock_connection_alive(PGconn* conn) {
+    if (!conn || PQstatus(conn) != CONNECTION_OK)
+        return false;
+    pg::PgResult res{PQexec(conn, "SELECT 1")};
+    return res.status() == PGRES_TUPLES_OK;
 }
 
 class DefaultCertsBootstrapLockGuard {
@@ -821,7 +898,7 @@ bool complete_default_cert_set_locked(pg::PgPool& pool, const fs::path& dir, con
     }
     return complete_default_cert_set(dir, hostname, extra_sans, cert_group, ca_store, kp,
                                      ca_cert_pem, ca_key_pem, ca_fp, ca_key_id, ca_info, marker,
-                                     out);
+                                     out, lease.get());
 }
 
 } // namespace
@@ -880,11 +957,16 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
         if (root_or_err->has_value()) {
             const auto& root = **root_or_err;
 
-            // UP-2 self-heal (Gate 4 unhappy-path, 2026-08-21): a crash between
-            // try_insert_root() succeeding and the marker being written leaves
-            // EXACTLY this state — ca_store already holds a root, on-disk is
-            // missing/corrupt/marker-less. Before refusing outright, check
-            // whether THIS instance is provably the one that minted it: for
+            // UP-2 self-heal (Gate 4 unhappy-path, 2026-08-21): reaches here any
+            // time the on-disk leaf set is unusable (missing, corrupt, no
+            // longer chains, or the CA isn't currently valid — see
+            // try_use_existing_complete_set() above) while ca_store already
+            // holds a root. This is NOT scoped to a first-boot crash window —
+            // enterprise-readiness (Gate 6, 2026-08-21) correctly named it
+            // broader: an ESTABLISHED, long-running install that later loses a
+            // leaf file (a bad partial restore, a lost volume file) hits this
+            // exact branch too. Before refusing outright, check whether THIS
+            // instance is provably the one that minted the root: for
             // FileKeyProvider, key_ref IS the local file path (never shared
             // state — see the "Store the CA private key LOCALLY" comment
             // below), so if a key still resolves at that exact path AND its
@@ -892,9 +974,11 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
             // this instance has DIRECTORY ACCESS to the material that minted
             // the root — a wiped persistent volume or a botched restore leaves
             // no local key, or a mismatched one, and falls through to the
-            // refusal unchanged. Resume completing the SAME root rather than a
-            // heavyweight clean re-root for a fresh install that never
-            // finished, not a lost one.
+            // refusal unchanged. Resume completing the SAME root (re-mints the
+            // server's own https/server/gateway leaves under it) rather than a
+            // heavyweight clean re-root — safe regardless of WHEN in the
+            // install's life this fires, because it never touches the root
+            // itself or any agent-issued leaf.
             //
             // CORRECTED (Gate 8, 2026-08-21): this is directory access, NOT
             // instance identity — every process sharing this exact cert
@@ -903,9 +987,17 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
             // Postgres advisory lock rather than treating this check alone as
             // sufficient mutual exclusion (unhappy-path Finding A named this
             // comment's original "no other instance could be the true owner"
-            // phrasing specifically — that claim was false for the
-            // shared-cert-volume HA topology this fix round's own
-            // upgrading.md HA note describes as supported).
+            // phrasing specifically — that claim was false for a
+            // shared-cert-volume topology). Multi-replica HA over one shared
+            // ca_store is NOT an officially supported deployment shape (see
+            // this ADR's Decision section) — the lock exists because the code
+            // must stay safe if an operator does it anyway, and because a
+            // self-heal resumer can race the ORIGINAL instance on a SINGLE
+            // host too (merely slow, not actually dead), which needs no HA
+            // topology at all (enterprise-readiness, Gate 6, 2026-08-21 —
+            // corrected from an earlier round's "describes as supported"
+            // overclaim, which contradicted this same ADR's own Decision
+            // section).
             FileKeyProvider self_heal_kp(dir);
             if (self_heal_kp.has_key(root.key_ref)) {
                 auto key_pem = self_heal_kp.load_key(root.key_ref);
@@ -921,16 +1013,18 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
                         auto ca_info = pki::parse_certificate(root.cert_pem);
                         if (!ca_info) {
                             spdlog::error(
-                                "default_certs: UP-2 self-heal aborted — the ca_store root cert "
-                                "this instance owns the key for does not parse; falling back to "
-                                "the manual-recovery refusal below");
+                                "default_certs: self-heal aborted — the ca_store root cert this "
+                                "instance owns the key for does not parse; falling back to the "
+                                "manual-recovery refusal below");
                         } else {
                             spdlog::warn(
-                                "default_certs: resuming an incomplete first-boot install under "
-                                "the SAME root (fingerprint {}) — the local CA key file still "
-                                "matches ca_store's stored root, so this instance provably "
-                                "minted it; likely a crash between establishing the root and "
-                                "completing the leaf set.",
+                                "default_certs: re-minting the default leaf set under the SAME "
+                                "root (fingerprint {}) — the local CA key file still matches "
+                                "ca_store's stored root (directory access, arbitrated under the "
+                                "bootstrap lock, not a standalone ownership proof); the on-disk "
+                                "set was missing/corrupt (a first-boot crash before completing, "
+                                "or later damage to an established install — e.g. a lost leaf "
+                                "file).",
                                 root.fingerprint_sha256);
                             const std::string ca_key_id =
                                 pki::issuer_key_id(root.cert_pem).value_or(std::string{});

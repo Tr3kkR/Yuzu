@@ -588,6 +588,58 @@ TEST_CASE("default_certs: a present-but-WRONG local key falls through to the B-2
     REQUIRE((*root_after)->fingerprint_sha256 == a.ca_fingerprint_sha256); // unchanged
 }
 
+TEST_CASE("default_certs: a mismatched cert/key pair that lands on disk (however it got "
+          "there) self-heals on the very next boot, never validates as intact forever "
+          "(chaos-injector C5-1, Gate 5, 2026-08-21)",
+          "[default_certs][ca_store][security][pg]") {
+    // C5-1's scenario: the bootstrap advisory lock's holding connection could
+    // die mid-critical-section (killed, idle-reaped, network-blackholed)
+    // without the process dying, silently releasing the session lock while a
+    // sibling racer's writes interleave with this attempt's still-in-flight
+    // ones — potentially leaving one purpose's on-disk cert from one racer
+    // paired with its key from the other. The fencing check added alongside
+    // this test (a liveness round-trip immediately before the marker write)
+    // closes the PREVENTION side; this test proves the DETECTION side: if a
+    // mismatched pair ever lands on disk regardless of cause, it must not
+    // validate as an intact, trustworthy set on every subsequent boot
+    // (before this fix, try_use_existing_complete_set() chain-verified but
+    // never checked key-pairing — a corrupted pair would have survived
+    // undetected indefinitely, worse than the crash-recovery gap UP-2 itself
+    // was about).
+    TempDir dir;
+    DefaultCertSet set;
+    REQUIRE(ensure_default_certs(dir.path, "host", nullptr, set));
+    REQUIRE(set.freshly_generated);
+
+    // Simulate the corruption directly: swap the server leaf's key for an
+    // unrelated (but real, well-formed) one — same shape as an interleaved
+    // rename would produce, without needing to actually win the race.
+    auto unrelated_key = pki::generate_private_key(pki::KeyAlgo::EcP256);
+    REQUIRE(unrelated_key.has_value());
+    {
+        std::ofstream out_key(set.server_key, std::ios::binary | std::ios::trunc);
+        out_key << *unrelated_key;
+    }
+    // Sanity: the corruption is real — chain verification alone does NOT
+    // catch it (both the cert and the unrelated key are independently valid).
+    REQUIRE(pki::verify_chain(read_file(set.server_cert), read_file(set.ca_cert)));
+    REQUIRE_FALSE(pki::cert_matches_key(read_file(set.server_cert), *unrelated_key));
+
+    DefaultCertSet healed;
+    REQUIRE(ensure_default_certs(dir.path, "host", nullptr, healed));
+    REQUIRE(healed.freshly_generated); // did NOT accept the corrupted set as intact
+    // (No ca_store here, so regeneration mints a fresh CA — expected for this
+    // no-PG mode; the self-heal-under-the-SAME-root case is covered
+    // separately by the ca_store-backed self-heal tests above.)
+    // Post-heal, every pair is genuinely consistent again.
+    for (const auto& [cert_path, key_path] :
+        {std::pair{healed.https_cert, healed.https_key},
+         std::pair{healed.server_cert, healed.server_key},
+         std::pair{healed.gateway_cert, healed.gateway_key}}) {
+        CHECK(pki::cert_matches_key(read_file(cert_path), read_file(key_path)));
+    }
+}
+
 TEST_CASE("default_certs: two racing first-boot instances never cross-purge each other's "
           "leaf inventory (architect review, 2026-08-21)",
           "[default_certs][ca_store][security][pg]") {

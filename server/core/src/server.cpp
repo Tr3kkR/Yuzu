@@ -2184,6 +2184,19 @@ public:
                           "Internal-CA CRL (re)publish failures (key load / build / record). A "
                           "non-zero value since a revocation means the public CRL is stale (PKI PR4)",
                           "counter");
+        // ADR-0053 UP-1 (gov sre F1, Gate 6, 2026-08-21): describe() alone populates a
+        // description entry but MetricsRegistry::serialize() only emits # TYPE/# HELP for
+        // a name already present in the counters_ map — without a matching .counter() call
+        // this series is entirely ABSENT from /metrics (not present-at-0) until its first
+        // failure ever fires, which makes an absent()-based alert useless (can't distinguish
+        // "healthy" from "never registered"). Pre-seed it here so it exists at 0 from boot.
+        metrics_.describe("yuzu_server_ca_revocation_sweep_read_failures_total",
+                          "Revocation-sweep tick's list_revoked_serials() read failed — that "
+                          "tick's sweep was skipped entirely rather than treating every live "
+                          "agent as revoked (ADR-0053 UP-1). A sustained non-zero rate means "
+                          "already-revoked agents' live streams may not be torn down promptly",
+                          "counter");
+        (void)metrics_.counter("yuzu_server_ca_revocation_sweep_read_failures_total");
         // #1128: a peer-IP mismatch that was TOLERATED (not rejected) because a
         // NAT-aware accommodation applied. Paired with _peer_mismatch_total
         // (rejects): a spike here without a matching reject spike is benign

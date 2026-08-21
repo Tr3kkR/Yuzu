@@ -528,13 +528,21 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
   actually enrolled under — a first boot that crashed before completing (no agents enrolled yet,
   same host, local `<ca-dir>` key material intact) self-heals automatically on the next start
   instead (ADR-0053, UP-2); you only need the steps below when that self-heal condition does not
-  hold (different host, wiped `<ca-dir>`, or a root you deliberately want to retire). The operator
-  must clear the store directly —
+  hold (different host, wiped `<ca-dir>`, or a root you deliberately want to retire). **Stop every
+  server instance sharing this Postgres substrate first** — `ca_store` is live, shared state:
+  `is_revoked()`/`list_revoked()` are read on the mTLS-accept hot path with no cache, so a
+  `TRUNCATE` against a still-running server (or any OTHER replica still running against the same
+  substrate) makes every previously-revoked certificate transiently read as not-revoked between the
+  truncate and that process's restart — reopening exactly what `is_revoked()`'s fail-closed design
+  exists to prevent. Take a fresh `pg_dump` of the `ca_store` schema immediately before truncating
+  as a rollback point (the operation itself is irreversible). Then, with every instance stopped,
+  the operator clears the store directly —
   `TRUNCATE ca_store.ca_root, ca_store.ca_issued, ca_store.ca_crl_versions` against the server's
-  Postgres substrate (`docs/postgres-store-playbook.md` for connecting) — and remove the on-disk
-  `<ca-dir>/default-*.{pem,key}` + `default-marker.json`, then restart. This orphans every
-  currently-enrolled agent (their leaves chain to the destroyed root); a full fleet re-enrollment
-  follows, same as a root-key loss. Prefer `POST /ca/import-chain` (Subordinate-CA, PR6) when the
+  Postgres substrate (`docs/postgres-store-playbook.md` for connecting) — and removes the on-disk
+  `<ca-dir>/default-*.{pem,key}` + `default-marker.json` on every instance, then restarts all of
+  them together. This orphans every currently-enrolled agent (their leaves chain to the destroyed
+  root); a full fleet re-enrollment follows, same as a root-key loss. Prefer `POST /ca/import-chain`
+  (Subordinate-CA, PR6) when the
   goal is re-keying under a new authority without an enrollment outage.
 
 ## Roadmap

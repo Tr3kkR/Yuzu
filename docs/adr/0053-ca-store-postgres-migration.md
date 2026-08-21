@@ -499,9 +499,10 @@ well-evidenced:
   proof (local CA key resolves at the exact recorded path + cryptographically pairs with the
   stored root) is a STATIC predicate — every process sharing the same cert directory satisfies it
   IDENTICALLY. It is not a claim/CAS, so nothing prevented two such processes (two HA replicas
-  restarting against one shared volume — exactly the topology this same fix round's own
-  `upgrading.md` HA note describes as supported; or a self-heal resumer racing the ORIGINAL
-  instance, which was merely slow, not actually dead) from both reaching
+  restarting against one shared volume — a topology this fix round's own `upgrading.md` HA note
+  describes what happens under, NOT one this ADR's Decision section calls officially supported; or
+  a self-heal resumer racing the ORIGINAL instance, which was merely slow, not actually dead — this
+  second case needs no HA topology at all, a single host is enough) from both reaching
   `complete_default_cert_set()` concurrently. Per-file writes are atomic (temp+rename) but the
   3-cert/3-key/marker SET is not atomic as a unit, so two racers could interleave a purpose's
   on-disk `.pem` from one process with its `.key` from the other — a cryptographically mismatched
@@ -544,9 +545,16 @@ well-evidenced:
   same WHERE clause and partial index (`idx_ca_issued_status`) as `list_revoked()`, but no
   `cert_pem`, no `ORDER BY` — and the sweep now reads that instead. `list_revoked()` is unchanged
   and still used by CRL publishing (which needs `revoked_at` per entry) and the
-  `sign_agent_csr` reissue-block check (which needs `subject`/`not_after`); both are lower-frequency
-  than the ~15s sweep, so the same asymmetry there is a smaller corridor, left as-is rather than
-  broadened out of scope for this fix. Regression tests (`test_ca_store.cpp`): parity between
+  `sign_agent_csr` reissue-block check (which needs `subject`/`not_after`). Left as-is deliberately
+  (unhappy-path, Gate 8 narrow re-verify, 2026-08-21): the sharper reason isn't just that these two
+  are lower-frequency than the ~15s sweep, it's that a degraded read on EITHER one fails CLOSED and
+  LOUD — `sign_agent_csr` refuses to issue (an operator-visible enrollment failure), `publish_crl`
+  aborts the publish and increments its own failures counter while consumers keep serving the last
+  still-valid CRL. The sweep's ORIGINAL defect was fail-OPEN and SILENT — a control quietly not
+  holding, invisible without correlating a metric — which is the specific risk class this fix
+  exists to close; the residual asymmetry on the other two callers stays a bounded, observable
+  availability blip, not a silent security-control gap, so fixing only the sweep is neither an
+  under-fix nor an over-fix. Regression tests (`test_ca_store.cpp`): parity between
   `list_revoked_serials()` and `list_revoked()`'s serial set, and the same sabotage-the-store
   pattern used elsewhere in this file confirming a genuine failure returns `unexpected`, never a
   silently-empty "nobody is revoked" set.
@@ -578,6 +586,150 @@ constructor comment now carries the same "deliberately NOT noexcept" rationale
 mirrors, not a new one); `list_revoked_serials()` now routes through the file's shared `text_col()`
 helper for idiom consistency with `list_revoked()`'s identical column (the raw `PQgetvalue` it
 replaced was never actually reachable — `serial_hex` is `PRIMARY KEY`/`NOT NULL` today).
+
+**Gate 8 narrow closure re-verify (2026-08-21).** Per this repo's standing rule that only the
+reporting domain (or another instance of it) can credibly sign off its own finding as fixed —
+never the fix author — security-guardian and unhappy-path each independently re-read the current
+code (not the diff, not the commit message) and confirmed their own original findings:
+
+- **Finding A: CLOSED** (both reviewers, independently). Exactly two live call sites reach
+  `complete_default_cert_set()` unlocked: inside `complete_default_cert_set_locked()`'s own
+  critical section, and the `!ca_store` local-only fallback (which can't host the race at all — no
+  shared root CAS substrate, no lock substrate, and ADR-0006/0007 refuse to boot without a reachable
+  Postgres DSN, so "no ca_store" is single-instance-only). Both racing paths (self-heal resume,
+  normal winning-the-race) route through the lock. Neither reviewer cited the concurrent-self-heal
+  test as closure evidence, matching `b37ecf042`'s own framing — closure rests on the lease/guard
+  destruction-ordering walk, independently confirmed against every early-return path.
+- **Finding B: CLOSED**, and the scoping decision (fix only the ~15s sweep, leave `list_revoked()`
+  unchanged for the two lower-frequency callers) is correct for a sharper reason than frequency
+  alone — see the fail-open/fail-closed distinction folded into the finding's own paragraph above.
+- One follow-up fixed in this round: an operator-facing log line in the self-heal resume path still
+  said "this instance provably minted it" — the exact overclaim the nearby comment was already
+  corrected away from (security-guardian). Reworded to describe the proof accurately (directory
+  access, arbitrated under the lock) rather than repeating the retracted claim.
+- The pool-size SHOULD's framing was sharpened (unhappy-path): at `--postgres-pool-size=1`
+  specifically this is not "self-contends under a race" but a **deterministic** failure on every
+  boot needing cert generation, zero racers required, since the outer lease alone exhausts a
+  pool of size 1. Still fails closed and loud, still non-blocking — the comment at
+  `kBootstrapLockAcquireTimeout` now says this precisely.
+
+Full agent reports: this run's governance transcript (session-local, not committed).
+
+## Governance Gate 5/6 findings (2026-08-21, pre-push)
+
+Gate 5 (chaos-injector, triggered because Gate 4 produced findings) and Gate 6 (compliance-officer
++ sre + enterprise-readiness, mandatory) ran together against the full branch diff
+(`origin/dev..HEAD`), plus a narrow closure re-verify (security-guardian + unhappy-path, confirming
+Findings A/B from the prior round independently, per this repo's rule that only the reporting
+domain can sign off its own finding) and an architect domain-trigger pass on the two new `CaStore`
+API additions.
+
+**HIGH (fixed, chaos-injector Gate 5, finding C5-1) — a fencing-token gap in the Gate 8 lock
+itself.** The advisory lock closes "two processes both think they can proceed" but not "this
+process's lock-holding CONNECTION dies mid-critical-section without the PROCESS dying"
+(`pg_terminate_backend`, an `idle_session_timeout`, a network blackhole to just that one socket).
+Postgres releases the session advisory lock the instant that session ends — silently, since every
+write inside the critical section draws its OWN fresh per-call lease from the pool rather than
+reusing the lock-holding connection, so nothing before this fix would ever notice the lock was
+gone. A sibling racer's retry loop then acquires the now-free lock and starts its own
+purge-and-regenerate concurrently with the first attempt's still-in-flight writes — reopening
+Finding A's exact corruption class via a broader, more realistic trigger population than "two
+processes racing at boot." Worse than Finding A's original defect: the idempotent fast path
+(`try_use_existing_complete_set()`) chain-verified every leaf but never checked cert/key pairing,
+so a corrupted pair would have validated as intact FOREVER — permanent, silent corruption, not a
+self-healing crash-recovery gap. Fixed, two layers (chaos-injector's own success criteria):
+(1) **prevention** — `lock_connection_alive()`, a real `SELECT 1` round-trip (not `PQstatus` alone,
+stale until the next I/O; not re-issuing `pg_try_advisory_lock`, re-entrant on the same
+connection — would falsely reconfirm exclusivity while silently incrementing the hold count rather
+than proving liveness) on the SAME connection holding the lock, checked immediately before the
+marker write; a failed check aborts without writing the marker. (2) **detection** —
+`try_use_existing_complete_set()` now also verifies `pki::cert_matches_key()` for every leaf/key
+pair, so a mismatched pair that lands on disk despite (1) — from ANY cause, not just this one —
+self-heals on the very next boot instead of validating forever. Regression test
+(`test_default_certs.cpp`): directly plants a mismatched key at a leaf's path (bypassing the need
+to actually win a race) and asserts the next boot detects it and regenerates, rather than accepting
+it as intact — this scenario, unlike Finding A's original race, is deterministically reproducible
+without timing dependence, so red/green is legitimate closure evidence here.
+- **Not separately fixed (chaos-injector C5-1's success criterion #3):** a fully deterministic
+  end-to-end repro (capture the lock connection's real backend PID, `pg_terminate_backend` it
+  mid-flight, assert the race then manifests) was considered and deliberately not built — it would
+  need a test-only hook exposing an internal connection handle across the anonymous-namespace
+  boundary, which this session judged not worth the production-code surface given the
+  prevention+detection test above already exercises both fix layers directly and deterministically.
+  Documented here rather than silently narrowed.
+- **MEDIUM, documented not fixed (chaos-injector C5-2):** the inverse case — a lock HELD too long
+  because the holder's HOST (not just the connection) dies without a clean disconnect — is an
+  availability/diagnosability gap, not a corruption risk (nothing writes concurrently). Postgres's
+  server-side `tcp_keepalives_*` GUCs (not this PR's `pg_pool.hpp` client-side `keepalives_idle_s`,
+  which only detects a dead SERVER) govern how long a genuinely-dead session's lock stays held —
+  potentially hours on defaults. Added a stuck-lock diagnosis pointer to `upgrading.md`'s HA note.
+
+**Two-reporter closure re-verify (security-guardian + unhappy-path, independent re-reads of the
+CURRENT code, not the diff):** both confirm Finding A and Finding B (prior round) CLOSED. One
+follow-up each, both folded into this round: an operator-facing log line still said "provably
+minted it" — the exact overclaim the adjacent comment had already been corrected away from
+(security-guardian); the pool-size SHOULD's framing was sharpened from "self-contends" to
+"deterministic at pool-size=1" (unhappy-path, folded into the prior round's entry above).
+
+**compliance-officer (Gate 6): PASS**, conditional on standard pre-merge evidentiary items (a
+`governance.d/` ledger fragment, an open PR, an independently-attested green CI run) rather than
+any control-design gap — every control-relevant defect found this run (boot-wiring fail-open,
+sweep false-audit-record, self-heal race, revoke taxonomy inversion) is verified fixed in code, not
+merely claimed fixed in prose. Confirmed the branch's own two mid-review self-corrections
+(the ownership-proof overclaim, the non-reproducing test) do not constitute a policy-floor
+violation, since both were caught and retracted before being used as sign-off evidence, not after.
+
+**sre (Gate 6): PASS with findings**, none blocking. Fixed in this round: the new
+`yuzu_server_ca_revocation_sweep_read_failures_total` counter had no `describe()`/boot-time
+pre-seed, so it was entirely ABSENT from `/metrics` (not present-at-0) until its first failure —
+useless for an `absent()`-based alert (F1); the "Deliberate clean re-root" TRUNCATE runbook didn't
+say to stop every server sharing the substrate first, a real hazard since `is_revoked()` reads are
+live and uncached (F4); the HA note's "restart-on-unready policy" mischaracterized the actual
+mechanism — a losing replica EXITS, it never reaches a running-but-unready state a readiness probe
+would catch (F5). Documented as follow-ups, not fixed inline: the whole CA counter family has no
+alert rules, pre-existing beyond this PR (F2); the new lock's pool-size floor isn't in the
+operator-facing capacity-planning doc (F3); `ca_issued` is unpruned and will keep growing (F6).
+
+**enterprise-readiness (Gate 6): PASS with findings**, none blocking, enterprise-pilot-ready as-is.
+Two real doc/code reconciliation gaps found independently of the chaos/sre passes above, both
+fixed: the self-heal mechanism is NOT scoped to first-boot — it fires on any boot with a corrupted
+on-disk leaf, including an established, long-running install (a bad partial restore, a lost volume
+file) — `server-admin.md`'s "refuses to start" claim was stale for this exact reason, and the
+`default_certs.cpp` log line said "first-boot install" when it can now fire on either (Finding A,
+fixed: `server-admin.md`, `upgrading.md`, the log line, all corrected). Separately, and sharper: a
+THIRD instance of the exact overclaiming pattern this branch's review process had already caught
+and corrected twice — this round's own Gate 8 finding text, alongside the code comment, asserted
+`upgrading.md`'s HA note "describes [multi-replica HA] as supported," when this ADR's own Decision
+section states plainly that topology is "not today" supported (Finding B, fixed: the ADR text and
+code comment now say what happens under that topology without calling it endorsed).
+
+**docs-writer: two SHOULD-fix, one structural follow-up.** Fixed: "UP-2" governance-jargon leaked
+into an operator-facing log line (every sibling log line in the same function is plain-language,
+this was the outlier); `server-admin.md`'s B-2 bullet needed the self-heal exception (same root
+cause as enterprise-readiness's Finding A, fixed together). Follow-up, not fixed here: this ADR has
+drifted from the sibling-ADR convention of folding fixes inline into `## Decision` — four stacked
+governance-round sections now hold ~40% of the file's length, with the self-heal mechanism's
+current truth spread across four non-contiguous locations. The forward/backward pointers are
+handled correctly (no silent contradiction anywhere), so this is navigability debt, not an
+accuracy gap — recommend a follow-up pass to fold each fix's final state back into `## Decision`
+once this branch stabilizes, demoting the round-by-round sections to a trailing historical
+appendix.
+
+**architect: no BLOCKING findings, all SHOULD/NICE (design taste).** `CaStore::pool()` is a new
+accessor pattern (no other store exposes its borrowed pool) but not a real encapsulation breach —
+`PgPool` is shared cross-store infrastructure by ADR-0008 design, not something `CaStore` privately
+owns; a cleaner alternative would have threaded `pg::PgPool&` through `ensure_default_certs()`'s
+signature instead, since the sole caller already has it in scope directly, but the current form
+costs nothing at its actual (2-call-site) scope. The proposed alternative of moving the lock
+entirely inside `CaStore` (a `run_under_bootstrap_lock()` method) was explicitly rejected — it
+would pull filesystem/PKI orchestration into a store whose file header scopes it to "METADATA
+ONLY"; `default_certs.cpp` is the architecturally correct layer for this policy. `list_revoked_serials()`'s
+one-line WHERE-clause duplication against `list_revoked()` matches this codebase's established
+convention (`response_store.hpp`, `management_group_store.hpp` precedent) — not a smell. The
+try-lock probe's tri-state-result shape is now a third near-identical copy across
+`kek_op_lock.hpp`/`api_token_store.cpp`/`default_certs.cpp` (a legitimate rule-of-three extraction
+candidate), but this migration inherited rather than introduced that duplication. Both left as
+follow-up issues, not fixed in this branch.
 
 Full agent reports: this run's governance transcript (session-local, not committed).
 
