@@ -439,6 +439,13 @@ void EnginePrincipalStore::sweep_expired_locked(
     std::chrono::steady_clock::time_point now) const {
     std::erase_if(revalidate_cache_, [&](const auto& kv) { return now >= kv.second.expires_at; });
     std::erase_if(revalidate_backoff_, [&](const auto& kv) { return now >= kv.second; });
+    // #3385: TTL, not LRU -- an entry is reclaimable once no in-flight reader
+    // could still be holding a snapshot taken before it was last bumped; see
+    // the hpp field comment for the bound `kRevokeGenerationEntryTtl` must
+    // satisfy for this to be sound.
+    std::erase_if(revoke_generation_by_principal_, [&](const auto& kv) {
+        return now - kv.second.last_bumped_at >= kRevokeGenerationEntryTtl;
+    });
 }
 
 std::size_t EnginePrincipalStore::revalidate_cache_size() const {
@@ -486,7 +493,7 @@ EnginePrincipalStore::snapshot_revoke_generation_locked(const std::string& princ
     RevokeGeneration g;
     if (auto it = revoke_generation_by_principal_.find(principal_id);
         it != revoke_generation_by_principal_.end()) {
-        g.per_principal = it->second;
+        g.per_principal = it->second.generation;
     }
     g.global_epoch = revoke_generation_global_epoch_;
     return g;
@@ -496,16 +503,17 @@ void EnginePrincipalStore::invalidate_revalidate_cache(const std::string& princi
     // #2454: bump AND erase in ONE critical section — see the hpp field
     // comment for why a per-principal map no longer needs the split
     // bump-then-lock ordering the single global atomic required.
+    const auto stamp = clock_();
     std::lock_guard lk(revalidate_cache_mu_);
     if (principal_id.empty()) {
         // No per-key identity to target, so the only sound guard is the
         // coarse global epoch — every in-flight reader, for every principal,
         // must be invalidated (this is not on any production call path
         // today; see the hpp field comment). Also reclaims the per-principal
-        // map (architect, Gate 3): the epoch bump already invalidates every
-        // pre-clear snapshot regardless of per-principal state, so clearing
-        // the map here is sound and gives an operator a capacity-reset lever
-        // if #2454's ceiling is ever actually reached.
+        // map: the epoch bump already invalidates every pre-clear snapshot
+        // regardless of per-principal state, so clearing the map here is
+        // sound and gives an operator a capacity-reset lever, on top of the
+        // TTL sweep (#3385) that now reclaims it on its own.
         ++revoke_generation_global_epoch_;
         revoke_generation_by_principal_.clear();
         revalidate_cache_.clear();
@@ -513,24 +521,31 @@ void EnginePrincipalStore::invalidate_revalidate_cache(const std::string& princi
         return;
     }
 
+    // #3385: sweep aged-out generation entries BEFORE the capacity check,
+    // same "sweep only when at/near the ceiling" discipline the backoff map
+    // below already uses — this is what turns "declined past the cap" from
+    // a process-lifetime-permanent condition into a recoverable one; see the
+    // hpp field comment for the eviction-safety argument
+    // (`next_generation_value_`) and the TTL's soundness bound.
+    if (revoke_generation_by_principal_.size() >= max_entries_)
+        sweep_expired_locked(stamp);
+
     // Ceiling-capped, but NOT by silent decline (Gate 3 finding, security-
     // guardian + cpp-safety + quality-engineer independently, same round):
-    // this map has no TTL and nothing else ever erases from it (unlike
-    // cache_/backoff_, which age out on their own), so "decline past the
-    // cap" is not a single skipped race the way it is for those maps — it is
-    // PERMANENT disablement of the guard for every principal not already
-    // resident, for the rest of process uptime, once `max_entries_` distinct
-    // principals have ever been revoked/transferred. Falling back to the
-    // coarse global epoch instead keeps the guard sound under exhaustion: it
-    // degrades to the OLD single-global-counter behavior (correct, if not as
-    // narrowly targeted) only once capacity is actually exceeded, rather
-    // than silently granting no protection at all to the entries that
-    // didn't make it in.
+    // declining past the cap is not one skipped race, it disables the guard
+    // for every principal not already resident until the NEXT sweep frees a
+    // slot. Falling back to the coarse global epoch instead keeps the guard
+    // sound under exhaustion: it degrades to the OLD single-global-counter
+    // behavior (correct, if not as narrowly targeted) only while genuinely
+    // exhausted, rather than granting no protection at all to whichever
+    // principal didn't make it in.
     if (auto it = revoke_generation_by_principal_.find(principal_id);
         it != revoke_generation_by_principal_.end()) {
-        ++it->second;
+        it->second.generation = ++next_generation_value_;
+        it->second.last_bumped_at = stamp;
     } else if (revoke_generation_by_principal_.size() < max_entries_) {
-        revoke_generation_by_principal_.emplace(principal_id, 1);
+        revoke_generation_by_principal_.emplace(
+            principal_id, GenerationEntry{++next_generation_value_, stamp});
     } else {
         ++revoke_generation_global_epoch_;
         revoke_generation_capacity_fallback_.fetch_add(1, std::memory_order_relaxed);
@@ -713,11 +728,18 @@ EnginePrincipalStore::transfer_owner(const std::string& principal_id,
             err = PQerrorMessage(lease.get());
     }
 
-    // #2367: same post-write invalidation as revoke(). No current caller reads
-    // `row` fields off a revalidate lookup (all five get_for_auth consumers
-    // branch on `.status` alone), so a stale owner_username is not an
-    // authorization bug today — this keeps it from becoming one.
-    invalidate_revalidate_cache(principal_id);
+    // #2367: same post-write invalidation as revoke(), EXCEPT #3385 narrows
+    // it to skip only a CONFIRMED no-op (query ran fine, zero rows matched).
+    // The WHERE clause also requires lifecycle_state='active', so a confirmed
+    // no-op means the principal doesn't exist or is already revoked -- either
+    // way there is no `Active`-status race for THIS call to guard against
+    // (that belongs to whichever revoke() call actually flipped
+    // lifecycle_state, which already invalidates unconditionally on every
+    // outcome of its own). An unknown outcome (!persisted) still invalidates,
+    // matching revoke()'s fail-closed reasoning -- this only avoids consuming
+    // a generation-map slot on a call that provably changed nothing.
+    if (!persisted || affected)
+        invalidate_revalidate_cache(principal_id);
 
     if (!persisted)
         return std::unexpected("transfer_owner did not persist: " + err);

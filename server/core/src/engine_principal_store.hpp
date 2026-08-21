@@ -256,12 +256,15 @@ public:
     [[nodiscard]] std::uint64_t revalidate_backoff_suppressed() const noexcept {
         return revalidate_backoff_suppressed_.load(std::memory_order_relaxed);
     }
-    /// #2454: how often the per-principal poisoning-guard map was full and a
-    /// NEW principal's invalidate fell back to the coarse global epoch
-    /// instead of getting its own slot. Not expected under ordinary load
-    /// (`max_entries_` defaults to 1024 distinct ever-revoked principals);
-    /// a climbing value means the per-principal guard is running at reduced
-    /// precision for new invalidations and the ceiling may need raising.
+    /// #2454: how often the per-principal poisoning-guard map was full (even
+    /// after a #3385 TTL sweep) and a NEW principal's invalidate fell back to
+    /// the coarse global epoch instead of getting its own slot. Not expected
+    /// under ordinary load (`max_entries_` defaults to 1024, and now needs
+    /// that many DISTINCT principals bumped within the same
+    /// `kRevokeGenerationEntryTtl` window, not merely ever); a climbing value
+    /// means the per-principal guard is running at reduced precision for new
+    /// invalidations and the ceiling may need raising — see
+    /// `docs/ops-runbooks/engine-principal-store-recovery.md`.
     [[nodiscard]] std::uint64_t revoke_generation_capacity_fallback() const noexcept {
         return revoke_generation_capacity_fallback_.load(std::memory_order_relaxed);
     }
@@ -293,6 +296,18 @@ public:
     /// reachable without materialising `kAuthCacheMaxEntries` principals.
     /// 0 restores the default.
     void set_max_entries_for_test(std::size_t n);
+
+    /// Test seam (#3385, breaker-open confirmed-unreachable coverage): force
+    /// `open_` without a working construction-time connect. Reaching
+    /// `get_for_auth`'s breaker-open branch needs `open_ == true` (the
+    /// `!open_` branch is checked first and short-circuits it) but a lease
+    /// acquire that genuinely arms `PgPool`'s connect-failure breaker — a
+    /// combination construction alone cannot produce against an
+    /// always-unreachable pool, since a failed construction-time connect
+    /// leaves `open_` false. This represents an equally real production
+    /// case construction-time failure doesn't cover: the store opened
+    /// successfully once, and connectivity was lost afterward.
+    void set_open_for_test(bool open) noexcept { open_ = open; }
 
     // Test-only seam (#2367), mirroring ApiTokenStore's
     // `test_hook_after_validate_select_`. Null in production (zero overhead).
@@ -535,23 +550,53 @@ private:
     /// paired erase, or vice versa — both now live in the writer's ONE
     /// critical section instead of two separately-ordered steps.
     ///
-    /// Ceiling-capped at `max_entries_`, but UNLIKE the cache/backoff maps
-    /// this one has no TTL — no per-tick sweep ever reclaims an entry from
-    /// it on ordinary operation (a full clear, `invalidate_revalidate_cache`
-    /// with an empty principal_id, does erase everything, but nothing in
-    /// production reaches that path — see #3385). A generation counter does
-    /// not go stale the way a cached VALUE does, so absent that clear it is
-    /// cumulative-over-process-lifetime, not windowed. That makes
-    /// "decline past the cap" the WRONG degradation here (Gate 3, security-
-    /// guardian + cpp-safety + quality-engineer, independently, same round):
-    /// declining does not skip one race for one principal, it PERMANENTLY
-    /// disables the guard for every principal that never got a slot, for the
-    /// rest of process uptime, once `max_entries_` distinct principals have
-    /// ever been revoked or transferred. So capacity exhaustion instead falls
-    /// back to bumping `revoke_generation_global_epoch_` below — degrading to
-    /// the OLD single-global-counter behavior (correct, merely coarse) only
-    /// once actually exhausted, rather than granting no protection at all to
-    /// whichever principal didn't make it in.
+    /// Ceiling-capped at `max_entries_`, AND (fix for #3385: the original
+    /// #2454 shipped this map with no reclaim path at all) swept on its own
+    /// insert path exactly like the cache/backoff maps — an entry whose
+    /// `last_bumped_at` is older than `kRevokeGenerationEntryTtl` is evicted,
+    /// so residency no longer depends on process lifetime.
+    ///
+    /// The tricky part sweeping introduces: a principal whose entry was
+    /// evicted and is later bumped again gets a FRESH map slot — if that
+    /// fresh slot's `generation` value could equal some OLDER value a
+    /// still-in-flight reader's stale snapshot happens to hold, the guard
+    /// would silently pass a poisoning race it exists to catch (a stale
+    /// snapshot from BEFORE the evicted entry existed, coincidentally
+    /// matching a NEW entry created after — a reused-value aliasing bug, not
+    /// present before sweeping existed because nothing was ever evicted).
+    /// `next_generation_value_` below closes that: every bump (existing slot
+    /// or fresh one) draws its new value from ONE shared, ever-increasing
+    /// counter, never a per-principal restart-at-1 — so no two bumps at any
+    /// point in this process's lifetime, for any principal, ever produce the
+    /// same value, and a reused map slot is safe by construction rather than
+    /// by argument about timing. Evicting the MAP ENTRY reclaims memory;
+    /// evicting the shared counter is never needed because it isn't sized
+    /// per-principal.
+    ///
+    /// `kRevokeGenerationEntryTtl` must exceed the true worst-case in-flight
+    /// window of a reader's own `get_for_auth()` call for eviction to be
+    /// sound (an entry must not be swept while a reader who snapshotted it
+    /// could still be mid-flight) — that window is bounded by `kReadTimeout`
+    /// (lease acquire) PLUS whatever the query itself can take once a lease
+    /// IS held, which today is `PgPool`'s `statement_timeout_ms` (30 s
+    /// default) and NOTHING tighter — #2457 (no client-side query deadline)
+    /// is still open. The chosen TTL doubles that sum for margin; if #2457
+    /// lands a tighter client-side bound, or an operator raises
+    /// `statement_timeout_ms` well past its default, this TTL should be
+    /// re-derived rather than assumed to still be safe.
+    ///
+    /// Capacity exhaustion (the map is still at `max_entries_` even after a
+    /// sweep pass — now a narrower case than before: it requires
+    /// `max_entries_` DISTINCT principals bumped within the SAME TTL window,
+    /// not merely `max_entries_` distinct-ever-revoked over the whole
+    /// process lifetime) still falls back to bumping
+    /// `revoke_generation_global_epoch_` below rather than silently
+    /// declining, for the same reason as before: declining permanently
+    /// disables the guard for the affected principal, while the epoch
+    /// fallback only degrades it, coarsely, until the fallback stops being
+    /// needed (which sweeping now makes a recoverable condition, not a
+    /// process-lifetime-permanent one — the trigger for the fallback keeps
+    /// moving as old entries age out and free slots for new ones).
     ///
     /// Be precise about what "coarse" means here (Gate 4, unhappy-path):
     /// this is not a narrowing of impact to the triggering principal. Every
@@ -559,14 +604,7 @@ private:
     /// SAME shared epoch, so one bump — from invalidating ANY principal, not
     /// just the one that tripped the fallback — defeats every OTHER
     /// principal's concurrent cache-write too, for as long as the epoch
-    /// keeps moving. Once tripped, this reproduces the EXACT #2454 bug
-    /// (fleet-wide cache disablement during write churn) this file exists to
-    /// have fixed — it is bounded to only start happening past the ceiling,
-    /// not bounded in blast radius once it does. It is also a ONE-WAY
-    /// ratchet for the rest of process uptime: nothing un-trips it short of
-    /// a restart (or the untaken full-clear path above). Legitimate,
-    /// sustained churn past the ceiling — not just an attacker — can trigger
-    /// it; see #3385.
+    /// keeps moving. See #3385 for the fuller history of this fallback.
     ///
     /// A principal absent from this map has an implicit generation of 0,
     /// matching a principal that has never been revoked or transferred.
@@ -582,15 +620,31 @@ private:
     /// operator-visible signal that per-principal capacity is being
     /// exhausted, mirroring `revalidate_backoff_suppressed_`'s
     /// instrument-on-degrade pattern.
-    mutable std::unordered_map<std::string, std::uint64_t> revoke_generation_by_principal_;
+    struct GenerationEntry {
+        std::uint64_t generation = 0;
+        std::chrono::steady_clock::time_point last_bumped_at{};
+    };
+    /// #3385: sized to exceed kReadTimeout (1.5 s) + PgPool's default
+    /// statement_timeout_ms (30 s) with a 2x margin — see the field comment
+    /// on `revoke_generation_by_principal_` for why this bound must hold for
+    /// eviction to be sound, and #2457 for the open issue that could someday
+    /// tighten it.
+    static constexpr auto kRevokeGenerationEntryTtl = std::chrono::seconds(63);
+    mutable std::unordered_map<std::string, GenerationEntry> revoke_generation_by_principal_;
     mutable std::uint64_t revoke_generation_global_epoch_ = 0;
+    /// Shared monotonic source for every `GenerationEntry::generation` value
+    /// this store ever assigns, regardless of principal — see the field
+    /// comment on `revoke_generation_by_principal_` for why a per-principal
+    /// restart-at-1 scheme is unsound once entries can be evicted and
+    /// recreated.
+    mutable std::uint64_t next_generation_value_ = 1;
     mutable std::atomic<std::uint64_t> revoke_generation_capacity_fallback_{0};
 
-    /// Read `revoke_generation_by_principal_[principal_id]` (0 if absent) plus
-    /// `revoke_generation_global_epoch_`, both under `revalidate_cache_mu_`.
-    /// The pairing IS the poisoning-guard token: a reader is unpoisoned iff
-    /// BOTH compare equal at insert time to what this returned at snapshot
-    /// time.
+    /// Read `revoke_generation_by_principal_[principal_id]`'s generation (0
+    /// if absent) plus `revoke_generation_global_epoch_`, both under
+    /// `revalidate_cache_mu_`. The pairing IS the poisoning-guard token: a
+    /// reader is unpoisoned iff BOTH compare equal at insert time to what
+    /// this returned at snapshot time.
     struct RevokeGeneration {
         std::uint64_t per_principal = 0;
         std::uint64_t global_epoch = 0;
