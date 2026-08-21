@@ -4271,13 +4271,21 @@ TEST_CASE("MCP get_dex_group_app_perf: still denies a service-scoped token "
     CHECK(res->status == 403); // denied at the GuaranteedState:Read gate
     // NOT the JSON-RPC kPermissionDenied error-code shape other tool-specific
     // denial tests in this file assert on — this test's denial comes from the
-    // fake perm_fn (McpTestServer harness, ~line 1018), which mimics
-    // require_permission's real REST-style 403 body, not an MCP JSON-RPC
-    // envelope (the tool-specific branch that would construct one is never
-    // reached, matching production's own perm_fn gate ordering).
+    // fake perm_fn (McpTestServer harness, ~line 1018), so the tool-specific
+    // branch that would construct that envelope is never reached (matching
+    // production's own perm_fn gate ordering). The harness's fake perm_fn
+    // returns a simplified {"error":"forbidden"} literal that does NOT match
+    // production's real shape (require_permission's actual denials always go
+    // through detail::a4_denial, where `error` is an object carrying
+    // code/message/correlation_id/etc — never a bare string, per
+    // rest_api_v1.cpp's error_json_a4). This test proves the tool respects a
+    // perm_fn denial and returns an error body at all; it does not and cannot
+    // prove the real production wire shape — that's proven generically by
+    // test_auth_routes.cpp:794 (governance run 2026-08-21, quality-engineer:
+    // an earlier draft of this comment incorrectly claimed the fixture
+    // "mimics" the real body).
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
-    CHECK(body["error"] == "forbidden");
 
     for (const auto& a : ts.audit_log)
         CHECK(a != "dex.perf.group.view|success");
