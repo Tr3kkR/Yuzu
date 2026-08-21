@@ -19,6 +19,14 @@ difference between a legacy-detection run and a spark-detection run must classif
 either a row in this table ("expected, already decided") or a genuine regression
 ("new, investigate"). This is that table.
 
+**A third bucket exists and must not be silently folded into the first: a row whose
+Epistemic status is `open-question`.** Such a row (currently only D3) documents a real,
+observed difference that has NOT been ruled deliberate — it is tracked, not dismissed. A
+diff line may be classified "expected" against a `verified`/`likely` row; it may **not**
+be waved through against an `open-question` row. Treat a diff matching an open row the
+same as a genuine regression: it blocks the parity gate until the linked issue resolves
+and the row is re-stamped `verified`/`likely`.
+
 **Every row below is an at-the-flip delta, not a live one.** `GuardianEngine`'s
 `prefer_spark` constructor parameter defaults `false` (`guardian_engine.hpp`), and the
 sole production call site (`agent.cpp`, `std::make_unique<GuardianEngine>(kv_store_.get(),
@@ -32,6 +40,13 @@ is what every agent actually does.
 it sets `SparkAvailability::SparkDisabled`, which `guardian_backend_from_state()` maps to
 the `legacy` backend label regardless of `prefer_spark`, restoring the full legacy path.
 
+**Re-verification obligation.** Every row's `verified <SHA>` stamp is a point-in-time fact
+about code that is still under active development, not a durable guarantee. `verified
+<SHA>` records that a claim was checked, not that it stays true. **F14's first step is
+re-verifying every row against flip-time HEAD and re-stamping the SHA** — treat this as a
+precondition of the flip, not an optional refresh. A row whose cited symbol no longer
+exists or no longer behaves as described is itself a flip blocker until corrected.
+
 **Not this doc:**
 - `docs/enterprise-parity-plan.md` — competitor feature parity, unrelated.
 - `docs/capability-registries/spark_mechanisms.tsv` — per-OS mechanism capability
@@ -44,11 +59,21 @@ the `legacy` backend label regardless of `prefer_spark`, restoring the full lega
 
 One row per **deliberate** legacy-vs-spark behavioral difference, only after re-verifying
 the current code (cite the symbol, not a line number — line refs drift, verified twice
-already in this subsystem's own history). Columns: **Delta** | **Legacy** | **Spark** |
-**Why deliberate (ruling)** | **Operator-visible symptom** | **Verify at** | **Epistemic**.
+already in this subsystem's own history). Each row is an `### <ID> — <one-line title>`
+heading followed by a table with columns **Delta** (the heading itself) | **Legacy** |
+**Spark** | **Why deliberate** | **Operator symptom** | **Verify at** | **Epistemic**.
 Epistemic values: `verified <SHA>` (I read the code myself, this date), `likely`
 (inferred from adjacent verified facts, not directly re-read), `open-question` (found
-during this pass, no existing ruling covers it — flag, don't invent a rationale).
+during this pass, no existing ruling covers it — flag, don't invent a rationale; may be
+combined with a verification stamp, e.g. `open-question, verified <SHA>`, when the
+*difference* is confirmed but its *disposition* isn't ruled — see D3).
+
+Placement: pick the lettered section (A backend selection, B enforcement, C
+placement/platform, D event streams, E cadence/resource) whose description above fits;
+IDs are sequential within that letter (the next File row after D9 is D10, not D1a or
+E-something). Insert the new `### <ID> — ...` block, with its own `---` separator
+immediately after it, right after the last existing row in that section and before that
+section's closing `---`.
 
 Two permitted variants: a row gating on a still-open flip-ladder decision (e.g. D4) may
 add an 8th **Ruling** field instead of leaving "Why deliberate" empty; a row describing a
@@ -312,8 +337,9 @@ Issue #2299 tracks five non-blocking follow-ups against the durable lifecycle jo
 | LIKE-escape helper extraction | **Done** — both new #2448 methods route through the existing shared `escape_like_prefix`. |
 | `KvStore::clear()` cosmetic migration to `DELETE ... RETURNING` | **Unmigrated**, correctness-neutral (whole op is under `lock_guard`), low priority. Historically tracked under issue #1033 (systemic `sqlite3_changes()`-after-`step()` race, 24 stores) — that issue was itself closed 2026-07-14 in an unverified backlog reset ("not individually verified... if it is still live, please reopen"), so #1033's closed state is not evidence this specific item shipped; it remains a real, minor, open item regardless of that issue's tracker status. |
 
-A sync comment recording this table's dispositions is posted to #2299 alongside this PR,
-so the issue's stale checkboxes stop contradicting this doc.
+A sync comment recording this table's dispositions (all five rows, including UP-4, which
+#2299's existing 2026-07-24 comment does not cover) should be posted to #2299 when this
+PR merges, so the issue's stale checkboxes stop contradicting this doc.
 
 ---
 
