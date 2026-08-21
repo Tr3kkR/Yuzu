@@ -1179,3 +1179,91 @@ TEST_CASE("migrate_from_sqlite aborts unstamped on a mid-scan legacy read failur
     REQUIRE(tokens2.has_value());
     CHECK(tokens2->size() == 1);
 }
+
+// ── #3399: v1 fingerprint stability (golden pin) ─────────────────────────────
+//
+// Pins the v1 canonical-fingerprint algorithm (sha256_hex(canonicalize_legacy_tokens(...)))
+// against a hardcoded digest, computed independently in Python from the same
+// length-prefixed-field / sorted-encoded-rows / "device-token-legacy-fingerprint-v1\n"-prefixed
+// scheme documented above migrate_from_sqlite. Exists so a future streaming rewrite of the
+// fingerprint computation (#3399) can be proven byte-identical to this value rather than merely
+// "still self-consistent" — a regression that silently changed the algorithm would still pass
+// every other backfill test (they never compare against an external oracle) but would orphan
+// every already-stamped marker in the field. Row order is deliberately NOT sorted-by-token_id in
+// the fixture, to prove the fingerprint does not depend on legacy scan/insertion order (the
+// canonicalizer's own std::sort — or an equivalent streaming digest fed in a different order,
+// since sorted-encoded order equals token_id-ASC scan order — is what makes that true).
+TEST_CASE("migrate_from_sqlite: v1 fingerprint is stable and independent of legacy row order",
+          "[device_token][pg][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_token_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    // token_id/token_hash are hand-written %032x/%064x of 1..3 (NOT the seed-mapped hex_id()/
+    // hex_hash() helpers) so the fixture matches the independently-computed Python oracle exactly.
+    LegacyTokenFixture c;
+    c.token_id = "00000000000000000000000000000003";
+    c.token_hash = "0000000000000000000000000000000000000000000000000000000000000003";
+    c.name = "fp-c";
+    c.principal_id = "alice";
+    c.device_id = "dev-c";
+    c.created_at = 300;
+
+    LegacyTokenFixture a;
+    a.token_id = "00000000000000000000000000000001";
+    a.token_hash = "0000000000000000000000000000000000000000000000000000000000000001";
+    a.name = "fp-a";
+    a.principal_id = "alice";
+    a.device_id = "dev-a";
+    a.created_at = 100;
+
+    LegacyTokenFixture b;
+    b.token_id = "00000000000000000000000000000002";
+    b.token_hash = "0000000000000000000000000000000000000000000000000000000000000002";
+    b.name = "fp-b";
+    b.principal_id = "bob";
+    b.device_id = "dev-b";
+    b.definition_id = "def-b";
+    b.created_at = 200;
+    b.expires_at = 999;
+    b.last_used_at = 150;
+    b.revoked = true;
+
+    constexpr const char* kExpectedFingerprint =
+        "98e611043d8a361bd017c3e00abec456b16986229e9830c159d9ee7aea01df6f";
+
+    // Written in insertion order [c, a, b] — deliberately not token_id-ascending.
+    auto path1 = yuzu::test::unique_temp_path("yuzu_test_devtoken_fpgolden1") / "device-tokens.db";
+    std::filesystem::create_directories(path1.parent_path());
+    write_legacy_sqlite_db(path1, {c, a, b});
+    REQUIRE(store.migrate_from_sqlite(path1));
+
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult r{PQexec(conn.get(),
+                          "SELECT fingerprint FROM device_token_store.sqlite_backfill_source")};
+        REQUIRE(r.ok());
+        REQUIRE(PQntuples(r.get()) == 1);
+        CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == kExpectedFingerprint);
+    }
+
+    // A second file holding the SAME three rows in a DIFFERENT insertion order [b, c, a] produces
+    // the SAME fingerprint, so this second call is a marker-skip, not a re-insert.
+    auto path2 = yuzu::test::unique_temp_path("yuzu_test_devtoken_fpgolden2") / "device-tokens.db";
+    std::filesystem::create_directories(path2.parent_path());
+    write_legacy_sqlite_db(path2, {b, c, a});
+
+    std::string captured;
+    {
+        LogCapture capture;
+        REQUIRE(store.migrate_from_sqlite(path2));
+        captured = capture.str();
+    }
+    CHECK(captured.find("fingerprint already processed, skipping") != std::string::npos);
+
+    auto tokens = store.list_tokens();
+    REQUIRE(tokens.has_value());
+    CHECK(tokens->size() == 3);
+}
