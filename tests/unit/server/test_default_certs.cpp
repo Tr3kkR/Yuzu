@@ -784,15 +784,27 @@ TEST_CASE("default_certs: a losing HA replica self-heals from the shared cert di
         // top-of-function B-2 self-heal check after ca_store already has a
         // root but before the winner has finished persisting its key file,
         // and refuses immediately rather than waiting — fail-closed,
-        // availability-only, and distinguishable by its own log line. Any
-        // OTHER oks[i]==false is unexplained and stays a hard failure.
-        if (std::any_of(oks.begin(), oks.end(), [](bool ok) { return !ok; })) {
-            const bool known_sibling_refusal_window =
-                logs.find("Refusing to regenerate — a fresh CA would re-root the fleet") !=
-                std::string::npos;
+        // availability-only, and distinguishable by its own log line, which
+        // maps 1:1 to a `return false` at that call site (never emitted
+        // elsewhere). Any OTHER oks[i]==false is unexplained and stays a hard
+        // failure — so this must be a COUNT match against the number of
+        // failed racers, not a bare substring presence check: a presence
+        // check would let one known-window failure mask a second, unrelated,
+        // genuinely-failing racer in the same attempt (cpp-safety, closure
+        // re-verify of d54311fce, 2026-08-21).
+        const auto failed_count =
+            static_cast<std::size_t>(std::count(oks.begin(), oks.end(), false));
+        if (failed_count > 0) {
+            std::size_t refusal_count = 0;
+            for (std::size_t pos = logs.find("Refusing to regenerate — a fresh CA would re-root "
+                                              "the fleet");
+                 pos != std::string::npos;
+                 pos = logs.find("Refusing to regenerate — a fresh CA would re-root the fleet",
+                                 pos + 1))
+                ++refusal_count;
             INFO("a racer failed this attempt; captured logs:\n" << logs);
-            REQUIRE(known_sibling_refusal_window);
-            continue; // known, accepted, fail-closed race — retry for a clean attempt
+            REQUIRE(refusal_count == failed_count);
+            continue; // every failure this attempt is the known, accepted, fail-closed race
         }
 
         const bool exercised_new_branch =

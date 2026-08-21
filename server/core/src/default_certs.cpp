@@ -1229,6 +1229,13 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
                 dir.string(),
                 std::chrono::duration_cast<std::chrono::seconds>(kLoserSelfHealPollWindow).count(),
                 *ca_fp);
+            // cpp-safety (closure re-verify of d54311fce, 2026-08-21): a fingerprint
+            // mismatch above can leave `out` populated with a validated-but-wrong-root
+            // set (try_use_existing_complete_set() writes it before this function gets
+            // a chance to reject it) that then survives to this false return if the
+            // poll window subsequently times out. Reset so `out` is never left holding
+            // material for a root this instance did NOT adopt.
+            out = DefaultCertSet{};
             return false;
         }
         // Won (or ca_store's root is uncontested single-instance) — the root race
