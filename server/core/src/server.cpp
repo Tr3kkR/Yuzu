@@ -2180,16 +2180,26 @@ public:
         // since server-side enforcement is live but external consumers are not
         // seeing the revocation. The audit row (ca.crl.published failure) is the
         // forensic pair; this counter is the real-time alert source.
-        metrics_.describe("yuzu_server_ca_crl_publish_failures_total",
-                          "Internal-CA CRL (re)publish failures (key load / build / record). A "
-                          "non-zero value since a revocation means the public CRL is stale (PKI PR4)",
-                          "counter");
         // ADR-0053 UP-1 (gov sre F1, Gate 6, 2026-08-21): describe() alone populates a
         // description entry but MetricsRegistry::serialize() only emits # TYPE/# HELP for
         // a name already present in the counters_ map — without a matching .counter() call
         // this series is entirely ABSENT from /metrics (not present-at-0) until its first
         // failure ever fires, which makes an absent()-based alert useless (can't distinguish
-        // "healthy" from "never registered"). Pre-seed it here so it exists at 0 from boot.
+        // "healthy" from "never registered"). All three CA-family failure counters below are
+        // pre-seeded at 0 for this reason (the sibling two had the same gap, found while
+        // writing this family's alert rules).
+        metrics_.describe("yuzu_server_ca_crl_publish_failures_total",
+                          "Internal-CA CRL (re)publish failures (key load / build / record). A "
+                          "non-zero value since a revocation means the public CRL is stale (PKI PR4)",
+                          "counter");
+        (void)metrics_.counter("yuzu_server_ca_crl_publish_failures_total");
+        metrics_.describe("yuzu_server_ca_reissue_blocked_total",
+                          "Agent CSR re-issuance refused because a revoked, non-expired cert "
+                          "already exists for that identity (sign_agent_csr's revocation-bypass "
+                          "guard). A sustained non-zero rate may indicate a revoked agent "
+                          "repeatedly attempting to re-provision.",
+                          "counter");
+        metrics_.counter("yuzu_server_ca_reissue_blocked_total", {{"reason", "revoked_identity"}});
         metrics_.describe("yuzu_server_ca_revocation_sweep_read_failures_total",
                           "Revocation-sweep tick's list_revoked_serials() read failed — that "
                           "tick's sweep was skipped entirely rather than treating every live "

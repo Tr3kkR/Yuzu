@@ -718,9 +718,17 @@ useless for an `absent()`-based alert (F1); the "Deliberate clean re-root" TRUNC
 say to stop every server sharing the substrate first, a real hazard since `is_revoked()` reads are
 live and uncached (F4); the HA note's "restart-on-unready policy" mischaracterized the actual
 mechanism — a losing replica EXITS, it never reaches a running-but-unready state a readiness probe
-would catch (F5). Documented as follow-ups, not fixed inline: the whole CA counter family has no
-alert rules, pre-existing beyond this PR (F2); the new lock's pool-size floor isn't in the
-operator-facing capacity-planning doc (F3); `ca_issued` is unpruned and will keep growing (F6).
+would catch (F5). Documented as follow-ups initially, then fixed on operator request in a later
+session round: F2 (the whole CA counter family had no alert rules) — a new `yuzu-pki` group in
+`docs/prometheus/yuzu-alerts.yml` covers all three (`YuzuCaCrlPublishFailing`,
+`YuzuCaRevocationSweepReadFailing`, `YuzuCaReissueBlocked`), which surfaced that the OTHER two
+counters (`yuzu_server_ca_crl_publish_failures_total`, `yuzu_server_ca_reissue_blocked_total`) had
+the identical missing-pre-seed gap F1 fixed for the sweep counter — fixed for all three while
+writing these rules, verified via `promtool check rules`/`test rules` against the pinned Docker
+image (101 rules, all green) rather than YAML-parse alone; F3 (the pool-size floor) — added to
+`server-admin.md`'s "Connection-pool sizing" section. Still deliberately deferred, not fixed:
+`ca_issued` is unpruned and will keep growing (F6) — a retention pass is a separate, appropriately
+scoped change (CLAUDE.md's clock-guarded-retention shape), not folded into this migration.
 
 **enterprise-readiness (Gate 6): PASS with findings**, none blocking, enterprise-pilot-ready as-is.
 Two real doc/code reconciliation gaps found independently of the chaos/sre passes above, both

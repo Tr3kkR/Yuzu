@@ -24,3 +24,12 @@
   treating every currently-connected agent as revoked and tearing down its live stream. A
   sustained failure is now visible via `yuzu_server_ca_revocation_sweep_read_failures_total`
   instead of manifesting only as unexplained agent disconnects.
+- **New `yuzu-pki` Prometheus alert group** (`docs/prometheus/yuzu-alerts.yml`) covers all three
+  CA failure/security counters: `YuzuCaCrlPublishFailing`, `YuzuCaRevocationSweepReadFailing`,
+  and `YuzuCaReissueBlocked` (an operator-visibility signal for a revoked identity attempting to
+  re-provision). All three underlying counters (`yuzu_server_ca_crl_publish_failures_total`,
+  `yuzu_server_ca_reissue_blocked_total`, `yuzu_server_ca_revocation_sweep_read_failures_total`)
+  are now boot-pre-seeded to 0, so `increase(...) > 0` catches even the first occurrence instead
+  of the series being entirely absent from `/metrics` until it first fires. The bootstrap
+  advisory lock's connection-pool floor (effectively 2 even at the smallest deployment sizes) is
+  now documented in `server-admin.md`'s "Connection-pool sizing" section.

@@ -857,6 +857,68 @@ groups:
             Check that the new PEM files are valid, the cert and key match,
             and file permissions are correct (chmod 600 on Unix).
 
+  # ── yuzu-pki — internal CA (ca_store, ADR-0053) ─────────────────────────────
+  # All three counters below are bare/pre-seeded to 0 at boot (server.cpp), so
+  # increase(x[window]) > 0 catches even the FIRST occurrence — see the
+  # yuzu-scim group's header comment for why absent() would be the wrong shape
+  # here.
+  - name: yuzu-pki
+    rules:
+      - alert: YuzuCaCrlPublishFailing
+        expr: |
+          increase(yuzu_server_ca_crl_publish_failures_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Internal-CA CRL (re)publish is failing"
+          description: >-
+            yuzu_server_ca_crl_publish_failures_total moved: a CRL (re)publish
+            attempt failed (CA key load / build / record). Consumers keep
+            serving the last still-valid CRL, so this is not yet an outage, but
+            a revocation made since the last successful publish is NOT
+            reflected in the public CRL — server-side enforcement (is_revoked())
+            is unaffected and still blocks the revoked cert directly. Check
+            Postgres availability (ca_store schema) and CA key
+            loadability. See docs/pki-architecture.md "CRL distribution".
+          runbook_url: "https://docs.yuzu.io/runbooks/ca-crl-publish-failing"
+
+      - alert: YuzuCaRevocationSweepReadFailing
+        expr: |
+          increase(yuzu_server_ca_revocation_sweep_read_failures_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "The ~15s revocation-sweep tick cannot read the revoked-cert set"
+          description: >-
+            yuzu_server_ca_revocation_sweep_read_failures_total moved: the
+            periodic sweep that tears down live Subscribe streams for
+            already-revoked agents could not read ca_store's revoked set, so
+            that tick was skipped entirely (ADR-0053 UP-1 — the sweep aborts
+            rather than treating every live agent as revoked). A sustained
+            non-zero rate means an already-revoked agent's live stream may not
+            be torn down promptly; the per-request mTLS-accept gate
+            (is_peer_cert_revoked) still fails closed independently, so no NEW
+            access is granted in the meantime. Check Postgres availability.
+          runbook_url: "https://docs.yuzu.io/runbooks/ca-revocation-sweep-failing"
+
+      - alert: YuzuCaReissueBlocked
+        expr: |
+          increase(yuzu_server_ca_reissue_blocked_total[1h]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "An agent attempted to re-provision under a revoked identity"
+          description: >-
+            yuzu_server_ca_reissue_blocked_total{reason="revoked_identity"}
+            moved — sign_agent_csr refused to re-issue because a revoked,
+            non-expired cert already exists for that agent_id (the
+            revocation-bypass guard is working as intended; ADR-0036/ADR-0053).
+            This is not a failure to fix, but is worth an operator's attention:
+            a revoked device attempting to silently re-enroll may indicate a
+            still-active compromised endpoint. An operator must deliberately
+            clear the revocation before re-provisioning can succeed.
+          runbook_url: "https://docs.yuzu.io/runbooks/ca-reissue-blocked"
+
   # ── yuzu-response-store — LIVE as of the response store's Postgres migration
   # (ADR-0039) ──────────────────────────────────────────────────────────────
   # These replace the old (never-emitted) `yuzu_server_response_store_writes_total`
