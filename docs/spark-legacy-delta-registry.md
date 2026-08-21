@@ -152,7 +152,7 @@ during this pass, no existing ruling covers it — flag, don't invent a rational
 | **Spark** | `guardian_emit_decider.hpp`'s shared `decide_emit` has **no last-terminal-state dedup** ("unlike systemd_decide_emit... not needed at the consumer" — reasoned from File/Registry's own re-read-on-change + debounce-fold behavior, and Service's one-event-per-edge behavior). Its only suppression is a debounce window (`RuleAssertion::debounce_ms`, default 1000 ms) measured from the last **emit**, not from attach or from a terminal-state hash. Convergence sweeps run every 60 s (service/registry) or 600 s (file) — both vastly exceed the 1000 ms default debounce. **Net: a persistently-drifted rule re-emits `drift.detected` on every convergence sweep of its lane** — roughly 1440/day/rule on the 60 s lanes, ~144/day on the 600 s file lane, absent any author-configured larger `debounce_ms`. |
 | **Why deliberate** | **No ruling found.** M1 (the design doc's cutover-blocking finding) scoped its flood analysis and fix explicitly to the **health** (Unknown) stream — its own text never mentions the Known/drift path, and no test in `test_guardian_spark_runtime.cpp` pins repeated-drift-sweep behavior (the "M1 flood guard"/"F11 flood" test cases are all Unknown/demotion cases). The `decide_emit` header comment's stated rationale ("not needed at the consumer... File/Registry re-read on each change... so a plain compliant-bool suffices") describes the *legacy-parity* reasoning for skipping terminal-state dedup, but does not address the convergence-scheduler sweep cadence being the trigger for repeat evaluation in the first place — that trigger doesn't exist for legacy (no sweep) and does for spark. |
 | **Operator symptom** | A rule left persistently drifted under spark (e.g. an enforce-mode rule now observe-only per B1, with nobody fixing the underlying drift) generates a steady ~1440/day (60 s lanes) or ~144/day (600 s lane) `drift.detected` stream — smaller than the pre-fix health flood (~17k/day) but structurally the same class of gap M1 was written to close, left open on the sibling stream. |
-| **Verify at** | `guardian_emit_decider.hpp::decide_emit` (no `last_compliant`-driven terminal dedup on the Drift branch); `guardian_rule_eval.cpp:48` (the sole call site, passing `a.debounce_ms`); `guardian_rule_eval.hpp` (`debounce_ms{1000}` default); `guard_systemd.cpp` `systemd_decide_emit` (contrast: has dedup). |
+| **Verify at** | `guardian_emit_decider.hpp::decide_emit` (no `last_compliant`-driven terminal dedup on the Drift branch); `guardian_rule_eval.cpp`'s sole `decide_emit` call site (passes `a.debounce_ms`); `guardian_rule_eval.hpp` (`debounce_ms{1000}` default on `RuleAssertion`); `guard_systemd.cpp` `systemd_decide_emit` (contrast: has terminal-state dedup). |
 | **Epistemic** | **open-question, verified 7b449e589** — this row documents a finding from this pass, not a pre-existing ruling. Flagged to the operator; recommend a D4-adjacent or standalone ruling before F14 if the steady-state rate is judged operationally significant. |
 
 ### D4 — Compliant-edge emission is unified across types (a spark-side legacy-parity fix)
@@ -188,6 +188,39 @@ during this pass, no existing ruling covers it — flag, don't invent a rational
 | **Verify at** | `guardian_rule_eval.hpp`/`guardian_rule_eval.cpp` Unknown-vs-Known-drift classification. |
 | **Epistemic** | verified 7b449e589 |
 
+### D7 — File hash-mode `settle_ms` coalescing is not honoured under spark
+
+| | |
+|---|---|
+| **Legacy** | `guard_file.hpp`'s `settle_ms` (default 750 ms) coalesces a burst of kernel file-change notifications before hashing, since writes aren't atomic — waits out the write before computing a hash, avoiding a torn read. |
+| **Spark** | No equivalent field on `RuleAssertion` or `FileSparkParams`. Spark's convergence scheduler instead dead-reckons via a size+mtime skip before re-hash plus a forced periodic re-hash (both **deferred to rung 5** — see E1; at rung 2 there is only the plain convergence sweep, no coalescing and no skip-optimization yet). |
+| **Why deliberate** | `guardian_spark_bridge.hpp` header comment states this explicitly: "an ACCEPTED behavioral delta from legacy... flagged here for the rung-9 design-doc rewrite and the rung-10 parity/durability matrix" — i.e. this doc is that flagged destination. |
+| **Operator symptom** | A file rule under active mid-write churn may see a spark hash read land mid-write (a torn read) where legacy's coalescing window would have waited it out — until rung 5's size+mtime skip + forced re-hash lands. |
+| **Verify at** | `guard_file.hpp` `Config::settle_ms`; `guardian_spark_bridge.hpp` header comment (immediately above `RuleAssertion`/`FileSparkParams`). |
+| **Epistemic** | verified 7b449e589 |
+
+### D8 — Deleted-service wire token: legacy `Absent`, spark folds into `Stopped`
+
+| | |
+|---|---|
+| **Legacy** | Reports a distinct `Absent`/`<unreadable>`-class token for a service that no longer exists on the host. |
+| **Spark** | A deleted service folds into `ServiceState::Stopped` at the reader — there is no `Absent` verdict; only the Unknown-vs-Known split of D6 distinguishes "can't tell" from "definitely not running." |
+| **Why deliberate** | Code comment (R5, accepted): "a deleted service folds into Stopped at the reader — the compliance VERDICT is identical, only `detected_value` differs from legacy." The enforcement/compliance outcome doesn't change; the wire-visible token does. |
+| **Operator symptom** | An F14 event-field parity capture comparing `detected_value` for a deleted-service rule will show `Absent` (legacy) vs `Stopped` (spark) — an expected, ruled diff, not a regression, but it WILL show up in a byte-level field diff even though the compliance verdict matches. |
+| **Verify at** | `guardian_rule_eval.cpp`/`guardian_rule_eval.hpp` "R5, accepted" comment on the deleted-service reader mapping into `ServiceState::Stopped`. |
+| **Epistemic** | verified 7b449e589 |
+
+### D9 — Send-path drop semantics: legacy silent/unbounded, spark counted/bounded
+
+| | |
+|---|---|
+| **Legacy** | `emit_guard_event` calls the event sink directly and synchronously from the guard worker thread (a potentially-blocking network send, no buffering). If no sink is wired yet (pre-Register), the event is silently dropped — no counter (comment: "sink not wired yet (pre-network arm) — drop; durable buffering is A3"). No capacity bound; nothing to overflow. |
+| **Spark** | Compliance/health entries route through `GuardianOutbox`, a FIFO, per-(domain,rule_id)-coalesced, **capacity-bounded** buffer. A push that would exceed capacity is dropped and **counted** (`backpressure_drops_`), never silent. |
+| **Why deliberate** | Consequence of the outbox design (#2233 hardening) rather than a single cited ruling — buffering was necessary once sends became asynchronous/batched (spark decouples eval from send; legacy doesn't). Shared drift/compliance fields stay byte-identical (§F) — this row is about drop/backpressure behavior, not event content. |
+| **Operator symptom** | Under sustained overload, legacy silently loses pre-Register events with no signal; spark surfaces the same class of loss as a counted, observable metric. Not a regression — an observability improvement — but a real behavioral difference in what "the agent tried to send N events" means on each backend. |
+| **Verify at** | `guardian_engine.cpp::emit_guard_event` (sink-not-wired drop, no counter); `guardian_outbox.hpp` `GuardianOutbox` capacity check + `backpressure_drops_`. |
+| **Epistemic** | verified 7b449e589 |
+
 ---
 
 ## E. Cadence / resource
@@ -201,6 +234,17 @@ during this pass, no existing ruling covers it — flag, don't invent a rational
 | **Why deliberate** | Spark's mechanisms don't all carry native change-notification for every read path (e.g. dead-reckoning a file's compliance without a kernel event on every convergence tick); the scheduled sweep is how it converges independent of notification delivery. Ruling: D2 (spark-flip ladder) — token bucket formally deferred to rung 5, confirmed at F11. |
 | **Operator symptom** | Periodic reads themselves are a resource delta the flip introduces (CPU/IO wake-ups on 60 s/600 s/5 s cadences per agent, independent of whether anything is actually drifted) — sized against `docs/spark-rebuild-baselines/stage0-resource-baseline.md` as part of F14's evidence, not restated here. |
 | **Verify at** | `guardian_convergence_scheduler.hpp` `Config` (`service_cadence_ms`, `registry_cadence_ms`, `file_cadence_ms`, `priority_poll_ms`, `jitter_pct`); its header comment on the deferred token bucket. |
+| **Epistemic** | verified 7b449e589 |
+
+### E2 — Shutdown: spark may force a hard, nonzero-code process exit; legacy joins its threads
+
+| | |
+|---|---|
+| **Legacy** | Each guard thread is stopped and `.join()`-ed cleanly (`guard_file.cpp`, `guard_registry.cpp`, `guard_service.cpp`, `guard_systemd.cpp` all join their worker thread on `stop()`). |
+| **Spark** | A detached Guardian I/O worker cannot always be joined within a bounded grace (`kOrphanDrainGrace`, 3 s). When that grace expires, `main.cpp`/`service_win.cpp` call `hard_exit()` (`TerminateProcess` on Windows to avoid the loader lock, `::_exit()` on POSIX for async-signal-safety) with a nonzero code, rather than race normal C++ teardown against a worker that may still be executing library code. |
+| **Why deliberate** | F3 (`hard_exit.hpp`): callers must pass a nonzero code specifically so systemd/SCM observe a real failure exit rather than a clean shutdown — an intentional signal to the service supervisor, not a bug being papered over. |
+| **Operator symptom** | Under spark, a slow/stuck drain can make agent shutdown/restart look like a **crash** to systemd/SCM (nonzero exit) where the equivalent legacy shutdown would report clean. Cross-platform crash-loop backstop parity (Windows SCM / macOS launchd / Docker restart policy vs Linux's `StartLimitIntervalSec`/`StartLimitBurst`) is tracked separately (#2241, Linux-only today). |
+| **Verify at** | `hard_exit.hpp` (`kOrphanDrainGrace`, nonzero-code contract); `main.cpp`'s `on_signal_hard_exit` signal handler and its orphan-worker grace-expiry check in the main shutdown path; `service_win.cpp`'s SCM stop handler; contrast `guard_file.cpp`/`guard_registry.cpp`/`guard_service.cpp`/`guard_systemd.cpp`, each of which `.join()`s its worker thread on `stop()`. |
 | **Epistemic** | verified 7b449e589 |
 
 ---
@@ -241,6 +285,31 @@ Issue #2299 tracks five non-blocking follow-ups against the durable lifecycle jo
 
 A sync comment recording this table's dispositions is posted to #2299 alongside this PR,
 so the issue's stale checkboxes stop contradicting this doc.
+
+---
+
+## H. Prose that goes stale at the flip (F14's job, recorded here so it isn't lost)
+
+Not deltas — statements in the tree that are true only because `prefer_spark` defaults
+`false` today, and become false the moment F14 flips it. F14 owns fixing these; this
+doc just makes sure they're findable rather than rediscovered from scratch.
+
+- **`agents/core/src/agent.cpp`, two SparkEngine-instantiation-failure catch blocks**
+  (the known-exception and unknown-exception handlers around SparkEngine construction):
+  both log `"...legacy IGuard detection is unaffected"`. True today
+  (legacy IS the sole enforcing path at `prefer_spark=false`); false post-flip
+  (`guardian_engine.cpp`'s `SparkFailed`/`Unwired` guard withdraws legacy entirely — see
+  A1). Two sibling `"Guardian detection path = legacy IGuard (enforcing)"` boot-log
+  strings carry the same property.
+- **`agents/core/include/yuzu/agent/guardian_engine.hpp`, `GuardianEngine` constructor
+  doc comment**: currently reads "...rung 7 ships with every production agent.cpp call
+  site passing the literal `false`... rung 12's 'default flip' changes that one
+  literal." This is **already inaccurate as written**, independent of the flip: the
+  actual production call site (`agent.cpp`) is a 2-argument call that omits
+  `prefer_spark` entirely, taking it from the constructor's **default parameter value**
+  — there is no literal `false` at the call site to change. F14 (or a sooner drive-by
+  fix, since this is stale now, not just stale-at-flip) should correct the comment to
+  describe a default-value change, not a call-site literal edit.
 
 ---
 
