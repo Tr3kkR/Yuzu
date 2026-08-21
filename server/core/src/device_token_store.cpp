@@ -365,6 +365,32 @@ bool DeviceTokenStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
             return false;
         }
 
+        // #3398: the pre-migration store set this (dbe176ed:63) and the rewrite dropped it —
+        // without it, a legacy file held by a concurrent writer (even just a RESERVED lock, not
+        // necessarily EXCLUSIVE) makes this connection's very first read fail SQLITE_BUSY
+        // immediately instead of waiting briefly, which the mid-scan-corruption guard below then
+        // reports as a corruption-flavoured "scan aborted mid-read" — misattributing transient
+        // contention as a corrupt file. Matches software_deployment_store.cpp's measured
+        // justification (taskset-pinned A/B, 30 runs each): 2/30 SQLITE_BUSY failures without
+        // this pragma, 0/30 with it, against a WAL-mode legacy file — WAL does not exempt this
+        // path.
+        sqlite3_exec(legacy.get(), "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
+
+        // A deferred transaction fixes ONE consistent snapshot for the table probe and every read
+        // below (software_deployment_store.cpp's identical precedent): without it, this
+        // connection's default autocommit mode makes each probe/read its own independent
+        // transaction, so a legacy file still being written by another process mid-backfill can
+        // interleave a write between them. `BEGIN` (not `BEGIN IMMEDIATE`) is sufficient: this
+        // connection is SQLITE_OPEN_READONLY, so there is nothing for it to write that a reserved
+        // lock would need to protect.
+        if (sqlite3_exec(legacy.get(), "BEGIN", nullptr, nullptr, nullptr) != SQLITE_OK) {
+            spdlog::error("DeviceTokenStore::migrate_from_sqlite: failed to start a snapshot "
+                          "transaction on legacy {}: {}",
+                          legacy_db_path.string(), sqlite3_errmsg(legacy.get()));
+            return false;
+        }
+        SqliteTxn legacy_txn(legacy.get());
+
         auto has_table_probe = sqlite_table_exists(legacy.get(), "device_auth_tokens");
         if (!has_table_probe) {
             spdlog::error(
@@ -456,6 +482,17 @@ bool DeviceTokenStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
                     return false;
                 }
             }
+        }
+
+        // Every prior early return in this scope leaves legacy_txn uncommitted, so its
+        // destructor ROLLBACKs (harmless — SQLITE_OPEN_READONLY, nothing written). Reaching here
+        // means the probe + scan shared one consistent snapshot; commit closes it cleanly before
+        // `legacy` itself closes below.
+        if (legacy_txn.commit() != SQLITE_OK) {
+            spdlog::error("DeviceTokenStore::migrate_from_sqlite: failed to close the snapshot "
+                          "transaction on legacy {}: {}",
+                          legacy_db_path.string(), sqlite3_errmsg(legacy.get()));
+            return false;
         }
     }
     // `legacy` (if opened) closed here via SqliteDb's destructor.
