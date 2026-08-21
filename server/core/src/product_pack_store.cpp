@@ -1170,8 +1170,12 @@ std::expected<std::vector<ProductPack>, std::string> ProductPackStore::list(
     for (int i = 0; i < rows; ++i) {
         auto p = read_pack_row(res.get(), i);
         auto items = read_items_for_pack(lease.get(), p.id);
-        if (!items)
+        if (!items) {
+            if (note_read_degrade(metrics_, kReasonQueryError, g_list_sampler))
+                spdlog::warn("ProductPackStore::list: item read failed for pack '{}': {}", p.id,
+                             items.error());
             return std::unexpected(items.error());
+        }
         p.items = std::move(*items);
         out.push_back(std::move(p));
     }
@@ -1209,8 +1213,12 @@ std::expected<std::optional<ProductPack>, std::string> ProductPackStore::get(
 
     auto p = read_pack_row(res.get(), 0);
     auto items = read_items_for_pack(lease.get(), p.id);
-    if (!items)
+    if (!items) {
+        if (note_read_degrade(metrics_, kReasonQueryError, g_get_sampler))
+            spdlog::warn("ProductPackStore::get: item read failed for pack '{}': {}", p.id,
+                         items.error());
         return std::unexpected(items.error());
+    }
     p.items = std::move(*items);
     return std::optional<ProductPack>{std::move(p)};
 }

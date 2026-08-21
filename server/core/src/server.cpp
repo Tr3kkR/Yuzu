@@ -5198,6 +5198,29 @@ public:
                 // registry wired only after the (one-shot, idempotent) backfill call
                 // would leave that specific pass permanently uncounted.
                 product_pack_store_->set_metrics(&metrics_);
+                // Pre-seed both bounded-label families to 0 (governance arch-F2, per
+                // docs/observability-conventions.md, TagStore precedent above) so
+                // absent()-based alerting stays meaningful before the first
+                // degrade/backfill event — load-bearing here specifically because a
+                // backfill failure sets startup_failed_ (refused boot never serves
+                // /metrics at all), so an alert on THIS store's backfill result must
+                // be able to fire on the ABSENCE of a success/fresh sample, which
+                // requires the label set to already exist.
+                metrics_.describe("yuzu_server_product_pack_read_degrade_total",
+                                  "ProductPackStore reads that degraded instead of answering, by "
+                                  "reason",
+                                  "counter");
+                for (auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"}) {
+                    metrics_.counter("yuzu_server_product_pack_read_degrade_total",
+                                     {{"reason", reason}});
+                }
+                metrics_.describe("yuzu_server_product_pack_backfill_total",
+                                  "One-time legacy product-packs.db backfill outcome (ADR-0054)",
+                                  "counter");
+                for (auto result : {"fresh", "success", "failed"}) {
+                    metrics_.counter("yuzu_server_product_pack_backfill_total",
+                                     {{"result", result}});
+                }
                 auto pack_db = cfg_.db_dir() / "product-packs.db";
                 if (!product_pack_store_->migrate_from_sqlite(pack_db)) {
                     spdlog::error(
