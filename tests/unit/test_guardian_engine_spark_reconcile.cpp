@@ -1533,9 +1533,9 @@ TEST_CASE("a production-order restart into each degraded spark posture: cached r
     { // SparkDisabled: --spark-disable at boot. Legacy is the CORRECT path here, not a
       // fallback (guardian_engine.hpp's SparkDisabled doc), so armed_guard_count() is
       // deliberately NOT asserted - Linux's legacy guard start() stubs return false
-      // regardless of correctness (the same trap documented at lines ~511 and ~889-891
-      // for other availability values), so the only portable assertion is that spark
-      // itself was never touched.
+      // regardless of correctness (the same trap documented at lines ~511 and
+      // ~889-891, in different test contexts), so the only portable assertion is
+      // that spark itself was never touched.
         const auto kv_path = unique_kv_path();
         yuzu::test::TempDbFile db{kv_path};
         seed_armed_rules(kv_path);
@@ -1583,13 +1583,19 @@ TEST_CASE("a production-order restart into each degraded spark posture: cached r
         CHECK(engine.rule_count() == 3); // cache intact
         CHECK(engine.spark_armed_rule_count() == 0);
         // 0 today because reconcile_rule_locked's mutual-exclusion guard withdraws
-        // BEFORE ever calling start_guard_for_rule_locked - never a legacy fallback.
-        // Same D-Bus/Linux-stub caveat as the SparkDisabled leg still applies to a
-        // REGRESSED guard, though: start_guard_for_rule_locked's own
-        // ServiceGuard::start() independently returns false on this host (no system
-        // bus), so a deleted mutual-exclusion guard would ALSO produce 0 here on
-        // Linux CI - this assertion is a real, deterministic proof against today's
-        // code, not proof against every possible regression on every host.
+        // BEFORE ever calling start_guard_for_rule_locked - never a legacy fallback,
+        // and that holds on any host. Whether a HYPOTHETICAL regression here (the
+        // guard deleted) would still be caught is host-dependent, though: it hinges
+        // on whether SystemdServiceGuard::start() (the class make_service_guard
+        // dispatches to on Linux) can reach a system bus. Where it can (a live
+        // dbus.service - true on this box: the SparkDisabled leg's own log shows
+        // real "watching unit" entries, not "system bus unavailable"), a deleted
+        // guard would arm for real and armed_guard_count() would go nonzero,
+        // catching the regression. On a D-Bus-less CI sandbox, start() fails
+        // regardless of the guard's correctness (the SparkDisabled leg's own
+        // documented trap), and a deleted guard would stay silently masked. This
+        // assertion is deterministic proof against TODAY's code on any host; its
+        // power to catch a future regression varies by host D-Bus reachability.
         CHECK(engine.armed_guard_count() == 0);
         CHECK(engine.unsupported_counts_by_type().empty());
         CHECK(engine.drain_worker_for_test() == nullptr);
@@ -1659,7 +1665,8 @@ TEST_CASE("a production-order restart into each degraded spark posture: cached r
         engine.stop(); // SIGTERM beat boot; sets the sticky stopped_ flag
         engine.wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
                                  [](const OutboxEntry&) { return SendResult::Sent; });
-        REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Unwired); // no-oped
+        // no-oped
+        REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Unwired);
 
         REQUIRE(engine.start_local().has_value()); // sticky-stop early return: SUCCESS, not an error
 
