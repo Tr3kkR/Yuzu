@@ -199,7 +199,7 @@ HTTP status codes follow standard conventions: `200` for success, `201` for reso
 | `correlation_id` | yes | A `req-<hex-ms>-<hex-seq>` token, also echoed on the `X-Correlation-Id` response header — join the response to server logs / audit rows by grepping this token. |
 | `retry_after_ms` | yes (nullable) | `null` unless the condition is retryable, in which case it advises how many milliseconds to back off (e.g. a `503` warm-up returns `5000`). |
 | `remediation` | when a hint exists | Natural-language self-recovery hint. Key is **omitted** when there is no hint (absence carries the same "no recovery available" meaning). |
-| `permission` | on permission denials | The `"SecurableType:Operation"` the caller was denied (e.g. `"Tag:Write"`) — the §A4 *kPermissionDenied* specialisation. Absent on whole-route admin gates that are not tied to a single securable, and absent on most service-scoped-token confinement denials even where the route IS tied to one — the caller is denied regardless of grant, so naming one would be a false self-remediation claim (`docs/adr/1006-service-scope-default-deny.md`). One documented exception: a confinement denial that fires *after* the route's own permission gate already confirmed the caller holds that exact grant (e.g. `GET /api/v1/inventory/software`) still names it — there `.permission` is informational, not a remediation hint (`.claude/routed-concerns-access-control.md`, "Service-scoped API token confinement" clause 5(a)). |
+| `permission` | on permission denials | The `"SecurableType:Operation"` the caller was denied (e.g. `"Tag:Write"`) — the §A4 *kPermissionDenied* specialisation. Absent on whole-route admin gates that are not tied to a single securable, and absent on most service-scoped-token confinement denials even where the route IS tied to one — the caller is denied regardless of grant, so naming one would be a false self-remediation claim (`docs/adr/1006-service-scope-default-deny.md`). One documented exception: a confinement denial that fires *after* the route's own permission gate already confirmed the caller holds that exact grant still names it — there `.permission` is informational, not a remediation hint (`.claude/routed-concerns-access-control.md`, "Service-scoped API token confinement" clause 5(a)). `GET /api/v1/inventory/software` no longer illustrates this — its after-gate deny was retired (#3290, provably dead: it fired after `perm_fn`, and the route migrated onto `require_fleet_read` entirely). No live example currently exists: an exhaustive check of every remaining `deny_fleet_wide_service_scoped` call site (20 in `rest_api_v1.cpp`, 6 in `mcp_server.cpp`) plus `deny_service_scoped_schedule`'s 4 sites found none currently match this exception's shape (`.claude/routed-concerns-access-control.md`, "Service-scoped API token confinement" clause 5) — the exception clause still governs the next one that appears. |
 | `approval_id` + `status_url` | reserved | The §A4 *kApprovalRequired* specialisation. Reserved for the Phase-2 approval re-dispatch flow; not populated by current denials (an approval-gated operation is denied with `permission` + `remediation` today, because no pollable approval exists yet). `status_url` points at `GET /api/v1/approvals/{id}`. |
 
 The R2 A4 completion (2026-07) routed the RBAC/tier denial gates (`require_admin`, `require_permission`, and the service-scope denials in the auth layer) and the ~156 legacy `error_json` sites in `rest_api_v1.cpp` through this one envelope. It does **not** yet cover literally every path — `compliance_routes.cpp` and several `auth_routes.cpp` MFA-flow branches still emit legacy shapes (tracked as #1552) — so automation crossing surfaces should treat the enrichment fields as present-when-available.
@@ -4417,7 +4417,7 @@ flag inside `data` — placement alignment is tracked with #2633.)
 
 Fleet-wide read of the typed installed-software inventory (ADR-0016, `SoftwareInventoryStore`). **Distinct** from the generic `/inventory/*` routes above, which read the generic per-source blob store (`InventoryStore`, also Postgres-backed as of ADR-0037, but a separate schema/table). This is the REST sibling of the `query_installed_software` MCP tool — same data, same scope contract.
 
-**Permission:** `Inventory:Read`. A service-scoped API token (bound to one IT service's agents) is denied outright (`inventory.software.query`, `result=denied`) — the management-group scope filter below is a separate, orthogonal confinement axis and does not narrow results for a service-scoped token.
+**Permission:** `Inventory:Read`, gated SOLELY by `AuthRoutes::require_fleet_read` (#3290 Phase 2 — never stacked with a separate permission check). A service-scoped API token (bound to one IT service's agents) is no longer denied outright: it gets a real filtered `200` scoped to its service-tagged agents, intersected with any management-group confinement that also applies (`meet(management-group, service-scope)`). A management-group-confined operator (no global grant) also now gets a genuinely filtered `200` instead of the fleet-wide/denied split of earlier releases.
 
 **Query parameters:**
 
@@ -4455,7 +4455,7 @@ Every row carries the **blob-v2 package fields** (`kind`, `ecosystem`, `epoch`, 
 
 `devices_omitted` is always present (0 when no scope filtering occurred). `result_truncated_by_cap` is present only when `count == limit` and more rows may exist past the cap (keyset pagination is a follow-up, #1634). `audit_persisted: false` is present only when the audit row could not be persisted (set-and-proceed posture — the data is still served, the lost-evidence flag is surfaced honestly).
 
-Results carry a **per-agent management-group drop filter**: out-of-scope devices are dropped and their distinct count returned in `devices_omitted`. A positive `devices_omitted` means matching software exists **outside** your scope — an empty or short result does **not** mean the software is absent fleet-wide. **Scope caveat (ADR-0017):** this confinement is **not yet verified effective** — the endpoint gates on the *global* `Inventory:Read` permission, under which the filter does not narrow results (a confined operator is denied at the gate; a global operator sees all). List-view management-group confinement becomes effective only once the ADR-0017 admit-then-filter gate lands (#1713/#1676 UAT to confirm); until then operator isolation on this surface holds for **per-device** routes only.
+Results carry a **per-agent scope drop filter** — the `require_fleet_read` gate's own composed `meet(management-group, service-scope)` visibility set (#3290): out-of-scope devices are dropped and their distinct count returned in `devices_omitted`. A positive `devices_omitted` means matching software exists **outside** your scope — an empty or short result does **not** mean the software is absent fleet-wide. This confinement is now **effective**, not a foundation: a management-group-confined operator and a correctly-confined service-scoped token both see a genuinely narrowed result, matching the ADR-0017 admit-then-filter model this route was the first to adopt in Phase 2.
 
 **Error responses:**
 
@@ -4463,10 +4463,10 @@ Results carry a **per-agent management-group drop filter**: out-of-scope devices
 |---|---|
 | 400 | `limit` is not a valid integer |
 | 401 | Unauthenticated |
-| 403 | Caller lacks `Inventory:Read` |
-| 503 | Store unavailable or degraded (A4 envelope with `correlation_id`, `retry_after_ms: 5000`) — **never an empty 200** |
+| 403 | No management-group grant for `Inventory:Read`; or a service-scoped token whose RBAC/ITServiceOwner grant is missing, or whose RBAC enforcement is disabled fleet-wide (a service-scoped token always hard-denies when RBAC is off) |
+| 503 | The gate's own RBAC/tag-store lookup is unavailable or degraded, the software inventory store is unavailable or degraded, or the `require_fleet_read` gate itself is unwired (server misconfiguration) — all A4 envelope with `correlation_id`, `retry_after_ms: 5000` where retryable — **never an empty 200** |
 
-On a `503` the store could not be read; do **not** treat it as "not installed anywhere" (ADR-0016 §7 authoritative reads). A genuine empty result is `200` with `count: 0`.
+On a `503` the store (or the confinement check itself) could not be read; do **not** treat it as "not installed anywhere" (ADR-0016 §7 authoritative reads). A genuine empty result is `200` with `count: 0`.
 
 ---
 
@@ -6816,11 +6816,19 @@ Returns current user info (legacy version; prefer `/api/v1/me`).
 
 #### `GET /api/analytics/status`
 
-Returns the status of the analytics event pipeline.
+Requires `Infrastructure:Read`. Returns the status of the analytics event pipeline:
+`{"enabled":true,"pending_count":N,"total_emitted":N}`, or `{"enabled":false,"pending_count":0,"total_emitted":0}`
+when analytics collection is disabled (`--no-analytics`). Degrade-distinguishable (ADR-0049): a
+Postgres read failure returns `503` — `{"error":{"code":503,"message":"analytics store degraded"},"meta":{"api_version":"v1"}}`
+— rather than a possibly-inaccurate `200`.
 
 #### `GET /api/analytics/recent`
 
-Returns recent analytics events. Accepts `limit` as a query parameter (default 50).
+Requires `Infrastructure:Read`. Returns recent analytics events. Accepts `limit` as a query
+parameter (default 50). `{"events":[...],"count":N}` on success, `{"events":[],"count":0}` when
+analytics collection is disabled. Degrade-distinguishable (ADR-0049): a Postgres read failure
+returns `503` with the same envelope shape as `/api/analytics/status` above, rather than a
+possibly-inaccurate `200`.
 
 #### `GET /api/nvd/status`
 
