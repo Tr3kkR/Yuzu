@@ -655,6 +655,14 @@ TEST_CASE("default_certs: two racing first-boot instances never cross-purge each
     // winner's, permanently orphaning its certs from ca_store. The fix moved
     // try_insert_root() before any leaf generation/purge/record_issued() call, so a
     // losing thread returns before touching ca_store's issued-cert table at all.
+    //
+    // NOTE (security-guardian, Gate 8 domain re-review of the UP-3 fix, 2026-08-21):
+    // since dir_a/dir_b are SEPARATE, the loser's UP-3 poll loop (default_certs.cpp)
+    // can never find the winner's files (they land in the OTHER directory) — this
+    // test now incurs the full kLoserSelfHealPollWindow (15s) wall-clock cost on the
+    // loser before it correctly falls back to refuse-and-restart. Expected, not a
+    // regression; noted so a slower run of this specific test isn't mistaken for
+    // infra flakiness.
     TempDir dir_a;
     TempDir dir_b;
     YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
@@ -705,96 +713,127 @@ TEST_CASE("default_certs: a losing HA replica self-heals from the shared cert di
     // SIX racers, not two: with a shared dir, a loser that checks get_root()
     // AFTER the winner has already committed short-circuits through the
     // pre-existing UP-2 self-heal branch (it finds the winner's key already on
-    // disk and adopts it there) WITHOUT ever reaching this fix's own code — a
-    // real run confirmed this happens with just two threads. The new
-    // fingerprint-mismatch poll loop only fires for a racer whose OWN get_root()
-    // check raced BEFORE the winner committed (so it generated its own candidate
-    // material and genuinely lost try_insert_root's CAS). Six concurrent
-    // candidates make it overwhelmingly likely several see the root as empty
-    // before any one of them commits (get_root()/try_insert_root() are both real
-    // network round-trips; EC-384 keygen + self-signing is real CPU work) —
-    // LogCapture confirms this fix's own code path actually ran rather than
-    // trusting the aggregate outcome alone (which the pre-existing UP-2 branch
-    // could equally produce).
-    TempDir dir;
-    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
-    // Pool sized generously above server-admin.md's documented "N+1 connections
-    // per racer needing the bootstrap lock" floor: with kRacers genuine
-    // candidates, several may independently reach the lock (winner + any that
-    // raced the UP-2 shortcut), each needing an outer lease plus its own nested
-    // per-call leases. This test deliberately over-races well beyond a
-    // realistic HA topology (2-3 replicas) specifically to reliably exercise
-    // the new poll-loop branch — a small pool here would hit the SAME
-    // documented capacity constraint the file's own kBootstrapLockAcquireTimeout
-    // comment describes, which is a property of this test's exaggerated
-    // concurrency, not a defect.
-    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 32}};
-    CaStore store{pool};
-    REQUIRE(store.is_open());
-    REQUIRE_FALSE(store.has_root());
-
+    // disk and adopts it there) WITHOUT ever reaching this fix's own code. The
+    // new fingerprint-mismatch poll loop only fires for a racer whose OWN
+    // get_root() check raced BEFORE the winner committed. Six concurrent
+    // candidates make this LIKELY but not GUARANTEED on every run — under
+    // real system load (confirmed empirically: this happened during a full
+    // 10-shard suite run, never in ~15 isolated runs) every racer's get_root()
+    // can land after the winner already committed, so all six correctly take
+    // the pre-existing UP-2 path and the run is a legitimate, non-buggy
+    // outcome that simply doesn't exercise THIS fix's own new code.
+    //
+    // BOUNDED retry of the WHOLE scenario (fresh dir + fresh store each
+    // attempt — a stale store already has a root, which cannot restage the
+    // "genuinely empty" precondition this race needs), mirroring
+    // test_mcp_stream_bridge.cpp's #3357 "quiesce B before the experiment"
+    // shape: exceeding the bound is a REQUIRE failure (a red assertion, not a
+    // silent pass or an infinite spin) — if six racers under
+    // kMaxSchedulingAttempts tries never once produce a genuine CAS loser,
+    // that is itself worth investigating, not something to retry away.
     constexpr int kRacers = 6;
-    std::array<DefaultCertSet, kRacers> sets;
-    std::array<bool, kRacers> oks{};
-    std::string logs;
-    {
-        yuzu::test::LogCapture log;
-        std::vector<std::thread> threads;
-        threads.reserve(kRacers);
-        for (int i = 0; i < kRacers; ++i) {
-            threads.emplace_back([&, i] {
-                oks[static_cast<size_t>(i)] = ensure_default_certs(
-                    dir.path, "host-" + std::to_string(i), &store, sets[static_cast<size_t>(i)]);
-            });
+    constexpr int kMaxSchedulingAttempts = 5;
+    for (int attempt = 0;; ++attempt) {
+        INFO("scheduling attempt " << attempt << ": did every racer's get_root() land after "
+             "the winner already committed? (legitimate, just doesn't exercise this fix's "
+             "own new code — retrying to get a genuine CAS loser)");
+        REQUIRE(attempt < kMaxSchedulingAttempts);
+
+        TempDir dir;
+        YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+        // Pool sized generously above server-admin.md's documented "N+1
+        // connections per racer needing the bootstrap lock" floor: with
+        // kRacers genuine candidates, several may independently reach the
+        // lock (winner + any that raced the UP-2 shortcut), each needing an
+        // outer lease plus its own nested per-call leases. This test
+        // deliberately over-races well beyond a realistic HA topology (2-3
+        // replicas) specifically to reliably exercise the new poll-loop
+        // branch — a small pool here would hit the SAME documented capacity
+        // constraint the file's own kBootstrapLockAcquireTimeout comment
+        // describes, which is a property of this test's exaggerated
+        // concurrency, not a defect.
+        yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 32}};
+        CaStore store{pool};
+        REQUIRE(store.is_open());
+        REQUIRE_FALSE(store.has_root());
+
+        std::array<DefaultCertSet, kRacers> sets;
+        std::array<bool, kRacers> oks{};
+        std::string logs;
+        {
+            yuzu::test::LogCapture log;
+            std::vector<std::thread> threads;
+            threads.reserve(kRacers);
+            for (int i = 0; i < kRacers; ++i) {
+                threads.emplace_back([&, i] {
+                    oks[static_cast<size_t>(i)] = ensure_default_certs(
+                        dir.path, "host-" + std::to_string(i), &store,
+                        sets[static_cast<size_t>(i)]);
+                });
+            }
+            for (auto& t : threads)
+                t.join();
+            log.stop();
+            logs = log.text();
         }
-        for (auto& t : threads)
-            t.join();
-        log.stop();
-        logs = log.text();
-    }
-    // Scoped to the REST of the test case (not the block above) — Catch2's
-    // INFO is lexically scoped, so it must outlive every assertion it should
-    // annotate, including the oks[] loop below.
-    INFO("captured boot logs from all " << kRacers << " racers:\n" << logs);
 
-    // The core claim of this fix: at least one racer actually reached the NEW
-    // poll loop (lost the fingerprint CAS after generating its own candidate)
-    // and self-healed via it, not just via the pre-existing UP-2 shortcut.
-    REQUIRE(logs.find("lost the first-boot CA-root race") != std::string::npos);
-    REQUIRE(logs.find("self-healed onto the winning root") != std::string::npos);
+        // ALL racers succeed regardless of which branch each loser took — a
+        // genuine oks[i]==false here is a real failure, not a "retry and
+        // hope" scheduling artifact, so assert it every attempt rather than
+        // only on the attempt that exercises the new branch.
+        for (int i = 0; i < kRacers; ++i)
+            REQUIRE(oks[static_cast<size_t>(i)]);
 
-    // ALL racers succeed now — every loser self-heals (via one branch or the
-    // other) rather than failing this boot.
-    for (int i = 0; i < kRacers; ++i)
-        REQUIRE(oks[static_cast<size_t>(i)]);
+        const bool exercised_new_branch =
+            logs.find("lost the first-boot CA-root race") != std::string::npos &&
+            logs.find("self-healed onto the winning root") != std::string::npos;
+        if (!exercised_new_branch)
+            continue; // legitimate scheduling outcome — retry for a genuine CAS loser
 
-    auto root = store.get_root();
-    REQUIRE(root.has_value());
-    REQUIRE(root->has_value());
+        // Scoped to the rest of THIS attempt — Catch2's INFO is lexically
+        // scoped, so it must outlive every assertion it should annotate.
+        INFO("captured boot logs from the attempt that exercised the new branch:\n" << logs);
 
-    // Every racer converges on the SAME winning root's material — no divergent
-    // view, and nobody adopted its own discarded generation.
-    for (int i = 0; i < kRacers; ++i)
-        REQUIRE(sets[static_cast<size_t>(i)].ca_fingerprint_sha256 == (*root)->fingerprint_sha256);
-    // Exactly one racer actually generated; try_use_existing_complete_set()
-    // never sets this true, so every self-healed loser reads false.
-    const auto winners = std::count_if(sets.begin(), sets.end(),
-                                       [](const auto& s) { return s.freshly_generated; });
-    REQUIRE(winners == 1);
+        // The core claim of this fix: at least one racer actually reached the
+        // NEW poll loop (lost the fingerprint CAS after generating its own
+        // candidate) and self-healed via it — restated as an explicit
+        // assertion (not just the branch condition above) so a future
+        // refactor that breaks this check still fails loudly at the specific
+        // claim, not just silently loops forever until the attempt bound.
+        REQUIRE(logs.find("lost the first-boot CA-root race") != std::string::npos);
+        REQUIRE(logs.find("self-healed onto the winning root") != std::string::npos);
 
-    // Still exactly 3 issued rows — no racer re-purges or re-records once it
-    // adopts the winner's already-written set.
-    auto issued = store.list_issued();
-    REQUIRE(issued.has_value());
-    REQUIRE(issued->size() == 3);
+        auto root = store.get_root();
+        REQUIRE(root.has_value());
+        REQUIRE(root->has_value());
 
-    // Every on-disk pair is genuinely consistent (every racer's `out` points at
-    // the same shared dir, so this checks the one real set on disk).
-    for (const auto& [cert_path, key_path] :
-        {std::pair{sets[0].https_cert, sets[0].https_key},
-         std::pair{sets[0].server_cert, sets[0].server_key},
-         std::pair{sets[0].gateway_cert, sets[0].gateway_key}}) {
-        CHECK(pki::cert_matches_key(read_file(cert_path), read_file(key_path)));
+        // Every racer converges on the SAME winning root's material — no
+        // divergent view, and nobody adopted its own discarded generation.
+        for (int i = 0; i < kRacers; ++i)
+            REQUIRE(sets[static_cast<size_t>(i)].ca_fingerprint_sha256 ==
+                   (*root)->fingerprint_sha256);
+        // Exactly one racer actually generated; try_use_existing_complete_set()
+        // never sets this true, so every self-healed loser reads false.
+        const auto winners = std::count_if(sets.begin(), sets.end(),
+                                           [](const auto& s) { return s.freshly_generated; });
+        REQUIRE(winners == 1);
+
+        // Still exactly 3 issued rows — no racer re-purges or re-records once
+        // it adopts the winner's already-written set.
+        auto issued = store.list_issued();
+        REQUIRE(issued.has_value());
+        REQUIRE(issued->size() == 3);
+
+        // Every on-disk pair is genuinely consistent (every racer's `out`
+        // points at the same shared dir, so this checks the one real set on
+        // disk).
+        for (const auto& [cert_path, key_path] :
+            {std::pair{sets[0].https_cert, sets[0].https_key},
+             std::pair{sets[0].server_cert, sets[0].server_key},
+             std::pair{sets[0].gateway_cert, sets[0].gateway_key}}) {
+            CHECK(pki::cert_matches_key(read_file(cert_path), read_file(key_path)));
+        }
+        break; // scenario fully exercised and asserted — done
     }
 }
 

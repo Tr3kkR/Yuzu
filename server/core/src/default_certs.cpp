@@ -1201,6 +1201,18 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
                 std::this_thread::sleep_for(kLoserSelfHealPollInterval);
                 if (try_use_existing_complete_set(dir, marker, hostname, extra_sans, cert_group,
                                                   out)) {
+                    // cpp-safety (Gate 8 domain re-review, 2026-08-21): don't assume the set this
+                    // just validated is necessarily THE root we lost the race to — cross-check
+                    // explicitly rather than relying on an unstated invariant, since this adoption
+                    // decision (and the log line below) both depend on it.
+                    if (out.ca_fingerprint_sha256 != established->fingerprint_sha256) {
+                        spdlog::warn(
+                            "default_certs: a complete cert set appeared on {} but its CA "
+                            "fingerprint ({}) does not match the root this instance lost the "
+                            "race to ({}) — not adopting; continuing to poll.",
+                            dir.string(), out.ca_fingerprint_sha256, established->fingerprint_sha256);
+                        continue;
+                    }
                     spdlog::warn(
                         "default_certs: self-healed onto the winning root (fingerprint {}) from "
                         "disk without a restart.",

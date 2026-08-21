@@ -394,10 +394,12 @@ here.
 ## Review History
 
 This is a compact provenance record — what ran, what it found, what happened to it. Current
-design truth lives in `## Decision` above, not here; full structured findings (trigger/impact/
+design truth lives in `## Decision` above, not here. Full structured findings (trigger/impact/
 exposure/epistemic-status per this repo's derivation scheme, plus provenance and disposition) are
-in the committed ledger: `governance.d/ca-store-postgres-migration.Hq3Wpm.jsonl` (42 findings
-across 9 review passes).
+in the committed ledger: `governance.d/ca-store-postgres-migration.Hq3Wpm.jsonl` (45 findings
+across 10 review passes). Resource-ownership detail for the bootstrap-lock/first-boot-key custody
+chain — a policy-floor artifact independent of this history, not process narrative — lives in its
+own durable file: `docs/resource-ledgers/default-certs-bootstrap-lock.md`.
 
 | # | Pass | Reviewers | Findings | What stood out |
 |---|---|---|---|---|
@@ -410,6 +412,7 @@ across 9 review passes).
 | 7 | Gate 5/6 | chaos-injector, compliance-officer, sre, enterprise-readiness, docs-writer, architect | 1 HIGH fixed, 1 MEDIUM documented, 3 SHOULD fixed, 4 SHOULD deferred, 4 NICE (mixed) | C5-1: a fencing-token gap in pass 4's own lock fix — the lock-holding *connection* could die without the *process* dying |
 | 8 | cpp-safety + security-guardian re-review of the C5-1 fix | cpp-safety, security-guardian | 2 policy floors fixed, 1 NICE deferred (pre-existing) | A `const_cast`-then-write UB (cpp-safety's enumerated floor) and a missing Resource Ledger |
 | 9 | cpp-expert gap-fill | cpp-expert | 3 NICE fixed | First review of the fix-round commits specifically — routed-concerns' trigger is unconditional on any C++ change, and this coverage cell had been empty |
+| 10 | cpp-safety + security-guardian re-review of the UP-3 fix | cpp-safety, security-guardian | 1 SHOULD fixed, 1 policy floor fixed, 1 MEDIUM documented | The ADR restructuring in this same round had deleted the committed Resource Ledger with no durable replacement — a policy floor, caught before push |
 
 **Notable process findings, not product findings.** Three separate instances of an overclaiming
 pattern were caught and retracted **before** being used as sign-off evidence, never after —
@@ -442,8 +445,36 @@ against one shared `TempDir` reproduced this on 7 of 8 runs before the fix (log 
 self-healed) and 0 of 15 runs after it. Fixed: the CA key is now written to disk only after a
 candidate is confirmed the CAS's sole winner, at which point no other candidate can still be
 racing for that name — `key_ref` itself is computed beforehand (a pure path calculation, no I/O)
-so it can still be recorded in the same `try_insert_root` call. This fix has not yet had its own
-dedicated domain re-review pass; treat it as pending that before merge.
+so it can still be recorded in the same `try_insert_root` call.
+
+**Pass 10 — cpp-safety + security-guardian domain re-review of this fix (2026-08-21).**
+cpp-safety: PASSES, no BLOCKING findings; one SHOULD fixed (the poll loop's adoption decision
+didn't cross-check the fingerprint of what it just validated against the root it lost the race
+to — an unstated invariant true by construction today, now asserted explicitly rather than
+assumed). security-guardian: one BLOCKING policy-floor finding, fixed — the ADR restructuring in
+this same round had deleted the two committed Resource Ledger tables for the bootstrap-lock chain
+with no durable replacement (the governance findings ledger has a different schema and cannot
+substitute for one); moved to `docs/resource-ledgers/default-certs-bootstrap-lock.md` instead,
+extended with this pass's own new resource (the deferred `default-ca` key write). One MEDIUM,
+non-blocking, documented not fixed: deferring the key write past the CAS opens a narrow window
+where a *sibling* process's unrelated, pre-existing self-heal check can see no local key yet and
+refuse immediately rather than waiting — availability-only, fail-closed, and extending that
+unrelated check's own poll would delay a genuine lost-key refusal by up to 15s on every
+established install, a worse trade than the rare sibling-refusal it would prevent. Full findings:
+`governance.d/ca-store-postgres-migration.Hq3Wpm.jsonl` pass 10.
+
+**Self-caught, not a review finding: the new UP-3 test was itself scheduling-dependent.** A
+subsequent full 10-shard suite run (higher system contention than an isolated run) hit a
+legitimate, non-buggy scheduling outcome the test's log-evidence assertions weren't tolerant of —
+all six racers' `get_root()` checks landed after the winner had already committed, so all six
+correctly took the pre-existing UP-2 path and none exercised this fix's own new branch, failing
+the test's `REQUIRE(logs.find("lost the first-boot CA-root race")...)`. Not weakened (a soft
+check would trade "sometimes red for a good reason" for "always green regardless of whether it
+verifies anything," which this branch's own review discipline treats as worse than an occasional
+red); instead wrapped in a bounded retry of the whole scenario (fresh directory and store each
+attempt, up to 5 attempts), mirroring `test_mcp_stream_bridge.cpp`'s `#3357` "quiesce before the
+experiment" shape — exceeding the bound is still a hard `REQUIRE` failure, never a silent pass or
+an infinite spin.
 
 ## Consequences
 
