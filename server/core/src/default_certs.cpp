@@ -677,12 +677,20 @@ bool try_use_existing_complete_set(const fs::path& dir, const fs::path& marker,
         // mismatched. This is the ONLY thing standing between that corruption
         // and it validating as intact forever, so it must self-heal on the
         // very next boot rather than depend solely on prevention.
-        const auto https_key = read_text_file(out.https_key);
-        const auto server_key = read_text_file(out.server_key);
-        const auto gateway_key = read_text_file(out.gateway_key);
-        KeyZeroGuard https_key_zero{const_cast<std::string&>(https_key)};
-        KeyZeroGuard server_key_zero{const_cast<std::string&>(server_key)};
-        KeyZeroGuard gateway_key_zero{const_cast<std::string&>(gateway_key)};
+        // Deliberately non-const (cpp-safety, Gate 8, 2026-08-21): a `const auto`
+        // here is a genuinely const-qualified automatic object, so wiping it via
+        // a `const_cast`-obtained reference in KeyZeroGuard would be UB under
+        // [dcl.type.cv]/4 — writing through a non-const reference to an object
+        // that is actually const, not the "const ref to a non-const object" case
+        // that would be fine. Matches this file's own established idiom
+        // (`KeyZeroGuard leaf_zero{kc->private_key_pem}` above, `ca_zero`
+        // elsewhere) — neither casts.
+        auto https_key = read_text_file(out.https_key);
+        auto server_key = read_text_file(out.server_key);
+        auto gateway_key = read_text_file(out.gateway_key);
+        KeyZeroGuard https_key_zero{https_key};
+        KeyZeroGuard server_key_zero{server_key};
+        KeyZeroGuard gateway_key_zero{gateway_key};
         const bool keys_paired =
             pki::cert_matches_key(read_text_file(out.https_cert), https_key) &&
             pki::cert_matches_key(read_text_file(out.server_cert), server_key) &&

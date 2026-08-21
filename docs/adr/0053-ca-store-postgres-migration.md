@@ -615,6 +615,23 @@ code (not the diff, not the commit message) and confirmed their own original fin
 
 Full agent reports: this run's governance transcript (session-local, not committed).
 
+## Resource Ledger — C5-1 fencing-check fix (commit `63cc22610`)
+
+cpp-safety's Gate 8 domain re-review of the fencing-check fix (below) flagged this round as
+missing a committed Resource Ledger — a policy floor independent of code correctness. Recorded
+here for that commit's new/changed resource-acquiring code:
+
+| Resource | Owner | Acquire | Release | Failure path |
+|---|---|---|---|---|
+| `PGconn* lock_conn` (borrowed, `default_certs.cpp`'s new `complete_default_cert_set()` parameter) | Not owned by this function — real owner is `pg::PgPool::Lease` in `complete_default_cert_set_locked()` | Passed in by the caller (`lease.get()`); the no-`ca_store` fallback passes nothing, defaults to `nullptr` | Never released here — the caller's `Lease` releases it on scope exit, unchanged by this diff | `lock_conn == nullptr` skips the check entirely (no lock to verify); a live-but-dead connection is handled by `lock_connection_alive`'s own `PQstatus`/`PQexec` checks, never dereferenced unsafely |
+| `pg::PgResult` inside `lock_connection_alive()` (new function) | Local, RAII (`PQclear` on destruction, existing `pg::PgResult` type, unchanged) | `PQexec(conn, "SELECT 1")` | Automatic, end of function scope | `PGRES_TUPLES_OK` check before use; no path leaves the result unowned |
+| `https_key`/`server_key`/`gateway_key` (`std::string`, new in `try_use_existing_complete_set()`) | Local, RAII via `KeyZeroGuard` (this file's established wipe-on-scope-exit pattern) | `read_text_file()` on each leaf's `.key` path | `KeyZeroGuard` destructor zeroes on every exit from the enclosing `try` block (normal return, early `return false`, and the `catch`) | A read failure returns an empty string, which `pki::cert_matches_key` treats as a non-match (fails closed to "regenerate"), never a crash |
+
+The `const_cast`-then-write UB cpp-safety also found in this same code (writing through a
+`const_cast`-obtained reference to a genuinely `const`-qualified `auto` object — [dcl.type.cv]/4)
+is fixed in the same round: the three declarations are non-`const`, matching this file's own
+established `KeyZeroGuard leaf_zero{kc->private_key_pem}` idiom (no cast needed).
+
 ## Governance Gate 5/6 findings (2026-08-21, pre-push)
 
 Gate 5 (chaos-injector, triggered because Gate 4 produced findings) and Gate 6 (compliance-officer
