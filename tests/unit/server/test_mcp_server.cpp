@@ -3114,7 +3114,7 @@ TEST_CASE("MCP Integration: discover_plugins wired vs unwired", "[mcp][integrati
     p->set_version("1.0");
     p->set_description("Process enumeration");
     p->add_capabilities("list");
-    registry.register_agent(info);
+    (void)registry.register_agent(info);
 
     McpTestServer ts;
     ts.agent_registry_for_test = &registry;
