@@ -803,7 +803,7 @@ Session-cookie auth with PBKDF2-hashed passwords.
 
 ### 18.8 Device Authorization Tokens :white_check_mark: `T2`
 
-`DeviceTokenStore` (SQLite) with SHA-256 hashed tokens, device_id and definition_id scoping. REST: `GET/POST/DELETE /api/v1/device-tokens`. Integrated into auth chain.
+`DeviceTokenStore` (PostgreSQL, ADR-0052) with SHA-256 hashed tokens, device_id and definition_id scoping. REST: `GET/POST/DELETE /api/v1/device-tokens`. **Dormant** (same family as `LicenseStore`/ADR-0048 and `SoftwareDeploymentStore`/ADR-0051) — the store is migrated and tested but not constructed by the server, so these routes do not register today.
 
 ### 18.9 HTTPS for Web Dashboard :white_check_mark: `T1`
 

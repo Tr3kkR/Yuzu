@@ -616,11 +616,16 @@ Plugins for running arbitrary commands, managing device tags, and structured ass
 | `clear` | Remove all tags. |
 | `count` | Return the total number of tags. |
 
-> **The `service` key is not synced from `tags.json` (#3289).** `service` is the confinement
+> **The `service` key is not synced from `tags.json` (#3289), and never answers scope-DSL
+> queries from the agent's live session either (#3295).** `service` is the confinement
 > boundary a service-scoped API token is checked against, so the server silently drops it from
-> an agent's self-reported tags rather than accepting it — set-locally-only, never propagated. A
-> device's `service` tag must always be assigned by an operator (dashboard/REST) or an API
-> integration, never by a `tags.json` entry shipped with the agent.
+> an agent's self-reported tags rather than accepting it — set-locally-only, never propagated,
+> and dropped from the agent's live session at registration too. A device's `service` tag must
+> always be assigned by an operator (dashboard/REST) or an API integration, never by a
+> `tags.json` entry shipped with the agent. Every OTHER key in `tags.json` still reaches
+> scope-DSL `tag:<key>` evaluation and the server tag store normally — see
+> `docs/asset-tagging-guide.md` "Tag source precedence (write time)" for the full precedence
+> rules (which source wins when an operator has also set the same key).
 
 ### asset_tags
 

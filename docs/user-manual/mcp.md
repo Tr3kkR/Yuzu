@@ -422,7 +422,7 @@ for the tool to execute.
 | 18 | `list_executions` | List recent command executions (filterable by definition, status). | `Execution:Read` |
 | 19 | `list_schedules` | List scheduled (recurring) instructions — a service-scoped API token is denied outright (`schedule.list`). | `Schedule:Read` |
 | 20 | `validate_scope` | Validate a scope expression without executing it. | (none -- always allowed) |
-| 21 | `preview_scope_targets` | Show which agents match a scope expression. | `Infrastructure:Read` |
+| 21 | `preview_scope_targets` | Show which agents match a scope expression. `tag:<key>` atoms resolve from the persistent tag store ONLY (unlike an actual dispatch, which also falls back to a connected agent's own live self-reported value when the store has no row for that agent) — a gateway-proxied or not-yet-synced agent whose only claim to a key is its own live report may be previewed as excluded here but still be targeted by the real dispatch. REST `POST /api/scope/estimate` does not share this limitation — it resolves through the same store-first-with-fallback path real dispatch uses, so it can report a different matched set than this tool for the same expression. See `docs/asset-tagging-guide.md` "Tag source precedence (read time, scope-DSL, #3295)". | `Infrastructure:Read` |
 | 22 | `list_pending_approvals` | List pending approval requests (filterable by status, submitter). | `Approval:Read` |
 | 23 | `execute_instruction` | Execute a plugin action on agents. Returns `{command_id, execution_id, agents_reached, plugin, action}` (`agents_reached` >= 1); poll results with `query_responses` or subscribe to live events via REST `GET /api/v1/events?execution_id=<id>`. If no agent was reachable, returns the OTHER outcome instead: `{status:"no_agents_reached", command_id, execution_id, agents_reached:0, plugin, action, message}` — the two shapes are mutually exclusive (`outputSchema`'s `oneOf`), never mixed. | `Execution:Execute` |
 | 24 | `list_issued_certs` | List certificates issued by the internal CA (serial, subject, purpose, status, expiry, revocation). MCP mirror of `GET /api/v1/ca/issued`. `limit`/`offset` args. | `Security:Read` |
@@ -699,6 +699,14 @@ URI.
 | `yuzu://server/health` | Server Health | Server health status and count of connected agents. | (none -- always allowed) |
 | `yuzu://compliance/fleet` | Fleet Compliance | Fleet-wide compliance overview (total checks, compliant, non-compliant, unknown, percentage). | `Policy:Read` |
 | `yuzu://audit/recent` | Recent Audit | Last 50 audit events with timestamp, principal, action, target, and result. | `AuditLog:Read` |
+| `yuzu://guardian/schemas` | Guardian Schemas | Guardian (Guaranteed State) Guard authoring schema catalog -- same builder as `GET /api/v1/guaranteed-state/schemas`. | `GuaranteedState:Read` |
+| `yuzu://about` | About Yuzu | Product primer, glossary, and safe operating rules for agentic workers. | `Infrastructure:Read` |
+| `yuzu://capabilities` | MCP Capabilities | What MCP can answer now, what needs live read-only dispatch, what requires external connectors, what is unsafe without approval. | `Infrastructure:Read` |
+| `yuzu://operating-model` | Agentic Operating Model | Recommended classify-plan-read-scope-approve-execute-monitor workflow. | `Infrastructure:Read` |
+| `yuzu://demo/playbooks` | Demo Playbooks | Deterministic CEO demo scenarios and live-fleet variants. | `Infrastructure:Read` |
+| `yuzu://golden-prompts/enterprise-it-v1` | Enterprise IT Golden Prompts v1 | Versioned prompt/eval catalogue for enterprise incident workflows. | `Infrastructure:Read` |
+| `yuzu://openapi` | OpenAPI Specification | REST API v1 OpenAPI spec, raw -- byte-identical to `GET /api/v1/openapi.json`; `discover_routes` wraps the same source in a distinct routes-catalog projection, not this shape. | `Infrastructure:Read` (tier- and RBAC-gated, matching `discover_routes`) |
+| `yuzu://scope-dsl` | Scope DSL Reference | Scope-kind and comparison-operator catalog -- same builder as `discover_scope_kinds` / `GET /api/v1/discover/scope-kinds`. | `Infrastructure:Read` (tier- and RBAC-gated, matching `discover_scope_kinds`) |
 
 ### Example: reading a resource
 

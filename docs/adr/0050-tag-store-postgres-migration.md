@@ -250,3 +250,63 @@ drift class the health block's own comments document). Backfill failure is fatal
   live agent's self-report shadows an operator store row during scope evaluation, opposite of
   the store-first cohort reads): out of scope for a substrate migration; preserved exactly and
   pinned by a test. If it is to change, that is its own reviewed decision.
+
+## Amendment — 2026-08-20: resolver precedence flips to store-first (#3295)
+
+The "Considered and rejected" entry above ("Changing the resolver's
+scopable_tags-first precedence... out of scope for a substrate migration...
+If it is to change, that is its own reviewed decision") named exactly this
+change and deferred it. #3295 is that reviewed decision: `evaluate_scope`'s
+`tag:<key>` resolver is now **store-first** — a TagStore row of any source
+wins over a connected agent's live `scopable_tags` claim; the in-memory
+value answers only when the store has no row at all for that `(agent,
+key)` (a gateway-proxied agent, whose tags never reach the store via
+`ProxyRegister` — tracked as #3372; or a tag not yet synced).
+Additionally, `register_agent` now drops an agent-claimed `service` key
+from the session entirely at ingest, mirroring the store-side purge
+`sync_agent_tags` already performed (#3289) — and, separately, drops any
+key/value pair failing `TagStore::validate_key`/`validate_value` (charset,
+length) before it can reach the in-memory fallback either, so an
+oversized or malformed self-report can never answer a `tag:` lookup for a
+store-miss agent, matching the validation `sync_agent_tags` already
+applies on the store side.
+
+This does NOT reopen the "Aborting scope evaluation on a NULL tag store"
+rejection above — a NULL store with no row to check still falls through to
+the in-memory value, matching a real test/embedded configuration with no
+store to distrust. It also does not disturb the DEGRADED-store fail-closed
+contract (a store/pool/query error still aborts the whole evaluation).
+
+The one accepted behavior change from the flip: if an agent's most recent
+`sync_agent_tags` write failed (`agent_service_impl.cpp` logs "prior tag
+set retained, agent re-syncs on next Register"), the store can briefly hold
+a stale agent-authored value while the live session holds a fresher one —
+store-first now returns the stale value where session-first would have
+returned the fresh one. Accepted: the store remains the single source of
+truth for `tag:` scope-DSL evaluation, and the row self-heals on the
+agent's next successful sync.
+
+A second, narrower residual window (pre-existing, not introduced by this
+flip): the bulk store preload snapshots `tag_values` before `mu_` is
+taken — a single bulk query rather than a per-agent round-trip while
+holding the lock, the same "N sequential blocking Postgres calls held
+under `AgentRegistry::mu_` is both a fail-open surface and a
+lock-hold-during-network-I/O violation of ADR-0012 §2(b)" reasoning
+ADR-0045 states for `props.<key>`. A concurrent operator write that
+commits after the snapshot but before the per-agent loop reaches that
+agent is invisible to that ONE `evaluate_scope` call — but what the
+resolver returns for it depends on whether a row for that `(agent, key)`
+already existed at snapshot time. If it did not (the write is a fresh
+INSERT), the lookup misses and the call answers from the in-memory
+fallback, indistinguishable from the pre-#3295 behavior for that one call.
+If a row already existed (the write is an UPDATE, or a DELETE), the lookup
+still hits — the call returns the pre-race, now-stale store value, never
+the fallback; this collapses into the same stale-value shape as the
+failed-resync trade-off above, not into session-first behavior. Either
+way the window is bounded to one call and self-corrects on the very next
+`evaluate_scope` call (a fresh preload). This shape already existed for
+`props.<key>` before this PR; it is now also true for `tag:<key>`.
+
+Full precedence rule: `docs/asset-tagging-guide.md` "Tag source precedence
+(read time, scope-DSL, #3295)"; cross-references: `docs/adr/1006-service-scope-default-deny.md`,
+`docs/auth-architecture.md`.
