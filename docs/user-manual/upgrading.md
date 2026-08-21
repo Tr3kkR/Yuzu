@@ -726,28 +726,36 @@ it was never in `ca.db` and stays a local file behind `KeyProvider` (`--ca-dir`)
   agent-issued certificate. Every occurrence logs a `spdlog::warn` line, but
   there is currently no dedicated audit-log row for it (unlike enrollment-time
   `ca.cert.issued`) — tracked as a follow-up, not fixed in this release.
-- **HA note: a losing first-boot replica does not self-heal on its own.** Multiple
-  server instances sharing one `--ca-dir` cert volume and one `ca_store` Postgres
-  substrate is not an officially supported deployment topology today (see
-  ADR-0053's Decision section) — this note describes what happens if it's done
-  anyway, safely, not a recommendation to do it. If two instances start against
-  the same fresh `ca_store` at once, exactly one wins the root race and
-  generates the live default certs; the other **exits** (refuses to start,
+- **HA note: a losing first-boot replica self-heals within the same boot attempt
+  (UP-3), bounded.** Multiple server instances sharing one `--ca-dir` cert
+  volume and one `ca_store` Postgres substrate is not an officially supported
+  deployment topology today (see ADR-0053's Decision section) — this note
+  describes what happens if it's done anyway, safely, not a recommendation to
+  do it. If two instances start against the same fresh `ca_store` at once,
+  exactly one wins the root race and generates the live default certs; the
+  other polls the shared cert directory for up to 15s for the winner's
+  complete set to land (it only adopts a fully-written set — the winner's
+  completion marker is written last, so a partial/in-flight write is never
+  picked up) and, on success, continues booting on the winner's certs without
+  a restart. If the winner hasn't finished within that window (a slow
+  Postgres, lock contention, or a winner that's itself still starting up), the
+  loser falls back to the original behavior: it **exits** (refuses to start,
   non-zero) rather than serving with its own discarded material — it does not
   reach a running-but-unready state, so a readiness-probe-driven restart never
-  applies here. Recovery is a plain process-supervisor restart (systemd
-  `Restart=on-failure`, Kubernetes `restartPolicy`) once the winner's certs are
-  in place, so the losing instance picks them up from disk on its next boot. On
-  systemd specifically, a slow winner (e.g. Postgres itself under load) can
-  interact with the crash-loop guard (`StartLimitBurst`/`StartLimitIntervalSec`)
-  — a losing replica that exhausts its restart budget first lands in the
-  service's "failed" state and needs a manual `systemctl reset-failed` once the
-  winner has actually finished, rather than retrying forever on its own.
-  Diagnosing a bootstrap that seems permanently stuck (neither replica ever
-  finishes): check `pg_locks` for a lingering `yuzu:default_certs_bootstrap`
-  session advisory lock with no live backend behind it (a host crash or network
-  partition can leave one held until Postgres notices the dead session) and
-  `pg_terminate_backend` it — see `docs/pki-architecture.md`'s operator runbook.
+  applies here. Recovery in that case is a plain process-supervisor restart
+  (systemd `Restart=on-failure`, Kubernetes `restartPolicy`) once the winner's
+  certs are in place, so the losing instance picks them up from disk on its
+  next boot attempt. On systemd specifically, a slow winner (e.g. Postgres
+  itself under load) can interact with the crash-loop guard
+  (`StartLimitBurst`/`StartLimitIntervalSec`) — a losing replica that exhausts
+  its restart budget first lands in the service's "failed" state and needs a
+  manual `systemctl reset-failed` once the winner has actually finished,
+  rather than retrying forever on its own. Diagnosing a bootstrap that seems
+  permanently stuck (neither replica ever finishes): check `pg_locks` for a
+  lingering `yuzu:default_certs_bootstrap` session advisory lock with no live
+  backend behind it (a host crash or network partition can leave one held
+  until Postgres notices the dead session) and `pg_terminate_backend` it — see
+  `docs/pki-architecture.md`'s operator runbook.
 
 ## ⚠️ Behaviour change: response history resets on Postgres cutover (ADR-0039)
 

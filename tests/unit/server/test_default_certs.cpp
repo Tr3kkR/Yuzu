@@ -17,6 +17,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <openssl/bio.h>
 #include <openssl/pem.h>
@@ -24,6 +25,7 @@
 #include <openssl/x509v3.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
@@ -688,6 +690,111 @@ TEST_CASE("default_certs: two racing first-boot instances never cross-purge each
     for (const auto& rec : *issued) {
         REQUIRE_FALSE(rec.cert_pem.empty());
         REQUIRE(rec.issuer_fingerprint == winner.ca_fingerprint_sha256);
+    }
+}
+
+TEST_CASE("default_certs: a losing HA replica self-heals from the shared cert dir instead "
+          "of needing a restart (UP-3, built on operator request)",
+          "[default_certs][ca_store][pg]") {
+    // Same race as above, but ONE SHARED cert directory (the only topology where
+    // self-heal is even possible — it reads the WINNER's material off the same
+    // disk both instances point at) instead of two separate ones. Before this
+    // fix, a loser returned false unconditionally, needing a process restart to
+    // pick up the winner's certs.
+    //
+    // SIX racers, not two: with a shared dir, a loser that checks get_root()
+    // AFTER the winner has already committed short-circuits through the
+    // pre-existing UP-2 self-heal branch (it finds the winner's key already on
+    // disk and adopts it there) WITHOUT ever reaching this fix's own code — a
+    // real run confirmed this happens with just two threads. The new
+    // fingerprint-mismatch poll loop only fires for a racer whose OWN get_root()
+    // check raced BEFORE the winner committed (so it generated its own candidate
+    // material and genuinely lost try_insert_root's CAS). Six concurrent
+    // candidates make it overwhelmingly likely several see the root as empty
+    // before any one of them commits (get_root()/try_insert_root() are both real
+    // network round-trips; EC-384 keygen + self-signing is real CPU work) —
+    // LogCapture confirms this fix's own code path actually ran rather than
+    // trusting the aggregate outcome alone (which the pre-existing UP-2 branch
+    // could equally produce).
+    TempDir dir;
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    // Pool sized generously above server-admin.md's documented "N+1 connections
+    // per racer needing the bootstrap lock" floor: with kRacers genuine
+    // candidates, several may independently reach the lock (winner + any that
+    // raced the UP-2 shortcut), each needing an outer lease plus its own nested
+    // per-call leases. This test deliberately over-races well beyond a
+    // realistic HA topology (2-3 replicas) specifically to reliably exercise
+    // the new poll-loop branch — a small pool here would hit the SAME
+    // documented capacity constraint the file's own kBootstrapLockAcquireTimeout
+    // comment describes, which is a property of this test's exaggerated
+    // concurrency, not a defect.
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 32}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE_FALSE(store.has_root());
+
+    constexpr int kRacers = 6;
+    std::array<DefaultCertSet, kRacers> sets;
+    std::array<bool, kRacers> oks{};
+    std::string logs;
+    {
+        yuzu::test::LogCapture log;
+        std::vector<std::thread> threads;
+        threads.reserve(kRacers);
+        for (int i = 0; i < kRacers; ++i) {
+            threads.emplace_back([&, i] {
+                oks[static_cast<size_t>(i)] = ensure_default_certs(
+                    dir.path, "host-" + std::to_string(i), &store, sets[static_cast<size_t>(i)]);
+            });
+        }
+        for (auto& t : threads)
+            t.join();
+        log.stop();
+        logs = log.text();
+    }
+    // Scoped to the REST of the test case (not the block above) — Catch2's
+    // INFO is lexically scoped, so it must outlive every assertion it should
+    // annotate, including the oks[] loop below.
+    INFO("captured boot logs from all " << kRacers << " racers:\n" << logs);
+
+    // The core claim of this fix: at least one racer actually reached the NEW
+    // poll loop (lost the fingerprint CAS after generating its own candidate)
+    // and self-healed via it, not just via the pre-existing UP-2 shortcut.
+    REQUIRE(logs.find("lost the first-boot CA-root race") != std::string::npos);
+    REQUIRE(logs.find("self-healed onto the winning root") != std::string::npos);
+
+    // ALL racers succeed now — every loser self-heals (via one branch or the
+    // other) rather than failing this boot.
+    for (int i = 0; i < kRacers; ++i)
+        REQUIRE(oks[static_cast<size_t>(i)]);
+
+    auto root = store.get_root();
+    REQUIRE(root.has_value());
+    REQUIRE(root->has_value());
+
+    // Every racer converges on the SAME winning root's material — no divergent
+    // view, and nobody adopted its own discarded generation.
+    for (int i = 0; i < kRacers; ++i)
+        REQUIRE(sets[static_cast<size_t>(i)].ca_fingerprint_sha256 == (*root)->fingerprint_sha256);
+    // Exactly one racer actually generated; try_use_existing_complete_set()
+    // never sets this true, so every self-healed loser reads false.
+    const auto winners = std::count_if(sets.begin(), sets.end(),
+                                       [](const auto& s) { return s.freshly_generated; });
+    REQUIRE(winners == 1);
+
+    // Still exactly 3 issued rows — no racer re-purges or re-records once it
+    // adopts the winner's already-written set.
+    auto issued = store.list_issued();
+    REQUIRE(issued.has_value());
+    REQUIRE(issued->size() == 3);
+
+    // Every on-disk pair is genuinely consistent (every racer's `out` points at
+    // the same shared dir, so this checks the one real set on disk).
+    for (const auto& [cert_path, key_path] :
+        {std::pair{sets[0].https_cert, sets[0].https_key},
+         std::pair{sets[0].server_cert, sets[0].server_key},
+         std::pair{sets[0].gateway_cert, sets[0].gateway_key}}) {
+        CHECK(pki::cert_matches_key(read_file(cert_path), read_file(key_path)));
     }
 }
 

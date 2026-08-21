@@ -773,6 +773,20 @@ void warn_on_san_drift(const fs::path& representative_leaf,
 constexpr std::chrono::milliseconds kBootstrapLockAcquireTimeout{5000};
 constexpr std::chrono::milliseconds kBootstrapLockRetryInterval{100};
 
+// UP-3 (consistency-auditor, Gate 4, 2026-08-21; built on operator request in a
+// later round): a losing HA replica used to discard its own material and
+// return false unconditionally, needing a full process restart to pick up
+// the winner's certs from the shared cert directory. Poll for the winner's
+// complete set to land instead, bounded so a genuinely stuck/absent winner
+// still falls back to today's refuse-and-restart behaviour rather than
+// hanging boot indefinitely. The window is sized around
+// kBootstrapLockAcquireTimeout (the winner's own lock-acquire budget) plus
+// slack for actual cert generation + the 3 record_issued round-trips — NOT a
+// tight bound, since a boot that's going to succeed anyway losing a few extra
+// seconds to self-heal is a better trade than an avoidable restart.
+constexpr std::chrono::milliseconds kLoserSelfHealPollWindow{15000};
+constexpr std::chrono::milliseconds kLoserSelfHealPollInterval{250};
+
 const pg::PgAdvisoryLockKey& default_certs_bootstrap_lock_key() {
     static const pg::PgAdvisoryLockKey key =
         pg::PgAdvisoryLockKey::single("hashtextextended('yuzu:default_certs_bootstrap', 0)");
@@ -1108,22 +1122,26 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
     const std::string ca_key_id = pki::issuer_key_id(*ca_cert_pem).value_or(std::string{});
 
     FileKeyProvider kp(dir);
-    // Store the CA private key LOCALLY (this dir is per-instance — never shared
-    // state, unlike ca_store) before the cross-replica root race resolves below.
-    // Safe to do speculatively even on eventual loss: an orphaned local key file
-    // with no marker/full cert set on disk is inert (never adopted; the existing
-    // B-2/corruption self-heal above only trusts a complete, marker-confirmed
-    // set) and this write never touches anything another racing instance can see.
-    auto ca_key_ref_opt = kp.store_key("default-ca", *ca_key_pem);
-    if (!ca_key_ref_opt) {
-        spdlog::error("default_certs: generation failed; leaving no marker (will retry next boot)");
-        return false;
-    }
+    // UP-3 (built on operator request, 2026-08-21): the CA private key is NOT
+    // written to disk here, before the cross-replica root race resolves — only
+    // its intended path is computed (path_for() is pure, no I/O). Multiple
+    // simultaneous candidates in a shared-cert-dir topology (the only place
+    // this race is reachable at all) would otherwise ALL speculatively write
+    // to the SAME well-known "default-ca" path, and whichever write lands
+    // LAST wins the file regardless of which candidate actually wins
+    // try_insert_root's CAS below — silently detaching the established root
+    // from its own real private key, permanently defeating every future
+    // self-heal attempt for that root (found empirically: a 6-way race on one
+    // shared TempDir hit this ~20% of the time before this fix). The actual
+    // key write is deferred to AFTER this candidate is confirmed the sole
+    // winner (below), by which point no other candidate can still be racing
+    // for the same "default-ca" name.
+    const std::string ca_key_ref = kp.path_for("default-ca").string();
 
     if (ca_store) {
         CaRoot root;
         root.cert_pem = *ca_cert_pem;
-        root.key_ref = *ca_key_ref_opt;
+        root.key_ref = ca_key_ref;
         root.algo = "EcP384";
         root.not_before = to_epoch(ca_info->not_before);
         root.not_after = to_epoch(ca_info->not_after);
@@ -1156,18 +1174,49 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
         if (established->fingerprint_sha256 != *ca_fp) {
             // Lost the race — another instance already established a DIFFERENT root. This
             // instance's freshly-generated key material is unusable (nobody else holds its
-            // private key): refuse to write the marker / proceed as though our own material is
-            // authoritative, rather than silently operating under, or clobbering, a root nobody
-            // else recognises. Nothing shared has been touched — no leaf was generated, no
-            // ca_issued row was written or purged.
-            spdlog::error(
+            // private key): never write it, or proceed as though it were authoritative, rather
+            // than silently operating under, or clobbering, a root nobody else recognises.
+            // Nothing shared has been touched — no leaf was generated, no ca_issued row was
+            // written or purged.
+            //
+            // UP-3 self-heal (consistency-auditor, Gate 4; built on operator request): if
+            // instances share one --ca-dir volume (the only topology where losing this race is
+            // even possible), the winner is writing its OWN complete set to that SAME directory
+            // concurrently. Poll for it rather than failing this boot outright —
+            // try_use_existing_complete_set() only succeeds once the winner's marker (written
+            // LAST, after every cert/key file) is present AND every file individually
+            // chain-verifies and cert/key-pairs, so a partial/in-flight write is never adopted.
+            // This instance holds no claim on the shared resource (it already lost), so no lock
+            // is needed here — purely a passive reader.
+            spdlog::warn(
                 "default_certs: lost the first-boot CA-root race — ca_store already holds a "
                 "DIFFERENT root (fingerprint {}) established by another instance. This "
-                "instance's freshly generated CA (fingerprint {}) is discarded; its default "
-                "certs are NOT written. If instances are meant to share one cert volume, restart "
-                "this instance to pick up the winning root's certs from disk; otherwise "
+                "instance's freshly generated CA (fingerprint {}) is discarded. Polling the "
+                "shared cert directory ({}) for up to {}s for the winner to finish writing its "
+                "own complete set before falling back to refusing boot.",
+                established->fingerprint_sha256, *ca_fp, dir.string(),
+                std::chrono::duration_cast<std::chrono::seconds>(kLoserSelfHealPollWindow).count());
+            const auto deadline = std::chrono::steady_clock::now() + kLoserSelfHealPollWindow;
+            do {
+                std::this_thread::sleep_for(kLoserSelfHealPollInterval);
+                if (try_use_existing_complete_set(dir, marker, hostname, extra_sans, cert_group,
+                                                  out)) {
+                    spdlog::warn(
+                        "default_certs: self-healed onto the winning root (fingerprint {}) from "
+                        "disk without a restart.",
+                        established->fingerprint_sha256);
+                    return true;
+                }
+            } while (std::chrono::steady_clock::now() < deadline);
+            spdlog::error(
+                "default_certs: lost the first-boot CA-root race and the winner's complete cert "
+                "set never appeared on {} within {}s. This instance's freshly generated CA "
+                "(fingerprint {}) remains discarded. If instances are meant to share one cert "
+                "volume, restart this instance once the winner has finished; otherwise "
                 "investigate why two instances raced first-boot generation concurrently.",
-                established->fingerprint_sha256, *ca_fp);
+                dir.string(),
+                std::chrono::duration_cast<std::chrono::seconds>(kLoserSelfHealPollWindow).count(),
+                *ca_fp);
             return false;
         }
         // Won (or ca_store's root is uncontested single-instance) — the root race
@@ -1176,6 +1225,26 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
         // this line. complete_default_cert_set() does the purge + leaf generation
         // + marker write (shared with the UP-2 same-instance resume path above).
         //
+        // UP-3: NOW safe to actually persist the CA key to the "default-ca" path
+        // computed above — no other candidate can still be racing for this exact
+        // name once try_insert_root's CAS has resolved in this candidate's
+        // favor. Residual (rare, already-covered by the existing manual-recovery
+        // runbook): if this specific write fails — a disk fault landing in the
+        // narrow window between winning the CAS and persisting the key — ca_store
+        // already holds this root with no local key resolving anywhere; the next
+        // boot hits the ordinary "on-disk certs missing/corrupt, no local key
+        // matches" refusal further up this function, the same recovery path any
+        // other cause of local key loss already documents (restore from backup,
+        // or a deliberate clean re-root).
+        if (!kp.store_key("default-ca", *ca_key_pem)) {
+            spdlog::error(
+                "default_certs: won the first-boot CA-root race (fingerprint {}) but failed to "
+                "persist the CA key locally at {} — ca_store now holds this root with no "
+                "resolvable local key. Restore default-ca.key from backup, or perform a "
+                "deliberate clean re-root per docs/pki-architecture.md \"Operator runbook\".",
+                *ca_fp, ca_key_ref);
+            return false;
+        }
         // Still routed through the SAME bootstrap advisory lock as the self-heal
         // path (Gate 8 fix, 2026-08-21): this instance winning try_insert_root's
         // CAS only proves no OTHER instance is establishing a NEW root right
@@ -1187,8 +1256,12 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
                                                 *ca_key_pem, *ca_fp, ca_key_id, *ca_info, out);
     }
 
-    // No ca_store (local-only / no-PG mode): no cross-instance coordination is
-    // possible or needed — proceed directly.
+    // No ca_store (local-only / no-PG mode): no shared substrate means no
+    // cross-instance race to defer the key write past — persist it directly.
+    if (!kp.store_key("default-ca", *ca_key_pem)) {
+        spdlog::error("default_certs: generation failed; leaving no marker (will retry next boot)");
+        return false;
+    }
     return complete_default_cert_set(dir, hostname, extra_sans, cert_group, ca_store, kp,
                                      *ca_cert_pem, *ca_key_pem, *ca_fp, ca_key_id, *ca_info,
                                      marker, out);
