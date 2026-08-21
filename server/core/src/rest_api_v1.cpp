@@ -8059,6 +8059,10 @@ void RestApiV1::register_routes(
             auto tokens = device_token_store->list_tokens();
             if (!tokens) {
                 res.status = device_token_error_status(tokens.error());
+                // gov Gate 4 (consistency-auditor, C2): sibling parity with
+                // api_token's GET-list 503, which sets Retry-After: 2.
+                if (res.status == 503)
+                    res.set_header("Retry-After", "2");
                 res.set_content(
                     detail::a4_error(res, device_token_client_message(
                                               "GET /api/v1/device-tokens", tokens.error())),
@@ -8232,6 +8236,17 @@ void RestApiV1::register_routes(
                     res.set_content(ok_json(JObj().add("revoked", true).str()), "application/json");
                 } else {
                     res.status = device_token_error_status(result.error());
+                    if (res.status == 503) {
+                        // gov Gate 4 (consistency-auditor, C1/C2): a genuine DB/lease
+                        // failure here is a failed revoke attempt, not a "not found" —
+                        // audit it like POST's db_error branch and api_token.revoke's
+                        // own 503 branch do; sibling parity on Retry-After too (api_token's
+                        // DELETE-revoke 503 sets 2s).
+                        audit_fn(req, "device_token.revoke", "failure", "DeviceToken", token_id,
+                                 device_token_client_message("DELETE /api/v1/device-tokens",
+                                                              result.error()));
+                        res.set_header("Retry-After", "2");
+                    }
                     res.set_content(
                         detail::a4_error(res, res.status == 404
                                                   ? "token not found"

@@ -753,6 +753,9 @@ TEST_CASE("REST device-token routes answer correct status on a genuine store fai
         auto res = h.sink.Get("/api/v1/device-tokens");
         REQUIRE(res);
         CHECK(res->status == 503);
+        // gov Gate 4 (consistency-auditor, C2): sibling parity with api_token's
+        // GET-list 503, which sets Retry-After: 2.
+        CHECK(res->get_header_value("Retry-After") == "2");
         CHECK(res->body.find("does not exist") == std::string::npos);
         CHECK(res->body.find("device_token_store") == std::string::npos);
     }
@@ -789,10 +792,21 @@ TEST_CASE("REST device-token routes answer correct status on a genuine store fai
         auto res = h.sink.Delete("/api/v1/device-tokens/deadbeef");
         REQUIRE(res);
         CHECK(res->status == 503);
+        // gov Gate 4 (consistency-auditor, C1/C2, round 3): this route's db_error
+        // branch now audits like POST's does and sets Retry-After like GET's does —
+        // previously it silently dropped both, the only device-token 503 branch that did.
+        CHECK(res->get_header_value("Retry-After") == "2");
         CHECK(res->body.find("service unavailable") != std::string::npos);
         CHECK(res->body.find("not found") == std::string::npos);
         CHECK(res->body.find("does not exist") == std::string::npos);
         CHECK(res->body.find("device_token_store") == std::string::npos);
+        REQUIRE(h.audit_log.size() == 1);
+        CHECK(h.audit_log[0].action == "device_token.revoke");
+        CHECK(h.audit_log[0].result == "failure");
+        CHECK(h.audit_log[0].target_id == "deadbeef");
+        CHECK(h.audit_log[0].detail.find("service unavailable") != std::string::npos);
+        CHECK(h.audit_log[0].detail.find("does not exist") == std::string::npos);
+        CHECK(h.audit_log[0].detail.find("device_token_store") == std::string::npos);
     }
 }
 
