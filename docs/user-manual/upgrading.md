@@ -690,6 +690,65 @@ dropped (governance #1593). Retention moved from an hourly background thread
 to a clock-guarded, capped reap on the maintenance tick (no operator-visible
 behaviour change beyond the same 90-day default).
 
+## ⚠️ Behaviour change: buffered analytics events reset on Postgres cutover (ADR-0049)
+
+`AnalyticsEventStore` (the outbox spool behind `/api/analytics/status` and
+`/api/analytics/recent` — login/MFA/OIDC/SAML/role-elevation and agent/gateway
+command-lifecycle events, drained to any configured JSONL/ClickHouse sink)
+moves from the SQLite `analytics.db` file to the server's PostgreSQL
+substrate in this release (ADR-0049, Wave 2 batch 3, schema
+`analytics_event_store`). Like `ResponseStore`, this is a **fresh-start
+cutover with no data migration** — the buffer is a transient spool, not
+authoritative or compliance evidence (ADR-0009 skippable backfill), so the
+legacy `analytics.db` is **never read** on upgrade.
+
+**What happens on first PG boot:**
+- The server logs `[PG] analytics spool on Postgres ...` at info level — this
+  line appears on every subsequent restart too (it states the store's
+  steady-state configuration, not a one-time cutover event), so don't expect
+  it to disappear after the first boot.
+- Any events buffered but not yet drained to a sink at the moment of cutover
+  are lost. In healthy operation this is bounded by the drain interval
+  (10s default); if a sink was failing before the upgrade, whatever backlog
+  had accumulated is lost too. Already-drained events were already delivered
+  and are unaffected.
+- New events buffer and drain normally from first boot. No operator action
+  required.
+- If analytics collection is disabled (`--no-analytics`), no store is
+  constructed and no log line is emitted for it. If it's enabled but the
+  schema fails to migrate, the server logs an error
+  (`[PG] analytics-event store migration/open failed ...`) and the store
+  stays constructed but degraded for that run (`is_open()==false`) — it
+  keeps accepting `emit()` calls, which fail-soft and count a
+  `store_not_open` drop, and `/api/analytics/status`/`/api/analytics/recent`
+  return `503` rather than a `200`. Either way, a broken analytics store
+  never blocks server startup (this store is the one Postgres-backed store
+  on this ladder that does NOT fail the server closed on a construction
+  failure; see ADR-0049) — `/readyz`'s `degraded` field (not
+  `failed_stores`) names it when it's on but dead, without affecting the
+  node's ready/not-ready status.
+- **The store does not retry a failed open.** `is_open()` is latched once at
+  construction — a Postgres blip that resolves moments after boot still
+  leaves the store degraded for the rest of that process's uptime. Restart
+  the server once Postgres connectivity for the configured DSN is confirmed
+  restored; there is no in-process self-heal to wait out instead.
+- **The Settings page's Enabled/Disabled analytics label is not accurate in
+  the migration-failed case above** (governance Gate 6 finding, 2026-08-16) —
+  it reads the `--no-analytics` config flag directly, not whether the store
+  actually opened, so it can still say "Enabled" while a failed migration has
+  left collection degraded for the run. Check `/readyz`'s `degraded` field
+  or `GET /api/analytics/status` (`503 {"error":{"message":"analytics store
+  degraded"}}` in this case — NOT `"enabled":false`, which is reserved for
+  `--no-analytics`) for the accurate state, not the Settings page, until
+  this is wired up.
+- **Security note, separate from the cutover itself:** this release also
+  fixes a pre-existing issue in the same store — `AnalyticsEvent.session_id`
+  is now a hash of the session cookie, not the raw bearer token. If a token
+  may have reached a shared analytics sink or a broadly-read analytics row
+  before upgrading, see the rotation guidance in
+  `changelog.d/20260816-analytics-session-id-hash.security.md` (assembled
+  into the release's Security section at release time).
+
 ## RBAC store moves to PostgreSQL — config preserved by mandatory backfill (RbacStore → Postgres, ADR-0041)
 
 `RbacStore` — the authorization substrate holding **role definitions,

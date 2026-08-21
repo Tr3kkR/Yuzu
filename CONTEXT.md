@@ -68,6 +68,18 @@ Timeline Activity Record. TAR captures ordered endpoint activity and response hi
 
 The Erlang service under `gateway/` that scales agent connectivity and command fanout. It proxies registration and heartbeat traffic upstream to the server, exposes agent-facing gRPC, and provides management forwarding for server-dispatched commands.
 
+## Gateway cluster
+
+A **trust-zone- or region-scoped** set of gateway nodes forming one OTP cluster, fronting its own slice of the fleet (ADR-2002). The cluster is the unit of gateway topology: internal-vs-external-facing and regional gateways are **separate** clusters (Erlang distribution's shared-cookie mesh must not span a DMZ or a WAN), and intra-zone scale is more **nodes** in a cluster, not more clusters. An agent is **pinned to its zone's cluster** and never fails over across zones. Any server locates an agent's owning cluster via the Postgres **agent→gateway-cluster routing directory**, then reaches any healthy node of that cluster (OTP `pg` finds the exact node). Distinct from a bare **Gateway** (a single node/service): the cluster is the HA and multi-gateway boundary.
+
+## Coordination substrate
+
+The mechanism the **active–active core tier** uses to agree and signal across instances (ADR-2002): **leader election** (which core instance runs the singleton background work) and **cross-instance signalling** (waking peers to a new event). Owned by **core** (the sole `yuzu` authority) — presentation replicas never hold coordination locks or `LISTEN` connections. It sits behind a narrow seam with a **Postgres-backed default** — advisory-lock leadership + `LISTEN`/`NOTIFY`-as-hint over durable tables — pluggable for SaaS without touching call sites. Chosen because Postgres already bounds system availability, so a Postgres-backed default adds no new single point of failure. Distinct from the **storage substrate** (Postgres-as-database, ADR-0006): the coordination substrate is Postgres-as-coordinator.
+
+## Server tier
+
+The collective **active–active replicated server-role set** behind the operator plane (ADR-2002) — comprising **two distinct replication axes** under the accepted presentation/core/engine decomposition (ADR-0031/0032/0033): **presentation** replicas, which terminate HTTP/SSE/MCP and **front the operator-plane load balancer** (inside the bearer-credential trust boundary, no `yuzu`-database access of their own), and **core** replicas, the **API authority and sole `yuzu`-database writer** plus owner of the coordination substrate (leader lock, event outbox, background workers), sitting **behind** presentation. In today's monolith both roles are one binary; the split binds prospectively. **Not** a fused server+everything box, and **not** core alone. Distinct from **gateway clusters** (the agent-plane concentrator) and **engine replicas/jobs** (the UCE, with its own database) — both separate axes, and `yuzu`-database availability is distinct from engine-database availability. Server-tier HA and **storage HA** (HA Postgres) are orthogonal: either can exist without the other.
+
 ## Reachability
 
 Whether one node in the fleet can initiate a network connection to another. Yuzu distinguishes two kinds and commits to one:
