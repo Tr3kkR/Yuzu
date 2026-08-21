@@ -830,14 +830,14 @@ Every non-success outcome is reported as its own line rather than an empty resul
 
 | | |
 |---|---|
-| **Version** | v1.0.0 |
+| **Version** | v1.1.0 |
 | **Platforms** | W |
 | **Description** | Windows Management Instrumentation (WMI) queries. Execute WQL SELECT statements against any WMI namespace with structured property/value output. |
 
 | Action | Description |
 |---|---|
-| `query` | Execute a WQL SELECT query. Only SELECT statements are allowed. Parameters: `wql` (required, e.g., `"SELECT * FROM Win32_OperatingSystem"`), `namespace` (optional, default `root\cimv2`). Returns property/value pairs. |
-| `get_instance` | Get all properties of the first instance of a WMI class. Parameters: `class` (required, e.g., `Win32_OperatingSystem`), `namespace` (optional). |
+| `query` | Execute a WQL SELECT query. Only SELECT statements are allowed. Parameters: `wql` (required, e.g., `"SELECT * FROM Win32_OperatingSystem"`), `namespace` (optional, default `root\cimv2`). Returns property/value pairs (null/empty/array-typed properties are omitted, not reported as empty). |
+| `get_instance` | Get the non-omitted properties of the first instance of a WMI class (null/empty/array-typed properties are omitted, not reported as empty). Parameters: `class` (required, e.g., `Win32_OperatingSystem`), `namespace` (optional). |
 
 ---
 

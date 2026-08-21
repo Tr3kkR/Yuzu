@@ -15,16 +15,13 @@
 #include "local_dispatcher.hpp"
 #include "sync_canonical.hpp" // sha256_hex
 #include "sync_source_software_licensing.hpp"
+#include "test_log_capture.hpp"
 
 #include <yuzu/plugin.h>
-
-#include <spdlog/sinks/ostream_sink.h>
-#include <spdlog/spdlog.h>
 
 #include <cstddef>
 #include <map>
 #include <optional>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -219,14 +216,7 @@ TEST_CASE("k_agent persists across a source 'restart' → identical blob",
 
 TEST_CASE("k_agent never appears in the blob or in captured logs", "[licensing_sync][r16]") {
     // Capture ALL log output at trace during the collect.
-    std::ostringstream oss;
-    auto sink = std::make_shared<spdlog::sinks::ostream_sink_mt>(oss);
-    auto capture_logger = std::make_shared<spdlog::logger>("licensing_sync_test", sink);
-    capture_logger->set_level(spdlog::level::trace);
-    auto prev = spdlog::default_logger();
-    auto prev_level = spdlog::get_level();
-    spdlog::set_default_logger(capture_logger);
-    spdlog::set_level(spdlog::level::trace);
+    yuzu::test::LogCapture cap;
 
     FakeKv kv;
     kv.m[std::string(yuzu::agent::kUserRefHmacKeyName)] = kKnownKeyHex; // known key
@@ -234,12 +224,11 @@ TEST_CASE("k_agent never appears in the blob or in captured logs", "[licensing_s
                             "\nprobe_status|slp_wmi|ok|2\n";
     auto res = collect_with(out, kv, UserRefMode::hash);
 
-    spdlog::set_default_logger(prev); // restore before asserting
-    spdlog::set_level(prev_level);
+    cap.stop(); // restore before asserting
 
     REQUIRE(res.has_value());
     const std::string& blob = res->first;
-    const std::string logs = oss.str();
+    const std::string logs = cap.text();
 
     // The hex-encoded key never appears in the blob or the logs.
     CHECK(blob.find(kKnownKeyHex) == std::string::npos);

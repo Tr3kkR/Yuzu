@@ -283,6 +283,14 @@ struct ServiceInfo {
     std::string startup_type; // honest automatic|disabled|unknown (C-1.12); never Windows' 5-state taxonomy
 };
 
+// Defensive row cap (mirrors the C-8 row_cap precedent in agents/shared/wmi_bounded.hpp):
+// real macOS systems run in the low hundreds of launchd services, so this
+// bounds worst-case memory/output size without affecting normal enumeration.
+// Rows beyond the cap are still drained from the `launchctl list` pipe (so
+// the child process never blocks writing into a full pipe) -- just not kept.
+constexpr std::size_t kMaxServiceRows = 512;
+
+
 // total_seen (out) receives the number of services that passed all filters
 // (label allowlist + running_only) BEFORE the yuzu::services::kMaxServiceRows
 // cap, so the caller can emit an honest truncation sentinel when rows were

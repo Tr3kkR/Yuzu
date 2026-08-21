@@ -85,9 +85,10 @@ struct Fixture {
     std::unique_ptr<ApiTokenStore> token_store;
     // ADR-2001 D1: the codebase's actual severity channel — AnalyticsEvent
     // ::severity via AnalyticsEventStore, the SAME mechanism AuthRoutes::
-    // emit_event uses for Severity::kCritical break-glass events. SQLite,
-    // ":memory:" per its own header doc ("in tests") — independent of the
-    // PG stores above, so no shared-pool concern here.
+    // emit_event uses for Severity::kCritical break-glass events. Ported to
+    // Postgres (ADR-0049): shares auth_db's PgPool/database, same "one
+    // PgPool, independent connections" pattern as ScimStore/ApiTokenStore
+    // above — no separate ephemeral database needed.
     std::unique_ptr<AnalyticsEventStore> analytics_store;
     // AuditStore ported to Postgres (ADR-0006): shares auth_db's PgPool/
     // database (same "one PgPool" pattern as ScimStore above) in the normal
@@ -121,7 +122,7 @@ struct Fixture {
         token_store = std::make_unique<ApiTokenStore>(auth_db.pool());
         REQUIRE(token_store->is_open());
 
-        analytics_store = std::make_unique<AnalyticsEventStore>(":memory:");
+        analytics_store = std::make_unique<AnalyticsEventStore>(auth_db.pool());
         REQUIRE(analytics_store->is_open());
 
         if (broken_audit) {
@@ -1669,8 +1670,9 @@ TEST_CASE("ScimRoutes: D1 — role-refused deprovision WITH an active linked ide
     // for break-glass logins) — asserted directly against the store, not
     // inferred from a magic string in an unrelated column.
     auto events = f.analytics_store->query_recent(10);
+    REQUIRE(events.has_value()); // degrade-distinguishable seam: not nullopt
     bool found_critical = false;
-    for (const auto& e : events) {
+    for (const auto& e : *events) {
         if (e.event_type == "scim.user.deprovision_role_refused_with_link") {
             CHECK(e.severity == Severity::kCritical);
             CHECK(e.attributes.value("scim_id", "") == id);
@@ -1704,7 +1706,8 @@ TEST_CASE("ScimRoutes: D1 — role-refused deprovision WITHOUT a link is a plain
          0.0);
 
     auto events = f.analytics_store->query_recent(10);
-    for (const auto& e : events)
+    REQUIRE(events.has_value()); // degrade-distinguishable seam: not nullopt
+    for (const auto& e : *events)
         CHECK(e.event_type != "scim.user.deprovision_role_refused_with_link");
 }
 
