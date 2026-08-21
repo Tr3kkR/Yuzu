@@ -573,6 +573,26 @@ private:
     /// evicting the shared counter is never needed because it isn't sized
     /// per-principal.
     ///
+    /// Why not reuse `last_bumped_at` itself as the generation value, instead
+    /// of adding a second field (architect, Gate 3)? `clock_` is an
+    /// injectable seam (`set_clock_for_test`), and even a real
+    /// `steady_clock` has finite resolution — two rapid successive bumps to
+    /// the SAME principal can land on an identical `time_point` on a
+    /// coarse-resolution clock (real or mocked), which would silently
+    /// reintroduce the exact aliasing collision this counter exists to rule
+    /// out. A dedicated monotonic integer has no such failure mode.
+    ///
+    /// The general rule for whether a store method may skip
+    /// `invalidate_revalidate_cache` on a "no rows changed" outcome (used by
+    /// `transfer_owner`, see its own comment) — for a FUTURE mutator of this
+    /// store to check before copying either pattern: skipping is safe ONLY
+    /// when the method's own WHERE clause already requires
+    /// `lifecycle_state='active'`, so that zero rows affected conclusively
+    /// means the principal doesn't exist or is already revoked and no
+    /// Active-status race exists for THAT call to guard against. `revoke()`
+    /// has no such precondition on its target row and stays the unconditional
+    /// default — when in doubt, invalidate unconditionally.
+    ///
     /// `kRevokeGenerationEntryTtl` must exceed the true worst-case in-flight
     /// window of a reader's own `get_for_auth()` call for eviction to be
     /// sound (an entry must not be swept while a reader who snapshotted it

@@ -1984,15 +1984,18 @@ public:
                           "failure backoff without taking a connection lease",
                           "counter");
         metrics_.describe("yuzu_server_engine_revalidate_generation_capacity_fallback_total",
-                          "#2454: the per-principal poisoning-guard map was full and a NEW "
-                          "principal's invalidate fell back to the coarse global epoch. NOT a "
-                          "narrowly-scoped degradation: once tripped, the epoch bump defeats "
-                          "EVERY principal's concurrent cache-write, not just the triggering "
-                          "one, until a process restart - reproducing the fleet-wide cache "
-                          "disablement #2454 exists to fix, bounded only to start past the "
-                          "1024-distinct-ever-revoked-principal ceiling. Not expected under "
-                          "ordinary load; a climbing value means the guard has degraded and "
-                          "will not recover without a restart.",
+                          "#2454/#3385: the per-principal poisoning-guard map was full (even "
+                          "after a TTL sweep) and a NEW principal's invalidate fell back to the "
+                          "coarse global epoch. NOT a narrowly-scoped degradation: while "
+                          "tripped, the epoch bump defeats EVERY principal's concurrent "
+                          "cache-write, not just the triggering one - reproducing the "
+                          "fleet-wide cache disablement #2454 exists to fix, bounded to start "
+                          "past the 1024-distinct-principals-per-63s ceiling. Since #3385 this "
+                          "is self-clearing: entries age out on a TTL, so the fallback stops "
+                          "once churn drops back under the ceiling - no restart required. Not "
+                          "expected under ordinary load; a climbing value means the guard is "
+                          "running at reduced precision - see "
+                          "docs/ops-runbooks/engine-principal-store-recovery.md.",
                           "counter");
         metrics_.describe("yuzu_server_audit_events_total",
                           "Audit events written, bucketed by result", "counter");

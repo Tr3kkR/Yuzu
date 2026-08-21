@@ -1445,6 +1445,40 @@ TEST_CASE("transfer_owner does not consume a generation slot on a confirmed no-o
     CHECK(store.revoke_generation_resident_for_test() == 1);
 }
 
+TEST_CASE("transfer_owner still invalidates on an UNKNOWN outcome, not just a real "
+          "transfer (#3385 fail-closed arm)",
+          "[pg][engine_principal][store]") {
+    // Companion to the confirmed-no-op case above (quality-engineer, Gate 3
+    // fold): the conditional is `if (!persisted || affected)`, and the
+    // `!persisted` half -- a query that ran and FAILED, so the outcome is
+    // unknown rather than a confirmed no-op -- had no coverage. Same
+    // dropped-table technique as the #2456 UP-17 test: the table is gone
+    // BEFORE construction, so `is_open()` still reports true (migration
+    // tracking only checks `schema_meta`), but the UPDATE itself fails.
+    YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    {
+        auto lease = pool.try_acquire_for(std::chrono::milliseconds{2000});
+        REQUIRE(lease);
+        auto res = pg::exec_params(
+            lease.get(), "DROP TABLE engine_principal_store.engine_principals CASCADE",
+            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    EnginePrincipalStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto result = store.transfer_owner("engine:no-such-table", "bob");
+    REQUIRE_FALSE(result.has_value()); // unexpected: the UPDATE itself failed
+    // The property under test: fail-closed still invalidates on an outcome
+    // that is neither a confirmed transfer nor a confirmed no-op -- matching
+    // revoke()'s own fail-closed reasoning, which this conditional must not
+    // have weakened.
+    CHECK(store.revoke_generation_resident_for_test() == 1);
+}
+
 TEST_CASE("a lease-acquire failure with the connect breaker armed is confirmed unreachable, "
           "not ambiguous (#2456 UP-4 breaker-open arm)",
           "[pg][engine_principal][store][cache]") {
@@ -1494,8 +1528,8 @@ TEST_CASE("a lease-acquire failure with the connect breaker armed is confirmed u
     CHECK(store.revalidate_backoff_resident_for_test() == 1);
 }
 
-TEST_CASE("a transient (non-42) SQLSTATE from a lock-timeout is confirmed unreachable, not "
-          "misclassified as permanent (#2456 is_permanent_sqlstate transient branch)",
+TEST_CASE("a transient (non-42) SQLSTATE from a lock-timeout reaches the confirmed-"
+          "unreachable query-failure branch (#2456 is_permanent_sqlstate transient branch)",
           "[pg][engine_principal][store][cache]") {
     // #2456's own governance round deferred this branch for lack of a seam
     // producing a real non-42 PG error deterministically. `lock_timeout_ms`
@@ -1503,6 +1537,14 @@ TEST_CASE("a transient (non-42) SQLSTATE from a lock-timeout is confirmed unreac
     // from a second connection, then let the store's own SELECT (needs only
     // ACCESS SHARE) time out waiting for it -- SQLSTATE 55P03 (class 55,
     // "object not in prerequisite state"), never class 42.
+    //
+    // What this proves: the branch is REACHABLE and the caller-visible
+    // contract (StoreUnreachable, confirmed, backoff armed) holds for a real
+    // non-42 SQLSTATE, not just the dropped-table (class-42) case above.
+    // `is_permanent_sqlstate`'s classification itself only changes a LOG
+    // line (quality-engineer, Gate 3 fold) -- this file has no log-capture
+    // seam, so a misclassified `is_permanent_sqlstate` would NOT fail this
+    // assertion set; that narrower claim is intentionally not made here.
     YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);
     PgPool store_pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
     REQUIRE(store_pool.valid());
@@ -1517,6 +1559,11 @@ TEST_CASE("a transient (non-42) SQLSTATE from a lock-timeout is confirmed unreac
     REQUIRE(locker_pool.valid());
     auto locker_lease = locker_pool.try_acquire_for(std::chrono::milliseconds{2000});
     REQUIRE(locker_lease);
+    // Manual BEGIN/LOCK/ROLLBACK rather than `pg::PgTxn`: cpp-safety (Gate 3
+    // fold) confirmed this is not a floor violation -- `PgPool::release()`
+    // detects a non-idle transaction when the lease returns and issues its
+    // own defensive ROLLBACK regardless, so an unrolled-back transaction
+    // here still cannot leak past this test's scope.
     auto begin = pg::exec_params(locker_lease.get(), "BEGIN", std::vector<std::string>{});
     REQUIRE(begin.status() == PGRES_COMMAND_OK);
     auto lock = pg::exec_params(
@@ -1533,5 +1580,5 @@ TEST_CASE("a transient (non-42) SQLSTATE from a lock-timeout is confirmed unreac
     CHECK(store.revalidate_backoff_resident_for_test() == 1);
 
     auto rollback = pg::exec_params(locker_lease.get(), "ROLLBACK", std::vector<std::string>{});
-    (void)rollback;
+    CHECK(rollback.status() == PGRES_COMMAND_OK);
 }
