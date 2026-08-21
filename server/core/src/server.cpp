@@ -7377,10 +7377,17 @@ public:
         // from Register/Subscribe/Heartbeat/CheckForUpdate/DownloadUpdate. The
         // drain above guarantees no handler is mid-invocation; null them for the
         // same belt-and-braces reason as the tracker so a stray late call cannot
-        // touch released CA state.
+        // touch released CA state. gateway_service_ is wired with the SAME
+        // cert_signer lambda at boot (server.cpp's PKI wiring block) — null its
+        // copy too, matching the blast-radius-detector/dex-alert-router parity
+        // above (governance Gate 3 cpp-safety, 2026-08-21). gateway_service_
+        // registers on the same agent_server_ builder, so the drain already
+        // covers it; this closes the belt-and-braces gap, not a proven UAF.
         agent_service_.set_agent_cert_signer(nullptr);
         agent_service_.set_revocation_checker(nullptr);
         agent_service_.set_peer_cert_recognizer(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_agent_cert_signer(nullptr);
 
         // 2f PR 3a: the bridge borrows the bus (unsubscribe on teardown) and the
         // session registry - shut it down and release it BEFORE the tracker/bus

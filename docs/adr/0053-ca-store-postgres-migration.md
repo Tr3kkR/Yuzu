@@ -354,6 +354,59 @@ cross-examination, converged on:
 
 Full transcripts: `/tmp/advrev-ca-store/{kimi,codex}.phase{1,2}.md` (local scratch, not committed).
 
+## Governance Gate 3 findings (2026-08-21, pre-push)
+
+The full `/governance` pipeline's Gate 3 (architect, cpp-expert, cpp-safety, quality-engineer,
+run in parallel) found one further HIGH the adversarial-review round above did not — a distinct
+first-boot cross-replica race, in a different part of the boot sequence than the one already
+fixed:
+
+- **HIGH (fixed, architect):** `default_certs.cpp`'s unscoped inventory purge
+  (`ca_store->delete_issued_by("system:default-certs")`) originally ran BEFORE the root race
+  resolved (`try_insert_root`, further down the function) — meaning two racing instances could
+  BOTH pass the B-2 empty-root check, both proceed to purge (a no-op the first time) and generate
+  + `record_issued()` their own three leaf rows, and whichever instance's purge landed SECOND
+  would delete the FIRST instance's already-committed rows via the same unscoped `issued_by`
+  match — including, if the first instance went on to WIN the root race, its own now-live,
+  in-service default certs. The result: an established root with in-service leaves whose
+  `ca_issued` rows are gone — permanently unrevocable through the normal control (`revoke()`
+  returns "not found" forever) and silently absent from every future CRL. Fixed by moving
+  `try_insert_root()` (and the local-file key storage it depends on) to run BEFORE any leaf
+  generation, purge, or `record_issued()` call — a losing instance now returns immediately,
+  having touched no shared `ca_store` inventory state at all, and the purge only ever runs after
+  this instance has confirmed it is the sole legitimate writer going forward. Closes the same
+  finding class as the LOW noted below it (a loser's own orphaned leaf rows, since a loser no
+  longer records any). Regression test: `test_default_certs.cpp`'s "two racing first-boot
+  instances never cross-purge each other's leaf inventory" — two real `std::thread`s racing
+  `ensure_default_certs` against one shared `CaStore`, asserting exactly the winner's 3 leaves
+  survive (verified red against the pre-fix code, reproducing the exact `issued->size() == 5`
+  corruption the bug produces, before being fixed to pass green).
+- **SHOULD (fixed, cpp-safety):** `ServerImpl::stop()` nulled `agent_service_`'s PKI callbacks
+  but not `gateway_service_`'s copy of the same `agent_cert_signer` lambda, inconsistent with the
+  `set_blast_radius_detector`/`set_dex_alert_router` parity a few lines above in the same
+  function. Not a proven UAF (`gateway_service_` shares `agent_server_`'s `Shutdown(deadline)`
+  drain), but closes the belt-and-braces gap for consistency. Fixed: added the matching
+  `gateway_service_->set_agent_cert_signer(nullptr)` call.
+- **SHOULD (fixed, quality-engineer):** the a14138449 HIGH fix (boot-time `get_root()` vs
+  `has_root()`) had no dedicated regression test — its correctness rested on compilation, the
+  existing suite still passing, and manual inspection. quality-engineer identified this
+  codebase's own established pattern for exactly this test class (`test_deployment_store.cpp`/
+  `test_api_token_store.cpp`'s "sabotage the store, assert the typed method reports `unexpected`"
+  shape) as directly applicable without needing to boot a real `ServerImpl`. Added: a
+  `test_ca_store.cpp` case that establishes a real root, drops `ca_store.ca_root` out from under
+  the open `CaStore` instance, and asserts `get_root()` returns `unexpected` (prefixed
+  `kCaDbErrorPrefix`) while `has_root()` — the SAME underlying failure — collapses to `false`,
+  pinning the exact contract the boot-wiring fix depends on.
+- Two further SHOULD findings (quality-engineer: `try_insert_root`'s winner/loser coverage is
+  sequential-call-order rather than genuine concurrent-thread; new `StoreError`/503 REST branches
+  are exercised via injected outcomes rather than a real degraded store) and one NICE
+  (cpp-expert: `kCaDuplicateSerialPrefix` has no production consumer yet — `sign_agent_csr`
+  doesn't currently retry on it, so the doc comment describing a retry overstates current
+  behavior) were reviewed and left open — bounded blast radius, not a policy floor, and
+  appropriately scoped to a future change rather than this migration.
+
+Full agent reports: this run's governance transcript (session-local, not committed).
+
 ## Consequences
 
 - Every CA read/write now surfaces a genuine database error to its REST/MCP/dashboard caller as a

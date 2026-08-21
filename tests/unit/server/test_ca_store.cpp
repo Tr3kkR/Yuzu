@@ -373,6 +373,53 @@ TEST_CASE("CaStore: try_insert_root rejects empty cert/key_ref", "[ca_store][pg]
     REQUIRE_FALSE(store.has_root());
 }
 
+TEST_CASE("CaStore: get_root() reports a genuine store failure as unexpected, while has_root() "
+          "collapses the SAME failure to false (governance Gate 3 quality-engineer, 2026-08-21)",
+          "[ca_store][pg][root][security]") {
+    // The distinction this test pins is exactly what the a14138449 adversarial-review fix
+    // depends on: server.cpp's boot-time PKI wiring block must call get_root() (typed,
+    // distinguishes "genuine DB error" from "no root") rather than has_root() (collapses
+    // BOTH cases to false) — a lossy has_root() at that ONE call site was the HIGH. This
+    // test does not exercise server.cpp's full boot sequence (not unit-constructible, see
+    // test_default_certs.cpp's existing note on that class of code) — it instead proves the
+    // store-level CONTRACT the fix relies on: given the identical underlying failure, the two
+    // methods must disagree in exactly this way, in isolation, cheaply, without booting a
+    // real ServerImpl.
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Establish a real root first — the pre-migration bug specifically mattered when a root
+    // ALREADY EXISTS and a later read of it degrades; a permanently-empty store never reaches
+    // the boot-wiring block's true branch in the first place.
+    auto root = sample_root("EXISTING:FP");
+    REQUIRE(store.try_insert_root(root).has_value());
+    REQUIRE(store.has_root());
+
+    // Sabotage the store out from under the open CaStore instance — same technique as
+    // test_deployment_store.cpp's "list_jobs/get_job report a genuine store failure as
+    // unexpected" and test_api_token_store.cpp's equivalent (both cited as this codebase's
+    // established pattern for this exact class of test).
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult d{PQexec(conn.get(), "DROP TABLE ca_store.ca_root CASCADE")};
+        REQUIRE(d.status() == PGRES_COMMAND_OK);
+    }
+
+    // get_root(): typed, distinguishable — a genuine DB error, never folded into "no root".
+    auto got = store.get_root();
+    CHECK_FALSE(got.has_value());
+    CHECK(got.error().starts_with(kCaDbErrorPrefix));
+
+    // has_root(): the SAME underlying failure collapses to false — indistinguishable, by
+    // design, from a genuinely-empty store. This is exactly why ADR-0053 restricts has_root()
+    // to the two callers that are provably safe with that collapse (the CRL-freshness sweep
+    // tick, /readyz) and why the boot-time PKI wiring block must NOT be a third.
+    CHECK_FALSE(store.has_root());
+}
+
 // ── Issued inventory ─────────────────────────────────────────────────────
 
 TEST_CASE("CaStore: issued record/get/list", "[ca_store][pg][issued]") {

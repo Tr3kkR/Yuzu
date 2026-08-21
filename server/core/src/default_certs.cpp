@@ -591,16 +591,6 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
         spdlog::error("default_certs: could not set 0700 on {}: {} (keys stay 0600 regardless)",
                       dir.string(), ec.message());
 
-    // On regeneration, purge any prior default-cert inventory rows so ca_store
-    // reflects only the live set (no orphan leaves referencing a replaced root;
-    // set_root REPLACEs the single root row separately). After B-2 this path is
-    // only reached with an EMPTY ca_store (regen against a populated root is now
-    // refused), so this normally deletes nothing — but a failed purge would leave
-    // stale rows, so surface it (#1238 should-fix: don't silently ignore the rc).
-    if (ca_store && !ca_store->delete_issued_by("system:default-certs"))
-        spdlog::warn("default_certs: failed to purge prior default-cert inventory rows "
-                     "(stale rows may remain) — continuing");
-
     auto ca_key_pem = pki::generate_private_key(pki::KeyAlgo::EcP384);
     if (!ca_key_pem)
         return false;
@@ -622,6 +612,83 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
     // "issued by this CA" query survives a subordinate re-key. Best-effort: a
     // derivation miss leaves the field blank (the row stays serial-addressable).
     const std::string ca_key_id = pki::issuer_key_id(*ca_cert_pem).value_or(std::string{});
+
+    FileKeyProvider kp(dir);
+    // Store the CA private key LOCALLY (this dir is per-instance — never shared
+    // state, unlike ca_store) before the cross-replica root race resolves below.
+    // Safe to do speculatively even on eventual loss: an orphaned local key file
+    // with no marker/full cert set on disk is inert (never adopted; the existing
+    // B-2/corruption self-heal above only trusts a complete, marker-confirmed
+    // set) and this write never touches anything another racing instance can see.
+    auto ca_key_ref_opt = kp.store_key("default-ca", *ca_key_pem);
+    if (!ca_key_ref_opt) {
+        spdlog::error("default_certs: generation failed; leaving no marker (will retry next boot)");
+        return false;
+    }
+
+    if (ca_store) {
+        CaRoot root;
+        root.cert_pem = *ca_cert_pem;
+        root.key_ref = *ca_key_ref_opt;
+        root.algo = "EcP384";
+        root.not_before = to_epoch(ca_info->not_before);
+        root.not_after = to_epoch(ca_info->not_after);
+        root.fingerprint_sha256 = *ca_fp;
+        root.mode = CaMode::Builtin;
+        // ADR-0053 "Root-singleton first-boot race": try_insert_root(), NOT set_root() — a
+        // shared Postgres substrate makes it possible for two instances to independently
+        // generate root material and race to establish it (impossible under per-instance
+        // SQLite, where this call used to be an unconditional INSERT OR REPLACE). ON CONFLICT
+        // DO NOTHING means at most one caller's row is ever inserted; every caller reads back
+        // whichever root is now canonical.
+        //
+        // RESOLVED HERE, BEFORE any leaf generation, disk writes, inventory purge, or
+        // record_issued() call below (architect review, 2026-08-21 — moved from AFTER leaf
+        // generation, where it originally sat). The prior ordering let two racing instances
+        // BOTH pass this function's earlier B-2 empty-root check, then both proceed to purge
+        // ("system:default-certs" is a shared, unscoped WHERE clause) and record their own
+        // three leaf rows concurrently — the SECOND instance's purge could delete the FIRST
+        // instance's already-committed, now-live leaf rows regardless of which one went on to
+        // win the root race below, permanently orphaning the winner's certs from ca_store
+        // (unrevocable, absent from any future CRL). Resolving the race FIRST means only the
+        // confirmed winner ever reaches the purge/leaf/record_issued code past this point — a
+        // losing instance returns immediately, having touched no shared ca_store state at all.
+        auto established = ca_store->try_insert_root(root);
+        if (!established) {
+            spdlog::error("default_certs: failed to record CA root in ca_store — aborting: {}",
+                          established.error());
+            return false; // before the marker — next boot regenerates
+        }
+        if (established->fingerprint_sha256 != *ca_fp) {
+            // Lost the race — another instance already established a DIFFERENT root. This
+            // instance's freshly-generated key material is unusable (nobody else holds its
+            // private key): refuse to write the marker / proceed as though our own material is
+            // authoritative, rather than silently operating under, or clobbering, a root nobody
+            // else recognises. Nothing shared has been touched — no leaf was generated, no
+            // ca_issued row was written or purged.
+            spdlog::error(
+                "default_certs: lost the first-boot CA-root race — ca_store already holds a "
+                "DIFFERENT root (fingerprint {}) established by another instance. This "
+                "instance's freshly generated CA (fingerprint {}) is discarded; its default "
+                "certs are NOT written. If instances are meant to share one cert volume, restart "
+                "this instance to pick up the winning root's certs from disk; otherwise "
+                "investigate why two instances raced first-boot generation concurrently.",
+                established->fingerprint_sha256, *ca_fp);
+            return false;
+        }
+        // Won (or ca_store's root is uncontested single-instance) — purge any prior
+        // default-cert inventory rows so ca_store reflects only the live set about to be
+        // generated below (no orphan leaves referencing a replaced root). Safe HERE,
+        // specifically because the root race above already confirmed this instance is the
+        // sole legitimate writer for "system:default-certs" going forward — a losing
+        // instance never reaches this line. Best-effort / non-fatal: a failed purge leaves
+        // stale rows, not a security or correctness defect (#1238 should-fix: don't
+        // silently ignore the rc).
+        if (!ca_store->delete_issued_by("system:default-certs"))
+            spdlog::warn("default_certs: failed to purge prior default-cert inventory rows "
+                         "(stale rows may remain) — continuing");
+    }
+
     // Leaves are sized to the CA's exact notAfter so they never outlive the
     // issuer (the x509_ca leaf-<=-CA invariant would otherwise reject them).
     // #1302: backdate notBefore by the clock-skew allowance — mirrors the CA root
@@ -669,7 +736,6 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
          pki::LeafUsage{.server_auth = true, .client_auth = true}},
     }};
 
-    FileKeyProvider kp(dir);
     bool ok = write_public_file(out.ca_cert, *ca_cert_pem);
 
     for (const auto& spec : leaves) {
@@ -711,56 +777,9 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
         }
     }
 
-    std::string ca_key_ref;
-    if (ok) {
-        auto ref = kp.store_key("default-ca", *ca_key_pem);
-        if (ref)
-            ca_key_ref = *ref;
-        else
-            ok = false;
-    }
     if (!ok) {
         spdlog::error("default_certs: generation failed; leaving no marker (will retry next boot)");
         return false;
-    }
-
-    if (ca_store) {
-        CaRoot root;
-        root.cert_pem = *ca_cert_pem;
-        root.key_ref = ca_key_ref;
-        root.algo = "EcP384";
-        root.not_before = to_epoch(ca_info->not_before);
-        root.not_after = to_epoch(ca_info->not_after);
-        root.fingerprint_sha256 = *ca_fp;
-        root.mode = CaMode::Builtin;
-        // ADR-0053 "Root-singleton first-boot race": try_insert_root(), NOT set_root() — a
-        // shared Postgres substrate makes it possible for two instances to independently
-        // generate root material and race to establish it (impossible under per-instance
-        // SQLite, where this call used to be an unconditional INSERT OR REPLACE). ON CONFLICT
-        // DO NOTHING means at most one caller's row is ever inserted; every caller reads back
-        // whichever root is now canonical.
-        auto established = ca_store->try_insert_root(root);
-        if (!established) {
-            spdlog::error("default_certs: failed to record CA root in ca_store — aborting: {}",
-                          established.error());
-            return false; // before the marker — next boot regenerates
-        }
-        if (established->fingerprint_sha256 != *ca_fp) {
-            // Lost the race — another instance already established a DIFFERENT root. This
-            // instance's freshly-generated key material is unusable (nobody else holds its
-            // private key): refuse to write the marker / proceed as though our own material is
-            // authoritative, rather than silently operating under, or clobbering, a root nobody
-            // else recognises.
-            spdlog::error(
-                "default_certs: lost the first-boot CA-root race — ca_store already holds a "
-                "DIFFERENT root (fingerprint {}) established by another instance. This "
-                "instance's freshly generated CA (fingerprint {}) is discarded; its default "
-                "certs are NOT written. If instances are meant to share one cert volume, restart "
-                "this instance to pick up the winning root's certs from disk; otherwise "
-                "investigate why two instances raced first-boot generation concurrently.",
-                established->fingerprint_sha256, *ca_fp);
-            return false;
-        }
     }
 
     // Marker LAST — its presence is the "set is complete" signal.

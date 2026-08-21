@@ -30,6 +30,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #ifndef _WIN32
@@ -408,6 +409,57 @@ TEST_CASE("default_certs: refuses to re-root a populated ca.db (B-2)",
     REQUIRE(root_after->has_value());
     REQUIRE((*root_after)->fingerprint_sha256 == a.ca_fingerprint_sha256);
     REQUIRE(store.list_issued()->size() == 3);
+}
+
+TEST_CASE("default_certs: two racing first-boot instances never cross-purge each other's "
+          "leaf inventory (architect review, 2026-08-21)",
+          "[default_certs][ca_store][security][pg]") {
+    // Two SEPARATE local --ca-dir trees (simulating two server instances) racing the
+    // SAME shared ca_store, both starting from a genuinely empty root — the exact
+    // first-boot race ADR-0053's try_insert_root() exists to resolve. Before the fix,
+    // try_insert_root() ran AFTER leaf generation/record_issued(), so both instances
+    // could pass the B-2 empty-root check, generate + record their own 3 leaves, and
+    // whichever purged ("system:default-certs", an unscoped WHERE) SECOND would
+    // delete the FIRST instance's already-committed rows — including the eventual
+    // winner's, permanently orphaning its certs from ca_store. The fix moved
+    // try_insert_root() before any leaf generation/purge/record_issued() call, so a
+    // losing thread returns before touching ca_store's issued-cert table at all.
+    TempDir dir_a;
+    TempDir dir_b;
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE_FALSE(store.has_root()); // genuinely empty — the race precondition
+
+    DefaultCertSet set_a, set_b;
+    bool ok_a = false, ok_b = false;
+    std::thread ta([&] { ok_a = ensure_default_certs(dir_a.path, "host-a", &store, set_a); });
+    std::thread tb([&] { ok_b = ensure_default_certs(dir_b.path, "host-b", &store, set_b); });
+    ta.join();
+    tb.join();
+
+    // Exactly one side wins (generates a root + writes local certs); the other loses
+    // (try_insert_root reads back the winner's DIFFERENT fingerprint and refuses,
+    // per the existing single-instance loser-discards-material contract).
+    REQUIRE(ok_a != ok_b);
+    const DefaultCertSet& winner = ok_a ? set_a : set_b;
+    REQUIRE(winner.freshly_generated);
+
+    auto root = store.get_root();
+    REQUIRE(root.has_value());
+    REQUIRE(root->has_value());
+    REQUIRE((*root)->fingerprint_sha256 == winner.ca_fingerprint_sha256);
+
+    // The core assertion: exactly the WINNER's 3 leaves survive — never 0 (the
+    // pre-fix cross-purge defect), never 6 (both sides' leaves double-counted).
+    auto issued = store.list_issued();
+    REQUIRE(issued.has_value());
+    REQUIRE(issued->size() == 3);
+    for (const auto& rec : *issued) {
+        REQUIRE_FALSE(rec.cert_pem.empty());
+        REQUIRE(rec.issuer_fingerprint == winner.ca_fingerprint_sha256);
+    }
 }
 
 TEST_CASE("default_certs: returns false (refuse) when the cert dir cannot be created",

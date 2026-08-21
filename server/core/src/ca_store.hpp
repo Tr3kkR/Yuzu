@@ -64,7 +64,11 @@ inline constexpr const char* kCaDbErrorPrefix = "db_error: ";
 /// Machine-checkable prefix on `record_issued`'s `unexpected()` when the failure is specifically
 /// a `serial_hex` unique-violation (PG SQLSTATE 23505) rather than a genuine DB/lease failure —
 /// see `record_issued`'s doc comment and the `.cpp` file header for #1276. Distinct from
-/// `kCaDbErrorPrefix` because this ONE case is retryable-with-a-fresh-serial, not an outage.
+/// `kCaDbErrorPrefix` because this ONE case is retryable-with-a-fresh-serial, not an outage —
+/// infrastructure for a FUTURE caller to act on; `sign_agent_csr` (the sole production caller
+/// today) does not yet inspect this prefix and retry, it logs and returns nullopt on any
+/// `record_issued` failure regardless of classification (governance Gate 3 cpp-expert,
+/// 2026-08-21 — this comment previously read as though the retry were already wired).
 inline constexpr const char* kCaDuplicateSerialPrefix = "duplicate_serial: ";
 
 /// Trust-source mode of the issuing CA. Builtin = self-signed install root (M1). Subordinate =
