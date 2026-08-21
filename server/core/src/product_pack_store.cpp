@@ -59,6 +59,12 @@ constexpr int kMaxListLimit = 10000;
 
 constexpr const char* kSourcelessFingerprint = "sourceless";
 
+int64_t now_epoch() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
 // ── Read-degrade observability (#1675 convention, mirrors CustomPropertiesStore) ──
 constexpr const char* kReasonStoreNotOpen = "store_not_open";
 constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
@@ -75,9 +81,7 @@ bool note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason, Degra
     if (metrics)
         metrics->counter("yuzu_server_product_pack_read_degrade_total", {{"reason", reason}})
             .increment();
-    const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
-                                  std::chrono::system_clock::now().time_since_epoch())
-                                  .count();
+    const std::int64_t now = now_epoch();
     const std::int64_t prev = s.last_ts.exchange(now, std::memory_order_relaxed);
     const std::uint64_t n = s.count.fetch_add(1, std::memory_order_relaxed) + 1;
     const bool new_episode = prev == 0 || (now - prev) > kDegradeEpisodeGapSecs;
@@ -88,12 +92,6 @@ bool note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason, Degra
 // mask a cold `get()` one from ever logging).
 DegradeSampler g_list_sampler;
 DegradeSampler g_get_sampler;
-
-int64_t now_epoch() {
-    return std::chrono::duration_cast<std::chrono::seconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
 
 // Only used against legacy SQLite text columns (may be nullptr).
 const char* safe(const char* p) {

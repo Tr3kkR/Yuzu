@@ -2134,12 +2134,20 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // nonexistent/unreachable pack id left zero audit rows. "denied"
             // (not a distinct "error" result) matches install's own vocabulary
             // for this same three-way not-found/validation/db-error split.
-            audit_fn(req, "product_pack.uninstall", "denied", "ProductPack", id, result.error());
+            //
+            // gov Gate 8 round-2 (security-guardian + docs-writer, independently):
+            // uninstall()'s not_found check reads via get() first, whose own
+            // query-error branch can embed a raw PQerrorMessage() fragment —
+            // unlike install()'s db-error branch, which never does. Genericize
+            // ONCE and reuse the result for both the audit `detail` and the
+            // client response, rather than calling product_pack_client_message
+            // twice (it spdlog::errors as a side effect — calling it twice would
+            // double-log the same failure).
+            const std::string client_msg = product_pack_client_message(
+                "DELETE /api/product-packs/:id", result.error());
+            audit_fn(req, "product_pack.uninstall", "denied", "ProductPack", id, client_msg);
             res.status = product_pack_error_status(result.error());
-            res.set_content(detail::a4_error(res, product_pack_client_message(
-                                                       "DELETE /api/product-packs/:id",
-                                                       result.error())),
-                            "application/json");
+            res.set_content(detail::a4_error(res, client_msg), "application/json");
             return;
         }
         // gov W7.4 R2 sec-MEDIUM: target_type "ProductPack" sibling parity
