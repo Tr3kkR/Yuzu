@@ -16,6 +16,7 @@
 #include "agent_registry.hpp"
 #include "device_token_store.hpp"
 #include "event_bus.hpp"
+#include "pg/pg_pool.hpp"
 
 #include <yuzu/metrics.hpp>
 
@@ -24,6 +25,9 @@
 #include "../test_helpers.hpp"
 
 #include "agent.pb.h"
+
+#include <stdexcept>
+#include <string>
 
 using namespace yuzu::server;
 using yuzu::server::detail::AgentRegistry;
@@ -42,17 +46,30 @@ agent_pb::AgentInfo make_info(const std::string& id, const std::string& host = "
     return info;
 }
 
+// Shares the "devicetokenstore" key with test_device_token_store.cpp's,
+// test_rest_api_t2.cpp's, and test_rest_api_tokens.cpp's own templates
+// (identical setup, replay-verified per docs/postgres-store-playbook.md
+// step 7).
+yuzu::test::PgTestTemplate device_token_store_tpl{
+    "devicetokenstore", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        DeviceTokenStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("device_token_store template: store failed to migrate");
+    }};
+
 } // namespace
 
 TEST_CASE("AgentRegistry: re-registering an agent revokes that agent's device tokens",
-          "[agent_registry][823][token_revocation]") {
+          "[agent_registry][823][token_revocation][pg]") {
     // Threat model: attacker re-registers under endpoint-99 (mTLS-disabled
     // impersonation, #779). The token previously issued to the legitimate
     // endpoint-99 must be revoked before the attacker's session is live, so
     // the attacker cannot replay the stolen token against any device-token-
     // authenticated REST endpoint.
-    yuzu::test::TempDbFile tdb{std::string_view{"agent-reg-token-rev-"}};
-    DeviceTokenStore tokens(tdb.path);
+    YUZU_REQUIRE_PG_DB_TPL(db, device_token_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore tokens(pool);
     REQUIRE(tokens.is_open());
 
     EventBus bus;
@@ -79,13 +96,14 @@ TEST_CASE("AgentRegistry: re-registering an agent revokes that agent's device to
 }
 
 TEST_CASE("AgentRegistry: first-time registration does NOT revoke pre-issued tokens",
-          "[agent_registry][823][token_revocation]") {
+          "[agent_registry][823][token_revocation][pg]") {
     // Operator workflow: pre-issue a device-bound token for an agent_id
     // that has not registered yet (legitimate enrollment automation). The
     // first-ever register_agent for that id must leave the pre-issued
     // token alone — only re-registration is the attack surface #823 closes.
-    yuzu::test::TempDbFile tdb{std::string_view{"agent-reg-token-rev-firsttime-"}};
-    DeviceTokenStore tokens(tdb.path);
+    YUZU_REQUIRE_PG_DB_TPL(db, device_token_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore tokens(pool);
     REQUIRE(tokens.is_open());
 
     EventBus bus;
@@ -104,11 +122,12 @@ TEST_CASE("AgentRegistry: first-time registration does NOT revoke pre-issued tok
 }
 
 TEST_CASE("AgentRegistry: re-register for one agent_id leaves other agents' tokens alone",
-          "[agent_registry][823][token_revocation]") {
+          "[agent_registry][823][token_revocation][pg]") {
     // Confidence check: the revoke is keyed on the re-registering agent_id,
     // not the whole table. Bob's token must survive alice's re-register.
-    yuzu::test::TempDbFile tdb{std::string_view{"agent-reg-token-rev-isolation-"}};
-    DeviceTokenStore tokens(tdb.path);
+    YUZU_REQUIRE_PG_DB_TPL(db, device_token_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore tokens(pool);
     REQUIRE(tokens.is_open());
 
     EventBus bus;
