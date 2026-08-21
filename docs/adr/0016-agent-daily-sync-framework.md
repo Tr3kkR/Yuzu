@@ -199,6 +199,16 @@ Therefore we **coexist, not replace**:
 > gate design), **#1716** (doc-honesty), and **#1713/#1676** (the inventory
 > effective-vs-inert UAT).
 
+> **Update (2026-08-20, #3290):** the effective-vs-inert gap above is closed for both
+> read surfaces. `query_installed_software` and `GET /api/v1/inventory/software`
+> migrated onto `AuthRoutes::require_fleet_read` (ADR-0017's admit-then-filter
+> primitive, composed with service-scope confinement) as their sole authorization
+> gate — a management-group-confined operator now gets a genuinely filtered result
+> instead of a 403, and a service-scoped token gets a filtered result instead of a
+> blanket deny. This closes ADR-0017's PR-D backlog item for these two surfaces; the
+> `/inventory` dashboard Find tab is unmigrated and stays global-gate-only for now.
+> See `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`.
+
 ## Consequences
 
 **Positive**

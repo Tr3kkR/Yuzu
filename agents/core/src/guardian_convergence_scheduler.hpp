@@ -131,6 +131,15 @@ public:
         return sweep_exceptions_.load(std::memory_order_relaxed);
     }
 
+    /// TEST-ONLY: whether start() actually ran (spawning the lane threads) — the
+    /// observable for GuardianEngine::wire_spark_engine's prefer_spark_ start gate
+    /// (#2238), which otherwise has none. Reads started_ under sig_->mu. No production
+    /// caller.
+    [[nodiscard]] bool started_for_test() const {
+        std::lock_guard<std::mutex> lk{sig_->mu};
+        return started_;
+    }
+
 private:
     std::shared_ptr<Signal> sig_;
     bool started_{false};
