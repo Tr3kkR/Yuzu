@@ -5,7 +5,6 @@
 #include "schedule_params_parsers.hpp"
 
 #include <nlohmann/json.hpp>
-#include <spdlog/spdlog.h>
 
 namespace yuzu::server {
 

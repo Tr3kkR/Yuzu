@@ -4241,8 +4241,15 @@ TEST_CASE("MCP compare_app_perf_versions: cohort-paired before/after (evidential
 // token now needs an explicit perm_override_for_test simulating what
 // require_permission's real flip-deny does for this securable/operation —
 // the same pattern other MCP tool-gating tests in this file already use.
-// The audit trail for THAT deny is require_permission's own concern,
-// covered generically in test_auth_routes.cpp — not re-proven per-tool here.
+// This test proves the TOOL honors a perm_fn denial — it does not itself
+// prove require_permission's real flip-deny fires for a genuine
+// service-scoped session (composition, not re-derivation): that is proven
+// generically, securable-agnostic (a pure empty-allow-list membership
+// check, no per-securable special-casing), by "AuthRoutes::require_permission
+// — service-scoped token: ITServiceOwner ceiling holds but the default-deny
+// allow-list still denies (the flip)", test_auth_routes.cpp:794 — including
+// the audit trail (`auth.permission_required`) this test does not
+// re-prove per-tool (quality-engineer, governance run 2026-08-21).
 TEST_CASE("MCP get_dex_group_app_perf: still denies a service-scoped token "
           "via perm_fn (interim tool-specific deny retired, #3290 bucket 1a)",
           "[mcp][integration][dex][app_perf][security]") {
