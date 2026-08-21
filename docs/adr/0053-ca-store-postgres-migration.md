@@ -401,8 +401,8 @@ here.
 This is a compact provenance record — what ran, what it found, what happened to it. Current
 design truth lives in `## Decision` above, not here. Full structured findings (trigger/impact/
 exposure/epistemic-status per this repo's derivation scheme, plus provenance and disposition) are
-in the committed ledger: `governance.d/ca-store-postgres-migration.Hq3Wpm.jsonl` (45 findings
-across 10 review passes). Resource-ownership detail for the bootstrap-lock/first-boot-key custody
+in the committed ledger: `governance.d/ca-store-postgres-migration.Hq3Wpm.jsonl` (46 findings
+across 12 review passes). Resource-ownership detail for the bootstrap-lock/first-boot-key custody
 chain — a policy-floor artifact independent of this history, not process narrative — lives in its
 own durable file: `docs/resource-ledgers/default-certs-bootstrap-lock.md`.
 
@@ -417,7 +417,9 @@ own durable file: `docs/resource-ledgers/default-certs-bootstrap-lock.md`.
 | 7 | Gate 5/6 | chaos-injector, compliance-officer, sre, enterprise-readiness, docs-writer, architect | 1 HIGH fixed, 1 MEDIUM documented, 3 SHOULD fixed, 4 SHOULD deferred, 4 NICE (mixed) | C5-1: a fencing-token gap in pass 4's own lock fix — the lock-holding *connection* could die without the *process* dying |
 | 8 | cpp-safety + security-guardian re-review of the C5-1 fix | cpp-safety, security-guardian | 2 policy floors fixed, 1 NICE deferred (pre-existing) | A `const_cast`-then-write UB (cpp-safety's enumerated floor) and a missing Resource Ledger |
 | 9 | cpp-expert gap-fill | cpp-expert | 3 NICE fixed | First review of the fix-round commits specifically — routed-concerns' trigger is unconditional on any C++ change, and this coverage cell had been empty |
-| 10 | cpp-safety + security-guardian re-review of the UP-3 fix | cpp-safety, security-guardian | 1 SHOULD fixed, 1 policy floor fixed, 1 MEDIUM documented | The ADR restructuring in this same round had deleted the committed Resource Ledger with no durable replacement — a policy floor, caught before push |
+| 10 | Post-governance follow-up (operator-directed) | claude, self-found | 1 SHOULD fixed | Two more metrics with CAPG-022's missing-boot-seed gap, same code region |
+| 11 | UP-3 build (operator-directed) | claude, self-found | 1 HIGH/BLOCKING fixed (pre-existing) | The key-clobbering race: 7/8 pre-fix repro runs red, 0/15 post-fix |
+| 12 | cpp-safety + security-guardian re-review of the UP-3 fix | cpp-safety, security-guardian | 1 SHOULD fixed, 1 policy floor fixed, 1 MEDIUM documented | The ADR restructuring in this same round had deleted the committed Resource Ledger with no durable replacement — a policy floor, caught before push |
 
 **Notable process findings, not product findings.** Three separate instances of an overclaiming
 pattern were caught and retracted **before** being used as sign-off evidence, never after —
@@ -450,23 +452,17 @@ against one shared `TempDir` reproduced this on 7 of 8 runs before the fix (log 
 self-healed) and 0 of 15 runs after it. Fixed: the CA key is now written to disk only after a
 candidate is confirmed the CAS's sole winner, at which point no other candidate can still be
 racing for that name — `key_ref` itself is computed beforehand (a pure path calculation, no I/O)
-so it can still be recorded in the same `try_insert_root` call.
+so it can still be recorded in the same `try_insert_root` call. Recorded as CAPG-043, pass 11,
+HIGH/BLOCKING (I1+I2, E4+E5), fixed.
 
-**Pass 10 — cpp-safety + security-guardian domain re-review of this fix (2026-08-21).**
-cpp-safety: PASSES, no BLOCKING findings; one SHOULD fixed (the poll loop's adoption decision
-didn't cross-check the fingerprint of what it just validated against the root it lost the race
-to — an unstated invariant true by construction today, now asserted explicitly rather than
-assumed). security-guardian: one BLOCKING policy-floor finding, fixed — the ADR restructuring in
-this same round had deleted the two committed Resource Ledger tables for the bootstrap-lock chain
-with no durable replacement (the governance findings ledger has a different schema and cannot
-substitute for one); moved to `docs/resource-ledgers/default-certs-bootstrap-lock.md` instead,
-extended with this pass's own new resource (the deferred `default-ca` key write). One MEDIUM,
-non-blocking, documented not fixed: deferring the key write past the CAS opens a narrow window
-where a *sibling* process's unrelated, pre-existing self-heal check can see no local key yet and
-refuse immediately rather than waiting — availability-only, fail-closed, and extending that
-unrelated check's own poll would delay a genuine lost-key refusal by up to 15s on every
-established install, a worse trade than the rare sibling-refusal it would prevent. Full findings:
-`governance.d/ca-store-postgres-migration.Hq3Wpm.jsonl` pass 10.
+**Pass 12 — cpp-safety + security-guardian domain re-review of this fix (2026-08-21).** One SHOULD
+fixed (the poll loop's adoption decision now cross-checks the fingerprint of what it just
+validated, an invariant that was true by construction but unasserted). One BLOCKING policy-floor
+finding, fixed — this same round's ADR restructuring had deleted the bootstrap-lock chain's
+committed Resource Ledger with no durable replacement; moved to
+`docs/resource-ledgers/default-certs-bootstrap-lock.md` instead, extended with this pass's own
+new resource. One MEDIUM documented, not fixed (the sibling-refusal window; see that file for the
+trade-off). Full findings: `governance.d/ca-store-postgres-migration.Hq3Wpm.jsonl` pass 12.
 
 **Self-caught, not a review finding: the new UP-3 test was itself scheduling-dependent.** A
 subsequent full 10-shard suite run (higher system contention than an isolated run) hit a

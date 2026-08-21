@@ -24,6 +24,16 @@
   treating every currently-connected agent as revoked and tearing down its live stream. A
   sustained failure is now visible via `yuzu_server_ca_revocation_sweep_read_failures_total`
   instead of manifesting only as unexplained agent disconnects.
+- **A losing first-boot CA-root racer now self-heals without a restart.** Instead of refusing
+  boot immediately on losing the race, it polls the shared cert directory for up to 15s for the
+  winning instance to finish writing its complete set, then adopts it (chain- and cert/key-pair-
+  verified, with an explicit fingerprint cross-check before adoption) — falling back to the
+  original refuse-and-restart behavior only if the winner never appears within the window. Fixed
+  a pre-existing defect this surfaced: on a shared cert directory, a racing candidate could
+  persist its own CA private key to the shared well-known path *before* its root-establishment
+  race resolved, so whichever candidate's write landed last could silently detach the winning
+  root from its real key regardless of which candidate won. The key write is now deferred until
+  strictly after this instance is confirmed the sole CAS winner.
 - **New `yuzu-pki` Prometheus alert group** (`docs/prometheus/yuzu-alerts.yml`) covers all three
   CA failure/security counters: `YuzuCaCrlPublishFailing`, `YuzuCaRevocationSweepReadFailing`,
   and `YuzuCaReissueBlocked` (an operator-visibility signal for a revoked identity attempting to
