@@ -165,7 +165,8 @@ Verified safe to change now:
 2. **Parity needs an intentional-delta registry.** Legacy silently no-ops where spark
    reports `unsupported`. Zero-tolerance parity cannot be literal across that dimension;
    rung 10's gate artifact must carry the documented delta list, or the gate fails
-   spuriously and gets quietly weakened until it means nothing.
+   spuriously and gets quietly weakened until it means nothing. **Shipped (F12,
+   #3386):** `docs/spark-legacy-delta-registry.md`.
 3. **macOS under spark preference is all-unsupported.** Both mechanism factories return
    nullptr off their platforms, so every rule on a spark-preferred macOS agent classifies
    `Unsupported`. That matches today's macOS enforcement reality, but the macOS CI leg
@@ -177,8 +178,8 @@ new `unsupported_rules_` map (per-outcome erase/insert at every other return pat
 against the actual push contents on `full_sync`, cleared in `stop()`). All three
 consequences above are addressed: (1) the reconcile tests were rewritten in the same PR,
 plus a real macOS-factory test asserting the all-unsupported posture directly (not (3),
-which is a rung-10 parity-gate item, still open); (2) not yet - the intentional-delta
-registry remains rung 10's job. Also shipped in the same PR: the `mech_unsupported_total`
+which is a rung-10 parity-gate item, still open); (2) **shipped (F12, #3386)** -
+`docs/spark-legacy-delta-registry.md`. Also shipped in the same PR: the `mech_unsupported_total`
 per-mechanism fleet gauge and `yuzu.guardian_backend` heartbeat tag (§Platform-rejection,
 §Fleet metrics, items 8-9 below).
 
@@ -433,7 +434,8 @@ pulls the largest piece of unspecified new semantics off the flip PR.
 
 `prefer_spark = !cfg_.spark_disable` (`agent.cpp:~579`, R1) as the **final commit**; the
 **intentional-delta registry** (R2 consequence 2 — pulled forward from rung 10 because
-7.7b changes the behaviour parity classifies); **production-order cached-KV
+7.7b changes the behaviour parity classifies; **shipped ahead of the flip, F12/#3386:
+`docs/spark-legacy-delta-registry.md`**); **production-order cached-KV
 restart/upgrade tests** (the current fixture runs `start_local()` before
 `wire_spark_engine()`, the reverse of production `agent.cpp:962` vs `990`, with an empty
 KV — it masks the rehydration path); parity + resource + **3-OS/gateway** evidence
@@ -1260,7 +1262,8 @@ Each rung is an independently-governed PR on `dev`, run through the full
        alert, all reporting the *inactive* posture; the #2238 test seams + TSan.
      - **PR-2 (thin cutover).** `prefer_spark = !cfg_.spark_disable`; the
        intentional-delta registry (R2 consequence 2, pulled forward from rung 10 since
-       7.7b changes the behaviour it classifies); production-order cached-KV
+       7.7b changes the behaviour it classifies; **shipped ahead of the flip, F12/#3386:
+       `docs/spark-legacy-delta-registry.md`**); production-order cached-KV
        restart/upgrade tests; parity + resource + **3-OS/gateway** evidence; the
        grep-enumerated stale-prose sweep; the flip as the **final commit**. **This is
        where detection moves to spark and legacy enforcement stops** (until rung 3).
@@ -1272,7 +1275,8 @@ Each rung is an independently-governed PR on `dev`, run through the full
      device detector, #2240 item 2, remains open).
    - **10.** Parity + durability + integration matrix. Semantic ports land **before**
      7.7b where possible; live/equivalence after. Carries the **intentional-delta
-     registry** (R2 consequence 2) so zero-tolerance parity survives the legacy-no-op
+     registry** (R2 consequence 2, **shipped ahead of schedule, F12/#3386:
+     `docs/spark-legacy-delta-registry.md`**) so zero-tolerance parity survives the legacy-no-op
      vs `unsupported` difference.
    - **11.** The `yuzu-fleet-spark` alert group (#2083) enabled + promtool CI lint,
      including the `SparkFailed`-prevalence alert (R1 correlated-outage note).
