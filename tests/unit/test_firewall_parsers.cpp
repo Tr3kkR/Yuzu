@@ -105,3 +105,105 @@ TEST_CASE("fw state to_string round-trip", "[firewall]") {
     CHECK(to_string(FwState::disabled) == "disabled");
     CHECK(to_string(FwState::unknown) == "unknown");
 }
+
+// ── Linux: ufw ───────────────────────────────────────────────────────────
+//
+// Synthetic fixtures matching documented `ufw` output (no live-captured ufw
+// output was available in this sandbox — flagged here, not silently assumed
+// verified).
+
+TEST_CASE("ufw status: enabled/disabled — the real regression this replaces", "[firewall]") {
+    // The bug this parser fixes: the old shell-out did
+    // `output.find("active") != npos`, which ALSO matches inside "inactive"
+    // -- misreporting a disabled ufw as active. A full-prefix check must
+    // never let "Status: inactive" satisfy the active branch.
+    CHECK(parse_ufw_status("Status: active\n") == FwState::enabled);
+    CHECK(parse_ufw_status("Status: inactive\n") == FwState::disabled);
+}
+
+TEST_CASE("ufw status: empty or unrecognised output is unknown", "[firewall]") {
+    CHECK(parse_ufw_status("") == FwState::unknown);
+    CHECK(parse_ufw_status("sh: ufw: command not found") == FwState::unknown);
+}
+
+TEST_CASE("ufw rules: numbered status parses To/Action/From columns — synthetic", "[firewall]") {
+    constexpr std::string_view out =
+        "Status: active\n"
+        "\n"
+        "     To                         Action      From\n"
+        "     --                         ------      ----\n"
+        "[ 1] 22/tcp                     ALLOW IN    Anywhere\n"
+        "[ 2] 80,443/tcp                 ALLOW IN    192.168.1.0/24\n";
+    auto rules = parse_ufw_rules(out);
+    REQUIRE(rules.size() == 2);
+    CHECK(rules[0].index == "1");
+    CHECK(rules[0].to == "22/tcp");
+    CHECK(rules[0].action == "ALLOW IN");
+    CHECK(rules[0].from == "Anywhere");
+    CHECK(rules[1].index == "2");
+    CHECK(rules[1].to == "80,443/tcp");
+    CHECK(rules[1].action == "ALLOW IN");
+    CHECK(rules[1].from == "192.168.1.0/24");
+}
+
+TEST_CASE("ufw rules: inactive ufw with zero numbered rows", "[firewall]") {
+    CHECK(parse_ufw_rules("Status: inactive\n").empty());
+}
+
+TEST_CASE("ufw rules: malformed bracket line is skipped, not crashed on", "[firewall]") {
+    CHECK(parse_ufw_rules("[unterminated bracket with no close\n").empty());
+}
+
+// ── Linux: iptables ─────────────────────────────────────────────────────
+//
+// Real capture: `iptables -S` inside a privileged Docker debian:bookworm-slim
+// container with seed rules (NET_ADMIN,NET_RAW), 2026-08-14 — see
+// ~/.claude/wave2-prestage/fixtures/linux/iptables_capture.out.
+
+TEST_CASE("iptables -S: real capture — policies, new chain, appends", "[firewall]") {
+    constexpr std::string_view out = "-P INPUT ACCEPT\n"
+                                     "-P FORWARD ACCEPT\n"
+                                     "-P OUTPUT ACCEPT\n"
+                                     "-N yuzu-quarantine\n"
+                                     "-A INPUT -j yuzu-quarantine\n"
+                                     "-A yuzu-quarantine -i lo -j ACCEPT\n"
+                                     "-A yuzu-quarantine -m state --state RELATED,ESTABLISHED -j ACCEPT\n"
+                                     "-A yuzu-quarantine -s 10.0.0.5/32 -j ACCEPT\n"
+                                     "-A yuzu-quarantine -j DROP\n";
+    auto rules = parse_iptables_save(out);
+    REQUIRE(rules.size() == 9);
+
+    CHECK(rules[0].type == IptablesEntryType::policy);
+    CHECK(rules[0].chain == "INPUT");
+    CHECK(rules[0].spec == "ACCEPT");
+    CHECK(rules[2].type == IptablesEntryType::policy);
+    CHECK(rules[2].chain == "OUTPUT");
+    CHECK(rules[2].spec == "ACCEPT");
+
+    CHECK(rules[3].type == IptablesEntryType::new_chain);
+    CHECK(rules[3].chain == "yuzu-quarantine");
+    CHECK(rules[3].spec.empty());
+
+    CHECK(rules[4].type == IptablesEntryType::append);
+    CHECK(rules[4].chain == "INPUT");
+    CHECK(rules[4].spec == "-j yuzu-quarantine");
+
+    CHECK(rules[6].type == IptablesEntryType::append);
+    CHECK(rules[6].chain == "yuzu-quarantine");
+    CHECK(rules[6].spec == "-m state --state RELATED,ESTABLISHED -j ACCEPT");
+
+    CHECK(rules[8].type == IptablesEntryType::append);
+    CHECK(rules[8].chain == "yuzu-quarantine");
+    CHECK(rules[8].spec == "-j DROP");
+}
+
+TEST_CASE("iptables -S: unrecognised line preserved, not dropped", "[firewall]") {
+    auto rules = parse_iptables_save("-X some-chain\n");
+    REQUIRE(rules.size() == 1);
+    CHECK(rules[0].type == IptablesEntryType::unknown);
+    CHECK(rules[0].spec == "-X some-chain");
+}
+
+TEST_CASE("iptables -S: empty output yields zero rules, never fabricated", "[firewall]") {
+    CHECK(parse_iptables_save("").empty());
+}

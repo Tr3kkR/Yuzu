@@ -28,14 +28,55 @@ Structured categories are enforced at the API layer:
 
 ## Setting Tags
 
-> **Tag source precedence.** Every tag carries a `source` field — `"api"` for REST/dashboard
-> writes (`PUT /api/v1/tags`), `"mcp"` for MCP `set_tag`, `"server"` for server-internal
-> writes, and `"agent"` for tags an agent self-reports via its heartbeat `scopable_tags`. An
-> agent-reported tag is written only when the stored row is itself `"agent"`-sourced or absent;
-> any non-`"agent"`-sourced tag for the same `(agent_id, key)` is **authoritative and cannot be
+> **Tag source precedence (write time).** Every tag carries a `source` field — `"api"` for
+> REST/dashboard writes (`PUT /api/v1/tags`), `"mcp"` for MCP `set_tag`, `"server"` for
+> server-internal writes, and `"agent"` for tags an agent self-reports at registration
+> (`scopable_tags`, synced to the store on gRPC `Register`). An agent-reported tag is
+> written only when the stored row is itself `"agent"`-sourced or absent; any
+> non-`"agent"`-sourced tag for the same `(agent_id, key)` is **authoritative and cannot be
 > overwritten by the agent**. This prevents a rogue or misconfigured agent from self-assigning
 > into an operator-declared benchmark cohort. To force a value regardless of the current
 > source, write it via the REST API or MCP `set_tag`.
+>
+> **The `service` key is a special case (#3289).** It is never accepted from an agent's
+> self-report at all — an agent-supplied `service` value is silently dropped during sync,
+> regardless of whether a stored row exists. `service` is the confinement boundary a
+> service-scoped API token is checked against, so it must always be operator/API-assigned,
+> never agent-claimed. A pre-existing agent-authored `service` row (from before this
+> restriction existed) is purged on the agent's next sync. A service-scoped token is also
+> denied writing or deleting its OWN `service` tag on any target, regardless of source — see
+> "Service-Scoped Tokens" under `docs/user-manual/authentication.md`.
+>
+> **Tag source precedence (read time, scope-DSL, #3295).** A `tag:<key>` expression in a
+> Scope (dispatch targeting, management-group membership, any `tag:` atom you write, including
+> `EXISTS`/`LEN`/`STARTSWITH` forms) resolves the TagStore row for that `(agent, key)` FIRST,
+> by presence alone — this is a separate rule from the write-time source precedence above, not
+> derived from it: the store row wins regardless of which source wrote it (even an
+> agent-sourced row beats a live, fresher in-memory claim from the same agent — see the
+> stale-sync note below). A connected agent's live self-reported value answers a `tag:<key>`
+> lookup ONLY when the store has NO row at all for that `(agent, key)` — e.g. a gateway-proxied
+> agent, whose tags are never synced to the store, or a tag not yet synced. `service` never
+> answers from the self-report at this stage either — it is dropped from the agent's live
+> session at registration, not just filtered from the store. An agent reporting an empty-string
+> value cannot mask an operator's non-empty stored value, and conversely an empty STORE value
+> is never masked by a non-empty in-memory claim: the store row, when present — even an empty
+> one — is always used regardless of the agent's own claim.
+>
+> **Accepted trade-off: a stale agent-sourced row can briefly outlast a fresher live claim.**
+> If an agent's most recent tag sync fails (a transient DB error, or exceeding the sync batch
+> limit), the store retains its PRIOR agent-sourced row for that agent while the agent's live
+> session already holds a newer value — read-time precedence still honors the (now stale)
+> store row until the agent's next successful sync. This is deliberate: the store remains the
+> single source of truth for scope-DSL reads, and the row self-heals automatically. See
+> `docs/adr/0050-tag-store-postgres-migration.md`'s 2026-08-20 amendment for the full rationale.
+>
+> **Two "preview" surfaces resolve `tag:<key>` differently.** MCP `preview_scope_targets`
+> resolves `tag:<key>` from the TagStore ONLY, with no live-agent fallback — for a
+> gateway-proxied or not-yet-synced agent it can under-report relative to what an actual
+> dispatch will match. REST `POST /api/scope/estimate` has no such gap: it resolves through
+> the same store-first-with-fallback path real dispatch uses, so it matches dispatch exactly.
+> Prefer `/api/scope/estimate` when previewing a scope for a fleet that may include
+> gateway-proxied or not-yet-synced agents.
 
 ### Via the REST API
 
@@ -344,6 +385,17 @@ When you set a `service` tag on a device, Yuzu automatically creates a **managem
 These groups use `dynamic` membership — the scope engine can refresh which devices belong to each group based on tag expressions.
 
 This means an ITServiceOwner assigned to "Service: payments" automatically has scoped access to every device tagged with `service=payments`.
+
+**Two distinct confinement axes.** The ITServiceOwner *role* documented above confines a
+management-group-scoped user via RBAC — that is unaffected by, and independent of, a
+*service-scoped API token*'s confinement (ADR-1006, "the flip"), which restricts what a
+minted token bound to a specific service value may reach. Holding ITServiceOwner (or
+Administrator, or Operator) with a plain `Tag:Write`/`Tag:Delete` grant remains sufficient
+to set or move any device's `service` tag — those are fleet-scoped RBAC roles, not
+service-scoped tokens, so moving a `service` tag through them is not a confinement bypass.
+The restriction in the callout above applies only to a session whose own API token carries
+a `token_scope_service` — such a token may never write or delete the `service` key on any
+target, in or out of its own scope (#3289).
 
 ### Setting up an IT Service Owner
 

@@ -21,6 +21,7 @@
 
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
+#include "test_analytics_pg_helper.hpp" // AnalyticsEventStorePg — ADR-0049 PG port
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
 #include "oidc_provider.hpp"
@@ -78,7 +79,9 @@ struct OidcRoutesFixture {
     std::optional<yuzu::test::PostgresTestDb> audit_db;
     std::optional<yuzu::server::pg::PgPool>   audit_pool;
     std::unique_ptr<AuditStore>           audit_store;
-    std::unique_ptr<AnalyticsEventStore>  analytics;
+    // AnalyticsEventStore ported to Postgres (ADR-0049) — own ephemeral
+    // clone, matching audit_store's pattern above.
+    yuzu::test::AnalyticsEventStorePg     analytics;
     std::shared_mutex                     oidc_mu;
     std::unique_ptr<oidc::OidcProvider>   oidc_provider; // set by tests that need it enabled
     std::unique_ptr<AuthRoutes>           auth_routes;
@@ -96,9 +99,7 @@ struct OidcRoutesFixture {
         REQUIRE(audit_db->available());
         audit_pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = audit_db->dsn(), .size = 4});
         audit_store = std::make_unique<AuditStore>(*audit_pool);
-        analytics   = std::make_unique<AnalyticsEventStore>(tmp.path / "analytics.db");
         REQUIRE(audit_store->is_open());
-        REQUIRE(analytics->is_open());
 
         auth_routes = std::make_unique<AuthRoutes>(
             cfg, auth_mgr,

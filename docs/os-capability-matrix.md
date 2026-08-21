@@ -69,8 +69,8 @@ duplicates.
 | **TAR — mapdrive** (network-share mappings) (`$MapDrive`) · *opt-in* | ✅ wnet | 🟡 procfs | 🔜 getfsstat | Win WNet outbound + NetSessionEnum inbound (+ history); Linux `/proc/mounts` cifs/nfs (username unavailable) + `smbstatus`; macOS `getfsstat`/smbutil **planned** (empty today). `mapdrive_enabled`. `tar_mapdrive_collector.cpp` |
 | **━━ Inventory & daily-sync sources (→ central Postgres) ━━** | | | | Agent daily-sync framework `sync_scheduler.cpp` pushes per-source state over `ReportInventory` (hash-skip), reusing plugins via `LocalDispatcher`. ADR-0016 |
 | **Installed-software inventory** | ✅ | ✅ | ✅ | `sync_source_installed_software.cpp` reuses `installed_apps` `list_inventory` (Win registry; Linux dpkg/rpm/pacman/**apk**; macOS `system_profiler`). Blob contract v2 (kind/ecosystem/EVR/arch/packager + rpm signature_status + distro; honest-empty; Win/macOS rows = kind=app, name/version/publisher). Machine-scope only. Server `SoftwareInventoryStore` |
-| **Software-licence detection (SLE)** | ✅ (WMI `SoftwareLicensingProduct` + Office C2R + `ProbeSpec` + per-user hives/files) | 🟡 (rpm/dpkg declared-licence classification — no lapse detection; RHEL entitlement + FlexLM `.lic` expiry authoritative) | 🟡 (`_MASReceipt` + machine-scope vendor plists — `probable` confidence only) | Per-OS TUs `license_scan/src/licensing_{win,wmi,linux,macos}.cpp`; `sync_source_software_licensing.cpp` → `SoftwareLicensingStore` (ADR-0024). Detail: `docs/user-manual/software-licensing.md`. Java + SWID tags are the fast-follow (#2112) |
-| **Device-identity inventory** (serial, UUID, BIOS, CPU/RAM/disk, MAC, OS) | ✅ | ✅ | ✅ | `sync_source_device_ci.cpp` reuses `hardware`/`device_identity`/`os_info`/`network_config`. `hardware` `system`: Win WMI `Win32_BIOS`/`Win32_ComputerSystemProduct`; Linux `/sys/class/dmi/id/product_{serial,uuid}` (0400 → needs `cap_dac_read_search`; `unknown` without it); macOS `ioreg IOPlatformExpertDevice` (`IOPlatformUUID` ≠ SMBIOS UUID). Machine-scope only. Server `DeviceInventoryStore` |
+| **Software-licence detection (SLE)** | ✅ (WMI `SoftwareLicensingProduct` + Office C2R + `ProbeSpec` + per-user hives/files) | 🟡 (rpm/dpkg declared-licence classification — no lapse detection; RHEL entitlement + FlexLM `.lic` expiry authoritative) | 🟡 (`_MASReceipt` + machine-scope vendor plists — `probable` confidence only) | Per-OS TUs `license_scan/src/licensing_{win,linux,macos}.cpp` (Windows WMI probe via the shared `agents/shared/wmi_bounded.hpp`); `sync_source_software_licensing.cpp` → `SoftwareLicensingStore` (ADR-0024). Detail: `docs/user-manual/software-licensing.md`. Java + SWID tags are the fast-follow (#2112) |
+| **Device-identity inventory** (serial, UUID, BIOS, CPU/RAM/disk, MAC, OS) | ✅ | ✅ | ✅ | `sync_source_device_ci.cpp` reuses `hardware`/`device_identity`/`os_info`/`network_config`. `hardware` `system`: Win WMI `Win32_BIOS`/`Win32_ComputerSystemProduct`; Linux `/sys/class/dmi/id/product_{serial,uuid}` (0400 → needs `cap_dac_read_search`; `unknown` without it); macOS native IOKit `IOPlatformExpertDevice` (`IOServiceGetMatchingService`/`IORegistryEntryCreateCFProperty`; `IOPlatformUUID` ≠ SMBIOS UUID). Machine-scope only. Server `DeviceInventoryStore` |
 | **━━ Live device snapshot ("Get live info") ━━** | | | | Device page dispatch-and-poll snapshot; each kind has its own `device.live.<kind>` audit verb. `docs/user-manual/device-management.md` |
 | **Live — process tree + per-process connections** | ✅ tree + conn join | 🟡 tree; conn join absent | 🟡 tree | `processes/list_tree` (`proc\|pid\|ppid\|name\|sha256\|path`, all OSes) joined by PID to `network_diag/connections` (owning PID via `GetExtendedTcpTable`, Windows). Linux `/proc/net/tcp` exposes inode not pid → no join |
 | **Live — ARP / neighbour table** | ✅ | 🔜 (`/proc/net/arp`) | 🔜 (route sysctl) | `network_config/arp` (`GetIpNetTable2`, Windows); macOS emits an honest `arp\|not_available` sentinel (real route-sysctl collector still 🔜); Linux `/proc/net/arp` 🔜 |
@@ -79,7 +79,7 @@ duplicates.
 | **Live — Wi-Fi current connection** | ✅ | ✅ | 🟡 | `wifi/connected` — Win `WlanQueryInterface`, Linux `nmcli`/`iwconfig`, macOS `wifi_corewlan.mm` `corewlan_current_connection` (CoreWLAN `CWWiFiClient`/`CWInterface`, first `.mm` TU; pure `format_connected_record` in `wifi_corewlan.hpp`). macOS 🟡: association/RSSI/channel/security read, but SSID/BSSID are withheld from a background daemon by Location Services on 14+ (`<ssid-withheld>`) — replaces the dead `airport -I` path |
 | **━━ Security posture & file/certificate surfaces ━━** | | | | Posture reads + signed-artifact/certificate actions; each row cites its per-OS legs |
 | **Antivirus posture** (`antivirus` plugin: `products` + `status`) | ✅ SecurityCenter2 products + Defender status | 🟡 process/dir detection only (ClamAV/CrowdStrike/Sophos; no `status` leg) | 🟡 `products`: XProtect bundle version + endpoint-security system-extension enumeration (`systemextensionsctl`, unprivileged) + process fallback; `status`: XProtect definition version + bundle mtime + Remediator/MRT — **no real-time-protection state** (macOS exposes no queryable equivalent), `av\|XProtect\|active` is a definitions-readable proxy, not a running-protection read | `agents/plugins/antivirus/src/antivirus_plugin.cpp` (`list_av_products_macos`/`xprotect_status_macos`); pure parsers `antivirus_parsers.hpp` (`parse_plist_version`/`parse_sysext_list`/`sysext_av_state`) tested every host |
-| **Firewall posture** (`firewall` plugin: `state` + `rules`) | ✅ per-profile via `netsh advfirewall` | ✅ backend autodetect (firewalld / ufw / iptables) | 🟡 `state`: Application Firewall primary (`socketfilterfw --getglobalstate`, unprivileged; `mode\|block_all` when State = 2) + pf secondary (`pfctl -s info`, root — `unknown` without it); `rules`: pf only (`pfctl -s rules`, root; no Application Firewall per-app list yet) | `agents/plugins/firewall/src/firewall_plugin.cpp` `state`/`rules` legs; pure parsers `firewall_parsers.hpp` (tested every host) |
+| **Firewall posture** (`firewall` plugin: `state` + `rules`) | ✅ per-profile via `INetFwPolicy2` COM (rung 1, native — no `netsh` shell-out) | ✅ backend autodetect, firewalld (rung 1, bounded sd-bus) → nftables (not yet implemented — falls through) → ufw → iptables (rung 2, `run_bounded_subprocess` argv, structured per-backend rows) | 🟡 `state`: Application Firewall primary (`socketfilterfw --getglobalstate`, unprivileged; `mode\|block_all` when State = 2) + pf secondary (`pfctl -s info`, root — `unknown` without it); `rules`: pf only (`pfctl -s rules`, root; no Application Firewall per-app list yet) — both via `run_bounded_subprocess` (rung 2, no shell) | `agents/plugins/firewall/src/firewall_plugin.cpp` `state`/`rules` legs; pure parsers `firewall_parsers.hpp` (tested every host) |
 | **Digital-signature verification** (`filesystem.get_signature`) | ✅ | ⛔ | ✅ | Win: WinVerifyTrust (Authenticode: valid/invalid/unsigned/untrusted) in `filesystem_plugin.cpp`. macOS: `codesign --verify --deep --strict` mapped to valid/unsigned/invalid/unknown by `classify_codesign_result` in `agents/plugins/filesystem/src/filesystem_macos_sig.hpp` (macOS `valid` = seal integrity, not Gatekeeper/notarization trust). Linux emits platform-unsupported |
 | **File version info** (`filesystem.get_version_info`) | ✅ | ⛔ | ✅ | Win: `GetFileVersionInfoW`/`VerQueryValueW` (VS_FIXEDFILEINFO + string table) in `filesystem_plugin.cpp`. macOS: CFBundleShortVersionString/CFBundleVersion from the bundle Info.plist via `plutil -extract`, mapped by `classify_plutil_extract` in `filesystem_macos_sig.hpp` (binary + XML plists; `version_status\|not_available` when absent). Linux emits platform-unsupported |
 | **Certificate store — login-keychain read** (`certificates.list`/`details` `store=login`/`all`) | ⛔ | ⛔ | ✅ | macOS-specific: reads the console user's login keychain via `launchctl asuser <uid> sudo -n -u <user> security find-certificate` (root-only; see `docs/agent-privilege-model.md`), built by `build_login_keychain_read_command` in `agents/shared/macos_console_user.hpp`, invoked from `agents/plugins/certificates/src/certificates_plugin.cpp`. Windows machine stores (CryptoAPI) and Linux `/etc/ssl/certs` have no per-user login-keychain equivalent for this hop |
@@ -118,7 +118,7 @@ duplicates.
 | os_info | ✅ | ✅ | ✅ | linux/apple/win branches |
 | processes | ✅ | ✅ | ✅ | win/linux/apple branches (point-in-time enum; streaming capture is under TAR `process`) |
 | procfetch | ✅ | ✅ | ✅ | linux/apple/win branches |
-| quarantine | ✅ | ✅ | ✅ | full per-OS blocks |
+| quarantine | ✅ | ⚠️ | ⚠️ | full per-OS blocks, but containment is not yet complete on Linux/macOS: Linux only filters IPv4 (`ip6tables` never called, #3282); macOS's status check doesn't verify pf is actually enabled, only that the ruleset was loaded (#3283); status checks on all three platforms verify partial/existence, not full containment (#3285) |
 | rdp_control | ✅ | ⛔ | ⛔ | Windows-only. Off-Windows returns an honest `rdp_control\|unsupported` sentinel (macOS names Screen Sharing); state-changing `set_state` reports terminal FAILURE, read-only `status` rc=0 — `rdp_control_plugin.cpp` `#ifndef _WIN32` branch |
 | registry | ✅ | ⛔ | ⛔ | Windows-only (advapi32). Off-Windows returns an honest `registry\|unsupported` sentinel (reads rc=0; mutating `set_value`/`delete_*` report terminal FAILURE — no false success) — `registry_plugin.cpp` `#ifndef _WIN32` branch. `list_profiles` (PR1.7) enumerates local profiles via ProfileList/HKEY_USERS. `get_user_value` resolves the target profile via ProfileList and reads the live `HKEY_USERS\<SID>` hive when the user is logged in, falling back to an offline `RegLoadKey` mount (SeBackup/SeRestore privileges, required only for that fallback) when not. The ladder lives in `agents/shared/win_profiles.hpp` and is shared with `installed_apps.list_per_user`, `license_scan`'s per-user surfaces and `tar`'s mapdrive history (#2771) |
 | sccm | ✅ | ⛔ | ⛔ | Windows-only. macOS returns an honest `sccm\|unsupported` (points at Jamf/MDM); Linux `installed\|false` + "platform not supported" — `sccm_plugin.cpp` `__APPLE__` branch |
@@ -247,11 +247,11 @@ implementation is.
 | device_identity | device_name | linux | supported | 1 | gethostname(3) | - |
 | device_identity | device_name | macos | supported | 1 | gethostname(3) | - |
 | device_identity | device_name | windows | supported | 1 | GetComputerNameExA | - |
-| device_identity | domain | linux | supported | 3 | /etc/resolv.conf read + popen(realm list) [fallback: /etc/sssd/sssd.conf read] | - |
-| device_identity | domain | macos | supported | 3 | popen(dsconfigad -show) [fallback: popen(hostname -f)] | - |
+| device_identity | domain | linux | supported | 1 | /etc/resolv.conf read + sd-bus org.freedesktop.sssd.infopipe ListDomains [fallback: run_bounded_subprocess(realm list); further fallback: /etc/sssd/sssd.conf read] | - |
+| device_identity | domain | macos | supported | 2 | run_bounded_subprocess(dsconfigad -show) + native parser (device_identity_macos.hpp) [fallback: gethostname(3) + getaddrinfo(AI_CANONNAME)] | - |
 | device_identity | domain | windows | supported | 1 | NetGetJoinInformation | - |
-| device_identity | ou | linux | supported | 3 | popen(realm list) [fallback: /etc/sssd/sssd.conf read] | - |
-| device_identity | ou | macos | supported | 3 | popen(dsconfigad -show) | - |
+| device_identity | ou | linux | supported | 2 | run_bounded_subprocess(realm list) [fallback: /etc/sssd/sssd.conf read] | - |
+| device_identity | ou | macos | supported | 2 | run_bounded_subprocess(dsconfigad -show) + native parser (device_identity_macos.hpp) | - |
 | device_identity | ou | windows | supported | 1 | GetComputerObjectNameA | - |
 | diagnostics | log_level | linux | supported | 1 | in-process agent config (agent.log_level) | - |
 | diagnostics | log_level | macos | supported | 1 | in-process agent config (agent.log_level) | - |
@@ -328,35 +328,35 @@ implementation is.
 | filesystem | delete_lines | linux | supported | 1 | atomic_write_file | - |
 | filesystem | delete_lines | macos | supported | 1 | atomic_write_file | - |
 | filesystem | delete_lines | windows | supported | 1 | atomic_write_file | - |
-| firewall | state | linux | supported | 3 | firewall-cmd/ufw/iptables via popen | - |
-| firewall | state | macos | supported | 3 | socketfilterfw/pfctl via popen | - |
-| firewall | state | windows | supported | 3 | netsh via popen | - |
-| firewall | rules | linux | supported | 3 | firewall-cmd/ufw/iptables via popen | - |
-| firewall | rules | macos | supported | 3 | pfctl via popen | - |
-| firewall | rules | windows | supported | 3 | netsh via popen | - |
+| firewall | state | linux | supported | 1 | firewalld sd-bus (rung 1), else ufw/iptables via run_bounded_subprocess (rung 2) | nftables backend not yet implemented -- falls through to ufw/iptables |
+| firewall | state | macos | supported | 2 | socketfilterfw/pfctl via run_bounded_subprocess | - |
+| firewall | state | windows | supported | 1 | INetFwPolicy2 COM (per-profile FirewallEnabled) | - |
+| firewall | rules | linux | supported | 1 | firewalld sd-bus (rung 1), else ufw/iptables via run_bounded_subprocess (rung 2) | nftables backend not yet implemented -- falls through to ufw/iptables |
+| firewall | rules | macos | supported | 2 | pfctl via run_bounded_subprocess | - |
+| firewall | rules | windows | supported | 1 | INetFwPolicy2 COM (INetFwRules enumeration) | - |
 | hardware | manufacturer | linux | supported | 1 | /sys/class/dmi/id/sys_vendor | - |
-| hardware | manufacturer | macos | supported | 3 | popen(sysctl -n hw.manufacturer) | - |
+| hardware | manufacturer | macos | supported | 1 | sysctlbyname(hw.manufacturer) | - |
 | hardware | manufacturer | windows | supported | 1 | WMI Win32_ComputerSystem.Manufacturer | - |
 | hardware | model | linux | supported | 1 | /sys/class/dmi/id/product_name | - |
-| hardware | model | macos | supported | 3 | popen(sysctl -n hw.model) | - |
+| hardware | model | macos | supported | 1 | sysctlbyname(hw.model) | - |
 | hardware | model | windows | supported | 1 | WMI Win32_ComputerSystem.Model | - |
 | hardware | bios | linux | supported | 1 | /sys/class/dmi/id/bios_vendor + bios_version + bios_date | - |
-| hardware | bios | macos | supported | 3 | popen(system_profiler SPHardwareDataType, grep 'Boot ROM', awk) | - |
+| hardware | bios | macos | supported | 2 | run_bounded_subprocess(system_profiler SPHardwareDataType) + native parser (hardware_macos_bios.hpp) | - |
 | hardware | bios | windows | supported | 1 | WMI Win32_BIOS | - |
 | hardware | processors | linux | supported | 1 | /proc/cpuinfo | - |
-| hardware | processors | macos | supported | 3 | popen(sysctl machdep.cpu.*, hw.*cpu*) | - |
+| hardware | processors | macos | supported | 1 | sysctlbyname(machdep.cpu.*, hw.*cpu*) | - |
 | hardware | processors | windows | supported | 1 | WMI Win32_Processor | - |
-| hardware | memory | linux | constrained | 3 | popen(dmidecode -t memory) | falls back to the aggregate MemTotal from /proc/meminfo (no per-DIMM detail) when dmidecode is unavailable or unprivileged |
-| hardware | memory | macos | constrained | 3 | popen(sysctl -n hw.memsize) | aggregate total only, no per-DIMM breakdown (macOS has no public per-DIMM API) |
+| hardware | memory | linux | constrained | 2 | run_bounded_subprocess(dmidecode -t memory) | falls back to the aggregate MemTotal from /proc/meminfo (no per-DIMM detail) when dmidecode is unavailable or unprivileged |
+| hardware | memory | macos | constrained | 1 | sysctlbyname(hw.memsize) | aggregate total only, no per-DIMM breakdown (macOS has no public per-DIMM API) |
 | hardware | memory | windows | supported | 1 | WMI Win32_PhysicalMemory | - |
-| hardware | disks | linux | supported | 3 | popen(lsblk) | - |
-| hardware | disks | macos | supported | 3 | popen(system_profiler SPStorageDataType SPNVMeDataType SPSerialATADataType -json) | - |
+| hardware | disks | linux | supported | 1 | /sys/block/*/{size,device/model} native walk | - |
+| hardware | disks | macos | supported | 2 | run_bounded_subprocess(system_profiler SPStorageDataType SPNVMeDataType SPSerialATADataType -json) + native parser (hardware_disks_macos.hpp) | - |
 | hardware | disks | windows | supported | 1 | WMI Win32_DiskDrive | - |
 | hardware | drivers | linux | supported | 1 | /proc/modules | - |
 | hardware | drivers | macos | unsupported | - | - | - |
 | hardware | drivers | windows | supported | 1 | WMI Win32_PnPSignedDriver | - |
 | hardware | system | linux | supported | 1 | /sys/class/dmi/id/product_serial + product_uuid | - |
-| hardware | system | macos | supported | 3 | popen(ioreg -rd1 -c IOPlatformExpertDevice, awk) | - |
+| hardware | system | macos | supported | 1 | IOServiceGetMatchingService(IOPlatformExpertDevice) + IORegistryEntryCreateCFProperty(kIOPlatformSerialNumberKey/kIOPlatformUUIDKey) | - |
 | hardware | system | windows | supported | 1 | WMI Win32_BIOS.SerialNumber + Win32_ComputerSystemProduct.UUID | - |
 | http_client | download | linux | supported | 1 | cpp-httplib (native sockets) | - |
 | http_client | download | macos | supported | 1 | cpp-httplib (native sockets) | - |
@@ -395,7 +395,7 @@ implementation is.
 | interaction | set_dnd | macos | supported | 1 | local_kv_store | - |
 | interaction | set_dnd | windows | supported | 1 | local_kv_store | - |
 | ioc | check | linux | supported | 1 | procfs | - |
-| ioc | check | macos | supported | 3 | lsof | - |
+| ioc | check | macos | supported | 1 | libproc | UDP rows carry an empty state (no fabricated "LISTEN") — a real UDP listener still matches a port check, but its detail text differs from a TCP match; a port shared by more than one process (SO_REUSEPORT, prefork) reports the pid of one arbitrarily-chosen owner in its match detail, not every owner |
 | ioc | check | windows | supported | 1 | iphlpapi_dnsapi | - |
 | license_scan | list | linux | supported | 3 | popen(rpm/dpkg-query/openssl) | - |
 | license_scan | list | macos | constrained | 1 | filesystem_probe(glob+plist) | binary (bplist00) Info.plist files are not parsed; falls back to the bundle name with an empty version |
@@ -446,19 +446,19 @@ implementation is.
 | network_config | arp | macos | unsupported | - | - | - |
 | network_config | arp | windows | supported | 1 | GetIpNetTable2 | - |
 | network_diag | listening | linux | supported | 1 | /proc/net/tcp[6] | - |
-| network_diag | listening | macos | supported | 3 | lsof via popen | - |
+| network_diag | listening | macos | supported | 1 | libproc | a socket shared by more than one process (SO_REUSEPORT, prefork) surfaces under one arbitrarily-chosen owning PID, not one row per owner |
 | network_diag | listening | windows | supported | 1 | GetExtendedTcpTable | - |
 | network_diag | connections | linux | supported | 1 | /proc/net/tcp[6] | - |
-| network_diag | connections | macos | supported | 3 | lsof via popen | - |
+| network_diag | connections | macos | supported | 1 | libproc | a socket shared by more than one process (SO_REUSEPORT, prefork) surfaces under one arbitrarily-chosen owning PID, not one row per owner |
 | network_diag | connections | windows | supported | 1 | GetExtendedTcpTable | - |
 | os_info | os_name | linux | supported | 1 | /etc/os-release | - |
-| os_info | os_name | macos | supported | 3 | popen(sw_vers -productName/-productVersion) | - |
+| os_info | os_name | macos | supported | 1 | SystemVersion.plist + sysctlbyname | - |
 | os_info | os_name | windows | supported | 1 | Reg*W CurrentVersion\\ProductName + build-number correction | - |
 | os_info | os_version | linux | supported | 1 | uname(2) | - |
-| os_info | os_version | macos | supported | 3 | uname(2) + popen(sw_vers -productVersion) | - |
+| os_info | os_version | macos | supported | 1 | uname(2) + SystemVersion.plist + sysctlbyname | - |
 | os_info | os_version | windows | supported | 1 | RtlGetVersion (ntdll) | - |
 | os_info | os_build | linux | supported | 1 | /proc/version | - |
-| os_info | os_build | macos | supported | 3 | popen(sw_vers -buildVersion) | - |
+| os_info | os_build | macos | supported | 1 | SystemVersion.plist + sysctlbyname | - |
 | os_info | os_build | windows | supported | 1 | Reg*W CurrentBuildNumber + UBR | - |
 | os_info | os_arch | linux | supported | 1 | uname(2) | - |
 | os_info | os_arch | macos | supported | 1 | uname(2) | - |
@@ -467,32 +467,32 @@ implementation is.
 | os_info | uptime | macos | supported | 1 | sysctl(2) KERN_BOOTTIME | - |
 | os_info | uptime | windows | supported | 1 | GetTickCount64 | - |
 | processes | list | linux | supported | 1 | /proc enumeration | - |
-| processes | list | macos | supported | 3 | popen(ps -axo pid,ppid,comm) | - |
+| processes | list | macos | supported | 1 | sysctl(KERN_PROC_ALL) | - |
 | processes | list | windows | supported | 1 | CreateToolhelp32Snapshot | - |
 | processes | list_hashed | linux | supported | 1 | /proc enumeration + readlink(/proc/<pid>/exe) + SHA-256 | - |
-| processes | list_hashed | macos | supported | 3 | popen(ps -axo pid,ppid,comm) + proc_pidpath + SHA-256 | - |
+| processes | list_hashed | macos | supported | 1 | sysctl(KERN_PROC_ALL) + proc_pidpath + SHA-256 | - |
 | processes | list_hashed | windows | supported | 1 | CreateToolhelp32Snapshot + QueryFullProcessImageNameW + SHA-256 | - |
 | processes | list_tree | linux | supported | 1 | /proc enumeration + readlink(/proc/<pid>/exe) + SHA-256 | - |
-| processes | list_tree | macos | supported | 3 | popen(ps -axo pid,ppid,comm) + proc_pidpath + SHA-256 | - |
+| processes | list_tree | macos | supported | 1 | sysctl(KERN_PROC_ALL) + proc_pidpath + SHA-256 | - |
 | processes | list_tree | windows | supported | 1 | CreateToolhelp32Snapshot + QueryFullProcessImageNameW + SHA-256 | - |
 | processes | query | linux | supported | 1 | /proc enumeration | - |
-| processes | query | macos | supported | 3 | popen(ps -axo pid,ppid,comm) | - |
+| processes | query | macos | supported | 1 | sysctl(KERN_PROC_ALL) | - |
 | processes | query | windows | supported | 1 | CreateToolhelp32Snapshot | - |
 | procfetch | procfetch_fetch | linux | supported | 1 | /proc enumeration + OpenSSL EVP SHA-1 | - |
 | procfetch | procfetch_fetch | macos | supported | 1 | libproc (proc_listpids/proc_pidpath) + OpenSSL EVP SHA-1 | - |
 | procfetch | procfetch_fetch | windows | supported | 1 | CreateToolhelp32Snapshot + BCrypt SHA-1 | - |
-| quarantine | quarantine | linux | supported | 3 | sudo iptables via popen | - |
-| quarantine | quarantine | macos | supported | 3 | sudo pfctl via popen | - |
-| quarantine | quarantine | windows | supported | 3 | netsh via popen | - |
-| quarantine | unquarantine | linux | supported | 3 | sudo iptables via popen | - |
-| quarantine | unquarantine | macos | supported | 3 | sudo pfctl via popen | - |
-| quarantine | unquarantine | windows | supported | 3 | netsh via popen | - |
-| quarantine | status | linux | supported | 3 | sudo iptables via popen | - |
-| quarantine | status | macos | supported | 3 | sudo pfctl via popen | - |
-| quarantine | status | windows | supported | 3 | netsh via popen | - |
-| quarantine | whitelist | linux | supported | 3 | sudo iptables via popen | - |
-| quarantine | whitelist | macos | supported | 3 | sudo pfctl via popen | - |
-| quarantine | whitelist | windows | supported | 3 | netsh via popen | - |
+| quarantine | quarantine | linux | supported | 2 | sudo-governed iptables via bounded runner argv | - |
+| quarantine | quarantine | macos | supported | 2 | sudo-governed pfctl via bounded runner argv | - |
+| quarantine | quarantine | windows | supported | 2 | netsh via bounded runner argv (service-account privilege, no sudo) | - |
+| quarantine | unquarantine | linux | supported | 2 | sudo-governed iptables via bounded runner argv | - |
+| quarantine | unquarantine | macos | supported | 2 | sudo-governed pfctl via bounded runner argv | - |
+| quarantine | unquarantine | windows | supported | 2 | netsh via bounded runner argv (service-account privilege, no sudo) | - |
+| quarantine | status | linux | supported | 2 | sudo-governed iptables via bounded runner argv | - |
+| quarantine | status | macos | supported | 2 | sudo-governed pfctl via bounded runner argv | - |
+| quarantine | status | windows | supported | 2 | netsh via bounded runner argv (service-account privilege, no sudo) | - |
+| quarantine | whitelist | linux | supported | 2 | sudo-governed iptables via bounded runner argv | - |
+| quarantine | whitelist | macos | supported | 2 | sudo-governed pfctl via bounded runner argv | - |
+| quarantine | whitelist | windows | supported | 2 | netsh via bounded runner argv (service-account privilege, no sudo) | - |
 | rdp_control | set_state | linux | unsupported | - | - | - |
 | rdp_control | set_state | macos | unsupported | - | - | - |
 | rdp_control | set_state | windows | supported | 1 | Win32 registry + INetFwPolicy2 COM + SCM | - |

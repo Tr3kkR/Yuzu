@@ -187,7 +187,12 @@ gateway/          Erlang/OTP gateway (standalone rebar3 project)
 sdk/              Public SDK — stable C ABI (plugin.h) + C++23 wrapper
 common/include/   Shared header-only include root between server/core and agents/ (#2549) —
                   pure decision code only: no I/O, no store/wire types, no server-trust-
-                  boundary authority
+                  boundary authority. One named exception, not a category: shutdown_watcher.hpp
+                  (#3007) — a self-pipe fd, a dedicated watcher thread, and firewalled failure-
+                  path logging; the signal-handler side stays a single async-signal-safe write().
+                  No store/wire access, no trust-boundary authority. A new I/O-bearing file here
+                  must be named here (amend this annotation) — this does not open the root to
+                  I/O generally
 proto/            Protobuf definitions (source of truth for wire protocol)
 tests/unit/       Catch2 unit tests
 docs/             Architecture docs, conventions, roadmap, capability map

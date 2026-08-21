@@ -1,7 +1,7 @@
 ## Hardware Inventory Plugin Definitions
 ## Queries manufacturer, model, BIOS/UEFI, processor, memory, and disk
 ## information from each endpoint using WMI (Windows), sysfs/dmidecode
-## (Linux), or sysctl/system_profiler (macOS).
+## (Linux), or sysctlbyname/IOKit and system_profiler (macOS).
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -13,7 +13,7 @@ metadata:
   description: >
     Returns the system manufacturer string (e.g. "Dell Inc.",
     "Apple Inc.", "Lenovo"). Uses Win32_ComputerSystem on Windows,
-    /sys/class/dmi/id/sys_vendor on Linux, sysctl on macOS.
+    /sys/class/dmi/id/sys_vendor on Linux, sysctlbyname(3) on macOS.
   tags: [hardware, inventory]
 
 spec:
@@ -63,7 +63,7 @@ metadata:
   description: >
     Returns the system model or product name (e.g. "OptiPlex 7090",
     "MacBookPro18,1"). Uses Win32_ComputerSystem on Windows,
-    /sys/class/dmi/id/product_name on Linux, sysctl hw.model on macOS.
+    /sys/class/dmi/id/product_name on Linux, sysctlbyname(3) hw.model on macOS.
   tags: [hardware, inventory]
 
 spec:
@@ -167,7 +167,7 @@ metadata:
   description: >
     Lists installed CPUs with model name, physical core count, logical
     thread count, and clock speed in MHz. Uses Win32_Processor on Windows,
-    /proc/cpuinfo on Linux, sysctl on macOS. Returns one row per physical
+    /proc/cpuinfo on Linux, sysctlbyname(3) on macOS. Returns one row per physical
     CPU socket.
   tags: [hardware, inventory, cpu]
 
@@ -227,7 +227,7 @@ metadata:
     Lists installed memory DIMMs with slot locator, capacity in MB,
     memory type (DDR3/DDR4/DDR5), and speed in MHz. Uses
     Win32_PhysicalMemory on Windows, dmidecode on Linux (falls back to
-    /proc/meminfo total), sysctl hw.memsize on macOS.
+    /proc/meminfo total), sysctlbyname(3) hw.memsize on macOS.
   tags: [hardware, inventory, memory]
 
 spec:
@@ -283,7 +283,7 @@ metadata:
   description: >
     Lists physical disk drives with model name, capacity in GB, media
     type (SSD/HDD/Removable), and interface type (SCSI, NVMe, SATA, USB).
-    Uses Win32_DiskDrive on Windows, lsblk on Linux, system_profiler on
+    Uses Win32_DiskDrive on Windows, native /sys/block on Linux, system_profiler on
     macOS.
   tags: [hardware, inventory, storage]
 
@@ -410,7 +410,9 @@ metadata:
     Windows reads Win32_BIOS.SerialNumber and Win32_ComputerSystemProduct.UUID via
     WMI; Linux reads /sys/class/dmi/id/product_serial and product_uuid (0400, via
     the agent's cap_dac_read_search capability); macOS reads IOPlatformSerialNumber
-    and IOPlatformUUID from ioreg. An absent value (e.g. a VM with no SMBIOS serial)
+    and IOPlatformUUID via native IOKit (IOServiceGetMatchingService +
+    IORegistryEntryCreateCFProperty against IOPlatformExpertDevice). An absent
+    value (e.g. a VM with no SMBIOS serial)
     returns the literal "unknown". This is the building block the device_ci
     daily-sync source (ADR-0016) collects in-process.
   tags: [hardware, inventory]

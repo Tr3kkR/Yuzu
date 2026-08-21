@@ -8,6 +8,8 @@
 
 #include "guardian_io_executor.hpp"
 
+#include "test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
@@ -45,18 +47,9 @@ struct Gate {
     }
 };
 
-// Bounded busy-wait on a predicate (the notification of a released detached worker
-// arrives before its ticket destructor runs, so counts settle asynchronously).
-template <class Pred>
-bool spin_until(Pred p, std::chrono::milliseconds timeout = 5s) {
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (p())
-            return true;
-        std::this_thread::sleep_for(1ms);
-    }
-    return p();
-}
+// spin_until / kSpinScale promoted to yuzu::test (test_helpers.hpp) — #2238 adversarial
+// review follow-up (CON-S4 third user, missed by the original promotion).
+using yuzu::test::spin_until;
 
 constexpr std::size_t kFile = io_class_index(IoClass::File);
 constexpr std::size_t kSvc = io_class_index(IoClass::Service);

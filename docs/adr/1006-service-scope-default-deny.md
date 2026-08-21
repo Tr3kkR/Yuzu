@@ -225,10 +225,41 @@ reasoning): `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md
   otherwise leave every `denied`-class MCP tool structurally invisible to
   the signal this bullet names (found by `sre` in this PR's own governance
   review, fixed in the same round).
-- **Service-tag writes are an accepted, unhardened boundary for now.**
-  Whoever can set an agent's `service` tag effectively moves that agent's
-  scope membership; this PR does not harden that write path. Tracked as
-  its own follow-up review, not folded in here.
+- **Service-tag writes are now hardened (#3289, follow-up to this PR).** Two
+  distinct gaps existed. (1) `require_scoped_permission`'s service branch
+  authorized a `Tag:Write`/`Tag:Delete` mutation by reading the target
+  agent's PRE-WRITE `service` tag — so a service-scoped token could rewrite
+  or delete its own cohort's `service` tag and move an agent out of (or a
+  different agent into) its own confinement, a TOCTOU on the very datum the
+  gate was checking. (2) the agent's own gRPC `Register` sync path
+  (`TagStore::sync_agent_tags`) had no restriction at all — see the
+  Bootstrap-gap bullet below. Both are now closed: a service-scoped session
+  is denied — value-blind, before the scoped gate ever runs — at every
+  REST/legacy-dashboard/MCP tag-mutation site, and the `service` key is
+  silently dropped from agent-sourced sync (a pre-existing agent-authored
+  row self-heals — purges on the agent's next sync). A plain
+  `Tag:Write`/`Tag:Delete` grant remains SUFFICIENT authority for a
+  non-service-scoped holder — Administrator, Operator, and an unscoped
+  ITServiceOwner grant are already fleet-scoped roles, so their ability to
+  move a `service` tag is not itself a confinement bypass; only a
+  service-scoped token's own write is restricted, because for that caller
+  the tag being written IS the confinement boundary. A third, related
+  finding — a live agent's in-memory self-reported tags shadowing the store
+  during scope-DSL evaluation (`agent_registry.cpp`), independent of any
+  TagStore write — surfaced during the same review and was tracked
+  separately as #3295; it is now CLOSED: the `evaluate_scope` `tag:<key>`
+  resolver is store-first (a TagStore row of any source wins over a
+  connected agent's live claim; the in-memory value answers only when the
+  store has no row at all — e.g. a gateway-proxied agent, whose tags never
+  reach the store), and `register_agent` drops an agent-claimed `service`
+  key from the session entirely at ingest, the same way sync already drops
+  it from the store. `derive_exec_visible` and the dynamic service
+  management groups (`server.cpp`) were already store-only and unaffected
+  by #3295 either way — the confinement ceiling this ADR establishes was
+  never in question; the fix closes a narrower gap in dispatch-targeting
+  and cohort-selection scope-DSL evaluation. Full precedence rule:
+  `docs/asset-tagging-guide.md` "Tag source precedence (read time,
+  scope-DSL, #3295)".
 - **No cached derived confinement sets.** Every check in this design reads
   live state (RBAC grants, the allow-list, tag data) — no precomputed
   "this token can see these agents" cache is introduced, avoiding a whole
@@ -238,11 +269,17 @@ reasoning): `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md
   (ADR-0033) is a separate, already-decided mechanism; migrating its four
   remaining `authorize_list_read` callers off a supersede-style
   composition is deferred to Phase 2 (§3d), not part of this PR.
-- **Bootstrap gap, by design.** An empty-cohort service token cannot
-  bootstrap its own scope — there is no route it can call, under this
-  design, that would let it discover or claim a service tag for itself.
-  Onboarding a brand-new service therefore still needs an interactive or
-  otherwise-unscoped path; see the operator runbook in
+- **Bootstrap gap — true for tokens by design; was NOT true for agents until
+  #3289.** An empty-cohort service TOKEN cannot bootstrap its own scope via
+  any REST/MCP route: no route lets a token holder discover or claim a
+  service tag for itself. That was never the whole boundary, though — the
+  AGENT's own gRPC `Register` call (`TagStore::sync_agent_tags`) had no
+  equivalent restriction, so an un-tagged (or freshly re-tagged) agent could
+  freely self-claim its own `service` value on every Register, independent
+  of any token. #3289 closed that path: `sync_agent_tags` now drops the
+  `service` key from agent-supplied tags outright. Onboarding a brand-new
+  service still needs an interactive or otherwise-unscoped path to assign
+  the FIRST `service` tag on a device; see the operator runbook in
   `docs/user-manual/authentication.md`.
 - **The per-file `deny_service_scoped_*` helpers become largely redundant
   double-denies** for any route that also calls `require_permission`
@@ -269,3 +306,36 @@ reasoning): `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md
   residual per-file helpers only remain for the smaller, now-closed §3e
   set, where the cost of a shared chokepoint no longer clearly outweighs
   the risk of a mid-migration call-site gap.
+
+## Update (2026-08-20, #3290 — Phase 2 begins)
+
+The first Phase 2 migration landed: `GET /api/v1/inventory/software` +
+its MCP twin `query_installed_software` are now on `require_fleet_read`,
+with their `deny_fleet_wide_service_scoped`/blanket-deny call sites
+retired. Two corrections to this ADR's own text, found while implementing:
+
+- **"Metric-prioritized" (Decision 2, above) does not hold yet.** There is
+  no production fleet, so `yuzu_auth_service_scope_default_denied_total`
+  carries no real traffic to rank migration order by. The substitute is
+  **documented reasoning** — rank by plausible ITServiceOwner value
+  (read-only high-value fleet reads first, mutations last) with the
+  reasoning recorded per migration, satisfying "rather than guessing" in
+  spirit without the metric data the original wording assumed would
+  exist by now. Revisit this bullet once real traffic exists.
+- **`require_fleet_read` gained the caller-class branches Decision 3
+  above never mentions needing.** Phase 0 (PR #3216) shipped it with none
+  of `require_permission`/`require_list_read`'s elevated/engine/mcp_tier
+  handling — harmless while it had zero callers, but a real regression
+  the moment a route migrates onto it: an engine principal under RBAC-off
+  would otherwise fall through to `authorize_list_read`'s legacy-open
+  `AdmitAll` (the exact fleet-wide-Read-on-RBAC-off hole Decision 3's
+  engine carve-out exists to close everywhere else), and a JIT-elevated
+  operator with no underlying grant would otherwise 403 (the #3038
+  regression class). #3290 added these branches, mirroring
+  `require_list_read`'s ladder, not `require_permission`'s (no
+  belt-and-braces service-scope check — `require_fleet_read` has no
+  `kServiceScopeGlobalSafe` allow-list for a corrupted engine row to
+  bypass in the first place).
+
+Ranked backlog, prioritization reasoning, and the migration checklist for
+subsequent routes: `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`.

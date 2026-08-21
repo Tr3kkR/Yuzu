@@ -178,7 +178,9 @@ public:
     [[nodiscard]] std::expected<bool, TagReadError> delete_tag(const std::string& agent_id,
                                                                const std::string& key);
 
-    /// Sync tags from agent heartbeat/registration — sets source="agent".
+    /// Sync tags from agent registration (gRPC Register only — there is no
+    /// heartbeat sync path, and ProxyRegister/gateway-proxied agents do not
+    /// call this at all, tracked as #3372) — sets source="agent".
     /// One transaction: delete all agent-sourced tags, re-insert the
     /// reported set (operator/API rows survive per #1411; the precedence
     /// no-op on a per-row conflict is success, not failure). Malformed

@@ -78,7 +78,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--mcp-disable` | off | Disable the MCP (Model Context Protocol) endpoint entirely. When set, all requests to `/mcp/v1/` are rejected with a JSON-RPC error. Use this in air-gapped or high-security environments where AI integration is not desired. Env: `YUZU_MCP_DISABLE`. |
 | `--mcp-read-only` | off | Restrict MCP to read-only tools only. Write and execute operations (Phase 2) are rejected even if the MCP token's tier would normally allow them. Env: `YUZU_MCP_READ_ONLY`. |
 | `--mcp-no-streaming` | off | Disable the MCP **Streamable HTTP** transport (ADR-1005 Decision 15): no `Mcp-Session-Id` minting, `GET`/`DELETE /mcp/v1/` return `405`, and only plain JSON-RPC POST is served. The spec-required `202` status on notification POSTs still applies. Use where a buffering reverse proxy interferes with streaming. Env: `YUZU_MCP_NO_STREAMING`. |
-| `--mcp-enable-streamed-post` / `--no-mcp-streamed-post` | on | Enable **SSE-on-POST** (streamed POST) for `execute_instruction` callers that supply a `progressToken`. **Ships ON** — the transport machinery is complete and reviewed, and the four defects that previously gated the on-by-default flip are fixed: #2739 (the 120 s response cap is now enforced on a busy execution — after it expires the bridge delivers one final drain of already-latched progress and then settles, bounding the response at the cap plus at most two ~3 s pump ticks plus one mailbox drain), #2740 (a committed-but-undelivered final no longer locks a session out of streaming — admission reclaims the slot and audits it), #2785 (streamed-POST frames now carry the replay-ring event id, so a POST-only client can build a `Last-Event-ID` resume cursor) and #2789 (end-to-end coverage of the per-principal admission reject). Pass `--no-mcp-streamed-post` to opt out. Distinct from `--mcp-no-streaming`, which disables the whole transport including the session lifecycle and GET channel. |
+| `--mcp-enable-streamed-post` / `--no-mcp-streamed-post` | on | Enable **SSE-on-POST** (streamed POST) for `execute_instruction` callers that supply a `progressToken`. **Ships ON** — the transport machinery is complete and reviewed, and the four defects that previously gated the on-by-default flip are fixed: #2739 (the 120 s response cap is now enforced on a busy execution — after it expires the bridge delivers one final drain of already-latched progress and then settles, bounding the response at the cap plus at most two ~3 s pump ticks plus one progress drain), #2740 (a committed-but-undelivered final no longer locks a session out of streaming — admission reclaims the slot and audits it), #2785 (streamed-POST frames now carry the replay-ring event id, so a POST-only client can build a `Last-Event-ID` resume cursor) and #2789 (end-to-end coverage of the per-principal admission reject). Pass `--no-mcp-streamed-post` to opt out. Distinct from `--mcp-no-streaming`, which disables the whole transport including the session lifecycle and GET channel. |
 | `--mcp-allowed-origin` | *(none)* | **Repeatable.** An allowed `Origin` header value (`scheme://host:port`, exact match) for `/mcp/v1/` DNS-rebinding defence. An **absent** `Origin` is always allowed (the endpoint requires a credential); an **empty allowlist rejects any *present* Origin** (secure default) — browser-based MCP clients must be listed explicitly, non-browser clients need no configuration. Env: `YUZU_MCP_ALLOWED_ORIGINS`. |
 | `--max-sse-streams` | `128` | **Concurrent held-open SSE responses this server is sized for, across EVERY streaming surface** — `GET /mcp/v1/`, MCP streamed POST, `GET /api/v1/events`, the dashboard executions drawer, and the legacy `/events` stream. The HTTP worker pool is derived *from* this number: cpp-httplib is thread-per-connection, so each held-open response pins one worker for its whole life. That thread burns no CPU, and its resident cost is a fraction of a stack reservation that is virtual and platform-dependent (8 MB on Linux/glibc, 1 MB on Windows, 512 KB for macOS secondary threads). The resident fraction itself is **not yet measured** on our platforms (ADR-0034), so treat the default as a starting point rather than a sizing guarantee until a per-platform baseline exists. Utilisation is `yuzu_http_held_open_responses / yuzu_http_held_open_capacity`. The ceiling is thread-count; see ADR-0034. Env: `YUZU_MAX_SSE_STREAMS`. |
 | `--mcp-max-streams-per-principal` | `4` | Max concurrent MCP SSE streams for one principal. An **anti-monopoly policy, not a capacity limit** — capacity is `--max-sse-streams`. Stops a single agentic token taking the channel; does not ration the fleet. Env: `YUZU_MCP_MAX_STREAMS_PER_PRINCIPAL`. |
@@ -737,7 +737,8 @@ Three operator-visible consequences:
   (120 s), enforced on a busy execution too (#2739): after the cap expires the
   bridge delivers one final drain of already-latched progress and then settles,
   so the bound is the cap plus at most two ~3 s pump ticks plus one bounded
-  mailbox drain and its socket-write time (the server's 30 s write timeout,
+  progress drain (a single latest-wins snapshot since #2412) and its
+  socket-write time (the server's 30 s write timeout,
   `set_write_timeout` in `server.cpp`) — worst case ~156 s, not the execution's
   duration. It leases from the same held-open budget as the GET channel, so
   total concurrency is unchanged — but `TimeoutStopSec` and any container
@@ -1291,6 +1292,15 @@ MFA CLI flags: `--mfa-enforcement` (default `optional`; `admin-only`/`required` 
 **Who this affects.** Any integration authenticating with a service-scoped API token that currently reaches fleet-wide data or actions through a route not on the seeded-empty allow-list will start receiving `403` on this upgrade — this is the intended fix, not a regression. This is a strictly larger set than the PR 2 note above: that note's fixes were routes someone had already found; this flip additionally denies routes nobody has found yet, the moment they're reached. Ordinary (non-service-scoped) operator sessions are unaffected.
 
 **What to do.** Same guidance as the PR 2 note above: use a global (non-service-scoped) credential for anything that genuinely needs fleet-wide reach, or the per-device REST/MCP reads that stay confined to the token's own service. There is no per-deployment or per-operator way to widen the allow-list — it is compile-time, and widening it for a specific `(securable, operation)` pair is a security decision requiring `security-guardian` sign-off, not an admin setting. If a service-scoped token's workflow breaks on this upgrade and there is no per-device equivalent for what it was doing, that workflow needs a non-service-scoped credential going forward; there is no config flag to opt back into the old admit-by-default behavior for one route or one deployment.
+
+### vNEXT — `GET /api/v1/inventory/software` and MCP `query_installed_software` diverge from the rest of the service-scoped-deny family: filtered data, not a 403 (#3290 Phase 2) (still in this vNEXT batch)
+
+**What changed.** Both notes immediately above this one (PR 2's enumerated fixes, then "the flip") describe `GET /api/v1/inventory/software` and MCP `query_installed_software` as denying a service-scoped API token outright (`403`). This still-unreleased batch changes that a second time, before either prior note has shipped: both surfaces now migrate onto `AuthRoutes::require_fleet_read`, a real per-request confinement gate — a correctly-confined service-scoped token gets a **filtered `200`** (rows limited to its own service-tagged agents, intersected with any management-group grant), not a `403`. This is a least-privilege improvement, not a widening: no caller sees any *row* it did not already hold a grant for. (A service-scoped caller's `devices_omitted` count can now be nonzero when a name-filtered query matches software outside its own scope — a bounded existence-only signal, reviewed and accepted, see `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`'s UP-2 ruling — not a row-level disclosure.) The two prior notes' own routes/tools are otherwise unaffected — only this one route pair's end-state changes. Because all three notes land in the same unreleased version, an operator reading only the two notes above would be told to expect a permanent `403` from these two surfaces that will not, in fact, occur. Full behavior table (every caller class, not just this one):
+`docs/security-reviews/service-scope-phase2-migrations-2026-08.md`.
+
+**Who this affects.** Any integration using a service-scoped API token against these two specific surfaces. If it was built to expect (or work around) the `403` the notes above describe, it will now receive real data instead — code that specifically branches on a `403` here to mean "not available to this token" should be updated; code that simply surfaces the error to an operator needs no change, since the success case is a strict improvement.
+
+**What to do.** Nothing required for the common case. If your integration has error-handling logic keyed specifically on a `403` from these two surfaces, update it to handle the real filtered result instead.
 
 ### v0.10.0 — API token revocation is owner-scoped
 
@@ -2895,7 +2905,7 @@ Yuzu exposes four HTTP probe endpoints for orchestrators, load balancers, and mo
 | Path | Use case | Body | Draining-aware |
 |---|---|---|---|
 | `/livez` | Kubernetes liveness probe — fast check that the HTTP listener is up. | `{"status":"ok"}` | No |
-| `/readyz` | Kubernetes readiness probe — covers per-store migration completion AND graceful-shutdown drain. | `{"status":"ready"}` (200), `{"status":"draining"}` (503), or `{"status":"not ready","failed_stores":["api_token_store", ...]}` (503) when a store's database failed to open at startup | **Yes** |
+| `/readyz` | Kubernetes readiness probe — covers per-store migration completion AND graceful-shutdown drain. | `{"status":"ready"}` (200), `{"status":"draining"}` (503), or `{"status":"not ready","failed_stores":["api_token_store", ...]}` (503) when a store's database failed to open at startup. A non-critical store that's on but degraded (currently: `analytics_event_store`, ADR-0049) is reported via a non-gating `"degraded":[...]` array alongside either `status` value, rather than flipping the node to not-ready. | **Yes** |
 | `/health` | Monitoring dashboards (Prometheus blackbox exporter, Datadog, Nagios). Rich JSON with per-store status, agent counts, execution stats, and version. | Structured JSON — see [REST API: Health](rest-api.md#health). | No |
 | `/api/health` | Identical alias of `/health`, provided for monitoring integrations that prefix every REST call with `/api/`. Restored in v0.12.0 (issue #620). | Identical to `/health`. | No |
 
@@ -2984,6 +2994,35 @@ exhaustion), a hard-exit handler is installed instead: the agent exits promptly
 on the FIRST signal, ungracefully — no plugin shutdown, no clean store close.
 (A default signal disposition would be discarded by PID 1 in a container, so
 the handler is the posture that stays killable.)
+
+**Stopping a wedged server (Linux/macOS, #3007).** Identical mechanism to the
+agent above, applied to the server. If a stop appears to hang: **send the
+signal a second time** (`kill -TERM <pid>` again, or a second Ctrl-C) and the
+server immediately hard-exits with code 1, no grace window — exactly like the
+agent. SQLite/Postgres state is crash-safe across the hard exit. On Windows, a
+second Ctrl-C also terminates promptly.
+
+Mechanism: `SIGTERM`/`SIGINT` (`systemctl stop`, `docker stop`, Ctrl-C)
+triggers a graceful stop on a dedicated watcher thread — HTTP admission stop,
+background thread joins, up to ~115s of stacked waits including webhook/
+offload store quiesce (see the stacked-shutdown-bound section in
+[Upgrading](upgrading.md); a rare thread-creation-exhaustion fallback path can
+push the quiesce portion alone to ~120s, worst case ~175s total, still inside
+the shipped 210s grace period), then store teardown. **A long-seeming wait can
+be completely normal, not evidence of a wedge**: each stage logs a
+`Shutting down server: waiting up to Ns for ...` line at its start, but
+nothing further until it completes or times out — so a silent gap of up to a
+minute or so between progress lines is expected, not a hang by itself. If the
+server logs `shutdown watcher unavailable` at boot, it falls back to a
+hard-exit handler: a `SIGTERM`/`SIGINT` then exits the process promptly on the
+FIRST signal, ungracefully (no store flush, no clean close) — the server keeps
+running normally until a signal actually arrives, this only changes how it
+responds once one does. Separately, a `SIGTERM`/`SIGINT` arriving before the
+server has finished starting up (`Server::create()` — TLS cert bootstrap, gRPC
+listener setup) also exits promptly with code 1 instead of attempting a
+graceful stop — a boot-time signal cannot be handled gracefully, so the server
+fails visibly rather than silently continuing to boot (or, before #3007, being
+silently ignored).
 
 **Crash-loop backstop (systemd).** The `yuzu-agent` unit sets `Restart=always` +
 `RestartSec=10`, but also `StartLimitIntervalSec=300` + `StartLimitBurst=5` (ADR-0021

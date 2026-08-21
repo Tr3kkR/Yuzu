@@ -86,6 +86,13 @@ elif host_machine.system() == 'windows'
   # its own copy, same shape as tar_test_deps' Windows block below.
   agent_test_native_deps += cxx.find_library('ws2_32')
   agent_test_native_deps += cxx.find_library('iphlpapi')
+  # test_wmi_bounded.cpp / test_wmi_local_dispatcher.cpp include the
+  # header-only agents/shared/wmi_bounded.hpp directly into this exe (same
+  # shape as tar_test_deps' Windows block) — bounded WMI needs WbemLocator
+  # (wbemuuid) + COM init/BSTR (ole32/oleaut32).
+  agent_test_native_deps += cxx.find_library('wbemuuid')
+  agent_test_native_deps += cxx.find_library('ole32')
+  agent_test_native_deps += cxx.find_library('oleaut32')
 endif
 
 # ── Test fixture: FROZEN ABI3-layout plugin (PLAN-03 — real backward-compat) ──
@@ -203,6 +210,8 @@ agent_test_exe = executable(
     'unit/test_guardian_lifecycle_journal.cpp',
     'unit/test_guardian_journal_heartbeat.cpp',
     'unit/test_guardian_health_heartbeat.cpp',
+    'unit/test_guardian_backend_heartbeat.cpp',
+    'unit/test_guardian_unsupported_heartbeat.cpp',
     'unit/test_guard_registry.cpp',
     'unit/test_guard_file.cpp',
     'unit/test_guard_service.cpp',
@@ -243,6 +252,7 @@ agent_test_exe = executable(
     'unit/test_netprobe_stats.cpp',
     'unit/test_antivirus_parsers.cpp',
     'unit/test_firewall_parsers.cpp',
+    'unit/test_firewall_local_dispatcher.cpp',
     'unit/test_agent_csr.cpp',
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
@@ -250,6 +260,7 @@ agent_test_exe = executable(
     'unit/test_device_ci_sync.cpp',
     'unit/test_sync_source_app_perf.cpp',
     'unit/test_win_str_utils.cpp',
+    'unit/test_wmi_bounded.cpp',        # shared bounded WMI helper (roadmap C-8 extraction); header-only, no separate .cpp to list
     'unit/test_installed_apps_registry_utf8.cpp',
     'unit/test_service_binpath.cpp',
     'unit/test_installed_apps_inventory.cpp',
@@ -275,6 +286,10 @@ agent_test_exe = executable(
     'unit/test_registry_local_dispatcher.cpp', # PR1.7 remediation fix #3: real registry.dll driven
                                                 # end to end via LocalDispatcher (Windows-only; a no-op
                                                 # TU elsewhere via the file's own #ifdef _WIN32 guard)
+    'unit/test_wmi_local_dispatcher.cpp',      # gate-1 remediation: real wmi.dll's query/get_instance
+                                                # actions driven end to end via LocalDispatcher, same
+                                                # pattern as test_registry_local_dispatcher.cpp above
+                                                # (Windows-only; a no-op TU elsewhere)
     'unit/test_content_dist_upload_parsers.cpp', # PR1.6b: pure upload-protocol planner/classifier (no I/O)
     'unit/test_runner_status.cpp',             # Wave 2 WP-0: pure runner-outcome -> ABI4 result-seam table
     'unit/test_host_arg.cpp',                 # Wave 2 WP-0: shared leading-'-' host-arg gate (Decision 6)
@@ -285,6 +300,8 @@ agent_test_exe = executable(
                                                 # end to end via LocalDispatcher (POSIX-only; a no-op
                                                 # TU on Windows via the file's own #ifndef _WIN32 guard)
     'unit/test_certificates_x509.cpp',        # Wave 2 WP-B: pure libcrypto PEM/DER field extraction
+    'unit/test_quarantine_parsers.cpp',       # Wave 2 WP-F: pure netsh/iptables/pfctl output parsers
+    'unit/test_quarantine_argv.cpp',          # Wave 2 WP-F remediation: pure mutating-argv construction (FN-03)
     'unit/test_network_actions_parsers.cpp',  # Wave 2 WP-D: pure resolver-flush-flag selection
     'unit/test_wol_check_plan.cpp',           # Wave 2 WP-E: pure check-mechanism decision logic
     'unit/test_services_parsers.cpp',         # Wave 2 WP-G: pure systemctl/launchctl output parsers
@@ -292,6 +309,19 @@ agent_test_exe = executable(
     'unit/test_discovery_scan_plan.cpp',      # Wave 2 WP-C: pure sweep bounds + honest-degrade decisions
     'unit/test_route_sysctl_arp.cpp',         # Wave 2 WP-C: pure sysctl NET_RT_FLAGS/RTF_LLINFO binary parser
     'unit/test_bounded_wait.cpp',             # Wave 2 WP-C remediation: uncancellable-call timeout wrapper
+    'unit/agent/test_socket_walk.cpp',        # Wave 3 PR3.1: macos_socket_walk.hpp libproc walk (Darwin-only, self-gated)
+    'unit/test_os_info_macos.cpp',            # Wave 3 PR3.1: os_info_macos.hpp SystemVersion.plist extractor (pure, every host)
+    'unit/agent/test_wave3_pr31_macos_actions.cpp', # Wave 3 PR3.1 remediation: real os_info/processes/
+                                                # network_diag/ioc .dylib driven end to end via
+                                                # LocalDispatcher (Darwin-only, self-gated) -- same
+                                                # shape as test_users_posix_actions.cpp
+    'unit/test_hardware_macos_bios.cpp',      # Wave 3 PR3.2: pure Boot ROM / System Firmware Version parser
+    'unit/test_hardware_linux_parsers.cpp',   # Wave 3 PR3.2: pure dmidecode memory parser + injected /sys/block disk-row builder
+    'unit/test_device_identity_macos.cpp',    # Wave 3 PR3.2: pure dsconfigad -show parser (device_identity's first tests)
+    'unit/test_hardware_device_identity_posix_actions.cpp', # Wave 3 PR3.2 gate-1 remediation: real
+                                                # hardware.dylib/device_identity.dylib driven end to end
+                                                # via LocalDispatcher (macOS-only; a no-op TU elsewhere
+                                                # via the file's own #if defined(__APPLE__) guard)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -311,11 +341,14 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/filesystem/src'),    # filesystem_macos_sig.hpp (#2273/1.14)
     include_directories('../agents/plugins/event_logs/src'),    # event_logs_macos.hpp (BR-08)
     include_directories('../agents/plugins/certificates/src'),  # certificates_macos_parsers.hpp (Gate-7 FIX A: pure helpers shared with the plugin)
+    include_directories('../agents/plugins/quarantine/src'),    # quarantine_parsers.hpp (Wave 2 WP-F)
     include_directories('../agents/plugins/users/src'),         # users_macos_last.hpp (qe-M1 pure parser)
     include_directories('../agents/plugins/content_dist/src'),  # content_dist_upload_parsers.hpp (PR1.6b pure helpers)
     include_directories('../agents/plugins/network_actions/src'), # network_actions_parsers.hpp (Wave 2 WP-D)
     include_directories('../agents/plugins/wol/src'),             # wol_check_plan.hpp (Wave 2 WP-E)
     include_directories('../agents/plugins/discovery/src'),      # discovery_parsers.hpp (Wave 2 WP-C pure parser)
+    include_directories('../agents/plugins/os_info/src'),        # os_info_macos.hpp (Wave 3 PR3.1 pure plist parser)
+    include_directories('../agents/plugins/device_identity/src'), # device_identity_macos.hpp (Wave 3 PR3.2 pure parser)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
@@ -338,8 +371,15 @@ agent_test_exe = executable(
   # loads the real users plugin by path -- without this, the plugin build isn't
   # ordered ahead of the test binary, and a not-yet-built plugin makes those
   # cases WARN-and-skip instead of failing (code-review re-verification finding).
+  # os_info_plugin_lib / processes_plugin_lib / network_diag_plugin_lib / ioc_plugin_lib:
+  # same reasoning, for test_wave3_pr31_macos_actions.cpp (Wave 3 PR3.1 remediation).
+  # hardware_plugin_lib / device_identity_plugin_lib (agents/plugins/{hardware,device_identity}/meson.build):
+  # test_hardware_device_identity_posix_actions.cpp loads both real plugins by
+  # path for the identical reason (Wave 3 PR3.2 gate-1 remediation).
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin,
-                users_plugin_lib],
+                users_plugin_lib, os_info_plugin_lib, processes_plugin_lib,
+                network_diag_plugin_lib, ioc_plugin_lib,
+                hardware_plugin_lib, device_identity_plugin_lib],
 )
 # Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
 # threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it
@@ -917,7 +957,7 @@ if build_server
   #     (2026-08-17, see scripts/ci/flake-retry.py's _cmd_for_case_retry);
   #   - no entry name may be a substring of another (flake-retry maps
   #     meson-junit names by longest substring match) — 'shard A'/'shard B'/
-  #     'shard C'/'shard D'/'shard E'/'shard F' and 'server unit tests' are
+  #     'shard C'/'shard D'/'shard E'/'shard F'/'shard G' and 'server unit tests' are
   #     pairwise non-substring.
   # If a quiet leg pushes a shard past the #2093 80%-of-budget warning, the first
   # move is the concurrency gate / per-op cost (Defender TEMP exclusion, RAM disk),
@@ -1023,9 +1063,10 @@ if build_server
   # 2026-08-17, see the shard-E block below).
   # When adding a new [pg] store tag: measure it, put it in whichever of B/D is
   # lighter by TIME, add it to shard C's exclusion list, AND add it to each of
-  # shard E's 22 per-clause exclusion suffixes below (all three or none — a
-  # tag added to D/C but not to every E clause double-runs any future case
-  # that also carries one of E's 22 category tags). If [rbac_store] itself
+  # shard E's AND shard G's per-clause exclusion suffixes below (all of them or
+  # none — a tag added to D/C but not to every E and G clause double-runs any
+  # future case that also carries one of their category tags; E and G hold ten
+  # each since the 2026-08-19 split). If [rbac_store] itself
   # grows toward the ceiling, split IT next (it is already the single densest
   # tag).
   #
@@ -1109,7 +1150,34 @@ if build_server
   # was verified the same way: no DSN set -> exit 0, 3 passed / 156 skipped —
   # it does NOT need --allow-running-no-tests (unlike shard D, #2092).
   test('server pg unit tests shard E', server_test_exe,
-       args: ['[pg][engine_principal]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][auth_routes]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][scim]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][saml]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][oidc]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][access_review]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][management_group]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][rbac]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][audit]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][authz]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][secrets]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][quarantine]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][agent_service]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][custom_props]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][guaranteed_state]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][notification_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][discovery]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][software_inventory]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][result_set]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][tar]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]'],
+       args: ['[pg][engine_principal]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][scim]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][oidc]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][management_group]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][rbac]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][quarantine]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][custom_props]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][guaranteed_state]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][notification_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][software_inventory]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]'],
+       suite: 'server', timeout: 600)
+  # 2026-08-19 (#3322): shard E timed out at its 600s ceiling on 10 of 14
+  # consecutive Linux gcc-15 runs, reddening dev itself — Fail: 0 every time,
+  # so nothing was failing, it simply did not finish. E held 608 of the 1876
+  # [pg] cases (32%) in one of six shards; at the ~1.0 s/case this suite runs
+  # at, that lands exactly on the ceiling.
+  #
+  # E had already been split TWICE that week (79040f7da carved it out of C,
+  # 1a509645e split E into E+F, 0f5fa1638 split F out of E again) and came
+  # straight back each time, because each split carved off a SMALL piece —
+  # F is only 138 cases — and left E oversized. This one halves it: measured
+  # E=329, G=278, against the same 607 distinct cases as before, with ZERO
+  # cases in both halves.
+  #
+  # --allow-running-no-tests: unlike E, every one of G's ten tags is DSN-gated,
+  # so on a leg with no YUZU_TEST_POSTGRES_DSN the whole entry all-skips and
+  # Catch2 exits 4 — measured: E exits 0, G exits 4. Same flag and same reason as
+  # shard D (#2092). E keeps the non-DSN cases and so still does not need it.
+  #
+  # G DEFERS TO E: every G clause additionally excludes each of E's ten
+  # remaining tags. Without that deferral 32 cases carrying a tag from each
+  # half would run in BOTH entries. If you move a tag between E and G, move
+  # it in the clause list AND in the other side's exclusion suffixes — the
+  # both-or-neither rule this file states for C/D/E applies here too.
+  test('server pg unit tests shard G', server_test_exe,
+       args: ['[pg][auth_routes]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][saml]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][access_review]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][audit]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][authz]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][secrets]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][agent_service]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][discovery]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][result_set]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][tar]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine]',
+              '--allow-running-no-tests'],
        suite: 'server', timeout: 600)
   test('server pg unit tests shard F', server_test_exe,
        args: ['[pg][dex]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment],[pg][mcp]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]'],
@@ -1117,6 +1185,29 @@ if build_server
   test('server pg unit tests shard C', server_test_exe,
        args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]'],
        suite: 'server', timeout: 600)
+
+  # ── #2519 MCP bridge teardown allocation-budget probe (separate binary) ────
+  # Same rationale as the #2270 spark probe above: a global operator new/delete
+  # replacement is process-wide, so it cannot share the multi-thousand-case
+  # server binary, and it must be ABSENT (not merely disabled) from sanitizer
+  # builds, which own the allocator themselves. Linux-only for the same
+  # ELF/libstdc++-interposition reason; see the file header.
+  if host_machine.system() == 'linux' and get_option('b_sanitize') == 'none'
+    mcp_bridge_alloc_budget_exe = executable(
+      'yuzu_mcp_bridge_alloc_budget_tests',
+      files('unit/server/test_mcp_bridge_alloc_budget.cpp'),
+      cpp_args: https_cpp_args + test_partial_init_args +
+                (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
+      dependencies: [yuzu_server_core_dep, catch2_dep,
+                     dependency('openssl', required: true, include_type: 'system')],
+    )
+    test(
+      'mcp bridge teardown allocation budget',
+      mcp_bridge_alloc_budget_exe,
+      suite: 'server',
+      timeout: 60,
+    )
+  endif
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────

@@ -1428,7 +1428,16 @@ jobs:
           echo "The Yuzu server is Linux-only (ADR-0035); Linux + Windows CI legs run the full [pg] suite."
 
       - name: Test
-        run: python3 scripts/ci/flake-retry.py --builddir build-macos -- --print-errorlogs
+        # --timeout-multiplier 2: BigMags is a shared box (2 runner agents, and
+        # the release+LTO build is co-resident after #3348), so give each test 2x
+        # meson's kill-timeout to absorb CPU/memory contention. Per tests/meson.build's
+        # own guidance, multiply for a slower environment rather than raising
+        # individual test `timeout:` kwargs. This ONLY covers a slow test being
+        # KILLED before it finishes — it does NOT help in-test wall-clock
+        # assertions (CHECK(elapsed < N), CHECK_FALSE(poll_until(...))), which flake
+        # on a loaded box and are fixed per-test (#3357, #2372, and the
+        # elapsed-ceiling issue).
+        run: python3 scripts/ci/flake-retry.py --builddir build-macos -- --print-errorlogs --timeout-multiplier 2
 
       # Same rationale as the linux + windows upload steps: keep test
       # failures diagnosable when meson's `--print-errorlogs` truncation
@@ -1735,7 +1744,20 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ccache
-          key: ccache-canary-x64-linux-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
+          # Scoped to the repo's own compiled source roots, NOT a bare `**/*.cpp`
+          # glob. `hashFiles` globs the whole workspace and does not honour
+          # .gitignore, and the vcpkg restore step ABOVE has already materialised
+          # thousands of vendored headers into vcpkg_installed/ by this point — so
+          # a bare glob hashes those too, and the key then differs between a
+          # vcpkg-cold and a vcpkg-warm run. Measured 2026-08-18: 8 distinct keys
+          # across 10 live entries, PR #3293 alone holding three at ~870 MB, and
+          # the dev-warmed entry sitting at a key no vcpkg-warm PR ever recomputes
+          # — i.e. the ccache half of the shared-scope warming was inert (#3270).
+          # These roots are every directory meson compiles (tools/ arrives via
+          # meson.build's `subdir('tools/capmatrix-gen')`). Missing a root would
+          # cost cache efficiency only, never correctness: ccache hashes the real
+          # preprocessed input, so a stale key cannot yield a wrong object.
+          key: ccache-canary-x64-linux-${{ hashFiles('agents/**/*.cpp', 'agents/**/*.hpp', 'agents/**/*.h', 'server/**/*.cpp', 'server/**/*.hpp', 'server/**/*.h', 'sdk/**/*.cpp', 'sdk/**/*.hpp', 'sdk/**/*.h', 'common/**/*.cpp', 'common/**/*.hpp', 'common/**/*.h', 'tests/**/*.cpp', 'tests/**/*.hpp', 'tests/**/*.h', 'tools/**/*.cpp', 'tools/**/*.hpp', 'tools/**/*.h') }}
           restore-keys: |
             ccache-canary-x64-linux-
 
@@ -1773,6 +1795,7 @@ jobs:
             -Dbuild_tests=true
 
       - name: Build
+        id: build-canary
         run: meson compile -C build-linux
 
       # Link-provenance assertion (#1331 review HIGH-2) — same check as the
@@ -1821,8 +1844,26 @@ jobs:
           path: ${{ github.workspace }}/vcpkg_installed
           key: ${{ steps.cache-vcpkg-canary.outputs.cache-primary-key }}
 
+      # ccache is ADDITIVE — every object in it is independently valid — so unlike
+      # the vcpkg tree above, a partial save is not a correctness problem. But key
+      # OCCUPANCY bites both classes: `cache-hit != 'true'` means a thin entry,
+      # once written, is exact-hit by every later same-source run, which then skips
+      # its own save. The key is immutable, so the cache stays thin until the
+      # sources change. Under `cancel-in-progress` on PRs, cancelled runs are the
+      # routine producer of thin entries, and #3270 makes the key stable enough for
+      # that to actually bite (#3269).
+      #
+      # So: save when Build RAN, pass or fail — a failed build still produced
+      # objects worth keeping, which is why this is not `== 'success'`. Skip when
+      # Build was cancelled or never started. The cost is that a run cancelled
+      # after a long compile loses its cache; that is small, because the push which
+      # superseded it has different sources and therefore a different key, so it
+      # could only ever have reached that entry by prefix fallback anyway.
       - name: Save ccache (canary)
-        if: always() && steps.cache-ccache-canary.outputs.cache-hit != 'true'
+        if: >-
+          always()
+          && (steps.build-canary.outcome == 'success' || steps.build-canary.outcome == 'failure')
+          && steps.cache-ccache-canary.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ccache
