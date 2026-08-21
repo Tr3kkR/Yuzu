@@ -44,7 +44,6 @@
 #include "licensing_parsers.hpp"
 #include "licensing_probes.hpp"
 #include "licensing_record.hpp"
-#include "licensing_wmi.hpp"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -63,6 +62,12 @@
 #include <user_profile_model.hpp>
 #include <win_profiles.hpp>
 #include <win_reg_handle.hpp>
+
+// Bounded WMI enumerator (roadmap C-8), hoisted to agents/shared/ — this file
+// was the reference wmi_bounded.{hpp,cpp} was extracted FROM (its own header
+// comment anticipated the move), and now consumes it instead of a
+// plugin-local copy.
+#include <wmi_bounded.hpp>
 
 #include <cstdlib>
 #include <optional>
@@ -219,6 +224,21 @@ private:
 
 // ── slp_wmi (authoritative; surface table Windows row 1) ───────────────────
 
+namespace wmi = yuzu::shared::wmi;
+
+// Thin caller of the shared bounded query — the license-specific SLP query
+// (roadmap surface table Windows row 1): all SoftwareLicensingProduct
+// instances from root\cimv2. SELECT * rather than a property list because the
+// property set drifts across Windows versions (e.g. ProductKeyChannel is
+// absent on older builds and a named-property query would fail outright);
+// the caller reads Name, Description, LicenseStatus, GracePeriodRemaining,
+// PartialProductKey, ProductKeyChannel and EvaluationEndDate from the row map
+// and filters to rows with a PartialProductKey or a meaningful (non-zero)
+// LicenseStatus.
+wmi::BoundedQueryResult query_software_licensing_products(const wmi::BoundedQueryOptions& opts = {}) {
+    return wmi::run_bounded_wmi_query(L"root\\cimv2", L"SELECT * FROM SoftwareLicensingProduct", opts);
+}
+
 std::string row_get(const wmi::WmiRow& row, const char* key) {
     const auto it = row.find(key);
     return it == row.end() ? std::string{} : it->second;
@@ -226,9 +246,9 @@ std::string row_get(const wmi::WmiRow& row, const char* key) {
 
 void run_slp_surface(long long now_epoch, std::vector<LicRecord>& records,
                      std::vector<ProbeOutcome>& outcomes) {
-    const auto result = wmi::query_software_licensing_products();
-    if (!result.ok) {
-        outcomes.push_back({"slp_wmi", false, 0, result.error});
+    const auto result = query_software_licensing_products();
+    if (result.error) {
+        outcomes.push_back({"slp_wmi", false, 0, *result.error});
         return;
     }
 
