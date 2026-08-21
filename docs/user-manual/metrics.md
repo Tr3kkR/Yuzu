@@ -144,7 +144,8 @@ Every held-open SSE stream re-validates its credential on each ~3 s pump tick. F
 | `yuzu_server_engine_revalidate_cache_hits_total` | counter | Liveness re-checks answered from cache — no Postgres read. In steady state hits should dominate misses by roughly `TTL / tick`. |
 | `yuzu_server_engine_revalidate_cache_misses_total` | counter | Re-checks that read through to Postgres (cold, expired, or invalidated by a revoke). A rate approaching one per stream per tick means the cache is not doing its job — look for a revoke loop or a clock problem. |
 | `yuzu_server_engine_revalidate_cache_size` | gauge | Principals with a live (unexpired) entry. Bounded by construction; sustained residence at the ceiling means engine-principal churn worth investigating. |
-| `yuzu_server_engine_revalidate_backoff_suppressed_total` | counter | Re-checks answered `StoreUnreachable` from the failure backoff **without** taking a pool lease. **This is the brownout signal**: it only moves while the store is unreachable, and while it moves the per-tick retry amplifier is being held off. Any movement means the store is unreachable — see the `EngineRevalidateStoreUnreachable` alert and `docs/ops-runbooks/engine-principal-store-recovery.md`. Read it alongside `yuzu_pg_acquire_wait_seconds` and `yuzu_mcp_stream_closes_total{reason="auth_unavailable"}` — streams are riding their grace windows and some will end. |
+| `yuzu_server_engine_revalidate_backoff_suppressed_total` | counter | Re-checks answered `StoreUnreachable` from the failure backoff **without** taking a pool lease. **This is the brownout signal**: it only moves while the store is unreachable, and while it moves the per-tick retry amplifier is being held off. Any movement means the store is unreachable — see the `YuzuMcpEngineRevalidateStoreUnreachable` alert and `docs/ops-runbooks/engine-principal-store-recovery.md`. Read it alongside `yuzu_pg_acquire_wait_seconds` and `yuzu_mcp_stream_closes_total{reason="auth_unavailable"}` — streams are riding their grace windows and some will end. **Backoff arms only on CONFIRMED unreachability** (the store closed, a query actually ran and failed, or a lease-acquire timeout occurred with PgPool's connect-failure breaker already open) — a bare pool-lease-acquire timeout with the breaker still closed under a healthy database does not arm it, so this counter does not climb on ordinary load contention (#2456). |
+| `yuzu_server_engine_revalidate_generation_capacity_fallback_total` | counter | The per-principal poisoning-guard map (#2454) was full and a NEW principal's invalidate fell back to the coarse global epoch instead of getting its own slot. **Not a narrowly-scoped degradation**: once tripped, the epoch bump defeats EVERY principal's concurrent cache-write, not just the triggering one, until a process restart — reproducing the fleet-wide cache disablement #2454 exists to fix, bounded only to start past the 1024-distinct-ever-revoked-principal ceiling. Not expected under ordinary load; a climbing value means the guard has degraded and will not recover without a restart. |
 
 This cache covers only the ENGINE half of stream re-validation; the API-token half has its own (`yuzu_server_token_cache_*`).
 
@@ -359,13 +360,13 @@ The per-session peer-IP binding for the agent `Subscribe` RPC (#826/#1058/#1059,
   annotations:
     summary: "FleetTopologyStore is evicting agents at the 100000-entry hard cap — fleet outgrew the cap or a cap-flood attack is in progress"
 
-- alert: EngineRevalidateStoreUnreachable
+- alert: YuzuMcpEngineRevalidateStoreUnreachable
   expr: increase(yuzu_server_engine_revalidate_backoff_suppressed_total[10m]) > 0
   labels:
     severity: warning
   annotations:
     summary: "Engine-principal liveness re-checks are being answered from the failure backoff - the principal store is unreachable and engine streams are riding their grace windows"
-    description: "This counter only moves while the store cannot be reached. First rule out real impact: a flat yuzu_mcp_stream_closes_total{reason=\"auth_unavailable\"} means the backoff is absorbing the blip and no streams have ended. Then correlate with yuzu_pg_acquire_wait_seconds and yuzu_pg_pool_in_use for pool exhaustion. Runbook: docs/ops-runbooks/engine-principal-store-recovery.md."
+    description: "This counter only moves on CONFIRMED unreachability (the store closed, or a query actually ran and failed, or PgPool's own connect-failure breaker is open) - a bare pool-lease-acquire timeout under a healthy database does not arm this backoff, so firing already rules out ordinary pool saturation. First rule out real impact: a flat yuzu_mcp_stream_closes_total{reason=\"auth_unavailable\"} means the backoff is absorbing the blip and no streams have ended. Then correlate with yuzu_pg_acquire_wait_seconds and yuzu_pg_pool_in_use for genuine connection exhaustion vs. a connect-level failure. Runbook: docs/ops-runbooks/engine-principal-store-recovery.md."
 
 - alert: VizFleetPushedMapNearCap
   expr: yuzu_viz_pushed_map_size > 80000
@@ -1282,6 +1283,17 @@ sum(rate(yuzu_server_custom_properties_backfill_total{result="failed"}[15m])) > 
 # One-time notification backfill failed → server refused to boot (ADR-0046).
 sum(rate(yuzu_server_notification_backfill_total{result="failed"}[15m])) > 0
 ```
+
+## Analytics event outbox metrics (ADR-0049)
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_analytics_emit_dropped_total{reason}` | counter | `AnalyticsEventStore::emit()` drops (fail-soft ingest — a dropped event never fails the request that emitted it). `reason` ∈ `store_not_open`, `pool_acquire_timeout`, `query_error`, `serialize_error`. All four series pre-seeded to `0` at startup. |
+| `yuzu_server_analytics_read_degrade_total{method,reason}` | counter | `/api/analytics/status`/`/api/analytics/recent` reads that returned a degrade (`503`) rather than a result. `method` ∈ `query_recent`, `pending_count`; `reason` ∈ `store_not_open`, `pool_acquire_timeout`, `query_error`. All six combinations pre-seeded to `0`. |
+| `yuzu_server_analytics_drain_pass_failed_total` | counter | Drain passes that threw an exception at the thread boundary and were abandoned (retried at the next interval, never crashes the server). |
+| `yuzu_server_analytics_drain_last_pass_unixtime` | gauge | Wall-clock reading stamped at the start of every drain pass attempt, success or failure. **Caveat before alerting on staleness**: this gauge stays flat at its pre-seeded `0` for TWO distinct reasons, not one — (a) no sink is configured (`--analytics-jsonl`/`--clickhouse-url` both unset, the default install), or (b) the store failed to open at boot (`is_open()==false`) — the family is still registered either way, but the drain loop never started in either case. A staleness alert on this gauge needs the same never-started/not-running/metric-missing split the audit-retention family uses (`YuzuAuditRetentionNotRunning`/`..._NeverRan`/`..._MetricMissing`), gated on whether a sink is actually configured AND the store opened — not yet shipped (tracked as a follow-up). |
+
+Analytics collection itself is disabled entirely with `--no-analytics` — no store is constructed, and the four metric families above are not registered at all (absent from `/metrics`, not present-at-zero; `absent()`-based alerting distinguishes this correctly from the degraded-but-registered case). See [Upgrading](upgrading.md) for the Postgres-cutover behavior change and ADR-0049 for the store's fail-soft/degrade-distinguishable posture.
 
 ## Tag store metrics (device tags / scope-targeting substrate, ADR-0050)
 

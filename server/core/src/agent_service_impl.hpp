@@ -7,6 +7,7 @@
 #include <chrono>
 #include <fstream>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -78,7 +79,9 @@ public:
     void set_nat_trust_mtls_identity(bool enabled) { nat_trust_mtls_identity_ = enabled; }
     void set_response_store(ResponseStore* store) { response_store_ = store; }
     void set_tag_store(TagStore* store) { tag_store_ = store; }
-    void set_analytics_store(AnalyticsEventStore* store) { analytics_store_ = store; }
+    void set_analytics_store(std::weak_ptr<AnalyticsEventStore> store) {
+        analytics_store_ = std::move(store);
+    }
     /// W1.4 / #827: AuditStore wired for enrollment-token consume rows.
     /// SOC 2 CC7.2/CC7.3 require attributable credential-rejection logs;
     /// the Register handler emits one audit row per successful consume AND
@@ -343,7 +346,7 @@ private:
     UpdateRegistry* update_registry_{nullptr};
     ResponseStore* response_store_{nullptr};
     TagStore* tag_store_{nullptr};
-    AnalyticsEventStore* analytics_store_{nullptr};
+    std::weak_ptr<AnalyticsEventStore> analytics_store_;
     AuditStore* audit_store_{nullptr};
     AgentHealthStore* health_store_{nullptr};
     ManagementGroupStore* mgmt_group_store_{nullptr};

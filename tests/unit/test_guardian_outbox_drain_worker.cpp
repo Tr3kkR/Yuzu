@@ -80,38 +80,11 @@ struct CollectingSink {
     }
 };
 
-/// Deadlines here bound "a background worker should have got to this by now". They are a
-/// liveness backstop so a stuck worker fails the suite instead of hanging it - never the
-/// property under test - so stretching them cannot weaken an assertion.
-///
-/// Under a sanitizer they must stretch. Instrumented builds run several times slower and the
-/// whole agent suite shares one process, so a deadline sized for a normal build turns into an
-/// unexplained failure that reproduces nowhere: twice in this file already, both times with
-/// ZERO ThreadSanitizer warnings and a clean 3/3 in isolation. Scaling once here beats
-/// discovering the next one in a nightly run.
-constexpr int kSpinScale =
-#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
-    6;
-#elif defined(__has_feature)
-#if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
-    6;
-#else
-    1;
-#endif
-#else
-    1;
-#endif
-
-bool spin_until(std::function<bool()> pred, std::chrono::milliseconds timeout = 5s) {
-    timeout *= kSpinScale;
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (pred())
-            return true;
-        std::this_thread::sleep_for(1ms);
-    }
-    return pred();
-}
+// spin_until / kSpinScale promoted to yuzu::test (test_helpers.hpp) — #2238, CON-S4
+// promote-at-second-user. Brought into this anonymous namespace's lookup so every
+// unqualified call site below keeps working unchanged.
+using yuzu::test::kSpinScale;
+using yuzu::test::spin_until;
 
 // A real KvStore + durable journal alongside the runtime, for the C0 (#2298)
 // maintenance-on-the-worker cases: prune + page now run HERE, not on the

@@ -86,6 +86,13 @@ elif host_machine.system() == 'windows'
   # its own copy, same shape as tar_test_deps' Windows block below.
   agent_test_native_deps += cxx.find_library('ws2_32')
   agent_test_native_deps += cxx.find_library('iphlpapi')
+  # test_wmi_bounded.cpp / test_wmi_local_dispatcher.cpp include the
+  # header-only agents/shared/wmi_bounded.hpp directly into this exe (same
+  # shape as tar_test_deps' Windows block) — bounded WMI needs WbemLocator
+  # (wbemuuid) + COM init/BSTR (ole32/oleaut32).
+  agent_test_native_deps += cxx.find_library('wbemuuid')
+  agent_test_native_deps += cxx.find_library('ole32')
+  agent_test_native_deps += cxx.find_library('oleaut32')
 endif
 
 # ── Test fixture: FROZEN ABI3-layout plugin (PLAN-03 — real backward-compat) ──
@@ -245,6 +252,7 @@ agent_test_exe = executable(
     'unit/test_netprobe_stats.cpp',
     'unit/test_antivirus_parsers.cpp',
     'unit/test_firewall_parsers.cpp',
+    'unit/test_firewall_local_dispatcher.cpp',
     'unit/test_agent_csr.cpp',
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
@@ -252,6 +260,7 @@ agent_test_exe = executable(
     'unit/test_device_ci_sync.cpp',
     'unit/test_sync_source_app_perf.cpp',
     'unit/test_win_str_utils.cpp',
+    'unit/test_wmi_bounded.cpp',        # shared bounded WMI helper (roadmap C-8 extraction); header-only, no separate .cpp to list
     'unit/test_installed_apps_registry_utf8.cpp',
     'unit/test_service_binpath.cpp',
     'unit/test_installed_apps_inventory.cpp',
@@ -277,6 +286,10 @@ agent_test_exe = executable(
     'unit/test_registry_local_dispatcher.cpp', # PR1.7 remediation fix #3: real registry.dll driven
                                                 # end to end via LocalDispatcher (Windows-only; a no-op
                                                 # TU elsewhere via the file's own #ifdef _WIN32 guard)
+    'unit/test_wmi_local_dispatcher.cpp',      # gate-1 remediation: real wmi.dll's query/get_instance
+                                                # actions driven end to end via LocalDispatcher, same
+                                                # pattern as test_registry_local_dispatcher.cpp above
+                                                # (Windows-only; a no-op TU elsewhere)
     'unit/test_content_dist_upload_parsers.cpp', # PR1.6b: pure upload-protocol planner/classifier (no I/O)
     'unit/test_runner_status.cpp',             # Wave 2 WP-0: pure runner-outcome -> ABI4 result-seam table
     'unit/test_host_arg.cpp',                 # Wave 2 WP-0: shared leading-'-' host-arg gate (Decision 6)
@@ -302,6 +315,13 @@ agent_test_exe = executable(
                                                 # network_diag/ioc .dylib driven end to end via
                                                 # LocalDispatcher (Darwin-only, self-gated) -- same
                                                 # shape as test_users_posix_actions.cpp
+    'unit/test_hardware_macos_bios.cpp',      # Wave 3 PR3.2: pure Boot ROM / System Firmware Version parser
+    'unit/test_hardware_linux_parsers.cpp',   # Wave 3 PR3.2: pure dmidecode memory parser + injected /sys/block disk-row builder
+    'unit/test_device_identity_macos.cpp',    # Wave 3 PR3.2: pure dsconfigad -show parser (device_identity's first tests)
+    'unit/test_hardware_device_identity_posix_actions.cpp', # Wave 3 PR3.2 gate-1 remediation: real
+                                                # hardware.dylib/device_identity.dylib driven end to end
+                                                # via LocalDispatcher (macOS-only; a no-op TU elsewhere
+                                                # via the file's own #if defined(__APPLE__) guard)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -328,6 +348,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/wol/src'),             # wol_check_plan.hpp (Wave 2 WP-E)
     include_directories('../agents/plugins/discovery/src'),      # discovery_parsers.hpp (Wave 2 WP-C pure parser)
     include_directories('../agents/plugins/os_info/src'),        # os_info_macos.hpp (Wave 3 PR3.1 pure plist parser)
+    include_directories('../agents/plugins/device_identity/src'), # device_identity_macos.hpp (Wave 3 PR3.2 pure parser)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
@@ -352,9 +373,13 @@ agent_test_exe = executable(
   # cases WARN-and-skip instead of failing (code-review re-verification finding).
   # os_info_plugin_lib / processes_plugin_lib / network_diag_plugin_lib / ioc_plugin_lib:
   # same reasoning, for test_wave3_pr31_macos_actions.cpp (Wave 3 PR3.1 remediation).
+  # hardware_plugin_lib / device_identity_plugin_lib (agents/plugins/{hardware,device_identity}/meson.build):
+  # test_hardware_device_identity_posix_actions.cpp loads both real plugins by
+  # path for the identical reason (Wave 3 PR3.2 gate-1 remediation).
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin,
                 users_plugin_lib, os_info_plugin_lib, processes_plugin_lib,
-                network_diag_plugin_lib, ioc_plugin_lib],
+                network_diag_plugin_lib, ioc_plugin_lib,
+                hardware_plugin_lib, device_identity_plugin_lib],
 )
 # Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
 # threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it
