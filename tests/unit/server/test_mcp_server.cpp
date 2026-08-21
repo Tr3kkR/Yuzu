@@ -4691,7 +4691,7 @@ TEST_CASE("MCP Integration: resources/list returns the expected resources", "[mc
     REQUIRE(result.contains("resources"));
     auto& resources = result["resources"];
     REQUIRE(resources.is_array());
-    CHECK(resources.size() == 9); // existing resources + agentic context resources
+    CHECK(resources.size() == 11); // existing 9 + 2g PR4 specs-as-resources
 
     // The Guardian schema discovery resource is advertised on the MCP plane.
     std::set<std::string> uris;
@@ -4703,6 +4703,8 @@ TEST_CASE("MCP Integration: resources/list returns the expected resources", "[mc
     CHECK(uris.count("yuzu://operating-model") == 1);
     CHECK(uris.count("yuzu://demo/playbooks") == 1);
     CHECK(uris.count("yuzu://golden-prompts/enterprise-it-v1") == 1);
+    CHECK(uris.count("yuzu://openapi") == 1);
+    CHECK(uris.count("yuzu://scope-dsl") == 1);
 
     // Each resource should have uri, name, description, mimeType
     for (const auto& r : resources) {
@@ -4711,6 +4713,100 @@ TEST_CASE("MCP Integration: resources/list returns the expected resources", "[mc
         CHECK(r.contains("description"));
         CHECK(r.contains("mimeType"));
     }
+}
+
+// ── 2g PR4: specs-as-resources (yuzu://openapi, yuzu://scope-dsl) ──────────
+//
+// Both resources share the SAME builder as their REST /discover/* and MCP
+// discover_* tool twins (A2 shared-builder principle) and are tier-gated
+// (unlike the 9 legacy resources above, which predate the annotation/tier
+// sweep and are perm_fn-only — #2713 tracks closing that gap for them).
+
+TEST_CASE("MCP 2g PR4: yuzu://openapi matches openapi_spec_json()",
+          "[mcp][2g][integration]") {
+    McpTestServer ts;
+    ts.start("readonly"); // Infrastructure:Read is allowed on every MCP tier
+
+    const auto expected = nlohmann::json::parse(yuzu::server::openapi_spec_json());
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":30,"params":{"uri":"yuzu://openapi"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& contents = body["result"]["contents"];
+    REQUIRE(contents.is_array());
+    REQUIRE(contents.size() == 1);
+    CHECK(contents[0]["uri"] == "yuzu://openapi");
+    CHECK(contents[0]["mimeType"] == "application/json");
+    auto got = nlohmann::json::parse(contents[0]["text"].get<std::string>());
+    CHECK(got == expected);
+}
+
+TEST_CASE("MCP 2g PR4: yuzu://scope-dsl matches scope_kinds_catalog()",
+          "[mcp][2g][integration]") {
+    McpTestServer ts;
+    ts.start("readonly");
+
+    const auto expected = nlohmann::json::parse(yuzu::server::scope_kinds_catalog().json);
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":31,"params":{"uri":"yuzu://scope-dsl"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& contents = body["result"]["contents"];
+    REQUIRE(contents.is_array());
+    REQUIRE(contents.size() == 1);
+    CHECK(contents[0]["uri"] == "yuzu://scope-dsl");
+    CHECK(contents[0]["mimeType"] == "application/json");
+    auto got = nlohmann::json::parse(contents[0]["text"].get<std::string>());
+    CHECK(got == expected);
+}
+
+TEST_CASE("MCP 2g PR4: yuzu://openapi and yuzu://scope-dsl deny without Infrastructure:Read",
+          "[mcp][2g][integration]") {
+    McpTestServer ts;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& operation) {
+        return !(securable == "Infrastructure" && operation == "Read");
+    };
+    ts.start("readonly");
+
+    auto res_openapi = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":32,"params":{"uri":"yuzu://openapi"}})");
+    REQUIRE(res_openapi);
+    CHECK(res_openapi->status != 200); // perm_fn denial sets its own error status
+
+    auto res_scope_dsl = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":33,"params":{"uri":"yuzu://scope-dsl"}})");
+    REQUIRE(res_scope_dsl);
+    CHECK(res_scope_dsl->status != 200);
+}
+
+TEST_CASE("MCP 2g PR4: yuzu://openapi and yuzu://scope-dsl deny at an unrecognized MCP tier",
+          "[mcp][2g][integration]") {
+    // tier_allows() returns false for any tier string it doesn't recognize
+    // (mcp_policy.hpp's final `return false;`) — this is the first tier-gated
+    // resource, so this test pins the branch against a future regression to
+    // the legacy perm_fn-only resources/read pattern.
+    McpTestServer ts;
+    ts.start("bogus-unrecognized-tier");
+
+    auto res_openapi = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":34,"params":{"uri":"yuzu://openapi"}})");
+    REQUIRE(res_openapi);
+    auto body = nlohmann::json::parse(res_openapi->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+
+    auto res_scope_dsl = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":35,"params":{"uri":"yuzu://scope-dsl"}})");
+    REQUIRE(res_scope_dsl);
+    auto body2 = nlohmann::json::parse(res_scope_dsl->body);
+    REQUIRE(body2.contains("error"));
+    CHECK(body2["error"]["code"] == yuzu::server::mcp::kTierDenied);
 }
 
 // ── 11. Unknown method — verify kMethodNotFound ─────────────────────────────

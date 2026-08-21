@@ -24,18 +24,16 @@
 #include <sqlite3.h>
 
 #include <cstdint>
-#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 using namespace yuzu::server;
-namespace fs = std::filesystem;
 
-// LicenseStore (ADR-0048) and SoftwareDeploymentStore (ADR-0051) are both
-// Postgres-backed; DeviceTokenStore/ExecutionTracker in this file remain
-// pre-migration SQLite. Mirrors test_deployment_store.cpp's PgTestTemplate
-// declaration.
+// LicenseStore (ADR-0048), SoftwareDeploymentStore (ADR-0051), and
+// DeviceTokenStore (ADR-0052) are all Postgres-backed; ExecutionTracker in
+// this file remains pre-migration SQLite. Mirrors test_deployment_store.cpp's
+// PgTestTemplate declaration.
 namespace {
 yuzu::test::PgTestTemplate license_store_tpl{
     "licensestore_t2", [](const std::string& dsn) {
@@ -55,6 +53,17 @@ yuzu::test::PgTestTemplate t2_sw_deploy_tpl{
         if (!store.is_open())
             throw std::runtime_error("software_deployment_store template: failed to migrate");
     }};
+
+// Shares the "devicetokenstore" key with test_device_token_store.cpp's and
+// test_rest_api_tokens.cpp's own templates (identical setup, replay-verified
+// per docs/postgres-store-playbook.md step 7).
+yuzu::test::PgTestTemplate t2_device_token_tpl{
+    "devicetokenstore", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        DeviceTokenStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("device_token_store template: store failed to migrate");
+    }};
 } // namespace
 
 // ── RAII wrapper for sqlite3* (in-memory) ─────────────────────────────────
@@ -66,27 +75,6 @@ struct TestDb {
         if (db)
             sqlite3_close(db);
     }
-};
-
-// ── Helpers: unique temp paths for file-backed stores ─────────────────────
-// Delegates to the shared salt + atomic counter helper (#482). The prior
-// thread::id-hash ^ steady_clock scheme was the Windows MSVC flake pattern
-// #473 traced back to.
-
-static fs::path unique_temp_path(const std::string& prefix) {
-    // yuzu_test_ prepended so every temp file this suite mints lands inside
-    // the Wee Tam Defender exclusion wildcard yuzu_* (adversarial-review
-    // K1/CX1 on the #1883 sweep — the path wildcard is the fallback layer
-    // behind the yuzu_server_tests.exe process exclusion).
-    return yuzu::test::unique_temp_path("yuzu_test_" + prefix + "-");
-}
-
-// RAII guard to remove temp files on scope exit. Thin wrapper over the
-// shared yuzu::test::TempDbFile (adopt-a-path ctor): the stores these tests
-// stand up run journal_mode=WAL, and the old local guard removed only the
-// base file — leaking -wal/-shm companions on an unclean close (#486).
-struct TempFileGuard : yuzu::test::TempDbFile {
-    explicit TempFileGuard(fs::path p) : TempDbFile(std::move(p)) {}
 };
 
 static Execution make_execution(const std::string& definition_id = "def-001",
@@ -370,10 +358,11 @@ TEST_CASE("T2 REST: inventory eval with contains operator", "[rest_api_t2][inven
 // Device Token flow (POST/GET/DELETE /api/v1/device-tokens)
 // ============================================================================
 
-TEST_CASE("T2 REST: device token create and validate round-trip", "[rest_api_t2][device_token]") {
-    auto path = unique_temp_path("device-token-test");
-    TempFileGuard guard(path);
-    DeviceTokenStore store(path);
+TEST_CASE("T2 REST: device token create and validate round-trip",
+          "[rest_api_t2][device_token][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, t2_device_token_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore store(pool);
     REQUIRE(store.is_open());
 
     auto token_result = store.create_token("test-token", "admin", "device-001", "def-001", 0);
@@ -391,27 +380,31 @@ TEST_CASE("T2 REST: device token create and validate round-trip", "[rest_api_t2]
     CHECK(validated->revoked == false);
 }
 
-TEST_CASE("T2 REST: device token list shows created tokens", "[rest_api_t2][device_token]") {
-    auto path = unique_temp_path("device-token-list");
-    TempFileGuard guard(path);
-    DeviceTokenStore store(path);
+TEST_CASE("T2 REST: device token list shows created tokens",
+          "[rest_api_t2][device_token][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, t2_device_token_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore store(pool);
     REQUIRE(store.is_open());
 
-    store.create_token("token-a", "admin", "", "", 0);
-    store.create_token("token-b", "admin", "", "", 0);
-    store.create_token("token-c", "user1", "", "", 0);
+    REQUIRE(store.create_token("token-a", "admin", "", "", 0).has_value());
+    REQUIRE(store.create_token("token-b", "admin", "", "", 0).has_value());
+    REQUIRE(store.create_token("token-c", "user1", "", "", 0).has_value());
 
     auto all = store.list_tokens();
-    CHECK(all.size() == 3);
+    REQUIRE(all.has_value());
+    CHECK(all->size() == 3);
 
     auto admin_only = store.list_tokens("admin");
-    CHECK(admin_only.size() == 2);
+    REQUIRE(admin_only.has_value());
+    CHECK(admin_only->size() == 2);
 }
 
-TEST_CASE("T2 REST: device token revoke invalidates validation", "[rest_api_t2][device_token]") {
-    auto path = unique_temp_path("device-token-revoke");
-    TempFileGuard guard(path);
-    DeviceTokenStore store(path);
+TEST_CASE("T2 REST: device token revoke invalidates validation",
+          "[rest_api_t2][device_token][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, t2_device_token_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore store(pool);
     REQUIRE(store.is_open());
 
     // Bind to an explicit device — empty device_id tokens are rejected as
@@ -426,9 +419,10 @@ TEST_CASE("T2 REST: device token revoke invalidates validation", "[rest_api_t2][
 
     // Get the token_id from the list so we can revoke by id
     auto tokens = store.list_tokens();
-    REQUIRE(!tokens.empty());
-    auto revoked = store.revoke_token(tokens[0].token_id);
-    CHECK(revoked == true);
+    REQUIRE(tokens.has_value());
+    REQUIRE(!tokens->empty());
+    auto revoked = store.revoke_token((*tokens)[0].token_id);
+    CHECK(revoked.has_value());
 
     // Validate after revoke should fail
     auto post_revoke = store.validate_token(raw_token, "device-RV");
@@ -437,10 +431,11 @@ TEST_CASE("T2 REST: device token revoke invalidates validation", "[rest_api_t2][
     CHECK(post_revoke.error().error == DeviceTokenValidateError::revoked);
 }
 
-TEST_CASE("T2 REST: device token expired token fails validation", "[rest_api_t2][device_token]") {
-    auto path = unique_temp_path("device-token-expire");
-    TempFileGuard guard(path);
-    DeviceTokenStore store(path);
+TEST_CASE("T2 REST: device token expired token fails validation",
+          "[rest_api_t2][device_token][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, t2_device_token_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore store(pool);
     REQUIRE(store.is_open());
 
     // Expires at epoch 1 (long past). Bind to a device so the failure is
@@ -874,9 +869,9 @@ TEST_CASE("T2 REST: execution statistics work with concurrent agent updates",
 
 TEST_CASE("T2 REST: device tokens and software deployment independent stores",
           "[rest_api_t2][cross_store][pg]") {
-    auto token_path = unique_temp_path("cross-token");
-    TempFileGuard tg1(token_path);
-    DeviceTokenStore token_store(token_path);
+    YUZU_REQUIRE_PG_DB_TPL(token_db, t2_device_token_tpl);
+    yuzu::server::pg::PgPool token_pool{{.conninfo = token_db.dsn(), .size = 4}};
+    DeviceTokenStore token_store(token_pool);
     REQUIRE(token_store.is_open());
 
     YUZU_REQUIRE_PG_DB_TPL(db, t2_sw_deploy_tpl);
