@@ -1,6 +1,8 @@
 #include "default_certs.hpp"
 
 #include "key_provider.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_session_advisory_lock.hpp"
 #include "x509_ca.hpp"
 
 #include <yuzu/secure_zero.hpp>
@@ -18,6 +20,7 @@
 #include <random>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #ifndef _WIN32
@@ -599,6 +602,199 @@ bool complete_default_cert_set(const fs::path& dir, const std::string& hostname,
     return true;
 }
 
+// The idempotent fast path, extracted so it can ALSO be used as the bootstrap
+// lock's re-validation check (UP-2 Gate 8 fix, 2026-08-21): a caller that just
+// won the lock must re-check whether a concurrent sibling already finished
+// this exact work while it waited, rather than unconditionally purging and
+// re-minting over a sibling's just-completed, now-live set. Returns true
+// (and populates `out`) iff a complete, currently-valid set already exists on
+// disk; false means the caller should proceed to generate.
+bool try_use_existing_complete_set(const fs::path& dir, const fs::path& marker,
+                                   const std::string& hostname,
+                                   const std::vector<std::string>& extra_sans,
+                                   const std::string& cert_group, DefaultCertSet& out) {
+    if (!(file_present(marker) && all_files_present(out)))
+        return false;
+    const std::string marker_text = read_text_file(marker);
+    try {
+        const auto j = nlohmann::json::parse(marker_text);
+        if (j.value("version", 0) != kMarkerVersion)
+            return false;
+        const std::string expected_fp = j.value("ca_fingerprint", "");
+        const std::string ca_pem = read_text_file(out.ca_cert);
+        auto fp = pki::fingerprint_sha256(ca_pem);
+        if (!fp || *fp != expected_fp || expected_fp.empty()) {
+            spdlog::warn("default_certs: marker/CA fingerprint mismatch — regenerating");
+            return false;
+        }
+        // Beyond file-exists+size: confirm every leaf still chains to this CA
+        // (catches a corrupt/substituted leaf) AND that the CA is CURRENTLY
+        // valid. The validity check self-heals a set minted under a skewed
+        // clock — e.g. clock ahead at first boot yields a not-yet-valid CA;
+        // once the clock is corrected the next boot regenerates rather than
+        // serving an unusable (or expired) cert.
+        const bool leaves_ok = pki::verify_chain(read_text_file(out.https_cert), ca_pem) &&
+                               pki::verify_chain(read_text_file(out.server_cert), ca_pem) &&
+                               pki::verify_chain(read_text_file(out.gateway_cert), ca_pem);
+        auto ca_info = pki::parse_certificate(ca_pem);
+        const auto now = std::chrono::system_clock::now();
+        const bool ca_valid_now =
+            ca_info && ca_info->not_before <= now && now < ca_info->not_after;
+        if (!leaves_ok || !ca_valid_now) {
+            spdlog::warn("default_certs: existing default certs unusable ({}) — regenerating",
+                         !leaves_ok ? "a leaf no longer chains to the CA"
+                                    : "CA not currently valid (clock skew?)");
+            return false;
+        }
+        out.ca_fingerprint_sha256 = *fp;
+        out.ca_expires_at = from_epoch(j.value("expires_at", int64_t{0}));
+        out.freshly_generated = false;
+        spdlog::info("default_certs: existing default cert set is intact (CA {})",
+                     out.ca_fingerprint_sha256);
+        // Tell the operator if --cert-san now asks for names the existing
+        // certs don't carry (we never auto-rotate).
+        warn_on_san_drift(out.gateway_cert, extra_sans);
+        // Re-assert the cert-sharing perms on the existing set so a restart
+        // (or a --cert-group added after first boot) is consistent — idempotent.
+        apply_cert_group_share(dir, out, cert_group);
+        return true;
+    } catch (const std::exception& e) {
+        spdlog::warn("default_certs: marker parse failed ({}) — regenerating", e.what());
+        return false;
+    }
+}
+
+// UP-2 Gate 8 fix (2026-08-21, security-guardian + unhappy-path): both
+// complete_default_cert_set() callers — the normal winning-the-root-race path
+// AND the B-2 self-heal resume path below — must run under mutual exclusion.
+// The self-heal ownership proof (local key resolves + cryptographically pairs
+// with the stored root) proves this instance MINTED the root, but is a static
+// predicate every process sharing the same cert directory satisfies
+// IDENTICALLY — it is not a claim/CAS, so it cannot by itself prevent two
+// instances (e.g. two HA replicas restarting against one shared volume, or a
+// self-heal resumer racing the ORIGINAL instance which was merely slow, not
+// actually dead) from both reaching complete_default_cert_set() concurrently
+// and corrupting the on-disk set (mismatched cert/key pairs from
+// unsynchronized per-file renames; a purge deleting a sibling's
+// just-recorded rows). The normal winning path is already serialized by
+// try_insert_root()'s Postgres CAS — a losing fresh-CA attempt never reaches
+// complete_default_cert_set() at all — but is wrapped in the SAME lock here
+// too, both for the 3-instance interleaving above and so there is exactly one
+// mutual-exclusion mechanism to reason about, not two.
+//
+// Mirrors kek_op_lock.hpp's non-blocking try-lock + confirmed-acquired guard
+// pattern (the ONE reusable session-advisory-lock idiom in this codebase,
+// PgSessionAdvisoryLockGuard) rather than hand-rolling a new one — but RETRIES
+// (bounded) instead of KEK's immediate-Conflict-report, since this is a
+// one-shot boot-time operation where briefly waiting for a sibling to finish
+// is preferable to failing the boot outright.
+constexpr std::chrono::milliseconds kBootstrapLockAcquireTimeout{5000};
+constexpr std::chrono::milliseconds kBootstrapLockRetryInterval{100};
+
+const pg::PgAdvisoryLockKey& default_certs_bootstrap_lock_key() {
+    static const pg::PgAdvisoryLockKey key =
+        pg::PgAdvisoryLockKey::single("hashtextextended('yuzu:default_certs_bootstrap', 0)");
+    return key;
+}
+
+enum class BootstrapLockAttempt { kAcquired, kConflict, kError };
+
+[[nodiscard]] BootstrapLockAttempt try_lock_default_certs_bootstrap(PGconn* conn) {
+    const std::string sql = default_certs_bootstrap_lock_key().try_lock_sql();
+    pg::PgResult res{PQexec(conn, sql.c_str())};
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("default_certs: bootstrap advisory-lock attempt failed: {}",
+                      PQerrorMessage(conn));
+        return BootstrapLockAttempt::kError;
+    }
+    // Guard the row read by construction, not by assumption (mirrors
+    // try_lock_kek_op's own defensive shape) — PQgetvalue returns nullptr
+    // out-of-range, so a future SQL edit would otherwise null-deref here.
+    if (PQntuples(res.get()) != 1 || PQgetisnull(res.get(), 0, 0)) {
+        spdlog::error("default_certs: bootstrap advisory-lock attempt returned an unexpected "
+                      "result shape");
+        return BootstrapLockAttempt::kError;
+    }
+    return (PQgetvalue(res.get(), 0, 0)[0] == 't') ? BootstrapLockAttempt::kAcquired
+                                                    : BootstrapLockAttempt::kConflict;
+}
+
+class DefaultCertsBootstrapLockGuard {
+public:
+    // Construct only after a `kAcquired` result — mirrors KekOpLockGuard.
+    // Declare AFTER the pool `Lease` in the same scope so it destructs
+    // (releases) BEFORE the lease returns the connection to the pool: a
+    // session advisory lock outlives the statement, so releasing it here is
+    // the only way to unlock at all.
+    explicit DefaultCertsBootstrapLockGuard(PGconn* conn)
+        : inner_(conn, default_certs_bootstrap_lock_key(), "default_certs bootstrap") {}
+    DefaultCertsBootstrapLockGuard(const DefaultCertsBootstrapLockGuard&) = delete;
+    DefaultCertsBootstrapLockGuard& operator=(const DefaultCertsBootstrapLockGuard&) = delete;
+    DefaultCertsBootstrapLockGuard(DefaultCertsBootstrapLockGuard&&) = delete;
+    DefaultCertsBootstrapLockGuard& operator=(DefaultCertsBootstrapLockGuard&&) = delete;
+
+private:
+    pg::PgSessionAdvisoryLockGuard inner_;
+};
+
+// Acquire the bootstrap lock (bounded retry on Conflict), re-validate inside
+// it (a sibling may have JUST finished), and only then purge + regenerate.
+// `pool` is the SAME pg::PgPool `ca_store` borrows (CaStore::pool()) — a
+// SEPARATE lease from ca_store's own per-call leasing, held for exactly the
+// duration of the critical section, matching KekOpLockGuard's precedent.
+bool complete_default_cert_set_locked(pg::PgPool& pool, const fs::path& dir, const fs::path& marker,
+                                      const std::string& hostname,
+                                      const std::vector<std::string>& extra_sans,
+                                      const std::string& cert_group, CaStore* ca_store,
+                                      FileKeyProvider& kp, const std::string& ca_cert_pem,
+                                      const std::string& ca_key_pem, const std::string& ca_fp,
+                                      const std::string& ca_key_id, const pki::CertDetails& ca_info,
+                                      DefaultCertSet& out) {
+    auto lease = pool.try_acquire_for(kBootstrapLockAcquireTimeout);
+    if (!lease) {
+        spdlog::error("default_certs: could not acquire a database connection to take the "
+                      "bootstrap advisory lock — aborting this attempt (will retry next boot)");
+        return false;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + kBootstrapLockAcquireTimeout;
+    BootstrapLockAttempt attempt;
+    for (;;) {
+        attempt = try_lock_default_certs_bootstrap(lease.get());
+        if (attempt != BootstrapLockAttempt::kConflict)
+            break;
+        if (std::chrono::steady_clock::now() >= deadline)
+            break;
+        std::this_thread::sleep_for(kBootstrapLockRetryInterval);
+    }
+    if (attempt == BootstrapLockAttempt::kError) {
+        spdlog::error("default_certs: bootstrap advisory-lock attempt failed — aborting this "
+                      "attempt (will retry next boot)");
+        return false;
+    }
+    if (attempt == BootstrapLockAttempt::kConflict) {
+        spdlog::error("default_certs: another instance is completing default-cert bootstrap "
+                      "concurrently and did not finish within {}ms — aborting this attempt "
+                      "(will retry next boot)",
+                      static_cast<long long>(kBootstrapLockAcquireTimeout.count()));
+        return false;
+    }
+    DefaultCertsBootstrapLockGuard guard{lease.get()};
+    // Re-validate INSIDE the lock: a sibling may have completed this exact
+    // work while we waited for the lock (or before we even asked). Without
+    // this, an instance that legitimately lost a close race would still
+    // unconditionally purge + re-mint over its sibling's just-completed,
+    // now-live set.
+    if (try_use_existing_complete_set(dir, marker, hostname, extra_sans, cert_group, out)) {
+        spdlog::info("default_certs: a concurrent instance already completed the default-cert "
+                     "set while this one waited for the bootstrap lock — using it, not "
+                     "re-minting");
+        return true;
+    }
+    return complete_default_cert_set(dir, hostname, extra_sans, cert_group, ca_store, kp,
+                                     ca_cert_pem, ca_key_pem, ca_fp, ca_key_id, ca_info, marker,
+                                     out);
+}
+
 } // namespace
 
 std::string detect_hostname() {
@@ -621,56 +817,8 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
     const fs::path marker = dir / "default-marker.json";
 
     // ── Idempotent fast path ──────────────────────────────────────────────────
-    if (file_present(marker) && all_files_present(out)) {
-        const std::string marker_text = read_text_file(marker);
-        try {
-            const auto j = nlohmann::json::parse(marker_text);
-            if (j.value("version", 0) == kMarkerVersion) {
-                const std::string expected_fp = j.value("ca_fingerprint", "");
-                const std::string ca_pem = read_text_file(out.ca_cert);
-                auto fp = pki::fingerprint_sha256(ca_pem);
-                if (fp && *fp == expected_fp && !expected_fp.empty()) {
-                    // Beyond file-exists+size: confirm every leaf still chains to
-                    // this CA (catches a corrupt/substituted leaf) AND that the CA
-                    // is CURRENTLY valid. The validity check self-heals a set minted
-                    // under a skewed clock — e.g. clock ahead at first boot yields a
-                    // not-yet-valid CA; once the clock is corrected the next boot
-                    // regenerates rather than serving an unusable (or expired) cert.
-                    const bool leaves_ok =
-                        pki::verify_chain(read_text_file(out.https_cert), ca_pem) &&
-                        pki::verify_chain(read_text_file(out.server_cert), ca_pem) &&
-                        pki::verify_chain(read_text_file(out.gateway_cert), ca_pem);
-                    auto ca_info = pki::parse_certificate(ca_pem);
-                    const auto now = std::chrono::system_clock::now();
-                    const bool ca_valid_now =
-                        ca_info && ca_info->not_before <= now && now < ca_info->not_after;
-                    if (leaves_ok && ca_valid_now) {
-                        out.ca_fingerprint_sha256 = *fp;
-                        out.ca_expires_at = from_epoch(j.value("expires_at", int64_t{0}));
-                        out.freshly_generated = false;
-                        spdlog::info("default_certs: existing default cert set is intact (CA {})",
-                                     out.ca_fingerprint_sha256);
-                        // Tell the operator if --cert-san now asks for names the
-                        // existing certs don't carry (we never auto-rotate).
-                        warn_on_san_drift(out.gateway_cert, extra_sans);
-                        // Re-assert the cert-sharing perms on the existing set so a
-                        // restart (or a --cert-group added after first boot) is
-                        // consistent — idempotent.
-                        apply_cert_group_share(dir, out, cert_group);
-                        return true;
-                    }
-                    spdlog::warn("default_certs: existing default certs unusable ({}) — "
-                                 "regenerating",
-                                 !leaves_ok ? "a leaf no longer chains to the CA"
-                                            : "CA not currently valid (clock skew?)");
-                } else {
-                    spdlog::warn("default_certs: marker/CA fingerprint mismatch — regenerating");
-                }
-            }
-        } catch (const std::exception& e) {
-            spdlog::warn("default_certs: marker parse failed ({}) — regenerating", e.what());
-        }
-    }
+    if (try_use_existing_complete_set(dir, marker, hostname, extra_sans, cert_group, out))
+        return true;
 
     // ── B-2 (#1238): never silently re-root a populated CA ─────────────────────
     // We only reach here because the fast path found the on-disk default certs
@@ -720,26 +868,44 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
             FileKeyProvider self_heal_kp(dir);
             if (self_heal_kp.has_key(root.key_ref)) {
                 auto key_pem = self_heal_kp.load_key(root.key_ref);
-                if (key_pem && pki::cert_matches_key(root.cert_pem, *key_pem)) {
-                    KeyZeroGuard heal_zero{*key_pem}; // exception-safe wipe
-                    auto ca_info = pki::parse_certificate(root.cert_pem);
-                    if (!ca_info) {
-                        spdlog::error("default_certs: UP-2 self-heal aborted — the ca_store root "
-                                      "cert this instance owns the key for does not parse; "
-                                      "falling back to the manual-recovery refusal below");
-                    } else {
-                        spdlog::warn(
-                            "default_certs: resuming an incomplete first-boot install under the "
-                            "SAME root (fingerprint {}) — the local CA key file still matches "
-                            "ca_store's stored root, so this instance provably minted it; likely "
-                            "a crash between establishing the root and completing the leaf set.",
-                            root.fingerprint_sha256);
-                        const std::string ca_key_id =
-                            pki::issuer_key_id(root.cert_pem).value_or(std::string{});
-                        return complete_default_cert_set(
-                            dir, hostname, extra_sans, cert_group, ca_store, self_heal_kp,
-                            root.cert_pem, *key_pem, root.fingerprint_sha256, ca_key_id, *ca_info,
-                            marker, out);
+                if (key_pem) {
+                    // Wrap the guard immediately on acquisition, matching every
+                    // other key-load in this file (ca_zero, leaf_zero) — Gate 8
+                    // security-guardian NICE (2026-08-21): constructing it only
+                    // after cert_matches_key succeeded left the present-but-WRONG
+                    // key case (a stale/mistaken local key from a botched
+                    // restore — real, not hypothetical) unwiped in freed heap.
+                    KeyZeroGuard heal_zero{*key_pem};
+                    if (pki::cert_matches_key(root.cert_pem, *key_pem)) {
+                        auto ca_info = pki::parse_certificate(root.cert_pem);
+                        if (!ca_info) {
+                            spdlog::error(
+                                "default_certs: UP-2 self-heal aborted — the ca_store root cert "
+                                "this instance owns the key for does not parse; falling back to "
+                                "the manual-recovery refusal below");
+                        } else {
+                            spdlog::warn(
+                                "default_certs: resuming an incomplete first-boot install under "
+                                "the SAME root (fingerprint {}) — the local CA key file still "
+                                "matches ca_store's stored root, so this instance provably "
+                                "minted it; likely a crash between establishing the root and "
+                                "completing the leaf set.",
+                                root.fingerprint_sha256);
+                            const std::string ca_key_id =
+                                pki::issuer_key_id(root.cert_pem).value_or(std::string{});
+                            // Gate 8 BLOCKING fix (security-guardian + unhappy-path,
+                            // 2026-08-21): the ownership proof above is a static
+                            // predicate every process sharing this cert directory
+                            // satisfies identically — it does NOT by itself prevent
+                            // two such instances (e.g. two HA replicas restarting
+                            // against one shared volume) from both reaching here
+                            // concurrently. Route through the bootstrap advisory
+                            // lock, not complete_default_cert_set() directly.
+                            return complete_default_cert_set_locked(
+                                ca_store->pool(), dir, marker, hostname, extra_sans, cert_group,
+                                ca_store, self_heal_kp, root.cert_pem, *key_pem,
+                                root.fingerprint_sha256, ca_key_id, *ca_info, out);
+                        }
                     }
                 }
             }
@@ -865,8 +1031,20 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
         // "system:default-certs" going forward; a losing instance never reaches
         // this line. complete_default_cert_set() does the purge + leaf generation
         // + marker write (shared with the UP-2 same-instance resume path above).
+        //
+        // Still routed through the SAME bootstrap advisory lock as the self-heal
+        // path (Gate 8 fix, 2026-08-21): this instance winning try_insert_root's
+        // CAS only proves no OTHER instance is establishing a NEW root right
+        // now — it says nothing about a self-heal resumer on another process
+        // that believes (wrongly, if this instance is merely slow rather than
+        // dead) it owns the SAME already-established root concurrently.
+        return complete_default_cert_set_locked(ca_store->pool(), dir, marker, hostname,
+                                                extra_sans, cert_group, ca_store, kp, *ca_cert_pem,
+                                                *ca_key_pem, *ca_fp, ca_key_id, *ca_info, out);
     }
 
+    // No ca_store (local-only / no-PG mode): no cross-instance coordination is
+    // possible or needed — proceed directly.
     return complete_default_cert_set(dir, hostname, extra_sans, cert_group, ca_store, kp,
                                      *ca_cert_pem, *ca_key_pem, *ca_fp, ca_key_id, *ca_info,
                                      marker, out);

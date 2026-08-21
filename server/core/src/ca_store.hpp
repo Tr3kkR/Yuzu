@@ -177,6 +177,14 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
+    /// The shared pool this store borrows. Exposed so a caller that already
+    /// holds a `CaStore*` can take an INDEPENDENT lease for its own purpose —
+    /// e.g. `default_certs.cpp`'s bootstrap advisory lock (ADR-0053 UP-2 Gate 8
+    /// fix, 2026-08-21), which needs a connection to hold a session advisory
+    /// lock across a multi-call critical section, separate from this store's
+    /// own per-call leasing.
+    [[nodiscard]] pg::PgPool& pool() const noexcept { return pool_; }
+
     /// Legacy-SQLite backfill (ADR-0009/0053). Call once at server startup, before serving, after
     /// construction has proven the Postgres schema is open. Idempotent PER DISTINCT LEGACY-FILE
     /// CONTENT across all THREE legacy tables (`ca_root`, `ca_issued`, `ca_crl_versions`) — never
@@ -287,6 +295,19 @@ public:
     /// from a silently-empty read would un-revoke every real revocation in every cache that trusts
     /// it (ADR-0036; ADR-0053 "CRL version continuity").
     [[nodiscard]] std::expected<std::vector<IssuedCertRecord>, std::string> list_revoked();
+
+    /// Serials-only revoked set — same WHERE clause as `list_revoked()` but no `cert_pem`
+    /// (unbounded blob, grows forever — nothing prunes `ca_issued`) and no `ORDER BY` (CRL
+    /// construction needs a stable, complete row set; the revocation-SWEEP caller below only
+    /// needs set membership). Gate 8 fix (unhappy-path, 2026-08-21): the ~15s revocation-sweep
+    /// tick used to share `list_revoked()` with CRL publishing, and that heavier query failing
+    /// under load/lock contention while the cheaper point-lookup `is_revoked()` kept succeeding
+    /// was a real, nameable corridor where the sweep silently stopped tearing down live streams
+    /// for already-revoked agents while new connections were still correctly gated — a security
+    /// control quietly not holding, not merely an availability blip. Same abort-never-empty
+    /// contract as `list_revoked()`: `unexpected(msg)` is a genuine read failure, never "nobody
+    /// is revoked".
+    [[nodiscard]] std::expected<std::vector<std::string>, std::string> list_revoked_serials();
 
     /// Delete all issued-cert rows with the given issued_by — used to purge stale default-cert
     /// inventory on regeneration so the store reflects only the live set. Best-effort / non-fatal

@@ -6303,30 +6303,40 @@ public:
                     }
                 }
                 // UP-1 (Gate 4 unhappy-path, 2026-08-21): build the revoked set ONCE per
-                // tick from the typed list_revoked() and ABORT the sweep on a degraded
+                // tick from a typed serials-only read and ABORT the sweep on a degraded
                 // read, rather than calling the per-request is_peer_cert_revoked() (which
                 // fails CLOSED = revoked, by design, for the mTLS-accept gate) once per
                 // live agent. Reusing the per-request gate here made a transient PG outage
                 // indistinguishable from "every enrolled agent was just revoked": every
                 // Subscribe stream got torn down AND a session.cert_revoked|denied audit
                 // row written for each — a false compliance record, not just an
-                // availability blip, since nothing was actually revoked. list_revoked()'s
-                // own contract already mandates abort-never-empty (mirrored by the CRL
-                // publish caller below); this sweep now follows the same rule.
+                // availability blip, since nothing was actually revoked.
+                //
+                // Gate 8 fix (unhappy-path, 2026-08-21): reads list_revoked_serials(), NOT
+                // list_revoked() — the full-row query (cert_pem blobs, ORDER BY, no cap,
+                // nothing ever prunes ca_issued) is measurably heavier than the point-lookup
+                // is_revoked() the per-request gate uses, so sharing it here opened a
+                // narrower but real corridor: a load/lock-contention pattern specific to the
+                // heavier query could fail THIS read while is_revoked() kept succeeding —
+                // new connections still correctly gated, but the ONLY mechanism that tears
+                // down an already-live stream silently doing nothing, indefinitely, with no
+                // "DB is down" to point to. list_revoked_serials() hits the same
+                // idx_ca_issued_status partial index at point-lookup-equivalent cost, closing
+                // that asymmetry. Same abort-never-empty contract either way (mirrored by the
+                // CRL publish caller below, which still needs the full rows).
                 if (ca_store_ && ca_store_->is_open()) {
-                    auto revoked_or_err = ca_store_->list_revoked();
+                    auto revoked_or_err = ca_store_->list_revoked_serials();
                     if (!revoked_or_err) {
-                        spdlog::error("PKI: revocation sweep skipped this tick — list_revoked() "
-                                      "failed ({}); live Subscribe streams left untouched rather "
-                                      "than treated as mass-revoked",
+                        spdlog::error("PKI: revocation sweep skipped this tick — "
+                                      "list_revoked_serials() failed ({}); live Subscribe "
+                                      "streams left untouched rather than treated as "
+                                      "mass-revoked",
                                       revoked_or_err.error());
                         metrics_.counter("yuzu_server_ca_revocation_sweep_read_failures_total")
                             .increment();
                     } else {
-                        std::unordered_set<std::string> revoked_serials;
-                        revoked_serials.reserve(revoked_or_err->size());
-                        for (const auto& rec : *revoked_or_err)
-                            revoked_serials.insert(rec.serial_hex);
+                        std::unordered_set<std::string> revoked_serials(revoked_or_err->begin(),
+                                                                        revoked_or_err->end());
                         const auto swept = registry_.sweep_revoked(
                             [this, &revoked_serials](const std::string& pem) {
                                 return is_peer_cert_revoked_in(pem, revoked_serials);

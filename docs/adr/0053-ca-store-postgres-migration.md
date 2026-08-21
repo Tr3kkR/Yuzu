@@ -481,6 +481,68 @@ Two further findings reviewed and left open, not blocking:
 
 Full agent reports: this run's governance transcript (session-local, not committed).
 
+## Governance Gate 8 findings (2026-08-21, pre-push)
+
+Gate 8 re-review (security-guardian + unhappy-path, run against the UP-1/UP-2 fix diff
+specifically, per the standing rule that Gate 8 re-runs every gate whose domain the fix diff
+touches) found the fix round above was itself incomplete — two BLOCKING findings, both
+converged on independently by both reviewers for the first, the second unhappy-path-only but
+well-evidenced:
+
+- **HIGH (fixed, both reviewers — 2-reporter convergence):** the UP-2 self-heal arm's ownership
+  proof (local CA key resolves at the exact recorded path + cryptographically pairs with the
+  stored root) is a STATIC predicate — every process sharing the same cert directory satisfies it
+  IDENTICALLY. It is not a claim/CAS, so nothing prevented two such processes (two HA replicas
+  restarting against one shared volume — exactly the topology this same fix round's own
+  `upgrading.md` HA note describes as supported; or a self-heal resumer racing the ORIGINAL
+  instance, which was merely slow, not actually dead) from both reaching
+  `complete_default_cert_set()` concurrently. Per-file writes are atomic (temp+rename) but the
+  3-cert/3-key/marker SET is not atomic as a unit, so two racers could interleave a purpose's
+  on-disk `.pem` from one process with its `.key` from the other — a cryptographically mismatched
+  pair, invisible at boot (the idempotent fast path chain-verifies but never checks key-pairing)
+  and invisible at TLS-listener startup (httplib's `SSLServer` never calls
+  `SSL_CTX_check_private_key`) — a full fleet outage with no log line pointing at the cause, since
+  `default-server.pem`/`.key` is both the agent-facing listener AND the server's own outbound mTLS
+  client cert to the gateway. Fixed: both `complete_default_cert_set()` callers (self-heal AND the
+  normal winning-the-race path, for one mutual-exclusion mechanism rather than two) now route
+  through a new Postgres session advisory lock (`hashtextextended('yuzu:default_certs_bootstrap',
+  0)`, non-blocking try + bounded retry, mirroring `kek_op_lock.hpp`'s reusable
+  `PgSessionAdvisoryLockGuard` idiom) — and, critically, RE-VALIDATE inside the lock (re-run the
+  idempotent fast-path check) before purging/re-minting, so a racer that loses the lock but finds
+  its sibling already finished uses that result instead of clobbering it. Regression test
+  (`test_default_certs.cpp`): two real threads racing `ensure_default_certs` against ONE shared
+  `TempDir` (not two, unlike the Gate 3 fresh-root-race test) from a simulated crash-mid-completion
+  state; asserts both succeed, exactly 3 issued rows survive, and every on-disk cert/key pair still
+  cryptographically matches (`pki::cert_matches_key`) — the specific corruption class this finding
+  identified.
+- **HIGH (fixed, unhappy-path):** the UP-1 fix's revocation-sweep tick read the full
+  `list_revoked()` (returns `cert_pem` blobs, `ORDER BY revoked_at`, no row cap, and nothing prunes
+  `ca_issued` — so the query gets more expensive over an install's life) while the per-request
+  `is_revoked()` gate is a cheap indexed point lookup. Both share one pool, but a load/contention
+  pattern specific to the heavier query is a real, nameable corridor where `list_revoked()` fails
+  while `is_revoked()` keeps succeeding — new connections stay correctly gated, but the ONLY
+  mechanism that tears down an already-live stream for an already-revoked agent silently does
+  nothing, indefinitely, with no "the database is down" to point to: a security control quietly
+  not holding, not merely an availability blip. Fixed: added `CaStore::list_revoked_serials()` —
+  same WHERE clause and partial index (`idx_ca_issued_status`) as `list_revoked()`, but no
+  `cert_pem`, no `ORDER BY` — and the sweep now reads that instead. `list_revoked()` is unchanged
+  and still used by CRL publishing (which needs `revoked_at` per entry) and the
+  `sign_agent_csr` reissue-block check (which needs `subject`/`not_after`); both are lower-frequency
+  than the ~15s sweep, so the same asymmetry there is a smaller corridor, left as-is rather than
+  broadened out of scope for this fix. Regression tests (`test_ca_store.cpp`): parity between
+  `list_revoked_serials()` and `list_revoked()`'s serial set, and the same sabotage-the-store
+  pattern used elsewhere in this file confirming a genuine failure returns `unexpected`, never a
+  silently-empty "nobody is revoked" set.
+- **NICE (fixed, security-guardian):** the self-heal branch's `KeyZeroGuard` was constructed only
+  AFTER `cert_matches_key` succeeded, leaving the load-succeeds-but-match-fails case (a real
+  operational case — a stale/mistaken local key from a botched restore) unwiped in freed heap.
+  Fixed: moved immediately after `load_key()` succeeds, matching every other key-load in the file.
+  Regression test added for the present-but-wrong-key path specifically (previously uncovered — the
+  existing "still refuses" test never reached `load_key()` at all, since `has_key()` short-circuits
+  for an absent file).
+
+Full agent reports: this run's governance transcript (session-local, not committed).
+
 ## Consequences
 
 - Every CA read/write now surfaces a genuine database error to its REST/MCP/dashboard caller as a

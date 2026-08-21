@@ -10,6 +10,7 @@
 #include "default_certs.hpp"
 
 #include "ca_store.hpp"
+#include "key_provider.hpp"
 #include "pg/pg_pool.hpp"
 #include "x509_ca.hpp"
 
@@ -448,6 +449,123 @@ TEST_CASE("default_certs: B-2 still refuses when the local CA key does NOT resol
     REQUIRE(root_after->has_value());
     REQUIRE((*root_after)->fingerprint_sha256 == a.ca_fingerprint_sha256);
     REQUIRE(store.list_issued()->size() == 3); // dir_a's inventory untouched
+}
+
+TEST_CASE("default_certs: two concurrent self-heal resumes on ONE shared cert dir never "
+          "produce a mismatched cert/key pair (Gate 8 fix, 2026-08-21)",
+          "[default_certs][ca_store][security][pg]") {
+    // Gate 8 (security-guardian + unhappy-path) found the self-heal ownership
+    // proof — local key resolves + cryptographically pairs with the stored root
+    // — is a STATIC predicate every process sharing the same cert directory
+    // satisfies IDENTICALLY. It is not a claim/CAS, so without a lock, two such
+    // processes (e.g. two HA replicas restarting against one shared volume,
+    // which docs/user-manual/upgrading.md's ADR-0053 HA note explicitly
+    // describes as supported) could both reach complete_default_cert_set()
+    // concurrently: unsynchronized per-file renames could leave a purpose's
+    // on-disk .pem from one racer and .key from the other, and both purges
+    // could each delete the other's just-recorded rows. The fix wraps entry to
+    // complete_default_cert_set() in a Postgres advisory lock + re-validate.
+    //
+    // ONE shared TempDir (not two, unlike the fresh-root race test above) — this
+    // is the multi-process-same-volume topology the bug required.
+    TempDir dir;
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 6}};
+    CaStore store{pool};
+    DefaultCertSet first;
+    REQUIRE(ensure_default_certs(dir.path, "host", &store, first));
+    REQUIRE(store.list_issued()->size() == 3);
+
+    // Simulate the UP-2 crash window: on-disk incomplete, ca_store root +
+    // local CA key both still intact — the self-heal precondition.
+    std::error_code ec;
+    std::filesystem::remove(first.server_key, ec);
+
+    DefaultCertSet set_a, set_b;
+    bool ok_a = false, ok_b = false;
+    std::thread ta([&] { ok_a = ensure_default_certs(dir.path, "host", &store, set_a); });
+    std::thread tb([&] { ok_b = ensure_default_certs(dir.path, "host", &store, set_b); });
+    ta.join();
+    tb.join();
+
+    // Both resolve successfully: whichever wins the advisory lock re-mints;
+    // whichever loses re-validates inside the lock, finds the winner's work
+    // already complete, and uses it — neither refuses (the lock never times
+    // out here; the critical section is milliseconds).
+    CHECK(ok_a);
+    CHECK(ok_b);
+
+    // The root itself is untouched — self-heal never re-roots.
+    auto root_after = store.get_root();
+    REQUIRE(root_after.has_value());
+    REQUIRE(root_after->has_value());
+    REQUIRE((*root_after)->fingerprint_sha256 == first.ca_fingerprint_sha256);
+
+    // The core assertion: exactly 3 issued rows survive (never 0 from a
+    // cross-purge, never 6 from double-recording), and — the specific
+    // corruption class Gate 8 identified — every on-disk cert/key pair still
+    // cryptographically matches, proving no interleaved rename left a
+    // purpose's .pem from one racer paired with the other racer's .key.
+    auto issued = store.list_issued();
+    REQUIRE(issued.has_value());
+    REQUIRE(issued->size() == 3);
+    for (const auto& rec : *issued) {
+        REQUIRE_FALSE(rec.cert_pem.empty());
+        REQUIRE(rec.issuer_fingerprint == first.ca_fingerprint_sha256);
+    }
+    const std::pair<std::filesystem::path, std::filesystem::path> pairs[] = {
+        {first.https_cert, first.https_key},
+        {first.server_cert, first.server_key},
+        {first.gateway_cert, first.gateway_key},
+    };
+    for (const auto& [cert_path, key_path] : pairs) {
+        REQUIRE(std::filesystem::exists(cert_path));
+        REQUIRE(std::filesystem::exists(key_path));
+        const std::string cert_pem = read_file(cert_path);
+        const std::string key_pem = read_file(key_path);
+        CHECK(pki::cert_matches_key(cert_pem, key_pem));
+        CHECK(pki::verify_chain(cert_pem, read_file(first.ca_cert)));
+    }
+}
+
+TEST_CASE("default_certs: a present-but-WRONG local key falls through to the B-2 refusal, "
+          "not a crash (Gate 8 fix, 2026-08-21)",
+          "[default_certs][ca_store][security][pg]") {
+    // Gate 8 (security-guardian NICE): the self-heal branch's KeyZeroGuard used
+    // to wrap the loaded key only AFTER cert_matches_key succeeded, leaving the
+    // load-succeeds-but-match-fails case unwiped in freed heap. Also: this exact
+    // branch had no coverage — the "still refuses" test above never reaches
+    // load_key() at all (has_key() short-circuits for an absent file). This
+    // exercises the present-but-mismatched path directly: a stale/mistaken
+    // local key from a botched restore, real operational case per the Gate 8
+    // report, not hypothetical.
+    TempDir dir_a;
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    CaStore store{pool};
+    DefaultCertSet a;
+    REQUIRE(ensure_default_certs(dir_a.path, "host-a", &store, a));
+
+    // Plant an unrelated, real, well-formed EC P-384 key at the exact path
+    // ca_store's root already points at — key PRESENT, but the WRONG one
+    // (simulating a botched restore that copied the wrong CA key into place).
+    const auto root = store.get_root();
+    REQUIRE(root.has_value());
+    REQUIRE(root->has_value());
+    std::error_code ec;
+    std::filesystem::remove(a.server_key, ec); // force past the idempotent fast path
+    yuzu::server::FileKeyProvider dir_a_kp(dir_a.path);
+    auto unrelated_key = pki::generate_private_key(pki::KeyAlgo::EcP384);
+    REQUIRE(unrelated_key.has_value());
+    REQUIRE(dir_a_kp.store_key("default-ca", *unrelated_key)); // overwrite dir_a's real key
+
+    DefaultCertSet c;
+    REQUIRE_FALSE(ensure_default_certs(dir_a.path, "host-a", &store, c)); // still refuses
+    REQUIRE_FALSE(c.freshly_generated);
+    auto root_after = store.get_root();
+    REQUIRE(root_after.has_value());
+    REQUIRE(root_after->has_value());
+    REQUIRE((*root_after)->fingerprint_sha256 == a.ca_fingerprint_sha256); // unchanged
 }
 
 TEST_CASE("default_certs: two racing first-boot instances never cross-purge each other's "

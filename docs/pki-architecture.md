@@ -145,8 +145,8 @@ failure). Metrics: `yuzu_server_ca_cert_issued_total{purpose}`,
 `yuzu_grpc_revoked_cert_total{rpc}`, `yuzu_server_ca_crl_publish_failures_total`,
 `yuzu_server_ca_reissue_blocked_total`,
 `yuzu_server_ca_revocation_sweep_read_failures_total` (ADR-0053 UP-1: the ~15s
-revocation-sweep tick's `list_revoked()` read failed, so that tick's sweep was
-skipped entirely rather than treating every live agent as revoked — a sustained
+revocation-sweep tick's `list_revoked_serials()` read failed, so that tick's sweep
+was skipped entirely rather than treating every live agent as revoked — a sustained
 Postgres outage shows here, not as a burst of `session.cert_revoked` audit rows).
 Errors use the A4 envelope
 (`docs/agentic-first-principle.md`). Revocation takes effect server-side

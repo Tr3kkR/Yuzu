@@ -44,6 +44,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <set>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -716,6 +717,71 @@ TEST_CASE("CaStore: list_revoked surfaces a revoked agent cert by BARE agent_id 
     CHECK(revoked->front().subject == agent_id);
     CHECK(revoked->front().not_after > now_s());
     CHECK(revoked->front().subject != other_id);
+}
+
+TEST_CASE("CaStore: list_revoked_serials matches list_revoked's serial set exactly "
+          "(Gate 8 fix, 2026-08-21)",
+          "[ca_store][pg][revoke][security]") {
+    // Gate 8 (unhappy-path): the revocation-sweep tick now reads this cheaper,
+    // serials-only variant instead of the full list_revoked() (cert_pem blobs +
+    // ORDER BY) — same WHERE clause, same partial index, must return the SAME
+    // set of serials or the sweep silently diverges from CRL construction.
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+
+    auto mk = [&](const std::string& serial) {
+        IssuedCertRecord r;
+        r.serial_hex = serial;
+        r.subject = "agent-" + serial;
+        r.purpose = "agent";
+        r.not_after = now_s() + 365 * 86400;
+        r.issued_at = now_s();
+        return r;
+    };
+    REQUIRE(store.record_issued(mk("A1")).has_value());
+    REQUIRE(store.record_issued(mk("B2")).has_value());
+    REQUIRE(store.record_issued(mk("C3")).has_value());
+    REQUIRE(store.revoke("A1", "compromised").value_or(false));
+    REQUIRE(store.revoke("C3", "key_loss").value_or(false));
+
+    auto serials = store.list_revoked_serials();
+    REQUIRE(serials.has_value());
+    std::set<std::string> got(serials->begin(), serials->end());
+    CHECK(got == std::set<std::string>{"A1", "C3"});
+
+    auto full = store.list_revoked();
+    REQUIRE(full.has_value());
+    std::set<std::string> from_full;
+    for (const auto& rec : *full)
+        from_full.insert(rec.serial_hex);
+    CHECK(got == from_full);
+}
+
+TEST_CASE("CaStore: list_revoked_serials reports a genuine store failure as unexpected, "
+          "never as an empty (nobody-revoked) set (Gate 8 fix, 2026-08-21)",
+          "[ca_store][pg][revoke][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    IssuedCertRecord r;
+    r.serial_hex = "DEAD";
+    r.subject = "agent-x";
+    r.purpose = "agent";
+    r.not_after = now_s() + 365 * 86400;
+    REQUIRE(store.record_issued(r).has_value());
+    REQUIRE(store.revoke("DEAD", "compromised").value_or(false));
+
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult d{PQexec(conn.get(), "DROP TABLE ca_store.ca_issued CASCADE")};
+        REQUIRE(d.status() == PGRES_COMMAND_OK);
+    }
+
+    auto serials = store.list_revoked_serials();
+    CHECK_FALSE(serials.has_value());
+    CHECK(serials.error().starts_with(kCaDbErrorPrefix));
 }
 
 // ── CRL versions ─────────────────────────────────────────────────────────

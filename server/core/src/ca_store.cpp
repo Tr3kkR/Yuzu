@@ -1336,6 +1336,29 @@ std::expected<std::vector<IssuedCertRecord>, std::string> CaStore::list_revoked(
     return out;
 }
 
+std::expected<std::vector<std::string>, std::string> CaStore::list_revoked_serials() {
+    if (!open_)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "database not open");
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "database unavailable — try again");
+    // No cert_pem (unbounded blob), no ORDER BY — this is the sweep-tick-cheap
+    // variant of list_revoked(); hits the same idx_ca_issued_status partial
+    // index, but returns nothing list_revoked()'s heavier row shape does.
+    pg::PgResult res = pg::exec_params(
+        lease.get(), "SELECT serial_hex FROM ca_store.ca_issued WHERE status = 'revoked'",
+        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kCaDbErrorPrefix) +
+                               "list_revoked_serials failed: " + PQerrorMessage(lease.get()));
+    const int serial_rows = PQntuples(res.get());
+    std::vector<std::string> serials;
+    serials.reserve(static_cast<std::size_t>(serial_rows));
+    for (int i = 0; i < serial_rows; ++i)
+        serials.emplace_back(PQgetvalue(res.get(), i, 0));
+    return serials;
+}
+
 bool CaStore::delete_issued_by(const std::string& issued_by) {
     if (!open_)
         return false;
