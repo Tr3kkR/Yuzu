@@ -382,12 +382,19 @@ TEST_CASE("default_certs: records root + leaves in ca_store", "[default_certs][c
     }
 }
 
-TEST_CASE("default_certs: refuses to re-root a populated ca.db (B-2)",
+TEST_CASE("default_certs: UP-2 self-heals a corrupt on-disk set when the local CA key "
+          "still matches ca_store's root, WITHOUT re-rooting (Gate 4 unhappy-path fix, "
+          "2026-08-21)",
           "[default_certs][ca_store][security][pg]") {
-    // B-2 (#1238): a wiped/corrupt on-disk cert dir on a PERSISTENT ca_store must NOT
-    // silently regenerate a fresh CA — that would re-root the fleet and orphan
-    // every agent enrolled under the old root. ensure_default_certs must refuse;
-    // the bootstrap caller turns that into a refuse-to-start with a restore hint.
+    // B-2 (#1238) originally refused OUTRIGHT on any on-disk corruption against a
+    // populated ca_store — correct for the danger it targets (minting a FRESH CA,
+    // which would re-root the fleet), but overbroad: it also refused the much
+    // narrower "this exact instance crashed mid-completion (or one of its leaf
+    // files was later lost) and still holds the same CA key" case, which has a
+    // provable-safe self-heal — see the same-root assertions below. Red-first
+    // regression recipe (advisor, 2026-08-21): complete a boot, delete a leaf file
+    // (simulating the UP-2 crash window / later corruption) but keep the local CA
+    // key + ca_store root, re-run, expect completion — NOT the old refusal.
     TempDir dir;
     YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
@@ -397,18 +404,50 @@ TEST_CASE("default_certs: refuses to re-root a populated ca.db (B-2)",
     REQUIRE(store.has_root());
     REQUIRE(store.list_issued()->size() == 3);
 
-    // Corrupt the on-disk set while ca_store stays populated.
+    // Corrupt the on-disk set while ca_store stays populated; the local CA key
+    // (default-ca.key, never touched here) is what makes this instance provably
+    // the same one that established the root.
     std::error_code ec;
     std::filesystem::remove(a.server_key, ec);
     DefaultCertSet b;
-    REQUIRE_FALSE(ensure_default_certs(dir.path, "host", &store, b)); // refuse, don't re-root
-    REQUIRE_FALSE(b.freshly_generated);
-    // ca_store root + inventory left intact (not REPLACEd, not purged).
+    REQUIRE(ensure_default_certs(dir.path, "host", &store, b)); // self-heals, does not refuse
+    REQUIRE(b.freshly_generated);
+    // The invariant B-2 exists to protect is untouched: SAME root, not a new one.
     auto root_after = store.get_root();
     REQUIRE(root_after.has_value());
     REQUIRE(root_after->has_value());
     REQUIRE((*root_after)->fingerprint_sha256 == a.ca_fingerprint_sha256);
+    REQUIRE(b.ca_fingerprint_sha256 == a.ca_fingerprint_sha256);
+    // Leaves were re-minted (purge + fresh record), still exactly 3.
     REQUIRE(store.list_issued()->size() == 3);
+}
+
+TEST_CASE("default_certs: B-2 still refuses when the local CA key does NOT resolve — the "
+          "genuine wiped-volume / botched-restore case (Gate 4 unhappy-path fix, 2026-08-21)",
+          "[default_certs][ca_store][security][pg]") {
+    // The self-heal above is gated on possessing the ORIGINAL instance's local CA
+    // key file. A different instance/host/directory — no local "default-ca" key at
+    // that ca_store-recorded key_ref (an absolute path under the FIRST instance's
+    // own dir) — must still hit the original heavyweight refusal: this is the
+    // actual danger B-2 exists for (an operator about to mint a fresh CA over a
+    // fleet that already has one).
+    TempDir dir_a;
+    TempDir dir_b; // never shares dir_a's local key material
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    DefaultCertSet a;
+    REQUIRE(ensure_default_certs(dir_a.path, "host", &store, a));
+    REQUIRE(store.has_root());
+
+    DefaultCertSet b;
+    REQUIRE_FALSE(ensure_default_certs(dir_b.path, "host", &store, b)); // refuse, don't re-root
+    REQUIRE_FALSE(b.freshly_generated);
+    auto root_after = store.get_root();
+    REQUIRE(root_after.has_value());
+    REQUIRE(root_after->has_value());
+    REQUIRE((*root_after)->fingerprint_sha256 == a.ca_fingerprint_sha256);
+    REQUIRE(store.list_issued()->size() == 3); // dir_a's inventory untouched
 }
 
 TEST_CASE("default_certs: two racing first-boot instances never cross-purge each other's "

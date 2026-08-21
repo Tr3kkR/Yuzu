@@ -9358,10 +9358,19 @@ McpServer::HandlerFn McpServer::build_handler(
                     // ADR-0053: a genuine DB/lease failure — distinct from "not found or
                     // already revoked" (a business fact). Must NOT be audited "denied": that
                     // would falsely record a database outage as a rejected revoke attempt.
-                    (void)audit_fn(req, "ca.cert.revoked", "failure", "AgentCertificate", serial,
-                                   revoked_or_err.error());
-                    res.set_content(error_response(id, kInternalError, "CA store unavailable"),
-                                    "application/json");
+                    // Gate 4 consistency-auditor SHOULD (2026-08-21): this branch discarded the
+                    // audit_fn return value, unlike its "denied"/"success" siblings just below —
+                    // an agentic caller had no way to learn a dropped audit row accompanied this
+                    // 503, the same evidence-chain gap the other two branches already surface.
+                    const bool store_error_audit_ok =
+                        audit_fn(req, "ca.cert.revoked", "failure", "AgentCertificate", serial,
+                                 revoked_or_err.error());
+                    res.set_content(
+                        error_response(id, kInternalError, "CA store unavailable",
+                                       store_error_audit_ok
+                                           ? std::string_view{}
+                                           : std::string_view{R"({"audit_persisted":false})"}),
+                        "application/json");
                     return;
                 }
                 if (!*revoked_or_err) {

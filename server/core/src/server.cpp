@@ -6302,27 +6302,55 @@ public:
                         }
                     }
                 }
+                // UP-1 (Gate 4 unhappy-path, 2026-08-21): build the revoked set ONCE per
+                // tick from the typed list_revoked() and ABORT the sweep on a degraded
+                // read, rather than calling the per-request is_peer_cert_revoked() (which
+                // fails CLOSED = revoked, by design, for the mTLS-accept gate) once per
+                // live agent. Reusing the per-request gate here made a transient PG outage
+                // indistinguishable from "every enrolled agent was just revoked": every
+                // Subscribe stream got torn down AND a session.cert_revoked|denied audit
+                // row written for each — a false compliance record, not just an
+                // availability blip, since nothing was actually revoked. list_revoked()'s
+                // own contract already mandates abort-never-empty (mirrored by the CRL
+                // publish caller below); this sweep now follows the same rule.
                 if (ca_store_ && ca_store_->is_open()) {
-                    const auto swept = registry_.sweep_revoked(
-                        [this](const std::string& pem) { return is_peer_cert_revoked(pem); });
-                    if (!swept.empty()) {
-                        spdlog::warn("Revocation sweep cancelled {} Subscribe stream(s)",
-                                     swept.size());
-                        // HIGH-1 (#1239 Hermes): a revocation-driven access termination
-                        // is a durable SOC 2 CC6.3/CC7.2 event, not just a metric/log.
-                        // The sweep is low-frequency (fires only on actual revocations),
-                        // so a WAL row per cancelled stream is not a flood risk.
-                        if (audit_store_ && audit_store_->is_open()) {
-                            for (const auto& aid : swept) {
-                                (void)audit_store_->log(
-                                    {.timestamp = std::time(nullptr),
-                                     .principal = "agent:" + aid,
-                                     .principal_role = "agent",
-                                     .action = "session.cert_revoked",
-                                     .target_type = "Session",
-                                     .target_id = aid,
-                                     .detail = "reason=revoked_client_cert source=stream_sweep",
-                                     .result = "denied"});
+                    auto revoked_or_err = ca_store_->list_revoked();
+                    if (!revoked_or_err) {
+                        spdlog::error("PKI: revocation sweep skipped this tick — list_revoked() "
+                                      "failed ({}); live Subscribe streams left untouched rather "
+                                      "than treated as mass-revoked",
+                                      revoked_or_err.error());
+                        metrics_.counter("yuzu_server_ca_revocation_sweep_read_failures_total")
+                            .increment();
+                    } else {
+                        std::unordered_set<std::string> revoked_serials;
+                        revoked_serials.reserve(revoked_or_err->size());
+                        for (const auto& rec : *revoked_or_err)
+                            revoked_serials.insert(rec.serial_hex);
+                        const auto swept = registry_.sweep_revoked(
+                            [this, &revoked_serials](const std::string& pem) {
+                                return is_peer_cert_revoked_in(pem, revoked_serials);
+                            });
+                        if (!swept.empty()) {
+                            spdlog::warn("Revocation sweep cancelled {} Subscribe stream(s)",
+                                         swept.size());
+                            // HIGH-1 (#1239 Hermes): a revocation-driven access termination
+                            // is a durable SOC 2 CC6.3/CC7.2 event, not just a metric/log.
+                            // The sweep is low-frequency (fires only on actual revocations),
+                            // so a WAL row per cancelled stream is not a flood risk.
+                            if (audit_store_ && audit_store_->is_open()) {
+                                for (const auto& aid : swept) {
+                                    (void)audit_store_->log(
+                                        {.timestamp = std::time(nullptr),
+                                         .principal = "agent:" + aid,
+                                         .principal_role = "agent",
+                                         .action = "session.cert_revoked",
+                                         .target_type = "Session",
+                                         .target_id = aid,
+                                         .detail =
+                                             "reason=revoked_client_cert source=stream_sweep",
+                                         .result = "denied"});
+                                }
                             }
                         }
                     }
@@ -8491,38 +8519,62 @@ private:
         return CaRoutes::ImportOutcome::Ok;
     }
 
-    /// True iff the presented client leaf is one of OURS and its serial is revoked
-    /// in ca_store. Issuer-scoped (is_yuzu_issued) so a foreign cert whose serial
-    /// happens to collide with a revoked Yuzu serial is not falsely rejected
-    /// (Hermes LOW-5). Reads only the CA store (its own mutex) — safe off the
-    /// agent-plane lock.
-    bool is_peer_cert_revoked(const std::string& peer_cert_pem) {
-        if (!ca_store_ || !ca_store_->is_open() || !is_yuzu_issued(peer_cert_pem))
-            return false;
-        // gov/sre: the serial is IMMUTABLE for a given leaf PEM, so cache the
-        // PEM→serial parse (mirrors yuzu_issued_cache_) — the per-heartbeat
-        // revocation gate would otherwise pay an X509 PEM parse on every call,
-        // fleet-wide. CRITICAL: the is_revoked() lookup below stays LIVE — caching
-        // the revocation *result* would let a revoked agent keep talking until the
-        // cache expired (a security bug). Only the parse is memoised.
-        std::string serial;
+    /// Issuer-scoped (is_yuzu_issued) PEM→serial resolution, shared by the live
+    /// per-request revocation gate and the tick-scoped sweep below. Empty return
+    /// means "not one of ours" (foreign cert or unparseable) — callers must NOT
+    /// treat that as revoked, only as "this gate has no opinion".
+    ///
+    /// gov/sre: the serial is IMMUTABLE for a given leaf PEM, so cache the
+    /// PEM→serial parse (mirrors yuzu_issued_cache_) — the per-heartbeat
+    /// revocation gate would otherwise pay an X509 PEM parse on every call,
+    /// fleet-wide. CRITICAL: only the parse is memoised — the revocation
+    /// lookup itself must stay live at the caller (caching it would let a
+    /// revoked agent keep talking until the cache expired).
+    std::string resolve_yuzu_peer_serial(const std::string& peer_cert_pem) {
+        if (!is_yuzu_issued(peer_cert_pem))
+            return {};
         {
             std::lock_guard<std::mutex> lk(peer_serial_cache_mu_);
             if (auto it = peer_serial_cache_.find(peer_cert_pem);
                 it != peer_serial_cache_.end())
-                serial = it->second;
+                return it->second;
         }
-        if (serial.empty()) {
-            auto details = pki::parse_certificate(peer_cert_pem);
-            if (!details || details->serial_hex.empty())
-                return false; // unparseable → not our cert; the identity gate handles it
-            serial = details->serial_hex;
-            std::lock_guard<std::mutex> lk(peer_serial_cache_mu_);
-            if (peer_serial_cache_.size() > 16384)
-                peer_serial_cache_.clear(); // crude bound; certs are stable → low churn
-            peer_serial_cache_[peer_cert_pem] = serial;
-        }
-        return ca_store_->is_revoked(serial);
+        auto details = pki::parse_certificate(peer_cert_pem);
+        if (!details || details->serial_hex.empty())
+            return {}; // unparseable → not our cert; the identity gate handles it
+        const std::string& serial = details->serial_hex;
+        std::lock_guard<std::mutex> lk(peer_serial_cache_mu_);
+        if (peer_serial_cache_.size() > 16384)
+            peer_serial_cache_.clear(); // crude bound; certs are stable → low churn
+        peer_serial_cache_[peer_cert_pem] = serial;
+        return serial;
+    }
+
+    /// True iff the presented client leaf is one of OURS and its serial is revoked
+    /// in ca_store. Issuer-scoped (is_yuzu_issued) so a foreign cert whose serial
+    /// happens to collide with a revoked Yuzu serial is not falsely rejected
+    /// (Hermes LOW-5). Reads only the CA store (its own mutex) — safe off the
+    /// agent-plane lock. Per-request gate: deliberately fails CLOSED (see
+    /// CaStore::is_revoked) on a degraded read — the documented exception to
+    /// UP-1's abort-on-degraded rule below, since a single mTLS accept refusing
+    /// to admit is bounded, unlike a fleet-wide sweep tick.
+    bool is_peer_cert_revoked(const std::string& peer_cert_pem) {
+        if (!ca_store_ || !ca_store_->is_open())
+            return false;
+        const std::string serial = resolve_yuzu_peer_serial(peer_cert_pem);
+        return !serial.empty() && ca_store_->is_revoked(serial);
+    }
+
+    /// Set-membership variant for the revocation sweep tick (UP-1, Gate 4
+    /// unhappy-path, 2026-08-21): checks against a revoked-serial set read ONCE
+    /// per tick via the typed list_revoked(), instead of calling the fail-closed
+    /// is_peer_cert_revoked() once per live agent — see the sweep-tick comment
+    /// in run() for why. Never touches ca_store_ directly, so it has no
+    /// degraded-read behavior of its own to get wrong.
+    bool is_peer_cert_revoked_in(const std::string& peer_cert_pem,
+                                  const std::unordered_set<std::string>& revoked_serials) {
+        const std::string serial = resolve_yuzu_peer_serial(peer_cert_pem);
+        return !serial.empty() && revoked_serials.contains(serial);
     }
 
     /// PKI PR4: build + record a new CRL version over the current revoked set,

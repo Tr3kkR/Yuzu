@@ -457,6 +457,148 @@ void warn_on_san_drift(const fs::path& representative_leaf,
                  joined);
 }
 
+// Shared tail for ensure_default_certs: purge stale default-cert inventory, mint
+// the 3 default leaves under an ALREADY-ESTABLISHED root, and write the
+// completion marker LAST (its presence is the "set is complete" signal). Two
+// callers reach here, both having already proven exclusive ownership of
+// `ca_cert_pem`/`ca_key_pem` before calling: (1) the normal first-boot path,
+// having just won try_insert_root(); (2) the UP-2 same-instance resume path
+// (Gate 4 unhappy-path, 2026-08-21), having proven via a local key-file match
+// that THIS instance minted the root ca_store already holds. The purge below is
+// safe in both cases for the same reason: whoever calls this function is the
+// confirmed sole legitimate writer for "system:default-certs" going forward.
+bool complete_default_cert_set(const fs::path& dir, const std::string& hostname,
+                               const std::vector<std::string>& extra_sans,
+                               const std::string& cert_group, CaStore* ca_store,
+                               FileKeyProvider& kp, const std::string& ca_cert_pem,
+                               const std::string& ca_key_pem, const std::string& ca_fp,
+                               const std::string& ca_key_id, const pki::CertDetails& ca_info,
+                               const fs::path& marker, DefaultCertSet& out) {
+    if (ca_store) {
+        // Best-effort / non-fatal: a failed purge leaves stale rows, not a
+        // security or correctness defect (#1238 should-fix: don't silently
+        // ignore the rc).
+        if (!ca_store->delete_issued_by("system:default-certs"))
+            spdlog::warn("default_certs: failed to purge prior default-cert inventory rows "
+                         "(stale rows may remain) — continuing");
+    }
+
+    // Leaves are sized to the CA's exact notAfter so they never outlive the
+    // issuer (the x509_ca leaf-<=-CA invariant would otherwise reject them).
+    // #1302: backdate notBefore by the clock-skew allowance — mirrors the CA root
+    // and the per-agent client leaf (sign_agent_csr, PR3 H-2). Without this, an
+    // agent whose clock lags the server at first connect sees these freshly-minted
+    // server leaves as not-yet-valid and rejects the TLS handshake, and the retry
+    // paths don't recover a "valid cert, skewed clock" until the skew elapses.
+    const pki::Validity leaf_validity{
+        std::chrono::system_clock::now() - pki::kClockSkewBackdate, ca_info.not_after};
+
+    pki::SubjectAltNames san;
+    san.dns = {"localhost"};
+    san.ips = {"127.0.0.1", "::1"};
+    // An IP-literal hostname must go in the iPAddress SAN, not dNSName. The
+    // detected hostname is gated through the SAME validation as operator extras
+    // (a container gethostname() can return non-hostname bytes) — if it is
+    // neither a valid IP nor a valid DNS name it is omitted with a warning rather
+    // than baking a malformed SAN; localhost/loopback still cover local access.
+    if (pki::is_valid_ip_literal(hostname))
+        san.ips.push_back(hostname);
+    else if (valid_dns_name(hostname))
+        san.dns.push_back(hostname);
+    else if (!hostname.empty())
+        spdlog::warn("default_certs: host name '{}' is not a valid DNS name — omitting from the "
+                     "default-cert SAN (use --cert-san to add a reachable name)",
+                     hostname);
+    // Operator --cert-san extend the SAME set on every default leaf. This mirrors
+    // the base set above — localhost/loopback/hostname is itself identical across
+    // all three leaves — so an extra grants nothing a stolen leaf key couldn't
+    // already do (impersonation needs the 0600 key = host compromise; all three
+    // are co-located, same-operator, same-CA server infra). Per-leaf scoping is a
+    // possible future refinement, not a day-one need.
+    merge_sans(san, parse_extra_sans(extra_sans));
+
+    const std::array<LeafSpec, 3> leaves = {{
+        {"default-https", "default-https.pem", "https", pki::LeafUsage{.server_auth = true}},
+        // The server is a server to agents/gateway AND a client when it forwards
+        // commands to the gateway's mgmt plane over mutual TLS (#1314), so its leaf
+        // needs clientAuth too — otherwise a strict verifier rejects it as a client
+        // cert and the mTLS command-forwarding dial fails.
+        {"default-server", "default-server.pem", "server",
+         pki::LeafUsage{.server_auth = true, .client_auth = true}},
+        // The gateway is a server to agents AND a client to the server upstream.
+        {"default-gateway", "default-gateway.pem", "gateway",
+         pki::LeafUsage{.server_auth = true, .client_auth = true}},
+    }};
+
+    bool ok = write_public_file(out.ca_cert, ca_cert_pem);
+
+    for (const auto& spec : leaves) {
+        if (!ok)
+            break;
+        pki::LeafParams lp;
+        lp.subject = {std::string("Yuzu Default ") + spec.purpose, "Yuzu"};
+        lp.san = san;
+        lp.validity = leaf_validity;
+        lp.usage = spec.usage;
+        auto kc = pki::issue_leaf(ca_cert_pem, ca_key_pem, pki::KeyAlgo::EcP256, lp);
+        if (!kc) {
+            ok = false;
+            break;
+        }
+        KeyZeroGuard leaf_zero{kc->private_key_pem}; // exception-safe wipe
+        ok = write_public_file(dir / spec.cert_file, kc->cert_pem);
+        if (ok && !kp.store_key(spec.key_id, kc->private_key_pem)) {
+            ok = false;
+        }
+
+        if (ok && ca_store) {
+            IssuedCertRecord rec;
+            rec.serial_hex = kc->serial_hex;
+            rec.subject = lp.subject.common_name;
+            rec.san = join_san(san);
+            rec.purpose = spec.purpose;
+            rec.not_after = to_epoch(ca_info.not_after);
+            rec.cert_pem = kc->cert_pem;
+            rec.issued_by = "system:default-certs";
+            rec.issuer_fingerprint = ca_fp;
+            rec.issuer_key_id = ca_key_id;
+            if (auto rec_result = ca_store->record_issued(rec); !rec_result) {
+                spdlog::error("default_certs: failed to record issued '{}' in ca_store — aborting "
+                              "(the inventory must be consistent for revocation / rotation): {}",
+                              spec.purpose, rec_result.error());
+                ok = false;
+            }
+        }
+    }
+
+    if (!ok) {
+        spdlog::error("default_certs: generation failed; leaving no marker (will retry next boot)");
+        return false;
+    }
+
+    // Marker LAST — its presence is the "set is complete" signal.
+    nlohmann::json j;
+    j["version"] = kMarkerVersion;
+    j["generated_at"] = to_epoch(std::chrono::system_clock::now());
+    j["ca_fingerprint"] = ca_fp;
+    j["expires_at"] = to_epoch(ca_info.not_after);
+    j["hostname"] = hostname;
+    if (!write_public_file(marker, j.dump(2))) {
+        spdlog::error("default_certs: failed to write marker");
+        return false;
+    }
+
+    out.ca_fingerprint_sha256 = ca_fp;
+    out.ca_expires_at = ca_info.not_after;
+    out.freshly_generated = true;
+    // Now that the full set (incl. default-gateway.key) exists, apply the
+    // cross-container sharing perms (no-op tight perms when --cert-group is unset).
+    apply_cert_group_share(dir, out, cert_group);
+    spdlog::warn("default_certs: generated default cert set — CA {} expires {}",
+                 out.ca_fingerprint_sha256, to_epoch(ca_info.not_after));
+    return true;
+}
+
 } // namespace
 
 std::string detect_hostname() {
@@ -560,6 +702,48 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
         }
         if (root_or_err->has_value()) {
             const auto& root = **root_or_err;
+
+            // UP-2 self-heal (Gate 4 unhappy-path, 2026-08-21): a crash between
+            // try_insert_root() succeeding and the marker being written leaves
+            // EXACTLY this state — ca_store already holds a root, on-disk is
+            // missing/corrupt/marker-less. Before refusing outright, check
+            // whether THIS instance is provably the one that minted it: for
+            // FileKeyProvider, key_ref IS the local file path (never shared
+            // state — see the "Store the CA private key LOCALLY" comment
+            // below), so if a key still resolves at that exact path AND its
+            // private half cryptographically pairs with the stored root cert,
+            // no other instance could be the true owner — a wiped persistent
+            // volume or a botched restore leaves no local key, or a mismatched
+            // one, and falls through to the refusal unchanged. Resume
+            // completing the SAME root rather than a heavyweight clean re-root
+            // for a fresh install that never finished, not a lost one.
+            FileKeyProvider self_heal_kp(dir);
+            if (self_heal_kp.has_key(root.key_ref)) {
+                auto key_pem = self_heal_kp.load_key(root.key_ref);
+                if (key_pem && pki::cert_matches_key(root.cert_pem, *key_pem)) {
+                    KeyZeroGuard heal_zero{*key_pem}; // exception-safe wipe
+                    auto ca_info = pki::parse_certificate(root.cert_pem);
+                    if (!ca_info) {
+                        spdlog::error("default_certs: UP-2 self-heal aborted — the ca_store root "
+                                      "cert this instance owns the key for does not parse; "
+                                      "falling back to the manual-recovery refusal below");
+                    } else {
+                        spdlog::warn(
+                            "default_certs: resuming an incomplete first-boot install under the "
+                            "SAME root (fingerprint {}) — the local CA key file still matches "
+                            "ca_store's stored root, so this instance provably minted it; likely "
+                            "a crash between establishing the root and completing the leaf set.",
+                            root.fingerprint_sha256);
+                        const std::string ca_key_id =
+                            pki::issuer_key_id(root.cert_pem).value_or(std::string{});
+                        return complete_default_cert_set(
+                            dir, hostname, extra_sans, cert_group, ca_store, self_heal_kp,
+                            root.cert_pem, *key_pem, root.fingerprint_sha256, ca_key_id, *ca_info,
+                            marker, out);
+                    }
+                }
+            }
+
             const std::string on_disk =
                 file_present(out.ca_cert)
                     ? ("on-disk CA " +
@@ -676,133 +860,16 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
                 established->fingerprint_sha256, *ca_fp);
             return false;
         }
-        // Won (or ca_store's root is uncontested single-instance) — purge any prior
-        // default-cert inventory rows so ca_store reflects only the live set about to be
-        // generated below (no orphan leaves referencing a replaced root). Safe HERE,
-        // specifically because the root race above already confirmed this instance is the
-        // sole legitimate writer for "system:default-certs" going forward — a losing
-        // instance never reaches this line. Best-effort / non-fatal: a failed purge leaves
-        // stale rows, not a security or correctness defect (#1238 should-fix: don't
-        // silently ignore the rc).
-        if (!ca_store->delete_issued_by("system:default-certs"))
-            spdlog::warn("default_certs: failed to purge prior default-cert inventory rows "
-                         "(stale rows may remain) — continuing");
+        // Won (or ca_store's root is uncontested single-instance) — the root race
+        // above already confirmed this instance is the sole legitimate writer for
+        // "system:default-certs" going forward; a losing instance never reaches
+        // this line. complete_default_cert_set() does the purge + leaf generation
+        // + marker write (shared with the UP-2 same-instance resume path above).
     }
 
-    // Leaves are sized to the CA's exact notAfter so they never outlive the
-    // issuer (the x509_ca leaf-<=-CA invariant would otherwise reject them).
-    // #1302: backdate notBefore by the clock-skew allowance — mirrors the CA root
-    // and the per-agent client leaf (sign_agent_csr, PR3 H-2). Without this, an
-    // agent whose clock lags the server at first connect sees these freshly-minted
-    // server leaves as not-yet-valid and rejects the TLS handshake, and the retry
-    // paths don't recover a "valid cert, skewed clock" until the skew elapses.
-    const pki::Validity leaf_validity{
-        std::chrono::system_clock::now() - pki::kClockSkewBackdate, ca_info->not_after};
-
-    pki::SubjectAltNames san;
-    san.dns = {"localhost"};
-    san.ips = {"127.0.0.1", "::1"};
-    // An IP-literal hostname must go in the iPAddress SAN, not dNSName. The
-    // detected hostname is gated through the SAME validation as operator extras
-    // (a container gethostname() can return non-hostname bytes) — if it is
-    // neither a valid IP nor a valid DNS name it is omitted with a warning rather
-    // than baking a malformed SAN; localhost/loopback still cover local access.
-    if (pki::is_valid_ip_literal(hostname))
-        san.ips.push_back(hostname);
-    else if (valid_dns_name(hostname))
-        san.dns.push_back(hostname);
-    else if (!hostname.empty())
-        spdlog::warn("default_certs: host name '{}' is not a valid DNS name — omitting from the "
-                     "default-cert SAN (use --cert-san to add a reachable name)",
-                     hostname);
-    // Operator --cert-san extend the SAME set on every default leaf. This mirrors
-    // the base set above — localhost/loopback/hostname is itself identical across
-    // all three leaves — so an extra grants nothing a stolen leaf key couldn't
-    // already do (impersonation needs the 0600 key = host compromise; all three
-    // are co-located, same-operator, same-CA server infra). Per-leaf scoping is a
-    // possible future refinement, not a day-one need.
-    merge_sans(san, parse_extra_sans(extra_sans));
-
-    const std::array<LeafSpec, 3> leaves = {{
-        {"default-https", "default-https.pem", "https", pki::LeafUsage{.server_auth = true}},
-        // The server is a server to agents/gateway AND a client when it forwards
-        // commands to the gateway's mgmt plane over mutual TLS (#1314), so its leaf
-        // needs clientAuth too — otherwise a strict verifier rejects it as a client
-        // cert and the mTLS command-forwarding dial fails.
-        {"default-server", "default-server.pem", "server",
-         pki::LeafUsage{.server_auth = true, .client_auth = true}},
-        // The gateway is a server to agents AND a client to the server upstream.
-        {"default-gateway", "default-gateway.pem", "gateway",
-         pki::LeafUsage{.server_auth = true, .client_auth = true}},
-    }};
-
-    bool ok = write_public_file(out.ca_cert, *ca_cert_pem);
-
-    for (const auto& spec : leaves) {
-        if (!ok)
-            break;
-        pki::LeafParams lp;
-        lp.subject = {std::string("Yuzu Default ") + spec.purpose, "Yuzu"};
-        lp.san = san;
-        lp.validity = leaf_validity;
-        lp.usage = spec.usage;
-        auto kc = pki::issue_leaf(*ca_cert_pem, *ca_key_pem, pki::KeyAlgo::EcP256, lp);
-        if (!kc) {
-            ok = false;
-            break;
-        }
-        KeyZeroGuard leaf_zero{kc->private_key_pem}; // exception-safe wipe
-        ok = write_public_file(dir / spec.cert_file, kc->cert_pem);
-        if (ok && !kp.store_key(spec.key_id, kc->private_key_pem)) {
-            ok = false;
-        }
-
-        if (ok && ca_store) {
-            IssuedCertRecord rec;
-            rec.serial_hex = kc->serial_hex;
-            rec.subject = lp.subject.common_name;
-            rec.san = join_san(san);
-            rec.purpose = spec.purpose;
-            rec.not_after = to_epoch(ca_info->not_after);
-            rec.cert_pem = kc->cert_pem;
-            rec.issued_by = "system:default-certs";
-            rec.issuer_fingerprint = *ca_fp;
-            rec.issuer_key_id = ca_key_id;
-            if (auto rec_result = ca_store->record_issued(rec); !rec_result) {
-                spdlog::error("default_certs: failed to record issued '{}' in ca_store — aborting "
-                              "(the inventory must be consistent for revocation / rotation): {}",
-                              spec.purpose, rec_result.error());
-                ok = false;
-            }
-        }
-    }
-
-    if (!ok) {
-        spdlog::error("default_certs: generation failed; leaving no marker (will retry next boot)");
-        return false;
-    }
-
-    // Marker LAST — its presence is the "set is complete" signal.
-    nlohmann::json j;
-    j["version"] = kMarkerVersion;
-    j["generated_at"] = to_epoch(std::chrono::system_clock::now());
-    j["ca_fingerprint"] = *ca_fp;
-    j["expires_at"] = to_epoch(ca_info->not_after);
-    j["hostname"] = hostname;
-    if (!write_public_file(marker, j.dump(2))) {
-        spdlog::error("default_certs: failed to write marker");
-        return false;
-    }
-
-    out.ca_fingerprint_sha256 = *ca_fp;
-    out.ca_expires_at = ca_info->not_after;
-    out.freshly_generated = true;
-    // Now that the full set (incl. default-gateway.key) exists, apply the
-    // cross-container sharing perms (no-op tight perms when --cert-group is unset).
-    apply_cert_group_share(dir, out, cert_group);
-    spdlog::warn("default_certs: generated default cert set — CA {} expires {}",
-                 out.ca_fingerprint_sha256, to_epoch(ca_info->not_after));
-    return true;
+    return complete_default_cert_set(dir, hostname, extra_sans, cert_group, ca_store, kp,
+                                     *ca_cert_pem, *ca_key_pem, *ca_fp, ca_key_id, *ca_info,
+                                     marker, out);
 }
 
 } // namespace yuzu::server

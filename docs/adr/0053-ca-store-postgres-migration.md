@@ -407,6 +407,80 @@ fixed:
 
 Full agent reports: this run's governance transcript (session-local, not committed).
 
+## Governance Gate 4 findings (2026-08-21, pre-push)
+
+Gate 4 (happy-path PASS; consistency-auditor PASS-with-SHOULDs; unhappy-path) found two further
+HIGHs — both newly reachable specifically because of this migration's fail-closed posture, and
+both fixed in this round:
+
+- **HIGH (fixed, unhappy-path UP-1):** the ~15s revocation-sweep tick (`server.cpp`, tears down
+  any live Subscribe stream whose agent leaf has since been revoked) called the same
+  `is_peer_cert_revoked()` used at the per-request mTLS-accept gate — which, by design (see
+  `CaStore::is_revoked`'s doc comment), fails CLOSED (treats as revoked) on ANY degraded read. A
+  single degraded mTLS accept failing closed is the correct, bounded posture; reusing that same
+  call once per LIVE AGENT inside the sweep tick meant a transient Postgres outage made the sweep
+  indistinguishable from "every enrolled agent was just revoked" — every Subscribe stream torn
+  down, AND a `session.cert_revoked|denied` audit row written for each. That second half is the
+  gating fact: a durable SOC 2 evidence row asserting a revocation-driven access termination that
+  never actually happened is a false compliance record (I3), not merely an availability blip
+  (I5/MEDIUM on its own). Newly reachable by this migration: verified against the pre-migration
+  SQLite `is_revoked()`, which returned `false` (fail-OPEN) on a null `db_` and had no comparable
+  transient-failure mode, so the sweep could never mass-fire on degradation before this diff.
+  Fixed: the sweep tick now reads the revoked set ONCE per tick via the typed `list_revoked()`
+  and ABORTS the sweep entirely on a degraded read (logs + a new
+  `yuzu_server_ca_revocation_sweep_read_failures_total` counter; live streams are left untouched
+  rather than treated as mass-revoked), instead of calling the fail-closed per-request gate once
+  per agent. The per-request gate (`is_peer_cert_revoked`) is untouched — still fails closed, as
+  documented and intended for a single bounded mTLS accept. Shared PEM→serial resolution
+  (`resolve_yuzu_peer_serial`, issuer-scoped via `is_yuzu_issued`) factored out so both the live
+  gate and the new set-membership sweep variant (`is_peer_cert_revoked_in`) use identical
+  issuer-scoping — a foreign cert cannot collide with a revoked Yuzu serial in either path.
+  Residual, recorded deliberately rather than fixed: an agent revoked immediately before an
+  outage keeps its live stream for the outage's duration (the per-request gate still fails closed
+  on its own next use, so no *new* access is granted) — the sweep is defense-in-depth on top of
+  that, not the only enforcement point.
+- **HIGH (fixed, unhappy-path UP-2; caused_by: b11be3551):** the Gate 3 HIGH fix above resolves
+  the first-boot root race by moving `try_insert_root()` BEFORE all leaf generation — correct,
+  and not reverted here — but it also WIDENED the crash-recovery gap on the other side of that
+  same call: a crash between `try_insert_root()` succeeding and the completion marker being
+  written now leaves the entire leaf sequence (3 `record_issued()` round-trips, key stores, file
+  writes) exposed, versus the pre-fix window of essentially one JSON write. Before this fix, the
+  ONLY documented recovery from that state was B-2's heavyweight "clean re-root" operator runbook
+  (`docs/pki-architecture.md`) — appropriate for an established, enrolled fleet, but disproportionate
+  for a FRESH install with zero enrolled agents that simply didn't finish. Fixed: `default_certs.cpp`
+  gained a self-heal arm inside the B-2 refusal path — before refusing, check whether THIS instance
+  can prove it minted the root ca_store already holds: the local "default-ca" key file (never
+  shared state, unlike `ca_store`) still resolves at the exact `key_ref` path ca_store recorded,
+  AND its private key cryptographically pairs with the stored root cert
+  (`pki::cert_matches_key`). If both hold, resume completing the SAME root (purge + regenerate the
+  3 leaves + write the marker) rather than refusing. `FileKeyProvider`'s existing `within_base`
+  scoping is what keeps this fail-closed for the genuine danger case: a different instance/host/
+  directory has no local key file at another instance's absolute `key_ref` path, so it still hits
+  the original refusal unchanged — verified by a dedicated test (two separate `TempDir`s against
+  one shared `CaStore`). The purge + leaf-generation + marker-write tail was factored into a
+  shared `complete_default_cert_set()` helper so both the normal winning-the-race path and this
+  self-heal path run identical code. Regression tests (`test_default_certs.cpp`): the pre-existing
+  B-2 test ("refuses to re-root a populated ca.db") encoded exactly the old, now-superseded
+  contract for this precise scenario (delete a leaf file, keep the local CA key + ca_store root) —
+  updated in place to assert self-heal completion instead of refusal (root fingerprint unchanged,
+  3 leaves re-recorded), per the advisor-prescribed red-first recipe; a new adjacent test covers
+  the genuine-refusal case (two distinct directories, one shared `CaStore`).
+
+Two further findings reviewed and left open, not blocking:
+
+- **SHOULD (consistency-auditor UP-3):** a losing HA replica (one that lost the first-boot root
+  race) never self-heals its own default-cert set from disk — it discards its freshly-generated
+  material and returns `false`, so `ensure_default_certs` must be re-invoked (a restart) to pick
+  up the winning root's certs. Documented rather than fixed here — a background retry loop is a
+  larger, separately scoped change: `docs/user-manual/upgrading.md`'s ADR-0053 section gained an
+  explicit HA note (a losing replica needs a restart to pick up the winner's certs).
+- **NICE (unhappy-path UP-4):** `rec.subject`/`rec.san` fields in `record_issued()` are not
+  explicitly NUL-sanitized before the Postgres write; a NUL byte would truncate silently at read
+  time in some clients. Bounded blast radius (server-controlled subject/SAN strings, not
+  attacker-influenced), left open.
+
+Full agent reports: this run's governance transcript (session-local, not committed).
+
 ## Consequences
 
 - Every CA read/write now surfaces a genuine database error to its REST/MCP/dashboard caller as a

@@ -143,7 +143,12 @@ retry-safe — matches the destructive-sibling convention); `result=failure` is
 reserved for an authorized-but-errored op (e.g. a `ca.crl.published` build/record
 failure). Metrics: `yuzu_server_ca_cert_issued_total{purpose}`,
 `yuzu_grpc_revoked_cert_total{rpc}`, `yuzu_server_ca_crl_publish_failures_total`,
-`yuzu_server_ca_reissue_blocked_total`. Errors use the A4 envelope
+`yuzu_server_ca_reissue_blocked_total`,
+`yuzu_server_ca_revocation_sweep_read_failures_total` (ADR-0053 UP-1: the ~15s
+revocation-sweep tick's `list_revoked()` read failed, so that tick's sweep was
+skipped entirely rather than treating every live agent as revoked — a sustained
+Postgres outage shows here, not as a burst of `session.cert_revoked` audit rows).
+Errors use the A4 envelope
 (`docs/agentic-first-principle.md`). Revocation takes effect server-side
 **immediately** (the mTLS accept gate reads `ca_store`, not the CRL); the CRL
 republish propagates it to external consumers. A republish failure is honest:
@@ -519,7 +524,12 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
   playbook.md`), not as a separate local file.
 - **Deliberate clean re-root** (wipe an established root, e.g. after root-key compromise):
   `default_certs.cpp`'s B-2 guard refuses to regenerate while `ca_store.ca_root` already holds a
-  row, so there is no in-product "reset" action. The operator must clear the store directly —
+  row, so there is no in-product "reset" action. This procedure is for a root the fleet is
+  actually enrolled under — a first boot that crashed before completing (no agents enrolled yet,
+  same host, local `<ca-dir>` key material intact) self-heals automatically on the next start
+  instead (ADR-0053, UP-2); you only need the steps below when that self-heal condition does not
+  hold (different host, wiped `<ca-dir>`, or a root you deliberately want to retire). The operator
+  must clear the store directly —
   `TRUNCATE ca_store.ca_root, ca_store.ca_issued, ca_store.ca_crl_versions` against the server's
   Postgres substrate (`docs/postgres-store-playbook.md` for connecting) — and remove the on-disk
   `<ca-dir>/default-*.{pem,key}` + `default-marker.json`, then restart. This orphans every

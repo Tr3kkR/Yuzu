@@ -7172,6 +7172,72 @@ TEST_CASE("MCP CA: revoke_certificate full approval-ticket round-trip reaches re
     CHECK(body2["result"]["structuredContent"] == payload);
 }
 
+// Gate 4 consistency-auditor SHOULD (2026-08-21): the StoreError (genuine ca_store
+// DB failure, not "serial not found") branch discarded audit_fn's return value —
+// unlike its "denied"/"success" siblings, an agentic caller had no way to learn a
+// dropped audit row accompanied the 503. Exercises BOTH halves together: the
+// ca_store degrade forces the StoreError branch, and audit_succeeds_=false forces
+// the audit_fn call inside it to fail, so a passing test proves the fix threads
+// audit_fn's result through this exact branch.
+TEST_CASE("MCP CA: revoke_certificate StoreError (genuine DB failure) surfaces "
+          "audit_persisted:false on a dropped audit row (Gate 4 fix, 2026-08-21)",
+          "[mcp][integration][pki][security][approval][audit][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    yuzu::server::IssuedCertRecord rec;
+    rec.serial_hex = "FEED";
+    rec.subject = "agent-storeerr";
+    rec.purpose = "agent";
+    rec.not_after = 4102444800;
+    REQUIRE(store.record_issued(rec).has_value());
+
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_storeerr_"}};
+    yuzu::test::SqliteHandleOwner<sqlite3> raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw.db) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.db);
+    appr.create_tables();
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.audit_succeeds_ = false; // the ca.cert.revoked|failure row cannot persist
+    ts.start("supervised");
+
+    // Mint + approve the ticket while the store is still healthy — schema
+    // validation and the approval flow are not what this test exercises.
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":8,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"FEED","reason":"key_compromise"}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    // Degrade the store out from under the live handler, same idiom as the
+    // tag_store StoreError suite: a QUERY failure once is_open() is still true.
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{PQexec(conn.get(), "DROP TABLE ca_store.ca_issued CASCADE")};
+        REQUIRE(r.ok());
+    }
+
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"FEED","reason":"key_compromise","approval_id":")" +
+        approval_id + R"("}}})";
+    auto res = ts.call(recall);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    REQUIRE(body["error"].contains("data"));
+    // The fix: this branch now threads audit_fn's (forced-false) return value
+    // through, exactly like the denied/success siblings already did.
+    REQUIRE(body["error"]["data"].contains("audit_persisted"));
+    CHECK(body["error"]["data"]["audit_persisted"] == false);
+}
+
 // #2444 item 3: yuzu_mcp_approval_burned_total{tool,reason}. revoke_certificate
 // is a deliberate pick — its "serial not found" business rejection (CaStore::
 // revoke returning false) is emitted ONLY via the domain-verb audit_fn call

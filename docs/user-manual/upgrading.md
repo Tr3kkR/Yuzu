@@ -689,6 +689,13 @@ it was never in `ca.db` and stays a local file behind `KeyProvider` (`--ca-dir`)
 - Every other CA behavior — revocation semantics, CRL numbering, the single
   `sign_agent_csr` chokepoint — is unchanged. Detail: `docs/pki-architecture.md`,
   `docs/adr/0053-ca-store-postgres-migration.md`.
+- **HA note: a losing first-boot replica does not self-heal on its own.** If two
+  server instances start against the same fresh `ca_store` at once, exactly one
+  wins the root race and generates the live default certs; the other discards
+  its own freshly-generated material and does not start serving with it. That
+  losing instance does not retry in the background — restart it (or let your
+  orchestrator's normal restart-on-unready policy do so) once the winner's
+  certs are in place, so it picks them up from disk on the next boot.
 
 ## ⚠️ Behaviour change: response history resets on Postgres cutover (ADR-0039)
 
