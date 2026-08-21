@@ -7841,12 +7841,23 @@ public:
         // margin. What .lock() alone does NOT protect is the pg::PgPool&
         // that object still borrows: AnalyticsEventStore::stop_drain(),
         // called well above, sets an internal shutting_down_ latch as its
-        // first statement, and emit()/query_recent()/pending_count()/
-        // start_drain() all check it before ever touching pool_ — a
-        // latch, not a rundown guard, so it refuses NEW entrants from the
-        // moment stop_drain() runs, not a caller already past the check.
-        // That residual is bounded by the multi-second span between
-        // stop_drain() (above) and pg_pool_.reset() (below) — several
+        // first statement, and emit()/start_drain() check it before ever
+        // touching pool_ — a latch, not a rundown guard, so it refuses NEW
+        // entrants from the moment stop_drain() runs, not a caller already
+        // past the check. query_recent()/pending_count() are deliberately
+        // NOT gated on it (fjarvis review, PR #3350, 2026-08-20 — an
+        // earlier version of this fix gated them too, which broke this
+        // store's own drain tests): their sole production callers are
+        // web_server_->Get(...) HTTP handlers, and web_thread_'s join
+        // below (with its own bounded wait/_Exit escalation) completes
+        // strictly before pg_pool_.reset() runs — every httplib worker,
+        // including any in-flight analytics handler, is already joined by
+        // the time that non-timeout path continues. That's a join
+        // ordering, not a timing margin.
+        // emit()'s residual (it IS still latch-gated, and the latch is a
+        // check-then-use gate, not a rundown guard) is bounded by the
+        // multi-second span between stop_drain() (above) and
+        // pg_pool_.reset() (below) — several
         // joins/quiesce waits sit in between — which makes it small in
         // practice, not zero by construction (cpp-expert review, PR
         // #3350, 2026-08-20). The detached thread itself outliving this
