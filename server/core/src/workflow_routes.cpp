@@ -914,14 +914,20 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // RestApiV1's blanket service-scoped deny for the identical reason —
     // ITServiceOwner grants full CRUD on Schedule, so a bare Schedule:Read
     // gate alone would still let a service-scoped token enumerate every
-    // schedule from every other service. Runs BEFORE perm_fn (independent
-    // of RBAC on/off branch ordering) — matches the GuardianRoutes/DexRoutes/
-    // NetworkRoutes family of fragment/REST denies with no single per-target
-    // to scope against: this fragment has no permission gate of its own to
-    // run after, unlike the now-retired REST `/api/schedules` family's
-    // interim deny (#3290 Phase 2 bucket 1a — that one ran AFTER its route's
-    // permission gate(s) and was made provably dead by the flip; this
-    // lambda's own route has no such gate, so it is NOT dead and stays).
+    // schedule from every other service. Runs BEFORE this route's own
+    // `perm_fn(Schedule,Read)` call below (independent of RBAC on/off branch
+    // ordering) — matches the GuardianRoutes/DexRoutes/NetworkRoutes family
+    // of fragment/REST denies with no single per-target to scope against.
+    // Security-guardian correction (governance run 2026-08-21): an earlier
+    // draft of this comment claimed this fragment "has no permission gate of
+    // its own to run after" — false, `perm_fn` runs right below. The correct
+    // classification is LIVE-but-redundant (fires BEFORE its gate, the same
+    // bucket-1b class as the routed-concern row's other still-listed
+    // helpers), not gate-less/§3e — this deny stays for that reason, not
+    // because the route lacks a gate. Contrast the now-retired REST
+    // `/api/schedules` family's interim deny (#3290 Phase 2 bucket 1a — that
+    // one ran AFTER its route's permission gate(s) and was made provably
+    // dead by the flip).
     auto deny_service_scoped_schedule_list = [auth_fn, audit_fn](const httplib::Request& req,
                                                                   httplib::Response& res) -> bool {
         auto session = auth_fn(req, res);
