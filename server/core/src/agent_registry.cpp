@@ -98,8 +98,36 @@ void AgentRegistry::register_agent(const pb::AgentInfo& info) {
             // registrations skip the revoke (agents_ has no entry), which
             // preserves the operator workflow of pre-issuing a token for an
             // agent_id that has not registered yet.
-            if (device_token_store_)
-                device_token_store_->revoke_by_principal(info.agent_id());
+            if (device_token_store_) {
+                // ADR-0052: revoke_by_principal is now type-distinguishable (a genuine DB error
+                // is not the same as "nothing to revoke") — log a failure rather than silently
+                // swallowing it. Re-wiring this store's construction (and deciding whether a
+                // revoke failure should instead block the registration) is out of scope for the
+                // migration; this call site has no live caller today (device_token_store_ is
+                // never non-null in production).
+                //
+                // gov cpp-safety + Gate 8 security-guardian: this call now runs a blocking
+                // Postgres round-trip INSIDE the `mu_` critical section above — up to
+                // kWriteTimeout (4s pool-acquire), PLUS a possible additional lock-wait up to
+                // lock_timeout_ms (10s default, server/core/src/pg/pg_pool.hpp) if a concurrent
+                // `validate_token` holds this row's `FOR UPDATE` lock — the same
+                // acquire-vs-lock-wait distinction ADR-0052's own "Capacity note" documents for
+                // `kValidateTimeout`, applying here too. The
+                // install-then-revoke atomicity W1.5/#823 requires is deliberate, but it means a
+                // future re-wiring serializes every `register_agent` caller behind this store's
+                // pool-acquire latency, the same lock-discipline shape `sweep_revoked` in this
+                // file documents as forbidden (gov #1117) for a cross-store query. The wiring PR
+                // must resolve this tension (e.g. `sweep_revoked`'s snapshot-off-lock,
+                // re-verify-under-lock pattern) rather than inherit "hold mu_ across the call" by
+                // default — do not copy this shape unexamined once the store goes live.
+                auto revoked = device_token_store_->revoke_by_principal(info.agent_id());
+                if (!revoked) {
+                    spdlog::error(
+                        "AgentRegistry::register_agent: device token revoke-by-principal "
+                        "failed for '{}': {}",
+                        info.agent_id(), revoked.error());
+                }
+            }
             if (!old->second->session_id.empty())
                 session_to_agent_.erase(old->second->session_id);
         }
