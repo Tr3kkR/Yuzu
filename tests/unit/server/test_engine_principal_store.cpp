@@ -1416,6 +1416,72 @@ TEST_CASE("a stale pre-eviction generation snapshot cannot alias a post-eviction
     CHECK(store.revalidate_cache_resident_for_test() == 1);
 }
 
+TEST_CASE("a sweep triggered by an UNRELATED principal's invalidate can evict a "
+          "straddling reader's own entry, safely (#3385 UP-3/UP-4, unhappy-path fold)",
+          "[pg][engine_principal][store][cache]") {
+    // The aliasing test above is single-principal: one hook fire, one
+    // principal, its OWN later bump forces the sweep that evicts its OWN
+    // entry. Unhappy-path (Gate 4) flagged a DIFFERENT interleaving with no
+    // coverage: a sweep triggered by a THIRD principal's invalidate can
+    // evict an aged entry belonging to a principal currently mid-read, as a
+    // pure side effect -- nothing targets that principal directly. This
+    // proves the fail-safe direction holds: the straddling reader declines
+    // to cache rather than risking a stale Active, exactly as an ordinary
+    // (non-cross-principal) generation mismatch already does.
+    auto fake_now = std::chrono::steady_clock::now();
+    YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    EnginePrincipalStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_clock_for_test([&] { return fake_now; });
+    store.set_max_entries_for_test(2); // A and B fill it; C's bump forces a sweep
+
+    REQUIRE(store.create("A", "alice", "j", "internal", "admin", "engine:cross-a")
+               .has_value());
+    REQUIRE(store.create("B", "alice", "j", "internal", "admin", "engine:cross-b")
+               .has_value());
+    REQUIRE(store.create("C", "alice", "j", "internal", "admin", "engine:cross-c")
+               .has_value());
+
+    // Fill the 2-slot map with A and B -- neither is revoked in the DB, this
+    // only touches the in-memory guard map.
+    store.invalidate_revalidate_cache("engine:cross-a");
+    store.invalidate_revalidate_cache("engine:cross-b");
+    CHECK(store.revoke_generation_resident_for_test() == 2);
+
+    // A's own read starts here; its pre-read snapshot reflects the bump
+    // above. Mid-read, age past the TTL and bump a DIFFERENT principal (C,
+    // never before in the map) -- the map is full, so C's bump sweeps FIRST,
+    // evicting BOTH A's and B's aged entries as a side effect, then C takes
+    // a fresh slot. A's own entry is gone, but nothing invalidated A
+    // directly.
+    bool fired = false;
+    store.test_hook_after_revalidate_read_ = [&] {
+        if (fired)
+            return;
+        fired = true;
+        fake_now += std::chrono::seconds(64);
+        store.invalidate_revalidate_cache("engine:cross-c");
+    };
+
+    const auto raced = EngineLivenessTestAccess::revalidate(store, "engine:cross-a");
+    store.test_hook_after_revalidate_read_ = nullptr;
+    REQUIRE(fired);
+    CHECK(raced.status == EngineLookupStatus::Active); // real DB state, unaffected
+
+    // A's entry no longer exists (evicted), so its implicit generation is
+    // now 0 -- which does NOT match A's nonzero pre-read snapshot, so the
+    // guard correctly declines to cache rather than risking staleness.
+    CHECK(store.revoke_generation_resident_for_test() == 1); // only C resident now
+    CHECK(store.revalidate_cache_resident_for_test() == 0);
+
+    // Vacuous-pass guard: once settled, a plain read of A caches normally.
+    CHECK(EngineLivenessTestAccess::revalidate(store, "engine:cross-a").status ==
+          EngineLookupStatus::Active);
+    CHECK(store.revalidate_cache_resident_for_test() == 1);
+}
+
 TEST_CASE("transfer_owner does not consume a generation slot on a confirmed no-op (#3385)",
           "[pg][engine_principal][store]") {
     YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);

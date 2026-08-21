@@ -589,9 +589,22 @@ private:
     /// when the method's own WHERE clause already requires
     /// `lifecycle_state='active'`, so that zero rows affected conclusively
     /// means the principal doesn't exist or is already revoked and no
-    /// Active-status race exists for THAT call to guard against. `revoke()`
-    /// has no such precondition on its target row and stays the unconditional
-    /// default — when in doubt, invalidate unconditionally.
+    /// Active-status race exists for THAT call to guard against.
+    ///
+    /// `revoke()` (below) carries that IDENTICAL WHERE-clause shape (also
+    /// `lifecycle_state='active'`) — consistency-auditor caught an earlier
+    /// draft of this comment claiming otherwise (Gate 4 fold) — so the
+    /// narrower rule would be formally sound for it too. `revoke()` stays
+    /// fully unconditional anyway, as a DELIBERATE conservative choice, not
+    /// because its precondition differs: it is the security-critical
+    /// Active→Revoked transition itself, and unconditional invalidation
+    /// there is a backstop against every other race this store's callers
+    /// might not have reasoned through as carefully as this comment has —
+    /// cheap insurance on the one call that flips `lifecycle_state` at all.
+    /// When in doubt, or when a mutator's blast radius is this central,
+    /// invalidate unconditionally; reserve the narrower, WHERE-clause-backed
+    /// skip for a call like `transfer_owner` that never touches
+    /// `lifecycle_state`.
     ///
     /// `kRevokeGenerationEntryTtl` must exceed the true worst-case in-flight
     /// window of a reader's own `get_for_auth()` call for eviction to be
