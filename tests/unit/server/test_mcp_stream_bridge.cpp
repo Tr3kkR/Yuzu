@@ -618,16 +618,93 @@ TEST_CASE("bridge #2411 - a wake dirty-marks only ITS OWN record, not every reco
         sink->poked.store(false, std::memory_order_release);
     }
 
+    // QUIESCE B before the experiment (#3357). B is marked dirty TWICE during
+    // setup - arm() self-marks at the handoff (mcp_stream_bridge.cpp's
+    // `mark_dirty(*core_, rec->key)  // the handoff`) and its own publish marks it
+    // again. The poll_until(poked) above only proves ONE pass drained a mark for
+    // B; if the other is still queued, a later pass - including the one A's
+    // publish triggers - still finds B in core_->dirty, visits it, and forwards
+    // the wake exactly as designed. That, not a dirty-set leak, is what made this
+    // test fail ~6% of runs on Linux and more on the BigMags pool.
+    //
+    // The precondition this test has always CLAIMED is "B holds pending work and
+    // is NOT dirty". Establish it rather than assuming it: drive cycles until B
+    // stops being poked. Each publish on A drives one pass; B's marks are finite,
+    // so this converges.
+    // Each publish carries a DISTINCT progress value: identical progress is
+    // deduplicated before the projector ever sees it (progress_suppressed_delta),
+    // so repeating prog(1, 3) would drive no cycle and emit no frame.
+    //
+    // BOUNDED, and the bound is load-bearing. A record that never quiesces is
+    // exactly the #2411 regression this test exists to catch, so exceeding the
+    // bound must FAIL - an unbounded spin converts that regression into a CI WEDGE
+    // (a 600 s meson timeout, surfacing as "suite failed but enumeration re-run
+    // reproduced no failing case") instead of a red assertion. Measured: with
+    // run_projector's ordinary path forced to a full-table scan, the unbounded
+    // version of this loop ran >3500 s instead of ~1 s.
+    int seq = 1;
+    int settled = 0;
+    for (int attempt = 0; settled < 3; ++attempt) {
+        INFO("quiesce attempt " << attempt << ": B still poked by a wake on A");
+        REQUIRE(attempt < 40);  // #2411 regression, or a genuinely stuck dirty set
+        {
+            std::lock_guard<std::mutex> lk(sink->mu);
+            sink->poked.store(false, std::memory_order_release);
+        }
+        const double c0 = fx.reg.counter("yuzu_mcp_bridge_projector_cycles_total").value();
+        fx.bus.publish("exec-2411-a", "execution-progress", prog(++seq, 100));
+        REQUIRE(poll_until([&] {
+            return fx.reg.counter("yuzu_mcp_bridge_projector_cycles_total").value() >= c0 + 1.0;
+        }));
+        settled = sink->poked.load(std::memory_order_acquire) ? 0 : settled + 1;
+    }
+    {
+        std::lock_guard<std::mutex> lk(sink->mu);
+        sink->poked.store(false, std::memory_order_release);
+    }
+    const std::size_t frames_before =
+        count_method(ring_frames(*a.stream, "alice"), "notifications/progress");
+
     // A's event: marks only A dirty. A's frame reaching the wire proves A's
     // own wake WAS processed - the test isn't vacuous.
-    fx.bus.publish("exec-2411-a", "execution-progress", prog(1, 3));
+    fx.bus.publish("exec-2411-a", "execution-progress", prog(++seq, 100));
     REQUIRE(poll_until([&] {
-        return count_method(ring_frames(*a.stream, "alice"), "notifications/progress") == 1;
+        return count_method(ring_frames(*a.stream, "alice"), "notifications/progress") ==
+               frames_before + 1;
     }));
 
     // B was NOT re-visited as a side effect of A's wake.
-    CHECK_FALSE(poll_until([&] { return sink->poked.load(std::memory_order_acquire); },
-                           std::chrono::milliseconds(100)));
+    //
+    // #3357: this was `CHECK_FALSE(poll_until(poked, 100ms))` - "assert nothing
+    // happened for 100 ms" - which is the wrong shape twice over. It false-REDs
+    // when a loaded box lets any visit land inside the window, and it false-GREENs
+    // if the poke arrives at 101 ms. Note poll_until's own "generous deadline,
+    // never false-RED on a loaded CI box" rationale holds only for POSITIVE waits;
+    // under CHECK_FALSE the polarity inverts and a LONGER window makes a false red
+    // MORE likely. It never failed in 33 GHA-hosted macOS jobs and then failed 3 of
+    // 20 once the leg moved to the self-hosted BigMags pool (3fed7c64), reddening
+    // dev and PRs that touch nothing near the bridge.
+    //
+    // Replaced with a driven happens-before barrier on a monotonic signal, so there
+    // is no window at all. kMetricProjectorCycles is incremented once per pass,
+    // AFTER every project_record in that pass has run, so once it has advanced by
+    // one from a value read here, some pass has RUN TO COMPLETION since - and the
+    // pass that projected A (which is the only thing that could have poked B) is
+    // therefore finished and its effects visible.
+    //
+    // The extra publish is what makes the barrier terminate: run_projector waits on
+    // `cv.wait(lk, work_pending)` with NO periodic tick, so without a new wake the
+    // counter would never advance and a bare wait would hang to poll_until's
+    // deadline and fail. A is kGetOnly with no bound post sink, so this touches
+    // nothing the assertion reads.
+    const double cycles_before =
+        fx.reg.counter("yuzu_mcp_bridge_projector_cycles_total").value();
+    fx.bus.publish("exec-2411-a", "execution-progress", prog(++seq, 100));
+    REQUIRE(poll_until([&] {
+        return fx.reg.counter("yuzu_mcp_bridge_projector_cycles_total").value() >=
+               cycles_before + 1.0;
+    }));
+    CHECK_FALSE(sink->poked.load(std::memory_order_acquire));
 }
 
 TEST_CASE("bridge #2411 - a listener fault on one record still flushes via that record's "

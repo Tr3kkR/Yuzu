@@ -130,6 +130,37 @@ bool should_log_unreachable() {
 }
 } // namespace
 
+namespace {
+
+/// #2456 UP-17: is this SQLSTATE a permanent condition (a missing table, a
+/// revoked grant, a broken constraint) rather than a transient connection or
+/// resource problem? Class 42 ("Syntax Error or Access Rule Violation")
+/// covers exactly the two examples the issue names — 42P01 undefined_table,
+/// 42501 insufficient_privilege — and, more generally, every SQLSTATE in
+/// that class shares the same operational fact: retrying the identical query
+/// will fail identically until an operator changes the schema or the grant.
+/// Deliberately narrow — classes 08/53/57/58 (connection/resource/operator-
+/// intervention/system) stay classified as transient, which is the existing,
+/// correct default for anything not matched here.
+bool is_permanent_sqlstate(std::string_view sqlstate) {
+    return sqlstate.size() == 5 && sqlstate.starts_with("42");
+}
+
+/// Best-effort SQLSTATE extraction for a log line. Never throws, never
+/// null-derefs — `PQresultErrorField` returns nullptr both for "no such
+/// field" and "PGresult itself is null", and the caller here always has a
+/// live result. Returns an empty string, not "<none>", when the field is
+/// absent — the ONLY caller substitutes "<none>" for display on its
+/// transient-log branch (the permanent-condition branch requires
+/// `.size() == 5` via `is_permanent_sqlstate`, so an empty string can never
+/// reach it either way).
+std::string result_sqlstate(const pg::PgResult& res) {
+    const char* p = res.get() ? PQresultErrorField(res.get(), PG_DIAG_SQLSTATE) : nullptr;
+    return p ? std::string(p) : std::string();
+}
+
+} // namespace
+
 EngineLookup EnginePrincipalStore::get_for_auth(const std::string& principal_id) const {
     // ADR-0012 §1 authoritative posture (design doc §3.1 / §12 decision 1):
     // BOTH non-Active outcomes below DENY the request — the split changes
@@ -141,16 +172,48 @@ EngineLookup EnginePrincipalStore::get_for_auth(const std::string& principal_id)
             spdlog::warn("{}: get_for_auth denied (store not open) — retryable PG-availability "
                         "condition, not a revoked credential",
                         kStoreName);
-        return {EngineLookupStatus::StoreUnreachable, std::nullopt};
+        // Confirmed, not ambiguous: the store was never opened, which cannot
+        // self-resolve the way a momentarily-saturated pool can.
+        return {EngineLookupStatus::StoreUnreachable, std::nullopt, /*confirmed_unreachable=*/true};
     }
 
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
-        if (should_log_unreachable())
-            spdlog::warn("{}: get_for_auth denied (lease acquire failed/timed out) — retryable "
-                        "PG-availability condition, not a revoked credential",
-                        kStoreName);
-        return {EngineLookupStatus::StoreUnreachable, std::nullopt};
+        // #2456 UP-4, corrected per security-guardian (Gate 2): NOT every
+        // `!lease` is ambiguous. `PgPool`'s own connect-failure breaker
+        // (`connect_breaker_open()`) fires ONLY on recent CONNECT failures,
+        // never on pool saturation alone (its own doc comment: "Pool
+        // saturation alone... does NOT arm the breaker, so this never
+        // false-trips under load") — so when it is armed, this `!lease` IS
+        // confirmed evidence of a real outage, not a load blip. Checking it
+        // matters here specifically: without it, the exact real-outage case
+        // #2367's backoff (and #2459's alert, which is driven by the same
+        // backoff-arming decision) exists to catch would be misclassified as
+        // ambiguous and the backoff would never arm for it.
+        const bool breaker_open = pool_.connect_breaker_open();
+        if (should_log_unreachable()) {
+            if (breaker_open) {
+                spdlog::warn("{}: get_for_auth denied (lease acquire failed, connect breaker "
+                            "OPEN) — CONFIRMED PG-unavailability (recent connect failures), "
+                            "not a revoked credential",
+                            kStoreName);
+            } else {
+                spdlog::warn("{}: get_for_auth denied (lease acquire failed/timed out, connect "
+                            "breaker closed) — retryable PG-availability condition, not a "
+                            "revoked credential",
+                            kStoreName);
+            }
+        }
+        // Ambiguous ONLY when the breaker is closed: a bare acquire timeout
+        // with no recent connect failure reads identically for "the database
+        // is gone" and "the pool was briefly saturated by unrelated traffic"
+        // (viz fan-out, heartbeat spike, cold start). get_for_auth_revalidate
+        // must not arm its failure backoff on THAT alone, or a healthy
+        // database stops being probed for 5-10 s on a load blip that had
+        // nothing to do with it. A breaker-open failure has no such
+        // ambiguity — it IS confirmed.
+        return {EngineLookupStatus::StoreUnreachable, std::nullopt,
+                /*confirmed_unreachable=*/breaker_open};
     }
 
     std::string sql =
@@ -159,11 +222,34 @@ EngineLookup EnginePrincipalStore::get_for_auth(const std::string& principal_id)
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(),
                                        std::vector<std::string>{principal_id});
     if (res.status() != PGRES_TUPLES_OK) {
-        if (should_log_unreachable())
-            spdlog::warn("{}: get_for_auth denied (query failed, status={}) — retryable "
-                        "PG-availability condition, not a revoked credential",
-                        kStoreName, static_cast<int>(res.status()));
-        return {EngineLookupStatus::StoreUnreachable, std::nullopt}; // transient/retryable
+        // #2456 UP-17: a query that actually RAN and came back with a bad
+        // status is not the same evidence as a bare acquire timeout — name
+        // the real cause when the error itself says so, instead of always
+        // logging "retryable PG-availability condition" over what might be a
+        // permanent schema or grant problem an operator needs to fix.
+        const std::string sqlstate = result_sqlstate(res);
+        if (should_log_unreachable()) {
+            if (is_permanent_sqlstate(sqlstate)) {
+                spdlog::warn("{}: get_for_auth denied (query failed, SQLSTATE={}) — NOT a "
+                            "transient PG-availability condition: this SQLSTATE class is a "
+                            "schema or access-rule problem (missing table, revoked grant, "
+                            "broken constraint) that will not self-resolve on retry",
+                            kStoreName, sqlstate);
+            } else {
+                spdlog::warn("{}: get_for_auth denied (query failed, status={}, SQLSTATE={}) — "
+                            "retryable PG-availability condition, not a revoked credential",
+                            kStoreName, static_cast<int>(res.status()),
+                            sqlstate.empty() ? "<none>" : sqlstate);
+            }
+        }
+        // Caller status is UNCHANGED either way (ADR-0012 §1 three-state
+        // contract, acceptance criterion of #2456): a permanent condition
+        // still denies as StoreUnreachable/retryable to every consumer but
+        // this store's own log line, which is the only thing that gets more
+        // accurate. A query that ran and failed IS confirmed evidence,
+        // regardless of which SQLSTATE class it falls into.
+        return {EngineLookupStatus::StoreUnreachable, std::nullopt,
+                /*confirmed_unreachable=*/true};
     }
 
     if (PQntuples(res.get()) == 0)
@@ -200,11 +286,14 @@ EnginePrincipalStore::get_for_auth_revalidate(const std::string& principal_id) c
     // amplifier: unreachable -> indeterminate -> keep retrying -> starve the
     // ordinary validate_token and fleet data-plane writes with it.
 
-    // Snapshot the generation BEFORE the lookup so a revoke racing our read is
-    // observable at the cache-write below. Cache-poisoning guard only; see the
-    // revoke_generation_ field comment for the residual single-call window.
-    const auto gen_before = revoke_generation_.load(std::memory_order_acquire);
+    // #2454: snapshot the PER-PRINCIPAL generation BEFORE the lookup, so a
+    // revoke racing our read is observable at the cache-write below. Folded
+    // into the same lock as the cache_/backoff_ checks right below (no
+    // separate lock acquisition needed — see the field comment in the hpp
+    // for why this no longer needs the atomic-before-lock ordering trick the
+    // single global counter used to require).
     const auto now = clock_();
+    RevokeGeneration gen_before;
 
     {
         std::lock_guard lk(revalidate_cache_mu_);
@@ -230,6 +319,8 @@ EnginePrincipalStore::get_for_auth_revalidate(const std::string& principal_id) c
             }
             revalidate_backoff_.erase(bo);
         }
+
+        gen_before = snapshot_revoke_generation_locked(principal_id);
     }
     revalidate_cache_misses_.fetch_add(1, std::memory_order_relaxed);
 
@@ -242,29 +333,44 @@ EnginePrincipalStore::get_for_auth_revalidate(const std::string& principal_id) c
 
     if (fresh.status == EngineLookupStatus::StoreUnreachable) {
         const auto stamp = clock_();
-        std::lock_guard lk(revalidate_cache_mu_);
-        // C1 (adversarial review, PR #2462): the SAME generation guard the
-        // Active arm below applies. If a revoke bumped the generation while
-        // this read was in flight, do NOT install a backoff -- it would answer
-        // StoreUnreachable (no read-through) for the whole backoff window once
-        // the store recovers, so a just-revoked principal's stream would ride
-        // its grace window instead of being cut on the next tick (contradicting
-        // ADR-0031's writing-replica "next tick" property). Leave it uncached;
-        // the next tick reads through to MissingOrRevoked. Fail-safe direction
-        // and bounded (the stream still dies at the grace deadline), but a real
-        // revocation delay on the auth path -- close it symmetrically.
-        if (revoke_generation_.load(std::memory_order_acquire) == gen_before) {
-            // The backoff map needs the SAME ceiling discipline as the positive
-            // map, and needs it on THIS path: an outage is the only thing that
-            // fills this map, and the positive-insert arm (the other sweep
-            // site) by definition does not run during one. Without this, a
-            // principal whose stream ends mid-outage leaves an entry resident
-            // for the process lifetime.
-            if (revalidate_backoff_.size() >= max_entries_)
-                sweep_expired_locked(stamp);
-            if (revalidate_backoff_.size() < max_entries_) {
-                revalidate_backoff_.insert_or_assign(
-                    principal_id, stamp + kAuthFailureBackoff + jitter_up_to(kAuthFailureBackoff));
+        // #2456 UP-4: only arm the backoff on CONFIRMED unreachability (the
+        // store was closed, a query actually ran and failed, or a
+        // lease-acquire timeout occurred with the connect-failure breaker
+        // already open) — not on a bare lease-acquire timeout with the
+        // breaker still closed, which reads identically for "the database is
+        // gone" and "the pool was briefly saturated by unrelated traffic".
+        // Arming a 5-10 s backoff on that ambiguous case would suppress
+        // probing a perfectly healthy database. This tick's answer
+        // is still StoreUnreachable either way (the caller denies+retries
+        // exactly as before) — the only thing this skips is PERSISTING that
+        // answer for future ticks on weaker evidence than the backoff exists
+        // to act on.
+        if (fresh.confirmed_unreachable) {
+            std::lock_guard lk(revalidate_cache_mu_);
+            // C1 (adversarial review, PR #2462): the SAME generation guard the
+            // Active arm below applies. If a revoke bumped the generation while
+            // this read was in flight, do NOT install a backoff -- it would answer
+            // StoreUnreachable (no read-through) for the whole backoff window once
+            // the store recovers, so a just-revoked principal's stream would ride
+            // its grace window instead of being cut on the next tick (contradicting
+            // ADR-0031's writing-replica "next tick" property). Leave it uncached;
+            // the next tick reads through to MissingOrRevoked. Fail-safe direction
+            // and bounded (the stream still dies at the grace deadline), but a real
+            // revocation delay on the auth path -- close it symmetrically.
+            if (snapshot_revoke_generation_locked(principal_id) == gen_before) {
+                // The backoff map needs the SAME ceiling discipline as the positive
+                // map, and needs it on THIS path: an outage is the only thing that
+                // fills this map, and the positive-insert arm (the other sweep
+                // site) by definition does not run during one. Without this, a
+                // principal whose stream ends mid-outage leaves an entry resident
+                // for the process lifetime.
+                if (revalidate_backoff_.size() >= max_entries_)
+                    sweep_expired_locked(stamp);
+                if (revalidate_backoff_.size() < max_entries_) {
+                    revalidate_backoff_.insert_or_assign(
+                        principal_id,
+                        stamp + kAuthFailureBackoff + jitter_up_to(kAuthFailureBackoff));
+                }
             }
         }
         // Declining to record a backoff is safe in the same way as declining
@@ -283,7 +389,7 @@ EnginePrincipalStore::get_for_auth_revalidate(const std::string& principal_id) c
         // the full TTL).
         std::lock_guard lk(revalidate_cache_mu_);
         revalidate_backoff_.erase(principal_id); // reachable again
-        if (revoke_generation_.load(std::memory_order_acquire) == gen_before) {
+        if (snapshot_revoke_generation_locked(principal_id) == gen_before) {
             // Age the entry from BEFORE the read, not after it. The consumer
             // treats a cache hit as "the store confirmed this within the TTL"
             // and credits its own freshness budget accordingly, so the stamp
@@ -353,6 +459,11 @@ std::size_t EnginePrincipalStore::revalidate_backoff_resident_for_test() const {
     return revalidate_backoff_.size();
 }
 
+std::size_t EnginePrincipalStore::revoke_generation_resident_for_test() const {
+    std::lock_guard lk(revalidate_cache_mu_);
+    return revoke_generation_by_principal_.size();
+}
+
 void EnginePrincipalStore::set_max_entries_for_test(std::size_t n) {
     std::lock_guard lk(revalidate_cache_mu_);
     max_entries_ = n == 0 ? kAuthCacheMaxEntries : n;
@@ -370,24 +481,66 @@ void EnginePrincipalStore::set_clock_for_test(ClockFn fn) {
     clock_ = fn ? std::move(fn) : ClockFn{[] { return std::chrono::steady_clock::now(); }};
 }
 
+EnginePrincipalStore::RevokeGeneration
+EnginePrincipalStore::snapshot_revoke_generation_locked(const std::string& principal_id) const {
+    RevokeGeneration g;
+    if (auto it = revoke_generation_by_principal_.find(principal_id);
+        it != revoke_generation_by_principal_.end()) {
+        g.per_principal = it->second;
+    }
+    g.global_epoch = revoke_generation_global_epoch_;
+    return g;
+}
+
 void EnginePrincipalStore::invalidate_revalidate_cache(const std::string& principal_id) {
-    // Bump BEFORE taking the mutex — the ordering half of the poisoning guard
-    // (see revoke_generation_ in the hpp). A reader that already sampled the
-    // old generation and is about to insert will observe the bump under the
-    // mutex and skip its write.
-    revoke_generation_.fetch_add(1, std::memory_order_acq_rel);
+    // #2454: bump AND erase in ONE critical section — see the hpp field
+    // comment for why a per-principal map no longer needs the split
+    // bump-then-lock ordering the single global atomic required.
     std::lock_guard lk(revalidate_cache_mu_);
     if (principal_id.empty()) {
+        // No per-key identity to target, so the only sound guard is the
+        // coarse global epoch — every in-flight reader, for every principal,
+        // must be invalidated (this is not on any production call path
+        // today; see the hpp field comment). Also reclaims the per-principal
+        // map (architect, Gate 3): the epoch bump already invalidates every
+        // pre-clear snapshot regardless of per-principal state, so clearing
+        // the map here is sound and gives an operator a capacity-reset lever
+        // if #2454's ceiling is ever actually reached.
+        ++revoke_generation_global_epoch_;
+        revoke_generation_by_principal_.clear();
         revalidate_cache_.clear();
         revalidate_backoff_.clear();
-    } else {
-        revalidate_cache_.erase(principal_id);
-        // The backoff entry must go too. Leaving it would answer this
-        // principal StoreUnreachable -> kIndeterminate for up to the backoff
-        // window, keeping a JUST-REVOKED principal's stream alive in grace and
-        // contradicting "the writing replica cuts the stream on the next tick".
-        revalidate_backoff_.erase(principal_id);
+        return;
     }
+
+    // Ceiling-capped, but NOT by silent decline (Gate 3 finding, security-
+    // guardian + cpp-safety + quality-engineer independently, same round):
+    // this map has no TTL and nothing else ever erases from it (unlike
+    // cache_/backoff_, which age out on their own), so "decline past the
+    // cap" is not a single skipped race the way it is for those maps — it is
+    // PERMANENT disablement of the guard for every principal not already
+    // resident, for the rest of process uptime, once `max_entries_` distinct
+    // principals have ever been revoked/transferred. Falling back to the
+    // coarse global epoch instead keeps the guard sound under exhaustion: it
+    // degrades to the OLD single-global-counter behavior (correct, if not as
+    // narrowly targeted) only once capacity is actually exceeded, rather
+    // than silently granting no protection at all to the entries that
+    // didn't make it in.
+    if (auto it = revoke_generation_by_principal_.find(principal_id);
+        it != revoke_generation_by_principal_.end()) {
+        ++it->second;
+    } else if (revoke_generation_by_principal_.size() < max_entries_) {
+        revoke_generation_by_principal_.emplace(principal_id, 1);
+    } else {
+        ++revoke_generation_global_epoch_;
+        revoke_generation_capacity_fallback_.fetch_add(1, std::memory_order_relaxed);
+    }
+    revalidate_cache_.erase(principal_id);
+    // The backoff entry must go too. Leaving it would answer this
+    // principal StoreUnreachable -> kIndeterminate for up to the backoff
+    // window, keeping a JUST-REVOKED principal's stream alive in grace and
+    // contradicting "the writing replica cuts the stream on the next tick".
+    revalidate_backoff_.erase(principal_id);
 }
 
 std::expected<EnginePrincipalRow, std::string>

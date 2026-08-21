@@ -2421,6 +2421,15 @@ static const ResourceDef kResources[] = {
      "Deterministic CEO demo scenarios and live-fleet variants", "application/json"},
     {"yuzu://golden-prompts/enterprise-it-v1", "Enterprise IT Golden Prompts v1",
      "Versioned prompt/eval catalogue for enterprise incident workflows", "application/json"},
+    {"yuzu://openapi", "OpenAPI Specification",
+     "REST API v1 OpenAPI spec, raw — byte-identical to GET /api/v1/openapi.json; the "
+     "discover_routes tool serves the same source wrapped in a distinct routes-catalog "
+     "projection, not this shape",
+     "application/json"},
+    {"yuzu://scope-dsl", "Scope DSL Reference",
+     "Scope-kind and comparison-operator catalog — same builder as GET "
+     "/api/v1/discover/scope-kinds and the discover_scope_kinds tool",
+     "application/json"},
 };
 
 static constexpr int kResourceCount = sizeof(kResources) / sizeof(kResources[0]);
@@ -3558,6 +3567,75 @@ McpServer::HandlerFn McpServer::build_handler(
                                  .add("uri", uri)
                                  .add("mimeType", "application/json")
                                  .add("text", content));
+                res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
+                                "application/json");
+                return;
+            }
+            // 2g PR 4 (specs-as-resources): yuzu://openapi and yuzu://scope-dsl reuse the
+            // SAME source builder as their REST /discover/* and MCP discover_* tool twins
+            // (A2 shared-builder principle). yuzu://openapi serves openapi_spec_json() raw —
+            // byte-identical to REST GET /api/v1/openapi.json's body, NOT to discover_routes'
+            // output, which wraps the same source in build_routes_catalog() as a distinct
+            // projection ({"source":"openapi", routes:[...]}). yuzu://scope-dsl serves
+            // scope_kinds_catalog().json raw, which IS byte-identical to both
+            // GET /api/v1/discover/scope-kinds and discover_scope_kinds (that builder has
+            // only one projection). Tier-gated (unlike the 9 legacy resources above, which
+            // predate the annotation/tier sweep and are perm_fn-only — #2713 tracks closing
+            // that gap for them separately), matching discover_routes/discover_scope_kinds's
+            // tier_allows-then-perm_fn order. This resources/read branch, like every other
+            // branch in this method, emits no audit row on tier denial (unlike tools/call's
+            // mcp_audit("denied", ...)) — the whole resources/read surface predates
+            // per-call audit, tracked by the same #2713 follow-up. Deliberately NOT
+            // unauthenticated like /api/v1/openapi.json — that posture is a tracked
+            // pre-existing gap (#2057), not a precedent to follow.
+            //
+            // Shared tier-denial remediation text for these two branches only — NOT the
+            // same scope as tools/call's kTierRemediation (declared later, inside that
+            // block), so not reused here; hoisting it across the ~40 tools/call call sites
+            // is out of scope for this PR.
+            constexpr std::string_view kResourceTierRemediation =
+                "this MCP token's tier does not permit the operation; use a higher-tier "
+                "MCP token (operator or supervised), or the REST API / dashboard";
+            if (uri == "yuzu://openapi") {
+                if (!tier_allows(session->mcp_tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        error_response_a4(id, kTierDenied, "MCP tier does not allow this operation",
+                                          yuzu::server::detail::make_correlation_id(),
+                                          kResourceTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                // Compiled-in — no store dependency. Raw openapi_spec_json(): byte-identical
+                // to REST GET /api/v1/openapi.json, a different projection than
+                // discover_routes (see the block comment above).
+                JArr contents;
+                contents.add(JObj()
+                                 .add("uri", uri)
+                                 .add("mimeType", "application/json")
+                                 .add("text", yuzu::server::openapi_spec_json()));
+                res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
+                                "application/json");
+                return;
+            }
+            if (uri == "yuzu://scope-dsl") {
+                if (!tier_allows(session->mcp_tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        error_response_a4(id, kTierDenied, "MCP tier does not allow this operation",
+                                          yuzu::server::detail::make_correlation_id(),
+                                          kResourceTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                // Compiled-in — no store dependency, same builder as REST
+                // /api/v1/discover/scope-kinds and discover_scope_kinds.
+                const auto& doc = yuzu::server::scope_kinds_catalog();
+                JArr contents;
+                contents.add(
+                    JObj().add("uri", uri).add("mimeType", "application/json").add("text", doc.json));
                 res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
                                 "application/json");
                 return;
