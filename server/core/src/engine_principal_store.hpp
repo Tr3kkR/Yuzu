@@ -65,10 +65,11 @@
 /// `validate_token` and the fleet data plane with it. (Past 60 s of a
 /// sustained outage the TOKEN half of the same tick resumes reading through
 /// too, since it has no equivalent backoff — so this removes one of the two
-/// amplifiers, not both. Tracked with #2447; the residual sharp edges of this
-/// one are #2454 (global revoke generation), #2455 (no single-flight), #2456
-/// (lease timeout vs permanent error), #2457 (unbounded read on the writer
-/// thread) and #2458 (silent ceiling / config binding).)
+/// amplifiers, not both. Tracked with #2447; #2454 (global revoke generation)
+/// and #2456 (lease timeout vs permanent error) are FIXED — see the
+/// per-principal generation map and `EngineLookup::confirmed_unreachable`
+/// below. Residual sharp edges: #2455 (no single-flight), #2457 (unbounded
+/// read on the writer thread), #2458 (silent ceiling / config binding).)
 ///
 /// So `get_for_auth_revalidate()` adds a short-TTL positive cache — and ONLY
 /// that method. `get_for_auth()` stays uncached and authoritative. Which
@@ -551,6 +552,21 @@ private:
     /// the OLD single-global-counter behavior (correct, merely coarse) only
     /// once actually exhausted, rather than granting no protection at all to
     /// whichever principal didn't make it in.
+    ///
+    /// Be precise about what "coarse" means here (Gate 4, unhappy-path):
+    /// this is not a narrowing of impact to the triggering principal. Every
+    /// snapshot taken via `snapshot_revoke_generation_locked` embeds the
+    /// SAME shared epoch, so one bump — from invalidating ANY principal, not
+    /// just the one that tripped the fallback — defeats every OTHER
+    /// principal's concurrent cache-write too, for as long as the epoch
+    /// keeps moving. Once tripped, this reproduces the EXACT #2454 bug
+    /// (fleet-wide cache disablement during write churn) this file exists to
+    /// have fixed — it is bounded to only start happening past the ceiling,
+    /// not bounded in blast radius once it does. It is also a ONE-WAY
+    /// ratchet for the rest of process uptime: nothing un-trips it short of
+    /// a restart (or the untaken full-clear path above). Legitimate,
+    /// sustained churn past the ceiling — not just an attacker — can trigger
+    /// it; see #3385.
     ///
     /// A principal absent from this map has an implicit generation of 0,
     /// matching a principal that has never been revoked or transferred.

@@ -1985,10 +1985,14 @@ public:
                           "counter");
         metrics_.describe("yuzu_server_engine_revalidate_generation_capacity_fallback_total",
                           "#2454: the per-principal poisoning-guard map was full and a NEW "
-                          "principal's invalidate fell back to the coarse global epoch. Not "
-                          "expected under ordinary load (max_entries_ defaults to 1024 distinct "
-                          "ever-revoked principals); a climbing value means the per-principal "
-                          "guard is running at reduced precision for new invalidations.",
+                          "principal's invalidate fell back to the coarse global epoch. NOT a "
+                          "narrowly-scoped degradation: once tripped, the epoch bump defeats "
+                          "EVERY principal's concurrent cache-write, not just the triggering "
+                          "one, until a process restart - reproducing the fleet-wide cache "
+                          "disablement #2454 exists to fix, bounded only to start past the "
+                          "1024-distinct-ever-revoked-principal ceiling. Not expected under "
+                          "ordinary load; a climbing value means the guard has degraded and "
+                          "will not recover without a restart.",
                           "counter");
         metrics_.describe("yuzu_server_audit_events_total",
                           "Audit events written, bucketed by result", "counter");

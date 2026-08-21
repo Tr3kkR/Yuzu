@@ -334,11 +334,13 @@ EnginePrincipalStore::get_for_auth_revalidate(const std::string& principal_id) c
     if (fresh.status == EngineLookupStatus::StoreUnreachable) {
         const auto stamp = clock_();
         // #2456 UP-4: only arm the backoff on CONFIRMED unreachability (the
-        // store was closed, or a query actually ran and failed) — not on a
-        // bare lease-acquire timeout, which reads identically for "the
-        // database is gone" and "the pool was briefly saturated by unrelated
-        // traffic". Arming a 5-10 s backoff on that ambiguous case would
-        // suppress probing a perfectly healthy database. This tick's answer
+        // store was closed, a query actually ran and failed, or a
+        // lease-acquire timeout occurred with the connect-failure breaker
+        // already open) — not on a bare lease-acquire timeout with the
+        // breaker still closed, which reads identically for "the database is
+        // gone" and "the pool was briefly saturated by unrelated traffic".
+        // Arming a 5-10 s backoff on that ambiguous case would suppress
+        // probing a perfectly healthy database. This tick's answer
         // is still StoreUnreachable either way (the caller denies+retries
         // exactly as before) — the only thing this skips is PERSISTING that
         // answer for future ticks on weaker evidence than the backoff exists
