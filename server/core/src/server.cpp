@@ -1983,6 +1983,17 @@ public:
                           "Engine-principal liveness re-checks answered StoreUnreachable from the "
                           "failure backoff without taking a connection lease",
                           "counter");
+        metrics_.describe("yuzu_server_engine_revalidate_generation_capacity_fallback_total",
+                          "#2454: the per-principal poisoning-guard map was full and a NEW "
+                          "principal's invalidate fell back to the coarse global epoch. NOT a "
+                          "narrowly-scoped degradation: once tripped, the epoch bump defeats "
+                          "EVERY principal's concurrent cache-write, not just the triggering "
+                          "one, until a process restart - reproducing the fleet-wide cache "
+                          "disablement #2454 exists to fix, bounded only to start past the "
+                          "1024-distinct-ever-revoked-principal ceiling. Not expected under "
+                          "ordinary load; a climbing value means the guard has degraded and "
+                          "will not recover without a restart.",
+                          "counter");
         metrics_.describe("yuzu_server_audit_events_total",
                           "Audit events written, bucketed by result", "counter");
         // gov PR-E OBS-2: a from_result_set: scope ref resolved to an
@@ -6324,6 +6335,11 @@ public:
                     metrics_.gauge("yuzu_server_engine_revalidate_backoff_suppressed_total")
                         .set(static_cast<double>(
                             engine_principal_store_->revalidate_backoff_suppressed()));
+                    // #2454: the per-principal poisoning-guard map's capacity-exhaustion
+                    // fallback rate.
+                    metrics_.gauge("yuzu_server_engine_revalidate_generation_capacity_fallback_total")
+                        .set(static_cast<double>(
+                            engine_principal_store_->revoke_generation_capacity_fallback()));
                 }
                 // Publish FleetTopologyStore internals so the 256 MiB store-
                 // level oversize cap and single-flight refill timeouts are

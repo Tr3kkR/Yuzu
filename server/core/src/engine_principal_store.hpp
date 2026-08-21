@@ -65,10 +65,11 @@
 /// `validate_token` and the fleet data plane with it. (Past 60 s of a
 /// sustained outage the TOKEN half of the same tick resumes reading through
 /// too, since it has no equivalent backoff — so this removes one of the two
-/// amplifiers, not both. Tracked with #2447; the residual sharp edges of this
-/// one are #2454 (global revoke generation), #2455 (no single-flight), #2456
-/// (lease timeout vs permanent error), #2457 (unbounded read on the writer
-/// thread) and #2458 (silent ceiling / config binding).)
+/// amplifiers, not both. Tracked with #2447; #2454 (global revoke generation)
+/// and #2456 (lease timeout vs permanent error) are FIXED — see the
+/// per-principal generation map and `EngineLookup::confirmed_unreachable`
+/// below. Residual sharp edges: #2455 (no single-flight), #2457 (unbounded
+/// read on the writer thread), #2458 (silent ceiling / config binding).)
 ///
 /// So `get_for_auth_revalidate()` adds a short-TTL positive cache — and ONLY
 /// that method. `get_for_auth()` stays uncached and authoritative. Which
@@ -96,10 +97,16 @@
 /// Only `Active` is cached. `MissingOrRevoked` is not (terminal and rare — the
 /// alerting path — and negative-caching it would need `create()` invalidation
 /// to avoid masking a fresh principal). `StoreUnreachable` is not cached
-/// either, but it IS rate-limited: a short jittered backoff repeats that
-/// answer without taking a lease, because otherwise the positive cache fixes
-/// only the warm steady state and the per-tick amplifier returns intact the
-/// moment entries age out during a sustained brownout.
+/// either, but a CONFIRMED one (#2456: the store was never open, or a query
+/// actually ran and failed, or `PgPool`'s own connect-failure breaker is
+/// open — see `EngineLookup::confirmed_unreachable`) IS rate-limited: a short
+/// jittered backoff repeats that answer without taking a lease, because
+/// otherwise the positive cache fixes only the warm steady state and the
+/// per-tick amplifier returns intact the moment entries age out during a
+/// sustained brownout. An AMBIGUOUS `StoreUnreachable` (a bare lease-acquire
+/// timeout with the breaker still closed — a pool briefly saturated by
+/// unrelated load, not a confirmed outage) does NOT arm the backoff — arming
+/// it there would suppress probing a perfectly healthy database.
 ///
 /// Revocation latency on the cached path: the writing replica invalidates
 /// synchronously in `revoke()`/`transfer_owner()`, so a single-server
@@ -157,9 +164,27 @@ enum class EngineLookupStatus : int {
 };
 
 /// Result of `get_for_auth`. `row` is set if and only if `status == Active`.
+///
+/// `confirmed_unreachable` (#2456) is a hint for `get_for_auth_revalidate`'s
+/// failure-backoff decision ONLY — every other consumer of `get_for_auth`
+/// ignores it and the three-state `status` contract above is unchanged for
+/// all of them. A `StoreUnreachable` result carries `true` from THREE
+/// sources: the store was never open; a query actually ran and failed; or a
+/// bare lease-acquire timeout (`try_acquire_for` returning nothing within
+/// `kReadTimeout`) where `PgPool`'s own connect-failure breaker
+/// (`connect_breaker_open()`) is open — the breaker fires only on recent
+/// CONNECT failures, never on pool saturation alone, so an open breaker at
+/// that point IS confirmed evidence of a real outage. It carries `false`
+/// ONLY for a bare lease-acquire timeout with the breaker still CLOSED, which
+/// is genuinely ambiguous — a briefly-saturated pool under unrelated load
+/// looks identical to a real outage at that exact point, and the breaker
+/// hasn't (yet) confirmed either way. Arming a 5-10 s backoff on the
+/// ambiguous case suppresses probing a perfectly healthy database; arming it
+/// on any of the three confirmed cases is the whole point of the backoff.
 struct EngineLookup {
     EngineLookupStatus status = EngineLookupStatus::StoreUnreachable;
     std::optional<EnginePrincipalRow> row;
+    bool confirmed_unreachable = false;
 };
 
 /// Result of `get_for_auth_revalidate` (#2367) — liveness only, no row.
@@ -231,6 +256,15 @@ public:
     [[nodiscard]] std::uint64_t revalidate_backoff_suppressed() const noexcept {
         return revalidate_backoff_suppressed_.load(std::memory_order_relaxed);
     }
+    /// #2454: how often the per-principal poisoning-guard map was full and a
+    /// NEW principal's invalidate fell back to the coarse global epoch
+    /// instead of getting its own slot. Not expected under ordinary load
+    /// (`max_entries_` defaults to 1024 distinct ever-revoked principals);
+    /// a climbing value means the per-principal guard is running at reduced
+    /// precision for new invalidations and the ceiling may need raising.
+    [[nodiscard]] std::uint64_t revoke_generation_capacity_fallback() const noexcept {
+        return revoke_generation_capacity_fallback_.load(std::memory_order_relaxed);
+    }
 
     /// Number of principals with a LIVE (unexpired) cache entry. Expired but
     /// not-yet-swept entries are not counted — "resident" and "currently
@@ -251,6 +285,9 @@ public:
     /// actually run rather than inferring it from a filtered count.
     [[nodiscard]] std::size_t revalidate_cache_resident_for_test() const;
     [[nodiscard]] std::size_t revalidate_backoff_resident_for_test() const;
+    /// #2454: physical occupancy of `revoke_generation_by_principal_`, for
+    /// proving the ceiling and the capacity-fallback path actually engage.
+    [[nodiscard]] std::size_t revoke_generation_resident_for_test() const;
 
     /// Test seam: shrink the entry ceiling so the full-after-sweep path is
     /// reachable without materialising `kAuthCacheMaxEntries` principals.
@@ -416,21 +453,27 @@ private:
     /// says it is.
     static constexpr auto kAuthCacheTtlJitter = std::chrono::milliseconds{3750};
 
-    /// After a read-through that could not reach the store, further reads for
-    /// that principal are suppressed and answered `StoreUnreachable` without
-    /// touching the pool. Jitter is ADDITIVE here (unlike the TTL's, which is
-    /// subtractive), so the real window is `kAuthFailureBackoff` to twice it —
-    /// 5 s to 10 s. Extending a backoff is safe; shortening a positive TTL is
-    /// the direction that must never overshoot, hence the opposite signs.
+    /// After a read-through that CONFIRMED the store unreachable (#2456: the
+    /// store was never open, or a query actually ran and failed, or the
+    /// connect-failure breaker is open — never a bare, ambiguous lease-acquire
+    /// timeout with the breaker closed), further reads for that principal are
+    /// suppressed and answered `StoreUnreachable` without touching the pool.
+    /// Jitter is ADDITIVE here (unlike the TTL's, which is subtractive), so
+    /// the real window is `kAuthFailureBackoff` to twice it — 5 s to 10 s.
+    /// Extending a backoff is safe; shortening a positive TTL is the direction
+    /// that must never overshoot, hence the opposite signs.
     ///
-    /// This is a RATE LIMITER, not a negative cache. The distinction matters:
-    /// it repeats an answer we obtained moments ago from the authoritative
-    /// store, for a window far shorter than the positive TTL, and it re-probes
-    /// promptly so recovery is detected fast. Without it the positive cache
-    /// fixes only the warm steady state: once entries expire during a sustained
-    /// brownout, every stream reads through on every ~3 s tick, each blocking
-    /// up to the 1500 ms lease timeout — which is precisely the amplifier
-    /// #2367 exists to remove, merely postponed by one TTL.
+    /// This is a RATE LIMITER for CONFIRMED failures, not a negative cache and
+    /// not armed on ambiguous ones. The distinction matters: it repeats an
+    /// answer we obtained moments ago from the authoritative store, for a
+    /// window far shorter than the positive TTL, and it re-probes promptly so
+    /// recovery is detected fast. Without it a sustained, CONFIRMED brownout
+    /// would have every stream read through on every ~3 s tick once positive
+    /// entries expire, each blocking up to the 1500 ms lease timeout — which
+    /// is precisely the amplifier #2367 exists to remove, merely postponed by
+    /// one TTL. Arming it on an AMBIGUOUS failure instead would suppress
+    /// probing a perfectly healthy, merely-busy database — the gap #2456
+    /// found and closed.
     static constexpr auto kAuthFailureBackoff = std::chrono::seconds(5);
 
     /// Hard ceiling on resident entries. Engine principals are created through
@@ -442,8 +485,10 @@ private:
     /// is slower, never wrong.
     static constexpr std::size_t kAuthCacheMaxEntries = 1024;
     /// Effective ceiling; `kAuthCacheMaxEntries` unless a test shrinks it.
-    /// Applies to BOTH maps — the backoff map is filled precisely when the
-    /// positive map is not, so bounding only one of them bounds neither.
+    /// Applies to all THREE maps below — the backoff map is filled precisely
+    /// when the positive map is not, so bounding only one of them bounds
+    /// neither; the per-principal generation map (#2454) shares the same
+    /// ceiling but a different eviction story (see its own field comment).
     std::size_t max_entries_{kAuthCacheMaxEntries};
 
     mutable std::mutex revalidate_cache_mu_;
@@ -468,24 +513,90 @@ private:
     /// `revalidate_cache_mu_`.
     void sweep_expired_locked(std::chrono::steady_clock::time_point now) const;
 
-    /// TOCTOU guard against cache POISONING, copied from
-    /// `ApiTokenStore::revoke_generation_` including its hard-won ordering
-    /// rule: a writer bumps this BEFORE it takes `revalidate_cache_mu_`, and
-    /// a reader re-checks it UNDER that mutex, in the same critical section as
-    /// the insert. A check-then-lock ordering leaves a real window — the
-    /// writer's erase runs between the reader's check and its insert (erasing
-    /// nothing, because nothing is inserted yet), after which the reader
-    /// installs a stale `Active` that survives the full TTL. Holding the lock
-    /// across re-check AND insert serializes the pair against the erase:
-    /// either the reader observes the bump and skips, or the erase lands
-    /// strictly after the insert and removes it.
+    /// TOCTOU guard against cache POISONING (#2454: per-principal, not the
+    /// single global counter this started as — see the issue for the failure
+    /// mode a global counter has: any write to ANY principal skips every
+    /// OTHER principal's concurrent cache-insert, so a revoke burst silently
+    /// disables the whole liveness cache for its duration).
     ///
-    /// This guards the CACHE only. It does not serialize an in-flight
-    /// revalidate against a concurrent revoke: a principal revoked during a
-    /// revalidate's own execution may be reported Active once. Bounded (the
-    /// next tick reads through) and inside the pump's grace window by
-    /// construction.
-    std::atomic<std::uint64_t> revoke_generation_{0};
+    /// Entirely lock-protected by `revalidate_cache_mu_` (unlike the field
+    /// this replaced, which was atomic specifically so a writer could bump it
+    /// BEFORE taking the lock — a per-principal map has no such need: writer
+    /// and reader now serialize on the SAME mutex for both the bump and the
+    /// check, so ordering follows directly from mutex serialization instead
+    /// of a separate atomic-ordering argument. A reader snapshots its
+    /// key's current value under a lock BEFORE the slow store read, and
+    /// re-checks the SAME key under the lock at insert time, in the same
+    /// critical section as the insert — a writer's invalidate_revalidate_cache
+    /// either fully precedes the reader's snapshot (reader sees the bumped
+    /// value, skips), or fully follows the reader's insert (the writer's own
+    /// erase removes what the reader just inserted). Neither leaves a stale
+    /// entry, and there is no window where a bump is visible without its
+    /// paired erase, or vice versa — both now live in the writer's ONE
+    /// critical section instead of two separately-ordered steps.
+    ///
+    /// Ceiling-capped at `max_entries_`, but UNLIKE the cache/backoff maps
+    /// this one has no TTL — no per-tick sweep ever reclaims an entry from
+    /// it on ordinary operation (a full clear, `invalidate_revalidate_cache`
+    /// with an empty principal_id, does erase everything, but nothing in
+    /// production reaches that path — see #3385). A generation counter does
+    /// not go stale the way a cached VALUE does, so absent that clear it is
+    /// cumulative-over-process-lifetime, not windowed. That makes
+    /// "decline past the cap" the WRONG degradation here (Gate 3, security-
+    /// guardian + cpp-safety + quality-engineer, independently, same round):
+    /// declining does not skip one race for one principal, it PERMANENTLY
+    /// disables the guard for every principal that never got a slot, for the
+    /// rest of process uptime, once `max_entries_` distinct principals have
+    /// ever been revoked or transferred. So capacity exhaustion instead falls
+    /// back to bumping `revoke_generation_global_epoch_` below — degrading to
+    /// the OLD single-global-counter behavior (correct, merely coarse) only
+    /// once actually exhausted, rather than granting no protection at all to
+    /// whichever principal didn't make it in.
+    ///
+    /// Be precise about what "coarse" means here (Gate 4, unhappy-path):
+    /// this is not a narrowing of impact to the triggering principal. Every
+    /// snapshot taken via `snapshot_revoke_generation_locked` embeds the
+    /// SAME shared epoch, so one bump — from invalidating ANY principal, not
+    /// just the one that tripped the fallback — defeats every OTHER
+    /// principal's concurrent cache-write too, for as long as the epoch
+    /// keeps moving. Once tripped, this reproduces the EXACT #2454 bug
+    /// (fleet-wide cache disablement during write churn) this file exists to
+    /// have fixed — it is bounded to only start happening past the ceiling,
+    /// not bounded in blast radius once it does. It is also a ONE-WAY
+    /// ratchet for the rest of process uptime: nothing un-trips it short of
+    /// a restart (or the untaken full-clear path above). Legitimate,
+    /// sustained churn past the ceiling — not just an attacker — can trigger
+    /// it; see #3385.
+    ///
+    /// A principal absent from this map has an implicit generation of 0,
+    /// matching a principal that has never been revoked or transferred.
+    ///
+    /// `revoke_generation_global_epoch_` is the coarse fallback signal:
+    /// bumped by a full-cache clear (`invalidate_revalidate_cache`
+    /// with an empty principal_id — not used by any production caller today,
+    /// reserved for tests/future admin use), which by definition must
+    /// invalidate every in-flight reader regardless of which principal it is
+    /// reading, since a full clear has no per-key identity to target, AND by
+    /// the capacity-exhaustion fallback above. `revoke_generation_capacity_fallback_`
+    /// counts how often that fallback fires — architect (Gate 3): an
+    /// operator-visible signal that per-principal capacity is being
+    /// exhausted, mirroring `revalidate_backoff_suppressed_`'s
+    /// instrument-on-degrade pattern.
+    mutable std::unordered_map<std::string, std::uint64_t> revoke_generation_by_principal_;
+    mutable std::uint64_t revoke_generation_global_epoch_ = 0;
+    mutable std::atomic<std::uint64_t> revoke_generation_capacity_fallback_{0};
+
+    /// Read `revoke_generation_by_principal_[principal_id]` (0 if absent) plus
+    /// `revoke_generation_global_epoch_`, both under `revalidate_cache_mu_`.
+    /// The pairing IS the poisoning-guard token: a reader is unpoisoned iff
+    /// BOTH compare equal at insert time to what this returned at snapshot
+    /// time.
+    struct RevokeGeneration {
+        std::uint64_t per_principal = 0;
+        std::uint64_t global_epoch = 0;
+        bool operator==(const RevokeGeneration&) const = default;
+    };
+    RevokeGeneration snapshot_revoke_generation_locked(const std::string& principal_id) const;
 };
 
 /// Test-only door to the private liveness path (#2367). Production code
