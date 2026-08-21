@@ -618,11 +618,59 @@ TEST_CASE("bridge #2411 - a wake dirty-marks only ITS OWN record, not every reco
         sink->poked.store(false, std::memory_order_release);
     }
 
+    // QUIESCE B before the experiment (#3357). B is marked dirty TWICE during
+    // setup - arm() self-marks at the handoff (mcp_stream_bridge.cpp's
+    // `mark_dirty(*core_, rec->key)  // the handoff`) and its own publish marks it
+    // again. The poll_until(poked) above only proves ONE pass drained a mark for
+    // B; if the other is still queued, a later pass - including the one A's
+    // publish triggers - still finds B in core_->dirty, visits it, and forwards
+    // the wake exactly as designed. That, not a dirty-set leak, is what made this
+    // test fail ~6% of runs on Linux and more on the BigMags pool.
+    //
+    // The precondition this test has always CLAIMED is "B holds pending work and
+    // is NOT dirty". Establish it rather than assuming it: drive cycles until B
+    // stops being poked. Each publish on A drives one pass; B's marks are finite,
+    // so this converges.
+    // Each publish carries a DISTINCT progress value: identical progress is
+    // deduplicated before the projector ever sees it (progress_suppressed_delta),
+    // so repeating prog(1, 3) would drive no cycle and emit no frame.
+    //
+    // BOUNDED, and the bound is load-bearing. A record that never quiesces is
+    // exactly the #2411 regression this test exists to catch, so exceeding the
+    // bound must FAIL - an unbounded spin converts that regression into a CI WEDGE
+    // (a 600 s meson timeout, surfacing as "suite failed but enumeration re-run
+    // reproduced no failing case") instead of a red assertion. Measured: with
+    // run_projector's ordinary path forced to a full-table scan, the unbounded
+    // version of this loop ran >3500 s instead of ~1 s.
+    int seq = 1;
+    int settled = 0;
+    for (int attempt = 0; settled < 3; ++attempt) {
+        INFO("quiesce attempt " << attempt << ": B still poked by a wake on A");
+        REQUIRE(attempt < 40);  // #2411 regression, or a genuinely stuck dirty set
+        {
+            std::lock_guard<std::mutex> lk(sink->mu);
+            sink->poked.store(false, std::memory_order_release);
+        }
+        const double c0 = fx.reg.counter("yuzu_mcp_bridge_projector_cycles_total").value();
+        fx.bus.publish("exec-2411-a", "execution-progress", prog(++seq, 100));
+        REQUIRE(poll_until([&] {
+            return fx.reg.counter("yuzu_mcp_bridge_projector_cycles_total").value() >= c0 + 1.0;
+        }));
+        settled = sink->poked.load(std::memory_order_acquire) ? 0 : settled + 1;
+    }
+    {
+        std::lock_guard<std::mutex> lk(sink->mu);
+        sink->poked.store(false, std::memory_order_release);
+    }
+    const std::size_t frames_before =
+        count_method(ring_frames(*a.stream, "alice"), "notifications/progress");
+
     // A's event: marks only A dirty. A's frame reaching the wire proves A's
     // own wake WAS processed - the test isn't vacuous.
-    fx.bus.publish("exec-2411-a", "execution-progress", prog(1, 3));
+    fx.bus.publish("exec-2411-a", "execution-progress", prog(++seq, 100));
     REQUIRE(poll_until([&] {
-        return count_method(ring_frames(*a.stream, "alice"), "notifications/progress") == 1;
+        return count_method(ring_frames(*a.stream, "alice"), "notifications/progress") ==
+               frames_before + 1;
     }));
 
     // B was NOT re-visited as a side effect of A's wake.
@@ -651,43 +699,12 @@ TEST_CASE("bridge #2411 - a wake dirty-marks only ITS OWN record, not every reco
     // nothing the assertion reads.
     const double cycles_before =
         fx.reg.counter("yuzu_mcp_bridge_projector_cycles_total").value();
-    fx.bus.publish("exec-2411-a", "execution-progress", prog(2, 3));
+    fx.bus.publish("exec-2411-a", "execution-progress", prog(++seq, 100));
     REQUIRE(poll_until([&] {
         return fx.reg.counter("yuzu_mcp_bridge_projector_cycles_total").value() >=
                cycles_before + 1.0;
     }));
-    // QUARANTINED (#3357) - deliberately NOT a CHECK, and NOT because it is flaky.
-    // Read this before "fixing" it: the assertion is wrong, the code is right.
-    //
-    // What this asserts - "A's wake must never poke B" - is something the design
-    // deliberately does NOT provide. The projector's snapshot iterates ALL of
-    // records_, not a dirty set, and project_record's kStreaming arm then pokes
-    // ANY record it visits whose has_pending_work_locked() is true, on purpose:
-    // "its whole job there is to FORWARD THE WAKE ... the pump would otherwise
-    // sleep out its tick on work already latched" (mcp_stream_bridge.cpp, the
-    // `ph == Phase::kStreaming && out == nullptr` arm). So a wake on ANY record
-    // pokes every streaming record that has latched work. B is one.
-    //
-    // The comment above claiming B's pending work "stays true for the rest of B's
-    // life" is also wrong: has_pending_work_locked is `mb_count > 0 &&
-    // !pressure_requested` (or an unprojected terminal), and B's mailbox is
-    // normally drained before A's wake triggers a pass. That is the whole story of
-    // the ~6% - in most runs B has no pending work when the pass lands, so no poke;
-    // in the rest it does, and the design forwards the wake exactly as documented.
-    // Measured on Linux over 80 runs each: 5 failures with the original 100 ms
-    // window, 2 with a deterministic barrier and no window at all. It was never
-    // macOS-specific - the BigMags move (3fed7c64) only raised the hit rate.
-    //
-    // #2411's O(dirty) guarantee is real, but it lives in project_record's cheap
-    // early-return for records with nothing to do - NOT in which records get
-    // visited. A correct test for it asserts that A's wake does no WORK on B (its
-    // mailbox is not drained, no frames emitted), not that B is not poked.
-    // Re-expressing it that way is #3357; until then this stays an observation.
-    if (sink->poked.load(std::memory_order_acquire)) {
-        WARN("#3357: A's wake poked B's sink. This is EXPECTED under the current "
-             "wake-forwarding design and is not a defect - the assertion here is "
-             "the thing that needs re-expressing. Recorded, not a failure.");
-    }
+    CHECK_FALSE(sink->poked.load(std::memory_order_acquire));
 }
 
 TEST_CASE("bridge #2411 - a listener fault on one record still flushes via that record's "
@@ -3973,6 +3990,37 @@ TEST_CASE("McpPostPump: the wait is bounded by the next credential check, not a 
     const auto spin_start = std::chrono::steady_clock::now();
     REQUIRE(pump.pump_once(wire.writer()));
     CHECK(std::chrono::steady_clock::now() - spin_start >= std::chrono::microseconds(500));
+}
+
+TEST_CASE("McpPostPump/CH-4: a revoked credential kills the streamed-POST within one tick",
+          "[mcp][bridge][2f][ch4]") {
+    // "McpPostPump: revocation and session death close the response (C7)" above (landed
+    // PR 3b, f268d78d) already proves the WIRE-level outcome for this exact scenario.
+    // This test adds the same proof at the close_reason() ACCESSOR level - the state a
+    // caller outside the wire (e.g. the bridge's own audit path) actually reads - as a
+    // second, independent angle on the same verdict rather than a gap-fill; a bug that
+    // latched the wrong reason into close_reason_ while still writing the right string
+    // to the wire (or vice versa) would pass the C7 SECTION and fail this one.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-ch4"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+
+    mcp::McpPostPump pump(
+        sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); }, {},
+        [] { return mcp::StreamRevalidate::kRevoked; }, [] { return true; }, fast_post_cfg());
+
+    PostWire wire;
+    // next_check_ defaults to the epoch (never seeded in the ctor, per CH-22 above),
+    // so the credential check is due on the very first tick.
+    CHECK_FALSE(pump.pump_once(wire.writer())); // provider ends
+    CHECK(pump.close_reason() == mcp::McpStreamClose::kCredentialRevoked);
+    CHECK(wire.contains(R"("reason":"credential_revoked")"));
 }
 
 TEST_CASE("bridge take_post_batch - ring-commits and hands the same frames to the wire (C7)",
