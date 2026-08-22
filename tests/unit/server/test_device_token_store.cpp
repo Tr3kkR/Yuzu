@@ -1525,8 +1525,23 @@ TEST_CASE("migrate_from_sqlite waits out a briefly-held exclusive lock instead o
         sqlite3_exec(h.get(), "COMMIT", nullptr, nullptr, nullptr);
     });
 
-    while (!lock_held.load(std::memory_order_acquire))
+    // Bounded wait, not an unconditional spin: if the holder thread fails before ever setting
+    // lock_held (sqlite3_open/BEGIN EXCLUSIVE failing), an unconditional spin here would hang to
+    // the CI/meson timeout with zero diagnostic. Watch the failure flags too, and give up with an
+    // actionable FAIL well inside Catch2's own per-test timeout.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!lock_held.load(std::memory_order_acquire)) {
+        if (holder_open_failed.load() || holder_begin_failed.load()) {
+            holder.join();
+            FAIL("holder thread failed to open/lock the legacy file before signalling — see "
+                 "holder_open_failed/holder_begin_failed");
+        }
+        if (std::chrono::steady_clock::now() > deadline) {
+            holder.join();
+            FAIL("holder thread did not acquire the lock within 10s");
+        }
         std::this_thread::yield();
+    }
 
     std::string captured;
     bool migrated = false;

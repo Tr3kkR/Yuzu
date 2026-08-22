@@ -204,11 +204,16 @@ public:
         return ctx_ && EVP_DigestInit_ex(ctx_.get(), EVP_sha256(), nullptr) == 1;
     }
     [[nodiscard]] bool update(std::string_view bytes) {
-        return EVP_DigestUpdate(ctx_.get(), bytes.data(), bytes.size()) == 1;
+        // Defence in depth: the one caller always checks init()'s return before calling this, so
+        // ctx_ is never null on any current path — but EVP_DigestUpdate(nullptr, ...) is not
+        // documented OpenSSL-safe, so guard here too rather than rely solely on the caller.
+        return ctx_ && EVP_DigestUpdate(ctx_.get(), bytes.data(), bytes.size()) == 1;
     }
     // Empty string on failure — callers fail closed on an empty return, matching the pre-#3399
     // sha256_hex() contract.
     [[nodiscard]] std::string final_hex() {
+        if (!ctx_)
+            return {};
         unsigned char md[EVP_MAX_MD_SIZE];
         unsigned int len = 0;
         if (EVP_DigestFinal_ex(ctx_.get(), md, &len) != 1)
@@ -518,12 +523,14 @@ bool flush_batch(PGconn* conn, std::span<const LegacyDeviceTokenRow> batch,
     hash_col.reserve(batch.size());
     revoked_col.reserve(batch.size());
 
-    // [name, principal_id, device_id, definition_id]
+    // [name, principal_id, device_id, definition_id]. Named text_cols (plural), not text_col —
+    // that singular name is a different, file-scope helper function (text_col(PGresult*, int,
+    // int), used by check_conflict above) this array must not shadow.
     std::vector<std::string> text_owned[4];
-    std::vector<std::string_view> text_col[4];
+    std::vector<std::string_view> text_cols[4];
     for (auto& v : text_owned)
         v.reserve(batch.size());
-    for (auto& v : text_col)
+    for (auto& v : text_cols)
         v.reserve(batch.size());
 
     // [created_at, expires_at, last_used_at]
@@ -546,7 +553,7 @@ bool flush_batch(PGconn* conn, std::span<const LegacyDeviceTokenRow> batch,
         text_owned[2].push_back(sanitize_pg_text(r.device_id));
         text_owned[3].push_back(sanitize_pg_text(r.definition_id));
         for (int i = 0; i < 4; ++i)
-            text_col[i].emplace_back(text_owned[i].back());
+            text_cols[i].emplace_back(text_owned[i].back());
 
         num_owned[0].push_back(std::to_string(r.created_at));
         num_owned[1].push_back(std::to_string(r.expires_at));
@@ -559,10 +566,10 @@ bool flush_batch(PGconn* conn, std::span<const LegacyDeviceTokenRow> batch,
     params.reserve(10);
     params.push_back(pg::to_text_array(id_col));
     params.push_back(pg::to_text_array(hash_col));
-    params.push_back(pg::to_text_array(text_col[0])); // name
-    params.push_back(pg::to_text_array(text_col[1])); // principal_id
-    params.push_back(pg::to_text_array(text_col[2])); // device_id
-    params.push_back(pg::to_text_array(text_col[3])); // definition_id
+    params.push_back(pg::to_text_array(text_cols[0])); // name
+    params.push_back(pg::to_text_array(text_cols[1])); // principal_id
+    params.push_back(pg::to_text_array(text_cols[2])); // device_id
+    params.push_back(pg::to_text_array(text_cols[3])); // definition_id
     params.push_back(pg::to_text_array(num_col[0]));  // created_at
     params.push_back(pg::to_text_array(num_col[1]));  // expires_at
     params.push_back(pg::to_text_array(num_col[2]));  // last_used_at
@@ -714,7 +721,17 @@ bool DeviceTokenStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
         // justification (taskset-pinned A/B, 30 runs each): 2/30 SQLITE_BUSY failures without
         // this pragma, 0/30 with it, against a WAL-mode legacy file — WAL does not exempt this
         // path.
-        sqlite3_exec(scan->db.get(), "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
+        if (sqlite3_exec(scan->db.get(), "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr) !=
+            SQLITE_OK) {
+            // Non-fatal: a failed PRAGMA leaves this connection at SQLite's compiled-in default
+            // (0), silently reintroducing the exact misattributed-contention failure mode #3398
+            // fixes — surfaced here so it's diagnosable rather than invisible, without making the
+            // backfill fail closed over a pragma the pre-#3398 code never had at all.
+            spdlog::warn("DeviceTokenStore::migrate_from_sqlite: failed to set busy_timeout on "
+                        "legacy {}: {} — a contended legacy file may now fail immediately "
+                        "instead of waiting",
+                        legacy_db_path.string(), sqlite3_errmsg(scan->db.get()));
+        }
 
         // A deferred transaction fixes ONE consistent snapshot for the table probe and BOTH
         // backfill passes below (software_deployment_store.cpp's precedent, extended here to
@@ -876,6 +893,10 @@ bool DeviceTokenStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
     std::size_t conflicted = 0;
     bool ok = pool_.with_txn([&](PGconn* conn) -> bool {
         // ── Pass 2: re-scan the SAME SQLite snapshot, batched copy (#3399) ──
+        // sqlite3_reset() is the raw C API call — restarts this prepared statement for
+        // re-stepping, does NOT finalize it. NOT scan->stmt.reset() (the SqliteStmt member
+        // function below, which DOES finalize) — the two share a name but are opposite
+        // operations; do not swap one for the other.
         sqlite3_reset(scan->stmt.get());
         std::vector<LegacyDeviceTokenRow> batch;
         batch.reserve(kBackfillBatchRows);

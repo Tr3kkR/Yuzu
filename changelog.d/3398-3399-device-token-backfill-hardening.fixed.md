@@ -10,4 +10,7 @@
   round-trip, so resident memory no longer scales with legacy table size. Single-transaction,
   fail-closed, all-or-nothing atomicity is unchanged — a new fault-injection test proves a
   multi-batch backfill rolls back to zero rows and zero markers on a later failure, and that the
-  same file retries cleanly once the fault is cleared.
+  same file retries cleanly once the fault is cleared. This store remains **dormant** — nothing
+  in `server.cpp` constructs a `DeviceTokenStore`, so neither fix is runtime-observable until a
+  future change wires the store in; both were found by external adversarial review before that
+  wiring, not by a live incident.
