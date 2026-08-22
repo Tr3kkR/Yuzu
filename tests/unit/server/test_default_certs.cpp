@@ -795,12 +795,11 @@ TEST_CASE("default_certs: a losing HA replica self-heals from the shared cert di
         const auto failed_count =
             static_cast<std::size_t>(std::count(oks.begin(), oks.end(), false));
         if (failed_count > 0) {
+            static const std::string kRefusalNeedle =
+                "Refusing to regenerate — a fresh CA would re-root the fleet";
             std::size_t refusal_count = 0;
-            for (std::size_t pos = logs.find("Refusing to regenerate — a fresh CA would re-root "
-                                              "the fleet");
-                 pos != std::string::npos;
-                 pos = logs.find("Refusing to regenerate — a fresh CA would re-root the fleet",
-                                 pos + 1))
+            for (std::size_t pos = logs.find(kRefusalNeedle); pos != std::string::npos;
+                 pos = logs.find(kRefusalNeedle, pos + kRefusalNeedle.size()))
                 ++refusal_count;
             INFO("a racer failed this attempt; captured logs:\n" << logs);
             REQUIRE(refusal_count == failed_count);

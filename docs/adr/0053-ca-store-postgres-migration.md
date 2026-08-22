@@ -401,8 +401,8 @@ here.
 This is a compact provenance record — what ran, what it found, what happened to it. Current
 design truth lives in `## Decision` above, not here. Full structured findings (trigger/impact/
 exposure/epistemic-status per this repo's derivation scheme, plus provenance and disposition) are
-in the committed ledger: `governance.d/ca-store-postgres-migration.Hq3Wpm.jsonl` (46 findings
-across 12 review passes). Resource-ownership detail for the bootstrap-lock/first-boot-key custody
+in the committed ledger: `governance.d/ca-store-postgres-migration.Hq3Wpm.jsonl` (52 findings
+across 14 review passes). Resource-ownership detail for the bootstrap-lock/first-boot-key custody
 chain — a policy-floor artifact independent of this history, not process narrative — lives in its
 own durable file: `docs/resource-ledgers/default-certs-bootstrap-lock.md`.
 
@@ -420,40 +420,35 @@ own durable file: `docs/resource-ledgers/default-certs-bootstrap-lock.md`.
 | 10 | Post-governance follow-up (operator-directed) | claude, self-found | 1 SHOULD fixed | Two more metrics with CAPG-022's missing-boot-seed gap, same code region |
 | 11 | UP-3 build (operator-directed) | claude, self-found | 1 HIGH/BLOCKING fixed (pre-existing) | The key-clobbering race: 7/8 pre-fix repro runs red, 0/15 post-fix |
 | 12 | cpp-safety + security-guardian re-review of the UP-3 fix | cpp-safety, security-guardian | 1 SHOULD fixed, 1 policy floor fixed, 1 MEDIUM documented | The ADR restructuring in this same round had deleted the committed Resource Ledger with no durable replacement — a policy floor, caught before push |
+| 13 | cpp-safety closure re-verify | cpp-safety | 2 SHOULD fixed | A retry-guard presence-vs-count masking risk; an unspecified-on-false output-parameter contract |
+| 14 | Operator re-derivation, routed-concern catch-up | security-guardian, cpp-expert, docs-writer, cpp-safety | 1 SHOULD, 2 NICE fixed, 1 INFO deferred | Pass 13 itself had gone unrecorded — the exact gap class this section exists to close |
 
-**Notable process findings, not product findings.** Three separate instances of an overclaiming
-pattern were caught and retracted **before** being used as sign-off evidence, never after —
-compliance-officer explicitly evaluated this as evidence of a sound review process, not a red
-flag: (1) a regression test cited as red/green closure evidence for pass 4's finding turned out
-not to reliably reproduce the pre-fix corruption (verified via 60 runs against the pre-fix commit
-in a throwaway worktree; closure was reframed onto the lock's by-construction ordering proof
-instead); (2) an operator-facing log line claimed "this instance provably minted it" after the
-nearby comment had already been corrected away from that exact claim; (3) this ADR's own Gate 8
-finding text asserted `upgrading.md`'s HA note "describes [multi-replica HA] as supported," when
-this ADR's own Decision section states plainly that topology is not officially supported today.
+**Notable process findings, not product findings.** Three overclaims were caught and retracted
+**before** being used as sign-off evidence, never after — compliance-officer evaluated this as
+evidence of a sound review process: (1) a regression test cited as closure evidence for pass 4
+didn't reliably reproduce the pre-fix corruption (verified via 60 runs in a throwaway worktree;
+reframed onto the lock's by-construction ordering proof); (2) a log line claimed "this instance
+provably minted it" after the nearby comment had already been corrected away from that claim; (3)
+a Gate 8 finding asserted `upgrading.md` "describes [multi-replica HA] as supported," contradicting
+this ADR's own Decision section.
 
-**Post-governance follow-up (operator-directed, after the formal run above).** Two items deferred
-by sre's Gate 6 pass (CA metrics alert rules, the bootstrap lock's pool-size floor in the capacity
-doc) were fixed rather than filed as separate issues — see "Observability" above.
+**Post-governance follow-up (operator-directed).** Two items sre's Gate 6 pass deferred (CA
+metrics alert rules, the bootstrap lock's pool-size floor in the capacity doc) were fixed rather
+than filed as issues — see "Observability" above.
 
 **UP-3 (self-heal without a restart) and a pre-existing defect it surfaced.**
 Consistency-auditor's Gate 4 pass deferred UP-3 as a larger, separately-scoped change; built here
 on operator request. A losing racer now polls the shared cert directory for the winner's complete
 set for up to 15s before falling back to the original refuse-and-restart behavior (see "Self-heal
-and the bootstrap advisory lock" above). Building it surfaced an independent, pre-existing defect
-that UP-3 didn't cause but made newly likely to matter: every first-boot candidate wrote its CA
-private key speculatively to the shared well-known `default-ca.key` path *before* racing
-`try_insert_root`'s CAS, so on a shared cert directory with multiple simultaneous candidates,
-whichever candidate's write landed last silently detached the established root from its real
-private key — regardless of which candidate actually won the CAS — permanently defeating every
-future self-heal attempt for that root. Verified empirically, not just reasoned: a 6-racer test
-against one shared `TempDir` reproduced this on 7 of 8 runs before the fix (log evidence: a
-"cert_matches_key mismatch" warning followed by the B-2 refusal, for a racer that should have
-self-healed) and 0 of 15 runs after it. Fixed: the CA key is now written to disk only after a
-candidate is confirmed the CAS's sole winner, at which point no other candidate can still be
-racing for that name — `key_ref` itself is computed beforehand (a pure path calculation, no I/O)
-so it can still be recorded in the same `try_insert_root` call. Recorded as CAPG-043, pass 11,
-HIGH/BLOCKING (I1+I2, E4+E5), fixed.
+and the bootstrap advisory lock" above). Building it surfaced an independent, pre-existing defect:
+every first-boot candidate wrote its CA private key speculatively to the shared well-known
+`default-ca.key` path *before* racing `try_insert_root`'s CAS, so whichever candidate's write
+landed last silently detached the established root from its real private key regardless of which
+candidate won — permanently defeating every future self-heal attempt for that root. Verified
+empirically: a 6-racer test against one shared `TempDir` reproduced this on 7 of 8 runs before the
+fix, 0 of 15 after. Fixed: the CA key is now written to disk only after a candidate is confirmed
+the CAS's sole winner; `key_ref` itself is computed beforehand (a pure path calculation, no I/O).
+Recorded as CAPG-043, pass 11, HIGH/BLOCKING (I1+I2, E4+E5), fixed.
 
 **Pass 12 — cpp-safety + security-guardian domain re-review of this fix (2026-08-21).** One SHOULD
 fixed (the poll loop's adoption decision now cross-checks the fingerprint of what it just
@@ -464,16 +459,27 @@ committed Resource Ledger with no durable replacement; moved to
 new resource. One MEDIUM documented, not fixed (the sibling-refusal window; see that file for the
 trade-off). Full findings: `governance.d/ca-store-postgres-migration.Hq3Wpm.jsonl` pass 12.
 
+**Pass 13 — cpp-safety closure re-verify.** Two SHOULD findings, both fixed: the racing-boot
+test's mixed-failure retry guard checked presence, not count, of the known CAPG-042 refusal log
+line (could mask a coincidental unrelated failure); and the fingerprint-mismatch branch could
+leave `out` populated with a validated-but-wrong-root set on the poll-timeout path — unreachable
+today, reset defensively and documented anyway.
+
+**Pass 14 — routed-concern catch-up, prompted by an operator re-derivation** ("has necessary
+governance been run?"). `default_certs.{hpp,cpp}` unconditionally triggers security-guardian/
+cpp-safety/docs-writer, and cpp-expert on any C++ change — neither pass 12's nor pass 13's fix
+commit had run all four. All four PASS; docs-writer found pass 13 had gone unrecorded here — the gap this section exists
+to close — fixed above.
+
 **Self-caught, not a review finding: the new UP-3 test was itself scheduling-dependent.** A
-subsequent full 10-shard suite run (higher system contention than an isolated run) hit a
-legitimate, non-buggy scheduling outcome the test's log-evidence assertions weren't tolerant of —
-all six racers' `get_root()` checks landed after the winner had already committed, so all six
-correctly took the pre-existing UP-2 path and none exercised this fix's own new branch, failing
-the test's `REQUIRE(logs.find("lost the first-boot CA-root race")...)`. Not weakened (a soft
-check would trade "sometimes red for a good reason" for "always green regardless of whether it
-verifies anything," which this branch's own review discipline treats as worse than an occasional
-red); instead wrapped in a bounded retry of the whole scenario (fresh directory and store each
-attempt, up to 5 attempts), mirroring `test_mcp_stream_bridge.cpp`'s `#3357` "quiesce before the
+subsequent full 10-shard suite run hit a legitimate, non-buggy scheduling outcome the test's
+log-evidence assertions weren't tolerant of — all six racers' `get_root()` checks landed after
+the winner had already committed, so all six correctly took the pre-existing UP-2 path and none
+exercised this fix's new branch, failing `REQUIRE(logs.find("lost the first-boot CA-root
+race")...)`. Not weakened (a soft check trades "sometimes red for a good reason" for "always
+green regardless of whether it verifies anything," worse than an occasional red); instead
+wrapped in a bounded retry of the whole scenario (fresh directory and store each attempt, up to 5
+attempts), mirroring `test_mcp_stream_bridge.cpp`'s `#3357` "quiesce before the
 experiment" shape — exceeding the bound is still a hard `REQUIRE` failure, never a silent pass or
 an infinite spin.
 
