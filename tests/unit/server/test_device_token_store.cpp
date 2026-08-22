@@ -44,8 +44,8 @@
 
 #include <atomic>
 #include <chrono>
-#include <cstdio>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <set>
 #include <sstream>
@@ -200,12 +200,8 @@ std::vector<LegacyTokenFixture> make_bulk_fixture(int n, std::string_view name_p
     bulk.reserve(static_cast<std::size_t>(n));
     for (int i = 0; i < n; ++i) {
         LegacyTokenFixture r;
-        char idbuf[33];
-        std::snprintf(idbuf, sizeof(idbuf), "%032x", i + 1);
-        r.token_id = idbuf;
-        char hashbuf[65];
-        std::snprintf(hashbuf, sizeof(hashbuf), "%064x", i + 1);
-        r.token_hash = hashbuf;
+        r.token_id = std::format("{:032x}", i + 1);
+        r.token_hash = std::format("{:064x}", i + 1);
         r.name = std::string(name_prefix) + std::to_string(i) +
                 "-padding-for-size-xxxxxxxxxxxxxxxxxxxxxx";
         r.principal_id = "admin";

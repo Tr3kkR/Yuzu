@@ -276,14 +276,16 @@ has to guard against.
   `QuarantineStore`, a cap would convert ordinary fleet growth into a boot refusal with no
   data-integrity justification — device tokens plausibly scale with device count, and streaming
   removes the reason a cap existed in the first place.
-- **Retry contract is fail-closed and all-or-nothing.** Every legacy read, every batch insert,
-  every conflict read-back, and the marker `INSERT` run inside ONE Postgres transaction (the
-  SQLite snapshot transaction closes inside it too, immediately before the marker stamp). Any
-  failure at any stage — a mid-scan read error, a hex-validation failure, a batch statement error,
-  an IDENTITY/LIFECYCLE fail-closed classification, a pass-1/pass-2 row-count mismatch, or a
-  failure to close the SQLite snapshot — leaves the marker unstamped, so the NEXT BOOT
-  re-fingerprints and retries the WHOLE file from scratch; a partial prior attempt never leaves
-  partial rows (a fault-injection regression test proves this for a multi-batch failure
+- **Retry contract is fail-closed and all-or-nothing.** The copy pass's batch inserts, every
+  conflict read-back, the SQLite snapshot close, and the marker `INSERT` all run inside ONE
+  Postgres transaction. The fingerprint pass (pass 1) runs BEFORE that transaction even opens —
+  it performs no Postgres reads or writes at all, so it is fail-closed independently: any failure
+  there (a mid-scan read error, a hex-validation failure) returns before `pool_.with_txn` is ever
+  called, leaving nothing to roll back. Any failure inside the Postgres transaction — a batch
+  statement error, an IDENTITY/LIFECYCLE fail-closed classification, a pass-1/pass-2 row-count
+  mismatch, or a failure to close the SQLite snapshot — leaves the marker unstamped, so the NEXT
+  BOOT re-fingerprints and retries the WHOLE file from scratch; a partial prior attempt never
+  leaves partial rows (a fault-injection regression test proves this for a multi-batch failure
   specifically, not just a single-row one). This is the same contract the pre-#3399 per-row loop
   had — restructuring the copy pass into batches did not change it.
 - **Legacy read discipline (#3398).** The read-only SQLite connection sets
