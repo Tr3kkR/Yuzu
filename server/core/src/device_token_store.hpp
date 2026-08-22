@@ -34,8 +34,9 @@
 /// statement (`device_token_store.device_auth_tokens`) — pooled connections carry no per-store
 /// search_path. Mutate-and-return uses `RETURNING`, never `sqlite3_changes()`.
 ///
-/// Secrets (ADR-0010): `token_hash` is a SHA-256 verify-only hash (BCrypt on Windows, OpenSSL
-/// elsewhere — kept cross-platform-identical to the pre-migration store) — the raw token is
+/// Secrets (ADR-0010): `token_hash` is a SHA-256 verify-only hash (checked EVP SHA-256 on every
+/// platform since #3351 — a prior Windows BCrypt branch is gone; output bytes unchanged) — the
+/// raw token is
 /// returned once at creation and never persisted. No `SecretCodec` involvement (hash-only, not
 /// envelope-encrypted) — this is why this store sits in Wave 3's "verify/hash" row rather than
 /// the SecretCodec-gated rows.

@@ -39,6 +39,10 @@ void AgentRegistry::set_device_token_store(DeviceTokenStore* store) {
     device_token_store_ = store;
 }
 
+void AgentRegistry::set_register_agent_interleave_hook_for_test(std::function<void()> hook) {
+    register_agent_interleave_hook_for_test_ = std::move(hook);
+}
+
 std::expected<void, std::string> AgentRegistry::register_agent(const pb::AgentInfo& info) {
     auto session = std::make_shared<AgentSession>();
     session->agent_id = info.agent_id();
@@ -84,17 +88,22 @@ std::expected<void, std::string> AgentRegistry::register_agent(const pb::AgentIn
         session->plugin_meta.push_back(std::move(pm));
     }
 
-    // Phase 1 (under mu_): snapshot whether a prior entry exists and the current device-token
-    // store pointer. Only this read is guarded by mu_ (matches set_device_token_store's "guarded
-    // by mu_" contract) — the revoke call itself, a blocking Postgres round-trip, runs OFF the
-    // lock below.
-    bool prior_exists = false;
+    // Phase 1 (under mu_): snapshot the CURRENT session for this agent_id (not just whether one
+    // exists) and the device-token store pointer. Only this read is guarded by mu_ (matches
+    // set_device_token_store's "guarded by mu_" contract) — the revoke call itself, a blocking
+    // Postgres round-trip, runs OFF the lock below. Holding the shared_ptr (not a bool) keeps
+    // phase 2's identity compare ABA-safe: as long as this call holds a strong ref, no other
+    // session can be allocated at the same address.
+    std::shared_ptr<AgentSession> prior_session;
     DeviceTokenStore* store = nullptr;
     {
         std::lock_guard lock(mu_);
-        prior_exists = agents_.contains(info.agent_id());
+        auto it = agents_.find(info.agent_id());
+        if (it != agents_.end())
+            prior_session = it->second;
         store = device_token_store_;
     }
+    const bool prior_exists = (prior_session != nullptr);
 
     // W1.5 / #823, corrected by #3401: re-registration revokes any device tokens bound to this
     // agent_id BEFORE the new session is installed, so an attacker who briefly held this
@@ -127,22 +136,55 @@ std::expected<void, std::string> AgentRegistry::register_agent(const pb::AgentIn
                           "for '{}', refusing registration: {}",
                           info.agent_id(), revoked.error());
             metrics_
-                .counter("yuzu_agent_registration_refused_total",
+                .counter("yuzu_agents_registration_refused_total",
                          {{"reason", "device_token_revoke_failed"}})
                 .increment();
             return std::unexpected("device token revoke failed: " + revoked.error());
         }
     }
 
-    // Phase 2 (under mu_): install the new session. Re-fetches the CURRENT prior entry rather
-    // than reusing phase 1's snapshot — a concurrent register_agent for the same agent_id may
-    // have already run to completion in between (its own revoke already committed under its own
-    // call); erasing against fresh state here is correct even if phase 1's snapshot is now stale.
+    // Test-only interleave seam (Gate 5 CH-1a): fires once, synchronously, in this exact window
+    // — after the revoke, before phase 2 re-locks. A test callback that itself calls
+    // register_agent again for the same agent_id deterministically exercises the supersede path
+    // just below, without real threads. No-op (nullptr) in production.
+    if (register_agent_interleave_hook_for_test_) {
+        auto hook = std::move(register_agent_interleave_hook_for_test_);
+        register_agent_interleave_hook_for_test_ = nullptr;
+        hook();
+    }
+
+    // Phase 2 (under mu_): install the new session. Re-fetches the CURRENT entry rather than
+    // reusing phase 1's snapshot, then compares it BY POINTER against that snapshot before
+    // touching anything.
+    //
+    // Because the revoke above runs off mu_, a second register_agent call for this SAME
+    // agent_id can run its own phase 1 + revoke + phase 2 to completion entirely within this
+    // call's revoke window (e.g. its revoke hits an empty pool queue while this one waits behind
+    // a FOR-UPDATE lock). Under the OLD single-locked implementation this could not happen —
+    // holding mu_ across the whole call serialized both calls end to end, so install order always
+    // matched arrival order. Splitting the lock restores that ordering explicitly here instead of
+    // getting it for free: if the entry we see now is not the SAME object phase 1 saw, a newer
+    // registration already won and installed — this call yields rather than overwrite it (its
+    // own revoke already committed, so the #823 guarantee for its identity is satisfied
+    // regardless; only the session install is skipped). An entry that has instead been REMOVED
+    // (`it == end()` — e.g. the prior session's stream tore down independently) is NOT
+    // "superseded": there is nothing live to protect, so this call installs normally.
     {
         std::lock_guard lock(mu_);
-        auto old = agents_.find(info.agent_id());
-        if (old != agents_.end() && !old->second->session_id.empty())
-            session_to_agent_.erase(old->second->session_id);
+        auto it = agents_.find(info.agent_id());
+        if (it != agents_.end() && it->second != prior_session) {
+            spdlog::warn("AgentRegistry::register_agent: superseded by a concurrent "
+                         "registration for '{}', not installing (this call's revoke already "
+                         "committed)",
+                         info.agent_id());
+            metrics_
+                .counter("yuzu_agents_registration_refused_total",
+                         {{"reason", "superseded_by_concurrent_registration"}})
+                .increment();
+            return std::unexpected("superseded by a concurrent registration for this agent_id");
+        }
+        if (it != agents_.end() && !it->second->session_id.empty())
+            session_to_agent_.erase(it->second->session_id);
         agents_[info.agent_id()] = session;
     }
     metrics_.counter("yuzu_agents_registered_total").increment();

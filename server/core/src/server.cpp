@@ -462,13 +462,22 @@ public:
                           "gauge");
         metrics_.describe("yuzu_agents_registered_total", "Total number of agent registrations",
                           "counter");
-        // #3401: a re-registration was refused because the W1.5/#823 device-token
-        // revoke-by-device sweep itself failed (fail-closed, ADR-0012 §1) — the agent retries on
-        // its normal reconnect backoff. Dormant today (device_token_store_ is never wired live).
-        metrics_.describe("yuzu_agent_registration_refused_total",
+        // #3401: a re-registration was refused, either because the W1.5/#823 device-token
+        // revoke-by-device sweep itself failed (fail-closed, ADR-0012 §1) or because a
+        // concurrent registration for the same agent_id already won (see register_agent's
+        // phase-2 supersede check) — either way the agent retries on its normal reconnect
+        // backoff. Pre-seed both reason values so absent()-style alerting works from a healthy
+        // boot (kNvdCountedReasons precedent above). Dormant today for the revoke-failure reason
+        // (device_token_store_ is never wired live); the supersede reason is live regardless.
+        metrics_.describe("yuzu_agents_registration_refused_total",
                           "Agent registration refused because a required pre-install step "
-                          "failed. Labelled reason.",
+                          "failed, or because a concurrent registration for the same agent_id "
+                          "already won. Labelled reason.",
                           "counter");
+        for (const char* reason :
+             {"device_token_revoke_failed", "superseded_by_concurrent_registration"}) {
+            metrics_.counter("yuzu_agents_registration_refused_total", {{"reason", reason}});
+        }
         metrics_.describe("yuzu_commands_dispatched_total",
                           "Total number of commands dispatched to agents", "counter");
         metrics_.describe("yuzu_commands_completed_total",

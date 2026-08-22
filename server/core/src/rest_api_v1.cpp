@@ -8172,6 +8172,42 @@ void RestApiV1::register_routes(
                     res.set_content(envelope.str(), "application/json");
                     return;
                 }
+                // gov Gate 4 (consistency-auditor, C-1): a store-level input-validation failure
+                // (`invalid_input_length:` or the pre-existing empty-principal_id guard) is a
+                // client error, not a service fault or CSPRNG exhaustion — the prior two-way
+                // classifier fell through to the CSPRNG arm below by elimination, which would
+                // have reported 503 + a misleading "CSPRNG unavailable" message/audit-reason and
+                // incremented yuzu_secure_random_failure_total for what is actually a 400.
+                // Unreachable via REST today (name/device_id/definition_id are pre-clamped at
+                // 256 chars above; principal_id is session->username, bounded by AuthDB's 64-char
+                // limit) — defence-in-depth for a future non-REST caller the store's own doc
+                // comment anticipates (e.g. an MCP twin).
+                if (result.error().starts_with("invalid_input_length:") ||
+                    result.error() == "principal_id cannot be empty") {
+                    bool audit_emitted = false;
+                    try {
+                        audit_emitted = audit_fn(req, "device_token.create", "failure",
+                                                 "DeviceToken", device_id,
+                                                 "invalid_input: " + result.error());
+                    } catch (const std::exception& ex) {
+                        spdlog::error("device_token.create audit emission threw: {}", ex.what());
+                        audit_emitted = false;
+                    } catch (...) {
+                        spdlog::error("device_token.create audit emission threw unknown");
+                        audit_emitted = false;
+                    }
+                    res.status = 400;
+                    if (!audit_emitted)
+                        res.set_header("Sec-Audit-Failed", "true");
+                    JObj envelope_err;
+                    envelope_err.add("code", 400).add("message", result.error());
+                    JObj envelope;
+                    envelope.raw("error", envelope_err.str())
+                        .add("audit_emitted", audit_emitted)
+                        .raw("meta", R"({"api_version":"v1"})");
+                    res.set_content(envelope.str(), "application/json");
+                    return;
+                }
                 // sre-1: Prometheus signal for CSPRNG failure (see
                 // /api/v1/tokens comment for full rationale).
                 if (metrics_registry) {

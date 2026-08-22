@@ -427,6 +427,14 @@ public:
     /// MUST NOT install a session after a refusal. The revoke runs OFF the registry mutex (see
     /// the .cpp for the two-phase structure, precedent `sweep_revoked`) — only the map
     /// read/write is held under `mu_`, not the blocking Postgres round-trip.
+    ///
+    /// Also refused, same way, if superseded: because the revoke runs off-lock, a second
+    /// `register_agent` call for the same `agent_id` can install its session while this call's
+    /// revoke is still in flight. Phase 2 re-checks the map entry against the pointer this call
+    /// observed in phase 1 — a mismatch means a newer registration already won, and THIS call
+    /// yields rather than overwriting a live session with a stale one (its own revoke already
+    /// committed, so nothing is lost by not installing). This restores the ordering the old
+    /// single-locked implementation gave for free; it does not add a NEW guarantee beyond that.
     [[nodiscard]] std::expected<void, std::string> register_agent(const pb::AgentInfo& info);
 
     void set_stream(const std::string& agent_id,
@@ -572,6 +580,16 @@ public:
     /// only reads this pointer under `mu_` — the revoke call it makes
     /// through it runs OFF the lock (#3401; see the .cpp).
     void set_device_token_store(DeviceTokenStore* store);
+
+    /// Test hook: fires once, synchronously, in the calling thread between `register_agent`'s
+    /// phase 1 (revoke) and phase 2 (install) — the exact window in which a concurrent
+    /// registration for the same `agent_id` can complete and install its own session. Setting
+    /// this to a callback that itself calls `register_agent` again deterministically exercises
+    /// the supersede-detection path without real threads or timing (mirrors the
+    /// `inject_*_fault_for_test` seams in `mcp_stream.hpp`). Cleared after firing — a callback
+    /// that re-arms it will recurse. Production code MUST NOT call this — no caller in
+    /// `server/core/src/**` references it.
+    void set_register_agent_interleave_hook_for_test(std::function<void()> hook);
 
     // PLAN item 3 (provenance not syntax): only a `ClassifiedCommand` — mintable
     // ONLY by `ServerImpl::build_classified_command` (or the test-only door) —
@@ -733,7 +751,18 @@ private:
     /// W1.5 / #823: optional device-token store used by `register_agent`
     /// to revoke stale tokens on re-registration. Guarded by `mu_` (set
     /// via `set_device_token_store`, read inside `register_agent`).
+    ///
+    /// Non-owning. `AgentRegistry` never constructs, destroys, or extends the lifetime of the
+    /// pointee — the owner (a startup-wiring-scoped `DeviceTokenStore` in tests today; the
+    /// server's long-lived one once a wiring PR lands) MUST outlive this registry, or call
+    /// `set_device_token_store(nullptr)` before its own destruction. The only production caller
+    /// today is one-time startup wiring, before any `register_agent` call can race it; a future
+    /// re-call mid-lifetime (there is none today) would need the same care `set_stream`/
+    /// `clear_stream` already take around a session's raw pointers.
     DeviceTokenStore* device_token_store_{nullptr};
+
+    /// Test-only, see `set_register_agent_interleave_hook_for_test`.
+    std::function<void()> register_agent_interleave_hook_for_test_;
 };
 
 // -- Scope kind discovery catalog ---------------------------------------------

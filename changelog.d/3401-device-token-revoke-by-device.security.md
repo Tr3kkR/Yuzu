@@ -6,5 +6,8 @@
   keyed on the column `validate_token` actually binds a presenter against, closes the gap.
   Registration now also fails closed on a genuine revoke failure (previously logged and
   proceeded), and the revoke's blocking database round-trip no longer runs under the registry's
-  mutex. `DeviceTokenStore` remains dormant — not yet constructed in production — so this has
-  no live effect today; it closes an activation gate ahead of a future wiring change.
+  mutex — instead, a re-registration that loses a race against a concurrent registration for the
+  same agent (its revoke still commits, but a newer registration already installed) also fails
+  closed rather than silently overwriting the newer session's live connection. `DeviceTokenStore`
+  remains dormant — not yet constructed in production — so this has no live effect today; it
+  closes an activation gate ahead of a future wiring change.

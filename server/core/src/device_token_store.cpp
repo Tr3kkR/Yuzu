@@ -11,7 +11,11 @@
 #include <libpq-fe.h>
 // #3351: EVP_Digest is the SOLE hashing path now (both sha256_hex's backfill fingerprinting AND
 // hash_token below) — the prior _WIN32/BCrypt split is gone, so this include is simply
-// unconditional rather than the split-with-a-comment it used to need.
+// unconditional rather than the split-with-a-comment it used to need. `spdlog/spdlog.h` below
+// pulls no transitive `<windows.h>` in this build (this project sets `SPDLOG_COMPILED_LIB`
+// project-wide, which dead-codes spdlog's header-only Windows.h-including paths) — cpp-expert and
+// cross-platform confirmed by source inspection, so this file carries zero `#ifdef _WIN32`
+// branches and needs none.
 #include <openssl/evp.h>
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>

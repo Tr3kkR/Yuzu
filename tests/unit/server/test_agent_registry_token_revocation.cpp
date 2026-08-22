@@ -215,7 +215,7 @@ TEST_CASE("AgentRegistry: register_agent refuses the registration when the devic
     registry.set_device_token_store(&tokens);
 
     yuzu::Labels refused_labels{{"reason", "device_token_revoke_failed"}};
-    REQUIRE(metrics.counter("yuzu_agent_registration_refused_total", refused_labels).value() ==
+    REQUIRE(metrics.counter("yuzu_agents_registration_refused_total", refused_labels).value() ==
            0.0);
 
     // First-time registration — establishes the prior session that must
@@ -241,6 +241,85 @@ TEST_CASE("AgentRegistry: register_agent refuses the registration when the devic
 
     // #3419: the refusal branch is now behaviorally observable, not just logged — pin it via the
     // Prometheus counter rather than a log-line scrape.
-    CHECK(metrics.counter("yuzu_agent_registration_refused_total", refused_labels).value() ==
+    CHECK(metrics.counter("yuzu_agents_registration_refused_total", refused_labels).value() ==
          1.0);
+}
+
+// Gate 5 CH-1a: verifies the phase-2 supersede check. Splitting the revoke off mu_ (this same
+// diff) opened a window the OLD single-locked implementation didn't have: a second
+// register_agent for the SAME agent_id can now run to completion — including mapping a live
+// stream — while a first, slower call's revoke is still in flight. Without the pointer-identity
+// check, the slower call's phase 2 would then overwrite the map with a fresh, unmapped session,
+// silently orphaning the live stream (dispatch would reach nothing). Uses the deterministic
+// interleave hook rather than real threads — the property under test is "what does phase 2 do
+// when the entry changed under it", not "can we reproduce OS scheduling", and a real race would
+// make this test flaky for no additional coverage.
+TEST_CASE("AgentRegistry: register_agent detects a concurrent registration that already won "
+          "and yields instead of orphaning its live session (Gate 5 CH-1a)",
+          "[agent_registry][823][3401][token_revocation][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_token_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore tokens(pool);
+    REQUIRE(tokens.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    registry.set_device_token_store(&tokens);
+
+    SECTION("a newer registration already installed a session -> superseded, yield") {
+        // Establishes prior_exists=true for the slow call below.
+        REQUIRE(registry.register_agent(make_info("endpoint-99", "original.local")).has_value());
+
+        std::string winner_session_id;
+        registry.set_register_agent_interleave_hook_for_test([&] {
+            // Runs synchronously inside the SLOW call, after its revoke, before its phase 2 —
+            // exactly the window a genuinely concurrent registration would land in.
+            REQUIRE(registry.register_agent(make_info("endpoint-99", "winner.local")).has_value());
+            winner_session_id = "winner-stream-session";
+            registry.map_session(winner_session_id, "endpoint-99"); // simulates Subscribe
+        });
+
+        auto slow_result = registry.register_agent(make_info("endpoint-99", "slow.local"));
+        REQUIRE(!slow_result.has_value());
+
+        // The winner's session — live stream mapped — must still be the one on record.
+        CHECK(registry.agent_count() == 1);
+        auto current = registry.get_session("endpoint-99");
+        REQUIRE(current != nullptr);
+        CHECK(current->hostname == "winner.local");
+        CHECK(current->session_id == winner_session_id);
+        // Dispatch (find_by_session) must still reach the winner's live stream.
+        auto by_session = registry.find_by_session(winner_session_id);
+        REQUIRE(by_session != nullptr);
+        CHECK(by_session->hostname == "winner.local");
+
+        // Discriminable from a revoke failure — its own reason label, not conflated.
+        yuzu::Labels superseded_labels{{"reason", "superseded_by_concurrent_registration"}};
+        CHECK(metrics.counter("yuzu_agents_registration_refused_total", superseded_labels)
+                  .value() == 1.0);
+        yuzu::Labels revoke_failed_labels{{"reason", "device_token_revoke_failed"}};
+        CHECK(metrics.counter("yuzu_agents_registration_refused_total", revoke_failed_labels)
+                  .value() == 0.0);
+    }
+
+    SECTION("the prior entry was instead REMOVED (disconnect) -> not superseded, installs") {
+        REQUIRE(registry.register_agent(make_info("endpoint-99", "original.local")).has_value());
+
+        registry.set_register_agent_interleave_hook_for_test([&] {
+            // A concurrent disconnect tears the entry down entirely — nothing live to protect.
+            registry.remove_agent("endpoint-99");
+        });
+
+        auto result = registry.register_agent(make_info("endpoint-99", "reconnect.local"));
+        REQUIRE(result.has_value());
+        CHECK(registry.agent_count() == 1);
+        auto current = registry.get_session("endpoint-99");
+        REQUIRE(current != nullptr);
+        CHECK(current->hostname == "reconnect.local");
+
+        yuzu::Labels superseded_labels{{"reason", "superseded_by_concurrent_registration"}};
+        CHECK(metrics.counter("yuzu_agents_registration_refused_total", superseded_labels)
+                  .value() == 0.0);
+    }
 }

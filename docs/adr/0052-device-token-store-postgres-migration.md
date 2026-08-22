@@ -147,7 +147,12 @@ auth-credential store, not durability-on-top:
   sub-second fail-fast budget and confirm pool sizing against anticipated validation QPS (the
   `PgPool`'s `Options` are shared cross-store today, no per-store knob). Mitigating factor: distinct
   tokens hash to distinct rows, so lock contention serializes per-device, not globally — a chatty
-  single device only ever serializes against itself.
+  single device only ever serializes against itself. **Extension (#3401, gov Gate 6 sre round 2)**:
+  the same acquire-vs-lock-wait exposure applies to `register_agent`'s `revoke_by_device` call, on
+  the gRPC thread pool rather than httplib's — a synchronized mass-reconnect (e.g. a gateway
+  bounce, agents retrying with no initial jitter) drives concurrent `revoke_by_device` calls
+  against the same shared `PgPool` on the registration path specifically. The wiring PR's capacity
+  review should cover both paths, not just `validate_token`.
 - **ADR-1005 note for the future wiring PR (gov Gate 4, round 3)** — wiring this store live makes
   its capability reachable for the first time, which triggers ADR-1005's REST+MCP parity
   requirement: every device-token behavior must be reachable via versioned REST *and* MCP, or
@@ -394,3 +399,90 @@ All of the above remains dormant-store defence-in-depth: `server.cpp` still pass
 `/*device_token_store=*/nullptr`, so none of this is reachable in production today. It closes
 before the wiring PR, per this ADR's original dormancy record above and `#3422`'s still-open
 question of what mechanically enforces that ordering.
+
+## Amendment — 2026-08-22: hardening round (Gate 5/6 findings on the above)
+
+Governance's unhappy-path/chaos passes on the `#3401` fix identified one race the two-phase
+restructure itself introduces (not present before it), which this round fixes; three
+observability/correctness follow-ups from the same passes; and confirms several other findings as
+pre-existing, out of scope, or already covered.
+
+**Fixed here — supersede detection (Gate 4 unhappy-path UP-1, Gate 5 CH-1a).** Splitting the
+revoke off `mu_` opened a window the OLD single-locked implementation did not have: because
+`register_agent` used to hold `mu_` across the ENTIRE call (revoke included), two concurrent calls
+for the same `agent_id` were fully serialized end to end — install order always matched lock-
+acquisition order. With the revoke off-lock, a second call for the same `agent_id` can now run its
+own phase 1, revoke, and phase 2 to completion (install a session, map a live stream) entirely
+within a first, slower call's revoke window. Without a check, the slower call's phase 2 would then
+overwrite the map with a fresh, unmapped session — silently orphaning the winner's live stream, a
+dispatch black hole. The fix: phase 1 now snapshots the *session itself* (`shared_ptr`, not a bool)
+under `mu_`; phase 2 re-reads and compares by pointer identity before touching anything. A
+mismatch means a newer registration already won — this call yields (`std::unexpected`, same
+retryable-`UNAVAILABLE` path already built for a revoke failure, its own `reason` label) rather than
+overwriting a live session with a stale one. An entry that was instead *removed* (not replaced)
+between phase 1 and phase 2 is not "superseded" — nothing live to protect — and installs normally.
+This **restores** the old implementation's ordering guarantee; it does not add a new one, and it
+does not touch the separate, pre-existing register→Subscribe gap (a registration landing after
+phase 2 but before the caller's own `Subscribe` call) — that gap is unchanged by this diff, exactly
+as it was before. Verified by a deterministic test-only interleave hook
+(`set_register_agent_interleave_hook_for_test`, `test_agent_registry_token_revocation.cpp`) that
+fires a second `register_agent` call synchronously inside the first call's revoke-to-install
+window — chosen over a real-thread race because the property under test is "what does phase 2 do
+when the entry changed under it," not "can we reproduce OS scheduling," and a timing-based test
+would be flaky for no additional coverage. The realistic-timing variant (an actual `pg_sleep`-held
+row lock racing real threads) is tracked as a follow-up chaos scenario (CH-1b), not a merge gate.
+
+**Fixed here — REST create-token error classifier, three-way (Gate 4 consistency-auditor C-1).**
+The POST `/api/v1/device-tokens` handler's own classifier was two-way (`kDeviceTokenDbErrorPrefix`/
+`internal_error:` → 503 fault; everything else assumed CSPRNG exhaustion), so the store's
+`invalid_input_length:`/`principal_id cannot be empty` validation errors fell into the CSPRNG arm
+by elimination — wrong audit reason, wrong Prometheus counter, and (unlike the other two arms,
+which agree on 503) a real status-code error, since a validation failure is a 400, not a 503.
+Unreachable via REST today (the route pre-clamps `name`/`device_id`/`definition_id` at 256 bytes,
+and the harness's own `auth_fn` refuses an empty `session_user` outright, matching production —
+`principal_id` can never be empty through a real session). Verified by inspection against
+`device_token_store.cpp`'s enumerated `create_token` error strings plus the store-level pinned-
+string tests already added for #3351, not a full REST round-trip — forcing an empty principal_id
+through the harness would require defeating `auth_fn`'s own gate in a way no production path can,
+which would be a false-representative test, not real coverage.
+
+**Fixed here — metric naming + pre-seed (Gate 6 sre).** `yuzu_agent_registration_refused_total`
+(singular) is renamed to `yuzu_agents_registration_refused_total`, matching its siblings
+`yuzu_agents_registered_total`/`yuzu_agents_connected` added in the same function; both reason
+values (`device_token_revoke_failed`, `superseded_by_concurrent_registration`) are now pre-seeded
+at construction (`kNvdCountedReasons` precedent) so `absent()`-style alerting has a series to watch
+from a healthy boot rather than only after the first failure.
+
+**Also fixed — capacity note extension (Gate 6 sre).** The existing "Capacity note for the future
+wiring PR" above covered only `validate_token`'s httplib-worker-starvation risk; it now also names
+`register_agent`'s `revoke_by_device` call on the gRPC thread pool as the same acquire-vs-lock-wait
+exposure, on the registration path specifically.
+
+**Confirmed, not fixed here — tracked as follow-ups:**
+- **Sequential impostor-evasion of the sweep (UP-2)** — `prior_exists` (does an `agents_` entry
+  currently exist) is the only gate on running the revoke; an identity holder disconnecting before
+  the legitimate device's next `Register` skips it entirely. Pre-existing (not introduced by this
+  diff, not addressed by it), a genuine design tension between preserving the pre-issuance
+  operator workflow and closing disconnect-evasion, not a same-PR-fixable bug — files as a decision
+  issue.
+- **Reconnect-storm / gRPC-thread-pinning compound (UP-3/UP-4, Gate 5 CH-2)** — pre-existing agent
+  backoff (no jitter) and gRPC thread-pool sizing characteristics, unrelated to this diff's own
+  correctness; tracked as a pre-release follow-up (P1), not a merge gate.
+- **Migration fail-closed abort is all-or-nothing (UP-6)** — matches this same function's
+  pre-existing hex-format-validation precedent (already aborts the whole migration on one
+  malformed row); the new length-bound check adds one more reason using an already-established
+  philosophy, not a new failure class. Rejected as a design change; noted for the wiring-PR
+  checklist.
+- **No `audit_log` row for the automated revoke sweep (Gate 6 compliance-officer)** — the REST-
+  driven `device_token.create`/`device_token.revoke` routes emit an audit row; the automatic #823
+  sweep inside `register_agent` emits only an `spdlog` line and a counter (the registry holds no
+  `AuditStore` reference — see `sweep_revoked`'s own comment on the same point). `E6`-capped today
+  (the store is dormant), real once live — close before the wiring PR, alongside `#3422`.
+- **Customer-assurance framing (Gate 6 enterprise-readiness)** — any security-questionnaire or
+  pilot-readiness answer about this history should name `#3422` explicitly (what mechanically
+  enforces closing these gates before the store goes live) rather than resting on "dormant" alone,
+  and should lead with the fix's rigor (external review, root-caused, converted to fail-closed)
+  rather than "it didn't matter because nothing called it."
+
+All of the above remains dormant-store defence-in-depth, same as the round above: none of it is
+reachable in production today (`server.cpp` still passes `nullptr`).
