@@ -306,12 +306,19 @@ TEST_CASE("AgentRegistry: register_agent detects a concurrent registration that 
     SECTION("the prior entry was instead REMOVED (disconnect) -> not superseded, installs") {
         REQUIRE(registry.register_agent(make_info("endpoint-99", "original.local")).has_value());
 
+        // gov Gate 8 (quality-engineer): without this flag, every assertion below is
+        // indistinguishable from the hook silently never firing at all (a dead hook also leaves
+        // agents_ unchanged since phase 1, so phase 2 would see it as unchanged and install
+        // normally regardless) — pin that the hook actually ran, not just the end state.
+        bool hook_fired = false;
         registry.set_register_agent_interleave_hook_for_test([&] {
+            hook_fired = true;
             // A concurrent disconnect tears the entry down entirely — nothing live to protect.
             registry.remove_agent("endpoint-99");
         });
 
         auto result = registry.register_agent(make_info("endpoint-99", "reconnect.local"));
+        REQUIRE(hook_fired);
         REQUIRE(result.has_value());
         CHECK(registry.agent_count() == 1);
         auto current = registry.get_session("endpoint-99");

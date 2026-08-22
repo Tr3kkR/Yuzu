@@ -90,9 +90,11 @@ construction site's argument).
 ### Secrets (ADR-0010) — Wave 3 classification resolved
 
 **Verify-only hash, no `SecretCodec` involvement.** `token_hash` is a SHA-256 hash of the raw
-token (`hash_token()` — BCrypt on Windows, OpenSSL elsewhere, kept cross-platform-identical to
-the pre-migration store); the raw token (`ydt_<64 hex chars>`) is generated, hashed, and returned
-to the caller ONCE at `create_token` time — it is never persisted. This is the same posture as
+token (`hash_token()` — checked EVP SHA-256 on every platform since #3351; originally a
+BCrypt-on-Windows/OpenSSL-elsewhere split, kept cross-platform-identical to the pre-migration
+store — see the 2026-08-22 amendment below); the raw token (`ydt_<64 hex chars>`) is generated,
+hashed, and returned to the caller ONCE at `create_token` time — it is never persisted. This is
+the same posture as
 `LicenseStore`'s `license_key_hash` (ADR-0048) and `ApiTokenStore`'s token hash (PR 4.1) — this
 is exactly why this Wave 3 store is migratable now without waiting on any further secrets-seam
 work: the ladder's "verify/hash (confirm in ADR)" placeholder is confirmed here, against the
@@ -478,11 +480,37 @@ exposure, on the registration path specifically.
   sweep inside `register_agent` emits only an `spdlog` line and a counter (the registry holds no
   `AuditStore` reference — see `sweep_revoked`'s own comment on the same point). `E6`-capped today
   (the store is dormant), real once live — close before the wiring PR, alongside `#3422`.
+- **No `audit_log` row for the supersede refusal either (Gate 8 security-guardian) — and this one
+  is live today, not `E6`-capped.** Same gap, same underlying cause (`AgentRegistry` has no
+  `AuditStore` reference at all), but the supersede check runs regardless of store wiring, so this
+  is a real, present audit-trail gap, derived MEDIUM (non-blocking — MEDIUM doesn't meet the
+  BLOCKING bar, and fixing it means threading an `AuditStore` dependency into `AgentRegistry`, a
+  real architectural addition disproportionate to this hardening round). Track as its own,
+  higher-priority item alongside the dormant one above — do not let the two share one disposition.
+- **Straggler revoke can sweep a later, unrelated re-issued token (Gate 8 unhappy-path UP-12)** —
+  `revoke_by_device` is unscoped in time: a pathologically delayed loser's revoke (stuck behind a
+  `FOR UPDATE` wait — see the capacity note above) can commit after an operator has legitimately
+  reissued a fresh token for a subsequent reconnection of the same device, silently revoking it.
+  `E6`-capped today (the store is dormant); add to the wiring-PR capacity/correctness checklist
+  alongside the existing pool-contention note.
 - **Customer-assurance framing (Gate 6 enterprise-readiness)** — any security-questionnaire or
   pilot-readiness answer about this history should name `#3422` explicitly (what mechanically
   enforces closing these gates before the store goes live) rather than resting on "dormant" alone,
   and should lead with the fix's rigor (external review, root-caused, converted to fail-closed)
   rather than "it didn't matter because nothing called it."
 
-All of the above remains dormant-store defence-in-depth, same as the round above: none of it is
-reachable in production today (`server.cpp` still passes `nullptr`).
+**Correction to "dormant" (docs-writer + Gate 8 unhappy-path UP-13):** most of the above remains
+dormant-store defence-in-depth like the round above — the revoke-failure refusal path, the
+input-length bound, the linear sanitize, and the checked hashing are all gated on a wired
+`DeviceTokenStore` (`server.cpp` still passes `nullptr`). The supersede check is not: phase 2's
+pointer-identity compare runs on every `register_agent` call, store or no store, so a genuine
+concurrent-registration race is caught in production today, and its
+`yuzu_agents_registration_refused_total{reason="superseded_by_concurrent_registration"}` series
+is exposed on every server's `/metrics` right now, pre-seeded at 0. The only live-today surface
+this round adds is that refusal-and-retry path and its metric — restoring the ordering the old
+single-locked implementation already gave for free, not a new capability. (Correction to the
+Gate 8 docs-writer finding that prompted this paragraph: `docs/user-manual/metrics.md` does not
+in fact catalog `yuzu_agents_registered_total`/`yuzu_agents_connected` either — the doc is a
+curated query/dashboard reference, not an exhaustive metrics catalog — so this is a pre-existing
+gap affecting the whole `yuzu_agents_*` family, not one this round newly introduces; a metrics
+catalog pass is a separate, larger piece of work.)

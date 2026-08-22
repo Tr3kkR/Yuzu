@@ -8,6 +8,8 @@
   proceeded), and the revoke's blocking database round-trip no longer runs under the registry's
   mutex — instead, a re-registration that loses a race against a concurrent registration for the
   same agent (its revoke still commits, but a newer registration already installed) also fails
-  closed rather than silently overwriting the newer session's live connection. `DeviceTokenStore`
-  remains dormant — not yet constructed in production — so this has no live effect today; it
-  closes an activation gate ahead of a future wiring change.
+  closed rather than silently overwriting the newer session's live connection — this race-refusal
+  applies on every registration regardless of whether `DeviceTokenStore` is wired. The revoke
+  sweep itself, and the input-bound/hashing hardening below, remain dormant-store defence-in-depth
+  (`DeviceTokenStore` is not yet constructed in production) and close an activation gate ahead of
+  a future wiring change.

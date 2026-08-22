@@ -589,6 +589,13 @@ public:
     /// `inject_*_fault_for_test` seams in `mcp_stream.hpp`). Cleared after firing — a callback
     /// that re-arms it will recurse. Production code MUST NOT call this — no caller in
     /// `server/core/src/**` references it.
+    ///
+    /// Single-threaded test use only: the member this sets is read/moved/cleared inside
+    /// `register_agent` with no synchronization of its own (guarded neither by `mu_` nor a
+    /// dedicated lock — deliberately, since the whole point of this hook is a same-thread,
+    /// synchronous interleave rather than a real race). Setting it from one thread while another
+    /// thread's `register_agent` call may read or fire it is a data race; every test using this
+    /// hook must do so single-threaded (set, call the one `register_agent` that fires it, done).
     void set_register_agent_interleave_hook_for_test(std::function<void()> hook);
 
     // PLAN item 3 (provenance not syntax): only a `ClassifiedCommand` — mintable
@@ -753,12 +760,14 @@ private:
     /// via `set_device_token_store`, read inside `register_agent`).
     ///
     /// Non-owning. `AgentRegistry` never constructs, destroys, or extends the lifetime of the
-    /// pointee — the owner (a startup-wiring-scoped `DeviceTokenStore` in tests today; the
-    /// server's long-lived one once a wiring PR lands) MUST outlive this registry, or call
-    /// `set_device_token_store(nullptr)` before its own destruction. The only production caller
-    /// today is one-time startup wiring, before any `register_agent` call can race it; a future
-    /// re-call mid-lifetime (there is none today) would need the same care `set_stream`/
-    /// `clear_stream` already take around a session's raw pointers.
+    /// pointee — the owner (test-scoped `DeviceTokenStore` instances only, today; the server's
+    /// long-lived one once a wiring PR lands) MUST outlive this registry, or call
+    /// `set_device_token_store(nullptr)` before its own destruction. There is NO production
+    /// caller of `set_device_token_store` today (`server.cpp` never invokes it; the pointer stays
+    /// `nullptr` in production, matching this store's own dormancy record). Once a wiring PR adds
+    /// one, it MUST be one-time startup wiring, before any `register_agent` call can race it — a
+    /// re-call mid-lifetime would need the same care `set_stream`/`clear_stream` already take
+    /// around a session's raw pointers.
     DeviceTokenStore* device_token_store_{nullptr};
 
     /// Test-only, see `set_register_agent_interleave_hook_for_test`.

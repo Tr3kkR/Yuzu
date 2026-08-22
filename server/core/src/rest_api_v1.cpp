@@ -8182,6 +8182,14 @@ void RestApiV1::register_routes(
                 // 256 chars above; principal_id is session->username, bounded by AuthDB's 64-char
                 // limit) — defence-in-depth for a future non-REST caller the store's own doc
                 // comment anticipates (e.g. an MCP twin).
+                //
+                // gov Gate 8 (consistency-auditor): uses the canonical detail::a4_error envelope
+                // (correlation_id, matches this endpoint's OWN pre-clamp 400s just above) rather
+                // than the hand-rolled shape the sibling 503 arms below use — two different 400s
+                // from the same endpoint should look the same. Sec-Audit-Failed header only (no
+                // audit_emitted body field), matching the same convention already used where an
+                // audited failure returns an A4-enveloped body elsewhere in this file (e.g.
+                // dex.device.view's audit fail-closed branch).
                 if (result.error().starts_with("invalid_input_length:") ||
                     result.error() == "principal_id cannot be empty") {
                     bool audit_emitted = false;
@@ -8196,16 +8204,10 @@ void RestApiV1::register_routes(
                         spdlog::error("device_token.create audit emission threw unknown");
                         audit_emitted = false;
                     }
-                    res.status = 400;
                     if (!audit_emitted)
                         res.set_header("Sec-Audit-Failed", "true");
-                    JObj envelope_err;
-                    envelope_err.add("code", 400).add("message", result.error());
-                    JObj envelope;
-                    envelope.raw("error", envelope_err.str())
-                        .add("audit_emitted", audit_emitted)
-                        .raw("meta", R"({"api_version":"v1"})");
-                    res.set_content(envelope.str(), "application/json");
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, result.error()), "application/json");
                     return;
                 }
                 // sre-1: Prometheus signal for CSPRNG failure (see

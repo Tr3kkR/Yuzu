@@ -36,10 +36,9 @@
 ///
 /// Secrets (ADR-0010): `token_hash` is a SHA-256 verify-only hash (checked EVP SHA-256 on every
 /// platform since #3351 — a prior Windows BCrypt branch is gone; output bytes unchanged) — the
-/// raw token is
-/// returned once at creation and never persisted. No `SecretCodec` involvement (hash-only, not
-/// envelope-encrypted) — this is why this store sits in Wave 3's "verify/hash" row rather than
-/// the SecretCodec-gated rows.
+/// raw token is returned once at creation and never persisted. No `SecretCodec` involvement
+/// (hash-only, not envelope-encrypted) — this is why this store sits in Wave 3's "verify/hash"
+/// row rather than the SecretCodec-gated rows.
 ///
 /// **Mandatory backfill** (ADR-0009): `migrate_from_sqlite()` is idempotent PER DISTINCT
 /// LEGACY-FILE CONTENT (a SHA-256 fingerprint, or a sourceless sentinel), mirroring
