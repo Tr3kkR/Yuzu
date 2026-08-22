@@ -1,7 +1,7 @@
 # High Availability Architecture
 
 ---
-status: proposed
+status: accepted
 owner: Fraser Jarvis (@fjarvis)
 ---
 
