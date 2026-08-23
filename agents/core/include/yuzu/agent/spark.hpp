@@ -55,6 +55,17 @@ enum class SparkType {
     Registry, ///< Windows registry key change (wait-pool; mechanism PR 1b)
 };
 
+/// Guardian convergence-scheduler lane cadences and jitter (ADR-0021 Stage 2 rung 4;
+/// design doc `guardian_convergence_scheduler.hpp`). Hoisted here, out of
+/// `ConvergenceScheduler::Config`'s struct defaults, so any OTHER site that needs to
+/// reason about a lane's sweep interval - `guardian_spark_bridge.hpp`'s per-type
+/// debounce default (#3388) is the first such site - single-sources them instead of
+/// risking a silently-drifted duplicate copy of the same tuning constants.
+inline constexpr std::uint64_t kGuardianServiceLaneCadenceMs = 60'000;
+inline constexpr std::uint64_t kGuardianRegistryLaneCadenceMs = 60'000;
+inline constexpr std::uint64_t kGuardianFileLaneCadenceMs = 600'000; ///< ~10 min (the 5-15 min band)
+inline constexpr std::uint32_t kGuardianLaneJitterPct = 20;         ///< +/- this % of the cadence
+
 /// Stable token for logs, keys, and (later) the content plane.
 [[nodiscard]] constexpr const char* spark_type_token(SparkType t) noexcept {
     switch (t) {
