@@ -393,7 +393,8 @@ artifact, not a shard's own baseline.
 Each pg shard carries `timeout: 600` as a hard per-test meson kwarg (not the
 job-level budget). Shard E hit it dead-on — 600.11–600.60 s, repeatedly —
 under this same uncapped fan-out before the 2026-08-19 E→E+G split (#3322);
-the post-split E/G pair was still measured at 88–94% of that ceiling as
+the post-split E/G pair was still measured at 86–96% of that ceiling across
+several runs, as
 recently as this week, i.e. the box was never actually scaling flat — the
 separate shard A→A+H split (#3434) addressed a different pair and only moved
 which shard sat closest to the ceiling, it didn't touch this mechanism. The

@@ -19,7 +19,7 @@
 # comment claimed Linux "scales flat" and needed neither gate — false: shard E
 # clipped its 600s meson timeout dead-on under this same fan-out before its
 # 2026-08-19 E->E+G split (#3322), and the post-split pair still ran at
-# 88-94% of that ceiling as recently as this week. A Linux cross-job gate via
+# 86-96% of that ceiling across several runs this week. A Linux cross-job gate via
 # this same script is a candidate fast-follow if within-job capping alone
 # proves insufficient — tracked in #3443.
 # Full diagnosis: docs/ci-architecture.md + the tests/meson.build server-shard

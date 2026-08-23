@@ -776,8 +776,8 @@ jobs:
         # hard per-test kwarg, not the job budget: shard E hit it dead-on
         # (600.11-600.60s) repeatedly under this same uncapped fan-out before the
         # 2026-08-19 E->E+G split (#3322), and the post-split E/G pair was still
-        # measured at 88-94% of that ceiling as recently as this week — so the
-        # box was never actually "scaling flat" (see the now-corrected claim in
+        # measured at 86-96% of that ceiling across several runs this week — so
+        # the box was never actually "scaling flat" (see the now-corrected claim in
         # docs/ci-architecture.md's "Linux within-job concurrency cap" section +
         # this step's Windows counterpart below). Solo/uncontended per-shard cost
         # is much lower — tests/meson.build's own recorded numbers run ~50-180s —
