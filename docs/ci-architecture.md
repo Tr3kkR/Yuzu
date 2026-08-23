@@ -299,8 +299,9 @@ supporting scaffolding:
 `ImageOS` stays `ubuntu24` on every leg (setup-beam has no `ubuntu26` prebuilt
 OTP; the 24.04 OTP runs fine on 26.04 — same `libcrypto.so.3` soname). Big Tam
 runs 4 runners on one host, so every apt step is `flock`-serialized on
-`/tmp/yuzu-ci-apt.lock`, the shared CI Postgres container is flock-serialized too
-(`scripts/ci/ensure-postgres.sh`), and meson is installed per-job via
+`/tmp/yuzu-ci-apt.lock`; each runner agent provisions its own persistent
+`yuzu-ci-postgres-<n>` container (#2094, `scripts/ci/ensure-postgres.sh`) rather
+than sharing one across agents, and meson is installed per-job via
 `pip --user` (it is not a host default). Full history + per-file detail:
 **`docs/ci-ubuntu-2604-cutover.md`**.
 
@@ -352,19 +353,68 @@ run their **test** phase at the same time, the heavy unit-test suites
 timeouts: per-runner telemetry (`ci_test_suites`) measured `server ~[pg]` at
 c0≈289 s → c2≈467 s → c4≈603 s — a **guaranteed** timeout once ≥4 test phases
 overlap, and a 22–25 % timeout rate on the `server ~[pg]`/`tar` suites overall.
-Big Tam (Linux) scales **flat** under the identical 4-on-one-box topology — cheap
-`fork()`/VFS/page-cache and no AV minifilter keep per-op cost low — so it needs no
-gate.
+`fork()`/VFS/page-cache and no AV minifilter keep Big Tam's (Linux) per-op cost
+lower than Wee Tam's — but a prior revision of this section claimed Big Tam
+"scales flat" and needed no gate at all, which was never actually true; see
+"Linux within-job concurrency cap" below.
 
 `ci.yml`'s Windows **Test** step therefore wraps the run in
 [`scripts/ci/with-test-slot.sh`](../scripts/ci/with-test-slot.sh) — a crash-safe
 `flock` gate (a killed job releases its slot via OS fd-close, so a timeout never
 leaks a slot) that caps concurrent heavy test phases to **2 per box** (the
 **build** phase stays 4-wide) — and passes `--num-processes 2` so meson's own
-fan-out can't pile the two ~400–600 s server shards onto one CCD+cluster. The slot
+fan-out can't pile the ~8 server pg shards onto one CCD+cluster. The slot
 count is the first knob to revisit (→3) once per-op cost is cut (Defender `%TEMP%`
 exclusion, RAM-disk data dirs). Full diagnosis: the `tests/meson.build`
 server-shard comment.
+
+### Linux within-job concurrency cap
+
+Big Tam's 4 runners are also CCD-pinned (16 logical CPUs each, "Self-hosted
+runner topology" above), and each runner agent's `Ensure Postgres (server
+tests)` step idempotently (re)uses one persistent `yuzu-ci-postgres-<n>`
+container scoped to that agent — so unlike Wee Tam, Big Tam was never
+suffering primarily from OTHER, concurrently-running jobs sharing the box. The
+bottleneck was **within one job**: `ci.yml`'s Linux `Test` step invoked
+`scripts/ci/flake-retry.py` with no `--num-processes` cap. meson's own default
+worker count is an uncapped, non-affinity-aware `cpu_count()` — the job's
+execution is genuinely confined to 16 logical CPUs via cgroup, but meson's own
+pool sizing ignores that confinement — so it fanned every `test()` entry out
+at once: all ~8 server pg shards running concurrently inside a single job,
+sharing that job's 16 logical CPUs and its one Postgres container. Proved via
+back-computed shard start times (printed-timestamp minus reported elapsed)
+landing within ~0.01 s of each other across every pg shard in a failing run —
+sequential execution would spread those start times by each shard's own
+duration, not cluster them. Solo/uncontended per-shard cost is much lower than
+what full contention produces — `tests/meson.build`'s own recorded
+measurements run ~50–180 s — the ~600 s figures below are a contention
+artifact, not a shard's own baseline.
+
+Each pg shard carries `timeout: 600` as a hard per-test meson kwarg (not the
+job-level budget). Shard E hit it dead-on — 600.11–600.60 s, repeatedly —
+under this same uncapped fan-out before the 2026-08-19 E→E+G split (#3322);
+the post-split E/G pair was still measured at 86–96% of that ceiling across
+several runs, as
+recently as this week, i.e. the box was never actually scaling flat — the
+separate shard A→A+H split (#3434) addressed a different pair and only moved
+which shard sat closest to the ceiling, it didn't touch this mechanism. The
+fix: `--num-processes 2` on the Linux Test step, mirroring the already-proven
+Windows value — chosen over a larger number specifically because E/G had no
+measured headroom to spend on a guess.
+
+`nightly.yml`'s Linux ASan/TSan/coverage legs and `sanitizer-tests.yml`'s
+ASan/TSan legs (the `/test --full` pre-push gate) invoke `meson test` directly
+with the identical uncapped-fan-out shape and are NOT fixed by this change —
+tracked in #3443 alongside the Linux cross-job gate below.
+
+A Linux cross-job gate via `with-test-slot.sh` (today Windows-only) is a
+candidate fast-follow if within-job capping alone proves insufficient; it isn't
+wired in yet because its default lock directory
+(`$RUNNER_TOOL_CACHE/yuzu-test-slots`) is per-agent on Big Tam, not box-wide
+like Wee Tam's shared `D:\ci\tool_cache` — bundling it would need an explicit
+shared `YUZU_TEST_SLOT_DIR` to actually gate cross-job, or it would silently
+no-op. Full diagnosis: the `tests/meson.build` server-shard comment (shard
+E/G split history) + #3443.
 
 ### Persistent runner-local test history
 
