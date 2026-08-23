@@ -426,6 +426,52 @@ Two consequences worth planning for:
   recovers. Alert on `yuzu_server_quarantine_gate_total{outcome="fail_closed"}` — see
   [Metrics](metrics.md) — because that series is an outage signal, not a quarantine signal.
 
+### Reconnect re-application (#3425)
+
+A device quarantined while **offline** is contained at the control plane immediately (the #881
+dispatch gate above refuses it), but its own firewall cannot be touched until a dispatch actually
+reaches it — and an offline device cannot be reached. Before #3425, that gap was permanent until
+an operator noticed and manually re-issued the quarantine after the device came back.
+
+`QuarantineContainmentReconciler` closes it automatically. For every device with an active
+quarantine record whose endpoint containment is not yet confirmed:
+
+- **Trigger.** A heartbeat from the device (the fast path — fires within one heartbeat interval
+  of reconnect) or a periodic ~20-second tick (the backstop — catches anything the heartbeat path
+  missed, and everything before the reconciler's heartbeat hook was wired). Deliberately **not**
+  agent registration/reconnect itself: the gRPC command stream is not yet established at that
+  point, so a dispatch fired from there would be silently dropped.
+- **What it dispatches.** The **stored** `reason`/`whitelist` — the same rule the MCP
+  `quarantine_device` retry path (#3127) follows, for the same reason: dispatching anything else
+  would silently rewrite a contained device's firewall allow-list with no store update and no
+  audit trail.
+- **Confirmation.** Dispatch acceptance alone is not proof of containment (a gateway-attached
+  agent's `send_to` only queues the frame). The reconciler follows up with a `quarantine.status`
+  read and only marks the device confirmed once it answers `state|active`. A previously-confirmed
+  device whose live agent session changes (a reboot, a service restart — the firewall rules from
+  before the restart are gone) drops confirmation and re-verifies via `status` first, rather than
+  blindly re-applying.
+- **Concurrency.** The agent-side quarantine plugin serializes its own mutating actions (a
+  2-second-bounded gate; a blocked caller answers `status|busy`) — the reconciler treats `busy` as
+  "already being handled," not a failure, and does not retry until its own per-agent backoff
+  (starting at 60s, doubling up to a 15-minute cap on repeated non-confirmation, reset on confirm)
+  elapses.
+- **Audit.** A system-initiated re-application is audited under `quarantine.reapply`
+  (`principal: system`), distinct from an operator-initiated `quarantine.enable`/`quarantine.disable`
+  — detail carries `command_id` and `trigger=tick|heartbeat`, or `CONFIRMED command_id=...` once
+  containment is verified.
+- **Observability.** `yuzu_server_quarantine_endpoint_unconfirmed{reachability="connected"|"offline"}`
+  is a per-replica gauge — never sum it across server instances — counting active records not yet
+  confirmed contained. `reachability="offline"` is expected and not alerted on (a device quarantined
+  while off is legitimately unconfirmed for its whole offline duration); a sustained
+  `reachability="connected"` count is the genuine divergence signal — see
+  `YuzuQuarantineEndpointUnconfirmed` in [Metrics](metrics.md). `yuzu_server_quarantine_reapply_total{result}`
+  breaks down every outcome (`reapplied`, `confirmed`, `unconfirmed`, `busy`, `offline`,
+  `not_reached`, `rate_limited`, `pending`, `degraded`, `validation_failed`, `dispatch_error`).
+
+A manual re-issue of `quarantine_device` (MCP) still works and re-drives the same stored intent —
+it is redundant with the automatic reconciler, never required, and never harmful.
+
 ## IOC Checking
 
 The `ioc` plugin supports Indicator of Compromise checking for threat hunting. Execute the `check` action with one or more indicator types to scan an endpoint for signs of compromise.

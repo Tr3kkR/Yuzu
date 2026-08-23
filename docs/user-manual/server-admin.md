@@ -983,6 +983,26 @@ you see this on a rolling upgrade, retry once traffic quiesces (a load
 balancer draining the outgoing replica is usually enough); it is not a data
 integrity concern either way.
 
+### vNEXT — a device quarantined while offline now re-contains itself automatically on reconnect (#3425)
+
+`QuarantineStore` gains schema v2: two columns on `quarantine_records`
+(`last_applied_at`, `last_confirmed_at`, both `BIGINT NOT NULL DEFAULT 0`) tracking whether a new
+background component, `QuarantineContainmentReconciler`, has re-applied and confirmed a device's
+endpoint firewall since it last reconnected. Same `ACCESS EXCLUSIVE` migration-lock note as the
+API-token entry above applies here too — negligible in practice, since `quarantine_records` is a
+small, manually-curated security-event table, not a hot path.
+
+No operator action needed. Previously, a device quarantined while offline stayed contained at the
+control plane (the #881 dispatch gate) indefinitely, but its own firewall was never (re-)applied
+until someone noticed and manually re-issued the `quarantine_device` MCP call. On upgrade, every
+pre-existing active quarantine record starts unconfirmed, so expect one automatic re-application
+attempt per connected contained device shortly after the new binary starts serving — this is
+idempotent and is the correct, intended behaviour (those are exactly the devices whose endpoint
+containment was never independently confirmed). See `docs/user-manual/security-hardening.md`
+"Reconnect re-application (#3425)" for the mechanism and the new
+`yuzu_server_quarantine_endpoint_unconfirmed{reachability}` / `yuzu_server_quarantine_reapply_total{result}`
+metrics.
+
 ### vNEXT — the rotation sweep now carries the full clock-guarded-retention shape (#2964)
 
 **What changed.** `ApiTokenStore::sweep_expired_rotations` — the 60-second

@@ -1466,13 +1466,24 @@ list entirely, not merely hidden from write access.
       "quarantined_by": "admin",
       "quarantined_at": 1710849600,
       "whitelist": "10.0.1.50,10.0.1.51",
-      "reason": "Suspicious network activity detected"
+      "reason": "Suspicious network activity detected",
+      "last_applied_at": 1710849660,
+      "last_confirmed_at": 1710849675
     }
   ],
   "pagination": { "total": 1, "start": 0, "page_size": 50 },
   "meta": { "api_version": "v1" }
 }
 ```
+
+> **`last_applied_at`/`last_confirmed_at` (#3425), both `0` = never.** Endpoint-containment
+> confirmation state written by `QuarantineContainmentReconciler`, the background component that
+> re-applies a device's own firewall on reconnect. `last_applied_at` means a system re-dispatch of
+> the stored whitelist was accepted (`agents_reached > 0`) — NOT proof of containment (a
+> gateway-attached agent's `send_to` only queues the frame). `last_confirmed_at` is the one field
+> that means the endpoint firewall is provably applied: it is set only after a follow-up
+> `quarantine.status` read reports `state|active`. See `docs/user-manual/security-hardening.md`
+> "Reconnect re-application (#3425)".
 
 ---
 

@@ -293,12 +293,35 @@ record-keeping substrate changed.
   (`tests/unit/server/test_quarantine_store.cpp`); construction-fail-closed and backfill tests
   use plain `YUZU_REQUIRE_PG_DB`.
 
+## Schema v2 (#3425)
+
+Added two columns to `quarantine_records`, migration id 2:
+
+```sql
+ALTER TABLE quarantine_records ADD COLUMN last_applied_at   BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE quarantine_records ADD COLUMN last_confirmed_at BIGINT NOT NULL DEFAULT 0;
+```
+
+Endpoint-containment confirmation state for `QuarantineContainmentReconciler` — see
+`docs/user-manual/security-hardening.md` "Reconnect re-application (#3425)" for the mechanism.
+`0` = never, matching this table's existing `released_at` never-happened sentinel rather than
+introducing nullable-column plumbing this store's read path (`read_record`/`to_i64`) does not
+otherwise have. Two new store APIs, `mark_endpoint_applied`/`mark_endpoint_confirmed`, share
+`release_device`'s exact shape: a single guarded `UPDATE ... WHERE agent_id = $1 AND status =
+'active' RETURNING id`, zero rows → the same unprefixed `"device is not quarantined"` business
+error (a released or never-quarantined agent_id is a business error, not a store failure — 400 at
+REST, matching `release_device`/`quarantine_device`'s existing split). Sole writer: the
+reconciler. The `ALTER TABLE` takes a brief `ACCESS EXCLUSIVE` lock — negligible at this table's
+size for the same reason `kMaxBackfillRows` above is sized the way it is (manually-curated
+security events, not a high-volume telemetry stream); see `docs/user-manual/server-admin.md` for
+the one-line operational note.
+
 ## Follow-ups
 
-- `get_status`/`get_history` currently have no REST/MCP caller (confirmed by repo-wide grep) —
-  pre-existing, unrelated to this migration; the type-distinguishable read contract is applied to
-  them anyway for API consistency with `list_quarantined`, per the playbook's "most migrated
-  stores are authoritative" default.
+- `get_status` now has real callers as of #3425 (the MCP already_active retry path predates this
+  ADR; `QuarantineContainmentReconciler`'s status-verify-first path is new) — this bullet
+  previously said "no REST/MCP caller (confirmed by repo-wide grep)", which #3425 makes false;
+  corrected rather than left to mislead a future reader. `get_history` still has none.
 - **Indefinite retention is a DELIBERATE posture decision, not a deferred gap (Gate 3 architect;
   reframed Gate 6 compliance-officer C-4).** `quarantine_records` is an unbounded, append-only
   history table with **no prune pass, and this migration does not add one on purpose** —
