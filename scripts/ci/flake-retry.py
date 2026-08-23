@@ -851,7 +851,17 @@ def _selftest():
     # comment on this sextet has the full reasoning and measurements).
     check(("~[pg][auth],~[pg][mcp]",) in _shard_specs
           and ("~[pg]~[auth]~[mcp]",) in _shard_specs
-          and ("[pg][routes],[pg][store],[pg][token]",) in _shard_specs
+          # shard A narrowed + shard H added 2026-08-22 (fable review, F1):
+          # this pin was NOT updated when the split landed, and the old
+          # unconditional shard-A spec below no longer exists in meson.build
+          # at all — the selftest failed on every leg unconditionally
+          # (suite `docs`, run by every ci.yml leg with no --suite filter),
+          # a whole-tree CI red neither of the two adversarial-review models
+          # caught (`--list-tests` partition checks don't exercise suite
+          # `docs`). Both or neither: update this pin AND the "ten shard tag
+          # filters" count below together whenever A or H's clause changes.
+          and ("[pg][routes]~[scim]~[dex]~[mfa],[pg][store],[pg][token]~[rotation]",) in _shard_specs
+          and ("[pg][routes][scim]~[store],[pg][routes][dex]~[store],[pg][routes][mfa]~[store],[pg][token][rotation]~[store]",) in _shard_specs
           and ("[pg][rbac_store]~[routes]~[store]~[token]",) in _shard_specs
           and ("[pg][audit_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token],[pg][software_deployment]~[routes]~[store]~[token]",)
           in _shard_specs
@@ -863,7 +873,7 @@ def _selftest():
           in _shard_specs
           and ("[pg][dex]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment],[pg][mcp]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]",)
           in _shard_specs,
-          "meson.build: all nine shard tag filters extracted verbatim")
+          "meson.build: all ten shard tag filters extracted verbatim")
 
     if failures:
         print("SELFTEST FAILURES:", *failures, sep="\n  ")
