@@ -169,7 +169,7 @@ never invent a rationale for what isn't ruled yet.
 | **Verify at** | `guardian_rule_eval.cpp` (`unhealthy_edge`), `guardian_spark_runtime.cpp` (`refresh_due`, `unhealthy_suppressed_`/`_refreshed_`/`priority_demoted_`), `guardian_spark_runtime.hpp` `Config::errored_refresh_ms`/`pending_demote_sweeps`/`pending_demote_ms`; `docs/spark-rebuild-baselines/f11-flood-measurement-run.md`. |
 | **Epistemic** | verified b16e5836d |
 
-### D2 — Lifecycle stream (`guard.armed`/`guard.disarmed`) is spark-only, durable, at-least-once
+### D2 — Lifecycle stream (`guard.armed`/`guard.disarmed`) is spark-only, durable, bounded-retry, duplicate-tolerant
 
 | | |
 |---|---|
@@ -180,7 +180,7 @@ never invent a rationale for what isn't ruled yet.
 | **Verify at** | `guardian_lifecycle_journal.hpp` `page_into_window`/`replay_sent`; `guardian_outbox_drain_worker.cpp` `force_page_` triggers; `guaranteed_state_store.cpp` `insert_event_classified` (SAVEPOINT + `23505` + `stored_event_matches`) and `insert_events`' header comment forbidding batch-path replay; `docs/user-manual/guaranteed-state.md` "Reconnect replay traffic". |
 | **Epistemic** | verified b16e5836d |
 
-### D3 — Drift re-emission has no per-sweep debounce guard (open question — not yet ruled)
+### D3 — Drift re-emission has a sweep-cadence-aware debounce guard (interim fix, RULED)
 
 | | |
 |---|---|
@@ -214,37 +214,37 @@ here.
 | **Verify at** | `guardian_emit_decider.hpp` (`emit_compliant_edge` doc comment); `guardian_engine.cpp`'s `attach_rule` call (`/*emit_compliant_edge=*/true`). |
 | **Epistemic** | verified b16e5836d |
 
-### D5 — Restart re-emits the initial compliant edge, as a genuinely new server row
+### D5 — Restart-compliant-row generation is shared by both backends; only the ID-construction mechanism differs (not itself a parity delta)
 
 | | |
 |---|---|
-| **Legacy** | No comparable concept — legacy guards don't carry a cross-restart identity token in their events. |
-| **Spark** | Every restart mints a fresh random `boot_nonce_`, folded into `make_event_id` (`agent_id-boot_nonce-rule_id-wall_ms-seq`). A fresh `RuleGeneration` is built on every attach (identical re-push included — "there is no diff-skip that preserves it"), and the boot re-arm loop (`start_local`) calls `attach_rule` with `emit_compliant_edge=true` for every cached enabled rule. Because the nonce changed, the resulting compliant-edge event has a genuinely new `event_id` and is **not** absorbed by the server's PK-based redelivery dedup (D2) — it is a real new row. |
-| **Why deliberate** | Code comment (consistency-auditor Gate 4 finding): "matches the legacy path's own tear-down-and-rebuild-every-push behavior, so this is not a regression." |
-| **Operator symptom** | Every agent restart with N armed spark rules produces N new `guard.compliant` server rows (not deduped, not suppressed) — a restart-storm across a fleet scales as rules × restarting agents. Sizing this is a fair F14 evidence-gathering input (3-OS matrix / resource baseline), not something this doc rules on. |
-| **Verify at** | `guardian_spark_runtime.cpp` (`make_boot_nonce`/`boot_nonce_`, `detach_rule_locked` + fresh `RuleGeneration` on attach, `make_event_id`); `guardian_engine.cpp` `start_local()` boot re-arm loop. |
+| **Legacy** | Also mints a genuinely new `guard.compliant` server row per rule on every restart. `guard_registry.cpp`'s (and File/Service's identical pattern's) `last_compliant` is a per-guard-instance member starting `nullopt`; `start_local()`'s restart re-arm loop spawns a **fresh** guard thread per cached enabled rule on every restart (arming a legacy guard spawns a `std::thread`), so `last_compliant` resets to `nullopt` and the guard fires `guard.compliant` on the first reconcile again, exactly as it would on first-ever arm. `emit_guard_event`'s `event_id` (`rule_id-agent_id-now_ms-seq`) is built from wall-clock `now_ms`, which differs across restarts by construction — so this is a real new server row under legacy too, not spark-only. |
+| **Spark** | Same restart-compliant-row behavior, via a different ID-construction mechanism: every restart mints a fresh random `boot_nonce_`, folded into `make_event_id` (`agent_id-boot_nonce-rule_id-wall_ms-seq`). A fresh `RuleGeneration` is built on every attach, and the boot re-arm loop (`start_local`) calls `attach_rule` with `emit_compliant_edge=true` for every cached enabled rule. |
+| **Why deliberate** | Not a spark-only delta. §F's first bullet already classifies `event_id`/`timestamp` differences as expected parity ("only `event_id`/`timestamp` differ, by design"), so even the narrow ID-construction-mechanism difference (legacy: wall-clock `now_ms`; spark: random `boot_nonce_`) isn't itself a new parity-gate concern. Retained as its own row, rather than folded silently into §F, so a reviewer who has already classified a restart-compliant-row diff against "D5" finds an accurate row rather than a dangling reference. |
+| **Operator symptom** | Not flip-specific: every agent restart with N armed rules produces N new `guard.compliant` server rows (not deduped, not suppressed) on **either** backend — a restart-storm across a fleet scales as rules × restarting agents regardless of `prefer_spark`. Sizing this is a fair F14 evidence-gathering input (3-OS matrix / resource baseline) precisely because it's shared, not because it's new at the flip. |
+| **Verify at** | `guard_registry.cpp`, `guard_file.cpp`, `guard_service.cpp` (each carries the identical `last_compliant` pattern — a per-instance `std::optional<bool>` starting `nullopt`, firing `guard.compliant` once on the edge into compliant including the first reconcile — confirmed directly in all three, not inferred from one); `guardian_engine.cpp::start_local()`'s restart re-arm loop (fresh legacy guard thread per cached rule) and `emit_guard_event` (`now_ms`-based `event_id`); `guardian_spark_runtime.cpp` (`make_boot_nonce`/`boot_nonce_`, fresh `RuleGeneration` on attach, `make_event_id`); §F's `event_id`/`timestamp` expected-parity bullet. |
 | **Epistemic** | verified b16e5836d |
 
-### D6 — Transient vs. persistent read failure: legacy conflates, spark splits
+### D6 — Transient vs. persistent read failure (file hash/read only): legacy conflates, spark splits
 
 | | |
 |---|---|
-| **Legacy** | One `<unreadable>` token for both a transient read glitch and a persistent drift-causing failure — both land as Known drift. |
-| **Spark** | Splits them: a persistent failure is Known drift (goes through D3/D4's normal drift path); a transient failure is Unknown (goes through D1's health stream instead). The recovery leg of that transient-Unknown path has its own forced-re-emit behavior — see D11. |
-| **Why deliberate** | `guardian_rule_eval.hpp` preamble: legacy conflated the two into one token; spark splits persistent (Known drift) from transient (Unknown) deliberately. |
-| **Operator symptom** | A flaky read source produces health-stream traffic under spark where it would have produced drift-stream traffic under legacy — different wire event types for the same underlying condition. |
-| **Verify at** | `guardian_rule_eval.hpp`/`guardian_rule_eval.cpp` Unknown-vs-Known-drift classification. |
+| **Legacy** | Scoped to **file** hash/read failures only — this is `FileSnapshot::readable`'s own concept (`guardian_rule_eval.hpp`'s comment ties `<unreadable>` explicitly to files), not a fleet-wide legacy behavior. For files: one `<unreadable>` token for both a transient read glitch and a persistent drift-causing failure — both land as Known drift. Registry and Service do **not** share this conflation: legacy registry returns distinct `<absent>`/`<unsupported-type>` tokens (`guard_registry.cpp`) rather than a generic unreadable token, and legacy systemd distinguishes `NoSuchUnit` (genuine absence) from a bare D-Bus transport failure via `systemd_error_name_is_absence` (`guard_systemd.cpp`) rather than conflating the two. |
+| **Spark** | For files: splits them — a persistent failure is Known drift (goes through D3's drift path); a transient failure is Unknown (goes through D1's health stream instead). The recovery leg of that transient-Unknown path has its own forced-re-emit behavior — see D11. Whether spark's registry/service readers make an equivalent transient-vs-persistent split has not been separately verified for this row — do not assume it from the file case. |
+| **Why deliberate** | `guardian_rule_eval.hpp` preamble: legacy's **file** reader conflated the two into one token; spark's file path splits persistent (Known drift) from transient (Unknown) deliberately. |
+| **Operator symptom** | A flaky **file** read source produces health-stream traffic under spark where it would have produced drift-stream traffic under legacy — different wire event types for the same underlying condition. A registry/service transient-fault capture should **not** be waved through against this row — legacy registry/systemd don't share the file-specific conflation this row documents, so there is no equivalent "expected" baseline here for those mechanisms without separate verification. |
+| **Verify at** | `guardian_rule_eval.hpp`'s `FileSnapshot::readable` comment (file-scoped) and `guardian_rule_eval.cpp` Unknown-vs-Known-drift classification; `guard_registry.cpp` (`<absent>`/`<unsupported-type>` tokens, contrast); `guard_systemd.cpp::systemd_error_name_is_absence` (contrast). |
 | **Epistemic** | verified b16e5836d |
 
 ### D7 — File hash-mode `settle_ms` coalescing is not honoured under spark
 
 | | |
 |---|---|
-| **Legacy** | `guard_file.hpp`'s `settle_ms` (default 750 ms) coalesces a burst of kernel file-change notifications before hashing, since writes aren't atomic — waits out the write before computing a hash, avoiding a torn read. |
+| **Legacy** | `guard_file.hpp`'s `settle_ms` (default 750 ms) coalesces a burst of kernel file-change notifications before hashing, since writes aren't atomic — waits out the write before computing a hash, to avoid a torn read. This is a bounded heuristic, not an unconditional guarantee: `max_settle_defer_ms` (default 5000 ms) caps the total defer, so under a write storm longer than that cap legacy hashes anyway and can still land a torn read. |
 | **Spark** | No equivalent field on `RuleAssertion` or `FileSparkParams`. Spark's convergence scheduler instead dead-reckons via a size+mtime skip before re-hash plus a forced periodic re-hash (both **deferred to rung 5** — see E1; at rung 2 there is only the plain convergence sweep, no coalescing and no skip-optimization yet). |
 | **Why deliberate** | `guardian_spark_bridge.hpp` header comment states this explicitly: "an ACCEPTED behavioral delta from legacy... flagged here for the rung-9 design-doc rewrite and the rung-10 parity/durability matrix" — i.e. this doc is that flagged destination. |
-| **Operator symptom** | A file rule under active mid-write churn may see a spark hash read land mid-write (a torn read) where legacy's coalescing window would have waited it out — until rung 5's size+mtime skip + forced re-hash lands. Spark does hedge this at the reader, not just leave it torn: `guardian_state_reader.cpp` retries the hash read up to `kHashAttempts` (3) times on a mutating file, and only if all three still land mid-write does it give up and report Unknown (`read_unknown<FileSnapshot>("file mutating during hash, retries exhausted")`) rather than a torn Known value — so the observable failure mode on a genuinely fast-churning file is D1's health stream, not a silently-wrong drift verdict. This is a detector, not a guarantee: it narrows the torn-read window, it doesn't remove `settle_ms`'s coalescing guarantee. |
-| **Verify at** | `guard_file.hpp` `Config::settle_ms`; `guardian_spark_bridge.hpp` header comment (immediately above `RuleAssertion`/`FileSparkParams`); `guardian_state_reader.cpp` `kHashAttempts` retry loop + its `read_unknown<FileSnapshot>("file mutating during hash, retries exhausted")` exhaustion path. |
+| **Operator symptom** | A file rule under active mid-write churn may see a spark hash read land mid-write (a torn read) where legacy's coalescing window would have waited it out — until rung 5's size+mtime skip + forced re-hash lands. Spark does hedge this at the reader, not just leave it torn: `guardian_state_reader.cpp` retries the hash read up to `kHashAttempts` (3) times on a mutating file, and only if all three still land mid-write does it give up and report Unknown (`read_unknown<FileSnapshot>("file mutating during hash, retries exhausted")`) rather than a torn Known value — so the observable failure mode on a genuinely fast-churning file is D1's health stream, not a silently-wrong drift verdict. This is a detector, not a replacement: it narrows the torn-read window, it doesn't restore `settle_ms`'s bounded coalescing heuristic (750 ms settle, 5000 ms cap) — and that heuristic was never an unconditional guarantee under legacy either (see Legacy cell). |
+| **Verify at** | `guard_file.hpp` `Config::settle_ms`/`Config::max_settle_defer_ms`; `guardian_spark_bridge.hpp` header comment (immediately above `RuleAssertion`/`FileSparkParams`); `guardian_state_reader.cpp` `kHashAttempts` retry loop + its `read_unknown<FileSnapshot>("file mutating during hash, retries exhausted")` exhaustion path. |
 | **Epistemic** | verified b16e5836d |
 
 ### D8 — Deleted-service wire token: legacy `Absent`, spark folds into `Stopped`
@@ -295,14 +295,14 @@ here.
 
 ## E. Cadence / resource
 
-### E1 — Spark runs a scheduled convergence sweep; legacy is purely notification-driven
+### E1 — Spark runs a scheduled convergence sweep across every rule; legacy is mostly notification-driven
 
 | | |
 |---|---|
-| **Legacy** | No polling loop for any of the four guards. File/Registry/Service block on kernel notification primitives with an `INFINITE` healthy-wait; only degraded-path retries run on a timer (30 s arm-fail/absent retry across the Windows guards and systemd's absent retry; systemd additionally has a 60 s healthy-reconcile safety poll). |
+| **Legacy** | No **compliance-detection** polling loop for any of the four guards — File/Registry/Service block on kernel notification primitives with an `INFINITE` healthy-wait. Not purely notification-driven overall, though: degraded-path retries run on a timer regardless (30 s arm-fail/absent retry across the Windows guards and systemd's absent retry), and legacy systemd **already** runs a steady 60 s healthy-reconcile safety poll (`kHealthyReconcileMs`) independent of `prefer_spark` — that cadence exists today and is not a cost the flip introduces; exclude it from any flip-attributed resource delta for Linux Service. |
 | **Spark** | `ConvergenceScheduler` runs one thread per type lane plus a priority lane, each on its own cadence with ±20% jitter: service 60 s, registry 60 s, file 600 s, priority (pending-initial backstop) 5 s. A file-lane byte-level token bucket (size+mtime skip before re-hash) is explicitly **deferred to rung 5** — "against rung 4's fake instant reader there is nothing to budget, so wiring them here would be untested theatre." The journal replay path has its own separate, active token bucket (0.1 batch/s, burst 5 — see D2), not to be confused with the deferred file-lane one. |
 | **Why deliberate** | Spark's mechanisms don't all carry native change-notification for every read path (e.g. dead-reckoning a file's compliance without a kernel event on every convergence tick); the scheduled sweep is how it converges independent of notification delivery. Ruling: D2 (spark-flip ladder) — token bucket formally deferred to rung 5, confirmed at F11. |
-| **Operator symptom** | Periodic reads themselves are a resource delta the flip introduces (CPU/IO wake-ups on 60 s/600 s/5 s cadences per agent, independent of whether anything is actually drifted) — sized against `docs/spark-rebuild-baselines/stage0-resource-baseline.md` as part of F14's evidence, not restated here. |
+| **Operator symptom** | Periodic reads themselves are a resource delta the flip introduces (CPU/IO wake-ups on 60 s/600 s/5 s cadences per agent, independent of whether anything is actually drifted) — sized against `docs/spark-rebuild-baselines/stage0-resource-baseline.md` as part of F14's evidence, not restated here. For Linux Service specifically, subtract legacy systemd's pre-existing 60 s reconcile cadence from that delta — it's already incurred today, so attributing it to the flip would overstate the new cost. |
 | **Verify at** | `guardian_convergence_scheduler.hpp` `Config` (`service_cadence_ms`, `registry_cadence_ms`, `file_cadence_ms`, `priority_poll_ms`, `jitter_pct`); its header comment on the deferred token bucket. |
 | **Epistemic** | verified b16e5836d |
 
