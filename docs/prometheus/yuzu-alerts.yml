@@ -805,9 +805,76 @@ groups:
 
   - name: yuzu-dispatch
     rules:
+      - alert: YuzuQuarantineGateFailClosed
+        expr: |
+          increase(yuzu_server_quarantine_gate_total{outcome="fail_closed"}[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Instruction dispatch is refusing every target - containment state is unreadable"
+          description: >-
+            The #881 containment gate cannot read quarantine state and is
+            failing CLOSED, so instruction dispatch reaches NOBODY on every arm
+            including broadcast. This is a fleet-wide dispatch OUTAGE, not a
+            quarantine event - a quarantined device produces
+            outcome="fresh"/"stale" and the per-denial audit row, never this.
+            The gate absorbs a transient read failure for up to 60s from its
+            last-known-good snapshot (outcome="stale"), so a sustained
+            fail_closed means the quarantine store has been unreadable past
+            that budget: check yuzu_server_quarantine_read_degrade_total{reason}
+            and the Postgres pool (yuzu_pg_acquire_wait_seconds,
+            yuzu_pg_pool_in_use). reason="read_concurrency_cap" is NOT a store
+            fault - it means this dispatch waited for one of four
+            containment-read slots and did not get one, the bound that stops a
+            stalled backend pinning the pool every other store shares. A slot
+            timeout fails closed deliberately: serving stale containment state
+            when nobody asked the store would under-enforce against a healthy
+            one. The quarantine plugin's own control actions stay
+            reachable throughout - releasing a device does not depend on this
+            read - as do the three system-reserved internal pushes
+            (yuzu_server_system_reserved_push_total). BE PRECISE ABOUT for: 2m:
+            it delays the page by two minutes, it does NOT require a sustained
+            episode. increase()[5m] stays true for ~5 minutes after a single
+            increment, so one fail-closed evaluation still pages, two minutes
+            later. That is deliberate - a dispatch refused against the entire
+            fleet is not something to sit on, and the snapshot refresher means
+            a single fail_closed already implies the store was unreadable past
+            the whole 60s budget. The delay exists so a self-resolving blip
+            clears before anyone is woken, not so it is ignored.
+
+      - alert: YuzuQuarantineGateServingStaleState
+        expr: |
+          sum(increase(yuzu_server_quarantine_gate_total{outcome="stale"}[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Containment decisions are being made from a stale snapshot"
+          description: >-
+            The containment read is failing and the gate is serving its
+            last-known-good snapshot. Two reasons this is worth a page before
+            the critical fail-closed rule fires. First, it is the LEADING
+            INDICATOR: the snapshot is only trusted for 60s, so a read failure
+            that outlasts that becomes a fleet-wide dispatch outage. Second and
+            less obvious, stale is the one gate outcome in which containment
+            UNDER-enforces - a device quarantined after the snapshot was taken
+            is absent from it, so dispatch to that device is permitted. The
+            fail-closed rule pages on over-enforcement; nothing else pages on
+            this. A background refresher re-reads containment state every 20s,
+            so a sustained stale outcome means those refreshes are ALSO
+            failing, not merely that traffic is sparse. Correlate with
+            yuzu_server_quarantine_read_degrade_total{reason} - store_not_open,
+            pool_acquire_timeout and query_error are store faults;
+            read_concurrency_cap does NOT appear under this alert - a slot
+            timeout fails the dispatch closed, so it shows up on
+            YuzuQuarantineGateFailClosed instead.
+
       - alert: YuzuDispatchTargetRejected
         expr: |
-          sum by (route, reason) (increase(yuzu_server_dispatch_target_rejected_total[15m])) > 3
+          sum by (route, reason) (
+            increase(yuzu_server_dispatch_target_rejected_total{reason!="quarantined"}[15m])
+          ) > 3
         labels:
           severity: warning
         annotations:
@@ -828,7 +895,16 @@ groups:
             nothing. Denials are audited as
             command.dispatch|denied, instruction.execute|denied or
             result_set.create|denied with detail "reason=<reason>"; correlate
-            there for the principal.
+            there for the principal. reason="quarantined" (#881) is
+            EXCLUDED from the expression: a withheld dispatch to a contained
+            device is the control WORKING, not a caller naming nothing. Any
+            looping automation against a single quarantined host clears 3 in 15m,
+            and one fail-closed episode increments by the whole fleet at once, so
+            folding correct enforcement in here would fire this constantly, get
+            it silenced, and take the genuine near-miss signal with it - the
+            outcome the >3 threshold above was chosen to avoid. Quarantine
+            denials are observed on yuzu_server_quarantine_gate_total and audited
+            as quarantine.dispatch_denied.
 
   - name: yuzu-tls
     rules:

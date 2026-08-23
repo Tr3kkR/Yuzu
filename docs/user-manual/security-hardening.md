@@ -386,6 +386,46 @@ curl -s -X POST http://localhost:8080/api/v1/executions \
 
 Execute the `unquarantine` action to remove quarantine rules and restore normal network access. You can also use `whitelist` to add exceptions (IP or CIDR range) to the quarantine rules before releasing.
 
+### Quarantine now blocks instruction dispatch (#881)
+
+A quarantined device is refused at the **server's dispatch chokepoint**, not only at its own
+firewall: any instruction targeting it — by id, by scope, by management group, or by broadcast —
+is dropped before it reaches the agent, and the refusal is audited as
+`quarantine.dispatch_denied`. Before this, quarantine isolated the network while the control
+plane carried on issuing commands to the device.
+
+Two consequences worth planning for:
+
+- **The quarantine plugin's own actions are exempt** — `quarantine`, `unquarantine`, `status` and
+  `whitelist` still reach a contained device, so release stays possible. The exemption is keyed on
+  the action, not the plugin, so a future fifth action would be gated until it is deliberately
+  added.
+- **Three server-internal pushes are also exempt, and you should know they exist.** The TAR
+  fleet-topology snapshot request (`tar.fleet_snapshot`), the Guardian rule push
+  (`__guard__.push_rules`) and the asset-tag sync (`asset_tags.sync`) continue to reach a
+  contained device. This is deliberate — gating the Guardian push would stop a quarantined device
+  receiving the enforcement rules that make containment meaningful — but it means the containment
+  boundary is not total, and a security review of the containment surface has to account for
+  those three channels. They are a closed set in code (`SystemReservedPush`) and are counted by
+  `yuzu_server_system_reserved_push_total{capability,result}`; a new one cannot be added without
+  appearing in that set. **They are counted, not audited** — there is no per-event row saying a
+  particular push reached a particular contained device, so this is a fleet-level signal rather
+  than per-device evidence. **Nothing outside that set and the plugin's own four actions reaches a
+  quarantined device.**
+
+  What that means for your threat model, channel by channel:
+
+  | Channel | What it can do on a contained device |
+  |---|---|
+  | `tar.fleet_snapshot` | Requests a read-only topology/process snapshot. No state change. |
+  | `asset_tags.sync` | Writes device tags. No code execution. |
+  | `__guard__.push_rules` | Delivers Guardian baseline rules, which the agent may *enforce*. Enforcement is **not arbitrary command execution**: the assertion vocabulary is a closed five-value set — file present/absent, file hash, registry value, service running, service stopped — and dangerous registry keys and service names are refused at the `dangerous_enforce_in_spec` chokepoint before a push is ever built. So an operator with Guardian deploy rights can still change *typed, bounded* state on a contained device while their `execute_instruction` is refused. That is deliberate — enforcing a security baseline on a compromised host is the point — but it is the one exempt channel that mutates the endpoint, so scope it accordingly. |
+- **If containment state becomes unreadable, dispatch fails closed** — the server refuses *every*
+  target rather than guess who is contained. A short store outage is absorbed by a 60-second
+  last-known-good snapshot; past that, instruction dispatch stops fleet-wide until the store
+  recovers. Alert on `yuzu_server_quarantine_gate_total{outcome="fail_closed"}` — see
+  [Metrics](metrics.md) — because that series is an outage signal, not a quarantine signal.
+
 ## IOC Checking
 
 The `ioc` plugin supports Indicator of Compromise checking for threat hunting. Execute the `check` action with one or more indicator types to scan an endpoint for signs of compromise.
