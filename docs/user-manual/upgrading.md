@@ -1783,9 +1783,16 @@ mandatory and fails closed rather than degrading silently — same posture class
   `product-packs.db` written before a pack was uninstalled elsewhere. `uninstall()`
   records the deleted pack id in Postgres (`deleted_pack_ids`, in the same transaction
   as the delete); `migrate_from_sqlite` checks it before treating an unmatched legacy
-  pack id as fresh content, so this case is a silent, logged skip rather than a
-  resurrection — matches `RbacStore`'s `revoked_seed_defaults` suppression-table
-  precedent for the same class of hazard.
+  pack id as fresh content, so this case is a logged skip (not a boot refusal) rather
+  than a resurrection — matches `RbacStore`'s `revoked_seed_defaults` suppression-table
+  precedent for the same class of hazard. **Caveat (ADR-0009 update note):** this closes
+  the cross-replica case only. If you roll the server *binary* back to the pre-migration
+  release during the one-release rollback window, that binary reads `product-packs.db`
+  directly and does not know Postgres or the tombstone table exist — an uninstalled
+  pack's catalog listing can reappear for the duration of the rollback. The pack's
+  actual content is not restored (it was permanently deleted from its own separate
+  store by `uninstall()`), so this is a stale listing, not reinstated content, and it
+  self-corrects on the next roll-forward.
 
 **Operator-visible behaviour changes.**
 

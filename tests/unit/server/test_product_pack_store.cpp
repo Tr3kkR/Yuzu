@@ -89,6 +89,24 @@ kind: InstructionDefinition
 name: test-instruction
 )";
 
+/// Two InstructionDefinition documents — paired with make_accept_all_install_fn() (which
+/// returns the same fixed id for every document), this bundle deterministically produces a
+/// duplicate item_id.
+constexpr const char* kUnsignedPackYamlDuplicateItems = R"(apiVersion: yuzu.io/v1alpha1
+kind: ProductPack
+name: test-duplicate-items
+version: 1.0.0
+description: Bundle with two documents assigned the same item id
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+name: test-instruction-a
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+name: test-instruction-b
+)";
+
 /// install_fn stub — accepts every item, returns a synthetic id. We don't
 /// care which items installed downstream because #802 is a pre-item-install
 /// reject check; the install_fn here is just to satisfy the signature.
@@ -455,6 +473,32 @@ TEST_CASE("ProductPackStore: list/get/uninstall round-trip", "[product_pack_stor
         REQUIRE(got.has_value());
         CHECK_FALSE(got->has_value());
     }
+}
+
+// Gate 8 review (Fable, external): a bundle whose documents assign the same item id twice
+// must fail as a plain validation error (never kProductPackDbErrorPrefix) — retryable-503
+// misclassification would turn a deterministic duplicate-id bundle into a repeated orphan
+// generator against the sibling stores, since install_fn runs with no pool_ lease held and
+// a client retry would re-invoke it on every attempt.
+TEST_CASE("ProductPackStore::install: a duplicate item id in one bundle fails as a plain "
+          "validation error, never a retryable db_error",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    auto result = store.install(kUnsignedPackYamlDuplicateItems, make_accept_all_install_fn());
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("duplicate item id") != std::string::npos);
+    CHECK(result.error().find(yuzu::server::kProductPackDbErrorPrefix) == std::string::npos);
+
+    // Nothing was persisted — the pack never reaches Postgres.
+    auto listed = store.list();
+    REQUIRE(listed.has_value());
+    for (const auto& p : *listed)
+        CHECK(p.name != "test-duplicate-items");
 }
 
 // ── Backfill (ADR-0009/0054) ─────────────────────────────────────────────────

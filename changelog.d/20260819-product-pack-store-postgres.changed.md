@@ -27,9 +27,11 @@
   genuine SQLite-level failure there (lock contention, disk full) still reaches the caller and
   the audit trail as raw `sqlite3_errmsg()` text, since it never carries `ProductPackStore`'s own
   DB-error marker and so isn't classified as one; tracked as a follow-up. Installing a bundle
-  whose documents assign the same item
-  id twice now fails the whole install with a database error instead of silently discarding the
-  duplicate item (a pre-migration bug, not a preserved behavior). No change to the `#802`/W7.4
+  whose documents assign the same item id twice now fails the whole install as a **400**
+  validation error (not a preserved behavior — the pre-migration store silently discarded the
+  duplicate item instead) — detected before any Postgres interaction, so a retryable-503
+  misclassification can't turn a deterministic duplicate-id bundle into a repeated orphan
+  generator against the sibling stores. No change to the `#802`/W7.4
   signed-pack enforcement default, the Ed25519 signature verification path, or the
   `--allow-unsigned-packs` / `YUZU_ALLOW_UNSIGNED_PACKS` operator escape hatch. A legacy
   `product-packs.db` written before 7.13 (predating the `verified` column) backfills correctly,

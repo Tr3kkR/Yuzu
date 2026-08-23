@@ -1169,6 +1169,25 @@ std::expected<std::string, std::string> ProductPackStore::install(const std::str
         return std::unexpected("no items installed: " + errors[0]);
     }
 
+    // Gate 8 review (Fable, external): a bundle whose documents assign the same item id
+    // twice would otherwise reach the persist transaction below, violate
+    // product_pack_items' (pack_id, item_id) PK, and fail with kProductPackDbErrorPrefix —
+    // classified as a genuine DB error, hence a RETRYABLE 503 at the REST layer. This
+    // condition is deterministic (the same bundle always duplicates the same id), so a
+    // client retry never succeeds and instead re-runs install_fn against every sibling
+    // store again on each attempt (no lease held across that loop, see the file header),
+    // compounding the F031/F033-tracked orphan risk. Detected here, before any Postgres
+    // interaction, and classified as a plain validation error (400, not 503) so a client
+    // knows not to retry — this does not change the "fails the whole install" outcome
+    // (already the case, see the changelog fragment), only its retryability.
+    {
+        std::unordered_set<std::string> seen_item_ids;
+        for (const auto& item : items_to_store) {
+            if (!seen_item_ids.insert(item.item_id).second)
+                return std::unexpected("duplicate item id in bundle: '" + item.item_id + "'");
+        }
+    }
+
     // Now persist the pack row + its successfully-installed item rows in ONE transaction
     // (parent-before-child for the product_pack_items -> product_packs FK).
     bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {

@@ -152,6 +152,28 @@ reference:
   `parent_id`, which needed row-level topological order within one table).
 - Legacy `product-packs.db` retained read-only for one release, per the standard rollback window.
 
+**Update (2026-08-23, erasure consistency — governance Gate 8, ADR-0009 update note):** the
+above did not originally address what stops a redeployed or newly-joined replica's own
+(untouched) legacy file from resurrecting a pack that was legitimately uninstalled elsewhere —
+`migrate_from_sqlite` re-checks its content-fingerprint marker on *every* boot, not just the
+fleet's first migration, so this is reachable on an ordinary rolling redeploy, not only a
+contrived scenario. Closed via a `deleted_pack_ids(pack_id, deleted_at)` tombstone table:
+`uninstall()` stamps a row into it in the same transaction as its deletes; every
+`migrate_from_sqlite` pass checks it before treating an unmatched legacy pack id as fresh
+content, skipping both the pack row and its item rows together (avoids a `product_pack_items ->
+product_packs` FK violation against a never-inserted parent). Both writers coordinate through a
+`pg_advisory_xact_lock` (`kErasureCoordLockSql`, mirroring `RbacStore`'s
+`kRevokeCoordLockSql`/CHAOS-1 fix for the identical check-then-insert race shape) taken as the
+first statement in each transaction — without it, a concurrent `uninstall()` committing between
+one replica's tombstone SELECT and its subsequent pack INSERT is invisible to that SELECT's
+already-taken READ COMMITTED snapshot. `deleted_pack_ids` is never pruned, by design (mirrors
+`revoked_seed_defaults`); low-cardinality operator-driven content makes unbounded retention a
+non-issue at realistic scale, and pruning would reopen the exact hazard this table exists to
+close. Full reasoning for the deliberate scope of this fix — and what it does NOT close (a
+rollback to the pre-migration binary, which never queries Postgres) — is recorded in ADR-0009's
+`ProductPackStore`/ADR-0054 update note; that residual is accepted as store-scoped, not a
+general precedent.
+
 ## Considered and rejected
 
 - **Keeping the SQLite-era whole-install transaction (metadata insert + `install_fn` calls) under

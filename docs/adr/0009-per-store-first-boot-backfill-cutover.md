@@ -80,3 +80,42 @@ data).
   off. `ResponseStore` is the reference case for this class: a future purely-TTL'd,
   purely-ephemeral store should also skip unconditionally, not gate the skip behind a flag,
   unless a specific store has a reason this one doesn't.
+
+  **Update (`ProductPackStore`/ADR-0054, 2026-08-23):** the "must... delete the same
+  subject/device from the rollback copy" sentence above literally names mutating the
+  retained legacy file as the mechanism. `ProductPackStore` satisfies the clause's
+  *purpose* — rollback cannot resurrect data whose erasure was reported successful — via a
+  different, and for this store's shape a *stronger*, mechanism: `uninstall()` stamps a
+  durable Postgres-side tombstone (`deleted_pack_ids`) in the same transaction as its
+  delete, under an advisory lock closing the obvious check-then-insert race; every
+  `migrate_from_sqlite()` pass on every replica, present or future, consults it before
+  treating an unmatched legacy row as fresh content. This closes the *permanent, shared*
+  resurrection hazard (a redeployed or newly-joined replica's own stale legacy-file copy)
+  that a literal per-file mutation cannot reach at all, since that mechanism only protects
+  the one replica whose file was written — it does nothing for a sibling replica's separate
+  copy. The literal mechanism is deliberately NOT also implemented: writing to the legacy
+  file at `uninstall()` time would introduce a write path into the one artifact that exists
+  specifically as a rollback safety net, so a partial/failed write during an uninstall could
+  corrupt the rollback net itself — while still only covering a single replica. That is a
+  strictly worse trade for a benefit the tombstone doesn't need.
+
+  **What the tombstone substitution does NOT close:** an operator who rolls the server
+  BINARY back to the pre-migration (SQLite-only) release, during the one-release rollback
+  window, reads `product-packs.db` directly — that binary has no knowledge Postgres or
+  `deleted_pack_ids` exist, so an uninstalled pack's catalog row can reappear for the
+  duration of the rollback. This residual is accepted, on grounds specific to
+  `ProductPackStore` and NOT a general precedent: the resurrection is metadata-only. The
+  pack's actual content (`InstructionDefinition`/`PolicyFragment`/`Workflow` rows) lives in
+  separate, still-live SQLite stores that `uninstall()`'s `uninstall_fn` callback deleted
+  permanently — a binary rollback does not restore them, and `install()`'s `#802` signature
+  gate means nothing re-materializes pack content short of a fresh `install()` call. Nothing
+  executable resurfaces; the operator sees a stale catalog listing, not reinstated content.
+  Re-uninstalling under the old binary mutates the legacy file directly (the pre-migration
+  code path always did), which changes its content fingerprint and lets the tombstone
+  re-suppress it cleanly on any subsequent roll-forward.
+
+  **This reasoning is store-scoped and MUST be re-derived, not copied, by the next store
+  whose wired erasure path covers genuinely personal or regulated subject/device data**
+  (the clause's original target) rather than operator-authored catalog metadata over
+  separately-erased content. That store will likely need the literal per-file mechanism
+  this update declines for `ProductPackStore`.
