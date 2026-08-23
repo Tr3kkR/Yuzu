@@ -5050,6 +5050,32 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // #3344 (Gate 8 fold, unhappy-path UP-1): read the tracker's
+                // terminal status BEFORE the response-store query below, not
+                // after. The writer (agent_service_impl.cpp) stores a
+                // response row, THEN marks the execution terminal — reading
+                // rows first and the tracker second could observe a stale-
+                // short rows snapshot alongside an ALREADY-terminal tracker in
+                // the race window between those two writes, producing
+                // "no more rows are coming" for an execution whose last row
+                // just hadn't been visible to the first read yet. Checking
+                // the tracker first matches the writer's causal order: a
+                // terminal read here guarantees every row this execution will
+                // ever produce was already written before the response-store
+                // query below runs.
+                //
+                // Only when execution_id was supplied AND the tracker
+                // resolves it: an instruction_id-only query has no execution
+                // to check in-flight-ness against, so in-flight-ness is
+                // honestly unknowable — nullopt, not false, so neither the
+                // hint nor the poll-rate count below is emitted (sre, Gate 8
+                // fold: folding an unknowable call into "ready" would dilute
+                // the not_ready fraction the counter exists to measure).
+                std::optional<bool> poll_hint;
+                if (!exec_id.empty() && execution_tracker) {
+                    if (auto exec_for_hint = execution_tracker->get_execution(exec_id))
+                        poll_hint = !mcp::is_execution_terminal(exec_for_hint->status);
+                }
                 ResponseQuery rq;
                 rq.agent_id = param_str(args, "agent_id");
                 rq.status = param_int32(args, "status", -1);
@@ -5171,23 +5197,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 // #1550 HIGH-2: observe the audit bool — a dropped evidence row on this
                 // SOC 2 read surface is surfaced to the caller via audit_persisted:false.
                 const bool audit_ok = mcp_audit("success", key) && denied_ok;
-                // #3344: retry_after_ms disambiguates an empty result that means
-                // "still in flight" from one that means "no rows matched" —
-                // regardless of row count, since a fan-out can be partially
-                // landed. Only when execution_id was supplied AND the tracker
-                // resolves it AND its status is non-terminal: an
-                // instruction_id-only query has no execution to check
-                // in-flight-ness against, so in-flight-ness is honestly
-                // unknowable and the hint stays absent (never guessed).
-                bool poll_hint = false;
-                if (!exec_id.empty() && execution_tracker) {
-                    if (auto exec_for_hint = execution_tracker->get_execution(exec_id)) {
-                        poll_hint = exec_for_hint->status != "succeeded" &&
-                                   exec_for_hint->status != "completed" &&
-                                   exec_for_hint->status != "cancelled";
-                    }
-                }
-                count_poll("query_responses", poll_hint);
+                // poll_hint was computed above, before the response-store
+                // query (UP-1). Emit the count only when in-flight-ness was
+                // actually checked — an instruction_id-only call (nullopt)
+                // is neither ready nor not_ready, it was never evaluated.
+                if (poll_hint)
+                    count_poll("query_responses", *poll_hint);
+                const bool emit_poll_hint = poll_hint.value_or(false);
                 JObj result_obj;
                 result_obj.raw("content",
                                JArr().add(JObj().add("type", "text").add("text", arr.str())).str());
@@ -5200,7 +5216,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // shape — content[].text stays the bare rows array, unchanged).
                 if (hit_cap)
                     result_obj.raw("result_truncated_by_cap", "true");
-                if (poll_hint)
+                if (emit_poll_hint)
                     result_obj.add("retry_after_ms", mcp::kMcpResultPollRetryMs);
                 // #2712: structuredContent combines the same rows + the same two
                 // conditional flags into ONE schema-conformant object (content[].text
@@ -5212,7 +5228,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     structured.add("audit_persisted", false);
                 if (hit_cap)
                     structured.add("result_truncated_by_cap", true);
-                if (poll_hint)
+                if (emit_poll_hint)
                     structured.add("retry_after_ms", mcp::kMcpResultPollRetryMs);
                 result_obj.raw("structuredContent", structured.str());
                 res.set_content(success_response(id, result_obj.str()), "application/json");
@@ -6035,15 +6051,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         .add("agents_success", static_cast<int64_t>(exec->agents_success))
                         .add("agents_failure", static_cast<int64_t>(exec->agents_failure))
                         .add("progress_pct", static_cast<int64_t>(summary.progress_pct));
-                // #3344: retry_after_ms is emitted ONLY while non-terminal — an
-                // explicit allowlist rather than execution_tracker.cpp's own
-                // "NOT IN (pending, running)" idiom, deliberately: a status this
-                // handler doesn't recognize (a future addition) must still get a
-                // hint (fail-safe — a caller keeps polling and self-corrects on
-                // the next response) rather than silently going hint-less
-                // forever, which the NOT-IN framing's opposite default risks.
-                const bool terminal = exec->status == "succeeded" || exec->status == "completed" ||
-                                     exec->status == "cancelled";
+                // #3344: retry_after_ms is emitted ONLY while non-terminal, via
+                // the shared mcp::is_execution_terminal() predicate (Gate 8
+                // fold: this and query_responses' poll-hint independently
+                // hand-rolled the same three-value set — see the predicate's
+                // own doc comment in mcp_retry.hpp for the fail-safe rationale).
+                const bool terminal = mcp::is_execution_terminal(exec->status);
                 if (!terminal)
                     obj.add("retry_after_ms", mcp::kMcpResultPollRetryMs);
                 count_poll("get_execution_status", !terminal);

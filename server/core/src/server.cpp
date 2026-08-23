@@ -159,6 +159,7 @@
 #include "fleet_topology_store.hpp"
 #include "heartbeat_ingestion.hpp"
 #include "fleet_topology_types.hpp"
+#include "mcp_retry.hpp"  // kMcpPollTotalMetric (#3344) — direct, not transitive
 #include "mcp_server.hpp"
 #include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
 #include "stream_budget.hpp" // shared held-open-SSE admission budget (2f PR 2, Decision 15(h))
@@ -724,7 +725,7 @@ public:
         // (tier/permission/invalid-params/not-found) — those are already
         // visible via the denial counters and A4 envelopes above. Both labels
         // are closed sets (3 tools x 2 results), pre-seeded below.
-        metrics_.describe("yuzu_mcp_poll_total",
+        metrics_.describe(mcp::kMcpPollTotalMetric,
                           "MCP result-poll tool calls by verdict (get_execution_status, "
                           "query_responses, get_bundle_result). not_ready: the success payload "
                           "carried a retry_after_ms poll hint; ready: served terminal/complete "

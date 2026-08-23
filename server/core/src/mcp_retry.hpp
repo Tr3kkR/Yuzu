@@ -19,6 +19,7 @@
 /// explicitly so a future re-tuning of one does not silently drag the other.
 
 #include <cstdint>
+#include <string_view>
 
 namespace yuzu::server::mcp {
 
@@ -85,5 +86,20 @@ inline constexpr std::int64_t kMcpApprovalPollRetryMs = 30000;
 /// cannot silently diverge into a shadow series — same precedent as
 /// `rotation_sweep_naming.hpp`'s `kApiTokenConfirmTotalMetric`.
 inline constexpr const char* kMcpPollTotalMetric = "yuzu_mcp_poll_total";
+
+/// Shared terminal-status predicate for `ExecutionTracker` rows (#3344 Gate 8
+/// fold: `get_execution_status` and `query_responses`' poll-hint logic both
+/// hand-rolled this exact three-value set independently — a future status
+/// added to one and not the other would make the two poll tools silently
+/// disagree about in-flight-ness for the same execution). Deliberately an
+/// explicit allowlist rather than `execution_tracker.cpp`'s own
+/// `NOT IN (pending, running)` idiom: that idiom's default is "an
+/// unrecognized future status counts as terminal", which is the WRONG
+/// default here — a status this predicate doesn't recognize must still read
+/// as non-terminal (fail-safe: the caller keeps polling and self-corrects on
+/// the next response) rather than silently going hint-less forever.
+inline bool is_execution_terminal(std::string_view status) {
+    return status == "succeeded" || status == "completed" || status == "cancelled";
+}
 
 }  // namespace yuzu::server::mcp

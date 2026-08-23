@@ -6957,6 +6957,18 @@ TEST_CASE("MCP query_responses: #3344 retry_after_ms confirms in-flight, absent 
     REQUIRE(instr_only);
     auto instr_only_body = nlohmann::json::parse(instr_only->body);
     CHECK_FALSE(instr_only_body["result"].contains("retry_after_ms"));
+    // #3344 Gate 8 fold (sre): an unknowable call is neither ready nor
+    // not_ready — it was never checked, so it must not be counted as either,
+    // or the "checked and found done" fraction the counter exists to
+    // measure gets diluted by calls that could never have been not_ready.
+    // Both series stay at their pre-call values (1.0 not_ready, 1.0 ready
+    // from the two calls above).
+    CHECK(reg.counter("yuzu_mcp_poll_total",
+                      {{"tool", "query_responses"}, {"result", "ready"}})
+              .value() == 1.0);
+    CHECK(reg.counter("yuzu_mcp_poll_total",
+                      {{"tool", "query_responses"}, {"result", "not_ready"}})
+              .value() == 1.0);
 }
 
 // ── #1550 HIGH-1/HIGH-2 + review hardening ───────────────────────────────────
