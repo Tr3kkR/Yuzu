@@ -451,7 +451,7 @@ int do_missing(yuzu::CommandContext& ctx) {
         // running this module's code after the host dlclose()s/
         // FreeLibrary()s the plugin on its reconnect/shutdown path -- a
         // fatal use-after-unload race ADR-3002 rejects this exact shape
-        // for (see the comment above SearchCompletedSink's declaration).
+        // for (see the comment above do_installed(), below BStrGuard).
         // Request the abort and drop the job's own reference via `job`'s
         // normal RAII destructor at scope exit -- no extra ref, no
         // background thread, no CleanUp() call. This accepts a bounded,
