@@ -208,8 +208,20 @@ uint64_t wmi_row_uint64(const wmi::WmiRow& row, const char* key) {
 // realistically exceed the row cap on a host with many installed drivers.
 template <typename Fn> bool wmi_query(const wchar_t* wql, Fn&& fn) {
     auto result = wmi::run_bounded_wmi_query(L"ROOT\\CIMV2", wql);
-    if (result.error)
+    if (result.error) {
+        // gate-6 sre remediation: a connect/query/deadline failure was
+        // previously indistinguishable from a genuinely-absent WMI class --
+        // every caller emits the same "unknown" sentinel either way, with no
+        // signal reaching the operator that this specific run hit
+        // wmi::error_tokens::kWmiDeadlineExceeded (bounded-wait timeout) vs.
+        // an ordinary "no such provider" outcome. wmi_plugin.cpp's own
+        // actions surface result.error directly in their output; this
+        // helper is a fire-and-forget accumulator instead (its callers embed
+        // an "unknown" row, not an error token), so a log line is the only
+        // place this can be observed.
+        spdlog::warn("hardware: WMI query failed: {}", *result.error);
         return false;
+    }
     for (const auto& row : result.rows)
         fn(row);
     return result.truncated;

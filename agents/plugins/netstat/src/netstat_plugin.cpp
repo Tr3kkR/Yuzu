@@ -133,15 +133,26 @@ uint16_t parse_hex_port(std::string_view hex) {
 }
 
 // Scan /proc/[pid]/fd/ symlinks to build inode → PID mapping.
+//
+// Both DIR* streams are RAII-owned, same idiom as build_socket_and_proc_maps()
+// below (adversarial-review gate-2 finding, #3403): allocating work
+// (std::format, std::string construction, map insertion) runs between
+// opendir() and the matching closedir(), so an exception there would
+// otherwise skip the manual cleanup and leak the fd for the life of the
+// agent (CLAUDE.md's non-RAII-manual-cleanup floor). This function predates
+// that fix and was found to still carry the same raw opendir()/closedir()
+// shape during this branch's governance gate-3 cpp-safety review -- fixed
+// here to match its sibling rather than leaving one of the two /proc
+// walkers unRAII'd in the same file.
 std::unordered_map<uint64_t, int> build_inode_to_pid_map() {
     std::unordered_map<uint64_t, int> map;
 
-    DIR* proc_dir = opendir("/proc");
+    const std::unique_ptr<DIR, int (*)(DIR*)> proc_dir{opendir("/proc"), &closedir};
     if (!proc_dir)
         return map;
 
     struct dirent* proc_entry = nullptr;
-    while ((proc_entry = readdir(proc_dir)) != nullptr) {
+    while ((proc_entry = readdir(proc_dir.get())) != nullptr) {
         int pid = 0;
         [[maybe_unused]] auto [ptr, ec] = std::from_chars(proc_entry->d_name,
                                          proc_entry->d_name + std::strlen(proc_entry->d_name), pid);
@@ -149,13 +160,13 @@ std::unordered_map<uint64_t, int> build_inode_to_pid_map() {
             continue;
 
         std::string fd_path = std::format("/proc/{}/fd", pid);
-        DIR* fd_dir = opendir(fd_path.c_str());
+        const std::unique_ptr<DIR, int (*)(DIR*)> fd_dir{opendir(fd_path.c_str()), &closedir};
         if (!fd_dir)
             continue;
 
         char link_buf[128];
         struct dirent* fd_entry = nullptr;
-        while ((fd_entry = readdir(fd_dir)) != nullptr) {
+        while ((fd_entry = readdir(fd_dir.get())) != nullptr) {
             if (fd_entry->d_name[0] == '.')
                 continue;
 
@@ -175,9 +186,7 @@ std::unordered_map<uint64_t, int> build_inode_to_pid_map() {
             if (inode > 0)
                 map.emplace(inode, pid);
         }
-        closedir(fd_dir);
     }
-    closedir(proc_dir);
     return map;
 }
 

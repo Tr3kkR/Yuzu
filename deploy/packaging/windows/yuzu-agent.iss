@@ -187,6 +187,17 @@ Filename: "{app}\bin\yuzu-agent.exe"; Parameters: "--remove-service"; Flags: run
 ; scripts/install-agent-user.ps1 Remove-ProcBootAutologger — keep in sync.
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Remove-AutologgerConfig -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; Stop-EtwTraceSession -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; Remove-Item '{commonappdata}\Yuzu\procboot.etl' -Force -ErrorAction SilentlyContinue | Out-Null; exit 0"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveProcBootAutologger"
 
+; gate-3 sre remediation (#3403 sockwho retirement): Inno Setup does not
+; delete a file merely dropped from [Files] on an in-place upgrade, and
+; PluginLoader::scan() (agents/core/src/plugin_loader.cpp) globs every
+; plugin-dir file by extension with no denylist -- the default
+; --plugin-allowlist is empty/unset, so a stale sockwho.dll left on disk
+; after upgrading past this release would be silently re-loaded and its
+; retired action would come back, not just linger as dead weight. Explicit
+; delete closes that.
+[InstallDelete]
+Type: files; Name: "{app}\plugins\sockwho.dll"
+
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\logs"
 
