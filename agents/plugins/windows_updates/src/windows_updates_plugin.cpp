@@ -32,7 +32,6 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -57,9 +56,9 @@
 #include <win_str.hpp>     // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #include <wmi_bounded.hpp> // shared yuzu::shared::wmi::run_bounded_wmi_query (bounded, never WBEM_INFINITE)
 #include <wuapi.h>         // IUpdateSession/IUpdateSearcher/ISearchJob (Windows Update Agent COM API)
-#include <spdlog/spdlog.h> // track_detached_cleanup's ceiling-reached warning (this file's #else
-                           // branch already includes this for its own spdlog::warn call, but
-                           // that include is POSIX-only -- unreachable from here)
+#include <spdlog/spdlog.h> // this file's degraded-run warning (this file's #else branch already
+                           // includes this for its own spdlog::warn call, but that include is
+                           // POSIX-only -- unreachable from here)
 #pragma comment(lib, "ws2_32.lib")
 #else
 #include <sys/types.h>
@@ -221,174 +220,21 @@ private:
 // SysFreeString deleter needs nothing from that file.
 using BStrGuard = std::unique_ptr<std::remove_pointer_t<BSTR>, decltype(&::SysFreeString)>;
 
-// Outstanding best-effort ISearchJob::CleanUp() threads from a deadline-
-// exceeded search (see do_missing() below). CleanUp() genuinely blocks with
-// no documented bound, so these run DETACHED during normal operation -- but
-// the host's reconnect/shutdown path does dlclose()/FreeLibrary() this
-// plugin on a live process (see agents/core/include/yuzu/agent/
-// subprocess_runner.hpp's header comment), and a thread still executing
-// this module's code when that happens crashes into unmapped memory.
-//
-// A prior version of this fix joined every such thread unconditionally at
-// shutdown() -- but shutdown() runs SYNCHRONOUSLY inside Agent::Run()'s
-// final-teardown loop (agents/core/src/agent.cpp), so an unbounded join on
-// a genuinely wedged CleanUp() (a wedged/offline WSUS -- precisely the
-// scenario the bounded-poll design exists to survive) hangs the ENTIRE
-// agent's shutdown, recreating the exact "hang-forever" failure mode
-// docs/adr/3002-acquisition-ladder.md's rung-1 bounded-broker-call
-// requirement exists to remove (adversarial review finding, both external
-// reviewers independently). Fixed here by giving shutdown() a short,
-// bounded grace to wait for outstanding cleanups (covering the normal case
-// -- CleanUp() returning promptly once RequestAbort() has been honored --
-// with the same closing-the-dlclose-race benefit as before) and, on
-// timeout, letting a still-running cleanup keep running detached rather
-// than blocking shutdown -- the same bounded-poll shape this codebase's
-// own wait_for_workers_to_drain() (agents/core/src/hard_exit.hpp) uses for
-// the identical problem class in Guardian's own detached I/O workers (F3);
-// reimplemented locally rather than included, since that header is
-// agents/core-internal (same-directory #include only, not exposed to
-// plugins via the public agents/core/include/yuzu/agent/ surface) and
-// pulling it in would be a larger cross-module API change than this
-// migration's own scope. A cleanup
-// thread outliving a timed-out grace period, in the rare genuinely-wedged
-// case, keeps the original (narrower) dlclose-race residual risk this
-// mechanism cannot fully close without an agent-core-owned killable
-// broker boundary -- a larger change than this migration's scope.
-constexpr std::chrono::seconds kCleanupJoinGrace{3}; // matches hard_exit.hpp's kOrphanDrainGrace
-
-// Well above realistic legitimate concurrency (a sustained WSUS wedge with
-// periodic dispatch could otherwise pile up one thread per timed-out
-// do_missing() call, unbounded) but far below what would meaningfully
-// threaten the process's OS thread budget -- same ceiling shape as
-// agents/plugins/discovery/src/bounded_wait.hpp's kMaxOutstandingBoundedCalls
-// (governance Gate 4 unhappy-path finding).
-constexpr int kMaxOutstandingCleanups = 64;
-std::atomic<int> g_outstanding_cleanups{0};
-
-// Move-only RAII guard for a claimed slot on kMaxOutstandingCleanups --
-// mirrors agents/plugins/discovery/src/bounded_wait.hpp's
-// OutstandingCallGuard exactly (governance Gate 8 re-review finding: an
-// earlier version of this file used manual load()-then-fetch_add()
-// bookkeeping instead of this guard, which had two real gaps this closes
-// at once):
-//  - TOCTOU. A separate load() followed by a separate fetch_add() is a
-//    classic check-then-act: two concurrent do_missing() calls near the
-//    ceiling could both observe "below ceiling" and both increment past
-//    it. try_acquire() below makes the increment itself the check --
-//    whichever fetch_add() lands second sees the already-incremented
-//    value and backs off; no window exists where two callers can both
-//    pass.
-//  - Exception-type-specific catches leak the counter. A prior version
-//    only caught `std::system_error` around std::thread's constructor,
-//    which the standard does not guarantee is the only exception type
-//    (e.g. std::bad_alloc from internal control-block allocation is
-//    plausible under exactly the resource-pressure scenario this whole
-//    mechanism exists to survive) -- an uncaught type would leak the
-//    slot forever. Moving the guard INTO the lambda passed to
-//    std::thread means its destructor releases the slot on ANY unwind,
-//    regardless of exception type, whether that unwind is std::thread's
-//    constructor throwing (the guard, still local to the caller at that
-//    point, is destroyed as the throwing expression unwinds) or the
-//    cleanup work itself throwing inside the detached thread (guarded
-//    separately by the try/catch(...) around cleanup_work() below).
-class OutstandingCleanupGuard {
-public:
-    OutstandingCleanupGuard(const OutstandingCleanupGuard&) = delete;
-    OutstandingCleanupGuard& operator=(const OutstandingCleanupGuard&) = delete;
-
-    OutstandingCleanupGuard(OutstandingCleanupGuard&& other) noexcept : held_{other.held_} {
-        other.held_ = false;
-    }
-    OutstandingCleanupGuard& operator=(OutstandingCleanupGuard&& other) noexcept {
-        if (this != &other) {
-            release();
-            held_ = other.held_;
-            other.held_ = false;
-        }
-        return *this;
-    }
-
-    ~OutstandingCleanupGuard() { release(); }
-
-    static std::optional<OutstandingCleanupGuard> try_acquire() {
-        if (g_outstanding_cleanups.fetch_add(1, std::memory_order_relaxed) + 1 >
-            kMaxOutstandingCleanups) {
-            g_outstanding_cleanups.fetch_sub(1, std::memory_order_relaxed);
-            // A sustained wedge already has this many searches stuck in
-            // cleanup -- spawning yet another thread risks exhausting the
-            // whole agent's OS thread budget, not just this plugin's.
-            spdlog::warn("windows_updates: outstanding WUA cleanup ceiling ({}) reached, "
-                         "not spawning another cleanup thread (sustained wedge?)",
-                         kMaxOutstandingCleanups);
-            return std::nullopt;
-        }
-        return OutstandingCleanupGuard{};
-    }
-
-private:
-    OutstandingCleanupGuard() = default;
-
-    void release() noexcept {
-        if (held_) {
-            g_outstanding_cleanups.fetch_sub(1, std::memory_order_relaxed);
-            held_ = false;
-        }
-    }
-
-    bool held_ = true;
-};
-
-// Attempts to spawn cleanup_work() on a detached thread, having already
-// claimed a ceiling slot via OutstandingCleanupGuard::try_acquire(). The
-// guard is moved into the thread's lambda (not kept by the caller), so its
-// lifetime spans the whole detached call: releases on normal completion,
-// on cleanup_work() throwing (caught here, never propagated), or on
-// std::thread's own constructor throwing (the not-yet-moved-away lambda
-// temporary, and the guard it holds, unwind normally). Returns false only
-// when the ceiling was already at capacity -- the caller is responsible
-// for its own bounded fallback (see do_missing()'s call site).
-template <typename Fn>
-bool track_detached_cleanup(Fn&& cleanup_work) {
-    auto guard = OutstandingCleanupGuard::try_acquire();
-    if (!guard)
-        return false;
-    std::thread([cleanup_work = std::forward<Fn>(cleanup_work),
-                 guard = std::move(*guard)]() mutable {
-        try {
-            cleanup_work();
-        } catch (...) {
-            // cleanup_work() throwing must not std::terminate() a
-            // detached thread (mirrors bounded_wait.hpp's identical
-            // guard around its own fn() call).
-        }
-        // `guard` releases its ceiling slot here, at end of scope --
-        // whether cleanup_work() returned normally or threw above.
-    }).detach();
-    return true;
-}
-
-// Polls g_outstanding_cleanups until it reaches zero or kCleanupJoinGrace
-// elapses -- the same bounded-poll shape as hard_exit.hpp's
-// wait_for_workers_to_drain(), reimplemented locally (see the header
-// comment above for why that utility isn't included directly). Returns
-// the number still outstanding when this returns (0 if every cleanup
-// finished within the grace) -- the caller (shutdown(), below) logs this
-// when nonzero, otherwise a sustained wedge or a post-dlclose crash report
-// has no breadcrumb at all pointing at this mechanism (governance Gate 6
-// sre finding; same shape as mcp_stream_bridge.cpp's
-// "mcp.bridge.shutdown_reap" reaped/abandoned-count logging). Does not
-// itself decide what "still nonzero after grace" means -- shutdown() lets
-// a not-yet-finished cleanup keep running detached rather than blocking.
-int join_all_detached_cleanups() {
-    const auto deadline = std::chrono::steady_clock::now() + kCleanupJoinGrace;
-    int remaining = 0;
-    while ((remaining = g_outstanding_cleanups.load(std::memory_order_relaxed)) > 0) {
-        if (std::chrono::steady_clock::now() >= deadline)
-            break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
-    return remaining;
-}
+// A deadline-exceeded search's ISearchJob is aborted and released WITHOUT
+// calling CleanUp() (see do_missing() below). CleanUp() genuinely blocks
+// with no documented bound, so running it -- inline or on a background
+// thread -- risks the same class of defect either way: the host's
+// reconnect/shutdown path does dlclose()/FreeLibrary() this plugin on a
+// live process (see agents/core/include/yuzu/agent/subprocess_runner.hpp's
+// header comment), and any thread still executing this module's code when
+// that happens crashes into unmapped memory. A detached CleanUp() thread
+// cannot be made safe against that race without an agent-core-owned
+// killable broker boundary that outlives the plugin's own unload (a larger
+// change than this migration's scope; ADR-3002's "Considered alternatives"
+// rejects the equivalent per-plugin-runner shape for a subprocess reaper
+// for the identical reason). Dropping CleanUp() entirely accepts a bounded,
+// WUA-internal resource residue on the rare genuinely-wedged search in
+// exchange for removing the unload race outright.
 #endif // _WIN32
 
 // ── installed action ───────────────────────────────────────────────────────
@@ -599,62 +445,19 @@ int do_missing(yuzu::CommandContext& ctx) {
     if (!completed) {
         // Deliberate bounded stop, not a crash/hang -- but ISearchJob::
         // CleanUp() is documented to block until the async operation has
-        // actually finished, so calling it inline here would just move the
-        // unbounded wait from Search() to CleanUp(), defeating the point of
-        // this whole bounded-poll design. Request the abort, then hand the
-        // job off (via an extra COM ref, not a move -- ComPtr is neither
-        // copyable nor movable) to a background thread that blocks in
-        // CleanUp() on its own time; this call returns the honest
-        // CONSTRAINED result immediately either way. shutdown() waits a
-        // short bounded grace for this to finish (see
-        // track_detached_cleanup/join_all_detached_cleanups above) rather
-        // than joining it unconditionally -- a wedged CleanUp() must not be
-        // able to hang the whole agent's shutdown.
+        // actually finished, so calling it here (inline OR on a detached
+        // thread outliving this call) would either reintroduce the
+        // unbounded wait CleanUp() itself has, or risk that thread still
+        // running this module's code after the host dlclose()s/
+        // FreeLibrary()s the plugin on its reconnect/shutdown path -- a
+        // fatal use-after-unload race ADR-3002 rejects this exact shape
+        // for (see the comment above SearchCompletedSink's declaration).
+        // Request the abort and drop the job's own reference via `job`'s
+        // normal RAII destructor at scope exit -- no extra ref, no
+        // background thread, no CleanUp() call. This accepts a bounded,
+        // WUA-internal resource residue on a genuinely wedged search in
+        // exchange for eliminating the unload race outright.
         job->RequestAbort();
-        ISearchJob* raw_job = job.get();
-        raw_job->AddRef();
-        const bool spawned = track_detached_cleanup([raw_job]() {
-            // COM apartment state is per-thread: the ComInit further up
-            // do_missing() only covers the calling thread, which returns
-            // (destroying that ComInit) right after this lambda is handed
-            // off. CleanUp()/Release() are COM interface calls, so this
-            // brand-new thread needs its own -- joining the same MTA the
-            // rest of this file uses, so the in-process WUA object can be
-            // called directly with no marshaling. Best-effort even if
-            // CoInitializeEx somehow fails here (RPC_E_CHANGED_MODE is
-            // already tolerated by ComInit::ok(), and either way Release()
-            // still needs to run: not calling it leaks the AddRef'd
-            // reference outright, which is worse than a degraded call).
-            //
-            // No try/catch needed here: track_detached_cleanup wraps this
-            // callable in its own catch(...), so a throw from either
-            // CleanUp() or Release() -- neither is expected to throw by
-            // contract, but an SEH-to-C++ translator or provider-side
-            // corruption could still surface one -- is swallowed there
-            // rather than escaping this detached thread's entry function
-            // and std::terminate()-ing the whole agent. If CleanUp() or
-            // Release() itself is what throws, the AddRef'd reference
-            // leaks; that's the accepted cost of surviving rather than
-            // terminating (governance Gate 4 unhappy-path finding; mirrors
-            // discovery/bounded_wait.hpp's identical guard on its own
-            // detached-thread body).
-            yuzu::shared::win::ComInit cleanup_com_init;
-            raw_job->CleanUp();
-            raw_job->Release();
-        });
-        if (!spawned) {
-            // Ceiling reached, or std::thread's constructor itself threw:
-            // cleanup_work() above never ran, so nothing released the
-            // AddRef() taken for it. Balance it directly here -- Release()
-            // alone (unlike CleanUp()) isn't documented to block, so this
-            // doesn't reintroduce an unbounded wait on this command
-            // thread; the cost is skipping CleanUp() itself (whatever
-            // WUA-internal state it would have released stays unreleased
-            // for this one search), a narrow, accepted tradeoff against
-            // either blocking this call or growing the OS thread count
-            // without bound.
-            raw_job->Release();
-        }
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               "windows_updates:search_deadline_exceeded");
         ctx.write_output("available|none|Update search did not complete within the time budget");
@@ -902,8 +705,12 @@ int do_pending_reboot(yuzu::CommandContext& ctx) {
     // Check 2: Running kernel vs installed kernel mismatch
     {
         bool found = false;
+        // sink: windows_updates/do_pending_reboot#2 -- uname -r, grandfathered
+        // rung-3 exception (docs/agent-spawn-sink-manifest.md), tracked #2380
         auto running = run_command("uname -r");
         // Use ls -t (sort by mtime) instead of sort -V for portability (busybox/Alpine)
+        // sink: windows_updates/do_pending_reboot#3 -- ls -t /boot/vmlinuz-* |
+        // head -1, grandfathered rung-3 exception (same manifest doc), #2380
         auto latest = run_command("ls -t /boot/vmlinuz-* 2>/dev/null | head -1");
         if (!latest.empty()) {
             // Strip "vmlinuz-" prefix and path
@@ -920,6 +727,8 @@ int do_pending_reboot(yuzu::CommandContext& ctx) {
         }
         if (latest.empty()) {
             // Fallback: needs-restarting (RHEL/CentOS/Fedora)
+            // sink: windows_updates/do_pending_reboot#4 -- needs-restarting -r,
+            // grandfathered rung-3 exception (same manifest doc), tracked #2380
             auto output = run_command("needs-restarting -r 2>&1");
             bool needs = output.find("Reboot is required") != std::string::npos;
             if (needs) {
@@ -1321,27 +1130,7 @@ public:
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
 
-    void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {
-#ifdef _WIN32
-        // Wait a short bounded grace for every background ISearchJob::
-        // CleanUp() thread left running by an aborted do_missing() search
-        // before returning -- the host dlcloses/FreeLibrary()s this module
-        // right after shutdown() on its reconnect/shutdown path, and a
-        // thread still executing this module's code at that point would
-        // crash into unmapped memory. NOT an unconditional join: a wedged
-        // CleanUp() must not be able to hang shutdown() itself, since this
-        // runs synchronously inside the agent's own final-teardown path.
-        if (const int remaining = join_all_detached_cleanups(); remaining > 0) {
-            // The only breadcrumb an operator/SRE has for diagnosing a
-            // sustained WSUS wedge, or correlating a post-dlclose crash
-            // report against it -- this thread is about to keep running
-            // detached past this module potentially being unloaded.
-            spdlog::warn("windows_updates: shutdown() proceeding with {} WUA cleanup "
-                         "thread(s) still outstanding after the {}s grace",
-                         remaining, kCleanupJoinGrace.count());
-        }
-#endif
-    }
+    void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
     int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params params) override {

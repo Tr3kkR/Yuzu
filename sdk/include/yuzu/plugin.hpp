@@ -246,8 +246,14 @@ public:
      * BOUNDED wait (e.g. a few seconds, with a documented fallback for the
      * timeout case) is an accepted pattern for a plugin that owns
      * background work it must not race against dlclose/FreeLibrary --
-     * see windows_updates_plugin.cpp's join_all_detached_cleanups() for a
-     * worked example. Never an unbounded wait/join.
+     * see agents/plugins/discovery/src/bounded_wait.hpp's
+     * OutstandingCallGuard for a worked example. A background thread that
+     * may still be running PAST the bounded wait's timeout must never touch
+     * this plugin's own code or statics after that point (dlclose/
+     * FreeLibrary can unmap them while it runs) -- if the underlying work
+     * can't be made safe against that, don't defer it to a thread at all;
+     * accept a bounded resource residue instead. Never an unbounded
+     * wait/join.
      */
     virtual void shutdown(PluginContext& ctx) noexcept = 0;
 

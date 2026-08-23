@@ -110,6 +110,9 @@ interim site — ADR-3002 Decisions 1 and 2).
 | `windows_updates/do_missing#3` | `agents/plugins/windows_updates/src/windows_updates_plugin.cpp:do_missing` | runner argv (`/usr/sbin/softwareupdate -l`) | macOS | compile-time literal argv | read-only | none — redirection eliminated (`2>/dev/null` -> `merge_stderr=false`) | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
 | `windows_updates/do_missing#4` | `agents/plugins/windows_updates/src/windows_updates_plugin.cpp:do_missing` | in-process WUA COM async search (`IUpdateSearcher::BeginSearch`/`ISearchJob::IsCompleted` poll/`EndSearch`, `IsInstalled=0`) — no child process spawned | Windows | compile-time literal search criteria | read-only | n/a — no shell/interpreter of any kind involved (replaces the prior `powershell -Command New-Object -ComObject Microsoft.Update.Session` interpreter shell-out); deliberately NOT the synchronous `Search()` call, which is an unbounded broker call ADR-3002 forbids | none beyond the agent's existing service context | Reviewed — promoted directly to rung 1, same reasoning as `do_installed#4` | 1 — daemon-mediated bounded broker call (WUA service), polled under an explicit 120s deadline with `RequestAbort`/`CleanUp` on timeout rather than left to block; not a spawn site at all as of this migration | n/a — not a spawn site as of this migration |
 | `windows_updates/do_pending_reboot#1` | `agents/plugins/windows_updates/src/windows_updates_plugin.cpp:do_pending_reboot` | runner argv (`/usr/sbin/softwareupdate -l`) | macOS | compile-time literal argv | read-only | none — redirection eliminated (`2>/dev/null` -> `merge_stderr=false`) | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess with an explicit 60s deadline, replacing the prior unbounded `popen()` call (the file's own TODO — could hang indefinitely on a headless/offline Mac); rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `windows_updates/do_pending_reboot#2` | `agents/plugins/windows_updates/src/windows_updates_plugin.cpp:do_pending_reboot` | `popen()` helper (`run_command`, string `uname -r`) | Linux | compile-time literal command string | read-only | none | none | a direct `uname(2)` syscall answers this without a subprocess at all — a real rung-1 candidate, not migrated in this PR | 3 — grandfathered raw `popen`, unbounded, no timeout; reviewed exception recorded here per ADR-3002 Decision 1 rather than migrated, out of scope for this PR's installed/missing-focused migration; tracked #2380 | n/a |
+| `windows_updates/do_pending_reboot#3` | `agents/plugins/windows_updates/src/windows_updates_plugin.cpp:do_pending_reboot` | `popen()` helper (`run_command`, string `ls -t /boot/vmlinuz-* 2>/dev/null \| head -1`) | Linux | compile-time literal command string | read-only | glob (`vmlinuz-*`), redirection (`2>/dev/null`), pipeline (`\| head -1`) | none | a `std::filesystem` directory scan answers this without a subprocess or a shell — a real rung-1 candidate, not migrated in this PR | 3 — grandfathered raw `popen`, unbounded, no timeout; reviewed exception recorded here per ADR-3002 Decision 1 rather than migrated, out of scope for this PR's installed/missing-focused migration; tracked #2380 | n/a |
+| `windows_updates/do_pending_reboot#4` | `agents/plugins/windows_updates/src/windows_updates_plugin.cpp:do_pending_reboot` | `popen()` helper (`run_command`, string `needs-restarting -r 2>&1`) | Linux | compile-time literal command string | read-only | redirection (`2>&1`) | none | no rung-1 API for this data on this OS in this plugin | 3 — grandfathered raw `popen`, unbounded, no timeout; reviewed exception recorded here per ADR-3002 Decision 1 rather than migrated, out of scope for this PR's installed/missing-focused migration; tracked #2380 | n/a |
 
 ## Seed inventory — known spawn surfaces awaiting transcription
 
@@ -199,12 +202,13 @@ unbounded `softwareupdate -l` — fixed onto a bounded 60s runner argv call).
 Still listed in the raw-popen inventory above because `pending_reboot`'s
 Linux leg (`uname -r`, `ls -t /boot/vmlinuz-*`, `needs-restarting -r`) was
 out of scope for this migration and remains on the old unbounded
-`popen()`-based `run_command`/`run_command_lines` helpers — no manifest rows
-for those three sites yet. Two of the three (`uname -r`, `ls -t
-/boot/vmlinuz-*`) are also good rung-1 promotion candidates in their own
-right (a direct `uname(2)` syscall and a `std::filesystem` directory scan
-respectively need no subprocess at all) rather than a straight argv
-migration; tracked in #2380.
+`popen()`-based `run_command` helper — recorded as three grandfathered
+rung-3 exceptions (`windows_updates/do_pending_reboot#2/#3/#4`, see
+Registered sites above) per ADR-3002 Decision 1 rather than migrated. Two of
+the three (`uname -r`, `ls -t /boot/vmlinuz-*`) are also good rung-1
+promotion candidates in their own right (a direct `uname(2)` syscall and a
+`std::filesystem` directory scan respectively need no subprocess at all)
+rather than a straight argv migration; tracked in #2380.
 
 **Migrated off raw spawn (Wave 3, PR33d):** `sccm` (0 spawn sites, was 3 —
 `client_version`'s `sc query ccmexec` text parse promoted to a native SCM
