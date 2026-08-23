@@ -179,6 +179,23 @@ uint64_t wmi_row_uint64(const wmi::WmiRow& row, const char* key) {
 // result set -- calls fn zero times, matching the removed private
 // WmiQuery's behaviour (callers already treat "fn never ran" as their
 // not-found case, e.g. an empty accumulator string or a zero row count).
+//
+// #3404 sentinel-row decision: several callers below (do_bios,
+// do_processors, do_memory, do_disks) now track a `found`/`idx` flag across
+// this call and emit an explicit "unknown"-valued row when it stays
+// false/zero -- covering BOTH the connect/query failure case AND a
+// genuinely empty (connected, zero-row) result. The pre-migration WmiQuery
+// class only emitted that sentinel on a connect/query failure (`!wmi.valid()`);
+// a connected-but-empty query silently emitted no row at all, because the
+// per-row callback -- the only place those actions wrote output -- simply
+// never ran. #3404's original acceptance bar called for byte-identical
+// output across the migration, which this technically violates for that one
+// case. This is a deliberate, reviewed divergence, not a missed edge case:
+// an explicit "unknown" row tells a consumer the probe ran and found
+// nothing, where the old silent-gap behaviour was indistinguishable from
+// "this plugin action produced no output for an unrelated reason" (dispatch
+// failure, truncation, etc). Do not "fix" this back to match the old
+// silent-gap behaviour.
 template <typename Fn> void wmi_query(const wchar_t* wql, Fn&& fn) {
     auto result = wmi::run_bounded_wmi_query(L"ROOT\\CIMV2", wql);
     if (result.error)
@@ -289,6 +306,8 @@ int do_bios(yuzu::CommandContext& ctx) {
                       std::format("bios_version|{}", version.empty() ? "unknown" : version));
                   ctx.write_output(std::format("bios_date|{}", date.empty() ? "unknown" : date));
               });
+    // Deliberate #3404 divergence from silent-gap-on-empty -- see wmi_query()'s
+    // doc comment above.
     if (!found) {
         ctx.write_output("bios_vendor|unknown");
         ctx.write_output("bios_version|unknown");
@@ -438,6 +457,8 @@ int do_processors(yuzu::CommandContext& ctx) {
                   ctx.write_output(
                       std::format("cpu|{}|{}|{}|{}|{}", idx++, name, cores, threads, mhz));
               });
+    // Deliberate #3404 divergence from silent-gap-on-empty -- see wmi_query()'s
+    // doc comment above.
     if (idx == 0)
         ctx.write_output("cpu|0|unknown|0|0|0");
 
@@ -535,6 +556,8 @@ int do_memory(yuzu::CommandContext& ctx) {
                   ctx.write_output(
                       std::format("dimm|{}|{}|{}|{}", slot, size_mb, type_str, speed));
               });
+    // Deliberate #3404 divergence from silent-gap-on-empty -- see wmi_query()'s
+    // doc comment above.
     if (!found)
         ctx.write_output("dimm|unknown|0|unknown|0");
 
@@ -640,6 +663,8 @@ int do_disks(yuzu::CommandContext& ctx) {
                   ctx.write_output(
                       std::format("disk|{}|{}|{}|{}|{}", idx, model, size_gb, type_str, iface));
               });
+    // Deliberate #3404 divergence from silent-gap-on-empty -- see wmi_query()'s
+    // doc comment above.
     if (!found)
         ctx.write_output("disk|0|unknown|0|unknown|unknown");
 

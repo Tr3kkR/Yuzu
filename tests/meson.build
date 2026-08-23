@@ -312,6 +312,10 @@ agent_test_exe = executable(
     'unit/test_route_sysctl_arp.cpp',         # Wave 2 WP-C: pure sysctl NET_RT_FLAGS/RTF_LLINFO binary parser
     'unit/test_bounded_wait.cpp',             # Wave 2 WP-C remediation: uncancellable-call timeout wrapper
     'unit/agent/test_socket_walk.cpp',        # Wave 3 PR3.1: macos_socket_walk.hpp libproc walk (Darwin-only, self-gated)
+    'unit/agent/test_netstat_attribution.cpp', # gate-1 remediation (#3403/#3404): real netstat.dylib
+                                                # attribution action driven end to end via LocalDispatcher
+                                                # (Darwin-only, self-gated) -- same shape as
+                                                # test_wave3_pr31_macos_actions.cpp
     'unit/test_os_info_macos.cpp',            # Wave 3 PR3.1: os_info_macos.hpp SystemVersion.plist extractor (pure, every host)
     'unit/agent/test_wave3_pr31_macos_actions.cpp', # Wave 3 PR3.1 remediation: real os_info/processes/
                                                 # network_diag/ioc .dylib driven end to end via
@@ -386,10 +390,13 @@ agent_test_exe = executable(
   # hardware_plugin_lib / device_identity_plugin_lib (agents/plugins/{hardware,device_identity}/meson.build):
   # test_hardware_device_identity_posix_actions.cpp loads both real plugins by
   # path for the identical reason (Wave 3 PR3.2 gate-1 remediation).
+  # netstat_plugin_lib (agents/plugins/netstat/meson.build): test_netstat_attribution.cpp
+  # loads the real netstat plugin by path for the identical reason (gate-1 remediation,
+  # #3403/#3404 netstat.attribution + hardware WMI bounded-migration test-coverage gap).
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin,
                 users_plugin_lib, os_info_plugin_lib, processes_plugin_lib,
                 network_diag_plugin_lib, ioc_plugin_lib,
-                hardware_plugin_lib, device_identity_plugin_lib],
+                hardware_plugin_lib, device_identity_plugin_lib, netstat_plugin_lib],
 )
 # Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
 # threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it
