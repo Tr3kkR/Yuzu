@@ -197,14 +197,18 @@ rule_assertion_from_rule(const yuzu::guardian::v1::GuaranteedStateRule& rule) {
     // driven model (no scheduled re-evaluation). Spark's convergence scheduler
     // re-evaluates every armed rule on a fixed per-type cadence, so a 1000ms
     // debounce expires before every single sweep, and a persistently-drifted
-    // rule re-emits drift.detected on every sweep of its lane (~1440/day on the
-    // 60s service/registry lanes, ~144/day on the 600s file lane). Interim fix
-    // (owner decision, pending a possible full M1-shaped edge+refresh redesign
-    // later): default to the rule's own lane cadence plus the scheduler's own
-    // jitter margin, so debounce reliably survives at least one full sweep even
-    // at the jitter-shortened extreme - roughly halves steady-state re-emission
-    // frequency. Reuses the SAME cadence/jitter constants the convergence
-    // scheduler itself uses (spark.hpp), so the two can't silently drift apart.
+    // rule re-emits drift.detected on every sweep of its lane - jitter-adjusted
+    // worst case ~1800/day on the 60s service/registry lanes, ~180/day on the
+    // 600s file lane (naive no-jitter figures of 1440/144 understate the worst
+    // case; see the delta registry's D3 row for the full jitter-floor
+    // derivation). Interim fix (owner decision, pending a possible full
+    // M1-shaped edge+refresh redesign later): default to the rule's own lane
+    // cadence plus the scheduler's own jitter span, so debounce reliably
+    // survives at least one full sweep even at the jitter-shortened extreme -
+    // roughly halves steady-state re-emission frequency. Reuses the SAME
+    // cadence/jitter constants AND the same jitter-span formula the convergence
+    // scheduler itself uses (guardian_jitter_span_ms, spark.hpp), so the two
+    // can't silently drift apart on either axis.
     const auto& rem = rule.remediation();
     auto get = [&rem](std::string_view k) -> std::string {
         const auto it = rem.params().find(std::string(k));
@@ -214,15 +218,18 @@ rule_assertion_from_rule(const yuzu::guardian::v1::GuaranteedStateRule& rule) {
     switch (*spark_type) {
     case SparkType::File:
         default_debounce_ms =
-            kGuardianFileLaneCadenceMs + kGuardianFileLaneCadenceMs * kGuardianLaneJitterPct / 100;
+            kGuardianFileLaneCadenceMs + guardian_jitter_span_ms(kGuardianFileLaneCadenceMs,
+                                                                 kGuardianLaneJitterPct);
         break;
     case SparkType::Registry:
-        default_debounce_ms = kGuardianRegistryLaneCadenceMs +
-                              kGuardianRegistryLaneCadenceMs * kGuardianLaneJitterPct / 100;
+        default_debounce_ms =
+            kGuardianRegistryLaneCadenceMs + guardian_jitter_span_ms(kGuardianRegistryLaneCadenceMs,
+                                                                     kGuardianLaneJitterPct);
         break;
     case SparkType::Service:
-        default_debounce_ms = kGuardianServiceLaneCadenceMs +
-                              kGuardianServiceLaneCadenceMs * kGuardianLaneJitterPct / 100;
+        default_debounce_ms =
+            kGuardianServiceLaneCadenceMs + guardian_jitter_span_ms(kGuardianServiceLaneCadenceMs,
+                                                                    kGuardianLaneJitterPct);
         break;
     case SparkType::Interval:
     case SparkType::Startup:
