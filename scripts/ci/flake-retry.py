@@ -744,7 +744,7 @@ def _selftest():
     # or the guard fails loudly instead of silently inspecting half the
     # surface.
     _entries = re.findall(r"test\(\s*'[^']*',\s*server_test_exe\b(.*?)\)", _src, re.S)
-    check(len(_entries) >= 8, "meson.build: all eight server shard entries located")
+    check(len(_entries) >= 10, "meson.build: all ten server shard entries located")
     _shard_specs = []
     for _body in _entries:
         # Quote-aware list match: a naive [(.*?)] truncates at the tag spec's
@@ -858,8 +858,13 @@ def _selftest():
           # (suite `docs`, run by every ci.yml leg with no --suite filter),
           # a whole-tree CI red neither of the two adversarial-review models
           # caught (`--list-tests` partition checks don't exercise suite
-          # `docs`). Both or neither: update this pin AND the "ten shard tag
-          # filters" count below together whenever A or H's clause changes.
+          # `docs`). Both or neither, and it's THREE things not two (gov Gate
+          # 4 consistency-auditor: the entry-count floor above this function
+          # went stale 8->9 on the earlier E->G split and was never caught
+          # until this round) — whenever a shard's clause OR the shard count
+          # changes, update this pin, the entry-count floor (`_entries`
+          # check above), AND the "ten shard tag filters" count below,
+          # together.
           and ("[pg][routes]~[scim]~[dex]~[mfa],[pg][store],[pg][token]~[rotation]",) in _shard_specs
           and ("[pg][routes][scim]~[store],[pg][routes][dex]~[store],[pg][routes][mfa]~[store],[pg][token][rotation]~[store]",) in _shard_specs
           and ("[pg][rbac_store]~[routes]~[store]~[token]",) in _shard_specs

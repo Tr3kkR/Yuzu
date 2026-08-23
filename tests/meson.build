@@ -1121,12 +1121,19 @@ if build_server
   # remove a case H would otherwise have double-run with A. This closes the
   # largest of the two theoretical (currently empty, but not structurally
   # impossible) overlap classes a future case could fall into; the smaller
-  # one — a case carrying both a routes-domain tag (scim/dex/mfa) AND
-  # [token][rotation] together — is not closable this way without risking an
-  # orphan (Catch2's flat tag algebra can't express "unless it's also
-  # elsewhere in H"), so it stays a documented residual, not a bug: verify
-  # with --list-tests that no case matches more than one of H's four clauses
-  # before adding a new routes+token-domain tag to any surviving store file.
+  # one is NOT closable this way without risking an orphan (Catch2's flat tag
+  # algebra can't express "unless it's also elsewhere in H"), so it stays a
+  # documented residual, not a bug. The actual hazard shapes (verified by
+  # working the filter algebra, gov Gate 2 docs-writer — an earlier draft of
+  # this comment named the wrong pairing, one that in fact matches ONLY H,
+  # never A, since A's [routes] clause excludes every domain tag and A's
+  # [token] clause excludes rotation): a bare [routes][token][rotation] case
+  # with NO domain tag (matches A via its undomained-routes clause AND H via
+  # its rotation clause), or a [routes]+{scim|dex|mfa}+[token] case with NO
+  # [rotation] (matches A via its non-rotation-token clause AND H via that
+  # domain's routes clause). Verify with --list-tests that no case matches
+  # more than one of H's four clauses before adding a new routes+token-domain
+  # tag to any surviving store file.
   test('server pg unit tests shard H', server_test_exe,
        args: ['[pg][routes][scim]~[store],[pg][routes][dex]~[store],[pg][routes][mfa]~[store],[pg][token][rotation]~[store]',
               '--allow-running-no-tests'],
