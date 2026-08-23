@@ -352,9 +352,10 @@ run their **test** phase at the same time, the heavy unit-test suites
 timeouts: per-runner telemetry (`ci_test_suites`) measured `server ~[pg]` at
 c0≈289 s → c2≈467 s → c4≈603 s — a **guaranteed** timeout once ≥4 test phases
 overlap, and a 22–25 % timeout rate on the `server ~[pg]`/`tar` suites overall.
-Big Tam (Linux) scales **flat** under the identical 4-on-one-box topology — cheap
-`fork()`/VFS/page-cache and no AV minifilter keep per-op cost low — so it needs no
-gate.
+`fork()`/VFS/page-cache and no AV minifilter keep Big Tam's (Linux) per-op cost
+lower than Wee Tam's — but a prior revision of this section claimed Big Tam
+"scales flat" and needed no gate at all, which was never actually true; see
+"Linux within-job concurrency cap" below.
 
 `ci.yml`'s Windows **Test** step therefore wraps the run in
 [`scripts/ci/with-test-slot.sh`](../scripts/ci/with-test-slot.sh) — a crash-safe
@@ -365,6 +366,37 @@ fan-out can't pile the two ~400–600 s server shards onto one CCD+cluster. The 
 count is the first knob to revisit (→3) once per-op cost is cut (Defender `%TEMP%`
 exclusion, RAM-disk data dirs). Full diagnosis: the `tests/meson.build`
 server-shard comment.
+
+### Linux within-job concurrency cap
+
+Big Tam's 4 runners are also CCD-pinned (16 logical CPUs each, "Self-hosted
+runner topology" above), and each job's `Ensure Postgres`
+step gets its own `yuzu-ci-postgres-<n>` container — so unlike Wee Tam, Big Tam
+was never suffering primarily from OTHER jobs sharing the box. The bottleneck
+was **within one job**: `ci.yml`'s Linux `Test` step invoked
+`scripts/ci/flake-retry.py` with no `--num-processes` cap, so meson fanned every
+`test()` entry out at once (CPU-count parallelism) — all ~8 server pg shards,
+each a solo 90–600 s, running concurrently inside a single job, sharing that
+job's 16 logical CPUs and its one Postgres container. Proved via back-computed
+shard start times (printed-timestamp minus reported elapsed) landing within
+~0.01 s of each other across every pg shard in a failing run — sequential
+execution would spread those start times by each shard's own duration, not
+cluster them.
+
+Each pg shard carries `timeout: 600` as a hard per-test meson kwarg (not the
+job-level budget) — shards E and G were clipping it dead-on, 600.5–600.6 s with
+zero margin, and had been since before #3434 split the then-overloaded shard A
+into A+H (i.e. the box was never actually scaling flat; splitting A only moved
+which shard hit the ceiling first). The fix: `--num-processes 2` on the Linux
+Test step, mirroring the already-proven Windows value — chosen over a larger
+number specifically because E/G had no measured headroom to spend on a guess.
+A Linux cross-job gate via `with-test-slot.sh` (today Windows-only) is a
+candidate fast-follow if within-job capping alone proves insufficient; it isn't
+wired in yet because its default lock directory
+(`$RUNNER_TOOL_CACHE/yuzu-test-slots`) is per-agent on Big Tam, not box-wide
+like Wee Tam's shared `D:\ci\tool_cache` — bundling it would need an explicit
+shared `YUZU_TEST_SLOT_DIR` to actually gate cross-job, or it would silently
+no-op.
 
 ### Persistent runner-local test history
 
