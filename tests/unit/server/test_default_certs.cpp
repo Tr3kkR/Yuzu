@@ -731,8 +731,22 @@ TEST_CASE("default_certs: a losing HA replica self-heals from the shared cert di
     // silent pass or an infinite spin) — if six racers under
     // kMaxSchedulingAttempts tries never once produce a genuine CAS loser,
     // that is itself worth investigating, not something to retry away.
+    //
+    // Widened from 5 (#3475): a heavily-loaded runner can make the "every
+    // racer's get_root() lands after the winner already committed" outcome
+    // land 5 times in a row — PgPool is lazily-connecting (no eager warm-up
+    // in its constructor), so most racers' first real work after thread
+    // creation is its own connect+query round trip (the CaStore constructor
+    // primes one connection into the pool before racers spawn, so one racer
+    // gets an instant idle-pool hit instead), and under contention
+    // that stagger dominates over pure CPU scheduling. A start barrier was
+    // tried and measured WORSE under load on this box (13/15 failures vs.
+    // baseline's occasional single miss) — it synchronizes thread launch,
+    // not the connection/keygen work after it, and forcing 6 threads to
+    // begin their CPU-heavy P-384 keygen simultaneously adds contention at
+    // the worst possible moment. Pure margin, not a mechanism claim.
     constexpr int kRacers = 6;
-    constexpr int kMaxSchedulingAttempts = 5;
+    constexpr int kMaxSchedulingAttempts = 15;
     for (int attempt = 0;; ++attempt) {
         INFO("scheduling attempt " << attempt << ": did every racer's get_root() land after "
              "the winner already committed? (legitimate, just doesn't exercise this fix's "
