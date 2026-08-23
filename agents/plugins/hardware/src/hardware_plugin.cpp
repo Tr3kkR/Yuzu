@@ -62,7 +62,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <wmi_bounded.hpp> // shared bounded WMI query helper (#3404 -- kills Next(WBEM_INFINITE); pulls in comdef.h/wbemidl.h)
+#include <wmi_bounded.hpp> // shared bounded WMI query helper (#3404 -- kills the old unbounded Next() enumerator wait; pulls in comdef.h/wbemidl.h)
 #pragma comment(lib, "wbemuuid.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
@@ -142,7 +142,7 @@ std::string io_registry_cf_string(io_object_t entry, CFStringRef key) {
 #ifdef _WIN32
 // #3404: this plugin's own WMI enumeration now rides the shared bounded
 // helper (agents/shared/wmi_bounded.hpp, PR3.3-a) instead of a private
-// Next(WBEM_INFINITE, ...) loop -- a wedged/slow WMI provider used to hang
+// unbounded-wait enumerator loop -- a wedged/slow WMI provider used to hang
 // this plugin indefinitely; every query below now bounds the per-Next wait,
 // the whole enumeration, and the row count (BoundedQueryOptions defaults).
 namespace wmi = yuzu::shared::wmi;
