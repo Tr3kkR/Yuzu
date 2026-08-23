@@ -715,6 +715,21 @@ public:
                           "kMcpSubmitterPendingCap 25-slot cap: a ticket leaves the pending "
                           "bucket at admin-approval time, before it can ever reach this class",
                           "counter");
+        // #3344: poll-rate signal for the three success-shaped result-poll
+        // tools, so the named retry_after_ms floors (mcp_retry.hpp) can be
+        // data-tuned instead of ossifying as guessed constants. not_ready:
+        // the response carried a retry_after_ms hint (execution non-terminal,
+        // bundle incomplete, or query_responses rows still in flight); ready:
+        // served terminal/complete without one. Excludes pre-verdict denials
+        // (tier/permission/invalid-params/not-found) — those are already
+        // visible via the denial counters and A4 envelopes above. Both labels
+        // are closed sets (3 tools x 2 results), pre-seeded below.
+        metrics_.describe("yuzu_mcp_poll_total",
+                          "MCP result-poll tool calls by verdict (get_execution_status, "
+                          "query_responses, get_bundle_result). not_ready: the success payload "
+                          "carried a retry_after_ms poll hint; ready: served terminal/complete "
+                          "without one. Excludes pre-verdict denials.",
+                          "counter");
         // Progress bridge core (2f PR 3a). Same closed-set posture: every reject/
         // degrade reason is a static literal inside the bridge, never derived
         // from caller input.
@@ -1044,6 +1059,15 @@ public:
             // pattern instead of introducing an unseeded one.
             metrics_.counter("yuzu_mcp_approval_burned_total",
                              {{"tool", tool}, {"reason", "handler_reject"}});
+        }
+        // #3344: yuzu_mcp_poll_total — the closed set is exactly the three
+        // success-shaped result-poll tools x the two verdicts, so every
+        // combination is pre-seeded here for absent() to stay meaningful.
+        for (const auto tool :
+             {"get_execution_status", "query_responses", "get_bundle_result"}) {
+            for (const auto result : {"ready", "not_ready"}) {
+                metrics_.counter(mcp::kMcpPollTotalMetric, {{"tool", tool}, {"result", result}});
+            }
         }
         // yuzu_mcp_approval_precondition_denied_total's reachable label set is
         // NARROWER than the two above: kPrecondition can only fire for a tool
