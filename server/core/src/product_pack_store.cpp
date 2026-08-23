@@ -52,6 +52,25 @@ constexpr const char* kStoreName = "product_pack_store";
 constexpr std::chrono::milliseconds kReadTimeout{2000};
 constexpr std::chrono::milliseconds kWriteTimeout{4000};
 
+// Gate 8 review of F035 (security-guardian/architect, both BLOCKING; same race RbacStore hit
+// and fixed as HIGH — CHAOS-1, see rbac_store.cpp's kRevokeCoordLockSql comment for the full
+// mechanism): without this, migrate_from_sqlite's tombstone check
+// (SELECT ... deleted_pack_ids) and its subsequent pack INSERT are two separate READ COMMITTED
+// statement snapshots — a concurrent uninstall() that commits its DELETE + tombstone INSERT in
+// the window between them is invisible to the already-taken SELECT snapshot, so the pack
+// resurrects despite the tombstone existing right next to it. Serializes every writer of the
+// erasure/backfill pair (uninstall()'s delete+tombstone, migrate_from_sqlite's
+// check-then-insert) against each other. MUST be acquired in its own statement, strictly
+// BEFORE the statement that checks-and-mutates — embedding it in the same statement does NOT
+// work (a single statement's snapshot is fixed before any of its own function calls run, incl.
+// a blocking pg_advisory_xact_lock). Coarse-grained (one fixed key, not per-pack-id): product
+// pack install/uninstall is operator-driven content-catalog management, never a hot path, so
+// store-wide serialization is cheap — same reasoning as RbacStore's coordination lock. Two-int32
+// form + the "yuzu" namespace constant matches house convention (pg_migration_runner.cpp,
+// auth_db.cpp, secret_codec.cpp, kek_op_lock.hpp, rbac_store.cpp).
+constexpr const char* kErasureCoordLockSql =
+    "SELECT pg_advisory_xact_lock(2037545589, hashtext('product_pack_store:erasure_coordination'))";
+
 // Preserves the pre-migration SQLite behavior ("generous default, effectively no hard cap") in
 // a form Postgres accepts — SQLite treats a non-positive LIMIT as "no limit"; Postgres errors on
 // a negative LIMIT. A hostile `?limit=-1` must clamp to the default, never surface as a 503.
@@ -553,6 +572,27 @@ ProductPackStore::ProductPackStore(pg::PgPool& pool) : pool_(pool) {
                       "disabled");
         return;
     }
+    // Gate 8 review of F035 (cpp-expert/sre, both MEDIUM): a second, independent line of
+    // defence behind the migration runner's own version guard (ApiTokenStore's #3013/#2964
+    // precedent — see its constructor comment for the full mechanism). `deleted_pack_ids` was
+    // folded into migration v1 rather than shipped as v2 (this store is unshipped — no v1 has
+    // ever been recorded against a live database by an earlier binary). If that assumption is
+    // ever wrong for a given database (e.g. a persistent dev/CI Postgres instance that already
+    // ran a pre-fix build of this branch's v1), the runner sees version 1 already applied and
+    // silently skips it, leaving `deleted_pack_ids` missing — this table-presence smoke-read
+    // catches that and fails CLOSED (ADR-0012 §1) rather than surfacing as a raw "relation does
+    // not exist" on the first uninstall()/migrate_from_sqlite call.
+    pg::PgResult smoke = pg::exec_params(
+        lease.get(), "SELECT 1 FROM product_pack_store.deleted_pack_ids LIMIT 0",
+        std::vector<std::string>{});
+    if (smoke.status() != PGRES_TUPLES_OK) {
+        spdlog::error(
+            "ProductPackStore: post-migration smoke-read of deleted_pack_ids failed ({}) — the "
+            "migration runner reported success but the schema this code expects is not "
+            "actually present — refusing to open (ADR-0012 §1 fail-closed)",
+            PQerrorMessage(lease.get()));
+        return;
+    }
     open_ = true;
 }
 
@@ -805,6 +845,15 @@ bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
     // closed).
     std::unordered_set<std::string> tombstoned_ids;
     bool ok = pool_.with_txn([&](PGconn* conn) -> bool {
+        // MUST be the first statement in this transaction — see kErasureCoordLockSql's comment.
+        // Without this, a concurrent uninstall() committing between one pack's tombstone check
+        // (below) and its INSERT is invisible to the check's already-taken snapshot.
+        pg::PgResult lk = pg::exec_params(conn, kErasureCoordLockSql, std::vector<std::string>{});
+        if (lk.status() != PGRES_TUPLES_OK) {
+            failure_detail = std::format("erasure-coordination lock: {}", PQerrorMessage(conn));
+            spdlog::error("ProductPackStore::migrate_from_sqlite: {}", failure_detail);
+            return false;
+        }
         for (const auto& p : legacy_packs) {
             pg::PgResult tomb = pg::exec_params(
                 conn, "SELECT 1 FROM product_pack_store.deleted_pack_ids WHERE pack_id = $1",
@@ -1290,6 +1339,10 @@ std::expected<void, std::string> ProductPackStore::uninstall(const std::string& 
     }
 
     bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        // MUST be the first statement in this transaction — see kErasureCoordLockSql's comment.
+        pg::PgResult lk = pg::exec_params(conn, kErasureCoordLockSql, std::vector<std::string>{});
+        if (lk.status() != PGRES_TUPLES_OK)
+            return false;
         pg::PgResult di = pg::exec_params(
             conn, "DELETE FROM product_pack_store.product_pack_items WHERE pack_id = $1",
             std::vector<std::string>{id});

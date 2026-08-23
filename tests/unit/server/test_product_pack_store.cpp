@@ -27,6 +27,7 @@
 
 #include "product_pack_store.hpp"
 
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "sqlite_raii.hpp"
@@ -43,10 +44,12 @@
 #include <libpq-fe.h>
 #include <sqlite3.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <format>
+#include <thread>
 #include <memory>
 #include <string>
 #include <tuple>
@@ -59,6 +62,7 @@ using yuzu::server::ProductPackStore;
 using yuzu::server::SqliteDb;
 using yuzu::server::SqliteStmt;
 using yuzu::server::WorkflowRoutes;
+namespace pg = yuzu::server::pg;
 using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
 using yuzu::server::pg::PgResult;
@@ -865,6 +869,120 @@ TEST_CASE("ProductPackStore::migrate_from_sqlite: an uninstalled pack is never r
     auto legit2 = store.get("legit-new-pack-2");
     REQUIRE(legit2.has_value());
     REQUIRE(legit2->has_value());
+}
+
+// Gate 8 review of F035 (security-guardian/architect, both BLOCKING — same race RbacStore hit
+// and fixed as HIGH, CHAOS-1; see test_rbac_store.cpp's identical-shaped test and
+// kErasureCoordLockSql's comment in product_pack_store.cpp for the full mechanism): without the
+// coordination lock, migrate_from_sqlite's tombstone check and its pack INSERT are two separate
+// READ COMMITTED statement snapshots — a concurrent uninstall() that commits its delete +
+// tombstone in the window between them would be invisible to the already-taken SELECT snapshot,
+// resurrecting the pack despite the tombstone existing right next to it.
+TEST_CASE("ProductPackStore::migrate_from_sqlite cannot resurrect a pack mid-uninstall "
+          "(erasure-coordination lock)",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    auto installed = store.install(kUnsignedPackYaml, make_accept_all_install_fn());
+    REQUIRE(installed.has_value());
+    const std::string ghost_id = *installed;
+
+    // A legacy file naming this still-installed pack, as migrate_from_sqlite will see it if it
+    // races a concurrent, not-yet-committed uninstall() of the same id.
+    yuzu::test::TempDbFile legacy_race{std::string_view{"pack-legacy-race-"}};
+    {
+        SqliteDb legacy_db;
+        REQUIRE(sqlite3_open_v2(legacy_race.path.string().c_str(), legacy_db.addr(),
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+        legacy_exec(legacy_db.get(),
+                    "CREATE TABLE product_packs (id TEXT PRIMARY KEY, name TEXT NOT NULL, "
+                    "version TEXT NOT NULL DEFAULT '1.0.0', description TEXT NOT NULL DEFAULT "
+                    "'', yaml_source TEXT NOT NULL, installed_at INTEGER NOT NULL DEFAULT 0, "
+                    "verified INTEGER NOT NULL DEFAULT 0);");
+        legacy_exec(legacy_db.get(),
+                    "CREATE TABLE product_pack_items (pack_id TEXT NOT NULL, kind TEXT NOT "
+                    "NULL, item_id TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', yaml_source "
+                    "TEXT NOT NULL DEFAULT '', PRIMARY KEY (pack_id, item_id));");
+        legacy_exec(legacy_db.get(),
+                    std::format("INSERT INTO product_packs VALUES ('{}', 'test-unsigned', "
+                                "'1.0.0', 'racing uninstall', 'kind: ProductPack', 1700000000, "
+                                "0);",
+                                ghost_id)
+                        .c_str());
+    }
+
+    // Connection A: hand-built SQL replicating uninstall()'s exact write sequence (lock, delete
+    // items, delete pack, insert tombstone) — held UNCOMMITTED, simulating uninstall()'s
+    // in-flight transaction racing a concurrent migrate_from_sqlite boot on another connection.
+    auto lease_a = pool.acquire();
+    REQUIRE(lease_a);
+    REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "SELECT pg_advisory_xact_lock(2037545589, "
+                            "hashtext('product_pack_store:erasure_coordination'))",
+                            std::vector<std::string>{})
+                .ok());
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "DELETE FROM product_pack_store.product_pack_items WHERE pack_id = $1",
+                            std::vector<std::string>{ghost_id})
+                .ok());
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "DELETE FROM product_pack_store.product_packs WHERE id = $1",
+                            std::vector<std::string>{ghost_id})
+                .ok());
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "INSERT INTO product_pack_store.deleted_pack_ids (pack_id, "
+                            "deleted_at) VALUES ($1, $2::bigint) ON CONFLICT (pack_id) DO "
+                            "NOTHING",
+                            std::vector<std::string>{ghost_id, "1700000099"})
+                .ok());
+
+    // Connection B, on a separate thread: the REAL migrate_from_sqlite, exercising the actual
+    // production code, not a hand-copy. Must BLOCK on connection A's held lock, and once
+    // unblocked, must see the tombstone A already committed and skip — not resurrect.
+    std::atomic<bool> b_started{false};
+    std::atomic<bool> b_done{false};
+    std::atomic<bool> b_ok{false};
+    std::thread migrate_thread([&] {
+        b_started = true;
+        b_ok = store.migrate_from_sqlite(legacy_race.path);
+        b_done = true;
+    });
+    // cpp-safety (Gate 8): join-on-unwind guard — a REQUIRE between thread construction and the
+    // explicit join() below throws on failure, and a joinable std::thread destroyed mid-unwind
+    // calls std::terminate(). Not safe to detach: the lambda captures store/b_started/b_done/
+    // b_ok BY REFERENCE (stack locals of this TEST_CASE) — a detached thread outliving them
+    // would be a use-after-free. The thread's only blocking wait is the advisory lock, server-
+    // side bounded by the pool's lock/statement timeouts, so join() here cannot hang forever.
+    struct ThreadJoiner {
+        std::thread& t;
+        ~ThreadJoiner() {
+            if (t.joinable())
+                t.join();
+        }
+    } joiner{migrate_thread};
+
+    // Give the migrate thread time to start and genuinely block on connection A's held lock —
+    // proves this is a real blocked-then-unblocked interleaving, not a lucky race.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    CHECK(b_started.load());
+    CHECK_FALSE(b_done.load());
+
+    const bool commit_ok = pg::exec_params(lease_a.get(), "COMMIT", std::vector<std::string>{}).ok();
+    lease_a.reset();
+    migrate_thread.join();
+    CHECK(commit_ok);
+    CHECK(b_done.load());
+    CHECK(b_ok.load());
+
+    // THE FIX: the pack must stay uninstalled — not resurrected by the racing backfill.
+    auto ghost = store.get(ghost_id);
+    REQUIRE(ghost.has_value());
+    CHECK_FALSE(ghost->has_value());
 }
 
 // H2 net (governance-pattern regression, matches ResultSetStore/LicenseStore's own mid-scan

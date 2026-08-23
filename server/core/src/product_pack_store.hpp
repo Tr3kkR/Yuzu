@@ -153,12 +153,24 @@ public:
     /// `verified=0` for that vintage, matching the pre-migration raw-`ALTER TABLE` shim this
     /// migration retires). Returns true (no-op) when `legacy_db_path` does not exist or holds
     /// neither table (fresh install). Opens the legacy file READ-ONLY and never deletes/moves it
-    /// — erasure consistency instead runs through `deleted_pack_ids` (ADR-0009): every legacy
-    /// pack id is checked against that table before being treated as fresh content, so a
-    /// redeployed/stale-image replica's own untouched legacy file can never resurrect a pack
-    /// this store has already reported erased via `uninstall()`. This runs on EVERY boot whose
-    /// legacy file content-fingerprint hasn't been seen before, not just the fleet's first
-    /// migration — see the fingerprint-marker check below.
+    /// — erasure consistency for THIS PATH instead runs through `deleted_pack_ids`: every legacy
+    /// pack id is checked against that table (under the same coordination lock `uninstall()`
+    /// takes — `kErasureCoordLockSql` — closing the check-then-insert race a concurrent
+    /// `uninstall()` would otherwise win) before being treated as fresh content, so a
+    /// redeployed/stale-image replica's own untouched legacy file cannot resurrect a pack this
+    /// store has already reported erased INTO POSTGRES via `uninstall()`. This runs on EVERY
+    /// boot whose legacy file content-fingerprint hasn't been seen before, not just the fleet's
+    /// first migration — see the fingerprint-marker check below.
+    ///
+    /// SCOPE, per Gate 8 review of F035 (docs-writer/architect/cpp-expert, all BLOCKING — self-
+    /// authored "now SATISFIED" ledger claim correctly rejected, pending adjudication): this
+    /// closes the cross-replica/redeployed-replica hazard only. ADR-0009's Decision section
+    /// separately requires a wired erasure path to "delete the same subject/device from the
+    /// rollback copy" — i.e. the retained legacy SQLite file itself — so that an operator who
+    /// rolls the server binary BACK to the pre-migration release (which reads this file directly
+    /// and has no knowledge Postgres or `deleted_pack_ids` exist) cannot see an uninstalled pack
+    /// reappear. This method does not implement that half of the clause; the legacy file is
+    /// never mutated. Tracked pending adjudication — see the F035 ledger rows.
     [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
     /// When true, packs WITHOUT a `signature` field are rejected at install time. Packs with a
@@ -213,8 +225,9 @@ public:
     std::expected<std::optional<ProductPack>, std::string> get(const std::string& id);
 
     /// Uninstall a product pack, removing all contained items via uninstall_fn. Stamps `id` into
-    /// `deleted_pack_ids` in the SAME transaction as the metadata delete (ADR-0009 erasure
-    /// consistency — see `migrate_from_sqlite`'s doc comment).
+    /// `deleted_pack_ids` in the SAME transaction as the metadata delete, under
+    /// `kErasureCoordLockSql` (ADR-0009 erasure consistency — see `migrate_from_sqlite`'s doc
+    /// comment for the full mechanism and its scope).
     /// `unexpected("not_found: ...")` when no pack with this id exists; any other
     /// `unexpected(msg)` (prefixed `kProductPackDbErrorPrefix`) is a genuine failure.
     std::expected<void, std::string> uninstall(const std::string& id, ItemUninstallFn uninstall_fn);
