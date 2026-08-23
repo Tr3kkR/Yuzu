@@ -16,10 +16,12 @@
 # its dominant contention was meson fanning every pg shard out at once inside a
 # single job (proved via back-computed shard start times landing within ~0.01s
 # of each other), not primarily cross-job like Wee Tam. A prior version of this
-# comment claimed Linux "scales flat" and needed neither gate — false: shards
-# E/G were clipping their 600s meson timeout dead-on with zero margin. A Linux
-# cross-job gate via this same script is a candidate fast-follow if within-job
-# capping alone proves insufficient.
+# comment claimed Linux "scales flat" and needed neither gate — false: shard E
+# clipped its 600s meson timeout dead-on under this same fan-out before its
+# 2026-08-19 E->E+G split (#3322), and the post-split pair still ran at
+# 88-94% of that ceiling as recently as this week. A Linux cross-job gate via
+# this same script is a candidate fast-follow if within-job capping alone
+# proves insufficient — tracked in #3443.
 # Full diagnosis: docs/ci-architecture.md + the tests/meson.build server-shard
 # comment.
 #

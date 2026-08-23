@@ -764,23 +764,31 @@ jobs:
 
       - name: Test
         # --num-processes 2: without a cap, meson fans every test() entry out at
-        # once (CPU-count parallelism, ~16 logical here), so the ~8 server pg
-        # shards — each a solo 90-600s — run CONCURRENTLY inside this one job,
-        # sharing this runner's 16 logical CPUs (one CCD, docs/ci-architecture.md
-        # "Linux CI runners") AND the one ensure-postgres.sh container this job
-        # got. Proved via back-computed shard start times (printed-timestamp minus
+        # once — its default worker count is an uncapped, non-affinity-aware
+        # cpu_count() (this runner's job is genuinely confined to execute on 16
+        # logical CPUs via cgroup, "Self-hosted runner topology" in
+        # docs/ci-architecture.md, but meson's own pool sizing ignores that) — so
+        # the ~8 server pg shards ran CONCURRENTLY inside this one job, sharing
+        # those 16 CPUs AND the one ensure-postgres.sh container this job got.
+        # Proved via back-computed shard start times (printed-timestamp minus
         # elapsed) landing within ~0.01s of each other across every pg shard in a
-        # failing run. Shards E/G's `timeout: 600` (tests/meson.build) is a hard
-        # per-test kwarg, not the job budget — they were clipping it dead-on
-        # (600.5-600.6s) with zero margin even before #3434's A->A+H split, so
-        # the box was never actually "scaling flat" (see the now-corrected claim
-        # in docs/ci-architecture.md + this step's Windows counterpart below).
-        # 2, not a higher number: E/G have no measured margin to spend, and this
-        # mirrors the Windows Test step's already-proven `--num-processes 2`
-        # rather than guessing at a bigger one. A box-wide cross-job gate
-        # (with-test-slot.sh, Windows-only today) is a candidate fast-follow if
-        # per-job capping alone isn't enough — not bundled here without its own
-        # measurement.
+        # failing run. Each pg shard's `timeout: 600` (tests/meson.build) is a
+        # hard per-test kwarg, not the job budget: shard E hit it dead-on
+        # (600.11-600.60s) repeatedly under this same uncapped fan-out before the
+        # 2026-08-19 E->E+G split (#3322), and the post-split E/G pair was still
+        # measured at 88-94% of that ceiling as recently as this week — so the
+        # box was never actually "scaling flat" (see the now-corrected claim in
+        # docs/ci-architecture.md's "Linux within-job concurrency cap" section +
+        # this step's Windows counterpart below). Solo/uncontended per-shard cost
+        # is much lower — tests/meson.build's own recorded numbers run ~50-180s —
+        # the ~600s figures are what full concurrent contention produces, not a
+        # shard's own baseline.
+        # 2, not a higher number: E/G have no measured margin to spend on a
+        # guess, and this mirrors the Windows Test step's already-proven
+        # `--num-processes 2` rather than deriving a Linux-specific value. A
+        # box-wide cross-job gate (with-test-slot.sh, Windows-only today) is a
+        # candidate fast-follow if per-job capping alone isn't enough — tracked
+        # in #3443, not bundled here without its own measurement.
         run: python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2
 
       # Break-glass MFA-reset CLI contract (#1226) — exit codes + JSON output of
@@ -1154,13 +1162,13 @@ jobs:
           # the server/tar suites into their timeouts (measured server ~[pg]:
           # c0 289s -> c4 603s). with-test-slot.sh caps concurrent heavy test
           # phases to 2 per box (crash-safe flock; build stays 4-wide), and
-          # --num-processes 2 caps meson's own fan-out so the two ~400-600s server
+          # --num-processes 2 caps meson's own fan-out so the ~8 server pg
           # shards don't pile onto one CCD+cluster. with-test-slot.sh (the
           # cross-job piece) is Windows-only — Linux's own within-job fan-out gets
           # the same --num-processes 2 cap on its Test step above; it was never
           # actually scaling flat (docs/ci-architecture.md, tests/meson.build
           # server-shard comment). A Linux cross-job gate is a candidate
-          # fast-follow, not shipped here.
+          # fast-follow tracked in #3443, not shipped here.
           bash scripts/ci/with-test-slot.sh 2 -- \
             python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2
 
