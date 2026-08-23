@@ -1807,6 +1807,105 @@ the device page) shows the same tags as before the upgrade, and
 outcome (alert `YuzuTagStoreBackfillNotCompleted` keys on the ABSENCE of a
 success/fresh sample — a refused boot never serves `/metrics` at all).
 
+## ⚠️ Behaviour change: quarantine is now enforced at instruction dispatch (#881, #3127)
+
+Quarantine previously isolated a device's network without stopping the control plane from
+sending it commands. This release closes that, and separately removes two paths on which the
+MCP `quarantine_device` tool claimed an isolation it had not achieved. Read this before
+upgrading a deployment that quarantines devices — the alert-rule item needs operator action.
+
+The agent-side plugin containment fixes (IPv6 coverage, and honest reporting on all three
+platforms) ship separately and have their own upgrade note.
+
+### A quarantined device is now refused at dispatch (#881)
+
+Quarantine previously isolated a device's network without stopping the control plane from
+sending it commands: the feature was enforced at the endpoint and nowhere else. Instruction
+dispatch now consults containment state at the server's single dispatch chokepoint, and a
+quarantined device is dropped from **every** targeting arm — by id, by scope, by management
+group, and by broadcast — before the command reaches the agent.
+
+- Denials increment `yuzu_server_dispatch_target_rejected_total{reason="quarantined"}` and write
+  a `quarantine.dispatch_denied` audit row (`result=denied`).
+- **The quarantine plugin's own four actions are exempt** — `quarantine`, `unquarantine`,
+  `status`, `whitelist` — so release stays reachable on a contained host. The exemption is keyed
+  on the action, not the plugin, so a future fifth action arrives gated rather than inheriting the
+  bypass.
+- **Three server-internal pushes are also exempt** — `tar.fleet_snapshot`, `__guard__.push_rules`
+  and `asset_tags.sync`. These are the server keeping its own state coherent, not operator
+  dispatch, and gating the Guardian push would stop a contained device receiving the enforcement
+  rules that make containment meaningful. If your threat model treats quarantine as a total
+  boundary, note that it is not: those three channels stay open. They are a closed set in code and
+  are counted by `yuzu_server_system_reserved_push_total{capability,result}` — counted, not
+  per-event audited: there is no row tying a particular push to a particular contained
+  device, so this is a fleet-level signal rather than per-device evidence. Nothing outside that
+  set and the plugin's own four actions reaches a quarantined device.
+- **Operator-visible:** automation that dispatched to quarantined devices and appeared to succeed
+  will now receive denials. That is the correction, not a regression — those commands were never
+  going to be safe to run on a device you had isolated.
+
+**Fail-closed under a degraded store.** If containment state cannot be read, the server serves a
+last-known-good snapshot for up to **60 seconds**; past that, or when the store is durably
+unavailable, dispatch **fails closed and refuses every target fleet-wide** rather than guess who
+is contained. A background refresher re-reads containment state every 20 seconds, so the snapshot
+is warm even on a server with no operator traffic — without it the budget would only have
+absorbed anything on a busy server, which is not when you need it.
+
+**The snapshot window cuts both ways, and the other direction is the quieter one.** While a
+stale snapshot is being served, a device quarantined *after* that snapshot was taken is absent
+from it — so dispatch to that device is **permitted**, and audited as an ordinary success. For
+up to the snapshot's remaining budget, containment does not hold for a freshly-quarantined
+device. The refresher bounds that window to roughly the refresh interval in the common case, and
+`YuzuQuarantineGateServingStaleState` alerts on it; if you quarantine a device while
+`yuzu_server_quarantine_read_degrade_total` is non-zero, confirm with `quarantine.status`
+rather than assuming the dispatch gate is already holding.
+
+**There is no operator override.** The 60-second budget is a fixed bound, not a tunable, and
+there is no flag to disable enforcement — a knob that let an operator turn the gate off under
+pressure would be the first thing reached for during exactly the incident it exists for. What
+survives a store outage regardless: the quarantine plugin's own four actions (they never read the
+store), and the three server-internal pushes below. So containment, release and whitelist repair
+all remain possible while the store is down; what stops is other operator dispatch. Alert on `yuzu_server_quarantine_gate_total{outcome="fail_closed"}` — it means
+instruction dispatch has stopped, and it is an outage signal rather than a quarantine one. All four `outcome` values are pre-seeded at boot, so a **zero is a measurement** rather than an absent series — you can alert on `fail_closed` before it has ever fired. Absence of the family then means the server is not exporting it at all (an older build, or a scrape that is failing), not that the gate is idle: a booted server publishes all four from boot whether or not any dispatch has happened yet.
+
+**Alert-rule change (action may be required).** `YuzuDispatchTargetRejected` now excludes
+`reason="quarantined"`. Without that exclusion, correct enforcement fires the alert: any looping
+automation against one contained host clears its `>3/15m` threshold, and a fail-closed episode
+increments by the whole fleet at once. If you maintain a fork of `docs/prometheus/yuzu-alerts.yml`,
+apply the same exclusion — otherwise the rule gets silenced and the genuine #2500 near-miss signal
+goes with it.
+
+### MCP `quarantine_device` no longer reports phantom isolation (#3127)
+
+Two independent bugs made the tool claim containment it had not achieved. Both are fixed, and
+both are **wire-visible to an MCP client**:
+
+- `agents_reached=0` (the agent was offline) or a dispatch that threw previously returned a
+  success envelope. It now answers `-32603` — *"quarantine recorded but isolation was not
+  confirmed"* — with `retry_after_ms: 5000` on a first failure. A **repeat** failure against a device that already
+  has a record backs off to `60000`: the device is offline rather than busy, and nothing changes
+  until it reconnects. Note what the server does *not* do — there is no hook that re-applies the
+  endpoint firewall on reconnect, so a device quarantined while offline is contained at the control
+  plane (dispatch to it is refused) but **not** at its own firewall until a quarantine dispatch
+  actually reaches it. Re-issue once it is back. **The record still persists**; retry the same call to
+  re-drive dispatch.
+- An **already-quarantined** device was a terminal error. It is now a retryable re-dispatch
+  against the **stored** `reason`/`whitelist`, not the retry's own arguments — a retry cannot
+  silently rewrite a contained device's allow-list with no store update and no audit trail.
+
+`dispatch_confirmed:true` means the plugin registry **accepted the frame**, never that the device
+is provably isolated (for a gateway-attached agent the frame is only queued). Confirming
+containment still requires a follow-up `status` read returning `state|active`.
+
+**Note the REST twin has diverged on one case.** `POST /api/v1/quarantine` records only — it has
+never dispatched — so it still answers `400` on an already-quarantined device: there is nothing
+for it to re-drive. The `400`-vs-`503` split is otherwise unchanged.
+
+### No migration, no schema change
+
+Rollback is data-safe. A mixed fleet is safe: the dispatch gate is server-side and applies
+regardless of agent version.
+
 ## Upgrade Order
 
 Always upgrade in this order:

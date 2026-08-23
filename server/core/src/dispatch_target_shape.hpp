@@ -149,6 +149,19 @@ inline constexpr std::array<std::string_view, 5> kRouteRejectReasons{
     kReasonScopeUnsupported, ///< the route cannot honour `scope` and refuses it
 };
 
+/// #881: a target the caller was AUTHORISED to reach (it survived the
+/// #1788 visible-set intersection) but was withheld by the quarantine
+/// dispatch gate (`dispatch_confined_arms.hpp`). Deliberately NOT a member
+/// of either array above: it is not a targeting-SHAPE violation
+/// (`kTargetingShapeReasons` — the request named nothing reachable) and not
+/// one of the specific route-owned shapes `kRouteRejectReasons` binds by
+/// test (`test_dispatch_target_shape.cpp` hand-lists exactly five, and this
+/// reason is emitted from the shared dispatch chokepoint, not a route body
+/// check). It reuses the same `yuzu_server_dispatch_target_rejected_total`
+/// series its siblings use rather than mint a fourth metric for a third
+/// kind of refusal.
+inline constexpr std::string_view kReasonQuarantined{"quarantined"};
+
 /// Reject a targeting argument that was SUPPLIED but names nothing.
 ///
 /// Both the type and the emptiness arms matter for the same reason: a handler

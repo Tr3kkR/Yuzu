@@ -283,6 +283,8 @@ agent_test_exe = executable(
     'unit/test_event_logs_macos.cpp',         # BR-08: pure `log show` SubprocessResult classifier
     'unit/test_users_macos_last.cpp',         # qe-M1: pure `last -y` timestamp/weekday parsers
     'unit/test_user_profile_model.cpp',       # PR1.7: pure ProfileList/HKU model (runs on every host)
+    'unit/test_value_enumeration.cpp',        # Wave 3 gate-2 remediation: pure registry-enumeration
+                                                # completeness decision (runs on every host)
     'unit/test_registry_local_dispatcher.cpp', # PR1.7 remediation fix #3: real registry.dll driven
                                                 # end to end via LocalDispatcher (Windows-only; a no-op
                                                 # TU elsewhere via the file's own #ifdef _WIN32 guard)
@@ -322,6 +324,19 @@ agent_test_exe = executable(
                                                 # hardware.dylib/device_identity.dylib driven end to end
                                                 # via LocalDispatcher (macOS-only; a no-op TU elsewhere
                                                 # via the file's own #if defined(__APPLE__) guard)
+    'unit/test_windows_updates_parsers.cpp',  # Wave 3: pure installed/missing parse+format helpers
+    'unit/test_windows_updates_posix_actions.cpp', # Wave 3 PR33d remediation: real windows_updates.dylib/.so driven (Linux/macOS)
+    'unit/test_windows_updates_win_actions.cpp',   # Wave 3 PR33d remediation: real windows_updates.dll driven (Windows WMI)
+    'unit/test_sccm_parsers.cpp',             # Wave 3 PR33d: pure SCM-status mirror + real authority-key/IDispatch decision logic
+    'unit/test_sccm_win_actions.cpp',         # Wave 3 PR33d remediation: real sccm.dll driven (Windows SCM/COM)
+    'unit/test_bitlocker_windows_wmi.cpp',    # Wave 3: pure WMI-row -> BitLocker output-row mapping
+    'unit/test_bitlocker_linux_parsers.cpp',  # Wave 3: pure dm-crypt uuid / LUKS state parser
+    'unit/test_antivirus_local_dispatcher.cpp', # Wave 3 gate remediation: real antivirus.dll driven
+                                                # end to end via LocalDispatcher (Windows-only; a no-op
+                                                # TU elsewhere via the file's own #ifdef _WIN32 guard)
+    'unit/test_bitlocker_local_dispatcher.cpp', # Wave 3 gate remediation: real bitlocker.dll driven
+                                                # end to end via LocalDispatcher (Windows-only; a no-op
+                                                # TU elsewhere via the file's own #ifdef _WIN32 guard)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -337,7 +352,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/hardware/src'),  # hardware_disks_macos.hpp (pure parser, PR1.8)
     include_directories('../agents/plugins/services/src'),      # services_macos_launchd.hpp (P8 test)
     include_directories('../agents/plugins/msi_packages/src'),  # msi_packages_macos.hpp (P8 test)
-    include_directories('../agents/plugins/bitlocker/src'),     # bitlocker_macos_apfs.hpp (P8 test)
+    include_directories('../agents/plugins/bitlocker/src'),     # bitlocker_macos_apfs.hpp (P8 test); Wave 3: bitlocker_windows_wmi.hpp, bitlocker_linux_parsers.hpp
     include_directories('../agents/plugins/filesystem/src'),    # filesystem_macos_sig.hpp (#2273/1.14)
     include_directories('../agents/plugins/event_logs/src'),    # event_logs_macos.hpp (BR-08)
     include_directories('../agents/plugins/certificates/src'),  # certificates_macos_parsers.hpp (Gate-7 FIX A: pure helpers shared with the plugin)
@@ -349,6 +364,8 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/discovery/src'),      # discovery_parsers.hpp (Wave 2 WP-C pure parser)
     include_directories('../agents/plugins/os_info/src'),        # os_info_macos.hpp (Wave 3 PR3.1 pure plist parser)
     include_directories('../agents/plugins/device_identity/src'), # device_identity_macos.hpp (Wave 3 PR3.2 pure parser)
+    include_directories('../agents/plugins/windows_updates/src'), # windows_updates_parsers.hpp (Wave 3 pure parser)
+    include_directories('../agents/plugins/sccm/src'),           # sccm_parsers.hpp (Wave 3 PR33d pure parser)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
@@ -376,10 +393,14 @@ agent_test_exe = executable(
   # hardware_plugin_lib / device_identity_plugin_lib (agents/plugins/{hardware,device_identity}/meson.build):
   # test_hardware_device_identity_posix_actions.cpp loads both real plugins by
   # path for the identical reason (Wave 3 PR3.2 gate-1 remediation).
+  # windows_updates_plugin_lib / sccm_plugin_lib: same reasoning for
+  # test_windows_updates_{posix,win}_actions.cpp / test_sccm_win_actions.cpp
+  # (Wave 3 PR33d code-review remediation).
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin,
                 users_plugin_lib, os_info_plugin_lib, processes_plugin_lib,
                 network_diag_plugin_lib, ioc_plugin_lib,
-                hardware_plugin_lib, device_identity_plugin_lib],
+                hardware_plugin_lib, device_identity_plugin_lib,
+                windows_updates_plugin_lib, sccm_plugin_lib],
 )
 # Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
 # threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it
@@ -665,6 +686,8 @@ if build_server
       'unit/server/test_rest_access_review.cpp',
       'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
+      'unit/server/test_quarantine_dispatch_decision.cpp', # #3127: pure write/response classification — no Postgres, no MCP transport, no agent
+      'unit/server/test_quarantine_dispatch_gate.cpp',     # #881: containment gate at the dispatch chokepoint — pure arm/degradation logic, no store
       'unit/server/test_result_set_store.cpp',
       'unit/server/test_result_set_matcher.cpp',
       'unit/server/test_rest_result_sets_async.cpp',
