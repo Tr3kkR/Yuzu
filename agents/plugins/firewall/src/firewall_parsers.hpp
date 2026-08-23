@@ -263,12 +263,16 @@ struct IptablesRule {
 // tar_netqual_nstat.hpp's private/unversioned Darwin nstat ABI, the structs
 // below transcribe STABLE, VERSIONED kernel UAPI headers (linux/netlink.h,
 // linux/netfilter/nfnetlink.h, linux/netfilter/nf_tables.h) — confidence is
-// correspondingly higher, but this leg has not been exercised against a live
-// kernel (no Linux host in this sandbox; see the PR notes), so every decode
-// function still degrades honestly (a malformed/unrecognised byte sequence
-// yields an empty result or an "unknown"/`policyN`-shaped fallback string,
-// never a crash or a fabricated value) exactly like this header's other
-// parsers.
+// correspondingly higher, and this leg HAS since been verified against a
+// real kernel (see docs/agent-privilege-model.md's "Verified 2026-08-23"
+// note: correct enumeration of ~50 real rules across ip/ip6/inet on a live
+// host, 129/129 assertions passing). Every decode function still degrades
+// honestly regardless (a malformed/unrecognised byte sequence yields an
+// empty result or an "unknown"/`policyN`-shaped fallback string, never a
+// crash or a fabricated value) exactly like this header's other parsers —
+// that contract is retained for the untested no-CAP_NET_ADMIN denial path
+// and any future malformed-reply case, not dropped now that the happy path
+// is proven.
 //
 // Byte-order note (load-bearing, easy to get backwards): `nlmsghdr`/
 // `nfgenmsg`/`nlattr` HEADER fields are HOST byte order (every supported

@@ -570,11 +570,14 @@ bool try_firewalld_rules(yuzu::CommandContext&) { return false; }
 // a mutating leg needs a separately-approved brokered-elevation design and
 // is out of scope here.
 //
-// Least-certain protocol assumption (flagged, not silently assumed): a
+// Protocol assumption, now confirmed rather than merely asserted: a
 // GETTABLE/GETCHAIN/GETRULE dump with family=NFPROTO_UNSPEC and no further
 // selector attributes enumerates every table/chain/rule across every
 // address family in one pass, mirroring how `nft list ruleset` walks the
-// whole namespace — not exercised against a live kernel in this sandbox.
+// whole namespace — verified 2026-08-23 against a real kernel (see
+// docs/agent-privilege-model.md): correctly returned every ip/ip6/inet
+// table on the test host in one pass each, including a manually-added
+// inet table alongside Docker's own ip/ip6 chains.
 
 constexpr std::uint16_t kNlmFRequest = 0x1;
 constexpr std::uint16_t kNlmFDump = 0x300; // NLM_F_ROOT | NLM_F_MATCH

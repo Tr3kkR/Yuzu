@@ -416,7 +416,7 @@ Plugins for antivirus, firewall, disk encryption, event logs, vulnerability scan
 | Action | Description |
 |---|---|
 | `state` | Whether the firewall is enabled, per profile (domain, private, public on Windows). On macOS, reports the Application Firewall global state (`backend\|appfirewall` + `state\|…`, plus `mode\|block_all` when block-all is set) and a secondary `pf\|<state>` row for the pf packet filter. `state\|unknown` means the check output was unreadable or unrecognised — never assumed safe; `pf\|unknown` is expected on agents not running as root (reading `/dev/pf` needs root) and is not a fault. |
-| `rules` | List firewall rules with direction, action, port, and protocol. |
+| `rules` | List firewall rules with direction, action, port, and protocol. On Linux, the nftables backend (probed before ufw/iptables) reports only base-chain hook/policy and per-rule table/chain/handle — no per-rule action/port/protocol (expression-level decoding is out of scope); the ufw/iptables fallback rows do carry action. |
 
 ### bitlocker
 
