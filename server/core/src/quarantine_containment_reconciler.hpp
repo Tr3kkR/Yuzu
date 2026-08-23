@@ -1,0 +1,202 @@
+#pragma once
+
+/// @file quarantine_containment_reconciler.hpp
+/// #3425: closes the "quarantined while offline, never re-contained on
+/// reconnect" gap. A `QuarantineStore` active record persists across a
+/// device going offline and the #881 dispatch gate keeps refusing operator
+/// commands to it — containment holds at the control plane — but nothing on
+/// the reconnect path re-applies the device's OWN firewall. This component
+/// is that "nothing": it re-drives `redispatch_stored_containment`
+/// (`quarantine_reapply.hpp`) for every active record whose endpoint
+/// containment is not yet confirmed.
+///
+/// Two triggers, one component (mirrors PreflightRunner + the Guardian
+/// heartbeat reconcile, both already in this file's neighborhood):
+///   * `tick()` — a background thread calls this on a cadence (server.cpp).
+///     `AgentRegistry::send_to` silently drops offline agents, so a tick
+///     against a still-offline device costs one cheap skip and naturally
+///     catches a device that reconnected since the last tick.
+///   * `notify_agent_heartbeat()` — wired via
+///     `HeartbeatIngestion::set_quarantine_reconcile_fn` (heartbeat, NOT
+///     `AgentServiceImpl::Register` — Register returns before the Subscribe
+///     stream exists, so `send_to` would silently drop a dispatch fired from
+///     there). Fast path is one mutex-guarded lookup in a cache `tick()`
+///     refreshes; a miss (the overwhelming majority of heartbeats, from
+///     agents with no active record) costs nothing — no store read on the
+///     hot path, and NOTHING on the registration path at all (acceptance
+///     criterion).
+///
+/// Confirmation is a FOLLOW-UP `quarantine.status` read, never inferred from
+/// `agents_reached > 0` (dispatch acceptance is not proof of endpoint
+/// containment — see `quarantine_reapply.hpp`). A previously-CONFIRMED
+/// agent whose live `AgentSession::session_id` changes (a reboot, a service
+/// restart — the firewall rules from before the restart are gone) drops
+/// confirmation and re-verifies via STATUS first, never a blind re-apply,
+/// so a genuinely-still-contained reconnect doesn't needlessly contend with
+/// the agent-side mutation gate (open PR #3429) for no reason.
+///
+/// State: durable across restarts via `QuarantineStore::mark_endpoint_applied`/
+/// `mark_endpoint_confirmed` (schema v2); in-memory (this class) for
+/// per-agent phase/in-flight-command/backoff/confirmed-session bookkeeping —
+/// lost on restart, which costs at most one redundant status verify per
+/// active record (`last_confirmed_at != 0` is available to a future caller
+/// that wants to skip that cost; this component does not read it back today).
+///
+/// Concurrency: `tick()` and `notify_agent_heartbeat()` both funnel into
+/// `reconcile_one()`, which claims a per-agent rate-limit slot UNDER THE
+/// LOCK before any I/O (the Guardian heartbeat reconcile's claim-then-act
+/// shape) — a concurrent tick and heartbeat for the same agent cannot both
+/// dispatch. Store reads/dispatch calls never run WHILE the lock is held
+/// (PolicyEvaluator's rule — dispatch is blocking gRPC).
+///
+/// Multi-replica: `reconcile_one`'s reachability check
+/// (`AgentRegistry::get_session`) naturally partitions reapply work to
+/// whichever replica holds the agent's live Subscribe stream — no
+/// cross-replica coordination needed.
+
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <functional>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+namespace yuzu {
+class MetricsRegistry;
+}
+
+namespace yuzu::server {
+
+/// Closed label set for `yuzu_server_quarantine_reapply_total{result}`,
+/// pre-seeded at boot (server.cpp) so `absent()` on any value can never be
+/// confused with "the reconciler has never ticked" (the `kQuarantineGateOutcomes`
+/// discipline, `dispatch_confined_arms.hpp`). Every value has exactly one
+/// emit site in `quarantine_containment_reconciler.cpp`.
+inline constexpr std::array<std::string_view, 11> kQuarantineReapplyResults{
+    "reapplied",         // an apply or status dispatch was accepted (agents_reached > 0)
+    "confirmed",         // a status read reported state|active
+    "unconfirmed",       // a status read reported anything else recognized (partial/inactive/uncertain/degraded)
+    "busy",              // the plugin's mutation gate answered status|busy
+    "offline",           // no live AgentSession — dispatch skipped entirely
+    "not_reached",       // dispatched but agents_reached==0, or the response never arrived before kResponseWait
+    "rate_limited",      // the per-agent claim was already held
+    "pending",           // an in-flight command is still within its response-wait window
+    "degraded",          // a store/response read failed
+    "validation_failed", // the stored whitelist failed server-edge validation
+    "dispatch_error",    // the dispatch call itself threw
+};
+
+class QuarantineStore;
+class ResponseStore;
+class AuditStore;
+
+namespace detail {
+class AgentRegistry;
+}
+
+class QuarantineContainmentReconciler {
+public:
+    /// Same 6-param shape as the shared `command_dispatch_fn`
+    /// (`server.cpp`) / `PreflightRunner::CommandDispatchFn` — background
+    /// dispatch, no per-caller identity (system-attributed inside the
+    /// wired lambda).
+    using CommandDispatchFn = std::function<std::pair<std::string, int>(
+        const std::string& plugin, const std::string& action,
+        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+        const std::unordered_map<std::string, std::string>& parameters,
+        const std::string& execution_id)>;
+
+    /// Epoch-seconds clock, injectable for tests.
+    using NowFn = std::function<std::int64_t()>;
+
+    struct Deps {
+        QuarantineStore* quarantine_store{nullptr};
+        ResponseStore* response_store{nullptr};
+        detail::AgentRegistry* registry{nullptr};
+        yuzu::MetricsRegistry* metrics{nullptr};
+        AuditStore* audit_store{nullptr}; // nullable — tests may omit
+        CommandDispatchFn dispatch_fn;
+        NowFn now_fn; // unset = system clock
+        // Timing overrides — tests only. Defaults (0) mean "use the
+        // production constant" (kMinReapplyInterval/kResponseWait/
+        // kVerifyGrace below); a non-zero override lets a test drive the
+        // full apply -> poll -> status -> confirm state machine in
+        // milliseconds instead of real minutes without touching production
+        // behavior (every production Deps leaves these at 0).
+        std::chrono::milliseconds min_reapply_interval_override{0};
+        std::chrono::milliseconds response_wait_override{0};
+        std::chrono::milliseconds verify_grace_override{0};
+    };
+
+    explicit QuarantineContainmentReconciler(Deps deps);
+
+    /// One scheduler cycle. Safe to call from a single background thread.
+    /// Lists active records, GCs per-agent state for anything released
+    /// since the last tick, detects session churn on previously-confirmed
+    /// agents, publishes the divergence gauge, refreshes the cache
+    /// `notify_agent_heartbeat` reads, then reconciles up to
+    /// `kMaxDispatchesPerTick` unconfirmed agents.
+    void tick();
+
+    /// Heartbeat fast path: O(1) cache lookup; a miss (no active
+    /// unconfirmed record for this agent) returns immediately with no store
+    /// read. A hit calls `reconcile_one`, which shares the same per-agent
+    /// rate-limit claim as `tick()` so a racing tick cannot double-dispatch.
+    void notify_agent_heartbeat(std::string_view agent_id);
+
+private:
+    enum class Pending { none, apply, status };
+
+    struct AgentState {
+        bool confirmed{false};
+        std::string confirmed_session_id;
+        // Set on session-churn detection (tick()): the next reconcile_one
+        // call verifies via `quarantine.status` before considering a fresh
+        // apply, rather than blindly re-dispatching.
+        bool verify_first{false};
+        Pending pending{Pending::none};
+        std::string pending_command_id;
+        std::chrono::steady_clock::time_point pending_since{};
+        std::chrono::steady_clock::time_point next_eligible_at{};
+        // Zero = "never claimed yet" — reconcile_one initializes it to
+        // min_reapply_interval() on first claim (can't use a class-scope
+        // default member initializer since the interval may be overridden
+        // per-instance via Deps). Milliseconds, not seconds: the test
+        // override in Deps is millisecond-granularity so a test can drive
+        // the state machine in well under a second, and truncating through
+        // seconds here would silently floor any sub-second override to 0.
+        std::chrono::milliseconds backoff{0};
+    };
+
+    // Steady-clock-facing constants, expressed in milliseconds so a test
+    // override (Deps, also milliseconds) composes without a lossy
+    // seconds-truncation step. Production values are unchanged (60s/900s/
+    // 60s/15s) — only the representation is finer-grained.
+    static constexpr std::chrono::milliseconds kMinReapplyInterval{60'000};
+    static constexpr std::chrono::milliseconds kMaxBackoff{900'000};
+    static constexpr std::chrono::milliseconds kResponseWait{60'000};
+    static constexpr std::chrono::milliseconds kVerifyGrace{15'000};
+    static constexpr std::size_t kMaxDispatchesPerTick = 50;
+
+    void reconcile_one(const std::string& agent_id, std::string_view trigger);
+    void count(const char* result) const;
+    void audit_reapply(const std::string& agent_id, const std::string& command_id,
+                       std::string_view trigger) const;
+    void audit_confirmed(const std::string& agent_id, const std::string& command_id) const;
+    [[nodiscard]] std::int64_t now_epoch() const;
+    [[nodiscard]] std::chrono::milliseconds min_reapply_interval() const;
+    [[nodiscard]] std::chrono::milliseconds response_wait() const;
+    [[nodiscard]] std::chrono::milliseconds verify_grace() const;
+
+    Deps d_;
+    std::mutex mu_;
+    std::unordered_map<std::string, AgentState> state_;
+    std::unordered_set<std::string> unconfirmed_cache_; // refreshed by tick(), read by the heartbeat fast path
+};
+
+} // namespace yuzu::server
