@@ -1,7 +1,13 @@
 #pragma once
 
+#include <cctype>
+#include <array>
+#include <chrono>
 #include <functional>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <unordered_set>
 #include <vector>
 
 #include "authz_model.hpp"
@@ -38,6 +44,21 @@
 /// `in_scope`/`filter_to_scope` call is removed. Route-level mocks that merely
 /// observe the VisibleSet being handed over cannot do that (CDX-R8-02) — they
 /// stay green while the intersection is deleted.
+///
+/// #881 — QUARANTINE CONTAINMENT is gated HERE too, for the identical reason
+/// #1788's visible-set intersection is: a per-route quarantine check is how
+/// the next identical defect survives on whichever route is added after this
+/// one. `ContainmentGate` is a SECOND, orthogonal filter applied AFTER the
+/// #1788 intersection and BEFORE the send — authz decides WHO MAY be
+/// targeted, containment decides WHO MAY be REACHED RIGHT NOW, and neither
+/// one substitutes for the other. Every arm applies it, including the
+/// `send_to_all_unfiltered` fast path: an unfiltered caller (`exec_visible ==
+/// nullopt`, e.g. every `system`-caller dispatch) is exactly the caller most
+/// likely to reach a quarantined agent if this gate were route-scoped instead
+/// of chokepoint-scoped, because it is the one path that was never filtered
+/// by anything else. `ContainmentGate::enforced == false` is a pure no-op —
+/// reserved for the quarantine plugin's OWN control channel, so lifting a
+/// quarantine can never be blocked by the quarantine it is lifting.
 namespace yuzu::server {
 
 /// The registry operations the arms need, injected so tests can observe the
@@ -71,68 +92,510 @@ struct ConfinedDispatchTargets {
     const std::vector<std::string>* scope_matched = nullptr;
 };
 
-/// Reach exactly the agents this caller is authorised to reach, and return how
-/// many were actually sent to.
+/// #881: the quarantine dispatch gate for ONE dispatch, built once by
+/// `ServerImpl::make_containment_gate` and threaded through every arm as a
+/// REQUIRED parameter (see `dispatch_confined_arms`'s own parameter comment
+/// for why a default would be exactly the drift this header exists to
+/// prevent).
+///
+/// The id set is held BY VALUE, not by pointer: `dispatch_confined_arms` can
+/// run from a background dispatcher with no request in flight, so a pointer
+/// into the caller's store lock / snapshot state would be a lifetime hazard
+/// the moment that caller's stack frame returns. A `ContainmentGate` is
+/// small and built once per dispatch — copying it is not a per-agent cost.
+struct ContainmentGate {
+    /// NOT DEFAULT-CONSTRUCTIBLE, deliberately.
+    ///
+    /// The permissive state (`enforced == false`) used to be what you got for
+    /// free from `ContainmentGate{}`, which made DISABLING containment the
+    /// syntactically cheapest thing a call site could do. That is the same
+    /// shape as this file's own `nullopt`-vs-present-empty invariant, where the
+    /// unwired value must never be the permissive one — and it was not
+    /// theoretical: replacing `make_containment_gate(plugin)` with
+    /// `ContainmentGate{}` at the confined-dispatch seam turned quarantine
+    /// enforcement off for REST, MCP, dashboard and workflow dispatch while the
+    /// entire suite — 10,454 MCP assertions included — stayed green.
+    ///
+    /// Both states must now be NAMED. `exempt_control_plugin()` says why it is
+    /// permissive; `enforcing()` cannot be built without deciding fail-closed.
+    /// A future call site cannot reach the permissive state by omission.
+    ContainmentGate() = delete;
+
+    ContainmentGate(bool enforced_in, bool fail_closed_in,
+                    std::unordered_set<std::string> quarantined_in)
+        : enforced(enforced_in), fail_closed(fail_closed_in),
+          quarantined(std::move(quarantined_in)) {}
+
+    /// Containment off for this dispatch — a pure no-op on every arm,
+    /// INCLUDING the unfiltered broadcast fast path. Reserved for the
+    /// quarantine plugin's OWN control channel (`is_quarantine_control_plugin`):
+    /// release must never be blocked by the containment it is lifting.
+    [[nodiscard]] static ContainmentGate exempt_control_plugin() {
+        return ContainmentGate{false, false, {}};
+    }
+
+    /// Containment on. `fail_closed` must be decided explicitly — there is no
+    /// default, because "reach nobody" and "reach everyone not quarantined"
+    /// are the two outcomes this type exists to keep apart.
+    [[nodiscard]] static ContainmentGate enforcing(bool fail_closed_in,
+                                                   std::unordered_set<std::string> quarantined_in) {
+        return ContainmentGate{true, fail_closed_in, std::move(quarantined_in)};
+    }
+
+    /// False disables containment entirely for this dispatch. Reserved for the
+    /// quarantine plugin's own control channel — see `exempt_control_plugin()`.
+    bool enforced;
+    /// True means the containment READ degraded past its bounded-staleness
+    /// budget, or the store is durably unavailable — reach NOBODY on every
+    /// arm, including Broadcast, rather than guess who is quarantined. Only
+    /// meaningful when `enforced` is true; see
+    /// `evaluate_quarantine_degradation` for how this is decided.
+    bool fail_closed;
+    /// Currently-quarantined agent ids (a fresh read, or a stale-but-in-
+    /// budget snapshot). Only consulted when `enforced && !fail_closed`.
+    std::unordered_set<std::string> quarantined;
+};
+
+/// Result of a confined dispatch: how many sends succeeded, and — #881 —
+/// which ids were REACHABLE (they survived the #1788 visible-set
+/// intersection) but withheld by the quarantine gate. The distinction
+/// matters for audit: an id absent from both `sent` and `denied_quarantined`
+/// was never authorised to be reached in the first place, which is a
+/// different fact than "authorised, but currently contained".
+///
+/// `denied_quarantined` mirrors the multiplicity of the target list it was
+/// built from — a duplicate id in an explicit `agent_ids` list yields a
+/// duplicate entry here, exactly as it already yields a duplicate count in
+/// `sent` today. Callers that fan this out into audit rows or metric
+/// increments (`ServerImpl::audit_quarantine_dispatch_denied`) inherit that
+/// multiplicity; nothing downstream assumes uniqueness.
+struct ArmDispatchResult {
+    int sent = 0;
+    /// The ids withheld, for the audit rows that name a device. **Empty on a
+    /// fail-closed denial** — see `denied_quarantined_count`.
+    std::vector<std::string> denied_quarantined;
+    /// How many were withheld, always. This is the field to report a COUNT
+    /// from; `denied_quarantined.size()` is not the same number under
+    /// fail-closed, where the ids are deliberately not collected. Two fields
+    /// rather than one because the two consumers want different things — the
+    /// audit path wants identities where they are meaningful, and every
+    /// response body wants a count — and conflating them cost a fleet-sized
+    /// allocation on the dispatch thread during exactly the degradation that
+    /// triggered it.
+    std::size_t denied_quarantined_count = 0;
+};
+
+/// #881: case-insensitive predicate for the quarantine control-channel
+/// exemption. Pure — no store access — so a test can bind it directly without
+/// a live `QuarantineStore`. Normalises to lowercase itself
+/// (`ServerImpl::dispatch_confined` already lowercases the ACTION at its own
+/// call site, never the plugin) so `"Quarantine"`/`"QUARANTINE"` exempt
+/// exactly like `"quarantine"`.
+///
+/// Keyed on the `(plugin, ACTION)` pair against a CLOSED set — not on the
+/// plugin name alone. All four actions the plugin registers today
+/// (quarantine, unquarantine, status, whitelist) are exempt, deliberately:
+/// narrowing it to `unquarantine` alone would break re-isolation (a fresh
+/// `quarantine` action against an already-contained device), whitelist repair
+/// of a contained device's exceptions, and #3127's retry path — all of which
+/// are the plugin managing its OWN containment state, not an operator
+/// reaching a quarantined agent through some other plugin. Keying on the
+/// plugin alone would have let a FIFTH action added later inherit the bypass
+/// silently, with nothing in review to notice; see the closed-set comment in
+/// the body.
+[[nodiscard]] inline bool is_quarantine_control_plugin(std::string_view plugin,
+                                                       std::string_view action) {
+    constexpr std::string_view kQuarantinePlugin{"quarantine"};
+    auto iequals = [](std::string_view a, std::string_view b) {
+        if (a.size() != b.size())
+            return false;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            if (std::tolower(static_cast<unsigned char>(a[i])) != b[i])
+                return false;
+        }
+        return true;
+    };
+    if (!iequals(plugin, kQuarantinePlugin))
+        return false;
+
+    // Keyed on the (plugin, ACTION) pair, not the plugin alone.
+    //
+    // Exempting a whole plugin means a FUTURE action inherits the exemption
+    // silently — the plugin declares exactly four today, and a fifth would
+    // arrive already able to bypass containment with nothing in review to
+    // notice. This set is closed against the plugin's declared actions
+    // (`acts[]` in quarantine_plugin.cpp); anything else is gated.
+    //
+    // Why all four are here rather than release alone: `unquarantine` IS the
+    // release path; `status` is read-only and answering it for a contained host
+    // is the point; `whitelist` is how a management path is repaired, and
+    // gating it would make a host whose whitelist is wrong unrecoverable
+    // remotely — the stranding this control exists to avoid; and `quarantine`
+    // on an already-contained host is the re-dispatch #3127 relies on. An
+    // action NOT on this list gets no exemption even on this plugin.
+    for (const auto allowed : {std::string_view{"quarantine"}, std::string_view{"unquarantine"},
+                               std::string_view{"status"}, std::string_view{"whitelist"}}) {
+        if (iequals(action, allowed))
+            return true;
+    }
+    return false;
+}
+
+/// The bounded-staleness budget (#881 spec item 6): a `nullopt` read served
+/// from the last-known-good snapshot is trusted only while the snapshot is
+/// younger than this. Chosen so a transient Postgres blip (pool-timeout,
+/// brief query error) degrades to "serve slightly-stale containment state"
+/// rather than "every dispatch on the fleet fails closed" — ADR-0012 §1
+/// governs the fail-closed DECISION on unreadable containment state; this is
+/// what keeps that posture from converting a connection-pool hiccup into a
+/// fleet-wide dispatch outage.
+inline constexpr std::chrono::seconds kQuarantineSnapshotMaxAge{60};
+
+/// The last-known-good containment read, held by `ServerImpl` behind its own
+/// mutex (never the store's) and refreshed on every SUCCESSFUL
+/// `list_quarantined()`. `valid == false` means no successful read has ever
+/// landed (e.g. fresh boot before the first dispatch).
+struct QuarantineSnapshot {
+    std::unordered_set<std::string> ids;
+    std::chrono::steady_clock::time_point at{};
+    bool valid = false;
+};
+
+/// Closed outcome-label set for `yuzu_server_quarantine_gate_total{outcome=}`
+/// — spelled once so the emit site can't drift from what a dashboard/alert
+/// expects.
+inline constexpr std::string_view kQuarantineGateOutcomeFresh{"fresh"};
+inline constexpr std::string_view kQuarantineGateOutcomeStale{"stale"};
+inline constexpr std::string_view kQuarantineGateOutcomeFailClosed{"fail_closed"};
+/// The fourth value. It was previously emitted as a bare literal at the
+/// composition site while this block called itself a closed set "spelled once
+/// so the emit site cannot drift" — the drift the constants exist to prevent,
+/// inside the declaration that forbids it.
+inline constexpr std::string_view kQuarantineGateOutcomeExempt{"exempt_control_plugin"};
+
+/// Every label the gate can emit, so the boot pre-seed cannot fall out of step
+/// with the emit sites. A bounded-label counter that is never pre-seeded makes
+/// `absent()` ambiguous between "the gate never blocked" and "the gate never
+/// ran", which is exactly the question a containment alert needs answered.
+inline constexpr std::array<std::string_view, 4> kQuarantineGateOutcomes{
+    kQuarantineGateOutcomeFresh, kQuarantineGateOutcomeStale,
+    kQuarantineGateOutcomeFailClosed, kQuarantineGateOutcomeExempt};
+
+/// #881 / #3402 — the CLOSED set of server-internal pushes that reach an agent
+/// WITHOUT passing through the containment gate above.
+///
+/// These are not operator instruction dispatch. They are the server keeping
+/// its own state coherent: a fleet-topology snapshot request, a Guardian rule
+/// push, an asset-tag sync. Gating them would mean a quarantined device stops
+/// receiving the enforcement rules that make containment meaningful, which
+/// inverts the control — so the bypass is correct. What was NOT correct was
+/// leaving it enforced by a comment at each `registry_.send_to` call site: a
+/// fifth site added later inherits the bypass silently, and the reviewer who
+/// would have caught it has nothing to grep for.
+///
+/// So the bypass is spelled as an ENUM, and `ServerImpl::send_system_reserved`
+/// is the only door. A new internal push cannot compile without adding an
+/// enumerator here — a visible diff in the file that documents the exemption,
+/// next to the rule it is an exemption from. The label doubles as the
+/// `capability` dimension on `yuzu_server_system_reserved_push_total`, so the
+/// pushes that bypass containment are also the pushes an operator can COUNT;
+/// before this they were invisible on every channel.
+/// SCOPE OF THE BYPASS, per enumerator — because "these three are exempt" is
+/// not by itself enough for anyone reviewing the containment surface:
+///   - `tar_fleet_snapshot` requests a READ-ONLY topology snapshot.
+///   - `asset_tags_sync` writes device tags. No execution.
+///   - `guardian_push_rules` delivers Guardian baseline rules the agent may
+///     ENFORCE, and is therefore the one exempt channel that mutates the
+///     endpoint. It is NOT arbitrary command execution: the assertion
+///     vocabulary is a closed five-value set (`AssertionKind` in
+///     agents/core/src/guardian_rule_eval.hpp — file presence, file hash,
+///     registry value, service running, service stopped), and dangerous
+///     registry keys / service names are refused at `dangerous_enforce_in_spec`
+///     before a push is built. So an operator with Guardian deploy rights can
+///     change TYPED, BOUNDED state on a contained device while their
+///     `execute_instruction` is refused — deliberate, since enforcing a
+///     baseline on a compromised host is the point, but it is the enumerator
+///     to think hardest about before adding a sibling.
+enum class SystemReservedPush { tar_fleet_snapshot, guardian_push_rules, asset_tags_sync };
+
+/// Label for one enumerator. A switch with no `default:` so a new enumerator
+/// fails to compile here rather than silently metering as something else.
+[[nodiscard]] inline constexpr std::string_view
+system_reserved_push_label(SystemReservedPush push) {
+    switch (push) {
+    case SystemReservedPush::tar_fleet_snapshot:
+        return "tar.fleet_snapshot";
+    case SystemReservedPush::guardian_push_rules:
+        return "__guard__.push_rules";
+    case SystemReservedPush::asset_tags_sync:
+        return "asset_tags.sync";
+    }
+    return "unknown"; // unreachable while the switch stays exhaustive
+}
+
+/// Every enumerator, so the boot pre-seed cannot fall out of step with the
+/// call sites — same reason `kQuarantineGateOutcomes` exists. An internal push
+/// that has never fired must read as zero, not as an absent series.
+inline constexpr std::array<SystemReservedPush, 3> kSystemReservedPushes{
+    SystemReservedPush::tar_fleet_snapshot, SystemReservedPush::guardian_push_rules,
+    SystemReservedPush::asset_tags_sync};
+
+/// The two outcomes a system-reserved push can have at the registry seam.
+/// `sent` means `AgentRegistry::send_to` accepted the frame (for a
+/// gateway-attached agent that is a QUEUE, not a delivery — the same caveat
+/// `dispatch_confirmed` carries on the MCP side); `undelivered` means it did
+/// not, which for a Guardian rule push is a silently unenforced device.
+inline constexpr std::array<std::string_view, 2> kSystemReservedPushResults{"sent", "undelivered"};
+
+/// Outcome of one degradation-policy evaluation: the `ContainmentGate` to
+/// dispatch with, the snapshot to persist (only set on a fresh read — the
+/// caller stores it back under its own mutex), and the metric label to
+/// increment.
+struct QuarantineDegradationResult {
+    ContainmentGate gate;
+    std::optional<QuarantineSnapshot> refreshed_snapshot;
+    std::string_view outcome;
+};
+
+/// #881 spec item 6 — the degradation policy itself, extracted pure so the
+/// bounded-staleness decision is unit-testable with a fake reader, no
+/// `ServerImpl`, no Postgres.
+///
+/// `list_quarantined()` returns `std::nullopt` for THREE conditions the
+/// caller cannot tell apart (store not open, pool-acquire timeout, query
+/// failure — quarantine_store.cpp) — `fresh_read` collapses all three to
+/// "no read". Those are ATTEMPTED reads that failed, and they are what the
+/// bounded-staleness budget is for.
+///
+/// `fail_closed_regardless` is the separate, stronger signal: the read was
+/// never attempted, or cannot be trusted to have been. Two callers set it,
+/// and the distinction from a failed read is the whole point — a stale
+/// snapshot is a reasonable answer when the store could not answer, and NOT a
+/// reasonable answer when nobody asked it:
+///   * the store is null or `!is_open()`;
+///   * the dispatch could not obtain a containment-read slot within its wait
+///     budget (server.cpp's read-concurrency bound). Serving stale here would
+///     under-enforce against a HEALTHY store — the read would have succeeded,
+///     nobody made it, and a device quarantined since the snapshot would be
+///     dispatched to. That is the containment bypass this gate exists to
+///     close, arriving through the mechanism added to protect the pool.
+///
+/// BE HONEST ABOUT ITS REACHABILITY: `QuarantineStore::open_` is set once at
+/// construction and never cleared, and the server refuses to boot on a store
+/// that did not open — so in a supported deployment this arm has NO
+/// production trigger today. It is not dead weight (a future caller
+/// constructing the store lazily, or a store that learns to close itself,
+/// arrives at a decision that is already correct and already tested) and it
+/// fails CLOSED, so the arm is safe in both directions. But an earlier
+/// revision of this comment presented it as a stronger RUNTIME signal than
+/// the `nullopt` read, which overstates what it can currently observe:
+/// today every real degradation arrives as `nullopt`, and the
+/// bounded-staleness budget below is what actually decides those.
+///
+/// Otherwise a `nullopt` read within
+/// `kQuarantineSnapshotMaxAge` of the last successful read serves the stale
+/// snapshot; past that budget, or with no snapshot at all, it fails closed.
+[[nodiscard]] inline QuarantineDegradationResult evaluate_quarantine_degradation(
+    const std::optional<std::unordered_set<std::string>>& fresh_read,
+    bool fail_closed_regardless, const QuarantineSnapshot& last_known_good,
+    std::chrono::steady_clock::time_point now) {
+    // Every arm names its fail-closed decision explicitly — `enforcing()` has
+    // no default for it, so a new branch cannot inherit one by omission.
+    if (fresh_read) {
+        return QuarantineDegradationResult{
+            .gate = ContainmentGate::enforcing(/*fail_closed=*/false, *fresh_read),
+            .refreshed_snapshot = QuarantineSnapshot{*fresh_read, now, true},
+            .outcome = kQuarantineGateOutcomeFresh};
+    }
+    if (fail_closed_regardless) {
+        return QuarantineDegradationResult{
+            .gate = ContainmentGate::enforcing(/*fail_closed=*/true, {}),
+            .refreshed_snapshot = std::nullopt,
+            .outcome = kQuarantineGateOutcomeFailClosed};
+    }
+    if (last_known_good.valid && (now - last_known_good.at) < kQuarantineSnapshotMaxAge) {
+        return QuarantineDegradationResult{
+            .gate = ContainmentGate::enforcing(/*fail_closed=*/false, last_known_good.ids),
+            .refreshed_snapshot = std::nullopt,
+            .outcome = kQuarantineGateOutcomeStale};
+    }
+    return QuarantineDegradationResult{
+        .gate = ContainmentGate::enforcing(/*fail_closed=*/true, {}),
+        .refreshed_snapshot = std::nullopt,
+        .outcome = kQuarantineGateOutcomeFailClosed};
+}
+
+/// #881 / CDX-P1-06 — the COMPOSITION of the containment gate, extracted so
+/// the production decision is reachable from a test.
+///
+/// `evaluate_quarantine_degradation` above is pure and well covered, and
+/// `dispatch_confined_arms` is bound by its own suite. What sat between them —
+/// the plugin exemption, and the choice to build an ENFORCED gate at all —
+/// lived only inside `ServerImpl::make_containment_gate`, where no test could
+/// reach it. That gap was not theoretical: making the exemption unconditional
+/// there (`if (true) return ContainmentGate{.enforced = false}`) disables
+/// containment for EVERY plugin, and the whole `[dispatch][quarantine]` suite
+/// still passed. That is exactly the failure this file's routed concern warns
+/// about — a well-tested helper whose production composition can be reverted
+/// with the suite green.
+///
+/// `ServerImpl` keeps only what is genuinely server-shaped: performing the
+/// store read, holding the snapshot mutex, and incrementing the metric. It
+/// must NOT carry its own copy of the exemption branch; it decides only
+/// whether to spend a read.
+///
+/// The snapshot is in/out. The MONOTONIC guard lives here rather than at the
+/// call site, so a slower concurrent read cannot overwrite a newer one — a
+/// property that is now testable too.
+[[nodiscard]] inline QuarantineDegradationResult compose_containment_gate(
+    std::string_view plugin, std::string_view action, bool fail_closed_regardless,
+    const std::optional<std::unordered_set<std::string>>& fresh_read,
+    QuarantineSnapshot& snapshot /*in/out*/, std::chrono::steady_clock::time_point now) {
+    // The quarantine plugin's own control channel is the ONE exemption:
+    // release must never be blocked by the containment it is lifting. Decided
+    // WITHOUT needing a store read, so a store outage cannot strand a
+    // quarantined host by blocking its own unquarantine.
+    if (is_quarantine_control_plugin(plugin, action))
+        return QuarantineDegradationResult{.gate = ContainmentGate::exempt_control_plugin(),
+                                           .refreshed_snapshot = std::nullopt,
+                                           .outcome = kQuarantineGateOutcomeExempt};
+
+    auto decision =
+        evaluate_quarantine_degradation(fresh_read, fail_closed_regardless, snapshot, now);
+
+    if (decision.refreshed_snapshot &&
+        (!snapshot.valid || decision.refreshed_snapshot->at > snapshot.at))
+        snapshot = *decision.refreshed_snapshot;
+
+    return decision;
+}
+
+/// Reach exactly the agents this caller is authorised to reach AND currently
+/// permitted to reach under containment, and return how many were actually
+/// sent to plus which reachable ids the quarantine gate withheld.
 ///
 /// `broadcast_on_none` is the ONE thing the arms parameterise: a caller whose
 /// UI/tool already normalised an empty selection into a deliberate fleet
 /// broadcast passes true; the shared closure — where no target named at all
 /// must reach NOBODY, not everybody (#2500) — passes false. The None arm never
 /// decides this for itself, so the meaning cannot drift per caller.
-[[nodiscard]] inline int dispatch_confined_arms(DispatchArm arm,
-                                                const ConfinedDispatchTargets& targets,
-                                                const authz::VisibleSet& exec_visible,
-                                                bool broadcast_on_none,
-                                                const ConfinedDispatchSink& sink) {
+///
+/// `gate` is REQUIRED, not defaulted, and sits immediately before `sink` —
+/// deliberately: a defaulted parameter (or folding containment into a sink
+/// field instead) would let a future caller silently opt out of quarantine
+/// enforcement by omission, which is exactly the per-route drift this
+/// header's doc comment exists to prevent for #1788 and now also for #881.
+[[nodiscard]] inline ArmDispatchResult dispatch_confined_arms(DispatchArm arm,
+                                                              const ConfinedDispatchTargets& targets,
+                                                              const authz::VisibleSet& exec_visible,
+                                                              bool broadcast_on_none,
+                                                              const ContainmentGate& gate,
+                                                              const ConfinedDispatchSink& sink) {
+    ArmDispatchResult result;
+
+    // #881: the ONE per-id containment check every arm applies AFTER the
+    // #1788 visible-set intersection and BEFORE the send. `!gate.enforced` is
+    // a pure no-op. `gate.fail_closed` withholds EVERY id it is asked about
+    // (a degraded containment read must not silently read as "nothing is
+    // quarantined" — ADR-0012 §1); otherwise it withholds only ids actually
+    // in `gate.quarantined`. Every id withheld here is recorded, whichever
+    // branch withheld it — the caller's audit trail does not need to
+    // distinguish "specifically quarantined" from "fail-closed" at this
+    // layer (it can, via `gate.fail_closed` itself, which the caller already
+    // has).
+    const auto contained = [&](const std::string& aid) -> bool {
+        if (!gate.enforced)
+            return false;
+        if (gate.fail_closed) {
+            // COUNT, don't collect. A fail-closed dispatch denies every target,
+            // so collecting them builds a fleet-sized vector<string> — on the
+            // dispatch thread, per refused dispatch, during the store
+            // degradation that caused the refusal — purely so the caller can
+            // take .size(). Every caller of a fail-closed result does exactly
+            // that: the audit path emits ONE aggregate row rather than N (see
+            // audit_quarantine_dispatch_fail_closed), and the response bodies
+            // report a count. The identities are not used and, for a
+            // fail-closed denial, carry no information the gate state does not
+            // already imply.
+            ++result.denied_quarantined_count;
+            return true;
+        }
+        if (gate.quarantined.contains(aid)) {
+            result.denied_quarantined.push_back(aid);
+            ++result.denied_quarantined_count;
+            return true;
+        }
+        return false;
+    };
+
     // Broadcast narrowed to the caller's visible set. Unfiltered (nullopt)
-    // authority keeps the fast send-to-all path; a present set — INCLUDING a
-    // present EMPTY one, which means deny-all under ADR-0033 §1 — walks the
-    // known ids filtered to scope, so an empty set reaches nobody.
+    // authority keeps the fast send-to-all path ONLY while containment is not
+    // enforced: `send_to_all_unfiltered()` has no per-id hook at all, so
+    // taking it while `gate.enforced` is true would reach a quarantined agent
+    // with no check whatsoever — the exact hole #881 exists to close on the
+    // production path that hits it (`command_dispatch_fn`'s
+    // `DispatchCaller{.system = true}`, `forward_legacy_command`'s Broadcast
+    // arm). Under enforcement the walk below runs regardless of visibility:
+    // `filter_to_scope` is a no-op on a `nullopt` visible set, so an
+    // unfiltered caller still walks every known agent — just individually
+    // gated instead of fast-pathed. A present set — INCLUDING a present EMPTY
+    // one, which means deny-all under ADR-0033 §1 — already took this walk
+    // before #881 and continues to.
+    //
+    // COST, ACCEPTED: this walk trades `send_to_all_unfiltered`'s single
+    // registry-lock snapshot for one `known_agent_ids()` acquisition plus a
+    // per-id `send_to()` acquisition — the same shape the filtered broadcast
+    // path has always used, now also paid by a `system`-caller fleet-wide
+    // dispatch once containment is enforced. Correctness, not throughput, is
+    // what #881 buys here; a single-snapshot `send_to_all_except(...)` sink
+    // operation would restore it but is a larger change than this gate
+    // package carries.
     const auto confined_broadcast = [&]() -> int {
-        if (!exec_visible)
+        if (!exec_visible && !gate.enforced)
             return sink.send_to_all_unfiltered();
         int n = 0;
         for (const auto& aid : authz::filter_to_scope(sink.known_agent_ids(), exec_visible))
-            if (sink.send_to(aid))
+            if (!contained(aid) && sink.send_to(aid))
                 ++n;
         return n;
     };
 
-    int sent = 0;
     switch (arm) {
     case DispatchArm::Group:
-        // A management group is a targeting mechanism, not an authz exemption.
+        // A management group is a targeting mechanism, not an authz
+        // exemption — and, per #881, not a containment exemption either.
         if (targets.group_members)
             for (const auto& aid : *targets.group_members)
-                if (authz::in_scope(exec_visible, aid) && sink.send_to(aid))
-                    ++sent;
+                if (authz::in_scope(exec_visible, aid) && !contained(aid) && sink.send_to(aid))
+                    ++result.sent;
         break;
     case DispatchArm::Scope:
         // Null == the caller aborted resolution and already audited it.
         if (targets.scope_matched)
             for (const auto& aid : authz::filter_to_scope(*targets.scope_matched, exec_visible))
-                if (sink.send_to(aid))
-                    ++sent;
+                if (!contained(aid) && sink.send_to(aid))
+                    ++result.sent;
         break;
     case DispatchArm::Ids:
         if (targets.agent_ids)
             for (const auto& aid : authz::filter_to_scope(*targets.agent_ids, exec_visible))
-                if (sink.send_to(aid))
-                    ++sent;
+                if (!contained(aid) && sink.send_to(aid))
+                    ++result.sent;
         break;
     case DispatchArm::Broadcast:
-        // Asked for by its published name (`__all__`) — still narrowed.
-        sent = confined_broadcast();
+        // Asked for by its published name (`__all__`) — still narrowed, and
+        // still gated: this is the unfiltered fast path's only other caller.
+        result.sent = confined_broadcast();
         break;
     case DispatchArm::None:
         // No target named at all. The caller decides what that MEANS; when it
         // means "reach nobody" the caller also owns the counter/log, because
         // there is no `req` here and background runners call this too.
         if (broadcast_on_none)
-            sent = confined_broadcast();
+            result.sent = confined_broadcast();
         break;
     }
-    return sent;
+    return result;
 }
 
 } // namespace yuzu::server

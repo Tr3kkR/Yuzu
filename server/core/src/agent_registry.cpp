@@ -797,6 +797,8 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // antivirus
         {"antivirus.products", "List installed antivirus products"},
         {"antivirus.status", "Detailed antivirus status (Windows Defender / macOS XProtect)"},
+        {"antivirus.av_exclusions",
+         "Windows Defender exclusion lists (paths/processes/extensions)"},
         // http_client
         {"http_client.download", "Download a file from URL with optional hash verification"},
         {"http_client.get", "HTTP GET a URL, return status and body"},

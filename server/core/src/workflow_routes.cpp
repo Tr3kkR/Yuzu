@@ -914,15 +914,20 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // RestApiV1's blanket service-scoped deny for the identical reason —
     // ITServiceOwner grants full CRUD on Schedule, so a bare Schedule:Read
     // gate alone would still let a service-scoped token enumerate every
-    // schedule from every other service. Runs BEFORE perm_fn (independent
-    // of RBAC on/off branch ordering) — matches the GuardianRoutes/DexRoutes/
-    // NetworkRoutes family of fragment/REST denies with no single per-target
-    // to scope against. The schedule feature's OWN shared REST helper,
-    // deny_service_scoped_schedule (schedule_routes.hpp), deliberately runs
-    // the OPPOSITE order — AFTER its route's permission gate(s) — because
-    // its resolve_session doesn't write a response on failure the way this
-    // lambda's auth_fn does; both orderings are correct for their own
-    // callback contract, this is not one universal rule.
+    // schedule from every other service. Runs BEFORE this route's own
+    // `perm_fn(Schedule,Read)` call below (independent of RBAC on/off branch
+    // ordering) — matches the GuardianRoutes/DexRoutes/NetworkRoutes family
+    // of fragment/REST denies with no single per-target to scope against.
+    // Security-guardian correction (governance run 2026-08-21): an earlier
+    // draft of this comment claimed this fragment "has no permission gate of
+    // its own to run after" — false, `perm_fn` runs right below. The correct
+    // classification is LIVE-but-redundant (fires BEFORE its gate, the same
+    // bucket-1b class as the routed-concern row's other still-listed
+    // helpers), not gate-less/§3e — this deny stays for that reason, not
+    // because the route lacks a gate. Contrast the now-retired REST
+    // `/api/schedules` family's interim deny (#3290 Phase 2 bucket 1a — that
+    // one ran AFTER its route's permission gate(s) and was made provably
+    // dead by the flip).
     auto deny_service_scoped_schedule_list = [auth_fn, audit_fn](const httplib::Request& req,
                                                                   httplib::Response& res) -> bool {
         auto session = auth_fn(req, res);
@@ -1791,9 +1796,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             if (execution_tracker && !execution_id.empty()) {
                 execution_tracker->mark_cancelled(execution_id, session->username);
             }
+            // #881: "no agents reached" now covers a THIRD condition this
+            // route cannot see — every target withheld by the containment
+            // gate, or the gate failing closed fleet-wide because containment
+            // state is unreadable. The shared dispatch closure returns only a
+            // sent count, so the discriminator is not available here (#3424);
+            // until it is, the message must not assert unreachability, which
+            // is what sends an operator to the agent/networking team during a
+            // Postgres incident.
             res.status = 503;
             res.set_content(
-                R"({"error":{"code":503,"message":"no agents reached"},"meta":{"api_version":"v1"}})",
+                R"({"error":{"code":503,"message":"no agents reached: every target was unreachable, quarantined, or withheld because containment state could not be read. Check GET /api/v1/quarantine and yuzu_server_quarantine_gate_total before treating this as an agent-connectivity fault."},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }
