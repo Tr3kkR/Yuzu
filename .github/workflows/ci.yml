@@ -394,6 +394,16 @@ jobs:
           bash tests/shell/test_review_driver_substitution.sh  # patsub_replacement prompt corruption (#2644)
           bash tests/shell/test_trusted_inputs_validate.sh    # the step that picks the BUILD COMMIT (#2832)
 
+      # Prometheus HELP-text ASCII gate (#2128). Source-only, no build deps,
+      # so it belongs on the PR fast path beside the shell gate above rather
+      # than in a build job. Selftest first (fixture-level proof the gate
+      # still discriminates clean/seeded/comment-prose text), then the real
+      # scan over the tree.
+      - name: Metrics HELP ASCII gate (#2128)
+        run: |
+          bash scripts/ci/check-metrics-help-ascii.sh --selftest
+          bash scripts/ci/check-metrics-help-ascii.sh
+
   # ── Lint (disabled — clang-format reorders Windows headers and breaks MSVC builds) ──
   # lint:
   #   name: "Lint (clang-format)"
