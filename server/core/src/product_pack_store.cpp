@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <format>
 #include <random>
+#include <unordered_set>
 
 // Ed25519 signature verification — OpenSSL EVP on every platform.
 // Pre-#802 / W7.4 R3, the Windows branch used BCrypt
@@ -311,7 +312,17 @@ const std::vector<pg::PgMigration>& migrations() {
          // completion flag (see migrate_from_sqlite's doc comment).
          "CREATE TABLE sqlite_backfill_source ("
          "  fingerprint  TEXT PRIMARY KEY,"
-         "  completed_at BIGINT NOT NULL);"},
+         "  completed_at BIGINT NOT NULL);"
+         // ADR-0009 erasure-consistency (RbacStore's `revoked_seed_defaults` is the precedent
+         // for this shape — a dedicated suppression table, never a plain DELETE an idempotent
+         // reseed/backfill would silently undo). `uninstall()` stamps a row here in the SAME
+         // transaction as its DELETEs; `migrate_from_sqlite` consults it before treating an
+         // unmatched legacy pack id as fresh content, so a stale/redeployed replica's legacy
+         // file can never resurrect a pack this store has already reported erased. See
+         // migrate_from_sqlite's doc comment for the full hazard this closes.
+         "CREATE TABLE deleted_pack_ids ("
+         "  pack_id    TEXT PRIMARY KEY,"
+         "  deleted_at BIGINT NOT NULL);"},
     };
     return kMigrations;
 }
@@ -785,8 +796,34 @@ bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
     // different tables rather than ResultSetStore's self-referencing case). Fail closed on any
     // error (ADR-0009): nothing partially committed.
     std::string failure_detail;
+    // ADR-0009 erasure consistency: pack ids this store has already reported erased via
+    // uninstall() (see deleted_pack_ids' schema comment). A legacy row naming one of these is
+    // NOT a conflict to compare against an existing row — there is no existing row, it was
+    // legitimately deleted — it is a resurrection attempt and must be silently skipped, along
+    // with every item row that belongs to it (an attempted item insert would otherwise hit the
+    // product_pack_items -> product_packs FK with no parent row and fail the whole backfill
+    // closed).
+    std::unordered_set<std::string> tombstoned_ids;
     bool ok = pool_.with_txn([&](PGconn* conn) -> bool {
         for (const auto& p : legacy_packs) {
+            pg::PgResult tomb = pg::exec_params(
+                conn, "SELECT 1 FROM product_pack_store.deleted_pack_ids WHERE pack_id = $1",
+                std::vector<std::string>{p.id});
+            if (tomb.status() != PGRES_TUPLES_OK) {
+                failure_detail = std::format("legacy product_packs row id='{}': tombstone check "
+                                             "failed: {}",
+                                             p.id, PQerrorMessage(conn));
+                spdlog::error("ProductPackStore::migrate_from_sqlite: {}", failure_detail);
+                return false;
+            }
+            if (PQntuples(tomb.get()) > 0) {
+                spdlog::info("ProductPackStore::migrate_from_sqlite: legacy pack id='{}' was "
+                             "already uninstalled — skipping (not a conflict, a resurrection "
+                             "attempt from a stale legacy file)",
+                             p.id);
+                tombstoned_ids.insert(p.id);
+                continue;
+            }
             pg::PgResult res = pg::exec_params(
                 conn,
                 "INSERT INTO product_pack_store.product_packs "
@@ -846,6 +883,8 @@ bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
             // Identical content — a benign replay from a shared/cloned legacy file.
         }
         for (const auto& it : legacy_items) {
+            if (tombstoned_ids.contains(it.pack_id))
+                continue; // parent pack was skipped above — see the tombstone check comment
             pg::PgResult res = pg::exec_params(
                 conn,
                 "INSERT INTO product_pack_store.product_pack_items "
@@ -1260,6 +1299,17 @@ std::expected<void, std::string> ProductPackStore::uninstall(const std::string& 
             conn, "DELETE FROM product_pack_store.product_packs WHERE id = $1",
             std::vector<std::string>{id});
         if (dp.status() != PGRES_COMMAND_OK)
+            return false;
+        // ADR-0009 erasure consistency: stamp the tombstone in the SAME transaction as the
+        // deletes, so migrate_from_sqlite can never observe a deletion without also observing
+        // its suppression marker (see the deleted_pack_ids schema comment / this store's
+        // migrate_from_sqlite doc comment).
+        pg::PgResult tomb = pg::exec_params(
+            conn,
+            "INSERT INTO product_pack_store.deleted_pack_ids (pack_id, deleted_at) "
+            "VALUES ($1, $2::bigint) ON CONFLICT (pack_id) DO NOTHING",
+            std::vector<std::string>{id, std::to_string(now_epoch())});
+        if (tomb.status() != PGRES_COMMAND_OK)
             return false;
         return true;
     });

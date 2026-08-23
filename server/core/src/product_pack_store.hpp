@@ -152,7 +152,13 @@ public:
     /// pre-7.13 legacy file whose `product_packs` table predates the `verified` column (defaults
     /// `verified=0` for that vintage, matching the pre-migration raw-`ALTER TABLE` shim this
     /// migration retires). Returns true (no-op) when `legacy_db_path` does not exist or holds
-    /// neither table (fresh install). Opens the legacy file READ-ONLY and never deletes/moves it.
+    /// neither table (fresh install). Opens the legacy file READ-ONLY and never deletes/moves it
+    /// — erasure consistency instead runs through `deleted_pack_ids` (ADR-0009): every legacy
+    /// pack id is checked against that table before being treated as fresh content, so a
+    /// redeployed/stale-image replica's own untouched legacy file can never resurrect a pack
+    /// this store has already reported erased via `uninstall()`. This runs on EVERY boot whose
+    /// legacy file content-fingerprint hasn't been seen before, not just the fleet's first
+    /// migration — see the fingerprint-marker check below.
     [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
     /// When true, packs WITHOUT a `signature` field are rejected at install time. Packs with a
@@ -206,7 +212,9 @@ public:
     /// treat the latter as "not found".
     std::expected<std::optional<ProductPack>, std::string> get(const std::string& id);
 
-    /// Uninstall a product pack, removing all contained items via uninstall_fn.
+    /// Uninstall a product pack, removing all contained items via uninstall_fn. Stamps `id` into
+    /// `deleted_pack_ids` in the SAME transaction as the metadata delete (ADR-0009 erasure
+    /// consistency — see `migrate_from_sqlite`'s doc comment).
     /// `unexpected("not_found: ...")` when no pack with this id exists; any other
     /// `unexpected(msg)` (prefixed `kProductPackDbErrorPrefix`) is a genuine failure.
     std::expected<void, std::string> uninstall(const std::string& id, ItemUninstallFn uninstall_fn);

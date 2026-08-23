@@ -35,4 +35,8 @@
   `product-packs.db` written before 7.13 (predating the `verified` column) backfills correctly,
   defaulting `verified=false` for that vintage. The new
   `yuzu_server_product_pack_{read_degrade,backfill}_total` metrics ship with paired alert rules
-  (`YuzuProductPackReadDegraded`, `YuzuProductPackBackfillNotCompleted`).
+  (`YuzuProductPackReadDegraded`, `YuzuProductPackBackfillNotCompleted`). **Erasure consistency
+  (ADR-0009):** `uninstall()` now stamps a `deleted_pack_ids` tombstone in the same transaction
+  as its delete, and `migrate_from_sqlite` checks it before treating an unmatched legacy pack id
+  as fresh content — closes a gap where a redeployed or newly-joined replica's own (stale) legacy
+  `product-packs.db` could silently resurrect a pack that was legitimately uninstalled elsewhere.

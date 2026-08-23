@@ -46,6 +46,7 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <format>
 #include <memory>
 #include <string>
 #include <tuple>
@@ -753,6 +754,117 @@ TEST_CASE("ProductPackStore::migrate_from_sqlite: differently-valued conflict fa
     auto c_only = store.get("diffconflict-pack-c-only");
     REQUIRE(c_only.has_value());
     CHECK_FALSE(c_only->has_value());
+}
+
+// ADR-0009 erasure consistency (F035/CH-E — the "ghost pack" hazard): a pack legitimately
+// uninstalled via uninstall() must never be resurrected by a LATER migrate_from_sqlite call
+// against a legacy file that still shows it installed — the concrete scenario is a redeployed
+// or newly-joined replica whose own local legacy file predates the uninstall performed
+// elsewhere/earlier. The uninstalled pack's id has no existing product_packs row to conflict
+// against, so without a tombstone this hits the plain "no conflict, insert it" path.
+TEST_CASE("ProductPackStore::migrate_from_sqlite: an uninstalled pack is never resurrected by a "
+          "later backfill against a legacy file that still shows it installed",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    // Install, then uninstall — this is the real, server-assigned pack id (a random surrogate,
+    // see product_pack_store.hpp), not a hand-chosen one.
+    auto installed = store.install(kUnsignedPackYaml, make_accept_all_install_fn());
+    REQUIRE(installed.has_value());
+    const std::string ghost_id = *installed;
+
+    auto uninstalled = store.uninstall(
+        ghost_id, [](const std::string&, const std::string&) { return true; });
+    REQUIRE(uninstalled.has_value());
+    REQUIRE_FALSE(store.get(ghost_id)->has_value());
+
+    // A legacy file — as if baked into a replica's image before the uninstall above happened —
+    // still shows the now-deleted pack installed, plus one genuinely-new, unrelated pack.
+    yuzu::test::TempDbFile legacy_ghost{std::string_view{"pack-legacy-ghost-"}};
+    {
+        SqliteDb legacy_db;
+        REQUIRE(sqlite3_open_v2(legacy_ghost.path.string().c_str(), legacy_db.addr(),
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+        legacy_exec(legacy_db.get(),
+                    "CREATE TABLE product_packs (id TEXT PRIMARY KEY, name TEXT NOT NULL, "
+                    "version TEXT NOT NULL DEFAULT '1.0.0', description TEXT NOT NULL DEFAULT "
+                    "'', yaml_source TEXT NOT NULL, installed_at INTEGER NOT NULL DEFAULT 0, "
+                    "verified INTEGER NOT NULL DEFAULT 0);");
+        legacy_exec(legacy_db.get(),
+                    "CREATE TABLE product_pack_items (pack_id TEXT NOT NULL, kind TEXT NOT "
+                    "NULL, item_id TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', yaml_source "
+                    "TEXT NOT NULL DEFAULT '', PRIMARY KEY (pack_id, item_id));");
+        legacy_exec(legacy_db.get(),
+                    std::format("INSERT INTO product_packs VALUES ('{}', 'test-unsigned', "
+                                "'1.0.0', 'stale snapshot of an uninstalled pack', "
+                                "'kind: ProductPack', 1700000000, 0);",
+                                ghost_id)
+                        .c_str());
+        legacy_exec(legacy_db.get(),
+                    std::format("INSERT INTO product_pack_items VALUES ('{}', "
+                                "'InstructionDefinition', 'ghost-item', 'Ghost Item', "
+                                "'kind: InstructionDefinition');",
+                                ghost_id)
+                        .c_str());
+        legacy_exec(legacy_db.get(),
+                    "INSERT INTO product_packs VALUES ('legit-new-pack', 'Legit New Pack', "
+                    "'1.0.0', 'a genuinely new pack in the same legacy file', "
+                    "'kind: ProductPack', 1700000001, 0);");
+    }
+
+    REQUIRE(store.migrate_from_sqlite(legacy_ghost.path));
+
+    // The uninstalled pack stays gone — not resurrected, and none of its items either.
+    auto ghost = store.get(ghost_id);
+    REQUIRE(ghost.has_value());
+    CHECK_FALSE(ghost->has_value());
+
+    // An unrelated pack in the SAME legacy file, SAME backfill pass, still backfills normally —
+    // the tombstone skip is scoped to the one id, not a whole-file failure.
+    auto legit = store.get("legit-new-pack");
+    REQUIRE(legit.has_value());
+    REQUIRE(legit->has_value());
+    CHECK((*legit)->name == "Legit New Pack");
+
+    // Idempotent: a second backfill pass against a legacy file with this exact same content is
+    // a no-op fingerprint-skip, but re-running against a DIFFERENT (not-yet-seen) legacy file
+    // naming the same ghost id must still refuse to resurrect it.
+    yuzu::test::TempDbFile legacy_ghost_2{std::string_view{"pack-legacy-ghost-2-"}};
+    {
+        SqliteDb legacy_db;
+        REQUIRE(sqlite3_open_v2(legacy_ghost_2.path.string().c_str(), legacy_db.addr(),
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+        legacy_exec(legacy_db.get(),
+                    "CREATE TABLE product_packs (id TEXT PRIMARY KEY, name TEXT NOT NULL, "
+                    "version TEXT NOT NULL DEFAULT '1.0.0', description TEXT NOT NULL DEFAULT "
+                    "'', yaml_source TEXT NOT NULL, installed_at INTEGER NOT NULL DEFAULT 0, "
+                    "verified INTEGER NOT NULL DEFAULT 0);");
+        legacy_exec(legacy_db.get(),
+                    "CREATE TABLE product_pack_items (pack_id TEXT NOT NULL, kind TEXT NOT "
+                    "NULL, item_id TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', yaml_source "
+                    "TEXT NOT NULL DEFAULT '', PRIMARY KEY (pack_id, item_id));");
+        // A second, independently-stale replica snapshot — different unrelated pack alongside
+        // the same ghost id, so this file's fingerprint differs from legacy_ghost's.
+        legacy_exec(legacy_db.get(),
+                    std::format("INSERT INTO product_packs VALUES ('{}', 'test-unsigned', "
+                                "'1.0.0', 'a second, independently-stale snapshot', "
+                                "'kind: ProductPack', 1700000000, 0);",
+                                ghost_id)
+                        .c_str());
+        legacy_exec(legacy_db.get(),
+                    "INSERT INTO product_packs VALUES ('legit-new-pack-2', 'Legit New Pack 2', "
+                    "'1.0.0', 'another genuinely new pack', 'kind: ProductPack', 1700000002, "
+                    "0);");
+    }
+    REQUIRE(store.migrate_from_sqlite(legacy_ghost_2.path));
+    CHECK_FALSE(store.get(ghost_id)->has_value());
+    auto legit2 = store.get("legit-new-pack-2");
+    REQUIRE(legit2.has_value());
+    REQUIRE(legit2->has_value());
 }
 
 // H2 net (governance-pattern regression, matches ResultSetStore/LicenseStore's own mid-scan

@@ -1778,6 +1778,14 @@ mandatory and fails closed rather than degrading silently — same posture class
   `TagStore`/`QuarantineStore`) — `product-packs.db` stays in place; the fingerprint
   marker alone makes repeat boots against it idempotent, so there is nothing to clean
   up before the next start.
+- **An uninstalled pack is never resurrected by a later backfill.** Because the legacy
+  file is never mutated, a redeployed or newly-joined replica may still carry a legacy
+  `product-packs.db` written before a pack was uninstalled elsewhere. `uninstall()`
+  records the deleted pack id in Postgres (`deleted_pack_ids`, in the same transaction
+  as the delete); `migrate_from_sqlite` checks it before treating an unmatched legacy
+  pack id as fresh content, so this case is a silent, logged skip rather than a
+  resurrection — matches `RbacStore`'s `revoked_seed_defaults` suppression-table
+  precedent for the same class of hazard.
 
 **Operator-visible behaviour changes.**
 
