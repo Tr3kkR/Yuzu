@@ -427,11 +427,11 @@ the string; the legacy SQLite read switched from a NUL-truncating C-string read 
 `sqlite3_column_bytes` read (mirrors `audit_store.cpp`) so an embedded NUL is defanged to U+FFFD
 rather than silently dropping everything after it; and `hash_token`'s Windows-only, four-call,
 entirely unchecked BCrypt branch (a failure anywhere in that chain silently produced the hex of 32
-zero bytes — a constant hash for every input) is removed outright in favor of the file's existing
-checked EVP SHA-256 path (`sha256_hex`, already used unconditionally for backfill fingerprinting)
-on every platform — OpenSSL is a required dependency on Windows regardless of linkage (see this
-repo's vcpkg notes), so the platform split no longer has a reason to exist. Output bytes are
-identical (both were SHA-256), so no previously-hashed token is invalidated.
+zero bytes — a constant hash for every input) is removed outright in favor of a single checked EVP
+SHA-256 call (`sha256_hex`) on every platform — OpenSSL is a required dependency on Windows
+regardless of linkage (see this repo's vcpkg notes), so the platform split no longer has a reason
+to exist. Output bytes are identical (both were SHA-256), so no previously-hashed token is
+invalidated.
 
 All of the above remains dormant-store defence-in-depth: `server.cpp` still passes
 `/*device_token_store=*/nullptr`, so none of this is reachable in production today. It closes
