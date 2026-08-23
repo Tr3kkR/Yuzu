@@ -1983,6 +1983,20 @@ public:
                           "Engine-principal liveness re-checks answered StoreUnreachable from the "
                           "failure backoff without taking a connection lease",
                           "counter");
+        metrics_.describe("yuzu_server_engine_revalidate_generation_capacity_fallback_total",
+                          "#2454/#3385: the per-principal poisoning-guard map was full (even "
+                          "after a TTL sweep) and a NEW principal's invalidate fell back to the "
+                          "coarse global epoch. NOT a narrowly-scoped degradation: while "
+                          "tripped, the epoch bump defeats EVERY principal's concurrent "
+                          "cache-write, not just the triggering one - reproducing the "
+                          "fleet-wide cache disablement #2454 exists to fix, bounded to start "
+                          "past the 1024-distinct-principals-per-63s ceiling. Since #3385 this "
+                          "is self-clearing: entries age out on a TTL, so the fallback stops "
+                          "once churn drops back under the ceiling - no restart required. Not "
+                          "expected under ordinary load; a climbing value means the guard is "
+                          "running at reduced precision - see "
+                          "docs/ops-runbooks/engine-principal-store-recovery.md.",
+                          "counter");
         metrics_.describe("yuzu_server_audit_events_total",
                           "Audit events written, bucketed by result", "counter");
         // gov PR-E OBS-2: a from_result_set: scope ref resolved to an
@@ -6324,6 +6338,11 @@ public:
                     metrics_.gauge("yuzu_server_engine_revalidate_backoff_suppressed_total")
                         .set(static_cast<double>(
                             engine_principal_store_->revalidate_backoff_suppressed()));
+                    // #2454: the per-principal poisoning-guard map's capacity-exhaustion
+                    // fallback rate.
+                    metrics_.gauge("yuzu_server_engine_revalidate_generation_capacity_fallback_total")
+                        .set(static_cast<double>(
+                            engine_principal_store_->revoke_generation_capacity_fallback()));
                 }
                 // Publish FleetTopologyStore internals so the 256 MiB store-
                 // level oversize cap and single-flight refill timeouts are
@@ -14733,14 +14752,18 @@ private:
                                                   httplib::Response& res) {
             if (!require_permission(req, res, "Schedule", "Read"))
                 return;
-            // guardian-confinement-2298 hardening sweep: ITServiceOwner grants
-            // full CRUD on Schedule, and query_schedules has no owner/service
-            // filter at all — a bare Schedule:Read gate lets a service-scoped
-            // token enumerate every schedule from every other service. No
-            // single schedule to confine per-target, so this is a blanket
-            // deny, same shape as the fleet-wide dashboard fragment twin.
-            if (deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.list", ""))
-                return;
+            // guardian-confinement-2298 hardening sweep originally added an
+            // explicit deny_service_scoped_schedule() call here (ITServiceOwner
+            // grants full CRUD on Schedule, and query_schedules has no owner/
+            // service filter at all — a bare Schedule:Read gate would let a
+            // service-scoped token enumerate every schedule from every other
+            // service). guardian-confinement-2298 PR 3 ("the flip") made it
+            // provably dead: require_permission above already denies any
+            // service-scoped token outright for (Schedule, Read)
+            // (kServiceScopeGlobalSafe is compile-time-empty), so a
+            // service-scoped session can never reach this point at all.
+            // Retired #3290 Phase 2 bucket 1a — see
+            // docs/security-reviews/service-scope-phase2-migrations-2026-08.md.
             if (!schedule_engine_) {
                 res.status = 503;
                 res.set_content(
@@ -14791,13 +14814,14 @@ private:
             }
 
             auto id = req.matches[1].str();
-            // Interim deny (schedule_routes.hpp): delete_schedule is
-            // username-owner-scoped below, and a service-scoped token shares
-            // its creating principal's username (ApiToken::principal_id) —
-            // without this it could delete a fleet-wide schedule its own
-            // principal created interactively.
-            if (deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.delete", id))
-                return;
+            // An interim deny_service_scoped_schedule() call used to sit here
+            // (delete_schedule is username-owner-scoped below, and a
+            // service-scoped token shares its creating principal's username —
+            // without a deny it could delete a fleet-wide schedule its own
+            // principal created interactively). guardian-confinement-2298 PR 3
+            // ("the flip") made it provably dead: require_permission above
+            // already denies any service-scoped token outright for
+            // (Schedule, Delete). Retired #3290 Phase 2 bucket 1a.
             // M-01 (#1806): owner-scoped delete — a Schedule:Delete grant
             // deletes only schedules the caller created, not the whole
             // fleet's. auth_routes_->resolve_session, not require_permission's
@@ -14841,15 +14865,19 @@ private:
             // runaway schedule even without Execution:Execute.
             if (enabled && !require_permission(req, res, "Execution", "Execute"))
                 return;
-            // Interim deny (schedule_routes.hpp), enable(true) only — a
-            // re-enabled schedule arms unattended fleet-wide dispatch through
-            // ScheduleRunner, the same concern as create. Disabling stays
-            // reachable: it only ever stops a schedule, never arms one, so a
-            // service-scoped token keeps its kill-switch (H-01's own
-            // rationale for gating disable on Schedule:Write alone).
-            if (enabled && deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.enable",
-                                                        id))
-                return;
+            // An interim deny_service_scoped_schedule() call used to sit here,
+            // enable(true) only — deliberately built to leave disable
+            // reachable for a service-scoped token as its kill switch (H-01).
+            // guardian-confinement-2298 PR 3 ("the flip") made the deny itself
+            // provably dead (require_permission above already denies any
+            // service-scoped token outright for (Schedule, Write), enabled or
+            // not) — retired here, #3290 Phase 2 bucket 1a. NOTE: the flip's
+            // unconditional Schedule:Write gate ALSO means the documented
+            // kill-switch guarantee (disable stays reachable) does not
+            // currently hold for a service-scoped token, since it never gets
+            // past `require_permission` above regardless of `enabled`'s
+            // value — a real, pre-existing, NOT-yet-fixed gap this retirement
+            // discovered but does not resolve; see #3378.
 
             // M-01 (#1806): owner-scoped enable/disable, same as delete above.
             auto session = auth_routes_->resolve_session(req);
@@ -16255,10 +16283,10 @@ private:
         // perf tags (validated through the SAME dex_perf_rules the Prometheus
         // gauges use), AgentRegistry sessions (OS + agent-reported tags) and the
         // TagStore (operator tags, ONE bulk query per render — not N point
-        // lookups). Cohort precedence mirrors evaluate_scope: agent scopable_tags
-        // first, then the tag store. Shared by the /dex Performance fragments,
-        // the /api/v1/dex/perf/* REST surface and the MCP perf tools so all
-        // three can never disagree.
+        // lookups). Cohort precedence mirrors evaluate_scope: the tag store
+        // first, then agent scopable_tags (#3295 — both are store-first now).
+        // Shared by the /dex Performance fragments, the /api/v1/dex/perf/*
+        // REST surface and the MCP perf tools so all three can never disagree.
         auto dex_perf_uncached = [this](const std::string& cohort_key) -> DexPerfSnapshot {
             DexPerfSnapshot snap;
             snap.cohort_key = cohort_key;
@@ -16314,16 +16342,16 @@ private:
                         detail::parse_perf_disk_lat_ms(get(detail::kPerfTagDiskLatMs));
                 }
                 if (!cohort_key.empty()) {
-                    // STORE-FIRST precedence — deliberately the OPPOSITE of
-                    // evaluate_scope's agent-first order: a benchmark cohort is
-                    // an operator-declared comparison population, so a rogue
-                    // agent must not self-assign into "executive-laptops" and
-                    // drag its p90 (G4 UP-5). The store already carries honest
-                    // agents' tags via sync_agent_tags, so store-first loses
-                    // nothing; the in-memory fallback only covers a tag not yet
-                    // synced, and it is value-validated (G2 sec-L2: scopable_tags
-                    // are unvalidated at session ingest) so oversized/garbage
-                    // bytes never become a cohort label.
+                    // STORE-FIRST precedence — the SAME order evaluate_scope's
+                    // tag: resolver uses since #3295 (previously the opposite):
+                    // a benchmark cohort is an operator-declared comparison
+                    // population, so a rogue agent must not self-assign into
+                    // "executive-laptops" and drag its p90 (G4 UP-5). The store
+                    // already carries honest agents' tags via sync_agent_tags,
+                    // so store-first loses nothing; the in-memory fallback only
+                    // covers a tag not yet synced. scopable_tags is validated
+                    // and 'service'-filtered at session ingest (register_agent,
+                    // #3295); this re-validates on top as defense-in-depth.
                     if (auto cv = cohort_values.find(id); cv != cohort_values.end()) {
                         d.cohort = cv->second;
                     } else if (auto it = s->scopable_tags.find(cohort_key);

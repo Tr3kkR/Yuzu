@@ -4231,8 +4231,28 @@ TEST_CASE("MCP compare_app_perf_versions: cohort-paired before/after (evidential
 // perm_fn - same gap here,
 // same fix (deny_fleet_wide_service_scoped, reused verbs). ────────────────
 
-TEST_CASE("MCP get_dex_group_app_perf: denies a service-scoped token, denial audited",
-          "[pg][mcp][integration][dex][app_perf][security]") {
+// #3290 Phase 2 bucket 1a retired this tool's interim deny_fleet_wide_
+// service_scoped() call as provably dead — perm_fn (production:
+// require_permission) already denies any service-scoped token outright for
+// (GuaranteedState, Read) before the tool-specific branch is ever reached
+// (kServiceScopeGlobalSafe is compile-time-empty). This test's OWN fake
+// perm_fn defaults to "always allow" (McpTestServer's documented default,
+// unlike production), so proving the tool still denies a service-scoped
+// token now needs an explicit perm_override_for_test simulating what
+// require_permission's real flip-deny does for this securable/operation —
+// the same pattern other MCP tool-gating tests in this file already use.
+// This test proves the TOOL honors a perm_fn denial — it does not itself
+// prove require_permission's real flip-deny fires for a genuine
+// service-scoped session (composition, not re-derivation): that is proven
+// generically, securable-agnostic (a pure empty-allow-list membership
+// check, no per-securable special-casing), by "AuthRoutes::require_permission
+// — service-scoped token: ITServiceOwner ceiling holds but the default-deny
+// allow-list still denies (the flip)", test_auth_routes.cpp:794 — including
+// the audit trail (`auth.permission_required`) this test does not
+// re-prove per-tool (quality-engineer, governance run 2026-08-21).
+TEST_CASE("MCP get_dex_group_app_perf: still denies a service-scoped token "
+          "via perm_fn (interim tool-specific deny retired, #3290 bucket 1a)",
+          "[mcp][integration][dex][app_perf][security]") {
     McpTestServer ts;
     ts.app_perf_providers_for_test.group =
         [](std::string_view, std::string_view,
@@ -4240,22 +4260,35 @@ TEST_CASE("MCP get_dex_group_app_perf: denies a service-scoped token, denial aud
         return std::vector<yuzu::server::AppPerfFleetRow>{};
     };
     ts.mock_token_scope_service = "printers";
+    ts.perm_override_for_test = [](const std::string& sec, const std::string& op) -> bool {
+        return !(sec == "GuaranteedState" && op == "Read");
+    };
     ts.start("readonly");
 
     auto res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":94,"params":{"name":"get_dex_group_app_perf","arguments":{"group_id":"g1","app":"chrome.exe"}}})");
     REQUIRE(res);
+    CHECK(res->status == 403); // denied at the GuaranteedState:Read gate
+    // NOT the JSON-RPC kPermissionDenied error-code shape other tool-specific
+    // denial tests in this file assert on — this test's denial comes from the
+    // fake perm_fn (McpTestServer harness, ~line 1018), so the tool-specific
+    // branch that would construct that envelope is never reached (matching
+    // production's own perm_fn gate ordering). The harness's fake perm_fn
+    // returns a simplified {"error":"forbidden"} literal that does NOT match
+    // production's real shape (require_permission's actual denials always go
+    // through detail::a4_denial, where `error` is an object carrying
+    // code/message/correlation_id/etc — never a bare string, per
+    // rest_api_v1.cpp's error_json_a4). This test proves the tool respects a
+    // perm_fn denial and returns an error body at all; it does not and cannot
+    // prove the real production wire shape — that's proven generically by
+    // test_auth_routes.cpp:794 (governance run 2026-08-21, quality-engineer:
+    // an earlier draft of this comment incorrectly claimed the fixture
+    // "mimics" the real body).
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
-    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
 
-    bool saw_denied = false;
-    for (const auto& a : ts.audit_log) {
-        if (a == "dex.perf.group.view|denied")
-            saw_denied = true;
+    for (const auto& a : ts.audit_log)
         CHECK(a != "dex.perf.group.view|success");
-    }
-    CHECK(saw_denied);
 }
 
 TEST_CASE("MCP compare_app_perf_versions: denies a service-scoped token, denied under "
@@ -4675,7 +4708,7 @@ TEST_CASE("MCP Integration: resources/list returns the expected resources", "[mc
     REQUIRE(result.contains("resources"));
     auto& resources = result["resources"];
     REQUIRE(resources.is_array());
-    CHECK(resources.size() == 9); // existing resources + agentic context resources
+    CHECK(resources.size() == 11); // existing 9 + 2g PR4 specs-as-resources
 
     // The Guardian schema discovery resource is advertised on the MCP plane.
     std::set<std::string> uris;
@@ -4687,6 +4720,8 @@ TEST_CASE("MCP Integration: resources/list returns the expected resources", "[mc
     CHECK(uris.count("yuzu://operating-model") == 1);
     CHECK(uris.count("yuzu://demo/playbooks") == 1);
     CHECK(uris.count("yuzu://golden-prompts/enterprise-it-v1") == 1);
+    CHECK(uris.count("yuzu://openapi") == 1);
+    CHECK(uris.count("yuzu://scope-dsl") == 1);
 
     // Each resource should have uri, name, description, mimeType
     for (const auto& r : resources) {
@@ -4695,6 +4730,100 @@ TEST_CASE("MCP Integration: resources/list returns the expected resources", "[mc
         CHECK(r.contains("description"));
         CHECK(r.contains("mimeType"));
     }
+}
+
+// ── 2g PR4: specs-as-resources (yuzu://openapi, yuzu://scope-dsl) ──────────
+//
+// Both resources share the SAME builder as their REST /discover/* and MCP
+// discover_* tool twins (A2 shared-builder principle) and are tier-gated
+// (unlike the 9 legacy resources above, which predate the annotation/tier
+// sweep and are perm_fn-only — #2713 tracks closing that gap for them).
+
+TEST_CASE("MCP 2g PR4: yuzu://openapi matches openapi_spec_json()",
+          "[mcp][2g][integration]") {
+    McpTestServer ts;
+    ts.start("readonly"); // Infrastructure:Read is allowed on every MCP tier
+
+    const auto expected = nlohmann::json::parse(yuzu::server::openapi_spec_json());
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":30,"params":{"uri":"yuzu://openapi"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& contents = body["result"]["contents"];
+    REQUIRE(contents.is_array());
+    REQUIRE(contents.size() == 1);
+    CHECK(contents[0]["uri"] == "yuzu://openapi");
+    CHECK(contents[0]["mimeType"] == "application/json");
+    auto got = nlohmann::json::parse(contents[0]["text"].get<std::string>());
+    CHECK(got == expected);
+}
+
+TEST_CASE("MCP 2g PR4: yuzu://scope-dsl matches scope_kinds_catalog()",
+          "[mcp][2g][integration]") {
+    McpTestServer ts;
+    ts.start("readonly");
+
+    const auto expected = nlohmann::json::parse(yuzu::server::scope_kinds_catalog().json);
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":31,"params":{"uri":"yuzu://scope-dsl"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& contents = body["result"]["contents"];
+    REQUIRE(contents.is_array());
+    REQUIRE(contents.size() == 1);
+    CHECK(contents[0]["uri"] == "yuzu://scope-dsl");
+    CHECK(contents[0]["mimeType"] == "application/json");
+    auto got = nlohmann::json::parse(contents[0]["text"].get<std::string>());
+    CHECK(got == expected);
+}
+
+TEST_CASE("MCP 2g PR4: yuzu://openapi and yuzu://scope-dsl deny without Infrastructure:Read",
+          "[mcp][2g][integration]") {
+    McpTestServer ts;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& operation) {
+        return !(securable == "Infrastructure" && operation == "Read");
+    };
+    ts.start("readonly");
+
+    auto res_openapi = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":32,"params":{"uri":"yuzu://openapi"}})");
+    REQUIRE(res_openapi);
+    CHECK(res_openapi->status != 200); // perm_fn denial sets its own error status
+
+    auto res_scope_dsl = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":33,"params":{"uri":"yuzu://scope-dsl"}})");
+    REQUIRE(res_scope_dsl);
+    CHECK(res_scope_dsl->status != 200);
+}
+
+TEST_CASE("MCP 2g PR4: yuzu://openapi and yuzu://scope-dsl deny at an unrecognized MCP tier",
+          "[mcp][2g][integration]") {
+    // tier_allows() returns false for any tier string it doesn't recognize
+    // (mcp_policy.hpp's final `return false;`) — this is the first tier-gated
+    // resource, so this test pins the branch against a future regression to
+    // the legacy perm_fn-only resources/read pattern.
+    McpTestServer ts;
+    ts.start("bogus-unrecognized-tier");
+
+    auto res_openapi = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":34,"params":{"uri":"yuzu://openapi"}})");
+    REQUIRE(res_openapi);
+    auto body = nlohmann::json::parse(res_openapi->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+
+    auto res_scope_dsl = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":35,"params":{"uri":"yuzu://scope-dsl"}})");
+    REQUIRE(res_scope_dsl);
+    auto body2 = nlohmann::json::parse(res_scope_dsl->body);
+    REQUIRE(body2.contains("error"));
+    CHECK(body2["error"]["code"] == yuzu::server::mcp::kTierDenied);
 }
 
 // ── 11. Unknown method — verify kMethodNotFound ─────────────────────────────

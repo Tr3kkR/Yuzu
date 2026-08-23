@@ -435,9 +435,13 @@ pf packet filter demoted to a secondary row; `rules` lists pf rules.
 
 ### 9.3 Disk Encryption Status :white_check_mark: `T1`
 
-`bitlocker` plugin (cross-platform): Windows BitLocker (`manage-bde`), Linux
-LUKS (`list_luks_volumes`), and macOS FileVault (`fdesetup` + per-APFS-volume
-`diskutil apfs list`) — all three dispatched from the plugin's `state` action.
+`bitlocker` plugin (cross-platform): Windows BitLocker via an in-process
+Win32_EncryptableVolume WMI query + per-volume `GetConversionStatus()`
+method call (rung 1, no subprocess), Linux LUKS via in-process libblkid
+enumeration + plain `/sys/class/block/dm-*/dm/uuid` reads (`list_luks_volumes`,
+rung 1, no subprocess), and macOS FileVault (`fdesetup` + per-APFS-volume
+`diskutil apfs list`, direct argv through the bounded subprocess runner,
+rung 2) — all three dispatched from the plugin's `state` action.
 
 ### 9.4 Vulnerability Scanning :large_orange_diamond: `T1`
 
@@ -801,7 +805,7 @@ Session-cookie auth with PBKDF2-hashed passwords.
 
 ### 18.8 Device Authorization Tokens :white_check_mark: `T2`
 
-`DeviceTokenStore` (SQLite) with SHA-256 hashed tokens, device_id and definition_id scoping. REST: `GET/POST/DELETE /api/v1/device-tokens`. Integrated into auth chain.
+`DeviceTokenStore` (PostgreSQL, ADR-0052) with SHA-256 hashed tokens, device_id and definition_id scoping. REST: `GET/POST/DELETE /api/v1/device-tokens`. **Dormant** (same family as `LicenseStore`/ADR-0048 and `SoftwareDeploymentStore`/ADR-0051) — the store is migrated and tested but not constructed by the server, so these routes do not register today.
 
 ### 18.9 HTTPS for Web Dashboard :white_check_mark: `T1`
 

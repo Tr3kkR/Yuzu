@@ -396,14 +396,15 @@ Plugins for antivirus, firewall, disk encryption, event logs, vulnerability scan
 
 | | |
 |---|---|
-| **Version** | v0.2.0 |
+| **Version** | v0.3.0 |
 | **Platforms** | W L M |
-| **Description** | Antivirus product detection and status. |
+| **Description** | Antivirus product detection, status, and (Windows) configured exclusions. Windows acquisition is in-process WMI/registry (rung 1); macOS/Linux read via the bounded subprocess runner. |
 
 | Action | Description |
 |---|---|
-| `products` | List detected antivirus products as `av\|<name>\|<state>` rows. Windows: SecurityCenter2 registered products (state is the raw productState code). Linux: process/directory detection. macOS: XProtect probed via its definition bundle (an `xprotect_version\|…` row rides alongside; `av\|XProtect\|unknown` means the bundle was unreadable — never assumed active) plus endpoint-security system extensions for third-party EDR/AV (each also emits `edr\|<bundle id>\|<version>`), with process detection as fallback. |
-| `status` | Windows: Defender real-time protection, signature version, last update, last quick scan. macOS: XProtect definition version, definition freshness (`last_update`), and Remediator/MRT engine versions — no real-time-protection row (macOS exposes no queryable equivalent); `status\|unknown` means the definition bundle was unreadable. Linux: `status\|not_available`. |
+| `products` | List detected antivirus products. Windows: SecurityCenter2 registered products as `av\|<name>\|<state>\|<definitions>` rows — the productState code is decoded into `enabled`/`snoozed`/`disabled` and a `current`/`stale` definitions-freshness field (`unknown\|unknown` when it cannot be decoded). Linux/macOS: 3-field `av\|<name>\|<state>` rows. Linux: process/directory detection. macOS: XProtect probed via its definition bundle (an `xprotect_version\|…` row rides alongside; `av\|XProtect\|unknown` means the bundle was unreadable — never assumed active) plus endpoint-security system extensions for third-party EDR/AV (each also emits `edr\|<bundle id>\|<version>`), with process detection as fallback. |
+| `status` | Windows: Defender real-time protection, signature version, last update, last quick scan. macOS: XProtect definition version, definition freshness (`last_update`), and Remediator/MRT engine versions — no real-time-protection row (macOS exposes no queryable equivalent); `status\|unknown` means the definition bundle was unreadable. Linux: `av\|ClamAV\|running` or `not_running` (plus `last_update\|<ISO-8601>` from the signature database's mtime when clamd is running), and presence-only `av\|CrowdStrike Falcon\|detected`/`not_detected` and `av\|Sophos\|detected`/`not_detected` — no definitions data is reported for those two. |
+| `av_exclusions` | Windows-only. Lists Defender's configured exclusions (paths, processes, file extensions) from both the operator-editable local hive and the GPO/MDM-managed policy hive, merged with provenance so an operator can tell which plane an exclusion came from. A `partial` result means the enumeration could not be confirmed complete (a registry read was truncated or transiently failed) — the exclusions returned are real, but there may be more that weren't collected. Other platforms report `unsupported`. |
 
 ### firewall
 
@@ -421,13 +422,13 @@ Plugins for antivirus, firewall, disk encryption, event logs, vulnerability scan
 
 | | |
 |---|---|
-| **Version** | v0.1.0 |
+| **Version** | v0.2.0 |
 | **Platforms** | W L M |
-| **Description** | Disk encryption status. Reports BitLocker on Windows, LUKS on Linux, and FileVault on macOS. |
+| **Description** | Disk encryption status. Reports BitLocker on Windows (in-process WMI, `Win32_EncryptableVolume`), LUKS on Linux (`libblkid` + `/sys/class/block/dm-*`), and FileVault on macOS (`fdesetup`/`diskutil` via the bounded subprocess runner). |
 
 | Action | Description |
 |---|---|
-| `state` | Encryption status per volume (encrypted, decrypted, encrypting, protection on/off). |
+| `state` | Encryption status per volume (encrypted, decrypted, encrypting, protection on/off). A host with more encryptable volumes than the query's row cap reports a `partial` completeness signal rather than silently omitting the excess volumes. |
 
 ### event_logs
 
@@ -615,11 +616,16 @@ Plugins for running arbitrary commands, managing device tags, and structured ass
 | `clear` | Remove all tags. |
 | `count` | Return the total number of tags. |
 
-> **The `service` key is not synced from `tags.json` (#3289).** `service` is the confinement
+> **The `service` key is not synced from `tags.json` (#3289), and never answers scope-DSL
+> queries from the agent's live session either (#3295).** `service` is the confinement
 > boundary a service-scoped API token is checked against, so the server silently drops it from
-> an agent's self-reported tags rather than accepting it — set-locally-only, never propagated. A
-> device's `service` tag must always be assigned by an operator (dashboard/REST) or an API
-> integration, never by a `tags.json` entry shipped with the agent.
+> an agent's self-reported tags rather than accepting it — set-locally-only, never propagated,
+> and dropped from the agent's live session at registration too. A device's `service` tag must
+> always be assigned by an operator (dashboard/REST) or an API integration, never by a
+> `tags.json` entry shipped with the agent. Every OTHER key in `tags.json` still reaches
+> scope-DSL `tag:<key>` evaluation and the server tag store normally — see
+> `docs/asset-tagging-guide.md` "Tag source precedence (write time)" for the full precedence
+> rules (which source wins when an operator has also set the same key).
 
 ### asset_tags
 
