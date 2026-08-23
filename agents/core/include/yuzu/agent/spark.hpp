@@ -80,12 +80,16 @@ inline constexpr std::uint32_t kGuardianLaneJitterPct = 20;         ///< +/- thi
     return (cadence_ms * jitter_pct) / 100;
 }
 
-/// #3388's debounce default (lane cadence + one jitter span) must exceed even the
-/// shortest jitter-shortened sweep (`cadence * (1 - jitter_pct/100)`) so a
-/// compliant-edge-then-redrift round trip is never silently swallowed rather than
-/// merely delayed (Gate 2 security-guardian derivation: holds for jitter_pct <
-/// 33.3%, comfortably true at 20%). A future jitter_pct raise past that bound
-/// should fail loud here, not silently reintroduce flap-suppression.
+/// #3388's debounce default (lane cadence + one jitter span) must stay BELOW the
+/// two-sweep minimum (`2 * cadence * (1 - jitter_pct/100)`) - not merely above a
+/// single sweep, which holds trivially for any positive jitter and proves
+/// nothing - so a compliant-edge-then-redrift round trip across one sweep is
+/// never silently swallowed by the first drift's debounce window, only delayed
+/// (Gate 2 security-guardian derivation, corrected at Gate 8 after the same
+/// wrong-inequality mistake showed up in this very comment: `1+j/100 < 2*(1-j/100)`
+/// solves to `j < 33.3%`, comfortably true at 20%). A future jitter_pct raise
+/// past that bound should fail loud here, not silently reintroduce
+/// flap-suppression.
 static_assert(kGuardianLaneJitterPct < 34,
              "raising jitter past ~1/3 needs re-deriving guardian_spark_bridge.hpp's "
              "debounce-vs-two-sweep-minimum margin (#3388), not just bumping this constant");
