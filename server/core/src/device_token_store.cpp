@@ -305,10 +305,10 @@ const std::vector<pg::PgMigration>& migrations() {
 // `hash[32]` and silently returned the hex of 32 zero bytes: a constant hash for every input,
 // which is an auth-bypass shape on a bearer-credential path (create_token would persist it,
 // validate_token would recompute the same constant for ANY raw token). Now a single checked path
-// on every platform via the file's existing sha256_hex (already used, unconditionally, for
-// backfill fingerprinting) — OpenSSL is required on Windows regardless of linkage (CLAUDE.md
-// vcpkg section), so there is no cross-platform reason left for a BCrypt branch. Output bytes are
-// identical to the old BCrypt branch (both are SHA-256), so no legacy hash is invalidated.
+// on every platform via a single checked EVP_Digest call (sha256_hex above) — OpenSSL is
+// required on Windows regardless of linkage (CLAUDE.md vcpkg section), so there is no
+// cross-platform reason left for a BCrypt branch. Output bytes are identical to the old BCrypt
+// branch (both are SHA-256), so no legacy hash is invalidated.
 std::expected<std::string, std::string> hash_token(const std::string& raw) {
     auto h = sha256_hex(raw);
     if (h.empty())
