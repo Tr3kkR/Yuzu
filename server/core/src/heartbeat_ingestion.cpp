@@ -73,6 +73,19 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
         }
     }
 
+    // #3425: quarantine reconnect reconciler. Unconditional — reconnect
+    // itself is the signal, no tag to gate on (unlike the guardian hook
+    // above). Defensive: never let a reconcile hook take down the rest of
+    // ingestion.
+    if (quarantine_reconcile_fn_) {
+        try {
+            quarantine_reconcile_fn_(agent_id_str);
+        } catch (const std::exception& e) {
+            spdlog::warn("[{}] Heartbeat quarantine reconcile threw for agent={}: {}", via_str,
+                        agent_id_str, e.what());
+        }
+    }
+
     // PR 10 / UAT 2026-05-12 — fleet_snapshot.v1 ingestion. Parse failures
     // are non-fatal: a malformed payload from a buggy agent must not knock
     // the heartbeat path offline for the rest of the fleet.

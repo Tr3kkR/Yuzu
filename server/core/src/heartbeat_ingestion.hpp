@@ -80,6 +80,17 @@ public:
         guardian_reconcile_fn_ = std::move(fn);
     }
 
+    /// Quarantine reconnect reconciler (#3425). Invoked UNCONDITIONALLY once
+    /// per ingested heartbeat (unlike the guardian hook above, this one
+    /// carries no tag to gate on — reconnect itself is the signal). The
+    /// callee (`QuarantineContainmentReconciler::notify_agent_heartbeat`)
+    /// owns its own fast-path cache lookup, so an unset or a hit-nothing fn
+    /// costs at most one branch here. Optional; unset = no reconcile.
+    using QuarantineReconcileFn = std::function<void(std::string_view agent_id)>;
+    void set_quarantine_reconcile_fn(QuarantineReconcileFn fn) {
+        quarantine_reconcile_fn_ = std::move(fn);
+    }
+
 private:
     detail::AgentRegistry& registry_;
     detail::AgentHealthStore* health_store_;
@@ -87,6 +98,7 @@ private:
     MetricsRegistry* metrics_;
     OfflineEndpointStore* offline_store_{nullptr};
     GuardianReconcileFn guardian_reconcile_fn_;
+    QuarantineReconcileFn quarantine_reconcile_fn_;
 };
 
 } // namespace yuzu::server
