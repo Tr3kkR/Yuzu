@@ -1,5 +1,6 @@
 #pragma once
 
+#include <string>
 #include <string_view>
 
 namespace yuzu::server {
@@ -33,6 +34,53 @@ inline std::string_view strip_conflict_prefix(std::string_view msg) {
 
 inline bool is_conflict_error(std::string_view msg) {
     return msg.rfind(kConflictPrefix, 0) == 0;
+}
+
+// Shared kind-validation wording (#753) so operators see one message
+// regardless of which store rejected their YAML. These are 400s, not
+// 409s — do NOT route them through kConflictPrefix.
+//
+// kind_mismatch_error() covers "kind" present but wrong; kind_missing_error()
+// covers "kind" absent entirely — a missing kind is not a mismatch, so it
+// gets its own honest verb rather than being force-fitted into the
+// mismatch string.
+//
+// Byte-exact outputs (verify any change against these before committing):
+//   kind_mismatch_error("X", "Y") ==
+//     "kind must be 'X', got 'Y'. yaml_source must be a complete YAML "
+//     "document including 'apiVersion: yuzu.io/v1alpha1' and 'kind: X'."
+//   kind_mismatch_error("X", "Y", example) appends " Example:\n" + example
+//   kind_mismatch_error("X", "Y", example, docs_ref) further appends
+//     "See " + docs_ref + "."
+//   kind_missing_error() ==
+//     "kind is required. yaml_source must be a complete YAML document "
+//     "including 'apiVersion: yuzu.io/v1alpha1' and a 'kind:' field."
+inline std::string kind_mismatch_error(std::string_view expected, std::string_view actual,
+                                        std::string_view example = {},
+                                        std::string_view docs_ref = {}) {
+    std::string msg = "kind must be '";
+    msg += expected;
+    msg += "', got '";
+    msg += actual;
+    msg += "'. yaml_source must be a complete YAML document including "
+           "'apiVersion: yuzu.io/v1alpha1' and 'kind: ";
+    msg += expected;
+    msg += "'.";
+    if (!example.empty()) {
+        msg += " Example:\n";
+        msg += example;
+    }
+    if (!docs_ref.empty()) {
+        msg += "See ";
+        msg += docs_ref;
+        msg += ".";
+    }
+    return msg;
+}
+
+inline std::string kind_missing_error() {
+    return "kind is required. yaml_source must be a complete YAML document "
+           "including 'apiVersion: yuzu.io/v1alpha1' and a 'kind:' field.";
 }
 
 } // namespace yuzu::server

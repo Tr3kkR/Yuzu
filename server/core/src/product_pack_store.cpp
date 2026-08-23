@@ -1,5 +1,6 @@
 #include "product_pack_store.hpp"
 #include "migration_runner.hpp"
+#include "store_errors.hpp"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -481,7 +482,7 @@ std::expected<std::string, std::string> ProductPackStore::install(const std::str
                 documents[i].find("plugin:") != std::string::npos) {
                 kind = "InstructionDefinition";
             } else {
-                errors.push_back("document " + std::to_string(i) + " has no kind");
+                errors.push_back("document " + std::to_string(i) + ": " + kind_missing_error());
                 continue;
             }
         }
