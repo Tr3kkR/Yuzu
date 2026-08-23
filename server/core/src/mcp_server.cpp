@@ -3141,6 +3141,21 @@ McpServer::HandlerFn McpServer::build_handler(
                     const auto cid = yuzu::server::detail::make_correlation_id();
                     session_audit("mcp.session.reject", "failure", "",
                                   "reason=" + mint.reject_reason + " cid=" + cid);
+                    // #3042: the registry's shutdown() flag rejects every mint with this
+                    // reason once ServerImpl::stop() has begun draining sessions — a
+                    // distinct, transient condition from the cap reject below (no session
+                    // to end, no timeout to wait out; the whole server is going away). No
+                    // retry_after_ms: this process has no visibility into when a
+                    // replacement instance will be reachable.
+                    if (mint.reject_reason == "shutdown") {
+                        res.status = 503;
+                        res.set_content(
+                            error_response_a4(id, kMcpShuttingDown, "Server is shutting down",
+                                              cid, "reconnect and re-initialize once the "
+                                                   "server is back"),
+                            "application/json");
+                        return;
+                    }
                     res.status = 429;
                     res.set_content(
                         error_response_a4(

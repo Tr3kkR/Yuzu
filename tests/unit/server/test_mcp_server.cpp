@@ -12779,6 +12779,43 @@ TEST_CASE("MCP 2f: streaming OFF mints no session header (byte-compat)", "[mcp][
     CHECK(res->get_header_value("Mcp-Session-Id").empty()); // no minting when streaming off
 }
 
+TEST_CASE("MCP #3042: initialize during shutdown gets a 503, distinct from the cap reject",
+          "[mcp][transport][2f]") {
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.start();
+
+    CHECK(reg.shutdown() == 0); // ServerImpl::stop()'s call, in miniature — nothing live yet
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}})");
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Mcp-Session-Id").empty()); // never minted
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == mcp::kMcpShuttingDown);
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.session.reject|failure") !=
+          ts.audit_log.end());
+}
+
+TEST_CASE("MCP #3042: a session live before shutdown 404s afterward, like any unknown session",
+          "[mcp][transport][2f][stream]") {
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.start();
+    const auto sid = mint_session(ts);
+    REQUIRE_FALSE(sid.empty());
+
+    CHECK(reg.shutdown() == 1);
+
+    auto get_res = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                           {"Accept", "text/event-stream"}});
+    CHECK(get_res->status == 404);
+    auto post_res = ts.call_raw("POST", R"({"jsonrpc":"2.0","method":"tools/list","id":9})",
+                                {{"Mcp-Session-Id", sid}});
+    CHECK(post_res->status == 404);
+}
+
 TEST_CASE("MCP 2f: initialize mints a principal-bound session + open audit", "[mcp][transport][2f]") {
     mcp::McpSessionRegistry reg;
     McpTestServer ts;

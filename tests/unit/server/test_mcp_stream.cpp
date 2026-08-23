@@ -1241,6 +1241,87 @@ TEST_CASE("McpSessionRegistry: a live stream's ticking keeps its session young",
     CHECK(reg.active_count() == 0);
 }
 
+// #3042: ServerImpl::stop()'s close-signal, proven end-to-end through the same
+// object graph stop() uses (registry -> live McpStreamState -> parked pump),
+// not just the registry's own bookkeeping (test_mcp_session.cpp covers that).
+TEST_CASE("McpSessionRegistry: shutdown wakes a live GET pump immediately, not a tick later",
+          "[mcp][session][stream][race]") {
+    mcp::McpSessionRegistry reg;
+    const auto minted = reg.mint("alice");
+    REQUIRE(minted.ok);
+    const auto sid = minted.session_id;
+    auto stream = reg.stream_for(sid, "alice");
+    REQUIRE(stream);
+    auto attached = stream->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    mcp::McpStreamPump::Config cfg;
+    cfg.tick = std::chrono::seconds(30); // a wakeup that RELIES on the tick would hang
+    mcp::McpStreamPump pump{
+        attached.sink, stream, attached.generation,
+        [] { return mcp::StreamRevalidate::kValid; },
+        [&reg, sid] {
+            // The real production wiring (mcp_server.cpp's session_alive closure),
+            // not a hardcoded `true` — proves shutdown() reaches this pump via the
+            // registry, not just via a direct state->close() call.
+            return reg.validate_and_touch(sid, "alice") ==
+                   mcp::McpSessionRegistry::ValidateResult::kValid;
+        },
+        cfg};
+
+    std::atomic<bool> returned{false};
+    FakeWire wire;
+    std::thread pumper([&] {
+        pump.pump_once(wire.writer());
+        returned.store(true);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50)); // let the pump reach its wait
+    CHECK(reg.shutdown() == 1); // ServerImpl::stop()'s call, in miniature
+    pumper.join();
+
+    CHECK(returned.load());
+    CHECK(attached.sink->close_reason.load() == mcp::McpStreamClose::kSessionTerminated);
+}
+
+// The streamed-POST surface never attaches through McpStreamState — its sink is
+// a standalone SseSinkState, and its only tie to a session is the session_alive_
+// check each tick. #3042: once shutdown() drains the registry, that check must
+// fail on the pump's very next tick, closing the response well before the
+// streamed-POST response cap — the gap the issue's UP-1 was actually about.
+TEST_CASE("McpSessionRegistry: shutdown closes a live streamed-POST pump within one tick",
+          "[mcp][session][stream][race]") {
+    mcp::McpSessionRegistry reg;
+    const auto minted = reg.mint("alice");
+    REQUIRE(minted.ok);
+    const auto sid = minted.session_id;
+
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    mcp::McpPostPump::Config cfg;
+    cfg.tick = std::chrono::milliseconds(10); // don't sleep 3 s in a unit test
+    mcp::McpPostPump pump{
+        sink,
+        [](bool /*cap_expired*/) { return mcp::McpStreamBridge::PostBatch{}; }, // nothing to drain
+        [] {},                                                                  // on_final_written
+        [] { return mcp::StreamRevalidate::kValid; },
+        [&reg, sid] {
+            return reg.validate_and_touch(sid, "alice") ==
+                   mcp::McpSessionRegistry::ValidateResult::kValid;
+        },
+        cfg};
+
+    FakeWire wire;
+    // First tick: the session is still live — continue (heartbeat), same as any
+    // ordinary in-progress streamed-POST call.
+    CHECK(pump.pump_once(wire.writer()));
+
+    CHECK(reg.shutdown() == 1);
+
+    // Next tick: session_alive_() now reads the drained registry and fails.
+    CHECK_FALSE(pump.pump_once(wire.writer()));
+    CHECK(pump.close_reason() == mcp::McpStreamClose::kSessionTerminated);
+}
+
 // ── Concurrency (TSan net) ──────────────────────────────────────────────────
 
 TEST_CASE("McpStreamState: concurrent publish / attach / detach / close is race-free",

@@ -58,7 +58,8 @@ public:
     struct MintResult {
         bool ok = false;
         std::string session_id;     // set iff ok
-        std::string reject_reason;  // set iff !ok: "per_principal_cap" | "global_cap" | "id_generation"
+        // set iff !ok: "per_principal_cap" | "global_cap" | "id_generation" | "shutdown"
+        std::string reject_reason;
     };
 
     // Mint a fresh, principal-bound session id (≥128-bit CSPRNG, lowercase hex).
@@ -108,6 +109,21 @@ public:
     // principal reads as absent.
     bool exists(const std::string& id, const std::string& principal) const;
 
+    // Server shutdown close-signal (#3042): stickily refuse every future mint()
+    // (reject_reason "shutdown") and close every currently-live stream
+    // (kSessionTerminated) so their pumps drain instead of riding the shutdown
+    // write-loop to its next check. Idempotent — a second call closes nothing and
+    // returns 0. NOT a full close-all guarantee: a caller that already holds a
+    // `stream_for()` result and attaches a fresh sink after this returns will
+    // still get a stream, but one now emptied from the registry — its pump's
+    // first `session_alive_` re-check (one tick, ~3s) finds the session gone and
+    // closes it. That residual window is accepted rather than made sticky on
+    // McpStreamState itself (larger diff, no bound improvement — see #3042).
+    // noexcept: called from ServerImpl::stop(), itself noexcept — every step
+    // that can throw (McpStreamState::close(), gauge publish) is internally
+    // contained so no exception escapes this call.
+    std::size_t shutdown() noexcept;
+
 private:
     struct Entry {
         std::string principal;
@@ -132,6 +148,7 @@ private:
     yuzu::MetricsRegistry* metrics_ = nullptr;
     mutable std::mutex mu_;
     std::unordered_map<std::string, Entry> sessions_;  // session id → entry
+    bool closing_ = false;  // sticky; set once by shutdown(), guarded by mu_
 };
 
 }  // namespace yuzu::server::mcp

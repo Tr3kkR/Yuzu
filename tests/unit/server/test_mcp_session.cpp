@@ -10,6 +10,8 @@
 
 #include "mcp_session.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
@@ -174,4 +176,108 @@ TEST_CASE("MCP session: idle GC reclaims cap room on mint", "[mcp][session]") {
     auto a2 = reg.mint("alice");        // mint's opportunistic GC frees a1's slot
     CHECK(a2.ok);
     CHECK(reg.active_count() == 1);
+}
+
+// #3042: ServerImpl::stop()'s close-signal for every live MCP session.
+TEST_CASE("MCP session: shutdown closes every live session and refuses new mints",
+          "[mcp][session]") {
+    McpSessionRegistry reg;
+    auto a = reg.mint("alice");
+    auto b = reg.mint("bob");
+    REQUIRE(a.ok);
+    REQUIRE(b.ok);
+    REQUIRE(reg.active_count() == 2);
+
+    CHECK(reg.shutdown() == 2);
+    CHECK(reg.active_count() == 0);
+
+    // Sticky: every read/write API sees a drained, closed registry afterward.
+    auto rejected = reg.mint("carol");
+    CHECK_FALSE(rejected.ok);
+    CHECK(rejected.reject_reason == "shutdown");
+    CHECK(reg.validate_and_touch(a.session_id, "alice") == Validate::kUnknown);
+    CHECK(reg.stream_for(a.session_id, "alice") == nullptr);
+    CHECK_FALSE(reg.terminate(a.session_id, "alice"));
+    CHECK_FALSE(reg.exists(a.session_id, "alice"));
+    reg.gc(); // no-op on an already-empty map; must not crash or resurrect anything
+    CHECK(reg.active_count() == 0);
+}
+
+TEST_CASE("MCP session: shutdown is idempotent — a second call closes nothing",
+          "[mcp][session]") {
+    McpSessionRegistry reg;
+    REQUIRE(reg.mint("alice").ok);
+    CHECK(reg.shutdown() == 1);
+    CHECK(reg.shutdown() == 0); // already-empty, already-closing: no double-close, no crash
+    CHECK(reg.shutdown() == 0);
+}
+
+TEST_CASE("MCP session: shutdown with no live sessions closes zero and still latches",
+          "[mcp][session]") {
+    McpSessionRegistry reg;
+    CHECK(reg.shutdown() == 0);
+    auto rejected = reg.mint("alice");
+    CHECK_FALSE(rejected.ok);
+    CHECK(rejected.reject_reason == "shutdown");
+}
+
+TEST_CASE("MCP session: shutdown publishes the active-sessions gauge at zero",
+          "[mcp][session]") {
+    yuzu::MetricsRegistry metrics;
+    McpSessionRegistry reg({.per_principal_cap = 8, .global_cap = 64}, {}, &metrics);
+    REQUIRE(reg.mint("alice").ok);
+    REQUIRE(reg.mint("bob").ok);
+    CHECK(metrics.gauge("yuzu_mcp_sessions_active").value() == 2.0);
+
+    reg.shutdown();
+    CHECK(metrics.gauge("yuzu_mcp_sessions_active").value() == 0.0);
+}
+
+TEST_CASE("MCP session: shutdown races mint/validate/terminate cleanly (TSan regression net)",
+          "[mcp][session]") {
+    // Same hammer shape as the concurrent-access test above, plus one thread that
+    // calls shutdown() partway through. Every mint that lands AFTER shutdown() takes
+    // effect must be refused; the registry must end up fully drained regardless of
+    // how the hammer and the shutdown call interleave.
+    McpSessionRegistry reg({.per_principal_cap = 1000, .global_cap = 100000});
+    constexpr int kThreads = 8;
+    constexpr int kOpsPerThread = 400;
+    std::atomic<bool> shutdown_done{false};
+    std::atomic<int> minted_after_shutdown{0}; // must stay 0
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&reg, &shutdown_done, &minted_after_shutdown, t] {
+            const std::string principal = "p" + std::to_string(t);
+            std::vector<std::string> mine;
+            for (int i = 0; i < kOpsPerThread; ++i) {
+                const bool done_before = shutdown_done.load(std::memory_order_acquire);
+                auto m = reg.mint(principal);
+                if (m.ok) {
+                    if (done_before) {
+                        ++minted_after_shutdown; // a mint must never succeed once shutdown fired
+                    }
+                    mine.push_back(m.session_id);
+                }
+                (void)reg.validate_and_touch(std::string(32, 'e'), "intruder");
+                if (!mine.empty() && (i % 3 == 0)) {
+                    reg.terminate(mine.back(), principal);
+                    mine.pop_back();
+                }
+                if (i % 7 == 0) {
+                    reg.gc();
+                }
+            }
+        });
+    }
+    threads.emplace_back([&reg, &shutdown_done] {
+        std::this_thread::sleep_for(std::chrono::microseconds{200});
+        reg.shutdown();
+        shutdown_done.store(true, std::memory_order_release);
+    });
+    for (auto& th : threads) {
+        th.join();
+    }
+    CHECK(minted_after_shutdown.load() == 0);
+    CHECK(reg.active_count() == 0);
+    CHECK_FALSE(reg.mint("late").ok); // registry stays refused post-join
 }

@@ -82,6 +82,40 @@ void McpSessionRegistry::gc() {
     }
 }
 
+std::size_t McpSessionRegistry::shutdown() noexcept {
+    std::unordered_map<std::string, Entry> grabbed;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (closing_) {
+            return 0;  // idempotent — a second call finds an already-empty map anyway
+        }
+        closing_ = true;
+        grabbed.swap(sessions_);  // O(1), non-throwing — keeps the critical section trivial
+    }
+    // Best-effort tail, outside mu_ (lock order, as in gc_locked): closing a stream
+    // takes its own mutex, and this function is noexcept (called from
+    // ServerImpl::stop(), itself noexcept), so nothing below may escape.
+    // McpStreamState::close() is not itself declared noexcept — a lock_guard ctor
+    // can theoretically throw — so each close is individually contained: one bad
+    // stream must not stop the rest from being signalled (mirrors #3043's still-open
+    // request to give gc()/mint()/validate_and_touch()'s close_sink() calls the same
+    // containment poison_terminal() already has; this call site is native-contained
+    // from the start rather than added retroactively).
+    for (auto& [id, entry] : grabbed) {
+        if (entry.stream) {
+            try {
+                entry.stream->close(McpStreamClose::kSessionTerminated);
+            } catch (...) {  // NOLINT(bugprone-empty-catch) — best-effort signal only
+            }
+        }
+    }
+    try {
+        publish_active_gauge(0);
+    } catch (...) {  // NOLINT(bugprone-empty-catch)
+    }
+    return grabbed.size();
+}
+
 McpSessionRegistry::MintResult McpSessionRegistry::mint(const std::string& principal) {
     std::vector<std::shared_ptr<McpStreamState>> reaped;
     MintResult result;
@@ -97,7 +131,9 @@ McpSessionRegistry::MintResult McpSessionRegistry::mint(const std::string& princ
         std::lock_guard<std::mutex> lk(mu_);
         reaped = gc_locked();  // reclaim idle sessions before enforcing caps
 
-        if (sessions_.size() >= cfg_.global_cap) {
+        if (closing_) {
+            result = {false, {}, "shutdown"};
+        } else if (sessions_.size() >= cfg_.global_cap) {
             result = {false, {}, "global_cap"};
         } else if (principal_count_locked(principal) >= cfg_.per_principal_cap) {
             result = {false, {}, "per_principal_cap"};
