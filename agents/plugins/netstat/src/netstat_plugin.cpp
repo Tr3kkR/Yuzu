@@ -33,6 +33,7 @@
 #include <charconv>
 #include <cstdint>
 #include <format>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -67,13 +68,22 @@ namespace {
 
 // Escape '|' in a field that may contain arbitrary text (process name/path)
 // so it can't be mistaken for a column separator downstream. Ported from the
-// retired sockwho_plugin.cpp.
+// retired sockwho_plugin.cpp. Also strips CR/LF (adversarial-review gate-2
+// finding, #3403): split_output_lines() on the server splits raw agent
+// output on '\n' and trims a trailing '\r', with no unescape for either —
+// only '\|' round-trips through unescape_pipes(). A POSIX filename may
+// legally contain a newline, so an unescaped process name/path could split
+// one attribution row into extra server-visible lines. There's no
+// reversible escape for a control character here, so it's replaced with
+// '_' (same choice as agents/shared/user_profile_model.hpp's sanitize_field).
 std::string escape_pipes(std::string_view sv) {
     std::string out;
     out.reserve(sv.size());
     for (char c : sv) {
         if (c == '|')
             out += "\\|";
+        else if (c == '\r' || c == '\n')
+            out += '_';
         else
             out += c;
     }
@@ -270,14 +280,21 @@ struct ProcInfo {
 // PID → ProcInfo (process name/path). Ported from sockwho_plugin.cpp's
 // build_maps() — sockwho is retired, this is now netstat's own attribution
 // enrichment path.
+//
+// Both DIR* streams are RAII-owned (adversarial-review gate-2 finding,
+// #3403): allocating work (std::format, std::string construction, map
+// insertion) runs between opendir() and the matching closedir(), so an
+// exception there would previously skip the manual cleanup and leak the fd
+// for the life of the agent (CLAUDE.md's non-RAII-manual-cleanup floor).
+// Same idiom as tar_proc_perf.cpp's read_proc_counters().
 void build_socket_and_proc_maps(std::unordered_map<uint64_t, int>& inode_map,
                                 std::unordered_map<int, ProcInfo>& proc_map) {
-    DIR* proc_dir = opendir("/proc");
+    const std::unique_ptr<DIR, int (*)(DIR*)> proc_dir{opendir("/proc"), &closedir};
     if (!proc_dir)
         return;
 
     struct dirent* proc_entry = nullptr;
-    while ((proc_entry = readdir(proc_dir)) != nullptr) {
+    while ((proc_entry = readdir(proc_dir.get())) != nullptr) {
         int pid = 0;
         [[maybe_unused]] auto [ptr, ec] = std::from_chars(proc_entry->d_name,
                                          proc_entry->d_name + std::strlen(proc_entry->d_name), pid);
@@ -302,13 +319,13 @@ void build_socket_and_proc_maps(std::unordered_map<uint64_t, int>& inode_map,
             proc_map.emplace(pid, std::move(info));
 
         std::string fd_path = proc_path + "/fd";
-        DIR* fd_dir = opendir(fd_path.c_str());
+        const std::unique_ptr<DIR, int (*)(DIR*)> fd_dir{opendir(fd_path.c_str()), &closedir};
         if (!fd_dir)
             continue;
 
         char link_buf[128];
         struct dirent* fd_entry = nullptr;
-        while ((fd_entry = readdir(fd_dir)) != nullptr) {
+        while ((fd_entry = readdir(fd_dir.get())) != nullptr) {
             if (fd_entry->d_name[0] == '.')
                 continue;
             std::string link_path = std::format("{}/{}", fd_path, fd_entry->d_name);
@@ -326,9 +343,7 @@ void build_socket_and_proc_maps(std::unordered_map<uint64_t, int>& inode_map,
             if (inode > 0)
                 inode_map.emplace(inode, pid);
         }
-        closedir(fd_dir);
     }
-    closedir(proc_dir);
 }
 
 void parse_proc_net_file_attributed(const char* path, std::string_view proto,
@@ -612,15 +627,29 @@ struct ProcInfo {
 
 using yuzu::win::from_wide;
 
+// Single-owner RAII for a process HANDLE: CloseHandle runs on every scope
+// exit, including an exception from from_wide/substr between acquire and
+// release (adversarial-review gate-2 finding, #3403 — the prior manual
+// CloseHandle could skip it). Same shape as processes_plugin.cpp's
+// HandleGuard.
+struct HandleGuard {
+    HANDLE h;
+    explicit HandleGuard(HANDLE handle) noexcept : h(handle) {}
+    ~HandleGuard() { if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h); }
+    HandleGuard(const HandleGuard&) = delete;
+    HandleGuard& operator=(const HandleGuard&) = delete;
+    explicit operator bool() const noexcept { return h && h != INVALID_HANDLE_VALUE; }
+};
+
 ProcInfo get_proc_info(DWORD pid) {
     ProcInfo info;
-    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!proc)
+    HandleGuard hg(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+    if (!hg)
         return info;
 
     wchar_t path_buf[MAX_PATH];
     DWORD path_len = MAX_PATH;
-    if (QueryFullProcessImageNameW(proc, 0, path_buf, &path_len)) {
+    if (QueryFullProcessImageNameW(hg.h, 0, path_buf, &path_len)) {
         info.path = from_wide(path_buf);
         auto slash = info.path.rfind('\\');
         if (slash != std::string::npos)
@@ -628,8 +657,7 @@ ProcInfo get_proc_info(DWORD pid) {
         else
             info.name = info.path;
     }
-    CloseHandle(proc);
-    return info;
+    return info; // ~HandleGuard closes the handle on every path
 }
 
 const ProcInfo& lookup_proc(DWORD pid, std::unordered_map<DWORD, ProcInfo>& cache) {
