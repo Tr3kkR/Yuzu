@@ -1,6 +1,6 @@
 # Spark / legacy Guardian detection: intentional delta registry
 
-Captured against `origin/dev @ 310b5d8f8` (2026-08-23). Authority: ADR-0021 Decision 11
+Captured against `origin/dev @ b16e5836d` (2026-08-23). Authority: ADR-0021 Decision 11
 amendment ("incremental per-consumer cutover... with the three gates applied per rung");
 `docs/spark-stage2-guardian-consumer-design.md` §R2 consequence 2 (origin ruling, quoted
 below); `docs/user-manual/guaranteed-state.md` "Per-rung default posture" table.
@@ -14,14 +14,15 @@ below); `docs/user-manual/guaranteed-state.md` "Per-rung default posture" table.
 > — `spark-stage2-guardian-consumer-design.md`, §R2 consequence 2
 
 The design doc's PR-2 ("thin cutover") and rung-10 ladder entries both list this
-registry as a named flip-gating deliverable — R2 consequence 2, pulled forward from
-rung 10 because 7.7b changes the behavior it classifies, "shipped ahead of the flip,
-F12/#3386: `docs/spark-legacy-delta-registry.md`"
-(`spark-stage2-guardian-consumer-design.md` §PR-2 + the rung-10 ladder item). The
-intent both sites express: every observed difference between a legacy-detection run
-and a spark-detection run at parity-capture time must classify as either a row in this
-table ("expected, already decided") or a genuine regression ("new, investigate"). This
-is that table.
+registry as a named flip-gating deliverable (R2 consequence 2, pulled forward from
+rung 10 because 7.7b changes the behavior it classifies): §PR-2 (`spark-stage2-guardian-
+consumer-design.md`, and the 7.7b bullet list restating it) calls it "shipped ahead of
+the flip, F12/#3386: `docs/spark-legacy-delta-registry.md`"; the numbered rung-10 ladder
+item phrases the same fact as "shipped ahead of schedule, F12/#3386: ..." — different
+wording, same claim. The intent both sites express: every observed difference between a
+legacy-detection run and a spark-detection run at parity-capture time must classify as
+either a row in this table ("expected, already decided") or a genuine regression ("new,
+investigate"). This is that table.
 
 **A third bucket exists and must not be silently folded into the first: a row whose
 Epistemic status is `open-question`.** Such a row (currently only D3) documents a real,
@@ -98,7 +99,7 @@ never invent a rationale for what isn't ruled yet.
 | **Why deliberate** | "SparkFailed and Unwired NEVER fall back to legacy - a failure must be visible (errored), never silently absorbed (mutual exclusion)." Ruling R1 (design doc, backend-selection table + correlated-outage note). |
 | **Operator symptom** | `yuzu.guardian_backend` heartbeat tag reads `spark_failed` or `unwired` for the affected agent. **No fleet-level Prometheus gauge exists for this today** — `yuzu_fleet_spark_failed{os}` is adjacent but not identical (it tracks SparkEngine boot failure only, not a post-boot wiring failure or `Unwired`). A fleet-wide SparkEngine boot throw is a correlated-outage tail: every agent in the cohort loses enforcement simultaneously until `--spark-disable` is set. |
 | **Verify at** | `GuardianEngine::reconcile_rule_locked`'s `SparkFailed`/`Unwired` guard (withdraws legacy, `unsupported_rules_.erase`, returns false); `GuardianEngine::wire_spark_engine()`'s `!engine` branch ("spark path unavailable... never silently substituted"); `guardian_backend_from_state()` / `guardian_backend_label()` in `guardian_backend.hpp`. |
-| **Epistemic** | verified 310b5d8f8 |
+| **Epistemic** | verified b16e5836d |
 
 ### A2 — Mutual exclusion is per-rule; a spark arm failure never falls through
 
@@ -109,7 +110,7 @@ never invent a rationale for what isn't ruled yet.
 | **Why deliberate** | Routed-concerns Spark row: "a rule is armed in at most one of legacy `guards_` or `spark_runtime_`, never both; an arm failure is errored, never a silent fallback." |
 | **Operator symptom** | A rule that fails to arm under spark reports `errored` via `get_status()` (same fail-closed bucket as everything else — see §F). No per-rule reason surfaced yet (rung 4). |
 | **Verify at** | `reconcile_rule_locked`'s `RulePlacement::Arm` branch (`guardian_engine.cpp`). |
-| **Epistemic** | verified 310b5d8f8 |
+| **Epistemic** | verified b16e5836d |
 
 ---
 
@@ -125,7 +126,7 @@ never invent a rationale for what isn't ruled yet.
 | **Operator symptom, stated precisely** | The flip's enforcement regression is: **Windows enforce-mode Registry/Service rules become observe-only until rung 3.** Linux and macOS enforcement posture is **unchanged** by the flip — legacy never enforced there either (Linux Service was already observe-only; File/Registry were never supported on Linux or macOS at all — see C2). |
 | **Ruling** | **D4 RULED (Dave, 2026-08-23):** the gap is accepted as temporary, with no fixed budgeted duration — rung 3 is not gated on a deadline, and `--spark-disable` remains the per-box escape hatch for any operator who needs continued Windows Registry/Service enforcement during the gap. The flip proceeds as a **hard cutover** (every agent flips `prefer_spark_` at once via version bump, matching the 7.7b design already described above), not a staged/canary rollout. |
 | **Verify at** | `guardian_spark_bridge.hpp` (RuleAssertion has no enforce field; ResilienceConfig discard comment); `guard_registry.cpp`/`guard_service.cpp` `cfg_.enforce` branches; `guard_systemd.cpp`'s Linux enforce-mode warn; `guard_file.cpp`'s "Detection-only: a FileGuard never writes" comment. |
-| **Epistemic** | verified 310b5d8f8 |
+| **Epistemic** | verified b16e5836d |
 
 ---
 
@@ -140,7 +141,7 @@ never invent a rationale for what isn't ruled yet.
 | **Why deliberate** | Ruling R2 + F7 (#3321): "Legacy already no-ops there; what changes is reporting" — since rung 5 deletes the legacy backend entirely, there is no fallthrough target left, so building the fallthrough once at rung 2 is building it twice. |
 | **Operator symptom** | `yuzu.spark_<mechanism>_unsupported` per-agent heartbeat tag → `yuzu_fleet_spark_unsupported{os,mechanism}` fleet gauge (a live, current-value gauge — it can legally decrease). **Caveat, not a universal guarantee:** `classify()` keys off registered-AND-non-inert capability, so a mechanism that started but couldn't bind its OS facility (no systemd bus in a container, `OpenSCManager` access denied) lands a rule in `Unsupported` on a platform where legacy might otherwise have worked. Cross-check `yuzu_fleet_spark_mechanisms{os,mechanism}` + that mechanism's boot logs before assuming "routine cross-platform gap." |
 | **Verify at** | `reconcile_rule_locked`'s `RulePlacement::Unsupported` branch; `classify()` in `guardian_spark_bridge.hpp`; `guardian_unsupported_heartbeat.hpp`; `agent_registry.cpp`'s `yuzu_fleet_spark_unsupported` gauge set. |
-| **Epistemic** | verified 310b5d8f8 |
+| **Epistemic** | verified b16e5836d |
 
 ### C2 — Platform coverage matrix
 
@@ -151,7 +152,7 @@ never invent a rationale for what isn't ruled yet.
 | macOS | Zero mechanisms — all three factories return `nullptr` | Zero — all four legacy guards are stubs on macOS (`make_service_guard()` routes to the non-Linux `ServiceGuard` stub) | **Zero-vs-zero today.** The flip does not create macOS zero-detection — macOS already has zero detection under legacy. What the flip changes is **visibility**: a macOS rule goes from silently-unarmed-with-no-signal (legacy) to `unsupported`-with-a-counted-gauge (spark). This corrects a broader D4/flip-ladder framing that stated "flip day makes macOS zero-detection" — the detection state doesn't change, the observability of it does. |
 | **Ruling** | **D4 RULED (Dave, 2026-08-23):** confirmed as this row states it — the macOS delta is visibility-only, not a detection regression, and D4's original "flip day makes macOS zero-detection" framing is retired. Nothing further to accept here; this row's finding stood as the correction. | | |
 | **Verify at** | `spark_file.cpp`/`spark_registry.cpp`/`spark_service.cpp` factory `#else` branches; `guard_file.cpp`'s `FileGuard::start()`, `guard_registry.cpp`'s `RegistryGuard::start()`, `guard_service.cpp`'s `ServiceGuard::start()`, and `guard_systemd.cpp`'s non-Linux stub — all `return false` unconditionally; `docs/capability-registries/spark_mechanisms.tsv` (independently agrees). |
-| **Epistemic** | verified 310b5d8f8 |
+| **Epistemic** | verified b16e5836d |
 
 ---
 
@@ -166,7 +167,7 @@ never invent a rationale for what isn't ruled yet.
 | **Why deliberate** | M1 finding (design doc): unconditional per-sweep health emission was a **cutover-blocking flood** (~17k/day/rule pre-fix) — "Legacy has no health stream, so this traffic class switches on at the flip." Fixed in two parts: edge-guard (`b30e93cfd`), then F5 (#3005) added the bounded refresh + demotion back on top of the edge-only silence as a deliberate, budgeted non-zero ceiling (a lost-edge backstop, not free). |
 | **Operator symptom** | Measured steady-state ceiling, F11 (#3267): **1 edge + 288 refreshes/day/rule/agent** on the 60 s lane, **1 edge + 180/day** on the 600 s file lane — full derivation (jitter accounting, the corrected 144-vs-180 figure) in `docs/spark-rebuild-baselines/f11-flood-measurement-run.md`. **Epistemic note:** per F11's own PR scope note, these are "a derived bound, mechanism empirically pinned" — no test asserts a per-day count directly; the mechanism constants (`errored_refresh_ms`, demotion thresholds, lane cadences) are pinned by Catch2, the per-day figure is arithmetic derived from them. Sparse heartbeat tags: `yuzu.guardian_unhealthy_suppressed`/`_refreshed`, `yuzu.guardian_priority_demoted` → fleet gauges `yuzu_fleet_guardian_unhealthy_suppressed`/`_refreshed`, `_priority_demoted` (monitor-only, per-sweep fleet sums). |
 | **Verify at** | `guardian_rule_eval.cpp` (`unhealthy_edge`), `guardian_spark_runtime.cpp` (`refresh_due`, `unhealthy_suppressed_`/`_refreshed_`/`priority_demoted_`), `guardian_spark_runtime.hpp` `Config::errored_refresh_ms`/`pending_demote_sweeps`/`pending_demote_ms`; `docs/spark-rebuild-baselines/f11-flood-measurement-run.md`. |
-| **Epistemic** | verified 310b5d8f8 |
+| **Epistemic** | verified b16e5836d |
 
 ### D2 — Lifecycle stream (`guard.armed`/`guard.disarmed`) is spark-only, durable, at-least-once
 
@@ -177,18 +178,18 @@ never invent a rationale for what isn't ruled yet.
 | **Why deliberate** | #2297: "honest process-crash-durable, duplicate-tolerant, bounded-retry — not audit-grade at-least-once. Every loss channel is a counted metric, never silent." #2448 (batch-key timestamp) made the maintenance passes O(work) instead of O(journal size). |
 | **Operator symptom** | Server absorbs duplicates silently and cheaply: `insert_event_classified` runs the row insert under its own `SAVEPOINT`; on SQLSTATE `23505` it rolls back to the savepoint (un-aborting the whole transaction, a Postgres-specific need) and byte-compares 13 agent-supplied columns. A match → `Redelivered` (debug-logged, no new row, DEX/blast-radius observers deliberately NOT re-fired — a redelivery must not re-trigger them); a mismatch → `Conflict` (warn-logged, dropped). Nothing is returned to the agent either way — the agent never sees a rejection for a legitimate replay. The batch insert path (`insert_events`) is explicitly forbidden for replays — it aborts the whole batch on any collision, unlike the one-at-a-time path. Traffic bounds: `yuzu_fleet_guardian_journal_*` — `_pages` (activity denominator), `_records_paged`, `_evicted_no_send_evidence` (the CC7.3-relevant integrity-gap counter), `_page_stale_seconds_max` (expect ~30 s), `_prune_stale_seconds_max` (expect ~120 s) — all absent while `prefer_spark` is off. |
 | **Verify at** | `guardian_lifecycle_journal.hpp` `page_into_window`/`replay_sent`; `guardian_outbox_drain_worker.cpp` `force_page_` triggers; `guaranteed_state_store.cpp` `insert_event_classified` (SAVEPOINT + `23505` + `stored_event_matches`) and `insert_events`' header comment forbidding batch-path replay; `docs/user-manual/guaranteed-state.md` "Reconnect replay traffic". |
-| **Epistemic** | verified 310b5d8f8 |
+| **Epistemic** | verified b16e5836d |
 
 ### D3 — Drift re-emission has no per-sweep debounce guard (open question — not yet ruled)
 
 | | |
 |---|---|
 | **Legacy** | No sweep to re-emit on: File/Registry/Windows-Service are kernel-notification-driven (`ReadDirectoryChangesW`/`RegNotifyChangeKeyValue`/SCM APC) with an `INFINITE` healthy-wait — no further FS/registry event, no further emission. systemd is D-Bus-signal-driven with a terminal-state dedup (`systemd_decide_emit`: identical terminal state → `NoChange`) — its 60 s "healthy reconcile" safety poll re-emits nothing for an unchanged state. **One asymmetry inside legacy itself:** Windows Service has *no* terminal-state dedup on the drift branch, and its 30 s absent-retry timer re-emits `drift.detected` every ~30 s while the service stays absent — this is a pre-existing legacy behavior, not spark-introduced. |
-| **Spark** | `guardian_emit_decider.hpp`'s shared `decide_emit` has **no last-terminal-state dedup** ("unlike systemd_decide_emit... not needed at the consumer" — reasoned from File/Registry's own re-read-on-change + debounce-fold behavior, and Service's one-event-per-edge behavior). Its only suppression is a debounce window (`RuleAssertion::debounce_ms`, default 1000 ms) measured from the last **emit**, not from attach or from a terminal-state hash. Convergence sweeps run every 60 s (service/registry) or 600 s (file) — both vastly exceed the 1000 ms default debounce. **Net: a persistently-drifted rule re-emits `drift.detected` on every convergence sweep of its lane.** Unlike D1's health refresh, the Drift branch has no `errored_refresh_ms`-style floor throttling it — so the bound here is sweep spacing itself, not a periodic-refresh cap, and the same worst-case-jitter convention D1/F11 use for the file lane applies directly: minimum sweep spacing under E1's ±20% jitter is `period × 0.8`, giving `86,400 / (60×0.8) ≈ 1800/day/rule` on the 60 s lanes and `86,400 / (600×0.8) = 180/day` on the 600 s file lane (naive, no-jitter figures of 1440/day and 144/day understate the worst case — see `docs/spark-rebuild-baselines/f11-flood-measurement-run.md`'s jitter-floor derivation, which explicitly calls out the file-lane 144-vs-180 correction; D1 does not carry the same 60 s-lane correction because its 288/day figure is bounded by the 300 s refresh floor, not by sweep cadence — that floor does not apply here) — all absent any author-configured larger `debounce_ms`. |
+| **Spark** | `guardian_emit_decider.hpp`'s shared `decide_emit` has **no last-terminal-state dedup** ("unlike systemd_decide_emit... not needed at the consumer" — reasoned from File/Registry's own re-read-on-change + debounce-fold behavior, and Service's one-event-per-edge behavior). Its only suppression is a debounce window (`RuleAssertion::debounce_ms`, default 1000 ms) measured from the last **emit**, not from attach or from a terminal-state hash. Convergence sweeps run every 60 s (service/registry) or 600 s (file) — both vastly exceed the 1000 ms default debounce. **Net: a persistently-drifted rule re-emits `drift.detected` on every convergence sweep of its lane, absent any author-configured larger `debounce_ms`.** Unlike D1's health refresh, the Drift branch has no `errored_refresh_ms`-style floor throttling it — so the bound here is sweep spacing itself, not a periodic-refresh cap, and the same worst-case-jitter convention D1/F11 use for the file lane applies directly: minimum sweep spacing under E1's ±20% jitter is `period × 0.8`, giving **`86,400 / (60×0.8) ≈ 1800/day/rule` on the 60 s lanes and `86,400 / (600×0.8) = 180/day` on the 600 s file lane** (naive, no-jitter figures of 1440/day and 144/day understate the worst case — see `docs/spark-rebuild-baselines/f11-flood-measurement-run.md`'s jitter-floor derivation, which explicitly calls out the file-lane 144-vs-180 correction; D1 does not carry the same 60 s-lane correction because its 288/day figure is bounded by the 300 s refresh floor, not by sweep cadence — that floor does not apply here). |
 | **Why deliberate** | **No ruling found.** M1 (the design doc's cutover-blocking finding) scoped its flood analysis and fix explicitly to the **health** (Unknown) stream — its own text never mentions the Known/drift path, and no test in `test_guardian_spark_runtime.cpp` pins repeated-drift-sweep behavior (the "M1 flood guard"/"F11 flood" test cases are all Unknown/demotion cases). The `decide_emit` header comment's stated rationale ("not needed at the consumer... File/Registry re-read on each change... so a plain compliant-bool suffices") describes the *legacy-parity* reasoning for skipping terminal-state dedup, but does not address the convergence-scheduler sweep cadence being the trigger for repeat evaluation in the first place — that trigger doesn't exist for legacy (no sweep) and does for spark. |
 | **Operator symptom** | A rule left persistently drifted under spark (e.g. an enforce-mode rule now observe-only per B1, with nobody fixing the underlying drift) generates a steady ~1800/day (60 s lanes) or ~180/day (600 s lane) `drift.detected` stream — jitter-adjusted worst case, per the Legacy/Spark cell above — smaller than the pre-fix health flood (~17k/day) but structurally the same class of gap M1 was written to close, left open on the sibling stream. |
 | **Verify at** | `guardian_emit_decider.hpp::decide_emit` (no `last_compliant`-driven terminal dedup on the Drift branch); `guardian_rule_eval.cpp`'s sole `decide_emit` call site (passes `a.debounce_ms`); `guardian_rule_eval.hpp` (`debounce_ms{1000}` default on `RuleAssertion`); `guard_systemd.cpp` `systemd_decide_emit` (contrast: has terminal-state dedup). |
-| **Epistemic** | **open-question, verified 310b5d8f8** — this row documents a finding from this pass, not a pre-existing ruling. Tracked in **#3388**; update this row once that issue resolves. |
+| **Epistemic** | **open-question, verified b16e5836d** — this row documents a finding from this pass, not a pre-existing ruling. Tracked in **#3388**; update this row once that issue resolves. |
 
 **Possible tension with the parity gate's own zero-tolerance clause (flagged during Gate 3
 architect review, not yet resolved):** the design doc states event-stream equivalence
@@ -211,7 +212,7 @@ here.
 | **Why deliberate** | `decide_emit`'s header comment: "unifies the compliant-census signal across platforms: legacy Windows-Service emitted it, legacy systemd did not." A caller may pass `false` to preserve exact legacy-systemd silence (pinned in parity tests), but production doesn't. |
 | **Operator symptom** | A Linux Service rule under spark reports one `guard.compliant` census event on arm/recovery that the equivalent legacy systemd guard never sent. |
 | **Verify at** | `guardian_emit_decider.hpp` (`emit_compliant_edge` doc comment); `guardian_engine.cpp`'s `attach_rule` call (`/*emit_compliant_edge=*/true`). |
-| **Epistemic** | verified 310b5d8f8 |
+| **Epistemic** | verified b16e5836d |
 
 ### D5 — Restart re-emits the initial compliant edge, as a genuinely new server row
 
@@ -222,7 +223,7 @@ here.
 | **Why deliberate** | Code comment (consistency-auditor Gate 4 finding): "matches the legacy path's own tear-down-and-rebuild-every-push behavior, so this is not a regression." |
 | **Operator symptom** | Every agent restart with N armed spark rules produces N new `guard.compliant` server rows (not deduped, not suppressed) — a restart-storm across a fleet scales as rules × restarting agents. Sizing this is a fair F14 evidence-gathering input (3-OS matrix / resource baseline), not something this doc rules on. |
 | **Verify at** | `guardian_spark_runtime.cpp` (`make_boot_nonce`/`boot_nonce_`, `detach_rule_locked` + fresh `RuleGeneration` on attach, `make_event_id`); `guardian_engine.cpp` `start_local()` boot re-arm loop. |
-| **Epistemic** | verified 310b5d8f8 |
+| **Epistemic** | verified b16e5836d |
 
 ### D6 — Transient vs. persistent read failure: legacy conflates, spark splits
 
@@ -233,7 +234,7 @@ here.
 | **Why deliberate** | `guardian_rule_eval.hpp` preamble: legacy conflated the two into one token; spark splits persistent (Known drift) from transient (Unknown) deliberately. |
 | **Operator symptom** | A flaky read source produces health-stream traffic under spark where it would have produced drift-stream traffic under legacy — different wire event types for the same underlying condition. |
 | **Verify at** | `guardian_rule_eval.hpp`/`guardian_rule_eval.cpp` Unknown-vs-Known-drift classification. |
-| **Epistemic** | verified 310b5d8f8 |
+| **Epistemic** | verified b16e5836d |
 
 ### D7 — File hash-mode `settle_ms` coalescing is not honoured under spark
 
@@ -242,9 +243,9 @@ here.
 | **Legacy** | `guard_file.hpp`'s `settle_ms` (default 750 ms) coalesces a burst of kernel file-change notifications before hashing, since writes aren't atomic — waits out the write before computing a hash, avoiding a torn read. |
 | **Spark** | No equivalent field on `RuleAssertion` or `FileSparkParams`. Spark's convergence scheduler instead dead-reckons via a size+mtime skip before re-hash plus a forced periodic re-hash (both **deferred to rung 5** — see E1; at rung 2 there is only the plain convergence sweep, no coalescing and no skip-optimization yet). |
 | **Why deliberate** | `guardian_spark_bridge.hpp` header comment states this explicitly: "an ACCEPTED behavioral delta from legacy... flagged here for the rung-9 design-doc rewrite and the rung-10 parity/durability matrix" — i.e. this doc is that flagged destination. |
-| **Operator symptom** | A file rule under active mid-write churn may see a spark hash read land mid-write (a torn read) where legacy's coalescing window would have waited it out — until rung 5's size+mtime skip + forced re-hash lands. Spark does hedge this at the reader, not just leave it torn: `guardian_state_reader.cpp` retries the hash read up to `kHashAttempts` (3) times on a mutating file, and only if all three still land mid-write does it give up and report Unknown (`read_unknown<FileSnapshot>("file mutating during hash, retries exhausted")`) rather than a torn Known value — so the observable failure mode on a genuinely fast-churning file is D1's health stream, not a silently-wrong drift verdict. This is a detector, not a bar: it narrows the torn-read window, it doesn't remove settle_ms's coalescing guarantee. |
+| **Operator symptom** | A file rule under active mid-write churn may see a spark hash read land mid-write (a torn read) where legacy's coalescing window would have waited it out — until rung 5's size+mtime skip + forced re-hash lands. Spark does hedge this at the reader, not just leave it torn: `guardian_state_reader.cpp` retries the hash read up to `kHashAttempts` (3) times on a mutating file, and only if all three still land mid-write does it give up and report Unknown (`read_unknown<FileSnapshot>("file mutating during hash, retries exhausted")`) rather than a torn Known value — so the observable failure mode on a genuinely fast-churning file is D1's health stream, not a silently-wrong drift verdict. This is a detector, not a guarantee: it narrows the torn-read window, it doesn't remove `settle_ms`'s coalescing guarantee. |
 | **Verify at** | `guard_file.hpp` `Config::settle_ms`; `guardian_spark_bridge.hpp` header comment (immediately above `RuleAssertion`/`FileSparkParams`); `guardian_state_reader.cpp` `kHashAttempts` retry loop + its `read_unknown<FileSnapshot>("file mutating during hash, retries exhausted")` exhaustion path. |
-| **Epistemic** | verified 310b5d8f8 |
+| **Epistemic** | verified b16e5836d |
 
 ### D8 — Deleted-service wire token: legacy `Absent`, spark folds into `Stopped`
 
@@ -255,18 +256,18 @@ here.
 | **Why deliberate** | Code comment (R5, accepted): "a deleted service folds into Stopped at the reader — the compliance VERDICT is identical, only `detected_value` differs from legacy." The enforcement/compliance outcome doesn't change; the wire-visible token does. |
 | **Operator symptom** | An F14 event-field parity capture comparing `detected_value` for a deleted-service rule will show `Absent` (legacy) vs `Stopped` (spark) — an expected, ruled diff, not a regression, but it WILL show up in a byte-level field diff even though the compliance verdict matches. |
 | **Verify at** | `guardian_rule_eval.cpp`/`guardian_rule_eval.hpp` "R5, accepted" comment on the deleted-service reader mapping into `ServiceState::Stopped`. |
-| **Epistemic** | verified 310b5d8f8 |
+| **Epistemic** | verified b16e5836d |
 
 ### D9 — Send-path drop semantics: legacy silent/unbounded, spark counted/bounded
 
 | | |
 |---|---|
-| **Legacy** | `emit_guard_event` calls the event sink directly and synchronously from the guard worker thread — no buffering, no capacity bound. Two distinct silent, uncounted failure modes, not one: (1) pre-Register, no sink wired yet — the event is dropped (comment: "sink not wired yet (pre-network arm) — drop; durable buffering is A3"); (2) post-Register but mid-reconnect, `agent.cpp`'s `emit_guardian_event` finds `guardian_sink_stream_` null and drops the write (comment: "Drops the event if the link is down between reconnects... durable buffering is A3" — same A3 residual, a second call site). Neither is counted. When a sink IS wired, the call does not drop under overload — it *blocks* the guard worker thread on the network send instead ("a potentially-blocking network send" per `emit_guard_event`'s own header comment), which is a different failure mode than "nothing to overflow": there is no overflow because there is no bound, but a slow/stalled send stalls detection on that thread rather than losing the event. |
+| **Legacy** | `emit_guard_event` calls the event sink directly and synchronously from the guard worker thread — no buffering, no capacity bound. Two distinct silent, uncounted failure modes, not one: (1) pre-Register, no sink wired yet — the event is dropped (comment: "sink not wired yet (pre-network arm) — drop; durable buffering is A3"); (2) post-Register but mid-reconnect, `agent.cpp`'s `emit_guardian_event` finds `guardian_sink_stream_` null and drops the write (comment: "Drops the event if the link is down between reconnects... durable buffering is A3" — same A3 residual, a second call site). Neither is counted. When a sink IS wired, the call does not drop under overload — it *blocks* the guard worker thread on the network send instead ("the (potentially blocking) network send" per `emit_guard_event`'s own header comment), which is a different failure mode than "nothing to overflow": there is no overflow because there is no bound, but a slow/stalled send stalls detection on that thread rather than losing the event. |
 | **Spark** | Compliance/health entries route through `GuardianOutbox`, a FIFO, per-(domain,rule_id)-coalesced, **capacity-bounded** buffer. A push that would exceed capacity is dropped and **counted** (`backpressure_drops_`), never silent. |
 | **Why deliberate** | Consequence of the outbox design (#2233 hardening) rather than a single cited ruling — buffering was necessary once sends became asynchronous/batched (spark decouples eval from send; legacy doesn't). Shared drift/compliance fields stay byte-identical (§F) — this row is about drop/backpressure behavior, not event content. |
-| **Operator symptom** | Under sustained overload, legacy either silently loses pre-Register/mid-reconnect events with no signal, or — once wired — stalls its guard worker thread on a blocking send rather than losing anything; spark surfaces its own drop class as a counted, observable metric instead. Not a regression — an observability improvement — but a real behavioral difference in what "the agent tried to send N events" means, and in what backpressure looks like, on each backend. |
-| **Verify at** | `guardian_engine.cpp::emit_guard_event` (sink-not-wired drop, no counter; the blocking `sink(ev)` send when wired); `agent.cpp::emit_guardian_event` (`guardian_sink_stream_` null mid-reconnect drop, no counter); `guardian_outbox.hpp` `GuardianOutbox` capacity check + `backpressure_drops_`. |
-| **Epistemic** | verified 310b5d8f8 |
+| **Operator symptom** | Two independent, link-state-conditioned gaps (not overload-conditioned): legacy silently loses events with no signal whenever no sink is wired yet or the reconnect gap is open, regardless of load. Overload itself only matters once a sink IS wired: there, legacy doesn't drop, it stalls its guard worker thread on a blocking send. Spark surfaces its own drop class — capacity-bounded, under sustained overload — as a counted, observable metric instead. Not a regression — an observability improvement — but a real behavioral difference in what "the agent tried to send N events" means, and in what backpressure looks like, on each backend. |
+| **Verify at** | `guardian_engine.cpp::emit_guard_event` (sink-not-wired drop, no counter; the blocking `sink(ev)` send when wired); `agent.cpp::emit_guardian_event` (`guardian_sink_stream_` null mid-reconnect drop, no counter — its own comment notes it's "Shared by the GuardianEngine drift sink and the (ruleless) DEX signal observer," so this same silent gap also affects DEX crash-recorder observations, not just Guardian compliance/drift events); `guardian_outbox.hpp` `GuardianOutbox` capacity check + `backpressure_drops_`. |
+| **Epistemic** | verified b16e5836d |
 
 ### D10 — Spark reads go through a bounded, bulkheaded I/O admission layer; legacy reads have none
 
@@ -277,7 +278,7 @@ here.
 | **Why deliberate** | R3 (design doc rung-9a decision record): a bulkhead is necessary once reads are dispatched from a shared scheduler across many rules/keys concurrently, which legacy's one-guard-one-thread model never needed. See R3 for the full starvation derivation and the `total_quota{8}`-vs-`sum(10)` history; the shipped design makes cross-class starvation structurally impossible rather than merely less likely. |
 | **Operator symptom** | Under read contention (many rules, a slow mechanism, a stalled filesystem) spark can produce `guard.unhealthy` traffic (via the Unknown→health-stream path, D1/D6) that has no legacy analog — a purely spark-introduced fault *source*, not just a different classification of a fault legacy would also have hit. Counted via `GuardianIoExecutor::Counters` (`timed_out`, `rejected_capacity`, `rejected_key`, `launch_failures`, `worker_exceptions`) per class — not yet routed to a heartbeat tag or fleet gauge as of this writing; verify current wiring before relying on fleet-level visibility into this specific fault class. |
 | **Verify at** | `guardian_io_executor.hpp` (`GuardianIoExecutor::Config` defaults, `kMaxProcessIoWorkers`, `IoFailure` enum); `guardian_state_reader.hpp` header comment (per-class deadlines, single-flight, decouple-not-cancel contract) confirming production wiring. |
-| **Epistemic** | verified 310b5d8f8 |
+| **Epistemic** | verified b16e5836d |
 
 ### D11 — Recovery from Unknown force-emits a compliance event even when the value didn't change
 
@@ -285,10 +286,10 @@ here.
 |---|---|
 | **Legacy** | No comparable concept: legacy has no Unknown/health state at all (D1, D6), so there is no "recovery from Unknown" transition to force anything on. A legacy compliance event fires only on a genuine compliant/drifted value transition. |
 | **Spark** | `guardian_rule_eval.cpp`'s `pack()` resets `state.emit.last_compliant`/`last_emit`/`suppressed` on every Unknown→Known recovery, with its own header comment stating the intent plainly: "reset the decider's edge/debounce so the verdict is FORCED to emit even if the value equals its pre-error value." `decide_emit()` then runs against that cleared state, so a rule that was compliant, went Unknown (a transient read glitch, D6), and reads compliant again emits a **new** `guard.compliant` census event even though the compliance verdict never actually changed. `guardian_spark_runtime.cpp`'s push site (the sole call site building the outbox batch) confirms this lands on the wire, not just internally: `out.recovered` unconditionally pushes a `health(true)` entry, and — independently — `out.status == EvalStatus::Emit` (which `pack()`'s reset guarantees on recovery) pushes a `compliance` entry in the same batch. Both land atomically; the pinning test `"recovery to a drifted state emits BOTH guard.healthy and the drift verdict"` (`tests/unit/test_guardian_spark_runtime.cpp`) exercises the drifted-recovery case, but the identical mechanism fires on an *unchanged-value* recovery too — a case that test does not name or assert on separately. |
-| **Why deliberate** | Not incidental — the design doc's **M2 ("one-legged recovery")** ruling (§"Two decisions settled 2026-07-18") is the reason this is forced, not a bug, and the mapping M2 cites still holds in current code: `guaranteed_state_store.cpp`'s `event_state_from_type` maps `guard.unhealthy`→`errored` but falls through to `nullptr` for `guard.healthy` (no branch matches it), so the server-side `errored` flag clears **only** via a paired *compliance* event — never via the health event alone. If the compliance value happened to be unchanged and `decide_emit` were allowed to debounce-fold it away, the server would see the health-recovery event, still map to `nullptr`, and leave the rule stuck `errored` with no compliance event ever arriving to clear it. Forcing the compliance emit on every recovery — value-changed or not — is the mechanism that keeps that server-side flag from wedging, at the cost of an occasional unchanged-value re-emit. This is genuinely conditional, not universal: the pinning test `"Unknown->Known recovery emits guard.healthy even when the verdict is Silent"` shows that with `emit_compliant_edge=false` (the systemd-parity option, D4), only the health entry fires on recovery — no forced compliance re-emit, because there's no compliant-edge signal to force in the first place. Production always calls with `emit_compliant_edge=true` (D4's sole production `attach_rule` call site), so this row's force-emit behavior is the production case. |
+| **Why deliberate** | Not incidental — the design doc's **M2 ("one-legged recovery")** ruling (§"Two decisions settled 2026-07-18") is the reason this is forced, not a bug, and the mapping M2 cites still holds in current code: `guaranteed_state_store.cpp`'s `event_state_from_type` maps `guard.unhealthy`→`errored` but falls through to `nullptr` for `guard.healthy` (no branch matches it), so the server-side `errored` flag clears **only** via a paired *compliance* event — never via the health event alone. If the compliance value happened to be unchanged and `decide_emit` were allowed to debounce-fold it away, the server would see the health-recovery event, still map to `nullptr`, and leave the rule stuck `errored` with no compliance event ever arriving to clear it. Forcing the compliance emit on every recovery — value-changed or not — is the mechanism that keeps that server-side flag from wedging, at the cost of an occasional unchanged-value re-emit. This is genuinely conditional, not universal: the pinning test `"Unknown->Known recovery emits guard.healthy even when the verdict is Silent"` shows that with `emit_compliant_edge=false` (the systemd-parity option, D4), only the health entry fires on recovery — no forced compliance re-emit, because there's no compliant-edge signal to force in the first place. Production always calls with `emit_compliant_edge=true` (D4's sole production `attach_rule` call site), so this row's force-emit behavior is the production case. **This protection is specific to `emit_compliant_edge=true`**: a future caller using `false` would reintroduce exactly the wedge this row exists to prevent, but only for a recovery-to-**unchanged-compliant** transition specifically — `decide_emit`'s Drift branch never consults `emit_compliant_edge` (only its `if (compliant)` branch does), so a recovery-to-**drifted** transition still clears via `drift.detected` (which `event_state_from_type` maps to `"drifted"`) regardless of the flag. |
 | **Operator symptom** | An F14 byte-level parity capture across a transient-Unknown-then-recovery episode will show spark emitting a `guard.compliant` event that legacy has no equivalent transition to produce at all (legacy never enters Unknown in the first place) — not just a differing field, a whole extra event on spark's side, on a case that is easy to trigger by design (any D6 transient read glitch) rather than requiring an actual compliance-value change. |
 | **Verify at** | `guardian_rule_eval.cpp::pack()` (the recovery reset + its header comment); `guardian_spark_runtime.cpp` outbox-batch push site (`out.recovered` → `health(true)`, `out.status == EvalStatus::Emit` → `compliance`, both unconditional on recovery); `spark-stage2-guardian-consumer-design.md` §"Two decisions settled 2026-07-18" M2; `guaranteed_state_store.cpp`'s `event_state_from_type` (`guard.healthy` falls through to `nullptr`). `tests/unit/test_guardian_spark_runtime.cpp` has four recovery-tagged cases as of this pass — `"a configured capacity below two is floored so a recovery pair can never be lost"`, `"M1 refresh: recovery after a refresh still emits guard.healthy and re-arms the edge (F5 6b)"`, `"Unknown->Known recovery emits guard.healthy even when the verdict is Silent"`, and `"recovery to a drifted state emits BOTH guard.healthy and the drift verdict"` — none set up a stable known-compliant value, drive it through a transient Unknown, and assert on the unchanged-value recovery case this row describes; re-check this list before relying on the absence claim. |
-| **Epistemic** | verified 310b5d8f8 |
+| **Epistemic** | verified b16e5836d |
 
 ---
 
@@ -303,7 +304,7 @@ here.
 | **Why deliberate** | Spark's mechanisms don't all carry native change-notification for every read path (e.g. dead-reckoning a file's compliance without a kernel event on every convergence tick); the scheduled sweep is how it converges independent of notification delivery. Ruling: D2 (spark-flip ladder) — token bucket formally deferred to rung 5, confirmed at F11. |
 | **Operator symptom** | Periodic reads themselves are a resource delta the flip introduces (CPU/IO wake-ups on 60 s/600 s/5 s cadences per agent, independent of whether anything is actually drifted) — sized against `docs/spark-rebuild-baselines/stage0-resource-baseline.md` as part of F14's evidence, not restated here. |
 | **Verify at** | `guardian_convergence_scheduler.hpp` `Config` (`service_cadence_ms`, `registry_cadence_ms`, `file_cadence_ms`, `priority_poll_ms`, `jitter_pct`); its header comment on the deferred token bucket. |
-| **Epistemic** | verified 310b5d8f8 |
+| **Epistemic** | verified b16e5836d |
 
 ### E2 — Shutdown: spark may force a hard, nonzero-code process exit; legacy joins its threads
 
@@ -314,7 +315,7 @@ here.
 | **Why deliberate** | F3 (`hard_exit.hpp`): callers must pass a nonzero code specifically so systemd/SCM observe a real failure exit rather than a clean shutdown — an intentional signal to the service supervisor, not a bug being papered over. |
 | **Operator symptom** | Under spark, a slow/stuck drain can make agent shutdown/restart look like a **crash** to systemd/SCM (nonzero exit) where the equivalent legacy shutdown would report clean. Cross-platform crash-loop backstop parity (Windows SCM / macOS launchd / Docker restart policy vs Linux's `StartLimitIntervalSec`/`StartLimitBurst`) is tracked separately (#2241, Linux-only today). |
 | **Verify at** | `hard_exit.hpp` (`kOrphanDrainGrace`, nonzero-code contract); `main.cpp`'s `on_signal_hard_exit` signal handler and its orphan-worker grace-expiry check in the main shutdown path; `service_win.cpp`'s SCM stop handler; contrast `guard_file.cpp`/`guard_registry.cpp`/`guard_service.cpp`/`guard_systemd.cpp`, each of which `.join()`s its worker thread on `stop()`. |
-| **Epistemic** | verified 310b5d8f8 |
+| **Epistemic** | verified b16e5836d |
 
 ---
 
@@ -354,8 +355,8 @@ Issue #2299 tracks five non-blocking follow-ups against the durable lifecycle jo
 
 A sync comment recording this table's dispositions (all five rows, including UP-4, which
 #2299's existing 2026-07-24 comment did not cover) has been posted:
-https://github.com/Tr3kkR/Yuzu/issues/2299#issuecomment-5369485845 — so the issue's
-stale checkboxes no longer contradict this doc.
+[#2299 comment](https://github.com/Tr3kkR/Yuzu/issues/2299#issuecomment-5369485845) — so
+the issue's stale checkboxes no longer contradict this doc.
 
 ---
 
