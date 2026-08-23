@@ -228,6 +228,49 @@ Adding connections to an already-struggling database makes matters worse;
 confirm the database is healthy first, and consider lowering SSE stream
 capacity instead.
 
+## Metric: `yuzu_server_engine_revalidate_generation_capacity_fallback_total` (#2454/#3385)
+
+**What it means.** This counts how often the per-principal poisoning-guard
+map (the TOCTOU defense behind `get_for_auth_revalidate`'s cache) was full —
+even after sweeping aged-out entries — and a principal's invalidate fell back
+to the coarse global epoch instead of getting its own slot. It is NOT an
+availability signal: the guard stays sound either way (the fallback still
+poisons every in-flight reader, just less precisely — see the field comment
+on `revoke_generation_by_principal_` in `engine_principal_store.hpp`), and no
+stream is dropped or denied because of this metric alone.
+
+**Since #3385, this is a recoverable condition, not a permanent one.** The map
+now sweeps entries whose `last_bumped_at` is older than
+`kRevokeGenerationEntryTtl` (63s) on its own insert path — the same lazy,
+capacity-triggered sweep the revalidate cache and failure-backoff maps
+already use. So the fallback firing means `max_entries_` (1024 by default)
+*distinct* principals had their generation entry bumped within the same
+63-second window, not merely 1024 distinct principals bumped at any point
+over the process's uptime (the pre-#3385 shape, where the fallback was
+permanent for the rest of the process's life once tripped once).
+
+**Triage.**
+
+1. Is this expected load? A large batch operation that revokes or transfers
+   ownership of many engine principals in a short window is the ordinary
+   trigger — the fallback recovers on its own once the burst passes and
+   entries age past the TTL.
+2. Is it climbing steadily rather than in a burst? That suggests sustained
+   churn above the ceiling (more than ~16 distinct principals/second,
+   sustained) rather than a one-off batch — the guard is running at reduced
+   (global-epoch, not per-principal) precision for as long as this continues,
+   which is safe but coarser: an invalidate anywhere defeats every OTHER
+   principal's concurrent cache-write too while the epoch keeps moving.
+
+**Recovery.** No restart is required — the condition self-clears once the
+churn rate drops back under the ceiling within a 63-second window; the next
+sweep reclaims capacity automatically. If it climbs persistently in normal
+operation (not a known batch job), that is a signal the ceiling itself may
+need raising rather than an operational fault to clear — there is no runtime
+admin surface for `max_entries_` today (it is a fixed constant,
+`kAuthCacheMaxEntries`), so raising it requires a code change and a new
+release, not a live toggle.
+
 ## Cross-references
 
 - Store contract, three-state `get_for_auth`, and construction posture:
