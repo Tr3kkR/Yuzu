@@ -195,6 +195,20 @@ std::string encode_legacy_row(const LegacyDeviceTokenRow& r) {
     return e;
 }
 
+// Shared by Sha256Stream::final_hex() and sha256_hex() below — both feed EVP's raw digest bytes
+// through the identical lowercase-hex encoding, so the encoding step lives once rather than
+// twice; the two functions differ only in how they GET those bytes (incremental vs one-shot).
+std::string hex_encode(const unsigned char* md, unsigned int len) {
+    static const char* kHex = "0123456789abcdef";
+    std::string out;
+    out.reserve(static_cast<std::size_t>(len) * 2);
+    for (unsigned int i = 0; i < len; ++i) {
+        out.push_back(kHex[md[i] >> 4]);
+        out.push_back(kHex[md[i] & 0x0f]);
+    }
+    return out;
+}
+
 // Incremental SHA-256 over EvpMdCtxPtr (evp_raii.hpp) — file_retrieval_routes.cpp's
 // compute_file_sha256_hex is the streaming-digest precedent this mirrors.
 //
@@ -230,14 +244,7 @@ public:
         unsigned int len = 0;
         if (EVP_DigestFinal_ex(ctx_.get(), md, &len) != 1)
             return {};
-        static const char* kHex = "0123456789abcdef";
-        std::string out;
-        out.reserve(static_cast<std::size_t>(len) * 2);
-        for (unsigned int i = 0; i < len; ++i) {
-            out.push_back(kHex[md[i] >> 4]);
-            out.push_back(kHex[md[i] & 0x0f]);
-        }
-        return out;
+        return hex_encode(md, len);
     }
 
 private:
@@ -251,19 +258,12 @@ constexpr std::string_view kLegacyFingerprintPrefix = "device-token-legacy-finge
 // pure overhead here). Byte-for-byte the same digest (both EVP_sha256, both lowercase-hex-encode
 // EVP_MAX_MD_SIZE bytes via the identical table) — restated standalone rather than routed through
 // Sha256Stream so a single call site is a single EVP_Digest(), not an init/update/final triple.
-std::string sha256_hex(const std::string& in) {
+std::string sha256_hex(std::string_view in) {
     unsigned char md[EVP_MAX_MD_SIZE];
     unsigned int len = 0;
     if (EVP_Digest(in.data(), in.size(), md, &len, EVP_sha256(), nullptr) != 1)
         return {};
-    static const char* kHex = "0123456789abcdef";
-    std::string out;
-    out.reserve(static_cast<std::size_t>(len) * 2);
-    for (unsigned int i = 0; i < len; ++i) {
-        out.push_back(kHex[md[i] >> 4]);
-        out.push_back(kHex[md[i] & 0x0f]);
-    }
-    return out;
+    return hex_encode(md, len);
 }
 
 // ── Migration DDL ────────────────────────────────────────────────────────────
@@ -371,7 +371,10 @@ LegacyStep read_legacy_row(sqlite3_stmt* s, LegacyDeviceTokenRow& out, int& step
     // safe()/sqlite3_column_text read: a NUL-truncated hex string is already shorter than the
     // required 32/64 chars, so the hex-format check below catches it without the length-aware
     // read too.
-    const auto col_text = [&](int i) {
+    // Named sqlite_text_col, not text_col — that similarly-spelled name is a different, file-scope
+    // helper (text_col(PGresult*, int, int), reading a Postgres result) — see flush_batch's
+    // identical text_col/text_cols confusability note for why this file is deliberate about it.
+    const auto sqlite_text_col = [&](int i) {
         const auto* v = sqlite3_column_text(s, i);
         const int n = sqlite3_column_bytes(s, i);
         return v ? std::string(reinterpret_cast<const char*>(v), static_cast<std::size_t>(n))
@@ -381,10 +384,10 @@ LegacyStep read_legacy_row(sqlite3_stmt* s, LegacyDeviceTokenRow& out, int& step
     LegacyDeviceTokenRow r;
     r.token_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
     r.token_hash = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
-    r.name = col_text(2);
-    r.principal_id = col_text(3);
-    r.device_id = col_text(4);
-    r.definition_id = col_text(5);
+    r.name = sqlite_text_col(2);
+    r.principal_id = sqlite_text_col(3);
+    r.device_id = sqlite_text_col(4);
+    r.definition_id = sqlite_text_col(5);
     r.created_at = sqlite3_column_int64(s, 6);
     r.expires_at = sqlite3_column_int64(s, 7);
     r.last_used_at = sqlite3_column_int64(s, 8);
