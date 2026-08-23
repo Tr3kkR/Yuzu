@@ -303,10 +303,14 @@ static_assert(sizeof(NlMsgHdr) == 16);
 
 /// linux/netfilter/nfnetlink.h `struct nfgenmsg` (4 bytes) — immediately
 /// follows nlmsghdr in every NFNETLINK-family message, nftables included.
+/// `family`/`version` are read like `nlmsghdr`/`nlattr` header fields (host
+/// byte order); `res_id` is `__be16` (network byte order) in the real UAPI
+/// struct, but this code always sends it as 0 and never reads it back on the
+/// decode side, so the byte-order distinction is inert here today.
 struct NfGenMsg {
     std::uint8_t family{};
     std::uint8_t version{};
-    std::uint16_t res_id{};
+    std::uint16_t res_id{}; // __be16 in the kernel struct; unused/always-zero here
 };
 static_assert(sizeof(NfGenMsg) == 4);
 
