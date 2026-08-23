@@ -660,19 +660,37 @@ bool nft_dump(int fd, std::uint16_t msg_type, std::vector<std::byte>& out,
 }
 
 bool try_nftables_state(yuzu::CommandContext& ctx) {
-    auto sock = open_nft_socket();
-    if (!sock)
-        return false;
     const auto deadline = std::chrono::steady_clock::now() + kAcqDeadline;
 
+    // Each dump gets its OWN socket rather than sharing one across
+    // GETTABLE/GETCHAIN/GETRULE (adversarial-review/governance gate-3
+    // finding UP-1, unverified/uncompiled until this branch's Linux
+    // container check): a dump abandoned mid-recv (deadline hit after
+    // partial bytes already arrived) can leave undrained bytes sitting in
+    // the socket buffer, and nft_dump has no seq/pid check to reject them
+    // -- a later dump on the SAME fd could then consume those stale bytes
+    // first and report fabricated content instead of the honest `unknown`
+    // this function exists to guarantee. A fresh fd per dump removes the
+    // shared-buffer assumption entirely rather than trying to correctly
+    // drain an abandoned read.
+    auto table_sock = open_nft_socket();
+    if (!table_sock)
+        return false;
     std::vector<std::byte> table_buf;
-    if (!nft_dump(sock.get(), nft::kNftMsgGettable, table_buf, deadline))
+    if (!nft_dump(table_sock.get(), nft::kNftMsgGettable, table_buf, deadline))
         return false; // unreachable -- fall through to ufw/iptables
+    table_sock.reset();
 
+    auto chain_sock = open_nft_socket();
     std::vector<std::byte> chain_buf;
-    const bool chains_ok = nft_dump(sock.get(), nft::kNftMsgGetchain, chain_buf, deadline);
+    const bool chains_ok =
+        chain_sock && nft_dump(chain_sock.get(), nft::kNftMsgGetchain, chain_buf, deadline);
+    chain_sock.reset();
+
+    auto rule_sock = open_nft_socket();
     std::vector<std::byte> rule_buf;
-    const bool rules_ok = nft_dump(sock.get(), nft::kNftMsgGetrule, rule_buf, deadline);
+    const bool rules_ok =
+        rule_sock && nft_dump(rule_sock.get(), nft::kNftMsgGetrule, rule_buf, deadline);
 
     ctx.write_output("backend|nftables");
     // Content is only trusted when BOTH follow-up dumps succeeded -- a
@@ -691,24 +709,34 @@ bool try_nftables_state(yuzu::CommandContext& ctx) {
 }
 
 bool try_nftables_rules(yuzu::CommandContext& ctx) {
-    auto sock = open_nft_socket();
-    if (!sock)
-        return false;
     const auto deadline = std::chrono::steady_clock::now() + kAcqDeadline;
 
+    // See try_nftables_state's comment on UP-1: a fresh socket per dump
+    // (rather than one shared across GETTABLE/GETCHAIN/GETRULE) removes the
+    // undrained-leftover-bytes class entirely.
+    auto table_sock = open_nft_socket();
+    if (!table_sock)
+        return false;
     std::vector<std::byte> table_buf;
-    if (!nft_dump(sock.get(), nft::kNftMsgGettable, table_buf, deadline))
+    if (!nft_dump(table_sock.get(), nft::kNftMsgGettable, table_buf, deadline))
         return false; // unreachable -- fall through to ufw/iptables
+    table_sock.reset();
 
     // Reachable even with zero tables -- report that honestly rather than
     // falling through, matching try_firewalld_rules's shape (an empty
     // active-zone list still reports backend|firewalld with no rule rows).
     ctx.write_output("backend|nftables");
 
+    auto chain_sock = open_nft_socket();
     std::vector<std::byte> chain_buf;
-    const bool chains_ok = nft_dump(sock.get(), nft::kNftMsgGetchain, chain_buf, deadline);
+    const bool chains_ok =
+        chain_sock && nft_dump(chain_sock.get(), nft::kNftMsgGetchain, chain_buf, deadline);
+    chain_sock.reset();
+
+    auto rule_sock = open_nft_socket();
     std::vector<std::byte> rule_buf;
-    const bool rules_ok = nft_dump(sock.get(), nft::kNftMsgGetrule, rule_buf, deadline);
+    const bool rules_ok =
+        rule_sock && nft_dump(rule_sock.get(), nft::kNftMsgGetrule, rule_buf, deadline);
 
     // Content is only trusted when BOTH dumps succeeded -- a partial read
     // (e.g. the rule dump alone failing) must not be reported as "these are
