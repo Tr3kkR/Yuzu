@@ -243,7 +243,10 @@ if _yaml_probe.returncode() != 0
     'PyYAML is required to embed shipped InstructionDefinitions but is '
     + 'not importable from ' + embed_python.full_path() + '. '
     + 'Install with `pip install pyyaml` (Linux/macOS) or '
-    + '`pacman -S python-yaml` (MSYS2). See CLAUDE.md "Instruction Engine".'
+    + '`pacman -S python-yaml` (MSYS2). If you have just installed PyYAML, '
+    + 're-run with `meson setup --wipe <builddir>` -- meson caches '
+    + 'run_command results in introspection state, so --reconfigure will '
+    + 'not re-probe. See CLAUDE.md "Instruction Engine".'
   )
 endif
 
