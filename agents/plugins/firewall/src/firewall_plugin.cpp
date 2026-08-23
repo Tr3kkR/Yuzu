@@ -696,25 +696,33 @@ bool try_nftables_rules(yuzu::CommandContext& ctx) {
     ctx.write_output("backend|nftables");
 
     std::vector<std::byte> chain_buf;
-    if (nft_dump(sock.get(), nft::kNftMsgGetchain, chain_buf, deadline)) {
-        for (const auto& c : yuzu::firewall::parse_nft_chains(chain_buf)) {
-            if (!c.is_base_chain)
-                continue; // regular chains carry no hook/policy of their own
-            ctx.write_output(std::format(
-                "rule|nftables|{}|{}|{}|{}|{}", yuzu::firewall::nft_family_name(c.family),
-                sanitize_field(c.table), sanitize_field(c.name),
-                yuzu::firewall::nft_hook_name(c.hooknum), yuzu::firewall::nft_policy_name(c.policy)));
-        }
+    const bool chains_ok = nft_dump(sock.get(), nft::kNftMsgGetchain, chain_buf, deadline);
+    std::vector<std::byte> rule_buf;
+    const bool rules_ok = nft_dump(sock.get(), nft::kNftMsgGetrule, rule_buf, deadline);
+
+    // Content is only trusted when BOTH dumps succeeded -- a partial read
+    // (e.g. the rule dump alone failing) must not be reported as "these are
+    // all the rules there are". Same honest-unknown invariant as
+    // try_nftables_state and try_iptables_rules's nonzero-exit path.
+    if (!chains_ok || !rules_ok) {
+        ctx.write_output("rules|unknown");
+        return true;
     }
 
-    std::vector<std::byte> rule_buf;
-    if (nft_dump(sock.get(), nft::kNftMsgGetrule, rule_buf, deadline)) {
-        for (const auto& r : yuzu::firewall::parse_nft_rules(rule_buf)) {
-            ctx.write_output(std::format(
-                "rule|nftables|{}|{}|{}|handle|{}", yuzu::firewall::nft_family_name(r.family),
-                sanitize_field(r.table), sanitize_field(r.chain),
-                r.handle ? std::to_string(*r.handle) : "unknown"));
-        }
+    for (const auto& c : yuzu::firewall::parse_nft_chains(chain_buf)) {
+        if (!c.is_base_chain)
+            continue; // regular chains carry no hook/policy of their own
+        ctx.write_output(std::format(
+            "rule|nftables|{}|{}|{}|{}|{}", yuzu::firewall::nft_family_name(c.family),
+            sanitize_field(c.table), sanitize_field(c.name),
+            yuzu::firewall::nft_hook_name(c.hooknum), yuzu::firewall::nft_policy_name(c.policy)));
+    }
+
+    for (const auto& r : yuzu::firewall::parse_nft_rules(rule_buf)) {
+        ctx.write_output(std::format(
+            "rule|nftables|{}|{}|{}|handle|{}", yuzu::firewall::nft_family_name(r.family),
+            sanitize_field(r.table), sanitize_field(r.chain),
+            r.handle ? std::to_string(*r.handle) : "unknown"));
     }
     return true;
 }
