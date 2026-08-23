@@ -64,31 +64,11 @@
 #include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #endif
 
+#include "netstat_parsers.hpp" // yuzu::netstat::escape_pipes -- pure, unit-tested (test_netstat_parsers.cpp)
+
 namespace {
 
-// Escape '|' in a field that may contain arbitrary text (process name/path)
-// so it can't be mistaken for a column separator downstream. Ported from the
-// retired sockwho_plugin.cpp. Also strips CR/LF (adversarial-review gate-2
-// finding, #3403): split_output_lines() on the server splits raw agent
-// output on '\n' and trims a trailing '\r', with no unescape for either —
-// only '\|' round-trips through unescape_pipes(). A POSIX filename may
-// legally contain a newline, so an unescaped process name/path could split
-// one attribution row into extra server-visible lines. There's no
-// reversible escape for a control character here, so it's replaced with
-// '_' (same choice as agents/shared/user_profile_model.hpp's sanitize_field).
-std::string escape_pipes(std::string_view sv) {
-    std::string out;
-    out.reserve(sv.size());
-    for (char c : sv) {
-        if (c == '|')
-            out += "\\|";
-        else if (c == '\r' || c == '\n')
-            out += '_';
-        else
-            out += c;
-    }
-    return out;
-}
+using yuzu::netstat::escape_pipes;
 
 // -- Linux implementation -----------------------------------------------------
 #ifdef __linux__
