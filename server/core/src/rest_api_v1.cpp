@@ -1925,10 +1925,20 @@ void RestApiV1::register_routes(
                 // METRIC is a known small imprecision, and the path is only
                 // reachable at all if scoped_perm_fn and the derived set
                 // disagree about this device, which is itself a bug.
+                // #881: this can also mean the device is QUARANTINED — a
+                // permanent policy denial, not a transient reachability
+                // problem — or that the containment gate is failing closed
+                // fleet-wide. The dispatch closure returns only a sent count,
+                // so this route cannot yet tell them apart (#3424). Naming all
+                // three beats asserting the one that is most often wrong
+                // during an incident.
                 res.status = 404;
                 bump("agent_not_connected");
                 res.set_content(
-                    detail::error_json_a4(404, "device offline or not reachable", cid, 5000, ""),
+                    detail::error_json_a4(404,
+                                          "device offline, quarantined, or withheld because "
+                                          "containment state could not be read",
+                                          cid, 5000, ""),
                     "application/json");
                 return;
             }
@@ -7318,8 +7328,19 @@ void RestApiV1::register_routes(
                 // That indistinguishability is deliberate — a distinct "refused
                 // by confinement" status would disclose the existence of
                 // devices the caller is not allowed to see.
+                // #881 adds two more ways to reach zero that are NOT about
+                // device visibility: every target quarantined, and the gate
+                // failing closed because containment state is unreadable.
+                // Neither discloses anything about devices the caller cannot
+                // see — a fail-closed gate is a server condition, and
+                // quarantine state is already readable at GET
+                // /api/v1/quarantine — so naming them does not weaken the
+                // confinement rationale above.
                 execution_tracker->mark_cancelled(exec_id, owner);
-                rs_err(res, 503, "RESULT_SET_NO_AGENTS: no agents reached in the target scope");
+                rs_err(res, 503,
+                       "RESULT_SET_NO_AGENTS: no agents reached in the target scope — targets may "
+                       "be unreachable, quarantined, or withheld because containment state could "
+                       "not be read");
                 return;
             }
             execution_tracker->set_agents_targeted(exec_id, sent);

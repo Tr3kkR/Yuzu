@@ -42,7 +42,7 @@ COPY deploy/docker/requirements-meson.txt /tmp/requirements-meson.txt
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake ninja-build gcc-13 g++-13 ccache pkg-config make linux-libc-dev \
     curl zip unzip tar git ca-certificates \
-    bison flex libsystemd-dev autoconf automake libtool \
+    bison flex libsystemd-dev libblkid-dev autoconf automake libtool \
     python3-pip python3-venv python3-yaml \
     && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 \
     && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 \
@@ -127,6 +127,9 @@ RUN set -eux; \
 #   libsqlite3-0_libs       agent KV / identity store.
 #   libsystemd0_libs        sd-bus, for the Linux Guardian systemd service guard
 #                           (libyuzu_agent_core.so DT_NEEDED libsystemd.so.0).
+#   libblkid1_libs          bitlocker plugin's in-process LUKS enumeration
+#                           (libbitlocker.so DT_NEEDED libblkid.so.1, wave-3
+#                           native/argv migration off `lsblk`/`cryptsetup`).
 #   busybox-static_bins     single static binary; PRE-EMPTIVE for a compose
 #                           healthcheck (no compose healthchecks an agent image
 #                           today — the agent has no HTTP endpoint). Gated anyway
@@ -142,7 +145,7 @@ RUN set -eux; mkdir -p /rootfs; \
     SLICES="base-files_base base-files_etc base-files_var base-files_tmp \
       base-files_release-info base-passwd_data netbase_config \
       ca-certificates_data openssl_config libc6_libs libgcc-s1_libs \
-      libstdc++6_libs libssl3t64_libs libsqlite3-0_libs libsystemd0_libs zlib1g_libs \
+      libstdc++6_libs libssl3t64_libs libsqlite3-0_libs libsystemd0_libs libblkid1_libs zlib1g_libs \
       busybox-static_bins"; \
     ok=0; for i in 1 2 3 4 5; do \
       if chisel cut --release "${CHISEL_RELEASE}" --root /rootfs ${SLICES}; then ok=1; break; fi; \

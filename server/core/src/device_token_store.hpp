@@ -47,7 +47,10 @@
 /// IDENTITY/LIFECYCLE conflict-handling split, including the security-relevant asymmetry on
 /// `revoked` (a legacy row revoked but not yet reflected in Postgres fails the backfill closed —
 /// silently keeping Postgres's stale "still active" value would resurrect a token the operator
-/// revoked).
+/// revoked). Memory-bounded (#3399): the legacy table is streamed, not materialized — resident
+/// state is O(kBackfillBatchRows), regardless of legacy table size. Fail-closed and all-or-
+/// nothing: every failure (scan, validation, insert, conflict, marker stamp) leaves the backfill
+/// marker unstamped, so the next boot re-fingerprints and retries the whole file.
 
 #include <cstdint>
 #include <expected>

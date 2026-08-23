@@ -230,6 +230,7 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <spdlog/spdlog.h>
 
 #include <atomic>
+#include <semaphore>
 #include <cctype>
 #include <charconv>
 #include <chrono>
@@ -1145,6 +1146,58 @@ public:
         metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                          {{"route", "dispatch_closure"},
                           {"reason", std::string(yuzu::server::kReasonClosureNoTarget)}});
+        // #881: the quarantine dispatch gate emits `reason=quarantined` from
+        // three routes — `dispatch_closure` (the shared closure serving MCP/
+        // workflows/schedules/REST v1), `command` (`/api/command`) and
+        // `legacy` (`forward_legacy_command`) — never as a cross-product with
+        // the targeting-shape reasons above, because a quarantine denial is a
+        // containment decision, not a targeting-shape violation. Seeded here,
+        // same discipline as every other pair on this series: an unseeded
+        // series reads as "quarantine has never blocked anything" when the
+        // truth may be "the gate never ran".
+        for (const char* route : {"dispatch_closure", "command", "legacy"})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", route},
+                              {"reason", std::string(yuzu::server::kReasonQuarantined)}});
+
+        // The containment gate's own outcome series, seeded across its whole
+        // closed label set for the same reason. Without this, `absent()` on
+        // `outcome="fail_closed"` cannot tell "the gate has never had to fail
+        // closed" from "the gate never ran at all" — and the second is the
+        // condition an operator most needs an alert to catch. Driven from
+        // `kQuarantineGateOutcomes` so a new label cannot be added at an emit
+        // site without appearing here too.
+        for (const auto outcome : yuzu::server::kQuarantineGateOutcomes)
+            metrics_.counter("yuzu_server_quarantine_gate_total",
+                             {{"outcome", std::string(outcome)}});
+
+        // The quarantine read-degrade family was never pre-seeded, unlike its
+        // mgmt-group and discovery siblings above, so every reason read as
+        // absent on a healthy server and `absent()` could not be used on any of
+        // them. Seeded here now that #881 adds a FOURTH reason — the
+        // read-concurrency cap — whose whole purpose is to be alertable before
+        // it ever fires. The three store-side values are emitted by
+        // quarantine_store.cpp; `read_concurrency_cap` is emitted by
+        // make_containment_gate and has no store involvement at all, which is
+        // exactly why it needs its own value rather than being folded into one
+        // of theirs.
+        for (const auto reason :
+             {"store_not_open", "pool_acquire_timeout", "query_error", "read_concurrency_cap"})
+            metrics_.counter("yuzu_server_quarantine_read_degrade_total", {{"reason", reason}});
+
+        // #3402: the internal pushes that deliberately BYPASS that gate, seeded
+        // across the full capability x result product. Every combination is
+        // reachable — each of the three pushes can fail at the registry seam —
+        // so unlike the per-route targeting seed above, the product is honest
+        // here rather than publishing series no code path can produce.
+        // `undelivered` at zero is the point: it is the value an operator needs
+        // to be able to alert on, and an absent series cannot be alerted on.
+        for (const auto push : yuzu::server::kSystemReservedPushes)
+            for (const auto result : yuzu::server::kSystemReservedPushResults)
+                metrics_.counter(
+                    "yuzu_server_system_reserved_push_total",
+                    {{"capability", std::string(yuzu::server::system_reserved_push_label(push))},
+                     {"result", std::string(result)}});
         // ── Dispatch chokepoint + gateway wire-capability denials ─────────
         //
         // These three series answer "did the gate run and refuse?" — a question
@@ -2000,15 +2053,18 @@ public:
                           "failure backoff without taking a connection lease",
                           "counter");
         metrics_.describe("yuzu_server_engine_revalidate_generation_capacity_fallback_total",
-                          "#2454: the per-principal poisoning-guard map was full and a NEW "
-                          "principal's invalidate fell back to the coarse global epoch. NOT a "
-                          "narrowly-scoped degradation: once tripped, the epoch bump defeats "
-                          "EVERY principal's concurrent cache-write, not just the triggering "
-                          "one, until a process restart - reproducing the fleet-wide cache "
-                          "disablement #2454 exists to fix, bounded only to start past the "
-                          "1024-distinct-ever-revoked-principal ceiling. Not expected under "
-                          "ordinary load; a climbing value means the guard has degraded and "
-                          "will not recover without a restart.",
+                          "#2454/#3385: the per-principal poisoning-guard map was full (even "
+                          "after a TTL sweep) and a NEW principal's invalidate fell back to the "
+                          "coarse global epoch. NOT a narrowly-scoped degradation: while "
+                          "tripped, the epoch bump defeats EVERY principal's concurrent "
+                          "cache-write, not just the triggering one - reproducing the "
+                          "fleet-wide cache disablement #2454 exists to fix, bounded to start "
+                          "past the 1024-distinct-principals-per-63s ceiling. Since #3385 this "
+                          "is self-clearing: entries age out on a TTL, so the fallback stops "
+                          "once churn drops back under the ceiling - no restart required. Not "
+                          "expected under ordinary load; a climbing value means the guard is "
+                          "running at reduced precision - see "
+                          "docs/ops-runbooks/engine-principal-store-recovery.md.",
                           "counter");
         metrics_.describe("yuzu_server_audit_events_total",
                           "Audit events written, bucketed by result", "counter");
@@ -3812,7 +3868,12 @@ public:
                 std::unordered_set<std::string> dispatched;
                 dispatched.reserve(agent_ids.size());
                 for (const auto& aid : agent_ids) {
-                    if (registry_.send_to(aid, *classified))
+                    // #881: system_reserved internal push (tar.fleet_snapshot),
+                    // not operator instruction dispatch — deliberately NOT
+                    // quarantine-gated (see dispatch_confined_arms.hpp).
+                    if (send_system_reserved(
+                            aid, *classified,
+                            yuzu::server::SystemReservedPush::tar_fleet_snapshot))
                         dispatched.insert(aid);
                 }
                 forward_gateway_pending();
@@ -4371,7 +4432,13 @@ public:
                     auto classified = build_classified_command(
                         yuzu::server::DispatchCaller{.system = true}, "__guard__", "push_rules",
                         command_id, /*parameters=*/{}, push.SerializeAsString());
-                    if (classified && registry_.send_to(agent_id, *classified)) {
+                    // #881: system_reserved internal push (__guard__.push_rules),
+                    // not operator instruction dispatch — deliberately NOT
+                    // quarantine-gated (see dispatch_confined_arms.hpp).
+                    if (classified &&
+                        send_system_reserved(
+                            agent_id, *classified,
+                            yuzu::server::SystemReservedPush::guardian_push_rules)) {
                         forward_gateway_pending();
                         metrics_
                             .counter("yuzu_server_guardian_reconciles_total",
@@ -5998,6 +6065,102 @@ public:
                          "gRPC listeners will use the certificates loaded at startup");
         }
 
+        // #881: keep the containment snapshot WARM.
+        //
+        // The bounded-staleness budget (`kQuarantineSnapshotMaxAge`, 60s) is
+        // meant to absorb a transient store blip so a pool-acquire timeout does
+        // not convert into a fleet-wide dispatch refusal. It could not do that,
+        // because the snapshot's only writer was `make_containment_gate` — i.e.
+        // a DISPATCH. So the snapshot's age was "time since the last dispatch",
+        // not "time since the last successful read", and on a server with no
+        // sustained operator traffic (the PolicyEvaluator's default interval is
+        // 3600s) every dispatch arrived with a snapshot already past the
+        // budget. One timed-out read then went straight to fail-closed, the
+        // operator's command was refused against every target, and a critical
+        // alert fired — while the runbook told them a 60-second cushion had
+        // absorbed it. The mechanism was sound; nothing kept it fed.
+        //
+        // This does NOT change what a dispatch does: every non-exempt dispatch
+        // still performs its own fresh read and uses this snapshot only as the
+        // fallback. Serving the snapshot directly would put a whole refresh
+        // interval of lag between a quarantine write and its enforcement, which
+        // is the bypass window the fresh-read-per-dispatch design exists to
+        // close. This only keeps the fallback recent enough to be worth having.
+        //
+        // Cadence is a third of the budget, so two consecutive refresh failures
+        // still leave a usable snapshot — and it narrows the other edge of the
+        // same window: a device quarantined while reads are degrading is absent
+        // from a snapshot taken before the write, so the shorter the snapshot's
+        // maximum age, the shorter that bypass.
+        if (quarantine_store_) {
+            quarantine_snapshot_refresh_thread_ = std::thread([this]() {
+                using namespace std::chrono_literals;
+                spdlog::info("Quarantine containment snapshot refresher started (interval=20s, "
+                             "staleness budget={}s)",
+                             yuzu::server::kQuarantineSnapshotMaxAge.count());
+                while (!stop_requested_.load(std::memory_order_acquire)) {
+                    for (int i = 0; i < 4 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                        std::this_thread::sleep_for(5s);
+                    if (stop_requested_.load(std::memory_order_acquire))
+                        break;
+                    // Per-tick try/catch: an exception escaping a std::thread
+                    // entry is std::terminate — the whole process, from a
+                    // best-effort cache refresh. This body allocates (the id
+                    // set, and list_quarantined's own vector), so `bad_alloc`
+                    // alone makes it reachable. Five other background loops in
+                    // this file already carry this shape; the two that did not
+                    // were this one and health_recompute_thread_.
+                    try {
+                    if (!quarantine_store_ || !quarantine_store_->is_open())
+                        continue;
+                    // Take a slot like any other containment read. Without
+                    // this the refresher is the ONE read the bound does not
+                    // bound — a stalled backend pins five pool connections,
+                    // not four, and the member's own doc comment is off by
+                    // one. It waits like a dispatch does; if it cannot get in,
+                    // it simply skips this tick, which costs nothing (the next
+                    // is 20s away and the snapshot is still inside its 60s
+                    // budget).
+                    if (!containment_read_slots_.try_acquire_for(std::chrono::seconds{2}))
+                        continue;
+                    ContainmentReadSlot release_slot{containment_read_slots_};
+                    // Stamped BEFORE the read for the same reason
+                    // make_containment_gate stamps before its own: the budget
+                    // bounds the age of the DATA, and a read that blocked for
+                    // seconds on a contended pool would otherwise be recorded
+                    // as fresher than it is.
+                    const auto read_started_at = std::chrono::steady_clock::now();
+                    auto rows = quarantine_store_->list_quarantined();
+                    if (!rows)
+                        continue; // a failed refresh leaves the previous snapshot to age out
+                    std::unordered_set<std::string> ids;
+                    ids.reserve(rows->size());
+                    for (const auto& r : *rows)
+                        ids.insert(r.agent_id);
+                    {
+                        std::lock_guard<std::mutex> lk(quarantine_snapshot_mtx_);
+                        // Never move the stamp BACKWARDS. A refresh that raced a
+                        // dispatch's own fresh read could otherwise replace a
+                        // newer snapshot with an older one and age the fallback
+                        // out early.
+                        if (quarantine_snapshot_.valid && quarantine_snapshot_.at > read_started_at)
+                            continue;
+                        quarantine_snapshot_ =
+                            yuzu::server::QuarantineSnapshot{std::move(ids), read_started_at, true};
+                    }
+                    } catch (const std::exception& e) {
+                        // Log and keep ticking. A failed refresh leaves the
+                        // previous snapshot to age out, which is the same
+                        // outcome as a failed read and is already handled.
+                        spdlog::warn("quarantine snapshot refresher tick failed: {}", e.what());
+                    } catch (...) {
+                        spdlog::warn("quarantine snapshot refresher tick failed: unknown exception");
+                    }
+                }
+                spdlog::info("Quarantine containment snapshot refresher stopped");
+            });
+        }
+
         // Spawn fleet health recomputation thread (aggregates agent heartbeat data)
         health_recompute_thread_ = std::thread([this]() {
             spdlog::info("Fleet health recomputation thread started (interval=15s)");
@@ -7171,6 +7334,12 @@ public:
         // statement_timeout/lock_timeout regardless.
         if (auth_db_) {
             auth_db_->request_stop();
+        }
+
+        // Join the containment snapshot refresher BEFORE the stores it reads
+        // (#881). It touches quarantine_store_ and quarantine_snapshot_ only.
+        if (quarantine_snapshot_refresh_thread_.joinable()) {
+            quarantine_snapshot_refresh_thread_.join();
         }
 
         // Join the fleet health recomputation thread
@@ -9004,6 +9173,36 @@ private:
     /// `std::unexpected` explicitly. Every denial is counted (one family,
     /// `reason` label) and logged; no path returns a permissive default
     /// (ADR-0033 §2).
+    /// #881 / #3402 — the ONE door for a server-internal push that reaches an
+    /// agent WITHOUT passing the containment gate.
+    ///
+    /// Four call sites bypass the gate deliberately (see
+    /// `SystemReservedPush` in dispatch_confined_arms.hpp for why each is
+    /// correct). Before this wrapper the bypass was enforced by a comment
+    /// above a raw `registry_.send_to`, which is not enforcement: a fifth site
+    /// added later would inherit it silently, and there was nothing to grep
+    /// for. Taking an ENUM rather than a string means a new internal push
+    /// cannot compile without adding an enumerator next to the rule it is an
+    /// exemption from.
+    ///
+    /// It also makes the bypass COUNTABLE. `undelivered` is the value that
+    /// matters: a Guardian rule push that never landed leaves a device
+    /// unenforced, and until now that fell on the floor at three of the four
+    /// sites (only the reconcile path metered anything, and only its success).
+    /// `sent` means the registry accepted the frame — for a gateway-attached
+    /// agent `send_to` only QUEUES it, so this is acceptance, never delivery.
+    [[nodiscard]] bool send_system_reserved(const std::string& agent_id,
+                                            const detail::ClassifiedCommand& cmd,
+                                            yuzu::server::SystemReservedPush push) {
+        const bool ok = registry_.send_to(agent_id, cmd);
+        metrics_
+            .counter("yuzu_server_system_reserved_push_total",
+                     {{"capability", std::string(yuzu::server::system_reserved_push_label(push))},
+                      {"result", ok ? "sent" : "undelivered"}})
+            .increment();
+        return ok;
+    }
+
     std::expected<detail::ClassifiedCommand, detail::DispatchDenial> build_classified_command(
         const yuzu::server::DispatchCaller& caller, const std::string& plugin,
         const std::string& action, const std::string& command_id,
@@ -9131,6 +9330,149 @@ private:
             }};
     }
 
+    /// #881: the ONE place a `ContainmentGate` is built. Called once per
+    /// dispatch — never per agent — at every one of the six production
+    /// dispatch sites (`dispatch_confined` below, the four `/api/command`
+    /// arms, `forward_legacy_command`).
+    ///
+    /// The quarantine plugin's OWN control channel is exempted WITHOUT
+    /// touching `quarantine_store_` at all: `is_quarantine_control_plugin`
+    /// is pure, so a Postgres outage that fails every other dispatch closed
+    /// cannot also block the one action (release) that would end it.
+    /// Keyed on the `(plugin, ACTION)` pair against a closed four-action set,
+    /// NOT on the plugin name — a fifth action added later arrives gated
+    /// rather than inheriting the bypass. See that predicate's own doc
+    /// comment for why all four of today's actions are on the list and why
+    /// `unquarantine` alone is not enough.
+    ///
+    /// Otherwise, `quarantine_store_->list_quarantined()` runs EXACTLY ONCE
+    /// and the result — success or the collapsed-to-nullopt failure —
+    /// crosses into `evaluate_quarantine_degradation`
+    /// (dispatch_confined_arms.hpp), the pure #881 policy that decides
+    /// fresh/stale/fail-closed and refreshes `quarantine_snapshot_` on a
+    /// successful read. `store_permanently_unavailable` is computed here
+    /// (null or `!is_open()`) rather than inside that pure function because
+    /// it is the one input that is genuinely `ServerImpl`-shaped — a
+    /// permanent condition the server already refuses to start on
+    /// (server.cpp, quarantine store construction), never something a fake
+    /// reader in a test needs to fabricate via `list_quarantined()` itself.
+    yuzu::server::ContainmentGate make_containment_gate(const std::string& plugin,
+                                                       const std::string& action) {
+        // The exemption DECISION lives in `compose_containment_gate` (testable,
+        // CDX-P1-06); this local only decides whether to spend a store READ.
+        // Deliberately not an early return: an early return here is exactly
+        // what the mutation test disabled to switch containment off for every
+        // plugin with the suite still green. Skipping the read keeps the
+        // property the spec asks for — the release path must survive a store
+        // outage, so it must not depend on a query — without giving this
+        // function a second, untested copy of the enforcement decision.
+        const bool exempt = yuzu::server::is_quarantine_control_plugin(plugin, action);
+        const bool store_unavailable = !quarantine_store_ || !quarantine_store_->is_open();
+        // #881: sampled BEFORE the store read, not after — the 60s budget in
+        // `evaluate_quarantine_degradation` is meant to bound the age of the
+        // DATA, and stamping `now` only after a read that may itself have
+        // blocked for seconds on a contended pool would understate that.
+        const auto read_started_at = std::chrono::steady_clock::now();
+        std::optional<std::unordered_set<std::string>> fresh_read;
+
+        // CONCURRENCY BOUND on the containment read — and a WAIT, not a skip.
+        //
+        // `list_quarantined()` is a synchronous libpq round trip with no
+        // client-side deadline that actually binds. `statement_timeout` is
+        // server-side and a FROZEN backend cannot enforce it; `tcp_user_timeout`
+        // only covers unacknowledged data, and a paused container still ACKs.
+        // Measured against the pool's exact conninfo with the backend paused
+        // for 100s: the query returned successfully after 101.009s, with
+        // neither bound firing.
+        //
+        // Before #881 no dispatch touched this store. Now every non-exempt one
+        // does, so without a bound a stalled backend pins one pool connection
+        // per dispatching worker — and that pool is the SAME one auth, RBAC,
+        // audit and every other store draw from. A dispatch stall would become
+        // server-wide pool exhaustion.
+        //
+        // WHY THIS WAITS RATHER THAN SKIPPING, which is the whole subtlety.
+        // The first version of this bound was non-blocking: miss a slot, fall
+        // through to the `nullopt` path. That is wrong, and wrong in the
+        // direction this gate exists to prevent. The `nullopt` path serves the
+        // last-known-good snapshot, which is a reasonable answer when the store
+        // COULD NOT answer — and a bypass when nobody asked it. Against a
+        // HEALTHY store, a dispatch that skipped its read would be decided from
+        // a snapshot up to 60s old, so a device quarantined in the meantime
+        // would be dispatched to. With the HTTP pool sized in the hundreds and
+        // this bound at four, missing a slot is the steady state under ordinary
+        // agentic load, not an edge case: it would have under-enforced
+        // routinely.
+        //
+        // A bounded wait has neither problem. Against a healthy store the read
+        // is milliseconds, so four slots sustain far more dispatch than the
+        // fleet generates and the wait is unobservable. The bound only bites
+        // when reads are SLOW — exactly the stall it exists for — and a
+        // genuine timeout then means the store is not answering, which is a
+        // fail-CLOSED condition, not a stale-snapshot one.
+        //
+        // The slot wait is DELIBERATELY SHORTER than the store's own read
+        // timeout (`QuarantineStore::kReadTimeout`, 2000ms) so the two bounds
+        // COMPOSE rather than stack. Waiting the full store timeout for a slot
+        // and then paying it again inside the read puts worst-case dispatch
+        // latency at 4s plus the query, all on an httplib worker from the pool
+        // `StreamBudget` is sized against. At 500ms a healthy store — where
+        // this read is milliseconds — never notices, and a stalled one is
+        // rejected quickly rather than parking a worker.
+        //
+        // Not configurable: a blast-radius bound, not a tuning knob. The bound
+        // itself is `kMaxConcurrentContainmentReads`, a class-scope constant.
+        static constexpr auto kContainmentReadSlotWait = std::chrono::milliseconds{500};
+        bool read_slot_timed_out = false;
+        if (!exempt && !store_unavailable) {
+            if (containment_read_slots_.try_acquire_for(kContainmentReadSlotWait)) {
+                ContainmentReadSlot release_slot{containment_read_slots_};
+                if (auto rows = quarantine_store_->list_quarantined()) {
+                    std::unordered_set<std::string> ids;
+                    ids.reserve(rows->size());
+                    for (const auto& r : *rows)
+                        ids.insert(r.agent_id);
+                    fresh_read = std::move(ids);
+                }
+            } else {
+                // Countable and DISTINCT: "the read was never attempted because
+                // reads are saturated" is a different operator problem from
+                // "the read failed", and it resolves to fail-closed rather than
+                // to the snapshot.
+                read_slot_timed_out = true;
+                metrics_
+                    .counter("yuzu_server_quarantine_read_degrade_total",
+                             {{"reason", "read_concurrency_cap"}})
+                    .increment();
+            }
+        }
+
+        // The exemption, the degradation policy and the monotonic snapshot
+        // advance all live in `compose_containment_gate` so they are reachable
+        // from a test (CDX-P1-06): this method previously held the plugin
+        // exemption inline, where making it unconditional disabled containment
+        // for every plugin with the whole dispatch suite still green. What
+        // stays here is only what is genuinely ServerImpl-shaped — the store
+        // read above, this lock, and the metric below.
+        // Constructed inside the lock rather than default-constructed and then
+        // assigned: ContainmentGate has no default state, so there is nothing to
+        // hold a gate in before the decision is made.
+        const yuzu::server::QuarantineDegradationResult decision = [&] {
+            std::lock_guard<std::mutex> lk(quarantine_snapshot_mtx_);
+            return yuzu::server::compose_containment_gate(
+                plugin, action, store_unavailable || read_slot_timed_out, fresh_read,
+                quarantine_snapshot_, read_started_at);
+        }();
+        // Outside the snapshot lock: the metrics registry has its own
+        // internal locking (yuzu::Counter) and does not need to serialise
+        // through `quarantine_snapshot_mtx_` as well.
+        metrics_
+            .counter("yuzu_server_quarantine_gate_total",
+                     {{"outcome", std::string(decision.outcome)}})
+            .increment();
+        return decision.gate;
+    }
+
     /// The SINGLE confined dispatch seam — the one place the target "arm"
     /// (Group / Scope / Ids / Broadcast / None) is resolved and a
     /// `CommandRequest` is handed to `registry_`. Shared by the shared
@@ -9240,6 +9582,13 @@ private:
                          plugin, norm_action, kBroadcastScope);
         }
 
+        // #881: the ONE store read for this whole dispatch (never per-agent —
+        // a fleet broadcast must not become N queries). Exempts the
+        // quarantine plugin's own control channel without touching the store
+        // at all, so release keeps working through a Postgres outage that
+        // would otherwise fail every OTHER dispatch closed.
+        const auto containment_gate = make_containment_gate(plugin, norm_action);
+
         // K-1/QE-2: the ladder resolution + per-arm visible-set intersection
         // (A-3) is the ONE call every caller makes — no per-arm branch is
         // hand-rolled here. The resolvers-and-sink WIRING itself (previously
@@ -9248,7 +9597,7 @@ private:
         // a real AgentRegistry independent of ServerImpl. A parse failure has
         // no `res` to answer on this path (matching pre-existing behaviour):
         // reach nobody, no audit.
-        const auto [ignored_command_id, sent] = yuzu::server::wire_and_dispatch_confined(
+        auto outcome = yuzu::server::wire_and_dispatch_confined(
             registry_, mgmt_group_store_.get(), result_set_store_.get(), tag_store_.get(),
             custom_properties_store_.get(), execution_tracker_.get(),
             [this](const std::string& principal, const std::string& role,
@@ -9262,13 +9611,30 @@ private:
                 audit_scope_evaluation_aborted(principal, role, cmd_id, reason);
             },
             command_id, execution_id, caller.principal_role, agent_ids, scope_expr,
-            caller.exec_visible, broadcast_on_none, *classified);
-        (void)ignored_command_id; // always == command_id, minted above
+            caller.exec_visible, broadcast_on_none, containment_gate, *classified);
+
+        // #881: this seam serves the MAJORITY of dispatch (MCP, workflows,
+        // schedules, REST v1) — without this, quarantine enforcement here
+        // would be silent. Fail-closed denies every connected agent, so it
+        // gets ONE aggregate row (see that function's own comment); a
+        // specific-quarantine denial gets one row per id up to a cap, then a
+        // single summary row — "bounded by the active-quarantine set" is not a
+        // bound during a mass-containment incident, which is precisely when
+        // this fires (see audit_quarantine_dispatch_denied_batch).
+        if (containment_gate.fail_closed) {
+            audit_quarantine_dispatch_fail_closed("dispatch_closure", caller.principal,
+                                                  caller.principal_role, command_id,
+                                                  outcome.denied_quarantined_count);
+        } else {
+            audit_quarantine_dispatch_denied_batch("dispatch_closure", caller.principal,
+                                                   caller.principal_role, command_id,
+                                                   std::move(outcome.denied_quarantined));
+        }
 
         forward_gateway_pending();
-        if (sent > 0)
+        if (outcome.sent > 0)
             metrics_.counter("yuzu_commands_dispatched_total").increment();
-        return {command_id, sent};
+        return {command_id, outcome.sent};
     }
 
     /// #1634: the SINGLE per-agent Response-scope predicate — every Response:Read
@@ -9457,7 +9823,12 @@ private:
         // (capdecls::core_dispatch_capabilities.hpp).
         auto classified = build_classified_command(yuzu::server::DispatchCaller{.system = true},
                                                     "asset_tags", "sync", command_id, parameters);
-        if (classified && registry_.send_to(agent_id, *classified)) {
+        // #881: system_reserved internal push (asset_tags.sync), not operator
+        // instruction dispatch — deliberately NOT quarantine-gated (see
+        // dispatch_confined_arms.hpp).
+        if (classified && send_system_reserved(
+                              agent_id, *classified,
+                              yuzu::server::SystemReservedPush::asset_tags_sync)) {
             spdlog::debug("Pushed asset tag sync to agent {}", agent_id);
             forward_gateway_pending();
         }
@@ -9559,6 +9930,213 @@ private:
         if (!audit_store_->log(ev))
             spdlog::error("audit write failed: scope.evaluation_aborted (command={} reason={})",
                           command_id, reason);
+    }
+
+    // #881: one audit row + counter increment per agent a quarantine gate
+    // specifically withheld, copying audit_scope_resolution_failed's exact
+    // mechanism above so a quarantine denial is visible through the SAME
+    // forensic chain every other dispatch refusal uses. `route` IS threaded
+    // per call site (unlike the None-arm "no target" counter above, whose
+    // `dispatch_closure` label is correct because that arm genuinely only
+    // fires inside the closure) — `route` on this series means "which surface
+    // dispatched", and collapsing it to one literal would let a `/api/command`
+    // or `forward_legacy_command` denial page on `dispatch_closure`'s
+    // published meaning ("a caller forgot to name a target — a code defect"),
+    // which a quarantine denial is not. Callers: `dispatch_confined` passes
+    // "dispatch_closure", the four `/api/command` arms pass "command",
+    // `forward_legacy_command` passes "legacy".
+    //
+    // Reserved for the NON-fail-closed case (a specific, bounded
+    // `gate.quarantined` set) — a fail-closed denial reaches every connected
+    // agent and goes through `audit_quarantine_dispatch_fail_closed` instead,
+    // which emits ONE row rather than fanning out N synchronous audit-store
+    // writes against the same pool whose degradation produced fail-closed.
+    void audit_quarantine_dispatch_denied(std::string_view route, const std::string& principal,
+                                          const std::string& principal_role,
+                                          const std::string& command_id,
+                                          const std::string& agent_id) {
+        metrics_
+            .counter("yuzu_server_dispatch_target_rejected_total",
+                     {{"route", std::string(route)},
+                      {"reason", std::string(yuzu::server::kReasonQuarantined)}})
+            .increment();
+        spdlog::warn("dispatch denied: command={} agent={} principal={} reason=quarantined",
+                     command_id, agent_id, principal.empty() ? "unknown" : principal);
+        if (!audit_store_)
+            return;
+        AuditEvent ev{};
+        ev.timestamp = std::time(nullptr);
+        ev.principal = principal.empty() ? "unknown" : principal;
+        ev.principal_role = principal_role;
+        ev.action = "quarantine.dispatch_denied";
+        // "Security", not "agent": the sibling quarantine.enable/disable rows
+        // (rest_api_v1.cpp) use the Security securable as target_type with the
+        // agent id as target_id, and target_type's documented vocabulary is
+        // PascalCase. A lowercase "agent" answered neither
+        // ?target_type=Security nor ?target_type=Agent, so an auditor
+        // collecting CC7.2 evidence for "were commands issued to contained
+        // devices" would have found none while the rows sat under a value no
+        // doc names.
+        ev.target_type = "Security";
+        ev.target_id = agent_id;
+        ev.detail = std::string("QUARANTINE_DISPATCH_DENIED command=") + command_id +
+                    " agent=" + agent_id + " reason=active_quarantine";
+        ev.result = "denied";
+        if (!audit_store_->log(ev))
+            spdlog::error("audit write failed: quarantine.dispatch_denied (command={} agent={})",
+                          command_id, agent_id);
+    }
+
+    /// Per-device denial rows, BOUNDED.
+    ///
+    /// The fail-closed case is already collapsed to one row (below) because it
+    /// denies the whole connected fleet. The specific-quarantine case was not,
+    /// and its bound — "the size of the active-quarantine set" — is exactly the
+    /// quantity that is large during the incident this feature exists for. A
+    /// ransomware response contains 1'000 hosts; a per-minute scheduled
+    /// broadcast then drives 1'000 blocking `pool_.try_acquire_for` INSERTs per
+    /// tick, on the dispatch thread, through the same PgPool serving dispatch.
+    /// That converts correct enforcement into an availability problem on a
+    /// path shared with a security operation, which is the class the
+    /// fail-closed collapse was written to avoid in the first place.
+    ///
+    /// So: per-device rows up to a cap — the normal case, a handful of
+    /// contained devices, keeps its full per-device evidence — then ONE
+    /// summary row naming how many were elided. The COUNTER is unaffected and
+    /// stays exact either way, so the metric never loses precision to the
+    /// audit bound, and the elision is declared in the row rather than silent.
+    static constexpr std::size_t kMaxPerDeviceQuarantineAuditRows = 25;
+
+    void audit_quarantine_dispatch_denied_batch(std::string_view route,
+                                                const std::string& principal,
+                                                const std::string& principal_role,
+                                                const std::string& command_id,
+                                                std::vector<std::string> ordered) {
+        // WHICH rows get elided must not be the caller's choice.
+        //
+        // The Ids arm's target list is the caller's own `agent_ids` array and
+        // `filter_to_scope` preserves its order, so capping the list as given
+        // let a caller decide whose denial got a device-named row: name 25
+        // other contained devices first and the 26th — theirs — is elided,
+        // taking its `spdlog::warn` with it. "Was a command issued to contained
+        // device D" is exactly the question the target_type fix was made to
+        // answer, and it would have been unanswerable for a caller-chosen D.
+        //
+        // Sorting makes the selection deterministic and independent of request
+        // order. It does not by itself make the set unreachable — a caller who
+        // knows the sort can still push a chosen id past the cap — which is why
+        // the elided IDENTITIES are logged below rather than dropped. The audit
+        // store is what the cap protects; the log is not, and it is where the
+        // forensic answer lives when a row was elided.
+        // Taken BY VALUE and sorted in place: the callers own their vectors and
+        // do not read them afterwards, so a `std::move` at the call site makes
+        // this free rather than a fleet-scale copy on the dispatch thread —
+        // which is the allocation shape the fail-closed path was just changed
+        // to avoid. Note the call sites are declared non-const for that reason:
+        // `std::move` on a `const` object yields `const T&&`, which cannot bind
+        // to the move constructor and silently selects the COPY — two of the
+        // three sites did exactly that until this was measured.
+        std::sort(ordered.begin(), ordered.end());
+        const std::size_t emit = std::min(ordered.size(), kMaxPerDeviceQuarantineAuditRows);
+        for (std::size_t i = 0; i < emit; ++i)
+            audit_quarantine_dispatch_denied(route, principal, principal_role, command_id,
+                                             ordered[i]);
+        if (ordered.size() <= kMaxPerDeviceQuarantineAuditRows)
+            return;
+
+        const std::size_t elided = ordered.size() - emit;
+
+        // The identities the audit row cannot carry, in bounded chunks so one
+        // line never grows with the fleet. Cheap: this is the log, not N
+        // blocking INSERTs through the pool that serves dispatch.
+        constexpr std::size_t kElidedPerLogLine = 50;
+        for (std::size_t i = emit; i < ordered.size(); i += kElidedPerLogLine) {
+            std::string chunk;
+            const std::size_t upto = std::min(i + kElidedPerLogLine, ordered.size());
+            for (std::size_t j = i; j < upto; ++j) {
+                if (!chunk.empty())
+                    chunk += ',';
+                chunk += ordered[j];
+            }
+            spdlog::warn("dispatch denied (audit-elided): command={} principal={} "
+                         "reason=quarantined agents={}",
+                         command_id, principal.empty() ? "unknown" : principal, chunk);
+        }
+        // The counter already moved by the true count inside the loop above for
+        // the emitted rows; move it by the remainder here so the metric total
+        // equals the denial total regardless of the audit cap.
+        metrics_
+            .counter("yuzu_server_dispatch_target_rejected_total",
+                     {{"route", std::string(route)},
+                      {"reason", std::string(yuzu::server::kReasonQuarantined)}})
+            .increment(static_cast<double>(elided));
+        if (!audit_store_)
+            return;
+        AuditEvent ev{};
+        ev.timestamp = std::time(nullptr);
+        ev.principal = principal.empty() ? "unknown" : principal;
+        ev.principal_role = principal_role;
+        ev.action = "quarantine.dispatch_denied";
+        ev.target_type = "Security";
+        ev.target_id = "*";
+        ev.detail = "QUARANTINE_DISPATCH_DENIED command=" + command_id +
+                    " reason=active_quarantine agents_elided=" + std::to_string(elided) +
+                    " agents_total=" + std::to_string(ordered.size()) +
+                    " (per-device rows capped at " +
+                    std::to_string(kMaxPerDeviceQuarantineAuditRows) +
+                    ", selected in sorted id order; the counter carries the exact total and the "
+                    "elided ids are in the server log at WARN, keyed on this command id)";
+        ev.result = "denied";
+        if (!audit_store_->log(ev))
+            spdlog::error("audit write failed: quarantine.dispatch_denied (command={} elided={})",
+                          command_id, elided);
+    }
+
+    // #881: a fail-closed dispatch denies EVERY connected agent, so emitting
+    // one audit row per id (as `audit_quarantine_dispatch_denied` does for a
+    // specific-quarantine denial) would drive N synchronous `AuditStore::log`
+    // INSERTs — each a blocking `pool_.try_acquire_for` — through the SAME
+    // `PgPool` whose degradation is why this dispatch fail-closed in the
+    // first place. On a large fleet with a saturated pool that turns one
+    // bounded read failure into an unbounded write storm on the dispatch/HTTP
+    // thread, which is exactly the outage the bounded-staleness snapshot
+    // exists to prevent. A fail-closed denial is ONE policy decision about
+    // the whole dispatch — it gets ONE audit row; the rejection counter still
+    // moves by the true denial count so the metric stays exact.
+    void audit_quarantine_dispatch_fail_closed(std::string_view route,
+                                                const std::string& principal,
+                                                const std::string& principal_role,
+                                                const std::string& command_id,
+                                                std::size_t denied_count) {
+        if (denied_count == 0)
+            return;
+        // One `Counter::increment(v)` call, not a loop — the counter itself
+        // adds `v` under its own lock, so this is the exact-metric guarantee
+        // without N lock acquisitions.
+        metrics_
+            .counter("yuzu_server_dispatch_target_rejected_total",
+                     {{"route", std::string(route)},
+                      {"reason", std::string(yuzu::server::kReasonQuarantined)}})
+            .increment(static_cast<double>(denied_count));
+        spdlog::warn("dispatch denied: command={} principal={} reason=quarantined "
+                     "fail_closed=true agents={}",
+                     command_id, principal.empty() ? "unknown" : principal, denied_count);
+        if (!audit_store_)
+            return;
+        AuditEvent ev{};
+        ev.timestamp = std::time(nullptr);
+        ev.principal = principal.empty() ? "unknown" : principal;
+        ev.principal_role = principal_role;
+        ev.action = "quarantine.dispatch_denied";
+        ev.target_type = "Security"; // see the per-device emitter above
+        ev.target_id = "*";
+        ev.detail = "QUARANTINE_DISPATCH_DENIED command=" + command_id +
+                    " reason=degraded_fail_closed agents=" + std::to_string(denied_count);
+        ev.result = "denied";
+        if (!audit_store_->log(ev))
+            spdlog::error("audit write failed: quarantine.dispatch_denied (command={} "
+                          "fail_closed, agents={})",
+                          command_id, denied_count);
     }
 
     // Apply stored runtime config overrides on startup
@@ -12677,7 +13255,25 @@ private:
 
             agent_service_.record_send_time(command_id);
 
+            // #881: the ONE store read for this whole request (never per
+            // arm, never per agent) — computed once here, AFTER every early
+            // return above (no-agent 503, classification 403/400), so a
+            // request that will be refused for an unrelated reason does not
+            // also cost a Postgres round trip. Still shared by all four arm
+            // branches below.
+            const auto containment_gate = make_containment_gate(plugin, action);
+
             int sent = 0;
+            // #881: filled by whichever arm branch below actually ran, then
+            // audited once — BEFORE the sent==0 -> 503 branch further down —
+            // so a deliberate policy denial correlates with the transport
+            // error it is knowingly reported as.
+            std::vector<std::string> denied_quarantined;
+            // Separate from the vector: under fail-closed the ids are
+            // deliberately not collected (a fleet-sized allocation on the
+            // dispatch thread, per refused dispatch), so .size() is not the
+            // denial count. See ArmDispatchResult.
+            std::size_t denied_quarantined_count = 0;
             // `__all__` is the PUBLISHED ground scope kind (/discover/scope-kinds,
             // the MCP execute_instruction schema, docs/scope-walking-design.md), and
             // it is handled here as "no scope expression" so the ordering matches the
@@ -12694,10 +13290,10 @@ private:
             // but the DECISION OF WHO IS REACHED is the shared one, so the two
             // can no longer drift.
             const auto confined_sink = make_confined_dispatch_sink(*classified);
-            const auto dispatch_broadcast = [&]() -> int {
+            const auto dispatch_broadcast = [&]() -> yuzu::server::ArmDispatchResult {
                 return yuzu::server::dispatch_confined_arms(
                     yuzu::server::DispatchArm::Broadcast, {}, exec_visible,
-                    /*broadcast_on_none=*/true, confined_sink);
+                    /*broadcast_on_none=*/true, containment_gate, confined_sink);
             };
 
             if (arm == yuzu::server::DispatchArm::Group) {
@@ -12711,9 +13307,12 @@ private:
                         members.push_back(m.agent_id);
                 yuzu::server::ConfinedDispatchTargets t;
                 t.group_members = &members;
-                sent = yuzu::server::dispatch_confined_arms(arm, t, exec_visible,
-                                                            /*broadcast_on_none=*/true,
-                                                            confined_sink);
+                const auto result = yuzu::server::dispatch_confined_arms(
+                    arm, t, exec_visible, /*broadcast_on_none=*/true, containment_gate,
+                    confined_sink);
+                sent = result.sent;
+                denied_quarantined = result.denied_quarantined;
+                denied_quarantined_count = result.denied_quarantined_count;
             } else if (arm == yuzu::server::DispatchArm::Scope) {
                 // Scope expression dispatch.
                 // Owner principal for from_result_set: resolution (review B1).
@@ -12766,8 +13365,12 @@ private:
                     // dispatch.
                     yuzu::server::ConfinedDispatchTargets t;
                     t.scope_matched = &*ladder.matched;
-                    sent = yuzu::server::dispatch_confined_arms(
-                        arm, t, exec_visible, /*broadcast_on_none=*/true, confined_sink);
+                    const auto result = yuzu::server::dispatch_confined_arms(
+                        arm, t, exec_visible, /*broadcast_on_none=*/true, containment_gate,
+                        confined_sink);
+                    sent = result.sent;
+                    denied_quarantined = result.denied_quarantined;
+                    denied_quarantined_count = result.denied_quarantined_count;
                 }
                 // else: the ladder already audited the abort (db_degraded /
                 // owner_check_failed / principal_unresolved) — sent stays 0.
@@ -12781,15 +13384,21 @@ private:
                 // non-empty list narrowed by visibility, a different thing).
                 yuzu::server::ConfinedDispatchTargets t;
                 t.agent_ids = &agent_ids;
-                sent = yuzu::server::dispatch_confined_arms(arm, t, exec_visible,
-                                                            /*broadcast_on_none=*/true,
-                                                            confined_sink);
+                const auto result = yuzu::server::dispatch_confined_arms(
+                    arm, t, exec_visible, /*broadcast_on_none=*/true, containment_gate,
+                    confined_sink);
+                sent = result.sent;
+                denied_quarantined = result.denied_quarantined;
+                denied_quarantined_count = result.denied_quarantined_count;
             } else if (arm == yuzu::server::DispatchArm::Broadcast) {
                 // Explicitly asked for the fleet by its published name — #1788
                 // still narrows delivery to the operator's visible set; the
                 // NAME `__all__` is preserved (never rejected, never reread as
                 // "no target"), only the SEND SET composes with visibility.
-                sent = dispatch_broadcast();
+                const auto result = dispatch_broadcast();
+                sent = result.sent;
+                denied_quarantined = result.denied_quarantined;
+                denied_quarantined_count = result.denied_quarantined_count;
             } else {
                 // Broadcast ONLY when the caller named no target at all (#2500).
                 // A target that was SUPPLIED but resolved to nothing must never
@@ -12849,17 +13458,53 @@ private:
                 // #1788: an omitted target means "the whole fleet" (#2500) —
                 // still narrowed to the operator's visible set, same as the
                 // named Broadcast arm above.
-                sent = dispatch_broadcast();
+                const auto result = dispatch_broadcast();
+                sent = result.sent;
+                denied_quarantined = result.denied_quarantined;
+                denied_quarantined_count = result.denied_quarantined_count;
+            }
+
+            // #881: emitted BEFORE the sent==0 -> 503 branch below, so a
+            // deliberate quarantine denial is correlated with the transport
+            // error it is knowingly reported as. Fail-closed denies every
+            // connected agent, so it gets ONE aggregate row rather than N.
+            if (containment_gate.fail_closed) {
+                audit_quarantine_dispatch_fail_closed("command", caller.principal,
+                                                      caller.principal_role, command_id,
+                                                      denied_quarantined_count);
+            } else {
+                audit_quarantine_dispatch_denied_batch("command", caller.principal,
+                                                       caller.principal_role, command_id,
+                                                       std::move(denied_quarantined));
             }
 
             // Forward commands queued for gateway agents
             forward_gateway_pending();
 
             if (sent == 0) {
+                // #881: say WHICH kind of nothing. All three of these answered
+                // "failed to send command to any agent", which reads as an
+                // agent-connectivity outage — so a fail-closed containment
+                // gate, which denies EVERY agent on EVERY dispatch fleet-wide,
+                // sent an operator diagnosing a transport problem while the
+                // real cause (the quarantine store is unreadable) appeared
+                // only in an audit row and a metric. ADR-0033 §2 names that
+                // shape — a silent deny-all reported as an empty fleet —
+                // as a gate violation.
                 res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"failed to send command to any agent"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                if (containment_gate.fail_closed) {
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"containment state is unreadable — dispatch is failing closed and reaching no agent; check the quarantine store","reason":"containment_unreadable","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                } else if (denied_quarantined_count > 0) {
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"every target is quarantined — dispatch was withheld, not attempted","reason":"quarantined","retry_after_ms":null},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                } else {
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"failed to send command to any agent"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                }
                 return;
             }
 
@@ -12874,13 +13519,27 @@ private:
                         {"action", action},
                         {"command_id", command_id},
                         {"scope", scope_expr}});
-            res.set_header("HX-Trigger", "{\"showToast\":{\"message\":\"Command sent to " +
-                                             std::to_string(sent) +
-                                             " agent(s)\",\"level\":\"success\"}}");
+            res.set_header(
+                "HX-Trigger",
+                "{\"showToast\":{\"message\":\"Command sent to " + std::to_string(sent) +
+                    " agent(s)" +
+                    (denied_quarantined_count == 0
+                         ? std::string{}
+                         : "; " + std::to_string(denied_quarantined_count) +
+                               " withheld (quarantined)") +
+                    "\",\"level\":\"success\"}}");
+            // #881: a PARTIAL dispatch must say so. Without this an operator
+            // targeting a 100-device group with 3 contained devices reads
+            // "Command sent to 97 agent(s)" and has no signal that 3 were
+            // deliberately withheld — the count alone is indistinguishable
+            // from three devices being offline. Always present (0 on a clean
+            // dispatch) rather than conditionally added, so a client can read
+            // the field unconditionally.
             res.set_content(
                 nlohmann::json({{"status", "sent"},
                                 {"command_id", command_id},
                                 {"agents_reached", sent},
+                                {"withheld_quarantined", denied_quarantined_count},
                                 {"thead_html", agent_service_.thead_for_plugin(plugin)}})
                     .dump(),
                 "application/json");
@@ -14765,14 +15424,18 @@ private:
                                                   httplib::Response& res) {
             if (!require_permission(req, res, "Schedule", "Read"))
                 return;
-            // guardian-confinement-2298 hardening sweep: ITServiceOwner grants
-            // full CRUD on Schedule, and query_schedules has no owner/service
-            // filter at all — a bare Schedule:Read gate lets a service-scoped
-            // token enumerate every schedule from every other service. No
-            // single schedule to confine per-target, so this is a blanket
-            // deny, same shape as the fleet-wide dashboard fragment twin.
-            if (deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.list", ""))
-                return;
+            // guardian-confinement-2298 hardening sweep originally added an
+            // explicit deny_service_scoped_schedule() call here (ITServiceOwner
+            // grants full CRUD on Schedule, and query_schedules has no owner/
+            // service filter at all — a bare Schedule:Read gate would let a
+            // service-scoped token enumerate every schedule from every other
+            // service). guardian-confinement-2298 PR 3 ("the flip") made it
+            // provably dead: require_permission above already denies any
+            // service-scoped token outright for (Schedule, Read)
+            // (kServiceScopeGlobalSafe is compile-time-empty), so a
+            // service-scoped session can never reach this point at all.
+            // Retired #3290 Phase 2 bucket 1a — see
+            // docs/security-reviews/service-scope-phase2-migrations-2026-08.md.
             if (!schedule_engine_) {
                 res.status = 503;
                 res.set_content(
@@ -14823,13 +15486,14 @@ private:
             }
 
             auto id = req.matches[1].str();
-            // Interim deny (schedule_routes.hpp): delete_schedule is
-            // username-owner-scoped below, and a service-scoped token shares
-            // its creating principal's username (ApiToken::principal_id) —
-            // without this it could delete a fleet-wide schedule its own
-            // principal created interactively.
-            if (deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.delete", id))
-                return;
+            // An interim deny_service_scoped_schedule() call used to sit here
+            // (delete_schedule is username-owner-scoped below, and a
+            // service-scoped token shares its creating principal's username —
+            // without a deny it could delete a fleet-wide schedule its own
+            // principal created interactively). guardian-confinement-2298 PR 3
+            // ("the flip") made it provably dead: require_permission above
+            // already denies any service-scoped token outright for
+            // (Schedule, Delete). Retired #3290 Phase 2 bucket 1a.
             // M-01 (#1806): owner-scoped delete — a Schedule:Delete grant
             // deletes only schedules the caller created, not the whole
             // fleet's. auth_routes_->resolve_session, not require_permission's
@@ -14873,15 +15537,19 @@ private:
             // runaway schedule even without Execution:Execute.
             if (enabled && !require_permission(req, res, "Execution", "Execute"))
                 return;
-            // Interim deny (schedule_routes.hpp), enable(true) only — a
-            // re-enabled schedule arms unattended fleet-wide dispatch through
-            // ScheduleRunner, the same concern as create. Disabling stays
-            // reachable: it only ever stops a schedule, never arms one, so a
-            // service-scoped token keeps its kill-switch (H-01's own
-            // rationale for gating disable on Schedule:Write alone).
-            if (enabled && deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.enable",
-                                                        id))
-                return;
+            // An interim deny_service_scoped_schedule() call used to sit here,
+            // enable(true) only — deliberately built to leave disable
+            // reachable for a service-scoped token as its kill switch (H-01).
+            // guardian-confinement-2298 PR 3 ("the flip") made the deny itself
+            // provably dead (require_permission above already denies any
+            // service-scoped token outright for (Schedule, Write), enabled or
+            // not) — retired here, #3290 Phase 2 bucket 1a. NOTE: the flip's
+            // unconditional Schedule:Write gate ALSO means the documented
+            // kill-switch guarantee (disable stays reachable) does not
+            // currently hold for a service-scoped token, since it never gets
+            // past `require_permission` above regardless of `enabled`'s
+            // value — a real, pre-existing, NOT-yet-fixed gap this retirement
+            // discovered but does not resolve; see #3378.
 
             // M-01 (#1806): owner-scoped enable/disable, same as delete above.
             auto session = auth_routes_->resolve_session(req);
@@ -18472,7 +19140,13 @@ private:
                     auto classified = build_classified_command(
                         yuzu::server::DispatchCaller{.system = true}, "__guard__", "push_rules",
                         push_command_id, /*parameters=*/{}, push.SerializeAsString());
-                    if (classified && registry_.send_to(aid, *classified)) {
+                    // #881: system_reserved internal push (__guard__.push_rules),
+                    // not operator instruction dispatch — deliberately NOT
+                    // quarantine-gated (see dispatch_confined_arms.hpp).
+                    if (classified &&
+                        send_system_reserved(
+                            aid, *classified,
+                            yuzu::server::SystemReservedPush::guardian_push_rules)) {
                         ++sent;
                         metrics_
                             .counter("yuzu_server_guardian_pushes_dispatched_total",
@@ -18987,15 +19661,52 @@ private:
             [&](const std::string& aid) { return registry_.send_to(aid, *classified); },
             [&] { return registry_.send_to_all(*classified); },
             [&] { return registry_.all_ids(); }};
-        int sent = yuzu::server::dispatch_confined_arms(
+        // #881: one of the two production sites that hits the unfiltered
+        // `send_to_all_unfiltered` fast path in practice — a default install
+        // with RBAC disabled (or a legacy-admin superuser) resolves
+        // `exec_visible` to `nullopt` here, and the Broadcast arm below is
+        // called directly, exactly the case #881's spec calls out. Without
+        // the gate, that unfiltered path bypasses containment with no per-id
+        // check at all.
+        const auto containment_gate = make_containment_gate(plugin, action);
+        auto result = yuzu::server::dispatch_confined_arms(
             yuzu::server::DispatchArm::Broadcast, {}, exec_visible,
-            /*broadcast_on_none=*/false, sink);
+            /*broadcast_on_none=*/false, containment_gate, sink);
+        int sent = result.sent;
+
+        // #881: emitted BEFORE the sent==0 -> 503 branch below, so a
+        // deliberate quarantine denial is correlated with the transport
+        // error it is knowingly reported as. Fail-closed denies every
+        // connected agent, so it gets ONE aggregate row rather than N.
+        if (containment_gate.fail_closed) {
+            audit_quarantine_dispatch_fail_closed("legacy", caller.principal,
+                                                  caller.principal_role, command_id,
+                                                  result.denied_quarantined_count);
+        } else {
+            audit_quarantine_dispatch_denied_batch("legacy", caller.principal,
+                                                   caller.principal_role, command_id,
+                                                   std::move(result.denied_quarantined));
+        }
 
         if (sent == 0) {
+            // Same three-way split as /api/command above — see the comment
+            // there. A fail-closed gate is a fleet-wide condition, not a
+            // per-agent transport failure, and reporting it as one sends the
+            // operator to the wrong subsystem.
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"failed to send command"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            if (containment_gate.fail_closed) {
+                res.set_content(
+                    R"({"error":{"code":503,"message":"containment state is unreadable — dispatch is failing closed and reaching no agent; check the quarantine store","reason":"containment_unreadable","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            } else if (result.denied_quarantined_count > 0) {
+                res.set_content(
+                    R"({"error":{"code":503,"message":"every target is quarantined — dispatch was withheld, not attempted","reason":"quarantined","retry_after_ms":null},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            } else {
+                res.set_content(
+                    R"({"error":{"code":503,"message":"failed to send command"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            }
             return;
         }
         res.set_content("{\"status\":\"sent\"}", "application/json");
@@ -19282,6 +19993,14 @@ private:
     /// `quarantine_store_.reset()` in stop(), alongside
     /// api_token_store_/engine_principal_store_/result_set_store_'s.
     std::unique_ptr<QuarantineStore> quarantine_store_;
+    /// #881: the last-known-good containment read, guarded by ITS OWN mutex
+    /// (never `quarantine_store_`'s pool lock) and refreshed on every
+    /// successful `list_quarantined()` inside `make_containment_gate`. Read
+    /// with `kQuarantineSnapshotMaxAge` bounded staleness on a `nullopt`
+    /// read — see `evaluate_quarantine_degradation` (dispatch_confined_arms.hpp)
+    /// for the policy this snapshot serves.
+    yuzu::server::QuarantineSnapshot quarantine_snapshot_;
+    std::mutex quarantine_snapshot_mtx_;
     /// Migrated Postgres store (ADR-0006/ADR-0036, schema `result_set_store`).
     /// Borrows pg_pool_ (declared earlier, destructs later) — declared here so
     /// it destructs after the ingest/HTTP paths that hold its raw pointer and
@@ -19596,6 +20315,33 @@ private:
 
     // Fleet health aggregation
     detail::AgentHealthStore health_store_;
+    /// #881: the containment-read concurrency bound, spelled ONCE. It appears
+    /// in the member's type, at both acquire sites and in the guard, and three
+    /// literal 4s would drift the moment one of them was tuned.
+    static constexpr int kMaxConcurrentContainmentReads = 4;
+    /// Releases a containment-read slot on scope exit. Shared by the dispatch
+    /// path and the snapshot refresher — it was declared separately in each,
+    /// which is one definition too many for four lines.
+    struct ContainmentReadSlot {
+        explicit ContainmentReadSlot(
+            std::counting_semaphore<kMaxConcurrentContainmentReads>& s) noexcept
+            : sem(s) {}
+        ~ContainmentReadSlot() { sem.release(); }
+        ContainmentReadSlot(const ContainmentReadSlot&) = delete;
+        ContainmentReadSlot& operator=(const ContainmentReadSlot&) = delete;
+
+    private:
+        std::counting_semaphore<kMaxConcurrentContainmentReads>& sem;
+    };
+
+    /// #881: how many dispatches may be inside `list_quarantined()` at once.
+    /// Bounds the pool connections a stalled backend can pin. A caller that
+    /// cannot acquire within its budget fails CLOSED — never falls back to the
+    /// stale snapshot, which against a healthy store would under-enforce. See
+    /// the reasoning at the acquire site in `make_containment_gate`.
+    std::counting_semaphore<kMaxConcurrentContainmentReads> containment_read_slots_{
+        kMaxConcurrentContainmentReads};
+    std::thread quarantine_snapshot_refresh_thread_; // #881; joined before stores
     std::thread health_recompute_thread_;
     std::thread policy_eval_thread_;
     std::thread app_perf_rollup_thread_;
