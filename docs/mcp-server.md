@@ -60,10 +60,15 @@ JSON-RPC error responses from the denial paths (read-only mode, tier policy, app
 > with two extra fields:
 >
 > ```json
-> { "correlation_id": "req-<hex-ms>-<hex-seq>", "retry_after_ms": null,
+> { "correlation_id": "req-<hex-ms>-<hex-seq>", "retry_after_ms": 30000,
 >   "remediation": "an admin must approve this approval_id (see status_url), then re-call this tool with the approval_id argument to execute",
 >   "approval_id": "<32-hex>", "status_url": "/api/v1/approvals/<32-hex>" }
 > ```
+>
+> `retry_after_ms` is honest here, not `null` (#3344, `kMcpApprovalPollRetryMs`
+> in `mcp_retry.hpp`) — this IS retryable, on human timescales, and approval
+> minting is deduplicated so a recall before the ticket resolves returns the
+> same pending ticket rather than minting a second one.
 >
 > Before ANY of the below — mint, dedup, recall lookup, consume — the
 > arguments must pass the #2405 input-schema validation (Security Model
@@ -110,7 +115,34 @@ JSON-RPC error responses from the denial paths (read-only mode, tier policy, app
 > can mint→approve→then 403 (burning the ticket) — a rare consequence of the
 > deliberate tier-then-RBAC two-gate split.
 
-`correlation_id` is a per-error token (`req-<hex-ms>-<hex-seq>`, the same format as the REST `X-Correlation-Id` header) returned to the caller in the error body, so a client can cite a stable handle when reporting a failure. **It is not persisted to the audit log today** — the audit row for a denied call (`mcp.<tool>`) is written separately and does not carry the token — so server-side correlation relies on any `spdlog` line the handler emits at that moment, not on `audit.db`. Two exceptions stamp the SAME token into the audit detail (one-cid pattern): the #2383 misconfig deny (`... correlation_id=<cid>`) and the #2405 input-schema deny (`arguments do not match the tool input schema at '<path>' correlation_id=<cid>`). `retry_after_ms` is `null` on tier/approval-denial errors (the denial is not retryable as-is); `remediation` carries an actionable hint — escalate to a higher-tier token, or use the REST API / dashboard. Per-tool validation errors (e.g. the dex-perf tools) populate `correlation_id`, a `null` `retry_after_ms`, and a field-specific `remediation`. Parse `error.code` for the error class and `error.data.correlation_id` for client-side traceability.
+`correlation_id` is a per-error token (`req-<hex-ms>-<hex-seq>`, the same format as the REST `X-Correlation-Id` header) returned to the caller in the error body, so a client can cite a stable handle when reporting a failure. **It is not persisted to the audit log today** — the audit row for a denied call (`mcp.<tool>`) is written separately and does not carry the token — so server-side correlation relies on any `spdlog` line the handler emits at that moment, not on `audit.db`. Two exceptions stamp the SAME token into the audit detail (one-cid pattern): the #2383 misconfig deny (`... correlation_id=<cid>`) and the #2405 input-schema deny (`arguments do not match the tool input schema at '<path>' correlation_id=<cid>`). `retry_after_ms` is `null` on tier-denial errors (a token's tier is fixed — the denial is not retryable as-is), but non-null on approval-required (`-32006`, #3344: it IS retryable, on human timescales — see above); `remediation` carries an actionable hint — escalate to a higher-tier token, or use the REST API / dashboard. Per-tool validation errors (e.g. the dex-perf tools) populate `correlation_id`, a `null` `retry_after_ms`, and a field-specific `remediation`. Parse `error.code` for the error class and `error.data.correlation_id` for client-side traceability.
+
+### `retry_after_ms` floors (#3344)
+
+Every `retry_after_ms` emission — error-shaped (A4 `error.data`) and, for the
+three result-poll tools below, success-shaped (in the tool's own structured
+payload) — is a named constant in `server/core/src/mcp_retry.hpp`, each
+carrying a mechanical derivation comment (no dispatch-to-first-result latency
+histogram exists to measure from — `yuzu_command_duration_seconds` is full
+command completion, not first-result):
+
+| Constant | Value | Covers |
+|---|---|---|
+| `kMcpStoreFaultRetryMs` | 5000 | Generic transient store/subsystem fault on an error-shaped response (REST 503 parity) |
+| `kMcpStoreFaultShortRetryMs` | 2000 | Plugin-config / API-token rotation family (REST `Retry-After: 2` parity) |
+| `kMcpProviderWarmupRetryMs` | 5000 | A DEX/app-perf provider still initializing at server start |
+| `kMcpResultPollRetryMs` | 2000 | Success-shaped result-not-ready poll — `get_execution_status`, `query_responses`, `get_bundle_result` |
+| `kMcpApprovalPollRetryMs` | 30000 | Approval-ticket poll (`-32006`) — human-timescale, anti-amplification derived |
+
+Several constants share a numeric value with a neighbour — that is
+coincidental historical pricing, not a shared derivation, and each is kept a
+distinct symbol so one can be re-tuned later without dragging the other.
+
+The three result-poll tools are counted at `yuzu_mcp_poll_total{tool,result}`
+(`result` is `ready` or `not_ready`, per served verdict, excluding pre-verdict
+denials) so the floors above can be data-tuned from real poll-rate evidence
+instead of ossifying as guessed constants. See
+`docs/observability-conventions.md`.
 
 ## Phase 1 (Implemented)
 
