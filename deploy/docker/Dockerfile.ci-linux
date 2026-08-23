@@ -28,6 +28,9 @@ RUN apt-get update && apt-get install -y \
     autoconf automake libtool bison flex \
     # sd-bus headers for the Linux Guardian systemd service guard (agent build)
     libsystemd-dev \
+    # libblkid headers for the bitlocker plugin's in-process LUKS enumeration
+    # (wave-3 native/argv migration off lsblk/cryptsetup)
+    libblkid-dev \
     # OpenSSL build deps
     perl linux-libc-dev \
     # Utilities

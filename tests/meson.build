@@ -283,6 +283,8 @@ agent_test_exe = executable(
     'unit/test_event_logs_macos.cpp',         # BR-08: pure `log show` SubprocessResult classifier
     'unit/test_users_macos_last.cpp',         # qe-M1: pure `last -y` timestamp/weekday parsers
     'unit/test_user_profile_model.cpp',       # PR1.7: pure ProfileList/HKU model (runs on every host)
+    'unit/test_value_enumeration.cpp',        # Wave 3 gate-2 remediation: pure registry-enumeration
+                                                # completeness decision (runs on every host)
     'unit/test_registry_local_dispatcher.cpp', # PR1.7 remediation fix #3: real registry.dll driven
                                                 # end to end via LocalDispatcher (Windows-only; a no-op
                                                 # TU elsewhere via the file's own #ifdef _WIN32 guard)
@@ -322,6 +324,14 @@ agent_test_exe = executable(
                                                 # hardware.dylib/device_identity.dylib driven end to end
                                                 # via LocalDispatcher (macOS-only; a no-op TU elsewhere
                                                 # via the file's own #if defined(__APPLE__) guard)
+    'unit/test_bitlocker_windows_wmi.cpp',    # Wave 3: pure WMI-row -> BitLocker output-row mapping
+    'unit/test_bitlocker_linux_parsers.cpp',  # Wave 3: pure dm-crypt uuid / LUKS state parser
+    'unit/test_antivirus_local_dispatcher.cpp', # Wave 3 gate remediation: real antivirus.dll driven
+                                                # end to end via LocalDispatcher (Windows-only; a no-op
+                                                # TU elsewhere via the file's own #ifdef _WIN32 guard)
+    'unit/test_bitlocker_local_dispatcher.cpp', # Wave 3 gate remediation: real bitlocker.dll driven
+                                                # end to end via LocalDispatcher (Windows-only; a no-op
+                                                # TU elsewhere via the file's own #ifdef _WIN32 guard)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -337,7 +347,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/hardware/src'),  # hardware_disks_macos.hpp (pure parser, PR1.8)
     include_directories('../agents/plugins/services/src'),      # services_macos_launchd.hpp (P8 test)
     include_directories('../agents/plugins/msi_packages/src'),  # msi_packages_macos.hpp (P8 test)
-    include_directories('../agents/plugins/bitlocker/src'),     # bitlocker_macos_apfs.hpp (P8 test)
+    include_directories('../agents/plugins/bitlocker/src'),     # bitlocker_macos_apfs.hpp (P8 test); Wave 3: bitlocker_windows_wmi.hpp, bitlocker_linux_parsers.hpp
     include_directories('../agents/plugins/filesystem/src'),    # filesystem_macos_sig.hpp (#2273/1.14)
     include_directories('../agents/plugins/event_logs/src'),    # event_logs_macos.hpp (BR-08)
     include_directories('../agents/plugins/certificates/src'),  # certificates_macos_parsers.hpp (Gate-7 FIX A: pure helpers shared with the plugin)

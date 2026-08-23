@@ -433,9 +433,13 @@ pf packet filter demoted to a secondary row; `rules` lists pf rules.
 
 ### 9.3 Disk Encryption Status :white_check_mark: `T1`
 
-`bitlocker` plugin (cross-platform): Windows BitLocker (`manage-bde`), Linux
-LUKS (`list_luks_volumes`), and macOS FileVault (`fdesetup` + per-APFS-volume
-`diskutil apfs list`) — all three dispatched from the plugin's `state` action.
+`bitlocker` plugin (cross-platform): Windows BitLocker via an in-process
+Win32_EncryptableVolume WMI query + per-volume `GetConversionStatus()`
+method call (rung 1, no subprocess), Linux LUKS via in-process libblkid
+enumeration + plain `/sys/class/block/dm-*/dm/uuid` reads (`list_luks_volumes`,
+rung 1, no subprocess), and macOS FileVault (`fdesetup` + per-APFS-volume
+`diskutil apfs list`, direct argv through the bounded subprocess runner,
+rung 2) — all three dispatched from the plugin's `state` action.
 
 ### 9.4 Vulnerability Scanning :large_orange_diamond: `T1`
 
