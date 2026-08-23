@@ -716,7 +716,6 @@ jobs:
           & $iscc `
             "/DAppVersion=${version}" `
             "/DBuildDir=${{ github.workspace }}\build-windows" `
-            "/DContentDir=${{ github.workspace }}\content" `
             "deploy\packaging\windows\yuzu-server.iss"
           if ($LASTEXITCODE -ne 0) { Write-Error "Server installer failed"; exit 1 }
 
