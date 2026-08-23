@@ -957,8 +957,8 @@ if build_server
   #     (2026-08-17, see scripts/ci/flake-retry.py's _cmd_for_case_retry);
   #   - no entry name may be a substring of another (flake-retry maps
   #     meson-junit names by longest substring match) — 'shard A'/'shard B'/
-  #     'shard C'/'shard D'/'shard E'/'shard F'/'shard G' and 'server unit tests' are
-  #     pairwise non-substring.
+  #     'shard C'/'shard D'/'shard E'/'shard F'/'shard G'/'shard H' and 'server
+  #     unit tests' are pairwise non-substring.
   # If a quiet leg pushes a shard past the #2093 80%-of-budget warning, the first
   # move is the concurrency gate / per-op cost (Defender TEMP exclusion, RAM disk),
   # then split or rebalance — raising the number is the last resort, not the first.
@@ -1040,11 +1040,103 @@ if build_server
   # store) — same confined-to-one-file precedent as every other tag in that
   # list, re-verified against this merge's actual case counts via --list-tests
   # on the built binary, not assumed from either side's pre-merge numbers.
-  # Partition preserved: N([pg]) == N(A) + N(B) + N(D) + N(E) + N(C). (shard B
-  # split into B+D on 2026-08-16, shard C split further into C+E on 2026-08-17
-  # — see the blocks below.)
+  # Partition preserved: N([pg]) == N(A) + N(B) + N(D) + N(E) + N(F) + N(G) +
+  # N(C) + N(H) (adversarial-review COD-P1-001/K5: an earlier version of this
+  # comment omitted F and G, which don't appear until further below in this
+  # file — the omission was prose-only, the filters and the verified sum at
+  # line ~1062 were always correct). (shard B split into B+D on 2026-08-16,
+  # shard C split further into C+E on 2026-08-17, shard A split into A+H on
+  # 2026-08-22 — see the blocks below.)
+  #
+  # SPLIT INTO A+H on 2026-08-22 (#2185-adjacent — same "reddening dev,
+  # unclassifiable TIMEOUT, no failing case on enumeration re-run" signature
+  # #3322 diagnosed for shard E on 2026-08-19): shard A reached 600.12/600s
+  # TIMEOUT on Linux gcc-15/clang-21 across a whole day's worth of dev pushes
+  # (confirmed via CI history: 549-580s on quiet runs, TIMEOUT under any
+  # added load, unrelated to any single PR — a #2093-style creep from many
+  # small additions, same as every prior split on this file). Per the
+  # standing house rule ("if it warns, split shard C itself" — the C->C+E
+  # precedent) and the "measure, don't just count" rule this file's own
+  # history rejected an unmeasured split for once already: the boundary was
+  # DESIGNED via an exhaustive tag-partition check (every candidate tag
+  # cross-referenced against every OTHER file using it, so no case straddling
+  # two shards, no case left in neither) and then VERIFIED on the built
+  # binary both ways — exact partition (`--list-tests`: A 251 + H 313 = 564,
+  # matching the pre-split undifferentiated shard A exactly; at the time of
+  # the split, the full 8-shard sum A+B+D+E+F+G+C+H = 2270 matched the
+  # binary's total [pg] case count — since risen to 2290 as later governance
+  # rounds restored migration-only tests found to be sole regression coverage
+  # for named catastrophic properties; re-verify the sum against --list-tests
+  # rather than trusting either number as current) and real wall-time
+  # against live Postgres, local :5433, quiet box:
+  # A 89.6s (251 cases, 4296 assertions), H 102.4s (313 cases, 27707
+  # assertions) — both ~15-17% of the 600s budget even before accounting for
+  # CI's ~2x contention multiplier. H's per-case rate (0.327s) is slightly
+  # CHEAPER than A's (0.357s) despite carrying more cases, consistent with
+  # the "store-CRUD cases cost more than route-handler cases" premise below.
+  #
+  # shard H carves out four DOMAINS that were only in shard A because they
+  # happen to carry the broad [routes]/[token] category tags shard A claimed
+  # unconditionally BEFORE this split (shard A's pre-split clause had no
+  # exclusions — everything HERE already only reached A because no OTHER
+  # shard's clause tolerated routes/store/token; docs-writer, governance Gate
+  # 2 2026-08-22 — the parenthetical previously read present-tense against
+  # code that, three lines below, now plainly does carry exclusions):
+  # SCIM routes (test_scim_routes.cpp, 101 cases),
+  # DEX routes (test_dex_routes.cpp + one case in test_dex_perf_model.cpp:916
+  # that also carries [pg][routes][dex], 37 — adversarial-review COD-P2-005/K4
+  # caught the initial 36-only count; the partition was never affected, only
+  # this prose), the whole MFA route surface (test_auth_routes_mfa.cpp +
+  # test_settings_routes_mfa.cpp via the shared [mfa] tag, 34+14=48), and
+  # token rotation (test_api_token_store.cpp's [rotation]-tagged subset +
+  # test_rest_api_tokens_rotation.cpp + test_engine_principal_lifecycle.cpp +
+  # test_mcp_server.cpp's [token][rotation] cases, 95+25+2+5=127) —
+  # 101+37+48+127=313, matching H's verified --list-tests count exactly. Each
+  # carve-out tag was checked
+  # against every OTHER file using it to confirm the exclusion added to A
+  # below can't orphan a same-tag case that belongs in a DIFFERENT shard
+  # (e.g. [mfa] alone would be unsafe — test_mfa_step_up.cpp/test_mfa_qr.cpp/
+  # test_mfa_store.cpp/test_totp.cpp also carry it but never with [routes],
+  # so they were never in A and are untouched either way; [rotation] alone
+  # would be unsafe too — test_rotation_sweep_naming.cpp/
+  # test_rotation_warn_dedup.cpp carry it with no [pg] tag at all, never
+  # shard candidates). H's own clauses require the SAME co-tag ([routes] or
+  # [token]) shard A's own clause already required, so nothing changes
+  # about which cases were ever reachable from A — only which of two A-side
+  # shards now claims them. 313 cases, 55% of the pre-split 564 — the larger
+  # half on a case-count basis but NOT the larger half on time (see the
+  # measured numbers above: H's per-case rate is the cheaper of the two, so
+  # 313 cases lands at 102.4s vs A's 251 at 89.6s — close to balanced by
+  # wall-time despite the count skew). All of H's cases are [pg]-tagged
+  # store/route behaviour tests with no non-DSN survivor — confirmed on the
+  # built binary (no-DSN run: exit 4 without the flag, exit 0 with it) —
+  # needs --allow-running-no-tests like shard D.
   test('server pg unit tests shard A', server_test_exe,
-       args: ['[pg][routes],[pg][store],[pg][token]'],
+       args: ['[pg][routes]~[scim]~[dex]~[mfa],[pg][store],[pg][token]~[rotation]'],
+       suite: 'server', timeout: 600)
+  # H's four clauses each add `~[store]` (fable review, structural hardening):
+  # A's own `[pg][store]` clause carries NO exclusions, so any [pg][store]
+  # case is unconditionally claimed by A regardless of what else it carries —
+  # excluding `[store]` from H therefore can never orphan a case, only ever
+  # remove a case H would otherwise have double-run with A. This closes the
+  # largest of the two theoretical (currently empty, but not structurally
+  # impossible) overlap classes a future case could fall into; the smaller
+  # one is NOT closable this way without risking an orphan (Catch2's flat tag
+  # algebra can't express "unless it's also elsewhere in H"), so it stays a
+  # documented residual, not a bug. The actual hazard shapes (verified by
+  # working the filter algebra, gov Gate 2 docs-writer — an earlier draft of
+  # this comment named the wrong pairing, one that in fact matches ONLY H,
+  # never A, since A's [routes] clause excludes every domain tag and A's
+  # [token] clause excludes rotation): a bare [routes][token][rotation] case
+  # with NO domain tag (matches A via its undomained-routes clause AND H via
+  # its rotation clause), or a [routes]+{scim|dex|mfa}+[token] case with NO
+  # [rotation] (matches A via its non-rotation-token clause AND H via that
+  # domain's routes clause). Verify with --list-tests that no case matches
+  # more than one of H's four clauses before adding a new routes+token-domain
+  # tag to any surviving store file.
+  test('server pg unit tests shard H', server_test_exe,
+       args: ['[pg][routes][scim]~[store],[pg][routes][dex]~[store],[pg][routes][mfa]~[store],[pg][token][rotation]~[store]',
+              '--allow-running-no-tests'],
        suite: 'server', timeout: 600)
   # shard B SPLIT into B+D on 2026-08-16 (#2092/#2093): the store-tag half had
   # reached 600/600s (100%) and flaked. BALANCED BY TIME, NOT COUNT — case count
