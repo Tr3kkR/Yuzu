@@ -79,6 +79,16 @@ struct QuarantineRecord {
     std::int64_t released_at{0};
     std::string whitelist; // comma-separated IPs
     std::string reason;
+    // Schema v2 (#3425): 0 = never, matching `released_at`'s existing
+    // never-happened sentinel on this same table — no optional plumbing.
+    // Written ONLY by QuarantineContainmentReconciler. `last_applied_at` is
+    // set when a system re-dispatch of the STORED whitelist is accepted by
+    // the plugin registry (agents_reached > 0); `last_confirmed_at` is set
+    // only after a FOLLOW-UP `quarantine.status` read reports `state|active`
+    // — dispatch acceptance is not proof of endpoint containment (the same
+    // distinction `quarantine_dispatch_decision.hpp` draws for the MCP path).
+    std::int64_t last_applied_at{0};
+    std::int64_t last_confirmed_at{0};
 };
 
 class QuarantineStore {
@@ -132,6 +142,26 @@ public:
     /// AUTHORITATIVE read: `std::nullopt` on a store/pool/query failure —
     /// NEVER a silent empty (an empty *value* is a genuinely empty result).
     [[nodiscard]] std::optional<std::vector<QuarantineRecord>> list_quarantined();
+
+    /// #3425: record that a system-initiated re-dispatch of the STORED
+    /// whitelist was accepted by the plugin registry (agents_reached > 0) —
+    /// NOT proof of endpoint containment, see `mark_endpoint_confirmed`.
+    /// Sole writer: `QuarantineContainmentReconciler`. `std::unexpected(msg)`
+    /// prefixed `kQuarantineDbErrorPrefix` on a genuine store/pool/query
+    /// failure; `std::unexpected("device is not quarantined")` (unprefixed
+    /// business error, matching `release_device`) when no ACTIVE record
+    /// exists for `agent_id` — the guarded `UPDATE ... WHERE status =
+    /// 'active'` returned zero rows, e.g. the record was released between
+    /// the reconciler's read and this write.
+    [[nodiscard]] std::expected<void, std::string>
+    mark_endpoint_applied(const std::string& agent_id, std::int64_t at);
+
+    /// #3425: record that a FOLLOW-UP `quarantine.status` read confirmed
+    /// `state|active` on the device's own firewall — the only signal this
+    /// store treats as proof of endpoint containment. Same error contract as
+    /// `mark_endpoint_applied`.
+    [[nodiscard]] std::expected<void, std::string>
+    mark_endpoint_confirmed(const std::string& agent_id, std::int64_t at);
 
     /// Full quarantine history (active and released) for `agent_id`, newest
     /// first. AUTHORITATIVE read: `std::nullopt` on a store/pool/query

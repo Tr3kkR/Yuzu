@@ -144,11 +144,14 @@ QuarantineRecord read_record(PGresult* res, int row) {
     r.released_at = to_i64(PQgetvalue(res, row, c++));
     r.whitelist = text_col(res, row, c++);
     r.reason = text_col(res, row, c++);
+    r.last_applied_at = to_i64(PQgetvalue(res, row, c++));
+    r.last_confirmed_at = to_i64(PQgetvalue(res, row, c++));
     return r;
 }
 
 constexpr const char* kRecordCols =
-    "agent_id, status, quarantined_by, quarantined_at, released_at, whitelist, reason";
+    "agent_id, status, quarantined_by, quarantined_at, released_at, whitelist, reason, "
+    "last_applied_at, last_confirmed_at";
 
 std::optional<std::string> sha256_hex(std::string_view in) {
     unsigned char md[EVP_MAX_MD_SIZE];
@@ -501,6 +504,16 @@ const std::vector<pg::PgMigration>& migrations() {
          "  key   TEXT PRIMARY KEY,"
          "  value TEXT NOT NULL"
          ");"},
+        // #3425: endpoint-containment confirmation state for
+        // QuarantineContainmentReconciler. 0 = never, matching this table's
+        // existing `released_at` never-happened sentinel — no optional
+        // plumbing, no nullable column. A brief ACCESS EXCLUSIVE lock during
+        // the ALTER is negligible at this table's size (manually-curated
+        // security events, not a telemetry stream — see kMaxBackfillRows'
+        // sizing rationale above).
+        {2,
+         "ALTER TABLE quarantine_records ADD COLUMN last_applied_at BIGINT NOT NULL DEFAULT 0;"
+         "ALTER TABLE quarantine_records ADD COLUMN last_confirmed_at BIGINT NOT NULL DEFAULT 0;"},
     };
     return kMigrations;
 }
@@ -587,6 +600,47 @@ std::expected<void, std::string> QuarantineStore::release_device(const std::stri
     if (PQntuples(res.get()) == 0)
         return std::unexpected("device is not quarantined");
     return {};
+}
+
+namespace {
+// Shared body for mark_endpoint_applied/mark_endpoint_confirmed — same
+// guarded-UPDATE-WHERE-active shape as release_device (the #3062 cancel_job
+// pattern), differing only in which column is stamped.
+std::expected<void, std::string> mark_endpoint_column(pg::PgPool& pool, const char* column,
+                                                       const std::string& agent_id,
+                                                       std::int64_t at, bool open) {
+    if (!open)
+        return std::unexpected(std::string(kQuarantineDbErrorPrefix) + "database not open");
+    if (agent_id.empty())
+        return std::unexpected("agent_id is required");
+
+    auto lease = pool.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kQuarantineDbErrorPrefix) +
+                               "database unavailable — try again");
+
+    std::string sql = std::string("UPDATE quarantine_store.quarantine_records SET ") + column +
+                      " = $1::bigint WHERE agent_id = $2 AND status = 'active' RETURNING id";
+    pg::PgResult res = pg::exec_params(
+        lease.get(), sql.c_str(),
+        std::vector<std::string>{std::to_string(at), sanitize_pg_text(agent_id)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kQuarantineDbErrorPrefix) + column +
+                               " update failed: " + PQerrorMessage(lease.get()));
+    if (PQntuples(res.get()) == 0)
+        return std::unexpected("device is not quarantined");
+    return {};
+}
+} // namespace
+
+std::expected<void, std::string>
+QuarantineStore::mark_endpoint_applied(const std::string& agent_id, std::int64_t at) {
+    return mark_endpoint_column(pool_, "last_applied_at", agent_id, at, open_);
+}
+
+std::expected<void, std::string>
+QuarantineStore::mark_endpoint_confirmed(const std::string& agent_id, std::int64_t at) {
+    return mark_endpoint_column(pool_, "last_confirmed_at", agent_id, at, open_);
 }
 
 std::expected<std::optional<QuarantineRecord>, std::string>
