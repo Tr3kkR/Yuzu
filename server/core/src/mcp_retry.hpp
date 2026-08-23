@@ -2,7 +2,9 @@
 
 /// @file mcp_retry.hpp
 /// Named `retry_after_ms` floors for the MCP tool-call surface (#3344, MCP 2g
-/// PR 3 remainder / ADR-1005 Decision 16 invariant A5).
+/// PR 3 remainder / ADR-1005 Decision 16 invariant A5), plus the shared
+/// `is_execution_terminal()` predicate the floors' consumers use to decide
+/// when a poll hint applies.
 ///
 /// Before this file, `retry_after_ms` was a bare literal (`5000`, `2000`, or
 /// `-1`/`null`) repeated independently at ~60 call sites in `mcp_server.cpp` —
@@ -98,7 +100,7 @@ inline constexpr const char* kMcpPollTotalMetric = "yuzu_mcp_poll_total";
 /// default here — a status this predicate doesn't recognize must still read
 /// as non-terminal (fail-safe: the caller keeps polling and self-corrects on
 /// the next response) rather than silently going hint-less forever.
-inline bool is_execution_terminal(std::string_view status) {
+inline constexpr bool is_execution_terminal(std::string_view status) {
     return status == "succeeded" || status == "completed" || status == "cancelled";
 }
 
