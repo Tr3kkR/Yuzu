@@ -103,6 +103,7 @@
 #include "oidc_provider.hpp"
 #include "saml_provider.hpp"
 #include "quarantine_store.hpp"
+#include "quarantine_containment_reconciler.hpp" // #3425: reconnect re-application
 #include "result_set_matcher.hpp"
 #include "result_set_store.hpp"
 #include "result_sets_ui.hpp"
@@ -1154,6 +1155,21 @@ public:
         for (const auto outcome : yuzu::server::kQuarantineGateOutcomes)
             metrics_.counter("yuzu_server_quarantine_gate_total",
                              {{"outcome", std::string(outcome)}});
+
+        // #3425: QuarantineContainmentReconciler's outcome series, seeded
+        // across its whole closed label set for the same "absent must not
+        // be confused with never ran" reason as the gate outcomes above.
+        for (const auto result : yuzu::server::kQuarantineReapplyResults)
+            metrics_.counter("yuzu_server_quarantine_reapply_total",
+                             {{"result", std::string(result)}});
+        // Per-replica gauge (never sum() across instances — each replica
+        // only sees the sessions its own gRPC listener holds). Seeded at 0
+        // for both label values so a healthy fleet with nothing unconfirmed
+        // renders as an explicit 0, not an absent series.
+        for (const char* reachability : {"connected", "offline"})
+            metrics_.gauge("yuzu_server_quarantine_endpoint_unconfirmed",
+                           {{"reachability", reachability}})
+                .set(0);
 
         // The quarantine read-degrade family was never pre-seeded, unlike its
         // mgmt-group and discovery siblings above, so every reason read as
@@ -7350,6 +7366,16 @@ public:
         }
         preflight_runner_.reset();
 
+        // Join the quarantine containment reconciler thread (#3425; uses
+        // quarantine_store_ + response_store_ + the dispatch path — stop
+        // before teardown). The object itself is NOT reset here: the
+        // heartbeat-triggered fast path (a separate, gRPC-thread-driven
+        // caller) can still invoke it until the fn is cleared below, well
+        // after this join — see the "after gRPC drain" block.
+        if (quarantine_reconcile_thread_.joinable()) {
+            quarantine_reconcile_thread_.join();
+        }
+
         // Join the schedule tick thread (borrows schedule_engine_ + the
         // instruction/execution/approval/audit stores via schedule_runner_ —
         // must stop before any of them are torn down), then drop the runner
@@ -7562,6 +7588,14 @@ public:
         if (heartbeat_ingestion_)
             heartbeat_ingestion_->set_offline_endpoint_store(nullptr);
         offline_endpoint_store_.reset();
+        // #3425: same discipline — null the heartbeat-side caller of
+        // quarantine_reconciler_ before dropping the object it calls into.
+        // The reconciler's own background thread is already joined above;
+        // this closes the OTHER caller (the heartbeat fast path, driven by
+        // gRPC handler threads already quiesced by the drains above).
+        if (heartbeat_ingestion_)
+            heartbeat_ingestion_->set_quarantine_reconcile_fn(nullptr);
+        quarantine_reconciler_.reset();
         // Generic InventoryStore (ADR-0037): same discipline as the typed PG
         // stores below — null the borrowed pointer in the ingest service
         // that actually borrows it (the gateway ProxyInventory path; the
@@ -16638,6 +16672,64 @@ private:
             }
         });
 
+        // QuarantineContainmentReconciler (#3425) — re-applies endpoint
+        // containment for an active quarantine record whose device has
+        // reconnected. Same shared dispatch lambda as every other
+        // background engine; the #881 gate's is_quarantine_control_plugin
+        // exemption already lets the quarantine plugin's own actions
+        // through unmodified. Joined BEFORE the stores in stop().
+        quarantine_reconciler_ =
+            std::make_unique<QuarantineContainmentReconciler>(QuarantineContainmentReconciler::Deps{
+                .quarantine_store = quarantine_store_.get(),
+                .response_store = response_store_.get(),
+                .registry = &registry_,
+                .metrics = &metrics_,
+                .audit_store = audit_store_.get(),
+                .dispatch_fn = command_dispatch_fn,
+                .now_fn = {},
+            });
+        // Heartbeat-triggered fast path (the ONLY event-driven trigger that
+        // is dispatch-safe — Register returns before Subscribe establishes
+        // the stream, so a hook fired from there would have `send_to`
+        // silently drop it). The tick below is the periodic backstop:
+        // AgentRegistry::send_to drops offline agents silently, so a tick
+        // against a still-offline device costs one cheap skip and catches a
+        // device that reconnected between heartbeats (same shape as
+        // PreflightRunner's re-dispatch-on-reconnect loop).
+        if (heartbeat_ingestion_) {
+            heartbeat_ingestion_->set_quarantine_reconcile_fn(
+                [this](std::string_view agent_id) {
+                    if (quarantine_reconciler_)
+                        quarantine_reconciler_->notify_agent_heartbeat(agent_id);
+                });
+        }
+        quarantine_reconcile_thread_ = std::thread([this]() {
+            spdlog::info("Quarantine containment reconciler thread started (cadence=20s)");
+            while (!stop_requested_.load(std::memory_order_acquire)) {
+                for (int i = 0; i < 4 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                    std::this_thread::sleep_for(std::chrono::seconds{5});
+                if (stop_requested_.load(std::memory_order_acquire))
+                    break;
+                if (quarantine_reconciler_) {
+                    // tick() touches PG and gRPC dispatch — either can throw;
+                    // an escaping exception would std::terminate the whole
+                    // process over a best-effort reconcile pass. Catch, log,
+                    // keep ticking (five other background loops in this file
+                    // already carry this shape).
+                    try {
+                        quarantine_reconciler_->tick();
+                    } catch (const std::exception& e) {
+                        spdlog::error("quarantine_reconciler: tick threw ({}) — thread continuing",
+                                      e.what());
+                    } catch (...) {
+                        spdlog::error(
+                            "quarantine_reconciler: tick threw unknown exception — continuing");
+                    }
+                }
+            }
+            spdlog::info("Quarantine containment reconciler thread stopped");
+        });
+
         // ScheduleRunner (#1191) — drives recurring-instruction schedules.
         // ScheduleEngine::evaluate_due/advance_schedule had no production
         // caller: schedules persisted and listed but never fired. Fires travel
@@ -19985,6 +20077,16 @@ private:
     /// for the policy this snapshot serves.
     yuzu::server::QuarantineSnapshot quarantine_snapshot_;
     std::mutex quarantine_snapshot_mtx_;
+    /// #3425: re-applies endpoint containment for an active quarantine
+    /// record whose device has reconnected. Borrows quarantine_store_ +
+    /// response_store_ + registry_ — declared here (near quarantine_store_)
+    /// but joined/cleared/reset explicitly in stop(), same discipline as
+    /// preflight_runner_/policy_evaluator_, not relied on via declaration
+    /// order alone (this member's own thread is a background ticker, not a
+    /// per-request borrower, so the explicit stop() sequence is what makes
+    /// teardown safe).
+    std::unique_ptr<QuarantineContainmentReconciler> quarantine_reconciler_;
+    std::thread quarantine_reconcile_thread_; // #3425; joined before stores
     /// Migrated Postgres store (ADR-0006/ADR-0036, schema `result_set_store`).
     /// Borrows pg_pool_ (declared earlier, destructs later) — declared here so
     /// it destructs after the ingest/HTTP paths that hold its raw pointer and

@@ -8953,22 +8953,21 @@ McpServer::HandlerFn McpServer::build_handler(
                     // every other command to this device, so containment at
                     // the control plane is in force.
                     //
-                    // And it says, explicitly, what does NOT happen — because
-                    // an earlier wording here promised "the endpoint firewall
-                    // applies when the agent reconnects" and nothing does that.
-                    // There is no reconnect hook that consults containment
-                    // state (verified: no `list_quarantined()` caller outside
-                    // `make_containment_gate` and the REST list route). A SOC
-                    // analyst who quarantines a powered-off laptop, reads that
-                    // sentence and closes the ticket gets a device that comes
-                    // back two days later with no endpoint containment at all
-                    // — and the #881 gate then refuses every command that would
-                    // have probed it. Recorded-but-not-enforced is exactly the
-                    // phantom-isolation class #3127 exists to eliminate, so the
-                    // message must not create a new one in the error text.
-                    // Automatic re-dispatch on reconnect is a real gap and is
-                    // tracked separately; until it exists the honest word is
-                    // "re-issue".
+                    // And it says, explicitly, what happens next — because an
+                    // earlier wording here promised "the endpoint firewall
+                    // applies when the agent reconnects" while nothing did
+                    // that, which was itself a phantom-isolation-shaped lie
+                    // (#3127's own class of bug) in the OPPOSITE direction: a
+                    // caller who believed it would under-react to an offline
+                    // device. #3425 closed that gap —
+                    // QuarantineContainmentReconciler re-applies the STORED
+                    // whitelist automatically once the device reconnects
+                    // (heartbeat-triggered, with a periodic tick backstop for
+                    // anything the heartbeat hook misses) and only marks
+                    // containment confirmed after a follow-up
+                    // `quarantine.status` read reports `state|active` — the
+                    // wording below reflects that a manual re-issue is no
+                    // longer load-bearing, only redundant-but-harmless.
                     //
                     // A first-attempt failure keeps the 5s hint — there, a
                     // retry genuinely can succeed.
@@ -8982,15 +8981,16 @@ McpServer::HandlerFn McpServer::build_handler(
                                      (device_durably_unreachable
                                           ? ". The record is persisted and the server is already "
                                             "denying dispatch to this device, so containment holds "
-                                            "at the control plane. The endpoint firewall is NOT "
-                                            "applied and nothing re-applies it automatically on "
-                                            "reconnect — re-issue this call once the agent is "
-                                            "back."
+                                            "at the control plane. The endpoint firewall is not yet "
+                                            "confirmed applied, but the server automatically "
+                                            "re-applies it once the device reconnects (#3425) — "
+                                            "re-issuing this call has the same effect and is not "
+                                            "required."
                                           : ""),
                                  device_durably_unreachable
                                      ? "the device has not been reachable across attempts — "
-                                       "re-issue once it reconnects; the endpoint firewall is not "
-                                       "applied until a dispatch reaches it"
+                                       "containment is re-applied automatically on reconnect; "
+                                       "re-issuing this call is optional, not required"
                                      : "retry the request",
                                  /*retry_after_ms=*/device_durably_unreachable ? 60000 : 5000),
                         "application/json");
