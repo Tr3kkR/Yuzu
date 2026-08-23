@@ -196,12 +196,23 @@ uint64_t wmi_row_uint64(const wmi::WmiRow& row, const char* key) {
 // "this plugin action produced no output for an unrelated reason" (dispatch
 // failure, truncation, etc). Do not "fix" this back to match the old
 // silent-gap behaviour.
-template <typename Fn> void wmi_query(const wchar_t* wql, Fn&& fn) {
+//
+// Return value: true when BoundedQueryResult::truncated was set (the
+// row_cap in agents/shared/wmi_bounded.hpp's BoundedQueryOptions, 512 rows
+// by default, was reached before enumeration finished) -- false on a
+// connect/query failure or a genuinely complete enumeration. This is a
+// narrow signal, not a redesign of wmi_query's contract: every existing
+// caller (do_manufacturer/do_model/do_bios/do_processors/do_memory/
+// do_disks/do_system) still discards it exactly as before; only do_drivers
+// below reads it, because it is the one action whose result set can
+// realistically exceed the row cap on a host with many installed drivers.
+template <typename Fn> bool wmi_query(const wchar_t* wql, Fn&& fn) {
     auto result = wmi::run_bounded_wmi_query(L"ROOT\\CIMV2", wql);
     if (result.error)
-        return;
+        return false;
     for (const auto& row : result.rows)
         fn(row);
+    return result.truncated;
 }
 #endif
 
@@ -697,19 +708,30 @@ std::string cim_date_to_iso(const std::string& cim) {
 int do_drivers(yuzu::CommandContext& ctx) {
 #ifdef _WIN32
     int idx = 0;
-    wmi_query(L"SELECT DeviceName, DriverVersion, DriverDate, DriverProviderName, "
-              L"DeviceClass FROM Win32_PnPSignedDriver WHERE DeviceName IS NOT NULL",
-              [&](const wmi::WmiRow& row) {
-                  auto name = wmi_row_string(row, "DeviceName");
-                  auto version = wmi_row_string(row, "DriverVersion");
-                  auto date = cim_date_to_iso(wmi_row_string(row, "DriverDate"));
-                  auto provider = wmi_row_string(row, "DriverProviderName");
-                  auto dev_class = wmi_row_string(row, "DeviceClass");
-                  ctx.write_output(std::format("driver|{}|{}|{}|{}|{}|{}", idx++, name,
-                                               version, date, provider, dev_class));
-              });
+    bool truncated =
+        wmi_query(L"SELECT DeviceName, DriverVersion, DriverDate, DriverProviderName, "
+                  L"DeviceClass FROM Win32_PnPSignedDriver WHERE DeviceName IS NOT NULL",
+                  [&](const wmi::WmiRow& row) {
+                      auto name = wmi_row_string(row, "DeviceName");
+                      auto version = wmi_row_string(row, "DriverVersion");
+                      auto date = cim_date_to_iso(wmi_row_string(row, "DriverDate"));
+                      auto provider = wmi_row_string(row, "DriverProviderName");
+                      auto dev_class = wmi_row_string(row, "DeviceClass");
+                      ctx.write_output(std::format("driver|{}|{}|{}|{}|{}|{}", idx++, name,
+                                                   version, date, provider, dev_class));
+                  });
+    // Deliberate #3404 divergence from silent-gap-on-empty -- see wmi_query()'s
+    // doc comment above.
     if (idx == 0)
         ctx.write_output("driver|0|unknown||||");
+    // wmi_query's row_cap (512, agents/shared/wmi_bounded.hpp) was reached --
+    // the driver list above is incomplete. "__truncated__" in the name slot
+    // mirrors the same hit-cap sentinel convention already used for a capped
+    // list elsewhere in the agent (services_plugin.cpp's macOS do_list,
+    // "svc|__truncated__|-|<total_seen>|-") -- it cannot collide with a real
+    // DeviceName, and the reached count rides in the idx slot.
+    else if (truncated)
+        ctx.write_output(std::format("driver|{}|__truncated__||||", idx));
 
 #elif defined(__linux__)
     // Read /proc/modules directly — it is the exact source lsmod pretty-prints,

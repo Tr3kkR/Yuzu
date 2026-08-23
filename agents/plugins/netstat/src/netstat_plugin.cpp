@@ -435,6 +435,15 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
 // attribution: the same shared walk, plus resolve_proc_name_path() per row
 // (sourced from sockwho_plugin.cpp originally — see macos_socket_walk.hpp's
 // file comment; sockwho itself is retired).
+//
+// dedup=true is deliberate here, not a leftover from copying
+// enumerate_and_stream() above: it collapses a fork-shared socket (multiple
+// processes holding the same fd) to a single owner row, intentionally
+// matching netstat_list's dedup semantics (#3403) so the two actions agree
+// on what "one socket" means. This differs from the retired sockwho
+// plugin, which emitted one row per (pid,fd) — i.e. one row per holder of a
+// shared socket, not one row per socket. That per-(pid,fd) shape was not
+// preserved on purpose; do not "fix" this back to dedup=false to restore it.
 void enumerate_and_stream_attribution(yuzu::CommandContext& ctx) {
     for (const auto& s : yuzu::shared::walk_sockets(/*dedup=*/true)) {
         std::string pname, ppath;

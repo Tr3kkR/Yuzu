@@ -230,7 +230,7 @@ Plugins for network configuration, active connections, diagnostics, and administ
 | Action | Description |
 |---|---|
 | `netstat_list` | List all TCP and UDP connections with local/remote address, port, state, and owning PID. |
-| `attribution` | Same enumeration, plus the owning process's name and executable path for each socket. Folds the retired `sockwho` plugin's functionality into netstat (#3403). |
+| `attribution` | Same enumeration, plus the owning process's name and executable path for each socket. Folds the retired `sockwho` plugin's functionality into netstat (#3403). On macOS, a socket shared across a fork (multiple processes holding the same fd) is deduplicated to one owner row, matching `netstat_list` — unlike the retired `sockwho`, which emitted one row per (pid, fd). |
 
 ### network_diag
 
