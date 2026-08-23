@@ -1221,6 +1221,25 @@ streamed POST is parked without having delivered its final (the client
 disconnected, the response cap elapsed, or the server could not complete the
 stream). Pass `--no-mcp-streamed-post` to rule this path out entirely.
 
+### -32015: Server is shutting down (HTTP 503)
+
+**Symptom**: `initialize` (with streaming on) returns `-32015` / HTTP `503`,
+"Server is shutting down", no `Mcp-Session-Id` header.
+
+**Cause**: `ServerImpl::stop()` (#3042) close-signals the session registry
+before closing the listening socket — every live session is closed, and every
+`initialize` landing in that window is refused rather than raced against the
+socket close or left to mint a session that is about to be torn down anyway.
+This is a narrow, transient window (seconds, not the deploy's whole grace
+period).
+
+**Fix**: Reconnect and re-`initialize` once the replacement instance is
+reachable — no `retry_after_ms` is given, since this process has no
+visibility into when that will be. A session that was already live when
+shutdown began instead receives a `notifications/yuzu.stream_closed` frame
+with `reason: session_terminated` (see that entry above) and should
+re-`initialize` the same way.
+
 ### A streamed final can be dropped entirely
 
 **Symptom**: A parked streamed request produces **no terminal frame and no close
