@@ -401,36 +401,36 @@ here.
 This is a compact provenance record — what ran, what it found, what happened to it. Current
 design truth lives in `## Decision` above, not here. Full structured findings (trigger/impact/
 exposure/epistemic-status per this repo's derivation scheme, plus provenance and disposition) are
-in the committed ledger: `governance.d/ca-store-postgres-migration.Hq3Wpm.jsonl` (52 findings
-across 14 review passes). Resource-ownership detail for the bootstrap-lock/first-boot-key custody
+in the committed ledger: `governance.d/ca-store-postgres-migration.Hq3Wpm.jsonl` (53 findings,
+15 review passes). Resource-ownership detail for the bootstrap-lock/first-boot-key custody
 chain — a policy-floor artifact independent of this history, not process narrative — lives in its
 own durable file: `docs/resource-ledgers/default-certs-bootstrap-lock.md`.
 
 | # | Pass | Reviewers | Findings | What stood out |
 |---|---|---|---|---|
-| 1 | Adversarial review | Kimi K2.7 + Codex GPT-5.5 (external, independent, each compiling + running the real suite) | 1 HIGH fixed, 1 MEDIUM fixed, 1 LOW deferred (pre-existing) | Both models independently found the boot-time `has_root()`/`get_root()` regression before cross-examining each other — the strongest class of finding this process produces |
-| 2 | Gate 3 (domain-triggered) | architect, cpp-expert, cpp-safety, quality-engineer | 1 HIGH fixed, 2 SHOULD fixed, 3 deferred (bounded) | The unscoped inventory-purge race — a distinct first-boot defect the adversarial round didn't cover |
-| 3 | Gate 4 | happy-path, unhappy-path, consistency-auditor | 2 HIGH fixed, 1 SHOULD documented, 1 NICE deferred | UP-1 (sweep fail-closed-amplification, a false compliance record) and UP-2 (a crash-recovery gap the Gate 3 fix itself widened — superseded by pass 4 below) |
-| 4 | Gate 8, round 1 | security-guardian + unhappy-path | 2 HIGH fixed, 1 NICE fixed | Both reviewers independently found UP-2's own self-heal fix had a concurrency gap — a static ownership proof, not a claim/CAS |
+| 1 | Adversarial review | Kimi K2.7 + Codex GPT-5.5 (external, independent, each compiling + running the real suite) | 1 HIGH fixed, 1 MEDIUM fixed, 1 LOW deferred (pre-existing) | Both models independently found the boot-time `has_root()`/`get_root()` regression before cross-examining each other — the strongest finding class this process produces |
+| 2 | Gate 3 (domain-triggered) | architect, cpp-expert, cpp-safety, quality-engineer | 1 HIGH fixed, 2 SHOULD fixed, 3 deferred (bounded) | The unscoped inventory-purge race — a distinct first-boot defect the adversarial round missed |
+| 3 | Gate 4 | happy-path, unhappy-path, consistency-auditor | 2 HIGH fixed, 1 SHOULD documented, 1 NICE deferred | UP-1 (sweep fail-closed-amplification, a false compliance record); UP-2 (a crash-recovery gap Gate 3's fix widened — superseded by pass 4) |
+| 4 | Gate 8, round 1 | security-guardian + unhappy-path | 2 HIGH fixed, 1 NICE fixed | Both independently found UP-2's own self-heal fix had a concurrency gap — a static ownership proof, not a claim/CAS |
 | 5 | Gate 8, cpp-safety domain re-review | cpp-safety | 1 SHOULD documented, 2 NICE fixed | The bootstrap lock's own pool-size floor |
-| 6 | Gate 8, narrow closure re-verify | security-guardian + unhappy-path (independent re-reads of current code, not the diff) | 1 NICE fixed | Confirmed pass 4's findings CLOSED — the standing rule that only the reporting domain signs off its own finding |
-| 7 | Gate 5/6 | chaos-injector, compliance-officer, sre, enterprise-readiness, docs-writer, architect | 1 HIGH fixed, 1 MEDIUM documented, 3 SHOULD fixed, 4 SHOULD deferred, 4 NICE (mixed) | C5-1: a fencing-token gap in pass 4's own lock fix — the lock-holding *connection* could die without the *process* dying |
-| 8 | cpp-safety + security-guardian re-review of the C5-1 fix | cpp-safety, security-guardian | 2 policy floors fixed, 1 NICE deferred (pre-existing) | A `const_cast`-then-write UB (cpp-safety's enumerated floor) and a missing Resource Ledger |
-| 9 | cpp-expert gap-fill | cpp-expert | 3 NICE fixed | First review of the fix-round commits specifically — routed-concerns' trigger is unconditional on any C++ change, and this coverage cell had been empty |
+| 6 | Gate 8, narrow closure re-verify | security-guardian + unhappy-path (independent re-reads, not the diff) | 1 NICE fixed | Confirmed pass 4's findings CLOSED — only the reporting domain signs off its own finding |
+| 7 | Gate 5/6 | chaos-injector, compliance-officer, sre, enterprise-readiness, docs-writer, architect | 1 HIGH fixed, 1 MEDIUM documented, 3 SHOULD fixed, 4 SHOULD deferred, 4 NICE (mixed) | C5-1: a fencing-token gap in pass 4's own lock fix — lock-holding *connection* could die without the *process* dying |
+| 8 | cpp-safety + security-guardian re-review of C5-1 fix | cpp-safety, security-guardian | 2 policy floors fixed, 1 NICE deferred (pre-existing) | A `const_cast`-then-write UB (cpp-safety's enumerated floor) + a missing Resource Ledger |
+| 9 | cpp-expert gap-fill | cpp-expert | 3 NICE fixed | First review of the fix-round commits — routed-concerns' trigger is unconditional on any C++ change, this coverage cell had been empty |
 | 10 | Post-governance follow-up (operator-directed) | claude, self-found | 1 SHOULD fixed | Two more metrics with CAPG-022's missing-boot-seed gap, same code region |
 | 11 | UP-3 build (operator-directed) | claude, self-found | 1 HIGH/BLOCKING fixed (pre-existing) | The key-clobbering race: 7/8 pre-fix repro runs red, 0/15 post-fix |
-| 12 | cpp-safety + security-guardian re-review of the UP-3 fix | cpp-safety, security-guardian | 1 SHOULD fixed, 1 policy floor fixed, 1 MEDIUM documented | The ADR restructuring in this same round had deleted the committed Resource Ledger with no durable replacement — a policy floor, caught before push |
-| 13 | cpp-safety closure re-verify | cpp-safety | 2 SHOULD fixed | A retry-guard presence-vs-count masking risk; an unspecified-on-false output-parameter contract |
-| 14 | Operator re-derivation, routed-concern catch-up | security-guardian, cpp-expert, docs-writer, cpp-safety | 1 SHOULD, 2 NICE fixed, 1 INFO deferred | Pass 13 itself had gone unrecorded — the exact gap class this section exists to close |
+| 12 | cpp-safety + security-guardian re-review of UP-3 fix | cpp-safety, security-guardian | 1 SHOULD, 1 policy floor fixed, 1 MEDIUM documented | Restructuring this round deleted the committed Resource Ledger with no replacement — floor, caught pre-push |
+| 13 | cpp-safety closure re-verify | cpp-safety | 2 SHOULD fixed | Retry-guard presence-vs-count masking risk; unspecified-on-false output-parameter contract |
+| 14 | Operator re-derivation, routed-concern catch-up | security-guardian, cpp-expert, docs-writer, cpp-safety | 1 SHOULD, 2 NICE fixed, 1 INFO deferred | Pass 13 itself had gone unrecorded — the gap this section exists to close |
+| 15 | Re-verify of #3475's CI-flake fix (routed-concern) | cpp-safety | 1 NICE fixed | "each racer's" overstated it — one hits a primed pool connection |
 
-**Notable process findings, not product findings.** Three overclaims were caught and retracted
-**before** being used as sign-off evidence, never after — compliance-officer evaluated this as
-evidence of a sound review process: (1) a regression test cited as closure evidence for pass 4
-didn't reliably reproduce the pre-fix corruption (verified via 60 runs in a throwaway worktree;
-reframed onto the lock's by-construction ordering proof); (2) a log line claimed "this instance
-provably minted it" after the nearby comment had already been corrected away from that claim; (3)
-a Gate 8 finding asserted `upgrading.md` "describes [multi-replica HA] as supported," contradicting
-this ADR's own Decision section.
+**Notable process findings, not product findings.** Three overclaims caught and retracted
+**before** being used as sign-off evidence — compliance-officer evaluated this as evidence of a
+sound review process: (1) a regression test cited as closure for pass 4 didn't reliably reproduce
+the pre-fix corruption (60 runs in a throwaway worktree; reframed onto the lock's ordering proof);
+(2) a log line claimed "this instance provably minted it" after the nearby comment had already
+been corrected away from that claim; (3) a Gate 8 finding asserted `upgrading.md` describes
+multi-replica HA as supported, contradicting this ADR's own Decision section.
 
 **Post-governance follow-up (operator-directed).** Two items sre's Gate 6 pass deferred (CA
 metrics alert rules, the bootstrap lock's pool-size floor in the capacity doc) were fixed rather
@@ -451,25 +451,23 @@ the CAS's sole winner; `key_ref` itself is computed beforehand (a pure path calc
 Recorded as CAPG-043, pass 11, HIGH/BLOCKING (I1+I2, E4+E5), fixed.
 
 **Pass 12 — cpp-safety + security-guardian domain re-review of this fix (2026-08-21).** One SHOULD
-fixed (the poll loop's adoption decision now cross-checks the fingerprint of what it just
-validated, an invariant that was true by construction but unasserted). One BLOCKING policy-floor
-finding, fixed — this same round's ADR restructuring had deleted the bootstrap-lock chain's
-committed Resource Ledger with no durable replacement; moved to
-`docs/resource-ledgers/default-certs-bootstrap-lock.md` instead, extended with this pass's own
-new resource. One MEDIUM documented, not fixed (the sibling-refusal window; see that file for the
-trade-off). Full findings: `governance.d/ca-store-postgres-migration.Hq3Wpm.jsonl` pass 12.
+fixed (the poll loop now cross-checks the fingerprint of what it just validated, true by
+construction but unasserted). One BLOCKING policy-floor fixed — this round's ADR restructuring had
+deleted the bootstrap-lock chain's committed Resource Ledger with no replacement; moved to
+`docs/resource-ledgers/default-certs-bootstrap-lock.md`, extended with this pass's own resource.
+One MEDIUM documented, not fixed (sibling-refusal window; see that file). Findings:
+`governance.d/ca-store-postgres-migration.Hq3Wpm.jsonl` pass 12.
 
-**Pass 13 — cpp-safety closure re-verify.** Two SHOULD findings, both fixed: the racing-boot
-test's mixed-failure retry guard checked presence, not count, of the known CAPG-042 refusal log
-line (could mask a coincidental unrelated failure); and the fingerprint-mismatch branch could
-leave `out` populated with a validated-but-wrong-root set on the poll-timeout path — unreachable
-today, reset defensively and documented anyway.
+**Pass 13 — cpp-safety closure re-verify.** Two SHOULD fixed: the racing-boot test's mixed-failure
+retry guard checked presence, not count, of the known CAPG-042 refusal log line (could mask a
+coincidental unrelated failure); the fingerprint-mismatch branch could leave `out` populated with
+a validated-but-wrong-root set on the poll-timeout path — unreachable today, reset defensively and
+documented anyway.
 
 **Pass 14 — routed-concern catch-up, prompted by an operator re-derivation** ("has necessary
 governance been run?"). `default_certs.{hpp,cpp}` unconditionally triggers security-guardian/
-cpp-safety/docs-writer, and cpp-expert on any C++ change — neither pass 12's nor pass 13's fix
-commit had run all four. All four PASS; docs-writer found pass 13 had gone unrecorded here — the gap this section exists
-to close — fixed above.
+cpp-safety/docs-writer, and cpp-expert on any C++ change — neither pass 12's nor 13's fix commit
+had run all four. All four PASS; docs-writer found pass 13 itself had gone unrecorded, fixed above.
 
 **Self-caught, not a review finding: the new UP-3 test was itself scheduling-dependent.** A
 subsequent full 10-shard suite run hit a legitimate, non-buggy scheduling outcome the test's
@@ -478,10 +476,12 @@ the winner had already committed, so all six correctly took the pre-existing UP-
 exercised this fix's new branch, failing `REQUIRE(logs.find("lost the first-boot CA-root
 race")...)`. Not weakened (a soft check trades "sometimes red for a good reason" for "always
 green regardless of whether it verifies anything," worse than an occasional red); instead
-wrapped in a bounded retry of the whole scenario (fresh directory and store each attempt, up to 5
-attempts), mirroring `test_mcp_stream_bridge.cpp`'s `#3357` "quiesce before the
-experiment" shape — exceeding the bound is still a hard `REQUIRE` failure, never a silent pass or
-an infinite spin.
+wrapped in a bounded retry of the whole scenario (fresh directory and store each attempt, up to 15
+as of PR #3475's CI-flake fix, widened from 5), mirroring `test_mcp_stream_bridge.cpp`'s `#3357`
+"quiesce before the experiment" shape — exceeding the bound is still a hard `REQUIRE` failure,
+never a silent pass. A `std::latch` start-barrier was tried alongside the widened bound and
+reverted — measured WORSE locally (13/15 failures): `PgPool` connects lazily, so a racer's real
+work happens well after any barrier releases (pass 15 re-verify, table below).
 
 ## Consequences
 
