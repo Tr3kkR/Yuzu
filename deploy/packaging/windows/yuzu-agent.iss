@@ -86,7 +86,6 @@ Source: "{#BuildDir}\agents\plugins\network_config\network_config.dll"; DestDir:
 Source: "{#BuildDir}\agents\plugins\network_diag\network_diag.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\network_actions\network_actions.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\netstat\netstat.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
-Source: "{#BuildDir}\agents\plugins\sockwho\sockwho.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\wifi\wifi.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\wol\wol.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\http_client\http_client.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion

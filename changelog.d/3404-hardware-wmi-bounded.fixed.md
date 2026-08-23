@@ -1,0 +1,1 @@
+- **`hardware` plugin's Windows WMI queries no longer block indefinitely.** The plugin's private WMI enumerator called `Next(WBEM_INFINITE, ...)`, which could hang the agent on a wedged or slow WMI provider. It now runs through the shared bounded WMI helper (`agents/shared/wmi_bounded.hpp`), which bounds both the per-call wait and the overall enumeration.

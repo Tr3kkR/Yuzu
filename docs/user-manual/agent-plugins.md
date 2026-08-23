@@ -225,22 +225,12 @@ Plugins for network configuration, active connections, diagnostics, and administ
 | | |
 |---|---|
 | **Platforms** | W L M |
-| **Description** | Active network connections (similar to the `netstat` command-line tool). |
+| **Description** | Active network connections (similar to the `netstat` command-line tool), and socket-to-process attribution. |
 
 | Action | Description |
 |---|---|
 | `netstat_list` | List all TCP and UDP connections with local/remote address, port, state, and owning PID. |
-
-### sockwho
-
-| | |
-|---|---|
-| **Platforms** | W L M |
-| **Description** | Maps open sockets to the processes that own them. |
-
-| Action | Description |
-|---|---|
-| `sockwho_list` | For each listening or established socket, returns the owning process name and PID alongside connection details. |
+| `attribution` | Same enumeration, plus the owning process's name and executable path for each socket. Folds the retired `sockwho` plugin's functionality into netstat (#3403). |
 
 ### network_diag
 

@@ -62,9 +62,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <comdef.h>
-#include <wbemidl.h>
-#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
+#include <wmi_bounded.hpp> // shared bounded WMI query helper (#3404 -- kills Next(WBEM_INFINITE); pulls in comdef.h/wbemidl.h)
 #pragma comment(lib, "wbemuuid.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
@@ -142,126 +140,52 @@ std::string io_registry_cf_string(io_object_t entry, CFStringRef key) {
 // ── Windows: WMI helper class ─────────────────────────────────────────────
 
 #ifdef _WIN32
-// TODO: bounded-WMI migration (shared agents/shared/wmi_bounded.hpp,
-// PR3.3-a, concurrent sibling) will swap this class's Next(WBEM_INFINITE,
-// ...) enumeration onto the bounded helper — no functional change here.
-class WmiQuery {
-public:
-    WmiQuery() {
-        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        if (FAILED(hr) && hr != RPC_E_CHANGED_MODE)
-            return;
-        com_init_ = true;
+// #3404: this plugin's own WMI enumeration now rides the shared bounded
+// helper (agents/shared/wmi_bounded.hpp, PR3.3-a) instead of a private
+// Next(WBEM_INFINITE, ...) loop -- a wedged/slow WMI provider used to hang
+// this plugin indefinitely; every query below now bounds the per-Next wait,
+// the whole enumeration, and the row count (BoundedQueryOptions defaults).
+namespace wmi = yuzu::shared::wmi;
 
-        hr = CoInitializeSecurity(nullptr, -1, nullptr, nullptr, RPC_C_AUTHN_LEVEL_DEFAULT,
-                                  RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE, nullptr);
-        // S_OK or RPC_E_TOO_LATE are both acceptable
-        if (FAILED(hr) && hr != RPC_E_TOO_LATE)
-            return;
+std::string wmi_row_string(const wmi::WmiRow& row, const char* key) {
+    const auto it = row.find(key);
+    return it == row.end() ? std::string{} : it->second;
+}
 
-        IWbemLocator* loc = nullptr;
-        hr = CoCreateInstance(CLSID_WbemLocator, nullptr, CLSCTX_INPROC_SERVER, IID_IWbemLocator,
-                              reinterpret_cast<void**>(&loc));
-        if (FAILED(hr))
-            return;
-        locator_ = loc;
-
-        IWbemServices* svc = nullptr;
-        hr = locator_->ConnectServer(_bstr_t(L"ROOT\\CIMV2"), nullptr, nullptr, nullptr, 0, nullptr,
-                                     nullptr, &svc);
-        if (FAILED(hr))
-            return;
-        services_ = svc;
-
-        CoSetProxyBlanket(services_, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr,
-                          RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE);
+uint32_t wmi_row_uint32(const wmi::WmiRow& row, const char* key) {
+    const auto s = wmi_row_string(row, key);
+    if (s.empty())
+        return 0;
+    try {
+        return static_cast<uint32_t>(std::stoul(s));
+    } catch (...) {
+        return 0;
     }
+}
 
-    ~WmiQuery() {
-        if (services_)
-            services_->Release();
-        if (locator_)
-            locator_->Release();
-        if (com_init_)
-            CoUninitialize();
+uint64_t wmi_row_uint64(const wmi::WmiRow& row, const char* key) {
+    const auto s = wmi_row_string(row, key);
+    if (s.empty())
+        return 0;
+    try {
+        return std::stoull(s);
+    } catch (...) {
+        return 0;
     }
+}
 
-    WmiQuery(const WmiQuery&) = delete;
-    WmiQuery& operator=(const WmiQuery&) = delete;
-
-    [[nodiscard]] bool valid() const { return services_ != nullptr; }
-
-    // Execute a WQL query and call fn for each result object
-    template <typename Fn> void query(const wchar_t* wql, Fn&& fn) {
-        if (!services_)
-            return;
-        IEnumWbemClassObject* enumerator = nullptr;
-        HRESULT hr = services_->ExecQuery(_bstr_t(L"WQL"), _bstr_t(wql),
-                                          WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
-                                          nullptr, &enumerator);
-        if (FAILED(hr) || !enumerator)
-            return;
-
-        IWbemClassObject* obj = nullptr;
-        ULONG count = 0;
-        while (enumerator->Next(WBEM_INFINITE, 1, &obj, &count) == S_OK) {
-            fn(obj);
-            obj->Release();
-        }
-        enumerator->Release();
-    }
-
-    // Get a string property from a WMI object
-    static std::string get_string(IWbemClassObject* obj, const wchar_t* prop) {
-        VARIANT vt;
-        VariantInit(&vt);
-        if (SUCCEEDED(obj->Get(prop, 0, &vt, nullptr, nullptr)) && vt.vt == VT_BSTR && vt.bstrVal) {
-            std::string result = yuzu::win::from_wide(vt.bstrVal); // (#1681) -1 convert, NUL dropped
-            VariantClear(&vt);
-            return result;
-        }
-        VariantClear(&vt);
-        return {};
-    }
-
-    // Get a uint32 property from a WMI object
-    static uint32_t get_uint32(IWbemClassObject* obj, const wchar_t* prop) {
-        VARIANT vt;
-        VariantInit(&vt);
-        uint32_t val = 0;
-        if (SUCCEEDED(obj->Get(prop, 0, &vt, nullptr, nullptr))) {
-            if (vt.vt == VT_I4 || vt.vt == VT_UI4)
-                val = vt.ulVal;
-        }
-        VariantClear(&vt);
-        return val;
-    }
-
-    // Get a uint64 property from a WMI object
-    static uint64_t get_uint64(IWbemClassObject* obj, const wchar_t* prop) {
-        VARIANT vt;
-        VariantInit(&vt);
-        uint64_t val = 0;
-        if (SUCCEEDED(obj->Get(prop, 0, &vt, nullptr, nullptr))) {
-            if (vt.vt == VT_BSTR && vt.bstrVal) {
-                // WMI returns uint64 as string
-                auto s = get_string(obj, prop);
-                try {
-                    val = std::stoull(s);
-                } catch (...) {}
-            } else if (vt.vt == VT_I4 || vt.vt == VT_UI4) {
-                val = vt.ulVal;
-            }
-        }
-        VariantClear(&vt);
-        return val;
-    }
-
-private:
-    bool com_init_ = false;
-    IWbemLocator* locator_ = nullptr;
-    IWbemServices* services_ = nullptr;
-};
+// Run a bounded WQL query against ROOT\CIMV2 and invoke fn(row) once per
+// result row. A connect/query/enumerate failure -- or a genuinely empty
+// result set -- calls fn zero times, matching the removed private
+// WmiQuery's behaviour (callers already treat "fn never ran" as their
+// not-found case, e.g. an empty accumulator string or a zero row count).
+template <typename Fn> void wmi_query(const wchar_t* wql, Fn&& fn) {
+    auto result = wmi::run_bounded_wmi_query(L"ROOT\\CIMV2", wql);
+    if (result.error)
+        return;
+    for (const auto& row : result.rows)
+        fn(row);
+}
 #endif
 
 // ── manufacturer action ───────────────────────────────────────────────────
@@ -277,12 +201,9 @@ int do_manufacturer(yuzu::CommandContext& ctx) {
     ctx.write_output(std::format("manufacturer|{}", mfr.empty() ? "Apple Inc." : mfr));
 
 #elif defined(_WIN32)
-    WmiQuery wmi;
     std::string mfr;
-    if (wmi.valid()) {
-        wmi.query(L"SELECT Manufacturer FROM Win32_ComputerSystem",
-                  [&](IWbemClassObject* obj) { mfr = WmiQuery::get_string(obj, L"Manufacturer"); });
-    }
+    wmi_query(L"SELECT Manufacturer FROM Win32_ComputerSystem",
+              [&](const wmi::WmiRow& row) { mfr = wmi_row_string(row, "Manufacturer"); });
     ctx.write_output(std::format("manufacturer|{}", mfr.empty() ? "unknown" : mfr));
 
 #else
@@ -303,12 +224,9 @@ int do_model(yuzu::CommandContext& ctx) {
     ctx.write_output(std::format("model|{}", model.empty() ? "unknown" : model));
 
 #elif defined(_WIN32)
-    WmiQuery wmi;
     std::string model;
-    if (wmi.valid()) {
-        wmi.query(L"SELECT Model FROM Win32_ComputerSystem",
-                  [&](IWbemClassObject* obj) { model = WmiQuery::get_string(obj, L"Model"); });
-    }
+    wmi_query(L"SELECT Model FROM Win32_ComputerSystem",
+              [&](const wmi::WmiRow& row) { model = wmi_row_string(row, "Model"); });
     ctx.write_output(std::format("model|{}", model.empty() ? "unknown" : model));
 
 #else
@@ -354,25 +272,24 @@ int do_bios(yuzu::CommandContext& ctx) {
     ctx.write_output("bios_date|N/A");
 
 #elif defined(_WIN32)
-    WmiQuery wmi;
-    if (wmi.valid()) {
-        wmi.query(
-            L"SELECT Manufacturer, SMBIOSBIOSVersion, ReleaseDate FROM Win32_BIOS",
-            [&](IWbemClassObject* obj) {
-                auto vendor = WmiQuery::get_string(obj, L"Manufacturer");
-                auto version = WmiQuery::get_string(obj, L"SMBIOSBIOSVersion");
-                auto date = WmiQuery::get_string(obj, L"ReleaseDate");
-                // WMI date format: "20240315000000.000000+000" → extract YYYY-MM-DD
-                if (date.size() >= 8) {
-                    date = date.substr(0, 4) + "-" + date.substr(4, 2) + "-" + date.substr(6, 2);
-                }
-                ctx.write_output(
-                    std::format("bios_vendor|{}", vendor.empty() ? "unknown" : vendor));
-                ctx.write_output(
-                    std::format("bios_version|{}", version.empty() ? "unknown" : version));
-                ctx.write_output(std::format("bios_date|{}", date.empty() ? "unknown" : date));
-            });
-    } else {
+    bool found = false;
+    wmi_query(L"SELECT Manufacturer, SMBIOSBIOSVersion, ReleaseDate FROM Win32_BIOS",
+              [&](const wmi::WmiRow& row) {
+                  found = true;
+                  auto vendor = wmi_row_string(row, "Manufacturer");
+                  auto version = wmi_row_string(row, "SMBIOSBIOSVersion");
+                  auto date = wmi_row_string(row, "ReleaseDate");
+                  // WMI date format: "20240315000000.000000+000" → extract YYYY-MM-DD
+                  if (date.size() >= 8) {
+                      date = date.substr(0, 4) + "-" + date.substr(4, 2) + "-" + date.substr(6, 2);
+                  }
+                  ctx.write_output(
+                      std::format("bios_vendor|{}", vendor.empty() ? "unknown" : vendor));
+                  ctx.write_output(
+                      std::format("bios_version|{}", version.empty() ? "unknown" : version));
+                  ctx.write_output(std::format("bios_date|{}", date.empty() ? "unknown" : date));
+              });
+    if (!found) {
         ctx.write_output("bios_vendor|unknown");
         ctx.write_output("bios_version|unknown");
         ctx.write_output("bios_date|unknown");
@@ -427,16 +344,13 @@ int do_system(yuzu::CommandContext& ctx) {
     ctx.write_output(std::format("system_uuid|{}", uuid.empty() ? "unknown" : uuid));
 
 #elif defined(_WIN32)
-    WmiQuery wmi;
     std::string serial;
     std::string uuid;
-    if (wmi.valid()) {
-        wmi.query(L"SELECT SerialNumber FROM Win32_BIOS", [&](IWbemClassObject* obj) {
-            serial = WmiQuery::get_string(obj, L"SerialNumber");
-        });
-        wmi.query(L"SELECT UUID FROM Win32_ComputerSystemProduct",
-                  [&](IWbemClassObject* obj) { uuid = WmiQuery::get_string(obj, L"UUID"); });
-    }
+    wmi_query(L"SELECT SerialNumber FROM Win32_BIOS", [&](const wmi::WmiRow& row) {
+        serial = wmi_row_string(row, "SerialNumber");
+    });
+    wmi_query(L"SELECT UUID FROM Win32_ComputerSystemProduct",
+              [&](const wmi::WmiRow& row) { uuid = wmi_row_string(row, "UUID"); });
     ctx.write_output(std::format("serial|{}", serial.empty() ? "unknown" : serial));
     ctx.write_output(std::format("system_uuid|{}", uuid.empty() ? "unknown" : uuid));
 
@@ -513,22 +427,19 @@ int do_processors(yuzu::CommandContext& ctx) {
         std::format("cpu|0|{}|{}|{}|{:.0f}", brand.empty() ? "unknown" : brand, cores, threads, mhz));
 
 #elif defined(_WIN32)
-    WmiQuery wmi;
-    if (wmi.valid()) {
-        int idx = 0;
-        wmi.query(L"SELECT Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed FROM "
-                  L"Win32_Processor",
-                  [&](IWbemClassObject* obj) {
-                      auto name = WmiQuery::get_string(obj, L"Name");
-                      auto cores = WmiQuery::get_uint32(obj, L"NumberOfCores");
-                      auto threads = WmiQuery::get_uint32(obj, L"NumberOfLogicalProcessors");
-                      auto mhz = WmiQuery::get_uint32(obj, L"MaxClockSpeed");
-                      ctx.write_output(
-                          std::format("cpu|{}|{}|{}|{}|{}", idx++, name, cores, threads, mhz));
-                  });
-    } else {
+    int idx = 0;
+    wmi_query(L"SELECT Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed FROM "
+              L"Win32_Processor",
+              [&](const wmi::WmiRow& row) {
+                  auto name = wmi_row_string(row, "Name");
+                  auto cores = wmi_row_uint32(row, "NumberOfCores");
+                  auto threads = wmi_row_uint32(row, "NumberOfLogicalProcessors");
+                  auto mhz = wmi_row_uint32(row, "MaxClockSpeed");
+                  ctx.write_output(
+                      std::format("cpu|{}|{}|{}|{}|{}", idx++, name, cores, threads, mhz));
+              });
+    if (idx == 0)
         ctx.write_output("cpu|0|unknown|0|0|0");
-    }
 
 #else
     ctx.write_output("cpu|0|unknown|0|0|0");
@@ -595,38 +506,37 @@ int do_memory(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(_WIN32)
-    WmiQuery wmi;
-    if (wmi.valid()) {
-        wmi.query(L"SELECT DeviceLocator, Capacity, MemoryType, SMBIOSMemoryType, Speed FROM "
-                  L"Win32_PhysicalMemory",
-                  [&](IWbemClassObject* obj) {
-                      auto slot = WmiQuery::get_string(obj, L"DeviceLocator");
-                      auto capacity = WmiQuery::get_uint64(obj, L"Capacity");
-                      auto speed = WmiQuery::get_uint32(obj, L"Speed");
-                      auto smbios_type = WmiQuery::get_uint32(obj, L"SMBIOSMemoryType");
-                      // SMBIOSMemoryType: 26=DDR4, 34=DDR5, 24=DDR3, 20=DDR2
-                      const char* type_str = "unknown";
-                      switch (smbios_type) {
-                      case 20:
-                          type_str = "DDR2";
-                          break;
-                      case 24:
-                          type_str = "DDR3";
-                          break;
-                      case 26:
-                          type_str = "DDR4";
-                          break;
-                      case 34:
-                          type_str = "DDR5";
-                          break;
-                      }
-                      auto size_mb = capacity / (1024 * 1024);
-                      ctx.write_output(
-                          std::format("dimm|{}|{}|{}|{}", slot, size_mb, type_str, speed));
-                  });
-    } else {
+    bool found = false;
+    wmi_query(L"SELECT DeviceLocator, Capacity, MemoryType, SMBIOSMemoryType, Speed FROM "
+              L"Win32_PhysicalMemory",
+              [&](const wmi::WmiRow& row) {
+                  found = true;
+                  auto slot = wmi_row_string(row, "DeviceLocator");
+                  auto capacity = wmi_row_uint64(row, "Capacity");
+                  auto speed = wmi_row_uint32(row, "Speed");
+                  auto smbios_type = wmi_row_uint32(row, "SMBIOSMemoryType");
+                  // SMBIOSMemoryType: 26=DDR4, 34=DDR5, 24=DDR3, 20=DDR2
+                  const char* type_str = "unknown";
+                  switch (smbios_type) {
+                  case 20:
+                      type_str = "DDR2";
+                      break;
+                  case 24:
+                      type_str = "DDR3";
+                      break;
+                  case 26:
+                      type_str = "DDR4";
+                      break;
+                  case 34:
+                      type_str = "DDR5";
+                      break;
+                  }
+                  auto size_mb = capacity / (1024 * 1024);
+                  ctx.write_output(
+                      std::format("dimm|{}|{}|{}|{}", slot, size_mb, type_str, speed));
+              });
+    if (!found)
         ctx.write_output("dimm|unknown|0|unknown|0");
-    }
 
 #else
     ctx.write_output("dimm|unknown|0|unknown|0");
@@ -706,33 +616,32 @@ int do_disks(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(_WIN32)
-    WmiQuery wmi;
-    if (wmi.valid()) {
-        wmi.query(L"SELECT Index, Model, Size, MediaType, InterfaceType FROM Win32_DiskDrive",
-                  [&](IWbemClassObject* obj) {
-                      auto idx = WmiQuery::get_uint32(obj, L"Index");
-                      auto model = WmiQuery::get_string(obj, L"Model");
-                      auto size = WmiQuery::get_uint64(obj, L"Size");
-                      auto media = WmiQuery::get_string(obj, L"MediaType");
-                      auto iface = WmiQuery::get_string(obj, L"InterfaceType");
-                      auto size_gb = size / (1024ULL * 1024 * 1024);
-                      // Simplify media type
-                      std::string type_str = "unknown";
-                      if (media.find("SSD") != std::string::npos ||
-                          media.find("Solid") != std::string::npos) {
-                          type_str = "SSD";
-                      } else if (media.find("Fixed") != std::string::npos ||
-                                 media.find("Hard") != std::string::npos) {
-                          type_str = "HDD";
-                      } else if (media.find("Removable") != std::string::npos) {
-                          type_str = "Removable";
-                      }
-                      ctx.write_output(
-                          std::format("disk|{}|{}|{}|{}|{}", idx, model, size_gb, type_str, iface));
-                  });
-    } else {
+    bool found = false;
+    wmi_query(L"SELECT Index, Model, Size, MediaType, InterfaceType FROM Win32_DiskDrive",
+              [&](const wmi::WmiRow& row) {
+                  found = true;
+                  auto idx = wmi_row_uint32(row, "Index");
+                  auto model = wmi_row_string(row, "Model");
+                  auto size = wmi_row_uint64(row, "Size");
+                  auto media = wmi_row_string(row, "MediaType");
+                  auto iface = wmi_row_string(row, "InterfaceType");
+                  auto size_gb = size / (1024ULL * 1024 * 1024);
+                  // Simplify media type
+                  std::string type_str = "unknown";
+                  if (media.find("SSD") != std::string::npos ||
+                      media.find("Solid") != std::string::npos) {
+                      type_str = "SSD";
+                  } else if (media.find("Fixed") != std::string::npos ||
+                             media.find("Hard") != std::string::npos) {
+                      type_str = "HDD";
+                  } else if (media.find("Removable") != std::string::npos) {
+                      type_str = "Removable";
+                  }
+                  ctx.write_output(
+                      std::format("disk|{}|{}|{}|{}|{}", idx, model, size_gb, type_str, iface));
+              });
+    if (!found)
         ctx.write_output("disk|0|unknown|0|unknown|unknown");
-    }
 
 #else
     ctx.write_output("disk|0|unknown|0|unknown|unknown");
@@ -762,25 +671,20 @@ std::string cim_date_to_iso(const std::string& cim) {
 
 int do_drivers(yuzu::CommandContext& ctx) {
 #ifdef _WIN32
-    WmiQuery wmi;
-    if (wmi.valid()) {
-        int idx = 0;
-        wmi.query(L"SELECT DeviceName, DriverVersion, DriverDate, DriverProviderName, "
-                  L"DeviceClass FROM Win32_PnPSignedDriver WHERE DeviceName IS NOT NULL",
-                  [&](IWbemClassObject* obj) {
-                      auto name = WmiQuery::get_string(obj, L"DeviceName");
-                      auto version = WmiQuery::get_string(obj, L"DriverVersion");
-                      auto date = cim_date_to_iso(WmiQuery::get_string(obj, L"DriverDate"));
-                      auto provider = WmiQuery::get_string(obj, L"DriverProviderName");
-                      auto dev_class = WmiQuery::get_string(obj, L"DeviceClass");
-                      ctx.write_output(std::format("driver|{}|{}|{}|{}|{}|{}", idx++, name,
-                                                   version, date, provider, dev_class));
-                  });
-        if (idx == 0)
-            ctx.write_output("driver|0|unknown||||");
-    } else {
+    int idx = 0;
+    wmi_query(L"SELECT DeviceName, DriverVersion, DriverDate, DriverProviderName, "
+              L"DeviceClass FROM Win32_PnPSignedDriver WHERE DeviceName IS NOT NULL",
+              [&](const wmi::WmiRow& row) {
+                  auto name = wmi_row_string(row, "DeviceName");
+                  auto version = wmi_row_string(row, "DriverVersion");
+                  auto date = cim_date_to_iso(wmi_row_string(row, "DriverDate"));
+                  auto provider = wmi_row_string(row, "DriverProviderName");
+                  auto dev_class = wmi_row_string(row, "DeviceClass");
+                  ctx.write_output(std::format("driver|{}|{}|{}|{}|{}|{}", idx++, name,
+                                               version, date, provider, dev_class));
+              });
+    if (idx == 0)
         ctx.write_output("driver|0|unknown||||");
-    }
 
 #elif defined(__linux__)
     // Read /proc/modules directly — it is the exact source lsmod pretty-prints,
