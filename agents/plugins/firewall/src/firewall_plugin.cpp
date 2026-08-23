@@ -620,6 +620,16 @@ bool nft_dump(int fd, std::uint16_t msg_type, std::vector<std::byte>& out,
     std::memcpy(req, &h, sizeof(h));
     std::memcpy(req + sizeof(h), &g, sizeof(g));
 
+    // Same bounded-deadline contract as the poll loop below: when this is the
+    // second or third dump on a shared per-call deadline (try_nftables_state/
+    // rules pass one `deadline` to all of GETTABLE/GETCHAIN/GETRULE), an
+    // earlier dump can already have consumed the whole budget -- sending a
+    // request whose reply has no chance of being read before the poll loop's
+    // own `now >= deadline` check triggers is wasted kernel-side work for no
+    // benefit (adversarial-review gate-2 finding, unverified/uncompiled).
+    if (std::chrono::steady_clock::now() >= deadline)
+        return false;
+
     if (::send(fd, req, sizeof(req), 0) != static_cast<ssize_t>(sizeof(req)))
         return false;
 
