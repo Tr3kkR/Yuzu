@@ -22,7 +22,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
@@ -56,9 +55,7 @@
 #include <win_str.hpp>     // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #include <wmi_bounded.hpp> // shared yuzu::shared::wmi::run_bounded_wmi_query (bounded, never WBEM_INFINITE)
 #include <wuapi.h>         // IUpdateSession/IUpdateSearcher/ISearchJob (Windows Update Agent COM API)
-#include <spdlog/spdlog.h> // this file's degraded-run warning (this file's #else branch already
-                           // includes this for its own spdlog::warn call, but that include is
-                           // POSIX-only -- unreachable from here)
+#include <yuzu/agent/wua_noop_callback.hpp> // process-lifetime BeginSearch callback singleton
 #pragma comment(lib, "ws2_32.lib")
 #else
 #include <sys/types.h>
@@ -163,51 +160,6 @@ ToolOutcome run_tool(std::vector<std::string> argv, std::size_t max_lines = 0,
 #endif // !_WIN32
 
 #ifdef _WIN32
-// Minimal ISearchCompletedCallback sink for IUpdateSearcher::BeginSearch.
-// BeginSearch requires a live callback object, but do_missing() polls
-// ISearchJob::IsCompleted itself under an explicit deadline rather than
-// waiting on Invoke to fire -- WUA invokes the callback on a background
-// thread of its own choosing, which would need its own cross-thread
-// hand-off to feed a bounded poll loop; polling the job directly is simpler
-// and no less correct here. Invoke() is therefore a no-op that just returns
-// S_OK. Self-refcounted starting at 1 (the caller's ComPtr holds that first
-// reference); QueryInterface/AddRef/Release follow standard COM idiom.
-class SearchCompletedSink final : public ISearchCompletedCallback {
-public:
-    SearchCompletedSink() = default;
-    SearchCompletedSink(const SearchCompletedSink&) = delete;
-    SearchCompletedSink& operator=(const SearchCompletedSink&) = delete;
-
-    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
-        if (!ppv)
-            return E_POINTER;
-        if (riid == __uuidof(IUnknown) || riid == __uuidof(ISearchCompletedCallback)) {
-            *ppv = static_cast<ISearchCompletedCallback*>(this);
-            AddRef();
-            return S_OK;
-        }
-        *ppv = nullptr;
-        return E_NOINTERFACE;
-    }
-    STDMETHODIMP_(ULONG) AddRef() override {
-        return ref_.fetch_add(1, std::memory_order_relaxed) + 1;
-    }
-    STDMETHODIMP_(ULONG) Release() override {
-        const ULONG n = ref_.fetch_sub(1, std::memory_order_acq_rel) - 1;
-        if (n == 0)
-            delete this;
-        return n;
-    }
-
-    STDMETHODIMP Invoke(ISearchJob* /*searchJob*/,
-                        ISearchCompletedCallbackArgs* /*callbackArgs*/) override {
-        return S_OK;
-    }
-
-private:
-    std::atomic<ULONG> ref_{1};
-};
-
 // RAII owner for a BSTR returned by an out-parameter (e.g. IUpdate::
 // get_Title/get_MsrcSeverity), so the allocation is freed on every exit
 // path -- including a throwing conversion between the accessor call and
@@ -399,18 +351,21 @@ int do_missing(yuzu::CommandContext& ctx) {
         return 0;
     }
 
-    // BeginSearch requires a live, functioning callback object even though
-    // this call polls the job itself (see SearchCompletedSink above). put()
-    // takes ownership of the object's single starting refcount.
-    ComPtr<ISearchCompletedCallback> callback;
-    *callback.put() = new SearchCompletedSink();
-
+    // BeginSearch requires a live callback object even though this call
+    // polls the job itself; yuzu::agent::wua_noop_search_completed_callback()
+    // is a borrowed, process-lifetime singleton (see wua_noop_callback.hpp)
+    // -- not owned here, so no ComPtr/AddRef/Release on this end. A
+    // plugin-local callback would be unsafe to hand to WUA: it can still be
+    // holding a reference to it past this call's own bounded timeout, and a
+    // plugin-resident vtable is unmapped the moment the agent dlclose()s
+    // this module.
     BStr criteria(L"IsInstalled=0");
     VARIANT state;
     VariantInit(&state);
 
     ComPtr<ISearchJob> job;
-    hr = searcher->BeginSearch(criteria.get(), callback.get(), state, job.put());
+    hr = searcher->BeginSearch(criteria.get(), yuzu::agent::wua_noop_search_completed_callback(),
+                               state, job.put());
     if (FAILED(hr)) {
         ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               "windows_updates:begin_search_failed");
@@ -1093,7 +1048,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
      /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "wua_com_async_search", nullptr}},
     {"pending_reboot",
      /* linux   = */
-     {YUZU_SUPPORT_SUPPORTED, 3, "filesystem+uname+needs_restarting", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 3, "filesystem+uname+vmlinuz_ls+needs_restarting", nullptr},
      /* macos   = */
      {YUZU_SUPPORT_CONSTRAINED, 2, "softwareupdate",
       "bounded (60s deadline) since this migration, but still a slow network call -- "

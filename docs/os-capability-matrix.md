@@ -712,7 +712,7 @@ implementation is.
 | windows_updates | missing | linux | supported | 2 | apt+yum | - |
 | windows_updates | missing | macos | supported | 2 | softwareupdate | - |
 | windows_updates | missing | windows | supported | 1 | wua_com_async_search | - |
-| windows_updates | pending_reboot | linux | supported | 3 | filesystem+uname+needs_restarting | - |
+| windows_updates | pending_reboot | linux | supported | 3 | filesystem+uname+vmlinuz_ls+needs_restarting | - |
 | windows_updates | pending_reboot | macos | constrained | 2 | softwareupdate | bounded (60s deadline) since this migration, but still a slow network call -- no longer able to hang indefinitely on an offline/headless Mac |
 | windows_updates | pending_reboot | windows | supported | 1 | registry | - |
 | windows_updates | patch_connectivity | linux | supported | 1 | raw_sockets | - |
