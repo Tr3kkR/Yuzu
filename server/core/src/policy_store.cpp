@@ -890,7 +890,14 @@ bool PolicyStore::delete_policy(const std::string& id) {
     pg::PgResult res = pg::exec_params(
         lease.get(), "DELETE FROM policy_store.policies WHERE id = $1 RETURNING id",
         std::vector<std::string>{id});
-    return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) > 0;
+    const bool deleted = res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) > 0;
+    if (deleted)
+        // The CASCADE above removes this policy's policy_status rows too —
+        // the fleet-compliance aggregate must not keep counting them for up
+        // to 60s (adversarial review, 2026-08-24: the other three
+        // policy_status writers were fixed for this, this one was missed).
+        invalidate_fleet_compliance_cache();
+    return deleted;
 }
 
 // ── Compliance tracking ──────────────────────────────────────────────────────
