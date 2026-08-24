@@ -287,7 +287,19 @@ concurrency replaces it. Mutate-and-return uses `RETURNING` (#1033); no
     other two call sites (`update_baseline_from_form`, `delete_baseline_action`) are
     pre-existing code this diff never touches and remain on plain `get_baseline()`
     with no `store_ok` — same out-of-scope reasoning as the `bump_policy_generation`
-    finding above. **Not yet filed as an issue** (governance Gate-8 unhappy-path
-    correction: unlike the `bump_policy_generation` finding, which already had #3281,
-    this specific residual has no tracking issue as of this commit) — pending
-    dedupe-and-file.
+    finding above; tracked as **#3512**.
+- **Governance-deferred follow-ups (this PR's own hardening rounds, tracked not
+  silently dropped):**
+  - Handler-level degrade tests for the `GET .../device-compliance` REST route and
+    `server.cpp`'s heartbeat-reconcile/push-fan-out abort paths (only `deploy_baseline`
+    got one) — **#3513**.
+  - `update_baseline`'s full-column overwrite has no optimistic-concurrency guard; a
+    concurrent rename between `deploy_baseline`'s read and write is silently clobbered
+    (`deployed_snapshot` itself stays correct, only metadata) — **#3514**.
+  - No dedicated `docs/ops-runbooks/baseline-store-backfill-recovery.md` (5 of 8
+    sibling mandatory-backfill stores have one; not universal precedent, kept SHOULD) —
+    **#3515**.
+  - The malformed-`deployed_snapshot` divergence warn-logs (added this round) have no
+    accompanying Prometheus counter — sre disagreed with deferring this indefinitely
+    given its repeat-fire characteristic on the enforcement chokepoint; kept log-only
+    to avoid opening new metrics-plumbing surface mid-round — **#3516**.
