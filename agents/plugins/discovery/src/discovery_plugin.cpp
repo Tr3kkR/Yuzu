@@ -68,8 +68,25 @@
 #include "discovery_scan_plan.hpp" // pure sweep bounds + honest-degrade decisions
 
 // Portable (no platform guard of its own): parse_proc_net_arp for the Linux
-// leg, format_mac48 for the Windows leg.
+// leg, format_mac48 + is_resolved_arp_row for the Windows leg.
 #include "discovery_parsers.hpp"
+
+#ifdef _WIN32
+// Pin discovery_parsers.hpp's portable ArpRowStateMirror values against the
+// real NL_NEIGHBOR_STATE enum (governance-deferred #3249) — is_resolved_arp_row
+// is fixture-tested off-Windows against literal ints because this header has
+// no <netioapi.h> dependency; these static_asserts are what makes that safe:
+// if a future Windows SDK ever renumbered the enum, this build breaks loudly
+// here rather than get_arp_table() silently misclassifying every row.
+static_assert(static_cast<int>(NlnsUnreachable) == yuzu::discovery::kNlnsUnreachable);
+static_assert(static_cast<int>(NlnsIncomplete) == yuzu::discovery::kNlnsIncomplete);
+static_assert(static_cast<int>(NlnsProbe) == yuzu::discovery::kNlnsProbe);
+static_assert(static_cast<int>(NlnsDelay) == yuzu::discovery::kNlnsDelay);
+static_assert(static_cast<int>(NlnsStale) == yuzu::discovery::kNlnsStale);
+static_assert(static_cast<int>(NlnsReachable) == yuzu::discovery::kNlnsReachable);
+static_assert(static_cast<int>(NlnsPermanent) == yuzu::discovery::kNlnsPermanent);
+static_assert(static_cast<int>(NlnsMaximum) == yuzu::discovery::kNlnsMaximum);
+#endif
 
 #ifdef __APPLE__
 #include "route_sysctl_arp.hpp" // yuzu::shared::{fetch,parse}_rt_flags_llinfo — sysctl ARP read
@@ -215,20 +232,12 @@ ArpRead get_arp_table() {
     for (ULONG i = 0; i < table->NumEntries; ++i) {
         const MIB_IPNET_ROW2& row = table->Table[i];
 
-        // Accept resolved/reachable states only, equivalent to the old
-        // MIB_IPNET_TYPE_DYNAMIC|MIB_IPNET_TYPE_STATIC filter.
-        switch (row.State) {
-        case NlnsReachable:
-        case NlnsStale:
-        case NlnsDelay:
-        case NlnsProbe:
-        case NlnsPermanent:
-            break;
-        default:
-            continue;
-        }
-
-        if (row.PhysicalAddressLength < 6)
+        // is_resolved_arp_row (discovery_parsers.hpp) — extracted so this
+        // accept/reject decision is fixture-tested off-Windows (#3249); see
+        // the static_asserts above pinning its portable state mirror against
+        // the real NL_NEIGHBOR_STATE enum.
+        if (!yuzu::discovery::is_resolved_arp_row(
+                static_cast<int>(row.State), static_cast<int>(row.PhysicalAddressLength)))
             continue;
 
         char ip[INET_ADDRSTRLEN]{};
@@ -718,7 +727,13 @@ private:
         // timeout) has been accumulated above by severity. Apply the worst one
         // to the ABI4 result seam exactly once, here — never at the individual
         // sites — so an earlier, more specific reason can't be silently
-        // overwritten by a later, less specific one.
+        // overwritten by a later, less specific one. Two same-severity pairs
+        // are the deliberate exception, applied inside worst_of() by
+        // degrade_tie_prefers_candidate(): a later scan:timeout DOES displace
+        // an earlier arp:table_truncated or dns:hostname_lookup_degraded,
+        // because a scan-level timeout is the more actionable reason of the
+        // two, not the less (#3253). Every condition still writes its own
+        // status|warning line above regardless of which one wins here.
         if (worst_degrade.has_report) {
             ctx.set_result_status(worst_degrade.report.status, worst_degrade.report.completeness,
                                   worst_degrade.report.reason);
