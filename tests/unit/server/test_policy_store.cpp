@@ -780,6 +780,37 @@ TEST_CASE("PolicyStore: delete policy cascades", "[policy_store][pg][policy]") {
     CHECK(store.delete_policy(pol_result.value()) == false);
 }
 
+TEST_CASE("PolicyStore: delete policy invalidates the fleet compliance cache "
+          "(security-guardian finding, 2026-08-24)",
+          "[policy_store][pg][policy]") {
+    // delete_policy()'s CASCADE removes this policy's policy_status rows too
+    // (security-guardian caught this during the bounded re-review of the K7
+    // fix: the other three policy_status writers were fixed to invalidate
+    // the cache, this one was missed) — the fleet-compliance aggregate must
+    // not keep counting a deleted policy's rows for up to 60s.
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+
+    REQUIRE(store.update_agent_status(pol.value(), "agent-1", "non_compliant").has_value());
+
+    // Populate the cache with this policy's data present.
+    auto fc1 = store.get_fleet_compliance();
+    REQUIRE(fc1.has_value());
+    CHECK(fc1->total_checks == 1);
+
+    CHECK(store.delete_policy(pol.value()) == true);
+
+    auto fc2 = store.get_fleet_compliance();
+    REQUIRE(fc2.has_value());
+    CHECK(fc2->total_checks == 0);
+}
+
 TEST_CASE("PolicyStore: create policy with empty YAML", "[policy_store][pg][policy]") {
     YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
