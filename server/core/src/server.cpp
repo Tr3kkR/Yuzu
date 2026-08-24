@@ -4453,14 +4453,46 @@ public:
                         }
                         return;
                     }
-                    // Per-agent filtering as the fan-out (M4): only rules that target
-                    // this agent's OS and name it in scope. Cache scope membership
-                    // across rules sharing a scope_expr within this one reconcile.
                     // Baseline gate (docs/guardian-baseline-model.md): the rule source
                     // is the union of member Guards of *deployed* Baselines, so an
                     // enabled-but-undeployed Guard is never reconciled onto an agent.
+                    // ADR-0055 catastrophic-read set: a degraded read MUST abort this
+                    // reconcile, never fan out an empty deployed-set it cannot
+                    // distinguish from "nothing deployed" — mirrors the list_rules
+                    // degrade handling immediately above.
+                    auto deployed_result = deployed_member_rule_ids();
+                    if (!deployed_result) {
+                        metrics_
+                            .counter("yuzu_server_guardian_reconciles_total",
+                                     {{"result", "degraded"}})
+                            .increment();
+                        spdlog::warn("Guardian heartbeat reconcile: deployed_member_rule_ids "
+                                     "degraded ({}) — aborting re-push for agent_id={}",
+                                     deployed_result.error(), agent_id);
+                        if (audit_store_ && audit_store_->is_open()) {
+                            AuditEvent ev;
+                            ev.timestamp =
+                                std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+                            ev.principal = "system";
+                            ev.action = "guaranteed_state.reconcile";
+                            ev.target_type = "GuaranteedState";
+                            ev.target_id = agent_id;
+                            ev.detail = "heartbeat reconcile ABORTED — baseline store degraded (" +
+                                        deployed_result.error() +
+                                        "); agent rules did not converge (generation " +
+                                        std::to_string(agent_gen) + ")";
+                            ev.result = "degraded";
+                            (void)audit_store_->log(ev);
+                        }
+                        return;
+                    }
+                    // Per-agent filtering as the fan-out (M4): only rules that target
+                    // this agent's OS and name it in scope. Cache scope membership
+                    // across rules sharing a scope_expr within this one reconcile.
                     const auto rules =
-                        guardian::filter_deployed_members(*rules_result, deployed_member_rule_ids());
+                        guardian::filter_deployed_members(*rules_result, *deployed_result);
                     std::unordered_map<std::string, bool> scope_member;
                     auto push = guardian::build_agent_push(
                         rules, sess->os,
@@ -5274,11 +5306,39 @@ public:
         // Guardian Baselines — the deployable collection of Guards (M:N members +
         // included/excluded management-group assignment). Control-plane only; the
         // agent never hears the word "Baseline". See docs/guardian-baseline-model.md.
-        {
-            auto bl_db = cfg_.db_dir() / "guardian-baselines.db";
-            baseline_store_ = std::make_unique<BaselineStore>(bl_db);
-            if (baseline_store_ && baseline_store_->is_open())
-                spdlog::info("BaselineStore initialized at {}", bl_db.string());
+        // Migrated Postgres store (ADR-0006/0055, schema `baseline_store`) —
+        // construction fail-CLOSED per ADR-0012 §1 (same template as
+        // GuaranteedStateStore above, its closest Guardian-domain sibling): a
+        // reachable database whose schema can't migrate/open is a fatal startup
+        // error, never a serve-degraded state. `migrate_from_sqlite` runs the
+        // one-time, idempotent legacy-`guardian-baselines.db` backfill (ADR-0009)
+        // — every table here is AUTHORITATIVE operator-authored enforcement
+        // config, so a backfill failure is ALSO fatal (never serve on top of a
+        // partially-migrated Baseline set).
+        if (pg_pool_ && !startup_failed_) {
+            baseline_store_ = std::make_unique<BaselineStore>(*pg_pool_);
+            if (!baseline_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: baseline store migration/open failed "
+                              "(database reachable but the baseline_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                auto bl_db = cfg_.db_dir() / "guardian-baselines.db";
+                if (!baseline_store_->migrate_from_sqlite(bl_db)) {
+                    spdlog::error(
+                        "[PG] Refusing to start: Guardian Baseline legacy-SQLite backfill failed "
+                        "(see prior log lines) — Baselines are authoritative enforcement config "
+                        "and must not serve partially-migrated data. Operator remediation: "
+                        "repair {} or move it aside to skip the backfill (Baselines in it will "
+                        "NOT carry over)",
+                        bl_db.string());
+                    startup_failed_ = true;
+                } else {
+                    spdlog::info("BaselineStore initialized (schema baseline_store; legacy "
+                                 "backfill source {})",
+                                 bl_db.string());
+                }
+            }
         }
 
         // Phase 7: Runtime Configuration + Custom Properties
@@ -19344,8 +19404,19 @@ private:
                 // Baseline gate: push only Guards that are members of a *deployed*
                 // Baseline (docs/guardian-baseline-model.md). With nothing deployed
                 // the set is empty and a full_sync converges agents to zero guards.
+                // ADR-0055 catastrophic-read set: a degraded read MUST abort the
+                // push, never fan out an empty deployed-set indistinguishable from
+                // "nothing deployed" — same -2 sentinel as the list_rules degrade
+                // just above, so the REST caller maps it to 503.
+                auto deployed_result = deployed_member_rule_ids();
+                if (!deployed_result) {
+                    spdlog::warn("Guardian push: deployed_member_rule_ids degraded ({}) — "
+                                 "aborting push (scope={})",
+                                 deployed_result.error(), scope);
+                    return -2;
+                }
                 const auto rules =
-                    guardian::filter_deployed_members(*rules_result, deployed_member_rule_ids());
+                    guardian::filter_deployed_members(*rules_result, *deployed_result);
 
                 // Resolve the agent set this push is ADDRESSED to. H1 scopes a single
                 // toggle to the affected rule's scope_expr (was the whole fleet); an
@@ -20402,12 +20473,16 @@ private:
     // fan-out and the heartbeat reconcile filter their rule source through this via
     // guardian::filter_deployed_members. Empty when nothing is deployed — a
     // full_sync push then converges agents to zero guards (correct by model).
-    // Delegates to BaselineStore (one shared lock; the store owns the snapshot
+    // Delegates to BaselineStore (one pool lease; the store owns the snapshot
     // format) so an edit to a deployed Baseline's members does not change what the
     // fleet enforces until a Push-gated re-deploy rewrites the snapshot.
-    std::unordered_set<std::string> deployed_member_rule_ids() const {
+    // CATASTROPHIC-READ SET (CLAUDE.md Guardian invariant, ADR-0055): typed
+    // `std::expected` — a degraded read is `std::unexpected`, NEVER a silent
+    // empty set. Every caller MUST abort (503 / no-op push) on `!result`,
+    // mirroring how `list_rules()`'s degrade is handled just above.
+    std::expected<std::unordered_set<std::string>, std::string> deployed_member_rule_ids() const {
         if (!baseline_store_)
-            return {};
+            return std::unexpected("baseline store not wired");
         return baseline_store_->deployed_member_rule_ids();
     }
 

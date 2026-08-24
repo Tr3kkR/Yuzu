@@ -11586,7 +11586,21 @@ void RestApiV1::register_routes(
             }
 
             const bool deployed = (baseline->lifecycle == kBaselineDeployed);
-            const auto guard_ids = baseline_store->deployed_member_rule_ids(baseline->baseline_id);
+            // ADR-0055 catastrophic-read set: a degraded deployed_member_rule_ids
+            // read must 503, never render an empty guard_ids that would flow
+            // through rule_names_for/the compliance tally below as a false-clean
+            // "0 guards, fully compliant" report for this baseline.
+            auto guard_ids_result = baseline_store->deployed_member_rule_ids(baseline->baseline_id);
+            if (!guard_ids_result) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "baseline store degraded", cid),
+                                "application/json");
+                spdlog::warn("guardian.device.view baseline store degraded (503) cid={} "
+                             "agent_id={}",
+                             cid, agent_id);
+                return;
+            }
+            const auto& guard_ids = *guard_ids_result;
 
             // rule_id -> Guard name, resolved ONLY for this baseline's deployed
             // members (name-only read; never materializes the rule body blobs).
