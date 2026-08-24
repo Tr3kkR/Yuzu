@@ -50,6 +50,7 @@ else
     deploy/docker/docker-compose.full-uat.yml
     deploy/docker/docker-compose.sanitizer-uat.yml
     deploy/docker/docker-compose.demo.yml
+    deploy/docker/docker-compose.ha-postgres.yml
   )
 fi
 
