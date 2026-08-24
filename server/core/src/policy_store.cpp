@@ -142,53 +142,69 @@ PolicyAgentStatus read_agent_status(PGresult* res, int row) {
 
 // Loads a policy's inputs/triggers/management-groups on the SAME connection
 // (shared by the public get_policy()/query_policies() lease and
-// claim_due_policies()'s in-transaction conn).
-void load_policy_details(PGconn* conn, Policy& p) {
+// claim_due_policies()'s in-transaction conn). Returns false if ANY detail
+// query fails — these reads feed dispatch/remediation targeting decisions,
+// so a partial load must never be indistinguishable from a genuinely
+// detail-less policy (adversarial review, 2026-08-24: previously silently
+// left the affected vector empty and returned success regardless).
+bool load_policy_details(PGconn* conn, Policy& p) {
     pg::PgResult inputs = pg::exec_params(
         conn, "SELECT key, value FROM policy_store.policy_inputs WHERE policy_id = $1",
         std::vector<std::string>{p.id});
-    if (inputs.status() == PGRES_TUPLES_OK) {
-        for (int i = 0; i < PQntuples(inputs.get()); ++i) {
-            PolicyInput inp;
-            inp.policy_id = p.id;
-            inp.key = text_col(inputs.get(), i, 0);
-            inp.value = text_col(inputs.get(), i, 1);
-            p.inputs.push_back(std::move(inp));
-        }
+    if (inputs.status() != PGRES_TUPLES_OK)
+        return false;
+    for (int i = 0; i < PQntuples(inputs.get()); ++i) {
+        PolicyInput inp;
+        inp.policy_id = p.id;
+        inp.key = text_col(inputs.get(), i, 0);
+        inp.value = text_col(inputs.get(), i, 1);
+        p.inputs.push_back(std::move(inp));
     }
     pg::PgResult triggers = pg::exec_params(
         conn,
         "SELECT id, trigger_type, config_json FROM policy_store.policy_triggers "
         "WHERE policy_id = $1",
         std::vector<std::string>{p.id});
-    if (triggers.status() == PGRES_TUPLES_OK) {
-        for (int i = 0; i < PQntuples(triggers.get()); ++i) {
-            PolicyTrigger t;
-            t.id = to_i64(PQgetvalue(triggers.get(), i, 0));
-            t.policy_id = p.id;
-            t.trigger_type = text_col(triggers.get(), i, 1);
-            t.config_json = text_col(triggers.get(), i, 2);
-            p.triggers.push_back(std::move(t));
-        }
+    if (triggers.status() != PGRES_TUPLES_OK)
+        return false;
+    for (int i = 0; i < PQntuples(triggers.get()); ++i) {
+        PolicyTrigger t;
+        t.id = to_i64(PQgetvalue(triggers.get(), i, 0));
+        t.policy_id = p.id;
+        t.trigger_type = text_col(triggers.get(), i, 1);
+        t.config_json = text_col(triggers.get(), i, 2);
+        p.triggers.push_back(std::move(t));
     }
     pg::PgResult groups = pg::exec_params(
         conn, "SELECT group_id FROM policy_store.policy_groups WHERE policy_id = $1",
         std::vector<std::string>{p.id});
-    if (groups.status() == PGRES_TUPLES_OK) {
-        for (int i = 0; i < PQntuples(groups.get()); ++i)
-            p.management_groups.push_back(text_col(groups.get(), i, 0));
-    }
+    if (groups.status() != PGRES_TUPLES_OK)
+        return false;
+    for (int i = 0; i < PQntuples(groups.get()); ++i)
+        p.management_groups.push_back(text_col(groups.get(), i, 0));
+    return true;
 }
 
-std::optional<Policy> read_policy_by_id(PGconn* conn, const std::string& id) {
+// Distinguishes "not found" (nullopt, success) from a DB error (unexpected)
+// at BOTH the top-level policies query and the detail-table loads — a
+// caller must never see a present-but-partial Policy on a detail-query
+// failure (adversarial review, 2026-08-24: the top-level query already had
+// this distinction; the detail loader silently swallowed its own failures
+// and this function returned a plain optional that erased even the
+// top-level distinction on the way out through get_policy()).
+std::expected<std::optional<Policy>, PolicyReadError> read_policy_by_id(PGconn* conn,
+                                                                        const std::string& id) {
     std::string sql = std::string("SELECT ") + kPolicyCols +
                       " FROM policy_store.policies WHERE id = $1";
     pg::PgResult res = pg::exec_params(conn, sql.c_str(), std::vector<std::string>{id});
-    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
-        return std::nullopt;
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(PolicyReadError::kDegraded);
+    if (PQntuples(res.get()) == 0)
+        return std::optional<Policy>{std::nullopt};
     Policy p = read_policy_row(res.get(), 0);
-    load_policy_details(conn, p);
-    return p;
+    if (!load_policy_details(conn, p))
+        return std::unexpected(PolicyReadError::kDegraded);
+    return std::optional<Policy>{std::move(p)};
 }
 
 /// Moved from policy_evaluator.cpp (ADR-0056): due-ness is now fully internal
@@ -790,7 +806,10 @@ PolicyStore::query_policies(const PolicyQuery& q) const {
     results.reserve(static_cast<size_t>(PQntuples(res.get())));
     for (int i = 0; i < PQntuples(res.get()); ++i) {
         Policy p = read_policy_row(res.get(), i);
-        load_policy_details(lease.get(), p);
+        if (!load_policy_details(lease.get(), p)) {
+            spdlog::warn("PolicyStore::query_policies: detail load failed for policy {}", p.id);
+            return std::unexpected(PolicyReadError::kDegraded);
+        }
         results.push_back(std::move(p));
     }
     return results;
@@ -1268,12 +1287,12 @@ PolicyStore::claim_due_policies(int64_t now, int64_t default_interval_seconds,
 
         for (const auto& pid : due_ids) {
             auto p = read_policy_by_id(conn, pid);
-            if (!p) {
+            if (!p || !*p) {
                 failure = "failed to load claimed policy " + pid;
                 degraded = true;
                 return false;
             }
-            claimed.push_back(std::move(*p));
+            claimed.push_back(std::move(**p));
         }
         return true;
     });
@@ -1663,6 +1682,46 @@ bool PolicyStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_pat
         }
         const bool already_processed = PQntuples(marker.get()) > 0;
 
+        // Holder-side verification (adversarial review, 2026-08-24): presence
+        // under OUR fingerprint (above) only proves OUR exact file was
+        // already landed. It says nothing about a DIFFERENT legacy file a
+        // sibling replica landed under its own, different, fingerprint —
+        // and the identity-insert loop below is not safe to run against
+        // that: ON CONFLICT DO NOTHING silently no-ops fragment/policy rows
+        // a different fingerprint already landed, and policy_triggers has
+        // no conflict target at all, so it would silently APPEND duplicate
+        // rows from a second, unrelated legacy file. Every intent table
+        // here is write-once (see header) — there is no legitimate reason
+        // for two DIFFERENT legacy files to both need migrating, so any
+        // other real fingerprint already present means this replica's
+        // local file diverges from what is already live and needs an
+        // operator, not a silent merge. (No sourceless marker is ever
+        // stamped — see below — so any row found here is real content.)
+        if (!already_processed && !sourceless) {
+            pg::PgResult other = pg::exec_params(
+                conn,
+                "SELECT fingerprint FROM policy_store.sqlite_backfill_source "
+                "WHERE fingerprint != $1 LIMIT 1",
+                std::vector<std::string>{fingerprint});
+            if (other.status() != PGRES_TUPLES_OK) {
+                spdlog::error(
+                    "PolicyStore: migrate_from_sqlite: holder-side verification query "
+                    "failed: {}",
+                    PQerrorMessage(conn));
+                return false;
+            }
+            if (PQntuples(other.get()) > 0) {
+                spdlog::error(
+                    "PolicyStore: migrate_from_sqlite: legacy file at {} (fingerprint {}) "
+                    "diverges from an already-landed legacy backfill (fingerprint {}) — "
+                    "refusing (holder-side verification failed; two different legacy "
+                    "files for a write-once store needs operator reconciliation, never "
+                    "a silent merge)",
+                    legacy_db_path.string(), fingerprint, text_col(other.get(), 0, 0));
+                return false;
+            }
+        }
+
         if (!already_processed && !sourceless) {
             // FK-dependency order: fragments -> policies -> the three detail
             // tables. A dangling reference in a corrupt legacy file surfaces
@@ -1780,21 +1839,52 @@ bool PolicyStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_pat
         }
 
         // policy_status: direction-aware LIFECYCLE merge, run on EVERY call
-        // (not fingerprint-gated) — safe to repeat since the WHERE guard
-        // makes a no-op of any row Postgres is already at-or-ahead of. At
-        // the actual cutover boot Postgres starts empty, so every legacy row
-        // lands via the INSERT branch regardless of the guard.
+        // (not fingerprint-gated) — safe to repeat. Postgres-ahead-or-tied
+        // is a benign no-op (an idempotent re-run after PG has already
+        // accumulated fresh evaluator writes — at the actual cutover boot
+        // Postgres starts empty, so every legacy row lands via the fresh
+        // INSERT branch below regardless). Legacy-ahead FAILS CLOSED (fixed
+        // in adversarial review, 2026-08-24: the previous WHERE-guarded
+        // single UPSERT silently overwrote Postgres on legacy-ahead instead
+        // — an independently-advanced or restored legacy snapshot must
+        // never clobber live post-cutover status) the same as
+        // `DeploymentStore`'s IDENTITY mismatch handling — this needs a
+        // read-before-write since a WHERE-guarded UPSERT can express only
+        // "update" or "no-op", never "abort the whole call".
         for (const auto& r : legacy_status) {
+            pg::PgResult existing = pg::exec_params(
+                conn,
+                "SELECT last_check_at FROM policy_store.policy_status "
+                "WHERE policy_id = $1 AND agent_id = $2",
+                std::vector<std::string>{r.base.policy_id, r.base.agent_id});
+            if (existing.status() != PGRES_TUPLES_OK) {
+                spdlog::error("PolicyStore: migrate_from_sqlite: status ({},{}) existing-row "
+                             "read failed: {}",
+                             r.base.policy_id, r.base.agent_id, PQerrorMessage(conn));
+                return false;
+            }
+            if (PQntuples(existing.get()) > 0) {
+                const int64_t pg_last_check_at = to_i64(PQgetvalue(existing.get(), 0, 0));
+                if (r.base.last_check_at > pg_last_check_at) {
+                    spdlog::error(
+                        "PolicyStore: migrate_from_sqlite: status ({},{}) legacy "
+                        "last_check_at {} is ahead of Postgres's {} — refusing "
+                        "(legacy-ahead fails closed; needs operator reconciliation, "
+                        "never a silent overwrite)",
+                        r.base.policy_id, r.base.agent_id, r.base.last_check_at,
+                        pg_last_check_at);
+                    return false;
+                }
+                // Postgres-ahead-or-tied: benign no-op — fall through to the
+                // idempotent ON CONFLICT DO NOTHING insert, which never
+                // touches an existing row.
+            }
             pg::PgResult res = pg::exec_params(
                 conn,
                 "INSERT INTO policy_store.policy_status "
                 "(policy_id, agent_id, status, last_check_at, last_fix_at, check_result, "
                 " fix_attempt_count) VALUES ($1,$2,$3,$4,$5,$6,$7) "
-                "ON CONFLICT (policy_id, agent_id) DO UPDATE SET "
-                "  status = EXCLUDED.status, last_check_at = EXCLUDED.last_check_at, "
-                "  last_fix_at = EXCLUDED.last_fix_at, check_result = EXCLUDED.check_result, "
-                "  fix_attempt_count = EXCLUDED.fix_attempt_count "
-                "WHERE policy_store.policy_status.last_check_at < EXCLUDED.last_check_at",
+                "ON CONFLICT (policy_id, agent_id) DO NOTHING",
                 std::vector<std::string>{r.base.policy_id, r.base.agent_id, r.base.status,
                                          std::to_string(r.base.last_check_at),
                                          std::to_string(r.base.last_fix_at),

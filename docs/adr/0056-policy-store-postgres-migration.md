@@ -364,6 +364,41 @@ dispatch-count mismatch that turned out to be fully deterministic once traced (a
 `evaluate_now()` + immediate-tick sequence in the *unrelated* `interval throttles re-dispatch`
 test, not the new test itself).
 
+**Second correction (adversarial review — Kimi + Codex, cross-examined, 2026-08-24):** three HIGH
+findings, all confirmed against the code and against this ADR's own text before being fixed — the
+first two are cases where the implementation shipped the OPPOSITE of what this document already
+said the design was, not new design questions.
+
+1. **Backfill never compared a stored fingerprint against the local one.** The Backfill section
+   above commits to "the `RbacStore`/post-#2703 shape" for holder-side verification; the shipped
+   `migrate_from_sqlite` only checked whether *its own* fingerprint was already present, never what
+   fingerprint(s) were actually stored. A second replica booting with a genuinely different legacy
+   `policies.db` was not rejected — its identity rows silently no-opped via `ON CONFLICT DO
+   NOTHING`, and `policy_triggers` (no conflict target at all) would have appended duplicate rows
+   from the second file. Fixed: before the identity-insert block, when the marker table holds any
+   row for a fingerprint other than the local one, refuse and return `false` — every intent table
+   here is write-once, so two different legacy files for the same store is a state divergence that
+   needs an operator, never a silent merge.
+2. **`policy_status` backfill overwrote Postgres on legacy-ahead instead of failing closed** — this
+   directly contradicted the Backfill section above ("legacy-ahead fails closed the same as
+   `DeploymentStore`'s IDENTITY mismatch handling"); the shipped `WHERE`-guarded single UPSERT
+   instead updated Postgres whenever the legacy row's `last_check_at` was newer. Fixed with a
+   read-before-write: an existing `(policy_id, agent_id)` row with Postgres behind the legacy row
+   now fails the whole backfill call closed (needs a read first, since a WHERE-guarded UPSERT can
+   only express "update" or "no-op," never "abort"); Postgres-ahead-or-tied stays the existing
+   benign no-op; a genuinely absent row still inserts normally (the ordinary post-cutover case).
+3. **Detail-query failures (`policy_inputs`/`policy_triggers`/`policy_groups`) were silently
+   dropped**, so `query_policies()`/`get_policy()`/`claim_due_policies()` could return a "successful"
+   `Policy` missing inputs, triggers, or management groups on a transient failure of just one of
+   those three queries — exactly the degrade-distinguishable violation the Posture section above
+   forbids for reads feeding dispatch/remediation. Fixed: the detail loader now reports failure,
+   and every caller (including the now-`std::expected`-returning internal `read_policy_by_id`,
+   previously a plain optional that also silently conflated its OWN top-level query failure with
+   "not found") propagates `PolicyReadError::kDegraded` instead of a partial object.
+
+None of the three needed a design change — each is the implementation not doing what the Decision
+already committed to. Regression tests for both backfill fixes were added alongside them.
+
 ### Construction — fail-closed (this store lacked it even on SQLite)
 
 `server.cpp:4979-4986` constructs `PolicyStore` and only logs on failure today — unlike
@@ -459,3 +494,16 @@ relying on declaration order to prove it).
   the same shape as #3399's copy pass alone (chunked `LIMIT`/`OFFSET` read + batched
   `INSERT ... SELECT FROM unnest(...)` write) without the fingerprint-streaming half, since there
   is no fingerprint pass to make streaming here.
+- **`claim_due_policies`'s single-sweeper transaction is O(enabled policy count), uncapped per
+  tick** (adversarial review, 2026-08-24). It holds `pg_try_advisory_xact_lock('policy_store:dispatch')`
+  across a sweep, a due-policy read, and ~5 round trips per enabled policy (claim upsert + a
+  4-query detail load); `with_txn_for`'s timeout bounds pool-acquire only, not execution, so
+  lock-hold time grows with fleet policy count with no cap, batching, or statement-level timeout.
+  At real fleet scale (thousands of policies) this risks sibling replicas skipping their claim tick
+  entirely while one replica works through the full list, slipping dispatch cadence past what the
+  10s-tick/15s-grace contract budgets for. Not fixed now: this is the shape the Decision above
+  deliberately chose (one transaction, every enabled policy), and no measurement yet shows it's a
+  real problem at this migration's actual deployed scale — recorded here so it isn't rediscovered
+  from scratch. If/when fleet-scale measurement shows lock-hold time approaching the tick budget,
+  the fix is a per-tick cap on policies claimed (processing the remainder on subsequent ticks) or
+  batching the claim+detail loads via `unnest()`/`IN (...)`.
