@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <yuzu/plugin.h> // YuzuResultStatus / YuzuResultCompleteness (ABI4)
@@ -225,16 +226,48 @@ inline int degrade_severity(YuzuResultStatus status) {
 }
 
 /**
+ * Secondary tie-break rank for a same-severity worst_of() merge, consulted
+ * ONLY when degrade_severity() ties — every other pair keeps the original
+ * "earliest-accumulated report wins" rule unchanged (governance-deferred
+ * #3253).
+ *
+ * The gap #3253 found: `scan:timeout` ("the whole back half of the scan
+ * didn't run") is strictly more actionable than `arp:table_truncated`
+ * ("some cached neighbours are missing") when both are CONSTRAINED — but
+ * plain accumulation order let the ARP condition win because Step 1
+ * (ARP read) always runs before Step 4 (the scan deadline). Ranking
+ * `arp:table_truncated` below the default flips that ONE pair so the
+ * timeout wins regardless of accumulation order, without touching any other
+ * same-severity pair — e.g. `icmp:transmit_blocked` still beats a later
+ * `scan:timeout` on a tie (see worst_of's own test), because "the sweep
+ * couldn't transmit at all" is not the data-completeness case #3253 is
+ * about. Extend this table deliberately, one named pair at a time, rather
+ * than inventing a general actionability ordering nobody has asked for yet.
+ */
+inline int degrade_tie_rank(std::string_view reason) {
+    if (reason == "arp:table_truncated")
+        return -1;
+    return 0;
+}
+
+/**
  * Keep `current` if it is at least as severe as `candidate`; otherwise adopt
- * `candidate`. A tie keeps `current` — the earliest-reported reason — so two
- * equally severe conditions still surface the more upstream cause.
+ * `candidate`. A same-severity tie is broken by degrade_tie_rank() (#3253);
+ * a tie on THAT rank too keeps `current` — the earliest-reported reason —
+ * exactly as before.
  */
 inline MaybeDegrade worst_of(MaybeDegrade current, const MaybeDegrade& candidate) {
     if (!candidate.has_report)
         return current;
     if (!current.has_report)
         return candidate;
-    if (degrade_severity(candidate.report.status) > degrade_severity(current.report.status))
+
+    const int current_sev = degrade_severity(current.report.status);
+    const int candidate_sev = degrade_severity(candidate.report.status);
+    if (candidate_sev != current_sev)
+        return candidate_sev > current_sev ? candidate : current;
+
+    if (degrade_tie_rank(candidate.report.reason) > degrade_tie_rank(current.report.reason))
         return candidate;
     return current;
 }

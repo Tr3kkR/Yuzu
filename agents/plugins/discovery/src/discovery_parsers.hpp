@@ -110,4 +110,63 @@ inline std::vector<ArpEntry> parse_proc_net_arp(std::string_view text) {
     return out;
 }
 
+// ── Windows ARP-row filtering (portable predicate) ────────────────────────
+
+/**
+ * Mirrors Win32's NL_NEIGHBOR_STATE (netioapi.h / nldef.h) as plain named
+ * ints so the accept/reject predicate below needs no Windows header — it
+ * compiles and is fixture-tested on every leg, this Mac included, where
+ * <netioapi.h> does not exist. Values are the enum's own published, stable
+ * numeric ABI (unchanged since GetIpNetTable2 shipped) — never re-derive
+ * them elsewhere; discovery_plugin.cpp's real _WIN32 call site carries a
+ * static_assert pinning these against the actual enum, so a future SDK
+ * changing them would fail that build loudly rather than silently
+ * misclassify rows here.
+ */
+enum ArpRowStateMirror : int {
+    kNlnsUnreachable = 0,
+    kNlnsIncomplete = 1,
+    kNlnsProbe = 2,
+    kNlnsDelay = 3,
+    kNlnsStale = 4,
+    kNlnsReachable = 5,
+    kNlnsPermanent = 6,
+    kNlnsMaximum = 7,
+};
+
+/**
+ * The Windows ARP-row accept/reject decision get_arp_table()
+ * (discovery_plugin.cpp) applies to every MIB_IPNET_ROW2. Extracted as a
+ * pure predicate (governance-deferred #3249) so logic that used to be
+ * inline in the impure GetIpNetTable2-calling loop — and therefore
+ * untestable off Windows — can be fixture-tested with literal state/length
+ * values on every leg, the same treatment parse_proc_net_arp above and the
+ * macOS routing-socket parser (route_sysctl_arp.hpp) already give their own
+ * platform's unresolved-entry filtering.
+ *
+ * Accepts only a resolved/reachable-ish neighbour — Reachable, Stale, Delay,
+ * Probe, or Permanent, equivalent to the old MIB_IPNET_TYPE_DYNAMIC |
+ * MIB_IPNET_TYPE_STATIC filter this replaced — with a full 6-byte Ethernet
+ * MAC. Rejects an Unreachable/Incomplete (in-flight probe, no answer yet)
+ * row or a short/absent physical address.
+ *
+ * `state` and `phys_len` are plain ints rather than NL_NEIGHBOR_STATE/USHORT
+ * so this header stays platform-neutral like its Linux/macOS siblings; the
+ * real Windows call site passes `static_cast<int>(row.State)` and
+ * `static_cast<int>(row.PhysicalAddressLength)`.
+ */
+inline bool is_resolved_arp_row(int state, int phys_len) {
+    switch (state) {
+    case kNlnsReachable:
+    case kNlnsStale:
+    case kNlnsDelay:
+    case kNlnsProbe:
+    case kNlnsPermanent:
+        break;
+    default:
+        return false;
+    }
+    return phys_len >= 6;
+}
+
 } // namespace yuzu::discovery

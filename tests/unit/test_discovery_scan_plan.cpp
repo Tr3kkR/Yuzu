@@ -358,6 +358,56 @@ TEST_CASE("worst_of: a tie keeps the earlier (first-accumulated) report",
     CHECK(std::string_view{merged.report.reason} == "icmp:transmit_blocked");
 }
 
+TEST_CASE("worst_of: a scan-level timeout dominates an ARP-truncation tie, either order",
+          "[agent][discovery_scan_plan]") {
+    // #3253: the concrete gap governance Gate 5 (chaos-injector) found —
+    // arp:table_truncated is always accumulated before scan:timeout in
+    // do_scan_subnet's real Step 1 -> Step 4 order, so the old "earliest
+    // wins" rule silently surfaced the less-actionable data-completeness
+    // reason over "the whole back half of the scan didn't run". Both sides
+    // of accumulation order are asserted so the fix isn't order-dependent.
+    const auto truncated = degrade_for_arp(/*ok=*/true, /*complete=*/false);
+    const auto timeout = MaybeDegrade{true, timeout_degrade()};
+    REQUIRE(truncated.has_report);
+    CHECK(degrade_severity(truncated.report.status) == degrade_severity(timeout.report.status));
+
+    const auto truncated_then_timeout = worst_of(worst_of(MaybeDegrade{}, truncated), timeout);
+    REQUIRE(truncated_then_timeout.has_report);
+    CHECK(std::string_view{truncated_then_timeout.report.reason} == "scan:timeout");
+
+    const auto timeout_then_truncated = worst_of(worst_of(MaybeDegrade{}, timeout), truncated);
+    REQUIRE(timeout_then_truncated.has_report);
+    CHECK(std::string_view{timeout_then_truncated.report.reason} == "scan:timeout");
+}
+
+TEST_CASE("worst_of: the ARP-truncation tie-break does not widen to every same-severity pair",
+          "[agent][discovery_scan_plan]") {
+    // #3253's fix is scoped to the one named pair. icmp:transmit_blocked vs.
+    // scan:timeout must keep the ORIGINAL "earliest wins" behaviour — this
+    // is the same scenario the pre-existing "a tie keeps the earlier report"
+    // test above pins, re-asserted here so a future edit to degrade_tie_rank
+    // that generalises past arp:table_truncated is caught immediately.
+    const auto blocked = degrade_for_sweep(SweepTally{2, 2, 0});
+    const auto timeout = MaybeDegrade{true, timeout_degrade()};
+    REQUIRE(blocked.has_report);
+
+    const auto blocked_then_timeout = worst_of(worst_of(MaybeDegrade{}, blocked), timeout);
+    CHECK(std::string_view{blocked_then_timeout.report.reason} == "icmp:transmit_blocked");
+
+    const auto timeout_then_blocked = worst_of(worst_of(MaybeDegrade{}, timeout), blocked);
+    CHECK(std::string_view{timeout_then_blocked.report.reason} == "scan:timeout");
+}
+
+TEST_CASE("degrade_tie_rank: only arp:table_truncated ranks below the default",
+          "[agent][discovery_scan_plan]") {
+    CHECK(degrade_tie_rank("arp:table_truncated") < degrade_tie_rank("scan:timeout"));
+    CHECK(degrade_tie_rank("scan:timeout") == 0);
+    CHECK(degrade_tie_rank("icmp:transmit_blocked") == 0);
+    CHECK(degrade_tie_rank("icmp:ping_group_range") == 0);
+    CHECK(degrade_tie_rank("dns:hostname_lookup_degraded") == 0);
+    CHECK(degrade_tie_rank("anything:unrecognised") == 0);
+}
+
 TEST_CASE("degrade_severity: exhaustive ranking, UNAVAILABLE worst, OK/UNDECLARED least",
           "[agent][discovery_scan_plan]") {
     CHECK(degrade_severity(YUZU_RESULT_STATUS_UNAVAILABLE) >

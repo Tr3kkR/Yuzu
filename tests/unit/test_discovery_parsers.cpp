@@ -174,3 +174,88 @@ TEST_CASE("format_mac48 handles the all-zero and all-ones extremes",
     const unsigned char bcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
     CHECK(yuzu::discovery::format_mac48(bcast) == "ff:ff:ff:ff:ff:ff");
 }
+
+// ── is_resolved_arp_row (Windows leg's per-row filter, portable + tested
+//    everywhere; #3249) ───────────────────────────────────────────────────
+// Extracted from the impure GetIpNetTable2-calling loop in
+// discovery_plugin.cpp, which is genuinely Windows-only and unbuildable on
+// this Mac. The predicate itself takes plain ints (see discovery_parsers.hpp
+// for why) so it is fixture-tested here against literal state/length values
+// without ever calling GetIpNetTable2 — the actual Windows call site wiring
+// (static_cast<int>(row.State), the static_asserts pinning these mirror
+// values against the real NL_NEIGHBOR_STATE enum) is macOS-unverifiable and
+// stays that way; only this predicate is proven off-Windows.
+
+TEST_CASE("is_resolved_arp_row accepts every resolved/reachable-ish state with a full MAC",
+         "[agent][discovery_parsers]") {
+    using yuzu::discovery::is_resolved_arp_row;
+    using yuzu::discovery::kNlnsDelay;
+    using yuzu::discovery::kNlnsPermanent;
+    using yuzu::discovery::kNlnsProbe;
+    using yuzu::discovery::kNlnsReachable;
+    using yuzu::discovery::kNlnsStale;
+
+    // One assertion per accepted state, not a loop over a vector — a state
+    // dropped from the switch by a future edit fails its own named line.
+    CHECK(is_resolved_arp_row(kNlnsReachable, 6));
+    CHECK(is_resolved_arp_row(kNlnsStale, 6));
+    CHECK(is_resolved_arp_row(kNlnsDelay, 6));
+    CHECK(is_resolved_arp_row(kNlnsProbe, 6));
+    CHECK(is_resolved_arp_row(kNlnsPermanent, 6));
+}
+
+TEST_CASE("is_resolved_arp_row rejects Unreachable and Incomplete regardless of length",
+         "[agent][discovery_parsers]") {
+    using yuzu::discovery::is_resolved_arp_row;
+    using yuzu::discovery::kNlnsIncomplete;
+    using yuzu::discovery::kNlnsUnreachable;
+
+    // A no-answer-yet probe can still carry a stale/zero-length physical
+    // address; the state check must reject it before length is even
+    // considered — a predicate that only checks length would wrongly accept
+    // an Incomplete row with a leftover 6-byte address from a prior lease.
+    CHECK_FALSE(is_resolved_arp_row(kNlnsUnreachable, 6));
+    CHECK_FALSE(is_resolved_arp_row(kNlnsIncomplete, 6));
+    CHECK_FALSE(is_resolved_arp_row(kNlnsUnreachable, 0));
+}
+
+TEST_CASE("is_resolved_arp_row rejects an unrecognised/out-of-range state",
+         "[agent][discovery_parsers]") {
+    using yuzu::discovery::is_resolved_arp_row;
+    // A value the enum has never defined (a hypothetical future SDK state,
+    // or corrupt/garbage input) must fail closed via the `default:` branch,
+    // not be silently accepted.
+    CHECK_FALSE(is_resolved_arp_row(/*state=*/99, /*phys_len=*/6));
+    CHECK_FALSE(is_resolved_arp_row(/*state=*/-1, /*phys_len=*/6));
+}
+
+TEST_CASE("is_resolved_arp_row rejects a short physical address on an otherwise-resolved row",
+         "[agent][discovery_parsers]") {
+    using yuzu::discovery::is_resolved_arp_row;
+    using yuzu::discovery::kNlnsReachable;
+
+    // < 6 bytes: not a full Ethernet MAC (e.g. a still-resolving or
+    // non-Ethernet link-layer address) — must be rejected even though the
+    // state itself is Reachable.
+    CHECK_FALSE(is_resolved_arp_row(kNlnsReachable, 5));
+    CHECK_FALSE(is_resolved_arp_row(kNlnsReachable, 0));
+    // Boundary: exactly 6 is the minimum accepted, and longer (e.g. a
+    // hypothetical 8-byte FireWire EUI-64) is not rejected on length alone.
+    CHECK(is_resolved_arp_row(kNlnsReachable, 6));
+    CHECK(is_resolved_arp_row(kNlnsReachable, 8));
+}
+
+TEST_CASE("is_resolved_arp_row: the state mirror values match NL_NEIGHBOR_STATE's documented ABI",
+         "[agent][discovery_parsers]") {
+    // Pins the numeric values discovery_plugin.cpp's _WIN32 static_asserts
+    // also pin against the real enum — a divergence here would silently
+    // make every test above assert against the wrong integers.
+    CHECK(yuzu::discovery::kNlnsUnreachable == 0);
+    CHECK(yuzu::discovery::kNlnsIncomplete == 1);
+    CHECK(yuzu::discovery::kNlnsProbe == 2);
+    CHECK(yuzu::discovery::kNlnsDelay == 3);
+    CHECK(yuzu::discovery::kNlnsStale == 4);
+    CHECK(yuzu::discovery::kNlnsReachable == 5);
+    CHECK(yuzu::discovery::kNlnsPermanent == 6);
+    CHECK(yuzu::discovery::kNlnsMaximum == 7);
+}
