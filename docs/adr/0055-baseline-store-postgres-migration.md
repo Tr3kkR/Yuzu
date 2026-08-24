@@ -6,7 +6,10 @@
 - **Parents:** ADR-0006/0007/0008 (+Correction), ADR-0009, ADR-0012; ADR-0038
   (`GuaranteedStateStore` → PostgreSQL, the closest Guardian-domain precedent — this
   ADR follows its posture/catastrophic-read reasoning directly); the TagStore (ADR-0050)
-  / RbacStore (#2703) fingerprint-verified backfill shape; `docs/yuzu-guardian-design-v1.1.md`
+  / RbacStore (#2703) fingerprint-verified backfill shape; ADR-0052/#3398/#3399
+  (`DeviceTokenStore` backfill hardening — `sanitize_pg_text` applied here too, see
+  "Backfill" below); ADR-0053 (`CaStore`, #3475 — the racing-first-boot precedent the
+  "Concurrency at boot" section below responds to); `docs/yuzu-guardian-design-v1.1.md`
   §9.1 (schema) + §24 (standing invariants); `docs/guardian-baseline-model.md`.
 
 ## Context
@@ -126,6 +129,75 @@ replica's data was never part of.
   because it was copied from a precedent.
 - Legacy file retained read-only, moved aside (`.migrated-<epoch>`) after a verified
   backfill — one release rollback window, matching every other migrated store.
+- **Text sanitization (ADR-0052/#3398/#3399 hardening pass, applied here retroactively):**
+  every free-text field — on EVERY write path, live CRUD and backfill alike, including
+  `baseline_id`/`rule_id`/`group_id` themselves — is scrubbed via `sanitize_pg_text`
+  (invalid UTF-8 → U+FFFD, then embedded NUL → U+FFFD) before it reaches a bound
+  parameter, matching TagStore/RbacStore/CustomPropertiesStore/DeviceTokenStore. Without
+  this, an embedded NUL silently truncates at libpq's text-format bind (`pg_exec.hpp`
+  binds via `.c_str()`, no explicit length) — for an id column, that is a *wrong-row*
+  hazard (a write or a lookup silently landing on a different, truncated id), not just a
+  display glitch. The backfill's direction-aware "identical" compare uses the SAME
+  sanitized values on both sides (TagStore's exact reasoning: a prior partial pass
+  stored sanitized bytes, so raw-vs-stored would false-mismatch on precisely the rows
+  sanitization touched). Two enum-shaped legacy fields get validation instead of mere
+  sanitization, since they are validated on every LIVE write but were previously
+  unvalidated at rest in the legacy file: a legacy `lifecycle` outside
+  `{draft, deployed}` and a legacy assignment `disposition` outside
+  `{include, exclude}` each fail the backfill closed, naming the offending row, rather
+  than reaching `deployed_member_rule_ids()`'s `WHERE lifecycle = 'deployed'` filter (or
+  an assignment reader) as a silently-inert third state.
+- **Deliberately NOT ported: DeviceTokenStore's (#3399) streaming/batched-`unnest`
+  backfill rewrite.** That rewrite exists because device tokens are a per-agent-scoped
+  table whose size tracks fleet size (unbounded materialization risk); Baselines are a
+  small, operator-curated, fleet-wide catalog — dozens to low hundreds of rows, the
+  store's own header comment's "bounded operator-authored config (not a multi-GB/day
+  stream)" — the same scale class as `TagStore`/`GuaranteedStateStore`, both of which
+  also fully materialize their legacy snapshot and are the shipped, governance-approved
+  precedent this migration follows instead. Porting the streaming rewrite here would be
+  disproportionate complexity for no safety gain at this store's actual scale.
+
+### Concurrency at boot (2026-08-24 hardening pass, prompted by ADR-0053/#3475)
+
+`CaStore`'s migration surfaced a first-boot race class specific to ITS design (multiple
+replicas racing to *generate* a new root cert, a single-winner CAS with no pre-existing
+data to fall back on). `BaselineStore`'s backfill is a different shape — copying
+*existing* legacy data, not generating new state — but the underlying question
+("what happens when two replicas' boots overlap against one shared Postgres database")
+deserves the same explicit answer, not an assumption inherited silently:
+
+- **Two replicas backfilling from identical legacy content** (a shared golden image,
+  or a shared volume mounted twice) converge safely and require no operator action.
+  Whichever racer's `INSERT ... ON CONFLICT (baseline_id) DO NOTHING` reaches Postgres
+  first wins the row; Postgres's row-level lock on a conflicting insert **serializes**
+  the second racer's attempt (it blocks until the first commits, then resolves as a
+  real conflict) — this is a property of Postgres's MVCC insert path, not a coin-flip
+  outcome dependent on CPU scheduling. The blocked racer's own `migrate_from_sqlite`
+  call refuses THAT pass (`PQcmdTuples()=="0"`, "concurrent writer inserted mid-backfill
+  — refusing (re-run will compare directions cleanly)") rather than trying to
+  re-derive the direction compare inline mid-transaction; an immediate single-threaded
+  retry (matching `server.cpp`'s existing "a failed backfill sets `startup_failed_`,
+  the orchestrator restarts that replica" contract — no new self-heal-without-restart
+  machinery was added, unlike `CaStore`'s operator-requested enhancement) then finds
+  the row already present with identical content and completes normally. Verified by a
+  genuine two-thread test (`test_baseline_store.cpp`, `[concurrency]`), not a sequential
+  simulation — 8/8 clean runs, no flake, and no bounded-retry-attempt loop needed
+  (unlike `CaStore`'s UP-3 test) precisely because the row lock makes the outcome
+  deterministic rather than schedule-dependent.
+- **Two replicas backfilling from genuinely divergent legacy content** (a real
+  deployment error — two different files ended up "the" legacy source for different
+  replicas) is refused, not silently merged, whichever replica's fingerprint-stamp
+  attempt loses the `backfill_source_fingerprint` monotonic-promotion race — covered by
+  the sequential "holder-side fingerprint mismatch refuses" test. One residual property,
+  inherited from the TagStore/RbacStore shape this ADR follows rather than introduced
+  here: because the row-insert transaction and the fingerprint-stamp transaction are
+  two SEPARATE transactions (the TagStore two-phase shape), a divergent racer's OWN
+  distinct rows can already have committed by the time its fingerprint-stamp attempt
+  loses and reports failure — the failure means "this replica's completion was not
+  recorded as authoritative," not "nothing from this replica's legacy file reached
+  Postgres." A genuinely divergent multi-replica deployment already needs manual
+  reconciliation per the refusal's own log message; this is a pre-existing, accepted
+  property of the shape, not a new gap.
 
 ### Lifecycle / concurrency
 

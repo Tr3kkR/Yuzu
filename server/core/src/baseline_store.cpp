@@ -6,6 +6,7 @@
 #include "pg/pg_raii.hpp"
 #include "sqlite_raii.hpp"
 #include "store_errors.hpp"
+#include "utf8_sanitize.hpp"
 
 #include <libpq-fe.h>
 #include <openssl/evp.h>
@@ -61,6 +62,26 @@ std::int64_t to_i64(const char* s) {
 
 std::string format_conflict(std::string_view detail) {
     return std::string(kConflictPrefix) + " " + std::string(detail);
+}
+
+// Same treatment as CustomPropertiesStore/RbacStore/TagStore (ADR-0041/0045/0050):
+// scrub invalid UTF-8 to U+FFFD, then replace any embedded NUL the scrub leaves
+// behind — PostgreSQL TEXT can't store NUL and libpq's text-format bind
+// C-string-truncates at the first one (pg_exec.hpp binds via `.c_str()`, no
+// explicit length). Applied to every free-text value on every write path,
+// including the backfill (a bad byte at-rest in a legacy guardian-baselines.db
+// must not brick the MANDATORY backfill) and read-path id/name lookups
+// (consistency: a lookup must transform its argument identically to how the
+// matching row's id was transformed when written, or a NUL-bearing id could
+// silently miss the very row it was meant to address).
+std::string sanitize_pg_text(std::string_view s) {
+    std::string out = sanitize_utf8_strict(s);
+    std::size_t pos = 0;
+    while ((pos = out.find('\0', pos)) != std::string::npos) {
+        out.replace(pos, 1, "\xEF\xBF\xBD");
+        pos += 3;
+    }
+    return out;
 }
 
 std::optional<std::string> sha256_hex(std::string_view in) {
@@ -665,15 +686,44 @@ bool BaselineStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_p
                   [](const auto& a, const auto& b) { return a.baseline_id < b.baseline_id; });
 
         for (const auto& lb : sorted_baselines) {
+            // Sanitize once per row (embedded NUL / invalid UTF-8 — see
+            // sanitize_pg_text's doc comment) and compare/insert using these
+            // values throughout, never the raw legacy fields: a prior partial
+            // backfill pass would have stored SANITIZED bytes, so a raw-vs-
+            // stored compare would false-mismatch on exactly the rows
+            // sanitization touched (TagStore precedent).
+            const std::string lb_id = sanitize_pg_text(lb.baseline_id);
+            const std::string lb_name = sanitize_pg_text(lb.name);
+            const std::string lb_desc = sanitize_pg_text(lb.description);
+            const std::string lb_snap = sanitize_pg_text(lb.deployed_snapshot);
+            const std::string lb_created_by = sanitize_pg_text(lb.created_by);
+            const std::string lb_updated_by = sanitize_pg_text(lb.updated_by);
+            const std::string lb_deployed_by = sanitize_pg_text(lb.deployed_by);
+
+            // `lifecycle` is a controlled enum on every live write path
+            // (create_baseline/update_baseline never accept caller-supplied
+            // free text for it) but the legacy row is unvalidated at-rest —
+            // refuse a corrupt value rather than let it reach
+            // deployed_member_rule_ids()'s `WHERE lifecycle = 'deployed'`
+            // filter as neither draft nor deployed (silently excluded from
+            // both, indistinguishable from "successfully migrated").
+            if (lb.lifecycle != kBaselineDraft && lb.lifecycle != kBaselineDeployed) {
+                failure_detail = std::format(
+                    "legacy baseline '{}' has an invalid lifecycle '{}' (expected '{}' or '{}') "
+                    "— refusing to stamp a backfill containing it",
+                    lb_id, lb.lifecycle, kBaselineDraft, kBaselineDeployed);
+                return false;
+            }
+
             pg::PgResult stored = pg::exec_params(
                 c,
                 "SELECT name, description, lifecycle, deployed_snapshot, created_by, "
                 "updated_by, deployed_by, created_at, updated_at, deployed_at FROM "
                 "baseline_store.baselines WHERE baseline_id = $1",
-                std::vector<std::string>{lb.baseline_id});
+                std::vector<std::string>{lb_id});
             if (stored.status() != PGRES_TUPLES_OK) {
                 failure_detail = std::format("stored-row lookup failed for baseline '{}': {}",
-                                             lb.baseline_id, PQerrorMessage(c));
+                                             lb_id, PQerrorMessage(c));
                 return false;
             }
             if (PQntuples(stored.get()) == 0) {
@@ -684,9 +734,8 @@ bool BaselineStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_p
                     "created_at, updated_at, deployed_at) VALUES "
                     "($1,$2,$3,$4,$5,$6,$7,$8,$9::bigint,$10::bigint,$11::bigint) "
                     "ON CONFLICT (baseline_id) DO NOTHING",
-                    std::vector<std::string>{lb.baseline_id, lb.name, lb.description,
-                                             lb.lifecycle, lb.deployed_snapshot, lb.created_by,
-                                             lb.updated_by, lb.deployed_by,
+                    std::vector<std::string>{lb_id, lb_name, lb_desc, lb.lifecycle, lb_snap,
+                                             lb_created_by, lb_updated_by, lb_deployed_by,
                                              std::to_string(lb.created_at),
                                              std::to_string(lb.updated_at),
                                              std::to_string(lb.deployed_at)});
@@ -699,10 +748,10 @@ bool BaselineStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_p
                             "constraint with a DIFFERENT already-live baseline_id — a name "
                             "conflict between this replica's legacy data and live Postgres data "
                             "cannot be auto-resolved (refusing; rename one side and re-run)",
-                            lb.baseline_id, lb.name);
+                            lb_id, lb_name);
                     } else {
                         failure_detail = std::format("insert failed for baseline '{}': {}",
-                                                     lb.baseline_id, PQerrorMessage(c));
+                                                     lb_id, PQerrorMessage(c));
                     }
                     return false;
                 }
@@ -714,10 +763,10 @@ bool BaselineStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_p
                     failure_detail = std::format(
                         "concurrent writer inserted baseline '{}' mid-backfill — refusing "
                         "(re-run will compare directions cleanly)",
-                        lb.baseline_id);
+                        lb_id);
                     return false;
                 }
-                freshly_inserted.push_back(lb.baseline_id);
+                freshly_inserted.push_back(lb_id);
                 continue;
             }
 
@@ -736,9 +785,9 @@ bool BaselineStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_p
             const std::int64_t st_deployed_at = to_i64(PQgetvalue(stored.get(), 0, 9));
 
             const bool identical =
-                st_name == lb.name && st_desc == lb.description && st_life == lb.lifecycle &&
-                st_snap == lb.deployed_snapshot && st_created_by == lb.created_by &&
-                st_updated_by == lb.updated_by && st_deployed_by == lb.deployed_by &&
+                st_name == lb_name && st_desc == lb_desc && st_life == lb.lifecycle &&
+                st_snap == lb_snap && st_created_by == lb_created_by &&
+                st_updated_by == lb_updated_by && st_deployed_by == lb_deployed_by &&
                 st_created_at == lb.created_at && st_updated_at == lb.updated_at &&
                 st_deployed_at == lb.deployed_at;
             if (identical)
@@ -750,14 +799,14 @@ bool BaselineStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_p
                     "Postgres's value (benign; this replica's legacy snapshot predates live "
                     "progress); its live members/assignment are already complete and "
                     "authoritative, legacy children for this baseline are NOT copied",
-                    lb.baseline_id, st_updated_at, lb.updated_at);
+                    lb_id, st_updated_at, lb.updated_at);
                 continue;
             }
             failure_detail = std::format(
                 "legacy baseline '{}' {} Postgres's current value (stored updated_at={}; legacy "
                 "updated_at={}) — refusing to silently discard live Guardian enforcement "
                 "config; reconcile which side is authoritative before restarting",
-                lb.baseline_id,
+                lb_id,
                 lb.updated_at > st_updated_at ? "shows MORE progress than"
                                               : "contradicts (tied updated_at, differing content)",
                 st_updated_at, lb.updated_at);
@@ -775,28 +824,46 @@ bool BaselineStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_p
         const std::unordered_set<std::string> fresh_set(freshly_inserted.begin(),
                                                          freshly_inserted.end());
         for (const auto& m : snap.members) {
-            if (!fresh_set.contains(m.baseline_id))
+            const std::string m_baseline_id = sanitize_pg_text(m.baseline_id);
+            if (!fresh_set.contains(m_baseline_id))
                 continue;
+            const std::string m_rule_id = sanitize_pg_text(m.rule_id);
             pg::PgResult ins = pg::exec_params(
                 c, "INSERT INTO baseline_store.baseline_rules (baseline_id, rule_id) VALUES ($1, $2)",
-                std::vector<std::string>{m.baseline_id, m.rule_id});
+                std::vector<std::string>{m_baseline_id, m_rule_id});
             if (ins.status() != PGRES_COMMAND_OK) {
                 failure_detail = std::format("member insert failed for ({}, {}): {}",
-                                             m.baseline_id, m.rule_id, PQerrorMessage(c));
+                                             m_baseline_id, m_rule_id, PQerrorMessage(c));
                 return false;
             }
         }
         for (const auto& g : snap.groups) {
-            if (!fresh_set.contains(g.baseline_id))
+            const std::string g_baseline_id = sanitize_pg_text(g.baseline_id);
+            if (!fresh_set.contains(g_baseline_id))
                 continue;
+            // The legacy row's disposition is unvalidated at-rest (unlike
+            // set_assignment's live-write path, which rejects anything but
+            // kAssignInclude/kAssignExclude before it can be persisted) —
+            // refuse a corrupt value rather than silently insert a third
+            // disposition string the read paths (get_assignment's include-
+            // before-exclude sort, any future include/exclude-only consumer)
+            // were never designed to handle.
+            if (g.disposition != kAssignInclude && g.disposition != kAssignExclude) {
+                failure_detail = std::format(
+                    "legacy assignment row ({}, {}) has an invalid disposition '{}' (expected "
+                    "'{}' or '{}') — refusing to stamp a backfill containing it",
+                    g_baseline_id, g.group_id, g.disposition, kAssignInclude, kAssignExclude);
+                return false;
+            }
+            const std::string g_group_id = sanitize_pg_text(g.group_id);
             pg::PgResult ins = pg::exec_params(
                 c,
                 "INSERT INTO baseline_store.baseline_groups (baseline_id, group_id, disposition) "
                 "VALUES ($1, $2, $3)",
-                std::vector<std::string>{g.baseline_id, g.group_id, g.disposition});
+                std::vector<std::string>{g_baseline_id, g_group_id, g.disposition});
             if (ins.status() != PGRES_COMMAND_OK) {
                 failure_detail = std::format("assignment insert failed for ({}, {}): {}",
-                                             g.baseline_id, g.group_id, PQerrorMessage(c));
+                                             g_baseline_id, g_group_id, PQerrorMessage(c));
                 return false;
             }
         }
@@ -843,7 +910,7 @@ std::expected<std::string, std::string> BaselineStore::create_baseline(const Bas
         return std::unexpected("no database connection: " + pool_.last_error());
     PGconn* conn = lease.get();
 
-    const std::string id = b.baseline_id.empty() ? generate_id() : b.baseline_id;
+    const std::string id = sanitize_pg_text(b.baseline_id.empty() ? generate_id() : b.baseline_id);
     const int64_t now = now_epoch();
     const std::string lifecycle = b.lifecycle.empty() ? kBaselineDraft : b.lifecycle;
 
@@ -853,8 +920,10 @@ std::expected<std::string, std::string> BaselineStore::create_baseline(const Bas
         "(baseline_id, name, description, lifecycle, deployed_snapshot, created_by, updated_by, "
         " deployed_by, created_at, updated_at, deployed_at) "
         "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::bigint,$10::bigint,$11::bigint)",
-        std::vector<std::string>{id, b.name, b.description, lifecycle, b.deployed_snapshot,
-                                 b.created_by, b.updated_by, b.deployed_by, std::to_string(now),
+        std::vector<std::string>{id, sanitize_pg_text(b.name), sanitize_pg_text(b.description),
+                                 lifecycle, sanitize_pg_text(b.deployed_snapshot),
+                                 sanitize_pg_text(b.created_by), sanitize_pg_text(b.updated_by),
+                                 sanitize_pg_text(b.deployed_by), std::to_string(now),
                                  std::to_string(now), std::to_string(b.deployed_at)});
     if (res.status() != PGRES_COMMAND_OK) {
         const char* sqlstate_p = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
@@ -880,7 +949,8 @@ std::optional<Baseline> BaselineStore::get_baseline(const std::string& baseline_
         return std::nullopt;
     const std::string sql =
         std::string("SELECT ") + kBaselineCols + " FROM baseline_store.baselines WHERE baseline_id = $1";
-    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{baseline_id});
+    pg::PgResult res =
+        pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{sanitize_pg_text(baseline_id)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("BaselineStore::get_baseline: query failed: {}",
                       PQresultErrorMessage(res.get()));
@@ -912,7 +982,8 @@ std::optional<Baseline> BaselineStore::get_baseline_by_name(const std::string& n
     // Names are unique (create_baseline rejects a dup); LIMIT 1 is belt-and-braces.
     const std::string sql = std::string("SELECT ") + kBaselineCols +
                             " FROM baseline_store.baselines WHERE name = $1 LIMIT 1";
-    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{name});
+    pg::PgResult res =
+        pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{sanitize_pg_text(name)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("BaselineStore::get_baseline_by_name: query failed: {}",
                       PQresultErrorMessage(res.get()));
@@ -960,14 +1031,16 @@ std::expected<void, std::string> BaselineStore::update_baseline(const Baseline& 
 
     // RETURNING (not sqlite3_changes()-style count) so the affected-row test
     // rides in the query result — CLAUDE.md #1033.
+    const std::string id = sanitize_pg_text(b.baseline_id);
     pg::PgResult res = pg::exec_params(
         conn,
         "UPDATE baseline_store.baselines SET name = $1, description = $2, lifecycle = $3, "
         "deployed_snapshot = $4, updated_by = $5, deployed_by = $6, deployed_at = $7::bigint, "
         "updated_at = $8::bigint WHERE baseline_id = $9 RETURNING baseline_id",
-        std::vector<std::string>{b.name, b.description, b.lifecycle, b.deployed_snapshot,
-                                 b.updated_by, b.deployed_by, std::to_string(b.deployed_at),
-                                 std::to_string(now), b.baseline_id});
+        std::vector<std::string>{sanitize_pg_text(b.name), sanitize_pg_text(b.description),
+                                 b.lifecycle, sanitize_pg_text(b.deployed_snapshot),
+                                 sanitize_pg_text(b.updated_by), sanitize_pg_text(b.deployed_by),
+                                 std::to_string(b.deployed_at), std::to_string(now), id});
     if (res.status() != PGRES_TUPLES_OK) {
         const char* sqlstate_p = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
         const std::string sqlstate = sqlstate_p ? sqlstate_p : "";
@@ -990,7 +1063,7 @@ std::expected<void, std::string> BaselineStore::delete_baseline(const std::strin
     // reports whether the baseline existed without a separate row-count read.
     pg::PgResult res = pg::exec_params(
         lease.get(), "DELETE FROM baseline_store.baselines WHERE baseline_id = $1 RETURNING baseline_id",
-        std::vector<std::string>{baseline_id});
+        std::vector<std::string>{sanitize_pg_text(baseline_id)});
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected("delete failed: " + std::string(PQresultErrorMessage(res.get())));
     if (PQntuples(res.get()) == 0)
@@ -1001,10 +1074,11 @@ std::expected<void, std::string> BaselineStore::delete_baseline(const std::strin
 // ── Member Guards (M:N) ──────────────────────────────────────────────────────
 
 std::expected<void, std::string>
-BaselineStore::set_members(const std::string& baseline_id,
+BaselineStore::set_members(const std::string& baseline_id_in,
                            const std::vector<std::string>& rule_ids) {
     if (!open_)
         return std::unexpected("database not open");
+    const std::string baseline_id = sanitize_pg_text(baseline_id_in);
 
     // Existence check up front: an INSERT enforces the FK, but an EMPTY member
     // set inserts nothing, so a clear() against a bogus baseline_id would
@@ -1031,8 +1105,12 @@ BaselineStore::set_members(const std::string& baseline_id,
             error = "delete failed: " + std::string(PQerrorMessage(c));
             return false;
         }
+        // Sanitize BEFORE de-duping: two distinct raw values that sanitize to
+        // the same string must collapse to one insert, not a mid-transaction
+        // PK violation on the second.
         std::unordered_set<std::string> seen;
-        for (const auto& rule_id : rule_ids) {
+        for (const auto& raw_rule_id : rule_ids) {
+            const std::string rule_id = sanitize_pg_text(raw_rule_id);
             if (rule_id.empty() || !seen.insert(rule_id).second)
                 continue; // skip blanks + de-dup
             pg::PgResult ins = pg::exec_params(
@@ -1065,7 +1143,7 @@ BaselineStore::get_members_checked(const std::string& baseline_id) const {
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT rule_id FROM baseline_store.baseline_rules WHERE baseline_id = $1 ORDER BY rule_id",
-        std::vector<std::string>{baseline_id});
+        std::vector<std::string>{sanitize_pg_text(baseline_id)});
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
     std::vector<std::string> out;
@@ -1087,7 +1165,7 @@ BaselineStore::baselines_containing_rule(const std::string& rule_id) const {
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT baseline_id FROM baseline_store.baseline_rules WHERE rule_id = $1 ORDER BY baseline_id",
-        std::vector<std::string>{rule_id});
+        std::vector<std::string>{sanitize_pg_text(rule_id)});
     if (res.status() != PGRES_TUPLES_OK)
         return out;
     const int n = PQntuples(res.get());
@@ -1106,7 +1184,7 @@ std::size_t BaselineStore::remove_rule_everywhere(const std::string& rule_id) {
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "DELETE FROM baseline_store.baseline_rules WHERE rule_id = $1 RETURNING baseline_id",
-        std::vector<std::string>{rule_id});
+        std::vector<std::string>{sanitize_pg_text(rule_id)});
     if (res.status() != PGRES_TUPLES_OK)
         return 0;
     return static_cast<std::size_t>(PQntuples(res.get()));
@@ -1115,14 +1193,18 @@ std::size_t BaselineStore::remove_rule_everywhere(const std::string& rule_id) {
 // ── Assignment (included − excluded management groups) ───────────────────────
 
 std::expected<void, std::string>
-BaselineStore::set_assignment(const std::string& baseline_id,
+BaselineStore::set_assignment(const std::string& baseline_id_in,
                               const std::vector<BaselineGroupAssignment>& groups) {
     if (!open_)
         return std::unexpected("database not open");
+    const std::string baseline_id = sanitize_pg_text(baseline_id_in);
 
     // Validate + collapse duplicates (last disposition wins) BEFORE any write,
     // so an invalid disposition aborts with nothing persisted. Insertion order
-    // is irrelevant — the PK is (baseline_id, group_id).
+    // is irrelevant — the PK is (baseline_id, group_id). Sanitize BEFORE
+    // keying the map, same reasoning as set_members: two raw group_ids that
+    // sanitize identically must collapse to one map entry, not two INSERTs
+    // colliding mid-transaction.
     std::unordered_map<std::string, std::string> resolved;
     for (const auto& g : groups) {
         if (g.group_id.empty())
@@ -1130,7 +1212,7 @@ BaselineStore::set_assignment(const std::string& baseline_id,
         if (g.disposition != kAssignInclude && g.disposition != kAssignExclude)
             return std::unexpected("invalid disposition '" + g.disposition +
                                    "' (expected 'include' or 'exclude')");
-        resolved[g.group_id] = g.disposition;
+        resolved[sanitize_pg_text(g.group_id)] = g.disposition;
     }
 
     {
@@ -1186,7 +1268,7 @@ BaselineStore::get_assignment(const std::string& baseline_id) const {
         lease.get(),
         "SELECT group_id, disposition FROM baseline_store.baseline_groups WHERE baseline_id = $1 "
         "ORDER BY disposition, group_id",
-        std::vector<std::string>{baseline_id});
+        std::vector<std::string>{sanitize_pg_text(baseline_id)});
     if (res.status() != PGRES_TUPLES_OK)
         return out;
     const int n = PQntuples(res.get());
@@ -1209,7 +1291,7 @@ std::size_t BaselineStore::remove_group_everywhere(const std::string& group_id) 
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "DELETE FROM baseline_store.baseline_groups WHERE group_id = $1 RETURNING baseline_id",
-        std::vector<std::string>{group_id});
+        std::vector<std::string>{sanitize_pg_text(group_id)});
     if (res.status() != PGRES_TUPLES_OK)
         return 0;
     return static_cast<std::size_t>(PQntuples(res.get()));
@@ -1290,7 +1372,7 @@ BaselineStore::deployed_member_rule_ids(const std::string& baseline_id) const {
         lease.get(),
         "SELECT deployed_snapshot FROM baseline_store.baselines WHERE baseline_id = $1 AND "
         "lifecycle = $2",
-        std::vector<std::string>{baseline_id, kBaselineDeployed});
+        std::vector<std::string>{sanitize_pg_text(baseline_id), kBaselineDeployed});
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
     std::vector<std::string> ids;
@@ -1331,7 +1413,7 @@ std::size_t BaselineStore::member_count(const std::string& baseline_id) const {
         return 0;
     pg::PgResult res = pg::exec_params(
         lease.get(), "SELECT COUNT(*) FROM baseline_store.baseline_rules WHERE baseline_id = $1",
-        std::vector<std::string>{baseline_id});
+        std::vector<std::string>{sanitize_pg_text(baseline_id)});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
         return 0;
     return static_cast<std::size_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
