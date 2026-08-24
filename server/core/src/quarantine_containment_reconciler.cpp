@@ -67,9 +67,9 @@ void QuarantineContainmentReconciler::count(const char* result) const {
             .increment();
 }
 
-void QuarantineContainmentReconciler::audit_reapply(const std::string& agent_id,
-                                                     const std::string& command_id,
-                                                     std::string_view trigger) const {
+void QuarantineContainmentReconciler::audit_event(const std::string& agent_id,
+                                                   const std::string& detail,
+                                                   const char* result) const {
     if (!d_.audit_store || !d_.audit_store->is_open())
         return;
     AuditEvent ev;
@@ -78,24 +78,40 @@ void QuarantineContainmentReconciler::audit_reapply(const std::string& agent_id,
     ev.action = "quarantine.reapply";
     ev.target_type = "Security";
     ev.target_id = agent_id;
-    ev.detail = "command_id=" + command_id + " trigger=" + std::string(trigger);
-    ev.result = "success";
+    ev.detail = detail;
+    ev.result = result;
     (void)d_.audit_store->log(ev);
+}
+
+void QuarantineContainmentReconciler::audit_reapply(const std::string& agent_id,
+                                                     const std::string& command_id,
+                                                     std::string_view trigger) const {
+    audit_event(agent_id, "command_id=" + command_id + " trigger=" + std::string(trigger),
+               "success");
 }
 
 void QuarantineContainmentReconciler::audit_confirmed(const std::string& agent_id,
                                                        const std::string& command_id) const {
-    if (!d_.audit_store || !d_.audit_store->is_open())
-        return;
-    AuditEvent ev;
-    ev.timestamp = default_now_epoch();
-    ev.principal = "system";
-    ev.action = "quarantine.reapply";
-    ev.target_type = "Security";
-    ev.target_id = agent_id;
-    ev.detail = "CONFIRMED command_id=" + command_id;
-    ev.result = "success";
-    (void)d_.audit_store->log(ev);
+    audit_event(agent_id, "CONFIRMED command_id=" + command_id, "success");
+}
+
+void QuarantineContainmentReconciler::audit_unstamped(const std::string& agent_id,
+                                                       const std::string& command_id,
+                                                       std::string_view what,
+                                                       const std::string& store_error) const {
+    // #3425 governance Gate 2 (security-guardian): the observable, agent-
+    // facing action described by `what` already happened by the time this
+    // is called (a dispatch was accepted, or a status read confirmed
+    // state|active) — that is a real containment-affecting system fact and
+    // must leave an audit trail even though the durable stamp write failed,
+    // or a transient store outage creates a silent gap in exactly the
+    // evidence this verb exists to provide. `result="failure"` (not
+    // "success") because the DURABLE record disagrees — audit and store
+    // must never both claim more than what actually landed.
+    audit_event(agent_id,
+               std::string(what) + " command_id=" + command_id +
+                   " but the durable stamp failed: " + store_error,
+               "failure");
 }
 
 void QuarantineContainmentReconciler::tick() {
@@ -296,15 +312,24 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
             // this agent_id.
             auto mark_res = d_.quarantine_store->mark_endpoint_confirmed(agent_id, now_epoch());
             if (!mark_res) {
-                std::lock_guard<std::mutex> lk(mu_);
-                auto& st = state_[agent_id];
-                st.pending = Pending::none;
-                if (mark_res.error() == "device is not quarantined") {
-                    state_.erase(agent_id); // released concurrently — nothing left to confirm
-                } else {
-                    st.backoff = next_backoff(st.backoff, kMaxBackoff);
-                    st.next_eligible_at = steady_now + st.backoff;
+                {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    auto& st = state_[agent_id];
+                    st.pending = Pending::none;
+                    if (mark_res.error() == "device is not quarantined") {
+                        state_.erase(agent_id); // released concurrently — nothing left to confirm
+                    } else {
+                        st.backoff = next_backoff(st.backoff, kMaxBackoff);
+                        st.next_eligible_at = steady_now + st.backoff;
+                    }
                 }
+                // #3425 governance Gate 2 (security-guardian): the status
+                // read DID confirm state|active — that observation is a
+                // real fact regardless of whether the stamp landed, and
+                // must not vanish with no audit trail just because the
+                // store write failed. Outside the lock, matching K10.
+                audit_unstamped(agent_id, pending_command_id, "status read confirmed state|active",
+                                mark_res.error());
                 count("degraded");
                 return false;
             }
@@ -433,6 +458,11 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
                                      // the "KNOWN RESIDUAL RACE" note in the header) but
                                      // there is nothing left here to track as pending.
         }
+        // #3425 governance Gate 2 (security-guardian): the dispatch WAS
+        // accepted (agents_reached>0, checked above) — a real containment-
+        // affecting system action already happened and must not vanish
+        // with no audit trail just because the store stamp failed.
+        audit_unstamped(agent_id, reapply_res->command_id, "dispatch accepted", mark_res.error());
         count("degraded");
         return true; // the dispatch itself was still attempted
     }

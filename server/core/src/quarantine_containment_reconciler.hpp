@@ -38,9 +38,13 @@
 /// State: durable across restarts via `QuarantineStore::mark_endpoint_applied`/
 /// `mark_endpoint_confirmed` (schema v2); in-memory (this class) for
 /// per-agent phase/in-flight-command/backoff/confirmed-session bookkeeping —
-/// lost on restart, which costs at most one redundant status verify per
-/// active record (`last_confirmed_at != 0` is available to a future caller
-/// that wants to skip that cost; this component does not read it back today).
+/// lost on restart. A restart therefore costs one full apply-then-verify
+/// cycle per previously-confirmed active record, NOT merely a redundant
+/// verify: a fresh `AgentState` defaults `confirmed=false`, so the record
+/// re-enters via the normal apply path, not the cheaper `verify_first`
+/// status-only path (`last_confirmed_at != 0` is available in the store for
+/// a future caller that wants to skip straight to a status-only verify on
+/// restart; this component does not read it back today, so it does not).
 ///
 /// Concurrency: `tick()` and `notify_agent_heartbeat()` both funnel into
 /// `reconcile_one()`, which claims a per-agent rate-limit slot UNDER THE
@@ -212,9 +216,18 @@ private:
     // reaching the periodic backstop.
     bool reconcile_one(const std::string& agent_id, std::string_view trigger);
     void count(const char* result) const;
+    void audit_event(const std::string& agent_id, const std::string& detail,
+                     const char* result) const;
     void audit_reapply(const std::string& agent_id, const std::string& command_id,
                        std::string_view trigger) const;
     void audit_confirmed(const std::string& agent_id, const std::string& command_id) const;
+    // #3425 governance Gate 2 (security-guardian): the observable agent-facing
+    // action named by `what` already happened (dispatch accepted / status read
+    // confirmed state|active) even though the durable stamp write failed — this
+    // records that fact with result="failure" so a transient store outage never
+    // produces a silent audit gap. See the two call sites for the full rationale.
+    void audit_unstamped(const std::string& agent_id, const std::string& command_id,
+                         std::string_view what, const std::string& store_error) const;
     [[nodiscard]] std::int64_t now_epoch() const;
     [[nodiscard]] std::chrono::milliseconds min_reapply_interval() const;
     [[nodiscard]] std::chrono::milliseconds response_wait() const;

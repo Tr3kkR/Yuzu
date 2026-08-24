@@ -815,3 +815,66 @@ TEST_CASE("QuarantineContainmentReconciler: backoff doubling takes effect on THI
     reconciler.notify_agent_heartbeat("agent-1");
     CHECK(dispatch.calls.size() == 1); // still just the one dispatch — no premature retry
 }
+
+// #3425 governance Gate 2 (security-guardian, 2026-08-24): the two regression
+// tests above both wire `.audit_store = nullptr`, so neither one could ever
+// have caught a missing audit row on the mark_endpoint_applied/confirmed
+// failure path — the exact gap the fix below closes. This test wires a REAL
+// AuditStore and asserts the "dispatch accepted but the durable stamp
+// failed" row actually lands with result="failure".
+yuzu::test::PgTestTemplate quarantine_recon_audit_tpl{"reconaudit", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    AuditStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("reconaudit template: store failed to migrate");
+}};
+
+TEST_CASE("QuarantineContainmentReconciler: a release racing mark_endpoint_applied still leaves "
+          "an audit row for the dispatch that already happened",
+          "[pg][quarantine][reconciler][regression]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_recon_tpl);
+    PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineStore qstore{qpool};
+    REQUIRE(qstore.is_open());
+    REQUIRE(qstore.quarantine_device("agent-1", "admin", "malware", "").has_value());
+
+    YUZU_REQUIRE_PG_DB_TPL(adb, quarantine_recon_audit_tpl);
+    PgPool apool{{.conninfo = adb.dsn(), .size = 4}};
+    AuditStore astore{apool};
+    REQUIRE(astore.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry{bus, metrics};
+    registry.register_agent(make_info("agent-1"));
+
+    MockDispatch dispatch;
+    // Same K1 injection as the test above: release from inside the dispatch
+    // callback so mark_endpoint_applied's guarded UPDATE affects zero rows —
+    // but this time with a real audit_store wired, so the fix's
+    // audit_unstamped call has somewhere real to land.
+    dispatch.on_dispatch = [&] { REQUIRE(qstore.release_device("agent-1").has_value()); };
+
+    QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
+        .quarantine_store = &qstore,
+        .response_store = nullptr,
+        .registry = &registry,
+        .metrics = &metrics,
+        .audit_store = &astore,
+        .dispatch_fn = dispatch.fn(),
+        .now_fn = {},
+    });
+
+    reconciler.tick();
+    REQUIRE(dispatch.calls.size() == 1); // the dispatch itself still happened
+
+    AuditQuery aq;
+    aq.action = "quarantine.reapply";
+    auto events = astore.query(aq);
+    REQUIRE(events.has_value());
+    REQUIRE(events->size() == 1); // the one "dispatch accepted, stamp failed" row — no crash, no silent drop
+    CHECK(events->front().result == "failure"); // the store write failed — must not claim "success"
+    CHECK(events->front().target_id == "agent-1");
+    CHECK(events->front().detail.find("dispatch accepted") != std::string::npos);
+    CHECK(events->front().detail.find("device is not quarantined") != std::string::npos);
+}

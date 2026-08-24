@@ -451,11 +451,13 @@ quarantine record whose endpoint containment is not yet confirmed:
   device whose live agent session changes (a reboot, a service restart — the firewall rules from
   before the restart are gone) drops confirmation and re-verifies via `status` first, rather than
   blindly re-applying.
-- **Concurrency.** The agent-side quarantine plugin serializes its own mutating actions (a
-  2-second-bounded gate; a blocked caller answers `status|busy`) — the reconciler treats `busy` as
-  "already being handled," not a failure, and does not retry until its own per-agent backoff
-  (starting at 60s, doubling up to a 15-minute cap on repeated non-confirmation, reset on confirm)
-  elapses.
+- **Concurrency.** The shipped agent-side quarantine plugin's `do_status` currently answers only
+  `active`/`inactive` — a `status|busy` response (from a mutation-serialization gate on the plugin's
+  mutating actions) cannot occur until that agent-side work lands (open, unmerged issue #3429). The
+  reconciler already parses `busy` defensively regardless (`quarantine_reapply.hpp`) and treats it as
+  "already being handled," not a failure, so no reconciler change is needed once #3429 ships. Either
+  way, the reconciler does not retry until its own per-agent backoff (starting at 60s, doubling up to
+  a 15-minute cap on repeated non-confirmation, reset on confirm) elapses.
 - **Audit.** A system-initiated re-application is audited under `quarantine.reapply`
   (`principal: system`), distinct from an operator-initiated `quarantine.enable`/`quarantine.disable`
   — detail carries `command_id` and `trigger=tick|heartbeat`, or `CONFIRMED command_id=...` once
@@ -471,6 +473,13 @@ quarantine record whose endpoint containment is not yet confirmed:
 
 A manual re-issue of `quarantine_device` (MCP) still works and re-drives the same stored intent —
 it is redundant with the automatic reconciler, never required, and never harmful.
+
+**Known limitation.** A device released (`DELETE /api/v1/quarantine/{agent_id}`) at the exact moment
+the reconciler is mid-reapply for it can end up re-firewalled just after its record becomes released —
+a narrow timing window, not a routine occurrence. This is over-containment, not a containment gap: the
+device stays isolated a cycle longer than intended, never less isolated than the record says. If you
+release a device that was actively reconnecting, a follow-up `quarantine.status` check is a reasonable
+sanity step. Tracked for a proper fix (a claim/generation token on the active record).
 
 ## IOC Checking
 
