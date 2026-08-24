@@ -165,12 +165,14 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                                        CallerFn caller_fn,
                                        ResolveFn resolve_fn,
                                        yuzu::MetricsRegistry* metrics,
-                                       InstructionStore* instruction_store) {
+                                       InstructionStore* instruction_store,
+                                       VisibleSetFn visible_set_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                     response_store, mgmt_group_store, registry, tag_store, event_bus,
                     std::move(agents_json_fn), std::move(dispatch_fn), std::move(caller_fn),
-                    std::move(resolve_fn), metrics, instruction_store);
+                    std::move(resolve_fn), metrics, instruction_store,
+                    std::move(visible_set_fn));
 }
 
 void DashboardRoutes::register_routes(HttpRouteSink& sink,
@@ -184,7 +186,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                        CallerFn caller_fn,
                                        ResolveFn resolve_fn,
                                        yuzu::MetricsRegistry* metrics,
-                                       InstructionStore* instruction_store) {
+                                       InstructionStore* instruction_store,
+                                       VisibleSetFn visible_set_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     audit_fn_ = std::move(audit_fn);
@@ -199,6 +202,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     resolve_fn_ = std::move(resolve_fn);
     metrics_ = metrics;
     instruction_store_ = instruction_store;
+    visible_set_fn_ = std::move(visible_set_fn);
 
     // Phase 15.A — issue #547 metric registrations. The design doc
     // (docs/tar-dashboard.md §7) defines the catalog; PR-A implements the
@@ -346,7 +350,15 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     // -- GET /fragments/results/filter-bar ------------------------------------
     sink.Get("/fragments/results/filter-bar",
             [this](const httplib::Request& req, httplib::Response& res) {
+                // Flat gate (ADR-0017 PR-B admission migration onto
+                // require_list_read/authorize_list_read is out of scope
+                // here): a caller whose only Response:Read grant is
+                // management-group-scoped is still denied at this line
+                // (require_list_read's documented non-composition,
+                // auth_routes.hpp).
                 if (!perm_fn_(req, res, "Response", "Read")) return;
+                auto session = auth_fn_(req, res);
+                if (!session) return;
 
                 auto command_id = req.get_param_value("command_id");
                 auto plugin = req.get_param_value("plugin");
@@ -371,7 +383,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                     if (std::regex_match(raw, kTplIdRegex)) template_id = raw;
                 }
 
-                auto html = render_filter_bar(command_id, plugin, definition_id, template_id);
+                auto html = render_filter_bar(command_id, plugin, definition_id, template_id,
+                                              session->username);
                 res.set_content(html, "text/html; charset=utf-8");
             });
 
@@ -449,11 +462,20 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     // -- GET /fragments/create-group-form -------------------------------------
     sink.Get("/fragments/create-group-form",
             [this](const httplib::Request& req, httplib::Response& res) {
+                // Flat gate (ADR-0017 PR-B admission migration onto
+                // require_list_read/authorize_list_read is out of scope
+                // here): a caller whose only Response:Read grant is
+                // management-group-scoped is still denied at this line
+                // (require_list_read's documented non-composition,
+                // auth_routes.hpp).
                 if (!perm_fn_(req, res, "ManagementGroup", "Write")) return;
+                auto session = auth_fn_(req, res);
+                if (!session) return;
 
                 auto command_id = req.get_param_value("command_id");
                 auto plugin = req.get_param_value("plugin");
                 auto filters = parse_filters(req, plugin);
+                auto agent_scope = resolve_visible_scope(session->username);
 
                 // nullopt (unwired store, or filters.empty() with no store
                 // call attempted) renders the same as a genuine store
@@ -462,7 +484,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 // no-store/no-filter cases need a NEW distinction from it.
                 std::optional<int64_t> agent_count;
                 if (response_store_ && !filters.empty())
-                    agent_count = response_store_->facet_agent_count(command_id, filters);
+                    agent_count = response_store_->facet_agent_count(command_id, filters,
+                                                                      agent_scope);
                 else if (filters.empty())
                     agent_count = 0; // genuine: no filter → no scoped count
 
@@ -519,6 +542,28 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      return;
                  }
                  auto& agent_ids = *agent_ids_opt;
+
+                 // D2: intersect against the caller's Response:Read-visible
+                 // scope before the empty check — the raw (unscoped) list
+                 // never reaches the caller, and an all-dropped result falls
+                 // straight into the pre-existing 422 below rather than a
+                 // bespoke error.
+                 auto agent_scope = resolve_visible_scope(session->username);
+                 if (agent_scope) {
+                     std::unordered_set<std::string> scope_set(agent_scope->begin(),
+                                                                agent_scope->end());
+                     std::size_t before = agent_ids.size();
+                     std::erase_if(agent_ids, [&scope_set](const std::string& id) {
+                         return !scope_set.contains(id);
+                     });
+                     std::size_t dropped = before - agent_ids.size();
+                     if (dropped > 0) {
+                         audit_fn_(req, "response.read", "denied", "Response", command_id,
+                                   "scope_dropped=" + std::to_string(dropped) +
+                                       " surface=group_from_results");
+                     }
+                 }
+
                  if (agent_ids.empty()) {
                      res.status = 422;
                      res.set_header("HX-Retarget", "#group-form-slot");
@@ -560,9 +605,36 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  }
                  auto& group_id = *group_result;
 
-                 // Add all matching agents as static members
+                 // Add all matching agents as static members. A partial
+                 // failure must not be swallowed — the group already exists
+                 // (no rollback), so silently reporting full-count success
+                 // would leave the operator with an honestly-under-populated
+                 // group and no signal to review it.
+                 std::size_t added = 0;
+                 std::size_t failed = 0;
                  for (const auto& aid : agent_ids) {
-                     mgmt_group_store_->add_member(group_id, aid);
+                     if (mgmt_group_store_->add_member(group_id, aid)) {
+                         ++added;
+                     } else {
+                         ++failed;
+                     }
+                 }
+
+                 if (failed > 0) {
+                     audit_fn_(req, "group.create_from_results", "failure",
+                              "ManagementGroup", group_id,
+                              "partial_materialisation added=" + std::to_string(added) +
+                                  " failed=" + std::to_string(failed));
+                     res.status = 500;
+                     res.set_header("HX-Retarget", "#group-form-slot");
+                     res.set_content(
+                         "<span class=\"feedback-error\">Group '" + html_escape(group_name) +
+                             "' was created but only " + std::to_string(added) + " of " +
+                             std::to_string(agent_ids.size()) +
+                             " agents could be added. Review the group's membership before "
+                             "use.</span>",
+                         "text/html; charset=utf-8");
+                     return;
                  }
 
                  audit_fn_(req, "group.create_from_results", "success",
@@ -1627,6 +1699,19 @@ std::vector<FacetFilter> DashboardRoutes::parse_filters(const httplib::Request& 
 }
 
 // ---------------------------------------------------------------------------
+// resolve_visible_scope — D3 Response:Read visibility for the facet/scope
+// surfaces (unwired visible_set_fn_ == legacy-open, nullopt)
+// ---------------------------------------------------------------------------
+
+std::optional<std::vector<std::string>> DashboardRoutes::resolve_visible_scope(
+    const std::string& username) const {
+    if (!visible_set_fn_) return std::nullopt;
+    auto scope = visible_set_fn_(username);
+    if (!scope) return std::nullopt;
+    return std::vector<std::string>(scope->begin(), scope->end());
+}
+
+// ---------------------------------------------------------------------------
 // resolve_render_columns
 // ---------------------------------------------------------------------------
 
@@ -1725,6 +1810,11 @@ std::string DashboardRoutes::render_results(
         // facet_agent_count is degrade-distinguishable too — a degraded count
         // also hides the "Create Group" button below, the safer default for a
         // write-adjacent action on an uncertain count.
+        //
+        // Deliberately left unscoped here (and facet_response_ids above,
+        // same reasoning) — superseded by the #1712 in-handler recompute
+        // plan (per the PR-4 re-enumeration); no behaviour change at this
+        // site.
         auto count_opt = response_store_->facet_agent_count(command_id, filters);
         store_degraded = store_degraded || !count_opt.has_value();
         total_agent_count = count_opt.value_or(0);
@@ -2011,8 +2101,10 @@ std::string DashboardRoutes::render_results(
 std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
                                                 const std::string& plugin,
                                                 const std::string& definition_id,
-                                                const std::string& template_id) {
+                                                const std::string& template_id,
+                                                const std::string& username) {
     auto& cols = columns_for_plugin(plugin);
+    auto agent_scope = resolve_visible_scope(username);
 
     std::string html;
     html += "<form id=\"filter-bar\" class=\"filter-bar\" hx-sync=\"this:abort\">"
@@ -2084,7 +2176,7 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
         std::vector<FacetValue> facet_vals;
         bool facet_degraded = false;
         if (response_store_) {
-            auto facet_opt = response_store_->facet_values(command_id, col_idx);
+            auto facet_opt = response_store_->facet_values(command_id, col_idx, agent_scope);
             facet_degraded = !facet_opt.has_value();
             facet_vals = std::move(facet_opt).value_or(std::vector<FacetValue>{});
         }

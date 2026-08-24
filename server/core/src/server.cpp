@@ -16800,6 +16800,36 @@ private:
             }
             return std::nullopt; // global read or RBAC disabled → sees all
         };
+        // D3: the dashboard facet/scope surfaces' Response:Read-visible set
+        // (dashboard_routes.hpp VisibleSetFn) — deliberately NOT built on
+        // mgmt_group_store_->get_visible_agents the way visible_set_fn above
+        // is. That join is permission-AGNOSTIC (it returns agents reachable
+        // via ANY management-group role the caller holds), so a user with
+        // Response:Read scoped to group G1 and some unrelated role on group
+        // G2 would leak/materialise G2's agents into these dropdowns/groups.
+        // Instead this resolves through visible_agents_for_permission — the
+        // set-form of the SAME resolve_perm_groups/expand_visible_set
+        // resolver that check_scoped_permission and authorize_list_read use
+        // for admission — so the set is permission-specific, deny-aware,
+        // hierarchy-expanded, and set-equivalent to the committed per-agent
+        // predicate response_agent_in_scope (server.cpp) by shared
+        // construction. This is the RbacStore PRIMITIVE, not the
+        // authorize_list_read transport gate — the dashboard routes' flat
+        // perm_fn_ admission gates are untouched by this resolver.
+        auto response_visible_set_fn =
+            [this](const std::string& username) -> std::optional<std::set<std::string>> {
+            if (!rbac_enforcement_in_effect(rbac_store_.get())) return std::nullopt;
+            bool global_read = rbac_store_ && rbac_store_->is_open() &&
+                               rbac_store_->check_permission(username, "Response", "Read");
+            if (global_read) return std::nullopt; // global Response:Read sees all, #1715(b)
+            if (!rbac_store_ || !mgmt_group_store_) {
+                return std::set<std::string>{}; // fail-closed, no store to resolve against
+            }
+            auto v = rbac_store_->visible_agents_for_permission(username, "Response", "Read",
+                                                                 mgmt_group_store_.get());
+            if (!v) return std::set<std::string>{}; // degrade → fail-closed, never nullopt
+            return std::set<std::string>(v->begin(), v->end());
+        };
         auto audit_fn = [this](const httplib::Request& req, const std::string& action,
                                const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
@@ -18368,7 +18398,7 @@ private:
                 }
                 return {"", ""};
             },
-            &metrics_, instruction_store_.get());
+            &metrics_, instruction_store_.get(), response_visible_set_fn);
 
         // WorkflowRoutes — /fragments/executions, /fragments/schedules, /api/workflows/*,
         //                   /api/workflow-executions/*, /api/product-packs/*, /api/scope/estimate
