@@ -1069,6 +1069,43 @@ TEST_CASE("PolicyStore: get fleet compliance with no data", "[policy_store][pg][
     CHECK(fc->compliance_pct == 0.0);
 }
 
+TEST_CASE("PolicyStore: fleet compliance cache is invalidated on the store's "
+          "own writes (adversarial review K7, 2026-08-24)",
+          "[policy_store][pg][compliance]") {
+    // Regression for the eighth-correction fix: get_fleet_compliance()'s 60s
+    // TTL cache was never cleared by update_agent_status/invalidate_policy/
+    // invalidate_all_policies, so a status change could read back through
+    // the aggregate as stale for up to a minute (ADR-0012 §4 rule 2). This
+    // pins that a write immediately followed by a read sees the new value,
+    // not the cached one — both calls land well inside the 60s TTL, so a
+    // pass here is only possible if the write actually invalidated the
+    // cache rather than the TTL happening to have expired.
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+
+    REQUIRE(store.update_agent_status(pol.value(), "agent-1", "compliant").has_value());
+
+    // Populate the cache with the all-compliant picture.
+    auto fc1 = store.get_fleet_compliance();
+    REQUIRE(fc1.has_value());
+    CHECK(fc1->compliant == 1);
+    CHECK(fc1->non_compliant == 0);
+
+    // The store's own write should invalidate that cache entry.
+    REQUIRE(store.update_agent_status(pol.value(), "agent-1", "non_compliant").has_value());
+
+    auto fc2 = store.get_fleet_compliance();
+    REQUIRE(fc2.has_value());
+    CHECK(fc2->compliant == 0);
+    CHECK(fc2->non_compliant == 1);
+}
+
 TEST_CASE("PolicyStore: get policy agent statuses", "[policy_store][pg][compliance]") {
     YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -1142,6 +1179,54 @@ TEST_CASE("PolicyStore: invalidate policy resets statuses", "[policy_store][pg][
         REQUIRE(s->has_value());
         CHECK((*s)->status == "unknown");
     }
+}
+
+TEST_CASE("PolicyStore: invalidate policy clears a capped fix_attempt_count "
+          "(adversarial review K2, 2026-08-24)",
+          "[policy_store][pg][invalidation]") {
+    // Regression for the eighth-correction fix: invalidate_policy() only
+    // reset `status` to 'unknown', leaving fix_attempt_count at the cap —
+    // remediate() dispatches the fix before marking 'fixing' (gov UP-7), so
+    // the fix genuinely runs, but the very next update_agent_status('fixing')
+    // immediately flipped straight to 'error' because the stale counter was
+    // still >= kMaxFixAttempts, misrepresenting a real remediation attempt
+    // as already-failed.
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+
+    // Drive fix_attempt_count to the cap, same as the sibling cap test above.
+    REQUIRE(store.update_agent_status(pol.value(), "agent-1", "non_compliant").has_value());
+    for (int i = 0; i < 3; ++i)
+        REQUIRE(store.update_agent_status(pol.value(), "agent-1", "fixing").has_value());
+    auto capped = store.get_agent_status(pol.value(), "agent-1");
+    REQUIRE(capped.has_value());
+    REQUIRE(capped->has_value());
+    CHECK((*capped)->status == "fixing"); // 3rd attempt, still under the cap
+
+    // One more 'fixing' write confirms the cap is live before invalidation.
+    REQUIRE(store.update_agent_status(pol.value(), "agent-1", "fixing").has_value());
+    auto pre = store.get_agent_status(pol.value(), "agent-1");
+    REQUIRE(pre.has_value());
+    REQUIRE(pre->has_value());
+    CHECK((*pre)->status == "error");
+
+    auto inv = store.invalidate_policy(pol.value());
+    REQUIRE(inv.has_value());
+
+    // The next remediation's 'fixing' write must NOT immediately flip back
+    // to 'error' — that would mean invalidation didn't actually reset the
+    // lifecycle, only the visible status field.
+    REQUIRE(store.update_agent_status(pol.value(), "agent-1", "fixing").has_value());
+    auto post = store.get_agent_status(pol.value(), "agent-1");
+    REQUIRE(post.has_value());
+    REQUIRE(post->has_value());
+    CHECK((*post)->status == "fixing");
 }
 
 TEST_CASE("PolicyStore: invalidate nonexistent policy returns 0",
