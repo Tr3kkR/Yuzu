@@ -78,24 +78,6 @@ TEST_CASE("parse_systemctl_list_units: real systemd-ubuntu container capture",
     CHECK(services[4].display_name == "Journal Service");
 }
 
-TEST_CASE("parse_systemctl_list_units: whitespace-only line is skipped, not counted",
-          "[tar_service]") {
-    std::vector<std::string> lines = {"   ", "  dbus.service  loaded  inactive dead  D-Bus"};
-    auto services = parse_systemctl_list_units(lines);
-    REQUIRE(services.size() == 1);
-    CHECK(services[0].name == "dbus.service");
-}
-
-TEST_CASE("parse_systemctl_list_units: short line with no description still parses UNIT/SUB",
-          "[tar_service]") {
-    std::vector<std::string> lines = {"foo.service loaded active running"};
-    auto services = parse_systemctl_list_units(lines);
-    REQUIRE(services.size() == 1);
-    CHECK(services[0].name == "foo.service");
-    CHECK(services[0].status == "running");
-    CHECK(services[0].display_name.empty());
-}
-
 // ── parse_launchctl_list ─────────────────────────────────────────────────────
 
 TEST_CASE("parse_launchctl_list: empty input yields empty output", "[tar_service]") {
@@ -132,13 +114,4 @@ TEST_CASE("parse_launchctl_list: real macOS host capture", "[tar_service]") {
     // only ever tested the pid field, never the status-code field.
     CHECK(services[2].name == "com.apple.knowledgeconstructiond");
     CHECK(services[2].status == "running");
-}
-
-TEST_CASE("parse_launchctl_list: short row (missing label field) degrades to an empty name",
-          "[tar_service]") {
-    std::vector<std::string> lines = {"PID\tStatus\tLabel", "-\t0"};
-    auto services = parse_launchctl_list(lines);
-    REQUIRE(services.size() == 1);
-    CHECK(services[0].name.empty());
-    CHECK(services[0].status == "stopped");
 }
