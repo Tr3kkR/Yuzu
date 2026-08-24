@@ -291,8 +291,11 @@ class).
 
 ## Follow-ups
 
-- File the ADR-0010 §Consequences (b) operator purge-flag issue (webhook-specific instance of
-  the program-wide capability).
+- **#3562** — operator purge flag for a retained legacy secret-bearing file (ADR-0010
+  §Consequences (b), webhook-specific instance of the program-wide capability).
+- **#3561** — `webhook_deliveries` has no retention/prune pass; unlike `ResponseStore` it was
+  deliberately given a mandatory (not skippable) backfill, but no future retention policy was
+  decided at migration time.
 - `OffloadTargetStore`/`RuntimeConfigStore` (the remaining Wave-3 stores) should read this ADR as
   their template — in particular the fingerprint-excludes-secret-bytes decision and the
   teardown-ordering fix, both of which generalize directly.
