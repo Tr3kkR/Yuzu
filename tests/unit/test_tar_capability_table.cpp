@@ -130,4 +130,12 @@ TEST_CASE("tar_capture_sources.tsv matches capture_sources()", "[tar][capability
                                   << "' but capture_sources() no longer declares it");
         CHECK(code_rows.count(r) == 1);
     }
+
+    // Wave-2 registry reconciliation: pin the three rows this package
+    // flipped from planned to their real status, so a regression back
+    // toward "planned" fails here even if both sides were edited in
+    // lockstep (which the drift checks above would not catch).
+    CHECK(table_rows.count(Row{"arp", "linux", "supported", "procfs"}) == 1);
+    CHECK(table_rows.count(Row{"arp", "macos", "constrained", "route_sysctl"}) == 1);
+    CHECK(table_rows.count(Row{"mapdrive", "macos", "constrained", "getfsstat"}) == 1);
 }

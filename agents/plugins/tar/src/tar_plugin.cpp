@@ -388,17 +388,22 @@ std::vector<std::string> load_stabilization_exclusions(yuzu::tar::TarDatabase& d
 //     effective_network_capture_method) + opt-in netqual are each native
 //     (rung 1) on every OS. macOS's process/tcp legs self-heal to a poll
 //     without the ES entitlement / nstat root privilege
-//     (tar_schema_registry.cpp process/tcp rows: kSupportedConstrained); on
-//     both Linux and macOS the opt-in arp/dns sub-sources are kPlanned
-//     (tar_arp_collector.cpp / tar_dns_collector.cpp) — CONSTRAINED, not a
-//     bare SUPPORTED, on those two legs.
-//   - collect_slow: service (SCM native / systemctl+launchctl popen) + user
-//     (native WTS/utmp/utmpx) + opt-in netconn/mapdrive. Windows is all
-//     native (scm/wts/wnet/wevtapi, rung 1). Linux/macOS service enumeration
-//     shells out via popen (tar_service_collector.cpp, rung 3 — the worst
-//     rung actually exercised on that OS); mapdrive is popen on Linux
-//     (tar_mapdrive_collector.cpp run_command, smbstatus) but a kPlanned
-//     empty stub on macOS, and netconn is kPlanned (no-op) on both non-
+//     (tar_schema_registry.cpp process/tcp rows: kSupportedConstrained); the
+//     opt-in arp sub-source is now wired natively on both non-Windows legs
+//     too (tar_arp_collector.cpp: /proc/net/arp on Linux, the shared
+//     route_sysctl_arp.hpp sysctl dump on macOS — constrained there,
+//     entry_type always 'unknown'), while dns remains kPlanned
+//     (tar_dns_collector.cpp) on both — CONSTRAINED, not a bare SUPPORTED,
+//     on those two legs.
+//   - collect_slow: service (SCM native / systemctl+launchctl, rung-2 argv
+//     via the shared subprocess runner) + user (native WTS/utmp/utmpx) +
+//     opt-in netconn/mapdrive. Windows is all native (scm/wts/wnet/wevtapi,
+//     rung 1). Linux/macOS service enumeration runs bounded argv
+//     (tar_service_collector.cpp, rung 2 — the worst rung actually
+//     exercised on that OS); mapdrive is native getfsstat (rung 1,
+//     outbound-live-only, constrained) on macOS and a rung-1/rung-2 mix on
+//     Linux (native /proc/mounts + /etc/fstab reads, rung-2 argv for
+//     smbstatus/journalctl), and netconn is kPlanned (no-op) on both non-
 //     Windows OSes (tar_netconn_win.cpp #else).
 //   - collect_perf: device counters (tar_perf.cpp) native on Windows/Linux,
 //     kPlanned (host_statistics) on macOS — the target rung is still 1
@@ -426,13 +431,14 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     },
     {
         "snapshot",
-        {YUZU_SUPPORT_CONSTRAINED, 3, "procfs+systemctl+dpkg_rpm(planned)",
+        {YUZU_SUPPORT_CONSTRAINED, 2, "procfs+systemctl+dpkg_rpm(planned)",
          "software inventory collection is PLANNED (dpkg/rpm not yet wired) on Linux; "
-         "service enumeration shells out via popen(systemctl)"},
-        {YUZU_SUPPORT_CONSTRAINED, 3, "endpoint_security+nstat+launchctl+pkgutil(planned)",
-         "software and mapdrive collection are PLANNED on macOS; service enumeration "
-         "shells out via popen(launchctl); process/tcp fall back to a poll without the "
-         "Endpoint Security entitlement or nstat root privilege"},
+         "service enumeration runs bounded argv (rung 2) via the shared subprocess runner"},
+        {YUZU_SUPPORT_CONSTRAINED, 2, "endpoint_security+nstat+launchctl+getfsstat+pkgutil(planned)",
+         "software collection is PLANNED on macOS; mapdrive is wired but outbound-live-only "
+         "(getfsstat, no username, no inbound, no history); service enumeration runs bounded "
+         "argv (rung 2) via the shared subprocess runner; process/tcp fall back to a poll "
+         "without the Endpoint Security entitlement or nstat root privilege"},
         {YUZU_SUPPORT_SUPPORTED, 1, "etw+iphlpapi+scm+wts+wnet+wevtapi+registry", nullptr},
     },
     {
@@ -450,22 +456,27 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         "collect_fast",
         {YUZU_SUPPORT_CONSTRAINED, 1, "procfs",
-         "arp/dns opt-in sub-sources are PLANNED (no-op) on Linux; core "
-         "process/network/netqual collection is native"},
-        {YUZU_SUPPORT_CONSTRAINED, 1, "endpoint_security+nstat",
+         "dns opt-in sub-source is PLANNED (no-op) on Linux; arp opt-in sub-source is "
+         "native (procfs, /proc/net/arp); core process/network/netqual collection is "
+         "native"},
+        {YUZU_SUPPORT_CONSTRAINED, 1, "endpoint_security+nstat+route_sysctl",
          "process/tcp fall back to a KERN_PROC_ALL/proc_pidfdinfo poll without the "
-         "Endpoint Security entitlement or nstat root privilege; arp/dns opt-in "
-         "sub-sources are PLANNED (no-op) on macOS"},
+         "Endpoint Security entitlement or nstat root privilege; dns opt-in sub-source "
+         "is PLANNED (no-op) on macOS; arp opt-in sub-source is native but constrained "
+         "(route_sysctl, entry_type always 'unknown')"},
         {YUZU_SUPPORT_SUPPORTED, 1, "etw+iphlpapi", nullptr},
     },
     {
         "collect_slow",
-        {YUZU_SUPPORT_CONSTRAINED, 3, "systemctl+utmp",
-         "service enumeration shells out via popen(systemctl); startup_type reads "
-         "'unknown'; netconn opt-in source is PLANNED (no-op) on Linux"},
-        {YUZU_SUPPORT_CONSTRAINED, 3, "launchctl+utmpx",
-         "service enumeration shells out via popen(launchctl); no startup_type; "
-         "mapdrive and netconn opt-in sources are PLANNED (no-op) on macOS"},
+        {YUZU_SUPPORT_CONSTRAINED, 2, "systemctl+utmp",
+         "service enumeration runs bounded argv (rung 2) via the shared subprocess "
+         "runner; startup_type reads 'unknown'; netconn opt-in source is PLANNED "
+         "(no-op) on Linux"},
+        {YUZU_SUPPORT_CONSTRAINED, 2, "launchctl+utmpx+getfsstat",
+         "service enumeration runs bounded argv (rung 2) via the shared subprocess "
+         "runner; no startup_type; mapdrive opt-in source is wired but "
+         "outbound-live-only (getfsstat, no username, no inbound, no history); "
+         "netconn opt-in source is PLANNED (no-op) on macOS"},
         {YUZU_SUPPORT_SUPPORTED, 1, "scm+wts+wnet+wevtapi", nullptr},
     },
     {
@@ -2210,13 +2221,14 @@ private:
         // §3.8 mapdrive — the capture mechanism is fixed per-OS (no runtime/health-
         // dependent path like process/module), so this reports the platform method
         // for parity with the other *_capture_method keys; the full per-OS matrix is
-        // in the `compatibility` action. "none" where the source is kPlanned.
+        // in the `compatibility` action. macOS reports "getfsstat" (outbound-live-only,
+        // constrained — see the mapdrive os_support row).
 #if defined(_WIN32)
         ctx.write_output("config|mapdrive_capture_method|wnet");
 #elif defined(__linux__)
         ctx.write_output("config|mapdrive_capture_method|procfs");
 #else
-        ctx.write_output("config|mapdrive_capture_method|none");
+        ctx.write_output("config|mapdrive_capture_method|getfsstat");
 #endif
         return 0;
     }

@@ -491,8 +491,6 @@ GRANDFATHERED = {
     # remove, the remaining half of #3405.
     "agents/plugins/network_config/src/network_config_plugin.cpp",
     "agents/plugins/software_actions/src/software_actions_plugin.cpp",
-    "agents/plugins/tar/src/tar_mapdrive_collector.cpp",
-    "agents/plugins/tar/src/tar_service_collector.cpp",
     "agents/plugins/vuln_scan/src/config_checks.hpp",
     "agents/plugins/vuln_scan/src/vuln_scan_plugin.cpp",
     "agents/plugins/windows_updates/src/windows_updates_plugin.cpp",
