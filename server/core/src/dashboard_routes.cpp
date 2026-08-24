@@ -462,12 +462,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     // -- GET /fragments/create-group-form -------------------------------------
     sink.Get("/fragments/create-group-form",
             [this](const httplib::Request& req, httplib::Response& res) {
-                // Flat gate (ADR-0017 PR-B admission migration onto
-                // require_list_read/authorize_list_read is out of scope
-                // here): a caller whose only Response:Read grant is
-                // management-group-scoped is still denied at this line
-                // (require_list_read's documented non-composition,
-                // auth_routes.hpp).
+                // Flat ManagementGroup:Write admission stays until ADR-0017
+                // PR-B; management-group-scoped Response:Read is applied only
+                // as a filter below and does not compose into this gate
+                // (auth_routes.hpp).
                 if (!perm_fn_(req, res, "ManagementGroup", "Write")) return;
                 auto session = auth_fn_(req, res);
                 if (!session) return;
@@ -497,6 +495,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     // -- POST /api/dashboard/group-from-results -------------------------------
     sink.Post("/api/dashboard/group-from-results",
              [this](const httplib::Request& req, httplib::Response& res) {
+                 // Flat ManagementGroup:Write admission stays until ADR-0017
+                 // PR-B; management-group-scoped Response:Read is applied only
+                 // as a filter below and does not compose into this gate
+                 // (auth_routes.hpp).
                  if (!perm_fn_(req, res, "ManagementGroup", "Write")) return;
                  auto session = auth_fn_(req, res);
                  if (!session) return;
