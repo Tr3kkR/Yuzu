@@ -24,7 +24,13 @@
 ///     per-replica and in-memory: only the replica that dispatched a check
 ///     ever holds its in-flight entry, so there is nothing to coordinate here
 ///     — `update_agent_status`'s UPSERT is naturally idempotent against a
-///     racing manual evaluate_now()/remediate() call on another replica.
+///     racing manual evaluate_now()/remediate() call on another replica FOR
+///     THE STATUS VALUE (each write converges to a consistent final row).
+///     This does NOT extend to remediate()'s retry-attempt counter (governance
+///     UP-3, 2026-08-24): two concurrent remediate() calls for the same
+///     policy — same-process, guarded by `remediating_`; cross-replica,
+///     still open — each independently increment it, which is a real double
+///     count, not an idempotent no-op.
 ///
 /// Remediation is MANUAL and opt-in (operator-gated) and only available when
 /// the fragment defines a fix_instruction: `remediate()` marks targets
@@ -42,6 +48,7 @@
 #include <expected>
 #include <functional>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -123,6 +130,13 @@ public:
     struct RemediateResult {
         bool ok{false};
         std::string error;        // set when !ok
+        // Governance (2026-08-24): set explicitly by remediate() at each
+        // degrade return point — the caller must not infer this from a
+        // string prefix on `error`. A previous route-layer version keyed off
+        // `error.starts_with("policy store")`, an unshared, untested string
+        // contract a future reword of any degrade message would silently
+        // break (consistency-auditor SHOULD-2).
+        bool degraded{false};
         std::string execution_id; // fix-dispatch execution id when ok
         int agents{0};            // agents the fix was dispatched to
     };
@@ -152,8 +166,16 @@ private:
     };
 
     Deps d_;
-    std::mutex mu_;                                   // guards in_flight_
+    std::mutex mu_;                                   // guards in_flight_, remediating_
     std::vector<InFlight> in_flight_;
+    // Governance UP-3 (2026-08-24): reserved policy_ids between remediate()'s
+    // dedupe check and the FixWait entry landing in in_flight_ — the window
+    // kickoff_check doesn't have (it dispatches, THEN registers, all under a
+    // single caller). remediate() burns the attempt-counter retry budget on
+    // its own dispatch, so a second concurrent call in that window is a
+    // stronger hazard than kickoff_check's equivalent gap, not just a
+    // duplicate-check nuisance. See remediate()'s RAII guard.
+    std::set<std::string> remediating_;
 
     void dispatch_due();
     void collect_ready();

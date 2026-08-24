@@ -152,8 +152,8 @@ enum class PolicyReadError { kDegraded };
 /// string-matching arbitrary text. Mirrors `kSwDeployDbErrorPrefix`.
 inline constexpr std::string_view kPolicyDbErrorPrefix = "db_error: ";
 
-/// Governance (2026-08-24): defined above but never checked anywhere —
-/// every mutator route mapped a degraded-store error the same as a
+/// Governance (2026-08-24): originally defined above but never checked
+/// anywhere — every mutator route mapped a degraded-store error the same as a
 /// validation error (400), leaking the raw internal string into the
 /// response body. Mirrors `is_conflict_error`/`strip_conflict_prefix` in
 /// store_errors.hpp.

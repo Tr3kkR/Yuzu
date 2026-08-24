@@ -328,9 +328,19 @@ void PolicyEvaluator::dispatch_due() {
     }
     for (const auto& p : *claimed) {
         auto k = kickoff_check(p); // does its own brief locking; dispatch runs without mu_
-        if (!k)
+        if (!k) {
+            // Governance UP-2 (2026-08-24): this policy's durable dispatch
+            // claim already committed as part of `claimed`'s single
+            // transaction — a degraded kickoff_check here leaves it claimed
+            // but never actually dispatched, silently skipping this policy
+            // for the rest of its interval. Same consequence class as the
+            // claim-failure counter above; give it the same visibility.
             spdlog::warn("policy_evaluator: dispatch_due: kickoff_check degraded for policy {}: {}",
                         p.id, k.error());
+            if (d_.metrics)
+                d_.metrics->counter("yuzu_server_policy_eval_errors_total", {{"phase", "dispatch"}})
+                    .increment();
+        }
     }
 }
 
@@ -359,8 +369,16 @@ PolicyEvaluator::evaluate_now(const std::string& policy_id) {
     // where a concurrent tick (this replica's background thread, or a
     // sibling replica) sees no row yet and re-dispatches before this
     // manual check's network call even returns. Stamping unconditionally,
-    // even if dispatch below ends up failing, matches the original: a
-    // failed manual check still consumed the interval slot.
+    // even if dispatch below ends up failing, matches the original in
+    // WHO consumes the interval slot: a failed manual check still consumed
+    // it. It does NOT match the original in BLAST RADIUS (governance UP-1,
+    // 2026-08-24): the old last_eval_ was per-replica in-memory, so a
+    // failed dispatch only cost that one replica's view of the interval —
+    // a sibling replica's own last_eval_ was untouched. This stamp is
+    // durable and fleet-wide, so the same failure now costs every replica
+    // the interval, not just one. Self-heals after one interval; tracked,
+    // not fixed, in ADR-0056's Follow-ups (same class as UP-2's
+    // dispatch_due() equivalent, just above).
     // If the stamp itself fails, do NOT dispatch (adversarial review,
     // 2026-08-24): the correction above only closed "dispatch succeeded but
     // the stamp was never attempted" — a failed record_dispatch call is the
@@ -388,11 +406,13 @@ PolicyEvaluator::remediate(const std::string& policy_id,
     RemediateResult out;
     if (!d_.policy_store) {
         out.error = "policy store unavailable";
+        out.degraded = true;
         return out;
     }
     auto p_res = d_.policy_store->get_policy(policy_id);
     if (!p_res) {
         out.error = "policy store degraded — try again";
+        out.degraded = true;
         return out;
     }
     if (!*p_res) {
@@ -403,6 +423,7 @@ PolicyEvaluator::remediate(const std::string& policy_id,
     auto frag_res = d_.policy_store->get_fragment(p_ref.fragment_id);
     if (!frag_res) {
         out.error = "policy store degraded — try again";
+        out.degraded = true;
         return out;
     }
     if (!*frag_res || (*frag_res)->fix_instruction.empty()) {
@@ -423,6 +444,7 @@ PolicyEvaluator::remediate(const std::string& policy_id,
             // agents" — that would silently remediate nobody when the
             // operator asked to fix everyone non-compliant.
             out.error = "policy store degraded — could not determine remediation targets";
+            out.degraded = true;
             return out;
         }
         for (const auto& s : *statuses)
@@ -448,6 +470,45 @@ PolicyEvaluator::remediate(const std::string& policy_id,
         out.error = "no non_compliant agents to remediate";
         return out;
     }
+
+    // Governance UP-3 (2026-08-24): reserve this policy_id BEFORE dispatch,
+    // not after — unlike kickoff_check's Check-phase dedupe (which only
+    // needs to avoid a duplicate DISPATCH), a second concurrent remediate()
+    // call reaching the blocking dispatch below would burn the retry-attempt
+    // cap twice (update_agent_status's "fixing" write increments it) on a
+    // fix instruction that may not be idempotent — a real double-run, not
+    // just a duplicate in-flight record. The comment on update_agent_status's
+    // UPSERT calling itself "naturally idempotent against a racing manual
+    // remediate() on another replica" is true for the STATUS ROW but was
+    // never true for the ATTEMPT COUNTER; this reservation only covers same
+    // process concurrency (two REST calls landing on this replica), not a
+    // cross-replica race — that residual is unchanged and tracked in
+    // ADR-0056's Follow-ups, same as kickoff_check's cross-replica gap.
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        bool already = remediating_.count(policy_id) > 0;
+        if (!already)
+            for (const auto& f : in_flight_)
+                if (f.phase == Phase::FixWait && f.policy_id == policy_id)
+                    already = true;
+        if (already) {
+            out.error = "remediation already in flight for this policy";
+            return out;
+        }
+        remediating_.insert(policy_id);
+    }
+    // RAII: erase the reservation on every exit from here down. Once the
+    // FixWait entry lands in in_flight_ on the success path, that entry
+    // itself is what a later concurrent call's scan above sees — the
+    // reservation only needs to cover THIS call's own window.
+    struct ReservationGuard {
+        PolicyEvaluator* self;
+        std::string id;
+        ~ReservationGuard() {
+            std::lock_guard<std::mutex> lk(self->mu_);
+            self->remediating_.erase(id);
+        }
+    } reservation_guard{this, policy_id};
 
     auto fix_params = build_params(frag->fix_parameters, p->inputs);
     std::string verify_instr = !frag->post_check_instruction.empty() ? frag->post_check_instruction

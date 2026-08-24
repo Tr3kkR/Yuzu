@@ -1022,14 +1022,14 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             auto result = policy_evaluator_->remediate(id, agent_ids);
             if (!result.ok) {
                 // Governance (2026-08-24): a genuine store-degrade error
-                // ("policy store degraded ...", "policy store unavailable")
                 // used to fall through to the 400/"denied" default below —
                 // a false diagnosis (this isn't a malformed/rejected
                 // request) AND a false audit entry (an infra failure is not
-                // an operator denial). Every degraded-read string
-                // policy_evaluator.cpp::remediate() produces starts with
-                // "policy store"; classify those first.
-                bool degraded = result.error.starts_with("policy store");
+                // an operator denial). Classified via RemediateResult::degraded
+                // (set explicitly by remediate() itself), not a string prefix
+                // guess (consistency-auditor SHOULD-2: an unshared,
+                // untested string contract on the route side).
+                bool degraded = result.degraded;
                 int code = 400;
                 if (degraded)
                     code = 503;
@@ -1037,7 +1037,8 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
                     code = 404;
                 else if (result.error.find("remediation pathway") != std::string::npos ||
                          result.error.find("no non_compliant") != std::string::npos ||
-                         result.error.find("no in-scope") != std::string::npos)
+                         result.error.find("no in-scope") != std::string::npos ||
+                         result.error.find("already in flight") != std::string::npos)
                     code = 409;
                 audit_fn_(req, "policy.remediate", degraded ? "error" : "denied", "policy", id,
                           result.error);
