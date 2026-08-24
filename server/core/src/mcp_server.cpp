@@ -4771,9 +4771,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 // existence of, and recover the hostname/os of, an agent in
                 // another group — hostname/os often encode role and site. An
                 // out-of-scope agent_id is rendered IDENTICALLY to not-found
-                // (same JSON-RPC code, same message, and neither path emits an
-                // mcp_audit row) so THIS tool cannot be used as an existence
-                // oracle. Unwired scope fn → legacy-open, matching
+                // (same JSON-RPC code, same message, byte-identical body) so
+                // THIS tool cannot be used as an existence oracle BY ITS
+                // CALLER. The two paths are deliberately asymmetric in the
+                // audit log — out-of-scope emits an `mcp_audit("denied")` row
+                // and genuine not-found emits none — because an audit row is
+                // server-side evidence that never reaches the caller, so it
+                // costs nothing in oracle terms and a cross-management-group
+                // probe would otherwise leave no trace at all. Unwired scope
+                // fn → legacy-open, matching
                 // query_responses/summarize_working_set.
                 //
                 // SCOPE OF THE CLAIM, deliberately narrow: this closes the

@@ -12,23 +12,28 @@
 /// converging on — how a fan-out of response rows is narrowed to the agents a
 /// caller may see.
 ///
-/// HONEST STATUS, because overstating this is worse than not having it: FIVE
+/// HONEST STATUS, because overstating this is worse than not having it: SEVEN
 /// hand-rolled copies of this loop PREDATE this header and are NOT yet
-/// migrated — `server.cpp`'s legacy `/api/responses/*` export and get readers,
-/// MCP `query_responses` and `query_installed_software` (`mcp_server.cpp`, the
-/// latter a set-based variant of the same drop-count semantics), and the
-/// `/api/v1/executions/{id}/visualization` reader (`rest_api_v1.cpp`). An
-/// earlier revision of this comment said three and named only the first three;
-/// the count was checked and corrected in review, which is the whole point of
-/// writing it down. They are semantically
+/// migrated — `server.cpp`'s legacy `/api/responses/*` export and get readers;
+/// MCP `query_responses` and `query_installed_software` (`mcp_server.cpp`) plus
+/// that tool's REST twin `GET /api/v1/inventory/software` (`rest_api_v1.cpp`),
+/// the last two being set-based variants of the same drop-count semantics; the
+/// dashboard inventory-software fragment (`inventory_routes.cpp`); and the
+/// `/api/v1/executions/{id}/visualization` reader (`rest_api_v1.cpp`).
+///
+/// This count has now been wrong TWICE — it shipped as "three", was corrected
+/// to "five" in governance, and the re-review of that correction found two
+/// more. Recount from the code before trusting it; that it keeps growing under
+/// inspection is the argument for the migration, not a reason to stop writing
+/// it down. They are semantically
 /// equivalent (memoize per distinct agent, keep admitted rows, count distinct
 /// drops) but structurally drifted, and a future change to the shared loop —
 /// drop-count semantics, exception behaviour — would silently miss them.
 /// (`server.cpp`'s aggregate reader is correctly NOT one of these: it pushes
 /// the scope into the store query instead of post-filtering.)
 /// Every reader this header is used by routes through it; migrating the other
-/// three is tracked as follow-up work, deliberately not folded into a security
-/// fix. Do NOT add a fourth copy: new readers use this function.
+/// six is tracked as follow-up work, deliberately not folded into a security
+/// fix. Do NOT add an eighth copy: new readers use this function.
 ///
 /// TWO DIFFERENT THINGS, DELIBERATELY SPLIT, because conflating them is how
 /// this class of defect keeps recurring:

@@ -1738,16 +1738,22 @@ TEST_CASE("#1712: KPI strip is marked scope-reconciled so the live progress fram
         CHECK(res->body.find("secret") == std::string::npos);
     }
 
-    SECTION("stamped even when nothing was dropped") {
+    SECTION("NOT stamped when nothing was withheld from this viewer") {
         auto eid = h.make_exec("def-recon", "running", 2, 2, 0);
         h.agent_status(eid, "recon-a", "success", 0, "", 1735689601);
         h.agent_status(eid, "recon-b", "success", 0, "", 1735689602);
-        // Admit-everyone default: zero drops, but the filter is still ACTIVE,
-        // so the fleet-wide progress payload must still be kept off the strip.
+        // Admit-everyone default — which is also what RBAC-off produces, and
+        // `ExecHarness` (like production) wires the predicate unconditionally.
+        // The strip must stay UNSTAMPED so the live progress frame keeps
+        // updating the counts: suppressing on a merely-wired predicate would
+        // kill the live KPI update in every deployment, RBAC-off included,
+        // rather than only for confined viewers. This is the negative half of
+        // the pair — without it the marker could be stamped unconditionally and
+        // the section above would still pass.
         auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
         REQUIRE(res);
         CHECK(res->status == 200);
-        CHECK(res->body.find("data-scope-reconciled=\"1\"") != std::string::npos);
+        CHECK(res->body.find("data-scope-reconciled") == std::string::npos);
     }
 }
 

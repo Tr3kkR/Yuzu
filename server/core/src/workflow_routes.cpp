@@ -402,17 +402,24 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // replaced by the fleet counts for the rest of the execution, which
             // re-discloses exactly the cardinality this recompute withholds.
             //
-            // Keyed on the filter being ACTIVE, not on `roster_dropped > 0`,
-            // and deliberately so — the same reasoning `dashboard_routes.cpp`
-            // records for its own recompute. `succeeded`/`failed` are counted
-            // from the FILTERED roster, so they are already scope-correct at
-            // zero drops; a confined viewer who happens to have dropped nothing
-            // in the status vector would still have them overwritten with fleet
-            // totals. The cost is that an unconfined viewer under RBAC-on gets
-            // these three cells from the 500 ms debounced refetch rather than
-            // instantly; the refetch is server-rendered and scope-correct.
+            // Keyed on `roster_dropped > 0` — on something having ACTUALLY
+            // been withheld from THIS viewer, not on the predicate merely
+            // being wired. `response_scope_fn` is wired UNCONDITIONALLY in
+            // `server.cpp`, so keying on it stamps every strip in every
+            // deployment, RBAC off (the default) included, and the live count
+            // update is then dead for everyone rather than suppressed for the
+            // confined. Wired-but-inert and actually-filtering are not the same
+            // state; conflating them is the shape ADR-0033 §2 names.
+            //
+            // Zero drops is safe to leave live, and that is a property of the
+            // data rather than an optimisation: an out-of-scope agent holding a
+            // status row would itself have been dropped, so at `roster_dropped
+            // == 0` every row in the roster is in scope and none of the three
+            // cells has a scope-driven divergence from the execution row. What
+            // remains at zero drops — targeted agents with no status row yet —
+            // is scope-independent staleness the static render already shows.
             html += "<div class=\"exec-kpi-strip\" id=\"exec-kpi-" + html_escape(exec.id) + "\"";
-            if (response_scope_fn)
+            if (roster_dropped > 0)
                 html += " data-scope-reconciled=\"1\"";
             html += ">";
             // #1712: `agents_targeted` is read off the EXECUTION row, not off
