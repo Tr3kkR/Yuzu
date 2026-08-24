@@ -18,8 +18,9 @@
  *             in-process via SecItemCopyMatching (certificates_x509.hpp's
  *             DER parse backs the result); the login keychain still reads
  *             via a `security find-certificate` subprocess routed through
- *             the per-user launchd/Aqua session (Decision-7 governed-shell
- *             exception -- see build_login_keychain_read_command()).
+ *             the per-user launchd/Aqua session, as a pre-split argv
+ *             through the bounded runner (rung 2, #3406 -- see
+ *             build_login_keychain_read_argv()).
  */
 
 #include <yuzu/plugin.hpp>
@@ -70,6 +71,8 @@
 // fail to resolve, since the nested `(anonymous namespace)::yuzu` has no
 // TempFile member.
 #include <unistd.h>
+#include <cerrno>                          // ERANGE (resolve_login_home's getpwnam_r retry)
+#include <pwd.h>                           // getpwnam_r -- in-process `~username` home resolution (#3406)
 #include <macos_console_user.hpp>          // shared console-user + store/keychain mapping (#2277)
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (BR-03)
 #if defined(YUZU_HAVE_SECURITY_FRAMEWORK)
@@ -182,7 +185,7 @@ CertRecord to_cert_record(const yuzu::certificates_x509::CertFields& fields, std
 /// a coarse success. Every degraded read here is therefore CONSTRAINED +
 /// PARTIAL, with `provenance` naming the half that failed so the two halves
 /// of a hybrid macOS read stay distinguishable ("login-keychain" is the
-/// spec-named value for the governed-shell half).
+/// spec-named value for the login-keychain subprocess half).
 ///
 /// Idempotent by construction: the seam records the last call for the
 /// currently-executing command, and every call here reports the same
@@ -731,8 +734,8 @@ CheckedCommandResult run_bounded_checked(const std::vector<std::string>& argv,
 //
 // System.keychain and SystemRootCertificates.keychain ONLY -- the login
 // keychain stays on the `security find-certificate` subprocess path via
-// build_login_keychain_read_command() below (Decision-7 governed-shell
-// exception, registered as sink `certificates/list_certs_macos#1` +
+// build_login_keychain_read_argv() below (rung-2 pre-split argv since
+// #3406, registered as sink `certificates/list_certs_macos#1` +
 // `certificates/details_cert_macos#1` in docs/agent-spawn-sink-manifest.md).
 // Gated on YUZU_HAVE_SECURITY_FRAMEWORK
 // (meson.build, required:false + -D flag -- same shape as
@@ -1018,12 +1021,49 @@ CertRecord parse_pem_block_macos(const std::string& pem_block, const std::string
 // TL;DR) and `launchctl asuser` -- which itself requires root privileges,
 // per `man launchctl` -- already succeeds with no escalation. The target
 // least-privilege `_yuzu` account (future hardening, #1455) is NOT root, so
-// build_login_keychain_read_command() uses this to decide whether it needs
+// build_login_keychain_read_argv() uses this to decide whether it needs
 // to add its own outer `sudo -n` hop first. Cached: EUID can't change during
 // the agent's lifetime.
 bool caller_is_root() {
     static const bool is_root = (geteuid() == 0);
     return is_root;
+}
+
+/**
+ * Resolve `username`'s home directory in-process via getpwnam_r -- the
+ * same directory-services lookup a POSIX shell performs for `~username`
+ * tilde expansion, so a relocated/mobile/network-home account resolves to
+ * the identical path the previous `/bin/sh -c` + `~user` mechanism
+ * produced (#3406 argv-ized the login-keychain read; this lookup replaced
+ * the shell's one remaining job). Not a subprocess and not an interpreter:
+ * a plain libc/directory-services read, so it adds no rung under ADR-3002.
+ *
+ * Returns std::nullopt on any lookup failure, a missing account entry, or
+ * a pw_dir that fails is_valid_home_dir (empty/relative) -- the caller
+ * treats that exactly like argv construction failing: an honest
+ * "command construction failed" sentinel, never a guessed path.
+ */
+std::optional<std::string> resolve_login_home(const std::string& username) {
+    struct passwd pwd {};
+    struct passwd* result = nullptr;
+    long suggested = sysconf(_SC_GETPW_R_SIZE_MAX);
+    // _SC_GETPW_R_SIZE_MAX is a HINT and may be -1; 4096 covers any real
+    // macOS record, and the one ERANGE retry below covers a pathological one.
+    std::vector<char> buf(suggested > 0 ? static_cast<std::size_t>(suggested) : 4096);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        int rc = getpwnam_r(username.c_str(), &pwd, buf.data(), buf.size(), &result);
+        if (rc == ERANGE) {
+            buf.resize(buf.size() * 4);
+            continue;
+        }
+        if (rc != 0 || result == nullptr || result->pw_dir == nullptr)
+            return std::nullopt;
+        std::string home = result->pw_dir;
+        if (!yuzu::macos::is_valid_home_dir(home))
+            return std::nullopt;
+        return home;
+    }
+    return std::nullopt; // still ERANGE after the retry -- treated as lookup failure
 }
 
 /**
@@ -1226,14 +1266,19 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
     if (plan.want_login) {
         // console_user is guaranteed engaged here: resolve_store_plan only
         // sets want_login when has_console_user was true.
-        auto cmd = yuzu::macos::build_login_keychain_read_command(
-            console_user->uid, console_user->username, caller_is_root());
-        if (cmd.empty()) {
-            // Defensive only -- resolve_console_user() already validated
-            // uid/username before console_user was populated, so
-            // build_login_keychain_read_command()'s own re-validation
-            // should never fail here. Still an honest sentinel rather than
-            // a silent no-op if it somehow does.
+        auto login_home = resolve_login_home(console_user->username);
+        auto argv = login_home ? yuzu::macos::build_login_keychain_read_argv(
+                                     console_user->uid, console_user->username, *login_home,
+                                     caller_is_root())
+                               : std::vector<std::string>{};
+        if (argv.empty()) {
+            // resolve_console_user() already validated uid/username before
+            // console_user was populated, so the realistic path here is
+            // resolve_login_home() failing for the resolved console user
+            // (getpwnam_r failure / no account record / non-absolute
+            // pw_dir); build_login_keychain_read_argv()'s own re-validation
+            // is defensive only. Either way: an honest sentinel rather
+            // than a silent no-op or a guessed keychain path.
             ctx.write_output("not_available|login keychain command construction failed");
             mark_result_partial(ctx, "login-keychain");
         } else {
@@ -1242,21 +1287,18 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
                 ctx.write_output("not_available|login keychain action deadline exceeded");
                 mark_result_partial(ctx, "login-keychain");
             } else {
-                // The launchctl/sudo wrapper relies on the outer shell's
-                // `~username` expansion (build_login_keychain_read_command's
-                // own comment) -- run_bounded_subprocess execs argv directly
-                // with no shell, so it can't expand that itself. `cmd` is a
-                // single, already-validated (uid/username allowlist-checked
-                // inside build_login_keychain_read_command) string with no
-                // caller-controlled shell metacharacters, so handing it to
-                // "/bin/sh -c" as ONE argv element keeps the outer exec
-                // shell-argument-free while still routing the whole call
-                // through the bounded runner for its deadline/cap/cancel
-                // support -- the same "trusted script as a single argv
-                // element" shape script_exec_plugin.cpp's bash action uses.
-                // sink: certificates/list_certs_macos#1 — Decision-7 governed-shell exception, see manifest
+                // Pre-split argv through the bounded runner -- no shell
+                // (#3406, rung 2). The former "/bin/sh -c" hop existed for
+                // exactly two shell features, both now provided without
+                // one: `~username` tilde expansion (resolve_login_home's
+                // getpwnam_r lookup above -- the same lookup the shell
+                // performed) and a `2>/dev/null` redirect (the runner's
+                // merge_stderr=false default already discards child
+                // stderr). The launchctl/sudo/security session hop itself
+                // never needed a shell -- it execs fine as plain argv.
+                // sink: certificates/list_certs_macos#1 — rung-2 runner argv (launchctl asuser + sudo -u session hop), see manifest
                 auto login_result = run_bounded_checked(
-                    {"/bin/sh", "-c", cmd},
+                    argv,
                     yuzu::agent::SubprocessOptions{.deadline = read_deadline},
                     "login keychain read");
                 if (login_result.ok) {
@@ -1438,9 +1480,12 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
     }
 
     if (plan.want_login) {
-        auto cmd = yuzu::macos::build_login_keychain_read_command(
-            console_user->uid, console_user->username, caller_is_root());
-        if (cmd.empty()) {
+        auto login_home = resolve_login_home(console_user->username);
+        auto argv = login_home ? yuzu::macos::build_login_keychain_read_argv(
+                                     console_user->uid, console_user->username, *login_home,
+                                     caller_is_root())
+                               : std::vector<std::string>{};
+        if (argv.empty()) {
             if (!read_failed) {
                 read_failed = true;
                 failure_reason = "login keychain command construction failed";
@@ -1455,13 +1500,13 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
                     failure_provenance = "login-keychain";
                 }
             } else {
-                // See list_certs_macos's matching comment: `cmd` needs the
-                // outer shell's `~username` expansion, so it is run as a
-                // single trusted argv element via "/bin/sh -c" rather than a
-                // clean multi-element argv.
-                // sink: certificates/details_cert_macos#1 — Decision-7 governed-shell exception, see manifest
+                // See list_certs_macos's matching comment: pre-split argv
+                // through the bounded runner, no shell (#3406, rung 2) --
+                // tilde expansion is replaced by resolve_login_home's
+                // getpwnam_r lookup above.
+                // sink: certificates/details_cert_macos#1 — rung-2 runner argv (launchctl asuser + sudo -u session hop), see manifest
                 auto login_result = run_bounded_checked(
-                    {"/bin/sh", "-c", cmd},
+                    argv,
                     yuzu::agent::SubprocessOptions{.deadline = read_deadline},
                     "login keychain read");
                 if (!login_result.ok) {
@@ -1763,11 +1808,13 @@ bool delete_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
 // System.keychain/SystemRootCertificates.keychain promotes to rung 1
 // (SecItemCopyMatching, a direct Security-framework API call — no
 // subprocess at all), but the SAME call also still reads the login
-// keychain by default, which requires the launchctl/sudo `~user` hop via
-// "/bin/sh -c" (Decision-7 governed-shell exception — see
-// build_login_keychain_read_command()) — so list/details stay rung 3
-// overall, the rung reflecting the DEEPEST interpreter either call path
-// intentionally invokes, not the shallowest. macOS delete (System/MY only,
+// keychain by default via the launchctl/sudo session hop — since #3406 a
+// PRE-SPLIT argv through the bounded runner (rung 2; the former
+// "/bin/sh -c" wrapping, whose only shell dependency was `~user` tilde
+// expansion, is gone — see build_login_keychain_read_argv()) — so
+// list/details declare rung 2 overall, the rung reflecting the DEEPEST
+// interpreter either call path intentionally invokes, not the shallowest
+// (no interpreter remains on any path here). macOS delete (System/MY only,
 // login unsupported — see below) is unchanged: a direct
 // `/usr/bin/security delete-certificate` argv call through the bounded
 // subprocess runner, rung 2, and also rejects SystemRootCertificates.keychain
@@ -1779,11 +1826,11 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .linux_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1, "libcrypto X509 (in-process PEM parse)", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "SecItem (System/root, in-process) + security find-certificate "
-                                    "via governed shell (login)",
+        {YUZU_SUPPORT_SUPPORTED, 2, "SecItem (System/root, in-process) + security find-certificate "
+                                    "argv via subprocess runner (login)",
          "System.keychain and SystemRootCertificates.keychain are read natively via "
          "SecItemCopyMatching (rung 1); the login keychain still requires the launchctl/sudo "
-         "~user hop (Decision-7 governed-shell exception)"},
+         "session hop, run as a pre-split argv through the bounded subprocess runner"},
         /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "CryptoAPI (CertEnumCertificatesInStore)",
                               nullptr},
     },
@@ -1792,11 +1839,11 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .linux_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1, "libcrypto X509 (in-process PEM parse)", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "SecItem (System/root, in-process) + security find-certificate "
-                                    "via governed shell (login)",
+        {YUZU_SUPPORT_SUPPORTED, 2, "SecItem (System/root, in-process) + security find-certificate "
+                                    "argv via subprocess runner (login)",
          "System.keychain and SystemRootCertificates.keychain are read natively via "
          "SecItemCopyMatching (rung 1); the login keychain still requires the launchctl/sudo "
-         "~user hop (Decision-7 governed-shell exception)"},
+         "session hop, run as a pre-split argv through the bounded subprocess runner"},
         /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "CryptoAPI (CertEnumCertificatesInStore)",
                               nullptr},
     },

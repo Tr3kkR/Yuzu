@@ -11,12 +11,12 @@
  * test_installed_apps_inventory.cpp). Runs on EVERY host (incl. MSVC), same
  * as test_dex_macos.cpp.
  *
- * The shell-injection-guard vectors (is_valid_username / is_valid_uid /
- * build_login_keychain_read_command) are the load-bearing ones: every value
- * macos_console_user.hpp validates ends up interpolated into a
- * bounded-subprocess argv/command line in certificates_plugin.cpp, so
- * "rejects an unsafe value" here is a direct proxy for "never runs an
- * attacker-influenced command."
+ * The injection-guard vectors (is_valid_username / is_valid_uid /
+ * is_valid_home_dir / build_login_keychain_read_argv) are the load-bearing
+ * ones: every value macos_console_user.hpp validates ends up in a
+ * bounded-subprocess argv element in certificates_plugin.cpp (pre-split, no
+ * shell -- #3406), so "rejects an unsafe value" here is a direct proxy for
+ * "never runs an attacker-influenced command."
  *
  * Gate-7 FIX A: the pure parse/validate/classify/verdict helpers the
  * BR-02/BR-03 and fix-round sections exercise (parse_openssl_native_date,
@@ -205,14 +205,24 @@ TEST_CASE("system_keychain_path and root_keychain_path are the fixed system path
          "/System/Library/Keychains/SystemRootCertificates.keychain");
 }
 
-TEST_CASE("login_keychain_path builds a ~username-relative path from the username",
+TEST_CASE("login_keychain_path builds the keychain path from a resolved home directory",
          "[certificates][macos]") {
-    // ~username (not a bare ~) so the OUTER shell resolves it via that
-    // specific account's directory-services home, independent of the
-    // invoking (daemon) process's own $HOME -- see the function comment.
-    CHECK(login_keychain_path("alice") == "~alice/Library/Keychains/login.keychain-db");
-    CHECK(login_keychain_path("bob.smith") ==
-         "~bob.smith/Library/Keychains/login.keychain-db");
+    // Since #3406 the caller resolves the account's home in-process
+    // (getpwnam_r -- the same lookup the shell's former `~username`
+    // expansion performed) and this is a plain absolute-path join; a
+    // non-standard (relocated/mobile/network) home passes through verbatim.
+    CHECK(login_keychain_path("/Users/alice") ==
+         "/Users/alice/Library/Keychains/login.keychain-db");
+    CHECK(login_keychain_path("/Volumes/Homes/bob.smith") ==
+         "/Volumes/Homes/bob.smith/Library/Keychains/login.keychain-db");
+}
+
+TEST_CASE("is_valid_home_dir accepts absolute paths only", "[certificates][macos]") {
+    CHECK(is_valid_home_dir("/Users/alice"));
+    CHECK(is_valid_home_dir("/var/empty"));
+    CHECK_FALSE(is_valid_home_dir(""));
+    CHECK_FALSE(is_valid_home_dir("Users/alice"));   // relative -- would resolve vs daemon cwd
+    CHECK_FALSE(is_valid_home_dir("~alice"));         // literal tilde is NOT a home directory
 }
 
 // ── resolve_store_plan ───────────────────────────────────────────────────────
@@ -353,53 +363,67 @@ TEST_CASE("sealed-root delete rejection uses the shared error| grammar, not a be
     CHECK(sealed_root_message.find("certificates|unsupported|") == std::string::npos);
 }
 
-// ── build_login_keychain_read_command (shell-injection guard) ───────────────
+// ── build_login_keychain_read_argv (injection guard, #3406) ─────────────────
 
-TEST_CASE("build_login_keychain_read_command: caller already root -- no outer sudo hop",
+TEST_CASE("build_login_keychain_read_argv: caller already root -- no outer sudo hop",
          "[certificates][macos]") {
     // Mirrors quarantine_plugin.cpp's sudo_prefix(): today's shipped
     // LaunchDaemon runs as root, so `launchctl asuser` (which itself
     // requires root) needs no escalation -- only the inner drop to the
-    // target console user does.
-    auto cmd = build_login_keychain_read_command("501", "alice", /*caller_is_root=*/true);
-    CHECK(cmd == "/bin/launchctl asuser 501 /usr/bin/sudo -n -u alice /usr/bin/security "
-                "find-certificate -a -p ~alice/Library/Keychains/login.keychain-db "
-                "2>/dev/null");
+    // target console user does. The exact element split is load-bearing:
+    // run_bounded_subprocess execs this vector directly, no shell, so
+    // every flag/value must be its own element (no `2>/dev/null` -- the
+    // runner's merge_stderr=false default already discards child stderr).
+    auto argv = build_login_keychain_read_argv("501", "alice", "/Users/alice",
+                                               /*caller_is_root=*/true);
+    CHECK(argv == std::vector<std::string>{
+                     "/bin/launchctl", "asuser", "501", "/usr/bin/sudo", "-n", "-u", "alice",
+                     "/usr/bin/security", "find-certificate", "-a", "-p",
+                     "/Users/alice/Library/Keychains/login.keychain-db"});
 }
 
-TEST_CASE("build_login_keychain_read_command: non-root caller escalates via an outer sudo",
+TEST_CASE("build_login_keychain_read_argv: non-root caller escalates via an outer sudo",
          "[certificates][macos]") {
     // The target `_yuzu` least-privilege account (#1455) is NOT root, so it
     // must sudo to root itself before launchctl asuser will admit it -- this
     // is exactly the command the sudoers handoff grant needs to cover.
-    auto cmd = build_login_keychain_read_command("501", "alice", /*caller_is_root=*/false);
-    CHECK(cmd == "/usr/bin/sudo -n /bin/launchctl asuser 501 /usr/bin/sudo -n -u alice "
-                "/usr/bin/security find-certificate -a -p "
-                "~alice/Library/Keychains/login.keychain-db 2>/dev/null");
+    auto argv = build_login_keychain_read_argv("501", "alice", "/Users/alice",
+                                               /*caller_is_root=*/false);
+    CHECK(argv == std::vector<std::string>{
+                     "/usr/bin/sudo", "-n", "/bin/launchctl", "asuser", "501", "/usr/bin/sudo",
+                     "-n", "-u", "alice", "/usr/bin/security", "find-certificate", "-a", "-p",
+                     "/Users/alice/Library/Keychains/login.keychain-db"});
 }
 
-TEST_CASE("build_login_keychain_read_command rejects an invalid uid", "[certificates][macos]") {
-    CHECK(build_login_keychain_read_command("abc", "alice", true).empty());
-    CHECK(build_login_keychain_read_command("", "alice", true).empty());
-    CHECK(build_login_keychain_read_command("501; rm -rf /", "alice", true).empty());
+TEST_CASE("build_login_keychain_read_argv rejects an invalid uid", "[certificates][macos]") {
+    CHECK(build_login_keychain_read_argv("abc", "alice", "/Users/alice", true).empty());
+    CHECK(build_login_keychain_read_argv("", "alice", "/Users/alice", true).empty());
+    CHECK(build_login_keychain_read_argv("501; rm -rf /", "alice", "/Users/alice", true).empty());
     // Invalid input is rejected the same way regardless of caller_is_root.
-    CHECK(build_login_keychain_read_command("abc", "alice", false).empty());
+    CHECK(build_login_keychain_read_argv("abc", "alice", "/Users/alice", false).empty());
 }
 
-TEST_CASE("build_login_keychain_read_command rejects an invalid username",
+TEST_CASE("build_login_keychain_read_argv rejects an invalid username",
          "[certificates][macos]") {
-    CHECK(build_login_keychain_read_command("501", "alice; rm -rf /", true).empty());
-    CHECK(build_login_keychain_read_command("501", "", true).empty());
-    CHECK(build_login_keychain_read_command("501", "alice`whoami`", true).empty());
-    CHECK(build_login_keychain_read_command("501", "$(whoami)", true).empty());
-    CHECK(build_login_keychain_read_command("501", "alice space", true).empty());
-    CHECK(build_login_keychain_read_command("501", "-G", true).empty());
+    CHECK(build_login_keychain_read_argv("501", "alice; rm -rf /", "/Users/alice", true).empty());
+    CHECK(build_login_keychain_read_argv("501", "", "/Users/alice", true).empty());
+    CHECK(build_login_keychain_read_argv("501", "alice`whoami`", "/Users/alice", true).empty());
+    CHECK(build_login_keychain_read_argv("501", "$(whoami)", "/Users/alice", true).empty());
+    CHECK(build_login_keychain_read_argv("501", "alice space", "/Users/alice", true).empty());
+    CHECK(build_login_keychain_read_argv("501", "-G", "/Users/alice", true).empty());
 }
 
-TEST_CASE("build_login_keychain_read_command rejects when both uid and username are invalid",
+TEST_CASE("build_login_keychain_read_argv rejects an invalid home directory",
          "[certificates][macos]") {
-    CHECK(build_login_keychain_read_command("", "", true).empty());
-    CHECK(build_login_keychain_read_command("nope", "nope; rm -rf /", true).empty());
+    CHECK(build_login_keychain_read_argv("501", "alice", "", true).empty());
+    CHECK(build_login_keychain_read_argv("501", "alice", "Users/alice", true).empty());
+    CHECK(build_login_keychain_read_argv("501", "alice", "~alice", true).empty());
+}
+
+TEST_CASE("build_login_keychain_read_argv rejects when every input is invalid",
+         "[certificates][macos]") {
+    CHECK(build_login_keychain_read_argv("", "", "", true).empty());
+    CHECK(build_login_keychain_read_argv("nope", "nope; rm -rf /", "relative", true).empty());
 }
 
 // ── classify_delete_verdict (PLAN-06: rc + still-present -> verdict) ────────
