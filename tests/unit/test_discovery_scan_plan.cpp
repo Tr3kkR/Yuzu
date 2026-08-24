@@ -456,41 +456,44 @@ TEST_CASE("worst_of: a scan-level timeout dominates a DNS-degrade tie, either or
     CHECK(std::string_view{timeout_then_dns.report.reason} == "scan:timeout");
 }
 
-TEST_CASE("worst_of: the fold is order-dependent — three-way outcomes are pinned, not assumed",
+TEST_CASE("worst_of: the pairwise fold is NOT transitive — a third condition changes the answer",
           "[agent][discovery_scan_plan]") {
-    // worst_of is applied PAIRWISE and the named-pair tie-break is NOT
-    // transitive, so a three-condition scan's reported reason depends on the
-    // order do_scan_subnet accumulates in. Nothing in the plugin pins that
-    // order, so these cases exist to make a future reordering VISIBLE: if
-    // someone moves the ICMP-session check above the ARP read, or the DNS
-    // degrade past the deadline check, one of these flips and says so.
-    // They document current behaviour; they are not an argument that this
-    // behaviour is the only defensible one.
+    // What this pins, precisely: worst_of is applied PAIRWISE and the
+    // named-pair tie-break is not transitive, so the SAME set of conditions
+    // can yield different reasons depending on what else is in the set.
+    //
+    // What it does NOT pin, so nobody mistakes it for a guard it isn't: this
+    // test hardcodes its own fold order and never references do_scan_subnet,
+    // so reordering the plugin's accumulation sites will NOT flip it. The
+    // ordering assumption the fix rests on is stated in the tie-break's doc
+    // comment; no test observes it, because at the fold level there is
+    // nothing to observe. Closing that would take a seam do_scan_subnet
+    // does not currently have.
     const auto truncated = degrade_for_arp(/*ok=*/true, /*complete=*/false);
     const auto blocked = degrade_for_sweep(SweepTally{2, 2, 0});
     const auto timeout = MaybeDegrade{true, timeout_degrade()};
     REQUIRE(truncated.has_report);
     REQUIRE(blocked.has_report);
+    // The non-transitivity is only meaningful while all three tie on
+    // severity: if one were ever reclassified, the severity branch would
+    // decide and these CHECKs would pass for the wrong reason.
+    REQUIRE(degrade_severity(truncated.report.status) == degrade_severity(blocked.report.status));
+    REQUIRE(degrade_severity(blocked.report.status) == degrade_severity(timeout.report.status));
 
-    // do_scan_subnet's real order: ARP (Step 1) -> sweep-blocked -> deadline.
-    // arp vs blocked -> tie, candidate is not scan:timeout -> keeps arp.
-    // arp vs timeout -> the named pair -> scan:timeout.
-    const auto arp_blocked_timeout =
+    // {arp, blocked, timeout} in do_scan_subnet's order: arp vs blocked ties
+    // and keeps arp (blocked is not scan:timeout); arp vs timeout is a named
+    // pair -> scan:timeout.
+    const auto all_three =
         worst_of(worst_of(worst_of(MaybeDegrade{}, truncated), blocked), timeout);
-    CHECK(std::string_view{arp_blocked_timeout.report.reason} == "scan:timeout");
+    CHECK(std::string_view{all_three.report.reason} == "scan:timeout");
 
-    // Drop the ARP condition and the SAME remaining two invert: blocked is
-    // not a named pair, so earliest-wins keeps it. This is the concrete
-    // non-transitivity — an unrelated third condition changes the answer.
-    const auto blocked_timeout = worst_of(worst_of(MaybeDegrade{}, blocked), timeout);
-    CHECK(std::string_view{blocked_timeout.report.reason} == "icmp:transmit_blocked");
-
-    // The probe-loop timeout accumulates BEFORE the DNS degrade, so on that
-    // path scan:timeout is already `current` and survives as such — the DNS
-    // pair does not need to fire for the right answer to come out.
-    const auto dns_degraded = MaybeDegrade{true, hostname_lookup_degraded()};
-    const auto timeout_then_dns = worst_of(worst_of(MaybeDegrade{}, timeout), dns_degraded);
-    CHECK(std::string_view{timeout_then_dns.report.reason} == "scan:timeout");
+    // Remove the ARP condition and the surviving two invert: blocked is not
+    // a named pair, so earliest-wins keeps it. Adding an unrelated third
+    // condition therefore CHANGES which reason is reported. That is the
+    // whole finding, and it is a known, accepted property of the named-pair
+    // design rather than a defect this test is guarding against.
+    const auto without_arp = worst_of(worst_of(MaybeDegrade{}, blocked), timeout);
+    CHECK(std::string_view{without_arp.report.reason} == "icmp:transmit_blocked");
 }
 
 TEST_CASE("degrade_tie_prefers_candidate: true ONLY for the two named "

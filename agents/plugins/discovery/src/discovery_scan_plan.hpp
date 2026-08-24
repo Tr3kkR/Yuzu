@@ -238,10 +238,13 @@ inline int degrade_severity(YuzuResultStatus status) {
  * and it is the reason an operator needs in order to know the result is
  * not merely thinner but truncated in scope. Plain accumulation order
  * loses it in both cases, because on the path each pair was filed for the
- * data-completeness condition is observed FIRST (this is NOT universal —
- * the probe loop's own timeout accumulates before the DNS degrade — but
- * that ordering is harmless, since only `scan:timeout` is ever a preferred
- * candidate and it therefore survives as `current` either way):
+ * data-completeness condition is observed FIRST. (One ordering runs the
+ * other way — the probe loop's own timeout is accumulated before the DNS
+ * degrade — but those two cannot co-occur: if the probe loop consumed the
+ * budget, the hostname loop's deadline check breaks it on its first
+ * iteration, so no lookup ever runs to degrade. It is also harmless
+ * regardless, since only `scan:timeout` is ever a preferred candidate and
+ * it therefore survives as `current` either way.)
  *
  *   - `arp:table_truncated` (Step 1, the ARP read) accumulates before any
  *     `scan:timeout` — the gap #3253 filed.
