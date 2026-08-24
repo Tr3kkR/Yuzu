@@ -323,3 +323,45 @@ TEST_CASE("merge_launch_env's denylist follows the target's case rule, not a bla
     CHECK(merge_launch_env(base, {{"LD_PRELOAD", "x"}}, /*windows=*/true).rejected ==
           std::vector<std::string>{"LD_PRELOAD"});
 }
+
+TEST_CASE("merge_launch_env rejects non-ASCII env names fail-closed rather than mismatch "
+          "Windows Unicode case folding (A0-002)",
+          "[subprocess][launch_spec][extra_env]") {
+    using namespace yuzu::agent;
+    const std::vector<EnvVar> base = default_launch_env(/*windows=*/false, std::nullopt);
+
+    // "\xc3\x85VAR" is UTF-8 for "AVAR" with a Latin capital letter A with
+    // ring above (U+00C5); "\xc3\xa5var" is UTF-8 for its lowercase form
+    // (U+00E5) followed by "var". A byte-wise ASCII fold cannot tell these
+    // are the same name under Windows' real (Unicode ordinal) case-folding
+    // rule, so both must be refused outright -- on EVERY target, not just
+    // Windows, since is_denied/is_malformed validation does not vary by
+    // target and a POSIX name is legitimately allowed to differ only in
+    // case, never in encoding validity.
+    const std::string upper_ring_name = "\xc3\x85VAR";
+    const std::string lower_ring_name = "\xc3\xa5var";
+
+    CHECK(merge_launch_env(base, {{upper_ring_name, "x"}}, /*windows=*/false).rejected ==
+          std::vector<std::string>{upper_ring_name});
+    CHECK(merge_launch_env(base, {{upper_ring_name, "x"}}, /*windows=*/true).rejected ==
+          std::vector<std::string>{upper_ring_name});
+    CHECK(merge_launch_env(base, {{lower_ring_name, "x"}}, /*windows=*/false).rejected ==
+          std::vector<std::string>{lower_ring_name});
+    CHECK(merge_launch_env(base, {{lower_ring_name, "x"}}, /*windows=*/true).rejected ==
+          std::vector<std::string>{lower_ring_name});
+
+    // Neither entry is silently applied -- base is returned unchanged, same
+    // fail-closed contract as the other denylist/malformed cases.
+    CHECK(merge_launch_env(base, {{upper_ring_name, "x"}}, /*windows=*/true).env == base);
+
+    // build_launch_spec fails closed the same way an LD_PRELOAD name would.
+    LaunchOptions opts;
+    opts.extra_env = {{upper_ring_name, "x"}};
+    LaunchSpec spec = build_launch_spec({"/bin/echo"}, opts);
+    CHECK(spec.error == LaunchSpecError::denied_env_var);
+    CHECK(spec.argv.empty());
+
+    // An ASCII name with a non-ASCII VALUE is unaffected -- the restriction
+    // is on names (matching semantics/comparison), not values.
+    CHECK(merge_launch_env(base, {{"FOO", "\xc3\xa5var"}}, /*windows=*/false).rejected.empty());
+}

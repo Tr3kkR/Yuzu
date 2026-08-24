@@ -168,11 +168,46 @@ inline bool contains_nul(const std::string& s) {
     return s.find('\0') != std::string::npos;
 }
 
+/// Explicit ASCII-only case fold: uppercases 'a'-'z' byte-wise and leaves
+/// every other byte untouched. Deliberately NOT std::toupper -- that function
+/// is C-locale-dependent (a global, process-wide, mutable setting) and
+/// operating on a security allow/deny-list must not vary with whatever
+/// locale happens to be active. This also means it is honestly ASCII-only:
+/// it never claims to fold non-ASCII bytes (see is_ascii()/the ASCII-only
+/// env-name restriction below for why a non-ASCII name never reaches here
+/// needing a fold in the first place).
 inline std::string to_upper_ascii(const std::string& s) {
     std::string out = s;
-    for (char& c : out)
-        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    for (char& c : out) {
+        if (c >= 'a' && c <= 'z')
+            c = static_cast<char>(c - ('a' - 'A'));
+    }
     return out;
+}
+
+/** True iff every byte of `s` is 7-bit US-ASCII (0x00-0x7F).
+ *
+ *  Environment-variable NAMES are restricted to ASCII (see
+ *  is_malformed_env_entry) rather than this header attempting a
+ *  host-independent case-insensitive Unicode comparison for the Windows
+ *  REPLACE-matching in merge_launch_env(): Windows' environment-block
+ *  contract calls for locale-independent *ordinal* Unicode case folding,
+ *  which byte-wise ASCII-only to_upper_ascii() cannot provide -- a non-ASCII
+ *  pair like "\xc3\x85VAR" ("AVAR" with a Latin capital A-ring) and
+ *  "\xc3\xa5var" (its lowercase form) would silently survive as two distinct
+ *  entries, breaking the replace-never-duplicate guarantee and leaving which
+ *  value the child observes ambiguous -- exactly the hazard this is a
+ *  security boundary against. The only in-tree caller (the planned
+ *  script_exec allow-list) uses ASCII names, so rejecting non-ASCII
+ *  fail-closed through the existing malformed-entry path is the strictly
+ *  smaller, more conservative choice over implementing (and testing) a full
+ *  ordinal Unicode fold for a case with no current caller. If a future
+ *  caller genuinely needs non-ASCII environment names, that is a deliberate
+ *  widening requiring its own ordinal-fold implementation and test
+ *  coverage, not a relaxation of this check. */
+inline bool is_ascii(const std::string& s) {
+    return std::all_of(s.begin(), s.end(),
+                        [](char c) { return static_cast<unsigned char>(c) < 0x80; });
 }
 
 /** True iff `name` is refused outright by the ADR-3002 A5 strip list --
@@ -205,13 +240,19 @@ inline bool is_denied_env_name(const std::string& name, bool windows) {
 
 /** Malformed per build_launch_spec's extra_env contract: an empty name, a
  *  name containing '=' (ambiguous once serialized as "KEY=VALUE") or a NUL,
- *  or a value containing a NUL. */
+ *  a non-ASCII byte in the name (see is_ascii() -- A0-002: this header does
+ *  not implement Windows ordinal Unicode case folding, so a non-ASCII name
+ *  is rejected fail-closed rather than risk two names the real OS treats as
+ *  one both silently surviving merge_launch_env()), or a value containing a
+ *  NUL. */
 inline bool is_malformed_env_entry(const EnvVar& v) {
     if (v.key.empty())
         return true;
     if (v.key.find('=') != std::string::npos)
         return true;
     if (contains_nul(v.key))
+        return true;
+    if (!is_ascii(v.key))
         return true;
     if (contains_nul(v.value))
         return true;
