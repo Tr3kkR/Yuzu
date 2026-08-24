@@ -239,6 +239,33 @@ TEST_CASE("policy evaluator: evaluate_now does not dispatch when record_dispatch
     CHECK(h.dispatch_calls == 0);
 }
 
+TEST_CASE("policy evaluator: evaluate_now degrades (not a silent no-op) when the fragment "
+          "table is unavailable (governance, 2026-08-24)",
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    auto pid = h.author("result.hostname != ''");
+
+    // record_dispatch() (the durable claim stamp) touches only
+    // policy_dispatch_state and must still succeed here — this test targets
+    // kickoff_check()'s OWN get_fragment() read, which used to collapse a
+    // degraded read into the same "" a genuine "no check instruction /
+    // matches no agents" no-op returns, so a false REST 409 masked what was
+    // actually a 503.
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult r{PQexec(conn.get(), "DROP TABLE policy_store.policy_fragments CASCADE")};
+        REQUIRE(r.ok());
+    }
+
+    PolicyEvaluator ev(h.deps());
+    auto result = ev.evaluate_now(pid);
+    CHECK_FALSE(result.has_value());
+    CHECK(h.dispatch_calls == 0);
+}
+
 TEST_CASE("policy evaluator: non-responder -> unknown, plugin failure -> error",
           "[pg][policy][evaluator]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
