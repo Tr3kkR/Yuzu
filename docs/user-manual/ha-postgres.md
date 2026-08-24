@@ -9,6 +9,13 @@ Postgres** profile, which removes that single point of failure with automatic fa
 > multiple server replicas). You can run either without the other. See ADR-2002 for the whole
 > picture.
 
+> ⚠️ **Before any customer-facing use, read [Production requirements](#production-requirements-read-before-deploying).**
+> The shipped Compose profile runs a **single etcd** and a **single HAProxy** — both single points of
+> failure on their own — and is host-HA only when its three Postgres nodes sit on distinct hosts. On
+> one Docker host it is for **development and testing**. Migrating an existing single-Postgres
+> deployment onto this profile (data cutover) is **not yet documented** — it is delivered separately
+> (WS-12); until then, stand this up on a fresh deployment or contact support.
+
 ## What you get
 
 - **Automatic failover.** Three PostgreSQL nodes are managed by [Patroni](https://patroni.readthedocs.io/),
@@ -75,8 +82,11 @@ is available** — including after an ordinary single-node failover.
 **selectable** via `YUZU_PG_SYNC_STRICT`:
 
 - **`false` (default)** — the lone primary continues in **degraded async mode**: it keeps accepting
-  writes (availability over durability), opening a bounded data-loss window until a standby returns.
-  Single-node failover recovers quickly and reliably.
+  writes (availability over durability), opening a data-loss window (bounded by the write rate over the
+  degraded interval, until a standby returns). Single-node failover recovers quickly and reliably.
+  **This degrade is currently unsignalled** — Prometheus HA-state metrics land in WS-11, so until then
+  poll Patroni's REST (`/cluster`, `synchronous_standby_names`) to detect it, or run `strict` if a
+  silent async window is unacceptable.
 - **`true`** — the primary **blocks writes** when no synchronous standby is available (fail-closed on
   quorum loss — the ADR-2002 §11 / ADR-0007 intent; it never acknowledges a write it cannot protect).
   **Validate failover timing before enabling:** kickoff testing measured a materially longer time for

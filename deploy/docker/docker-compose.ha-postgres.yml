@@ -45,7 +45,7 @@ x-pg-common: &pg-common
     # Liveness (pg_isready) AND proof the app role/db that post_init creates
     # exists — a bare pg_isready reports healthy even if the app init failed. The
     # app SELECT 1 goes over the local socket with scram (matches the pg_hba).
-    test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${YUZU_SUPERUSER_NAME:-postgres} -d postgres && PGPASSWORD=$${YUZU_DB_PASSWORD} psql -h /var/run/postgresql -U $${YUZU_DB_USER:-yuzu} -d $${YUZU_DB_NAME:-yuzu} -tAc 'SELECT 1' >/dev/null"]
+    test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${YUZU_SUPERUSER_NAME:-postgres} -d postgres && PGPASSWORD=\"$${YUZU_DB_PASSWORD}\" psql -h /var/run/postgresql -U \"$${YUZU_DB_USER:-yuzu}\" -d \"$${YUZU_DB_NAME:-yuzu}\" -tAc 'SELECT 1' >/dev/null"]
     interval: 10s
     timeout: 5s
     retries: 12

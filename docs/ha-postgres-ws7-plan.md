@@ -17,7 +17,8 @@ at deploy time, giving:
 - **No storage SPOF** — automatic primary failover (Patroni), RTO ≈ 10–30 s (ADR-2002 §13).
 - **RPO = 0 while a synchronous-commit quorum holds** — default **3-node quorum** (1 primary + 2 sync
   standbys, `synchronous_standby_names = ANY 1 (s1,s2)`), selectable down to async/2-node profiles
-  (ADR-2002 §11). Quorum loss blocks writes by design (fail-closed, consistent with ADR-0007).
+  (ADR-2002 §11). On **total** standby loss the shipped default degrades to async (fail-closed is the
+  opt-in `YUZU_PG_SYNC_STRICT=true` — see §7 for why it is not the default).
 - **Transparent to the server binary** — the server reaches the cluster through a stable endpoint;
   **no server code change** is required (see §3).
 
@@ -112,11 +113,13 @@ init inside a Spilo template) would drift the two apart.
 ### Durability profiles (selectable — ADR-2002 §11)
 | Profile | `synchronous_standby_names` | RPO | Notes |
 |---|---|---|---|
-| `quorum3` (**default**) | `ANY 1 (pg2,pg3)` | 0 while ≥1 standby up | writes stall only if **both** standbys lost |
+| `quorum3` (**default**) | `ANY 1 (pg2,pg3)` | 0 while ≥1 standby up | on **total** standby loss: degrade to async by default, or block writes with `YUZU_PG_SYNC_STRICT=true` |
 | `sync2` | `FIRST 1 (pg2)` | 0 while the one standby up | single standby loss stalls writes (the §11 footgun — offered, not default) |
 | `async` | *(empty)* | > 0 (bounded by replication lag) | max availability, accepts bounded data loss |
 
-Selected via an env var on the Patroni nodes; the failure-domain placement (distinct hosts) is an
+`YUZU_PG_SYNC_STRICT` (default **false**) selects the total-standby-loss behaviour for the synchronous
+profiles — see §7 for why fail-closed is opt-in. Selected via env vars on the Patroni nodes; the
+failure-domain placement (distinct hosts) is an
 **operator** responsibility that Compose cannot enforce — documented loudly (ADR-2002 §11: Compose
 pins containers, not hosts; co-locating all three voids the RPO=0-across-host-failure guarantee).
 
