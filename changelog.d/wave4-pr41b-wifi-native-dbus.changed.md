@@ -1,0 +1,1 @@
+- **Wi-Fi scanning now reads NetworkManager directly over D-Bus on Linux, falling back automatically to nmcli/iw when unavailable, and no longer spawns a shell anywhere in the plugin.** macOS scan keeps its airport/system_profiler sources but invokes them as direct argv through the bounded subprocess runner.
