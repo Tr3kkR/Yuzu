@@ -113,7 +113,9 @@ struct ChromeIrHarness {
         tracker = std::make_unique<ExecutionTracker>(tracker_guard.db);
         tracker->create_tables();
 
-        instr = std::make_unique<InstructionStore>(":memory:");
+        // ADR-0058: InstructionStore is now a migrated Postgres store — shares
+        // the same pool/database as ResultSetStore above (schema-per-store).
+        instr = std::make_unique<InstructionStore>(pool);
         REQUIRE(instr->is_open());
 
         auto auth_fn = [](const httplib::Request&,

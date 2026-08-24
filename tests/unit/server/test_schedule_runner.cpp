@@ -55,14 +55,44 @@ struct DispatchCall {
     std::unordered_map<std::string, std::string> params;
 };
 
+// InstructionStore is now a migrated Postgres store (ADR-0058).
+yuzu::test::PgTestTemplate schedrunner_instr_tpl{
+    "schedrunnerinstr", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        InstructionStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("schedrunner instruction template: store failed to migrate");
+    }};
+
+// A trivial first-declared Harness member whose sole purpose is running the
+// YUZU_REQUIRE_PG_DB_TPL skip-check BEFORE the non-movable PostgresTestDb/
+// PgPool members below it construct (both delete their move ctor, so they
+// cannot be built elsewhere and relocated in). SKIP() works correctly here
+// because we're still within the dynamic extent of the TEST_CASE that
+// constructs Harness — Catch2's macros don't care about call depth, only
+// about running inside a live test case (Harness's own constructor body
+// already relies on this same fact for its REQUIRE calls, below). Keeping
+// every one of the 19 existing `Harness h;` / `Harness h(...)` call sites
+// unchanged is the whole point of gating this way instead of threading a
+// pg::PgPool& through the constructor.
+struct PgSkipGate {
+    PgSkipGate() {
+        if (yuzu::test::pg_admin_dsn_env() == nullptr)
+            SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    }
+};
+
 struct Harness {
+    PgSkipGate pg_gate_; // MUST stay the first declared member — see its own doc comment.
+    yuzu::test::PostgresTestDb instr_db{schedrunner_instr_tpl};
+    yuzu::server::pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+
     TestDb db; // shared by engine + tracker + approvals (production shape)
-    yuzu::test::TempDbFile insdb{std::string_view("schedrun-ins-")};
 
     ScheduleEngine engine{db.db};
     ExecutionTracker tracker{db.db};
     ApprovalManager approvals{db.db};
-    InstructionStore is{insdb.path};
+    InstructionStore is{instr_pool};
 
     std::vector<DispatchCall> calls;
     int reach{1};        // agents "reached" by the fake dispatch
@@ -108,6 +138,9 @@ struct Harness {
               },
               .arming_check = std::move(arming),
           }) {
+        INFO("[schedrunner instr] fixture status (blank == database came up OK): "
+             << instr_db.error());
+        REQUIRE(instr_db.available());
         engine.create_tables();
         tracker.create_tables();
         approvals.create_tables();

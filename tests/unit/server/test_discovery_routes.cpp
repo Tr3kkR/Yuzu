@@ -116,7 +116,9 @@ struct DiscoverHarness {
         REQUIRE(rbac_pool->valid());
         rbac = std::make_unique<RbacStore>(*rbac_pool);
         REQUIRE(rbac->is_open());
-        instr = std::make_unique<InstructionStore>(":memory:");
+        // ADR-0058: InstructionStore is now a migrated Postgres store — shares
+        // the same pool/database as RbacStore above (schema-per-store, ADR-0008).
+        instr = std::make_unique<InstructionStore>(*rbac_pool);
         REQUIRE(instr->is_open());
 
         // The /discover/plugins parameter_schema enrichment is gated on the

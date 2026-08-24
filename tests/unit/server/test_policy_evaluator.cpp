@@ -58,9 +58,11 @@ std::string out_json2(const std::string& c1, const std::string& v1, const std::s
 }
 
 struct Harness {
-    yuzu::test::TempDbFile poldb{std::string_view("pol-")}, insdb{std::string_view("ins-")};
+    yuzu::test::TempDbFile poldb{std::string_view("pol-")};
     PolicyStore ps{poldb.path};
-    InstructionStore is{insdb.path};
+    // InstructionStore is now a migrated Postgres store (ADR-0058) — shares the
+    // same pool/database as ResponseStore below (schema-per-store, ADR-0008).
+    InstructionStore is;
     ResponseStore rs;
     yuzu::test::ManagementGroupStorePg mg_bundle;
     ManagementGroupStore& mg = *mg_bundle;
@@ -73,7 +75,7 @@ struct Harness {
 
     std::string group_id;
 
-    explicit Harness(pg::PgPool& pool) : rs(pool) {
+    explicit Harness(pg::PgPool& pool) : is(pool), rs(pool) {
         auto def = [&](const std::string& id, const std::string& plugin) {
             InstructionDefinition d;
             d.id = id;

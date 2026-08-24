@@ -51,6 +51,14 @@ yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::stri
     if (!store.is_open())
         throw std::runtime_error("responsestore template: store failed to migrate");
 }};
+// InstructionStore is now a migrated Postgres store (ADR-0058).
+yuzu::test::PgTestTemplate dashboard_cols_instr_tpl{
+    "dashcolsinstr", [](const std::string& dsn) {
+        PgPool pool{{.conninfo = dsn, .size = 1}};
+        InstructionStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("dashboard_cols_instr template: store failed to migrate");
+    }};
 } // namespace
 
 // Test-only accessor for the private schema-aware column resolution +
@@ -131,7 +139,9 @@ std::size_t count_occurrences(const std::string& hay, std::string_view needle) {
 TEST_CASE("render_results: a schema-only definition (no visualization) resolves "
           "real columns instead of the plugin-only fallback (PR1.7 remediation)",
           "[pg][server][dashboard][render_results]") {
-    InstructionStore is{":memory:"};
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, dashboard_cols_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
     REQUIRE(is.is_open());
     auto created = is.create_definition(make_list_profiles_definition());
     REQUIRE(created.has_value());
@@ -178,7 +188,9 @@ TEST_CASE("render_results: a schema-only definition (no visualization) resolves 
 TEST_CASE("render_results: no definition_id falls back to columns_for_plugin "
           "unchanged (regression pin for every other plugin/action)",
           "[pg][server][dashboard][render_results]") {
-    InstructionStore is{":memory:"};
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, dashboard_cols_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
     REQUIRE(is.is_open());
 
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
@@ -210,7 +222,9 @@ TEST_CASE("render_results: no definition_id falls back to columns_for_plugin "
 TEST_CASE("render_results: a degraded store read renders the degrade banner "
           "not \"no results match your filters\"",
           "[server][dashboard][render_results]") {
-    InstructionStore is{":memory:"};
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, dashboard_cols_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
     REQUIRE(is.is_open());
 
     PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
@@ -233,7 +247,9 @@ TEST_CASE("render_results: a degraded store read renders the degrade banner "
 TEST_CASE("render_filter_bar: a degraded facet read disables the dropdown "
           "instead of rendering an empty All",
           "[server][dashboard][render_filter_bar]") {
-    InstructionStore is{":memory:"};
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, dashboard_cols_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
     REQUIRE(is.is_open());
 
     PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};

@@ -1,18 +1,34 @@
 /**
  * test_instruction_store.cpp — Unit tests for InstructionStore
  *
+ * Migrated-to-Postgres store (ADR-0006/0009/0058, ADR-0012 §1 authoritative/fail-hard). PG-gated:
+ * skips when YUZU_TEST_POSTGRES_DSN is unset, fails when set but broken (test_helpers.hpp
+ * skip-vs-fail contract). Store-behaviour cases use the pre-migrated PgTestTemplate variant
+ * (docs/postgres-store-playbook.md step 7).
+ *
  * Covers: CRUD definitions, uniqueness, filters, import/export,
  *         instruction sets, extended fields, validation.
+ *
+ * The `[instruction_store][seed]`-tagged cases at the end of this file (trusted reseed /
+ * seed-vs-live, ADR-0058) are a SEPARATE concern from the rest of this file's mechanical
+ * PG-harness conversion — they encode the deliberate Option B behaviour-inversion decision and
+ * are maintained as their own section.
  */
 
 #include "instruction_store.hpp"
 #include "store_errors.hpp"
+
+#include "pg/pg_pool.hpp"
+
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
 
 using namespace yuzu::server;
+namespace pg = yuzu::server::pg;
+using yuzu::server::pg::PgPool;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -44,17 +60,32 @@ static InstructionDefinition make_action(const std::string& name,
     return def;
 }
 
+namespace {
+yuzu::test::PgTestTemplate instruction_store_tpl{
+    "instructionstore", [](const std::string& dsn) {
+        PgPool pool{{.conninfo = dsn, .size = 1}};
+        InstructionStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("instruction_store template: store failed to migrate");
+    }};
+} // namespace
+
 // ── Lifecycle ──────────────────────────────────────────────────────────────
 
-TEST_CASE("InstructionStore: open in-memory", "[instruction_store][db]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: opens against Postgres", "[instruction_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
     REQUIRE(store.is_open());
 }
 
 // ── Create Definition ──────────────────────────────────────────────────────
 
-TEST_CASE("InstructionStore: create question definition", "[instruction_store]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: create question definition", "[instruction_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     auto def = make_question("Get Hostname");
     auto result = store.create_definition(def);
@@ -62,8 +93,11 @@ TEST_CASE("InstructionStore: create question definition", "[instruction_store]")
     CHECK(!result->empty());
 }
 
-TEST_CASE("InstructionStore: create action definition", "[instruction_store]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: create action definition", "[instruction_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     auto def = make_action("Restart Service");
     auto result = store.create_definition(def);
@@ -71,8 +105,11 @@ TEST_CASE("InstructionStore: create action definition", "[instruction_store]") {
     CHECK(!result->empty());
 }
 
-TEST_CASE("InstructionStore: create with empty name fails", "[instruction_store]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: create with empty name fails", "[instruction_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     InstructionDefinition def;
     def.name = "";
@@ -84,8 +121,11 @@ TEST_CASE("InstructionStore: create with empty name fails", "[instruction_store]
     CHECK(!result.has_value());
 }
 
-TEST_CASE("InstructionStore: create with invalid type fails", "[instruction_store]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: create with invalid type fails", "[instruction_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     InstructionDefinition def;
     def.name = "Bad";
@@ -97,12 +137,15 @@ TEST_CASE("InstructionStore: create with invalid type fails", "[instruction_stor
     CHECK(!result.has_value());
 }
 
-TEST_CASE("InstructionStore: explicit id is bounded to a safe charset", "[instruction_store]") {
+TEST_CASE("InstructionStore: explicit id is bounded to a safe charset", "[instruction_store][pg]") {
     // Explicit ids are operator-controlled (JSON create #402, YAML Save
     // metadata.id #1993) and are interpolated into dashboard fragments,
     // route paths, and audit rows — the store is the single chokepoint that
     // bounds them (governance sec-M1).
-    InstructionStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     InstructionDefinition def;
     def.name = "Charset Probe";
@@ -143,14 +186,17 @@ TEST_CASE("InstructionStore: explicit id is bounded to a safe charset", "[instru
 }
 
 TEST_CASE("InstructionStore: the mcp. definition-id namespace is reserved",
-          "[instruction_store][security]") {
+          "[instruction_store][security][pg]") {
     // #2442: the MCP approval gate mints tickets under `mcp.<tool>` and its
     // recall matches on (definition_id, scope_expression) without binding the
     // submitter. A definition authored under that prefix is what would let an
     // approval raised on the instruction surface line up with an MCP tool's
     // canonical arguments — so the prefix is refused at the authoring
     // chokepoint as well as at the mint.
-    InstructionStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     InstructionDefinition def;
     def.name = "Namespace Probe";
@@ -172,13 +218,16 @@ TEST_CASE("InstructionStore: the mcp. definition-id namespace is reserved",
 }
 
 TEST_CASE("InstructionStore: NUL in yaml_source is rejected at the store chokepoint",
-          "[instruction_store]") {
-    // sqlite3_bind_text(-1) truncates at the first NUL, so a NUL-bearing
-    // source would persist a blob that diverges from the extracted columns
-    // (and, on the signed-import path, from the signature-verified bytes).
-    // The store rejects it for every surface, not just the dashboard
-    // validator (governance UP-2 / Gate 8).
-    InstructionStore store(":memory:");
+          "[instruction_store][pg]") {
+    // libpq's text-format binding is C-string-based, so a NUL-bearing source would silently
+    // TRUNCATE the stored value at that point (persisting a blob that diverges from the
+    // extracted columns and, on the signed-import path, from the signature-verified bytes).
+    // The store rejects it for every surface, not just the dashboard validator (governance
+    // UP-2 / Gate 8).
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     InstructionDefinition def;
     def.name = "Nul Probe";
@@ -212,8 +261,12 @@ InstructionDefinition scoped_def(const std::string& scope_and_assignment) {
 } // namespace
 
 TEST_CASE("InstructionStore: spec.scope.fromResultSet with static mode is accepted + round-trips",
-          "[instruction_store][scope]") {
-    InstructionStore store(":memory:");
+          "[instruction_store][scope][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
     auto def = scoped_def("  scope:\n"
                           "    fromResultSet: rs_abc\n"
                           "  assignment:\n"
@@ -222,12 +275,17 @@ TEST_CASE("InstructionStore: spec.scope.fromResultSet with static mode is accept
     REQUIRE(r.has_value());
     auto got = store.get_definition(r.value());
     REQUIRE(got.has_value());
-    CHECK(got->yaml_source.find("fromResultSet") != std::string::npos);
+    REQUIRE(got->has_value());
+    CHECK((*got)->yaml_source.find("fromResultSet") != std::string::npos);
 }
 
 TEST_CASE("InstructionStore: spec.scope.fromResultSet with dynamic mode is rejected",
-          "[instruction_store][scope]") {
-    InstructionStore store(":memory:");
+          "[instruction_store][scope][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
     auto r = store.create_definition(scoped_def("  scope:\n"
                                                 "    fromResultSet: rs_abc\n"
                                                 "  assignment:\n"
@@ -237,8 +295,12 @@ TEST_CASE("InstructionStore: spec.scope.fromResultSet with dynamic mode is rejec
 }
 
 TEST_CASE("InstructionStore: update_definition enforces the same scope validation (arch-B1)",
-          "[instruction_store][scope]") {
-    InstructionStore store(":memory:");
+          "[instruction_store][scope][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
     // Create a clean definition...
     auto def = scoped_def("  scope:\n    fromResultSet: rs_abc\n  assignment:\n    mode: static\n");
     auto created = store.create_definition(def);
@@ -255,8 +317,12 @@ TEST_CASE("InstructionStore: update_definition enforces the same scope validatio
 }
 
 TEST_CASE("InstructionStore: inline flow-mapping scope is rejected (UP-6)",
-          "[instruction_store][scope]") {
-    InstructionStore store(":memory:");
+          "[instruction_store][scope][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
     InstructionDefinition def;
     def.name = "Inline";
     def.type = "action";
@@ -271,8 +337,12 @@ TEST_CASE("InstructionStore: inline flow-mapping scope is rejected (UP-6)",
 }
 
 TEST_CASE("InstructionStore: spec.scope.fromResultSet + assignment.managementGroups is rejected",
-          "[instruction_store][scope]") {
-    InstructionStore store(":memory:");
+          "[instruction_store][scope][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
     auto r = store.create_definition(scoped_def("  scope:\n"
                                                 "    fromResultSet: rs_abc\n"
                                                 "  assignment:\n"
@@ -284,15 +354,22 @@ TEST_CASE("InstructionStore: spec.scope.fromResultSet + assignment.managementGro
 }
 
 TEST_CASE("InstructionStore: a scope-less definition is unaffected by PR-E validation",
-          "[instruction_store][scope]") {
-    InstructionStore store(":memory:");
+          "[instruction_store][scope][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
     CHECK(store.create_definition(make_question("Plain")).has_value());
 }
 
 // ── ID Uniqueness ─────────────────────────────────────────────────────────
 
-TEST_CASE("InstructionStore: auto-generated IDs are unique", "[instruction_store]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: auto-generated IDs are unique", "[instruction_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     auto result1 = store.create_definition(make_question("Get Hostname", "1.0"));
     REQUIRE(result1.has_value());
@@ -311,8 +388,11 @@ TEST_CASE("InstructionStore: auto-generated IDs are unique", "[instruction_store
 
 // ── Get By ID ──────────────────────────────────────────────────────────────
 
-TEST_CASE("InstructionStore: get definition by ID", "[instruction_store]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: get definition by ID", "[instruction_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     auto def = make_question("Get Hostname");
     def.description = "Returns the machine hostname";
@@ -321,35 +401,48 @@ TEST_CASE("InstructionStore: get definition by ID", "[instruction_store]") {
 
     auto fetched = store.get_definition(*result);
     REQUIRE(fetched.has_value());
-    CHECK(fetched->name == "Get Hostname");
-    CHECK(fetched->version == "1.0");
-    CHECK(fetched->plugin == "system_info");
-    CHECK(fetched->type == "question");
-    CHECK(fetched->description == "Returns the machine hostname");
-    CHECK(fetched->enabled == true);
+    REQUIRE(fetched->has_value());
+    CHECK((*fetched)->name == "Get Hostname");
+    CHECK((*fetched)->version == "1.0");
+    CHECK((*fetched)->plugin == "system_info");
+    CHECK((*fetched)->type == "question");
+    CHECK((*fetched)->description == "Returns the machine hostname");
+    CHECK((*fetched)->enabled == true);
 }
 
-TEST_CASE("InstructionStore: get nonexistent returns empty", "[instruction_store]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: get nonexistent returns empty", "[instruction_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
     auto result = store.get_definition("nonexistent-id");
-    CHECK(!result.has_value());
+    REQUIRE(result.has_value()); // successful read...
+    CHECK_FALSE(result->has_value()); // ...that found nothing
 }
 
 // ── Query with Filters ─────────────────────────────────────────────────────
 
-TEST_CASE("InstructionStore: query all definitions", "[instruction_store]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: query all definitions", "[instruction_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     store.create_definition(make_question("Get Hostname"));
     store.create_definition(make_action("Restart Service"));
     store.create_definition(make_question("Get OS Version"));
 
     auto results = store.query_definitions();
-    REQUIRE(results.size() == 3);
+    REQUIRE(results.has_value());
+    REQUIRE(results->size() == 3);
 }
 
-TEST_CASE("InstructionStore: query by name filter", "[instruction_store]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: query by name filter", "[instruction_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     store.create_definition(make_question("Get Hostname"));
     store.create_definition(make_question("Get OS Version"));
@@ -358,12 +451,16 @@ TEST_CASE("InstructionStore: query by name filter", "[instruction_store]") {
     InstructionQuery q;
     q.name_filter = "Hostname";
     auto results = store.query_definitions(q);
-    REQUIRE(results.size() == 1);
-    CHECK(results[0].name == "Get Hostname");
+    REQUIRE(results.has_value());
+    REQUIRE(results->size() == 1);
+    CHECK((*results)[0].name == "Get Hostname");
 }
 
-TEST_CASE("InstructionStore: query by plugin filter", "[instruction_store]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: query by plugin filter", "[instruction_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     store.create_definition(make_question("Get Hostname", "1.0", "system_info"));
     store.create_definition(make_action("Restart Service", "1.0", "remediation"));
@@ -372,11 +469,15 @@ TEST_CASE("InstructionStore: query by plugin filter", "[instruction_store]") {
     InstructionQuery q;
     q.plugin_filter = "system_info";
     auto results = store.query_definitions(q);
-    REQUIRE(results.size() == 2);
+    REQUIRE(results.has_value());
+    REQUIRE(results->size() == 2);
 }
 
-TEST_CASE("InstructionStore: query by type filter", "[instruction_store]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: query by type filter", "[instruction_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     store.create_definition(make_question("Get Hostname"));
     store.create_definition(make_action("Restart Service"));
@@ -385,11 +486,15 @@ TEST_CASE("InstructionStore: query by type filter", "[instruction_store]") {
     InstructionQuery q;
     q.type_filter = "action";
     auto results = store.query_definitions(q);
-    REQUIRE(results.size() == 2);
+    REQUIRE(results.has_value());
+    REQUIRE(results->size() == 2);
 }
 
-TEST_CASE("InstructionStore: query enabled_only filter", "[instruction_store]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: query enabled_only filter", "[instruction_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     auto def1 = make_question("Get Hostname");
     def1.enabled = true;
@@ -402,12 +507,16 @@ TEST_CASE("InstructionStore: query enabled_only filter", "[instruction_store]") 
     InstructionQuery q;
     q.enabled_only = true;
     auto results = store.query_definitions(q);
-    REQUIRE(results.size() == 1);
-    CHECK(results[0].name == "Get Hostname");
+    REQUIRE(results.has_value());
+    REQUIRE(results->size() == 1);
+    CHECK((*results)[0].name == "Get Hostname");
 }
 
-TEST_CASE("InstructionStore: query by set_id_filter", "[instruction_store]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: query by set_id_filter", "[instruction_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     InstructionSet iset;
     iset.name = "Fleet Overview";
@@ -428,11 +537,15 @@ TEST_CASE("InstructionStore: query by set_id_filter", "[instruction_store]") {
     InstructionQuery q;
     q.set_id_filter = *set_result;
     auto results = store.query_definitions(q);
-    REQUIRE(results.size() == 2);
+    REQUIRE(results.has_value());
+    REQUIRE(results->size() == 2);
 }
 
-TEST_CASE("InstructionStore: query with limit", "[instruction_store]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: query with limit", "[instruction_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     for (int i = 0; i < 10; ++i) {
         auto def = make_question("Def " + std::to_string(i), std::to_string(i) + ".0");
@@ -442,13 +555,17 @@ TEST_CASE("InstructionStore: query with limit", "[instruction_store]") {
     InstructionQuery q;
     q.limit = 3;
     auto results = store.query_definitions(q);
-    REQUIRE(results.size() == 3);
+    REQUIRE(results.has_value());
+    REQUIRE(results->size() == 3);
 }
 
 // ── Update Definition ──────────────────────────────────────────────────────
 
-TEST_CASE("InstructionStore: update definition", "[instruction_store]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: update definition", "[instruction_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     auto def = make_question("Get Hostname");
     auto id_result = store.create_definition(def);
@@ -456,20 +573,25 @@ TEST_CASE("InstructionStore: update definition", "[instruction_store]") {
 
     auto fetched = store.get_definition(*id_result);
     REQUIRE(fetched.has_value());
-    fetched->description = "Updated description";
-    fetched->enabled = false;
+    REQUIRE(fetched->has_value());
+    (*fetched)->description = "Updated description";
+    (*fetched)->enabled = false;
 
-    auto update_result = store.update_definition(*fetched);
+    auto update_result = store.update_definition(**fetched);
     REQUIRE(update_result.has_value());
 
     auto refetched = store.get_definition(*id_result);
     REQUIRE(refetched.has_value());
-    CHECK(refetched->description == "Updated description");
-    CHECK(refetched->enabled == false);
+    REQUIRE(refetched->has_value());
+    CHECK((*refetched)->description == "Updated description");
+    CHECK((*refetched)->enabled == false);
 }
 
-TEST_CASE("InstructionStore: update nonexistent fails", "[instruction_store]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: update nonexistent fails", "[instruction_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     InstructionDefinition def;
     def.id = "nonexistent-id";
@@ -485,29 +607,41 @@ TEST_CASE("InstructionStore: update nonexistent fails", "[instruction_store]") {
 
 // ── Delete Definition ──────────────────────────────────────────────────────
 
-TEST_CASE("InstructionStore: delete definition", "[instruction_store]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: delete definition", "[instruction_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     auto id_result = store.create_definition(make_question("Get Hostname"));
     REQUIRE(id_result.has_value());
 
-    bool deleted = store.delete_definition(*id_result);
-    REQUIRE(deleted);
+    auto deleted = store.delete_definition(*id_result);
+    REQUIRE(deleted.has_value());
 
     auto result = store.get_definition(*id_result);
-    CHECK(!result.has_value());
+    REQUIRE(result.has_value());
+    CHECK_FALSE(result->has_value());
 }
 
-TEST_CASE("InstructionStore: delete nonexistent returns false", "[instruction_store]") {
-    InstructionStore store(":memory:");
-    bool deleted = store.delete_definition("nonexistent-id");
-    CHECK(!deleted);
+TEST_CASE("InstructionStore: delete nonexistent returns not_found", "[instruction_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto deleted = store.delete_definition("nonexistent-id");
+    REQUIRE_FALSE(deleted.has_value());
+    CHECK(deleted.error().starts_with("not_found:"));
 }
 
 // ── Import/Export JSON ─────────────────────────────────────────────────────
 
-TEST_CASE("InstructionStore: export and import round-trip", "[instruction_store][json]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: export and import round-trip", "[instruction_store][json][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     auto def = make_question("Get Hostname");
     def.parameter_schema = R"({"type":"object","properties":{"timeout":{"type":"integer"}}})";
@@ -516,40 +650,57 @@ TEST_CASE("InstructionStore: export and import round-trip", "[instruction_store]
     REQUIRE(id_result.has_value());
 
     auto json = store.export_definition_json(*id_result);
-    REQUIRE(!json.empty());
-    CHECK(json != "{}");
+    REQUIRE(json.has_value());
+    REQUIRE(!json->empty());
+    CHECK(*json != "{}");
 
-    // Import into a fresh store (avoids name+version uniqueness collision)
-    InstructionStore store2(":memory:");
+    // Import into a fresh, separately-cloned store (avoids name+version uniqueness collision).
+    YUZU_REQUIRE_PG_DB_TPL(db2, instruction_store_tpl);
+    PgPool pool2{{.conninfo = db2.dsn(), .size = 2}};
+    InstructionStore store2{pool2};
+    REQUIRE(store2.is_open());
     // #1073: opt out of signature enforcement — this test exercises
     // import-round-trip, not the signature gate.
     store2.set_require_signed_definitions(false);
-    auto import_result = store2.import_definition_json(json);
+    auto import_result = store2.import_definition_json(*json);
     REQUIRE(import_result.has_value());
 
     // Verify the imported definition preserves fields
     auto imported = store2.get_definition(*import_result);
     REQUIRE(imported.has_value());
-    CHECK(imported->name == "Get Hostname");
-    CHECK(imported->plugin == "system_info");
+    REQUIRE(imported->has_value());
+    CHECK((*imported)->name == "Get Hostname");
+    CHECK((*imported)->plugin == "system_info");
 }
 
-TEST_CASE("InstructionStore: import invalid JSON fails", "[instruction_store][json]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: import invalid JSON fails", "[instruction_store][json][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
     auto result = store.import_definition_json("not valid json {{{");
     CHECK(!result.has_value());
 }
 
-TEST_CASE("InstructionStore: export nonexistent returns empty", "[instruction_store][json]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: export nonexistent returns empty", "[instruction_store][json][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
     auto json = store.export_definition_json("nonexistent-id");
-    CHECK((json.empty() || json == "{}"));
+    REQUIRE(json.has_value()); // successful read finding nothing, not a DB error
+    CHECK(*json == "{}");
 }
 
 // ── Instruction Sets ───────────────────────────────────────────────────────
 
-TEST_CASE("InstructionStore: create instruction set", "[instruction_store][sets]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: create instruction set", "[instruction_store][sets][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     InstructionSet iset;
     iset.name = "Baseline Audit";
@@ -559,8 +710,11 @@ TEST_CASE("InstructionStore: create instruction set", "[instruction_store][sets]
     CHECK(!result->empty());
 }
 
-TEST_CASE("InstructionStore: list instruction sets", "[instruction_store][sets]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: list instruction sets", "[instruction_store][sets][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     InstructionSet s1;
     s1.name = "Baseline Audit";
@@ -570,27 +724,35 @@ TEST_CASE("InstructionStore: list instruction sets", "[instruction_store][sets]"
     store.create_set(s2);
 
     auto sets = store.list_sets();
-    REQUIRE(sets.size() == 2);
+    REQUIRE(sets.has_value());
+    REQUIRE(sets->size() == 2);
 }
 
-TEST_CASE("InstructionStore: delete instruction set", "[instruction_store][sets]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: delete instruction set", "[instruction_store][sets][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     InstructionSet iset;
     iset.name = "Temporary Set";
     auto result = store.create_set(iset);
     REQUIRE(result.has_value());
 
-    bool deleted = store.delete_set(*result);
-    REQUIRE(deleted);
+    auto deleted = store.delete_set(*result);
+    REQUIRE(deleted.has_value());
 
     auto sets = store.list_sets();
-    CHECK(sets.empty());
+    REQUIRE(sets.has_value());
+    CHECK(sets->empty());
 }
 
 TEST_CASE("InstructionStore: delete set unsets instruction_set_id on definitions",
-          "[instruction_store][sets]") {
-    InstructionStore store(":memory:");
+          "[instruction_store][sets][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     InstructionSet iset;
     iset.name = "Fleet Overview";
@@ -603,25 +765,35 @@ TEST_CASE("InstructionStore: delete set unsets instruction_set_id on definitions
     REQUIRE(def_result.has_value());
 
     // Delete the set
-    bool deleted = store.delete_set(*set_result);
-    REQUIRE(deleted);
+    auto deleted = store.delete_set(*set_result);
+    REQUIRE(deleted.has_value());
 
     // The definition should still exist but with instruction_set_id cleared
     auto fetched = store.get_definition(*def_result);
     REQUIRE(fetched.has_value());
-    CHECK(fetched->instruction_set_id.empty());
+    REQUIRE(fetched->has_value());
+    CHECK((*fetched)->instruction_set_id.empty());
 }
 
-TEST_CASE("InstructionStore: delete nonexistent set returns false", "[instruction_store][sets]") {
-    InstructionStore store(":memory:");
-    bool deleted = store.delete_set("nonexistent-set-id");
-    CHECK(!deleted);
+TEST_CASE("InstructionStore: delete nonexistent set returns not_found",
+          "[instruction_store][sets][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto deleted = store.delete_set("nonexistent-set-id");
+    REQUIRE_FALSE(deleted.has_value());
+    CHECK(deleted.error().starts_with("not_found:"));
 }
 
 // ── Extended Fields ────────────────────────────────────────────────────────
 
-TEST_CASE("InstructionStore: extended fields round-trip", "[instruction_store][extended]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: extended fields round-trip", "[instruction_store][extended][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     auto def = make_action("Patch Windows");
     def.yaml_source = "name: Patch Windows\ntype: action\n";
@@ -642,22 +814,26 @@ TEST_CASE("InstructionStore: extended fields round-trip", "[instruction_store][e
 
     auto fetched = store.get_definition(*id_result);
     REQUIRE(fetched.has_value());
-    CHECK(fetched->yaml_source == def.yaml_source);
-    CHECK(fetched->parameter_schema == def.parameter_schema);
-    CHECK(fetched->result_schema == def.result_schema);
-    CHECK(fetched->approval_mode == "role-gated");
-    CHECK(fetched->concurrency_mode == "per-device");
-    CHECK(fetched->platforms == "windows");
-    CHECK(fetched->min_agent_version == "2.1.0");
-    CHECK(fetched->required_plugins == "windows_update,remediation");
-    CHECK(fetched->readable_payload == "Install KB ${kb} on target");
-    CHECK(fetched->created_by == "admin");
-    CHECK(fetched->gather_ttl_seconds == 600);
-    CHECK(fetched->response_ttl_days == 180);
+    REQUIRE(fetched->has_value());
+    CHECK((*fetched)->yaml_source == def.yaml_source);
+    CHECK((*fetched)->parameter_schema == def.parameter_schema);
+    CHECK((*fetched)->result_schema == def.result_schema);
+    CHECK((*fetched)->approval_mode == "role-gated");
+    CHECK((*fetched)->concurrency_mode == "per-device");
+    CHECK((*fetched)->platforms == "windows");
+    CHECK((*fetched)->min_agent_version == "2.1.0");
+    CHECK((*fetched)->required_plugins == "windows_update,remediation");
+    CHECK((*fetched)->readable_payload == "Install KB ${kb} on target");
+    CHECK((*fetched)->created_by == "admin");
+    CHECK((*fetched)->gather_ttl_seconds == 600);
+    CHECK((*fetched)->response_ttl_days == 180);
 }
 
-TEST_CASE("InstructionStore: timestamps set on create", "[instruction_store][extended]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: timestamps set on create", "[instruction_store][extended][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     auto def = make_question("Get Hostname");
     auto id_result = store.create_definition(def);
@@ -665,15 +841,19 @@ TEST_CASE("InstructionStore: timestamps set on create", "[instruction_store][ext
 
     auto fetched = store.get_definition(*id_result);
     REQUIRE(fetched.has_value());
-    CHECK(fetched->created_at > 0);
-    CHECK(fetched->updated_at > 0);
+    REQUIRE(fetched->has_value());
+    CHECK((*fetched)->created_at > 0);
+    CHECK((*fetched)->updated_at > 0);
 }
 
 // ── Duplicate-id guard (#402) ──────────────────────────────────────────────
 
 TEST_CASE("InstructionStore: explicit duplicate id rejected with conflict prefix",
-          "[instruction_store][duplicate]") {
-    InstructionStore store(":memory:");
+          "[instruction_store][duplicate][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     auto first = make_question("First", "1.0");
     first.id = "test.os.info";
@@ -692,12 +872,16 @@ TEST_CASE("InstructionStore: explicit duplicate id rejected with conflict prefix
     // First definition is unchanged — no silent overwrite.
     auto fetched = store.get_definition("test.os.info");
     REQUIRE(fetched.has_value());
-    CHECK(fetched->name == "First");
+    REQUIRE(fetched->has_value());
+    CHECK((*fetched)->name == "First");
 }
 
 TEST_CASE("InstructionStore: empty id still gets generated UUID with no conflict",
-          "[instruction_store][duplicate]") {
-    InstructionStore store(":memory:");
+          "[instruction_store][duplicate][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     auto a = make_question("Alpha");
     auto b = make_question("Bravo");
@@ -724,12 +908,17 @@ TEST_CASE("InstructionStore: kConflictPrefix has the documented literal value",
     // is_conflict_error() and would silently regress if a third consumer
     // used a substring match. Pinning the literal here is the only way to
     // detect a constant rename that drops the documented prefix shape.
+    //
+    // No PG dependency — pure constant check, no store construction.
     CHECK(std::string_view(kConflictPrefix) == "conflict:");
 }
 
 TEST_CASE("InstructionStore: import_definition_json duplicate uses kConflictPrefix",
-          "[instruction_store][duplicate][import]") {
-    InstructionStore store(":memory:");
+          "[instruction_store][duplicate][import][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
     // #1073: this test pins the duplicate-import error contract for the
     // boot-time auto-import flow; opt out of signature enforcement so the
     // unsigned envelope below isn't pre-emptively rejected.
@@ -756,8 +945,11 @@ TEST_CASE("InstructionStore: import_definition_json duplicate uses kConflictPref
 }
 
 TEST_CASE("InstructionStore: create_set duplicate uses kConflictPrefix",
-          "[instruction_store][duplicate][set]") {
-    InstructionStore store(":memory:");
+          "[instruction_store][duplicate][set][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     InstructionSet s;
     s.id = "test.set.dup";
@@ -791,18 +983,34 @@ TEST_CASE("InstructionStore: create_set duplicate uses kConflictPrefix",
 // SHOULD do, so a behaviour change during the port is a deliberate,
 // ADR-recorded decision rather than an accidental regression.
 //
-// Notably: the store's ONLY seed-vs-live signal is id existence. That
-// preserves an operator's in-place EDIT (case 2 below) but does NOT
-// preserve an operator's DELETE (case 3 below) — a deleted bundled id is
-// indistinguishable from a never-seeded one, so the next boot silently
-// recreates it. Whatever the kickoff doc's aspirational "must not be
-// resurrected" language intended, this is the behaviour actually shipping
-// today; ADR-0058 must explicitly decide whether to keep or change it.
+// Notably: the store's seed-vs-live signal for a LIVE row is id existence,
+// preserving an operator's in-place EDIT (case 2 below). Deletion is
+// DIFFERENT: ADR-0058 made it an intentional suppression (`deleted_seed_content`,
+// consulted only by the trusted-reseed insert path and the backfill) rather
+// than a plain DELETE the every-boot reseed loop could silently undo — this
+// is a DELIBERATE BEHAVIOUR CHANGE from the pre-migration SQLite store, which
+// resurrected an operator-deleted bundled definition on the very next boot
+// (see docs/adr/0058-instruction-store-postgres-migration.md for the full
+// reasoning and the independent-model consult that informed the decision).
+// Case 3 below asserts the NEW behaviour, not the old one.
+
+namespace {
+yuzu::test::PgTestTemplate instruction_store_seed_tpl{
+    "instrstoreseed", [](const std::string& dsn) {
+        PgPool pool{{.conninfo = dsn, .size = 1}};
+        InstructionStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("instruction_store_seed template: store failed to migrate");
+    }};
+} // namespace
 
 TEST_CASE("InstructionStore: trusted reseed of an untouched bundled definition "
           "is a conflict-skip, not a re-import",
-          "[instruction_store][seed]") {
-    InstructionStore store(":memory:");
+          "[instruction_store][seed][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_seed_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     const std::string envelope = R"({
         "id":"bundled.seed.probe",
@@ -829,8 +1037,11 @@ TEST_CASE("InstructionStore: trusted reseed of an untouched bundled definition "
 
 TEST_CASE("InstructionStore: trusted reseed does not clobber an operator edit to a "
           "bundled definition",
-          "[instruction_store][seed]") {
-    InstructionStore store(":memory:");
+          "[instruction_store][seed][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_seed_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     const std::string envelope = R"({
         "id":"bundled.seed.probe",
@@ -848,8 +1059,10 @@ TEST_CASE("InstructionStore: trusted reseed does not clobber an operator edit to
     // Operator edits the seeded definition in place (e.g. dashboard YAML Save).
     auto live = store.get_definition(*seeded);
     REQUIRE(live.has_value());
-    live->description = "operator-edited description";
-    REQUIRE(store.update_definition(*live).has_value());
+    REQUIRE(live->has_value());
+    InstructionDefinition edited = **live;
+    edited.description = "operator-edited description";
+    REQUIRE(store.update_definition(edited).has_value());
 
     // Next boot replays the SAME bundled envelope — must not clobber the edit.
     auto reseed = store.import_definition_json_trusted(envelope);
@@ -858,14 +1071,18 @@ TEST_CASE("InstructionStore: trusted reseed does not clobber an operator edit to
 
     auto after = store.get_definition(*seeded);
     REQUIRE(after.has_value());
-    CHECK(after->description == "operator-edited description");
+    REQUIRE(after->has_value());
+    CHECK((*after)->description == "operator-edited description");
 }
 
-TEST_CASE("InstructionStore: trusted reseed RESURRECTS an operator-deleted bundled "
-          "definition (current SQLite behaviour — ADR-0058 must decide whether to "
-          "keep this)",
-          "[instruction_store][seed]") {
-    InstructionStore store(":memory:");
+TEST_CASE("InstructionStore: trusted reseed does NOT resurrect an operator-deleted "
+          "bundled definition (ADR-0058 — deliberate behaviour change from the "
+          "pre-migration SQLite store)",
+          "[instruction_store][seed][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_seed_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     const std::string envelope = R"({
         "id":"bundled.seed.probe",
@@ -880,26 +1097,34 @@ TEST_CASE("InstructionStore: trusted reseed RESURRECTS an operator-deleted bundl
     auto seeded = store.import_definition_json_trusted(envelope);
     REQUIRE(seeded.has_value());
 
-    // Operator deletes the seeded definition outright.
-    REQUIRE(store.delete_definition(*seeded));
-    CHECK_FALSE(store.get_definition(*seeded).has_value());
+    // Operator deletes the seeded definition outright — this stamps
+    // deleted_seed_content(kind='definition', id='bundled.seed.probe') in the
+    // same transaction as the delete (ADR-0058).
+    REQUIRE(store.delete_definition(*seeded).has_value());
+    auto gone = store.get_definition(*seeded);
+    REQUIRE(gone.has_value());
+    CHECK_FALSE(gone->has_value());
 
     // Next boot replays the SAME bundled envelope against the now-vacant id.
-    // The store's only seed-vs-live signal is id existence, so a deleted id
-    // is indistinguishable from a never-seeded one: the row comes back.
+    // Pre-migration this resurrected the row (id-existence-only check); the
+    // tombstone now suppresses it — the reseed reports the SAME conflict-skip
+    // shape as an untouched row, and the id stays deleted.
     auto reseed = store.import_definition_json_trusted(envelope);
-    REQUIRE(reseed.has_value());
-    CHECK(*reseed == "bundled.seed.probe");
+    REQUIRE_FALSE(reseed.has_value());
+    CHECK(is_conflict_error(reseed.error()));
 
-    auto after = store.get_definition("bundled.seed.probe");
-    REQUIRE(after.has_value());
-    CHECK(after->description == "original bundled description");
+    auto still_gone = store.get_definition("bundled.seed.probe");
+    REQUIRE(still_gone.has_value());
+    CHECK_FALSE(still_gone->has_value());
 }
 
 TEST_CASE("InstructionStore: trusted reseed of a CHANGED bundled envelope (release "
           "upgrade) never updates an existing row, operator-touched or not",
-          "[instruction_store][seed]") {
-    InstructionStore store(":memory:");
+          "[instruction_store][seed][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_seed_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     const std::string v1_envelope = R"({
         "id":"bundled.seed.probe",
@@ -936,19 +1161,119 @@ TEST_CASE("InstructionStore: trusted reseed of a CHANGED bundled envelope (relea
     CHECK(is_conflict_error(upgrade_untouched.error()));
     auto after_untouched = store.get_definition(*seeded);
     REQUIRE(after_untouched.has_value());
-    CHECK(after_untouched->description == "v1 bundled description");
+    REQUIRE(after_untouched->has_value());
+    CHECK((*after_untouched)->description == "v1 bundled description");
 
     // Case (b): operator has since edited the row. Same outcome — the
     // upgrade's changed content still cannot reach an existing id.
     auto live = store.get_definition(*seeded);
     REQUIRE(live.has_value());
-    live->description = "operator-edited description";
-    REQUIRE(store.update_definition(*live).has_value());
+    REQUIRE(live->has_value());
+    InstructionDefinition edited = **live;
+    edited.description = "operator-edited description";
+    REQUIRE(store.update_definition(edited).has_value());
 
     auto upgrade_edited = store.import_definition_json_trusted(v2_envelope);
     REQUIRE_FALSE(upgrade_edited.has_value());
     CHECK(is_conflict_error(upgrade_edited.error()));
     auto after_edited = store.get_definition(*seeded);
     REQUIRE(after_edited.has_value());
-    CHECK(after_edited->description == "operator-edited description");
+    REQUIRE(after_edited->has_value());
+    CHECK((*after_edited)->description == "operator-edited description");
+}
+
+// ── create_set_seed / delete_set tombstone (ADR-0058) ───────────────────────
+//
+// Mirrors the definitions coverage above for the set-side seed-aware entry
+// point — a genuinely new code path (no pre-migration equivalent existed:
+// the every-boot kBundledSets loop called plain create_set, which never
+// resurrected a deleted set only because the pre-migration store never
+// tombstoned deletes at all).
+
+TEST_CASE("InstructionStore: create_set_seed of an untouched bundled set is a "
+          "conflict-skip, not a re-create",
+          "[instruction_store][seed][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_seed_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    InstructionSet s;
+    s.id = "bundled.seed.set";
+    s.name = "Bundled Seed Set";
+    s.created_by = "system";
+
+    auto first = store.create_set_seed(s);
+    REQUIRE(first.has_value());
+    CHECK(*first == "bundled.seed.set");
+
+    auto second = store.create_set_seed(s);
+    REQUIRE_FALSE(second.has_value());
+    CHECK(is_conflict_error(second.error()));
+}
+
+TEST_CASE("InstructionStore: create_set_seed does NOT resurrect an operator-deleted "
+          "bundled set (ADR-0058)",
+          "[instruction_store][seed][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_seed_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    InstructionSet s;
+    s.id = "bundled.seed.set.deleted";
+    s.name = "Bundled Seed Set (deleted)";
+    s.created_by = "system";
+
+    auto seeded = store.create_set_seed(s);
+    REQUIRE(seeded.has_value());
+
+    // Operator deletes the seeded set outright — stamps
+    // deleted_seed_content(kind='set', id=...) in the same transaction.
+    REQUIRE(store.delete_set(*seeded).has_value());
+    auto sets_after_delete = store.list_sets();
+    REQUIRE(sets_after_delete.has_value());
+    for (const auto& stored : *sets_after_delete)
+        CHECK(stored.id != "bundled.seed.set.deleted");
+
+    // Next boot replays the same bundled set — must stay suppressed.
+    auto reseed = store.create_set_seed(s);
+    REQUIRE_FALSE(reseed.has_value());
+    CHECK(is_conflict_error(reseed.error()));
+
+    auto sets_after_reseed = store.list_sets();
+    REQUIRE(sets_after_reseed.has_value());
+    for (const auto& stored : *sets_after_reseed)
+        CHECK(stored.id != "bundled.seed.set.deleted");
+}
+
+TEST_CASE("InstructionStore: plain create_set (operator path) is unaffected by a "
+          "bundled-set tombstone",
+          "[instruction_store][seed][pg]") {
+    // The tombstone is consulted ONLY by the seed-aware path — an operator
+    // must be able to freely (re)create a set under any id, including one
+    // that was previously bundled-and-deleted (ADR-0058 "Locking": plain
+    // create_set never touches deleted_seed_content).
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_seed_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    InstructionSet s;
+    s.id = "bundled.seed.set.reclaimed";
+    s.name = "Reclaimed Set";
+    s.created_by = "system";
+
+    REQUIRE(store.create_set_seed(s).has_value());
+    REQUIRE(store.delete_set(s.id).has_value());
+
+    // Operator (not the boot loop) recreates a set under the same, previously
+    // bundled-and-deleted id — plain create_set must succeed normally.
+    InstructionSet reclaimed;
+    reclaimed.id = s.id;
+    reclaimed.name = "Operator-Recreated Set";
+    reclaimed.created_by = "operator";
+    auto recreated = store.create_set(reclaimed);
+    REQUIRE(recreated.has_value());
+    CHECK(*recreated == s.id);
 }
