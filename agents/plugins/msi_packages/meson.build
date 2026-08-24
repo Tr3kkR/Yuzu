@@ -8,7 +8,7 @@ if host_machine.system() == 'windows'
   msi_packages_deps += cxx.find_library('msi')
 endif
 
-shared_library(
+msi_packages_plugin_lib = shared_library(
   'msi_packages',
   files('src/msi_packages_plugin.cpp'),
   name_prefix: '',

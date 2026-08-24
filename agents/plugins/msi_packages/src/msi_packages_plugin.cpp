@@ -45,9 +45,10 @@ static constexpr const char* kInstallLocation = "InstallLocation";
 #include <cstddef>
 #include <cstdio>
 #include <memory>
+#include <vector>
 
 #include <spdlog/spdlog.h>
-#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (K-7/CDX-07)
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess / probe_tool_path (Wave 4 PR4.3a, ADR-3002 rung 2)
 
 #include "msi_packages_macos.hpp"
 #endif
@@ -107,47 +108,35 @@ std::string get_product_info(const char* product_code, const char* property) {
     return {};
 }
 #elif defined(__APPLE__)
-// Run a shell command, capturing stdout with trailing newline(s) stripped.
-// Internal newlines are preserved — callers that need per-line data (pkgutil
-// output) parse those via the pure helpers in msi_packages_macos.hpp.
-std::string run_command(const std::string& cmd) {
-    // Route through the bounded, fork-lock-covered runner instead of a raw,
-    // deadline-less popen (K-7/CDX-07). This matters most here: `list` issues up
-    // to 500 sequential `pkgutil --pkg-info` calls, so a single wedged receipt
-    // read could otherwise pin the instruction worker for the whole loop. Each
-    // call now carries a hard per-call deadline. `/bin/sh -c` preserves the
-    // shell semantics popen used (the commands rely on `2>/dev/null`), so the
-    // returned stdout blob is byte-identical; internal newlines are preserved
-    // for the pure per-line parsers in msi_packages_macos.hpp.
+// Direct-argv, shell-free replacement for the old `/bin/sh -c` hop (Wave 4
+// PR4.3a, ADR-3002 rung 2): argv[0] (always the probed absolute pkgutil
+// path) is exec'd directly through the bounded runner — no shell in
+// between, so no shell-quoting/injection surface, and shell_quote() is gone
+// entirely (each argv element, including a package identifier, is passed
+// verbatim — execve never re-parses it). Route through the bounded,
+// fork-lock-covered runner instead of a raw, deadline-less popen (K-7/
+// CDX-07). This matters most here: `list` issues up to 500 sequential
+// `pkgutil --pkg-info` calls, so a single wedged receipt read could
+// otherwise pin the instruction worker for the whole loop — each call
+// carries a hard per-call deadline. Internal newlines in the captured
+// output are preserved for the pure per-line parsers in
+// msi_packages_macos.hpp.
+std::string run_command(const std::vector<std::string>& argv) {
+    if (argv.empty() || argv.front().empty())
+        return {};
     auto res = yuzu::agent::run_bounded_subprocess(
-        {"/bin/sh", "-c", cmd},
-        yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{15}});
+        argv, yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{15}});
     // A cut-short pkgutil returns empty/partial output that parses as "no
     // packages" — a silent false-negative. Warn so an operator can tell a
     // degraded scan from a genuinely empty receipt DB (sre-M1).
     if (res.timed_out || !res.tool_ran || res.output_truncated) {
-        spdlog::warn("msi_packages: degraded shell-out (timed_out={}, tool_ran={}, truncated={}): {}",
-                     res.timed_out, res.tool_ran, res.output_truncated, cmd);
+        spdlog::warn("msi_packages: degraded run (timed_out={}, tool_ran={}, truncated={}): {}",
+                     res.timed_out, res.tool_ran, res.output_truncated, argv.front());
     }
     std::string result = res.output;
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
         result.pop_back();
     return result;
-}
-
-// Single-quote a package identifier for safe interpolation into a shell
-// command line (identifiers come from a prior `pkgutil --pkgs` call, but are
-// still untrusted free text as far as this process is concerned).
-std::string shell_quote(std::string_view s) {
-    std::string out = "'";
-    for (char c : s) {
-        if (c == '\'')
-            out += "'\\''";
-        else
-            out += c;
-    }
-    out += "'";
-    return out;
 }
 
 // pkgutil --pkg-info loops are sequential and per-package; a receipt DB can
@@ -179,7 +168,9 @@ int do_list(yuzu::CommandContext& ctx) {
     using yuzu::msi_packages::macos::parse_pkg_ids;
     using yuzu::msi_packages::macos::parse_pkg_info;
 
-    auto ids = parse_pkg_ids(run_command("pkgutil --pkgs 2>/dev/null"));
+    // msi_packages/do_list#1 (docs/agent-spawn-sink-manifest.md)
+    auto pkgutil_path = yuzu::agent::probe_tool_path({"/usr/sbin/pkgutil"});
+    auto ids = parse_pkg_ids(run_command({pkgutil_path, "--pkgs"}));
     const std::size_t total_seen = ids.size();
     const bool truncated = total_seen > kMaxPackages;
     if (truncated)
@@ -187,8 +178,9 @@ int do_list(yuzu::CommandContext& ctx) {
 
     int count = 0;
     for (const auto& id : ids) {
-        auto info = parse_pkg_info(
-            run_command(std::format("pkgutil --pkg-info {} 2>/dev/null", shell_quote(id))), id);
+        // msi_packages/do_list#2 -- one call per receipt, id passed as its
+        // own argv element (no shell, so no quoting is needed at all).
+        auto info = parse_pkg_info(run_command({pkgutil_path, "--pkg-info", id}), id);
         ctx.write_output(sanitize_utf8(yuzu::msi_packages::macos::format_msi_row(info)));
         ++count;
     }
@@ -231,7 +223,9 @@ int do_product_codes(yuzu::CommandContext& ctx) {
     // receipt carries no separate display-name field either — see
     // msi_packages_macos.hpp), so this action never needs the per-package
     // --pkg-info round trip that `list` does.
-    auto ids = parse_pkg_ids(run_command("pkgutil --pkgs 2>/dev/null"));
+    // msi_packages/do_product_codes#1 (docs/agent-spawn-sink-manifest.md)
+    auto ids =
+        parse_pkg_ids(run_command({yuzu::agent::probe_tool_path({"/usr/sbin/pkgutil"}), "--pkgs"}));
     int count = 0;
     for (const auto& id : ids) {
         ctx.write_output(sanitize_utf8(yuzu::msi_packages::macos::format_product_code_row(id)));
@@ -250,19 +244,19 @@ int do_product_codes(yuzu::CommandContext& ctx) {
 // ── ABI4 capability declarations (#2204) ────────────────────────────────────
 //
 // windows: MsiEnumProductsA/MsiGetProductInfoA -- native MSI API, rung 1.
-// macos: pkgutil --pkgs / --pkg-info via run_bounded_subprocess({"/bin/sh",
-// "-c", cmd}, ...) -- rung 3, ships via msi_packages_macos.hpp's pure
-// parsers.
+// macos: pkgutil --pkgs / --pkg-info via the bounded argv runner (Wave 4
+// PR4.3a, ADR-3002 rung 2) -- direct argv, no shell hop; ships via
+// msi_packages_macos.hpp's pure parsers, unchanged.
 // linux: no MSI/pkgutil equivalent -- the code returns "platform not
 // supported" outright.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {"list",
      /* linux   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
-     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 3, "pkgutil", nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 2, "pkgutil via bounded argv runner", nullptr},
      /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "msi_api", nullptr}},
     {"product_codes",
      /* linux   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
-     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 3, "pkgutil", nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 2, "pkgutil via bounded argv runner", nullptr},
      /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "msi_api", nullptr}},
 };
 
