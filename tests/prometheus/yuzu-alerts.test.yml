@@ -1971,17 +1971,19 @@ tests:
           - labels: 'ALERTS{alertname="YuzuQuarantineGateServingStaleState", alertstate="firing", severity="warning"}'
             value: 1
 
-  # CASE 67 -- #3481/Gate 8 (sre): pins the pre-seed's load-bearing role for
-  # YuzuProductPackCompensationPartial, empirically confirmed the hard way
-  # during Gate 8 review — an `increase()` query cannot detect a 0->1 step on
-  # a series whose FIRST-EVER sample is already 1 (no earlier zero to diff
-  # against), so a future edit that "simplifies" server.cpp's pre-seed loop
-  # into dead code would silently disarm this alert. The series here starts
-  # pre-seeded at 0 (t=0..30m), then one partial-compensation event bumps it
-  # to 1 at t=31m and it stays there (no second event) — `for: 0m` means it
-  # must fire on the very next eval after the step, not later.
+  # CASE 67 -- #3481/Gate 8 (sre): documents the RULE's dependency on a pre-seeded series —
+  # empirically confirmed the hard way during Gate 8 review — an `increase()` query cannot
+  # detect a 0->1 step on a series whose FIRST-EVER sample is already 1 (no earlier zero to
+  # diff against), so a future edit that "simplifies" server.cpp's pre-seed loop into dead code
+  # would silently disarm this alert. This case proves the RULE fires correctly GIVEN a
+  # pre-seeded-at-0 series (the input_series below is synthetic, modeling what the pre-seed
+  # produces) — it does NOT exercise server.cpp's own pre-seed loop at boot (gov Gate 3,
+  # quality-engineer: no C++ test does, for this counter or its siblings). The series here
+  # starts pre-seeded at 0 (t=0..30m), then one partial-compensation event bumps it to 1 at
+  # t=31m and it stays there (no second event) — `for: 0m` means it must fire on the very next
+  # eval after the step, not later.
   - interval: 1m
-    name: product-pack compensation partial - a single event fires immediately (pre-seed pinned)
+    name: product-pack compensation partial - a single event fires immediately given a pre-seeded series
     input_series:
       - series: 'yuzu_server_product_pack_install_compensation_total{job="yuzu",instance="s1",result="partial"}'
         values: "0x30 1+0x40"
