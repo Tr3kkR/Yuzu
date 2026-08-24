@@ -203,7 +203,7 @@ TEST_CASE("policy evaluator: compliant + non_compliant verdicts (multi-agent fan
     auto pid = h.author("result.hostname != ''");
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).empty());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20; // past grace
     ev.tick();
 
@@ -234,7 +234,8 @@ TEST_CASE("policy evaluator: evaluate_now does not dispatch when record_dispatch
     }
 
     PolicyEvaluator ev(h.deps());
-    CHECK(ev.evaluate_now(pid).empty());
+    auto result = ev.evaluate_now(pid);
+    CHECK_FALSE(result.has_value()); // degraded, never a silent "no targets" empty string
     CHECK(h.dispatch_calls == 0);
 }
 
@@ -248,7 +249,7 @@ TEST_CASE("policy evaluator: non-responder -> unknown, plugin failure -> error",
     auto pid = h.author("result.hostname != ''");
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).empty());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
     ev.tick();
 
@@ -269,7 +270,7 @@ TEST_CASE("policy evaluator: missing CEL field resolves empty -> non_compliant",
     auto pid = h.author("result.hostname != ''");
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).empty());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
     ev.tick();
 
@@ -289,7 +290,7 @@ TEST_CASE("policy evaluator: CEL evaluation error -> error", "[pg][policy][evalu
     auto pid = h.author("result.num / result.den");
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).empty());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
     ev.tick();
 
@@ -305,7 +306,7 @@ TEST_CASE("policy evaluator: interval throttles re-dispatch", "[pg][policy][eval
     auto pid = h.author("result.hostname != ''");
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).empty()); // dispatch #1
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty()); // dispatch #1
     CHECK(h.dispatch_calls == 1);
 
     h.fake_now += 20;
@@ -329,7 +330,7 @@ TEST_CASE("policy evaluator: empty compliance CEL -> error (no false compliant)"
     auto pid = h.author(/*check_cel=*/"");
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).empty());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
     ev.tick();
 
@@ -346,7 +347,7 @@ TEST_CASE("policy evaluator: remediation attempt cap -> error after 3 fixing tra
     h.canned["agentA|fixp"] = {1, "ok"};
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).empty());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
     ev.tick();
     REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
@@ -372,7 +373,7 @@ TEST_CASE("policy evaluator: verify dispatch failure -> error", "[pg][policy][ev
     auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).empty());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
     ev.tick();
     REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
@@ -399,7 +400,7 @@ TEST_CASE("policy evaluator: manual remediation fix -> verify -> compliant",
     auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).empty());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
     ev.tick();
     REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
@@ -429,7 +430,7 @@ TEST_CASE("policy evaluator: remediation rejected when no fix_instruction",
     auto pid = h.author("result.hostname != ''", /*with_fix=*/false);
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).empty());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
     ev.tick();
     REQUIRE(h.status_of(pid, "agentA") == "non_compliant");

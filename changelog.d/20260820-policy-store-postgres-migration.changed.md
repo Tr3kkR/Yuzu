@@ -5,4 +5,7 @@
   durable, single-sweeper claim (`claim_due_policies`) instead of per-process
   memory, so running the server with multiple replicas no longer risks duplicate
   or missed policy dispatch. Existing `policies.db` files are backfilled
-  automatically on first boot; no operator action is required.
+  automatically on first boot in the common case; the backfill refuses to
+  boot (and logs why) if it finds two divergent legacy files or a status row
+  Postgres has already advanced past — both require operator reconciliation,
+  by design, rather than a silent merge.

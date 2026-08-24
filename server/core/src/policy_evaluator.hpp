@@ -39,6 +39,7 @@
 /// another replica's still-live remediation under N replicas.
 
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -111,8 +112,12 @@ public:
 
     /// Force an immediate check of one policy, ignoring its interval. Returns
     /// the dispatch execution_id, or "" if the policy is missing / has no check
-    /// instruction / matches no agents.
-    std::string evaluate_now(const std::string& policy_id);
+    /// instruction / matches no agents / already has one in flight — a
+    /// legitimate no-op, never an error. `unexpected` means an internal store
+    /// failure (degraded policy read, or the durable-dispatch-claim stamp
+    /// failed) — the caller must surface this as degraded, not as "no
+    /// targets."
+    std::expected<std::string, std::string> evaluate_now(const std::string& policy_id);
 
     struct RemediateResult {
         bool ok{false};

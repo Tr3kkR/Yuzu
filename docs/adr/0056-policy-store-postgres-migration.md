@@ -408,15 +408,43 @@ still proceeded to `kickoff_check` regardless — so a `record_dispatch` failure
 store error, not a design gap) reproduced the exact "manual dispatch leaves the durable claim blind"
 bug the first correction fixed, by a different path: the check still dispatches and returns success
 to the operator, but with no `policy_dispatch_state` row, so the very next automatic tick sees
-nothing claimed and re-dispatches immediately. Fixed: `evaluate_now()` now returns `""` (not
-dispatched) instead of proceeding when `record_dispatch` fails. Kimi found two LOW items in the same
+nothing claimed and re-dispatches immediately. Fixed at the time: `evaluate_now()` returned `""` (not
+dispatched) instead of proceeding when `record_dispatch` fails — since superseded by the Fourth
+correction below, which found that `""` was itself indistinguishable from the pre-existing legitimate
+"no targets" empty return and widened the signature accordingly. Kimi found two LOW items in the same
 round: no dedicated regression test existed for the second correction's detail-query-degrade fix
 (added: a test that drops `policy_triggers` and asserts `get_policy`/`query_policies` degrade rather
 than returning a partial policy), and `claim_due_policies`' failure branch conflated "degraded read"
 with "claimed policy vanished mid-transaction" in its logging (split for clarity; not reachable
 today given the transaction/FK guarantees, but cheap to make precise). A regression test for the
 `record_dispatch`-failure fix was added alongside it (`test_policy_evaluator.cpp`, drops
-`policy_dispatch_state` and asserts `evaluate_now()` returns empty with zero dispatch calls).
+`policy_dispatch_state` and asserts `evaluate_now()` returns empty with zero dispatch calls; later
+widened — see Fourth correction — to assert the typed error instead).
+
+**Fourth correction (self-directed, advisor-prompted, 2026-08-24 — no external reviewer has graded
+this pass):** the Third correction's fix for `evaluate_now()` had its own residual: an operator
+`POST /api/policies/:id/evaluate` call that hit a genuine `record_dispatch` store failure landed on
+`compliance_routes.cpp`'s existing `exec_id.empty()` branch, which returns 409 with the message
+"policy has no check instruction or matches no agents" — false for a degraded-store outcome, and a
+regression from the pre-Third-correction behavior (a transient DB error on this path used to return
+202, not a factually wrong 4xx). Root cause: `evaluate_now()`'s `""` return conflated two different
+things — "legitimately nothing to dispatch" (no check instruction, no targets, a check already
+in-flight) and "an internal store failure prevented the attempt" (degraded policy read,
+`record_dispatch` failure) — and the caller had no way to tell them apart. Fixed by widening
+`evaluate_now()`'s return type from `std::string` to `std::expected<std::string, std::string>`: `""`
+keeps its original no-op meaning (the route's 409 stays correct for that case); an internal store
+failure (either the initial `get_policy` re-read or `record_dispatch`) now returns `std::unexpected`,
+which the route maps to a 503 "policy evaluation degraded" response instead. Checked for a third
+instance of the same bug class: `remediate()` was compared against the pre-migration source
+(`git show 3c0cc0ade:server/core/src/policy_evaluator.cpp`) and confirmed it never stamped
+`last_eval_`/an equivalent durable marker even before this migration — no equivalent gap exists
+there, nothing to fix. Also fixed in this pass: the changelog fragment's "no operator action is
+required" line overclaimed past the two new refuse-to-boot backfill paths the Second correction
+added (a divergent-fingerprint legacy file, a legacy-ahead status row) — both are, by design, cases
+where operator reconciliation IS required; qualified. All existing `evaluate_now()` call sites
+(the route, and the ten happy-path assertions in `test_policy_evaluator.cpp`) were updated for the
+new return type; the round-2 regression test was widened to assert `CHECK_FALSE(result.has_value())`
+instead of just `.empty()`, so it now actually distinguishes the error case it was written to catch.
 
 ### Construction — fail-closed (this store lacked it even on SQLite)
 

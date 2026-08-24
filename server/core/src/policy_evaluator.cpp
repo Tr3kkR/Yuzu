@@ -319,13 +319,14 @@ void PolicyEvaluator::dispatch_due() {
         kickoff_check(p); // does its own brief locking; dispatch runs without mu_
 }
 
-std::string PolicyEvaluator::evaluate_now(const std::string& policy_id) {
+std::expected<std::string, std::string>
+PolicyEvaluator::evaluate_now(const std::string& policy_id) {
     if (!d_.policy_store)
-        return "";
+        return std::unexpected("policy store not wired");
     auto p_res = d_.policy_store->get_policy(policy_id);
     if (!p_res) {
         spdlog::warn("policy_evaluator: evaluate_now: degraded policy read for {}", policy_id);
-        return "";
+        return std::unexpected("degraded policy read for " + policy_id);
     }
     if (!*p_res)
         return "";
@@ -358,7 +359,7 @@ std::string PolicyEvaluator::evaluate_now(const std::string& policy_id) {
         spdlog::warn("policy_evaluator: evaluate_now: record_dispatch failed for {}: {} — "
                     "not dispatching (would leave the durable claim blind)",
                     policy_id, r.error());
-        return "";
+        return std::unexpected("dispatch claim failed for " + policy_id + ": " + r.error());
     }
     auto execid = kickoff_check(**p_res); // dispatch runs without mu_ held
     return execid;

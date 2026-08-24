@@ -873,7 +873,17 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
                 res.set_content(R"({"error":{"code":404,"message":"policy not found"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
-            auto exec_id = policy_evaluator_->evaluate_now(id);
+            auto exec_res = policy_evaluator_->evaluate_now(id);
+            if (!exec_res) {
+                res.status = 503;
+                res.set_content(
+                    nlohmann::json({{"error", {{"code", 503}, {"message", "policy evaluation degraded"}}},
+                                    {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
+                    "application/json");
+                return;
+            }
+            auto exec_id = *exec_res;
             if (exec_id.empty()) {
                 res.status = 409;
                 res.set_content(
