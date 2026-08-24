@@ -247,17 +247,20 @@ PolicyEvaluator::dispatch_instruction(const std::string& instruction_id,
     return execid;
 }
 
-std::string PolicyEvaluator::kickoff_check(const Policy& p) {
+std::expected<std::string, std::string> PolicyEvaluator::kickoff_check(const Policy& p) {
     if (!d_.policy_store)
-        return "";
+        return std::unexpected("policy store not wired");
     auto frag_res = d_.policy_store->get_fragment(p.fragment_id);
     if (!frag_res) {
         // ADR-0036: a degraded read must not be treated as "no fragment" —
-        // log and skip this dispatch attempt rather than silently doing
-        // nothing indistinguishably from "fragment not found".
+        // and must not collapse into the same "" a legitimate no-op returns
+        // either (adversarial review / governance, 2026-08-24): a bare ""
+        // here was indistinguishable from "no check instruction" / "no
+        // targets" / "check already in flight" one level up, so evaluate_now()
+        // surfaced this as a false REST 409 instead of a 503.
         spdlog::warn("policy_evaluator: kickoff_check: degraded fragment read for policy {}",
                      p.id);
-        return "";
+        return std::unexpected("degraded fragment read for policy " + p.id);
     }
     if (!*frag_res || (*frag_res)->check_instruction.empty())
         return "";
@@ -311,12 +314,24 @@ void PolicyEvaluator::dispatch_due() {
         d_.policy_store->claim_due_policies(now(), d_.default_interval_seconds,
                                             d_.fixing_stale_seconds);
     if (!claimed) {
-        spdlog::warn("policy_evaluator: claim_due_policies degraded, skipping tick: {}",
-                    claimed.error());
+        // sre (governance, 2026-08-24): this is the ADR's own stated worst
+        // case for this store — a persistently failing claim means
+        // compliance checks silently stop running fleet-wide. A warn-only
+        // log with no counter left that failure mode with no alerting
+        // surface at all.
+        spdlog::error("policy_evaluator: claim_due_policies degraded, skipping tick: {}",
+                     claimed.error());
+        if (d_.metrics)
+            d_.metrics->counter("yuzu_server_policy_eval_errors_total", {{"phase", "claim"}})
+                .increment();
         return;
     }
-    for (const auto& p : *claimed)
-        kickoff_check(p); // does its own brief locking; dispatch runs without mu_
+    for (const auto& p : *claimed) {
+        auto k = kickoff_check(p); // does its own brief locking; dispatch runs without mu_
+        if (!k)
+            spdlog::warn("policy_evaluator: dispatch_due: kickoff_check degraded for policy {}: {}",
+                        p.id, k.error());
+    }
 }
 
 std::expected<std::string, std::string>
@@ -361,8 +376,10 @@ PolicyEvaluator::evaluate_now(const std::string& policy_id) {
                     policy_id, r.error());
         return std::unexpected("dispatch claim failed for " + policy_id + ": " + r.error());
     }
-    auto execid = kickoff_check(**p_res); // dispatch runs without mu_ held
-    return execid;
+    auto k = kickoff_check(**p_res); // dispatch runs without mu_ held
+    if (!k)
+        return std::unexpected("kickoff_check degraded for " + policy_id + ": " + k.error());
+    return *k;
 }
 
 PolicyEvaluator::RemediateResult

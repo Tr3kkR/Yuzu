@@ -1475,16 +1475,28 @@ LegacyTableStatus legacy_has_table(sqlite3* db, const char* table) {
 /// Pre-wart legacy files (predating G4-UHP-POL-003) lack this column —
 /// PolicyStore's own equivalent of the SQLite ctor's runtime ALTER, applied
 /// here instead since a fresh PG schema has no in-place ALTER to run.
-bool legacy_has_column(sqlite3* db, const char* table, const char* column) {
+///
+/// Governance (2026-08-24): originally a bare bool that conflated "column
+/// absent" with "probe failed" — a `PRAGMA table_info` prepare failure
+/// silently read as "column absent" and defaulted every row's
+/// `fix_attempt_count` to 0 even on a legacy file where the column (and its
+/// real values) genuinely exist. Mirrors `legacy_has_table`'s tri-state,
+/// which already fails the whole backfill closed on the same class of
+/// probe error — this must not conflate the two either.
+LegacyTableStatus legacy_has_column(sqlite3* db, const char* table, const char* column) {
     SqliteStmt s;
     std::string sql = std::string("PRAGMA table_info(") + table + ")";
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, s.addr(), nullptr) != SQLITE_OK)
-        return false;
-    while (sqlite3_step(s.get()) == SQLITE_ROW) {
+        return LegacyTableStatus::Error;
+    for (;;) {
+        const int rc = sqlite3_step(s.get());
+        if (rc == SQLITE_DONE)
+            return LegacyTableStatus::Absent;
+        if (rc != SQLITE_ROW)
+            return LegacyTableStatus::Error;
         if (sqlite_text(s.get(), 1) == column)
-            return true;
+            return LegacyTableStatus::Present;
     }
-    return false;
 }
 
 struct LegacyStatusRow {
@@ -1628,8 +1640,15 @@ bool PolicyStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_pat
                      });
 
             if (legacy_has_table(legacy.get(), "policy_status") == LegacyTableStatus::Present) {
-                const bool has_fix_count =
+                const auto fix_count_status =
                     legacy_has_column(legacy.get(), "policy_status", "fix_attempt_count");
+                if (fix_count_status == LegacyTableStatus::Error) {
+                    spdlog::error("PolicyStore: migrate_from_sqlite: fix_attempt_count column "
+                                  "probe failed on legacy policy_status — refusing (never "
+                                  "conflate a probe failure with column absence)");
+                    read_ok = false;
+                }
+                const bool has_fix_count = fix_count_status == LegacyTableStatus::Present;
                 std::string sql =
                     std::string("SELECT policy_id, agent_id, status, last_check_at, last_fix_at, "
                                "check_result") +

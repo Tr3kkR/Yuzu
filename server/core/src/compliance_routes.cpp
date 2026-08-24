@@ -502,7 +502,8 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
                 // string when audit needs it — the parsed YAML name isn't
                 // available here without re-extracting.
                 bool is_conflict = is_conflict_error(result.error());
-                res.status = is_conflict ? 409 : 400;
+                bool is_degraded = is_db_error(result.error());
+                res.status = is_conflict ? 409 : (is_degraded ? 503 : 400);
                 if (is_conflict) {
                     // iter-M1: target_id is the fragment name (parsed from
                     // YAML) so SOC 2 audit reviewers can answer "duplicate
@@ -511,9 +512,9 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
                     audit_fn_(req, "policy_fragment.create", "denied",
                               "policy_fragment", attempted_name, "duplicate_name");
                 }
-                auto body_msg = is_conflict
-                    ? std::string(strip_conflict_prefix(result.error()))
-                    : result.error();
+                std::string body_msg = is_conflict ? std::string(strip_conflict_prefix(result.error()))
+                                      : is_degraded ? std::string(strip_db_error_prefix(result.error()))
+                                                    : result.error();
                 res.set_content(nlohmann::json({{"error", body_msg}}).dump(), "application/json");
                 return;
             }
@@ -634,8 +635,14 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
 
             auto result = policy_store_->create_policy(yaml_source);
             if (!result) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                bool is_degraded = is_db_error(result.error());
+                res.status = is_degraded ? 503 : 400;
+                res.set_content(
+                    nlohmann::json({{"error", is_degraded
+                                                   ? std::string(strip_db_error_prefix(result.error()))
+                                                   : result.error()}})
+                        .dump(),
+                    "application/json");
                 return;
             }
             audit_fn_(req, "policy.create", "success", "policy", *result, "");
@@ -761,8 +768,14 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             auto id = req.matches[1].str();
             auto result = policy_store_->enable_policy(id);
             if (!result) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                bool is_degraded = is_db_error(result.error());
+                res.status = is_degraded ? 503 : 400;
+                res.set_content(
+                    nlohmann::json({{"error", is_degraded
+                                                   ? std::string(strip_db_error_prefix(result.error()))
+                                                   : result.error()}})
+                        .dump(),
+                    "application/json");
                 return;
             }
             audit_fn_(req, "policy.enable", "success", "policy", id, "");
@@ -786,8 +799,14 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             auto id = req.matches[1].str();
             auto result = policy_store_->disable_policy(id);
             if (!result) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                bool is_degraded = is_db_error(result.error());
+                res.status = is_degraded ? 503 : 400;
+                res.set_content(
+                    nlohmann::json({{"error", is_degraded
+                                                   ? std::string(strip_db_error_prefix(result.error()))
+                                                   : result.error()}})
+                        .dump(),
+                    "application/json");
                 return;
             }
             audit_fn_(req, "policy.disable", "success", "policy", id, "");
@@ -811,8 +830,14 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             auto id = req.matches[1].str();
             auto result = policy_store_->invalidate_policy(id);
             if (!result) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                bool is_degraded = is_db_error(result.error());
+                res.status = is_degraded ? 503 : 400;
+                res.set_content(
+                    nlohmann::json({{"error", is_degraded
+                                                   ? std::string(strip_db_error_prefix(result.error()))
+                                                   : result.error()}})
+                        .dump(),
+                    "application/json");
                 return;
             }
             audit_fn_(req, "policy.invalidate", "success", "policy", id, "");
@@ -837,8 +862,14 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
 
             auto result = policy_store_->invalidate_all_policies();
             if (!result) {
-                res.status = 500;
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                bool is_degraded = is_db_error(result.error());
+                res.status = is_degraded ? 503 : 500;
+                res.set_content(
+                    nlohmann::json({{"error", is_degraded
+                                                   ? std::string(strip_db_error_prefix(result.error()))
+                                                   : result.error()}})
+                        .dump(),
+                    "application/json");
                 return;
             }
             audit_fn_(req, "policy.invalidate_all", "success", "", "", "");
@@ -990,14 +1021,26 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             }
             auto result = policy_evaluator_->remediate(id, agent_ids);
             if (!result.ok) {
+                // Governance (2026-08-24): a genuine store-degrade error
+                // ("policy store degraded ...", "policy store unavailable")
+                // used to fall through to the 400/"denied" default below —
+                // a false diagnosis (this isn't a malformed/rejected
+                // request) AND a false audit entry (an infra failure is not
+                // an operator denial). Every degraded-read string
+                // policy_evaluator.cpp::remediate() produces starts with
+                // "policy store"; classify those first.
+                bool degraded = result.error.starts_with("policy store");
                 int code = 400;
-                if (result.error.find("not found") != std::string::npos)
+                if (degraded)
+                    code = 503;
+                else if (result.error.find("not found") != std::string::npos)
                     code = 404;
                 else if (result.error.find("remediation pathway") != std::string::npos ||
                          result.error.find("no non_compliant") != std::string::npos ||
                          result.error.find("no in-scope") != std::string::npos)
                     code = 409;
-                audit_fn_(req, "policy.remediate", "denied", "policy", id, result.error);
+                audit_fn_(req, "policy.remediate", degraded ? "error" : "denied", "policy", id,
+                          result.error);
                 res.status = code;
                 // Nested A4 error envelope, matching /evaluate and the other
                 // policy endpoints (gov consistency SHOULD-1).

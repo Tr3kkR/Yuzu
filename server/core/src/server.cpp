@@ -5119,11 +5119,16 @@ public:
             } else {
                 auto policy_db = cfg_.db_dir() / "policies.db";
                 if (!policy_store_->migrate_from_sqlite(policy_db)) {
+                    // Recovery procedure for every refusal shape (divergent
+                    // legacy file, legacy-ahead status row, unreadable file):
+                    // docs/ops-runbooks/policy-store-backfill-recovery.md.
                     spdlog::error("[PG] Refusing to start: policy legacy-SQLite backfill failed "
                                   "(see prior log lines) — policy_store is authoritative and "
                                   "must not serve partially-migrated compliance data. Operator "
                                   "remediation: repair {} or move it aside to skip the backfill "
-                                  "(policy definitions in it will NOT carry over)",
+                                  "(policy definitions AND per-agent status history in it will "
+                                  "NOT carry over — see "
+                                  "docs/ops-runbooks/policy-store-backfill-recovery.md)",
                                   policy_db.string());
                     startup_failed_ = true;
                 } else {

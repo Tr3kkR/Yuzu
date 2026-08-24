@@ -117,7 +117,8 @@ public:
     /// failure (degraded policy read, or the durable-dispatch-claim stamp
     /// failed) — the caller must surface this as degraded, not as "no
     /// targets."
-    std::expected<std::string, std::string> evaluate_now(const std::string& policy_id);
+    [[nodiscard]] std::expected<std::string, std::string>
+    evaluate_now(const std::string& policy_id);
 
     struct RemediateResult {
         bool ok{false};
@@ -168,7 +169,7 @@ private:
     // acquires mu_ only briefly (dedupe scan, in-flight push) and NEVER holds it
     // across the dispatch call — dispatch_fn does blocking gRPC + gateway
     // forwarding, so it must run lock-free. Caller must NOT hold mu_.
-    std::string kickoff_check(const Policy& p);
+    std::expected<std::string, std::string> kickoff_check(const Policy& p);
 
     // Dispatch `instruction_id` to `targets`; returns a fresh execution_id, or
     // "" on failure (unknown definition / empty targets). Must be called WITHOUT
