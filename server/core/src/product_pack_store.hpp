@@ -217,13 +217,18 @@ enum class TransactionOutcome {
 /// 1's already-created row (surfaces as a new errors[] entry); an auto-id document silently
 /// creates a full second copy under a NEW pack_id, orphaning attempt 1's content with no
 /// pack_id, no audit row, and no metric distinguishing it from an ordinary kUnknown. Also:
-/// `check_transaction_outcome` leases from the SAME pool_ whose exhaustion or a Postgres outage
-/// is a common cause of the persist failure it exists to diagnose — under correlated failure
-/// (pool saturation, a DB outage window), kUnknown becomes the DEFAULT outcome fleet-wide
-/// precisely when resolution matters most, each one independently vulnerable to the retry
-/// hazard above. Neither is fixed here — the fail-toward-`kUnknown` design is still the
-/// correct, safe choice (never guess `kAborted`); this documents the residual so an operator
-/// investigating a kUnknown spike during an outage window knows what it can compound into.
+/// `check_transaction_outcome` leases from the SAME pool_ as the write step whose failure it's
+/// diagnosing — but this reaches `check_transaction_outcome` ONLY when `write_lease_acquired`
+/// was true (the write lease WAS obtained, then the txn body failed); under a SUSTAINED full
+/// outage the write lease's own `try_acquire_for` fails first for nearly every caller, routing
+/// straight to the unambiguous, safe direct-compensate path — NOT through kUnknown at all (gov
+/// Gate 6, sre, correcting an earlier overstatement in this same note). The real window is
+/// narrower: a BRIEF flap/failover, where a write lease is granted just before the backend
+/// drops and collides with pool exhaustion on the immediately-following outcome check. Rare and
+/// narrow, not "every in-flight install during an outage" — but each occurrence still carries
+/// the retry-collision hazard above. Neither is fixed here — the fail-toward-`kUnknown` design
+/// is still the correct, safe choice (never guess `kAborted`); this documents the residual so
+/// an operator investigating a kUnknown event during a flap knows what it can compound into.
 
 // ── Callbacks for delegating item install/uninstall to existing stores ────────
 
