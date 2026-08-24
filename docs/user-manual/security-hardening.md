@@ -368,7 +368,89 @@ curl -s -X POST http://localhost:8080/api/v1/executions \
   }'
 ```
 
-The plugin blocks all network traffic except communication with the Yuzu server using platform-native firewalling: `netsh` on Windows, `iptables`/`nftables` on Linux, and `pfctl` on macOS.
+The plugin blocks all network traffic except communication with the Yuzu server using
+platform-native firewalling: `netsh` on Windows, `iptables` **and `ip6tables`** on Linux, and `pfctl` on macOS.
+
+### Whitelisting on a dual-stack host (read this before quarantining one)
+
+Containment covers **both address families**. On Linux the plugin installs the same
+`yuzu-quarantine` chain in `iptables` *and* `ip6tables`; each whitelist entry is routed to the
+chain matching its own family, so a **v4-only whitelist leaves IPv6 fully contained**.
+
+That is the correct posture — before this, an IPv6-capable host was never contained at all
+(#3282) — but it changes what a whitelist has to contain:
+
+- There is no blanket "keep existing connections alive" rule on either family — only a
+  whitelisted address's traffic survives, in any connection state (new, reconnecting, or
+  already established). The agent automatically whitelists its own configured server address
+  (`--server`) for this: an IP literal is used directly, and a hostname is resolved to its
+  address(es) **once, at agent startup** — never at quarantine time — covering whichever
+  families it resolves to at that point.
+- **Trust boundary: startup-time resolution uses the endpoint's own resolver.** This is a
+  deliberate improvement over resolving at quarantine time (which would let a host already
+  under active compromise steer its own containment exception via a poisoned `/etc/hosts` or
+  local resolver, right when quarantine is dispatched in response to that compromise) — but it
+  is not a trusted-channel guarantee against a resolver that was already compromised before or
+  at agent startup. For endpoints where containment integrity matters most, **configure `--server`
+  as an IP literal** rather than a hostname, removing DNS from the equation entirely.
+- If the agent's configured server address is a hostname that resolves to an IPv4 address but
+  the agent actually reaches the server over IPv6 through some other path (a split-horizon DNS
+  setup, a manually pinned route), or if the server's address changes after the agent last
+  started, the automatic whitelisting will not cover that path — **add the server's address to
+  the whitelist explicitly** in that case. The common case (the configured address resolves to
+  the address actually used, and doesn't change between agent restarts) needs no manual
+  whitelist entry for the server at all.
+- Whitelist entries that are neither valid IPv4 nor valid IPv6 (a hostname, a malformed literal)
+  are **skipped, and the skip is reported** — the plugin does not silently drop them and report a
+  clean success.
+- **On macOS, `whitelist` is a quarantine-time action.** It rebuilds and reloads the whole pf
+  ruleset, which includes the `block all` default-deny, and enables pf. Dispatching it at a device
+  that is *not* quarantined therefore isolates it. Use it to repair a contained device's
+  exceptions, which is what it is for; check `status` first if you are unsure of the device's
+  state.
+- If `ip6tables` is absent from the host, the v6 leg is reported as unavailable rather than
+  counted as applied.
+
+When in doubt, whitelist both families for the management server. An over-broad whitelist keeps
+the device manageable; a missing one requires physical or out-of-band access to recover.
+
+### Reading the result honestly
+
+The plugin reports on **two channels, and they carry different things**. `status|`/`state|` in the
+output line is the operator-readable detail; the ABI result status is what a generic
+success/failure consumer sees. Neither is allowed to say "clean" for a containment that is
+partial, unenforced, or unreadable.
+
+**Mutation actions** (`quarantine`, `unquarantine`, `whitelist`) emit `status|<token>`:
+
+| Token | Meaning | What to do |
+|---|---|---|
+| `quarantined` | Every rule the host's supported families need was applied | Nothing |
+| `quarantined_partial` | Some rules applied, some did not — e.g. IPv4 contained, IPv6 not | Treat the device as **not contained**; the `note\|` field names what is missing |
+| `failed` | Nothing applied | Not contained |
+| `released` | Rules removed | Nothing |
+| `release_uncertain` | The release ran but its result could not be confirmed | Verify with `status`; the device may still be contained |
+| `updated` | *(`whitelist`)* The exception list was changed | Nothing |
+| `update_uncertain` | *(`whitelist`)* The edit ran but its result could not be confirmed | Treat the repair as **not applied**; confirm with `status` before relying on it. This is the outcome to watch for on the stranded-device recovery path above |
+| `busy` | Another mutating quarantine action on this device held the serialization gate for longer than the wait budget | Nothing was changed by this call — retry. Waiters are served in arrival order, so a release queued behind a burst of quarantines is not starved |
+
+**`quarantine.status`** emits `state|<token>`:
+
+| Token | Meaning |
+|---|---|
+| `active` | Containment is in force |
+| `partial` | Some of the expected rules are present and some are not — a real containment gap |
+| `degraded` | *(macOS)* A blocking pf ruleset is loaded but pf is **disabled** — traffic is not actually being blocked |
+| `uncertain` | The firewall state could not be read, so the answer is unknown |
+| `inactive` | Not quarantined |
+
+`status` returns a **non-zero exit code** on `degraded` and `uncertain`, and sets the ABI result
+status to `UNAVAILABLE`/`PARTIAL`, so automation that only inspects the return code cannot read an
+unenforced or unreadable host as a clean status. `partial` returns 0 but is reported `PARTIAL` on
+the result-status channel. `active` and `inactive` are genuine answers and return 0.
+
+A quarantine result is a claim about firewall rules, not proof that traffic is blocked — for a
+device you believe is actively hostile, confirm with an independent probe.
 
 ### Checking Quarantine Status
 
@@ -385,7 +467,38 @@ curl -s -X POST http://localhost:8080/api/v1/executions \
 
 ### Releasing a Device
 
-Execute the `unquarantine` action to remove quarantine rules and restore normal network access. You can also use `whitelist` to add exceptions (IP or CIDR range) to the quarantine rules before releasing.
+Execute the `unquarantine` action to remove quarantine rules and restore normal network access. On
+Linux this tears down both the `iptables` and `ip6tables` chains; a release whose teardown does not
+fully succeed reports `release_uncertain`, not `released` — treat the device as possibly still
+contained and confirm with `status`.
+
+You can also use `whitelist` to add exceptions (IP or CIDR range) to the quarantine rules before
+releasing — the usual repair when a device has been contained without a reachable management
+address. `whitelist` is exempt from the dispatch gate below precisely so that repair stays possible.
+
+### Checking Quarantine Status
+
+```bash
+# Execute quarantine.status to check if an agent is isolated
+curl -s -X POST http://localhost:8080/api/v1/executions \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "definition_id": "quarantine.status",
+    "scope": "agent_id == \"agent-id\""
+  }'
+```
+
+### Releasing a Device
+
+Execute the `unquarantine` action to remove quarantine rules and restore normal network access. On
+Linux this tears down both the `iptables` and `ip6tables` chains; a release whose teardown does not
+fully succeed reports `release_uncertain`, not `released` — treat the device as possibly still
+contained and confirm with `status`.
+
+You can also use `whitelist` to add exceptions (IP or CIDR range) to the quarantine rules before
+releasing — the usual repair when a device has been contained without a reachable management
+address. `whitelist` is the repair path for a device whose exceptions are wrong.
 
 ### Quarantine now blocks instruction dispatch (#881)
 

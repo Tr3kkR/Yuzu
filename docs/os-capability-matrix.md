@@ -111,20 +111,19 @@ duplicates.
 | license_scan | ✅ | ✅ | ✅ | per-OS TUs `licensing_{win,linux,macos}.cpp` (feeds SLE sync) |
 | msi_packages | ✅ | ⛔ | ✅ | Win MSI (`MsiEnumProductsA`); macOS `pkgutil --pkgs`/`--pkg-info` receipts (reverse-domain id / derived name / version / install location) — pure parser `msi_packages_macos.hpp` + `__APPLE__` branch in `msi_packages_plugin.cpp` (500-pkg cap, `__truncated__` sentinel); Linux `#else` → "platform not supported" |
 | netprobe | ✅ | ✅ | ✅ | `_WIN32` vs POSIX portable sockets |
-| netstat | ✅ | ✅ | ✅ | linux/apple/win branches |
+| netstat | ✅ | ✅ | ✅ | linux/apple/win branches. `attribution` action additionally resolves the owning process's name/path (folds the retired sockwho plugin in, #3403) |
 | network_actions | ✅ | ✅ | ✅ | win/linux/apple branches. macOS `flush_dns` runs both `dscacheutil -flushcache` **and** `killall -HUP mDNSResponder` (the load-bearing reset), honest status from real exit codes (`network_actions_plugin.cpp`) |
 | network_config | ✅ | ✅ | ✅ | win/linux/apple throughout. macOS: real adapter link speed via `SIOCGIFMEDIA` (was hardcoded 0); `arp`/`dns_cache` return honest `not_available`/`unsupported` sentinels (`network_config_plugin.cpp`) |
 | network_diag | ✅ | ✅ | ✅ | win/linux/apple all implemented |
 | os_info | ✅ | ✅ | ✅ | linux/apple/win branches |
 | processes | ✅ | ✅ | ✅ | win/linux/apple branches (point-in-time enum; streaming capture is under TAR `process`) |
 | procfetch | ✅ | ✅ | ✅ | linux/apple/win branches |
-| quarantine | ✅ | ⚠️ | ⚠️ | full per-OS blocks, but containment is not yet complete on Linux/macOS: Linux only filters IPv4 (`ip6tables` never called, #3282); macOS's status check doesn't verify pf is actually enabled, only that the ruleset was loaded (#3283); status checks on all three platforms verify partial/existence, not full containment (#3285) |
+| quarantine | ✅ | ✅ | ✅ | full per-OS blocks; Linux covers IPv4 and IPv6 (honest `note\|ipv6_unavailable` on hosts with no IPv6 stack), macOS verifies pf is actually ENABLED and not merely loaded, and status on all three platforms reports partial/degraded containment rather than a clean `active` (#3282, #3283, #3285). Windows containment now blocks via profile-default policy rather than named Block rules, so the loopback/whitelist Allow rules actually take effect once quarantined (#3284) — see docs/quarantine-windows-firewall-precedence.md |
 | rdp_control | ✅ | ⛔ | ⛔ | Windows-only. Off-Windows returns an honest `rdp_control\|unsupported` sentinel (macOS names Screen Sharing); state-changing `set_state` reports terminal FAILURE, read-only `status` rc=0 — `rdp_control_plugin.cpp` `#ifndef _WIN32` branch |
 | registry | ✅ | ⛔ | ⛔ | Windows-only (advapi32). Off-Windows returns an honest `registry\|unsupported` sentinel (reads rc=0; mutating `set_value`/`delete_*` report terminal FAILURE — no false success) — `registry_plugin.cpp` `#ifndef _WIN32` branch. `list_profiles` (PR1.7) enumerates local profiles via ProfileList/HKEY_USERS. `get_user_value` resolves the target profile via ProfileList and reads the live `HKEY_USERS\<SID>` hive when the user is logged in, falling back to an offline `RegLoadKey` mount (SeBackup/SeRestore privileges, required only for that fallback) when not. The ladder lives in `agents/shared/win_profiles.hpp` and is shared with `installed_apps.list_per_user`, `license_scan`'s per-user surfaces and `tar`'s mapdrive history (#2771) |
 | sccm | ✅ | ⛔ | ⛔ | Windows-only. macOS returns an honest `sccm\|unsupported` (points at Jamf/MDM); Linux `installed\|false` + "platform not supported" — `sccm_plugin.cpp` `__APPLE__` branch |
 | script_exec | ✅ | ✅ | ✅ | win/apple/linux. Different action sets per OS (`bash` POSIX-only; powershell/cmd on Windows) |
 | services | ✅ | ✅ | ✅ | win/linux/apple branches. macOS `list`/`running` now emit `startup_type` (automatic/disabled/unknown) from a bulk `launchctl print-disabled` join (parser `services_macos_launchd.hpp`); `set_start_mode` rejects `manual` (launchd is binary enable/disable) |
-| sockwho | ✅ | ✅ | ✅ | linux/apple/win branches |
 | software_actions | ✅ | ✅ | ✅ | win/linux/apple branches |
 | status | ✅ | ✅ | ✅ | linux/apple/win branches |
 | storage | ✅ | ✅ | ✅ | portable — persistent KV store |
@@ -424,6 +423,9 @@ implementation is.
 | netstat | netstat_list | linux | supported | 1 | /proc/net/{tcp,udp}[6] | - |
 | netstat | netstat_list | macos | supported | 1 | libproc | - |
 | netstat | netstat_list | windows | supported | 1 | GetExtendedTcpTable/GetExtendedUdpTable | - |
+| netstat | attribution | linux | supported | 1 | /proc/net/* + /proc/[pid]/{comm,exe,fd} | - |
+| netstat | attribution | macos | supported | 1 | libproc | - |
+| netstat | attribution | windows | supported | 1 | IP Helper API + QueryFullProcessImageNameW | - |
 | network_actions | flush_dns | linux | constrained | 2 | resolvectl/systemd-resolve via bounded argv runner (sudo -n) | requires resolvectl (systemd-resolved) or the legacy systemd-resolve CLI; an honest failure is reported if neither is present |
 | network_actions | flush_dns | macos | supported | 2 | dscacheutil + killall via bounded argv runner (sudo -n) | - |
 | network_actions | flush_dns | windows | supported | 2 | ipconfig via bounded argv runner | - |
@@ -553,9 +555,6 @@ implementation is.
 | services | set_start_mode | linux | supported | 2 | runner argv 'sudo -n -- systemctl enable\|disable\|mask\|unmask' | - |
 | services | set_start_mode | macos | supported | 2 | runner argv 'sudo -n -- launchctl enable\|disable' | - |
 | services | set_start_mode | windows | supported | 1 | win32_service_api | - |
-| sockwho | sockwho_list | linux | supported | 1 | /proc/net/* + /proc/[pid]/{comm,exe,fd} | - |
-| sockwho | sockwho_list | macos | supported | 1 | libproc | - |
-| sockwho | sockwho_list | windows | supported | 1 | IP Helper API + QueryFullProcessImageNameW | - |
 | software_actions | list_upgradable | linux | supported | 3 | apt+yum | - |
 | software_actions | list_upgradable | macos | supported | 3 | softwareupdate | - |
 | software_actions | list_upgradable | windows | supported | 3 | winget | - |

@@ -304,6 +304,12 @@ agent_test_exe = executable(
     'unit/test_certificates_x509.cpp',        # Wave 2 WP-B: pure libcrypto PEM/DER field extraction
     'unit/test_quarantine_parsers.cpp',       # Wave 2 WP-F: pure netsh/iptables/pfctl output parsers
     'unit/test_quarantine_argv.cpp',          # Wave 2 WP-F remediation: pure mutating-argv construction (FN-03)
+    'unit/test_quarantine_serialization.cpp', # Wave 2 P4: MutationGate bounded-wait serialization (#3286)
+    'unit/test_server_address_parsers.cpp',   # #3429 round 4: pure host:port / IP-literal helpers for
+                                                # server_address_resolver.cpp's boot-time DNS resolution
+    'unit/test_server_address_resolver.cpp',  # #3429 round 4 fix: resolve_bounded's deadline wrapper,
+                                                # resolver injected (no network) -- proves the caller
+                                                # returns at the deadline, not after the resolver finishes
     'unit/test_network_actions_parsers.cpp',  # Wave 2 WP-D: pure resolver-flush-flag selection
     'unit/test_wol_check_plan.cpp',           # Wave 2 WP-E: pure check-mechanism decision logic
     'unit/test_services_parsers.cpp',         # Wave 2 WP-G: pure systemctl/launchctl output parsers
@@ -312,6 +318,12 @@ agent_test_exe = executable(
     'unit/test_route_sysctl_arp.cpp',         # Wave 2 WP-C: pure sysctl NET_RT_FLAGS/RTF_LLINFO binary parser
     'unit/test_bounded_wait.cpp',             # Wave 2 WP-C remediation: uncancellable-call timeout wrapper
     'unit/agent/test_socket_walk.cpp',        # Wave 3 PR3.1: macos_socket_walk.hpp libproc walk (Darwin-only, self-gated)
+    'unit/agent/test_netstat_attribution.cpp', # gate-1 remediation (#3403/#3404): real netstat.dylib
+                                                # attribution action driven end to end via LocalDispatcher
+                                                # (Darwin-only, self-gated) -- same shape as
+                                                # test_wave3_pr31_macos_actions.cpp
+    'unit/test_netstat_parsers.cpp',          # gate-2 remediation: pure escape_pipes() CR/LF handling
+                                                # (netstat_parsers.hpp, portable, every host)
     'unit/test_os_info_macos.cpp',            # Wave 3 PR3.1: os_info_macos.hpp SystemVersion.plist extractor (pure, every host)
     'unit/agent/test_wave3_pr31_macos_actions.cpp', # Wave 3 PR3.1 remediation: real os_info/processes/
                                                 # network_diag/ioc .dylib driven end to end via
@@ -364,6 +376,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/discovery/src'),      # discovery_parsers.hpp (Wave 2 WP-C pure parser)
     include_directories('../agents/plugins/os_info/src'),        # os_info_macos.hpp (Wave 3 PR3.1 pure plist parser)
     include_directories('../agents/plugins/device_identity/src'), # device_identity_macos.hpp (Wave 3 PR3.2 pure parser)
+    include_directories('../agents/plugins/netstat/src'),        # netstat_parsers.hpp (gate-2 remediation pure parser)
     include_directories('../agents/plugins/windows_updates/src'), # windows_updates_parsers.hpp (Wave 3 pure parser)
     include_directories('../agents/plugins/sccm/src'),           # sccm_parsers.hpp (Wave 3 PR33d pure parser)
   ],
@@ -393,13 +406,16 @@ agent_test_exe = executable(
   # hardware_plugin_lib / device_identity_plugin_lib (agents/plugins/{hardware,device_identity}/meson.build):
   # test_hardware_device_identity_posix_actions.cpp loads both real plugins by
   # path for the identical reason (Wave 3 PR3.2 gate-1 remediation).
+  # netstat_plugin_lib (agents/plugins/netstat/meson.build): test_netstat_attribution.cpp
+  # loads the real netstat plugin by path for the identical reason (gate-1 remediation,
+  # #3403/#3404 netstat.attribution + hardware WMI bounded-migration test-coverage gap).
   # windows_updates_plugin_lib / sccm_plugin_lib: same reasoning for
   # test_windows_updates_{posix,win}_actions.cpp / test_sccm_win_actions.cpp
   # (Wave 3 PR33d code-review remediation).
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin,
                 users_plugin_lib, os_info_plugin_lib, processes_plugin_lib,
                 network_diag_plugin_lib, ioc_plugin_lib,
-                hardware_plugin_lib, device_identity_plugin_lib,
+                hardware_plugin_lib, device_identity_plugin_lib, netstat_plugin_lib,
                 windows_updates_plugin_lib, sccm_plugin_lib],
 )
 # Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five

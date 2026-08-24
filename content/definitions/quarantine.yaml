@@ -1,6 +1,6 @@
 ## Device Quarantine (Network Isolation) Definitions
 ## Manages network isolation of endpoints via firewall rules.
-## Windows: netsh advfirewall, Linux: iptables, macOS: pf anchors.
+## Windows: netsh advfirewall, Linux: iptables, macOS: pf main ruleset (atomic pfctl -f load).
 ## All quarantine rules are prefixed with "YuzuQuarantine_" for identification.
 
 ---
@@ -15,7 +15,8 @@ metadata:
     block all inbound and outbound traffic except loopback and explicitly
     whitelisted IP addresses. The management server IP should always be
     whitelisted to maintain remote control. On Windows this creates netsh
-    advfirewall rules, on Linux iptables chains, and on macOS pf anchors.
+    advfirewall rules, on Linux iptables chains, and on macOS an atomically
+    loaded pf main ruleset (via `pfctl -f`, not a named pf anchor).
   tags: [security, quarantine, incident-response, network]
 
 spec:
@@ -80,8 +81,9 @@ metadata:
   description: >
     Remove all quarantine firewall rules and restore normal network access.
     On Windows this deletes all netsh rules prefixed with "YuzuQuarantine_",
-    on Linux it flushes and removes the yuzu-quarantine iptables chain,
-    and on macOS it flushes the yuzu-quarantine pf anchor.
+    on Linux it flushes and removes the yuzu-quarantine iptables chain, and
+    on macOS it restores the system default pf ruleset by reloading
+    `/etc/pf.conf` (not a named pf anchor).
   tags: [security, quarantine, incident-response, network]
 
 spec:
