@@ -2054,8 +2054,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // F031/#3481: best-effort undo of whatever install_fn already committed, if the final
         // persist transaction below fails.
         auto compensate_fn = make_item_delete_fn(instruction_store, policy_store, workflow_engine);
-        auto result =
-            product_pack_store->install(yaml_bundle, install_fn, compensate_fn, idempotency_key);
+        // #3479: per-document detail — a bundle where some (not all) documents fail no longer
+        // silently drops which ones and why behind a bare "installed" response.
+        InstallPartialResult partial_result;
+        auto result = product_pack_store->install(yaml_bundle, install_fn, compensate_fn,
+                                                  idempotency_key, &partial_result);
         if (!result) {
             // gov W7.4 R1 UP-1 / compliance CC6.7 / sre B2: SOC 2 CC6.7
             // requires "all access decisions logged". The pack-install
@@ -2083,13 +2086,25 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // (1484/1533/1647/1692), and the audit-log.md docs entry. Was
         // "product_pack" pre-W7.4 R2 — SIEM rules filtering on either
         // string would have missed half the rows for this action.
-        audit_fn(req, "product_pack.install", "success", "ProductPack", *result, "");
+        // #3479: audit detail names the partial-failure count too, so an auditor doesn't need
+        // to reconstruct it from the response body — same "identity, not just outcome" bar the
+        // compensation N/M suffix (#3481) already set for the denied path.
+        std::string audit_detail;
+        nlohmann::json response_body{{"id", *result}, {"status", "installed"}};
+        if (!partial_result.errors.empty()) {
+            response_body["errors"] = partial_result.errors;
+            response_body["installed_count"] = partial_result.installed_count;
+            response_body["total_items"] = partial_result.total_items;
+            audit_detail = std::to_string(partial_result.errors.size()) + "/" +
+                           std::to_string(partial_result.total_items) +
+                           " item(s) failed to install";
+        }
+        audit_fn(req, "product_pack.install", "success", "ProductPack", *result, audit_detail);
         emit_fn("product_pack.installed", req);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Product pack installed","level":"success"}})");
         res.status = 201;
-        res.set_content(nlohmann::json({{"id", *result}, {"status", "installed"}}).dump(),
-                        "application/json");
+        res.set_content(response_body.dump(), "application/json");
     });
 
     // GET /api/product-packs/:id -- get product pack detail

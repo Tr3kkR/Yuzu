@@ -1044,7 +1044,7 @@ bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
 
 std::expected<std::string, std::string> ProductPackStore::install(
     const std::string& yaml_bundle, ItemInstallFn install_fn, ItemUninstallFn compensate_fn,
-    const std::string& idempotency_key) {
+    const std::string& idempotency_key, InstallPartialResult* partial_result) {
     if (!open_)
         return std::unexpected(std::string(kProductPackDbErrorPrefix) + "database not open");
     if (!install_fn)
@@ -1221,9 +1221,30 @@ std::expected<std::string, std::string> ProductPackStore::install(
         }
     }
 
+    // #3479: populates the caller-supplied out-param, if any, with per-document detail —
+    // called at every return point below that carries an install_fn outcome (total failure or
+    // either success path), so a caller always sees which documents failed and why, not just a
+    // bare pack id or the first of potentially several failure reasons.
+    auto populate_partial_result = [&]() {
+        if (partial_result) {
+            partial_result->errors = errors;
+            partial_result->total_items = installed_count + static_cast<int>(errors.size());
+            partial_result->installed_count = installed_count;
+        }
+    };
+
     if (installed_count == 0 && !errors.empty()) {
         // Nothing was ever written to Postgres — no rollback needed.
-        return std::unexpected("no items installed: " + errors[0]);
+        // Every document's failure reason, not just the first — a bundle with several
+        // independently-wrong documents previously only ever told the caller about one.
+        std::string joined;
+        for (std::size_t i = 0; i < errors.size(); ++i) {
+            if (i > 0)
+                joined += "; ";
+            joined += errors[i];
+        }
+        populate_partial_result();
+        return std::unexpected("no items installed: " + joined);
     }
 
     // F031/#3481 (gov Gate 2 finding, security-guardian): factored out so every failure path
@@ -1423,6 +1444,7 @@ std::expected<std::string, std::string> ProductPackStore::install(
                     "COMMIT-acknowledgment loss, not a real failure. Treating as success; no "
                     "compensation run.",
                     sanitize_for_log(pack_name), pack_id, current_xact_id);
+                populate_partial_result();
                 return pack_id;
             case TransactionOutcome::kUnknown:
                 // Still in progress, too old for the commit log, or the check itself couldn't
@@ -1455,6 +1477,7 @@ std::expected<std::string, std::string> ProductPackStore::install(
     spdlog::info("ProductPackStore: installed '{}' v{} ({}), {} items, {} errors",
                  sanitize_for_log(pack_name), pack_version, pack_id, installed_count,
                  errors.size());
+    populate_partial_result();
     return pack_id;
 }
 

@@ -58,6 +58,8 @@
 #include <tuple>
 #include <vector>
 
+using yuzu::server::InstallPartialResult;
+using yuzu::server::InstructionStore;
 using yuzu::server::ItemInstallFn;
 using yuzu::server::ProductPack;
 using yuzu::server::ProductPackQuery;
@@ -90,6 +92,27 @@ description: Bundle without signature for #802 test
 apiVersion: yuzu.io/v1alpha1
 kind: InstructionDefinition
 name: test-instruction
+)";
+
+/// Three item documents — one intended to succeed, two intended to fail with DISTINCT reasons
+/// (#3479). Paired with an install_fn keyed on `name` (see the test), not a fixed stub.
+constexpr const char* kThreeItemPartialFailureYaml = R"(apiVersion: yuzu.io/v1alpha1
+kind: ProductPack
+name: test-partial-failure
+version: 1.0.0
+description: One item succeeds, two fail with distinct reasons
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+name: item-ok
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+name: item-bad-a
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+name: item-bad-b
 )";
 
 /// Two InstructionDefinition documents — paired with make_accept_all_install_fn() (which
@@ -512,6 +535,99 @@ TEST_CASE("ProductPackStore: list/get/uninstall round-trip", "[product_pack_stor
         REQUIRE(got.has_value());
         CHECK_FALSE(got->has_value());
     }
+}
+
+// ── Per-document partial-failure detail (#3479) ──────────────────────────────
+
+TEST_CASE("ProductPackStore::install: a partial success surfaces which documents failed and "
+          "why, not just a bare pack id",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    auto install_fn =
+        [](const std::string&,
+           const std::string& yaml_source) -> std::expected<std::string, std::string> {
+        auto name = ProductPackStore::extract_yaml_value(yaml_source, "name");
+        if (name == "item-bad-a")
+            return std::unexpected("reason A: bad configuration");
+        if (name == "item-bad-b")
+            return std::unexpected("reason B: unsupported field");
+        return std::string{"item-id-ok"};
+    };
+
+    yuzu::server::InstallPartialResult partial;
+    auto result = store.install(kThreeItemPartialFailureYaml, install_fn, {}, {}, &partial);
+    // Overall outcome is still success — one item installed.
+    REQUIRE(result.has_value());
+
+    REQUIRE(partial.errors.size() == 2);
+    CHECK(partial.installed_count == 1);
+    CHECK(partial.total_items == 3);
+    // Both distinct reasons are recoverable, not just the first.
+    bool saw_a = false, saw_b = false;
+    for (const auto& e : partial.errors) {
+        if (e.find("reason A") != std::string::npos)
+            saw_a = true;
+        if (e.find("reason B") != std::string::npos)
+            saw_b = true;
+    }
+    CHECK(saw_a);
+    CHECK(saw_b);
+}
+
+TEST_CASE("ProductPackStore::install: a total failure surfaces EVERY document's reason, not "
+          "just the first",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    auto install_fn =
+        [](const std::string&,
+           const std::string& yaml_source) -> std::expected<std::string, std::string> {
+        auto name = ProductPackStore::extract_yaml_value(yaml_source, "name");
+        return std::unexpected("rejected: " + name);
+    };
+
+    yuzu::server::InstallPartialResult partial;
+    auto result = store.install(kThreeItemPartialFailureYaml, install_fn, {}, {}, &partial);
+    REQUIRE_FALSE(result.has_value());
+    // Pre-#3479 this only ever surfaced errors[0] here.
+    CHECK(result.error().find("item-ok") != std::string::npos);
+    CHECK(result.error().find("item-bad-a") != std::string::npos);
+    CHECK(result.error().find("item-bad-b") != std::string::npos);
+
+    REQUIRE(partial.errors.size() == 3);
+    CHECK(partial.installed_count == 0);
+    CHECK(partial.total_items == 3);
+}
+
+TEST_CASE("ProductPackStore::install: omitting partial_result preserves prior behavior exactly "
+          "(no crash, no observable difference)",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    auto install_fn =
+        [](const std::string&,
+           const std::string& yaml_source) -> std::expected<std::string, std::string> {
+        auto name = ProductPackStore::extract_yaml_value(yaml_source, "name");
+        if (name == "item-bad-a" || name == "item-bad-b")
+            return std::unexpected("rejected");
+        return std::string{"item-id-ok"};
+    };
+    // No trailing partial_result argument — matches every pre-#3479 call site.
+    auto result = store.install(kThreeItemPartialFailureYaml, install_fn);
+    REQUIRE(result.has_value());
 }
 
 // Gate 8 review (Fable, external): a bundle whose documents assign the same item id twice
@@ -1770,7 +1886,8 @@ struct ProductPackRestHarness {
         audit_rows; // (action, result, target_type, target_id, detail)
     yuzu::server::test::TestRouteSink sink;
 
-    explicit ProductPackRestHarness(ProductPackStore* store) {
+    explicit ProductPackRestHarness(ProductPackStore* store,
+                                    InstructionStore* instruction_store = nullptr) {
         WorkflowRoutes routes;
         WorkflowRoutes::Deps deps;
         deps.perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
@@ -1782,6 +1899,7 @@ struct ProductPackRestHarness {
         };
         deps.emit_fn = [](const std::string&, const httplib::Request&) {};
         deps.product_pack_store = store;
+        deps.instruction_store = instruction_store;
         deps.metrics = &metrics;
         routes.register_routes(sink, std::move(deps));
     }
@@ -1935,4 +2053,74 @@ description: A different metadata-only bundle
         if (std::get<0>(row) == "product_pack.install")
             ++install_audit_rows;
     CHECK(install_audit_rows == 3); // first (success) + replay (success) + conflict (denied)
+}
+
+// #3479: end-to-end through the real POST handler — a live InstructionStore lets one document
+// genuinely succeed alongside two that genuinely fail for two DIFFERENT real reasons (an
+// invalid approval mode, checked inside workflow_routes.cpp's own install_fn; an unsupported
+// kind, checked before any store is touched) without needing PolicyStore/WorkflowEngine at all.
+TEST_CASE("REST: POST /api/product-packs reports which documents failed and why on a partial "
+          "success, and the audit detail names the count",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    yuzu::test::TempDbFile inst_db{std::string_view{"yuzu_test_partial-instr-"}};
+    InstructionStore instruction_store{inst_db.path};
+    REQUIRE(instruction_store.is_open());
+
+    ProductPackRestHarness h{&store, &instruction_store};
+
+    constexpr const char* kMixedBundle = R"(apiVersion: yuzu.io/v1alpha1
+kind: ProductPack
+name: test-rest-partial-failure
+version: 1.0.0
+description: One item succeeds, two fail for distinct real reasons
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+name: rest-item-ok
+plugin: system
+action: noop
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+name: rest-item-bad-mode
+plugin: system
+action: noop
+mode: not-a-real-mode
+---
+apiVersion: yuzu.io/v1alpha1
+kind: NotARealKind
+name: rest-item-bad-kind
+)";
+
+    auto res = h.sink.dispatch("POST", "/api/product-packs", kMixedBundle, "text/plain");
+    REQUIRE(res);
+    CHECK(res->status == 201); // overall success — one item installed
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("errors"));
+    REQUIRE(body["errors"].size() == 2);
+    CHECK(body["installed_count"] == 1);
+    CHECK(body["total_items"] == 3);
+
+    bool saw_mode_error = false, saw_kind_error = false;
+    for (const auto& e : body["errors"]) {
+        auto s = e.get<std::string>();
+        if (s.find("invalid approval mode") != std::string::npos)
+            saw_mode_error = true;
+        if (s.find("unsupported kind") != std::string::npos)
+            saw_kind_error = true;
+    }
+    CHECK(saw_mode_error);
+    CHECK(saw_kind_error);
+
+    REQUIRE(h.audit_rows.size() == 1);
+    const auto& [action, result, target_type, target_id, detail] = h.audit_rows[0];
+    CHECK(action == "product_pack.install");
+    CHECK(result == "success");
+    CHECK(detail.find("2/3") != std::string::npos);
 }

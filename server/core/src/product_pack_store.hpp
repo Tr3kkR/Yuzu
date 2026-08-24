@@ -170,6 +170,21 @@ struct ProductPackQuery {
     int limit{100};
 };
 
+/// #3479: per-document outcome detail from `install()`, optionally requested via its trailing
+/// `partial_result` out-param. `install_fn` tolerates a single document failing without failing
+/// the whole bundle — this is how a caller learns WHICH documents failed and why, instead of
+/// only a bare pack id (success) or the first of potentially several failure reasons (total
+/// failure). Populated on BOTH outcomes: a total failure (`install()` returns `unexpected`) and
+/// a partial success (`install()` returns the pack id with some documents still having failed).
+struct InstallPartialResult {
+    std::vector<std::string> errors; ///< One entry per document install_fn rejected, in
+                                     ///< document order — kind + install_fn's own error string.
+    int total_items{0};              ///< Item documents in the bundle (excludes the ProductPack
+                                     ///< metadata document itself).
+    int installed_count{0};          ///< `total_items - errors.size()`, restated for callers
+                                     ///< that only have this struct, not the raw counts.
+};
+
 /// Server-authoritative outcome of a post-failure transaction-status re-check (gov Gate 5
 /// CHAOS-1/CHAOS-1b, #3481) — see `ProductPackStore::check_transaction_outcome`'s doc comment.
 /// Deliberately NOT based on row visibility: a row's absence from a fresh read cannot
@@ -322,10 +337,18 @@ public:
     /// compensation path already handles; a client retry then re-hits the pre-check and converges
     /// on the winner's id. Same class of accepted race already documented for concurrent
     /// `uninstall()` above.
+    ///
+    /// `partial_result` (#3479): when non-null, populated with per-document failure detail —
+    /// on EITHER outcome, a total failure (every document's error, not just the first) or a
+    /// partial success (which documents failed and why, alongside the ones that installed).
+    /// Defaults to null — preserves existing callers' behavior exactly; the idempotency
+    /// pre-check's short-circuit return (a replay) does NOT populate it, since install_fn never
+    /// ran on that call.
     std::expected<std::string, std::string> install(const std::string& yaml_bundle,
                                                     ItemInstallFn install_fn,
                                                     ItemUninstallFn compensate_fn = {},
-                                                    const std::string& idempotency_key = {});
+                                                    const std::string& idempotency_key = {},
+                                                    InstallPartialResult* partial_result = nullptr);
 
     /// List installed product packs, newest-installed first. `unexpected(msg)` (prefixed
     /// `kProductPackDbErrorPrefix`) is a genuine read failure — never treat it as "no packs
