@@ -759,10 +759,10 @@ covers this file; no separate ad hoc run scheduled). Fixed this round: the compl
 hardcoded "Last evaluated: just now" span asserted a freshness claim the server was not actually
 tracking — an I3 (wrong result presented as correct) finding once evaluation genuinely runs and can
 genuinely go stale (compliance-officer HIGH); removed rather than backed with real tracking, which
-would be a separate feature (see below). Five of the six mutator routes' new degrade-503 bodies used
-the flat legacy `{"error": "<string>"}` shape instead of the nested A4 envelope `remediate` alone used
-(enterprise-readiness); brought all six into the nested shape already used one branch above in the same
-routes for the "store not open" 503, without touching the pre-existing flat 400s (tracked separately,
+would be a separate feature (see below). All six mutator routes' new degrade-503 bodies used the flat
+legacy `{"error": "<string>"}` shape instead of the nested A4 envelope the same routes already used one
+branch above for the "store not open" 503 (enterprise-readiness); brought all six into that existing
+nested shape, without touching the pre-existing flat 400s (tracked separately,
 above). Added the missing `docs/user-manual/upgrading.md` section for this migration (enterprise-
 readiness BLOCKING — every sibling Postgres-store migration has one, this didn't); a dedicated
 `changelog.d/20260824-policy-store-degrade-classification.fixed.md` fragment for the 503-taxonomy
