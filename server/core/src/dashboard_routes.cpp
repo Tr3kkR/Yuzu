@@ -385,6 +385,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                 auto html = render_filter_bar(command_id, plugin, definition_id, template_id,
                                               session->username, auth::is_elevated(*session));
+                // The body is now principal-specific (confined per caller's
+                // visible scope) rather than fleet-common, so an unpartitioned
+                // shared cache would replay one operator's facet values to
+                // another — same guard the per-operator TAR fragments use.
+                res.set_header("Cache-Control", "no-store, private");
+                res.set_header("Vary", "Cookie");
                 res.set_content(html, "text/html; charset=utf-8");
             });
 
@@ -494,6 +500,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                 auto html = render_create_group_form(command_id, plugin, filters,
                                                       agent_count);
+                // Same cross-operator shared-cache concern as filter-bar above.
+                res.set_header("Cache-Control", "no-store, private");
+                res.set_header("Vary", "Cookie");
                 res.set_content(html, "text/html; charset=utf-8");
             });
 

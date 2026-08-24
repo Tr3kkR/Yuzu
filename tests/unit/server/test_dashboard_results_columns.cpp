@@ -469,6 +469,10 @@ TEST_CASE("render_filter_bar route: dispatched through TestRouteSink, the "
     CHECK(res->status == 200);
     CHECK(contains(res->body, "value=\"loaded\""));
     CHECK_FALSE(contains(res->body, "value=\"unloaded\""));
+    // BR-002: the body is now principal-specific -- a shared cache must
+    // never be allowed to key/replay it across operators.
+    CHECK(res->get_header_value("Cache-Control") == "no-store, private");
+    CHECK(res->get_header_value("Vary") == "Cookie");
 }
 
 // -- Branch-review finding BR-004: create-group-form had no route-dispatch
@@ -546,6 +550,9 @@ TEST_CASE("create-group-form route: dispatched through TestRouteSink, the "
     CHECK(res->status == 200);
     CHECK(contains(res->body, "1 agent will be added"));
     CHECK_FALSE(contains(res->body, "2 agents will be added"));
+    // BR-002: same cross-operator shared-cache concern as filter-bar.
+    CHECK(res->get_header_value("Cache-Control") == "no-store, private");
+    CHECK(res->get_header_value("Vary") == "Cookie");
 }
 
 // -- Branch-review finding BR-001: a JIT-elevated session must get the
