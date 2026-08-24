@@ -818,7 +818,7 @@ grpc::Status AgentServiceImpl::Subscribe(
     // PR3: revoked-cert gate. The presented client leaf IS the agent's mTLS
     // identity (issued bound to agent_id at enrollment). If its serial is on the
     // CRL the whole data plane is closed to it — reject before any registry work.
-    // Independent of pending_mu_: reads only the gRPC auth context + ca.db, so it
+    // Independent of pending_mu_: reads only the gRPC auth context + ca_store, so it
     // runs BEFORE the plane lock is taken (no cross-store query under the lock,
     // gov #1117). No-op when no cert is presented or no checker is wired.
     if (revocation_checker_) {
