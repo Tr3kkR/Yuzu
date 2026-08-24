@@ -4,11 +4,31 @@
 
 namespace yuzu::server {
 
-void WebhookRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
-                                    AuditFn audit_fn, EmitEventFn emit_event_fn,
-                                    WebhookStore* webhook_store) {
+namespace {
+
+// Gov Gate 4 consistency-auditor: the store layer distinguishes
+// store_unavailable (pool exhausted / codec unavailable) from db_error (a
+// query against an open store failed) precisely so a 503's audit row can
+// tell an incident investigator which one happened — collapsing both to a
+// single "db_error" literal discarded that distinction on the audit path
+// alone (the HTTP status/body were already correctly identical for both,
+// per the #3097 classification: both are 503).
+std::string_view audit_detail_for(WebhookWriteError err) {
+    switch (err) {
+    case WebhookWriteError::invalid_url:
+        return "invalid_url";
+    case WebhookWriteError::store_unavailable:
+        return "store_unavailable";
+    case WebhookWriteError::db_error:
+        return "db_error";
+    }
+    return "db_error"; // unreachable; keeps the prior collapsed behavior as a floor
+}
+
+void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::AuditFn audit_fn,
+          WebhookRoutes::EmitEventFn emit_event_fn, WebhookStore* webhook_store) {
     // GET /api/webhooks — list all webhooks
-    svr.Get("/api/webhooks",
+    sink.Get("/api/webhooks",
             [perm_fn, webhook_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
@@ -47,7 +67,7 @@ void WebhookRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn
             });
 
     // POST /api/webhooks — create a new webhook
-    svr.Post("/api/webhooks",
+    sink.Post("/api/webhooks",
              [perm_fn, audit_fn, emit_event_fn, webhook_store](const httplib::Request& req,
                                                                 httplib::Response& res) {
                  if (!perm_fn(req, res, "Infrastructure", "Write"))
@@ -92,7 +112,8 @@ void WebhookRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn
                              R"({"error":{"code":400,"message":"url must be http:// or https://"},"meta":{"api_version":"v1"}})",
                              "application/json");
                      } else {
-                         audit_fn(req, "webhook.create", "failure", "webhook", "", "db_error");
+                         audit_fn(req, "webhook.create", "failure", "webhook", "",
+                                  std::string(audit_detail_for(result.error())));
                          res.status = 503;
                          res.set_content(
                              R"({"error":{"code":503,"message":"webhook store unavailable"},"meta":{"api_version":"v1"}})",
@@ -112,7 +133,7 @@ void WebhookRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn
              });
 
     // DELETE /api/webhooks/:id — delete a webhook
-    svr.Delete(R"(/api/webhooks/(\d+))",
+    sink.Delete(R"(/api/webhooks/(\d+))",
                [perm_fn, audit_fn, webhook_store](const httplib::Request& req,
                                                    httplib::Response& res) {
                    if (!perm_fn(req, res, "Infrastructure", "Write"))
@@ -131,7 +152,7 @@ void WebhookRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn
                        // open store is 503, distinct from the plain
                        // not-found case below (never conflated).
                        audit_fn(req, "webhook.delete", "failure", "webhook", std::to_string(id),
-                                "db_error");
+                                std::string(audit_detail_for(result.error())));
                        res.status = 503;
                        res.set_content(
                            R"({"error":{"code":503,"message":"webhook store unavailable"},"meta":{"api_version":"v1"}})",
@@ -151,7 +172,7 @@ void WebhookRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn
                });
 
     // GET /api/webhooks/:id/deliveries — get delivery history
-    svr.Get(R"(/api/webhooks/(\d+)/deliveries)",
+    sink.Get(R"(/api/webhooks/(\d+)/deliveries)",
             [perm_fn, webhook_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
@@ -182,6 +203,21 @@ void WebhookRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn
                 res.set_content(nlohmann::json({{"deliveries", arr}}).dump(),
                                 "application/json");
             });
+}
+
+} // namespace
+
+void WebhookRoutes::register_routes(httplib::Server& svr, AuthFn /*auth_fn*/, PermFn perm_fn,
+                                    AuditFn audit_fn, EmitEventFn emit_event_fn,
+                                    WebhookStore* webhook_store) {
+    HttplibRouteSink sink(svr);
+    mount(sink, std::move(perm_fn), std::move(audit_fn), std::move(emit_event_fn), webhook_store);
+}
+
+void WebhookRoutes::register_routes(HttpRouteSink& sink, AuthFn /*auth_fn*/, PermFn perm_fn,
+                                    AuditFn audit_fn, EmitEventFn emit_event_fn,
+                                    WebhookStore* webhook_store) {
+    mount(sink, std::move(perm_fn), std::move(audit_fn), std::move(emit_event_fn), webhook_store);
 }
 
 } // namespace yuzu::server

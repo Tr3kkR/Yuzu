@@ -223,8 +223,15 @@ class).
 - **Legacy file disposition (ADR-0010 §Consequences (a)–(d) — first store to actually implement
   this; `AuthDB` was fresh-start/no-backfill, so this is the program's first secret-bearing
   legacy-retention window in practice):**
-  - (a) **0600 forced** on the legacy file before it is opened for reading, and re-applied to
-    the moved-aside copy (defence-in-depth; `ca_store.cpp`'s idiom).
+  - (a) **0600 forced, POSIX only** — on the legacy file before it is opened for reading, and
+    re-applied to the moved-aside copy (defence-in-depth; `auth.cpp`'s belt-and-suspenders
+    idiom for credential-bearing files). `std::filesystem::permissions` with owner-only POSIX
+    bits is a silent no-op on Windows (no ACL is touched, the call reports success) — gov
+    Gate 3 cross-platform caught an earlier revision of this ADR and the shipped code both
+    claiming "0600" unconditionally, which was false there. Both are now `#ifndef _WIN32`-
+    guarded and the Windows-side log line does not claim a restriction that did not happen. No
+    compensating Windows ACL exists for this path today (unlike `key_provider.hpp`'s
+    `WinOwnerOnlyDacl` for the KEK file itself) — tracked as a follow-up, not fixed here.
   - Moved aside (never deleted) on a verified backfill, WAL/SHM sidecars carried across
     (`AuditStore`/ADR-0040 precedent — an unclean shutdown's committed tail lives in `-wal`, and
     the retained copy is unopenable standalone without it).

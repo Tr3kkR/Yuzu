@@ -1445,6 +1445,23 @@ systemctl start yuzu-server
 
 **Authoring caveats.** The dashboard YAML editor's lightweight line-scanner does not extract `spec.responseTemplates` into the indexed column; author through `POST /api/v1/definitions/import` (JSON envelope) or the REST template endpoints. Imported templates with the reserved `id: __default__` are silently dropped during normalisation.
 
+### vNEXT — webhook store moves to Postgres; secrets now encrypted at rest (ADR-0057) (breaking)
+
+`WebhookStore` moves from SQLite (`webhooks.db`) to the PostgreSQL substrate, and the webhook
+HMAC signing secret is now envelope-encrypted at rest (`SecretCodec`, ADR-0010) instead of a
+plaintext column. A **mandatory, automatic backfill** re-encrypts every existing webhook's
+secret and carries over the delivery log on first boot; a failed backfill refuses to start the
+server (the boot log names the exact remediation). `POST /api/webhooks` now returns `400`
+for an invalid URL, distinct from a `503` for a genuine store/database error; both `POST` and
+`DELETE` return `503` (rather than a silently-empty/silently-failed result) on that latter
+case, previously ambiguous. The legacy `webhooks.db` is retained one release as a rollback
+reference (never deleted) and still holds every pre-cutover secret in plaintext during that
+window, restricted to the file owner where the platform supports it (POSIX only, see the ADR)
+— see [`rest-api.md`](rest-api.md#post-apiwebhooks) for the rotation guidance. Full
+detail: `docs/adr/0057-webhook-store-postgres-migration.md` and the
+`## ⚠️ Behaviour change: webhook store moves to Postgres (ADR-0057)` section in
+`docs/user-manual/upgrading.md`.
+
 ---
 
 ## Settings Page
@@ -2143,7 +2160,7 @@ Schedule the dump alongside the existing SQLite/cert-dir backups; verify restore
 
 Secret columns in PostgreSQL are **envelope-encrypted app-side** (ADR-0010): each value is sealed under a fresh data-encryption key (DEK), and the DEK is wrapped by the install's key-encryption key (KEK). The KEK is a 32-byte key file generated on first boot (`secrets-kek-v1.key`, mode 0600, in the same key directory as the CA root key — `--ca-dir`, default `/etc/yuzu/certs` on Linux/macOS, `C:\ProgramData\Yuzu\certs` on Windows) and **never enters the database** — `kek_meta` in the `secrets` schema records only non-secret fingerprints (key-check values), which the server verifies against the key files at every boot.
 
-> The encryption machinery ships ahead of its consumers: as of this release **no store writes secret columns yet** — the gated stores (`auth` TOTP secrets, `webhooks`, `offload_targets`, the OIDC client secret) adopt it as each migrates to Postgres. Set your backup procedure up for the pairing below **now** so those migrations don't invalidate it.
+> Two of the four gated stores now write secret columns through this machinery: `auth` (TOTP secrets, since 2026-07-16) and `webhooks` (the outbound HMAC signing secret, ADR-0057). `offload_targets` and the OIDC client secret adopt it as each migrates to Postgres. Set your backup procedure up for the pairing below **now** — every additional migration widens the blast radius of a KEK/DB backup mismatch, never narrows it.
 
 **The restore-pairing invariant.** `pg_dump` output and volume snapshots contain **ciphertext and wrapped DEKs only** — a database backup alone recovers no secrets, and a database restore is unusable without the matching keys directory. DB backups and keys-dir backups are a *pair*: back them up on the same schedule, restore them **together**, and keep a separate offline copy of the KEK file exactly like the CA root key. The restore-verification drill must restore both halves and confirm a clean boot — the server checks every registered KEK fingerprint at startup and **fails closed** rather than serving with unreadable secrets. The failure classes below are stable error *prefixes* at the start of the fatal startup message (match the prefix in the message text when writing log-scraping alerts; they are not structured log fields):
 
@@ -2604,8 +2621,12 @@ Decrypt failures are counted per store and failure class as
 `yuzu_server_secret_decrypt_failures_total{store, failure_class}` (classes:
 `tag_mismatch`, `kek_unresolvable`, `malformed_blob`, `crypto_failure`).
 **This is live as of the auth store's Postgres migration** — the auth store
-(`auth.users.mfa_totp_secret`, TOTP secrets) is the first secret-bearing
-store to ship, so `store="auth"` is the only label value today. A sustained
+(`auth.users.mfa_totp_secret`, TOTP secrets) was the first secret-bearing
+store to ship; `webhook_store` (`webhooks.secret`, ADR-0057) joined it, so
+`store` already has more than one live value and gains a new one with each
+further secret-gated migration (`offload_targets`, then the OIDC client
+secret). Scope any dashboard/alert to the specific `store` you care about
+rather than assuming a single fixed value. A sustained
 non-zero `kek_unresolvable` rate after a deployment or restore is the
 primary backup-skew alert signal; a single-row `tag_mismatch` is the tamper
 signal and warrants investigation, not retry. Ready-made alert rules for

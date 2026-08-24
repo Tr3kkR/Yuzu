@@ -739,6 +739,7 @@ if build_server
       'unit/server/test_tag_scope_authz.cpp',
       'unit/server/test_notification_store.cpp',
       'unit/server/test_webhook_store.cpp',
+      'unit/server/test_webhook_routes.cpp',
       'unit/server/test_migration_runner.cpp',
       'unit/server/test_rate_limiter.cpp',
       'unit/server/test_cert_reloader.cpp',

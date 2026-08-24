@@ -319,10 +319,12 @@ void move_legacy_aside(const std::filesystem::path& legacy_db_path) {
                          "until the sidecar is moved beside it",
                          suffix, side_ec.message(), aside.string());
     }
+#ifndef _WIN32
     // The main file was already forced to 0600 before it was opened for
     // reading (ADR-0010 §Consequences (a)); re-apply to the moved copy too
     // — rename preserves mode, so this is normally a no-op, defence in
-    // depth if the move landed on semantics where it wasn't.
+    // depth if the move landed on semantics where it wasn't. POSIX-only,
+    // same reason as the read-time force above.
     std::error_code perm_ec;
     std::filesystem::permissions(aside,
                                  std::filesystem::perms::owner_read |
@@ -332,6 +334,14 @@ void move_legacy_aside(const std::filesystem::path& legacy_db_path) {
                  "retained one release per ADR-0009 — still holds the pre-cutover PLAINTEXT "
                  "signing secret(s); see ADR-0057 for the operator purge/rotate guidance)",
                  aside.string());
+#else
+    // No equivalent access-restriction is applied on Windows today (see the
+    // read-time force's comment) — the log line must not claim one.
+    spdlog::info("WebhookStore::migrate_from_sqlite: moved legacy webhook db to {} — retained "
+                 "one release per ADR-0009 — still holds the pre-cutover PLAINTEXT signing "
+                 "secret(s); see ADR-0057 for the operator purge/rotate guidance",
+                 aside.string());
+#endif
 }
 
 } // namespace
@@ -410,15 +420,28 @@ WebhookStore::~WebhookStore() {
     // while this body executes. In the intended production flow
     // (ServerImpl::stop() -> quiesce(60s) -> success -> .reset()) this is
     // always instant — the pool is already empty by the time this
-    // destructor runs. Bounded generously (24h) rather than literally
-    // forever; if still not drained, LEAK rather than let a worker's
-    // decrypt-and-sign call touch pool_/secret_codec_ (and, transitively,
-    // the KeyProvider its codec borrows) after this store is gone.
+    // destructor runs.
+    //
+    // On a 24h timeout this call does NOT leak or abandon anything (gov
+    // Gate 3 cpp-safety, hardening round: an earlier version of this
+    // comment/log claimed "leaking", which is inaccurate) — ~StoreWorkerPool
+    // (delivery_pool_, this class's last-declared member) runs immediately
+    // after this body returns and unconditionally joins every worker
+    // thread, so this destructor call BLOCKS the whole process shutdown
+    // until the wedged task actually finishes, however long that takes. The
+    // critical log below is the operator-facing signal that the process
+    // *looks* stuck for that reason, not a report that anything was left
+    // behind unsafely — blocking indefinitely is the safe outcome; the
+    // unsafe one would be proceeding to destruct pool_/secret_codec_ (and,
+    // transitively, the KeyProvider secret_codec_ borrows) while a worker's
+    // decrypt-and-sign call could still touch them.
     if (!delivery_pool_.quiesce(std::chrono::hours(24))) {
         try {
-            spdlog::critical("WebhookStore::~WebhookStore: delivery pool did not quiesce within "
-                             "24h - leaking rather than risking a use-after-free against an "
-                             "in-flight delivery");
+            spdlog::critical(
+                "WebhookStore::~WebhookStore: delivery pool did not quiesce within 24h - "
+                "about to block in ~StoreWorkerPool's unconditional join until the wedged "
+                "delivery finishes, however long that takes, rather than risking a "
+                "use-after-free against it");
         } catch (...) {
         }
     }
@@ -842,10 +865,19 @@ bool WebhookStore::migrate_from_sqlite_impl(const std::filesystem::path& legacy_
         return false;
     }
 
+#ifndef _WIN32
+    // ADR-0010 §Consequences (a): a legacy file we are about to read holds a
+    // PLAINTEXT webhook signing secret column — force 0600 defence-in-depth
+    // before touching it (auth.cpp's belt-and-suspenders idiom for
+    // credential-bearing files). POSIX-only: std::filesystem::permissions
+    // with owner-only POSIX bits is a silent no-op on Windows (no ACL is
+    // touched, `ec` stays clear) — gov Gate 3 cross-platform round 1 caught
+    // an earlier version of this code claiming "0600" unconditionally in
+    // its log line, which was simply false on Windows. No compensating
+    // Windows ACL exists for this path today (unlike key_provider.cpp's
+    // WinOwnerOnlyDacl for the KEK file) — tracked as a follow-up, not
+    // fixed here.
     if (legacy_exists) {
-        // ADR-0010 §Consequences (a): a legacy file we are about to read
-        // holds a PLAINTEXT webhook signing secret column — force 0600
-        // defence-in-depth before touching it (ca_store.cpp idiom).
         std::filesystem::permissions(legacy_db_path,
                                      std::filesystem::perms::owner_read |
                                          std::filesystem::perms::owner_write,
@@ -854,6 +886,7 @@ bool WebhookStore::migrate_from_sqlite_impl(const std::filesystem::path& legacy_
             spdlog::warn("WebhookStore::migrate_from_sqlite: could not set 0600 on legacy {}: {}",
                          legacy_db_path.string(), ec.message());
     }
+#endif
 
     std::string fingerprint;
     std::vector<LegacyWebhook> legacy_hooks;
@@ -1094,6 +1127,20 @@ bool WebhookStore::migrate_from_sqlite_impl(const std::filesystem::path& legacy_
         encrypted_secrets[i] = std::move(*enc);
     }
 
+    // Zeroize every legacy plaintext secret now that it's been consumed —
+    // gov Gate 2 security-guardian: an unzeroized std::string here departs
+    // from this same file's own SecureBuffer discipline at the delivery
+    // site (ADR-0010 zeroization rule). legacy_hooks is not `const` past
+    // this point, so every read below must key off `encrypted_secrets[i]`
+    // (populated iff the secret was non-empty), never `h.secret`, which the
+    // has_secret derivation just inside the transaction below now does.
+    for (auto& h : legacy_hooks) {
+        if (!h.secret.empty()) {
+            OPENSSL_cleanse(h.secret.data(), h.secret.size());
+            h.secret.clear();
+        }
+    }
+
     std::string failure_detail;
     // ONE transaction: fail closed on any error, nothing partially
     // committed (ADR-0009). Unbounded with_txn: startup is serial, same
@@ -1101,7 +1148,11 @@ bool WebhookStore::migrate_from_sqlite_impl(const std::filesystem::path& legacy_
     const bool ok = pool_.with_txn([&](PGconn* conn) -> bool {
         for (std::size_t i = 0; i < legacy_hooks.size(); ++i) {
             const auto& h = legacy_hooks[i];
-            const bool has_secret = !h.secret.empty();
+            // has_secret derives from the ENCRYPTED output, not h.secret —
+            // the plaintext was zeroized+cleared right after the encrypt
+            // loop above, so h.secret.empty() would be true unconditionally
+            // by this point.
+            const bool has_secret = !encrypted_secrets[i].empty();
             std::vector<std::optional<std::string>> params = {
                 std::to_string(h.id),
                 sanitize_pg_text(h.url),

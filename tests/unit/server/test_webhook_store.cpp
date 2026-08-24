@@ -309,6 +309,22 @@ TEST_CASE("WebhookStore[pg]: a tampered secret blob is skipped, never fired unsi
     // through to an unsigned (or any) network attempt.
     CHECK(deliveries[0].error == "secret_unavailable");
     CHECK(deliveries[0].status_code == 0);
+
+    // gov Gate 3 quality-engineer: the delivery-outcome assertions above
+    // prove ONLY that some decrypt failure occurred — they can't
+    // distinguish this tamper from e.g. a malformed_blob false-pass. Assert
+    // the codec's own internal counter to prove tag_mismatch specifically
+    // was hit, confirming the byte flip landed inside the GCM tag/
+    // ciphertext region (kCiphertextOffset=93, well past the 11-byte
+    // plaintext here) rather than some other failure class.
+    bool saw_tag_mismatch = false;
+    for (const auto& [key, count] : store.codec().decrypt_failure_counts()) {
+        const auto& [codec_store, cls] = key;
+        if (codec_store == "webhook_store" &&
+            cls == yuzu::server::pg::SecretCodec::FailureClass::tag_mismatch && count > 0)
+            saw_tag_mismatch = true;
+    }
+    CHECK(saw_tag_mismatch);
 }
 
 TEST_CASE("WebhookStore[pg]: NULL secret with has_secret=true is a hard decrypt error",
@@ -329,6 +345,27 @@ TEST_CASE("WebhookStore[pg]: NULL secret with has_secret=true is a hard decrypt 
     REQUIRE(lease);
     auto res = yuzu::server::pg::exec_params(
         lease.get(), "UPDATE webhook_store.webhooks SET secret = NULL WHERE id = $1::bigint",
+        std::vector<std::string>{std::to_string(*id)});
+    CHECK(res.status() == PGRES_FATAL_ERROR); // CHECK constraint violation
+}
+
+TEST_CASE("WebhookStore[pg]: a non-NULL secret with has_secret=false is also a CHECK violation",
+         "[webhook_store][pg][security]") {
+    // gov Gate 3 quality-engineer: the CHECK constraint
+    // (webhook_store.cpp's migration DDL) is a symmetric XNOR —
+    // (has_secret AND secret IS NOT NULL) OR (NOT has_secret AND secret IS
+    // NULL) — and the sibling test above only exercised one arm. Prove the
+    // other: has_secret=false with a non-NULL secret is refused too, not
+    // just silently ignored.
+    WebhookStorePg store;
+    auto id = store->create_webhook("http://127.0.0.1:1/h", "agent.registered", /*secret=*/"");
+    REQUIRE(id.has_value());
+
+    auto lease = store.pool().acquire();
+    REQUIRE(lease);
+    auto res = yuzu::server::pg::exec_params(
+        lease.get(),
+        "UPDATE webhook_store.webhooks SET secret = decode('00','hex') WHERE id = $1::bigint",
         std::vector<std::string>{std::to_string(*id)});
     CHECK(res.status() == PGRES_FATAL_ERROR); // CHECK constraint violation
 }
