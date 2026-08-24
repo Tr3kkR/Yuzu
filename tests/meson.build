@@ -322,6 +322,8 @@ agent_test_exe = executable(
     'unit/test_users_posix_actions.cpp',      # Wave 2 WP-A remediation: real users.dylib/.so driven
                                                 # end to end via LocalDispatcher (POSIX-only; a no-op
                                                 # TU on Windows via the file's own #ifndef _WIN32 guard)
+    'unit/test_content_dist_actions.cpp',      # Wave 5 PR5.1: content_dist dispatch gates via LocalDispatcher (POSIX-only TU guard)
+    'unit/test_content_dist_exec_parsers.cpp', # Wave 5 PR5.1: pure SubprocessResult -> wire mapping + options builder (no I/O)
     'unit/test_certificates_x509.cpp',        # Wave 2 WP-B: pure libcrypto PEM/DER field extraction
     'unit/test_quarantine_parsers.cpp',       # Wave 2 WP-F: pure netsh/iptables/pfctl output parsers
     'unit/test_quarantine_argv.cpp',          # Wave 2 WP-F remediation: pure mutating-argv construction (FN-03)
@@ -451,12 +453,14 @@ agent_test_exe = executable(
   # (agents/plugins/{installed_apps,msi_packages}/meson.build):
   # test_installed_apps_actions.cpp / test_msi_packages_actions.cpp load both
   # real plugins by path for the identical reason (Wave 4 PR4.3a remediation).
+  # content_dist_plugin_lib: same reasoning, for test_content_dist_actions.cpp.
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin,
                 users_plugin_lib, os_info_plugin_lib, processes_plugin_lib,
                 network_diag_plugin_lib, ioc_plugin_lib,
                 hardware_plugin_lib, device_identity_plugin_lib, netstat_plugin_lib,
                 windows_updates_plugin_lib, sccm_plugin_lib, event_logs_plugin_lib,
-                installed_apps_plugin_lib, msi_packages_plugin_lib],
+                installed_apps_plugin_lib, msi_packages_plugin_lib,
+                content_dist_plugin_lib],
 )
 # Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
 # threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it
