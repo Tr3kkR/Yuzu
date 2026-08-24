@@ -1623,7 +1623,8 @@ inventory and revoke endpoints are gated by the `Security` securable.
 Download the CA root certificate (PEM) and add it to an OS/browser trust store.
 **Public** — no authentication. Returns `Content-Type: application/x-pem-file`,
 `Content-Disposition: attachment; filename="yuzu-ca.pem"`,
-`Cache-Control: public, max-age=86400`. `404` if no CA root exists.
+`Cache-Control: public, max-age=86400`. `404` if no CA root exists; `503` if the
+CA store is unavailable (a genuine database error, distinct from no-root).
 
 ```bash
 curl https://yuzu.example.com/api/v1/ca/root -o yuzu-ca.pem
@@ -1647,7 +1648,8 @@ openssl crl -inform DER -in yuzu.crl -noout -text
 
 List certificates issued by the internal CA. **Permission:** `Security:Read`.
 Query params `limit` (1–1000, default 200) and `offset` (default 0). The full
-certificate PEM and enrollment reference are intentionally omitted.
+certificate PEM and enrollment reference are intentionally omitted. `503` if
+the CA store is unavailable.
 
 `meta.has_more` is `true` when more rows exist beyond the current page; when it is,
 `meta.next_offset` carries the `offset` to pass for the next page. Iterate until
@@ -1677,8 +1679,8 @@ The MCP `list_issued_certs` tool mirrors this contract (same `has_more` / `next_
 #### `POST /api/v1/ca/revoke`
 
 Revoke a certificate by serial. **Permission:** `Security:Delete`. Revocation
-takes effect server-side **immediately** (the mTLS accept gate reads `ca.db`, not
-the CRL); the CRL is then republished. Request body (max 64 KB):
+takes effect server-side **immediately** (the mTLS accept gate reads `ca_store`,
+not the CRL); the CRL is then republished. Request body (max 64 KB):
 
 ```json
 { "serial_hex": "3A4B5C6D...", "reason": "key compromise" }
@@ -2686,7 +2688,7 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `quarantine.enable` | Device quarantined |
 | `quarantine.disable` | Device released from quarantine |
 | `ca.cert.issued` | Internal CA signed a per-agent client certificate at enrollment. `target_type=AgentCertificate`, `target_id=<serial>`, `result=success`. |
-| `ca.cert.revoked` | Certificate revoked via `POST /api/v1/ca/revoke`. `target_type=AgentCertificate`, `target_id=<serial>`. `result=success`, or `result=failure` with `detail="serial not found or already revoked"` for an unknown/already-revoked serial. |
+| `ca.cert.revoked` | Certificate revoked via `POST /api/v1/ca/revoke`. `target_type=AgentCertificate`, `target_id=<serial>`. `result=success`; `result=denied` with `detail="serial not found or already revoked"` for an unknown/already-revoked serial (reject without state change, matches every destructive sibling); `result=failure` (ADR-0053) for a genuine ca_store DB/lease error — kept distinct from `denied` so a database outage is never audited as a rejected revoke attempt. |
 | `ca.crl.published` | CRL (re)published after a revocation. `target_type=Security`, `target_id=<serial that triggered it>`. `result=success`, or `result=failure` when the CRL could not be rebuilt/recorded (the revocation still stands; the public CRL is momentarily stale). |
 | `ca.root_csr.exported` | The install CA's CSR was exported via `GET /api/v1/ca/root-csr` (subordinate-CA setup). `target_type=CaRoot`, `target_id=root`. `result=success`, or `result=failure` if generation failed. |
 | `ca.subordinate.imported` | An enterprise-signed intermediate was imported via `POST /api/v1/ca/import-chain` (or the dashboard wrapper). `target_type=CaRoot`, `target_id=root`. `result=success` on a validated switch to subordinate mode; `result=denied` when the uploaded material is rejected (not a CA / wrong key / does not chain); `result=failure` on a server-side persistence error. `detail` carries `reason=...` on rejection and `via=dashboard` for the panel path. |
@@ -8196,7 +8198,7 @@ Structured JSON health check endpoint. This endpoint is **unauthenticated** and 
 | `uptime_seconds` | integer | Server uptime in seconds |
 | `agents.online` | integer | Number of currently connected agents |
 | `agents.pending` | integer | Number of agents awaiting enrollment approval |
-| `stores` | object | Health status of each data store (`"ok"` or `"error"`). Includes `ca` — the internal-CA store (`ca.db`) — which is load-bearing whenever default certs are active; `status` is `"degraded"` if it is down. |
+| `stores` | object | Health status of each data store (`"ok"` or `"error"`). Includes `ca` — the internal-CA store (`ca_store`, Postgres) — which is load-bearing whenever default certs are active; `status` is `"degraded"` if it is down. |
 | `tls.default_certs_active` | bool | `true` when running with built-in per-install default certs (replace before production — see security-hardening.md). Unauthenticated so monitoring can detect it. |
 | `tls.ca_fingerprint` | string | SHA-256 fingerprint of the active default CA (empty when not on default certs). Public. |
 | `tls.ca_expires_at` | integer | Unix timestamp of the default CA's expiry (`0` when not on default certs). |
