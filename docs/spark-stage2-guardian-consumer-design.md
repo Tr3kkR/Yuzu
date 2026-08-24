@@ -139,9 +139,19 @@ state then. Keeping the fallthrough means implementing the same outcome twice, a
 teaching the parity suite, the telemetry, and the operator model two behaviours.
 
 Verified safe to change now:
-- **Enforcement behaviour is identical.** The legacy File/Registry guards already return
-  false from `start()` off-Windows: a silent no-op, no `guards_` entry. Nothing enforces
-  either way. What changes is reporting, from silence to an explicit state.
+- **Enforcement behaviour is identical for the File/Registry case.** The legacy
+  File/Registry guards already return false from `start()` off-Windows: a silent
+  no-op, no `guards_` entry. Nothing enforces either way. What changes is reporting,
+  from silence to an explicit state. This is scoped to File/Registry, not a blanket
+  guarantee across every mechanism: the Service guard's legacy path (`guard_systemd.cpp`)
+  opens its own independent D-Bus connection, so a spark-side registration failure or
+  registered-but-inert mechanism (a containerised host with no systemd bus, per
+  `guaranteed-state.md`'s own worked example) can in principle diverge from legacy's
+  outcome on that one mechanism - see `reconcile_rule_locked`'s own comment on the
+  `Unsupported` branch (enterprise-readiness governance finding, F7/#2298; by
+  inspection, the one documented inert case shows no delta - legacy fails identically
+  there too - but the guarantee is narrower than this bullet's original wording
+  implied).
 - **Nothing server-side breaks.** The Guardian status surface is still mock/placeholder
   (§Health/status surface), so no server code validates status tokens yet. This is the
   cheapest moment to introduce one; rung 4 owns its wiring.
@@ -160,6 +170,17 @@ Verified safe to change now:
    nullptr off their platforms, so every rule on a spark-preferred macOS agent classifies
    `Unsupported`. That matches today's macOS enforcement reality, but the macOS CI leg
    must assert exactly that posture or it passes by testing nothing.
+
+**Landed (F7, #2298):** `reconcile_rule_locked` gives `RulePlacement::Unsupported` a
+distinct terminal-state branch - withdraws from both backends, tracks the rule_id in a
+new `unsupported_rules_` map (per-outcome erase/insert at every other return path, swept
+against the actual push contents on `full_sync`, cleared in `stop()`). All three
+consequences above are addressed: (1) the reconcile tests were rewritten in the same PR,
+plus a real macOS-factory test asserting the all-unsupported posture directly (not (3),
+which is a rung-10 parity-gate item, still open); (2) not yet - the intentional-delta
+registry remains rung 10's job. Also shipped in the same PR: the `mech_unsupported_total`
+per-mechanism fleet gauge and `yuzu.guardian_backend` heartbeat tag (§Platform-rejection,
+§Fleet metrics, items 8-9 below).
 
 ### R3 - I/O executor quota semantics
 
@@ -1246,6 +1267,9 @@ Each rung is an independently-governed PR on `dev`, run through the full
    - **8.** `mech_unsupported_total` + `yuzu_fleet_spark_unsupported` - **folded into
      7.7b PR-1** per R2 (unsupported must be loud the moment a rule can land on spark);
      current-gauge vs cumulative-counter split per §7.7b split.
+     **Landed (F7, #2298),** together with R2's terminal-state code and the
+     `yuzu.guardian_backend` heartbeat tag (#2240 item 1 - the server-side flap/dark-
+     device detector, #2240 item 2, remains open).
    - **10.** Parity + durability + integration matrix. Semantic ports land **before**
      7.7b where possible; live/equivalence after. Carries the **intentional-delta
      registry** (R2 consequence 2) so zero-tolerance parity survives the legacy-no-op

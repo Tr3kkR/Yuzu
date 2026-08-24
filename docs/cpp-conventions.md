@@ -126,6 +126,7 @@ Use for vendored assets (Three.js r168, ECharts, Inter typeface, htmx bundles la
 
 - Raw error codes or output parameters (use `std::expected`).
 - printf-family calls (use `std::format` or spdlog).
+- scanf-family calls (`sscanf`/`fscanf`/`scanf`): glibc 2.38 redirects them to versioned `__isoc23_*` symbols under C23/C++23, so binaries built on new-glibc toolchains refuse to load on RHEL-era glibc. Parse with `std::strtol`-family + end-pointer checks (width-capped fields: see `tar_mapdrive_collector.cpp::scan_int`).
 - Raw `new`/`delete` (use RAII).
 - Manual resource cleanup (use RAII / smart pointers).
 - C++ types crossing the C ABI boundary in `plugin.h`.

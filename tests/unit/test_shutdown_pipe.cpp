@@ -1,11 +1,12 @@
 /**
- * test_shutdown_pipe.cpp — pins the REAL ShutdownWatcher (agents/core/src/shutdown_watcher.hpp).
+ * test_shutdown_pipe.cpp — pins the REAL ShutdownWatcher (common/include/yuzu/shutdown_watcher.hpp,
+ * shared by the agent and server binaries as of #3007).
  *
  * WHY THIS EXISTS, and why it tests the real class rather than a copy of it.
  *
- * The agent's graceful shutdown runs through a self-pipe: the signal handler writes ONE byte,
- * and a watcher thread parked in read() wakes and runs the teardown. A single wrong flag
- * silently disables all of it — `pipe2(fds, O_CLOEXEC | O_NONBLOCK)` sets O_NONBLOCK on BOTH
+ * Graceful shutdown runs through a self-pipe: the signal handler writes ONE byte, and a
+ * watcher thread parked in read() wakes and runs the teardown. A single wrong flag silently
+ * disables all of it — `pipe2(fds, O_CLOEXEC | O_NONBLOCK)` sets O_NONBLOCK on BOTH
  * descriptors, so the watcher's read() returns EAGAIN immediately, the thread exits within
  * microseconds, and SIGTERM stops triggering a graceful stop. Nothing LOOKS broken: the
  * process still dies via the signal's default disposition.
@@ -20,7 +21,7 @@
 
 #ifndef _WIN32
 
-#include "shutdown_watcher.hpp"
+#include <yuzu/shutdown_watcher.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -29,7 +30,7 @@
 #include <unistd.h>
 
 using namespace std::chrono_literals;
-using yuzu::agent::ShutdownWatcher;
+using yuzu::ShutdownWatcher;
 
 // DELIBERATE CONTRACT DEVIATION, safe here only: these cases pass STACK atomics as
 // `wfd_slot` where the production contract requires static storage duration (the dtor's

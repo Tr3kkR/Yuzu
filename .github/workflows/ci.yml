@@ -576,7 +576,7 @@ jobs:
             sudo apt-get -o DPkg::Lock::Timeout=300 update
             sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
               cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
-              bison flex libsystemd-dev autoconf automake libtool \
+              bison flex libsystemd-dev libblkid-dev autoconf automake libtool \
               ${{ matrix.compiler == 'gcc-15' && 'gcc-15 g++-15' || 'clang-21' }}
           ) 9>/tmp/yuzu-ci-apt.lock
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
@@ -763,7 +763,33 @@ jobs:
         run: bash scripts/ci/ensure-postgres.sh
 
       - name: Test
-        run: python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs
+        # --num-processes 2: without a cap, meson fans every test() entry out at
+        # once — its default worker count is an uncapped, non-affinity-aware
+        # cpu_count() (this runner's job is genuinely confined to execute on 16
+        # logical CPUs via cgroup, "Self-hosted runner topology" in
+        # docs/ci-architecture.md, but meson's own pool sizing ignores that) — so
+        # the ~8 server pg shards ran CONCURRENTLY inside this one job, sharing
+        # those 16 CPUs AND the one ensure-postgres.sh container this job got.
+        # Proved via back-computed shard start times (printed-timestamp minus
+        # elapsed) landing within ~0.01s of each other across every pg shard in a
+        # failing run. Each pg shard's `timeout: 600` (tests/meson.build) is a
+        # hard per-test kwarg, not the job budget: shard E hit it dead-on
+        # (600.11-600.60s) repeatedly under this same uncapped fan-out before the
+        # 2026-08-19 E->E+G split (#3322), and the post-split E/G pair was still
+        # measured at 86-96% of that ceiling across several runs this week — so
+        # the box was never actually "scaling flat" (see the now-corrected claim in
+        # docs/ci-architecture.md's "Linux within-job concurrency cap" section +
+        # this step's Windows counterpart below). Solo/uncontended per-shard cost
+        # is much lower — tests/meson.build's own recorded numbers run ~50-180s —
+        # the ~600s figures are what full concurrent contention produces, not a
+        # shard's own baseline.
+        # 2, not a higher number: E/G have no measured margin to spend on a
+        # guess, and this mirrors the Windows Test step's already-proven
+        # `--num-processes 2` rather than deriving a Linux-specific value. A
+        # box-wide cross-job gate (with-test-slot.sh, Windows-only today) is a
+        # candidate fast-follow if per-job capping alone isn't enough — tracked
+        # in #3443, not bundled here without its own measurement.
+        run: python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2
 
       # Break-glass MFA-reset CLI contract (#1226) — exit codes + JSON output of
       # `yuzu-server --mfa-reset` are not exercisable by the Catch2 suite (which
@@ -1136,10 +1162,13 @@ jobs:
           # the server/tar suites into their timeouts (measured server ~[pg]:
           # c0 289s -> c4 603s). with-test-slot.sh caps concurrent heavy test
           # phases to 2 per box (crash-safe flock; build stays 4-wide), and
-          # --num-processes 2 caps meson's own fan-out so the two ~400-600s server
-          # shards don't pile onto one CCD+cluster. Windows-only (this step);
-          # Linux scales flat and needs neither. See tests/meson.build server-shard
-          # comment + docs/ci-architecture.md.
+          # --num-processes 2 caps meson's own fan-out so the ~8 server pg
+          # shards don't pile onto one CCD+cluster. with-test-slot.sh (the
+          # cross-job piece) is Windows-only — Linux's own within-job fan-out gets
+          # the same --num-processes 2 cap on its Test step above; it was never
+          # actually scaling flat (docs/ci-architecture.md, tests/meson.build
+          # server-shard comment). A Linux cross-job gate is a candidate
+          # fast-follow tracked in #3443, not shipped here.
           bash scripts/ci/with-test-slot.sh 2 -- \
             python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2
 
@@ -1428,7 +1457,16 @@ jobs:
           echo "The Yuzu server is Linux-only (ADR-0035); Linux + Windows CI legs run the full [pg] suite."
 
       - name: Test
-        run: python3 scripts/ci/flake-retry.py --builddir build-macos -- --print-errorlogs
+        # --timeout-multiplier 2: BigMags is a shared box (2 runner agents, and
+        # the release+LTO build is co-resident after #3348), so give each test 2x
+        # meson's kill-timeout to absorb CPU/memory contention. Per tests/meson.build's
+        # own guidance, multiply for a slower environment rather than raising
+        # individual test `timeout:` kwargs. This ONLY covers a slow test being
+        # KILLED before it finishes — it does NOT help in-test wall-clock
+        # assertions (CHECK(elapsed < N), CHECK_FALSE(poll_until(...))), which flake
+        # on a loaded box and are fixed per-test (#3357, #2372, and the
+        # elapsed-ceiling issue).
+        run: python3 scripts/ci/flake-retry.py --builddir build-macos -- --print-errorlogs --timeout-multiplier 2
 
       # Same rationale as the linux + windows upload steps: keep test
       # failures diagnosable when meson's `--print-errorlogs` truncation
@@ -1676,7 +1714,7 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build gcc-13 g++-13 \
             pkg-config curl zip unzip tar python3-pip ccache \
-            bison flex libsystemd-dev autoconf automake libtool
+            bison flex libsystemd-dev libblkid-dev autoconf automake libtool
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -1735,7 +1773,20 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ccache
-          key: ccache-canary-x64-linux-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
+          # Scoped to the repo's own compiled source roots, NOT a bare `**/*.cpp`
+          # glob. `hashFiles` globs the whole workspace and does not honour
+          # .gitignore, and the vcpkg restore step ABOVE has already materialised
+          # thousands of vendored headers into vcpkg_installed/ by this point — so
+          # a bare glob hashes those too, and the key then differs between a
+          # vcpkg-cold and a vcpkg-warm run. Measured 2026-08-18: 8 distinct keys
+          # across 10 live entries, PR #3293 alone holding three at ~870 MB, and
+          # the dev-warmed entry sitting at a key no vcpkg-warm PR ever recomputes
+          # — i.e. the ccache half of the shared-scope warming was inert (#3270).
+          # These roots are every directory meson compiles (tools/ arrives via
+          # meson.build's `subdir('tools/capmatrix-gen')`). Missing a root would
+          # cost cache efficiency only, never correctness: ccache hashes the real
+          # preprocessed input, so a stale key cannot yield a wrong object.
+          key: ccache-canary-x64-linux-${{ hashFiles('agents/**/*.cpp', 'agents/**/*.hpp', 'agents/**/*.h', 'server/**/*.cpp', 'server/**/*.hpp', 'server/**/*.h', 'sdk/**/*.cpp', 'sdk/**/*.hpp', 'sdk/**/*.h', 'common/**/*.cpp', 'common/**/*.hpp', 'common/**/*.h', 'tests/**/*.cpp', 'tests/**/*.hpp', 'tests/**/*.h', 'tools/**/*.cpp', 'tools/**/*.hpp', 'tools/**/*.h') }}
           restore-keys: |
             ccache-canary-x64-linux-
 
@@ -1773,6 +1824,7 @@ jobs:
             -Dbuild_tests=true
 
       - name: Build
+        id: build-canary
         run: meson compile -C build-linux
 
       # Link-provenance assertion (#1331 review HIGH-2) — same check as the
@@ -1821,8 +1873,26 @@ jobs:
           path: ${{ github.workspace }}/vcpkg_installed
           key: ${{ steps.cache-vcpkg-canary.outputs.cache-primary-key }}
 
+      # ccache is ADDITIVE — every object in it is independently valid — so unlike
+      # the vcpkg tree above, a partial save is not a correctness problem. But key
+      # OCCUPANCY bites both classes: `cache-hit != 'true'` means a thin entry,
+      # once written, is exact-hit by every later same-source run, which then skips
+      # its own save. The key is immutable, so the cache stays thin until the
+      # sources change. Under `cancel-in-progress` on PRs, cancelled runs are the
+      # routine producer of thin entries, and #3270 makes the key stable enough for
+      # that to actually bite (#3269).
+      #
+      # So: save when Build RAN, pass or fail — a failed build still produced
+      # objects worth keeping, which is why this is not `== 'success'`. Skip when
+      # Build was cancelled or never started. The cost is that a run cancelled
+      # after a long compile loses its cache; that is small, because the push which
+      # superseded it has different sources and therefore a different key, so it
+      # could only ever have reached that entry by prefix fallback anyway.
       - name: Save ccache (canary)
-        if: always() && steps.cache-ccache-canary.outputs.cache-hit != 'true'
+        if: >-
+          always()
+          && (steps.build-canary.outcome == 'success' || steps.build-canary.outcome == 'failure')
+          && steps.cache-ccache-canary.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ccache

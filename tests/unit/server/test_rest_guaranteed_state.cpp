@@ -509,7 +509,7 @@ struct RestGsHarness {
                             wire_scoped_perm ? RestApiV1::ScopedPermFn{scoped_perm_fn}
                                              : RestApiV1::ScopedPermFn{},
                             /*software_inventory_store=*/nullptr,
-                            /*inventory_scope_fn=*/{}, /*response_scope_fn=*/{}, app_perf_providers_,
+                            /*response_scope_fn=*/{}, app_perf_providers_,
                             /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
                             /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
                             /*stream_budget=*/nullptr,

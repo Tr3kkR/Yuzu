@@ -35,9 +35,11 @@
 #include <unordered_set>
 #include <vector>
 
+using yuzu::server::ArmDispatchResult;
 using yuzu::server::ConfinedDispatchOutcome;
 using yuzu::server::ConfinedDispatchSink;
 using yuzu::server::ConfinedDispatchTargets;
+using yuzu::server::ContainmentGate;
 using yuzu::server::dispatch_confined_arms;
 using yuzu::server::DispatchArm;
 using yuzu::server::DispatchResolvers;
@@ -87,6 +89,16 @@ VisibleSet deny_all() { return std::unordered_set<std::string>{}; }
 
 const std::vector<std::string> kThree{"dev-A", "dev-B", "dev-C"};
 
+/// #881: containment disabled — every test in this file exercises
+/// `dispatch_confined_arms` with quarantine enforcement OFF, so a mutation
+/// that deletes the containment check entirely cannot hide behind these
+/// cases; that mutation is bound separately in
+/// test_quarantine_dispatch_gate.cpp, which sets `enforced = true`.
+// Containment off. Named rather than default-constructed: ContainmentGate
+// has no default state, precisely so a production call site cannot reach the
+// permissive one by omission.
+const ContainmentGate kNoContainment = ContainmentGate::exempt_control_plugin();
+
 } // namespace
 
 // ---------------------------------------------------------------- Ids arm ---
@@ -96,7 +108,9 @@ TEST_CASE("Ids arm: unfiltered authority reaches every named agent",
     RecordingSink sink;
     ConfinedDispatchTargets t;
     t.agent_ids = &kThree;
-    const int sent = dispatch_confined_arms(DispatchArm::Ids, t, unfiltered(), false, sink.make());
+    const int sent =
+        dispatch_confined_arms(DispatchArm::Ids, t, unfiltered(), false, kNoContainment, sink.make())
+            .sent;
     CHECK(sent == 3);
     CHECK(sink.reached_exactly({"dev-A", "dev-B", "dev-C"}));
 }
@@ -106,8 +120,9 @@ TEST_CASE("Ids arm: an out-of-scope id is DROPPED, not reached",
     RecordingSink sink;
     ConfinedDispatchTargets t;
     t.agent_ids = &kThree;
-    const int sent =
-        dispatch_confined_arms(DispatchArm::Ids, t, only({"dev-B"}), false, sink.make());
+    const int sent = dispatch_confined_arms(DispatchArm::Ids, t, only({"dev-B"}), false,
+                                            kNoContainment, sink.make())
+                         .sent;
     CHECK(sent == 1);
     CHECK(sink.reached_exactly({"dev-B"}));
     // The security property, stated positively: the hidden agents were never sent to.
@@ -120,7 +135,9 @@ TEST_CASE("Ids arm: a present-EMPTY visible set reaches NOBODY (fail-closed)",
     RecordingSink sink;
     ConfinedDispatchTargets t;
     t.agent_ids = &kThree;
-    const int sent = dispatch_confined_arms(DispatchArm::Ids, t, deny_all(), false, sink.make());
+    const int sent =
+        dispatch_confined_arms(DispatchArm::Ids, t, deny_all(), false, kNoContainment, sink.make())
+            .sent;
     CHECK(sent == 0);
     CHECK(sink.reached.empty());
     CHECK_FALSE(sink.unfiltered_broadcast_used);
@@ -134,7 +151,8 @@ TEST_CASE("Group arm: members outside the visible set are dropped",
     ConfinedDispatchTargets t;
     t.group_members = &kThree;
     const int sent = dispatch_confined_arms(DispatchArm::Group, t, only({"dev-A", "dev-C"}), false,
-                                            sink.make());
+                                            kNoContainment, sink.make())
+                         .sent;
     CHECK(sent == 2);
     CHECK(sink.reached_exactly({"dev-A", "dev-C"}));
 }
@@ -144,7 +162,9 @@ TEST_CASE("Group arm: a management group is targeting, never an authz exemption"
     RecordingSink sink;
     ConfinedDispatchTargets t;
     t.group_members = &kThree;
-    const int sent = dispatch_confined_arms(DispatchArm::Group, t, deny_all(), false, sink.make());
+    const int sent = dispatch_confined_arms(DispatchArm::Group, t, deny_all(), false,
+                                            kNoContainment, sink.make())
+                         .sent;
     CHECK(sent == 0);
     CHECK(sink.reached.empty());
 }
@@ -154,7 +174,8 @@ TEST_CASE("Group arm: an unavailable management-group store reaches nobody",
     RecordingSink sink;
     ConfinedDispatchTargets t; // group_members left null == store unavailable
     const int sent = dispatch_confined_arms(DispatchArm::Group, t, unfiltered(), false,
-                                            sink.make());
+                                            kNoContainment, sink.make())
+                         .sent;
     CHECK(sent == 0);
     CHECK(sink.reached.empty());
 }
@@ -166,8 +187,9 @@ TEST_CASE("Scope arm: the matched set is intersected before dispatch",
     RecordingSink sink;
     ConfinedDispatchTargets t;
     t.scope_matched = &kThree;
-    const int sent =
-        dispatch_confined_arms(DispatchArm::Scope, t, only({"dev-C"}), false, sink.make());
+    const int sent = dispatch_confined_arms(DispatchArm::Scope, t, only({"dev-C"}), false,
+                                            kNoContainment, sink.make())
+                         .sent;
     CHECK(sent == 1);
     CHECK(sink.reached_exactly({"dev-C"}));
 }
@@ -180,7 +202,8 @@ TEST_CASE("Scope arm: aborted resolution (null) reaches nobody — ADR-0036 fail
     RecordingSink sink;
     ConfinedDispatchTargets t; // scope_matched null
     const int sent = dispatch_confined_arms(DispatchArm::Scope, t, unfiltered(), false,
-                                            sink.make());
+                                            kNoContainment, sink.make())
+                         .sent;
     CHECK(sent == 0);
     CHECK(sink.reached.empty());
     CHECK_FALSE(sink.unfiltered_broadcast_used);
@@ -192,7 +215,8 @@ TEST_CASE("Broadcast arm: unfiltered authority uses the fast send-to-all path",
           "[server][dispatch][scope][security]") {
     RecordingSink sink;
     const int sent = dispatch_confined_arms(DispatchArm::Broadcast, {}, unfiltered(), false,
-                                            sink.make());
+                                            kNoContainment, sink.make())
+                         .sent;
     CHECK(sent == 3);
     CHECK(sink.unfiltered_broadcast_used);
 }
@@ -201,7 +225,8 @@ TEST_CASE("Broadcast arm: a named __all__ is still narrowed to the visible set",
           "[server][dispatch][scope][security]") {
     RecordingSink sink;
     const int sent = dispatch_confined_arms(DispatchArm::Broadcast, {}, only({"dev-B"}), false,
-                                            sink.make());
+                                            kNoContainment, sink.make())
+                         .sent;
     CHECK(sent == 1);
     CHECK(sink.reached_exactly({"dev-B"}));
     // Naming the broadcast must NOT buy the unfiltered path.
@@ -212,7 +237,8 @@ TEST_CASE("Broadcast arm: present-EMPTY reaches nobody and never falls back to s
           "[server][dispatch][scope][security]") {
     RecordingSink sink;
     const int sent = dispatch_confined_arms(DispatchArm::Broadcast, {}, deny_all(), false,
-                                            sink.make());
+                                            kNoContainment, sink.make())
+                         .sent;
     CHECK(sent == 0);
     CHECK(sink.reached.empty());
     CHECK_FALSE(sink.unfiltered_broadcast_used);
@@ -224,7 +250,9 @@ TEST_CASE("None arm: the shared closure reaches NOBODY, not everybody (#2500)",
           "[server][dispatch][scope][security]") {
     RecordingSink sink;
     const int sent = dispatch_confined_arms(DispatchArm::None, {}, unfiltered(),
-                                            /*broadcast_on_none=*/false, sink.make());
+                                            /*broadcast_on_none=*/false, kNoContainment,
+                                            sink.make())
+                         .sent;
     CHECK(sent == 0);
     CHECK(sink.reached.empty());
     CHECK_FALSE(sink.unfiltered_broadcast_used);
@@ -234,7 +262,9 @@ TEST_CASE("None arm: broadcast_on_none honours a deliberate fleet selection, sti
           "[server][dispatch][scope][security]") {
     RecordingSink sink;
     const int sent = dispatch_confined_arms(DispatchArm::None, {}, only({"dev-A"}),
-                                            /*broadcast_on_none=*/true, sink.make());
+                                            /*broadcast_on_none=*/true, kNoContainment,
+                                            sink.make())
+                         .sent;
     CHECK(sent == 1);
     CHECK(sink.reached_exactly({"dev-A"}));
 }
@@ -245,7 +275,9 @@ TEST_CASE("None arm: broadcast_on_none with a present-EMPTY set still reaches no
     // set rather than nullopt, so failing closed must survive broadcast_on_none.
     RecordingSink sink;
     const int sent = dispatch_confined_arms(DispatchArm::None, {}, deny_all(),
-                                            /*broadcast_on_none=*/true, sink.make());
+                                            /*broadcast_on_none=*/true, kNoContainment,
+                                            sink.make())
+                         .sent;
     CHECK(sent == 0);
     CHECK(sink.reached.empty());
     CHECK_FALSE(sink.unfiltered_broadcast_used);
@@ -281,7 +313,7 @@ TEST_CASE("resolve_and_dispatch_confined: Ids arm is classified and intersected 
     RecordingSink sink;
     const std::vector<std::string> ids{"dev-A", "dev-B", "dev-C"};
     const auto outcome = resolve_and_dispatch_confined(
-        ids, /*scope_expr=*/"", only({"dev-B"}), /*broadcast_on_none=*/false,
+        ids, /*scope_expr=*/"", only({"dev-B"}), /*broadcast_on_none=*/false, kNoContainment,
         no_group_no_scope_resolvers(), sink.make());
     CHECK(outcome.sent == 1);
     CHECK(sink.reached_exactly({"dev-B"}));
@@ -302,7 +334,8 @@ TEST_CASE("resolve_and_dispatch_confined: Group arm resolves via the injected gr
     };
     const auto outcome =
         resolve_and_dispatch_confined({}, "group:eng", only({"dev-A", "dev-C"}),
-                                      /*broadcast_on_none=*/false, resolvers, sink.make());
+                                      /*broadcast_on_none=*/false, kNoContainment, resolvers,
+                                      sink.make());
     CHECK(requested_group == "eng"); // the "group:" prefix is stripped before lookup
     CHECK(outcome.sent == 2);
     CHECK(sink.reached_exactly({"dev-A", "dev-C"}));
@@ -314,7 +347,7 @@ TEST_CASE("resolve_and_dispatch_confined: Broadcast arm (__all__) still narrows 
     RecordingSink sink;
     const auto outcome =
         resolve_and_dispatch_confined({}, "__all__", only({"dev-B"}), /*broadcast_on_none=*/true,
-                                      no_group_no_scope_resolvers(), sink.make());
+                                      kNoContainment, no_group_no_scope_resolvers(), sink.make());
     CHECK(outcome.sent == 1);
     CHECK(sink.reached_exactly({"dev-B"}));
     CHECK_FALSE(sink.unfiltered_broadcast_used);
@@ -326,7 +359,7 @@ TEST_CASE("resolve_and_dispatch_confined: None arm reaches nobody when broadcast
     RecordingSink sink;
     const auto outcome =
         resolve_and_dispatch_confined({}, "", unfiltered(), /*broadcast_on_none=*/false,
-                                      no_group_no_scope_resolvers(), sink.make());
+                                      kNoContainment, no_group_no_scope_resolvers(), sink.make());
     CHECK(outcome.sent == 0);
     CHECK(sink.reached.empty());
 }
@@ -343,8 +376,8 @@ TEST_CASE("resolve_and_dispatch_confined: Scope arm dispatches exactly the ladde
         return r;
     };
     const auto outcome = resolve_and_dispatch_confined(
-        {}, "tag:role == \"web\"", only({"dev-C"}), /*broadcast_on_none=*/false, resolvers,
-        sink.make());
+        {}, "tag:role == \"web\"", only({"dev-C"}), /*broadcast_on_none=*/false, kNoContainment,
+        resolvers, sink.make());
     CHECK(requested_expr == "tag:role == \"web\"");
     CHECK(outcome.sent == 1);
     CHECK(sink.reached_exactly({"dev-C"}));
@@ -359,8 +392,8 @@ TEST_CASE("resolve_and_dispatch_confined: Scope arm aborted resolution reaches n
         return ScopeLadderResult{}; // matched stays nullopt — an aborted ladder
     };
     const auto outcome = resolve_and_dispatch_confined(
-        {}, "tag:role == \"web\"", unfiltered(), /*broadcast_on_none=*/false, resolvers,
-        sink.make());
+        {}, "tag:role == \"web\"", unfiltered(), /*broadcast_on_none=*/false, kNoContainment,
+        resolvers, sink.make());
     CHECK(outcome.sent == 0);
     CHECK(sink.reached.empty());
     CHECK_FALSE(sink.unfiltered_broadcast_used);
@@ -376,8 +409,8 @@ TEST_CASE("resolve_and_dispatch_confined: a Scope arm parse error is surfaced, n
         return r;
     };
     const auto outcome = resolve_and_dispatch_confined(
-        {}, "tag:role == \"web\"", unfiltered(), /*broadcast_on_none=*/false, resolvers,
-        sink.make());
+        {}, "tag:role == \"web\"", unfiltered(), /*broadcast_on_none=*/false, kNoContainment,
+        resolvers, sink.make());
     CHECK(outcome.sent == 0);
     REQUIRE(outcome.scope_parse_error.has_value());
     CHECK(*outcome.scope_parse_error == "unexpected token");
@@ -541,14 +574,17 @@ TEST_CASE("wire_and_dispatch_confined: the Ids arm intersects exec_visible again
 
     auto noop_audit = [](const std::string&, const std::string&, const std::string&,
                          const std::string&) {};
-    const auto [command_id, sent] = yuzu::server::wire_and_dispatch_confined(
+    const auto outcome = yuzu::server::wire_and_dispatch_confined(
         registry, /*mgmt_group_store=*/nullptr, /*result_set_store=*/nullptr,
         /*tag_store=*/nullptr, /*custom_properties_store=*/nullptr,
         /*execution_tracker=*/nullptr, noop_audit, noop_audit,
         /*command_id=*/"wiring-test-cmd", /*execution_id=*/"", /*principal_role=*/"",
-        agent_ids, /*scope_expr=*/"", exec_visible, /*broadcast_on_none=*/false, classified);
+        agent_ids, /*scope_expr=*/"", exec_visible, /*broadcast_on_none=*/false, kNoContainment,
+        classified);
 
-    CHECK(sent == 1);
+    CHECK(outcome.sent == 1);
+    CHECK(outcome.command_id == "wiring-test-cmd");
+    CHECK(outcome.denied_quarantined.empty());
     auto pending = registry.drain_gateway_pending();
     REQUIRE(pending.size() == 1);
     CHECK(pending[0].agent_id == "dev-A");

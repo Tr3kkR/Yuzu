@@ -30,6 +30,7 @@
 #include "guaranteed_state.pb.h"
 
 // rung 7: the spark detection path GuardianEngine wires alongside legacy IGuard.
+#include "guardian_backend.hpp" // GuardianBackend, guardian_backend_from_state/label (F7)
 #include "guardian_convergence_scheduler.hpp"
 #include "guardian_drift_event.hpp" // apply_drift_to_event (shared with the spark path)
 #include "guardian_joined_thread_role.hpp"
@@ -275,12 +276,38 @@ std::expected<void, std::string> GuardianEngine::start_local() {
         // Degrade per-rule (LOUD error, this rule does not enforce) so the agent survives
         // to arm the rest, rather than terminating the whole process.
         try {
+            if (rearm_fault_hook_for_test_)
+                rearm_fault_hook_for_test_(rule.rule_id());
             if (reconcile_rule_locked(rule)) // count only rules that actually armed (either backend)
                 ++rearmed;
         } catch (const std::exception& e) {
-            spdlog::error("Guardian: rule '{}' failed to re-arm ({}) - NOT enforcing this rule; "
-                          "agent continues with the remaining rules",
-                          rule.rule_id(), e.what());
+            // Build once, log, and record for last_rearm_degrade_message_for_test - a single
+            // source of truth rather than a second copy of this text. spdlog::error("{}", msg),
+            // a literal one-placeholder format string with msg as the substituted argument,
+            // never reparses msg's own content as format syntax regardless of vendored spdlog
+            // version/overload resolution - the version-proof safe idiom for logging arbitrary
+            // (here, exception-supplied) text, not a workaround for a throw this specific
+            // vendored version happens not to have.
+            //
+            // Nested try/catch (Gate 4 unhappy-path review, #2238): spdlog::error() firewalls
+            // its OWN allocation internally (SPDLOG_TRY/SPDLOG_LOGGER_CATCH - never rethrows),
+            // but the raw string concatenation building degrade_msg runs OUTSIDE that firewall,
+            // in a catch block whose entire purpose is to survive exactly the resource-exhaustion
+            // class (thread/handle exhaustion often correlates with memory pressure) that could
+            // also make this concatenation throw bad_alloc. An uncaught throw here would escape
+            // start_local() and terminate the agent - precisely the failure this outer catch
+            // exists to prevent. Degrade further on a secondary failure rather than risk that.
+            try {
+                const std::string degrade_msg =
+                    "Guardian: rule '" + rule.rule_id() + "' failed to re-arm (" + e.what() +
+                    ") - NOT enforcing this rule; agent continues with the remaining rules";
+                spdlog::error("{}", degrade_msg);
+                last_rearm_degrade_message_for_test_ = degrade_msg;
+            } catch (...) {
+                spdlog::error("Guardian: a rule failed to re-arm and the degrade message itself "
+                              "could not be built (secondary allocation failure) - NOT enforcing "
+                              "this rule; agent continues with the remaining rules");
+            }
         }
     }
 
@@ -341,6 +368,11 @@ void GuardianEngine::stop() {
     if (spark_drain_worker_)
         spark_drain_worker_->stop();
     stop_all_guards_locked();
+    // F7: stop() is terminal - nothing reconciles again afterward, so there is no
+    // re-log/false-transition risk (unlike apply_rules's full_sync, which must sweep
+    // precisely instead). Blanket-clearing here just keeps a heartbeat composed
+    // mid/post-shutdown from reporting stale unsupported counts.
+    unsupported_rules_.clear();
     // Final flush: anything staged while the workers wound down, plus any records a prior
     // failed write left pending; there is no maintenance tick after stop(). Bounded +
     // circuit-broken (worst case one KvStore 5 s busy-timeout). FIREWALLED: stop() is reached
@@ -566,6 +598,14 @@ std::uint64_t GuardianEngine::priority_demoted() const {
     return spark_runtime_ ? spark_runtime_->priority_demoted() : 0;
 }
 
+std::map<SparkType, std::uint64_t> GuardianEngine::unsupported_counts_by_type() const {
+    std::lock_guard lock(mtx_);
+    std::map<SparkType, std::uint64_t> out;
+    for (const auto& [rule_id, type] : unsupported_rules_)
+        ++out[type];
+    return out;
+}
+
 std::expected<std::size_t, std::string>
 GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     std::lock_guard lock(mtx_);
@@ -595,6 +635,13 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
 
     std::size_t applied = 0;
     std::size_t reconcile_failures = 0;
+    // F7: rule_ids seen in a full_sync push, for the unsupported_rules_ sweep below.
+    // guards_/spark_runtime_ don't need this - they're unconditionally torn down and
+    // rebuilt fresh by stop_all_guards_locked()/detach_all() + the loop below.
+    // unsupported_rules_ is passive bookkeeping, not a live resource, so it is
+    // deliberately NOT blanket-cleared the same way (see the comment further down) -
+    // it needs this set instead.
+    std::set<std::string> full_sync_ids;
     if (push.full_sync()) {
         const int cleared = kv_->clear(kKvNamespace);
         if (cleared > 0)
@@ -614,6 +661,12 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
             stop_all_guards_locked();
             if (spark_runtime_)
                 spark_runtime_->detach_all();
+            // F7: deliberately NOT unsupported_rules_.clear() here - that would make
+            // every rule the loop below re-classifies Unsupported look "newly"
+            // unsupported (the per-outcome erase/insert in reconcile_rule_locked can't
+            // detect "already tracked" against an emptied map), spamming the
+            // edge-triggered log on every full_sync. Swept precisely, after the loop,
+            // against full_sync_ids instead.
         } catch (...) {
             ++reconcile_failures;
             arm_failures_.fetch_add(1, std::memory_order_relaxed);
@@ -630,6 +683,8 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
             spdlog::warn("Guardian: skipping rule with empty rule_id (name={})", rule.name());
             continue;
         }
+        if (push.full_sync())
+            full_sync_ids.insert(rule.rule_id()); // F7
         if (!put_rule_locked(rule)) {
             return std::unexpected("failed to persist rule '" + rule.rule_id() + "'");
         }
@@ -653,6 +708,25 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
             continue; // not counted as applied
         }
         ++applied;
+    }
+
+    if (push.full_sync()) {
+        // F7: a rule_id that was Unsupported before this full_sync but is absent from
+        // the new push is no longer part of the active rule set at all (kv_ was
+        // cleared above; only push.rules() gets re-persisted) - forget it, or it
+        // reports a phantom count forever. Rule_ids retained in the new push were
+        // already updated in place by the loop above (erase-if-not-Unsupported /
+        // insert-if-Unsupported inside reconcile_rule_locked), so this only removes
+        // what's genuinely gone. Deliberately unreached if the loop above returned
+        // early via the put_rule_locked failure path above - the whole push is
+        // mid-rebuild on that path (generation held, existing pre-F7 behavior), and
+        // the next successful push's sweep heals it; not a new gap F7 introduces.
+        for (auto it = unsupported_rules_.begin(); it != unsupported_rules_.end();) {
+            if (!full_sync_ids.count(it->first))
+                it = unsupported_rules_.erase(it);
+            else
+                ++it;
+        }
     }
 
     // Do NOT advance the policy generation when any rule failed to arm. The server's
@@ -794,6 +868,11 @@ std::size_t GuardianEngine::armed_guard_count() const {
 std::size_t GuardianEngine::spark_armed_rule_count() const {
     std::lock_guard lock(mtx_);
     return spark_runtime_ ? spark_runtime_->rule_count() : 0;
+}
+
+std::string GuardianEngine::last_rearm_degrade_message_for_test() const {
+    std::lock_guard lock(mtx_);
+    return last_rearm_degrade_message_for_test_;
 }
 
 std::uint64_t GuardianEngine::policy_generation() const {
@@ -1104,6 +1183,7 @@ bool GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule)
         if (spark_runtime_)
             spark_runtime_->detach_rule(rule.rule_id());
         withdraw_legacy_guard_locked(rule.rule_id());
+        unsupported_rules_.erase(rule.rule_id()); // F7: disabled, not Unsupported
         return false;
     }
 
@@ -1133,6 +1213,7 @@ bool GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule)
         if (spark_runtime_)
             spark_runtime_->detach_rule(rule.rule_id());
         withdraw_legacy_guard_locked(rule.rule_id());
+        unsupported_rules_.erase(rule.rule_id()); // F7: an authoring fault, not Unsupported
         return false;
     }
 
@@ -1143,6 +1224,7 @@ bool GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule)
     if (prefer_spark_ && (spark_availability_ == SparkAvailability::SparkFailed ||
                           spark_availability_ == SparkAvailability::Unwired)) {
         withdraw_legacy_guard_locked(rule.rule_id());
+        unsupported_rules_.erase(rule.rule_id()); // F7: agent-wide errored/inert, not per-rule Unsupported
         return false;
     }
 
@@ -1160,6 +1242,7 @@ bool GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule)
         const RulePlacement placement = classify(rule.spark().type(), supported);
         if (placement == RulePlacement::Arm) {
             withdraw_legacy_guard_locked(rule.rule_id());
+            unsupported_rules_.erase(rule.rule_id()); // F7: about to arm (or fail arming) - not Unsupported either way
             auto gen = spark_runtime_->attach_rule(rule.rule_id(), std::move(*spec),
                                                    std::move(*assertion),
                                                    /*emit_compliant_edge=*/true);
@@ -1175,21 +1258,53 @@ bool GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule)
             // Structurally unreachable here: spec/assertion validation above
             // already rejected an unrecognized spark type before this point
             // is ever reached. Kept as an explicit branch (not folded into
-            // the Unsupported fallthrough below) so a future reordering of
+            // the Unsupported branch below) so a future reordering of
             // the validation step cannot silently start treating an
             // authoring fault as a routine legacy fallback.
             if (spark_runtime_)
                 spark_runtime_->detach_rule(rule.rule_id());
             withdraw_legacy_guard_locked(rule.rule_id());
+            unsupported_rules_.erase(rule.rule_id()); // F7: an authoring fault, not Unsupported
             return false;
         }
-        // placement == Unsupported: a ROUTINE cross-platform gap (a known
-        // type, no mechanism on THIS host) - legacy is the correct, expected
-        // outcome here, not a failure. Falls through to the legacy arm below.
+        // placement == Unsupported (F7, #2298 rung 2 / design doc §R2 + §Platform-
+        // rejection): a known spark type with NO mechanism registered on this host.
+        // A distinct terminal state now, not a legacy fallback - withdraw from BOTH
+        // backends and record it. Enforcement is unchanged from before F7 for the
+        // common off-Windows File/Registry case (legacy already no-ops there); what
+        // changes is reporting. That is NOT a universal guarantee, though:
+        // classify() keys off the REGISTERED-AND-NON-INERT capability set above, so
+        // a registration failure or a registered-but-inert mechanism can also land a
+        // rule here on a platform where legacy might otherwise have worked. Fleet-loud
+        // via mech_unsupported_total (rungs 2-3); per-rule REST/MCP surfacing is rung
+        // 4 - get_status() is deliberately untouched here.
+        withdraw_legacy_guard_locked(rule.rule_id()); // a rule_id legacy-armed by a
+            // PRIOR push (a different type, or pre-dating this reconcile op) must not
+            // keep silently enforcing in place of the terminal state.
+        if (spark_runtime_)
+            spark_runtime_->detach_rule(rule.rule_id()); // detach whatever was attached - a
+                // no-op if this rule was never armed via spark, LOAD-BEARING (not merely
+                // defensive) if it was: an Arm-to-Unsupported transition (a mechanism going
+                // inert, or a rule's spark type edited) reaches this call still attached
+                // (happy-path finding, F7/#2298 governance)
+        if (const auto type = spark_type_from_token(rule.spark().type())) {
+            // classify() only reaches Unsupported for a RECOGNIZED token, so this is
+            // always Some - belt-and-braces, not a real gap.
+            auto it = unsupported_rules_.find(rule.rule_id());
+            const bool changed = (it == unsupported_rules_.end()) || (it->second != *type);
+            unsupported_rules_[rule.rule_id()] = *type;
+            if (changed) // log only on a genuine edge (new, or a different type than before)
+                spdlog::info("Guardian: rule '{}' classified unsupported ({} has no "
+                             "mechanism on this host) - enforced by neither backend, "
+                             "a routine cross-platform gap, not an error",
+                             rule.rule_id(), rule.spark().type());
+        }
+        return false;
     }
 
     if (spark_runtime_)
         spark_runtime_->detach_rule(rule.rule_id()); // harmless no-op if never attached
+    unsupported_rules_.erase(rule.rule_id()); // F7: legacy-selected path, not Unsupported
     return start_guard_for_rule_locked(rule); // existing legacy path, UNCHANGED
 }
 
@@ -1219,8 +1334,15 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
     }
     if (!engine) {
         spark_availability_ = SparkAvailability::SparkFailed;
-        spdlog::warn("Guardian: spark_engine_ failed to boot - spark path unavailable; legacy "
-                     "IGuard is the sole detection path (never silently substituted)");
+        // F7: legacy is the actual backend only when prefer_spark_ is false (today's
+        // production default); under prefer_spark_=true, reconcile_rule_locked's own
+        // SparkFailed guard withdraws legacy entirely, so nothing is enforced. Derived
+        // from the same guardian_backend_from_state() the heartbeat tag and agent.cpp's
+        // boot log use, so this can't drift from either of them again.
+        spdlog::warn("Guardian: spark_engine_ failed to boot - spark path unavailable; "
+                     "detection backend = {} (never silently substituted)",
+                     guardian_backend_label(guardian_backend_from_state(
+                         prefer_spark_, SparkAvailability::SparkFailed)));
         return;
     }
 

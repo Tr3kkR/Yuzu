@@ -2,7 +2,9 @@
 
 #include "auth_routes.hpp"
 #include "authz_model.hpp"
+#include "mcp_policy.hpp" // mcp::tier_allows — #3290 Phase 2 caller-class parity with require_permission/require_list_read
 #include "rest_a4_envelope_http.hpp"
+#include "service_scope_policy.hpp" // authz::kServiceTagKey — #3289 single confinement-key definition
 
 #include <unordered_set>
 
@@ -20,6 +22,95 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
         return std::unexpected(authz::GateFailure::Unauthenticated);
 
     const std::string perm = securable_type + ":" + operation;
+
+    // Structurally Read-only (mirrors require_list_read): the legacy-open
+    // AdmitAll branch below has no MCP approval-ticket check (that only
+    // fires inside require_permission's own mcp_tier branch), so a mutation
+    // must never reach it through this gate.
+    if (operation != "Read") {
+        audit_log(req, "auth.fleet_read_required", "denied", "", "",
+                  "fleet read gate accepts Read operations only: " + perm);
+        res.status = 403;
+        res.set_content(detail::a4_denial(res, 403,
+                                          "fleet read gate accepts Read operations only",
+                                          detail::A4ErrorOpts{.permission = perm}),
+                        "application/json");
+        return std::unexpected(authz::GateFailure::Forbidden);
+    }
+
+    // #3290 Phase 2 — caller-class parity with require_permission/
+    // require_list_read (this gate previously had none of the branches
+    // below, which is a security regression once a route actually migrates
+    // onto it: an engine principal under RBAC-off would otherwise fall
+    // through to authorize_list_read's legacy-open AdmitAll, and a
+    // JIT-elevated operator with no underlying RBAC grant would otherwise
+    // 403 at the management-group axis below). Canon order (routed-concern
+    // "Service-scoped API token confinement" clause 2): elevated -> engine
+    // -> mcp_tier -> service -> RBAC.
+
+    // JIT admin elevation: same semantics as require_permission/
+    // require_list_read — full admin for the elevation window, no
+    // underlying grant needed, and never reachable by a service-scoped
+    // token (elevate_session never runs for MCP/service tokens). Do NOT
+    // call authorize_list_read for an elevated session: it has no elevation
+    // concept, so an elevated session with zero RBAC grants would otherwise
+    // be denied (the regression the first #3038 fix attempt shipped,
+    // closed in require_list_read and mirrored here).
+    if (auth::is_elevated(*session) && session->token_scope_service.empty())
+        return authz::ListAuthority(std::nullopt); // TOP — unfiltered
+
+    // Engine principals have NO legacy or service-scoped authority — their
+    // only authority is an explicit RBAC assignment (design §4.2
+    // default-deny). authorize_list_read's own legacy-open branch would
+    // otherwise hand an engine credential fleet-wide read the moment RBAC
+    // is disabled (the default) — resolve engine sessions here, RBAC-only,
+    // or deny. Mirrors require_list_read's engine branch, not
+    // require_permission's: this gate has no service-scope allow-list
+    // concept for a belt-and-braces corrupted-row check to guard, since an
+    // engine session never reaches the service axis below (it returns
+    // here). A successful admit stays TOP — "current engine grants are
+    // fleet-wide only" (require_list_read), no per-tag scoping concept
+    // applies to engine principals.
+    if (session->principal_kind == "engine") {
+        if (!rbac_store_ || !rbac_store_->is_open()) {
+            audit_log(req, "auth.fleet_read_required", "denied", "", "",
+                      "engine principal denied: RBAC store unavailable");
+            res.status = 503;
+            res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
+                                              detail::A4ErrorOpts{.retry_after_ms = 5000,
+                                                                  .permission = perm}),
+                            "application/json");
+            return std::unexpected(authz::GateFailure::Degraded);
+        }
+        if (!rbac_store_->is_rbac_enabled() ||
+            !rbac_store_->check_permission(session->username, securable_type, operation)) {
+            audit_log(req, "auth.fleet_read_required", "denied", "", "",
+                      "engine principal denied " + perm);
+            res.status = 403;
+            res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
+                                              detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
+            return std::unexpected(authz::GateFailure::Forbidden);
+        }
+        return authz::ListAuthority(std::nullopt); // TOP — fleet-wide only
+    }
+
+    // MCP-tier tokens: tier policy precedes RBAC (matches
+    // require_permission/require_list_read). Deny-or-fall-through ONLY — an
+    // allowed tier continues below with its creator's role/authority, this
+    // branch never admits on its own (routed-concern clause 2: a tier-admit
+    // that bypasses the service check would reopen the flip on every route
+    // at once).
+    if (!session->mcp_tier.empty() &&
+        !mcp::tier_allows(session->mcp_tier, securable_type, operation)) {
+        audit_log(req, "auth.fleet_read_required", "denied", "", "",
+                  "MCP token tier '" + session->mcp_tier + "' does not allow " + perm);
+        res.status = 403;
+        res.set_content(detail::a4_denial(res, 403, "MCP token tier does not allow " + perm,
+                                          detail::A4ErrorOpts{.permission = perm}),
+                        "application/json");
+        return std::unexpected(authz::GateFailure::Forbidden);
+    }
 
     // ── management-group axis: RbacStore::authorize_list_read (ADR-0017),
     // reused as the subordinate primitive — never rewritten. ──────────────
@@ -64,11 +155,42 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
         audit_log(req, "auth.fleet_read_required", "denied", "", "",
                   "fleet read blocked: service-scoped token requires RBAC to be enabled");
         res.status = 403;
+        // No `.permission` (#3290 D5, routed-concern clause 5): granting
+        // `perm` does not fix "RBAC disabled" — same shape as
+        // require_permission's identical branch.
         res.set_content(detail::a4_denial(res, 403,
-                                          "service-scoped tokens require RBAC to be enabled",
-                                          detail::A4ErrorOpts{.permission = perm}),
+                                          "service-scoped tokens require RBAC to be enabled"),
                         "application/json");
         return std::unexpected(authz::GateFailure::Forbidden);
+    }
+
+    // Null/not-yet-open management-group store: rbac_store_/tag_store_ each
+    // get an explicit pre-check turning "store unavailable" into a retryable
+    // 503 before any real decision is attempted; this axis had none.
+    // authorize_list_read's own helpers (resolve_perm_groups/
+    // expand_visible_set) already null-check mgmt_group_store_ internally
+    // and fail closed to DenyAll — never a crash, never a partial admit —
+    // but DenyAll renders as 403 below, indistinguishable from "this caller
+    // genuinely has no grant." A caller doing exponential backoff on 503
+    // would never retry a transient store-construction gap that looks like a
+    // permanent deny (unhappy-path finding UP-1, governance run 2026-08-20).
+    // NOTE: this closes only the null/not-open half — a mid-query degrade
+    // (the store opens fine but a later read fails) still renders as 403
+    // here, because it is indistinguishable from a real DenyAll inside
+    // authorize_list_read's own return value; that is the SAME deliberate
+    // weakening implementation plan §2c accepts for every other
+    // authorize_list_read caller (plugin_config_routes.cpp, the upload-grants
+    // resolver in server.cpp), not a new gap this gate introduces, and fixing
+    // it is a separate, larger change to the shared primitive.
+    if (!mgmt_group_store_ || !mgmt_group_store_->is_open()) {
+        audit_log(req, "auth.fleet_read_required", "denied", "", "",
+                  "fleet read blocked: management-group store unavailable");
+        res.status = 503;
+        res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
+                                          detail::A4ErrorOpts{.retry_after_ms = 5000,
+                                                              .permission = perm}),
+                        "application/json");
+        return std::unexpected(authz::GateFailure::Degraded);
     }
 
     // Spelled via deny_all() rather than relying on the switch below to
@@ -118,7 +240,8 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
         // GateFailure::Degraded on the latter — never read a degraded store
         // as an empty-but-legitimate service, and never collapse Degraded
         // into Forbidden (the 503-vs-403 distinction this gate exists for).
-        auto tagged = tag_store_->agents_with_tag("service", session->token_scope_service);
+        auto tagged = tag_store_->agents_with_tag(std::string(authz::kServiceTagKey),
+                                                  session->token_scope_service);
         if (!tagged) {
             audit_log(req, "auth.fleet_read_required", "denied", "", "",
                       "fleet read blocked: tag store degraded resolving service scope");
@@ -145,10 +268,12 @@ bool AuthRoutes::confine_agent_target(const httplib::Request& req, httplib::Resp
 
     // #2437/#2500 omitted-vs-empty rule: an empty agent_id is a caller bug
     // (a route that should have required the param but didn't), not "no
-    // target to check" — never fall through to an admit for it. This is the
-    // exact bug this gate exists to not repeat: require_scoped_permission's
-    // service branch skips its only comparison on an empty agent_id and
-    // falls through to `return true`.
+    // target to check" — never fall through to an admit for it.
+    // `require_scoped_permission`'s service branch had this exact
+    // degenerate shape (an empty agent_id skipped its only comparison and
+    // fell through to `return true`); that was closed at #2298 PR 3 §3b
+    // (auth_routes.cpp) — this gate was built to not repeat it, not to fix
+    // a bug still live there.
     if (agent_id.empty()) {
         audit_log(req, "auth.agent_target_required", "denied", "", "",
                   "agent target blocked: empty agent_id");
@@ -180,7 +305,8 @@ bool AuthRoutes::confine_agent_target(const httplib::Request& req, httplib::Resp
     }
     // ADR-0050 typed read — degrade maps to the 503 branch below, never to
     // the not-in-service Forbidden (same reasoning as require_fleet_read).
-    auto tagged = tag_store_->agents_with_tag("service", session->token_scope_service);
+    auto tagged = tag_store_->agents_with_tag(std::string(authz::kServiceTagKey),
+                                              session->token_scope_service);
     if (!tagged) {
         audit_log(req, "auth.agent_target_required", "denied", "Agent", agent_id,
                   "agent target blocked: tag store degraded resolving service scope");

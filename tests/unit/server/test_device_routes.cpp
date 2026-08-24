@@ -19,6 +19,7 @@
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <memory>
 #include <optional>
@@ -857,6 +858,15 @@ TEST_CASE("device routes: /fragments/devices/list denies a service-scoped "
     REQUIRE(r);
     CHECK(r->status == 403);
     CHECK(r->body.find("mine-host") == std::string::npos);
+    // #3167: no `.permission` (no grant admits a service-scoped caller here —
+    // naming one is a false self-remediation claim), and header/body
+    // correlation-id parity.
+    auto body = nlohmann::json::parse(r->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body["error"].contains("permission"));
+    CHECK_FALSE(body["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(r->get_header_value("X-Correlation-Id") ==
+         body["error"]["correlation_id"].get<std::string>());
     REQUIRE(audit_log.size() == 1);
     CHECK(audit_log[0] == "device.list.view|denied");
 }

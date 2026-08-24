@@ -21,7 +21,6 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
-#include <cstdio>
 #include <format>
 #include <string>
 #include <string_view>
@@ -48,6 +47,7 @@
 
 #ifdef __APPLE__
 #include <libproc.h> // proc_pidpath
+#include <yuzu/agent/process_enum.hpp> // yuzu::agent::enumerate_processes (sysctl KERN_PROC_ALL)
 #endif
 
 namespace {
@@ -150,61 +150,32 @@ std::vector<ProcessInfo> enumerate_processes() {
     return procs;
 }
 #elif defined(__APPLE__)
+// Wraps the agent-core sysctl(KERN_PROC_ALL) enumerator (already linked via
+// yuzu_agent_core_dep) rather than shelling out to `ps`. Three mapping
+// differences from a direct pass-through, all load-bearing:
+//   - agent-core's ProcessInfo.name is 16-char-truncated p_comm, not a full
+//     path -- prefer .cmdline (the real proc_pidpath) when it starts with
+//     '/', else fall back to the truncated name (matches `ps`'s COMM column
+//     honestly rather than silently truncating a resolvable name).
+//   - pid 0 (kernel_task) is skipped -- `ps -ax` never listed it, but
+//     KERN_PROC_ALL does, so a naive pass-through would introduce a new row.
+//   - output is sorted ascending by pid -- `ps`'s natural order, whereas
+//     KERN_PROC_ALL is unordered; list_hashed/list_tree feed the server's
+//     device-page "Get live info" surface, which relies on this ordering.
 std::vector<ProcessInfo> enumerate_processes() {
     std::vector<ProcessInfo> procs;
-    FILE* pipe = popen("ps -axo pid,ppid,comm", "r");
-    if (!pipe)
-        return procs;
-
-    std::array<char, 512> buf{};
-    // Skip header line
-    if (fgets(buf.data(), static_cast<int>(buf.size()), pipe) == nullptr) {
-        pclose(pipe);
-        return procs;
-    }
-
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        std::string line{buf.data()};
-        // Trim trailing newline
-        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
-            line.pop_back();
-        }
-        if (line.empty())
+    for (auto& p : yuzu::agent::enumerate_processes()) {
+        if (p.pid == 0)
             continue;
-
-        // Parse: "  PID  PPID COMMAND"
-        auto pos = line.find_first_not_of(' ');
-        if (pos == std::string::npos)
-            continue;
-        auto space = line.find(' ', pos);
-        if (space == std::string::npos)
-            continue;
-
         ProcessInfo pi;
-        try {
-            pi.pid = std::stoul(line.substr(pos, space - pos));
-        } catch (...) {
-            continue;
-        }
-        // PPID column
-        auto ppid_start = line.find_first_not_of(' ', space);
-        if (ppid_start == std::string::npos)
-            continue;
-        auto ppid_end = line.find(' ', ppid_start);
-        if (ppid_end == std::string::npos)
-            continue;
-        try {
-            pi.ppid = std::stoul(line.substr(ppid_start, ppid_end - ppid_start));
-        } catch (...) {
-            pi.ppid = 0;
-        }
-        auto cmd_start = line.find_first_not_of(' ', ppid_end);
-        if (cmd_start != std::string::npos) {
-            pi.name = line.substr(cmd_start);
-        }
+        pi.pid = p.pid;
+        pi.ppid = p.ppid;
+        pi.name = (!p.cmdline.empty() && p.cmdline.front() == '/') ? std::move(p.cmdline)
+                                                                    : std::move(p.name);
         procs.push_back(std::move(pi));
     }
-    pclose(pipe);
+    std::sort(procs.begin(), procs.end(),
+             [](const ProcessInfo& a, const ProcessInfo& b) { return a.pid < b.pid; });
     return procs;
 }
 #else
@@ -273,18 +244,15 @@ std::string resolve_exe_path(unsigned long) {
 
 // ABI4 capability declarations (#2204). All four actions call the same
 // enumerate_processes() (and, for the hashed/tree variants, resolve_exe_path
-// + sha256_file) — Linux (/proc) and Windows (CreateToolhelp32Snapshot +
-// QueryFullProcessImageNameW) are native in-process enumerations, rung 1.
-// macOS enumeration shells out via popen("ps -axo pid,ppid,comm") — an
-// ungoverned rung-3 shell exec per ADR-3002's "27 of 49 plugins ... sit at
-// an ungoverned rung 3" — even though the per-process path resolution
-// (proc_pidpath) and hashing that follow it are native/rung 1, so the
-// action as a whole is rung 3 on macOS.
+// + sha256_file) — Linux (/proc), Windows (CreateToolhelp32Snapshot +
+// QueryFullProcessImageNameW), and macOS (yuzu::agent::enumerate_processes,
+// sysctl KERN_PROC_ALL) are all native in-process enumerations. Rung 1
+// everywhere.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "list",
         /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/proc enumeration", nullptr},
-        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "popen(ps -axo pid,ppid,comm)", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "sysctl(KERN_PROC_ALL)", nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "CreateToolhelp32Snapshot", nullptr},
     },
@@ -294,8 +262,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_SUPPORTED, 1, "/proc enumeration + readlink(/proc/<pid>/exe) + SHA-256",
          nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3,
-         "popen(ps -axo pid,ppid,comm) + proc_pidpath + SHA-256", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sysctl(KERN_PROC_ALL) + proc_pidpath + SHA-256", nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "CreateToolhelp32Snapshot + QueryFullProcessImageNameW + SHA-256", nullptr},
@@ -306,8 +273,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_SUPPORTED, 1, "/proc enumeration + readlink(/proc/<pid>/exe) + SHA-256",
          nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3,
-         "popen(ps -axo pid,ppid,comm) + proc_pidpath + SHA-256", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sysctl(KERN_PROC_ALL) + proc_pidpath + SHA-256", nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "CreateToolhelp32Snapshot + QueryFullProcessImageNameW + SHA-256", nullptr},
@@ -315,7 +281,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "query",
         /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/proc enumeration", nullptr},
-        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "popen(ps -axo pid,ppid,comm)", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "sysctl(KERN_PROC_ALL)", nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "CreateToolhelp32Snapshot", nullptr},
     },

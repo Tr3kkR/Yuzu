@@ -1062,7 +1062,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
         // pre-migration read collapsed both to "", which happened to
         // deny (fail-closed) but audited the outage as a scope MISMATCH,
         // hiding the real cause from the operator.
-        auto service_tag = tag_store_->get_tag(agent_id, "service");
+        auto service_tag = tag_store_->get_tag(agent_id, std::string(authz::kServiceTagKey));
         if (!service_tag) {
             audit_log(req, "auth.scoped_permission_required", "denied", agent_id, "",
                       "service-scoped token blocked: tag store degraded");
@@ -1417,6 +1417,44 @@ bool AuthRoutes::deny_service_scoped_session(const httplib::Request& req, httpli
     return true;
 }
 
+bool AuthRoutes::deny_service_scoped_service_tag_mutation(const httplib::Request& req,
+                                                            httplib::Response& res,
+                                                            const std::string& action,
+                                                            const std::string& agent_id,
+                                                            const std::string& key) {
+    auto session = require_auth(req, res);
+    if (!session)
+        return true; // require_auth already wrote 401/redirect; caller returns.
+    if (authz::service_scope_may_mutate_tag_key(session->token_scope_service, key))
+        return false;
+    // Write the 403 FIRST, audit after — same throw-safety ordering as
+    // deny_service_scoped_session immediately above.
+    res.status = 403;
+    res.set_content(
+        detail::a4_denial(res, 403,
+                          authz::kServiceTagMutationDeniedMessage),
+        "application/json");
+    try {
+        // Gate 4/#3289 hardening round: target_type="Tag" matches REST v1's
+        // convention for this identical logical event (a denied tag
+        // mutation) — not "Agent", which matched neither REST's nor any
+        // other surface's convention. This does NOT resolve the separate,
+        // pre-existing mismatch against server.cpp's own tag.set/tag.delete
+        // success/failure rows, which use lowercase "tag" — this caller
+        // (server.cpp, via the legacy dashboard routes) is a DIFFERENT file
+        // from where this comment lives; see the routed-concern row for the
+        // tracked residual.
+        audit_log(req, action, "denied", "Tag", agent_id + ":" + key,
+                 "service-scoped token blocked: cannot mutate the service tag (path=" +
+                     req.path + ")");
+    } catch (const std::exception& e) {
+        spdlog::warn("deny_service_scoped_service_tag_mutation: audit_log threw: {}", e.what());
+    } catch (...) {
+        spdlog::warn("deny_service_scoped_service_tag_mutation: audit_log threw (non-std)");
+    }
+    return true;
+}
+
 void AuthRoutes::emit_event(const std::string& event_type, const httplib::Request& req,
                             const nlohmann::json& attrs, const nlohmann::json& payload_data,
                             Severity sev) {
@@ -1433,7 +1471,38 @@ void AuthRoutes::emit_event(const std::string& event_type, const httplib::Reques
         // effective_role: an elevated session's analytics row reflects admin too
         // (#1748 H1/L4). No-op when not elevated.
         ae.principal_role = auth::role_to_string(auth::effective_role(*session));
-        ae.session_id = extract_session_cookie(req);
+        // HASHED, never the raw cookie (ADR-0049 governance Gate 2, 2026-08-16):
+        // this value is durably persisted into AnalyticsEventStore (unbounded
+        // retention on Postgres, ADR-0049) and readable by anyone holding the
+        // broad Infrastructure:Read permission via /api/analytics/recent — the
+        // live bearer token is exactly what validate_session() accepts, so
+        // storing it raw would let any Infrastructure:Read holder hijack the
+        // session (including an elevated admin's, via role.elevation.granted
+        // events). The hash still correlates events from the same session
+        // (same cookie -> same hash) without being a redeemable credential.
+        // Guard on the COOKIE, not just the session (governance Gate 3
+        // cpp-expert finding, 2026-08-16): resolve_session() also succeeds
+        // for Bearer/X-Yuzu-Token auth, which carries no cookie —
+        // extract_session_cookie returns "", and sha256_hex("") is a FIXED
+        // constant. Hashing unconditionally would give every token-
+        // authenticated row the SAME non-empty session_id, falsely
+        // correlating unrelated principals as "the same session" — a
+        // regression the pre-hash code didn't have (empty stayed
+        // distinguishably empty). Only hash a real cookie; leave
+        // session_id at its default-empty value otherwise.
+        //
+        // Fail-soft parity (governance Gate 3 cpp-safety finding,
+        // 2026-08-16): sha256_hex can throw on an internal EVP failure
+        // (OOM-class, rare) — this whole function exists so a dropped
+        // analytics event never fails the operation that emitted it.
+        // Degrades to an empty session_id, not a failed request.
+        if (auto cookie = extract_session_cookie(req); !cookie.empty()) {
+            try {
+                ae.session_id = auth::AuthManager::sha256_hex(cookie);
+            } catch (const std::exception& e) {
+                spdlog::debug("AuthRoutes::emit_event: session_id hash failed: {}", e.what());
+            }
+        }
     }
     analytics_store_->emit(std::move(ae));
 }

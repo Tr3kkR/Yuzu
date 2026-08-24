@@ -47,8 +47,10 @@ __declspec(allocate(".CRT$XCB"))
 #include "net_quality_sampler.hpp" // slice 4a: heartbeat network-quality facts
 #include "guardian_spark_send.hpp" // rung 7.7a: OutboxEntry -> GuaranteedStateEvent send mapping
 #include "spark_engine.hpp"    // ADR-0021 Stage-2 rung 1: instantiate observe-only
+#include "guardian_backend.hpp"           // GuardianBackend, guardian_backend_from_state/label (F7)
 #include "guardian_health_heartbeat.hpp"  // emit_guardian_health_heartbeat_tags (M1)
 #include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (item 7 PR-Ag)
+#include "guardian_unsupported_heartbeat.hpp" // emit_guardian_unsupported_heartbeat_tags (F7)
 #include "spark_heartbeat.hpp" // emit_spark_heartbeat_tags — spark fleet telemetry
 #include "spark_mechanism.hpp" // make_{file,registry,service}_mechanism factories
 #include "thread_pool.hpp" // bounded dispatch pool + per-task exception firewall (#2037)
@@ -1110,25 +1112,35 @@ public:
         guardian_->wire_spark_engine(
             spark_engine_.get(), cfg_.spark_disable,
             [this](const OutboxEntry& e) { return send_guardian_outbox_entry(e); });
-        switch (guardian_->spark_availability()) {
+        // F7: derive the reported backend from the SAME function the
+        // yuzu.guardian_backend heartbeat tag uses, so this log and the tag can
+        // never drift apart again the way "detection backend = legacy IGuard"
+        // (hardcoded, unconditionally) used to once prefer_spark_ could be true.
+        const bool ps = guardian_->prefer_spark();
+        const auto avail = guardian_->spark_availability();
+        const char* backend = guardian_backend_label(guardian_backend_from_state(ps, avail));
+        switch (avail) {
         case GuardianEngine::SparkAvailability::Available:
-            spdlog::info("Guardian: spark path WIRED (observe-only, prefer_spark=false); "
-                         "detection backend = legacy IGuard");
+            spdlog::info("Guardian: spark path WIRED (prefer_spark={}); detection backend = {}",
+                         ps, backend);
             break;
         case GuardianEngine::SparkAvailability::SparkDisabled:
             spdlog::info("Guardian: spark path wired as DISABLED (--spark-disable); "
-                         "detection backend = legacy IGuard");
+                         "detection backend = {}",
+                         backend); // accurate regardless of prefer_spark_: SparkDisabled always means legacy
             break;
         case GuardianEngine::SparkAvailability::SparkFailed:
             spdlog::warn("Guardian: spark path wired as FAILED (SparkEngine did not boot); "
-                         "detection backend = legacy IGuard");
+                         "detection backend = {}",
+                         backend);
             break;
         case GuardianEngine::SparkAvailability::Unwired:
             // Reachable, and NOT an error: wire_spark_engine() bails leaving Unwired when
             // a stop() already ran (a SIGTERM / service-stop during boot). Log at info -
             // the agent is shutting down; legacy was never displaced.
             spdlog::info("Guardian: spark path left Unwired (stop requested during boot); "
-                         "detection backend = legacy IGuard");
+                         "detection backend = {}",
+                         backend);
             break;
         }
 
@@ -2169,6 +2181,17 @@ public:
                                         .unhealthy_suppressed = guardian_->unhealthy_suppressed(),
                                         .unhealthy_refreshed = guardian_->unhealthy_refreshed(),
                                         .priority_demoted = guardian_->priority_demoted()});
+                                // F7 (#2298 rung 2): per-type CURRENT count of rules classified
+                                // Unsupported (neither backend enforces them) - fleet-loud via
+                                // mech_unsupported_total, sparse (0 omits its tag).
+                                emit_guardian_unsupported_heartbeat_tags(
+                                    tags, guardian_->unsupported_counts_by_type());
+                                // F7: which backend is ACTUALLY enforcing - always emitted (a
+                                // categorical value, not a sparse counter), so the server can
+                                // distinguish SparkFailed (nothing enforced fleet-wide) from a
+                                // routine per-rule Unsupported classification.
+                                emit_guardian_backend_heartbeat_tag(
+                                    tags, guardian_->prefer_spark(), guardian_->spark_availability());
                             }
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
                             // DEX signal observer (every platform with a real observer —

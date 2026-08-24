@@ -477,23 +477,13 @@ RUNNER_ALLOWLIST = {
 # drifted). A meson.build hit (Meson's own `host_machine.system()`) is not a
 # C/C++ source file and is excluded by SCAN_EXT below, not by this list.
 GRANDFATHERED = {
-    "agents/plugins/antivirus/src/antivirus_plugin.cpp",
-    "agents/plugins/bitlocker/src/bitlocker_plugin.cpp",
     "agents/plugins/content_dist/src/content_dist_plugin.cpp",
-    "agents/plugins/device_identity/src/device_identity_plugin.cpp",
     "agents/plugins/event_logs/src/event_logs_plugin.cpp",
     "agents/plugins/firewall/src/firewall_plugin.cpp",
-    "agents/plugins/hardware/src/hardware_plugin.cpp",
     "agents/plugins/installed_apps/src/installed_apps_plugin.cpp",
-    "agents/plugins/ioc/src/ioc_plugin.cpp",
     "agents/plugins/license_scan/src/licensing_linux.cpp",
     "agents/plugins/msi_packages/src/msi_packages_plugin.cpp",
     "agents/plugins/network_config/src/network_config_plugin.cpp",
-    "agents/plugins/network_diag/src/network_diag_plugin.cpp",
-    "agents/plugins/os_info/src/os_info_plugin.cpp",
-    "agents/plugins/processes/src/processes_plugin.cpp",
-    "agents/plugins/quarantine/src/quarantine_plugin.cpp",
-    "agents/plugins/sccm/src/sccm_plugin.cpp",
     "agents/plugins/script_exec/src/script_exec_plugin.cpp",
     "agents/plugins/software_actions/src/software_actions_plugin.cpp",
     "agents/plugins/tar/src/tar_mapdrive_collector.cpp",

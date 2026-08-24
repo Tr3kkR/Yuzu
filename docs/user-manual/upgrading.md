@@ -124,6 +124,46 @@ An MCP approval-ticket recall that hits a store fault has always returned `-3260
 
 **What to do:** if you have automation that blindly retries on `-32603` without checking `retry_after_ms`, it now stops retrying sooner in this specific case — which is the correct behavior (the old retries were futile). If your automation already honors `retry_after_ms` per [invariant A5](../agentic-first-principle.md), no change is needed. See [`mcp.md`](mcp.md) "`-32603`: Approval store unavailable" for the full response-body reference.
 
+## Behaviour change: four MCP tool input schemas got stricter (#2444)
+
+`revoke_certificate.serial_hex`, `confirm_engine_rotation.token_id`, `quarantine_device.reason`/`whitelist`, and the eight *approval-gated* engine-principal tools' `principal_id` (`create`/`revoke_engine_principal`, `mint`/`rotate_engine_credential`, `transfer_engine_principal_owner`, `assign`/`unassign_engine_role`) now carry `pattern`/`maxLength` bounds mirroring their handlers' own checks (previously enforced only at the handler, after an approval ticket was already consumed). `get_engine_principal` and `list_engine_roles` also gained the same `principal_id` pattern, but per this codebase's standing rule that input-schema validation runs only on the approval-gated path (`mcp-server.md`'s "Pre-approval input-schema validation"), those two are Read-tier and never approval-gated — the pattern is advertised metadata on `tools/list` only, not server-enforced; a malformed `principal_id` still reaches the handler and is rejected there exactly as before.
+
+**Who this affects:** any operator or automation with an outstanding (pending or
+approved-but-unconsumed) approval ticket for one of these ten tools —
+`revoke_certificate`, `confirm_engine_rotation`, `quarantine_device`,
+`create_engine_principal`, `revoke_engine_principal`, `mint_engine_credential`,
+`rotate_engine_credential`, `transfer_engine_principal_owner`,
+`assign_engine_role`, `unassign_engine_role` — whose arguments don't match the
+new bound: `serial_hex` must be `^[0-9A-Fa-f]{1,64}$`; `token_id` must be
+`^[0-9a-f]{24}$`; `quarantine_device.reason`/`whitelist` must be ≤1024/≤512
+bytes (whitelist additionally charset-restricted); `principal_id` must match
+`^engine:[a-z0-9._-]+$` (or the bare-slug form on `assign`/`unassign_engine_role`).
+Full patterns: `mcp-server.md`'s "Pre-approval input-schema validation" section.
+
+**What to do:** such a ticket becomes unrecallable fail-closed once the new
+server is running — the recall fails pre-consume just like any other
+schema-invalid call, and the ticket is never burned, but it also can't be
+redeemed as originally minted. It stays valid until its normal 7-day expiry
+(pending or approved-unconsumed), then ages out and must be re-requested. To
+check exposure before upgrading, list your outstanding tickets for these ten
+tools (`list_pending_approvals` MCP tool or `GET /api/v1/approvals`) and
+compare each one's arguments against the patterns above; no action is needed
+for a ticket that already matches, or if you have none outstanding.
+
+**Verify:** re-request any ticket the check above flagged, confirm the new
+recall succeeds under the same tier, and confirm a deliberately malformed
+value (e.g. a non-hex `serial_hex`) is now rejected at mint time — `-32602`,
+no approval created — rather than being accepted and only failing later at
+the handler.
+
+## Behaviour change: `discover_instructions`/`GET /api/v1/discover/instructions` null out a non-object stored `parameter_schema` (#2986)
+
+Both surfaces share one builder (`build_instructions_catalog`) that parses each `InstructionDefinition`'s stored `parameter_schema` text. It previously forwarded any value that parsed as JSON, even a non-object (an array, string, number, or boolean). It now forwards it only when the parsed value is itself a JSON object — a non-object value is reported as `null` instead, matching `GET /api/v1/discover/plugins`' existing behavior for the same field.
+
+**Who this affects:** an operator or integration that authored an `InstructionDefinition` with a non-object `parameter_schema` — reachable via the ordinary `create`/`update`/`import` paths, which don't validate the field's shape on write. No shipped content sets `parameter_schema` to anything but an object or leaves it unset (defaults to `{}`), so this affects only a deliberately or accidentally malformed definition.
+
+**What to do:** if you have such a definition and relied on the old raw-forwarding behavior, re-author `parameter_schema` as a JSON Schema object. No action is required otherwise.
+
 ## Behaviour change: webhook and offload-target deliveries, and enrollment/execution-failure notifications, now actually fire (#3261)
 
 A boot-ordering bug wired `NotificationStore`/`WebhookStore`/`OffloadTargetStore` into
@@ -167,6 +207,14 @@ These rows are background-actor events (`principal=system`), not operator action
 An MCP `tools/call` request naming a tool that doesn't exist has always returned `-32601` (`kMethodNotFound`) with the same error message. The audit row for that rejection previously carried `result=failure` - the token this codebase reserves for server-side faults - while every sibling denial on the surface (tier, read-only, schema, input-bounds, per-submitter-cap) uses `result=denied`. It now audits `result=denied` too, matching those siblings. Nothing about the JSON-RPC response changed.
 
 **What to do:** if you have a SIEM rule, dashboard or evidence query that classifies `mcp.<tool_name>` rows by filtering on `result=failure` to catch unknown-tool probes, re-point it at `result=denied` before upgrading, or it will stop matching. A rule that already filters on `result != "success"` sees both and needs no change. Note `result=failure` was never a clean isolator for unknown-tool probes specifically - it is also emitted for genuine server-side faults on *known* tools (store degraded, dispatch exception, etc.) and for several other client-caused-but-mislabeled rejections on the same surface (still open, tracked in #3176), so a rule that wants unknown-tool rows specifically should filter on `detail="unknown tool"`, which this change does not touch. See [`audit-log.md`](audit-log.md) "Result vocabulary" for the surface's current token usage.
+
+## Behaviour change: a failed MCP progress-bridge teardown is now retried instead of being permanently retained (#2513)
+
+A `mcp.bridge.*` teardown step (unsubscribe, releasing the streamed admission charge, or erasing the correlation record) that failed used to strand the record - and the bus channel, replay buffer, and per-session admission slot it held - for the rest of the process's life. It now gets up to `Config::teardown_retry_max` retries beyond the first attempt (4 total attempts by default), one per later sweep tick, before falling back to the old permanent-retention behavior. New `yuzu_mcp_bridge_teardown_retry_total{outcome="recovered"|"exhausted"}` metric and `mcp.bridge.teardown_retry` audit action evidence which happened; see [`audit-log.md`](audit-log.md) and [`../ops-runbooks/mcp-bridge-teardown-recovery.md`](../ops-runbooks/mcp-bridge-teardown-recovery.md).
+
+**What to do:** the shipped `YuzuMcpBridgeTeardownIncomplete` alert changed from a raw counter test (fires and never clears, since the underlying series is monotonic) to a windowed `increase(...[15m]) > 0` test, because most of its movement now self-heals via retry within a few sweep ticks. If you copied the old rule into your own alerting config instead of re-importing `docs/prometheus/yuzu-alerts.yml`, update it the same way or it will stay permanently firing on transient, already-recovered blips. The new `YuzuMcpBridgeTeardownRetryExhausted` alert is now the actual permanent-retention signal - add it if you track these alerts individually rather than loading the bundled rules file wholesale.
+
+If you have dashboard or SIEM logic reading the pre-existing `yuzu_mcp_bridge_teardown_incomplete_total` counter directly rather than through the bundled alert - it is unchanged in name and label shape, but its increment semantics changed: previously one increment per stranded record (ever), now up to `Config::teardown_retry_max` + 1 increments for the SAME record (once per failed step, per attempt) before it either recovers or exhausts. Arithmetic that read the counter as "count of stranded records" will now overcount under retry; read `yuzu_mcp_bridge_teardown_retry_total{outcome="exhausted"}` for that instead. `Config::teardown_retry_max` is a code-constant default, not an operator-configurable flag or env var - there is nothing to tune here.
 
 ## Behaviour change: an MCP maintenance failure degrades instead of aborting the server (#2487)
 
@@ -338,12 +386,37 @@ values winning over an operator/API-set tag for the same key. After upgrade thos
 agent values stop overriding — silently (no error, no log line); an affected device
 simply drops out of the cohort the operator-set value defines.
 
-**Verify:** audit the `source` column — `GET /api/v1/tags?agent_id=<id>` shows whether
-each key is `server`- (operator/API) or `agent`-sourced.
+**Verify:** audit the `source` field via MCP `get_tags` — `GET /api/v1/tags` does not
+expose `source`, only `key`/`value` pairs (see the read-side note below) — to see whether
+each key is `api`/`mcp`-sourced (operator/API) or `agent`-sourced.
+
+**Read-side completion (#3295):** #1411 closed the write-time overwrite; scope-DSL
+`tag:<key>` evaluation (dispatch targeting, management-group membership) had its own,
+separate precedence — a currently-connected agent's live self-report answered before the
+store was even consulted. That is now also store-first: an operator/API-set row always
+wins for scope-DSL purposes too, and an agent-claimed `service` value never answers from
+the live self-report at all (it is dropped at registration, not just at store sync).
+**Who this affects:** an operator who deliberately relied on a live agent's tag value
+overriding an operator/API-set tag specifically for dispatch targeting or cohort
+membership while that agent stayed connected. See `docs/asset-tagging-guide.md` "Tag
+source precedence (read time, scope-DSL, #3295)".
+
+**Caution:** the `/devices` tag-chip display is unaffected by this change and can now
+visibly disagree with what actually governs targeting: it renders only the agent's live
+self-report, never the TagStore row, so a store value that now wins for dispatch
+purposes — of any source, including a previously-synced agent value that's now stale
+relative to the agent's live report, not only an operator-set one — may not be what the
+dashboard chip shows. When a store row exists for the key, MCP `get_tags` (its `source`
+field) is the source of truth for what governs a device's scope-DSL matching, not the
+dashboard; `GET /api/v1/tags?agent_id=<id>` does not expose `source`. For a
+gateway-proxied or not-yet-synced agent with no store row at all, the live self-report
+(what the dashboard shows) is what actually governs — an empty `get_tags`/`GET
+/api/v1/tags` result for a key means the live claim decides, not that nothing does.
 
 **Remediate:** if an agent-reported value was the *intended* one, re-set it explicitly
-via the REST API or MCP `set_tag` (which writes `source=server`, authoritative). Keys
-the agent reports that the operator never set are unaffected.
+via the REST API (writes `source=api`) or MCP `set_tag` (writes `source=mcp`) — either is
+authoritative over an agent-sourced row. Keys the agent reports that the operator never
+set are unaffected.
 
 ## Behaviour change: MCP approval-gated calls use ticket-then-recall (-32006) (#289)
 
@@ -610,9 +683,79 @@ What to expect / do:
   Agents that previously connected over plaintext must switch to TLS — point them
   at the CA with `--ca-cert <ca-dir>/default-ca.pem`.
 - **To keep the legacy refuse-to-start behaviour**, pass `--no-default-certs`.
-- **Back up `<ca-dir>/default-ca.key` (0600) and the new `ca.db`** in `--data-dir`
-  — losing the CA key forces a full fleet re-enrollment.
+- **Back up `<ca-dir>/default-ca.key` (0600) and the `ca_store` Postgres schema**
+  (`pg_dump`/`pg_restore`, ADR-0053) — losing the CA key forces a full fleet
+  re-enrollment.
 - Relocate the cert directory with `--ca-dir` (e.g. a dedicated container volume).
+
+## ⚠️ Behaviour change: internal-CA store moves to Postgres (ADR-0053)
+
+`CaStore` (internal-CA root metadata, issued-certificate inventory, CRL version
+history — everything the mTLS-accept revocation gate and `GET /api/v1/ca/*`
+read) moves from the SQLite `ca.db` file to the server's PostgreSQL substrate
+in this release (schema `ca_store`). The private CA root key is unaffected —
+it was never in `ca.db` and stays a local file behind `KeyProvider` (`--ca-dir`).
+
+- **Mandatory, automatic backfill on first boot.** The legacy `ca.db` (if
+  present) is read once at startup and its full issued-cert inventory + CRL
+  history is copied into `ca_store`, fingerprint-verified. The legacy file is
+  left in place, read-only, for one release as a rollback reference — it is
+  never deleted or written to.
+- **New fail-closed-at-boot behaviour.** A genuine Postgres error while wiring
+  the per-agent mTLS revocation checker at boot now refuses to start the
+  server, rather than starting with revocation enforcement silently unwired.
+  If the server previously started cleanly on a working Postgres connection,
+  this changes nothing observable; it only changes what happens during a
+  Postgres outage at exactly that boot step, from "starts degraded" to
+  "refuses to start."
+- **`GET`/`POST /api/v1/ca/*` and the CA MCP tools now return a `503`/internal
+  error on a genuine database error**, instead of a silently-empty or
+  silently-false result.
+- Every other CA behavior — revocation semantics, CRL numbering, the single
+  `sign_agent_csr` chokepoint — is unchanged. Detail: `docs/pki-architecture.md`,
+  `docs/adr/0053-ca-store-postgres-migration.md`.
+- **New: an established, already-running default-cert install can now self-heal
+  its own listener leaves without operator action.** This is not limited to a
+  first-boot crash window — any boot where the on-disk `--ca-dir` default
+  leaves are missing, corrupt, or a leaf was later lost (a bad partial restore,
+  a lost volume file) hits the same path, as long as `ca_store` already holds
+  a root and this instance's local CA key file still matches it. When that
+  holds, the server automatically **re-mints its own https/server/gateway
+  leaves with fresh private keys** under the existing root and resumes,
+  instead of refusing to start. It never touches the CA root itself or any
+  agent-issued certificate. Every occurrence logs a `spdlog::warn` line, but
+  there is currently no dedicated audit-log row for it (unlike enrollment-time
+  `ca.cert.issued`) — tracked as a follow-up, not fixed in this release.
+- **HA note: a losing first-boot replica self-heals within the same boot attempt
+  (UP-3), bounded.** Multiple server instances sharing one `--ca-dir` cert
+  volume and one `ca_store` Postgres substrate is not an officially supported
+  deployment topology today (see ADR-0053's Decision section) — this note
+  describes what happens if it's done anyway, safely, not a recommendation to
+  do it. If two instances start against the same fresh `ca_store` at once,
+  exactly one wins the root race and generates the live default certs; the
+  other polls the shared cert directory for up to 15s for the winner's
+  complete set to land (it only adopts a fully-written set — the winner's
+  completion marker is written last, so a partial/in-flight write is never
+  picked up) and, on success, continues booting on the winner's certs without
+  a restart. If the winner hasn't finished within that window (a slow
+  Postgres, lock contention, or a winner that's itself still starting up), the
+  loser falls back to the original behavior: it **exits** (refuses to start,
+  non-zero) rather than serving with its own discarded material — it does not
+  reach a running-but-unready state, so a readiness-probe-driven restart never
+  applies here. Recovery in that case is a plain process-supervisor restart
+  (systemd `Restart=on-failure`, Kubernetes `restartPolicy`) once the winner's
+  certs are in place, so the losing instance picks them up from disk on its
+  next boot attempt. On systemd specifically, a slow winner (e.g. Postgres
+  itself under load) can interact with the crash-loop guard
+  (`StartLimitBurst`/`StartLimitIntervalSec`) — a losing replica that exhausts
+  its restart budget first lands in the service's "failed" state and needs a
+  manual `systemctl reset-failed` once the winner has actually finished,
+  rather than retrying forever on its own. Diagnosing a bootstrap that seems
+  permanently stuck (neither replica ever finishes): check `pg_locks` for a
+  lingering `yuzu:default_certs_bootstrap` session advisory lock with no live
+  backend behind it (a host crash or network partition can leave one held
+  until Postgres notices the dead session) and `pg_terminate_backend` it — see
+  `docs/pki-architecture.md`'s operator runbook.
 
 ## ⚠️ Behaviour change: response history resets on Postgres cutover (ADR-0039)
 
@@ -641,6 +784,65 @@ response row is still stored and still renders, defanged, rather than being
 dropped (governance #1593). Retention moved from an hourly background thread
 to a clock-guarded, capped reap on the maintenance tick (no operator-visible
 behaviour change beyond the same 90-day default).
+
+## ⚠️ Behaviour change: buffered analytics events reset on Postgres cutover (ADR-0049)
+
+`AnalyticsEventStore` (the outbox spool behind `/api/analytics/status` and
+`/api/analytics/recent` — login/MFA/OIDC/SAML/role-elevation and agent/gateway
+command-lifecycle events, drained to any configured JSONL/ClickHouse sink)
+moves from the SQLite `analytics.db` file to the server's PostgreSQL
+substrate in this release (ADR-0049, Wave 2 batch 3, schema
+`analytics_event_store`). Like `ResponseStore`, this is a **fresh-start
+cutover with no data migration** — the buffer is a transient spool, not
+authoritative or compliance evidence (ADR-0009 skippable backfill), so the
+legacy `analytics.db` is **never read** on upgrade.
+
+**What happens on first PG boot:**
+- The server logs `[PG] analytics spool on Postgres ...` at info level — this
+  line appears on every subsequent restart too (it states the store's
+  steady-state configuration, not a one-time cutover event), so don't expect
+  it to disappear after the first boot.
+- Any events buffered but not yet drained to a sink at the moment of cutover
+  are lost. In healthy operation this is bounded by the drain interval
+  (10s default); if a sink was failing before the upgrade, whatever backlog
+  had accumulated is lost too. Already-drained events were already delivered
+  and are unaffected.
+- New events buffer and drain normally from first boot. No operator action
+  required.
+- If analytics collection is disabled (`--no-analytics`), no store is
+  constructed and no log line is emitted for it. If it's enabled but the
+  schema fails to migrate, the server logs an error
+  (`[PG] analytics-event store migration/open failed ...`) and the store
+  stays constructed but degraded for that run (`is_open()==false`) — it
+  keeps accepting `emit()` calls, which fail-soft and count a
+  `store_not_open` drop, and `/api/analytics/status`/`/api/analytics/recent`
+  return `503` rather than a `200`. Either way, a broken analytics store
+  never blocks server startup (this store is the one Postgres-backed store
+  on this ladder that does NOT fail the server closed on a construction
+  failure; see ADR-0049) — `/readyz`'s `degraded` field (not
+  `failed_stores`) names it when it's on but dead, without affecting the
+  node's ready/not-ready status.
+- **The store does not retry a failed open.** `is_open()` is latched once at
+  construction — a Postgres blip that resolves moments after boot still
+  leaves the store degraded for the rest of that process's uptime. Restart
+  the server once Postgres connectivity for the configured DSN is confirmed
+  restored; there is no in-process self-heal to wait out instead.
+- **The Settings page's Enabled/Disabled analytics label is not accurate in
+  the migration-failed case above** (governance Gate 6 finding, 2026-08-16) —
+  it reads the `--no-analytics` config flag directly, not whether the store
+  actually opened, so it can still say "Enabled" while a failed migration has
+  left collection degraded for the run. Check `/readyz`'s `degraded` field
+  or `GET /api/analytics/status` (`503 {"error":{"message":"analytics store
+  degraded"}}` in this case — NOT `"enabled":false`, which is reserved for
+  `--no-analytics`) for the accurate state, not the Settings page, until
+  this is wired up.
+- **Security note, separate from the cutover itself:** this release also
+  fixes a pre-existing issue in the same store — `AnalyticsEvent.session_id`
+  is now a hash of the session cookie, not the raw bearer token. If a token
+  may have reached a shared analytics sink or a broadly-read analytics row
+  before upgrading, see the rotation guidance in
+  `changelog.d/20260816-analytics-session-id-hash.security.md` (assembled
+  into the release's Security section at release time).
 
 ## RBAC store moves to PostgreSQL — config preserved by mandatory backfill (RbacStore → Postgres, ADR-0041)
 
@@ -845,10 +1047,11 @@ server `PgPool`).
   delivery. If any of these bounds is exceeded, the diagnostic line is
   written directly to **stderr** (not through the configured logger,
   and naming which store timed out for the webhook/offload case) before the
-  process force-exits — an
-  async-signal-safety requirement, since `stop()` runs synchronously inside
-  the SIGTERM handler (see #3007). If you rely on the log file or a
-  structured log sink rather than captured stderr, this one line will not
+  process force-exits. `stop()` now runs on an ordinary thread, not inside
+  the SIGTERM handler (#3007), so `spdlog` would be legal here — the raw
+  write stays anyway because `std::_Exit()` skips any buffered sink flush,
+  and this line must reach the operator regardless. If you rely on the log
+  file or a structured log sink rather than captured stderr, this one line will not
   appear there; check container/service stderr capture for it instead.
 - Confirm on first boot: the backfill completion log line, no `RbacStore`
   open/migrate errors, and that RBAC is still enabled if you had enabled it
@@ -1604,6 +1807,105 @@ the device page) shows the same tags as before the upgrade, and
 outcome (alert `YuzuTagStoreBackfillNotCompleted` keys on the ABSENCE of a
 success/fresh sample — a refused boot never serves `/metrics` at all).
 
+## ⚠️ Behaviour change: quarantine is now enforced at instruction dispatch (#881, #3127)
+
+Quarantine previously isolated a device's network without stopping the control plane from
+sending it commands. This release closes that, and separately removes two paths on which the
+MCP `quarantine_device` tool claimed an isolation it had not achieved. Read this before
+upgrading a deployment that quarantines devices — the alert-rule item needs operator action.
+
+The agent-side plugin containment fixes (IPv6 coverage, and honest reporting on all three
+platforms) ship separately and have their own upgrade note.
+
+### A quarantined device is now refused at dispatch (#881)
+
+Quarantine previously isolated a device's network without stopping the control plane from
+sending it commands: the feature was enforced at the endpoint and nowhere else. Instruction
+dispatch now consults containment state at the server's single dispatch chokepoint, and a
+quarantined device is dropped from **every** targeting arm — by id, by scope, by management
+group, and by broadcast — before the command reaches the agent.
+
+- Denials increment `yuzu_server_dispatch_target_rejected_total{reason="quarantined"}` and write
+  a `quarantine.dispatch_denied` audit row (`result=denied`).
+- **The quarantine plugin's own four actions are exempt** — `quarantine`, `unquarantine`,
+  `status`, `whitelist` — so release stays reachable on a contained host. The exemption is keyed
+  on the action, not the plugin, so a future fifth action arrives gated rather than inheriting the
+  bypass.
+- **Three server-internal pushes are also exempt** — `tar.fleet_snapshot`, `__guard__.push_rules`
+  and `asset_tags.sync`. These are the server keeping its own state coherent, not operator
+  dispatch, and gating the Guardian push would stop a contained device receiving the enforcement
+  rules that make containment meaningful. If your threat model treats quarantine as a total
+  boundary, note that it is not: those three channels stay open. They are a closed set in code and
+  are counted by `yuzu_server_system_reserved_push_total{capability,result}` — counted, not
+  per-event audited: there is no row tying a particular push to a particular contained
+  device, so this is a fleet-level signal rather than per-device evidence. Nothing outside that
+  set and the plugin's own four actions reaches a quarantined device.
+- **Operator-visible:** automation that dispatched to quarantined devices and appeared to succeed
+  will now receive denials. That is the correction, not a regression — those commands were never
+  going to be safe to run on a device you had isolated.
+
+**Fail-closed under a degraded store.** If containment state cannot be read, the server serves a
+last-known-good snapshot for up to **60 seconds**; past that, or when the store is durably
+unavailable, dispatch **fails closed and refuses every target fleet-wide** rather than guess who
+is contained. A background refresher re-reads containment state every 20 seconds, so the snapshot
+is warm even on a server with no operator traffic — without it the budget would only have
+absorbed anything on a busy server, which is not when you need it.
+
+**The snapshot window cuts both ways, and the other direction is the quieter one.** While a
+stale snapshot is being served, a device quarantined *after* that snapshot was taken is absent
+from it — so dispatch to that device is **permitted**, and audited as an ordinary success. For
+up to the snapshot's remaining budget, containment does not hold for a freshly-quarantined
+device. The refresher bounds that window to roughly the refresh interval in the common case, and
+`YuzuQuarantineGateServingStaleState` alerts on it; if you quarantine a device while
+`yuzu_server_quarantine_read_degrade_total` is non-zero, confirm with `quarantine.status`
+rather than assuming the dispatch gate is already holding.
+
+**There is no operator override.** The 60-second budget is a fixed bound, not a tunable, and
+there is no flag to disable enforcement — a knob that let an operator turn the gate off under
+pressure would be the first thing reached for during exactly the incident it exists for. What
+survives a store outage regardless: the quarantine plugin's own four actions (they never read the
+store), and the three server-internal pushes below. So containment, release and whitelist repair
+all remain possible while the store is down; what stops is other operator dispatch. Alert on `yuzu_server_quarantine_gate_total{outcome="fail_closed"}` — it means
+instruction dispatch has stopped, and it is an outage signal rather than a quarantine one. All four `outcome` values are pre-seeded at boot, so a **zero is a measurement** rather than an absent series — you can alert on `fail_closed` before it has ever fired. Absence of the family then means the server is not exporting it at all (an older build, or a scrape that is failing), not that the gate is idle: a booted server publishes all four from boot whether or not any dispatch has happened yet.
+
+**Alert-rule change (action may be required).** `YuzuDispatchTargetRejected` now excludes
+`reason="quarantined"`. Without that exclusion, correct enforcement fires the alert: any looping
+automation against one contained host clears its `>3/15m` threshold, and a fail-closed episode
+increments by the whole fleet at once. If you maintain a fork of `docs/prometheus/yuzu-alerts.yml`,
+apply the same exclusion — otherwise the rule gets silenced and the genuine #2500 near-miss signal
+goes with it.
+
+### MCP `quarantine_device` no longer reports phantom isolation (#3127)
+
+Two independent bugs made the tool claim containment it had not achieved. Both are fixed, and
+both are **wire-visible to an MCP client**:
+
+- `agents_reached=0` (the agent was offline) or a dispatch that threw previously returned a
+  success envelope. It now answers `-32603` — *"quarantine recorded but isolation was not
+  confirmed"* — with `retry_after_ms: 5000` on a first failure. A **repeat** failure against a device that already
+  has a record backs off to `60000`: the device is offline rather than busy, and nothing changes
+  until it reconnects. Note what the server does *not* do — there is no hook that re-applies the
+  endpoint firewall on reconnect, so a device quarantined while offline is contained at the control
+  plane (dispatch to it is refused) but **not** at its own firewall until a quarantine dispatch
+  actually reaches it. Re-issue once it is back. **The record still persists**; retry the same call to
+  re-drive dispatch.
+- An **already-quarantined** device was a terminal error. It is now a retryable re-dispatch
+  against the **stored** `reason`/`whitelist`, not the retry's own arguments — a retry cannot
+  silently rewrite a contained device's allow-list with no store update and no audit trail.
+
+`dispatch_confirmed:true` means the plugin registry **accepted the frame**, never that the device
+is provably isolated (for a gateway-attached agent the frame is only queued). Confirming
+containment still requires a follow-up `status` read returning `state|active`.
+
+**Note the REST twin has diverged on one case.** `POST /api/v1/quarantine` records only — it has
+never dispatched — so it still answers `400` on an already-quarantined device: there is nothing
+for it to re-drive. The `400`-vs-`503` split is otherwise unchanged.
+
+### No migration, no schema change
+
+Rollback is data-safe. A mixed fleet is safe: the dispatch gate is server-side and applies
+regardless of agent version.
+
 ## Upgrade Order
 
 Always upgrade in this order:
@@ -1701,6 +2003,23 @@ Before upgrading any component:
   wedged". Stop scripts that deliberately double-signal agents will now
   force-kill them; send one signal and wait instead. On Windows a second Ctrl-C
   also terminates promptly. See *Stopping a wedged agent* in
+  [Server Administration](server-admin.md).
+- [ ] **Changed server signal handling (Linux/macOS, #3007):** the identical fix
+  as above, now applied to the server — graceful shutdown runs on a dedicated
+  watcher thread (fixes the same abort/hang class on `SIGTERM`, previously
+  reproducible as a debug-build `SIGABRT` from a deadlock detector), and a
+  **second** `SIGTERM`/`SIGINT` immediately hard-exits the server (exit 1) with
+  **no grace window**. Also new: a `SIGTERM`/`SIGINT` arriving before the server
+  finishes starting up now exits promptly with code 1, instead of being
+  silently ignored — a boot-time signal genuinely cannot be handled gracefully,
+  so this is a fail-visible improvement, but it means a very-early stop attempt
+  during a fast redeploy or a mistuned `livenessProbe.initialDelaySeconds`
+  (a failing *readiness* probe only pulls a pod from Service endpoints — it
+  never sends a stop signal; a failing *liveness* probe is what triggers a
+  kill-and-restart) will now observably exit rather than continue booting.
+  Stop scripts that
+  deliberately double-signal the server will now force-kill it; send one
+  signal and wait instead. See *Stopping a wedged server* in
   [Server Administration](server-admin.md).
 - **Non-English fleets — additional plugins (#1682).** The same `Reg*A` → `Reg*W`
   encoding fix was extended to four more Windows plugins: `vuln_scan` (app
@@ -2558,6 +2877,12 @@ Three operator-visible behaviour changes ship in the v0.12.0 A3 ladder. None req
 **2. `/api/health` is restored as an alias of `/health` (#620).** The pre-#401 endpoint path is back. Monitoring integrations that point at `/api/health` work without reconfiguration; both URLs serve identical JSON. Both are exempt from rate limiting (a follow-up hardening over the bare `/health` behaviour). For load-balancer probes that should drain in-flight traffic before stopping, continue using `/readyz` — `/health` and `/api/health` are intentionally not draining-aware (Kubernetes pattern: liveness/health probes are not draining-aware).
 
 **3. File-logger boot messages are now quieter (#624).** The previous `WARN: Could not create log directory /var/log/yuzu` + `ERROR: file logger setup failed` pair on every container boot is replaced by a single INFO-level line when the default path cannot be created. The Docker server image now pre-creates `/var/log/yuzu` (mode 0750, owned by `yuzu`) so the path is writable out of the box. **If your monitoring previously alerted on the WARN/ERROR lines as a misconfig signal, those signals will no longer fire** — the failure mode is now a single INFO line. Operators who require explicit on-disk logs should pass `--log-file <path>`; explicit-path failures still log at ERROR and are not silently degraded.
+
+### `quarantine` plugin: reporting is now more conservative (Wave-2 argv migration)
+
+The `quarantine` plugin's Windows/Linux/macOS `netsh`/`iptables`/`pfctl` invocations were migrated off shell-outs onto a bounded argv runner. Alongside the mechanism change, two reporting bugs were fixed: a Linux chain-flush could previously be miscounted as an applied containment rule (`status|quarantined|rules_applied|1` reported with zero rules actually installed), and macOS whitelist mutations could silently proceed on a failed prerequisite read or report success despite `pfctl -e` failing to enable pf.
+
+**If your automation alerts on `status|failed`/`status|release_uncertain`/`status|update_uncertain` from `quarantine` actions, you may see these fire more often after upgrading** — this is expected. Nothing got more broken; the plugin's failure reporting simply got more honest about cases it previously reported as clean success. No action is required beyond expecting the change.
 
 ## Rollback
 

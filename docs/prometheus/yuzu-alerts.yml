@@ -510,27 +510,56 @@ groups:
             bus-buffer sizing question.
       - alert: YuzuMcpBridgeTeardownIncomplete
         expr: |
-          sum by (reason) (yuzu_mcp_bridge_teardown_incomplete_total) > 0
+          sum by (reason) (increase(yuzu_mcp_bridge_teardown_incomplete_total[15m])) > 0
+        for: 15m
         labels:
           severity: warning
         annotations:
-          summary: "MCP progress-bridge teardown could not complete (resource retained)"
+          summary: "MCP progress-bridge teardown attempt failed (may self-heal via retry)"
           description: >-
-            reason={{ $labels.reason }}. A claimed teardown could not finish on the
-            maintenance thread. The sweep's claim is one-way, so the record is
-            NEVER retried: whatever it still owns is held until the server
-            restarts - unsubscribe = its event-bus subscription (which also
-            blocks that execution's channel and replay buffer from being
-            collected), release_charge = a per-session admission slot,
-            erase = the correlation record and a global slot. A retained record
-            also pins that session's whole stream state and any pinned finals.
-            Client results stay durably fetchable by execution_id. NOTE this is a
-            defence-in-depth counter: on current code only a mutex failure can
-            reach these steps, so for allocation pressure watch
+            reason={{ $labels.reason }}. A teardown ATTEMPT could not finish on the
+            maintenance thread - unsubscribe = its event-bus subscription (which
+            also blocks that execution's channel and replay buffer from being
+            collected), release_charge = a per-session admission slot AND the
+            record itself, erase = the correlation record and a global slot
+            (reaching erase means the subscription and charge already settled).
+            A retained record also pins that session's whole stream state and
+            any pinned finals. Client results stay durably fetchable by
+            execution_id. NOT yet a strand: a LATER sweep (15s cadence) retries
+            the same record (#2513, up to Config::teardown_retry_max beyond
+            this attempt - a few sweep ticks, well inside this alert's window),
+            so this counter alone can recover on its own. INCREASE OVER A
+            WINDOW ON PURPOSE, unlike its sibling below: a raw counter test
+            would never clear after the first-ever transient blip, since the
+            underlying series is monotonic and most of its movement recovers.
+            Check yuzu_mcp_bridge_teardown_retry_total next: outcome="recovered"
+            means it did, outcome="exhausted" means it did not and retention is
+            now permanent (see YuzuMcpBridgeTeardownRetryExhausted, the alert
+            that actually pages). NOTE this is a defence-in-depth counter: on
+            current code only a mutex failure can reach these steps, so for
+            allocation pressure watch
             yuzu_mcp_stream_terminal_publish_failures_total instead.
-            DELIBERATELY a raw counter test, not increase() over a window: the
-            retention lasts until the process restarts, so an alert that cleared
-            after 15 minutes would contradict the contract it exists to report.
+            Runbook: docs/ops-runbooks/mcp-bridge-teardown-recovery.md
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
+      - alert: YuzuMcpBridgeTeardownRetryExhausted
+        expr: |
+          sum (yuzu_mcp_bridge_teardown_retry_total{outcome="exhausted"}) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP progress-bridge teardown exhausted its retry budget (resource retained until restart)"
+          description: >-
+            A record's teardown failed on every attempt up to
+            Config::teardown_retry_max (4 total attempts by default) and will
+            not be reattempted. This IS the permanent-retention signal -
+            yuzu_mcp_bridge_teardown_incomplete_total moving alone is not,
+            since most of its movement recovers via retry. See
+            yuzu_mcp_bridge_teardown_incomplete_total{reason} for which
+            resource(s) are held, and the mcp.bridge.teardown_retry audit row
+            for this record's execution_id. DELIBERATELY a raw counter test,
+            not increase() over a window: the retention lasts until the
+            process restarts, so an alert that cleared after 15 minutes would
+            contradict the contract it exists to report.
             Runbook: docs/ops-runbooks/mcp-bridge-teardown-recovery.md
           runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
       - alert: YuzuMcpStreamedPinSlotsWedged
@@ -675,12 +704,15 @@ groups:
             exception aborted the whole process, so a firing here is strictly
             better than the alternative - but a sustained rate means that class of
             maintenance is not running at all. Correlate with host memory pressure.
-            DELIBERATELY increase() over a window, unlike the teardown-incomplete
-            rule next to it: a skipped tick is retried on the next cycle, so this
-            condition is self-healing and the alert must clear when it stops. The
-            raw-counter form is correct ONLY where the retention it reports is
-            permanent until restart, which is true of teardown_incomplete and not
-            of this.
+            DELIBERATELY increase() over a window, same shape as
+            YuzuMcpBridgeTeardownIncomplete (#2513 rewrote that one to match, since
+            teardown is now retried too - see that alert's own annotation): a
+            skipped tick is retried on the next cycle, so this condition is
+            self-healing and the alert must clear when it stops. The raw-counter
+            form is correct ONLY where the retention it reports is permanent until
+            restart - that is now YuzuMcpBridgeTeardownRetryExhausted, not
+            teardown_incomplete, which moved to this same windowed shape for the
+            identical reason.
             Runbook: docs/ops-runbooks/mcp-bridge-teardown-recovery.md
           runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
       - alert: YuzuMcpBridgeRecordsNearCap
@@ -750,11 +782,99 @@ groups:
             Denials are audited as mcp.<tool>|denied with detail
             "input bound exceeded: <reason>"; correlate there for the principal.
 
+      - alert: YuzuMcpEngineRevalidateStoreUnreachable
+        expr: |
+          increase(yuzu_server_engine_revalidate_backoff_suppressed_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Engine-principal liveness re-checks are being answered from the failure backoff - the principal store is unreachable and engine streams are riding their grace windows"
+          description: >-
+            This counter only moves on CONFIRMED unreachability (the store
+            closed, or a query actually ran and failed, or PgPool's own
+            connect-failure breaker is open) - a bare pool-lease-acquire
+            timeout under a healthy database does not arm this backoff, so
+            firing already rules out ordinary pool saturation. First rule out
+            real impact: a flat
+            yuzu_mcp_stream_closes_total{reason="auth_unavailable"} means the
+            backoff is absorbing the blip and no streams have ended. Then
+            correlate with yuzu_pg_acquire_wait_seconds and
+            yuzu_pg_pool_in_use for genuine connection exhaustion vs. a
+            connect-level failure.
+          runbook_url: "https://docs.yuzu.io/runbooks/engine-principal-store-recovery"
+
   - name: yuzu-dispatch
     rules:
+      - alert: YuzuQuarantineGateFailClosed
+        expr: |
+          increase(yuzu_server_quarantine_gate_total{outcome="fail_closed"}[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Instruction dispatch is refusing every target - containment state is unreadable"
+          description: >-
+            The #881 containment gate cannot read quarantine state and is
+            failing CLOSED, so instruction dispatch reaches NOBODY on every arm
+            including broadcast. This is a fleet-wide dispatch OUTAGE, not a
+            quarantine event - a quarantined device produces
+            outcome="fresh"/"stale" and the per-denial audit row, never this.
+            The gate absorbs a transient read failure for up to 60s from its
+            last-known-good snapshot (outcome="stale"), so a sustained
+            fail_closed means the quarantine store has been unreadable past
+            that budget: check yuzu_server_quarantine_read_degrade_total{reason}
+            and the Postgres pool (yuzu_pg_acquire_wait_seconds,
+            yuzu_pg_pool_in_use). reason="read_concurrency_cap" is NOT a store
+            fault - it means this dispatch waited for one of four
+            containment-read slots and did not get one, the bound that stops a
+            stalled backend pinning the pool every other store shares. A slot
+            timeout fails closed deliberately: serving stale containment state
+            when nobody asked the store would under-enforce against a healthy
+            one. The quarantine plugin's own control actions stay
+            reachable throughout - releasing a device does not depend on this
+            read - as do the three system-reserved internal pushes
+            (yuzu_server_system_reserved_push_total). BE PRECISE ABOUT for: 2m:
+            it delays the page by two minutes, it does NOT require a sustained
+            episode. increase()[5m] stays true for ~5 minutes after a single
+            increment, so one fail-closed evaluation still pages, two minutes
+            later. That is deliberate - a dispatch refused against the entire
+            fleet is not something to sit on, and the snapshot refresher means
+            a single fail_closed already implies the store was unreadable past
+            the whole 60s budget. The delay exists so a self-resolving blip
+            clears before anyone is woken, not so it is ignored.
+
+      - alert: YuzuQuarantineGateServingStaleState
+        expr: |
+          sum(increase(yuzu_server_quarantine_gate_total{outcome="stale"}[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Containment decisions are being made from a stale snapshot"
+          description: >-
+            The containment read is failing and the gate is serving its
+            last-known-good snapshot. Two reasons this is worth a page before
+            the critical fail-closed rule fires. First, it is the LEADING
+            INDICATOR: the snapshot is only trusted for 60s, so a read failure
+            that outlasts that becomes a fleet-wide dispatch outage. Second and
+            less obvious, stale is the one gate outcome in which containment
+            UNDER-enforces - a device quarantined after the snapshot was taken
+            is absent from it, so dispatch to that device is permitted. The
+            fail-closed rule pages on over-enforcement; nothing else pages on
+            this. A background refresher re-reads containment state every 20s,
+            so a sustained stale outcome means those refreshes are ALSO
+            failing, not merely that traffic is sparse. Correlate with
+            yuzu_server_quarantine_read_degrade_total{reason} - store_not_open,
+            pool_acquire_timeout and query_error are store faults;
+            read_concurrency_cap does NOT appear under this alert - a slot
+            timeout fails the dispatch closed, so it shows up on
+            YuzuQuarantineGateFailClosed instead.
+
       - alert: YuzuDispatchTargetRejected
         expr: |
-          sum by (route, reason) (increase(yuzu_server_dispatch_target_rejected_total[15m])) > 3
+          sum by (route, reason) (
+            increase(yuzu_server_dispatch_target_rejected_total{reason!="quarantined"}[15m])
+          ) > 3
         labels:
           severity: warning
         annotations:
@@ -775,7 +895,16 @@ groups:
             nothing. Denials are audited as
             command.dispatch|denied, instruction.execute|denied or
             result_set.create|denied with detail "reason=<reason>"; correlate
-            there for the principal.
+            there for the principal. reason="quarantined" (#881) is
+            EXCLUDED from the expression: a withheld dispatch to a contained
+            device is the control WORKING, not a caller naming nothing. Any
+            looping automation against a single quarantined host clears 3 in 15m,
+            and one fail-closed episode increments by the whole fleet at once, so
+            folding correct enforcement in here would fire this constantly, get
+            it silenced, and take the genuine near-miss signal with it - the
+            outcome the >3 threshold above was chosen to avoid. Quarantine
+            denials are observed on yuzu_server_quarantine_gate_total and audited
+            as quarantine.dispatch_denied.
 
   - name: yuzu-tls
     rules:
@@ -824,6 +953,68 @@ groups:
             minutes. The server is still using the previous valid certificate.
             Check that the new PEM files are valid, the cert and key match,
             and file permissions are correct (chmod 600 on Unix).
+
+  # ── yuzu-pki — internal CA (ca_store, ADR-0053) ─────────────────────────────
+  # All three counters below are bare/pre-seeded to 0 at boot (server.cpp), so
+  # increase(x[window]) > 0 catches even the FIRST occurrence — see the
+  # yuzu-scim group's header comment for why absent() would be the wrong shape
+  # here.
+  - name: yuzu-pki
+    rules:
+      - alert: YuzuCaCrlPublishFailing
+        expr: |
+          increase(yuzu_server_ca_crl_publish_failures_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Internal-CA CRL (re)publish is failing"
+          description: >-
+            yuzu_server_ca_crl_publish_failures_total moved: a CRL (re)publish
+            attempt failed (CA key load / build / record). Consumers keep
+            serving the last still-valid CRL, so this is not yet an outage, but
+            a revocation made since the last successful publish is NOT
+            reflected in the public CRL — server-side enforcement (is_revoked())
+            is unaffected and still blocks the revoked cert directly. Check
+            Postgres availability (ca_store schema) and CA key
+            loadability. See docs/pki-architecture.md "CRL distribution".
+          runbook_url: "https://docs.yuzu.io/runbooks/ca-crl-publish-failing"
+
+      - alert: YuzuCaRevocationSweepReadFailing
+        expr: |
+          increase(yuzu_server_ca_revocation_sweep_read_failures_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "The ~15s revocation-sweep tick cannot read the revoked-cert set"
+          description: >-
+            yuzu_server_ca_revocation_sweep_read_failures_total moved: the
+            periodic sweep that tears down live Subscribe streams for
+            already-revoked agents could not read ca_store's revoked set, so
+            that tick was skipped entirely (ADR-0053 UP-1 — the sweep aborts
+            rather than treating every live agent as revoked). A sustained
+            non-zero rate means an already-revoked agent's live stream may not
+            be torn down promptly; the per-request mTLS-accept gate
+            (is_peer_cert_revoked) still fails closed independently, so no NEW
+            access is granted in the meantime. Check Postgres availability.
+          runbook_url: "https://docs.yuzu.io/runbooks/ca-revocation-sweep-failing"
+
+      - alert: YuzuCaReissueBlocked
+        expr: |
+          increase(yuzu_server_ca_reissue_blocked_total[1h]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "An agent attempted to re-provision under a revoked identity"
+          description: >-
+            yuzu_server_ca_reissue_blocked_total{reason="revoked_identity"}
+            moved — sign_agent_csr refused to re-issue because a revoked,
+            non-expired cert already exists for that agent_id (the
+            revocation-bypass guard is working as intended; ADR-0036/ADR-0053).
+            This is not a failure to fix, but is worth an operator's attention:
+            a revoked device attempting to silently re-enroll may indicate a
+            still-active compromised endpoint. An operator must deliberately
+            clear the revocation before re-provisioning can succeed.
+          runbook_url: "https://docs.yuzu.io/runbooks/ca-reissue-blocked"
 
   # ── yuzu-response-store — LIVE as of the response store's Postgres migration
   # (ADR-0039) ──────────────────────────────────────────────────────────────
@@ -2409,6 +2600,35 @@ groups:
             not read a scoped operator's short/empty list as authoritative while
             this fires.
           runbook_url: "https://docs.yuzu.io/runbooks/management-groups"
+      - alert: YuzuAnalyticsStoreNotOpen
+        # AnalyticsEventStore (ADR-0049) failed to open at boot and is
+        # DEGRADED FOR THE ENTIRE PROCESS UPTIME — is_open() is latched
+        # once at construction and never retried (governance Gate 8,
+        # 2026-08-19), so this condition does not self-heal even if
+        # Postgres connectivity recovers; a restart is required. Analytics
+        # is deliberately non-critical/expendable telemetry (this store is
+        # the one PG-backed store on the ladder that does NOT fail the
+        # server closed on a construction failure) so this stays a warning,
+        # not a page — but it's worth knowing about, since without this
+        # alert the only signals are a boot-time log line and /readyz's
+        # non-gating degraded field, both easy to miss on a long-running
+        # process. reason="store_not_open" specifically (not
+        # pool_acquire_timeout/query_error, which are transient runtime
+        # blips on an otherwise-open store, not this durable condition).
+        expr: |
+          sum(rate(yuzu_server_analytics_emit_dropped_total{reason="store_not_open"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AnalyticsEventStore failed to open at boot and will not self-heal"
+          description: >-
+            yuzu_server_analytics_emit_dropped_total{reason="store_not_open"}
+            is advancing: the analytics store failed to open (schema
+            migration or initial connection) and is dropping every emit.
+            Check Postgres reachability for the configured DSN, then
+            restart the server - this does not recover on its own.
+          runbook_url: "https://docs.yuzu.io/runbooks/analytics-store-not-open"
       - alert: YuzuMgmtGroupBackfillFailing
         # The one-time SQLite->Postgres confinement backfill (ADR-0042) reported
         # a failed outcome. The server fails closed at boot on a backfill failure
@@ -2910,6 +3130,19 @@ groups:
   #           or contended watcher. Sustained slow ops can delay detection. Inspect the
   #           mechanism's OS facility (IOCP / TP_WAIT pool / sd-bus / SCM) on the OS.
   #         runbook_url: "https://docs.yuzu.io/runbooks/spark-slow-op"
+  #     # No YuzuSparkUnsupported rule (F7, #2298 rung 2 - governance finding, sre Gate 3):
+  #     # yuzu_fleet_spark_unsupported is a ROUTINE signal, not a fault - a known spark type
+  #     # with no mechanism on that host (every rule reads unsupported on macOS today, since
+  #     # macOS registers none of file/registry/service) is expected, not a regression. A
+  #     # bare `> 0` would page on every legitimate cross-platform deploy. It is NOT
+  #     # universally safe to ignore, though: classify() keys off the registered-AND-
+  #     # non-inert capability set (guardian_engine.cpp), so a registration failure or a
+  #     # registered-but-inert mechanism can also land a rule here on a platform where it
+  #     # should have worked - see docs/user-manual/guaranteed-state.md's on-call note for
+  #     # how to tell the two apart. Revisit at rung 11 (docs/spark-stage2-guardian-
+  #     # consumer-design.md's deferred server-side fleet-signal alert work - flap
+  #     # detector + SparkFailed-prevalence) once real per-platform baselines exist to
+  #     # alert against.
   #     - alert: YuzuSparkQueuedDropped
   #       expr: |
   #         increase(yuzu_fleet_spark_queued_dropped[15m]) > 0
