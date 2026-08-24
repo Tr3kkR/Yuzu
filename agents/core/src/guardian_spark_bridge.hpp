@@ -201,7 +201,7 @@ rule_assertion_from_rule(const yuzu::guardian::v1::GuaranteedStateRule& rule) {
     // worst case ~1800/day on the 60s service/registry lanes, ~180/day on the
     // 600s file lane (naive no-jitter figures of 1440/144 understate the worst
     // case; full jitter-floor derivation in docs/spark-legacy-delta-registry.md's
-    // D3 row - not yet on this branch as of writing, lands via PR #3417).
+    // D3 row).
     // Interim fix (owner decision, pending a possible full M1-shaped
     // edge+refresh redesign later): default to the rule's own lane
     // cadence plus the scheduler's own jitter span, so debounce reliably
