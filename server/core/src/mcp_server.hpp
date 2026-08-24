@@ -31,6 +31,7 @@
 // kek_routes.hpp above.
 #include "file_retrieval_routes.hpp"
 #include "management_group_store.hpp"
+#include "mcp_retry.hpp"  // named retry_after_ms floors + poll counter name (#3344)
 #include "mcp_session.hpp"
 #include "mcp_stream.hpp" // GET SSE channel: StreamRevalidateFn, handle_get_tail (2f PR 2)
 #include "policy_store.hpp"
