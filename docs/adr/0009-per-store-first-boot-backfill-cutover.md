@@ -80,3 +80,54 @@ data).
   off. `ResponseStore` is the reference case for this class: a future purely-TTL'd,
   purely-ephemeral store should also skip unconditionally, not gate the skip behind a flag,
   unless a specific store has a reason this one doesn't.
+
+  **Update (`ProductPackStore`/ADR-0054, 2026-08-23):** the "must... delete the same
+  subject/device from the rollback copy" sentence above literally names mutating the
+  retained legacy file as the mechanism. `ProductPackStore` satisfies the clause's
+  *purpose* — rollback cannot resurrect data whose erasure was reported successful — via a
+  different, and for this store's shape a *stronger*, mechanism: `uninstall()` stamps a
+  durable Postgres-side tombstone (`deleted_pack_ids`) in the same transaction as its
+  delete, under an advisory lock closing the obvious check-then-insert race. The FIRST TIME
+  a given legacy file's exact content is seen (its whole-file fingerprint has no prior
+  marker), `migrate_from_sqlite()` checks every unmatched row against the tombstone before
+  treating it as fresh content; a later pass against byte-identical content is a safe
+  no-op skip (that content was already fully reconciled, tombstone-checked, in the
+  transaction that stamped its marker) rather than a re-check. This closes the *permanent,
+  shared* resurrection hazard (a redeployed or newly-joined replica's own stale
+  legacy-file copy) that a literal per-file mutation cannot reach at all, since that
+  mechanism only protects the one replica whose file was written — it does nothing for a
+  sibling replica's separate copy. The literal mechanism is deliberately NOT also
+  implemented: writing to the legacy file at `uninstall()` time would introduce a write
+  path into the one artifact that exists specifically as a rollback safety net, so a
+  partial/failed write during an uninstall could corrupt the rollback net itself — while
+  still only covering a single replica. That is a strictly worse trade for a benefit the
+  tombstone doesn't need.
+
+  **What the tombstone substitution does NOT close:** an operator who rolls the server
+  BINARY back to the pre-migration (SQLite-only) release, during the one-release rollback
+  window, reads `product-packs.db` directly — that binary has no knowledge Postgres or
+  `deleted_pack_ids` exist, so an uninstalled pack's catalog row can reappear for the
+  duration of the rollback. This residual is accepted, on grounds specific to
+  `ProductPackStore` and NOT a general precedent: the resurrection is metadata-only. The
+  pack's actual content (`InstructionDefinition`/`PolicyFragment`/`Workflow` rows) lives in
+  separate, still-live SQLite stores that `uninstall()`'s `uninstall_fn` callback attempts
+  to delete — ordinarily permanently, though a `PolicyFragment` still referenced by another
+  policy is a documented, logged exception (`uninstall()` tolerates that one failure and
+  still completes the pack-level delete + tombstone; see `PolicyStore::delete_fragment`'s
+  own referential-integrity refusal) — a binary rollback does not restore anything that
+  *was* deleted, and there is no automatic/boot-time caller of `install()` anywhere in this
+  codebase, so nothing re-materializes pack content short of a fresh, explicit `install()`
+  call (the `#802` signature gate constrains what such a call may install; it is not itself
+  what prevents an automatic reinstall). Nothing executable resurfaces; the operator sees a
+  stale catalog listing, not reinstated content — though a lookup that follows one of that
+  listing's item ids into another endpoint (fetch/execute an instruction by id, for
+  example) will 404 against content already deleted, which is expected during the window,
+  not a new fault. Re-uninstalling under the old binary mutates the legacy file directly
+  (the pre-migration code path always did); once the row is absent from a later re-scan of
+  that file, there is nothing left to resurrect regardless of the tombstone.
+
+  **This reasoning is store-scoped and MUST be re-derived, not copied, by the next store
+  whose wired erasure path covers genuinely personal or regulated subject/device data**
+  (the clause's original target) rather than operator-authored catalog metadata over
+  separately-erased content. That store will likely need the literal per-file mechanism
+  this update declines for `ProductPackStore`.
