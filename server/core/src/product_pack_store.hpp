@@ -169,9 +169,11 @@ public:
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
     /// Wire a metrics registry for the backfill-result counter
-    /// (`yuzu_server_product_pack_backfill_total{result}`) and `list`/`get`'s read-degrade
-    /// counter (`yuzu_server_product_pack_read_degrade_total{reason}`), matching
-    /// `CustomPropertiesStore`/`DiscoveryStore`'s #1675 convention. Set ONCE during
+    /// (`yuzu_server_product_pack_backfill_total{result}`), `list`/`get`'s read-degrade counter
+    /// (`yuzu_server_product_pack_read_degrade_total{reason}`), matching
+    /// `CustomPropertiesStore`/`DiscoveryStore`'s #1675 convention, and `install`'s F031/#3481
+    /// compensation-outcome counter (`yuzu_server_product_pack_install_compensation_total{result}`).
+    /// Set ONCE during
     /// single-threaded startup — BEFORE `migrate_from_sqlite()`, so the backfill counter is
     /// live on the one pass that matters (the #3261/#3294 wiring-order class; see the
     /// construction-site comment in server.cpp). A null registry (the default, e.g. in unit
