@@ -1796,9 +1796,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             if (execution_tracker && !execution_id.empty()) {
                 execution_tracker->mark_cancelled(execution_id, session->username);
             }
+            // #881: "no agents reached" now covers a THIRD condition this
+            // route cannot see — every target withheld by the containment
+            // gate, or the gate failing closed fleet-wide because containment
+            // state is unreadable. The shared dispatch closure returns only a
+            // sent count, so the discriminator is not available here (#3424);
+            // until it is, the message must not assert unreachability, which
+            // is what sends an operator to the agent/networking team during a
+            // Postgres incident.
             res.status = 503;
             res.set_content(
-                R"({"error":{"code":503,"message":"no agents reached"},"meta":{"api_version":"v1"}})",
+                R"({"error":{"code":503,"message":"no agents reached: every target was unreachable, quarantined, or withheld because containment state could not be read. Check GET /api/v1/quarantine and yuzu_server_quarantine_gate_total before treating this as an agent-connectivity fault."},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }

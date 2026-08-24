@@ -2,14 +2,26 @@
 # with-test-slot.sh — run a command while holding one of N machine-wide "heavy
 # test" slots, so at most N concurrent CI jobs execute their test phase at once.
 #
-# WHY (Windows/Wee Tam only): Wee Tam runs 4 CCD-pinned GitHub Actions runners on
+# WHY (Windows/Wee Tam today): Wee Tam runs 4 CCD-pinned GitHub Actions runners on
 # ONE physical box. CPU affinity partitions cores between runners, but NOT the
 # shared DRAM bandwidth, the single disk, or the Windows Defender minifilter — so
 # every heavy unit-test suite's wall time scales with how many Windows jobs run
 # their test phase concurrently (measured server ~[pg]: c0 289s -> c4 603s, i.e.
-# a guaranteed timeout at >=4). Linux (Big Tam) does NOT need this: fork()/VFS/
-# page-cache/no-AV keep per-op cost low, so it scales flat. This gate caps
-# concurrent *test phases* per box; the build stays 4-wide (unaffected).
+# a guaranteed timeout at >=4). This gate caps concurrent *test phases* per box;
+# the build stays 4-wide (unaffected).
+#
+# Linux (Big Tam) is NOT wired into this cross-job gate yet — but it is not
+# exempt from the underlying problem. Its Test step got its own WITHIN-job fix
+# instead (--num-processes 2 on the flake-retry.py invocation in ci.yml), because
+# its dominant contention was meson fanning every pg shard out at once inside a
+# single job (proved via back-computed shard start times landing within ~0.01s
+# of each other), not primarily cross-job like Wee Tam. A prior version of this
+# comment claimed Linux "scales flat" and needed neither gate — false: shard E
+# clipped its 600s meson timeout dead-on under this same fan-out before its
+# 2026-08-19 E->E+G split (#3322), and the post-split pair still ran at
+# 86-96% of that ceiling across several runs this week. A Linux cross-job gate via
+# this same script is a candidate fast-follow if within-job capping alone
+# proves insufficient — tracked in #3443.
 # Full diagnosis: docs/ci-architecture.md + the tests/meson.build server-shard
 # comment.
 #
