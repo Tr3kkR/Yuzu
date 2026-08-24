@@ -7467,10 +7467,12 @@ public:
         // write resolves — that residual case is still the bounded web-thread
         // join + `_Exit` escalation below.
         if (mcp_sessions_) {
+            // `n` is every registry entry drained, not just ones with an attached sink
+            // (close() no-ops on an entry with none) — say "removed", not "live", so this
+            // line can't overstate how many clients were actually connected.
             const std::size_t n = mcp_sessions_->shutdown();
             if (n > 0) {
-                spdlog::info(
-                    "MCP sessions: close-signalled {} live session stream(s) for shutdown", n);
+                spdlog::info("MCP sessions: removed {} session(s) for shutdown", n);
             }
         }
 

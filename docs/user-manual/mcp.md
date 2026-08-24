@@ -1227,11 +1227,14 @@ stream). Pass `--no-mcp-streamed-post` to rule this path out entirely.
 "Server is shutting down", no `Mcp-Session-Id` header.
 
 **Cause**: `ServerImpl::stop()` (#3042) close-signals the session registry
-before closing the listening socket — every live session is closed, and every
-`initialize` landing in that window is refused rather than raced against the
-socket close or left to mint a session that is about to be torn down anyway.
-This is a narrow, transient window (seconds, not the deploy's whole grace
-period).
+before closing the listening socket — every live session is closed, and an
+`initialize` that reaches the registry after its closing flag is set is
+refused rather than raced against the socket close or left to mint a session
+that is about to be torn down anyway. (A request whose `mint()` call happens
+to win the registry's lock a hair earlier still succeeds, but that session is
+then closed by the same drain a moment later — same outcome, no client-visible
+difference, just not literally "refused.") This is a narrow, transient window
+(seconds, not the deploy's whole grace period).
 
 **Fix**: Reconnect and re-`initialize` once the replacement instance is
 reachable — no `retry_after_ms` is given, since this process has no

@@ -12793,8 +12793,13 @@ TEST_CASE("MCP #3042: initialize during shutdown gets a 503, distinct from the c
     CHECK(res->get_header_value("Mcp-Session-Id").empty()); // never minted
     auto body = nlohmann::json::parse(res->body);
     CHECK(body["error"]["code"] == mcp::kMcpShuttingDown);
-    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.session.reject|failure") !=
-          ts.audit_log.end());
+    auto reject_it =
+        std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.session.reject|failure");
+    REQUIRE(reject_it != ts.audit_log.end());
+    // Pin the reason, not just the action/result — a refactor that changed or dropped
+    // it while keeping the 503 would otherwise sail through this test (adv-review #3042).
+    const auto reject_idx = std::distance(ts.audit_log.begin(), reject_it);
+    CHECK(ts.audit_details[reject_idx].find("reason=shutdown") != std::string::npos);
 }
 
 TEST_CASE("MCP #3042: a session live before shutdown 404s afterward, like any unknown session",
