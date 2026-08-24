@@ -12,6 +12,20 @@
  * the Windows leg is native MsiEnumProductsA, not a spawn site this PR
  * touches) -- a no-op TU elsewhere via the file's own guard, matching the
  * Darwin-only shape of test_wave3_pr31_macos_actions.cpp.
+ *
+ * TEST-EFFICIENCY JUSTIFICATION (CLAUDE.md unit-suite discipline requires one
+ * whenever a test's runtime depends on process creation):
+ *   - What it costs, MEASURED on this host (macOS 26, arm64, 2026-08-24):
+ *     2.25 s wall for both cases together. `list` does issue one
+ *     `pkgutil --pkg-info` per receipt under the kMaxPackages (500) cap, but
+ *     pkgutil is a local receipt-database read and the real cost is small.
+ *     Re-measure rather than assume if that cap is ever raised.
+ *   - Why a pure-function test cannot replace it: the point of the change is
+ *     that the argv reaches the real pkgutil after the `/bin/sh -c` hop and
+ *     shell_quote() were deleted. Feeding a fixture string to a parser
+ *     exercises neither the argv construction nor the exec, and would stay
+ *     green against the pre-change shell implementation.
+ *   - Bound: two cases, macOS-only, no other spawning tests added here.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -89,8 +103,7 @@ TEST_CASE("msi_packages plugin: list executes real pkgutil --pkgs/--pkg-info arg
           "[msi_packages][posix_actions]") {
     auto plugin = load_msi_packages_plugin();
     if (!plugin) {
-        WARN("msi_packages plugin library not found -- skipping LocalDispatcher round-trip test");
-        return;
+        SKIP("msi_packages plugin library not found -- cannot drive LocalDispatcher");
     }
 
     yuzu::agent::LocalDispatcher dispatcher;
@@ -110,8 +123,7 @@ TEST_CASE("msi_packages plugin: product_codes executes real pkgutil --pkgs argv"
           "[msi_packages][posix_actions]") {
     auto plugin = load_msi_packages_plugin();
     if (!plugin) {
-        WARN("msi_packages plugin library not found -- skipping");
-        return;
+        SKIP("msi_packages plugin library not found -- cannot drive LocalDispatcher");
     }
 
     yuzu::agent::LocalDispatcher dispatcher;

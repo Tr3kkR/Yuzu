@@ -27,13 +27,20 @@ struct InvRecord {
     std::string name;
     std::string version;      // upstream version, release/revision stripped
     std::string publisher;    // rpm PACKAGER / deb Maintainer / Windows Publisher
-    std::string install_date;
-    std::string kind;         // "package" | "app"
-    std::string ecosystem;    // rpm|deb|apk|pacman|windows|macos|homebrew
+    std::string install_date; // human-readable per ecosystem, EXCEPT macos_pkgutil,
+                              // whose receipts store only a UNIX epoch-seconds
+                              // integer -- carried through verbatim rather than
+                              // reformatted into a shape the receipt never had
+    std::string kind;         // "package" | "app" | "pkg" (macOS pkgutil receipt)
+    std::string ecosystem;    // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|homebrew
     std::string epoch;
     std::string release;      // rpm RELEASE / deb revision / apk pkgrel
     std::string arch;
-    std::string signature_status; // "signed"|"unsigned" (rpm stored tags only)
+    std::string signature_status; // "signed"|"unsigned"; empty where unknown.
+                                  // Sourced from rpm's STORED signature tags, and
+                                  // (macOS `app` rows) from Security.framework's
+                                  // SecStaticCode seal -- integrity-at-creation,
+                                  // never a Gatekeeper/notarization trust verdict.
     std::string distro_id;        // /etc/os-release ID (Linux rows only)
     std::string distro_version;   // /etc/os-release VERSION_ID (Linux rows only)
 };

@@ -13,6 +13,25 @@
  * per-app enrichment loop) -- assertions are on rc and output SHAPE
  * (every emitted line matches the `app|` wire prefix), never on specific
  * app names/counts, which are entirely host-dependent.
+ *
+ * TEST-EFFICIENCY JUSTIFICATION (CLAUDE.md unit-suite discipline requires one
+ * whenever a test's runtime depends on process creation):
+ *   - What it costs, measured on this host (macOS 26, arm64, 2026-08-24):
+ *     `list` 4.5 s wall, `list_inventory` a few seconds more. Both are
+ *     dominated by one `system_profiler` call, not by fan-out; the pkgutil
+ *     receipt leg is a bounded per-id loop under kMaxPkgutilPackages.
+ *   - Why a pure-function test cannot replace it: the pure parsers in
+ *     installed_apps_parsers.hpp are already exhaustively covered by
+ *     test_installed_apps_parsers.cpp. What is NOT reachable that way is the
+ *     thing this PR actually changes -- that the migrated argv reaches a real
+ *     binary, and that the collector wires enrichment and receipts into
+ *     emitted rows. A fixture string re-asserts the parser and proves nothing
+ *     about the migration; external functional review specifically found that
+ *     the parser-only tests survive reverting every changed call site.
+ *   - Bound: these two cases are the ONLY process-spawning tests added here,
+ *     and both are macOS/POSIX-gated. Everything else added by this PR is a
+ *     pure-function case. If the cost ever becomes a problem, the right move
+ *     is an integration tag, not weaker assertions.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -104,8 +123,12 @@ TEST_CASE("installed_apps plugin: list executes real dpkg-query/rpm/pacman/syste
           "[installed_apps][posix_actions]") {
     auto plugin = load_installed_apps_plugin();
     if (!plugin) {
-        WARN("installed_apps plugin library not found -- skipping LocalDispatcher round-trip test");
-        return;
+        // SKIP, not WARN-and-return: a bare `return` retires the case with ZERO
+        // assertions and Catch2 reports it as PASSED, so a plugin that stopped
+        // loading would read as a green test. SKIP reports it as skipped
+        // instead. (Named false-green policy floor; tests/meson.build's
+        // link_depends means the artifact is built whenever this runs.)
+        SKIP("installed_apps plugin library not found -- cannot drive LocalDispatcher");
     }
 
     yuzu::agent::LocalDispatcher dispatcher;
@@ -124,5 +147,118 @@ TEST_CASE("installed_apps plugin: list executes real dpkg-query/rpm/pacman/syste
     // -- never a stray error string or fragment from a reverted parser.
     CHECK(count_non_matching_lines(result.captured, "app|") == 0);
 }
+
+#if defined(__APPLE__)
+
+// Gate-1 remediation (external functional review): NOTHING dispatched
+// `list_inventory`, so the whole point of this PR on macOS -- the #2273
+// enrichment fields and the new pkgutil receipt rows -- could regress with
+// every other assertion still green. The pure parsers prove they can PARSE
+// their inputs; only a dispatch proves the collector actually WIRES them into
+// emitted rows.
+//
+// Assertions are on the row CONTRACT (field count, allowed enum values,
+// cross-field consistency), never on host-specific names or counts -- except
+// the two macOS invariants that hold on any Mac: /System/Applications is
+// populated with Apple-signed apps, and pkgutil always holds receipts.
+TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows and pkgutil receipts",
+          "[installed_apps][posix_actions][macos_inventory]") {
+    auto plugin = load_installed_apps_plugin();
+    if (!plugin)
+        SKIP("installed_apps plugin library not found -- cannot drive LocalDispatcher");
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto result = dispatcher.run(plugin->descriptor, "list_inventory");
+
+    CHECK(result.rc == 0);
+    REQUIRE_FALSE(result.captured.empty());
+
+    std::size_t app_rows = 0, pkg_rows = 0;
+    std::size_t signed_apps = 0, unsigned_apps = 0, apps_with_publisher = 0;
+    std::size_t bad_prefix = 0, bad_field_count = 0, bad_sig_value = 0;
+    std::size_t pkg_bad_ecosystem = 0, pkg_non_numeric_date = 0;
+    std::size_t publisher_without_signature = 0;
+
+    std::istringstream iss(result.captured);
+    std::string line;
+    while (std::getline(iss, line)) {
+        if (line.empty())
+            continue;
+        if (line.rfind("inv|", 0) != 0) {
+            ++bad_prefix;
+            continue;
+        }
+        // ADR-0016 blob v2: "inv" + exactly 12 fields. Splitting manually
+        // (not on a parser helper) keeps this a genuine wire-shape check.
+        std::vector<std::string> f;
+        std::size_t start = 0;
+        while (true) {
+            const auto bar = line.find('|', start);
+            if (bar == std::string::npos) {
+                f.push_back(line.substr(start));
+                break;
+            }
+            f.push_back(line.substr(start, bar - start));
+            start = bar + 1;
+        }
+        if (f.size() != 13) { // "inv" + 12 fields
+            ++bad_field_count;
+            continue;
+        }
+        const std::string& kind = f[5];
+        const std::string& ecosystem = f[6];
+        const std::string& publisher = f[3];
+        const std::string& install_date = f[4];
+        const std::string& signature = f[10];
+
+        if (signature != "" && signature != "signed" && signature != "unsigned")
+            ++bad_sig_value;
+
+        if (kind == "app") {
+            ++app_rows;
+            if (signature == "signed")
+                ++signed_apps;
+            else if (signature == "unsigned")
+                ++unsigned_apps;
+            if (!publisher.empty()) {
+                ++apps_with_publisher;
+                // A publisher is read off the signing leaf certificate, so it
+                // can never be present on a row we called unsigned.
+                if (signature != "signed")
+                    ++publisher_without_signature;
+            }
+        } else if (kind == "pkg") {
+            ++pkg_rows;
+            if (ecosystem != "macos_pkgutil")
+                ++pkg_bad_ecosystem;
+            // pkgutil receipts carry raw epoch seconds, never a formatted date.
+            if (!install_date.empty() &&
+                install_date.find_first_not_of("0123456789") != std::string::npos)
+                ++pkg_non_numeric_date;
+        }
+    }
+
+    CHECK(bad_prefix == 0);
+    CHECK(bad_field_count == 0);
+    CHECK(bad_sig_value == 0);
+    CHECK(publisher_without_signature == 0);
+
+    // The #2273 enrichment actually ran and populated the previously
+    // always-empty fields.
+    CHECK(app_rows > 0);
+    CHECK(signed_apps > 0);          // /System/Applications is Apple-signed
+    CHECK(apps_with_publisher > 0);  // leaf-certificate CN extraction works
+
+    // The new pkgutil receipt leg actually emitted rows.
+    CHECK(pkg_rows > 0);
+    CHECK(pkg_bad_ecosystem == 0);
+    CHECK(pkg_non_numeric_date == 0);
+
+    // Caps hold (kMaxEnrichApps / kMaxPkgutilPackages are both 500).
+    CHECK(pkg_rows <= 500);
+    CHECK(signed_apps + unsigned_apps <= 500);
+}
+
+#endif // __APPLE__
 
 #endif // !_WIN32

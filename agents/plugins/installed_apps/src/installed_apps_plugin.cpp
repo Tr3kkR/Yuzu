@@ -91,15 +91,15 @@ namespace parsers = yuzu::installed_apps::parsers;
 // byte-for-byte what the old shell command line built -- see each call
 // site's own comment for the exact escaping preserved.
 #if defined(__linux__) || defined(__APPLE__)
-struct ToolOutcome {
-    std::string output;
-    yuzu::agent::SubprocessResult res;
-};
-
-ToolOutcome run_tool(std::vector<std::string> argv,
+// Returns the captured stdout only. The full SubprocessResult is deliberately
+// NOT surfaced: every call site here consumes stdout and nothing else, and the
+// one thing a caller might branch on -- a degraded run -- is already reported
+// centrally by the warn below, so handing back the struct would invite a
+// second, divergent degraded-run policy per call site.
+std::string run_tool(std::vector<std::string> argv,
                      std::chrono::seconds deadline = std::chrono::seconds{20}) {
     if (argv.empty() || argv.front().empty())
-        return ToolOutcome{std::string{}, yuzu::agent::SubprocessResult{}};
+        return {};
     auto res = yuzu::agent::run_bounded_subprocess(
         argv, yuzu::agent::SubprocessOptions{.deadline = deadline});
     // A cut-short enumeration returns empty/partial output that parses as "0
@@ -111,8 +111,7 @@ ToolOutcome run_tool(std::vector<std::string> argv,
             "installed_apps: degraded run (timed_out={}, tool_ran={}, truncated={}): {}",
             res.timed_out, res.tool_ran, res.output_truncated, argv.front());
     }
-    std::string output = res.output;
-    return ToolOutcome{std::move(output), std::move(res)};
+    return std::move(res.output);
 }
 #endif
 
@@ -311,7 +310,7 @@ std::vector<AppInfo> get_installed_apps_linux() {
         // real newline byte) -- contrast get_inventory_linux's tab-separated
         // sibling call, which embeds real tab/newline bytes instead.
         auto out =
-            run_tool({path, "-W", "-f=${Package}|${Version}|${Maintainer}|${Status}\\n"}).output;
+            run_tool({path, "-W", "-f=${Package}|${Version}|${Maintainer}|${Status}\\n"});
         for (auto& rec : parsers::parse_dpkg_list(out)) {
             // parse_dpkg_list already filters to "install ok installed" rows.
             apps.push_back({std::move(rec.name), std::move(rec.version),
@@ -322,8 +321,7 @@ std::vector<AppInfo> get_installed_apps_linux() {
         // installed_apps/get_installed_apps_linux#2
         // RHEL/Fedora/SUSE.
         auto out = run_tool({path, "-qa", "--queryformat",
-                             "%{NAME}|%{VERSION}-%{RELEASE}|%{VENDOR}|%{INSTALLTIME:date}\\n"})
-                       .output;
+                             "%{NAME}|%{VERSION}-%{RELEASE}|%{VENDOR}|%{INSTALLTIME:date}\\n"});
         for (auto& rec : parsers::parse_rpm_list(out)) {
             apps.push_back({std::move(rec.name), std::move(rec.version),
                             std::move(rec.publisher), std::move(rec.install_date)});
@@ -332,7 +330,7 @@ std::vector<AppInfo> get_installed_apps_linux() {
               !path.empty()) {
         // installed_apps/get_installed_apps_linux#3
         // Arch Linux. Format: "name version".
-        auto out = run_tool({path, "-Q"}).output;
+        auto out = run_tool({path, "-Q"});
         for (auto& rec : parsers::parse_pacman_list(out))
             apps.push_back({std::move(rec.name), std::move(rec.version), "-", "-"});
     }
@@ -352,12 +350,15 @@ std::vector<AppInfo> get_installed_apps_macos() {
     // installed_apps/get_installed_apps_macos#1 (docs/agent-spawn-sink-manifest.md)
     // GUI applications from system_profiler. The `| grep` pipe stage is gone
     // (rung 2: clean argv, no shell) -- parsers::parse_system_profiler_apps
-    // replicates the old grep's exact three-way line selection in-process
-    // (see that function's own header comment), so this action's emitted
-    // rows are byte-identical to before.
+    // replicates the old grep's three-way line selection in-process (see that
+    // function's own header comment), so this action's emitted rows are
+    // byte-identical to before for every app the old grep admitted -- plus
+    // apps whose names begin with punctuation or a non-ASCII byte, which the
+    // old `\w` grep silently dropped and which are now included (additive
+    // only; the one documented deviation from byte-identity).
     if (auto path = yuzu::agent::probe_tool_path({"/usr/sbin/system_profiler"});
         !path.empty()) {
-        auto out = run_tool({path, "SPApplicationsDataType", "-detailLevel", "mini"}).output;
+        auto out = run_tool({path, "SPApplicationsDataType", "-detailLevel", "mini"});
         for (auto& rec : parsers::parse_system_profiler_apps(out)) {
             apps.push_back(
                 {std::move(rec.name), std::move(rec.version), "-", std::move(rec.install_date)});
@@ -399,7 +400,7 @@ std::vector<inv::InvRecord> get_inventory_linux() {
     std::vector<inv::InvRecord> recs;
 
     const auto collect = [&recs](std::vector<std::string> argv, auto parse_line) {
-        auto out = run_tool(std::move(argv)).output;
+        auto out = run_tool(std::move(argv));
         std::istringstream ss(out);
         std::string line;
         while (std::getline(ss, line)) {
@@ -491,7 +492,7 @@ std::vector<inv::InvRecord> get_inventory_macos() {
     // legacy list/query wire format never carried.
     if (auto path = yuzu::agent::probe_tool_path({"/usr/sbin/system_profiler"});
         !path.empty()) {
-        auto out = run_tool({path, "SPApplicationsDataType", "-detailLevel", "mini"}).output;
+        auto out = run_tool({path, "SPApplicationsDataType", "-detailLevel", "mini"});
         auto apps = parsers::parse_system_profiler_apps(out);
 
         std::size_t enriched = 0;
@@ -525,7 +526,7 @@ std::vector<inv::InvRecord> get_inventory_macos() {
     // installer packages (Command Line Tools, XProtect payloads, ...) that
     // never appear in system_profiler's GUI-app enumeration above.
     if (auto path = yuzu::agent::probe_tool_path({"/usr/sbin/pkgutil"}); !path.empty()) {
-        auto ids = parsers::parse_pkgutil_pkgs(run_tool({path, "--pkgs"}).output);
+        auto ids = parsers::parse_pkgutil_pkgs(run_tool({path, "--pkgs"}));
         if (ids.size() > kMaxPkgutilPackages)
             ids.resize(kMaxPkgutilPackages);
 
@@ -534,7 +535,7 @@ std::vector<inv::InvRecord> get_inventory_macos() {
             // same bounded per-id loop shape as msi_packages_plugin.cpp's
             // established `list` action.
             auto info =
-                parsers::parse_pkgutil_pkg_info(run_tool({path, "--pkg-info", id}).output);
+                parsers::parse_pkgutil_pkg_info(run_tool({path, "--pkg-info", id}));
             inv::InvRecord r;
             r.name = id; // honest reverse-domain identifier -- never a
                          // derived "friendly" name (msi_packages precedent)
@@ -851,7 +852,7 @@ private:
         if (auto brew_path =
                 yuzu::agent::probe_tool_path({"/opt/homebrew/bin/brew", "/usr/local/bin/brew"});
             !brew_path.empty()) {
-            auto brew_out = run_tool({brew_path, "list", "--versions"}).output;
+            auto brew_out = run_tool({brew_path, "list", "--versions"});
             for (auto& rec : parsers::parse_brew_list(brew_out)) {
                 ctx.write_output(sanitize_utf8(std::format(
                     "user_app|brew|{}|{}|-|-", rec.name, rec.version.empty() ? "-" : rec.version)));

@@ -19,19 +19,19 @@ cadences.
   empty string, **never synthesised** (no `-` placeholders, no guessed `0`
   epoch). Per-ecosystem availability:
 
-  | Field | rpm | deb | apk | pacman | Windows | macOS |
-  |---|---|---|---|---|---|---|
-  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` |
-  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` |
-  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — |
-  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — |
-  | `arch` | ✓ | ✓ | — | — | — | — |
-  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | — |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified |
-  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | — |
-  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — |
+  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil |
+  |---|---|---|---|---|---|---|---|
+  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` |
+  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` |
+  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) |
+  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — |
+  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — |
+  | `arch` | ✓ | ✓ | — | — | — | — | — |
+  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds |
+  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned` | — |
+  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — |
 
   Notes: rpm `signature_status` reflects the **stored** signature header tags in
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
@@ -39,6 +39,25 @@ cadences.
   `ID`/`VERSION_ID`), stamped on every Linux row. deb rows include **held**
   packages (they are installed). `homebrew` is a reserved `ecosystem` value —
   not collected yet (brew is per-user; the sync is machine-scope).
+
+  **macOS `app` rows** carry `publisher` and `signature_status` read natively
+  through CoreFoundation + Security.framework (`CFBundleCreate`,
+  `SecStaticCodeCreateWithPath`, `SecCodeCopySigningInformation`) — no
+  `codesign` subprocess, and no deep `SecStaticCodeCheckValidity` verify. Like
+  rpm's, the verdict is **integrity-at-creation, not trust**: a bundle carrying
+  its own valid seal reads `signed` even when ad-hoc or self-signed, so this is
+  never a Gatekeeper or notarization result. `publisher` is the signing leaf
+  certificate's Common Name and is empty for ad-hoc-signed and unsigned apps.
+  Enrichment covers the first 500 located apps per collection.
+
+  **macOS `pkg` rows** are `pkgutil` receipts — system installer packages
+  (Command Line Tools, XProtect payloads, vendor `.pkg` installs) that never
+  appear in `system_profiler`'s GUI-app enumeration. `name` is the receipt's
+  reverse-domain identifier (`com.apple.pkg.CLTools_Executables`), not a
+  display name. `install_date` is the receipt's raw **UNIX epoch seconds**,
+  the only form `pkgutil --pkg-info` reports — deliberately carried through
+  verbatim under the honest-empty contract rather than reformatted into a
+  precision the receipt never recorded. Capped at 500 receipts per collection.
 - **Changes for rpm fleets vs the v1 (4-field) contract:** `publisher` is now
   the rpm **PACKAGER** tag (was VENDOR), and `version` is the upstream version
   only — the release moved to its own `release` column (was fused

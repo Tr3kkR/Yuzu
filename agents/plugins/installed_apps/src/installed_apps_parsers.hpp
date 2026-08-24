@@ -50,6 +50,24 @@ inline void strip_trailing_cr(std::string& line) {
         line.pop_back();
 }
 
+// Value half of a `Key: value` system_profiler line, given the already-trimmed
+// line. Returns empty for a valueless key ("Version:", "Location:") instead of
+// running off the end: `string_view::substr` THROWS std::out_of_range once the
+// offset passes size(), and a bare key makes `colon + 2` exactly size() + 1.
+// system_profiler omits the key entirely rather than emitting a valueless one
+// on the hosts checked, so this is a latent rather than live crash -- but it is
+// reachable from parser input, and this header's sibling parsers promise
+// "malformed/empty input yields an all-empty result, never a crash".
+[[nodiscard]] inline std::string_view value_after_colon(std::string_view trimmed) {
+    const auto colon = trimmed.find(':');
+    if (colon == std::string_view::npos)
+        return {};
+    auto pos = colon + 1;
+    while (pos < trimmed.size() && (trimmed[pos] == ' ' || trimmed[pos] == '\t'))
+        ++pos;
+    return trimmed.substr(pos);
+}
+
 } // namespace detail
 
 // ── Linux: dpkg-query ───────────────────────────────────────────────────────
@@ -128,11 +146,22 @@ inline void strip_trailing_cr(std::string& line) {
 // piped this through
 // `grep -E '^ {4}\w|Version:|Last Modified:'` before any C++ ever saw it;
 // with that shell stage gone (rung 2: clean argv, no pipe), this function
-// replicates the SAME three-way selection in-process so `list`/`query`'s
-// emitted rows are byte-identical to before:
-//   - a line with EXACTLY 4 leading spaces then a non-space character is an
-//     app-name header (e.g. "    Keynote:") -- ANY other indent (0, the
-//     top-level "Applications:" line; 6, an attribute line) is not a header;
+// replicates that three-way selection in-process. `list`/`query`'s emitted
+// rows are byte-identical to before FOR EVERY APP THE OLD GREP ADMITTED --
+// with one deliberate, documented WIDENING called out below, which can only
+// ADD rows, never change or drop an existing one:
+//   - a line with EXACTLY 4 leading spaces then a non-space, non-tab
+//     character is an app-name header (e.g. "    Keynote:") -- ANY other
+//     indent (0, the top-level "Applications:" line; 6, an attribute line)
+//     is not a header.
+//     WIDENING (Wave 4 PR4.3a): the old grep's `\w` is [A-Za-z0-9_] in the C
+//     locale, so it silently DROPPED any app whose name begins with
+//     punctuation or a non-ASCII byte -- ".hidden", "Ubersicht" spelled with
+//     a leading U-umlaut, a CJK-named app. Those apps were missing from
+//     `list`/`query` entirely. Matching on "not a space or tab" admits them.
+//     This is a fix, not an accident: an inventory collector silently
+//     omitting non-ASCII-named apps is a defect. It is the ONE respect in
+//     which output is not byte-identical, and it is additive only;
 //   - a line containing the substring "Version:" carries the version;
 //   - a line containing the substring "Last Modified:" carries the install
 //     date;
@@ -183,14 +212,11 @@ inline void strip_trailing_cr(std::string& line) {
         const std::string_view trimmed = std::string_view(line).substr(start);
 
         if (trimmed.starts_with("Version:")) {
-            const auto colon = trimmed.find(':');
-            current_version = std::string(trimmed.substr(colon + 2));
+            current_version = std::string(detail::value_after_colon(trimmed));
         } else if (trimmed.starts_with("Last Modified:")) {
-            const auto colon = trimmed.find(':');
-            current_date = std::string(trimmed.substr(colon + 2));
+            current_date = std::string(detail::value_after_colon(trimmed));
         } else if (trimmed.starts_with("Location:")) {
-            const auto colon = trimmed.find(':');
-            current_location = std::string(trimmed.substr(colon + 2));
+            current_location = std::string(detail::value_after_colon(trimmed));
         } else if (!trimmed.empty() && trimmed.back() == ':') {
             flush();
             current_name = std::string(trimmed.substr(0, trimmed.size() - 1));

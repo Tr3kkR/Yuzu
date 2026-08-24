@@ -152,6 +152,66 @@ TEST_CASE("system_profiler apps: an app header with no body fields is still emit
     CHECK(apps[1].version == "1.0");
 }
 
+TEST_CASE("system_profiler apps: a valueless key does not throw and yields an empty field",
+          "[installed_apps]") {
+    // Gate-1 regression. The value half used to be `trimmed.substr(colon + 2)`,
+    // and string_view::substr THROWS std::out_of_range once the offset passes
+    // size() -- for a bare "Version:" (size 8, colon at 7) that offset is 9.
+    // No host observed emits a valueless key, so this was latent rather than
+    // live, but it is reachable from parser input and the sibling parsers in
+    // this header promise "never a crash" on malformed input.
+    constexpr std::string_view out = "    OddApp:\n"
+                                     "      Version:\n"
+                                     "      Last Modified:\n"
+                                     "      Location:\n";
+    std::vector<AppRecord> apps;
+    REQUIRE_NOTHROW(apps = parse_system_profiler_apps(out));
+    REQUIRE(apps.size() == 1);
+    CHECK(apps[0].name == "OddApp");
+    CHECK(apps[0].version.empty());
+    CHECK(apps[0].install_date.empty());
+    CHECK(apps[0].location.empty());
+}
+
+TEST_CASE("system_profiler apps: non-ASCII and punctuation-leading names are emitted",
+          "[installed_apps]") {
+    // Documents the ONE deliberate deviation from byte-identity with the old
+    // shell pipeline. The retired `grep -E '^ {4}\w'` matched [A-Za-z0-9_] in
+    // the C locale, so it silently DROPPED these apps from list/query
+    // entirely; the in-process header test admits them. Additive only -- it
+    // cannot change or remove a row the old grep already produced.
+    constexpr std::string_view out = "    \xC3\x9C" "bersicht:\n"
+                                     "      Version: 2.0\n"
+                                     "    .hidden-helper:\n"
+                                     "      Version: 3.0\n"
+                                     "    Normal:\n"
+                                     "      Version: 4.0\n";
+    auto apps = parse_system_profiler_apps(out);
+    REQUIRE(apps.size() == 3);
+    CHECK(apps[0].name == "\xC3\x9C" "bersicht");
+    CHECK(apps[0].version == "2.0");
+    CHECK(apps[1].name == ".hidden-helper");
+    CHECK(apps[2].name == "Normal");
+}
+
+TEST_CASE("system_profiler apps: deeper-indented lines are never app headers",
+          "[installed_apps]") {
+    // The widening above loosens WHICH character may follow the 4 spaces, not
+    // the indent rule itself: a 6-space attribute line must still never be
+    // mistaken for an app header, or every app would gain phantom siblings.
+    constexpr std::string_view out = "Applications:\n"
+                                     "\n"
+                                     "    RealApp:\n"
+                                     "      Obtained from: Apple\n"
+                                     "      Kind: Universal\n"
+                                     "      Signed by: Software Signing\n"
+                                     "      Version: 1.2\n";
+    auto apps = parse_system_profiler_apps(out);
+    REQUIRE(apps.size() == 1);
+    CHECK(apps[0].name == "RealApp");
+    CHECK(apps[0].version == "1.2");
+}
+
 // ── macOS: brew list --versions ─────────────────────────────────────────
 
 TEST_CASE("brew list: name/version split, missing version tolerated — documented-format reconstruction",
