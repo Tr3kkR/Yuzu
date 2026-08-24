@@ -64,7 +64,7 @@
 
 #include "icmp_probe.hpp" // yuzu::shared::IcmpSession — shared unprivileged ping sweep
 
-#include "bounded_wait.hpp"        // yuzu::discovery::bounded_call — uncancellable-call timeout
+#include "bounded_wait.hpp"        // yuzu::shared::bounded_call — uncancellable-call timeout
 #include "discovery_scan_plan.hpp" // pure sweep bounds + honest-degrade decisions
 
 // Portable (no platform guard of its own): parse_proc_net_arp for the Linux
@@ -352,7 +352,7 @@ constexpr std::chrono::milliseconds kHostnameLookupTimeout{5000};
 // didn't reach, because the degrade is per-item rather than per-scan. The
 // caller aggregates degrades across the whole hostname-resolution pass.
 std::optional<std::string> resolve_hostname(const std::string& ip) {
-    return yuzu::discovery::bounded_call(
+    return yuzu::shared::bounded_call(
         kHostnameLookupTimeout, [ip] { return detail::resolve_hostname_blocking(ip); });
 }
 
