@@ -1,16 +1,20 @@
 // test_tar_mapdrive.cpp -- Mapped-drive capture source (capability-map §3.8).
 //
 // The live/history enumeration is platform-gated (WNet / NetApi / registry /
-// subprocess), so coverage rides on:
+// subprocess / getfsstat), so coverage rides on:
 //   * the PURE text parsers (parse_proc_mounts / parse_fstab / parse_smbstatus /
 //     parse_win_security_logons / parse_samba_logs), exercised from captured
-//     sample output — these compile and run on every OS; and
+//     sample output — these compile and run on every OS;
+//   * the PURE macOS mount classifier (classify_macos_mounts /
+//     apply_entry_cap, tar_mapdrive_macos_parsers.hpp), exercised from
+//     getfsstat(2) records — also compiles and runs on every OS; and
 //   * an insert round-trip through TarDatabase for both origin='historical'
 //     (incl. ts=0) and origin='live' rows.
 // The diff (compute_mapdrive_events) is covered in test_tar_diff.cpp.
 
 #include "tar_collectors.hpp"
 #include "tar_db.hpp"
+#include "tar_mapdrive_macos_parsers.hpp"
 #include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -314,4 +318,220 @@ TEST_CASE("mapdrive dedup_history: collapses by identity, keeps earliest non-zer
             srv = &r;
     REQUIRE(srv != nullptr);
     CHECK(srv->ts == 100); // earliest non-zero sighting wins over 0 and 300
+}
+
+// ── classify_macos_mounts (macOS outbound live, capability-map §3.8) ──────────
+//
+// Fixture provenance: the local-fstype rows below are a REAL getfsstat(2)
+// capture, taken on an arm64 macOS 15 host by compiling and running a
+// standalone `getfsstat(nullptr, 0, MNT_NOWAIT)` size-then-fill probe
+// (matching tar_mapdrive_collector.cpp's read_getfsstat) and printing
+// f_fstypename/f_mntfromname/f_mntonname for every returned struct statfs —
+// exactly the ten local volumes/pseudo-filesystems (apfs/devfs/autofs) this
+// particular out-of-the-box macOS install mounts (a `csrutil`-sealed system
+// volume splits into more apfs rows than a stock install — /, VM, Preboot,
+// xarts, iSCPreboot, Hardware, Update, Data — plus devfs and the auto_home
+// autofs map), none of them network. No smbfs/nfs/afpfs/webdav mount was
+// reachable on that host to capture live (no network share was mounted at
+// capture time), so those rows instead cite the device-string syntax
+// mount_smbfs(8)/mount_nfs(8)/mount_afp(8) document (`//host/share`,
+// `host:/export`, `afp://host/share`) — a documented format, not a live
+// network capture; recorded here as exactly that, not represented as a
+// live capture.
+
+TEST_CASE("mapdrive classify_macos_mounts: real local-fstype capture is entirely filtered",
+          "[tar][mapdrive][macos][parse]") {
+    // Real capture (see provenance note above) — apfs/devfs/autofs, no network fstype.
+    std::vector<MacMountRec> mounts = {
+        {"apfs", "/dev/disk3s1s1", "/"},
+        {"devfs", "devfs", "/dev"},
+        {"apfs", "/dev/disk3s6", "/System/Volumes/VM"},
+        {"apfs", "/dev/disk3s2", "/System/Volumes/Preboot"},
+        {"apfs", "/dev/disk3s4", "/System/Volumes/Update"},
+        {"apfs", "/dev/disk1s2", "/System/Volumes/xarts"},
+        {"apfs", "/dev/disk1s1", "/System/Volumes/iSCPreboot"},
+        {"apfs", "/dev/disk1s3", "/System/Volumes/Hardware"},
+        {"apfs", "/dev/disk3s5", "/System/Volumes/Data"},
+        {"autofs", "map auto_home", "/System/Volumes/Data/home"},
+    };
+    auto resolve_host = [](const std::string&) -> std::string {
+        FAIL("resolve_host must not be called for a filtered-out (non-network) row");
+        return {};
+    };
+    auto out = classify_macos_mounts(mounts, resolve_host);
+    CHECK(out.empty());
+}
+
+TEST_CASE("mapdrive classify_macos_mounts: network fstypes populate the full MapDriveEntry "
+          "contract",
+          "[tar][mapdrive][macos][parse]") {
+    // Transcribed device-string shapes (see provenance note above) — no live
+    // smbfs/nfs/afpfs/webdav mount was available to capture on the test host.
+    // Row 0 embeds a username ahead of the host (`//alice@fileserver/...`),
+    // the credentialed-UNC form mount_smbfs(8) documents, to exercise the
+    // user-info-stripping path (matches remote_host_of's fix for B2-001:
+    // a credentialed UNC or URI authority must yield the bare host, not the
+    // embedded username).
+    std::vector<MacMountRec> mounts = {
+        {"smbfs", "//alice@fileserver/public", "/Volumes/public"},
+        {"cifs", "//nas.example.com/backup", "/Volumes/backup"},
+        {"nfs", "nfshost:/export/home", "/Volumes/home"},
+        {"afpfs", "afp://afpserver/shared", "/Volumes/shared"},
+        {"webdav", "https://dav.example.com/files", "/Volumes/files"},
+        {"apfs", "/dev/disk3s5", "/System/Volumes/Data"}, // still dropped even mixed in
+    };
+    // Fixture-equivalent host resolver (the collector injects the real
+    // remote_host_of instead — see the header comment on classify_macos_mounts
+    // for why this header cannot call it directly). Mirrors remote_host_of's
+    // URI-authority + UNC + user@host: forms, including user-info stripping,
+    // so this double stays a faithful stand-in for the production helper.
+    auto resolve_host = [](const std::string& from) -> std::string {
+        auto strip_userinfo = [](std::string authority) {
+            if (auto at = authority.rfind('@'); at != std::string::npos)
+                authority.erase(0, at + 1);
+            return authority;
+        };
+        if (auto scheme = from.find("://"); scheme != std::string::npos) {
+            auto rest = from.substr(scheme + 3);
+            return strip_userinfo(rest.substr(0, rest.find('/')));
+        }
+        if (from.rfind("//", 0) == 0) {
+            auto rest = from.substr(2);
+            return strip_userinfo(rest.substr(0, rest.find('/')));
+        }
+        if (auto colon = from.find(':'); colon != std::string::npos)
+            return from.substr(0, colon);
+        return {};
+    };
+    auto out = classify_macos_mounts(mounts, resolve_host);
+    REQUIRE(out.size() == 5); // the apfs row is dropped
+
+    CHECK(out[0].direction == "outbound");
+    CHECK(out[0].local_mount == "/Volumes/public");
+    CHECK(out[0].remote_path == "//alice@fileserver/public");
+    CHECK(out[0].remote_host == "fileserver"); // username stripped
+    CHECK(out[0].username == ""); // unavailable via getfsstat, like the Linux leg
+    CHECK(out[0].provider == "SMB");
+
+    CHECK(out[1].direction == "outbound");
+    CHECK(out[1].local_mount == "/Volumes/backup");
+    CHECK(out[1].remote_path == "//nas.example.com/backup");
+    CHECK(out[1].remote_host == "nas.example.com");
+    CHECK(out[1].username == "");
+    CHECK(out[1].provider == "SMB"); // cifs maps to SMB same as smbfs
+
+    CHECK(out[2].direction == "outbound");
+    CHECK(out[2].local_mount == "/Volumes/home");
+    CHECK(out[2].remote_path == "nfshost:/export/home");
+    CHECK(out[2].remote_host == "nfshost");
+    CHECK(out[2].username == "");
+    CHECK(out[2].provider == "NFS");
+
+    CHECK(out[3].direction == "outbound");
+    CHECK(out[3].local_mount == "/Volumes/shared");
+    CHECK(out[3].remote_path == "afp://afpserver/shared");
+    CHECK(out[3].remote_host == "afpserver");
+    CHECK(out[3].username == "");
+    CHECK(out[3].provider == "AFP");
+
+    CHECK(out[4].direction == "outbound");
+    CHECK(out[4].local_mount == "/Volumes/files");
+    CHECK(out[4].remote_path == "https://dav.example.com/files");
+    CHECK(out[4].remote_host == "dav.example.com");
+    CHECK(out[4].username == "");
+    CHECK(out[4].provider == "WebDAV");
+}
+
+// remote_host_of itself (tar_mapdrive_collector.cpp) is anonymous-namespace
+// scoped and unreachable directly from this TU (see the header comment on
+// classify_macos_mounts) — but it is exercised for real, not via a double,
+// through parse_proc_mounts/parse_fstab. This case adds the two forms the
+// B2-001 fix taught remote_host_of to strip correctly: a scheme:// authority
+// (`davfs` device strings are commonly a WebDAV https:// URL, per davfs2's
+// fstab documentation) and a credentialed UNC (`mount.cifs` accepts a
+// username embedded ahead of the host in the device field). This proves the
+// production fix at the same helper the macOS getfsstat leg calls, without
+// needing a network mount live on the test host.
+TEST_CASE("mapdrive parse_fstab: scheme:// and credentialed-UNC hosts resolve to the bare host",
+          "[tar][mapdrive][parse]") {
+    const std::string text = "https://dav.example.com/files /mnt/dav davfs defaults 0 0\n"
+                             "//alice@fileserver/share /mnt/smb cifs defaults 0 0\n";
+    auto out = parse_fstab(text);
+    REQUIRE(out.size() == 2);
+    CHECK(out[0].entry.remote_host == "dav.example.com");
+    CHECK(out[1].entry.remote_host == "fileserver"); // username stripped, not "alice@fileserver"
+}
+
+// ── apply_entry_cap (kMapDriveEntryCap parity with the Linux leg) ─────────────
+
+TEST_CASE("mapdrive apply_entry_cap: truncates at kMapDriveEntryCap, reports truncation",
+          "[tar][mapdrive][macos][cap]") {
+    auto make_entry = [](int i) {
+        MapDriveEntry e;
+        e.direction = "outbound";
+        e.remote_host = "host" + std::to_string(i);
+        e.provider = "NFS";
+        return e;
+    };
+
+    // Exactly at the cap: no truncation.
+    std::vector<MapDriveEntry> at_cap;
+    for (std::size_t i = 0; i < kMapDriveEntryCap; ++i)
+        at_cap.push_back(make_entry(static_cast<int>(i)));
+    CHECK_FALSE(apply_entry_cap(at_cap, kMapDriveEntryCap));
+    CHECK(at_cap.size() == kMapDriveEntryCap);
+
+    // cap + 1 constructed records: truncates to exactly the cap.
+    std::vector<MapDriveEntry> over_cap;
+    for (std::size_t i = 0; i < kMapDriveEntryCap + 1; ++i)
+        over_cap.push_back(make_entry(static_cast<int>(i)));
+    CHECK(apply_entry_cap(over_cap, kMapDriveEntryCap));
+    REQUIRE(over_cap.size() == kMapDriveEntryCap);
+    // The kept rows are the first kMapDriveEntryCap, in order.
+    CHECK(over_cap.front().remote_host == "host0");
+    CHECK(over_cap.back().remote_host == "host" + std::to_string(kMapDriveEntryCap - 1));
+}
+
+// ── argv re-home: same blob -> same entries ────────────────────────────────
+//
+// tar_mapdrive_collector.cpp's run_command()/popen()/_popen() sites were
+// re-homed onto run_bounded_subprocess (rung 2 argv), which hands the exact
+// same parsers below the exact same output blob via SubprocessResult::output
+// (see run_bounded_subprocess's ADR-3002 contract). These pins prove the
+// three blob-oriented parsers the migration touched (parse_smbstatus /
+// parse_win_security_logons / parse_samba_logs) are byte-for-byte unmodified
+// by the migration: the same captured-shape blob still yields the same
+// entries, independent of how that blob was obtained.
+
+TEST_CASE("mapdrive argv re-home: parse_smbstatus/parse_win_security_logons/parse_samba_logs "
+          "are unchanged by the popen->runner migration",
+          "[tar][mapdrive][parse][regression]") {
+    const std::string smb_blob =
+        "PID     Username     Group        Machine                          Protocol\n"
+        "3456    alice        domain users 192.168.1.50 (ipv4:192.168.1.50:44556)  SMB3_11\n";
+    auto smb = parse_smbstatus(smb_blob);
+    REQUIRE(smb.size() == 1);
+    CHECK(smb[0].username == "alice");
+    CHECK(smb[0].remote_host == "192.168.1.50");
+
+    const std::string wevt_blob =
+        "Event[0]:\n"
+        "  Date: 2026-07-01T10:20:30\n"
+        "  Event ID: 4624\n"
+        "Logon Type:\t\t3\n"
+        "New Logon:\n"
+        "\tAccount Name:\t\talice\n"
+        "\tSource Network Address:\t192.168.1.50\n";
+    auto wevt = parse_win_security_logons(wevt_blob);
+    REQUIRE(wevt.size() == 1);
+    CHECK(wevt[0].entry.username == "alice");
+    CHECK(wevt[0].entry.remote_host == "192.168.1.50");
+
+    const std::string samba_blob =
+        "2026-07-02T08:15:00+0000 host smbd[1234]: srv (ipv4:10.0.0.9:445) connect to service "
+        "srv initially as user carol\n";
+    auto samba = parse_samba_logs(samba_blob);
+    REQUIRE(samba.size() == 1);
+    CHECK(samba[0].entry.username == "carol");
+    CHECK(samba[0].entry.local_mount == "srv");
 }

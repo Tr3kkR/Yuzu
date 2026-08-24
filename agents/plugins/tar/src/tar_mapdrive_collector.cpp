@@ -4,7 +4,9 @@
 // (insert_mapdrive_events). Core capture-source pattern — types/decls in
 // tar_collectors.hpp. See docs/tar-implementer.md "Adding a capture source".
 //
-// Two directions, both in scope (Windows + Linux; macOS kPlanned):
+// Two directions, both in scope on Windows + Linux; macOS has outbound live
+// only (getfsstat exposes the current mount table and nothing historical or
+// inbound — honestly out of reach for an unprivileged agent):
 //   outbound = drives THIS host maps to remote shares
 //   inbound  = remote hosts mapping THIS host's shares (the §3.8 lateral-movement signal)
 // and two modes:
@@ -13,9 +15,10 @@
 //
 // The raw text parsers (parse_proc_mounts / parse_fstab / parse_smbstatus /
 // parse_win_security_logons / parse_samba_logs) are PURE and compiled on every
-// platform so each leg is unit-tested off its native OS from captured samples.
-// Only the I/O (WNet / NetApi / registry hive loads / subprocess / file reads)
-// is #ifdef-guarded.
+// platform so each leg is unit-tested off its native OS from captured samples;
+// the macOS classifier (classify_macos_mounts, tar_mapdrive_macos_parsers.hpp)
+// follows the same pure/impure split. Only the I/O (WNet / NetApi / registry
+// hive loads / subprocess / getfsstat / file reads) is #ifdef-guarded.
 //
 // PII: mapped-drive rows expose usernames + share paths. Per the works-council
 // posture the source is opt-in (default_enabled=false); rows are NOT run through
@@ -24,14 +27,14 @@
 
 #include "tar_collectors.hpp"
 
+#include <yuzu/agent/subprocess_runner.hpp> // run_bounded_subprocess (rung 2 argv sites)
+
 #include <spdlog/spdlog.h>
 
-#include <algorithm>
-#include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib> // std::strtol — timestamp/event-field parsing (no scanf family)
 #include <fstream>
 #include <optional>
@@ -57,6 +60,12 @@
 #include <win_profiles.hpp>
 #include <win_reg_handle.hpp>
 #include <cwchar>      // wcslen
+#elif defined(__linux__)
+// Candidate-path probing on Linux goes through yuzu::agent::probe_tool_path
+// (subprocess_runner.hpp, already included above) — no direct unistd.h use.
+#elif defined(__APPLE__)
+#include <sys/mount.h> // getfsstat / struct statfs — rung 1 native, no shell
+#include "tar_mapdrive_macos_parsers.hpp"
 #endif
 
 namespace yuzu::tar {
@@ -214,13 +223,32 @@ bool is_network_fstype(const std::string& fs) {
 
 // Best-effort host extraction from a share/device string across the forms:
 //   \\server\share  //server/share  server:/export  user@host:/path
+//   scheme://[user@]host/path  (afp://, https:// (WebDAV), smb://, ...)
+//   //user@server/share  (credentialed UNC — macOS getfsstat can surface
+//   embedded usernames in f_mntfromname for smbfs mounts)
 std::string remote_host_of(const std::string& path) {
     std::string p = path;
+    // Both the URI-authority and UNC forms below may embed "user@" ahead of
+    // the host; strip it so the returned host is never a credential.
+    auto strip_userinfo = [](std::string authority) {
+        if (auto at = authority.rfind('@'); at != std::string::npos)
+            authority.erase(0, at + 1);
+        return authority;
+    };
+    // scheme://[user@]host[/path] — checked first since "://" never appears
+    // in the UNC or bare user@host: forms below.
+    if (auto scheme = p.find("://"); scheme != std::string::npos) {
+        const auto start = scheme + 3;
+        const auto end = p.find('/', start);
+        return strip_userinfo(
+            p.substr(start, end == std::string::npos ? std::string::npos : end - start));
+    }
     // UNC: leading \\ or //
     if (p.size() >= 2 && (p[0] == '\\' || p[0] == '/') && (p[1] == '\\' || p[1] == '/')) {
         std::size_t start = 2;
         std::size_t end = p.find_first_of("\\/", start);
-        return p.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        return strip_userinfo(
+            p.substr(start, end == std::string::npos ? std::string::npos : end - start));
     }
     // user@host:/path — strip the user@ prefix first
     auto at = p.find('@');
@@ -271,54 +299,6 @@ std::string word_after(const std::string& line, const std::string& marker) {
     while (pos < line.size() && !std::isspace(static_cast<unsigned char>(line[pos])))
         ++pos;
     return line.substr(start, pos - start);
-}
-
-// cpp-conventions.md §Shell/process boundaries: this is a popen/_popen shell
-// site. DOCUMENTED EXCEPTION (a shell is used rather than argv-style
-// CreateProcess/posix_spawn):
-//   1. Every command passed here is either a COMPILE-TIME CONSTANT literal, or
-//      built at runtime from an OS-derived System32 path (system32_path, below)
-//      that is quoted for the shell — never from the network, registry,
-//      filesystem, or operator, so there is no command-injection surface.
-//   2. The Linux tools (smbstatus/journalctl) live at distro-varying paths and we
-//      parse their line-oriented text output; an argv helper would still need a
-//      PATH lookup. The one Windows tool (wevtutil) is invoked by its ABSOLUTE
-//      System32 path (see system32_path) so PATH resolution cannot be hijacked on
-//      the privileged agent.
-//   3. Output is byte-capped (max_bytes) so a runaway tool cannot exhaust memory;
-//      the pipe is fully drained so the child never blocks on a full pipe.
-// [[maybe_unused]]: unused on the macOS stub build.
-[[maybe_unused]] std::string run_command(const std::string& cmd,
-                                         std::size_t max_bytes = 8u * 1024 * 1024) {
-    std::string out;
-#ifdef _WIN32
-    FILE* pipe = _popen(cmd.c_str(), "r");
-#else
-    FILE* pipe = popen(cmd.c_str(), "r");
-#endif
-    if (!pipe)
-        return out;
-    std::array<char, 4096> buf{};
-    std::size_t n;
-    bool capped = false;
-    while ((n = std::fread(buf.data(), 1, buf.size(), pipe)) > 0) {
-        if (out.size() < max_bytes) {
-            std::size_t take = std::min(n, max_bytes - out.size());
-            out.append(buf.data(), take);
-            if (out.size() >= max_bytes)
-                capped = true;
-        }
-        // Past the cap: keep reading (discarding) so the child can finish writing
-        // rather than blocking on a full pipe — memory stays bounded by max_bytes.
-    }
-#ifdef _WIN32
-    _pclose(pipe);
-#else
-    pclose(pipe);
-#endif
-    if (capped)
-        spdlog::warn("TAR mapdrive: command output capped at {} bytes (tail discarded)", max_bytes);
-    return out;
 }
 
 [[maybe_unused]] std::string read_file(const std::string& path) {
@@ -632,15 +612,21 @@ struct NetApiBufGuard {
     NetApiBufGuard& operator=(const NetApiBufGuard&) = delete;
 };
 
-// Absolute path to a System32 tool, quoted for the shell (cpp-conventions §Shell:
-// removes PATH-hijack exposure for wevtutil on the privileged agent). Falls back
-// to the bare name if GetSystemDirectoryW fails (defensive; effectively never).
+// Absolute path to a System32 tool, as a bare (unquoted) argv element —
+// run_bounded_subprocess execs argv[0] directly (no shell in between), so the
+// quoting the old shell-pipe call needed to protect a spaced path is neither
+// needed nor wanted here; quotes embedded in the string would become literal
+// characters in the exec'd path. Removes PATH-hijack exposure for wevtutil on
+// the privileged agent the same way the old quoted-shell form did. Falls back
+// to the bare name if GetSystemDirectoryW fails (defensive; effectively
+// never) — the runner will report spawn_error for a relative argv[0], which
+// degrades to an empty parse the same way the old shell-pipe call failing did.
 std::string system32_path(const char* exe) {
     wchar_t dir[MAX_PATH]{};
     UINT n = GetSystemDirectoryW(dir, MAX_PATH);
     if (n == 0 || n >= MAX_PATH)
-        return exe; // fallback: bare name resolved via PATH
-    return "\"" + yuzu::win::from_wide(dir) + "\\" + exe + "\"";
+        return exe; // fallback: bare name (spawn_error via the runner, not a PATH search)
+    return yuzu::win::from_wide(dir) + "\\" + exe;
 }
 
 // --- outbound live: currently-connected network drives (WNet) ---
@@ -1001,10 +987,25 @@ std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
     // not parsed, so including it would waste up to half the newest-first /c:5000
     // budget on events we discard, halving the effective backfill depth. Bounded
     // read; constant query (no interpolation). Empty on access denial.
-    const std::string cmd =
-        system32_path("wevtutil.exe") +
-        " qe Security /q:\"*[System[(EventID=4624)]]\" /c:5000 /f:text /rd:true 2>nul";
-    auto inbound = parse_win_security_logons(run_command(cmd));
+    //
+    // The \" quotes the old shell string wrapped around the XPath were
+    // SHELL-level protection (so the space-and-bracket-laden filter survived
+    // the shell's `cmd /c` parse) — run_bounded_subprocess execs argv directly,
+    // so the XPath is one quote-free argv element; embedding literal '"' chars
+    // here would pass them straight to wevtutil and break the filter. The old
+    // `2>nul` is subsumed by the runner's default (stderr discarded unless
+    // merge_stderr is set).
+    std::vector<std::string> argv = {system32_path("wevtutil.exe"),
+                                     "qe",
+                                     "Security",
+                                     "/q:*[System[(EventID=4624)]]",
+                                     "/c:5000",
+                                     "/f:text",
+                                     "/rd:true"};
+    auto run = yuzu::agent::run_bounded_subprocess(
+        argv, yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(15),
+                                             .output_cap_bytes = 8u * 1024 * 1024});
+    auto inbound = parse_win_security_logons(run.output);
     rows.insert(rows.end(), inbound.begin(), inbound.end());
     return dedup_history(std::move(rows));
 }
@@ -1014,8 +1015,23 @@ std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
 
 std::vector<MapDriveEntry> enumerate_mapdrive() {
     std::vector<MapDriveEntry> out = parse_proc_mounts(read_file("/proc/mounts"));
-    // Inbound: current Samba sessions. Empty if Samba isn't installed / no perms.
-    auto inbound = parse_smbstatus(run_command("timeout 10 smbstatus -b 2>/dev/null"));
+    // Inbound: current Samba sessions. Empty if Samba isn't installed / no perms
+    // (unmodified degrade-to-empty contract — `timeout 10` becomes the
+    // runner's own deadline, `2>/dev/null` becomes its default stderr discard).
+    // yuzu::agent::probe_tool_path (the shared runner's own probe) requires a
+    // regular, executable file — stricter than a bare access(X_OK) check,
+    // which would also accept a directory or other non-regular executable
+    // object at the candidate path.
+    std::string tool = yuzu::agent::probe_tool_path(
+        {"/usr/bin/smbstatus", "/usr/local/bin/smbstatus", "/bin/smbstatus"});
+    std::vector<MapDriveEntry> inbound;
+    if (!tool.empty()) {
+        auto run = yuzu::agent::run_bounded_subprocess(
+            std::vector<std::string>{tool, "-b"},
+            yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(10),
+                                           .output_cap_bytes = 8u * 1024 * 1024});
+        inbound = parse_smbstatus(run.output);
+    }
     out.insert(out.end(), inbound.begin(), inbound.end());
     if (out.size() > kMapDriveEntryCap) {
         static std::atomic<bool> warned{false};
@@ -1033,18 +1049,89 @@ std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
     // journald. Best-effort (log verbosity varies) — empty where neither exists.
     // Bounded: read only the last 4 MiB (the recent tail — a busy server's
     // log.smbd is unbounded with `max log size = 0`) and cap the journalctl
-    // fallback with a timeout so a hung journald can't stall the init backfill.
+    // fallback with a deadline so a hung journald can't stall the init backfill.
     constexpr std::size_t kSambaLogTailBytes = 4u * 1024 * 1024;
     std::string logs = read_file_tail("/var/log/samba/log.smbd", kSambaLogTailBytes);
-    if (logs.empty())
-        logs = run_command(
-            "timeout 15 journalctl -u smbd --no-pager -o short-iso -n 5000 2>/dev/null");
+    if (logs.empty()) {
+        std::string jtool = yuzu::agent::probe_tool_path(
+            {"/usr/bin/journalctl", "/bin/journalctl", "/usr/local/bin/journalctl"});
+        if (!jtool.empty()) {
+            auto run = yuzu::agent::run_bounded_subprocess(
+                std::vector<std::string>{jtool, "-u", "smbd", "--no-pager", "-o", "short-iso",
+                                         "-n", "5000"},
+                yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(15),
+                                               .output_cap_bytes = 8u * 1024 * 1024});
+            logs = run.output;
+        }
+    }
     auto inbound = parse_samba_logs(logs);
     rows.insert(rows.end(), inbound.begin(), inbound.end());
     return dedup_history(std::move(rows));
 }
 
-// ── macOS / other: kPlanned ───────────────────────────────────────────────────
+// ── macOS platform shell ──────────────────────────────────────────────────────
+#elif defined(__APPLE__)
+
+namespace {
+
+// Size-then-fill getfsstat(2) (rung 1 — native syscall, no shell/subprocess):
+// a NULL buf with bufsize 0 returns the current mount count with no
+// allocation; a second call fills a buffer sized to that count. A mount
+// appearing between the two calls is simply not included this cycle rather
+// than reallocating in a loop — getfsstat has no resume handle, and a
+// once-per-tick miss is acceptable for a low-cardinality, slowly-changing
+// table (same posture as this file's other snapshot legs). MNT_NOWAIT reads
+// the kernel's cached mount table without blocking on a hung/unreachable
+// remote filesystem, matching this collector's degrade-not-block contract
+// for every other leg (WNet/NetSessionEnum/smbstatus/journalctl all avoid
+// blocking calls too).
+std::vector<MacMountRec> read_getfsstat() {
+    int n = getfsstat(nullptr, 0, MNT_NOWAIT);
+    if (n <= 0)
+        return {};
+    std::vector<struct statfs> buf(static_cast<std::size_t>(n));
+    int filled =
+        getfsstat(buf.data(), static_cast<int>(buf.size() * sizeof(struct statfs)), MNT_NOWAIT);
+    if (filled <= 0)
+        return {};
+    if (static_cast<std::size_t>(filled) < buf.size())
+        buf.resize(static_cast<std::size_t>(filled));
+    std::vector<MacMountRec> out;
+    out.reserve(buf.size());
+    for (const auto& fs : buf)
+        out.push_back(MacMountRec{fs.f_fstypename, fs.f_mntfromname, fs.f_mntonname});
+    return out;
+}
+
+} // namespace
+
+std::vector<MapDriveEntry> enumerate_mapdrive() {
+    // remote_host_of is injected so the pure classifier
+    // (tar_mapdrive_macos_parsers.hpp) stays free of any dependency on this
+    // translation unit's anonymous-namespace helpers — the same function a
+    // unit test can substitute a fixture-equivalent implementation for.
+    auto out = classify_macos_mounts(read_getfsstat(), remote_host_of);
+    // Cap-and-warn parity with the Linux leg (same pattern, same message);
+    // the truncation decision itself is apply_entry_cap (pure, unit-tested).
+    if (apply_entry_cap(out, kMapDriveEntryCap)) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            spdlog::warn("TAR mapdrive: live cap {} reached — truncating (repeats suppressed)",
+                         kMapDriveEntryCap);
+    }
+    return out;
+}
+
+std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
+    // Inbound (this host's own SMB/NFS/AFP server sessions) and any
+    // persistent history artifact equivalent to Linux's /etc/fstab or
+    // Windows' registry MRU/event log are honestly out of reach for an
+    // unprivileged agent on macOS — getfsstat exposes only the current live
+    // mount table, nothing historical. Empty, not guessed.
+    return {};
+}
+
+// ── other: kPlanned ───────────────────────────────────────────────────────────
 #else
 
 std::vector<MapDriveEntry> enumerate_mapdrive() { return {}; }
