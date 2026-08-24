@@ -378,6 +378,14 @@ agent_test_exe = executable(
                                                 # end to end via LocalDispatcher (Darwin-only, self-gated)
     'unit/test_installed_apps_macos_enrich.cpp', # Wave 4 PR4.3a gate-1 fix: SecStaticCode signed/unsigned
                                                 # discrimination (macOS-only; a no-op TU elsewhere)
+    'unit/test_software_actions_parsers.cpp', # Wave 4 PR4.3b: software_actions' FIRST tests --
+                                                # pure winget/apt/yum/softwareupdate/dpkg-query parsers
+    'unit/test_software_actions_actions.cpp', # Wave 4 PR4.3b: real software_actions.dylib/.so driven
+                                                # end to end via LocalDispatcher (installed_count only;
+                                                # POSIX-only, a no-op TU on Windows via #ifndef _WIN32)
+    'unit/test_license_scan_actions.cpp',     # Wave 4 PR4.3b: real license_scan.dylib/.so driven
+                                                # end to end via LocalDispatcher after the Linux-leg
+                                                # runner migration (POSIX-only, a no-op TU on Windows)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -408,6 +416,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/netstat/src'),        # netstat_parsers.hpp (gate-2 remediation pure parser)
     include_directories('../agents/plugins/windows_updates/src'), # windows_updates_parsers.hpp (Wave 3 pure parser)
     include_directories('../agents/plugins/sccm/src'),           # sccm_parsers.hpp (Wave 3 PR33d pure parser)
+    include_directories('../agents/plugins/software_actions/src'), # software_actions_parsers.hpp (Wave 4 PR4.3b pure parser)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
@@ -455,7 +464,8 @@ agent_test_exe = executable(
                 network_diag_plugin_lib, ioc_plugin_lib,
                 hardware_plugin_lib, device_identity_plugin_lib, netstat_plugin_lib,
                 windows_updates_plugin_lib, sccm_plugin_lib, event_logs_plugin_lib,
-                installed_apps_plugin_lib, msi_packages_plugin_lib],
+                installed_apps_plugin_lib, msi_packages_plugin_lib,
+                software_actions_plugin_lib, license_scan_plugin_lib],
 )
 # Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
 # threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it

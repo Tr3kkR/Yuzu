@@ -1,0 +1,115 @@
+/**
+ * test_software_actions_actions.cpp — Wave 4 PR4.3b: loads the ACTUAL built
+ * software_actions plugin (software_actions.dylib/.so, the same artifact the
+ * agent daemon loads in production) via PluginHandle::load and drives it
+ * through yuzu::agent::LocalDispatcher (test_users_posix_actions.cpp's
+ * pattern) — proves the migrated argv actually reaches the real
+ * dpkg-query/rpm/pkgutil tool, not just that the pure parsers are correct in
+ * isolation.
+ *
+ * ONLY `installed_count` is dispatched here — it is fast and fully local
+ * (dpkg-query/rpm on Linux, pkgutil --pkgs on macOS). `list_upgradable` is
+ * deliberately NEVER dispatched from a unit test: on macOS it shells out to
+ * `softwareupdate -l`, which hits Apple's catalog over the network and can
+ * take tens of seconds — exactly the slow/network-dependent shape the repo's
+ * test-efficiency discipline keeps out of the unit suites.
+ */
+#include <catch2/catch_test_macros.hpp>
+
+#ifndef _WIN32
+
+#include <yuzu/agent/plugin_loader.hpp>
+#include <yuzu/plugin.h>
+
+#include "local_dispatcher.hpp"
+
+#include <cctype>
+#include <filesystem>
+#include <string>
+
+namespace fs = std::filesystem;
+
+namespace {
+
+#if defined(__APPLE__)
+constexpr const char* kPluginExt = ".dylib";
+#else
+constexpr const char* kPluginExt = ".so";
+#endif
+
+// Mirrors test_users_posix_actions.cpp's find_users_plugin, pointed at the
+// software_actions plugin's own build output.
+fs::path find_software_actions_plugin() {
+    const std::string lib_name = std::string{"software_actions"} + kPluginExt;
+
+    std::vector<fs::path> candidates;
+    if (auto* build_root = std::getenv("MESON_BUILD_ROOT")) {
+        candidates.emplace_back(fs::path{build_root} / "agents" / "plugins" / "software_actions" /
+                                lib_name);
+    }
+    candidates.emplace_back(fs::path{"agents"} / "plugins" / "software_actions" / lib_name);
+    candidates.emplace_back(fs::path{".."} / "agents" / "plugins" / "software_actions" / lib_name);
+    candidates.emplace_back(fs::path{"build-macos"} / "agents" / "plugins" / "software_actions" /
+                            lib_name);
+    candidates.emplace_back(fs::path{"build-linux"} / "agents" / "plugins" / "software_actions" /
+                            lib_name);
+
+    for (const auto& p : candidates) {
+        std::error_code ec;
+        if (fs::exists(p, ec) && !ec)
+            return fs::absolute(p, ec);
+    }
+    return {};
+}
+
+struct LoadedPlugin {
+    yuzu::agent::PluginHandle handle;
+    const YuzuPluginDescriptor* descriptor;
+};
+
+std::optional<LoadedPlugin> load_software_actions_plugin() {
+    auto plugin_path = find_software_actions_plugin();
+    if (plugin_path.empty())
+        return std::nullopt;
+    auto handle = yuzu::agent::PluginHandle::load(plugin_path);
+    if (!handle.has_value())
+        return std::nullopt;
+    const auto* descriptor = handle->descriptor();
+    if (!descriptor)
+        return std::nullopt;
+    return LoadedPlugin{std::move(*handle), descriptor};
+}
+
+} // namespace
+
+TEST_CASE("software_actions plugin: installed_count reports a real digit count via "
+          "dpkg-query/rpm/pkgutil argv",
+          "[software_actions]") {
+    auto plugin = load_software_actions_plugin();
+    if (!plugin) {
+        WARN("software_actions plugin library not found -- skipping LocalDispatcher round-trip "
+             "test");
+        return;
+    }
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto result = dispatcher.run(plugin->descriptor, "installed_count");
+    CHECK(result.rc == 0);
+
+    // A reverted/broken migration (wrong tool, wrong argv, a silently
+    // reintroduced shell hop that no-ops) would either fail this call or
+    // produce output that never matches `count|<digits>` -- this line only
+    // appears if the real dpkg-query/rpm/pkgutil argv actually ran and the
+    // pure parser counted its output correctly.
+    auto pos = result.captured.find("count|");
+    REQUIRE(pos != std::string::npos);
+    auto rest = result.captured.substr(pos + 6);
+    while (!rest.empty() && (rest.back() == '\n' || rest.back() == '\r'))
+        rest.pop_back();
+    REQUIRE_FALSE(rest.empty());
+    for (char c : rest) {
+        CHECK(std::isdigit(static_cast<unsigned char>(c)));
+    }
+}
+
+#endif // !_WIN32
