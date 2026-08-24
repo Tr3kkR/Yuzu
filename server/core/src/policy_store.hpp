@@ -183,7 +183,11 @@ public:
     /// `policy_status` is copied (not fresh-started, see ADR-0056); the new
     /// `policy_dispatch_state` table is deliberately excluded — it is pure
     /// claim-tracking state invented by this migration, not legacy data.
-    /// Fails closed on any error. Idempotent: a fingerprint marker makes a
+    /// Fails closed on any error EXCEPT one: a `policy_status` row whose
+    /// policy_id has no match in the legacy file's own `policies` table
+    /// (orphan debris, unrepresentable under the new FK) is skipped and
+    /// counted, not treated as a backfill failure — see the deliberate-
+    /// exception note in the .cpp. Idempotent: a fingerprint marker makes a
     /// repeat call (or a second replica racing the same legacy file) a
     /// cheap no-op.
     [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
@@ -276,6 +280,12 @@ private:
     mutable FleetCompliance cached_fleet_compliance_;
     mutable std::chrono::steady_clock::time_point fleet_compliance_last_computed_{};
     static constexpr auto kFleetComplianceCacheTtl = std::chrono::seconds(60);
+
+    // ADR-0012 §4 rule 2: invalidate synchronously on the store's OWN writes,
+    // after the write lands. Called by every mutator of policy_status
+    // (update_agent_status, invalidate_policy, invalidate_all_policies) on
+    // success. Cheap: this only resets the TTL clock, not the DB.
+    void invalidate_fleet_compliance_cache() const;
 
     static std::string generate_id();
 

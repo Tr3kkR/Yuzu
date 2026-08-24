@@ -701,7 +701,7 @@ PolicyStore::create_policy(const std::string& yaml_source) {
     // back cleanly instead of leaving a policy row with partial/missing
     // inputs/triggers/groups).
     std::string failure;
-    const bool ok = pool_.with_txn([&](PGconn* conn) -> bool {
+    const bool ok = pool_.with_txn_for(kAcquireTimeout, [&](PGconn* conn) -> bool {
         pg::PgResult exists = pg::exec_params(
             conn, "SELECT EXISTS(SELECT 1 FROM policy_store.policy_fragments WHERE id = $1)",
             std::vector<std::string>{fragment_id});
@@ -963,6 +963,7 @@ PolicyStore::update_agent_status(const std::string& policy_id, const std::string
         return std::unexpected(std::string(kPolicyDbErrorPrefix) +
                                "failed to update compliance status");
     }
+    invalidate_fleet_compliance_cache();
     return {};
 }
 
@@ -1140,6 +1141,11 @@ std::expected<FleetCompliance, PolicyReadError> PolicyStore::get_fleet_complianc
     return *fc;
 }
 
+void PolicyStore::invalidate_fleet_compliance_cache() const {
+    std::lock_guard<std::mutex> lock(cache_mtx_);
+    fleet_compliance_last_computed_ = {};
+}
+
 // ── Cache invalidation ───────────────────────────────────────────────────────
 
 std::expected<int64_t, std::string> PolicyStore::invalidate_policy(const std::string& policy_id) {
@@ -1155,8 +1161,8 @@ std::expected<int64_t, std::string> PolicyStore::invalidate_policy(const std::st
 
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "UPDATE policy_store.policy_status SET status = 'unknown' WHERE policy_id = $1 "
-        "RETURNING policy_id",
+        "UPDATE policy_store.policy_status SET status = 'unknown', fix_attempt_count = 0 "
+        "WHERE policy_id = $1 RETURNING policy_id",
         std::vector<std::string>{policy_id});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("PolicyStore: update failed in invalidate_policy: {}",
@@ -1165,6 +1171,7 @@ std::expected<int64_t, std::string> PolicyStore::invalidate_policy(const std::st
     }
     auto changes = static_cast<int64_t>(PQntuples(res.get()));
     spdlog::info("PolicyStore: invalidated {} agent statuses for policy '{}'", changes, policy_id);
+    invalidate_fleet_compliance_cache();
     return changes;
 }
 
@@ -1178,7 +1185,9 @@ std::expected<int64_t, std::string> PolicyStore::invalidate_all_policies() {
                                "database unavailable — try again");
 
     pg::PgResult res = pg::exec_params(
-        lease.get(), "UPDATE policy_store.policy_status SET status = 'unknown' RETURNING policy_id",
+        lease.get(),
+        "UPDATE policy_store.policy_status SET status = 'unknown', fix_attempt_count = 0 "
+        "RETURNING policy_id",
         std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("PolicyStore: update failed in invalidate_all_policies: {}",
@@ -1187,6 +1196,7 @@ std::expected<int64_t, std::string> PolicyStore::invalidate_all_policies() {
     }
     auto changes = static_cast<int64_t>(PQntuples(res.get()));
     spdlog::info("PolicyStore: invalidated ALL agent statuses ({} rows)", changes);
+    invalidate_fleet_compliance_cache();
     return changes;
 }
 
@@ -1880,6 +1890,19 @@ bool PolicyStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_pat
         // `DeploymentStore`'s IDENTITY mismatch handling — this needs a
         // read-before-write since a WHERE-guarded UPSERT can express only
         // "update" or "no-op", never "abort the whole call".
+        //
+        // FK violation (below) is NOT failed closed, unlike everything else
+        // in this transaction: the five identity tables land earlier in this
+        // SAME transaction, so a policy_status row whose policy_id has no
+        // match there is provably absent from the legacy file's OWN
+        // `policies` table too — orphan debris with no valid target under
+        // the new FK (the SQLite original had no FK to enforce this). There
+        // is nothing to reconcile an operator TO; failing the boot on
+        // unrepresentable garbage would turn an upgrade into an outage for
+        // no recoverable reason. Skipped, but counted and logged as a
+        // summary below — silent discard was the actual defect, not the
+        // discard itself (adversarial review, 2026-08-24).
+        int64_t orphan_status_skips = 0;
         for (const auto& r : legacy_status) {
             pg::PgResult existing = pg::exec_params(
                 conn,
@@ -1923,6 +1946,7 @@ bool PolicyStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_pat
                 if (is_fk_violation(res)) {
                     spdlog::warn("PolicyStore: migrate_from_sqlite: status row for deleted "
                                 "policy {} skipped", r.base.policy_id);
+                    ++orphan_status_skips;
                     continue;
                 }
                 spdlog::error("PolicyStore: migrate_from_sqlite: status ({},{}) merge failed: {}",
@@ -1930,6 +1954,12 @@ bool PolicyStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_pat
                 return false;
             }
         }
+        if (orphan_status_skips > 0)
+            spdlog::warn("PolicyStore: migrate_from_sqlite: {} of {} legacy policy_status rows "
+                        "were orphan debris (no matching policy in the legacy file) and were "
+                        "discarded, not migrated — see docs/ops-runbooks/"
+                        "policy-store-backfill-recovery.md",
+                        orphan_status_skips, legacy_status.size());
         return true;
     });
 
