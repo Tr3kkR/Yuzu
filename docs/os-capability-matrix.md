@@ -399,10 +399,10 @@ implementation is.
 | ioc | check | linux | supported | 1 | procfs | - |
 | ioc | check | macos | supported | 1 | libproc | UDP rows carry an empty state (no fabricated "LISTEN") — a real UDP listener still matches a port check, but its detail text differs from a TCP match; a port shared by more than one process (SO_REUSEPORT, prefork) reports the pid of one arbitrarily-chosen owner in its match detail, not every owner |
 | ioc | check | windows | supported | 1 | iphlpapi_dnsapi | - |
-| license_scan | list | linux | supported | 3 | popen(rpm/dpkg-query/openssl) | - |
+| license_scan | list | linux | constrained | 2 | rpm/dpkg-query/openssl via bounded argv runner | declared-licence classification only (no lapse detection) for pkg_metadata; entitlement_certs' authoritative expiry still depends on the openssl CLI being present |
 | license_scan | list | macos | constrained | 1 | filesystem_probe(glob+plist) | binary (bplist00) Info.plist files are not parsed; falls back to the bundle name with an empty version |
 | license_scan | list | windows | supported | 1 | wmi+win32_registry | - |
-| license_scan | surfaces | linux | supported | 3 | popen(rpm/dpkg-query/openssl) | - |
+| license_scan | surfaces | linux | constrained | 2 | rpm/dpkg-query/openssl via bounded argv runner | declared-licence classification only (no lapse detection) for pkg_metadata; entitlement_certs' authoritative expiry still depends on the openssl CLI being present |
 | license_scan | surfaces | macos | constrained | 1 | filesystem_probe(glob+plist) | binary (bplist00) Info.plist files are not parsed; falls back to the bundle name with an empty version |
 | license_scan | surfaces | windows | supported | 1 | wmi+win32_registry | - |
 | msi_packages | list | linux | unsupported | - | - | - |
@@ -555,12 +555,12 @@ implementation is.
 | services | set_start_mode | linux | supported | 2 | runner argv 'sudo -n -- systemctl enable\|disable\|mask\|unmask' | - |
 | services | set_start_mode | macos | supported | 2 | runner argv 'sudo -n -- launchctl enable\|disable' | - |
 | services | set_start_mode | windows | supported | 1 | win32_service_api | - |
-| software_actions | list_upgradable | linux | supported | 3 | apt+yum | - |
-| software_actions | list_upgradable | macos | supported | 3 | softwareupdate | - |
-| software_actions | list_upgradable | windows | supported | 3 | winget | - |
-| software_actions | installed_count | linux | supported | 3 | dpkg+rpm | - |
-| software_actions | installed_count | macos | supported | 3 | pkgutil | - |
-| software_actions | installed_count | windows | supported | 3 | powershell_registry_count | - |
+| software_actions | list_upgradable | linux | supported | 2 | apt/yum check-update via bounded argv runner | - |
+| software_actions | list_upgradable | macos | supported | 2 | softwareupdate -l via bounded argv runner | - |
+| software_actions | list_upgradable | windows | constrained | 2 | winget via bounded argv runner | winget App-Execution-Alias may be unavailable to the agent service context; reports an honest empty/unavailable result |
+| software_actions | installed_count | linux | supported | 2 | dpkg-query/rpm via bounded argv runner | - |
+| software_actions | installed_count | macos | supported | 2 | pkgutil --pkgs via bounded argv runner | - |
+| software_actions | installed_count | windows | supported | 1 | native Reg*W subkey count of the Uninstall key | - |
 | status | version | linux | supported | 1 | in-process (compiled version constants) | - |
 | status | version | macos | supported | 1 | in-process (compiled version constants) | - |
 | status | version | windows | supported | 1 | in-process (compiled version constants) | - |

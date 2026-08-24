@@ -479,7 +479,6 @@ RUNNER_ALLOWLIST = {
 GRANDFATHERED = {
     "agents/plugins/content_dist/src/content_dist_plugin.cpp",
     "agents/plugins/firewall/src/firewall_plugin.cpp",
-    "agents/plugins/license_scan/src/licensing_linux.cpp",
     # installed_apps AND msi_packages both removed here (#3405): this PR
     # argv-ised the last shell hop in each, so both files now have zero raw
     # spawn primitives and their entries grandfathered nothing while masking any
@@ -487,9 +486,10 @@ GRANDFATHERED = {
     # the base-diff path onto the FULL scan, so it is strictly stricter.
     # network_config stays -- it is still rung 3 and is PR4.1's to remove, the
     # remaining half of #3405.
+    # license_scan (Linux leg) removed here too (Wave 4 PR4.3b): same reasoning
+    # -- licensing_linux.cpp is now clean of raw spawn tokens outside the runner.
     "agents/plugins/network_config/src/network_config_plugin.cpp",
     "agents/plugins/script_exec/src/script_exec_plugin.cpp",
-    "agents/plugins/software_actions/src/software_actions_plugin.cpp",
     "agents/plugins/tar/src/tar_mapdrive_collector.cpp",
     "agents/plugins/tar/src/tar_service_collector.cpp",
     "agents/plugins/vuln_scan/src/config_checks.hpp",

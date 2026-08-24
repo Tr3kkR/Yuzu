@@ -148,6 +148,17 @@ interim site — ADR-3002 Decisions 1 and 2).
 | `msi_packages/do_list#1` | `agents/plugins/msi_packages/src/msi_packages_plugin.cpp:do_list` | runner argv (`pkgutil --pkgs`) | macOS | compile-time literal argv (probe_tool_path-resolved tool path) | read-only | none — the `/bin/sh -c` hop and its `shell_quote()` are gone entirely (direct argv, no shell to quote against) | none | no rung-1 API enumerates pkgutil receipts | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
 | `msi_packages/do_list#2` | `agents/plugins/msi_packages/src/msi_packages_plugin.cpp:do_list` | runner argv (`pkgutil --pkg-info <id>`), one call per receipt, bounded at `kMaxPackages` (500) | macOS | package identifier is `#1`'s own prior output (local-system enumeration, not operator input); passed as its own argv element, never shell-interpolated | read-only | none — `shell_quote()` deleted; no shell in the call path to quote against | none | no rung-1 API reads a single pkgutil receipt | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
 | `msi_packages/do_product_codes#1` | `agents/plugins/msi_packages/src/msi_packages_plugin.cpp:do_product_codes` | runner argv (`pkgutil --pkgs`) | macOS | compile-time literal argv (probe_tool_path-resolved tool path) | read-only | none — `/bin/sh -c` hop gone | none | no rung-1 API enumerates pkgutil receipts | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `software_actions/list_upgradable_windows#1` | `agents/plugins/software_actions/src/software_actions_plugin.cpp:do_list_upgradable` | runner argv (`winget upgrade --accept-source-agreements`), `winget.exe` resolved via `%LOCALAPPDATA%\Microsoft\WindowsApps\winget.exe` + `probe_tool_path` | Windows | compile-time literal argv; tool path derived from the native `GetEnvironmentVariableW` read of `%LOCALAPPDATA%`, not operator input | read-only | none — redirection eliminated (`2>nul` -> `merge_stderr=false` default) | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `software_actions/list_upgradable_linux#1` | `agents/plugins/software_actions/src/software_actions_plugin.cpp:do_list_upgradable` | runner argv (`apt list --upgradable`) | Linux | compile-time literal argv | read-only | none | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `software_actions/list_upgradable_linux#2` | `agents/plugins/software_actions/src/software_actions_plugin.cpp:do_list_upgradable` | runner argv (`yum check-update` / `dnf check-update`), tried only when `#1` (apt) produces no rows | Linux | compile-time literal argv | read-only | none | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `software_actions/list_upgradable_macos#1` | `agents/plugins/software_actions/src/software_actions_plugin.cpp:do_list_upgradable` | runner argv (`softwareupdate -l`) | macOS | compile-time literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `software_actions/installed_count_linux#1` | `agents/plugins/software_actions/src/software_actions_plugin.cpp:do_installed_count` | runner argv (`dpkg-query -W -f='${db:Status-Abbrev}\n'`) | Linux | compile-time literal argv | read-only | none | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `software_actions/installed_count_linux#2` | `agents/plugins/software_actions/src/software_actions_plugin.cpp:do_installed_count` | runner argv (`rpm -qa`), fallback when `#1` (dpkg-query) is absent | Linux | compile-time literal argv | read-only | none | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `software_actions/installed_count_macos#1` | `agents/plugins/software_actions/src/software_actions_plugin.cpp:do_installed_count` | runner argv (`pkgutil --pkgs`) | macOS | compile-time literal argv | read-only | none — redirection+pipeline eliminated (`2>/dev/null \| wc -l` -> line count moved in-process to `count_nonempty_lines`) | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `license_scan/run_pkg_metadata_surface_linux#1` | `agents/plugins/license_scan/src/licensing_linux.cpp:run_pkg_metadata_surface` | runner argv (`rpm -qa --queryformat '%{NAME}\t%{VERSION}-%{RELEASE}\t%{VENDOR}\t%{LICENSE}\n'`) | Linux | compile-time literal queryformat argv (byte-identical to the pre-migration shell form; rpm's own queryformat engine interprets the `\t`/`\n` escapes, not a shell) | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false); shell single-quoting eliminated (no shell to quote against) | none | no rung-1 API for per-package declared-licence metadata on this OS | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `license_scan/run_pkg_metadata_surface_linux#2` | `agents/plugins/license_scan/src/licensing_linux.cpp:run_pkg_metadata_surface` | runner argv (`dpkg-query -W -f='${Package}\t${Version}\t${db:Status-Abbrev}\n'`), tried when `#1` (rpm) is absent | Linux | compile-time literal queryformat argv (byte-identical to the pre-migration shell form) | read-only | none — redirection eliminated; shell single-quoting eliminated | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `license_scan/run_entitlement_certs_surface_linux#1` | `agents/plugins/license_scan/src/licensing_linux.cpp:run_entitlement_certs_surface` | runner argv (`openssl x509 -noout -enddate -dateopt iso_8601 -in <cert>`) | Linux | `<cert>` is a path returned by `host.glob("/etc/pki/entitlement/*.pem")` — local-system, not operator input; as a plain argv element it is injection-proof by construction, no shell-quoting needed | read-only | none — redirection eliminated; the `shell_single_quote()` escaping this replaced is gone outright (no shell left to escape against) | none | no rung-1 API for X.509 notAfter parsing on this OS in this plugin (the agent has no shared in-process X509 helper) | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `license_scan/run_entitlement_certs_surface_linux#2` | `agents/plugins/license_scan/src/licensing_linux.cpp:run_entitlement_certs_surface` | runner argv (`openssl x509 -noout -enddate -in <cert>`), fallback when `#1`'s `-dateopt iso_8601` form fails or is truncated | Linux | same as `#1` | read-only | none | none | same as `#1` | 2 — same as `#1` | n/a |
 
 ## Seed inventory — known spawn surfaces awaiting transcription
 
@@ -159,9 +170,9 @@ these rows are pointers, not evidence.
 **Raw `popen`/`system` helpers:**
 device_identity, hardware, installed_apps,
 device_identity, event_logs, hardware,
-ioc, license_scan, network_config,
+ioc, network_config,
 network_diag, os_info, processes,
-software_actions, tar, vuln_scan, wifi, windows_updates.
+tar, vuln_scan, wifi, windows_updates.
 (`vuln_scan` carries code slated for retirement per ADR-0028/ADR-0018 —
 sequence that cleanup against migrating it, tracked in #2380.)
 
@@ -302,6 +313,23 @@ enumeration + plain `/sys/class/block/dm-*/dm/uuid` reads, rung 1, 0 spawn
 sites. macOS: `fdesetup`/`diskutil` stay on the bounded runner, promoted
 from a `/bin/sh -c` shell wrapper to direct argv, rung 2 — see Registered
 sites above).
+
+**Migrated off raw spawn (Wave 4, PR4.3b):** `software_actions` (0 spawn
+sites remaining on Windows: `list_upgradable`'s winget call and
+`installed_count`'s prior `powershell -Command` registry-count call are BOTH
+gone — installed_count is now a native Reg\*W subkey count, rung 1, no
+subprocess at all, replacing a payload ADR-3002 Decision 5 pins at rung 3
+forever; Linux/macOS moved from `popen()`/`_popen()` to direct runner argv
+for both actions — see Registered sites above) and a **partial** migration of
+`license_scan`: only the Linux leg (`licensing_linux.cpp`) moved off
+`popen()`/`std::system()` onto the runner (Windows/macOS were already
+rung-1 native and untouched). This is also a deliberate DEMOTION, not a
+promotion: the Linux `pkg_metadata`/`entitlement_certs` legs go from
+SUPPORTED/rung 3 to CONSTRAINED/rung 2 (Alex/K-review decision) — the
+acquisition mechanism improved, but the underlying capability was already
+limited (declared-licence classification only, no lapse detection for
+pkg_metadata; entitlement expiry still depends on the openssl CLI), and the
+descriptor now says so honestly instead of overclaiming SUPPORTED.
 
 **Direct exec via private helpers:** script_exec, content_dist, filesystem
 (filesystem is fully migrated onto the runner on the #2321 branch).
