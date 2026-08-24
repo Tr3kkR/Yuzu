@@ -645,6 +645,8 @@ tar_test_exe = executable(
     'unit/test_tar_module_stream.cpp',
     'unit/test_tar_module_etw.cpp',
     'unit/test_tar_mapdrive.cpp',
+    'unit/test_tar_service.cpp',   # Wave 5 PR5.2: pure systemctl/launchctl list parsers (fixture-fed, no spawn)
+    'unit/test_tar_arp.cpp',       # Wave 5 PR5.2: pure /proc/net/arp parser + macOS record mapping (fixture-fed)
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
     '../agents/plugins/tar/src/tar_sql_executor.cpp',
