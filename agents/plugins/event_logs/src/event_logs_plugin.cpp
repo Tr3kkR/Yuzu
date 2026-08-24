@@ -243,6 +243,14 @@ constexpr auto kJournalReadBudget = std::chrono::milliseconds(10'000);
 // ADR-3002 bound for the read).
 constexpr std::size_t kJournalScanCap = 50'000;
 
+// Rung-2 fallback scan window: how many recent journal lines the argv leg pulls
+// back before filtering in-process. Deliberately larger than `count`'s 500
+// ceiling so a filtered query has depth to search, and deliberately far below
+// the native leg's 50'000-entry cap because every line here is buffered in the
+// runner. When the window fills, the result is reported CONSTRAINED rather than
+// as a confident absence.
+constexpr std::size_t kJournalctlScanWindow = 2'000;
+
 #if defined(YUZU_HAVE_LIBSYSTEMD)
 
 namespace journal = yuzu::event_logs_journal;
@@ -338,12 +346,12 @@ bool try_journal_query(yuzu::CommandContext&, std::string_view, int) { return fa
 //     same predicate the native leg uses removes that divergence.
 int run_journalctl_fallback(yuzu::CommandContext& ctx, std::vector<std::string> argv,
                             std::string_view prefix, std::string_view empty_message,
-                            const char* unavailable_provenance,
+                            const char* unavailable_provenance, std::size_t scan_window,
                             std::string_view match_filter = {},
                             std::size_t match_cap = 0) {
     auto result = yuzu::agent::run_bounded_subprocess(
         argv, yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{20},
-                                             .max_lines = 500,
+                                             .max_lines = scan_window,
                                              .merge_stderr = false,
                                              .stop_after_max_lines = true});
     // Every reachable (termination_reason, exit_code, timed_out) combination is
@@ -373,26 +381,34 @@ int run_journalctl_fallback(yuzu::CommandContext& ctx, std::vector<std::string> 
         break;
     }
 
-    // Compose first, emit second: a filter that matches nothing must still reach
-    // the honest-empty sentinel below rather than emitting no rows at all.
-    std::vector<std::string> rows;
-    for (const auto& line : result.lines) {
-        if (line.empty())
-            continue;
-        auto parsed = parsers::parse_short_iso_line(line);
-        if (!match_filter.empty() &&
-            !parsers::journal_message_matches(parsed.message, match_filter))
-            continue;
-        rows.push_back(parsers::journal_row(prefix, parsed));
-        if (match_cap != 0 && rows.size() >= match_cap)
-            break;
+    // Row selection is the pure, fixture-tested select_journal_rows: it folds
+    // journalctl's indented continuation lines back into their own record
+    // (so a MESSAGE containing a newline cannot forge a row), applies the
+    // filter, keeps the NEWEST `match_cap` matches, and returns them
+    // oldest-first. The lines arrive newest-first because the argv passes
+    // --reverse.
+    const auto selection = parsers::select_journal_rows(result.lines, prefix, match_filter,
+                                                        match_cap);
+
+    // The scan window is bounded, so "nothing matched" is only the truth if we
+    // actually reached the end of the journal. If journalctl filled the window
+    // we asked for, older matches may exist beyond it and absence is NOT
+    // established — say so rather than answering a confident "none found".
+    // The native leg draws exactly this distinction; the two rungs must agree.
+    const bool window_saturated = result.lines.size() >= scan_window;
+    if (window_saturated && selection.rows.size() < match_cap) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              unavailable_provenance);
+        if (selection.rows.empty())
+            sentinel_message = "journalctl scan window exhausted before the end of the journal "
+                               "(no match found within it; older entries not searched)";
     }
 
-    if (rows.empty()) {
+    if (selection.rows.empty()) {
         ctx.write_output(std::format("{}|none|-|{}", prefix, sentinel_message));
         return 0;
     }
-    for (const auto& row : rows)
+    for (const auto& row : selection.rows)
         ctx.write_output(row);
     return 0;
 }
@@ -437,9 +453,12 @@ int do_errors(yuzu::CommandContext& ctx, yuzu::Params params) {
         return 0;
     return run_journalctl_fallback(
         ctx,
-        {"/usr/bin/journalctl", "-q", "-p", "err", "--since",
+        // --reverse: select_journal_rows consumes newest-first and returns
+        // oldest-first, matching the native leg and the pre-migration order.
+        {"/usr/bin/journalctl", "-q", "-r", "-p", "err", "--since",
          std::format("{} hours ago", hours), "-n", "100", "--no-pager", "-o", "short-iso"},
-        "error", "No error events found", "event_logs_journalctl:errors_unavailable");
+        "error", "No error events found", "event_logs_journalctl:errors_unavailable",
+        /*scan_window=*/100);
 
 #elif defined(__APPLE__)
     constexpr std::size_t kMaxLines = 100;
@@ -522,6 +541,19 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
         ctx.write_output(parsers::win_event_row(ev));
         any = true;
     }
+    // `count` bounds the events EXAMINED here, not the matches returned, so a
+    // full read means older matching events may exist beyond the window and
+    // absence is not established. Report that rather than answering a
+    // confident "none found" — the same distinction both Linux rungs draw.
+    if (events.size() >= static_cast<std::size_t>(count)) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "event_logs_win:count_window_full");
+        if (!any) {
+            ctx.write_output("event|none|-|-|-|No match within the newest events examined "
+                             "(count window full; older events not searched)");
+            return 0;
+        }
+    }
     if (!any)
         ctx.write_output("event|none|-|-|-|No matching events found");
 
@@ -531,12 +563,13 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
     return run_journalctl_fallback(
         ctx,
         // No --grep: the filter is applied in-process (see run_journalctl_fallback).
-        // -n bounds the scan window rather than the match count, so `count`
-        // matches can still be found among recent entries; the runner's
-        // max_lines cap is the hard bound.
-        {"/usr/bin/journalctl", "-q", "-n", "500", "--no-pager", "-o", "short-iso"},
-        "event", "No matching events found", "event_logs_journalctl:query_unavailable", filter,
-        static_cast<std::size_t>(count));
+        // --reverse so the newest matches are the ones kept; -n bounds the scan
+        // window, and a filled window is reported CONSTRAINED rather than as an
+        // absence.
+        {"/usr/bin/journalctl", "-q", "-r", "-n", std::format("{}", kJournalctlScanWindow),
+         "--no-pager", "-o", "short-iso"},
+        "event", "No matching events found", "event_logs_journalctl:query_unavailable",
+        kJournalctlScanWindow, filter, static_cast<std::size_t>(count));
 
 #elif defined(__APPLE__)
     std::vector<std::string> argv{"/usr/bin/log",

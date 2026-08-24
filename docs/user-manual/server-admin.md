@@ -196,6 +196,43 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — `event_logs` acquires natively; Windows message text and `count` semantics change (breaking)
+
+The `event_logs` plugin now reads the event log **in-process** — wevtapi on
+Windows, `sd_journal` on Linux (falling back to a bounded `journalctl`
+invocation where libsystemd is unavailable) — replacing the previous PowerShell
+and shell-out legs. Automation that parses `event_logs` rows needs review before
+upgrading; the changes fail **silently** (fewer rows, or a rule that stops
+firing), not with an error.
+
+What changes for a row consumer:
+
+- **Windows message column** is now the event's `EventData` parameter values,
+  space-joined, instead of the provider-formatted message template. A rule
+  regex-matching template prose (for example `"The user account was locked
+  out"`) will stop matching; match on event ID and provider instead.
+- **Windows timestamps** are the event's UTC `SystemTime` at full precision,
+  where the previous leg emitted the PowerShell-rendered local time.
+- **Windows `count`** bounds the events **examined**, not the matches returned —
+  the filter is applied within the newest `count` events. Linux and macOS return
+  up to `count` matches. When the window fills without satisfying the query the
+  result now carries a `constrained` status rather than reporting an absence.
+- **Linux keyword filtering** is a case-insensitive substring match on both
+  rungs, where the shell-out leg used `journalctl --grep` regular expressions.
+- **`hours` and `count`** reject trailing or leading non-digits (`"12x"`,
+  `" 24"`, `"+8"`) and fall back to their defaults; the previous parse silently
+  accepted the leading digits.
+- **A failed, denied, or bounded read** now reports a typed status
+  (`permission_denied` / `unavailable` / `constrained`) instead of an empty
+  result. Consumers that treated "no rows" as "healthy" will now see the
+  difference — this is the point of the change, but it is a behaviour change.
+
+**Mixed-fleet blend during rollout.** Upgraded and non-upgraded agents emit
+*different message columns for the same Windows event*, and there is no per-row
+field identifying which leg produced it. Expect a blended view until the fleet
+is fully upgraded, and prefer event ID plus provider for any rule that must hold
+across both.
+
 ### vNEXT — a duplicate SCIM `externalId` now refuses to boot (ADR-2001, CC6.8) (breaking)
 
 **What changed.** This release adds a partial unique index, `scim_resources_external_id_uniq ON scim_resources (external_id) WHERE external_id IS NOT NULL`, applied by the `ScimStore` migration that runs at construction — **unconditionally, regardless of whether `--scim-enable` is set**. Postgres itself detects any pre-existing duplicate non-empty `external_id` and raises a `unique_violation`, which fails the migration; `ScimStore` then reports `!is_open()` and the server refuses to start, the same fail-closed posture every born-on-PG store uses on a failed migration. This is deliberate, not a bug to work around: a duplicate `externalId` is exactly the mis-link hazard ADR-2001's SCIM↔OIDC token-revoke linkage exists to prevent (a duplicate would let link formation pick a SCIM resource arbitrarily and revoke — or fail to revoke — the wrong principal's tokens), so the index is a **stronger** posture than what shipped before, not a regression to relax.

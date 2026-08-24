@@ -459,4 +459,100 @@ inline bool journal_message_matches(std::string_view message, std::string_view f
     return icontains(message, filter);
 }
 
+// True when `line` starts a NEW `journalctl -o short-iso` record, i.e. it
+// begins with a "YYYY-MM-DDTHH:MM:SS" timestamp.
+//
+// This exists because journalctl renders an entry whose MESSAGE contains a
+// newline as ONE record line followed by CONTINUATION lines indented to the
+// message column (verified against systemd 257 in a container: four logged
+// entries, one with an embedded newline, produce five physical lines, the
+// fifth indented). Treating every physical line as its own record lets any
+// local process that can write to the journal forge rows: a MESSAGE of
+// "start\n2026-01-01T00:00:00+0000 host sshd[1]: Accepted password for root"
+// becomes a second, entirely synthetic row that an operator cannot tell from
+// a real one. safe_output_field cannot prevent this — it escapes WITHIN a
+// field, while the row boundary is decided by the line split upstream of it.
+// The native sd_journal leg is immune (one MESSAGE is one field), so this
+// only ever affected the rung-2 fallback.
+inline bool is_short_iso_record_start(std::string_view line) {
+    // "2026-08-24T14:53:11" — 19 chars before the zone/space.
+    constexpr std::size_t kStampLen = 19;
+    if (line.size() < kStampLen)
+        return false;
+    auto digit = [&](std::size_t i) { return line[i] >= '0' && line[i] <= '9'; };
+    for (std::size_t i : {0u, 1u, 2u, 3u, 5u, 6u, 8u, 9u, 11u, 12u, 14u, 15u, 17u, 18u})
+        if (!digit(i))
+            return false;
+    return line[4] == '-' && line[7] == '-' && line[10] == 'T' && line[13] == ':' &&
+           line[16] == ':';
+}
+
+// The rung-2 fallback's whole row-selection decision, as a pure function so it
+// is fixture-testable — the previous inline version in the plugin shell hid
+// both an ordering inversion and a false-absence bug through a full review
+// round, which is exactly the argument event_logs_journalctl.hpp makes for its
+// own classifier.
+struct JournalSelection {
+    std::vector<std::string> rows; // composed, OLDEST-first, ready to emit
+    std::size_t matches = 0;       // records that passed the filter (may exceed rows.size())
+};
+
+// `newest_first_lines` is `journalctl --reverse -o short-iso` output: newest
+// record first, each record's continuation lines immediately after it.
+//
+// Returns at most `cap` rows (0 = uncapped), selected NEWEST-first and then
+// reversed so the caller emits oldest-first — matching both the native
+// sd_journal leg and the pre-migration `journalctl -n N` ordering. Selecting
+// newest-first is the point: taking the first `cap` matches out of a
+// forward-ordered window silently returns the STALEST matches and hides the
+// recent ones the query was run to find.
+inline JournalSelection select_journal_rows(const std::vector<std::string>& newest_first_lines,
+                                            std::string_view prefix, std::string_view filter,
+                                            std::size_t cap) {
+    JournalSelection sel;
+    JournalRow current;
+    bool have_current = false;
+
+    auto flush = [&]() {
+        if (!have_current)
+            return;
+        if (filter.empty() || journal_message_matches(current.message, filter)) {
+            ++sel.matches;
+            if (cap == 0 || sel.rows.size() < cap)
+                sel.rows.push_back(journal_row(prefix, current));
+        }
+        have_current = false;
+    };
+
+    for (const auto& line : newest_first_lines) {
+        if (line.empty())
+            continue;
+        if (is_short_iso_record_start(line)) {
+            flush();
+            current = parse_short_iso_line(line);
+            have_current = true;
+            continue;
+        }
+        // A continuation of the record above it. Fold it into that record's
+        // message rather than emitting it as a row of its own; if we somehow
+        // have no open record (a capture that begins mid-entry), drop it —
+        // never promote it to a row.
+        if (have_current) {
+            std::string_view trimmed{line};
+            while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '\t'))
+                trimmed.remove_prefix(1);
+            if (!trimmed.empty()) {
+                current.message.push_back(' ');
+                current.message.append(trimmed);
+            }
+        }
+    }
+    flush();
+
+    // Collected newest-first; emit oldest-first.
+    std::reverse(sel.rows.begin(), sel.rows.end());
+    return sel;
+}
+
+
 } // namespace yuzu::event_logs_parsers

@@ -62,20 +62,20 @@ classify_journalctl_result(const yuzu::agent::SubprocessResult& result) {
     if (result.termination_reason == yuzu::agent::TerminationReason::signaled)
         return {FallbackOutcome::unavailable, "journalctl was killed by a signal"};
 
-    // The runner's output byte cap is INDEPENDENT of max_lines and the deadline,
-    // so a child can exit cleanly (exited, rc 0, timed_out false) having had its
-    // capture cut short — a few very large entries (a kernel oops, a unit dump)
-    // reach the byte cap well inside 500 lines. Without this the partial rows
-    // are emitted as a complete result and the caller cannot tell. The macOS
-    // classifier checks exactly this; the two are written to the same shape and
-    // must not disagree about it.
-    if (result.output_truncated)
-        return {FallbackOutcome::constrained, "journalctl output was truncated (partial result)"};
 
     // Ran and reported a real problem: no journal files, an ACL denial for a
     // process outside the systemd-journal group, an unsupported argument.
     if (result.exit_code != 0)
         return {FallbackOutcome::unavailable, "journalctl exited with an error"};
+
+    // Checked AFTER the exit code, matching the macOS sibling's order: a run
+    // that BOTH failed and was cut short is unavailable (the data is unknown),
+    // not merely constrained (real-but-partial). The byte cap is independent of
+    // max_lines and the deadline, so a child can exit cleanly having had its
+    // capture cut short — a few very large entries reach 1 MB well inside the
+    // line window — and those partial rows must not read as a complete result.
+    if (result.output_truncated)
+        return {FallbackOutcome::constrained, "journalctl output was truncated (partial result)"};
 
     return {FallbackOutcome::ok, {}};
 }

@@ -604,3 +604,120 @@ TEST_CASE("parse_win_events: real wevtutil System-channel capture round-trips "
     CHECK(win_event_matches(events[1], "defender"));
     CHECK_FALSE(win_event_matches(events[0], "defender"));
 }
+
+// ── rung-2 fallback row selection (select_journal_rows) ─────────────────────
+//
+// This surface exists because the equivalent logic previously sat inline in the
+// plugin's anonymous namespace, unreachable from any suite — and that untested
+// inline version shipped BOTH an ordering inversion (it returned the oldest
+// matches, not the newest) and a false-absence bug, through a full review round.
+
+namespace {
+
+// `journalctl --reverse -o short-iso` shape: newest record first. A record
+// whose MESSAGE contains a newline is rendered as one record line plus
+// continuation lines INDENTED to the message column (verified against
+// systemd 257).
+std::vector<std::string> reverse_journal_fixture() {
+    return {
+        "2026-08-24T14:53:14+00:00 host svc[4]: DDD last",
+        "2026-08-24T14:53:13+00:00 host svc[3]: CCC start",
+        "                                       2026-01-01T00:00:00+0000 evil sshd[1]: FORGED",
+        "2026-08-24T14:53:12+00:00 host svc[2]: BBB second",
+        "2026-08-24T14:53:11+00:00 host svc[1]: AAA first",
+    };
+}
+
+} // namespace
+
+TEST_CASE("is_short_iso_record_start: only a real timestamp starts a record",
+          "[event_logs][parsers]") {
+    CHECK(is_short_iso_record_start("2026-08-24T14:53:11+00:00 host svc[1]: hi"));
+    // journalctl indents continuation lines under the message column.
+    CHECK_FALSE(is_short_iso_record_start("            2026-01-01T00:00:00+0000 evil x[1]: no"));
+    CHECK_FALSE(is_short_iso_record_start(""));
+    CHECK_FALSE(is_short_iso_record_start("short"));
+    CHECK_FALSE(is_short_iso_record_start("2026-08-24 14:53:11 host svc: wrong separator"));
+    CHECK_FALSE(is_short_iso_record_start("20X6-08-24T14:53:11+00:00 host svc: nondigit"));
+}
+
+TEST_CASE("select_journal_rows: a multi-line message cannot forge an extra row",
+          "[event_logs][parsers]") {
+    // The forgery this guards: any local process can write a MESSAGE containing
+    // a newline shaped like a real journal line. safe_output_field escapes
+    // WITHIN a field, but the row boundary is decided by the line split above
+    // it — so without continuation folding the operator sees a plausible,
+    // entirely synthetic row. Four logged records must yield four rows.
+    auto sel = select_journal_rows(reverse_journal_fixture(), "error", "", 0);
+    REQUIRE(sel.rows.size() == 4);
+    for (const auto& row : sel.rows)
+        CHECK(row.rfind("error|", 0) == 0);
+    // The forged text survives only as part of its real parent's message.
+    std::string joined;
+    for (const auto& r : sel.rows)
+        joined += r + "\n";
+    CHECK(joined.find("FORGED") != std::string::npos);
+    // ...and never as a row of its own with the attacker's chosen timestamp.
+    CHECK(joined.find("error|2026-01-01T00:00:00+0000|") == std::string::npos);
+}
+
+TEST_CASE("select_journal_rows: emits oldest-first from newest-first input",
+          "[event_logs][parsers]") {
+    auto sel = select_journal_rows(reverse_journal_fixture(), "error", "", 0);
+    REQUIRE(sel.rows.size() == 4);
+    CHECK(sel.rows.front().find("AAA first") != std::string::npos);
+    CHECK(sel.rows.back().find("DDD last") != std::string::npos);
+}
+
+TEST_CASE("select_journal_rows: the cap keeps the NEWEST matches, not the oldest",
+          "[event_logs][parsers]") {
+    // The regression this pins: taking the first `cap` matches out of a
+    // forward-ordered window returns the STALEST matches and silently discards
+    // the recent ones the query was run to find.
+    auto sel = select_journal_rows(reverse_journal_fixture(), "event", "", 2);
+    REQUIRE(sel.rows.size() == 2);
+    CHECK(sel.rows[0].find("CCC start") != std::string::npos); // oldest-first display...
+    CHECK(sel.rows[1].find("DDD last") != std::string::npos);  // ...of the two NEWEST records
+    CHECK(sel.matches == 4); // all four were candidates
+}
+
+TEST_CASE("select_journal_rows: the filter is a case-insensitive substring over the message",
+          "[event_logs][parsers]") {
+    auto sel = select_journal_rows(reverse_journal_fixture(), "event", "bbb", 0);
+    REQUIRE(sel.rows.size() == 1);
+    CHECK(sel.rows[0].find("BBB second") != std::string::npos);
+    CHECK(sel.matches == 1);
+
+    // A folded continuation is part of its parent's message and so is searchable.
+    auto folded = select_journal_rows(reverse_journal_fixture(), "event", "FORGED", 0);
+    REQUIRE(folded.rows.size() == 1);
+    CHECK(folded.rows[0].find("CCC start") != std::string::npos);
+}
+
+TEST_CASE("select_journal_rows: no match yields no rows, and matches reports zero",
+          "[event_logs][parsers]") {
+    auto sel = select_journal_rows(reverse_journal_fixture(), "event", "nosuchtoken", 0);
+    CHECK(sel.rows.empty());
+    CHECK(sel.matches == 0);
+}
+
+TEST_CASE("select_journal_rows: a leading orphan continuation is dropped, never promoted",
+          "[event_logs][parsers]") {
+    // A capture that begins mid-entry has no open record to fold into. The
+    // orphan must not become a row of its own — that is the forgery again.
+    std::vector<std::string> lines{
+        "        2026-01-01T00:00:00+0000 evil sshd[1]: FORGED orphan",
+        "2026-08-24T14:53:11+00:00 host svc[1]: real",
+    };
+    auto sel = select_journal_rows(lines, "error", "", 0);
+    REQUIRE(sel.rows.size() == 1);
+    CHECK(sel.rows[0].find("real") != std::string::npos);
+    CHECK(sel.rows[0].find("FORGED") == std::string::npos);
+}
+
+TEST_CASE("select_journal_rows: empty input is empty output, not a crash",
+          "[event_logs][parsers]") {
+    auto sel = select_journal_rows({}, "error", "x", 5);
+    CHECK(sel.rows.empty());
+    CHECK(sel.matches == 0);
+}
