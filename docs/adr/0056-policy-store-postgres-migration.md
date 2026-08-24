@@ -446,6 +446,87 @@ where operator reconciliation IS required; qualified. All existing `evaluate_now
 new return type; the round-2 regression test was widened to assert `CHECK_FALSE(result.has_value())`
 instead of just `.empty()`, so it now actually distinguishes the error case it was written to catch.
 
+**Fifth correction (`/governance`, full 8-agent Gate 2/3 pass — security-guardian, docs-writer,
+architect, cpp-expert, cpp-safety, sre, quality-engineer, build-ci — 2026-08-24):** the Fourth
+correction's `evaluate_now()` widening was itself incomplete — it fixed the two checks inside
+`evaluate_now()` directly but missed that `evaluate_now()` calls `kickoff_check()`, which had its
+OWN unfixed degrade-collapse: a `get_fragment()` store failure inside `kickoff_check` returned a
+bare `""`, indistinguishable from every legitimate no-op `kickoff_check` returns (no check
+instruction, no targets, a check already in flight) — so the exact false-409 bug the Fourth
+correction closed for `record_dispatch` was still reachable through this second, adjacent path.
+Independently found by security-guardian, corroborated by architect (both traced the code directly)
+and by quality-engineer (confirmed no test exercised it). Fixed the same way: `kickoff_check` widened
+to `std::expected<std::string, std::string>` (not `PolicyReadError` — `policy_evaluator.hpp` only
+forward-declares `PolicyStore` to avoid a hard include, and the dominant same-class idiom for a
+single success-or-error-string outcome, per cpp-expert, is already `std::expected<std::string,
+std::string>` — see `record_dispatch`/`create_fragment`/`create_policy`), threaded through both
+`dispatch_due()` (now logs a warning on a degraded `kickoff_check`, previously discarded silently)
+and `evaluate_now()`.
+
+Four more findings from the same pass, all fixed:
+
+- **`kPolicyDbErrorPrefix` was defined but never consumed** (security-guardian MEDIUM, corroborated
+  by architect) — every mutator route (`create_policy`/`create_fragment`/`enable`/`disable`/
+  `invalidate`/`invalidate-all`) mapped a genuine store degrade to the same 400 a validation error
+  gets, leaking the raw internal error string into the response body. Added `is_db_error`/
+  `strip_db_error_prefix` helpers in `policy_store.hpp` (mirrors `is_conflict_error`/
+  `strip_conflict_prefix` in `store_errors.hpp`) and wired all six mutator routes in
+  `compliance_routes.cpp` to check the prefix and return 503 instead of 400/500 on a genuine degrade.
+- **`remediate()`'s HTTP-status classifier didn't recognize its own new degraded-store error
+  strings** (docs-writer code-truth finding, sharpened by quality-engineer into a concrete two-part
+  defect) — the Third correction's `remediate()` degrade strings ("policy store degraded — try
+  again", "policy store unavailable", etc.) all fell through the route's substring classifier to the
+  400 default, AND the `!result.ok` branch unconditionally audited the outcome as `policy.remediate
+  | denied` — recording an infrastructure failure as an operator business denial, corrupting the
+  audit trail for exactly the kind of evidence this codebase's SOC 2 posture depends on. Fixed:
+  every degrade string this store's `remediate()` produces starts with `"policy store"` (verified
+  against the actual four call sites in `policy_evaluator.cpp`), so the route classifies on that
+  prefix first, maps it to 503, and audits it as `policy.remediate | error` (an established
+  disposition value elsewhere in this codebase, e.g. `settings_routes.cpp`'s MFA/CSRF audit calls) —
+  distinct from both `success` and `denied`.
+- **`legacy_has_column` fails open on a probe error** (security-guardian LOW, corroborated by
+  quality-engineer) — unlike its sibling `legacy_has_table`, a `PRAGMA table_info` prepare failure
+  read the same as "column absent," silently defaulting every `policy_status` row's
+  `fix_attempt_count` to 0 even when the column and its real values genuinely exist. Widened to
+  reuse the existing `LegacyTableStatus` tri-state (Present/Absent/Error) and made the caller fail
+  the whole backfill closed on `Error`, mirroring `legacy_has_table`'s existing contract exactly.
+- **`claim_due_policies` failures had no alerting surface** (sre) — a persistently-failing dispatch
+  claim (the ADR's own stated worst case: compliance checks silently stop running fleet-wide) only
+  ever logged at `warn`, with no counter. Bumped to `error` and added a
+  `yuzu_server_policy_eval_errors_total{phase="claim"}` increment, reusing the counter
+  `PolicyEvaluator::Deps` already carries for the fix/verify phases — zero new plumbing.
+
+**Documentation gap** (docs-writer HIGH, sre SHOULD — sre's read was the more operationally serious
+of the two: the "move it aside" remediation server.cpp already logged is technically correct but
+incomplete, since it also drops per-agent status history, not just definitions, and the
+`policy_status` legacy-ahead check re-runs on **every** boot for as long as the legacy file exists at
+its configured path — leaving it in place post-cutover as a "backup" reproduces the refusal, as a
+boot crash loop, on any later clock skew or restored-backup drift): added
+`docs/ops-runbooks/policy-store-backfill-recovery.md` (mirrors `tag-store-backfill-recovery.md`'s
+structure) covering both refusal shapes, the status-history caveat, and the every-boot re-check
+caveat; linked from the `server.cpp` refusal log line and the `docs/postgres-migration-ladder.md`
+ladder row. Also qualified `docs/user-manual/rest-api.md`'s `/evaluate`, `/remediate`,
+`/api/compliance`, and `/api/compliance/{policy_id}` sections, which either omitted the 503 branches
+entirely or documented only one of several live 503 messages; and added a one-line pointer to the
+durable dispatch claim in the `.claude/routed-concerns.md` "Compliance evaluation pipeline" row,
+which still described only the tick cadence.
+
+**Not fixed, explicitly out of scope for this round:** two SHOULD-level findings from architect are
+pre-existing gaps this migration did not introduce and are tracked separately rather than folded in —
+whether the REST-only mutator surface (fragment CRUD, `create_policy`, `enable`/`disable_policy`,
+`delete_policy`, `invalidate[_all]_policy`) needs an MCP twin or a recorded ADR-1005 exception-ledger
+entry, and whether `compliance_routes.cpp`'s hand-rolled 503 bodies should migrate onto the canonical
+`error_json_a4()` helper (missing `correlation_id`/`retry_after_ms`) — both pre-date this PR and apply
+file-wide, not to the lines this migration touched. **Also not fixed:** quality-engineer's structural
+finding that `test_compliance_routes.cpp`'s harness hardcodes `policy_store=nullptr`, making it
+incapable of exercising ANY of the store-backed branches this round fixed at the route-classifier
+level — the underlying logic defects are covered by new tests in `test_policy_store.cpp`/
+`test_policy_evaluator.cpp` at the store/evaluator layer, but the route-level classification code in
+`compliance_routes.cpp` (the 503-vs-400 mapping, the audit-disposition choice) has no direct test
+coverage and could regress silently on a future change. Retrofitting a PG-backed
+`ComplianceHarness` is a genuine, separate piece of work, not a drop-in addition to this round; filed
+as a follow-up rather than solved here.
+
 ### Construction — fail-closed (this store lacked it even on SQLite)
 
 `server.cpp:4979-4986` constructs `PolicyStore` and only logs on failure today — unlike
@@ -554,3 +635,16 @@ relying on declaration order to prove it).
   from scratch. If/when fleet-scale measurement shows lock-hold time approaching the tick budget,
   the fix is a per-tick cap on policies claimed (processing the remainder on subsequent ticks) or
   batching the claim+detail loads via `unnest()`/`IN (...)`.
+- `test_compliance_routes.cpp`'s `ComplianceHarness` hardcodes `policy_store=nullptr` and every
+  existing test only exercises the pre-`policy_store` 403 auth-denial path — it is structurally
+  incapable of exercising any store-backed branch, including every degrade-classification fix in
+  the Fifth correction above. A PG-backed harness variant is a genuine piece of work (`/governance`,
+  quality-engineer, 2026-08-24), not a drop-in test.
+- `compliance_routes.cpp`'s REST-only mutator surface (fragment CRUD, `create_policy`, `enable`/
+  `disable_policy`, `delete_policy`, `invalidate[_all]_policy`) has no MCP twin; unclear whether
+  this pre-existing gap is recorded in ADR-1005's exception ledger (`/governance`, architect,
+  2026-08-24).
+- `compliance_routes.cpp`'s hand-rolled 503 JSON bodies (this migration added several more, matching
+  the file's pre-existing convention) never call the canonical `error_json_a4()` helper
+  (`rest_a4_envelope.hpp`) — missing `correlation_id` and nullable `retry_after_ms` (`/governance`,
+  architect, 2026-08-24). File-wide, not specific to this migration's lines.

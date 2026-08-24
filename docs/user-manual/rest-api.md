@@ -3258,8 +3258,12 @@ verdicts appear a few seconds later.
 ```
 
 **Response (404):** policy not found. **Response (409):** the policy's fragment
-has no `check` instruction, or the policy matches no agents. **Response (503):**
-policy evaluation not available.
+has no `check` instruction, the policy matches no agents, or a check for this
+policy is already in flight. **Response (503):** either the policy evaluator
+isn't wired ("policy evaluation not available"), or a genuine internal store
+failure occurred while reading the policy or fragment, or recording the
+dispatch claim ("policy store degraded" / "policy evaluation degraded") — a
+transient failure of this kind is safe to retry and is never reported as a 409.
 
 **Audit:** `policy.evaluate`.
 
@@ -3299,9 +3303,14 @@ is remediated.
 
 **Response (404):** policy not found. **Response (409):** the fragment defines no
 `fix` instruction, or there are no non-compliant agents to remediate.
-**Response (503):** policy evaluation not available.
+**Response (503):** either the policy evaluator isn't wired ("policy evaluation
+not available"), or a genuine internal store failure occurred while resolving
+the policy or its remediation targets ("policy store degraded" / "policy store
+unavailable") — safe to retry, and distinguished from the 400/409 business
+rejections above.
 
-**Audit:** `policy.remediate` (`result` ∈ {`success`, `denied`}).
+**Audit:** `policy.remediate` (`result` ∈ {`success`, `denied`, `error`} — `error`
+is a store degrade, never a business rejection).
 
 ---
 
@@ -3315,7 +3324,7 @@ Fleet compliance summary across all active policies.
 
 **Permission:** `Policy:Read`
 
-**Response:**
+**Response (200):**
 
 ```json
 {
@@ -3329,6 +3338,10 @@ Fleet compliance summary across all active policies.
 }
 ```
 
+**Response (503):** `policy store degraded` — a genuine internal store failure,
+distinct from a genuine 0% (no policies enabled yet reads as all-zero counts
+with `200`, never a 503).
+
 ---
 
 #### `GET /api/compliance/{policy_id}`
@@ -3337,7 +3350,7 @@ Per-policy compliance detail with per-agent statuses.
 
 **Permission:** `Policy:Read`
 
-**Response:**
+**Response (200):**
 
 ```json
 {
@@ -3360,6 +3373,9 @@ Per-policy compliance detail with per-agent statuses.
   ]
 }
 ```
+
+**Response (503):** `policy store degraded`, on either the summary or the
+per-agent-status read.
 
 ---
 
