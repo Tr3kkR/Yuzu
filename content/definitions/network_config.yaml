@@ -334,3 +334,72 @@ spec:
 
 status:
   phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.network_config.arp
+  displayName: ARP / Neighbour Table
+  version: 1.0.0
+  description: >
+    Returns the host ARP / neighbour table (interface, IP, MAC address,
+    static/dynamic type). On Windows reads GetIpNetTable2 — IPv4 ARP and
+    IPv6 neighbours, including incomplete entries, capped at 20000 rows.
+    On Linux reads /proc/net/arp: IPv4 ARP only — IPv6 neighbours live in
+    a separate kernel table and are not reported, and non-Ethernet or
+    incomplete (non-ATF_COM) entries are skipped. On macOS reads a
+    PF_ROUTE RTF_LLINFO sysctl and de-duplicates; the dump carries no
+    interface name or static/dynamic type, so both fields are reported
+    as "-". Linux and macOS share Windows' 20000-row cap. This collects
+    the host's known neighbour identities (IP + MAC address) and is
+    tagged for compliance/inventory review on that basis.
+  tags: [network, inventory, arp, compliance]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: network_config
+    action: arp
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: interface
+        type: string
+      - name: ip_address
+        type: string
+      - name: mac_address
+        type: string
+      - name: entry_type
+        type: string
+    aggregation:
+      groupBy:
+        - entry_type
+      operations:
+        - count
+
+  readablePayload: "Get ARP / neighbour table"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [network_config]
+
+status:
+  phase: active

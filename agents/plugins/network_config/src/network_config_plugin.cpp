@@ -396,6 +396,15 @@ constexpr std::size_t kNetlinkRecvBufSize = 16384; // matches net_quality_sample
 // a local process writing to our netlink socket.
 constexpr int kMaxForeignDatagrams = 64;
 
+// SO_RCVTIMEO bounds each INDIVIDUAL recvmsg() call, but it resets on every
+// arriving datagram -- including one this loop goes on to discard. A local
+// process pacing one foreign-origin datagram just under each 2s window can
+// therefore stretch the count-based budget above to kMaxForeignDatagrams *
+// ~2s (~128s) of real wall-clock time before this thread ever gives up.
+// This deadline bounds the WHOLE discard loop instead, independent of how
+// the per-call timeout keeps resetting.
+constexpr auto kNetlinkDiscardDeadline = std::chrono::seconds{4};
+
 yuzu::agent::ScopedFd open_rtnetlink_socket() {
     yuzu::agent::ScopedFd fd{::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)};
     if (fd.get() >= 0) {
@@ -453,6 +462,7 @@ LinkDumpResult fetch_link_dump() {
     alignas(NLMSG_ALIGNTO) unsigned char buf[kNetlinkRecvBufSize];
     bool truncated = false;
     int foreign_datagrams = 0;
+    const auto discard_deadline = std::chrono::steady_clock::now() + kNetlinkDiscardDeadline;
     for (;;) {
         struct sockaddr_nl rsa {};
         struct iovec riov {buf, sizeof(buf)};
@@ -484,6 +494,9 @@ LinkDumpResult fetch_link_dump() {
             // an availability one. Give up after a small budget and report an
             // incomplete read.
             if (++foreign_datagrams > kMaxForeignDatagrams)
+                return result; // ok stays false — honest incomplete read
+            // Count alone is not enough — see kNetlinkDiscardDeadline above.
+            if (std::chrono::steady_clock::now() >= discard_deadline)
                 return result; // ok stays false — honest incomplete read
             continue; // not from the kernel — discard, do not parse
         }
@@ -551,6 +564,7 @@ AddrDumpResult fetch_addr_dump() {
     alignas(NLMSG_ALIGNTO) unsigned char buf[kNetlinkRecvBufSize];
     bool truncated = false;
     int foreign_datagrams = 0;
+    const auto discard_deadline = std::chrono::steady_clock::now() + kNetlinkDiscardDeadline;
     for (;;) {
         struct sockaddr_nl rsa {};
         struct iovec riov {buf, sizeof(buf)};
@@ -582,6 +596,9 @@ AddrDumpResult fetch_addr_dump() {
             // an availability one. Give up after a small budget and report an
             // incomplete read.
             if (++foreign_datagrams > kMaxForeignDatagrams)
+                return result; // ok stays false — honest incomplete read
+            // Count alone is not enough — see kNetlinkDiscardDeadline above.
+            if (std::chrono::steady_clock::now() >= discard_deadline)
                 return result; // ok stays false — honest incomplete read
             continue; // not from the kernel — discard, do not parse
         }
@@ -649,6 +666,7 @@ RouteDumpResult fetch_default_route_dump() {
     alignas(NLMSG_ALIGNTO) unsigned char buf[kNetlinkRecvBufSize];
     bool truncated = false;
     int foreign_datagrams = 0;
+    const auto discard_deadline = std::chrono::steady_clock::now() + kNetlinkDiscardDeadline;
     for (;;) {
         struct sockaddr_nl rsa {};
         struct iovec riov {buf, sizeof(buf)};
@@ -680,6 +698,9 @@ RouteDumpResult fetch_default_route_dump() {
             // an availability one. Give up after a small budget and report an
             // incomplete read.
             if (++foreign_datagrams > kMaxForeignDatagrams)
+                return result; // ok stays false — honest incomplete read
+            // Count alone is not enough — see kNetlinkDiscardDeadline above.
+            if (std::chrono::steady_clock::now() >= discard_deadline)
                 return result; // ok stays false — honest incomplete read
             continue; // not from the kernel — discard, do not parse
         }
@@ -1581,6 +1602,13 @@ private:
                 state_to_type(row.State)));
             ++emitted;
         }
+        if (table->NumEntries > kArpEntryCap) {
+            // Every other truncation path in this file reports a degraded
+            // status; hitting the row cap must too, or a genuinely large (or
+            // locally inflated) table silently reports as a complete small one.
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "network_config:arp_row_cap_reached");
+        }
         return 0; // ~MibTableGuard frees the table on every path
 
 #elif defined(__linux__)
@@ -1606,6 +1634,10 @@ private:
                 break;
             ctx.write_output(std::format("arp|{}|{}|{}|{}", e.iface, e.ip, e.mac, e.type));
             ++emitted;
+        }
+        if (entries.size() > kArpEntryCap) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "network_config:arp_row_cap_reached");
         }
         return 0;
 
@@ -1648,6 +1680,10 @@ private:
                 break;
             ctx.write_output(line);
             ++emitted;
+        }
+        if (deduped.size() > kArpEntryCap) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "network_config:arp_row_cap_reached");
         }
         return 0;
 
