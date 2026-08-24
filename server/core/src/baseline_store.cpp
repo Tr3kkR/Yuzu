@@ -913,6 +913,10 @@ std::expected<std::string, std::string> BaselineStore::create_baseline(const Bas
     const std::string id = sanitize_pg_text(b.baseline_id.empty() ? generate_id() : b.baseline_id);
     const int64_t now = now_epoch();
     const std::string lifecycle = b.lifecycle.empty() ? kBaselineDraft : b.lifecycle;
+    if (lifecycle != kBaselineDraft && lifecycle != kBaselineDeployed)
+        return std::unexpected("invalid lifecycle '" + lifecycle + "': must be '" +
+                                std::string(kBaselineDraft) + "' or '" +
+                                std::string(kBaselineDeployed) + "'");
 
     pg::PgResult res = pg::exec_params(
         conn,
@@ -1023,6 +1027,10 @@ std::expected<void, std::string> BaselineStore::update_baseline(const Baseline& 
         return std::unexpected("database not open");
     if (b.name.empty())
         return std::unexpected("baseline name cannot be empty");
+    if (b.lifecycle != kBaselineDraft && b.lifecycle != kBaselineDeployed)
+        return std::unexpected("invalid lifecycle '" + b.lifecycle + "': must be '" +
+                                std::string(kBaselineDraft) + "' or '" +
+                                std::string(kBaselineDeployed) + "'");
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease)
         return std::unexpected("no database connection: " + pool_.last_error());
@@ -1121,6 +1129,13 @@ BaselineStore::set_members(const std::string& baseline_id_in,
                 error = "insert member failed: " + std::string(PQerrorMessage(c));
                 return false;
             }
+        }
+        pg::PgResult touch = pg::exec_params(
+            c, "UPDATE baseline_store.baselines SET updated_at = $1::bigint WHERE baseline_id = $2",
+            std::vector<std::string>{std::to_string(now_epoch()), baseline_id});
+        if (touch.status() != PGRES_COMMAND_OK) {
+            error = "touch updated_at failed: " + std::string(PQerrorMessage(c));
+            return false;
         }
         return true;
     });
@@ -1247,6 +1262,13 @@ BaselineStore::set_assignment(const std::string& baseline_id_in,
                 error = "insert assignment failed: " + std::string(PQerrorMessage(c));
                 return false;
             }
+        }
+        pg::PgResult touch = pg::exec_params(
+            c, "UPDATE baseline_store.baselines SET updated_at = $1::bigint WHERE baseline_id = $2",
+            std::vector<std::string>{std::to_string(now_epoch()), baseline_id});
+        if (touch.status() != PGRES_COMMAND_OK) {
+            error = "touch updated_at failed: " + std::string(PQerrorMessage(c));
+            return false;
         }
         return true;
     });

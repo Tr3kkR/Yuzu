@@ -46,6 +46,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <thread>
 
@@ -296,6 +297,27 @@ TEST_CASE("update/delete of unknown baseline are non-conflict errors", "[pg][bas
     CHECK_FALSE(is_conflict_error(d.error()));
 }
 
+TEST_CASE("create_baseline/update_baseline reject an invalid lifecycle", "[pg][baseline_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, baselinestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BaselineStore store{pool};
+
+    Baseline bad = make_baseline("bad-lifecycle");
+    bad.lifecycle = "active"; // not draft/deployed
+    auto created = store.create_baseline(bad);
+    REQUIRE_FALSE(created.has_value());
+    CHECK_FALSE(is_conflict_error(created.error()));
+    CHECK_FALSE(store.get_baseline_by_name("bad-lifecycle", nullptr).has_value());
+
+    const std::string id = *store.create_baseline(make_baseline("ok-lifecycle"));
+    Baseline update = *store.get_baseline(id);
+    update.lifecycle = "active";
+    auto updated = store.update_baseline(update);
+    REQUIRE_FALSE(updated.has_value());
+    CHECK_FALSE(is_conflict_error(updated.error()));
+    CHECK(store.get_baseline(id)->lifecycle == kBaselineDraft); // untouched
+}
+
 TEST_CASE("Member set replace is transactional and de-duplicates", "[pg][baseline_store]") {
     YUZU_REQUIRE_PG_DB_TPL(db, baselinestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -354,6 +376,27 @@ TEST_CASE("Assignment include/exclude round-trip and validation", "[pg][baseline
     REQUIRE(d.size() == 1);
     CHECK(d[0].group_id == "g-dup");
     CHECK(d[0].disposition == kAssignExclude);
+}
+
+TEST_CASE("set_members/set_assignment advance the parent baseline's updated_at",
+          "[pg][baseline_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, baselinestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BaselineStore store{pool};
+    const std::string id = *store.create_baseline(make_baseline("touch"));
+    const int64_t created_updated_at = store.get_baseline(id)->updated_at;
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100)); // now_epoch() is second-granular
+
+    REQUIRE(store.set_members(id, {"r1"}).has_value());
+    const int64_t after_members = store.get_baseline(id)->updated_at;
+    CHECK(after_members > created_updated_at);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+    REQUIRE(store.set_assignment(id, {{"g1", kAssignInclude}}).has_value());
+    const int64_t after_assignment = store.get_baseline(id)->updated_at;
+    CHECK(after_assignment > after_members);
 }
 
 TEST_CASE("delete_baseline cascades members and assignment", "[pg][baseline_store]") {
