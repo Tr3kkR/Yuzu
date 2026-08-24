@@ -436,18 +436,31 @@ an operator noticed and manually re-issued the quarantine after the device came 
 `QuarantineContainmentReconciler` closes it automatically. For every device with an active
 quarantine record whose endpoint containment is not yet confirmed:
 
-- **Trigger.** A heartbeat from the device (the fast path — fires within one heartbeat interval
-  of reconnect) or a periodic ~20-second tick (the backstop — catches anything the heartbeat path
-  missed, and everything before the reconciler's heartbeat hook was wired). Deliberately **not**
-  agent registration/reconnect itself: the gRPC command stream is not yet established at that
-  point, so a dispatch fired from there would be silently dropped.
+- **Trigger.** A heartbeat from the device (the fast path — the reconciler no longer holds a
+  reconnecting device to a stale offline-tick's claim window, governance Gate 4, so the first
+  post-reconnect heartbeat is eligible to dispatch immediately) or a periodic ~20-second tick (the
+  backstop — catches anything the heartbeat path missed, and everything before the reconciler's
+  heartbeat hook was wired). Deliberately **not** agent registration/reconnect itself: the gRPC
+  command stream is not yet established at that point, so a dispatch fired from there would be
+  silently dropped. Full end-to-end confirmation is **not** one heartbeat interval — it is a real
+  state machine (apply, a follow-up `quarantine.status` verify after a short grace window, then
+  confirm), so it typically spans a few heartbeat intervals from reconnect to a confirmed record,
+  not one; the `#881` gate holds containment at the control plane for the entire span regardless.
 - **What it dispatches.** The **stored** `reason`/`whitelist` — the same rule the MCP
   `quarantine_device` retry path (#3127) follows, for the same reason: dispatching anything else
   would silently rewrite a contained device's firewall allow-list with no store update and no
   audit trail.
 - **Confirmation.** Dispatch acceptance alone is not proof of containment (a gateway-attached
   agent's `send_to` only queues the frame). The reconciler follows up with a `quarantine.status`
-  read and only marks the device confirmed once it answers `state|active`. A previously-confirmed
+  read and only marks the device confirmed once it answers `state|active`. **This is the target
+  agent's own self-report** — cert-bound to the correct agent identity (a different agent cannot
+  forge it), but not independently corroborated by any network-side signal. A device whose
+  quarantine plugin or execution environment is itself tampered could in principle reply
+  `state|active` regardless of its true firewall state; the `#881` dispatch-confinement gate does
+  not key off `last_confirmed_at`, so a false confirmation narrows to false operator/audit
+  assurance rather than widening what commands can reach that device. This is the same trust
+  boundary #3127's MCP `already_active` retry path already relies on, not new to this feature.
+  A previously-confirmed
   device whose live agent session changes (a reboot, a service restart — the firewall rules from
   before the restart are gone) drops confirmation and re-verifies via `status` first, rather than
   blindly re-applying.

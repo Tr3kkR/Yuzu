@@ -189,6 +189,14 @@ private:
         bool verify_first{false};
         Pending pending{Pending::none};
         std::string pending_command_id;
+        // #3425 governance Gate 4 (unhappy-path, Finding A): the
+        // `QuarantineRecord::id` the in-flight command was actually built
+        // from — carried into the eventual `mark_endpoint_applied`/
+        // `mark_endpoint_confirmed` call so a release-then-requarantine race
+        // that swaps in a new active row for this agent_id mid-cycle cannot
+        // have the confirmation stamp land on the wrong (never-dispatched)
+        // record. 0 only before the first-ever claim.
+        std::int64_t pending_record_id{0};
         std::chrono::steady_clock::time_point pending_since{};
         std::chrono::steady_clock::time_point next_eligible_at{};
         // Zero = "never claimed yet" — reconcile_one initializes it to

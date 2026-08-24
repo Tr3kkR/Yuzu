@@ -274,14 +274,14 @@ TEST_CASE("QuarantineStore: mark_endpoint_applied/confirmed happy path, read bac
     CHECK((*fresh)->last_applied_at == 0); // never, matches released_at's sentinel
     CHECK((*fresh)->last_confirmed_at == 0);
 
-    REQUIRE(store.mark_endpoint_applied("agent-001", 1000).has_value());
+    REQUIRE(store.mark_endpoint_applied("agent-001", (*fresh)->id, 1000).has_value());
     auto after_apply = store.get_status("agent-001");
     REQUIRE(after_apply.has_value());
     REQUIRE(after_apply->has_value());
     CHECK((*after_apply)->last_applied_at == 1000);
     CHECK((*after_apply)->last_confirmed_at == 0); // apply alone is not confirmation
 
-    REQUIRE(store.mark_endpoint_confirmed("agent-001", 2000).has_value());
+    REQUIRE(store.mark_endpoint_confirmed("agent-001", (*fresh)->id, 2000).has_value());
     auto after_confirm = store.get_status("agent-001");
     REQUIRE(after_confirm.has_value());
     REQUIRE(after_confirm->has_value());
@@ -297,12 +297,12 @@ TEST_CASE("QuarantineStore: mark_endpoint_applied/confirmed on a non-quarantined
     QuarantineStore store{pool};
     REQUIRE(store.is_open());
 
-    auto applied = store.mark_endpoint_applied("never-quarantined", 1000);
+    auto applied = store.mark_endpoint_applied("never-quarantined", /*record_id=*/0, 1000);
     REQUIRE_FALSE(applied.has_value());
     CHECK(applied.error() == "device is not quarantined");
     CHECK_FALSE(applied.error().starts_with(yuzu::server::kQuarantineDbErrorPrefix));
 
-    auto confirmed = store.mark_endpoint_confirmed("never-quarantined", 1000);
+    auto confirmed = store.mark_endpoint_confirmed("never-quarantined", /*record_id=*/0, 1000);
     REQUIRE_FALSE(confirmed.has_value());
     CHECK(confirmed.error() == "device is not quarantined");
 }
@@ -316,11 +316,69 @@ TEST_CASE("QuarantineStore: mark_endpoint_applied/confirmed on a RELEASED (not a
     REQUIRE(store.is_open());
 
     REQUIRE(store.quarantine_device("agent-002", "admin", "reason", "").has_value());
+    auto before_release = store.get_status("agent-002");
+    REQUIRE(before_release.has_value());
+    REQUIRE(before_release->has_value());
+    const auto record_id = (*before_release)->id;
     REQUIRE(store.release_device("agent-002").has_value());
 
-    auto applied = store.mark_endpoint_applied("agent-002", 1000);
+    // Even with the CORRECT (real, pre-release) id, status != 'active' alone
+    // still fails the guarded UPDATE — id-scoping is additive, not a
+    // replacement for the status check.
+    auto applied = store.mark_endpoint_applied("agent-002", record_id, 1000);
     REQUIRE_FALSE(applied.has_value());
     CHECK(applied.error() == "device is not quarantined");
+}
+
+TEST_CASE("QuarantineStore: mark_endpoint_applied/confirmed with the WRONG record id (a "
+          "release-then-requarantine race) is a business error, never silently stamps the new "
+          "record (governance Gate 4, unhappy-path Finding A)",
+          "[pg][quarantine][reconciler][regression]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.quarantine_device("agent-003", "admin", "malware", "10.0.0.1").has_value());
+    auto old_status = store.get_status("agent-003");
+    REQUIRE(old_status.has_value());
+    REQUIRE(old_status->has_value());
+    const auto old_id = (*old_status)->id;
+
+    // Simulates the race: the OLD record is released and a NEW, unrelated
+    // active record now exists for the same agent_id by the time the write
+    // for the OLD record's dispatch arrives.
+    REQUIRE(store.release_device("agent-003").has_value());
+    REQUIRE(
+        store.quarantine_device("agent-003", "admin", "NEW-reason", "99.99.99.99").has_value());
+    auto new_status = store.get_status("agent-003");
+    REQUIRE(new_status.has_value());
+    REQUIRE(new_status->has_value());
+    const auto new_id = (*new_status)->id;
+    REQUIRE(new_id != old_id); // a genuinely different row
+
+    // Using the STALE (old) record id must fail — id AND status='active' AND
+    // agent_id all have to match; the id alone belonging to a real row that
+    // once existed is not enough.
+    auto applied = store.mark_endpoint_applied("agent-003", old_id, 1000);
+    REQUIRE_FALSE(applied.has_value());
+    CHECK(applied.error() == "device is not quarantined");
+    auto confirmed = store.mark_endpoint_confirmed("agent-003", old_id, 1000);
+    REQUIRE_FALSE(confirmed.has_value());
+    CHECK(confirmed.error() == "device is not quarantined");
+
+    // The NEW record must be completely untouched by either failed call —
+    // this is the exact misattribution Finding A described.
+    auto after = store.get_status("agent-003");
+    REQUIRE(after.has_value());
+    REQUIRE(after->has_value());
+    CHECK((*after)->id == new_id);
+    CHECK((*after)->last_applied_at == 0);
+    CHECK((*after)->last_confirmed_at == 0);
+
+    // Using the CURRENT (new) record id succeeds, proving id-scoping isn't
+    // simply broken/over-strict.
+    REQUIRE(store.mark_endpoint_applied("agent-003", new_id, 1000).has_value());
 }
 
 TEST_CASE("QuarantineStore: mark_endpoint_applied/confirmed share quarantine_device's "
@@ -334,11 +392,11 @@ TEST_CASE("QuarantineStore: mark_endpoint_applied/confirmed share quarantine_dev
     // A precondition the store enforces BEFORE ever touching the pool — the
     // db_error PREFIX contract on a genuine store failure is exercised
     // end-to-end by the construction-fails-closed test above.
-    auto applied = store.mark_endpoint_applied("", 1000);
+    auto applied = store.mark_endpoint_applied("", /*record_id=*/0, 1000);
     REQUIRE_FALSE(applied.has_value());
     CHECK(applied.error() == "agent_id is required");
 
-    auto confirmed = store.mark_endpoint_confirmed("", 1000);
+    auto confirmed = store.mark_endpoint_confirmed("", /*record_id=*/0, 1000);
     REQUIRE_FALSE(confirmed.has_value());
     CHECK(confirmed.error() == "agent_id is required");
 }
@@ -427,7 +485,7 @@ TEST_CASE("QuarantineStore: a genuine v1->v2 upgrade (real ALTER against a popul
 
     // And mark_endpoint_applied/confirmed round-trip through the now-v2
     // schema end-to-end for that same pre-existing row.
-    REQUIRE(store.mark_endpoint_applied("pre-v2-agent", 5000).has_value());
+    REQUIRE(store.mark_endpoint_applied("pre-v2-agent", (*status)->id, 5000).has_value());
     auto after = store.get_status("pre-v2-agent");
     REQUIRE(after.has_value());
     REQUIRE(after->has_value());

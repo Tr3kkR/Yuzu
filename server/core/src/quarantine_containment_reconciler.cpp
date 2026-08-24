@@ -220,6 +220,7 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
     // does not spin".
     Pending pending_at_entry = Pending::none;
     std::string pending_command_id;
+    std::int64_t pending_record_id = 0;
     std::chrono::steady_clock::time_point pending_since{};
     bool verify_first = false;
     {
@@ -235,6 +236,7 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
         st.next_eligible_at = now_steady + st.backoff;
         pending_at_entry = st.pending;
         pending_command_id = st.pending_command_id;
+        pending_record_id = st.pending_record_id;
         pending_since = st.pending_since;
         verify_first = st.verify_first;
     }
@@ -310,7 +312,8 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
             // agent within one reconcile_one call are safe here because the
             // claim above already excludes any concurrent reconcile_one for
             // this agent_id.
-            auto mark_res = d_.quarantine_store->mark_endpoint_confirmed(agent_id, now_epoch());
+            auto mark_res = d_.quarantine_store->mark_endpoint_confirmed(agent_id, pending_record_id,
+                                                                         now_epoch());
             if (!mark_res) {
                 {
                     std::lock_guard<std::mutex> lk(mu_);
@@ -361,6 +364,25 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
     // ── No in-flight command: reachability first, no store I/O if offline ──
     auto session = d_.registry ? d_.registry->get_session(agent_id) : nullptr;
     if (!session) {
+        // #3425 governance Gate 4 (happy-path): an offline skip never
+        // actually attempted anything (same K11/CDX-P1-05 reasoning already
+        // applied to the per-tick dispatch cap, now applied to the per-agent
+        // CLAIM) — release it immediately rather than let it hold the full
+        // claim window. Without this, the claim taken at the top of this
+        // call (before reachability was even checked) persists at its full
+        // duration regardless of how many times the device is found
+        // offline, so the FIRST heartbeat after a genuine reconnect can
+        // inherit a stale offline-tick's window and sit rate_limited for up
+        // to that long — directly undermining the "fires within one
+        // heartbeat interval of reconnect" design intent for the device
+        // class this feature exists to fix. Safe: offline agents don't
+        // heartbeat, so nothing re-drives this before the next ~20s tick;
+        // backoff itself is untouched, so a flapping device still can't spin
+        // faster than its own reconnect cadence.
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            state_[agent_id].next_eligible_at = std::chrono::steady_clock::now();
+        }
         count("offline");
         return false;
     }
@@ -378,6 +400,23 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
         if (!status_res->has_value()) {
             std::lock_guard<std::mutex> lk(mu_);
             state_.erase(agent_id); // released since verify_first was set
+            return false;
+        }
+        // #3425 governance Gate 4 (unhappy-path, Finding A), residual window:
+        // `pending_record_id != 0` here means this verify follows a completed
+        // apply for a SPECIFIC record (see the apply-poll transition above,
+        // and the pure-churn path below where it carries the last-confirmed
+        // record's id). If the currently-active record's id no longer
+        // matches, the record was released-and-requarantined (or otherwise
+        // replaced) since that apply/confirm — dispatching a status check
+        // now and confirming it against the CURRENT record would attribute
+        // "confirmed" to a record whose whitelist this reconciler never
+        // actually applied. Bail like the "no active record" case above; the
+        // new current record has its own last_applied_at==0 and re-enters
+        // fresh via the normal apply path on the next tick/heartbeat.
+        if (pending_record_id != 0 && status_res->value().id != pending_record_id) {
+            std::lock_guard<std::mutex> lk(mu_);
+            state_.erase(agent_id);
             return false;
         }
         std::string command_id;
@@ -402,6 +441,11 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
         auto& st = state_[agent_id];
         st.pending = Pending::status;
         st.pending_command_id = command_id;
+        // #3425 governance Gate 4 (unhappy-path, Finding A): the record this
+        // status dispatch is ABOUT is the one `status_res` just read — carry
+        // its id forward so the eventual mark_endpoint_confirmed call is
+        // scoped to it, not to whatever happens to be active by then.
+        st.pending_record_id = status_res->value().id;
         st.pending_since = std::chrono::steady_clock::now();
         st.verify_first = false;
         count("reapplied");
@@ -446,17 +490,26 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
         return true; // dispatch attempted; registry just didn't reach anyone
     }
     // #3425 review K2/CDX-P1-02: same discipline as the confirm branch above
-    // — a failed guarded UPDATE (released concurrently, or a genuine store
-    // error) must not leave the reconciler believing an apply is durably
-    // recorded and polling ResponseStore for a command whose record is gone.
-    auto mark_res = d_.quarantine_store->mark_endpoint_applied(agent_id, now_epoch());
+    // — a failed guarded UPDATE (released concurrently, superseded by a
+    // requarantine, or a genuine store error) must not leave the reconciler
+    // believing an apply is durably recorded and polling ResponseStore for a
+    // command whose record is gone. `stored.id` (governance Gate 4,
+    // unhappy-path Finding A) scopes the write to the record this dispatch
+    // was actually built from — a release-then-requarantine race that swaps
+    // in a NEW active row for `agent_id` between the read and this write now
+    // affects zero rows here (falls into the same branch below) instead of
+    // silently stamping the new, never-actually-dispatched record.
+    auto mark_res = d_.quarantine_store->mark_endpoint_applied(agent_id, stored.id, now_epoch());
     if (!mark_res) {
         if (mark_res.error() == "device is not quarantined") {
             std::lock_guard<std::mutex> lk(mu_);
-            state_.erase(agent_id); // released concurrently — the dispatch already fired
-                                     // (K8/CDX-P1-01, the disclosed residual TOCTOU — see
-                                     // the "KNOWN RESIDUAL RACE" note in the header) but
-                                     // there is nothing left here to track as pending.
+            state_.erase(agent_id); // released, OR superseded by a requarantine, concurrently
+                                     // — the dispatch already fired (K8/CDX-P1-01, the
+                                     // disclosed residual TOCTOU — see the "KNOWN RESIDUAL
+                                     // RACE" note in the header) but there is nothing left
+                                     // here to track as pending; the current active record
+                                     // (if any) re-enters fresh via the normal apply path on
+                                     // the next tick/heartbeat.
         } else {
             // #3425 governance Gate 3 (cpp-safety, finding C): mirror the
             // confirm branch's backoff escalation below — without this, a
@@ -484,6 +537,10 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
         auto& st = state_[agent_id];
         st.pending = Pending::apply;
         st.pending_command_id = reapply_res->command_id;
+        // #3425 governance Gate 4 (unhappy-path, Finding A): carried forward
+        // into the eventual verify -> mark_endpoint_confirmed call too (the
+        // confirm is ABOUT the record whose whitelist was just applied).
+        st.pending_record_id = stored.id;
         st.pending_since = std::chrono::steady_clock::now();
     }
     count("reapplied");

@@ -307,14 +307,23 @@ Endpoint-containment confirmation state for `QuarantineContainmentReconciler` �
 `0` = never, matching this table's existing `released_at` never-happened sentinel rather than
 introducing nullable-column plumbing this store's read path (`read_record`/`to_i64`) does not
 otherwise have. Two new store APIs, `mark_endpoint_applied`/`mark_endpoint_confirmed`, share
-`release_device`'s exact shape: a single guarded `UPDATE ... WHERE agent_id = $1 AND status =
-'active' RETURNING id`, zero rows → the same unprefixed `"device is not quarantined"` business
-error (a released or never-quarantined agent_id is a business error, not a store failure — 400 at
-REST, matching `release_device`/`quarantine_device`'s existing split). Sole writer: the
-reconciler. The `ALTER TABLE` takes a brief `ACCESS EXCLUSIVE` lock — negligible at this table's
-size for the same reason `kMaxBackfillRows` above is sized the way it is (manually-curated
-security events, not a high-volume telemetry stream); see `docs/user-manual/server-admin.md` for
-the one-line operational note.
+`release_device`'s guarded-UPDATE shape, extended with a THIRD predicate (governance Gate 4,
+unhappy-path Finding A, 2026-08-24): `UPDATE ... SET <col> = $1 WHERE agent_id = $2 AND id = $3
+AND status = 'active' RETURNING id`. The `id` predicate is load-bearing, not defensive
+redundancy — `agent_id`+`status='active'` alone is not a stable row identity across a
+release-then-requarantine race: a NEW active row can exist for the same `agent_id` while a
+reconcile cycle for the OLD row is still in flight, and without `id` scoping the stamp write
+would silently land on the new row (misattributing "applied"/"confirmed" to a whitelist that was
+never actually dispatched). Zero rows (from EITHER cause — genuinely released, or superseded by a
+different active record) → the same unprefixed `"device is not quarantined"` business error (a
+released or never-quarantined agent_id is a business error, not a store failure — 400 at REST,
+matching `release_device`/`quarantine_device`'s existing split); every caller's handling (erase
+in-memory state, let the current record re-enter fresh) is correct for either cause, so this stays
+one error string rather than forking one per cause. Sole writer: the reconciler. The `ALTER TABLE`
+takes a brief `ACCESS EXCLUSIVE` lock — negligible at this table's size for the same reason
+`kMaxBackfillRows` above is sized the way it is (manually-curated security events, not a
+high-volume telemetry stream); see `docs/user-manual/server-admin.md` for the one-line operational
+note.
 
 ## Follow-ups
 

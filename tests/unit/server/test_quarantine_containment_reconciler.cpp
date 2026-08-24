@@ -242,6 +242,51 @@ TEST_CASE("QuarantineContainmentReconciler: a device with no live session is ski
               .value() == 0);
 }
 
+// #3425 governance Gate 4 (happy-path, 2026-08-24): an offline-tick claim
+// must not hold a reconnecting device's FIRST post-reconnect heartbeat to
+// the full claim window — that directly undermines the "fast path fires
+// promptly on reconnect" design intent for exactly the device class this
+// feature exists to fix.
+TEST_CASE("QuarantineContainmentReconciler: a device found offline is immediately eligible again "
+          "on the next heartbeat, not held to the claim window an offline tick took",
+          "[pg][quarantine][reconciler][regression]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_recon_tpl);
+    PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineStore qstore{qpool};
+    REQUIRE(qstore.is_open());
+    REQUIRE(qstore.quarantine_device("agent-1", "admin", "malware", "").has_value());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry{bus, metrics};
+    // Deliberately NOT registered yet — offline at the first tick.
+
+    MockDispatch dispatch;
+    QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
+        .quarantine_store = &qstore,
+        .response_store = nullptr,
+        .registry = &registry,
+        .metrics = &metrics,
+        .audit_store = nullptr,
+        .dispatch_fn = dispatch.fn(),
+        .now_fn = {},
+        // A generous production-scale claim window — if the offline skip
+        // held it, a same-millisecond heartbeat would be rate_limited; the
+        // fix means it isn't, regardless of how large this is.
+        .min_reapply_interval_override = std::chrono::milliseconds(60'000),
+    });
+
+    reconciler.tick(); // offline — claims, then immediately releases the claim
+    CHECK(dispatch.calls.empty());
+
+    // Reconnect: register the session, then heartbeat right away — no sleep.
+    registry.register_agent(make_info("agent-1"));
+    reconciler.notify_agent_heartbeat("agent-1");
+    REQUIRE(dispatch.calls.size() == 1); // NOT rate_limited despite the 60s window
+    CHECK(dispatch.calls[0].plugin == "quarantine");
+    CHECK(dispatch.calls[0].action == "quarantine");
+}
+
 TEST_CASE("QuarantineContainmentReconciler: a busy mutation-gate response does not spin — "
           "the per-agent claim governs the next attempt",
           "[pg][quarantine][reconciler]") {
@@ -877,4 +922,75 @@ TEST_CASE("QuarantineContainmentReconciler: a release racing mark_endpoint_appli
     CHECK(events->front().target_id == "agent-1");
     CHECK(events->front().detail.find("dispatch accepted") != std::string::npos);
     CHECK(events->front().detail.find("device is not quarantined") != std::string::npos);
+}
+
+// #3425 governance Gate 4 (unhappy-path, Finding A, 2026-08-24): a
+// release-then-requarantine sequence landing inside a reconcile cycle for
+// the OLD record must never have its confirmation/apply stamp land on the
+// NEW, unrelated record — that record's whitelist was never actually
+// dispatched. Fixed by scoping `mark_endpoint_applied`/`mark_endpoint_confirmed`
+// to the specific `QuarantineRecord::id` the dispatch was built from,
+// threaded through `AgentState::pending_record_id`. Same deterministic
+// on_dispatch injection technique as the K1/K2 regression tests above.
+TEST_CASE("QuarantineContainmentReconciler: a release+requarantine race does not misattribute "
+          "the apply stamp to the NEW unrelated record, and the new record still gets its own "
+          "fresh apply",
+          "[pg][quarantine][reconciler][regression]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_recon_tpl);
+    PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineStore qstore{qpool};
+    REQUIRE(qstore.is_open());
+    REQUIRE(qstore.quarantine_device("agent-1", "admin", "malware", "10.0.0.1").has_value());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry{bus, metrics};
+    registry.register_agent(make_info("agent-1"));
+
+    MockDispatch dispatch;
+    // Fires after the apply dispatch (with the OLD record's whitelist,
+    // 10.0.0.1) is recorded but BEFORE reconcile_one's own
+    // mark_endpoint_applied call: release the OLD record and immediately
+    // re-quarantine with a DIFFERENT whitelist — an operator's
+    // release-then-requarantine-for-a-new-reason sequence landing in the
+    // window between dispatch and the store stamp.
+    dispatch.on_dispatch = [&] {
+        REQUIRE(qstore.release_device("agent-1").has_value());
+        REQUIRE(qstore.quarantine_device("agent-1", "admin", "NEW-reason", "99.99.99.99")
+                    .has_value());
+    };
+
+    QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
+        .quarantine_store = &qstore,
+        .response_store = nullptr,
+        .registry = &registry,
+        .metrics = &metrics,
+        .audit_store = nullptr,
+        .dispatch_fn = dispatch.fn(),
+        .now_fn = {},
+    });
+
+    reconciler.tick();
+    REQUIRE(dispatch.calls.size() == 1);
+    // What was ACTUALLY dispatched was the OLD record's whitelist — the
+    // stored-whitelist-only invariant holds for the dispatch itself.
+    CHECK(dispatch.calls[0].parameters.at("whitelist_ips") == "10.0.0.1");
+
+    // The NEW record (whitelist 99.99.99.99, reason NEW-reason) is now the
+    // sole 'active' row for agent-1 — and it must be COMPLETELY untouched by
+    // the failed (id-mismatched) mark_endpoint_applied call.
+    auto status = qstore.get_status("agent-1");
+    REQUIRE(status.has_value());
+    REQUIRE(status->has_value());
+    CHECK((*status)->whitelist == "99.99.99.99");
+    CHECK((*status)->reason == "NEW-reason");
+    CHECK((*status)->last_applied_at == 0); // NOT stamped — this is the fix
+    CHECK((*status)->last_confirmed_at == 0);
+
+    // A further tick must dispatch a FRESH apply for the NEW record's own
+    // whitelist — proving this isn't just non-corruption but real recovery.
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    reconciler.tick();
+    REQUIRE(dispatch.calls.size() == 2);
+    CHECK(dispatch.calls[1].parameters.at("whitelist_ips") == "99.99.99.99");
 }
