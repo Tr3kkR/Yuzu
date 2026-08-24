@@ -391,7 +391,30 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // KPI strip — id-tagged for the SSE drawer (#exec-kpi-{id}). PR 3
             // listeners locate this strip via id and swap individual cell
             // values rather than re-rendering the whole strip.
-            html += "<div class=\"exec-kpi-strip\" id=\"exec-kpi-" + html_escape(exec.id) + "\">";
+            // #1712: mark the strip when a per-agent scope filter is in force
+            // for this viewer, so the LIVE channel does not undo the
+            // reconciliation below. `execution-progress` is execution-scoped
+            // and therefore always admitted, but its payload carries the parent
+            // row's FLEET-WIDE agents_targeted/_success/_failure — and
+            // `execApplyProgress` (instruction_ui.cpp) writes those straight
+            // into these three cells. Without this marker the reconciled
+            // in-scope counts survive for well under a second and are then
+            // replaced by the fleet counts for the rest of the execution, which
+            // re-discloses exactly the cardinality this recompute withholds.
+            //
+            // Keyed on the filter being ACTIVE, not on `roster_dropped > 0`,
+            // and deliberately so — the same reasoning `dashboard_routes.cpp`
+            // records for its own recompute. `succeeded`/`failed` are counted
+            // from the FILTERED roster, so they are already scope-correct at
+            // zero drops; a confined viewer who happens to have dropped nothing
+            // in the status vector would still have them overwritten with fleet
+            // totals. The cost is that an unconfined viewer under RBAC-on gets
+            // these three cells from the 500 ms debounced refetch rather than
+            // instantly; the refetch is server-rendered and scope-correct.
+            html += "<div class=\"exec-kpi-strip\" id=\"exec-kpi-" + html_escape(exec.id) + "\"";
+            if (response_scope_fn)
+                html += " data-scope-reconciled=\"1\"";
+            html += ">";
             // #1712: `agents_targeted` is read off the EXECUTION row, not off
             // the (now filtered) status vector, so narrowing `agents` does not
             // reconcile it — left alone it still tells a management-group-
@@ -911,19 +934,30 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                  // releasing early at post-routing (see is_streaming_path /
                  // adopt_quota_slot_into_stream in principal_quota_gate.hpp).
                  // #1712: the per-connection scope state. `viewer` is copied
-                 // (the session does not outlive the handler); `scope_memo`
-                 // memoizes the predicate per distinct agent_id for the life
-                 // of the stream, the same "first answer for an agent applies"
-                 // property `filter_rows_in_scope` documents — a store that
-                 // degrades mid-stream can never retroactively widen an agent
-                 // already admitted, nor admit one already denied. Only the
-                 // content-provider thread touches it, so it needs no lock.
+                 // (the session does not outlive the handler).
+                 //
+                 // The scope memo is deliberately NOT per-connection: it is
+                 // rebuilt on every provider invocation (see the drain below),
+                 // so it carries exactly the "within a single call the FIRST
+                 // answer for an agent applies" property `filter_rows_in_scope`
+                 // documents — and nothing longer. An earlier revision hoisted
+                 // it to the life of the stream and cited that same property to
+                 // justify it; the citation was false. `filter_rows_in_scope`'s
+                 // memo is a function local that lives for one render (a few
+                 // ms), whereas an EventSource stays open for as long as the
+                 // drawer does. A cached ADMIT that never re-evaluates means a
+                 // revoked management-group membership, or RBAC being switched
+                 // on mid-stream, keeps streaming an agent's transitions until
+                 // the client disconnects — an unbounded confinement window.
+                 // Re-deciding per tick bounds that to one drain (<=3s) and
+                 // costs one predicate call per distinct agent per tick, which
+                 // is what every other reader on this surface already pays per
+                 // poll.
                  const std::string viewer = session->username;
-                 auto scope_memo = std::make_shared<std::unordered_map<std::string, bool>>();
                  res.set_chunked_content_provider(
                      "text/event-stream",
-                     [sink_state, stream_budget, response_scope_fn, viewer,
-                      scope_memo](size_t offset, httplib::DataSink& s) -> bool {
+                     [sink_state, stream_budget, response_scope_fn,
+                      viewer](size_t offset, httplib::DataSink& s) -> bool {
                          // Re-implement the existing sse_content_provider in-line
                          // with id-aware framing. We can't reuse `format_sse`
                          // verbatim because it doesn't emit `id:`; the prefixed
@@ -960,10 +994,20 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                          // event TYPE); only the "may this user see this agent"
                          // answer is cached, which is what makes the cache safe
                          // to key on agent_id alone.
+                         //
+                         // Scope: this memo is a LOCAL of one provider
+                         // invocation, so it dies with this drain. That is the
+                         // whole of the "first answer for an agent applies"
+                         // property — within one batch a degrading store cannot
+                         // retroactively widen an agent already admitted, and
+                         // the next tick re-decides from scratch, so a revoked
+                         // grant (or RBAC switched on mid-stream) takes effect
+                         // within one drain instead of never.
+                         std::unordered_map<std::string, bool> scope_memo;
                          ResponseScopePredicate memoized_scope =
                              [&response_scope_fn, &scope_memo](const std::string& user,
                                                                const std::string& aid) {
-                                 auto [it, inserted] = scope_memo->try_emplace(aid, false);
+                                 auto [it, inserted] = scope_memo.try_emplace(aid, false);
                                  if (inserted)
                                      it->second = response_scope_fn(user, aid);
                                  return it->second;
@@ -986,11 +1030,28 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                              // on an agent-attributed event carrying no
                              // agent_id. Unwired predicate = no filter, the
                              // deliberate legacy-open case (workflow_routes.hpp).
+                             //
+                             // The admission runs inside a catch-all that DROPS
+                             // the event. httplib invokes this content provider
+                             // from a worker task outside its routing try/catch
+                             // (`event_bus.hpp` documents the same hazard —
+                             // #2037's class), so an escaping exception here is
+                             // `std::terminate`, not a 500. The predicate reaches
+                             // the PostgreSQL RBAC store and allocates, so it is
+                             // not a noexcept path. Dropping is the fail-CLOSED
+                             // direction and matches what a denying predicate
+                             // would have done.
                              if (response_scope_fn) {
-                                 ExecutionEvent probe;
-                                 probe.event_type = ev.event_type;
-                                 probe.agent_id = ev.agent_id;
-                                 if (!execution_event_in_scope(probe, viewer, memoized_scope))
+                                 bool admit = false;
+                                 try {
+                                     ExecutionEvent probe;
+                                     probe.event_type = ev.event_type;
+                                     probe.agent_id = ev.agent_id;
+                                     admit = execution_event_in_scope(probe, viewer, memoized_scope);
+                                 } catch (...) {
+                                     admit = false;
+                                 }
+                                 if (!admit)
                                      continue;
                              }
 

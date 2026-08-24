@@ -39,22 +39,30 @@ enabled = true
 > `yuzu_server_rbac_read_degrade_total` metric. In that degraded state, device
 > visibility falls back to the role-scoped path for every caller, so agents stop
 > appearing in the dashboard list, `/api/agents`, and TAR fleet scans rather than
-> the whole fleet being exposed. **The same fail-closed posture covers every
-> response/execution reader (#1634, #1712):** `query_responses`, `aggregate_responses`,
-> `GET /api/v1/executions/{id}/visualization`, the legacy `GET /api/responses/{id}`
-> / `/aggregate` / `/export` surfaces, the dashboard `/fragments/results/…` table,
-> and the workflow executions-drawer reader all return **zero rows** (the legacy
-> aggregate returns `503`) on a corrupt store rather than reopening the
-> cross-operator fleet-wide read. The drawer's **live channel**
-> (`GET /sse/executions/{id}`) applies the same predicate per event: on a corrupt
-> store it streams **no per-agent transitions at all**, only the execution-wide
-> progress/completion frames, which name no agent. So a degraded store looks like "no agents in
-> scope" / "no responses" everywhere, never a visibility leak. Check the server
-> startup log for `RbacStore` errors, the `/health` store status, and
-> `yuzu_server_rbac_read_degrade_total`, then restore PostgreSQL (`rbac_store`)
-> availability immediately. (If Grafana panels or scripted aggregate consumers
-> show zero rows after an upgrade or restart, check for `RbacStore` open/migrate
-> errors first.)
+> the whole fleet being exposed. **The same fail-closed posture covers the
+> response/execution readers listed here (#1634, #1712):** `query_responses`,
+> `aggregate_responses`, `GET /api/v1/executions/{id}/visualization`, the legacy
+> `GET /api/responses/{id}` / `/aggregate` / `/export` surfaces, the dashboard
+> `/fragments/results/…` table, and the workflow executions-drawer reader all
+> return **zero rows** (the legacy aggregate returns `503`) on a corrupt store
+> rather than reopening the cross-operator fleet-wide read. The drawer's **live
+> channel** (`GET /sse/executions/{id}`) applies the same predicate per event: on a
+> corrupt store it streams **no per-agent transitions at all**, only the
+> execution-wide progress/completion frames, which name no agent.
+>
+> **Still NOT covered — these have no per-agent filter, so a degraded store is not
+> the only way they over-disclose:** the agentic SSE twin `GET /api/v1/events`
+> streams the same per-agent `agent-transition` frames (agent id, status, exit
+> code, agent-returned error text) on a flat global `Execution:Read`, and
+> `GET /api/executions/{id}/agents` / `/summary` return the per-agent roster and
+> the fleet-wide aggregate counts on the same flat gate. Scoping them is tracked
+> follow-up work. So a degraded store looks like "no agents in scope" / "no
+> responses" **on the covered surfaces above, while those three remain a
+> visibility leak** — check the server startup log for `RbacStore` errors, the
+> `/health` store status, and `yuzu_server_rbac_read_degrade_total`, then restore
+> PostgreSQL (`rbac_store`) availability immediately. (If Grafana panels or
+> scripted aggregate consumers show zero rows after an upgrade or restart, check
+> for `RbacStore` open/migrate errors first.)
 >
 > **Note (#1634):** the per-agent filter on these response readers is, under
 > *normal* RBAC operation, currently **inert** — a holder of global `Response:Read`

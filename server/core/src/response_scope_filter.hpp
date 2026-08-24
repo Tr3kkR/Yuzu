@@ -12,13 +12,20 @@
 /// converging on — how a fan-out of response rows is narrowed to the agents a
 /// caller may see.
 ///
-/// HONEST STATUS, because overstating this is worse than not having it: three
+/// HONEST STATUS, because overstating this is worse than not having it: FIVE
 /// hand-rolled copies of this loop PREDATE this header and are NOT yet
 /// migrated — `server.cpp`'s legacy `/api/responses/*` export and get readers,
-/// and MCP `query_responses` (`mcp_server.cpp`). They are semantically
+/// MCP `query_responses` and `query_installed_software` (`mcp_server.cpp`, the
+/// latter a set-based variant of the same drop-count semantics), and the
+/// `/api/v1/executions/{id}/visualization` reader (`rest_api_v1.cpp`). An
+/// earlier revision of this comment said three and named only the first three;
+/// the count was checked and corrected in review, which is the whole point of
+/// writing it down. They are semantically
 /// equivalent (memoize per distinct agent, keep admitted rows, count distinct
 /// drops) but structurally drifted, and a future change to the shared loop —
 /// drop-count semantics, exception behaviour — would silently miss them.
+/// (`server.cpp`'s aggregate reader is correctly NOT one of these: it pushes
+/// the scope into the store query instead of post-filtering.)
 /// Every reader this header is used by routes through it; migrating the other
 /// three is tracked as follow-up work, deliberately not folded into a security
 /// fix. Do NOT add a fourth copy: new readers use this function.

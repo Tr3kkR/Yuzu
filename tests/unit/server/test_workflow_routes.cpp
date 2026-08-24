@@ -1695,6 +1695,62 @@ TEST_CASE("SSE handler: detail KPI strip carries id=exec-kpi-{id} for partial sw
     CHECK(res->body.find("id=\"exec-kpi-" + exec_id + "\"") != std::string::npos);
 }
 
+TEST_CASE("#1712: KPI strip is marked scope-reconciled so the live progress frame "
+          "cannot overwrite the in-scope counts",
+          "[pg][workflow][executions][1712]") {
+    // The drawer reconciles Total/Succeeded/Failed to the IN-SCOPE roster when
+    // a scope filter is in force. `execution-progress` is execution-scoped, so
+    // `execution_event_in_scope` admits it to a confined viewer by design — and
+    // its payload carries the parent row's FLEET-WIDE agents_targeted /
+    // agents_success / agents_failure. `execApplyProgress` (instruction_ui.cpp)
+    // writes those into exactly the three cells the server just narrowed, so
+    // without a marker the reconciliation survives well under a second and the
+    // fleet cardinality is re-disclosed live.
+    //
+    // This pins the SERVER half — the attribute the client keys on. Deleting
+    // the stamp in workflow_routes.cpp fails this; the client half is the
+    // `data-scope-reconciled` early return in execApplyProgress.
+    //
+    // Keyed on the filter being ACTIVE, not on "something was dropped":
+    // succeeded/failed are counted from the filtered roster and so are already
+    // scope-correct at zero drops, which is why the zero-drop case below must
+    // ALSO carry the marker.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-recon", "Recon");
+
+    SECTION("stamped when the filter drops an agent") {
+        auto eid = h.make_exec("def-recon", "running", 2, 1, 0);
+        h.agent_status(eid, "recon-in", "success", 0, "", 1735689601);
+        h.agent_status(eid, "recon-out", "failure", 3, "secret", 1735689602);
+        h.response_scope_predicate = [](const std::string&, const std::string& aid) {
+            return aid != "recon-out";
+        };
+        auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("data-scope-reconciled=\"1\"") != std::string::npos);
+        // And the out-of-scope agent really is withheld, so the marker is
+        // protecting a genuinely narrowed strip rather than decorating a
+        // fleet-wide one.
+        CHECK(res->body.find("recon-out") == std::string::npos);
+        CHECK(res->body.find("secret") == std::string::npos);
+    }
+
+    SECTION("stamped even when nothing was dropped") {
+        auto eid = h.make_exec("def-recon", "running", 2, 2, 0);
+        h.agent_status(eid, "recon-a", "success", 0, "", 1735689601);
+        h.agent_status(eid, "recon-b", "success", 0, "", 1735689602);
+        // Admit-everyone default: zero drops, but the filter is still ACTIVE,
+        // so the fleet-wide progress payload must still be kept off the strip.
+        auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("data-scope-reconciled=\"1\"") != std::string::npos);
+    }
+}
+
 TEST_CASE("SSE handler: per-agent status badge has .per-agent-status class for partial swaps",
           "[pg][workflow][executions][pr3]") {
     // Client SSE listener swaps the status badge in place via

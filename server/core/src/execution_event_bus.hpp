@@ -76,7 +76,12 @@ struct ExecutionEvent {
     /// a confined consumer without an `agent_id` is dropped rather than
     /// delivered. That is what keeps this parameter's convenience default
     /// from becoming a fail-open hole in a future publisher.
-    std::string agent_id;
+    ///
+    /// Default-member-initialized to match `id`/`timestamp_ms` above and
+    /// `SseEvent::agent_id` — a trailing member without one warns under
+    /// `-Wmissing-field-initializers` on gcc/Clang at the first aggregate-init
+    /// call site (there are none today, which is exactly when it is cheap).
+    std::string agent_id{};
 };
 
 class ExecutionEventBus {

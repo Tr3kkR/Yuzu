@@ -4789,6 +4789,18 @@ McpServer::HandlerFn McpServer::build_handler(
                 const bool in_scope =
                     !response_scope_fn || response_scope_fn(session->username, agent_id);
                 if (!in_scope) {
+                    // Audit the DENIAL, matching every sibling scope-drop reader
+                    // (`query_responses`, `query_installed_software`, the two
+                    // #1712 dashboard readers). An audit row is server-side and
+                    // never reaches the caller, so it costs nothing in
+                    // existence-oracle terms — the response body below stays
+                    // byte-identical to the genuine not-found one. Without it a
+                    // cross-management-group probe against a specific agent_id
+                    // leaves no trace in the CC7.2 evidence chain, which is the
+                    // one read this gate exists to make accountable.
+                    (void)mcp_audit("denied", "scope: filtered 1 out-of-management-group "
+                                              "agent(s) for " +
+                                                  agent_id);
                     res.set_content(
                         error_response(id, kInvalidParams, "Agent not found: " + agent_id),
                         "application/json");

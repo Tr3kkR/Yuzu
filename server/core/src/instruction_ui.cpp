@@ -699,6 +699,16 @@ function execApplyProgress(drawerEl, execId, payload) {
   var strip = drawerEl.querySelector('#exec-kpi-' + execCssEsc(execId));
   if (!strip) return;
   var values = strip.querySelectorAll('.exec-kpi-value');
+  /* #1712: these counts are the parent execution row's FLEET-WIDE
+     totals. `execution-progress` names no agent, so it is admitted to a
+     scope-confined viewer by design — but writing its aggregates here
+     would overwrite the in-scope counts the server reconciled when it
+     rendered the strip, re-disclosing how many agents outside the
+     viewer's management group the command reached. When the server
+     stamped `data-scope-reconciled`, leave all three cells alone; the
+     debounced full-fragment refetch (which IS scope-filtered) keeps them
+     current. */
+  if (strip.hasAttribute('data-scope-reconciled')) return;
   /* Strip layout: Total / Succeeded / Failed / p50 / p95.
      Update the first three from counts; p50 / p95 stay on "—" until the
      next full detail-fragment fetch so we don't re-implement the

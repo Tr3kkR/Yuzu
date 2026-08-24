@@ -328,11 +328,26 @@ The scope DECISION itself is not re-implemented there: it is
 `ServerImpl::response_agent_in_scope`, the same predicate the drawer's
 static fragment and the REST/MCP response readers use.
 
-Today the dashboard SSE route (`GET /sse/executions/{id}`) is the consumer
+Today the dashboard SSE route (`GET /sse/executions/{id}`) is the ONLY consumer
 that applies it - it is the drawer's live half, and the static half is
-scope-filtered (#1712). `GET /api/v1/events` and the MCP progress bridge
-carry the field through unchanged and are unfiltered as before; scoping them
-is follow-up work, not a behaviour change made here.
+scope-filtered (#1712).
+
+`GET /api/v1/events` and the MCP progress bridge are unfiltered as before, and
+neither READS the field today: `/api/v1/events` copies only `event_type` and
+`data` into its per-connection queue and its JSON envelope
+(`ExecutionSseEvent`) has no `agent_id` member, and the bridge projects only
+`execution-completed` / `execution-progress` and returns early on
+`agent-transition`. So scoping `/api/v1/events` is larger than adding a
+predicate call - the field has to be threaded through its queue, its envelope
+and the published OpenAPI schema first. That is tracked follow-up work, not a
+behaviour change made here; until it lands, `/api/v1/events` is the unconfined
+twin of a confined dashboard route, and `docs/user-manual/rbac.md` says so.
+
+The MCP bridge's early return is a SECOND hardcoded copy of this taxonomy
+(`mcp_stream_bridge.cpp`), predating the classifier. It is safe today - its
+allow-list is exactly the execution-scoped set, so it fails closed the same way
+- but a new event type must be classified in BOTH places until it is migrated
+onto `classify_execution_event`.
 
 The agentic route's audit verb is `api.v1.events.subscribe` (separate
 from `execution.live_subscribe` so SIEM filters can distinguish browser

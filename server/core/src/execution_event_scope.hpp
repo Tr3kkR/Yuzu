@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional> // std::function::operator bool — used directly below
 #include <string>
 #include <string_view>
 
@@ -33,9 +34,18 @@
 /// consumer — so a future publisher that adds a per-agent event type and
 /// forgets to set `agent_id`, or forgets to classify it here, withholds
 /// data from a confined operator rather than leaking it. Extend
-/// `classify_execution_event` when the taxonomy grows; that is the single
-/// place to extend, and the bus-side taxonomy rule ("add the type on the
-/// bus, never per consumer") is unchanged by it.
+/// `classify_execution_event` when the taxonomy grows; the bus-side taxonomy
+/// rule ("add the type on the bus, never per consumer") is unchanged by it.
+///
+/// It is NOT yet the ONLY site that classifies this taxonomy. The MCP
+/// progress bridge (`mcp_stream_bridge.cpp`) predates this header and carries
+/// its own hardcoded allow-list of the two execution-scoped types, returning
+/// early on everything else. That copy is safe today — its allow-list is
+/// exactly the `kExecutionScoped` set, so it fails closed the same way — but
+/// until it is migrated onto this function a new event type must be
+/// classified in BOTH places. Migrating it is how this becomes the single
+/// site; asserting that it already is would be the drift this header exists
+/// to prevent.
 ///
 /// WHAT CALLERS STILL OWN: the FAIL-OPEN-WHEN-UNWIRED test. An unwired
 /// `ResponseScopePredicate` means "no filter" (legacy behaviour for
@@ -47,13 +57,23 @@
 /// RESIDUAL, stated rather than left for a reader to discover: the two
 /// execution-scoped frames carry the parent row's fleet-wide aggregate
 /// counts (`agents_targeted` / `_responded` / `_success` / `_failure`).
-/// Those name no agent, so they are admitted — but for a confined operator
-/// they are a cardinality disclosure of the same class the drawer's static
-/// KPI strip reconciles by recomputing from the surviving roster. Per-viewer
+/// Those name no agent, so they are admitted here — per-viewer
 /// reconciliation is not possible on a shared bus without rewriting each
 /// payload per connection (the per-event JSON parse this design exists to
-/// avoid), so it is deliberately NOT attempted here; the identity leak — the
-/// live one — is what this closes.
+/// avoid), so it is deliberately NOT attempted at this layer. The identity
+/// leak — the live one — is what this function closes.
+///
+/// That makes the aggregate counts the CONSUMER's problem, and the drawer
+/// handles them at the point of use rather than on the bus: the KPI strip
+/// carries `data-scope-reconciled` whenever a scope filter is in force, and
+/// `execApplyProgress` (`instruction_ui.cpp`) then leaves those three cells
+/// to the scope-filtered fragment refetch instead of writing the frame's
+/// fleet totals over the server-reconciled in-scope ones. Do not read this
+/// paragraph as "the bus reconciles it" — it does not, and an earlier
+/// revision of this comment claimed the static strip alone was sufficient,
+/// which was false while the live frame overwrote it. Any NEW confined
+/// consumer of these two frames inherits the same obligation and must decide
+/// what to do with the aggregates itself.
 
 namespace yuzu::server {
 
