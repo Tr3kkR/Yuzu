@@ -178,13 +178,18 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
     // outcome (rc=1, publish nothing), so assert THAT here instead of skipping:
     // a partial inventory must never be emitted alongside a degraded result.
     if (result.rc != 0) {
-        WARN("list_inventory reported a degraded acquisition (rc="
-             << result.rc << ") -- asserting the degraded contract instead");
         CHECK(result.rc == 1);
         // The whole point of the degraded path: nothing is published, so the
         // daily sync skips the cycle rather than committing a partial set.
         CHECK(result.captured.empty());
-        return;
+        // SKIP, not return. This is the ONLY test of the enrichment + receipt
+        // integration, so a degraded run leaves that integration UNVERIFIED --
+        // and a `return` here would report the case as PASSED, which is the
+        // vacuous green this suite's policy floor forbids (phase-2 review).
+        // Reporting skipped keeps the degraded-contract assertions above while
+        // telling the truth about what was not covered.
+        SKIP("system_profiler degraded on this host -- degraded contract verified, but the "
+             "enrichment/receipt integration was NOT exercised");
     }
 
     REQUIRE_FALSE(result.captured.empty());

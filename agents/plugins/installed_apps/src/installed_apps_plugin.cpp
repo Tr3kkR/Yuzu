@@ -109,12 +109,10 @@ constexpr std::chrono::seconds kCollectionBudget{120};
 
 struct ToolOutcome {
     std::string output;
-    // True when the acquisition itself was cut short -- spawn failure, deadline,
-    // or capture truncation. NOT set for a nonzero exit code: several inventory
-    // tools exit nonzero for benign reasons, and treating that as degraded
-    // would make a healthy host skip its inventory cycle forever. The exit code
-    // is logged instead. Deliberate narrowing of the adversarial reviewers'
-    // proposed gate -- recorded here rather than silently dropped.
+    // True when the acquisition did not run to completion on its own terms --
+    // any termination_reason other than `exited`, or a capture truncation. NOT
+    // set for a nonzero exit code (see the derivation at the assignment): a
+    // benign nonzero exit must not make a healthy host skip its cycle forever.
     bool degraded = false;
     // True when probe_tool_path found the binary AND it executed. Distinguishes
     // "this ecosystem is absent" (normal: no dpkg on a Fedora box) from "the
@@ -133,11 +131,28 @@ ToolOutcome run_tool(std::vector<std::string> argv,
     // apps/packages" -- a silent false-negative. Warn so an operator can tell
     // a degraded enumeration from a genuinely empty one (sre-M1, matches
     // services_plugin.cpp's run_tool precedent).
-    const bool degraded = res.timed_out || !res.tool_ran || res.output_truncated;
+    //
+    // The discriminator is termination_reason, NOT the individual flags. A
+    // first cut tested `timed_out || !tool_ran || output_truncated`, which
+    // covers only `deadline` and `spawn_error` -- three of the enum's six
+    // states slip through with all three flags clear (phase-2 review):
+    //   signaled   -- the child was killed by a signal it received itself
+    //                 (the OOM killer taking dpkg-query/rpm on a dense host),
+    //   cancelled  -- shutdown or the global subprocess cancel fired,
+    //   line_limit -- a deliberate bounded stop.
+    // Each yields a TRUNCATED enumeration that would have been published as
+    // the host's complete software set. `exited` is the only outcome that
+    // means the tool finished on its own terms -- and it deliberately covers
+    // ANY exit code, because several inventory tools exit nonzero benignly
+    // and gating on the code would make a healthy host skip forever. Death by
+    // signal is not an exit code, so this keeps that narrowing principled.
+    const bool degraded =
+        res.termination_reason != yuzu::agent::TerminationReason::exited || res.output_truncated;
     if (degraded) {
-        spdlog::warn(
-            "installed_apps: degraded run (timed_out={}, tool_ran={}, truncated={}): {}",
-            res.timed_out, res.tool_ran, res.output_truncated, argv.front());
+        spdlog::warn("installed_apps: degraded run (reason={}, timed_out={}, tool_ran={}, "
+                     "truncated={}, exit_code={}): {}",
+                     static_cast<int>(res.termination_reason), res.timed_out, res.tool_ran,
+                     res.output_truncated, res.exit_code, argv.front());
     }
     return ToolOutcome{std::move(res.output), degraded, res.tool_ran};
 }
@@ -551,6 +566,7 @@ std::vector<inv::InvRecord> get_inventory_macos(bool& degraded) {
         }
 
         std::size_t enriched = 0;
+        bool enrich_budget_exhausted = false;
         for (auto& app : apps) {
             inv::InvRecord r;
             r.name = std::move(app.name);
@@ -564,20 +580,38 @@ std::vector<inv::InvRecord> get_inventory_macos(bool& degraded) {
             // fields -- ADR-0016: the hashed 12-field row is NEVER
             // added-to/reordered. bundle_id has no home in this row; see that
             // header's comment.
-            if (!app.location.empty() && enriched < kMaxEnrichApps && !over_budget()) {
-                ++enriched;
-                auto enrich = yuzu::installed_apps::macos_enrich::enrich_app(app.location);
-                if (!enrich.publisher.empty())
-                    r.publisher = std::move(enrich.publisher);
-                if (!enrich.signature_status.empty())
-                    r.signature_status = std::move(enrich.signature_status);
+            if (!app.location.empty() && enriched < kMaxEnrichApps) {
+                // The budget stopping enrichment is NOT a benign partial: every
+                // remaining row's publisher/signature_status silently flips from
+                // a real value to empty, which reads downstream as "we looked and
+                // could not tell". That is precisely the security-posture field
+                // this PR exists to populate, so it degrades the cycle rather
+                // than publishing a quietly hollowed-out inventory.
+                if (over_budget()) {
+                    enrich_budget_exhausted = true;
+                } else {
+                    ++enriched;
+                    auto enrich = yuzu::installed_apps::macos_enrich::enrich_app(app.location);
+                    if (!enrich.publisher.empty())
+                        r.publisher = std::move(enrich.publisher);
+                    if (!enrich.signature_status.empty())
+                        r.signature_status = std::move(enrich.signature_status);
+                }
             }
             recs.push_back(std::move(r));
         }
         // An un-enriched row's empty signature_status is indistinguishable from
         // "we looked and could not tell", so say when the cap bit rather than
         // leaving the gap silent.
-        if (apps.size() > enriched && enriched >= kMaxEnrichApps) {
+        if (enrich_budget_exhausted) {
+            spdlog::warn("installed_apps: enrichment exceeded the {}s collection budget after {} "
+                         "of {} apps -- reporting a degraded collection rather than publishing "
+                         "rows whose publisher/signature_status silently went empty. If this "
+                         "recurs the inventory will stop updating: raise the budget or "
+                         "investigate the host.",
+                         kCollectionBudget.count(), enriched, apps.size());
+            degraded = true;
+        } else if (apps.size() > enriched && enriched >= kMaxEnrichApps) {
             spdlog::warn("installed_apps: enrichment capped at {} apps ({} present) -- the "
                          "remainder carry empty publisher/signature_status",
                          kMaxEnrichApps, apps.size());
@@ -605,7 +639,7 @@ std::vector<inv::InvRecord> get_inventory_macos(bool& degraded) {
             // would be consumed by pkgutil's OWN option parser as a flag (no
             // shell involved -- this is argv[2] reaching getopt). Skip rather
             // than issue a call whose meaning we cannot predict.
-            if (id.front() == '-') {
+            if (!id.empty() && id.front() == '-') {
                 spdlog::warn("installed_apps: skipping option-like pkgutil receipt id '{}'", id);
                 continue;
             }
@@ -655,7 +689,15 @@ int do_list_inventory(yuzu::CommandContext& ctx) {
     // existing contract rather than inventing a new signal.
     [[maybe_unused]] bool degraded = false;
 #ifdef _WIN32
-    auto recs = get_inventory_windows(); // native registry reads, no subprocess to degrade
+    // Windows acquires natively (registry), so there is no SUBPROCESS outcome to
+    // propagate and `degraded` stays false here. That is NOT a claim the Windows
+    // leg cannot under-report: enumerate_uninstall_key returns silently if
+    // RegOpenKeyExW fails and stops at the first non-ERROR_SUCCESS from
+    // RegEnumKeyExW, so a partial registry walk publishes as complete. That is
+    // pre-existing behaviour this PR does not touch or worsen, and closing it
+    // needs its own change plus Windows-side testing -- flagged in the gate
+    // report rather than silently implied to be covered here.
+    auto recs = get_inventory_windows();
 #elif defined(__linux__)
     auto recs = get_inventory_linux(degraded);
 #elif defined(__APPLE__)

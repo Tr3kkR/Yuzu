@@ -147,9 +147,15 @@ inline void strip_trailing_cr(std::string& line) {
 // `grep -E '^ {4}\w|Version:|Last Modified:'` before any C++ ever saw it;
 // with that shell stage gone (rung 2: clean argv, no pipe), this function
 // replicates that three-way selection in-process. `list`/`query`'s emitted
-// rows are byte-identical to before FOR EVERY APP THE OLD GREP ADMITTED --
-// with one deliberate, documented WIDENING called out below, which can only
-// ADD rows, never change or drop an existing one:
+// rows are byte-identical to before FOR EVERY APP THE OLD GREP ADMITTED,
+// with TWO deliberate, documented deviations:
+//   (1) the header-character WIDENING described below -- additive only;
+//   (2) the header-BEFORE-attribute branch order (see the ordering comment in
+//       the loop): an app named "Location"/"Version"/"Last Modified" is now
+//       its own row instead of being swallowed as an attribute of the app
+//       above it. That also changes the PRECEDING app's version/location back
+//       to its own correct values, so unlike (1) it is not purely additive --
+//       it is a correctness fix for a row that was previously wrong.
 //   - a line with EXACTLY 4 leading spaces then a non-space, non-tab
 //     character is an app-name header (e.g. "    Keynote:") -- ANY other
 //     indent (0, the top-level "Applications:" line; 6, an attribute line)
@@ -160,8 +166,7 @@ inline void strip_trailing_cr(std::string& line) {
 //     a leading U-umlaut, a CJK-named app. Those apps were missing from
 //     `list`/`query` entirely. Matching on "not a space or tab" admits them.
 //     This is a fix, not an accident: an inventory collector silently
-//     omitting non-ASCII-named apps is a defect. It is the ONE respect in
-//     which output is not byte-identical, and it is additive only;
+//     omitting non-ASCII-named apps is a defect. It is additive only;
 //   - a line containing the substring "Version:" carries the version;
 //   - a line containing the substring "Last Modified:" carries the install
 //     date;
