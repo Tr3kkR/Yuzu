@@ -793,3 +793,98 @@ drop mid-`remediate()`, clock skew against the legacy-ahead check, a malformed `
 column mid-backfill, and a stranded-`fixing` sweep racing a live remediation) — none blocking, drafted
 as candidate follow-up issues, not yet filed pending operator go-ahead and a dedupe pass against the
 existing issue tracker.
+
+**Eighth correction** (2026-08-24, external adversarial review — Kimi K2.7 + Codex GPT-5.5,
+`--reasoning high`, two-phase independent review + cross-examination, both DYNAMIC (compiled +
+targeted-suite-run) against `origin/dev..HEAD`, synthesized against the real code by the orchestrator):
+four internal governance rounds on this exact file — including a dedicated `cpp-safety` pass —
+missed a verified ADR-0012 §2(a) contract violation that both external models found independently in
+Phase 1 without seeing each other's work. That is the headline result of running this review, not a
+footnote. Findings, adjudicated against source (falsifier shown for each):
+
+- **`create_policy` used an unbounded blocking pool acquire** (Kimi HIGH, confirmed independently by
+  Codex in cross-exam, verdict flipped PASS→BLOCK on it) — `pool_.with_txn(...)` at
+  `policy_store.cpp:704` calls `PgPool::acquire()` (blocking, no deadline; `pg_pool.cpp:93,350`) where
+  every other runtime mutator in this file uses `pool_.try_acquire_for(kAcquireTimeout)` via
+  `with_txn_for`. ADR-0012 §2(a): "Runtime acquires are always bounded... unbounded `acquire()` is
+  permitted only at construction." Under pool exhaustion this hangs a REST/dashboard worker
+  indefinitely instead of returning 503. Fixed: `pool_.with_txn_for(kAcquireTimeout, ...)`. The
+  existing `!ok` fallback (`failure.empty() ? kPolicyDbErrorPrefix + "failed to create policy" :
+  failure`) already produces a correctly-classified degrade message on an acquire timeout — no new
+  empty-message trap, since `run_in_txn` returns `false` before invoking the callback when the lease
+  is empty, and the caller's existing default handles that.
+- **Invalidation left `fix_attempt_count` at the retry cap** (Kimi HIGH: "the fix is never
+  dispatched" — REFUTED by cross-exam and independently verified against
+  `policy_evaluator.cpp:522-535`: `remediate()` dispatches the fix instruction BEFORE marking targets
+  `fixing`, specifically so a dispatch failure never burns a cap attempt — gov UP-7. Codex's MEDIUM
+  reframing is correct and adopted: the fix genuinely IS dispatched; the residual defect is that
+  `update_agent_status('fixing')`, called right after, sees `fix_attempt_count >= 3` from BEFORE the
+  invalidation and immediately flips the row to `error` — a real remediation attempt gets recorded as
+  already-failed before it has run, misleading the operator/dashboard and any code reading status as a
+  proxy for "did the fix run." `docs/user-manual/policy-engine.md`'s invalidation contract ("Reset all
+  agent statuses... forcing re-evaluation") implies the whole lifecycle resets, not just `status`.
+  Fixed: `fix_attempt_count = 0` added to both `invalidate_policy` and `invalidate_all_policies`'s
+  UPDATE statements.
+- **Fleet-compliance cache (`get_fleet_compliance`, 60s TTL, pre-existing — carried over from the
+  SQLite-era store, not new to this migration) never invalidated on the store's own writes** (Kimi
+  MEDIUM K7, confirmed independently by Codex) — `update_agent_status`, `invalidate_policy`, and
+  `invalidate_all_policies` never cleared `fleet_compliance_last_computed_`, so a status change could
+  read back through the dashboard/MCP fleet-compliance aggregate as stale for up to 60s. ADR-0012 §4
+  rule 2 ("invalidate synchronously on the store's own writes") now binds this store regardless of
+  whether the cache code itself predates the Postgres port — the store becoming authoritative-Postgres
+  is what makes the contract apply. Fixed: a `invalidate_fleet_compliance_cache()` helper, called at
+  the success point of all three writers. Trades some cache-hit rate during an evaluator tick's burst
+  of status writes for correctness — the tradeoff ADR-0012 §4 mandates.
+- **`policy_status` backfill silently skips FK-violating rows, understating the header's "Fails closed
+  on any error"** (Kimi MEDIUM K8, confirmed independently by Codex) — verified the discriminating
+  fact: the five identity tables (including `policies`) insert earlier in the SAME transaction as the
+  `policy_status` merge loop, so an FK violation on a status row proves that `policy_id` is absent from
+  the legacy file's own `policies` table too (the SQLite original had no FK to have ever caught this) —
+  orphan debris with no valid reconciliation target, not a data-integrity conflict like the
+  legacy-ahead case above it. Failing the boot on unrepresentable garbage would turn an upgrade into an
+  outage for nothing recoverable, so the skip itself is the right call — but it was previously silent
+  (a per-row `warn`, no aggregate signal) against a header comment that unqualifiedly said "fails
+  closed on any error." Fixed: skipped rows are now counted and summarized in one `warn` line at
+  backfill completion (`N of M ... discarded`); `policy_store.hpp`'s doc comment now names this one
+  deliberate exception; the runbook gained an "Orphan `policy_status` rows" section explaining it is
+  not a refusal and needs no operator action.
+- **`last_check_at`-only LIFECYCLE-merge direction check** (Kimi LOW K9: should compare the full
+  `(last_check_at, last_fix_at, check_result)` tuple) — **rebutted by Codex, independently confirmed**:
+  this ADR's own Backfill section (above) explicitly defines the direction check as
+  "Postgres-ahead-or-tied-by-`last_check_at`" — the code implements exactly the documented, deliberate
+  design. Not a defect. Withdrawn.
+- **Deferred, not fixed** (all non-blocking, both reviewers converged on severity): fleet-compliance
+  cache reads carry no `from_cache`/`age_seconds` provenance field (Codex C-POL-001/Kimi K11, MEDIUM,
+  ADR-0012 §4 rule 3 — groups naturally with the already-deferred eval-health-signal follow-up above,
+  same REST/MCP-shape-change reason); `remediate()`'s 404/409 classification still string-matches
+  business-rejection reasons on `RemediateResult::error` rather than a typed code (Kimi K6, MEDIUM,
+  new — the degrade/503 path already has a typed `degraded` bool from the Sixth correction, this is
+  the same defect class for the 404/409 path, not yet done). `claim_due_policies`'s O(N) unbounded lock
+  hold (Kimi/Codex K3, MEDIUM), `delete_fragment`/`delete_policy`'s bare-`bool` collapse (K4, MEDIUM),
+  the file-wide A4-envelope gap (K5, MEDIUM), and the route-test coverage gap (K10, LOW) were all
+  independently re-derived by both external reviewers with no prompting — each already exists in this
+  Follow-ups section above (respectively: the `claim_due_policies` scaling entry, the
+  `delete_fragment`/`delete_policy` entry, the `error_json_a4()` entry, the `ComplianceHarness` entry);
+  recorded here as a second, independent confirmation, not a new item.
+
+Merged `origin/dev` (baseline PR #3517: two doc-only conflicts — a stale Wave-2 ladder-queue stub row
+each side needed removed for the other's already-Done store, and `upgrading.md` section ordering —
+resolved by keeping both stores' Done rows/sections; no conflict in any code this migration touches).
+
+**Empiricism correction, same round.** The suite runs immediately after the merge, and immediately
+after this round's first pass at the three fixes, both reported 11/11 shards `OK` — but with
+`YUZU_TEST_POSTGRES_DSN` unset in this segment's shell (lost across a context-compaction restart, not
+re-exported before resuming the established `meson test` command pattern), every Postgres-backed test
+across all three PolicyStore suites silently SKIPPED rather than ran (2,644 skip lines in that run's
+`testlog.txt`, one meson `test()` reporting `OK` on zero real assertions being indistinguishable from
+`OK` on a genuine pass). Both external reviewers' own Empiricism/RAN sections had already reported this
+in their footers (Codex explicitly, Kimi implicitly via its first `[policy_store]`/`[policy][evaluator]`
+run) — missed on first read. Caught, DSN re-exported (`postgresql://yuzu:yuzu@localhost:5456/yuzu`,
+the dedicated `yuzu-policy-pg` container), and the full suite re-run for real: 11/11 shards green, 0
+skip lines, 137,836 total assertions server-wide, `[policy_store]` 548/63 and `[policy][evaluator]`
+225/14 (the two suite-specific counts matching the pre-compaction segment's own last verified run
+exactly, modulo the two new regression tests added this round). No BLOCKING finding's closure this
+session ever rested on skip-mode-only evidence: the Sixth correction's UP-3 fix was verified
+pre-compaction, in a segment where the DSN was genuinely set (confirmed via that run's own
+`SharedPgDbRegistry` drain lines and 13,865-assertion total); the Seventh correction's BLOCKING finding
+was a documentation gap, not a code path the PG suite could exercise either way.

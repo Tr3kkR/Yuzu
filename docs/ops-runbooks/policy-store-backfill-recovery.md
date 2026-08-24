@@ -90,6 +90,21 @@ just the definitions. The server's own boot-refusal log line already says so
 over") — this section spells out why, for an operator who wants the
 mechanism, not just the warning.
 
+## Orphan `policy_status` rows — discarded, not a refusal
+
+Log line (info-level, not a refusal): `PolicyStore: migrate_from_sqlite: N of
+M legacy policy_status rows were orphan debris (no matching policy in the
+legacy file) and were discarded, not migrated`.
+
+Unlike the legacy-ahead case above, this does NOT fail the boot. A
+`policy_status` row whose `policy_id` isn't in the legacy file's own
+`policies` table (the SQLite original never enforced this FK) has no valid
+target under the new Postgres FK and no source of truth to reconcile against
+— it is legacy debris, not a data-integrity conflict. It is silently
+discarded rather than migrated. If you see a nonzero count here and want to
+know which rows were dropped, the individual `spdlog::warn` line above the
+summary names each skipped `policy_id`. No operator action is required.
+
 ## After the backfill succeeds
 
 The `sqlite_backfill_source` fingerprint marker and the `policy_status` merge
