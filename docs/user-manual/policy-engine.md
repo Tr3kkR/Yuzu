@@ -198,10 +198,12 @@ every **10 seconds** (the evaluation cadence). On each tick the server:
 
 The evaluation interval is taken from the policy's first `interval` trigger
 (`interval_seconds`, clamped to a 60-second floor). A policy with no interval
-trigger defaults to **3600 seconds** (1 hour). Evaluation timing is in-memory,
-so after a server restart every enabled policy is due on the first tick (a
-freshly authored or just-restarted policy evaluates within ~25 seconds without
-waiting a full interval).
+trigger defaults to **3600 seconds** (1 hour). Dispatch timing is durable
+(stored in Postgres), so an ordinary server restart preserves each policy's
+last-dispatched time and does not reset its interval clock. Only the first
+boot after a Postgres cutover — when that table is still empty — makes every
+enabled policy due immediately (a freshly authored policy evaluates within
+~25 seconds of creation, the same as any other newly-due policy).
 
 Verdict semantics: a plugin failure / timeout / rejection → `error`; a
 non-responder after the grace window → `unknown`; a successful response that
