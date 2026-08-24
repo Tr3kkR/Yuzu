@@ -169,15 +169,15 @@ void QuarantineContainmentReconciler::tick() {
     }
 
     std::size_t dispatched = 0;
-    for (const auto& agent_id : to_reconcile) {
+    for (std::size_t i = 0; i < to_reconcile.size(); ++i) {
         if (dispatched >= kMaxDispatchesPerTick) {
             spdlog::warn("QuarantineContainmentReconciler: tick hit kMaxDispatchesPerTick ({}) — "
                         "{} unconfirmed record(s) deferred to the next tick",
-                        kMaxDispatchesPerTick, to_reconcile.size() - dispatched);
+                        kMaxDispatchesPerTick, to_reconcile.size() - i);
             break;
         }
-        reconcile_one(agent_id, "tick");
-        ++dispatched;
+        if (reconcile_one(to_reconcile[i], "tick"))
+            ++dispatched;
     }
 }
 
@@ -188,13 +188,13 @@ void QuarantineContainmentReconciler::notify_agent_heartbeat(std::string_view ag
         if (!unconfirmed_cache_.contains(agent_id))
             return; // fast path: no active unconfirmed record — no store read
     }
-    reconcile_one(agent_id, "heartbeat");
+    (void)reconcile_one(agent_id, "heartbeat"); // no per-tick budget to track on this path
 }
 
-void QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
+bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
                                                      std::string_view trigger) {
     if (!d_.quarantine_store || !d_.dispatch_fn)
-        return;
+        return false;
 
     // Claim-then-act (Guardian heartbeat reconcile precedent, server.cpp):
     // the rate-limit slot is claimed UNDER THE LOCK before any I/O, so a
@@ -212,7 +212,7 @@ void QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
         const auto now_steady = std::chrono::steady_clock::now();
         if (now_steady < st.next_eligible_at) {
             count("rate_limited");
-            return;
+            return false;
         }
         if (st.backoff.count() == 0)
             st.backoff = min_reapply_interval(); // first-ever claim for this agent
@@ -230,22 +230,28 @@ void QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
             resp = d_.response_store->query(pending_command_id, ResponseQuery{.agent_id = agent_id});
         if (!resp) {
             count("degraded");
-            return;
+            return false;
         }
         const auto steady_now = std::chrono::steady_clock::now();
         const bool timed_out = (steady_now - pending_since) >= response_wait();
         if (resp->empty()) {
             if (!timed_out) {
                 count("pending"); // no re-dispatch — the no-spin contract
-                return;
+                return false;
             }
             std::lock_guard<std::mutex> lk(mu_);
             auto& st = state_[agent_id];
             st.pending = Pending::none;
             st.verify_first = false;
             st.backoff = next_backoff(st.backoff, kMaxBackoff);
+            // #3425 review K9/CDX-P1-03: enforce the just-doubled wait on
+            // THIS claim's deadline now, not only on some future claim —
+            // otherwise the very next heartbeat/tick retries immediately
+            // (the prior claim's now-stale next_eligible_at already elapsed
+            // by the time a timed-out poll gets here).
+            st.next_eligible_at = steady_now + st.backoff;
             count("not_reached");
-            return;
+            return false;
         }
 
         const auto parsed = parse_quarantine_endpoint_state(combined_output(*resp));
@@ -258,7 +264,7 @@ void QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
                 // just "already busy being quarantined". Wait for the
                 // normal claim interval before trying again.
                 count("busy");
-                return;
+                return false;
             }
             // Dispatch acceptance (agents_reached>0, already known when this
             // command was issued) is not proof of containment — verify soon,
@@ -266,33 +272,72 @@ void QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
             // delayed a full backoff cycle.
             st.verify_first = true;
             st.next_eligible_at = steady_now + verify_grace();
-            return;
+            return false;
         }
 
         // pending_at_entry == Pending::status
-        std::lock_guard<std::mutex> lk(mu_);
-        auto& st = state_[agent_id];
-        st.pending = Pending::none;
         if (endpoint_state_confirms_containment(parsed)) {
-            (void)d_.quarantine_store->mark_endpoint_confirmed(agent_id, now_epoch());
+            // #3425 review K1/CDX-P1-02: the guarded UPDATE (WHERE
+            // status='active') affects zero rows if the record was released
+            // concurrently, and can fail on a genuine store error — never
+            // trust the in-memory "confirmed" transition on an unchecked
+            // write, or the reconciler can believe a released/never-stamped
+            // device is confirmed for the rest of the process lifetime
+            // (excluded from to_reconcile forever, since only tick()'s GC
+            // sweep against list_quarantined() would catch it, and that GC
+            // only fires when the agent drops out of the active set — a
+            // plain store-error, with the record still active, never
+            // triggers it). Also moved OUTSIDE mu_ (K10/CDX-P1-04): this is
+            // a blocking Postgres write + an AuditStore write, and the
+            // class header promises no store/audit I/O runs while the lock
+            // is held — multiple short lock/unlock cycles for the SAME
+            // agent within one reconcile_one call are safe here because the
+            // claim above already excludes any concurrent reconcile_one for
+            // this agent_id.
+            auto mark_res = d_.quarantine_store->mark_endpoint_confirmed(agent_id, now_epoch());
+            if (!mark_res) {
+                std::lock_guard<std::mutex> lk(mu_);
+                auto& st = state_[agent_id];
+                st.pending = Pending::none;
+                if (mark_res.error() == "device is not quarantined") {
+                    state_.erase(agent_id); // released concurrently — nothing left to confirm
+                } else {
+                    st.backoff = next_backoff(st.backoff, kMaxBackoff);
+                    st.next_eligible_at = steady_now + st.backoff;
+                }
+                count("degraded");
+                return false;
+            }
             auto sess = d_.registry ? d_.registry->get_session(agent_id) : nullptr;
-            st.confirmed = true;
-            st.confirmed_session_id = sess ? sess->session_id : std::string{};
-            st.backoff = min_reapply_interval();
+            const std::string confirmed_session_id = sess ? sess->session_id : std::string{};
             audit_confirmed(agent_id, pending_command_id);
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                auto& st = state_[agent_id];
+                st.pending = Pending::none;
+                st.confirmed = true;
+                st.confirmed_session_id = confirmed_session_id;
+                st.backoff = min_reapply_interval();
+            }
             count("confirmed");
-            return;
+            return false;
         }
-        st.backoff = next_backoff(st.backoff, kMaxBackoff);
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto& st = state_[agent_id];
+            st.pending = Pending::none;
+            st.backoff = next_backoff(st.backoff, kMaxBackoff);
+            st.next_eligible_at = steady_now + st.backoff; // K9/CDX-P1-03, same fix as above
+        }
         count(parsed == QuarantineEndpointState::busy ? "busy" : "unconfirmed");
-        return;
+        return false;
     }
 
     // ── No in-flight command: reachability first, no store I/O if offline ──
     auto session = d_.registry ? d_.registry->get_session(agent_id) : nullptr;
     if (!session) {
         count("offline");
-        return;
+        return false;
     }
 
     if (verify_first) {
@@ -303,12 +348,12 @@ void QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
         auto status_res = d_.quarantine_store->get_status(agent_id);
         if (!status_res) {
             count("degraded");
-            return;
+            return false;
         }
         if (!status_res->has_value()) {
             std::lock_guard<std::mutex> lk(mu_);
             state_.erase(agent_id); // released since verify_first was set
-            return;
+            return false;
         }
         std::string command_id;
         int agents_reached = 0;
@@ -322,11 +367,11 @@ void QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
         }
         if (threw) {
             count("dispatch_error");
-            return;
+            return true; // a dispatch WAS attempted, even though it threw
         }
         if (agents_reached == 0) {
             count("not_reached");
-            return;
+            return true; // dispatch attempted; registry just didn't reach anyone
         }
         std::lock_guard<std::mutex> lk(mu_);
         auto& st = state_[agent_id];
@@ -335,7 +380,7 @@ void QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
         st.pending_since = std::chrono::steady_clock::now();
         st.verify_first = false;
         count("reapplied");
-        return;
+        return true;
     }
 
     // Normal path: re-drive the STORED whitelist via the one shared recipe
@@ -365,17 +410,32 @@ void QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
             count("validation_failed");
             break;
         }
-        return;
+        return false; // no dispatch_fn call was ever made on any of these branches
     }
     if (reapply_res->dispatch_threw) {
         count("dispatch_error");
-        return;
+        return true; // a dispatch WAS attempted
     }
     if (reapply_res->agents_reached == 0) {
         count("not_reached");
-        return;
+        return true; // dispatch attempted; registry just didn't reach anyone
     }
-    (void)d_.quarantine_store->mark_endpoint_applied(agent_id, now_epoch());
+    // #3425 review K2/CDX-P1-02: same discipline as the confirm branch above
+    // — a failed guarded UPDATE (released concurrently, or a genuine store
+    // error) must not leave the reconciler believing an apply is durably
+    // recorded and polling ResponseStore for a command whose record is gone.
+    auto mark_res = d_.quarantine_store->mark_endpoint_applied(agent_id, now_epoch());
+    if (!mark_res) {
+        if (mark_res.error() == "device is not quarantined") {
+            std::lock_guard<std::mutex> lk(mu_);
+            state_.erase(agent_id); // released concurrently — the dispatch already fired
+                                     // (K8/CDX-P1-01, the disclosed residual TOCTOU — see
+                                     // the "KNOWN RESIDUAL RACE" note in the header) but
+                                     // there is nothing left here to track as pending.
+        }
+        count("degraded");
+        return true; // the dispatch itself was still attempted
+    }
     audit_reapply(agent_id, reapply_res->command_id, trigger);
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -385,6 +445,7 @@ void QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
         st.pending_since = std::chrono::steady_clock::now();
     }
     count("reapplied");
+    return true;
 }
 
 } // namespace yuzu::server

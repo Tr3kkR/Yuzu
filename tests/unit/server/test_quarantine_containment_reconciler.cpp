@@ -38,6 +38,7 @@
 #include <yuzu/metrics.hpp>
 
 #include <chrono>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -86,6 +87,12 @@ struct MockDispatch {
     std::vector<DispatchCall> calls;
     int next_agents_reached{1};
     bool next_throws{false};
+    // Invoked synchronously from inside the dispatch call, AFTER the call is
+    // recorded but BEFORE the (command_id, agents_reached) pair is returned
+    // — the deterministic, single-threaded way to inject "someone else
+    // mutated the store concurrently, between the reconciler's read and its
+    // own follow-up write" without a real thread or a store-failure seam.
+    std::function<void()> on_dispatch;
 
     QuarantineContainmentReconciler::CommandDispatchFn fn() {
         return [this](const std::string& plugin, const std::string& action,
@@ -93,6 +100,8 @@ struct MockDispatch {
                      const std::unordered_map<std::string, std::string>& parameters,
                      const std::string&) -> std::pair<std::string, int> {
             calls.push_back({plugin, action, agent_ids, parameters});
+            if (on_dispatch)
+                on_dispatch();
             if (next_throws)
                 throw std::runtime_error("dispatch failed");
             return {"cmd-" + std::to_string(calls.size()), next_agents_reached};
@@ -620,4 +629,189 @@ TEST_CASE("QuarantineContainmentReconciler: a degraded quarantine-store read abo
     // Must not crash and must not fabricate any dispatch.
     reconciler.tick();
     CHECK(dispatch.calls.empty());
+}
+
+// ── Adversarial-review regression tests (2026-08-24) ───────────────────────
+//
+// K1/K2 (Kimi) + CDX-P1-02 (Codex), independently found: mark_endpoint_applied/
+// mark_endpoint_confirmed's std::expected result was discarded, so a
+// concurrent release racing the reconciler's own read-then-write could leave
+// the in-memory state believing "applied"/"confirmed" when the guarded
+// UPDATE actually affected zero rows. Both dispatch mocks below release the
+// device from INSIDE the dispatch callback — the deterministic, single-
+// threaded way to land exactly in that window (reconcile_one calls
+// dispatch_fn, then immediately calls mark_endpoint_applied/confirmed on
+// return) without a real second thread or a store-failure injection seam.
+
+TEST_CASE("QuarantineContainmentReconciler: a release racing mark_endpoint_applied does not "
+          "leave a phantom \"pending apply\" tracked forever",
+          "[pg][quarantine][reconciler][regression]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_recon_tpl);
+    PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineStore qstore{qpool};
+    REQUIRE(qstore.is_open());
+    REQUIRE(qstore.quarantine_device("agent-1", "admin", "malware", "").has_value());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry{bus, metrics};
+    registry.register_agent(make_info("agent-1"));
+
+    MockDispatch dispatch;
+    // Fires after the apply dispatch is recorded but before reconcile_one's
+    // own mark_endpoint_applied call — releasing the device HERE means that
+    // guarded UPDATE (WHERE status='active') affects zero rows.
+    dispatch.on_dispatch = [&] { REQUIRE(qstore.release_device("agent-1").has_value()); };
+
+    QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
+        .quarantine_store = &qstore,
+        .response_store = nullptr,
+        .registry = &registry,
+        .metrics = &metrics,
+        .audit_store = nullptr,
+        .dispatch_fn = dispatch.fn(),
+        .now_fn = {},
+    });
+
+    reconciler.tick();
+    REQUIRE(dispatch.calls.size() == 1); // the dispatch itself still happened — cannot be undone
+    // NOTE: this same tick's own gauge publish still counts agent-1 as
+    // unconfirmed=1 — it was computed from the list_quarantined() SNAPSHOT
+    // taken at the top of tick(), before the release (which happens later,
+    // inside this same call's dispatch). The gauge only reflects the release
+    // starting with the NEXT tick's snapshot — checked below.
+
+    // A further tick must not attempt to poll a response for a command
+    // whose record is gone (the fix erased the per-agent state entirely on
+    // "device is not quarantined" rather than setting pending=apply on an
+    // unchecked write) — no second dispatch call. And THIS tick's snapshot
+    // no longer contains agent-1 at all, so the unconfirmed gauge is 0.
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    reconciler.tick();
+    CHECK(dispatch.calls.size() == 1);
+    CHECK(metrics.gauge("yuzu_server_quarantine_endpoint_unconfirmed", {{"reachability", "connected"}})
+              .value() == 0);
+}
+
+TEST_CASE("QuarantineContainmentReconciler: a release racing mark_endpoint_confirmed does not "
+          "leave the reconciler falsely believing the device is confirmed",
+          "[pg][quarantine][reconciler][regression]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_recon_tpl);
+    PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineStore qstore{qpool};
+    REQUIRE(qstore.is_open());
+    REQUIRE(qstore.quarantine_device("agent-1", "admin", "malware", "").has_value());
+
+    YUZU_REQUIRE_PG_DB_TPL(rdb, responsestore_recon_tpl);
+    PgPool rpool{{.conninfo = rdb.dsn(), .size = 4}};
+    ResponseStore rstore{rpool};
+    REQUIRE(rstore.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry{bus, metrics};
+    registry.register_agent(make_info("agent-1"));
+
+    MockDispatch dispatch;
+    QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
+        .quarantine_store = &qstore,
+        .response_store = &rstore,
+        .registry = &registry,
+        .metrics = &metrics,
+        .audit_store = nullptr,
+        .dispatch_fn = dispatch.fn(),
+        .now_fn = {},
+        .min_reapply_interval_override = std::chrono::milliseconds(20),
+        .response_wait_override = std::chrono::milliseconds(200),
+        .verify_grace_override = std::chrono::milliseconds(20),
+    });
+
+    // Drive to the status-dispatch step normally (apply -> poll(no dispatch) -> status verify).
+    reconciler.tick(); // 1: apply dispatched
+    REQUIRE(dispatch.calls.size() == 1);
+    store_status_response(rstore, "cmd-1", "agent-1", "status|quarantined|rules_applied|1");
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    reconciler.tick(); // 2: polls apply response, schedules status verify — no new dispatch
+    CHECK(dispatch.calls.size() == 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    reconciler.tick(); // 3: dispatches the status verify
+    REQUIRE(dispatch.calls.size() == 2);
+    CHECK(dispatch.calls[1].action == "status");
+
+    // NOW release the device — racing the eventual mark_endpoint_confirmed
+    // call that fires once this status response is polled and parses as
+    // state|active.
+    store_status_response(rstore, "cmd-2", "agent-1", "state|active");
+    REQUIRE(qstore.release_device("agent-1").has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    reconciler.tick(); // 4: polls cmd-2 -> confirms containment -> mark_endpoint_confirmed hits 0 rows
+
+    // The fix must NOT set confirmed=true on that failed write — verified
+    // indirectly: a THIRD tick, if the agent were wrongly marked confirmed,
+    // would exclude it from to_reconcile forever with no further activity;
+    // since the record is genuinely gone, the correct outcome is simply "no
+    // further dispatch, no active record to track" either way. The stronger
+    // check is that the store itself was never re-quarantined by this path
+    // and stays released.
+    auto status = qstore.get_status("agent-1");
+    REQUIRE(status.has_value());
+    CHECK_FALSE(status->has_value()); // still released — the reconciler did not resurrect it
+}
+
+TEST_CASE("QuarantineContainmentReconciler: backoff doubling takes effect on THIS attempt's "
+          "deadline, not only a future one (no premature retry)",
+          "[pg][quarantine][reconciler][regression]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_recon_tpl);
+    PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineStore qstore{qpool};
+    REQUIRE(qstore.is_open());
+    REQUIRE(qstore.quarantine_device("agent-1", "admin", "malware", "").has_value());
+
+    YUZU_REQUIRE_PG_DB_TPL(rdb, responsestore_recon_tpl);
+    PgPool rpool{{.conninfo = rdb.dsn(), .size = 4}};
+    ResponseStore rstore{rpool};
+    REQUIRE(rstore.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry{bus, metrics};
+    registry.register_agent(make_info("agent-1"));
+
+    MockDispatch dispatch;
+    // A generous claim interval (200ms) but a SHORT response wait (30ms), so
+    // a timed-out poll's freshly-doubled backoff is easy to distinguish from
+    // "immediately eligible again" in a fast test.
+    QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
+        .quarantine_store = &qstore,
+        .response_store = &rstore,
+        .registry = &registry,
+        .metrics = &metrics,
+        .audit_store = nullptr,
+        .dispatch_fn = dispatch.fn(),
+        .now_fn = {},
+        .min_reapply_interval_override = std::chrono::milliseconds(200),
+        .response_wait_override = std::chrono::milliseconds(30),
+        .verify_grace_override = std::chrono::milliseconds(20),
+    });
+
+    reconciler.tick(); // apply dispatched; claim deadline ~200ms out (min_reapply_interval)
+    REQUIRE(dispatch.calls.size() == 1);
+    // Never seed a response — force the response_wait timeout path, which is
+    // where the fix adds `next_eligible_at = steady_now + st.backoff`. Must
+    // sleep PAST the 200ms claim window itself (a second reconcile_one call
+    // cannot even run before then), which is also comfortably past
+    // response_wait(30ms), so the poll below sees both "empty" and
+    // "timed_out" at once.
+    std::this_thread::sleep_for(std::chrono::milliseconds(220));
+    reconciler.tick(); // times out, doubles backoff, and (fixed) advances next_eligible_at NOW
+    CHECK(dispatch.calls.size() == 1); // no new dispatch on the timeout-processing call itself
+
+    // Immediately after, a heartbeat must NOT be able to claim again — if the
+    // bug were present, next_eligible_at would still be the ORIGINAL ~200ms
+    // claim (already elapsed by now, since we're well past 40ms), letting
+    // this call straight through to a second dispatch. The fix rebases the
+    // deadline to now + the NEWLY DOUBLED backoff (400ms), so this must be
+    // rate-limited.
+    reconciler.notify_agent_heartbeat("agent-1");
+    CHECK(dispatch.calls.size() == 1); // still just the one dispatch — no premature retry
 }

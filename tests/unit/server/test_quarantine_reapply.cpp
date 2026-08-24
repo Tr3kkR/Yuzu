@@ -100,6 +100,21 @@ TEST_CASE("parse_quarantine_endpoint_state: mutation-gate busy response",
     CHECK(parse_quarantine_endpoint_state("status|busy") == QuarantineEndpointState::busy);
 }
 
+TEST_CASE("parse_quarantine_endpoint_state: CRLF-terminated lines still match "
+          "(#3425 adversarial review K3)",
+          "[server][quarantine][reapply][regression]") {
+    // A Windows agent (or any wrapped tool) emitting \r\n must not silently
+    // stall confirmation forever — a bare \n split alone would leave a
+    // trailing \r on the token and "active\r" != "active".
+    CHECK(parse_quarantine_endpoint_state("state|active\r\n") == QuarantineEndpointState::active);
+    CHECK(parse_quarantine_endpoint_state("state|active\r") == QuarantineEndpointState::active);
+    CHECK(parse_quarantine_endpoint_state("state|partial|note|x\r\n") ==
+          QuarantineEndpointState::partial);
+    CHECK(parse_quarantine_endpoint_state("status|busy\r\n") == QuarantineEndpointState::busy);
+    CHECK(parse_quarantine_endpoint_state("preamble\r\nstate|active\r\n") ==
+          QuarantineEndpointState::active);
+}
+
 TEST_CASE("parse_quarantine_endpoint_state: multi-line payload, state line not first",
           "[server][quarantine][reapply]") {
     CHECK(parse_quarantine_endpoint_state("some runner preamble line\nstate|active") ==

@@ -53,6 +53,26 @@
 /// (`AgentRegistry::get_session`) naturally partitions reapply work to
 /// whichever replica holds the agent's live Subscribe stream — no
 /// cross-replica coordination needed.
+///
+/// KNOWN RESIDUAL RACE, DISCLOSED NOT SILENTLY ACCEPTED (adversarial review
+/// 2026-08-24, Kimi K8 / Codex CDX-P1-01): `redispatch_stored_containment`
+/// reads the active row, then dispatches, with no re-validation in between —
+/// a concurrent `release_device` can commit inside that window. The dispatch
+/// itself cannot be recalled once sent, so a device released at the exact
+/// moment the reconciler is mid-apply can end up firewalled with no active
+/// `QuarantineStore` record naming it (the store-side bookkeeping now stays
+/// honest either way — see the `mark_endpoint_applied`/`mark_endpoint_confirmed`
+/// result-checking below — but the already-sent endpoint action is not
+/// itself undone). The window is narrow (one synchronous read-then-dispatch
+/// pair inside a single `reconcile_one` call, not spanning any of this
+/// component's own waiting) and `release_device` is an infrequent, deliberate
+/// operator action, so this ships as a disclosed, tracked limitation rather
+/// than a merge-blocking defect — the proper fix (a database-backed claim or
+/// generation on the active row, checked by both `release_device` and the
+/// reapply path) is a real schema/contract change of its own, not a
+/// same-round patch. Track as a follow-up before relying on this component
+/// as a complete substitute for auditing release-vs-reapply interleavings by
+/// hand on a high-value target.
 
 #include <array>
 #include <chrono>
@@ -183,7 +203,14 @@ private:
     static constexpr std::chrono::milliseconds kVerifyGrace{15'000};
     static constexpr std::size_t kMaxDispatchesPerTick = 50;
 
-    void reconcile_one(const std::string& agent_id, std::string_view trigger);
+    // Returns true iff a dispatch_fn call was actually attempted this call
+    // (regardless of its outcome) — the fair-cap signal tick() uses
+    // (#3425 adversarial review K11/CDX-P1-05): rate-limited, pending-poll,
+    // degraded-read, offline, and no-op transitions (confirm, busy, erase)
+    // must NOT consume a tick's kMaxDispatchesPerTick budget, or a stable
+    // leading cohort of skip-only agents can starve later ones from ever
+    // reaching the periodic backstop.
+    bool reconcile_one(const std::string& agent_id, std::string_view trigger);
     void count(const char* result) const;
     void audit_reapply(const std::string& agent_id, const std::string& command_id,
                        std::string_view trigger) const;

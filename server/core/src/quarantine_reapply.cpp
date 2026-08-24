@@ -55,6 +55,13 @@ QuarantineEndpointState parse_quarantine_endpoint_state(std::string_view payload
         std::size_t nl = payload.find('\n', line_start);
         auto line = payload.substr(
             line_start, nl == std::string_view::npos ? std::string_view::npos : nl - line_start);
+        // #3425 adversarial review K3: strip a trailing CR so a CRLF-
+        // terminated line (a Windows agent, or a wrapped tool's output)
+        // still matches — a bare `\n` split alone would otherwise leave a
+        // `state|active\r` token that never equals "active" and silently
+        // stalls confirmation forever on that platform.
+        if (!line.empty() && line.back() == '\r')
+            line.remove_suffix(1);
 
         if (line.starts_with("state|")) {
             auto rest = line.substr(6);
