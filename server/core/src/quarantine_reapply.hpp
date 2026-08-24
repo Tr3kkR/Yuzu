@@ -84,13 +84,13 @@ inline constexpr std::size_t kQuarantineWhitelistMaxLen = 512;
 build_quarantine_reapply_params(std::string_view stored_whitelist);
 
 /// The agent-side quarantine plugin's `do_status` response vocabulary. Dual:
-/// this repo's current dev plugin emits only `active`/`inactive`; open PR
-/// #3429 (agent-side mutation-serialization hardening) adds
-/// `partial`/`uncertain`/`degraded` and a `status|busy` mutation-gate
-/// response. Parsing both vocabularies here means #3425 does not need to
-/// land in lockstep with #3429 — a fleet upgrades agents gradually either
-/// way, so both vocabularies are live in production simultaneously for as
-/// long as any pre-#3429 agent is deployed.
+/// a pre-#3429 agent emits only `active`/`inactive`; #3429 (agent-side
+/// mutation-serialization hardening, merged) adds `partial`/`uncertain`/
+/// `degraded` and a `status|busy` mutation-gate response. Parsing both
+/// vocabularies here means this fleet-version-skew requirement holds
+/// regardless of merge order — a fleet upgrades agents gradually, so both
+/// vocabularies are live in production simultaneously for as long as any
+/// pre-#3429 agent is deployed.
 enum class QuarantineEndpointState { active, partial, inactive, uncertain, degraded, busy, unknown };
 
 /// Parses a `quarantine.status` (or a busy mutation response) command

@@ -460,21 +460,28 @@ quarantine record whose endpoint containment is not yet confirmed:
   not key off `last_confirmed_at`, so a false confirmation narrows to false operator/audit
   assurance rather than widening what commands can reach that device. This is the same trust
   boundary #3127's MCP `already_active` retry path already relies on, not new to this feature. A
-  previously-confirmed device whose live agent session changes (a reboot, a service restart — the
-  firewall rules from before the restart are gone) drops confirmation and re-verifies via `status`
-  first, rather than blindly re-applying. **Confirmation is point-in-time, not continuous**: once
-  confirmed, a device is not asked again unless its session churns — if something *other* than a
-  session change clears its firewall rules out-of-band (an OS firewall daemon restart, an
-  unrelated admin `iptables -F`/`netsh advfirewall reset`), this component does not notice and
-  does not re-verify. Ongoing drift detection outside the reconnect/session-churn case is
-  Guardian/DEX's domain, not this component's.
-- **Concurrency.** The shipped agent-side quarantine plugin's `do_status` currently answers only
-  `active`/`inactive` — a `status|busy` response (from a mutation-serialization gate on the plugin's
-  mutating actions) cannot occur until that agent-side work lands (open, unmerged issue #3429). The
-  reconciler already parses `busy` defensively regardless (`quarantine_reapply.hpp`) and treats it as
-  "already being handled," not a failure, so no reconciler change is needed once #3429 ships. Either
-  way, the reconciler does not retry until its own per-agent backoff (starting at 60s, doubling up to
-  a 15-minute cap on repeated non-confirmation, reset on confirm) elapses.
+  previously-confirmed device re-verifies via `status` first, rather than blindly re-applying, on
+  either of two independent signals checked every tick: its live agent session changes (a reboot,
+  a service restart — the firewall rules from before the restart are gone), or its active
+  `QuarantineStore` record is replaced (released, then requarantined — possibly with a different
+  whitelist — while the agent stayed connected the whole time, so a session change alone would
+  never have caught it; a record replacement resets straight to a fresh apply instead, since a
+  status check would say nothing about whether the NEW record's whitelist was ever applied). A
+  confirm is additionally checked against the session that was live when the verifying `status`
+  dispatch was actually sent, not just whatever session is live at confirm time, closing a narrow
+  reboot window in between that would otherwise attribute a stale session's status read to a new
+  one. **Confirmation is point-in-time, not continuous**: once confirmed, a device is not asked
+  again unless one of those two signals fires — if something *other* than a session or record
+  change clears its firewall rules out-of-band (an OS firewall daemon restart, an unrelated admin
+  `iptables -F`/`netsh advfirewall reset`), this component does not notice and does not re-verify.
+  Ongoing drift detection outside those cases is Guardian/DEX's domain, not this component's.
+- **Concurrency.** The shipped agent-side quarantine plugin's `do_status` answers `active`/`inactive`,
+  and a `status|busy` response is possible on all three platforms once a mutating action (`quarantine`/
+  `unquarantine`/`whitelist`) is already in flight (#3429's mutation-serialization gate). The
+  reconciler parses `busy` defensively (`quarantine_reapply.hpp`) and treats it as "already being
+  handled," not a failure. Either way, the reconciler does not retry until its own per-agent backoff
+  (starting at 60s, doubling up to a 15-minute cap on repeated non-confirmation, reset on confirm)
+  elapses.
 - **Audit.** A system-initiated re-application is audited under `quarantine.reapply`
   (`principal: system`), distinct from an operator-initiated `quarantine.enable`/`quarantine.disable`
   — detail carries `record_id=<id> command_id=<id> trigger=tick|heartbeat`, or

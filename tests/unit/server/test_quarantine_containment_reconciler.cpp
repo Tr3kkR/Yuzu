@@ -547,6 +547,161 @@ TEST_CASE("QuarantineContainmentReconciler: session churn on a confirmed agent r
     CHECK(dispatch.calls[2].action == "status"); // verify-first, never a blind re-apply
 }
 
+TEST_CASE("QuarantineContainmentReconciler: record churn on a confirmed, still-connected agent "
+          "re-enters via the fresh apply path (governance re-review Finding UP-1)",
+          "[pg][quarantine][reconciler]") {
+    // UP-1: releasing and re-quarantining the SAME agent_id while its
+    // session never changes (a normal whitelist-update workflow) must not
+    // leave the reconciler believing the NEW record is already contained
+    // just because the OLD one was. Session churn alone (the pre-existing
+    // check) never fires here, so this pins the SEPARATE record-identity
+    // check tick() now also performs.
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_recon_tpl);
+    PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineStore qstore{qpool};
+    REQUIRE(qstore.is_open());
+    REQUIRE(qstore.quarantine_device("agent-1", "admin", "malware", "").has_value());
+
+    YUZU_REQUIRE_PG_DB_TPL(rdb, responsestore_recon_tpl);
+    PgPool rpool{{.conninfo = rdb.dsn(), .size = 4}};
+    ResponseStore rstore{rpool};
+    REQUIRE(rstore.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry{bus, metrics};
+    registry.register_agent(make_info("agent-1"));
+    registry.map_session("session-A", "agent-1"); // stays live through the whole test
+
+    MockDispatch dispatch;
+    QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
+        .quarantine_store = &qstore,
+        .response_store = &rstore,
+        .registry = &registry,
+        .metrics = &metrics,
+        .audit_store = nullptr,
+        .dispatch_fn = dispatch.fn(),
+        .now_fn = {},
+        .min_reapply_interval_override = std::chrono::milliseconds(20),
+        .response_wait_override = std::chrono::milliseconds(200),
+        .verify_grace_override = std::chrono::milliseconds(20),
+    });
+
+    // Drive the first record to confirmed (apply -> poll -> status verify -> confirm).
+    reconciler.tick(); // 1: apply
+    REQUIRE(dispatch.calls.size() == 1);
+    store_status_response(rstore, "cmd-1", "agent-1", "status|quarantined|rules_applied|1");
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    reconciler.tick(); // 2: polls apply, schedules status verify
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    reconciler.tick(); // 3: dispatches status verify
+    REQUIRE(dispatch.calls.size() == 2);
+    store_status_response(rstore, "cmd-2", "agent-1", "state|active");
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    reconciler.tick(); // 4: polls status -> confirms
+    auto confirmed = qstore.get_status("agent-1");
+    REQUIRE(confirmed.has_value());
+    REQUIRE(confirmed->has_value());
+    REQUIRE((*confirmed)->last_confirmed_at > 0);
+    const auto old_record_id = (*confirmed)->id;
+
+    // A further tick would normally dispatch nothing for a confirmed,
+    // session-unchanged agent (pinned by the sibling test above) — confirm
+    // that baseline still holds right before the release+requarantine.
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    reconciler.tick(); // 5
+    REQUIRE(dispatch.calls.size() == 2);
+
+    // Release then re-quarantine the SAME agent_id — same session throughout,
+    // a different stored whitelist this time. This is the exact operator
+    // workflow UP-1 named: updating containment without a reboot in between.
+    REQUIRE(qstore.release_device("agent-1").has_value());
+    REQUIRE(qstore.quarantine_device("agent-1", "admin", "reassessed", "10.0.0.9").has_value());
+    auto new_record = qstore.get_status("agent-1");
+    REQUIRE(new_record.has_value());
+    REQUIRE(new_record->has_value());
+    REQUIRE((*new_record)->id != old_record_id);
+    REQUIRE((*new_record)->last_confirmed_at == 0); // never verified — the whole point
+
+    // tick()'s own sweep must detect the record churn and re-enter the fresh
+    // apply path for the NEW record THIS tick — the same call, not a later
+    // one — rather than silently continuing to treat this agent as confirmed.
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    reconciler.tick(); // 6: record churn detected -> fresh apply dispatched
+    REQUIRE(dispatch.calls.size() == 3);
+    CHECK(dispatch.calls[2].action == "quarantine"); // fresh APPLY, not a status-only re-verify
+    CHECK(dispatch.calls[2].parameters.at("whitelist_ips") == "10.0.0.9");
+    CHECK(metrics.gauge("yuzu_server_quarantine_endpoint_unconfirmed", {{"reachability", "connected"}})
+              .value() == 1); // visible again — not silently still "confirmed"
+}
+
+TEST_CASE("QuarantineContainmentReconciler: a session churn between the status dispatch and its "
+          "confirm does not stamp the new session as confirmed (governance re-review Finding "
+          "UP-2)",
+          "[pg][quarantine][reconciler]") {
+    // UP-2: the status dispatch that will confirm containment is sent while
+    // session-A is live; if the device reboots onto session-B before the
+    // reconciler processes that response, the response describes session-A's
+    // (possibly already-gone) firewall state — stamping it as evidence for
+    // session-B would be a false assurance the NEW session was ever verified.
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_recon_tpl);
+    PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineStore qstore{qpool};
+    REQUIRE(qstore.is_open());
+    REQUIRE(qstore.quarantine_device("agent-1", "admin", "malware", "").has_value());
+
+    YUZU_REQUIRE_PG_DB_TPL(rdb, responsestore_recon_tpl);
+    PgPool rpool{{.conninfo = rdb.dsn(), .size = 4}};
+    ResponseStore rstore{rpool};
+    REQUIRE(rstore.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry{bus, metrics};
+    registry.register_agent(make_info("agent-1"));
+    registry.map_session("session-A", "agent-1");
+
+    MockDispatch dispatch;
+    QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
+        .quarantine_store = &qstore,
+        .response_store = &rstore,
+        .registry = &registry,
+        .metrics = &metrics,
+        .audit_store = nullptr,
+        .dispatch_fn = dispatch.fn(),
+        .now_fn = {},
+        .min_reapply_interval_override = std::chrono::milliseconds(20),
+        .response_wait_override = std::chrono::milliseconds(200),
+        .verify_grace_override = std::chrono::milliseconds(20),
+    });
+
+    reconciler.tick(); // 1: apply
+    REQUIRE(dispatch.calls.size() == 1);
+    store_status_response(rstore, "cmd-1", "agent-1", "status|quarantined|rules_applied|1");
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    reconciler.tick(); // 2: polls apply, schedules status verify
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    reconciler.tick(); // 3: dispatches status verify (session-A live at dispatch time)
+    REQUIRE(dispatch.calls.size() == 2);
+    CHECK(dispatch.calls[1].action == "status");
+
+    // The device reboots BEFORE the reconciler processes the response —
+    // session-B replaces session-A in the registry now, but the response
+    // still describes session-A's state.
+    registry.register_agent(make_info("agent-1"));
+    registry.map_session("session-B", "agent-1");
+    store_status_response(rstore, "cmd-2", "agent-1", "state|active");
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    reconciler.tick(); // 4: polls status — must NOT confirm against session-B
+
+    auto status = qstore.get_status("agent-1");
+    REQUIRE(status.has_value());
+    REQUIRE(status->has_value());
+    CHECK((*status)->last_confirmed_at == 0); // never stamped on stale evidence
+    CHECK(metrics.gauge("yuzu_server_quarantine_endpoint_unconfirmed", {{"reachability", "connected"}})
+              .value() == 1); // still counted as unconfirmed, not silently cleared
+}
+
 TEST_CASE("QuarantineContainmentReconciler: heartbeat fast path is a no-op for an agent with "
           "no active record (no store read)",
           "[pg][quarantine][reconciler]") {

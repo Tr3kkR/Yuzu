@@ -80,7 +80,16 @@ void QuarantineContainmentReconciler::audit_event(const std::string& agent_id,
     ev.target_id = agent_id;
     ev.detail = detail;
     ev.result = result;
-    (void)d_.audit_store->log(ev);
+    // #3425 governance re-review (unhappy-path, Finding UP-4): every call
+    // site into this function exists specifically because a containment-
+    // affecting system fact must not vanish with no trail (see
+    // audit_unstamped's rationale) — a failed audit WRITE itself must not
+    // be silent either, or the exact failure this function guards against
+    // (store outage swallowing evidence) reproduces one layer up.
+    if (!d_.audit_store->log(ev))
+        spdlog::error("QuarantineContainmentReconciler: audit write failed for agent={} "
+                     "action=quarantine.reapply result={} detail={}",
+                     agent_id, result, detail);
 }
 
 void QuarantineContainmentReconciler::audit_reapply(const std::string& agent_id,
@@ -136,9 +145,13 @@ void QuarantineContainmentReconciler::tick() {
     }
 
     std::unordered_set<std::string> active_ids;
+    std::unordered_map<std::string, std::int64_t> active_record_ids;
     active_ids.reserve(rows->size());
-    for (const auto& r : *rows)
+    active_record_ids.reserve(rows->size());
+    for (const auto& r : *rows) {
         active_ids.insert(r.agent_id);
+        active_record_ids.emplace(r.agent_id, r.id);
+    }
 
     std::vector<std::string> to_reconcile;
     double unconfirmed_connected = 0;
@@ -154,17 +167,32 @@ void QuarantineContainmentReconciler::tick() {
         for (const auto& agent_id : active_ids) {
             auto& st = state_[agent_id]; // default-constructs an unconfirmed entry
             if (st.confirmed) {
-                // Session churn (#3425 review): a reconnect after a reboot
-                // wipes the endpoint's firewall rules even though the
-                // record never changed — a stale "confirmed" would be a
-                // false assurance. Verify via `status` first, not a blind
-                // re-apply, so a still-genuinely-contained reconnect
-                // doesn't needlessly contend with the agent-side mutation
-                // gate for no reason.
-                auto sess = d_.registry ? d_.registry->get_session(agent_id) : nullptr;
-                if (sess && sess->session_id != st.confirmed_session_id) {
-                    st.confirmed = false;
-                    st.verify_first = true;
+                // #3425 governance re-review (unhappy-path, Finding UP-1):
+                // record churn — the active row for this agent_id is not the
+                // one `confirmed` was earned against (released, then
+                // requarantined, possibly with a different whitelist, all
+                // while the agent stayed connected on the same session so
+                // the churn check below never fires). A status re-check
+                // against the CURRENT record would prove nothing about
+                // whether ITS whitelist was ever applied, so this resets to
+                // fresh rather than routing through verify_first's
+                // status-only recheck — the new record re-enters via the
+                // normal apply path below, this same tick.
+                if (st.confirmed_record_id != active_record_ids.at(agent_id)) {
+                    st = AgentState{};
+                } else {
+                    // Session churn: a reconnect after a reboot wipes the
+                    // endpoint's firewall rules even though the record never
+                    // changed — a stale "confirmed" would be a false
+                    // assurance. Verify via `status` first, not a blind
+                    // re-apply, so a still-genuinely-contained reconnect
+                    // doesn't needlessly contend with the agent-side
+                    // mutation gate for no reason.
+                    auto sess = d_.registry ? d_.registry->get_session(agent_id) : nullptr;
+                    if (sess && sess->session_id != st.confirmed_session_id) {
+                        st.confirmed = false;
+                        st.verify_first = true;
+                    }
                 }
             }
             if (!st.confirmed) {
@@ -240,6 +268,7 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
     Pending pending_at_entry = Pending::none;
     std::string pending_command_id;
     std::int64_t pending_record_id = 0;
+    std::string pending_session_id;
     std::chrono::steady_clock::time_point pending_since{};
     bool verify_first = false;
     {
@@ -256,6 +285,7 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
         pending_at_entry = st.pending;
         pending_command_id = st.pending_command_id;
         pending_record_id = st.pending_record_id;
+        pending_session_id = st.pending_session_id;
         pending_since = st.pending_since;
         verify_first = st.verify_first;
     }
@@ -331,6 +361,42 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
             // agent within one reconcile_one call are safe here because the
             // claim above already excludes any concurrent reconcile_one for
             // this agent_id.
+            // #3425 governance re-review (unhappy-path, Finding UP-2): checked
+            // BEFORE the durable stamp write, not after. The status response
+            // just parsed above describes the session that was live when the
+            // STATUS dispatch was SENT (`pending_session_id`) — a reboot
+            // landing between dispatch and here (the response was generated,
+            // or sat in ResponseStore, before the new session existed) would
+            // otherwise let evidence about a gone session get attributed to
+            // the new one. Checking first avoids writing a misleading
+            // `last_confirmed_at` for a session that was never actually
+            // verified.
+            auto sess = d_.registry ? d_.registry->get_session(agent_id) : nullptr;
+            const std::string confirmed_session_id = sess ? sess->session_id : std::string{};
+            // Plain equality, not an empty-string special case: some
+            // deployment paths (and this component's own test harness) never
+            // populate `AgentSession::session_id` at all, so "both empty"
+            // must read as a match, exactly as the pre-existing churn check
+            // in tick() already treats it — only a genuine CHANGE (session
+            // gone, or a different session live now) is the signal.
+            if (confirmed_session_id != pending_session_id) {
+                {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    auto& st = state_[agent_id];
+                    st.pending = Pending::none;
+                    st.backoff = next_backoff(st.backoff, kMaxBackoff);
+                    st.next_eligible_at = steady_now + st.backoff;
+                }
+                audit_event(agent_id,
+                           "status read confirmed state|active but the session churned "
+                           "between dispatch and confirm (dispatch_session=" +
+                               pending_session_id + " confirm_session=" + confirmed_session_id +
+                               ") record_id=" + std::to_string(pending_record_id) +
+                               " command_id=" + pending_command_id,
+                           "failure");
+                count("unconfirmed");
+                return false;
+            }
             auto mark_res = d_.quarantine_store->mark_endpoint_confirmed(agent_id, pending_record_id,
                                                                          now_epoch());
             if (!mark_res) {
@@ -355,8 +421,6 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
                 count("degraded");
                 return false;
             }
-            auto sess = d_.registry ? d_.registry->get_session(agent_id) : nullptr;
-            const std::string confirmed_session_id = sess ? sess->session_id : std::string{};
             audit_confirmed(agent_id, pending_record_id, pending_command_id);
             {
                 std::lock_guard<std::mutex> lk(mu_);
@@ -364,6 +428,7 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
                 st.pending = Pending::none;
                 st.confirmed = true;
                 st.confirmed_session_id = confirmed_session_id;
+                st.confirmed_record_id = pending_record_id;
                 st.backoff = min_reapply_interval();
             }
             count("confirmed");
@@ -465,6 +530,12 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
         // its id forward so the eventual mark_endpoint_confirmed call is
         // scoped to it, not to whatever happens to be active by then.
         st.pending_record_id = status_res->value().id;
+        // #3425 governance re-review (unhappy-path, Finding UP-2): the
+        // session live right now, at the moment this status dispatch is
+        // actually sent — compared at confirm time against whatever session
+        // is live THEN, so a reboot in between is caught rather than
+        // silently attributing a stale response to the new session.
+        st.pending_session_id = session->session_id;
         st.pending_since = std::chrono::steady_clock::now();
         st.verify_first = false;
         count("reapplied");

@@ -29,11 +29,26 @@
 /// Confirmation is a FOLLOW-UP `quarantine.status` read, never inferred from
 /// `agents_reached > 0` (dispatch acceptance is not proof of endpoint
 /// containment — see `quarantine_reapply.hpp`). A previously-CONFIRMED
-/// agent whose live `AgentSession::session_id` changes (a reboot, a service
-/// restart — the firewall rules from before the restart are gone) drops
-/// confirmation and re-verifies via STATUS first, never a blind re-apply,
-/// so a genuinely-still-contained reconnect doesn't needlessly contend with
-/// the agent-side mutation gate (open PR #3429) for no reason.
+/// agent re-verifies on EITHER of two independent churn signals, checked
+/// separately every tick (governance re-review, Findings UP-1/UP-2):
+///   * SESSION churn — live `AgentSession::session_id` no longer matches
+///     `confirmed_session_id` (a reboot, a service restart — the firewall
+///     rules from before the restart are gone). Re-verifies via STATUS
+///     first, never a blind re-apply, so a genuinely-still-contained
+///     reconnect doesn't needlessly contend with the agent-side mutation
+///     gate for no reason.
+///   * RECORD churn — the active row's id no longer matches
+///     `confirmed_record_id` (released, then requarantined — possibly with
+///     a different whitelist — while the agent stayed connected on the same
+///     session, so session churn alone would never have caught it). A
+///     status re-check would prove nothing about whether the NEW record's
+///     whitelist was ever applied, so this resets straight to the fresh
+///     apply path instead of routing through the status-first recheck.
+/// A confirm is additionally checked against the session that was live when
+/// the verifying STATUS dispatch was actually SENT (`pending_session_id`),
+/// not just the session live at confirm time — closes a narrow reboot
+/// window between dispatch and confirm that would otherwise attribute a
+/// stale session's status read to a new one.
 ///
 /// State: durable across restarts via `QuarantineStore::mark_endpoint_applied`/
 /// `mark_endpoint_confirmed` (schema v2); in-memory (this class) for
@@ -195,6 +210,18 @@ private:
     struct AgentState {
         bool confirmed{false};
         std::string confirmed_session_id;
+        // #3425 governance re-review (unhappy-path, Finding UP-1): the
+        // `QuarantineRecord::id` this `confirmed` flag was actually earned
+        // against. tick()'s per-agent GC only erases an entry when the
+        // agent_id itself leaves the active set — a release-then-requarantine
+        // of the SAME agent_id (a normal whitelist-update workflow) swaps in
+        // a new active row without ever removing the map entry, so a
+        // confirmed-flag keyed on agent_id alone survives untouched and the
+        // NEW record is silently treated as already-contained, forever,
+        // until the agent's session happens to churn too. Session churn
+        // (below) and record churn are independent events; tick() checks
+        // both.
+        std::int64_t confirmed_record_id{0};
         // Set on session-churn detection (tick()): the next reconcile_one
         // call verifies via `quarantine.status` before considering a fresh
         // apply, rather than blindly re-dispatching.
@@ -209,6 +236,15 @@ private:
         // have the confirmation stamp land on the wrong (never-dispatched)
         // record. 0 only before the first-ever claim.
         std::int64_t pending_record_id{0};
+        // #3425 governance re-review (unhappy-path, Finding UP-2): the live
+        // `AgentSession::session_id` at the moment the verify `quarantine.
+        // status` dispatch was SENT — compared against the CURRENT session
+        // at confirm time. Without this, a reboot landing between dispatch
+        // and confirm lets a status response that describes the OLD
+        // session's (possibly already-gone) firewall state get attributed to
+        // the NEW session, stamping "confirmed" on evidence that was never
+        // actually about the session now live.
+        std::string pending_session_id;
         std::chrono::steady_clock::time_point pending_since{};
         std::chrono::steady_clock::time_point next_eligible_at{};
         // Zero = "never claimed yet" — reconcile_one initializes it to
