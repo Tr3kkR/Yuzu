@@ -431,7 +431,7 @@ public:
     /// periodically from the reaper thread and callable immediately after an
     /// operator revoke (PR4) for prompt teardown. `is_revoked(peer_pem)` returns
     /// true iff that leaf is on the CRL; sessions with no presented cert are
-    /// skipped. The predicate is evaluated OFF stream_mu (it reads ca.db);
+    /// skipped. The predicate is evaluated OFF stream_mu (it reads ca_store);
     /// teardown re-acquires the lock and re-checks the cert is unchanged.
     /// Returns the `agent_id`s whose streams were cancelled (so the caller can
     /// emit a per-teardown audit row — the registry holds no AuditStore). Null

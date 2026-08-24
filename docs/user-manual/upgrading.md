@@ -683,9 +683,79 @@ What to expect / do:
   Agents that previously connected over plaintext must switch to TLS — point them
   at the CA with `--ca-cert <ca-dir>/default-ca.pem`.
 - **To keep the legacy refuse-to-start behaviour**, pass `--no-default-certs`.
-- **Back up `<ca-dir>/default-ca.key` (0600) and the new `ca.db`** in `--data-dir`
-  — losing the CA key forces a full fleet re-enrollment.
+- **Back up `<ca-dir>/default-ca.key` (0600) and the `ca_store` Postgres schema**
+  (`pg_dump`/`pg_restore`, ADR-0053) — losing the CA key forces a full fleet
+  re-enrollment.
 - Relocate the cert directory with `--ca-dir` (e.g. a dedicated container volume).
+
+## ⚠️ Behaviour change: internal-CA store moves to Postgres (ADR-0053)
+
+`CaStore` (internal-CA root metadata, issued-certificate inventory, CRL version
+history — everything the mTLS-accept revocation gate and `GET /api/v1/ca/*`
+read) moves from the SQLite `ca.db` file to the server's PostgreSQL substrate
+in this release (schema `ca_store`). The private CA root key is unaffected —
+it was never in `ca.db` and stays a local file behind `KeyProvider` (`--ca-dir`).
+
+- **Mandatory, automatic backfill on first boot.** The legacy `ca.db` (if
+  present) is read once at startup and its full issued-cert inventory + CRL
+  history is copied into `ca_store`, fingerprint-verified. The legacy file is
+  left in place, read-only, for one release as a rollback reference — it is
+  never deleted or written to.
+- **New fail-closed-at-boot behaviour.** A genuine Postgres error while wiring
+  the per-agent mTLS revocation checker at boot now refuses to start the
+  server, rather than starting with revocation enforcement silently unwired.
+  If the server previously started cleanly on a working Postgres connection,
+  this changes nothing observable; it only changes what happens during a
+  Postgres outage at exactly that boot step, from "starts degraded" to
+  "refuses to start."
+- **`GET`/`POST /api/v1/ca/*` and the CA MCP tools now return a `503`/internal
+  error on a genuine database error**, instead of a silently-empty or
+  silently-false result.
+- Every other CA behavior — revocation semantics, CRL numbering, the single
+  `sign_agent_csr` chokepoint — is unchanged. Detail: `docs/pki-architecture.md`,
+  `docs/adr/0053-ca-store-postgres-migration.md`.
+- **New: an established, already-running default-cert install can now self-heal
+  its own listener leaves without operator action.** This is not limited to a
+  first-boot crash window — any boot where the on-disk `--ca-dir` default
+  leaves are missing, corrupt, or a leaf was later lost (a bad partial restore,
+  a lost volume file) hits the same path, as long as `ca_store` already holds
+  a root and this instance's local CA key file still matches it. When that
+  holds, the server automatically **re-mints its own https/server/gateway
+  leaves with fresh private keys** under the existing root and resumes,
+  instead of refusing to start. It never touches the CA root itself or any
+  agent-issued certificate. Every occurrence logs a `spdlog::warn` line, but
+  there is currently no dedicated audit-log row for it (unlike enrollment-time
+  `ca.cert.issued`) — tracked as a follow-up, not fixed in this release.
+- **HA note: a losing first-boot replica self-heals within the same boot attempt
+  (UP-3), bounded.** Multiple server instances sharing one `--ca-dir` cert
+  volume and one `ca_store` Postgres substrate is not an officially supported
+  deployment topology today (see ADR-0053's Decision section) — this note
+  describes what happens if it's done anyway, safely, not a recommendation to
+  do it. If two instances start against the same fresh `ca_store` at once,
+  exactly one wins the root race and generates the live default certs; the
+  other polls the shared cert directory for up to 15s for the winner's
+  complete set to land (it only adopts a fully-written set — the winner's
+  completion marker is written last, so a partial/in-flight write is never
+  picked up) and, on success, continues booting on the winner's certs without
+  a restart. If the winner hasn't finished within that window (a slow
+  Postgres, lock contention, or a winner that's itself still starting up), the
+  loser falls back to the original behavior: it **exits** (refuses to start,
+  non-zero) rather than serving with its own discarded material — it does not
+  reach a running-but-unready state, so a readiness-probe-driven restart never
+  applies here. Recovery in that case is a plain process-supervisor restart
+  (systemd `Restart=on-failure`, Kubernetes `restartPolicy`) once the winner's
+  certs are in place, so the losing instance picks them up from disk on its
+  next boot attempt. On systemd specifically, a slow winner (e.g. Postgres
+  itself under load) can interact with the crash-loop guard
+  (`StartLimitBurst`/`StartLimitIntervalSec`) — a losing replica that exhausts
+  its restart budget first lands in the service's "failed" state and needs a
+  manual `systemctl reset-failed` once the winner has actually finished,
+  rather than retrying forever on its own. Diagnosing a bootstrap that seems
+  permanently stuck (neither replica ever finishes): check `pg_locks` for a
+  lingering `yuzu:default_certs_bootstrap` session advisory lock with no live
+  backend behind it (a host crash or network partition can leave one held
+  until Postgres notices the dead session) and `pg_terminate_backend` it — see
+  `docs/pki-architecture.md`'s operator runbook.
 
 ## ⚠️ Behaviour change: response history resets on Postgres cutover (ADR-0039)
 
