@@ -404,12 +404,6 @@ dispatch_and_poll tar query '{"limit":"5"}'
 dispatch_and_poll tar export '{"type":"all","limit":"5"}'
 echo ""
 
-# ── Group 21: Vulnerability Scanning ────────────────────────────────────
-echo -e "${BOLD}[Vulnerability Scanning]${NC}"
-dispatch_and_poll vuln_scan summary
-dispatch_and_poll vuln_scan inventory
-echo ""
-
 # ── Group 22: HTTP Client (read-only) ───────────────────────────────────
 echo -e "${BOLD}[HTTP Client]${NC}"
 dispatch_and_poll http_client head '{"url":"https://httpbin.org/get"}'
@@ -472,15 +466,6 @@ echo -e "${BOLD}[TAR Extended]${NC}"
 dispatch_and_poll tar status
 dispatch_and_poll tar sql '{"query":"SELECT count(*) as cnt FROM events LIMIT 1"}'
 dispatch_and_poll tar configure '{"interval":"60"}'
-echo ""
-
-# ── Group 31: Vulnerability Scanning Extended ─────────────────────────
-echo -e "${BOLD}[Vulnerability Scanning Extended]${NC}"
-dispatch_and_poll vuln_scan summary
-dispatch_and_poll vuln_scan inventory
-dispatch_and_poll vuln_scan scan
-dispatch_and_poll vuln_scan cve_scan '{"cve":"CVE-2021-44228"}'
-dispatch_and_poll vuln_scan config_scan
 echo ""
 
 # ── Group 32: Wake-on-LAN ─────────────────────────────────────────────

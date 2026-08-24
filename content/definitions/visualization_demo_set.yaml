@@ -21,12 +21,11 @@ metadata:
   displayName: Fleet Posture Charts (Demo)
   version: 1.0.0
   description: >
-    Demo bundle of six chart-bearing instruction definitions that turn
+    Demo bundle of five chart-bearing instruction definitions that turn
     common fan-out queries into at-a-glance pies and bars. Includes
-    vulnerability severity distribution (the highest-ROI chart for any
-    operator), Defender real-time protection status, disk encryption
+    Defender real-time protection status, disk encryption
     protection state, firewall state per profile, certificate issuer
-    breakdown, and OS distribution across the fleet. All six are
+    breakdown, and OS distribution across the fleet. All five are
     read-only `question` definitions and run in auto-approve mode.
   tags: [demo, visualization, dashboard, posture, charts]
   platforms: [windows, linux, darwin]
@@ -38,10 +37,6 @@ metadata:
 
   contents:
     instructionDefinitions:
-      # Pie of vulnerabilities by severity — the headline chart.
-      # Hosted on the `scan` action (one row per finding) rather than `summary`
-      # (which also emits a TOTAL row that dominates the pie).
-      - security.vuln_scan.scan
       # Pie of Windows Defender real-time protection state.
       - security.antivirus.defender_status
       # Pie of disk encryption protection status (BitLocker / LUKS / FileVault).

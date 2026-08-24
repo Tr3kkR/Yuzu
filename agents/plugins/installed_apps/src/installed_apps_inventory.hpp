@@ -142,8 +142,8 @@ inline EvrParts split_pacman_version(std::string_view v) {
 }
 
 // `apk info -v` line = name-pkgver-rN. pkgver/pkgrel never contain '-', so the
-// last two dash-separated segments are the version and the release (the same
-// split the vuln_scan plugin has proven in the field). The trailing segment's
+// last two dash-separated segments are the version and the release (the
+// split the retired vuln_scan plugin proved in the field). The trailing segment's
 // 'r' is apk's display decoration, not part of pkgrel -- strip it iff the
 // segment matches r[0-9]+; otherwise there is no pkgrel and the tail is the
 // version (tolerance for a malformed/foreign line, release stays empty).

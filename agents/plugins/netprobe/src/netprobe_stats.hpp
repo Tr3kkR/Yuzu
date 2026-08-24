@@ -7,7 +7,8 @@
  *
  * Header-only and OS-free so the fiddly parts (stddev arithmetic, the
  * target charset gate, CSV splitting) are unit-tested on every host
- * (test_netprobe_stats.cpp — the cve_rules.hpp pattern); the socket work in
+ * (test_netprobe_stats.cpp — the pure-header testing pattern the retired
+ * vuln_scan plugin's cve_rules.hpp established); the socket work in
  * netprobe_plugin.cpp is the impure shell.
  */
 

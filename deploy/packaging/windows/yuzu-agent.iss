@@ -54,7 +54,20 @@ Name: "plugins\network"; Description: "Network (config, diagnostics, actions, Wi
 Name: "plugins\security"; Description: "Security (antivirus, BitLocker, certificates, firewall)"; Types: full custom
 Name: "plugins\windows"; Description: "Windows (event logs, registry, WMI, updates, SCCM)"; Types: full custom
 Name: "plugins\management"; Description: "Management (processes, services, software, scripts)"; Types: full custom
-Name: "plugins\advanced"; Description: "Advanced (discovery, IOC, vuln scan, quarantine)"; Types: full custom
+Name: "plugins\advanced"; Description: "Advanced (discovery, IOC, quarantine)"; Types: full custom
+
+[InstallDelete]
+; Retired plugins must be deleted explicitly on upgrade. Inno Setup only adds
+; the files listed in [Files]; dropping an entry stops shipping the file but
+; never removes a copy an earlier release already installed. That matters here
+; because the agent's plugin loader walks the plugin directory with
+; recursive_directory_iterator and loads EVERY .dll it finds — allowlist
+; enforcement is off unless an operator configures --plugin-allowlist — so a
+; leftover DLL keeps getting loaded on in-place upgrades. Linux deb/rpm need no
+; equivalent: dpkg/rpm own the installed file list and drop what leaves it.
+;
+; vuln_scan: plugin retired outright (ADR-0018, ADR-0028 Decision 2).
+Type: files; Name: "{app}\plugins\vuln_scan.dll"
 
 [Files]
 ; --- Core agent ---
@@ -97,7 +110,6 @@ Source: "{#BuildDir}\agents\plugins\certificates\certificates.dll"; DestDir: "{a
 Source: "{#BuildDir}\agents\plugins\firewall\firewall.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\quarantine\quarantine.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\ioc\ioc.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
-Source: "{#BuildDir}\agents\plugins\vuln_scan\vuln_scan.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
 
 ; --- Plugins: windows ---
 Source: "{#BuildDir}\agents\plugins\event_logs\event_logs.dll"; DestDir: "{app}\plugins"; Components: plugins\windows; Flags: ignoreversion

@@ -114,8 +114,7 @@ std::string read_registry_string(HKEY root, const char* subkey, const char* valu
     // mojibake (#1662 / #1682). Widen the names BEFORE opening the key so the only
     // operation between open and RegCloseKey is the non-allocating RegQueryValueExW;
     // the allocating reg_sz_to_utf8 runs AFTER the handle is closed, so a
-    // std::bad_alloc cannot leak the HKEY (#1682 Gate-4 R1; vuln_scan's loop uses
-    // HKeyCloser RAII instead).
+    // std::bad_alloc cannot leak the HKEY (#1682 Gate-4 R1).
     const std::wstring wsubkey = yuzu::win::to_wide(subkey);
     const std::wstring wvalue = yuzu::win::to_wide(value);
     HKEY hkey{};

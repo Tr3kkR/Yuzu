@@ -6,9 +6,15 @@ fleet-wide `docs/capability-map.md`. **Merge target:** expand `§9.4 Vulnerabili
 Scanning` and add a new top-level domain (provisionally **§32 — Vulnerability &
 Attack-Path Management (CAVM)**). See **Merge guidance** at the bottom.
 
+> **Status note, 2026-08-24:** the `vuln_scan` agent plugin and `content/definitions/vuln_scan.yaml`
+> were retired (ADR-0018, ADR-0028 Decision 2), so the first source-of-truth reference below no
+> longer resolves. This is @lesault's dated working document and is otherwise left as written; the
+> server-side NVD/CAVM machinery it depends on is unaffected by that retirement.
+
 Sources of truth this map is reconciled against (2026-06-30; **last reconciled 2026-07-01**
 against ADR-0018/ADR-0019 below):
 - Plugin: `agents/plugins/vuln_scan/src/`, contract `content/definitions/vuln_scan.yaml`
+  *(both retired 2026-08-24 — see the status note above)*
 - North-star design: `docs/vuln-scan-engine-design.md` (floor = Phases 1–5, differentiator = Phases 6–8)
 - Theory: `CAVM_WhitePaper_v16` (EUC, composite score, AMAPC, choke points, crown jewels, gate model)
 - Topology: `server/core/src/fleet_topology_store.{hpp,cpp}`, `fleet_topology_types.hpp`

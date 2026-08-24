@@ -181,7 +181,7 @@ Every `dependency()` is marked `include_type: 'system'` so vcpkg/gRPC/abseil/pro
 
 ```
 agents/core/      Agent daemon (gRPC client, plugin loader, trigger engine)
-agents/plugins/   49 plugins
+agents/plugins/   48 plugins
 server/core/      Server daemon (sessions, auth, dashboard, REST API, policy engine)
 gateway/          Erlang/OTP gateway (standalone rebar3 project)
 sdk/              Public SDK — stable C ABI (plugin.h) + C++23 wrapper

@@ -204,8 +204,8 @@ inline constexpr std::array<CommandCapability, 4> kOperatorFixture{{
         .system_reserved = false,
     },
     {
-        .plugin = "vuln_scan",
-        .action = "scan",
+        .plugin = "antivirus",
+        .action = "status",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
         .securable = "Security",
@@ -364,10 +364,10 @@ TEST_CASE("classify_and_authorize_dispatch: a non-authorized operator principal 
     }
 
     SECTION("dispatch_confined-under-an-MCP-shaped caller: an MCP session's principal "
-            "dispatching vuln_scan.scan") {
+            "dispatching antivirus.status") {
         DispatchCaller caller{.principal = "dave", .principal_role = "mcp-operator"};
-        auto result =
-            classify_and_authorize_dispatch(registry, caller, "vuln_scan", "scan", always_deny);
+        auto result = classify_and_authorize_dispatch(registry, caller, "antivirus",
+                                                      "status", always_deny);
         REQUIRE_FALSE(result.has_value());
         CHECK(result.error().reason == DispatchDenialReason::Forbidden);
         CHECK(result.error().securable == "Security");

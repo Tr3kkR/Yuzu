@@ -1,5 +1,7 @@
 # Vuln-Scan Roadmap
 
+> **Status note, 2026-08-24:** the `vuln_scan` agent plugin and `content/definitions/vuln_scan.yaml` were retired (ADR-0018, ADR-0028 Decision 2), so references below to the agent-side plugin no longer resolve. This is @lesault's dated working document and is otherwise left as written; the server-side NVD/CAVM machinery it depends on is unaffected by that retirement.
+
 **Status:** working roadmap for the vuln_scan / CAVM workstream (owner: Andy / @lesault).
 **Created:** 2026-06-30.
 **Last reconciled:** 2026-07-08 — against ADR-1005 (headless platform; placement note below, extended for ADR-4001).

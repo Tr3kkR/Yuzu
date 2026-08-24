@@ -637,7 +637,7 @@ TEST_CASE("extract_plugin: dash at start", "[web_utils][plugin]") {
 }
 
 TEST_CASE("extract_plugin: underscore plugin name", "[web_utils][plugin]") {
-    REQUIRE(extract_plugin("vuln_scan-12345") == "vuln_scan");
+    REQUIRE(extract_plugin("license_scan-12345") == "license_scan");
     REQUIRE(extract_plugin("script_exec-12345") == "script_exec");
 }
 

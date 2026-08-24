@@ -74,7 +74,6 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 | chargen | `chargen_line()` in string_utils | Thread/sleep loop |
 | script_exec | `split_args()` in string_utils | CreateProcess/fork/execvp |
 | installed_apps | `icontains()`, `sanitize_utf8()`, and (blob v2) the full `installed_apps_inventory.hpp` parse/format surface — see `test_installed_apps_inventory.cpp` above | Registry enum, dpkg/rpm/pacman/apk subprocess invocation, `/etc/os-release` file I/O |
-| vuln_scan | `compare_versions()`, `icontains()`, `escape_pipes()` | Registry, package queries |
 | event_logs | `sanitize_input()` | PowerShell, journalctl, log |
 | os_info | `format_uptime()` | uname, sysctl, registry |
 | netstat | TCP state enums, IP parsing | GetExtendedTcpTable, /proc/net |
@@ -163,7 +162,6 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 |--------|----------|---------|
 | `yuzu/string_utils.hpp` | `sdk/include/yuzu/` | Agent tests, plugins |
 | `web_utils.hpp` | `server/core/src/` | Server tests |
-| `cve_rules.hpp` | `agents/plugins/vuln_scan/src/` | Agent tests (vuln rules) |
 
 ---
 

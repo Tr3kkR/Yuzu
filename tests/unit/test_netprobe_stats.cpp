@@ -4,7 +4,8 @@
  * The socket work is the impure shell; everything decision-shaped — the
  * min/avg/max/jitter/loss arithmetic, parameter clamping, the probe-target
  * charset gate, and CSV splitting — is header-pure and pinned here on every
- * host (the cve_rules.hpp testing pattern).
+ * host (the pure-header testing pattern the retired vuln_scan plugin's
+ * cve_rules.hpp established).
  */
 
 #include "netprobe_stats.hpp"

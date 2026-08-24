@@ -161,7 +161,8 @@ void run_pkg_metadata_surface(ProbeHost& host, std::vector<LicRecord>& records,
             if (fields.size() < 3 || fields[0].empty())
                 continue;
             // Installed or held (2nd status char 'i') — matches the
-            // installed_apps/vuln_scan presence filter.
+            // installed_apps presence filter, so the two collectors agree on
+            // this field for the same package.
             if (fields[2].size() < 2 || fields[2][1] != 'i')
                 continue;
             const std::string copyright_path = "/usr/share/doc/" + fields[0] + "/copyright";

@@ -55,7 +55,7 @@
  * migrated to run_bounded_subprocess so the list now matches reality.)
  * The remaining popen() call sites scattered across the plugin directories
  * (the single-shot `popen(cmd, "r")` info-gathering plugins -- hardware,
- * discovery, os_info, vuln_scan, ioc, network_diag, license_scan, and others --
+ * discovery, os_info, ioc, network_diag, license_scan, and others --
  * plus the tar mapdrive/service collectors) are NOT migrated and NOT covered;
  * any of them can still race a locked launcher's window until they are migrated
  * too. The Linux branch of trigger_engine.cpp's query_service_status has its

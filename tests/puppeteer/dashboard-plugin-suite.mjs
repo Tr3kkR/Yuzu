@@ -153,10 +153,6 @@ const GROUPS = [
     ['tar query limit=5', 0],
     ['tar export type=all limit=5', 0],
   ]],
-  ['Vulnerability Scanning', [
-    ['vuln_scan summary', 1],
-    ['vuln_scan inventory', 1],
-  ]],
   ['HTTP Client', [
     ['http_client head url=https://httpbin.org/get', 1],
     ['http_client get url=https://httpbin.org/get', 1],

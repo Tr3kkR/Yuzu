@@ -497,6 +497,20 @@ is the wrong foundation to build on right now:
   not an optional nicety, and depends on Decision 8's field-list/action-name detail before it can be
   authored.
 
+> **Correction, 2026-08-24 (maintainer decision, 2026-08-21 — roadmap PR4.4).** The disposition
+> below is **superseded on one point**: `security.vuln_scan.scan` is **not** repointed and kept.
+> All **five** definitions retire now, together with the plugin, in a single change; the
+> `security.vuln_scan.scan` entry point is **re-created** — not repointed — when the ADR-0028
+> component-inventory collector lands. The maintainer's decision was that carrying a definition
+> whose execution target does not yet exist is worse than a documented interim gap. Consequently
+> the three-phase rollout ordering recorded further below (ship `component_inventory` first,
+> then repoint, then remove the plugin code) is **not** the order actually taken, and its
+> "binding condition" no longer binds: the plugin code and all five definitions are removed
+> first, and the collector plus a re-created `scan` definition follow. See the correction note on
+> that paragraph. Everything else in this Resolution — the id/plugin decoupling analysis, the
+> per-definition dispositions for `cve_scan`/`config_scan`/`summary`/`inventory`, and the
+> `result.columns`/`visualization` reasoning — stands as written.
+
 **Resolution: `vuln_scan` survives as an operator-facing command name, with zero vestigial plugin
 code, by retiring the plugin but re-pointing one of its instruction definitions (decided
 2026-07-07; scope corrected following hardening-round re-review, 2026-07-07 — the original wording
@@ -575,6 +589,25 @@ definitions; (iii) only then remove `vuln_scan`'s legacy plugin code. This order
 requirement that phase (ii) not begin before phase (i)'s fleet adoption is confirmed, is a binding
 condition on the implementation plan — see Ratification.
 
+> **Correction, 2026-08-24 (maintainer decision, 2026-08-21 — roadmap PR4.4).** This three-phase
+> ordering was **not** followed and no longer binds. The plugin code and **all five** definitions
+> were removed first, before any `component_inventory` collector exists in the tree; the collector
+> and a **re-created** `security.vuln_scan.scan` definition follow in a later change. The skew
+> analysis above remains correct and is the reason the order was inverted rather than merely
+> dropped: **on a fresh install** the definitions and the plugin leave together, so no definition
+> can dispatch to a plugin that is absent and the lagging-agent hazard the phasing existed to
+> prevent cannot arise. On an **already-upgraded deployment** it is not eliminated but relocated —
+> boot content import never prunes, so the five definitions persist in the database after the
+> plugin is gone; what protects those deployments is that the server's capability catalogue no
+> longer classifies these actions, so a dispatch is refused at the chokepoint before it reaches
+> any agent, rather than being attempted against a missing plugin. The cost accepted in exchange
+> is an **interim gap** — no vulnerability-scan entry
+> point at all between this change and the collector — plus the upgrade consequence that
+> definitions already imported into existing deployments' databases are not pruned by boot import
+> (see `docs/user-manual/upgrading.md`). When the collector lands, phase (i) — fleet-wide
+> `component_inventory` adoption before the re-created `scan` definition is published — still
+> applies, and that requirement carries forward to the collector's own implementation plan.
+
 **Consequence:** the plugin's action(s) are reachable both on the new sync cadence (Decision 3) and
 on-demand via `CommandRequest`/`execute_instruction` — the same dual-path `vuln_scan` itself
 supports for an ad-hoc scan today — without duplicating the collection logic to get that
@@ -596,7 +629,7 @@ as exempt from the capacity concern just because it is deliberate rather than au
 **On-demand collection must be usable as a fresh input to CVE matching, not just a store update
 that waits for the next scheduled correlation.** A concrete workflow this ADR must support: an
 operator suspects exposure on a subset of assets, triggers a scoped on-demand component-inventory
-refresh (whether by name via the retired-and-repointed `vuln_scan scan` instruction, Decision 2
+refresh (whether by name via the `vuln_scan scan` instruction, Decision 2 *(Superseded 2026-08-24 — the plugin and all five definitions were retired outright; `security.vuln_scan.scan` is re-created, not repointed. See the correction under Decision 2's Resolution.)*
 above, or by any other entry point that dispatches the same action), and wants a *current*
 vulnerability view for that subset — not one still keyed to last week's passive sync. This ADR
 commits to the collection half of that: an on-demand result is ingested into the store as soon as
@@ -608,7 +641,7 @@ re-evaluation design, not in this collection-only ADR. **Sharpened trigger-keyin
 detail (following the `vuln_scan`-instruction-repointing discussion, Decision 2):** that trigger
 should key off **the `component_inventory` action's completion for an agent/scope**, not off any
 specific instruction-definition name or id. `vuln_scan.scan` is one operator-facing entry point that
-happens to dispatch this action after Decision 2's repointing — it must not become the thing the
+happens to dispatch this action after Decision 2's repointing *(Superseded 2026-08-24 — the plugin and all five definitions were retired outright; `security.vuln_scan.scan` is re-created, not repointed. See the correction under Decision 2's Resolution.)* — it must not become the thing the
 matching engine's trigger logic actually depends on, or every other legitimate entry point (an
 agentic worker calling `execute_instruction` directly with a different instruction, or a future
 operator-configured scheduled scan per Decision 3's out-of-scope note) would silently fail to get
@@ -1320,7 +1353,7 @@ not permanently settled by this ADR — worth re-checking if and when ADR-1005 i
    narrows but does not close the bundled-dependency blind spot.
 5. **The storage-format decision (6) commits to a principle, not a schema** — the actual relational
    schema is still deferred (Decision 8), so this cost isn't yet retired, only correctly located.
-6. **`vuln_scan`'s own retirement cleanup remains a separate, still-unscheduled item** — rejecting
+6. **`vuln_scan`'s own retirement cleanup remains a separate, still-unscheduled item** *(No longer accurate: the retirement SHIPPED 2026-08-24, ahead of this ADR's collector — see the correction under Decision 2's Resolution and the Ratification discharge.)* — rejecting
    it as a host for this capability (Decision 2) does not itself fix or schedule that cleanup; it
    only avoids making this ADR depend on it. Decision 2's instruction-definition repointing means
    this cleanup and the `component_inventory` rollout are coordinated, not independent, once
@@ -1333,7 +1366,11 @@ coverage-metric definition"). Retiring the `vuln_scan` *plugin*'s legacy code (D
 implementation-level change in where the code lives; it is not a change in who owns the capability
 operators know as `vuln_scan` — which, per Decision 2's instruction-definition repointing, keeps
 that exact name and keeps working from an operator's or agentic worker's perspective throughout the
-transition. Eng owns the mechanics of the plugin split, the instruction repointing, and the
+transition. *(Superseded 2026-08-24 — this is now FALSE as written: all five definitions were
+retired with the plugin, so the capability does NOT keep working throughout the transition. There
+is an interim gap with no agent-side vulnerability-scan entry point until the collector lands, at
+which point `security.vuln_scan.scan` is re-created. Ownership as described is unchanged. See the
+correction under Decision 2's Resolution and the Ratification discharge.)* Eng owns the mechanics of the plugin split, the instruction repointing, and the
 retirement PR itself.
 
 ## Alternatives considered
@@ -1472,6 +1509,28 @@ legacy plugin code), not a single "coordinated" step (added following hardening-
 must not begin before phase (ii)'s repoint is confirmed live fleet-wide — either phase run out of
 order reproduces the dispatch-to-a-plugin-that-doesn't-exist failure this sequencing exists to
 prevent. This includes the RBAC re-audit named in Decision 2's point 4, which is part of phase (ii).
+
+> **This binding condition is DISCHARGED as written, 2026-08-24 (maintainer decision, 2026-08-21 —
+> roadmap PR4.4).** It no longer gates any PR in the form above, and a reviewer should not hold a
+> change against it. The sequence actually taken inverts it: `vuln_scan`'s plugin code and **all
+> five** definitions were removed together, in one change, before any `component_inventory`
+> collector exists. The failure this condition existed to prevent — a definition dispatching to a
+> plugin that is not there — cannot arise from that ordering, because no definition outlives the
+> plugin on a fresh install; the definitions and the code go in the same commit. Two obligations
+> survive and transfer to the collector's own implementation PR, which must carry them:
+>
+> 1. **Phase (i) still binds there.** Fleet-wide `component_inventory` adoption must be confirmed
+>    before a re-created `security.vuln_scan.scan` definition is published, for the original skew
+>    reason.
+> 2. **The RBAC re-audit** named in Decision 2's point 4 was *not* performed by the retiring change
+>    and is **not** discharged here. Grants naming `security.vuln_scan.*` survive the definitions'
+>    deletion; they are inert while no such definition exists, but would silently re-attach if the
+>    id returns for a materially more invasive capability. The audit must happen in the collector PR,
+>    before that id is re-created.
+>
+> The residual cost accepted in exchange is an interim gap with no vulnerability-scan entry point,
+> plus the upgrade consequences for deployments that already imported the definitions
+> (`docs/user-manual/upgrading.md`).
 
 No works-council/co-determination review is required — Decision 1's reversal to machine-scope-only
 collection, with no new cross-user privilege grant, was specifically designed to avoid that

@@ -8,9 +8,10 @@
 
 /// @file plugin_action_catalogue_a.hpp
 /// PR1.10 group A + PR1.9 data A (#2204): the command-capability-catalogue
-/// fragment for five plugins — filesystem (16 actions), tar (13 of its 14
-/// actions — see the NOTE below), registry (9), license_scan (2), vuln_scan
-/// (5) — 45 rows total. Every `dispatch_class`/`mutability` pair and every
+/// fragment for four plugins — filesystem (16 actions), tar (13 of its 14
+/// actions — see the NOTE below), registry (9), license_scan (2) — 40 rows
+/// total (the vuln_scan rows were retired with the plugin, ADR-0018/-0028).
+/// Every `dispatch_class`/`mutability` pair and every
 /// `securable`/`operation` choice was made by reading the implementation,
 /// never the action name; ambiguous calls are resolved conservatively
 /// (Mutating over ReadOnly, Irreversible over Reversible) and say so inline.
@@ -18,7 +19,7 @@
 /// `seed_defaults()` `types[]`; `operation` reuses only `authz::Operation`'s
 /// seven values; every `risk_tier` is at or above `authz::min_risk_tier_for`
 /// its row's operation. `system_reserved` is false on every row — none of
-/// these forty-five dispatches is one the server issues to itself.
+/// these forty dispatches is one the server issues to itself.
 ///
 /// NOTE — `tar.fleet_snapshot` is DELIBERATELY ABSENT from this fragment.
 /// `capability_decls/core_dispatch_capabilities.hpp` (a different package's
@@ -38,7 +39,7 @@ namespace yuzu::server::capdecls {
 
 namespace detail {
 
-inline constexpr std::array<CommandCapability, 45> kPluginActionCatalogueA{{
+inline constexpr std::array<CommandCapability, 40> kPluginActionCatalogueA{{
     // ── filesystem (agents/plugins/filesystem/src/filesystem_plugin.cpp) ──
     // All 16 actions classified under the `FileRetrieval` securable — the
     // plugin's own doc comment names it a file-operations surface requiring
@@ -516,63 +517,6 @@ inline constexpr std::array<CommandCapability, 45> kPluginActionCatalogueA{{
         .system_reserved = false,
     },
 
-    // ── vuln_scan (agents/plugins/vuln_scan/src/vuln_scan_plugin.cpp) ────
-    // scan/cve_scan/config_scan/summary only detect and report vulnerability/
-    // configuration findings — `Security` securable, Read. inventory returns
-    // the same raw software listing tar.query's software source and the
-    // `/inventory` REST route serve — `Inventory` securable, matching
-    // rbac_store.cpp's own note that "the /inventory software catalog
-    // remains under Inventory:Read".
-    {
-        .plugin = "vuln_scan",
-        .action = "scan",
-        .dispatch_class = DispatchClass::ReadOnly,
-        .mutability = Mutability::None,
-        .securable = "Security",
-        .operation = authz::Operation::Read,
-        .risk_tier = authz::RiskTier::Low,
-        .system_reserved = false,
-    },
-    {
-        .plugin = "vuln_scan",
-        .action = "cve_scan",
-        .dispatch_class = DispatchClass::ReadOnly,
-        .mutability = Mutability::None,
-        .securable = "Security",
-        .operation = authz::Operation::Read,
-        .risk_tier = authz::RiskTier::Low,
-        .system_reserved = false,
-    },
-    {
-        .plugin = "vuln_scan",
-        .action = "config_scan",
-        .dispatch_class = DispatchClass::ReadOnly,
-        .mutability = Mutability::None,
-        .securable = "Security",
-        .operation = authz::Operation::Read,
-        .risk_tier = authz::RiskTier::Low,
-        .system_reserved = false,
-    },
-    {
-        .plugin = "vuln_scan",
-        .action = "summary",
-        .dispatch_class = DispatchClass::ReadOnly,
-        .mutability = Mutability::None,
-        .securable = "Security",
-        .operation = authz::Operation::Read,
-        .risk_tier = authz::RiskTier::Low,
-        .system_reserved = false,
-    },
-    {
-        .plugin = "vuln_scan",
-        .action = "inventory",
-        .dispatch_class = DispatchClass::ReadOnly,
-        .mutability = Mutability::None,
-        .securable = "Inventory",
-        .operation = authz::Operation::Read,
-        .risk_tier = authz::RiskTier::Low,
-        .system_reserved = false,
-    },
 }};
 
 } // namespace detail

@@ -570,39 +570,7 @@ for row in responses:
 
 ---
 
-### 1.9 Vulnerability Scan (`vuln_scan`)
-
-Scan endpoints for known CVEs. Demonstrates security workflows with severity-based CEL.
-
-#### Python: Scan All Machines for Vulnerabilities
-
-```python
-exec_id = execute("security.vuln_scan.scan")  # empty scope = all machines
-summary = wait_for(exec_id, timeout=600)  # scans take longer
-print(f"Scanned {summary['agents_success']} machines")
-
-responses = get_responses("security.vuln_scan.scan", exec_id)
-critical = [r for r in responses if r["output"].get("severity") in ("critical", "high")]
-print(f"Found {len(critical)} critical/high vulnerabilities across fleet")
-```
-
-#### CEL Compliance Expression
-
-Policy: no critical vulnerabilities allowed:
-
-```cel
-result.severity != 'critical' && result.severity != 'high'
-```
-
-Policy: CVSS score must be below threshold:
-
-```cel
-result.cvss_score < 7.0
-```
-
----
-
-### 1.10 Hardware (`hardware`)
+### 1.9 Hardware (`hardware`)
 
 Hardware inventory with no parameters. Demonstrates simple asset tracking.
 
@@ -892,8 +860,6 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 | `device.event_logs.errors` | errors | Q | WLM | log:string, hours:int32 | timestamp:string, event_id:string, source:string, message:string |
 | `device.event_logs.query` | query | Q | WLM | log:string (req), filter:string (req), count:int32 | timestamp:string, level:string, event_id:string, message:string |
 | `security.ioc.check` | ioc check | Q | WLM | ip_addresses:string, domains:string, file_hashes:string | type:string, value:string, matched:bool, detail:string |
-| `security.vuln_scan.scan` | vuln scan | Q | WLM | *(none)* | severity:string, category:string, title:string, detail:string |
-| `security.vuln_scan.summary` | vuln summary | Q | WLM | *(none)* | severity:string, count:int32 |
 | `security.encryption.state` | bitlocker | Q | WLM | *(none)* | volume:string, protection_status:string, encryption_method:string |
 | `security.quarantine.status` | status | Q | WLM | *(none)* | state:string, whitelist:string |
 | `security.quarantine.isolate` | isolate | A | WLM | server_ip:string, whitelist_ips:string | status:string, rules_applied:int32 |
@@ -999,9 +965,6 @@ execute("windows.registry.get_value", scope='ostype == "windows"',
 # Run a PowerShell command on one machine
 execute("crossplatform.script.powershell", scope='agent_id == "agent-007"',
         params={"command": "Get-ComputerInfo | Select-Object OsName, OsVersion"})
-
-# Scan for vulnerabilities fleet-wide
-execute("security.vuln_scan.scan")
 
 # Get hardware inventory
 execute("device.hardware.manufacturer")

@@ -133,7 +133,7 @@ abi4_declared_fixture_plugin = shared_library(
 # through the C++ `yuzu::Plugin` + YUZU_PLUGIN_EXPORT path rather than
 # hand-rolling the C descriptor. It is the regression proving the descriptor
 # seam (the two non-pure virtuals on yuzu::Plugin) actually reaches
-# capmatrix-gen — the path all 49 real plugins take.
+# capmatrix-gen — the path all 48 real plugins take.
 abi4_cpp_wrapper_fixture_plugin = shared_library(
   'abi4_cpp_wrapper_fixture_plugin',
   files('fixtures/abi4/abi4_cpp_wrapper_fixture_plugin.cpp'),
@@ -200,7 +200,6 @@ agent_test_exe = executable(
     'unit/test_filesystem_read.cpp',
     'unit/test_filesystem_actions.cpp',
     'unit/test_string_utils.cpp',
-    'unit/test_vuln_rules.cpp',
     'unit/test_metrics.cpp',
     'unit/test_metrics_perf.cpp',
     'unit/test_kv_store.cpp',
@@ -351,7 +350,6 @@ agent_test_exe = executable(
                                                 # TU elsewhere via the file's own #ifdef _WIN32 guard)
   ),
   include_directories: [
-    include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
     include_directories('../agents/plugins/netprobe/src'),   # netprobe_stats.hpp (pure helpers)
     include_directories('../agents/plugins/antivirus/src'),  # antivirus_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/firewall/src'),   # firewall_parsers.hpp (pure helpers)

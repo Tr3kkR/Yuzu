@@ -1686,7 +1686,7 @@ Every failure response includes `correlation_id`, `retry_after_ms` (nullable), `
 ### Issue 18.1: Vulnerability Lifecycle
 **Capability:** new | **Scope:** UCE module (was: Server) | **Status:** Proposed
 
-CVE → CVSS → owner → SLA → remediation tracking. Supplements the existing `vuln_scan` collection plugin with a findings store carrying a triage lifecycle (new / triaged / accepted-risk / remediated / reopened) **in the vulnerability-management use-case engine (UCE) module, not a server-side store** — the execution plan's M3 milestone builds exactly this findings store + lifecycle as part of the module that re-homes the server-side NVD capability (ADR-1005 grandfathered surface #2; see `docs/adr-1005-execution-plan.md`, Module scoping). Integrates with Phase 9 connectors for SCCM/Intune CVE feeds.
+CVE → CVSS → owner → SLA → remediation tracking. Supplements agent-side inventory collection (`installed_apps` / the ADR-0028 component-inventory plugin — the `vuln_scan` collection plugin is retired, ADR-0018/ADR-0028) with a findings store carrying a triage lifecycle (new / triaged / accepted-risk / remediated / reopened) **in the vulnerability-management use-case engine (UCE) module, not a server-side store** — the execution plan's M3 milestone builds exactly this findings store + lifecycle as part of the module that re-homes the server-side NVD capability (ADR-1005 grandfathered surface #2; see `docs/adr-1005-execution-plan.md`, Module scoping). Integrates with Phase 9 connectors for SCCM/Intune CVE feeds.
 
 ### Issue 18.2: Compliance Reporting Templates
 **Capability:** new | **Scope:** Server | **Status:** Proposed — **boundary-affected by ADR-1005**

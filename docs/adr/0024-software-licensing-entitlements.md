@@ -154,7 +154,7 @@ rather than requesting an in-server exception:
 
 | §27 element | ADR-0024 decision | ADR-1005 class | Justification (Decision 2 + tiebreakers) |
 |---|---|---|---|
-| `license_scan` plugin | D2 | **core** | Collection of estate facts — parallel to the `vuln_scan` plugin ADR-1005 keeps core. |
+| `license_scan` plugin | D2 | **core** | Collection of estate facts — collection is mechanism and stays core (ADR-1005 Decision 2). *(The original wording drew the parallel to "the `vuln_scan` plugin ADR-1005 keeps core"; that plugin was retired outright on 2026-08-24 — ADR-0018 / ADR-0028 Decision 2. The conclusion is unaffected: it rests on the mechanism-vs-interpretation test, not on that plugin's survival.)* |
 | `software_licensing` daily-sync | D3 | **core** | Transport of collected facts on the ADR-0016 framework. |
 | Raw discovered-licence rows | D4 | **core** | An inventory store of raw estate facts. |
 | `ProductRegistryStore` + `product_normalize` | D4/D6 | **core** | Deterministic identity resolution over pure fleet-internal aggregation (a generic engine, no external data) — the `software_catalog`-rollup tiebreaker. |

@@ -449,7 +449,6 @@ if build_agent
     subdir('agents/plugins/firewall')
     subdir('agents/plugins/antivirus')
     subdir('agents/plugins/bitlocker')
-    subdir('agents/plugins/vuln_scan')
     subdir('agents/plugins/tags')
     subdir('agents/plugins/asset_tags')
     subdir('agents/plugins/quarantine')

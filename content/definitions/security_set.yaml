@@ -6,10 +6,9 @@ metadata:
   version: 1.0.0
   description: >
     Security posture assessment instructions covering antivirus product
-    detection, firewall state and rules, disk encryption verification,
-    host vulnerability scanning, and event log analysis. Provides the
-    foundational security visibility needed for compliance dashboards
-    and policy enforcement.
+    detection, firewall state and rules, disk encryption verification, and
+    event log analysis. Provides the foundational security visibility needed
+    for compliance dashboards and policy enforcement.
   platforms: [windows, linux, darwin]
 
   permissions:
@@ -28,12 +27,6 @@ metadata:
       - security.firewall.rules
       # Disk encryption
       - security.encryption.state
-      # Vulnerability scanning
-      - security.vuln_scan.scan
-      - security.vuln_scan.cve_scan
-      - security.vuln_scan.config_scan
-      - security.vuln_scan.summary
-      - security.vuln_scan.inventory
       # Event log analysis
       - device.event_logs.errors
       - device.event_logs.query

@@ -10,10 +10,10 @@ namespace yuzu::tar {
 // each segment numerically where possible, so "10.0" > "9.0" (a plain
 // std::string `operator>` gets this lexicographically wrong and would suppress
 // real upgrade events — #1620). Non-numeric segments (e.g. "1.9.5p2") fall back
-// to a lexicographic compare of that segment. This mirrors the proven, unit-
-// tested comparator in agents/plugins/vuln_scan/src/cve_rules.hpp; kept as a
-// self-contained agent-side copy rather than a shared dependency, the same
-// deliberate duplication documented in server/core/src/nvd_db.cpp.
+// to a lexicographic compare of that segment. The algorithm originated in the
+// retired vuln_scan plugin's cve_rules.hpp and lives on in
+// server/core/src/nvd_db.cpp; this is a self-contained agent-side copy rather
+// than a shared dependency — the same deliberate duplication that file documents.
 inline int compare_versions(std::string_view a, std::string_view b) {
     auto next_segment = [](std::string_view& s) -> std::string_view {
         if (s.empty()) {

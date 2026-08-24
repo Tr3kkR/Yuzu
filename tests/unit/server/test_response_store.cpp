@@ -430,20 +430,20 @@ TEST_CASE("ResponseStore: facets are derived post-sanitize (invalid-UTF-8 value 
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ResponseStore store(pool);
 
-    // vuln_scan schema: severity|category|title|detail. Put an invalid byte in
-    // the category field (col_idx 1) — the facet value must come back defanged.
+    // procfetch schema: pid|name|path|sha1. Put an invalid byte in
+    // the name field (col_idx 1) — the facet value must come back defanged.
     StoredResponse resp;
     resp.instruction_id = "cmd-facet-badutf8";
     resp.agent_id = "agent-1";
     resp.status = 1;
-    resp.plugin = "vuln_scan";
-    resp.output = std::string("high|") + '\xff' + "category|title|detail";
+    resp.plugin = "procfetch";
+    resp.output = std::string("100|") + '\xff' + "name|/bin/tool|sha";
     store.store(resp);
 
     auto facets = store.facet_values("cmd-facet-badutf8", /*col_idx=*/1);
     REQUIRE(facets.has_value());
     REQUIRE(facets->size() == 1); // derived, not dropped
-    CHECK((*facets)[0].value == "\xEF\xBF\xBD" "category");
+    CHECK((*facets)[0].value == "\xEF\xBF\xBD" "name");
     // No raw invalid byte survived into the persisted facet value.
     CHECK((*facets)[0].value.find('\xff') == std::string::npos);
 }
@@ -1177,8 +1177,8 @@ TEST_CASE("ResponseStore: reap_expired deletes correctly across a chunk boundary
         r.instruction_id = "chunk-" + std::to_string(i);
         r.agent_id = "agent-a";
         r.status = 1;
-        r.plugin = "vuln_scan";
-        r.output = "high|cat-" + std::to_string(i) + "|title|detail";
+        r.plugin = "procfetch";
+        r.output = "100|name-" + std::to_string(i) + "|/bin/tool|sha";
         store.store(r);
     }
     exec_sql(db.dsn(), "UPDATE response_store.responses SET ttl_expires_at = 1 WHERE "
@@ -1537,19 +1537,19 @@ TEST_CASE("ResponseStore: facet cardinality is capped independently of output si
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ResponseStore store(pool);
 
-    // vuln_scan schema: severity|category|title|detail. 6001 distinct
-    // category values in col_idx 1 — well under kMaxIngestBytes (a few
-    // hundred KB), comfortably over kMaxFacetsPerResponse (5000).
+    // procfetch schema: pid|name|path|sha1. 6001 distinct name values in
+    // col_idx 1 — well under kMaxIngestBytes (a few hundred KB),
+    // comfortably over kMaxFacetsPerResponse (5000).
     std::string output;
     constexpr int kDistinctValues = 6001;
     for (int i = 0; i < kDistinctValues; ++i)
-        output += "high|category-" + std::to_string(i) + "|title|detail\n";
+        output += "100|name-" + std::to_string(i) + "|/bin/tool|sha\n";
 
     StoredResponse resp;
     resp.instruction_id = "cmd-facetcap";
     resp.agent_id = "agent-1";
     resp.status = 1;
-    resp.plugin = "vuln_scan";
+    resp.plugin = "procfetch";
     resp.output = output;
     store.store(resp);
 
@@ -1577,16 +1577,16 @@ TEST_CASE("ResponseStore: wide facet set (>64 distinct values) all persist via b
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ResponseStore store(pool);
 
-    // vuln_scan schema: severity|category|title|detail. 200 distinct category
-    // values in col_idx 1 — well past the 64-subxid suboverflow threshold.
+    // procfetch schema: pid|name|path|sha1. 200 distinct name values in
+    // col_idx 1 — well past the 64-subxid suboverflow threshold.
     std::string out;
     for (int i = 0; i < 200; ++i)
-        out += "high|category-" + std::to_string(i) + "|title|detail\n";
+        out += "100|name-" + std::to_string(i) + "|/bin/tool|sha\n";
     StoredResponse resp;
     resp.instruction_id = "cmd-wide";
     resp.agent_id = "agent-1";
     resp.status = 1;
-    resp.plugin = "vuln_scan";
+    resp.plugin = "procfetch";
     resp.output = out;
     store.store(resp);
 
@@ -1614,11 +1614,11 @@ TEST_CASE("ResponseStore: facet_agent_count and facet_line_count distinguish deg
     resp.instruction_id = "cmd-facetcount";
     resp.agent_id = "agent-1";
     resp.status = 1;
-    resp.plugin = "vuln_scan";
-    resp.output = "high|cat-a|title|detail\nhigh|cat-a|title2|detail2\n";
+    resp.plugin = "procfetch";
+    resp.output = "100|name-a|/bin/tool|sha\n101|name-a|/bin/tool2|sha2\n";
     store.store(resp);
 
-    FacetFilter match{/*col_idx=*/1, "cat-a"};
+    FacetFilter match{/*col_idx=*/1, "name-a"};
     auto count = store.facet_agent_count("cmd-facetcount", {match});
     REQUIRE(count.has_value());
     CHECK(*count == 1); // one distinct agent

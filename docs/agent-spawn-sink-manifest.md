@@ -142,9 +142,9 @@ these rows are pointers, not evidence.
 device_identity, event_logs, hardware, installed_apps,
 ioc, license_scan, network_config,
 network_diag, os_info, processes,
-software_actions, tar, vuln_scan, wifi, windows_updates.
-(`vuln_scan` carries code slated for retirement per ADR-0028/ADR-0018 —
-sequence that cleanup against migrating it, tracked in #2380.)
+software_actions, tar, wifi, windows_updates.
+(`vuln_scan`, formerly in this list, was retired outright with its spawn
+sites per ADR-0028/ADR-0018 — the #2380 sequencing note is resolved.)
 
 **Migrated off raw spawn (Wave 2, PR2.1a):** `users` (Windows session
 history moved to wevtapi/EvtQuery, ProfileList to native enumeration; POSIX

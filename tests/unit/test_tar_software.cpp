@@ -49,6 +49,22 @@ TEST_CASE("compare_versions: differing segment counts treat missing as zero",
     CHECK(compare_versions("1.2", "1.2.0.1") < 0);
 }
 
+TEST_CASE("compare_versions: dash is a segment separator, not a lexicographic tail",
+          "[tar][software][version]") {
+    // The comparator splits on ".-" (see tar_version.hpp), so a Debian/RPM-style
+    // revision suffix compares NUMERICALLY as its own segment rather than
+    // dragging the whole string into the lexicographic fallback.
+    //
+    // This was covered only by tests/unit/test_vuln_rules.cpp, deleted with the
+    // vuln_scan plugin (ADR-0018/-0028). The behaviour it asserted is still live
+    // in two places — this comparator and server/core/src/nvd_db.cpp's copy — so
+    // the coverage moves here rather than being retired with the plugin.
+    CHECK(compare_versions("1.0.0-1", "1.0.0-2") < 0);
+    CHECK(compare_versions("1.0.0-2", "1.0.0-1") > 0);
+    CHECK(compare_versions("1.0.0-10", "1.0.0-9") > 0); // numeric, not lexicographic
+    CHECK(compare_versions("1.0-2", "1.0.2") == 0);     // '-' and '.' split alike
+}
+
 TEST_CASE("compare_versions: non-numeric segment falls back to lexicographic",
           "[tar][software][version]") {
     CHECK(compare_versions("1.9.5p2", "1.9.5p3") < 0);

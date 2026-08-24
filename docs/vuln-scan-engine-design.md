@@ -1,5 +1,7 @@
 # Modern Vulnerability Detection Engine — North Star Design & Roadmap
 
+> **Status note, 2026-08-24:** the `vuln_scan` agent plugin and `content/definitions/vuln_scan.yaml` were retired (ADR-0018, ADR-0028 Decision 2), so references below to the agent-side plugin no longer resolve. This is @lesault's dated working document and is otherwise left as written; the server-side NVD/CAVM machinery it depends on is unaffected by that retirement.
+
 | | |
 |---|---|
 | **Status** | North Star — for review |

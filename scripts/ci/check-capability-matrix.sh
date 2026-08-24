@@ -48,7 +48,7 @@ set -euo pipefail
 
 # Every discovered plugin now declares its ABI4 action_descriptors array —
 # #2204 shipped the machinery, and per-plugin adoption completed across all
-# 49 in this PR, so the floor is 0. DECREASE this the moment the count
+# of them in that PR, so the floor is 0. DECREASE this the moment the count
 # drops further (it cannot from 0); increasing it requires a deliberate,
 # reviewed decision — and at 0 that means a NEW plugin directory landed
 # under agents/plugins/ without descriptors, which is exactly the

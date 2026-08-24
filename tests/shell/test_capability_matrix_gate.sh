@@ -4,7 +4,7 @@
 # finding F10).
 #
 # WHY: the production gate only ever observes ONE state at a time — today
-# all 49 shipped plugins declare and RATCHET_BASELINE_UNDECLARED is 0, so it
+# all 48 shipped plugins declare and RATCHET_BASELINE_UNDECLARED is 0, so it
 # observes the all-declared, count-equals-baseline state (when this file was
 # written the situation was the exact inverse: nothing declared, baseline 49).
 # Either way a green production gate proves nothing about the ratchet's two

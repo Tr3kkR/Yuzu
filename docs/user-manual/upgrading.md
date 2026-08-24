@@ -2264,7 +2264,9 @@ Before upgrading any component:
   data — no stored names are rewritten; each call simply delivers correct UTF-8
   immediately after the agent upgrade. Any operator automation that matched
   previously-mangled non-ASCII strings in those plugins' responses (e.g. a vuln
-  finding filtered on `title == "Caf?"`) will need updating.
+  finding filtered on `title == "Caf?"`) will need updating. (`vuln_scan` has
+  since been retired — see *`vuln_scan` plugin retired* under **Upgrade notes by
+  release**; this item no longer applies to it.)
 
 ## Upgrading the Server
 
@@ -3119,6 +3121,107 @@ The `quarantine` plugin's Windows/Linux/macOS `netsh`/`iptables`/`pfctl` invocat
 
 **If your automation alerts on `status|failed`/`status|release_uncertain`/`status|update_uncertain` from `quarantine` actions, you may see these fire more often after upgrading** — this is expected. Nothing got more broken; the plugin's failure reporting simply got more honest about cases it previously reported as clean success. No action is required beyond expecting the change.
 
+### `vuln_scan` plugin retired — its five instruction definitions are dead on upgrade
+
+The `vuln_scan` agent plugin is removed in this release (ADR-0018: the agent collects, it never decides; ADR-0028 Decision 2). Its agent-side CVE rule list (`cve_rules.hpp`) and config checks are retired in favour of server-authoritative vulnerability matching. **Server-side vulnerability handling is unaffected** — NVD sync, CVE correlation, the vulnerability dashboard, and stored findings all continue to work exactly as before. Only the agent plugin and its instruction definitions are gone.
+
+**The five definitions persist in already-upgraded deployments and will fail if dispatched.** Boot content import upserts with conflict-*skip* and never prunes, so deleting the shipped YAML only affects fresh installs. On any deployment that previously imported them, these ids remain in `instructions.db` and stay visible in the dashboard's **Send** panel:
+
+- `security.vuln_scan.scan`
+- `security.vuln_scan.cve_scan`
+- `security.vuln_scan.config_scan`
+- `security.vuln_scan.summary`
+- `security.vuln_scan.inventory`
+
+Dispatching any of them now fails: the server's command-capability catalogue no longer classifies `vuln_scan` actions, so the request is rejected at the dispatch chokepoint before it ever reaches an agent. The failure is safe — nothing is executed on any endpoint — but it is **unexplained** from the operator's point of view, which is why the cleanup below is worth doing rather than leaving the dead entries in place.
+
+**Agent-side, the managed installers handle this for you; a tarball/sideload install needs one manual step.** This matters because the agent loads *every* plugin library it finds in its plugin directory (allowlist enforcement is off unless you configure `--plugin-allowlist`), so a file left behind by an older release would keep being loaded:
+
+- **Windows** (installer) — *attempts* to delete a leftover `plugins\vuln_scan.dll` via an `[InstallDelete]` entry. This is best-effort, not guaranteed: Inno Setup stops the service and polls for it to reach `STOPPED` before installing, but proceeds regardless if that poll times out, and a file still locked by a slow-to-exit agent process can make the delete fail silently — no install-log warning, no visible error. If you have reason to think an upgrade happened on a loaded or slow-shutdown host, verify by hand: `dir "%ProgramFiles%\Yuzu\plugins\vuln_scan.dll"` should report the file missing; if it is still there, delete it and restart the `YuzuAgent` service.
+- **macOS** (`.pkg`) — the `preinstall` script removes a leftover `vuln_scan.dylib` from `/usr/local/lib/yuzu/plugins`, and logs a `WARNING` to the install log if the removal itself fails. (`pkgbuild` never prunes files dropped from a later payload, so this is explicit.)
+- **Linux** (`.deb`/`.rpm`) — dropped automatically; dpkg/rpm own the installed file list.
+- **⚠️ Tarball, agent bundle, or any sideload install** — **no automatic cleanup.** Extracting or rsyncing a new release over an existing tree adds and overwrites files but never removes one that is no longer shipped. Delete it by hand from your plugin directory (the one you pass to `--plugin-dir`):
+
+  ```bash
+  rm -f <plugin-dir>/vuln_scan.so     # Linux
+  rm -f <plugin-dir>/vuln_scan.dylib  # macOS
+  ```
+
+  `rm -f` does not error if the file is already gone or the path is wrong, so confirm the directory before trusting a silent, no-output run — `ls <plugin-dir> | grep vuln_scan` should return nothing.
+
+  Leaving it is not a security hole — the server refuses `vuln_scan.*` dispatch at the capability chokepoint regardless — but the agent will keep loading dead code on every start.
+
+The steps below concern the **server's** databases only.
+
+There is no automatic removal: this is the first release to retire shipped content, and the boot importer is deliberately designed never to override in-place operator edits, so it will not delete rows on your behalf. **Manual remediation, until a content-retirement mechanism lands. Run each step in order:**
+
+1. **Back up the instruction database first.** Destructive SQL with no rollback.
+
+   Use SQLite's own `.backup` — **not** `cp`. The instruction database runs in WAL mode, so a plain file copy of `instructions.db` taken against a running server captures only what has been checkpointed and silently omits everything still in the `-wal` sidecar. That produces a backup that looks valid and restores to a stale state, which is the worst possible outcome for a step whose whole job is to protect a destructive delete.
+
+   ```bash
+   docker exec yuzu-server sqlite3 /var/lib/yuzu/instructions.db \
+     ".backup '/var/lib/yuzu/instructions.db.bak.$(date +%Y%m%d)'"
+   # or for a systemd install:
+   sqlite3 /var/lib/yuzu/instructions.db \
+     ".backup '/var/lib/yuzu/instructions.db.bak.$(date +%Y%m%d)'"
+   ```
+
+   (Stopping the server first and copying all three of `instructions.db`, `instructions.db-wal` and `instructions.db-shm` together is equally safe, if you would rather take the outage.)
+
+2. **Preview the rows that will be deleted.** Expect at most these five ids. If a row comes back that you have customised and want to keep — for example one you re-pointed at a different plugin yourself — stop here and prune the remainder by hand.
+
+   ```bash
+   docker exec -i yuzu-server sqlite3 /var/lib/yuzu/instructions.db \
+     "SELECT id, instruction_set_id FROM instruction_definitions \
+       WHERE id GLOB 'security.vuln_scan.*' ORDER BY id;"
+   ```
+
+3. **Remove schedules and pending approvals that target these ids — do this before step 4.** `schedules.definition_id` is plain text with no foreign key, so a schedule pointing at a retired id survives both the upgrade and the deletion below, and then fails on every tick forever, generating a permanent stream of failure records. Approvals are the same shape.
+
+   ```bash
+   # Preview first — note anything you want to re-point rather than delete:
+   docker exec -i yuzu-server sqlite3 /var/lib/yuzu/instructions.db \
+     "SELECT id, name, definition_id FROM schedules \
+       WHERE definition_id GLOB 'security.vuln_scan.*';
+      SELECT id, definition_id, status FROM approvals \
+       WHERE definition_id GLOB 'security.vuln_scan.*' AND status = 'pending';"
+
+   # Then remove them:
+   docker exec -i yuzu-server sqlite3 /var/lib/yuzu/instructions.db \
+     "DELETE FROM schedules   WHERE definition_id GLOB 'security.vuln_scan.*';
+      DELETE FROM approvals   WHERE definition_id GLOB 'security.vuln_scan.*' AND status = 'pending';"
+   ```
+
+4. **Delete the retired definitions.** Scoped to the `security.vuln_scan.` prefix so nothing else is touched. Instruction-**set** membership lives on the definition row itself (`instruction_set_id`), so this also removes them from the **Endpoint Security Posture** set — no separate set cleanup is needed. Content **packs** are a different store and are handled in step 6.
+
+   ```bash
+   docker exec -i yuzu-server sqlite3 /var/lib/yuzu/instructions.db \
+     "DELETE FROM instruction_definitions WHERE id GLOB 'security.vuln_scan.*';"
+   ```
+
+5. **Confirm cleanup:** re-run the preview queries from steps 2 and 3 — zero rows expected.
+
+6. **Check every installed pack — not just the shipped demo pack.** Pack membership is **not** stored on the definition row — it lives in `product_pack_store.product_pack_items` in **Postgres**, with its own copy of the item's YAML, independent of anything you did in steps 1–5. **Do not skip this step because you don't recognise `pack.demo.visualization`** — any pack import, including one authored internally, downloaded from elsewhere, or restored from an old archive, can carry the same `security.vuln_scan.scan` item id. As long as a row survives here, re-installing or repairing *that* pack — for any reason, at any later date — **recreates** the definition you deleted in step 4, and any RBAC grant naming it (see below) reactivates silently with it. Adjust the `psql` connection details to match your deployment:
+
+   ```bash
+   # Preview — across ALL packs, not just the demo pack:
+   psql "$YUZU_POSTGRES_DSN" -c \
+     "SELECT pack_id, kind, item_id FROM product_pack_store.product_pack_items \
+       WHERE item_id LIKE 'security.vuln\_scan.%';"
+
+   # Remove:
+   psql "$YUZU_POSTGRES_DSN" -c \
+     "DELETE FROM product_pack_store.product_pack_items \
+       WHERE item_id LIKE 'security.vuln\_scan.%';"
+   ```
+
+7. **Confirm cleanup is COMPLETE before treating this as done.** Re-run the step 6 preview — zero rows expected. A deployment where steps 1–5 ran but step 6 did not is only *partially* remediated: the definition rows are gone today, but the moment described in step 6 above still applies. There is no automated check for this — record locally that step 6 was completed, the same way you would record any other manual remediation.
+
+Safe on fresh installs (no matching rows). RBAC grants naming these ids are **not** removed by the steps above and are inert while no such definition exists; they are covered by a one-time role audit when the replacement collector lands (ADR-0028) — but that audit assumes step 6 was actually completed. If it was skipped, the audit's premise (no definition exists to reactivate) may already be false by the time it runs.
+
+**The `security.vuln_scan.scan` entry point is expected to return** in a later release, re-created against the ADR-0028 component-inventory collector rather than the retired plugin. Until then there is no vulnerability-scan instruction to dispatch from the agent side.
+
 ## Rollback
 
 If an upgrade causes issues:
@@ -3128,6 +3231,8 @@ If an upgrade causes issues:
 3. Start the previous version binary
 
 **Important:** Rolling back after a schema migration requires restoring the database files from backup. The old binary cannot read the new schema.
+
+**Restoring a pre-`vuln_scan`-retirement backup onto a post-retirement server** (a rollback test, disaster recovery from an old backup, or any restore of an `instructions.db` predating this release) reintroduces the five `security.vuln_scan.*` definitions described earlier in this file, under **"`vuln_scan` plugin retired"** (Upgrade notes by release) — visible in the Send panel, safely refused at dispatch. This is the same "already-upgraded deployment" case, triggered by a restore rather than an in-place upgrade; the cleanup steps there apply unchanged.
 
 ## Troubleshooting
 

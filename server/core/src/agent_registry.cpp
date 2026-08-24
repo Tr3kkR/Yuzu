@@ -910,11 +910,6 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // wol
         {"wol.wake", "Send a Wake-on-LAN magic packet to a MAC address"},
         {"wol.check", "Ping a host to verify it responded to WoL wake"},
-        // vuln_scan
-        {"vuln_scan.scan", "Full vulnerability scan (CVE + configuration checks)"},
-        {"vuln_scan.cve_scan", "CVE-only: match installed software against known CVEs"},
-        {"vuln_scan.config_scan", "Configuration and compliance checks only"},
-        {"vuln_scan.summary", "Quick severity counts from a full vulnerability scan"},
         // wifi
         {"wifi.list_networks", "Scan for visible WiFi networks (SSID, signal, security)"},
         {"wifi.connected", "Currently connected WiFi network info"},

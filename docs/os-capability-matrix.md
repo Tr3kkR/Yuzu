@@ -8,7 +8,7 @@ whole agent surface, grouped into sections: **agent core**, **Guardian guards**,
 **Spark detection mechanisms**, **DEX**, **TAR warehouse capture sources**,
 **inventory / daily-sync sources**, **live device snapshot**, **security posture
 & file/certificate surfaces**, **network quality**, and every **agent plugin**
-(49).
+(48).
 
 **Read this first — accuracy & drift.** This is a *curated snapshot*, and a
 hand-maintained matrix drifts from code exactly the way the gap above happened.
@@ -86,7 +86,7 @@ duplicates.
 | **Certificate delete — verified / SIP-aware** (`certificates.delete`) | ✅ | ✅ | ✅ | Win: CryptoAPI store delete; Linux: remove matching PEM under `/etc/ssl/certs`. macOS: `security delete-certificate` on `System.keychain` then a re-enumeration that reports `deleted` only on a positively-proven absence (`classify_delete_verdict` in `agents/shared/macos_console_user.hpp`); `store=root` rejected (SystemRootCertificates.keychain is SIP-sealed) in `certificates_plugin.cpp` |
 | **━━ Network quality (`/network`) ━━** | | | | Measurement-first device/local-link health lens. `net_quality_sampler.cpp`; `docs/user-manual/network.md` "Platform coverage" |
 | **Network quality** (throughput / retransmit / RTT) | 🟡 throughput + retransmit (no RTT) | ✅ all three | 🟡 throughput only | Win `GetIfTable2` throughput + `GetTcpStatisticsEx` system-wide interval retransmit (**measurement-first, not loss-validated** — withheld from the fleet retransmit aggregate); RTT needs ESTATS (admin+overhead) → 🔜. Linux has all three. macOS `NET_RT_IFLIST2` throughput only (`read_net_counters()` sums non-loopback `if_data64` rx/tx, differenced per heartbeat); retransmit + RTT deferred — global `net.inet.tcp.stats` reads all-zero on modern macOS → 🔜 |
-| **━━ Agent plugins (49) — per-plugin build/availability ━━** | | | | Per-OS via platform macros / per-OS TUs (`agents/plugins/*/src/*`). 42 fully cross-platform, 4 Windows-only (`rdp_control`, `registry`, `sccm`, `wmi`), 2 uneven (`tar` — richest on Windows; `msi_packages` — Win+macOS, no Linux), 1 macOS-constrained (`interaction` — GUI-less daemon). "Full" = the plugin builds and its core actions work on that OS; a plugin can be cross-platform yet expose a few OS-specific actions (noted) |
+| **━━ Agent plugins (48) — per-plugin build/availability ━━** | | | | Per-OS via platform macros / per-OS TUs (`agents/plugins/*/src/*`). 41 fully cross-platform, 4 Windows-only (`rdp_control`, `registry`, `sccm`, `wmi`), 2 uneven (`tar` — richest on Windows; `msi_packages` — Win+macOS, no Linux), 1 macOS-constrained (`interaction` — GUI-less daemon). "Full" = the plugin builds and its core actions work on that OS; a plugin can be cross-platform yet expose a few OS-specific actions (noted) |
 | agent_actions | ✅ | ✅ | ✅ | portable — no platform macros |
 | agent_logging | ✅ | ✅ | ✅ | `_WIN32`/`__APPLE__`/Linux branches all implemented |
 | antivirus | ✅ | ✅ | ✅ | Defender/WMI (in-process, no more `powershell`) + exclusion-registry read · ClamAV+Falcon+Sophos with a real `status` leg · macOS real probes — XProtect bundle version + endpoint-security system-extension enumeration (`antivirus_plugin.cpp`, parsers `antivirus_parsers.hpp`), no longer a hardcoded assertion (posture depth: the **Antivirus posture** row) |
@@ -130,7 +130,6 @@ duplicates.
 | tags | ✅ | ✅ | ✅ | portable — `std::filesystem` |
 | **tar** | ✅ | 🟡 | 🟡 | Uneven by design — richest on Windows (ETW/dnsapi/registry), `/proc`-based on Linux, ES + scattered branches on macOS. Per-source depth is the **TAR warehouse capture sources** section above (`tar_schema_registry.cpp`) |
 | users | ✅ | ✅ | ✅ | linux/apple/win branches. macOS `local_users` now adds real `last_logon` (`last -y`) and a tri-state `console_state` GUI-login flag (`SCDynamicStoreCopyConsoleUser`, shared `macos_console_user.hpp`); Windows `primary_user`/`session_history` now read the Security channel natively via wevtapi, and the POSIX account tools run as bounded argv invocations instead of a shell |
-| vuln_scan | ✅ | ✅ | ✅ | linux/apple/win branches |
 | wifi | ✅ | ✅ | ✅ | win/linux/apple all implemented; macOS `connected` via CoreWLAN (`wifi_corewlan.mm`), `list_networks` legacy `airport -s`/`system_profiler` (connection depth: the **Live — Wi-Fi current connection** row) |
 | windows_updates | ✅ | ✅ | ✅ | update history / rpm+apt / `system_profiler` install history (Linux/mac report installed-package history) |
 | wmi | ✅ | ⛔ | ⛔ | Windows-only (`#ifndef _WIN32` → not available) |
@@ -159,7 +158,7 @@ merely shrink it — the script exits 1 on a *lower* count too until
 adoption gain is sticky rather than leaving room for a later regression back
 up to the old baseline.
 
-Adoption is now **complete**: all 49 plugins the CI gate tracks populate
+Adoption is now **complete**: all 48 plugins the CI gate tracks populate
 `action_descriptors`, so the undeclared count and `RATCHET_BASELINE_UNDECLARED`
 are both **0** and the "Undeclared plugins" section below is empty. From here
 the ratchet is equivalent to a hard fail — a new plugin directory landing
@@ -684,21 +683,6 @@ implementation is.
 | users | session_history | linux | supported | 2 | runner argv 'last -F -n <count>' | - |
 | users | session_history | macos | supported | 2 | runner argv 'last -n <count>' | - |
 | users | session_history | windows | constrained | 1 | wevtapi (EvtQuery/EvtRender, Security 4624/4634) | requires an elevated token to read the Security channel; reports an error otherwise |
-| vuln_scan | scan | linux | supported | 3 | popen(pkg-manager+iptables/nft/ufw) | - |
-| vuln_scan | scan | macos | supported | 3 | popen(system_profiler/brew+security-checks) | - |
-| vuln_scan | scan | windows | supported | 1 | win32_registry | - |
-| vuln_scan | cve_scan | linux | supported | 3 | popen(dpkg-query/rpm/pacman/apk) | - |
-| vuln_scan | cve_scan | macos | supported | 3 | popen(system_profiler/brew) | - |
-| vuln_scan | cve_scan | windows | supported | 1 | win32_registry | - |
-| vuln_scan | config_scan | linux | supported | 3 | popen(iptables/nft/ufw)+procfs | - |
-| vuln_scan | config_scan | macos | supported | 3 | popen(spctl/fdesetup/csrutil/socketfilterfw) | - |
-| vuln_scan | config_scan | windows | supported | 1 | win32_registry | - |
-| vuln_scan | summary | linux | supported | 3 | popen(pkg-manager+iptables/nft/ufw) | - |
-| vuln_scan | summary | macos | supported | 3 | popen(system_profiler/brew+security-checks) | - |
-| vuln_scan | summary | windows | supported | 1 | win32_registry | - |
-| vuln_scan | inventory | linux | supported | 3 | popen(dpkg-query/rpm/pacman/apk) | - |
-| vuln_scan | inventory | macos | supported | 3 | popen(system_profiler/brew) | - |
-| vuln_scan | inventory | windows | supported | 1 | win32_registry | - |
 | wifi | list_networks | linux | constrained | 3 | nmcli via governed shell runner | falls back to a raw, unstructured iw/iwlist text dump when nmcli is unavailable |
 | wifi | list_networks | macos | constrained | 3 | airport -s via governed shell runner | airport was removed in macOS 14 (Sonoma); the system_profiler SPAirPortDataType fallback needs Location Services authorisation a background daemon may lack, so an unauthorised modern host yields no networks and an honest wifi\|info sentinel |
 | wifi | list_networks | windows | supported | 1 | WlanGetAvailableNetworkList | - |

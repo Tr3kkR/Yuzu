@@ -105,7 +105,7 @@ These commercial-peer features have functional equivalents in Yuzu that are as g
 | API tokens | ApiTokenStore + MCP tiers |
 | Software deployment | SoftwareDeploymentStore (stage/deploy/rollback) |
 | Patch management | PatchManager (scan/download/install/verify/reboot) |
-| Vulnerability scanning | `vuln_scan` plugin + NVD sync |
+| Vulnerability scanning | Server-side NVD sync + matching over `installed_apps` inventory (agent `vuln_scan` plugin retired, ADR-0018/-0028) |
 | Workflows | WorkflowEngine (if/foreach/retry/parallel) |
 
 ### Gaps: Not Started in Capability Map (19 items)

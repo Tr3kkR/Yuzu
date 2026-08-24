@@ -71,7 +71,6 @@ Use `execute_instruction` for each of these plugin/action pairs. After each disp
 - `filesystem` / `list_dir` (params: `{"path": "/tmp"}`)
 - `tar` / `status`
 - `quarantine` / `status`
-- `vuln_scan` / `summary`
 
 **Safe mutating commands:**
 - `storage` / `set` (params: `{"key": "mcp_test", "value": "haiku_was_here"}`)

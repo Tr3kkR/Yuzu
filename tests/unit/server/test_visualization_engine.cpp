@@ -218,19 +218,22 @@ TEST_CASE("VisualizationEngine: max_categories caps and produces an 'Other' buck
 
 TEST_CASE("VisualizationEngine: multi_series groups by series_field",
           "[visualization][engine][multi_series][column]") {
-    // Schema: Agent + Severity + Category + Title + Detail (vuln_scan, 4 fields)
-    // label_field=0 (Severity), series_field=1 (Category).
+    // Schema: Agent + PID + Name + Path + SHA-1 (procfetch, 4 data fields).
+    // label_field=0, series_field=1. multi_series groups purely by field
+    // INDEX and is value-agnostic, so the field-0 values here are synthetic
+    // low-cardinality buckets chosen to exercise grouping — not realistic
+    // PIDs (a real PID is unique per row and would group into singletons).
     std::vector<StoredResponse> responses;
     responses.push_back(make_resp("a1",
-        "high|chrome|CVE-1|d1\n"
-        "high|chrome|CVE-2|d2\n"
-        "low|chrome|CVE-3|d3\n"
-        "high|firefox|CVE-4|d4\n"
-        "low|firefox|CVE-5|d5"));
+        "1000|chrome|/usr/bin/chrome|d1\n"
+        "1000|chrome|/usr/bin/chrome|d2\n"
+        "2000|chrome|/usr/bin/chrome|d3\n"
+        "1000|firefox|/usr/bin/firefox|d4\n"
+        "2000|firefox|/usr/bin/firefox|d5"));
 
     VisualizationEngine eng;
     auto spec = R"({"type":"column","processor":"multi_series","labelField":0,"seriesField":1})";
-    auto r = eng.transform(spec, "vuln_scan", responses);
+    auto r = eng.transform(spec, "procfetch", responses);
     REQUIRE(r.ok);
 
     auto j = nlohmann::json::parse(r.json);
@@ -243,10 +246,10 @@ TEST_CASE("VisualizationEngine: multi_series groups by series_field",
         for (size_t i = 0; i < labels.size(); ++i)
             got[name][labels[i].get<std::string>()] = s["data"][i].get<double>();
     }
-    CHECK(got["chrome"]["high"] == 2);
-    CHECK(got["chrome"]["low"] == 1);
-    CHECK(got["firefox"]["high"] == 1);
-    CHECK(got["firefox"]["low"] == 1);
+    CHECK(got["chrome"]["1000"] == 2);
+    CHECK(got["chrome"]["2000"] == 1);
+    CHECK(got["firefox"]["1000"] == 1);
+    CHECK(got["firefox"]["2000"] == 1);
 }
 
 TEST_CASE("VisualizationEngine: datetime_series uses response timestamp by default",

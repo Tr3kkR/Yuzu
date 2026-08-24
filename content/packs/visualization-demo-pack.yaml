@@ -29,10 +29,10 @@ metadata:
   version: 1.0.0
   description: >
     Default examples pack demonstrating the Response Visualization Engine
-    (#253). Bundles six chart-bearing instruction definitions covering
-    vulnerability severity, antivirus posture, disk encryption, firewall
-    state, certificate issuers, and OS distribution. Install this pack
-    against any UAT or demo fleet and run any of the six instructions
+    (#253). Bundles five chart-bearing instruction definitions covering
+    antivirus posture, disk encryption, firewall state, certificate
+    issuers, and OS distribution. Install this pack
+    against any UAT or demo fleet and run any of the five instructions
     from the dashboard "Send" panel — a chart card auto-renders above
     the results table.
 spec:
@@ -48,7 +48,6 @@ spec:
     instructionSets:
       - demo.visualization.fleet-posture
     instructionDefinitions:
-      - security.vuln_scan.scan
       - security.antivirus.defender_status
       - security.encryption.state
       - security.firewall.state
@@ -56,7 +55,6 @@ spec:
       - device.os_info.os_name
   dependencies:
     plugins:
-      - vuln_scan
       - antivirus
       - bitlocker
       - firewall

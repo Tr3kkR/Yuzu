@@ -425,7 +425,7 @@ std::vector<inv::InvRecord> get_inventory_linux() {
     if (command_exists("dpkg-query")) {
         // ${db:Status-Abbrev} (want+status, 2 chars) keeps installed AND held
         // packages via its 2nd char == 'i' ("ii" want=install, "hi" want=hold)
-        // — matches vuln_scan's vuln_identity.hpp (PR #1804) exactly, so the
+        // — matches the retired vuln_scan plugin's vuln_identity.hpp (PR #1804), so
         // two collectors agree on which packages are present. "rc"
         // (removed, config-files) and "un" (unknown) are correctly excluded;
         // this also supersedes the legacy `list` filter's narrower
@@ -436,8 +436,8 @@ std::vector<inv::InvRecord> get_inventory_linux() {
     } else if (command_exists("rpm")) {
         // Raw SIGPGP (payload) + RSAHEADER (header) signature tags; signed vs
         // unsigned is computed in C++ by parse_rpm_inv_line/rpm_sig_present —
-        // matches vuln_scan's vuln_identity.hpp (PR #1804) exactly, so the two
-        // collectors agree on this field for the same rpm. Never a live
+        // matches the retired vuln_scan plugin's vuln_identity.hpp (PR #1804), the
+        // enumeration this collector superseded. Never a live
         // `rpm -K` verification. PACKAGER per the v2 spec (`list` keeps VENDOR
         // for its stable operator contract).
         collect("rpm -qa --queryformat '%{NAME}\\t%{EPOCH}\\t%{VERSION}\\t%{RELEASE}\\t"
@@ -448,7 +448,7 @@ std::vector<inv::InvRecord> get_inventory_linux() {
         collect("pacman -Q 2>/dev/null", inv::parse_pacman_inv_line);
     } else if (command_exists("apk")) {
         // Alpine — first apk enumeration on the sync path (the legacy `list`
-        // has no apk branch; precedent is vuln_scan's enumerator).
+        // has no apk branch; precedent was the retired vuln_scan enumerator).
         collect("apk info -v 2>/dev/null", inv::parse_apk_inv_line);
     }
 

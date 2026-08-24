@@ -200,13 +200,8 @@ const COMMANDS = [
   ['http_client request url=http://127.0.0.1:8080/livez method=GET',
                                     'HTTP GET livez', 'rows'],
 
-  // ─── IOC / Vuln Scan ───
+  // ─── IOC ───
   ['ioc check',              'IOC check',         'any'],
-  ['vuln_scan scan',         'Vulnerability scan', 'any'],
-  ['vuln_scan cve_scan',     'CVE scan',           'any'],
-  ['vuln_scan config_scan',  'Config compliance',  'any'],
-  ['vuln_scan summary',      'Vuln scan summary',  'any'],
-  ['vuln_scan inventory',    'Vuln inventory',     'any'],
 
   // ─── Process Fetch / Socket Who ───
   ['procfetch procfetch',   'Process fetch with hashes', 'any'],

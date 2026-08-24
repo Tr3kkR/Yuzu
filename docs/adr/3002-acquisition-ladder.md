@@ -173,7 +173,7 @@ recognised categories:
 
 - **The fleet is split by platform and by history.** Windows plugins largely
   live at rung 1 already (WMI/Win32, registry via `Reg*W`); TAR capture
-  sources were built at rung 1 (ES/ETW). But 27 of 49 plugins — heavily
+  sources were built at rung 1 (ES/ETW). But 27 of 48 plugins — heavily
   concentrated on macOS and Linux — sit at an *ungoverned* rung 3: per-plugin
   shell helpers of varying shapes (`run_command`, `run_command_rc`,
   `run_command_lines`, bare `system()` probes, bespoke `tar`/`interaction`

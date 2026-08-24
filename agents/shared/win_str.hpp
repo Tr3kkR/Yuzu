@@ -4,7 +4,8 @@
 // plugins had each re-derived. (Do NOT trust the originating issue's "~6 byte-identical"
 // shorthand -- the real prior spread was wider and uneven.) #1681/#1682 migrated the
 // plugins that carried a NAMED wide<->UTF-8 helper to this header:
-//   - vuln_scan / os_info / sccm / windows_updates -- the previously-ANSI Reg*A siblings (#1682);
+//   - os_info / sccm / windows_updates -- the previously-ANSI Reg*A siblings (#1682);
+//     (vuln_scan was a fourth, retired outright with the plugin -- ADR-0018/-0028);
 //   - registry / wmi / services / interaction / tar_module_etw -- de-dup of the trio /
 //     single-direction local copies;
 //   - network_config / procfetch / sockwho / users / wifi / tar_service_collector /
@@ -37,7 +38,7 @@
 // Windows-only by construction (#ifdef _WIN32); the header is empty elsewhere.
 // Deliberately free of Reg* I/O so the pure string conversion is unit-testable
 // without advapi32 (tests/unit/test_win_str_utils.cpp). The Reg* read sites that
-// consume these (installed_apps, vuln_scan, os_info, ...) stay integration-tested.
+// consume these (installed_apps, os_info, ...) stay integration-tested.
 //
 // Derived from the #1679-hardened installed_apps trio, with two deliberate
 // divergences: (1) null / non-positive guards make from_wide / reg_sz_to_utf8 total

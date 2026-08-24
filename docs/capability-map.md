@@ -446,7 +446,9 @@ rung 2) — all three dispatched from the plugin's `state` action.
 
 ### 9.4 Vulnerability Scanning :large_orange_diamond: `T1`
 
-`vuln_scan` plugin + NVD database sync on server. Server-side matching now uses
+NVD database sync + matching on server (the agent-side `vuln_scan` plugin is
+retired — ADR-0018/ADR-0028; component inventory collection is owned by
+`installed_apps` and the ADR-0028 component-inventory plugin). Server-side matching now uses
 real CPE version ranges (`cve`+`cve_match` schema), but **coverage is still
 partial**: the NVD sync now backfills the full CVE catalog newest-first
 (configurable window via `--nvd-backfill-years`, default 8y, resumable across
@@ -460,11 +462,12 @@ collisions possible; vendor precision pending ADR-0018). See
 > grandfathered until re-homed into the first use-case engine (UCE) module —
 > a strangler migration gated on a matcher-parity milestone (M3) before any
 > server-side deletion; see `docs/adr-1005-execution-plan.md`. The agent-side
-> `vuln_scan` collection action is *mechanism* and stays core, but the
-> plugin's embedded static CVE rule list (`cve_rules.hpp`) and its use as an
-> authoritative `cve_scan` finding source are **frozen (no further rule
-> updates) and deprecated** — the long-term replacement is engine-published
-> content delivered through the existing content-distribution plane.
+> `vuln_scan` plugin — including its embedded static CVE rule list
+> (`cve_rules.hpp`) and `config_checks.hpp` — is **retired** (ADR-0018 "the
+> agent collects, never decides"; ADR-0028 Decision 2): agent-side inventory
+> collection is mechanism and lives in `installed_apps`/the ADR-0028
+> component-inventory plugin, and the long-term rule source is
+> engine-published content delivered through the content-distribution plane.
 
 ### 9.5 Event Log Collection :white_check_mark: `T1`
 
@@ -1102,7 +1105,7 @@ Not implemented, and **re-scoped** by ADR-0024's "Placement under ADR-1005": the
 
 ### 28.1 Response Visualization Engine :white_check_mark: `T2`
 
-Implemented. Server-side data transformation with built-in processors (`single_series`, `multi_series`, `datetime_series`) and an optional row pre-filter (`whereField` / `whereEquals`). Chart types: pie, bar, column, line, area. Configured via `spec.visualization` (singular) or `spec.visualizations` (plural for multi-chart). REST: `GET /api/v1/executions/{id}/visualization?definition_id=<id>&index=<N>` gated on `Response:Read`. Renderer is Apache ECharts 5 (vendored at `/static/echarts.min.js`) wrapped by a thin adapter at `/static/yuzu-charts.js` that reads `--mds-color-chart-*` Yuzu design tokens at render time. Six chart-bearing demo definitions (vuln_scan, antivirus, bitlocker, firewall, certificates, os_info) ship as `InstructionSet demo.visualization.fleet-posture`, auto-imported on server startup.
+Implemented. Server-side data transformation with built-in processors (`single_series`, `multi_series`, `datetime_series`) and an optional row pre-filter (`whereField` / `whereEquals`). Chart types: pie, bar, column, line, area. Configured via `spec.visualization` (singular) or `spec.visualizations` (plural for multi-chart). REST: `GET /api/v1/executions/{id}/visualization?definition_id=<id>&index=<N>` gated on `Response:Read`. Renderer is Apache ECharts 5 (vendored at `/static/echarts.min.js`) wrapped by a thin adapter at `/static/yuzu-charts.js` that reads `--mds-color-chart-*` Yuzu design tokens at render time. Five chart-bearing demo definitions (antivirus, bitlocker, firewall, certificates, os_info) ship as `InstructionSet demo.visualization.fleet-posture`, auto-imported on server startup.
 
 ### 28.2 Response Templates :white_check_mark: `T2`
 
@@ -1274,7 +1277,6 @@ Not implemented (PRs 12, 15). HMAC rule signing (HKDF per design §11.2) with pe
 | firewall | Y | Y | Y | Security |
 | bitlocker | Y | Y | Y | Security |
 | event_logs | Y | Y | Y | Security |
-| vuln_scan | Y | Y | Y | Security |
 | ioc | Y | Y | Y | Security |
 | quarantine | Y | Y | Y | Security |
 | certificates | Y | Y | Y | Security |
