@@ -65,6 +65,8 @@ Plugins for querying operating system details, hardware inventory, device identi
 | `disks` | Physical disk model, size, interface type, and health status. |
 | `drivers` | Installed device drivers: name, version, date, provider, and device class. Uses `Win32_PnPSignedDriver` on Windows (the query takes several seconds — the `device.hardware.drivers` definition gathers it with a daily TTL); loaded kernel modules via `/proc/modules` on Linux (module name only — version/date not available). Not supported on macOS. |
 
+**Sentinel rows.** Any field the underlying probe cannot read (WMI/DMI/`sysctl` call failed, or ran on an unsupported platform) is emitted as the literal string `unknown` rather than being omitted — this applies to `manufacturer`, `model`, `bios`, `processors`, `memory`, and `disks`. `drivers` additionally emits a `__truncated__` sentinel in the driver-name field on Windows when the WMI enumeration hit its row cap (`agents/shared/wmi_bounded.hpp`, 512 rows) — the reached count rides in the row-index column, and `__truncated__` cannot collide with a real `DeviceName`, so a consumer can distinguish "no more drivers" from "the list was cut short."
+
 ### device_identity
 
 | | |
@@ -225,22 +227,12 @@ Plugins for network configuration, active connections, diagnostics, and administ
 | | |
 |---|---|
 | **Platforms** | W L M |
-| **Description** | Active network connections (similar to the `netstat` command-line tool). |
+| **Description** | Active network connections (similar to the `netstat` command-line tool), and socket-to-process attribution. |
 
 | Action | Description |
 |---|---|
 | `netstat_list` | List all TCP and UDP connections with local/remote address, port, state, and owning PID. |
-
-### sockwho
-
-| | |
-|---|---|
-| **Platforms** | W L M |
-| **Description** | Maps open sockets to the processes that own them. |
-
-| Action | Description |
-|---|---|
-| `sockwho_list` | For each listening or established socket, returns the owning process name and PID alongside connection details. |
+| `attribution` | Same enumeration, plus the owning process's name and executable path for each socket. Folds the retired `sockwho` plugin's functionality into netstat (#3403). On macOS, a socket shared across a fork (multiple processes holding the same fd) is deduplicated to one owner row, matching `netstat_list` — unlike the retired `sockwho`, which emitted one row per (pid, fd). |
 
 ### network_diag
 

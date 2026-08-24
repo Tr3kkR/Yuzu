@@ -824,6 +824,9 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // netstat
         {"netstat.netstat_list",
          "Active TCP/UDP connections and listening sockets with owning PID"},
+        {"netstat.attribution",
+         "Active TCP/UDP connections and listening sockets with owning process name and path "
+         "(folds the retired sockwho plugin in, #3403)"},
         // netprobe
         {"netprobe.icmp", "ICMP round-trip time, jitter, and loss to targets"},
         {"netprobe.tcp", "TCP connect-time RTT, jitter, and loss to targets (default port 443)"},
@@ -904,8 +907,6 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"asset_tags.changes", "Report the change log (what changed and when)"},
         // procfetch
         {"procfetch.procfetch_fetch", "Enumerate processes with PID, name, path, and SHA-1 hash"},
-        // sockwho
-        {"sockwho.sockwho_list", "Map open sockets to owning processes (PID, name, path)"},
         // wol
         {"wol.wake", "Send a Wake-on-LAN magic packet to a MAC address"},
         {"wol.check", "Ping a host to verify it responded to WoL wake"},
