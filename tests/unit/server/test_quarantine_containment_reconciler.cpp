@@ -702,6 +702,73 @@ TEST_CASE("QuarantineContainmentReconciler: a session churn between the status d
               .value() == 1); // still counted as unconfirmed, not silently cleared
 }
 
+TEST_CASE("QuarantineContainmentReconciler: a sustained response_store outage escalates backoff "
+          "on a pending poll instead of retrying at a flat cadence forever "
+          "(#3425 gate4-response-store-degradation-freezes-timeout)",
+          "[pg][quarantine][reconciler]") {
+    // response_store = nullptr from construction (matches this file's own
+    // "simulates unavailable" convention) means every poll of the pending
+    // apply command hits reconcile_one's `!resp` branch every single time —
+    // isolating exactly the branch under test, with no interference from
+    // the sibling resp->empty()/timed_out paths.
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_recon_tpl);
+    PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineStore qstore{qpool};
+    REQUIRE(qstore.is_open());
+    REQUIRE(qstore.quarantine_device("agent-1", "admin", "malware", "").has_value());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry{bus, metrics};
+    registry.register_agent(make_info("agent-1"));
+
+    MockDispatch dispatch;
+    QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
+        .quarantine_store = &qstore,
+        .response_store = nullptr, // degraded for the whole test
+        .registry = &registry,
+        .metrics = &metrics,
+        .audit_store = nullptr,
+        .dispatch_fn = dispatch.fn(),
+        .now_fn = {},
+        .min_reapply_interval_override = std::chrono::milliseconds(20),
+        .response_wait_override = std::chrono::milliseconds(5000), // large: never let
+                                                                    // timed_out fire —
+                                                                    // isolates the !resp
+                                                                    // branch specifically
+        .verify_grace_override = std::chrono::milliseconds(20),
+    });
+
+    reconciler.tick(); // 1: apply dispatched (doesn't touch response_store)
+    REQUIRE(dispatch.calls.size() == 1);
+
+    auto degraded_count = [&] {
+        return metrics.counter("yuzu_server_quarantine_reapply_total", {{"result", "degraded"}})
+            .value();
+    };
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(30)); // past the 20ms interval
+    reconciler.tick(); // 2: polls, response_store null -> degraded, backoff 20ms -> 40ms
+    CHECK(degraded_count() == 1);
+    CHECK(dispatch.calls.size() == 1); // no new dispatch — still the same pending command
+
+    // Only 25ms elapsed: past the OLD 20ms window (which the pre-fix code
+    // would still be using, since it never touched backoff on this branch)
+    // but short of the NEW 40ms window. Under the fix, this call must be
+    // rate_limited — no poll attempt, no second "degraded" count.
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    reconciler.tick(); // 3: rate_limited if backoff escalated; degraded again if it didn't
+    CHECK(degraded_count() == 1); // unchanged — proves the wait window actually grew
+
+    // Now past the escalated 40ms window — the next poll attempt fires and
+    // escalates again (40ms -> 80ms), continuing the same exponential shape
+    // every other repeated-failure path in this state machine already uses.
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    reconciler.tick(); // 4
+    CHECK(degraded_count() == 2);
+    CHECK(dispatch.calls.size() == 1); // still no new dispatch — command is still pending
+}
+
 TEST_CASE("QuarantineContainmentReconciler: heartbeat fast path is a no-op for an agent with "
           "no active record (no store read)",
           "[pg][quarantine][reconciler]") {

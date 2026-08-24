@@ -296,6 +296,26 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
         if (d_.response_store)
             resp = d_.response_store->query(pending_command_id, ResponseQuery{.agent_id = agent_id});
         if (!resp) {
+            // #3425 review, sharpened at Gate 5 (gate4-response-store-
+            // degradation-freezes-timeout): pending_since is deliberately
+            // NOT touched here — the moment response_store recovers,
+            // `timed_out` below is computed against the ORIGINAL
+            // pending_since and resolves in one shot, so this is not an
+            // indefinite stall. What WAS missing: every other repeated-
+            // failure path in this state machine (not_reached, busy,
+            // unconfirmed, degraded on the confirm/apply store writes)
+            // escalates backoff so a SUSTAINED failure retries less often
+            // over time — a sustained response_store outage instead retried
+            // at a flat ~60s cadence forever. `st.pending` stays untouched
+            // (the command genuinely is still pending; this round simply
+            // couldn't check its status), matching the "still waiting"
+            // shape rather than the "attempt concluded" shape below.
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                auto& st = state_[agent_id];
+                st.backoff = next_backoff(st.backoff, kMaxBackoff);
+                st.next_eligible_at = std::chrono::steady_clock::now() + st.backoff;
+            }
             count("degraded");
             return false;
         }
