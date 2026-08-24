@@ -1,6 +1,68 @@
 #pragma once
 
-#include <sqlite3.h>
+/// @file instruction_store.hpp
+/// Migrated Postgres store (ADR-0006/0009/0058, schema `instruction_store`) for the content-plane
+/// catalog `docs/Instruction-Engine.md` describes: `InstructionDefinition -> InstructionSet ->
+/// ProductPack`. Two tables, no FK between them (`instruction_set_id` is a soft TEXT reference;
+/// `delete_set` unsets it on referencing definitions rather than relying on a cascade).
+///
+/// Posture (ADR-0012 §1): AUTHORITATIVE / fail-hard, both construction and runtime — a
+/// silent-empty definition read breaks dispatch (`execute_instruction` resolves definitions
+/// here). `create_definition`/`update_definition`/`import_definition_json`/
+/// `import_definition_json_trusted`/`create_set` already returned `std::expected`
+/// pre-migration; `query_definitions`/`get_definition`/`list_sets`/`delete_definition`/
+/// `delete_set`/`export_definition_json` are widened to `std::expected` here (ADR-0036
+/// typed-read policy) so a genuine DB error is never collapsed into "no definitions" / "not
+/// found" — matching `ProductPackStore::get`'s `std::expected<std::optional<T>, std::string>`
+/// shape.
+///
+/// Substrate contract (ADR-0008): the store holds a `pg::PgPool&` (not a `sqlite3*`), runs its
+/// schema migration at construction on a pinned lease, and schema-qualifies every runtime
+/// statement. Mutate-and-return uses `RETURNING` where a caller needs to distinguish "inserted"
+/// from "conflicted" — never a bare `PGRES_COMMAND_OK` on `ON CONFLICT DO NOTHING`.
+///
+/// **Seed-vs-live semantics (ADR-0058, the headline decision).** The boot-time reseed loop
+/// (`server.cpp`'s every-boot walk of `kBundledDefinitions`/`kBundledSets`) stays
+/// conflict-skip-on-id-existence, content-blind, exactly as pre-migration — an operator's edit
+/// to a bundled definition is never clobbered by a later reseed. Deletion, however, is now an
+/// INTENTIONAL SUPPRESSION rather than a plain DELETE: `deleted_seed_content(kind, id)` records
+/// every deleted definition/set id, consulted ONLY by the seed-aware insert paths below and by
+/// `migrate_from_sqlite`'s backfill — never by any read path, any normal `create_definition`/
+/// `create_set` call, or any authorization/targeting decision. This is a DELIBERATE BEHAVIOUR
+/// CHANGE from the pre-migration SQLite store, which resurrected an operator-deleted bundled
+/// definition on the very next boot (pinned and then inverted — see
+/// `tests/unit/server/test_instruction_store.cpp` tag `[instruction_store][seed]`). See
+/// `docs/adr/0058-instruction-store-postgres-migration.md` for the full reasoning, the
+/// independent-model consult that informed it, and what this migration does NOT solve (an
+/// untouched-but-stale bundled row never auto-refreshes to newer bundled content on a release
+/// upgrade — flagged as a follow-up, not fixed here).
+///
+/// **Two named entry points make the seed-vs-tombstone distinction explicit at every call
+/// site**, mirroring `import_definition_json`/`import_definition_json_trusted`'s existing
+/// signature-trust-boundary pattern:
+///   - `import_definition_json_trusted` (its own signature gate bypass is unchanged) now ALSO
+///     routes through the seed-aware insert path internally — it is exclusively the boot-loop
+///     caller (no REST/MCP/network surface reaches it, by design), so `!check_signature` is
+///     already a sound proxy for "this is the reseed loop."
+///   - `create_set_seed` is a NEW public method, the set-side seed-aware entry point (sets have
+///     no signature concept at all — "seed" names the actual distinction being made, not
+///     "trusted", which would misleadingly imply one). Plain `create_set` is unchanged — used by
+///     the REST-facing "create a custom instruction set" route, no lock, no tombstone
+///     consultation, exactly as before.
+/// Callers of `create_set_seed` MUST be internal boot-time code — there is no REST/MCP/network
+/// surface for this method by design, matching `import_definition_json_trusted`'s contract.
+///
+/// No secrets (ADR-0010 N/A): verified against `docs/Instruction-Engine.md`/
+/// `docs/yaml-dsl-spec.md`, neither of which defines a secret-typed/credential-bearing YAML
+/// field — the only crypto-adjacent fields are the definition's public `signature`/`publicKey`
+/// pair (Ed25519), not secret material. Free-text columns are `sanitize_pg_text`'d before every
+/// write (NUL-truncation hygiene over libpq's C-string text binding), applied AFTER signature
+/// verification, over the pre-sanitized bytes — mirrors `product_pack_store.hpp`'s identical
+/// note; `verify_signature` runs once over the exact bytes that were signed.
+///
+/// **No `mtx_`** (the pre-migration `shared_mutex` is dropped) — Postgres's MVCC + the pool's
+/// own connection-level concurrency replace it, matching every other migrated store on the
+/// ladder.
 
 #include <atomic>
 #include <cstdint>
@@ -8,10 +70,23 @@
 #include <filesystem>
 #include <optional>
 #include <string>
-#include <shared_mutex>
 #include <vector>
 
+namespace yuzu::server::pg {
+class PgPool;
+}
+
+namespace yuzu {
+class MetricsRegistry;
+}
+
 namespace yuzu::server {
+
+/// Machine-checkable prefix on every `InstructionStore` `unexpected()` that represents a
+/// genuine DB/lease failure rather than caller-input validation, a signature/policy rejection,
+/// or a not-found error (mirrors `ProductPackStore::kProductPackDbErrorPrefix`). Callers
+/// classify: `"not_found:"` prefix -> 404, this prefix -> 503, else -> 400.
+inline constexpr const char* kInstructionStoreDbErrorPrefix = "db_error: ";
 
 struct InstructionDefinition {
     std::string id;
@@ -75,13 +150,46 @@ std::optional<std::string> validate_definition_scope(const std::string& yaml_sou
 
 class InstructionStore {
 public:
-    explicit InstructionStore(const std::filesystem::path& db_path);
-    ~InstructionStore();
+    /// Borrows the shared pool and runs the `instruction_store` schema migration on a pinned
+    /// lease. `is_open()` is false if the lease was empty or the migration failed.
+    explicit InstructionStore(pg::PgPool& pool);
 
     InstructionStore(const InstructionStore&) = delete;
     InstructionStore& operator=(const InstructionStore&) = delete;
 
-    bool is_open() const;
+    [[nodiscard]] bool is_open() const noexcept { return open_; }
+
+    /// Wire a metrics registry for the backfill-result counter
+    /// (`yuzu_server_instruction_backfill_total{result}`) and the read-degrade counters
+    /// (`yuzu_server_instruction_read_degrade_total{reason}`), matching
+    /// `ProductPackStore`/`CustomPropertiesStore`'s #1675 convention. Set ONCE during
+    /// single-threaded startup, BEFORE `migrate_from_sqlite()`. A null registry (the default,
+    /// e.g. in unit tests) disables emission.
+    void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
+
+    /// Legacy-SQLite backfill (ADR-0009/0058). Call once at server startup, before serving,
+    /// after construction has proven the Postgres schema is open, and BEFORE the boot-time
+    /// bundled-content reseed loop runs (load-bearing ordering — see the ADR's "Boot ordering"
+    /// section: seeding before backfill can let pristine bundled content silently shadow an
+    /// operator's legacy-side edit). Idempotent PER DISTINCT LEGACY-FILE CONTENT (a SHA-256
+    /// fingerprint over both tables' rows, or a sourceless sentinel). Conflict handling
+    /// partitions `instruction_definitions` columns into IDENTITY (`id`/`created_by`/
+    /// `created_at` — write-once) and LIFECYCLE (everything else, mutable via
+    /// `update_definition`): an IDENTITY mismatch fails the backfill closed; a LIFECYCLE
+    /// mismatch is a benign no-op — Postgres's existing value always wins, matching the reseed
+    /// loop's own "operator edit is never clobbered" rule. `instruction_sets` has no mutation
+    /// path at all (no `update_set` exists) — any conflict there is full-row-equality-or-
+    /// fail-closed, mirroring `ProductPackStore`. Every legacy row is also checked against
+    /// `deleted_seed_content` before being treated as fresh content, so a redeployed/stale-image
+    /// replica's own untouched legacy file cannot resurrect a definition or set this store has
+    /// already reported erased. Transparently handles a legacy file predating any of the
+    /// compat-`ALTER`/v2/v3 columns (defaults match the pre-migration `ALTER ... DEFAULT`
+    /// clauses exactly). Returns true (no-op) when `legacy_db_path` does not exist or holds
+    /// neither table (fresh install). Opens the legacy file READ-ONLY and never deletes/moves
+    /// it — the file remains live for `InstructionDbPool`'s still-SQLite siblings
+    /// (`ExecutionTracker`/`ApprovalManager`/`ScheduleEngine`); only the two tables this store
+    /// owns become dead weight, retained indefinitely, harmlessly.
+    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
     /// When true, `import_definition_json` rejects payloads that lack a
     /// `signature` field. Payloads WITH a signature are always verified
@@ -96,11 +204,10 @@ public:
     /// emits a `server.unsigned_definitions_allowed` startup audit event —
     /// exact parity with #802 / `--allow-unsigned-packs`.
     ///
-    /// Atomic for the same reason as ProductPackStore::require_signed_packs_:
-    /// the setter is called at startup before any concurrent reader, but
-    /// TSAN cannot prove that; atomic load/store with relaxed memory order
-    /// silences TSAN and future-proofs against any later runtime-toggle
-    /// endpoint.
+    /// Atomic for the same reason as `ProductPackStore::require_signed_packs_`: the setter is
+    /// called at startup before any concurrent reader, but TSAN cannot prove that; atomic
+    /// load/store with relaxed memory order silences TSAN and future-proofs against any later
+    /// runtime-toggle endpoint.
     void set_require_signed_definitions(bool require) {
         require_signed_definitions_.store(require, std::memory_order_relaxed);
     }
@@ -109,14 +216,33 @@ public:
     }
 
     // Definitions
-    std::vector<InstructionDefinition> query_definitions(const InstructionQuery& q = {}) const;
-    std::optional<InstructionDefinition> get_definition(const std::string& id) const;
+
+    /// `unexpected(msg)` (prefixed `kInstructionStoreDbErrorPrefix`) is a genuine read failure —
+    /// never treat it as "no definitions match."
+    std::expected<std::vector<InstructionDefinition>, std::string>
+    query_definitions(const InstructionQuery& q = {}) const;
+
+    /// `nullopt` = a successful read finding none; `unexpected(msg)` (prefixed
+    /// `kInstructionStoreDbErrorPrefix`) = a genuine read failure — never treat the latter as
+    /// "not found." Matches `ProductPackStore::get`'s exact shape.
+    std::expected<std::optional<InstructionDefinition>, std::string>
+    get_definition(const std::string& id) const;
+
     std::expected<std::string, std::string> create_definition(const InstructionDefinition& def);
     std::expected<void, std::string> update_definition(const InstructionDefinition& def);
-    bool delete_definition(const std::string& id);
+
+    /// `unexpected("not_found: ...")` when no definition with this id exists; any other
+    /// `unexpected(msg)` (prefixed `kInstructionStoreDbErrorPrefix`) is a genuine failure.
+    /// Stamps `deleted_seed_content` in the SAME transaction as the delete (ADR-0058
+    /// seed-suppression) under `kSeedCoordLockSql`.
+    std::expected<void, std::string> delete_definition(const std::string& id);
 
     // Import/Export
-    std::string export_definition_json(const std::string& id) const;
+
+    /// `unexpected(msg)` (prefixed `kInstructionStoreDbErrorPrefix`) on a genuine read failure
+    /// — never treat as "nothing to export." Returns `"{}"` only for a successful read that
+    /// found nothing.
+    std::expected<std::string, std::string> export_definition_json(const std::string& id) const;
 
     /// Parse a JSON-encoded InstructionDefinition envelope and create it.
     ///
@@ -156,11 +282,11 @@ public:
     ///     (DoS amplification guard).
     std::expected<std::string, std::string> import_definition_json(const std::string& json);
 
-    /// Trusted-content variant — bypasses the signature gate. ONLY for
-    /// build-time-baked content (the `kBundledDefinitions` boot seed in
-    /// `bundled_content.cpp`), where the authenticity of the bytes is
-    /// established by the build-time linkage into the binary itself, not
-    /// by a runtime signature. The operator-facing
+    /// Trusted-content variant — bypasses the signature gate AND routes through the seed-aware
+    /// insert path (ADR-0058 — see the file header's "Seed-vs-live semantics" section). ONLY
+    /// for build-time-baked content (the `kBundledDefinitions` boot seed in `bundled_content.cpp`),
+    /// where the authenticity of the bytes is established by the build-time linkage into the
+    /// binary itself, not by a runtime signature. The operator-facing
     /// `--allow-unsigned-definitions` flag controls the public path only;
     /// it does NOT affect this trusted path. Callers MUST be internal
     /// boot-time code — there is no REST / MCP / network surface for this
@@ -168,28 +294,62 @@ public:
     std::expected<std::string, std::string> import_definition_json_trusted(const std::string& json);
 
     // Instruction Sets
-    std::vector<InstructionSet> list_sets() const;
+
+    /// `unexpected(msg)` (prefixed `kInstructionStoreDbErrorPrefix`) is a genuine read failure —
+    /// never treat it as "no sets."
+    std::expected<std::vector<InstructionSet>, std::string> list_sets() const;
+
+    /// Operator-facing entry point — no lock, no `deleted_seed_content` consultation. Used by
+    /// the REST "create a custom instruction set" route.
     std::expected<std::string, std::string> create_set(const InstructionSet& s);
-    bool delete_set(const std::string& id);
+
+    /// Boot-time seed-aware entry point (ADR-0058) — used ONLY by `server.cpp`'s
+    /// `kBundledSets` reseed loop. Same id-existence conflict-skip semantics as `create_set`,
+    /// PLUS: an id present in `deleted_seed_content` (an operator having deleted this bundled
+    /// set via `delete_set`) is ALSO treated as a conflict-skip, so an every-boot replay can
+    /// never resurrect it. Takes `kSeedCoordLockSql` as its first statement. No REST/MCP/network
+    /// surface reaches this method by design, matching `import_definition_json_trusted`.
+    std::expected<std::string, std::string> create_set_seed(const InstructionSet& s);
+
+    /// `unexpected("not_found: ...")` when no set with this id exists; any other
+    /// `unexpected(msg)` (prefixed `kInstructionStoreDbErrorPrefix`) is a genuine failure.
+    /// Unsets `instruction_set_id` on every referencing definition and stamps
+    /// `deleted_seed_content` in the SAME transaction as the delete, under `kSeedCoordLockSql`.
+    std::expected<void, std::string> delete_set(const std::string& id);
 
 private:
-    sqlite3* db_{nullptr};
-    mutable std::shared_mutex mtx_; // protects db_ access (G3-ARCH-003)
+    pg::PgPool& pool_;
+    bool open_{false};
     /// Security-by-default since #1073 (W7.4 sibling-gap closure): imports
     /// without a `signature` field are rejected by `import_definition_json`.
     /// See setter doc above for the operator opt-out flag.
     std::atomic<bool> require_signed_definitions_{true};
+    yuzu::MetricsRegistry* metrics_{nullptr};
 
-    // Internal variants called under existing lock (no re-lock)
-    std::optional<InstructionDefinition> get_definition_impl(const std::string& id) const;
-    std::expected<std::string, std::string>
-    create_definition_impl(const InstructionDefinition& def);
+    // Shared validation (name/type/plugin required; yaml_source scope gates; explicit-id
+    // charset + length + reserved-namespace checks) — pure C++/string logic, no DB access.
+    // Mutates `def.id` to a generated id when the caller supplied none. Returns the (possibly
+    // generated) id on success.
+    std::expected<std::string, std::string> validate_and_prepare(InstructionDefinition& def) const;
+
+    // Executes the INSERT for an already-validated definition. `is_seed=false` (every normal
+    // caller: create_definition, and import_definition_json's signed path) is a plain
+    // `INSERT ... ON CONFLICT (id) DO NOTHING RETURNING id`, no lock, no tombstone consultation.
+    // `is_seed=true` (import_definition_json_trusted only) takes `kSeedCoordLockSql` first, then
+    // checks `deleted_seed_content` before inserting — ADR-0058.
+    std::expected<std::string, std::string> insert_definition_row(const InstructionDefinition& def,
+                                                                   bool is_seed);
+
+    // Executes the INSERT for an already-validated set, mirroring insert_definition_row's
+    // is_seed split. Shared by create_set (is_seed=false) and create_set_seed (is_seed=true).
+    std::expected<std::string, std::string> insert_set_row(const InstructionSet& s, bool is_seed);
 
     /// Shared implementation behind `import_definition_json` and
     /// `import_definition_json_trusted`. When `check_signature` is true,
     /// runs the #1073 Ed25519 signature gate against `signature` +
     /// `publicKey` + `yaml_source` JSON fields before parsing the
-    /// definition. When false, bypasses the gate entirely. Public callers
+    /// definition. When false, bypasses the gate entirely AND routes the
+    /// final insert through the seed-aware path (ADR-0058). Public callers
     /// must use one of the two named entry points so the trust boundary
     /// is explicit at every call site.
     std::expected<std::string, std::string> import_definition_json_impl(const std::string& json,
