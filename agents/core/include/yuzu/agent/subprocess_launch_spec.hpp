@@ -178,21 +178,26 @@ inline std::string to_upper_ascii(const std::string& s) {
 /** True iff `name` is refused outright by the ADR-3002 A5 strip list --
  *  default_launch_env's own comment enumerates the same set: the LD_ and
  *  DYLD_ dynamic-linker-injection prefixes, and the exact interpreter/locale-hijack
- *  names IFS, BASH_ENV, ENV, GCONV_PATH, NLSPATH, LOCPATH. Matched
- *  case-insensitively regardless of target: POSIX env names ARE
- *  case-sensitive, but rejecting e.g. "ld_preload" as well as "LD_PRELOAD"
- *  is strictly more conservative, never less, so one rule safely serves both
- *  targets here (unlike the base/extra REPLACE matching in
- *  merge_launch_env(), where case-sensitivity changes which entry wins and
- *  so must track the real target OS -- see that function's comment). */
-inline bool is_denied_env_name(const std::string& name) {
-    const std::string upper = to_upper_ascii(name);
-    if (upper.rfind("LD_", 0) == 0 || upper.rfind("DYLD_", 0) == 0)
+ *  names IFS, BASH_ENV, ENV, GCONV_PATH, NLSPATH, LOCPATH. Matching follows
+ *  the target `windows` was built for -- exact-case on POSIX (real POSIX env
+ *  names are case-sensitive, so "ld_preload" is a genuinely different
+ *  variable from "LD_PRELOAD" there and rejecting it anyway would be an
+ *  unspecified, unnecessary contract widening) and case-insensitive on
+ *  Windows via to_upper_ascii() (matching the base/extra REPLACE matching in
+ *  merge_launch_env(), which the caller below must pass the identical
+ *  `windows` value into). */
+inline bool is_denied_env_name(const std::string& name, bool windows) {
+    // On POSIX `candidate` is `name` untouched, so these upper-case literals
+    // only match a name that is ITSELF upper-case -- exact-case comparison,
+    // not a case-insensitive one. On Windows `candidate` is upper-cased
+    // first, so the same literals catch any casing.
+    const std::string candidate = windows ? to_upper_ascii(name) : name;
+    if (candidate.rfind("LD_", 0) == 0 || candidate.rfind("DYLD_", 0) == 0)
         return true;
     static constexpr std::string_view kDeniedExact[] = {"IFS",        "BASH_ENV", "ENV",
                                                          "GCONV_PATH", "NLSPATH",  "LOCPATH"};
     for (const auto& denied : kDeniedExact) {
-        if (upper == denied)
+        if (candidate == denied)
             return true;
     }
     return false;
@@ -323,7 +328,7 @@ inline EnvMergeResult merge_launch_env(const std::vector<EnvVar>& base, const st
     EnvMergeResult result;
     result.env = base;
     for (const auto& entry : extra) {
-        if (detail::is_malformed_env_entry(entry) || detail::is_denied_env_name(entry.key)) {
+        if (detail::is_malformed_env_entry(entry) || detail::is_denied_env_name(entry.key, windows)) {
             result.rejected.push_back(entry.key);
             continue;
         }

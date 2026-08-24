@@ -15,6 +15,7 @@
 
 #include <yuzu/agent/subprocess_launch_spec.hpp>
 
+#include <algorithm>
 #include <optional>
 #include <string>
 #include <vector>
@@ -284,4 +285,41 @@ TEST_CASE("merge_launch_env's REPLACE matching is case-sensitive on POSIX, case-
                                              // rename the key to the extra
                                              // entry's casing.
     CHECK(win_merged.env[0].value == "/opt/bin");
+}
+
+TEST_CASE("merge_launch_env's denylist follows the target's case rule, not a blanket "
+          "case-insensitive one (A0-001)",
+          "[subprocess][launch_spec][extra_env]") {
+    using namespace yuzu::agent;
+    const std::vector<EnvVar> base = default_launch_env(/*windows=*/false, std::nullopt);
+
+    // POSIX target: "ld_preload" is a genuinely different variable from
+    // "LD_PRELOAD" there (POSIX env names are case-sensitive), so it must be
+    // ACCEPTED, not swept up by a case-insensitive rule that doesn't apply
+    // to this target.
+    EnvMergeResult posix_merged = merge_launch_env(base, {{"ld_preload", "marker"}}, /*windows=*/false);
+    CHECK(posix_merged.rejected.empty());
+    const auto it = std::find_if(posix_merged.env.begin(), posix_merged.env.end(),
+                                  [](const EnvVar& v) { return v.key == "ld_preload"; });
+    REQUIRE(it != posix_merged.env.end());
+    CHECK(it->value == "marker");
+
+    // Windows target: the same lowercase name IS caught, because Windows
+    // environment-block comparison is case-insensitive.
+    EnvMergeResult win_merged = merge_launch_env(base, {{"ld_preload", "marker"}}, /*windows=*/true);
+    CHECK(win_merged.rejected == std::vector<std::string>{"ld_preload"});
+
+    // The exact-name denylist (not just the LD_/DYLD_ prefixes) follows the
+    // same rule: "bash_env" is accepted on POSIX, denied on Windows.
+    CHECK(merge_launch_env(base, {{"bash_env", "x"}}, /*windows=*/false).rejected.empty());
+    CHECK(merge_launch_env(base, {{"bash_env", "x"}}, /*windows=*/true).rejected ==
+          std::vector<std::string>{"bash_env"});
+
+    // Upper-case names remain denied on both targets -- this rule only
+    // widens acceptance for a differently-cased POSIX name, it never
+    // narrows the original upper-case contract.
+    CHECK(merge_launch_env(base, {{"LD_PRELOAD", "x"}}, /*windows=*/false).rejected ==
+          std::vector<std::string>{"LD_PRELOAD"});
+    CHECK(merge_launch_env(base, {{"LD_PRELOAD", "x"}}, /*windows=*/true).rejected ==
+          std::vector<std::string>{"LD_PRELOAD"});
 }
