@@ -501,8 +501,13 @@ struct NetshBaseRules {
     bool block_out = false;
     bool allow_lo_in = false;
     bool allow_lo_out = false;
+    bool allow_lo_in6 = false;
+    bool allow_lo_out6 = false;
 
-    bool complete() const { return block_in && block_out && allow_lo_in && allow_lo_out; }
+    bool complete() const {
+        return block_in && block_out && allow_lo_in && allow_lo_out && allow_lo_in6 &&
+               allow_lo_out6;
+    }
 
     // Comma-joined names of every missing rule, fixed order, for the
     // `note|missing: <names>` field. Empty when complete().
@@ -516,6 +521,10 @@ struct NetshBaseRules {
             missing.push_back(std::format("{}AllowLoopbackIn", kRulePrefix));
         if (!allow_lo_out)
             missing.push_back(std::format("{}AllowLoopbackOut", kRulePrefix));
+        if (!allow_lo_in6)
+            missing.push_back(std::format("{}AllowLoopbackIn6", kRulePrefix));
+        if (!allow_lo_out6)
+            missing.push_back(std::format("{}AllowLoopbackOut6", kRulePrefix));
         std::string joined;
         for (size_t i = 0; i < missing.size(); ++i) {
             if (i)
@@ -560,6 +569,10 @@ inline NetshBaseRules netsh_base_rules_present(std::string_view show_rule_output
             result.allow_lo_in = true;
         else if (val == std::format("{}AllowLoopbackOut", kRulePrefix))
             result.allow_lo_out = true;
+        else if (val == std::format("{}AllowLoopbackIn6", kRulePrefix))
+            result.allow_lo_in6 = true;
+        else if (val == std::format("{}AllowLoopbackOut6", kRulePrefix))
+            result.allow_lo_out6 = true;
     }
     return result;
 }
@@ -631,7 +644,7 @@ inline std::vector<std::string> netsh_whitelist_ips(std::string_view show_rule_o
             current_rule = val;
         } else if (key == "RemoteIP" && current_rule.starts_with(kRulePrefix) &&
                    current_rule.find("Allow") != std::string::npos) {
-            if (val != "127.0.0.1" && val != "Any") {
+            if (val != "127.0.0.1" && val != "::1" && val != "Any") {
                 auto slash = val.find('/');
                 if (slash != std::string::npos)
                     val = val.substr(0, slash);

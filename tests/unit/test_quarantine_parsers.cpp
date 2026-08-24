@@ -328,7 +328,7 @@ Direction:                            Out
 
 // ── NetshBaseRules (#3285) ──────────────────────────────────────────────
 
-TEST_CASE("netsh_base_rules_present finds all four base rules in a combined "
+TEST_CASE("netsh_base_rules_present finds all six base rules in a combined "
          "dir=in + dir=out capture and complete() is true",
          "[agent][quarantine_parsers]") {
     constexpr std::string_view kCombined = R"(
@@ -340,11 +340,19 @@ Rule Name:                           YuzuQuarantine_AllowLoopbackIn
 ----------------------------------------------------------------------
 Direction:                            In
 
+Rule Name:                           YuzuQuarantine_AllowLoopbackIn6
+----------------------------------------------------------------------
+Direction:                            In
+
 Rule Name:                           YuzuQuarantine_BlockAllOutbound
 ----------------------------------------------------------------------
 Direction:                            Out
 
 Rule Name:                           YuzuQuarantine_AllowLoopbackOut
+----------------------------------------------------------------------
+Direction:                            Out
+
+Rule Name:                           YuzuQuarantine_AllowLoopbackOut6
 ----------------------------------------------------------------------
 Direction:                            Out
 )";
@@ -353,6 +361,8 @@ Direction:                            Out
     CHECK(rules.block_out);
     CHECK(rules.allow_lo_in);
     CHECK(rules.allow_lo_out);
+    CHECK(rules.allow_lo_in6);
+    CHECK(rules.allow_lo_out6);
     CHECK(rules.complete());
     CHECK(rules.missing_names().empty());
 }
@@ -371,10 +381,12 @@ Direction:                            In
     CHECK_FALSE(rules.block_out);
     CHECK_FALSE(rules.allow_lo_in);
     CHECK_FALSE(rules.allow_lo_out);
+    CHECK_FALSE(rules.allow_lo_in6);
+    CHECK_FALSE(rules.allow_lo_out6);
     CHECK_FALSE(rules.complete());
 }
 
-TEST_CASE("netsh_base_rules_present: each of the four base rules missing "
+TEST_CASE("netsh_base_rules_present: each of the six base rules missing "
          "individually is reported by name in missing_names()",
          "[agent][quarantine_parsers]") {
     constexpr std::string_view kMissingBlockIn = R"(
@@ -383,6 +395,10 @@ Rule Name:                           YuzuQuarantine_BlockAllOutbound
 Rule Name:                           YuzuQuarantine_AllowLoopbackIn
 ----------------------------------------------------------------------
 Rule Name:                           YuzuQuarantine_AllowLoopbackOut
+----------------------------------------------------------------------
+Rule Name:                           YuzuQuarantine_AllowLoopbackIn6
+----------------------------------------------------------------------
+Rule Name:                           YuzuQuarantine_AllowLoopbackOut6
 ----------------------------------------------------------------------
 )";
     auto missing_block_in = netsh_base_rules_present(kMissingBlockIn);
@@ -396,6 +412,10 @@ Rule Name:                           YuzuQuarantine_AllowLoopbackIn
 ----------------------------------------------------------------------
 Rule Name:                           YuzuQuarantine_AllowLoopbackOut
 ----------------------------------------------------------------------
+Rule Name:                           YuzuQuarantine_AllowLoopbackIn6
+----------------------------------------------------------------------
+Rule Name:                           YuzuQuarantine_AllowLoopbackOut6
+----------------------------------------------------------------------
 )";
     auto missing_block_out = netsh_base_rules_present(kMissingBlockOut);
     CHECK_FALSE(missing_block_out.complete());
@@ -407,6 +427,10 @@ Rule Name:                           YuzuQuarantine_BlockAllInbound
 Rule Name:                           YuzuQuarantine_BlockAllOutbound
 ----------------------------------------------------------------------
 Rule Name:                           YuzuQuarantine_AllowLoopbackOut
+----------------------------------------------------------------------
+Rule Name:                           YuzuQuarantine_AllowLoopbackIn6
+----------------------------------------------------------------------
+Rule Name:                           YuzuQuarantine_AllowLoopbackOut6
 ----------------------------------------------------------------------
 )";
     auto missing_lo_in = netsh_base_rules_present(kMissingLoIn);
@@ -420,10 +444,46 @@ Rule Name:                           YuzuQuarantine_BlockAllOutbound
 ----------------------------------------------------------------------
 Rule Name:                           YuzuQuarantine_AllowLoopbackIn
 ----------------------------------------------------------------------
+Rule Name:                           YuzuQuarantine_AllowLoopbackIn6
+----------------------------------------------------------------------
+Rule Name:                           YuzuQuarantine_AllowLoopbackOut6
+----------------------------------------------------------------------
 )";
     auto missing_lo_out = netsh_base_rules_present(kMissingLoOut);
     CHECK_FALSE(missing_lo_out.complete());
     CHECK(missing_lo_out.missing_names() == "YuzuQuarantine_AllowLoopbackOut");
+
+    constexpr std::string_view kMissingLoIn6 = R"(
+Rule Name:                           YuzuQuarantine_BlockAllInbound
+----------------------------------------------------------------------
+Rule Name:                           YuzuQuarantine_BlockAllOutbound
+----------------------------------------------------------------------
+Rule Name:                           YuzuQuarantine_AllowLoopbackIn
+----------------------------------------------------------------------
+Rule Name:                           YuzuQuarantine_AllowLoopbackOut
+----------------------------------------------------------------------
+Rule Name:                           YuzuQuarantine_AllowLoopbackOut6
+----------------------------------------------------------------------
+)";
+    auto missing_lo_in6 = netsh_base_rules_present(kMissingLoIn6);
+    CHECK_FALSE(missing_lo_in6.complete());
+    CHECK(missing_lo_in6.missing_names() == "YuzuQuarantine_AllowLoopbackIn6");
+
+    constexpr std::string_view kMissingLoOut6 = R"(
+Rule Name:                           YuzuQuarantine_BlockAllInbound
+----------------------------------------------------------------------
+Rule Name:                           YuzuQuarantine_BlockAllOutbound
+----------------------------------------------------------------------
+Rule Name:                           YuzuQuarantine_AllowLoopbackIn
+----------------------------------------------------------------------
+Rule Name:                           YuzuQuarantine_AllowLoopbackOut
+----------------------------------------------------------------------
+Rule Name:                           YuzuQuarantine_AllowLoopbackIn6
+----------------------------------------------------------------------
+)";
+    auto missing_lo_out6 = netsh_base_rules_present(kMissingLoOut6);
+    CHECK_FALSE(missing_lo_out6.complete());
+    CHECK(missing_lo_out6.missing_names() == "YuzuQuarantine_AllowLoopbackOut6");
 }
 
 // ── netsh_firewall_policy / all_profiles_blocking (#3284 branch A) ──────

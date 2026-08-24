@@ -380,13 +380,17 @@ chain matching its own family, so a **v4-only whitelist leaves IPv6 fully contai
 That is the correct posture — before this, an IPv6-capable host was never contained at all
 (#3282) — but it changes what a whitelist has to contain:
 
-- The management channel survives on both families while it stays up, via
-  `ESTABLISHED,RELATED`. A device that **drops and reconnects** while quarantined is a new
-  connection, and it is matched only by an explicit whitelist entry.
-- So if the agent reaches the server over IPv6 — a dual-stack host with AAAA resolution
-  preferred, or an IPv6-only management network — **the whitelist must carry the server's IPv6
-  address**, not only its IPv4 one. A v4-only whitelist on such a host survives the initial
-  isolation and then strands the device on its first reconnect, with no remote path to release it.
+- There is no blanket "keep existing connections alive" rule on either family — only a
+  whitelisted address's traffic survives, in any connection state (new, reconnecting, or
+  already established). The agent automatically whitelists its own configured server address
+  (`--server`) for this: an IP literal is used directly, and a hostname is resolved to its
+  current address(es) at quarantine time, covering whichever families it resolves to.
+- If the agent's configured server address is a hostname that resolves to an IPv4 address but
+  the agent actually reaches the server over IPv6 through some other path (a split-horizon DNS
+  setup, a manually pinned route), the automatic whitelisting will not cover that path — **add
+  the server's IPv6 address to the whitelist explicitly** in that case. The common case (the
+  configured address resolves to the address actually used) needs no manual whitelist entry for
+  the server at all.
 - Whitelist entries that are neither valid IPv4 nor valid IPv6 (a hostname, a malformed literal)
   are **skipped, and the skip is reported** — the plugin does not silently drop them and report a
   clean success.

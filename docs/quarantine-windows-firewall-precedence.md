@@ -29,14 +29,17 @@ defect, so it was measured rather than assumed.
 
 ## Purpose
 
-win_quarantine (`agents/plugins/quarantine/src/quarantine_plugin.cpp`)
-applies `YuzuQuarantine_BlockAllInbound`/`BlockAllOutbound` and then layers
-narrower `AllowIn_<ip>`/`AllowOut_<ip>` rules for whitelisted addresses.
-Whether a later, narrower Allow rule actually overrides an earlier, broader
-Block rule at the same (default) priority is a live Windows Firewall
-behaviour question, not something inferable from the netsh invocations
-alone. #3284 asks for ground truth on a real box before any redesign is
-considered. This doc is that ground truth.
+win_quarantine (`agents/plugins/quarantine/src/quarantine_plugin.cpp`) used to apply
+`YuzuQuarantine_BlockAllInbound`/`BlockAllOutbound` and then layer narrower
+`AllowIn_<ip>`/`AllowOut_<ip>` rules for whitelisted addresses — that is Scenario A above,
+the shape that shipped. Whether a later, narrower Allow rule actually overrides an earlier,
+broader Block rule at the same (default) priority is a live Windows Firewall behaviour
+question, not something inferable from the netsh invocations alone. #3284 asks for ground
+truth on a real box before any redesign is considered. This doc is that ground truth — and
+Scenario B is the redesign that shipped as a result: win_quarantine no longer creates named
+Block rules at all, containing via the profile-default policy instead (see `## Status` above),
+so the question this doc actually answers today is whether an Allow rule overrides a
+PROFILE-DEFAULT block, not a named Block rule.
 
 ## The safety harness
 

@@ -1825,12 +1825,13 @@ IPv6-capable host the device stayed fully reachable over IPv6 while reporting a 
 counted as applied.
 
 **Action required for dual-stack fleets.** Whitelist entries are routed to the chain matching
-their own family, so a **v4-only whitelist now leaves IPv6 contained**. The management channel
-survives on `ESTABLISHED,RELATED` while it stays up, but a device that drops and reconnects while
-quarantined is a new connection — matched only by an explicit whitelist entry. If your agents can
-reach the server over IPv6, **add the server's IPv6 address to the whitelist**; a v4-only
-whitelist on such a host isolates successfully and then strands the device on its first
-reconnect, with no remote path to release it. See
+their own family, so a **v4-only whitelist now leaves IPv6 contained**. There is no blanket
+"keep existing connections alive" rule on either family — only a whitelisted address survives,
+in any connection state. The agent automatically whitelists its own configured server address
+(an IP literal directly, a hostname resolved to its current address(es) at quarantine time), so
+most fleets need no manual action here. If your agents reach the server over IPv6 through a path
+DNS resolution of the configured address wouldn't reproduce (split-horizon DNS, a manually
+pinned route), **add the server's IPv6 address to the whitelist explicitly**. See
 [Security Hardening](security-hardening.md#whitelisting-on-a-dual-stack-host-read-this-before-quarantining-one).
 
 ### 2. Reporting is more conservative again (#3283, #3285, #3286, #3260)

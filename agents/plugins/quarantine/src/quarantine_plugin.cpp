@@ -76,7 +76,14 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h> // getaddrinfo/freeaddrinfo/inet_ntop -- resolve_server_hostname_literals
 #include "win_str.hpp" // yuzu::win::from_wide (agents/shared, #1681)
+#pragma comment(lib, "ws2_32.lib")
+#else
+#include <arpa/inet.h> // inet_ntop -- resolve_server_hostname_literals
+#include <netdb.h>     // getaddrinfo/freeaddrinfo -- resolve_server_hostname_literals
+#include <sys/socket.h>
 #endif
 
 namespace {
@@ -86,6 +93,87 @@ using yuzu::quarantine::is_safe_ip;
 using yuzu::quarantine::kRulePrefix;
 using yuzu::quarantine::QuarStatus;
 using yuzu::quarantine::quar_status_token;
+
+#ifdef _WIN32
+// Idempotent Winsock init (getaddrinfo requires it) -- same RAII-static
+// pattern as agents/core/src/cloud_identity.cpp's ensure_wsa(), duplicated
+// locally rather than shared: that one lives in agent-core and this call is
+// synchronous and self-contained (see resolve_server_hostname_literals
+// below), so there is no cross-module lifetime reason to route through it.
+void ensure_wsa_init() {
+    struct WsaInit {
+        WsaInit() {
+            WSADATA wsa;
+            WSAStartup(MAKEWORD(2, 2), &wsa);
+        }
+        ~WsaInit() { WSACleanup(); }
+    };
+    static WsaInit init;
+    (void)init;
+}
+#endif
+
+// Resolves a hostname to its IPv4/IPv6 literal address(es) via a
+// synchronous getaddrinfo() call -- do_quarantine's fallback for when
+// agent.server_address is configured as a hostname rather than an IP
+// literal (the common case per --server's own "host:port" help text), so
+// quarantine can still whitelist the management server instead of silently
+// skipping it. This closes the gap on the one LIVE quarantine dispatch
+// path, MCP's quarantine_device, which never supplies an explicit
+// server_ip and advertises "whitelisting the management server" as an
+// unconditional guarantee.
+//
+// Deliberately SYNCHRONOUS, not a detached thread: a blocking library call
+// on the calling thread has no ADR-3002 unload-race exposure at all -- the
+// plugin cannot be dlclose()'d while its own code is still on the call
+// stack, unlike a detached thread whose completion could run past unload
+// (the exact class of bug a sibling PR's WUA-callback fix closed the other
+// direction of). The only cost is latency, bounded by the OS resolver's own
+// configured timeout -- the same order of magnitude as this action's
+// existing multi-second sequential sudo-governed subprocess calls
+// (kQuarantineMutateDeadline below), not a new class of slowness. A
+// wedged/unreachable DNS server delays this one quarantine call; it does
+// not corrupt it -- an empty return here just means the caller's existing
+// hostname-not-whitelisted fallback behavior applies, same as before this
+// function existed.
+std::vector<std::string> resolve_server_hostname_literals(const std::string& host) {
+    std::vector<std::string> out;
+    if (host.empty())
+        return out;
+#ifdef _WIN32
+    ensure_wsa_init();
+#endif
+    struct addrinfo hints {};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo* result = nullptr;
+    if (::getaddrinfo(host.c_str(), nullptr, &hints, &result) != 0 || !result)
+        return out;
+    for (auto* p = result; p != nullptr; p = p->ai_next) {
+        char buf[INET6_ADDRSTRLEN] = {};
+        const void* addr = nullptr;
+        if (p->ai_family == AF_INET)
+            addr = &reinterpret_cast<struct sockaddr_in*>(p->ai_addr)->sin_addr;
+        else if (p->ai_family == AF_INET6)
+            addr = &reinterpret_cast<struct sockaddr_in6*>(p->ai_addr)->sin6_addr;
+        else
+            continue;
+        if (::inet_ntop(p->ai_family, addr, buf, sizeof(buf))) {
+            std::string lit{buf};
+            bool dup = false;
+            for (const auto& existing : out) {
+                if (existing == lit) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup)
+                out.push_back(std::move(lit));
+        }
+    }
+    ::freeaddrinfo(result);
+    return out;
+}
 
 // ── Bounded-execution deadlines (ADR-3002 runner-idiom ceiling) ────────────
 //
@@ -775,7 +863,8 @@ StatusReadResult win_is_quarantined(yuzu::CommandContext& ctx, bool& status_forw
 
     const std::string combined = out_in.output + "\n" + out_out.output;
     const auto rules = yuzu::quarantine::netsh_base_rules_present(combined);
-    const bool loopback_present = rules.allow_lo_in && rules.allow_lo_out;
+    const bool loopback_present =
+        rules.allow_lo_in && rules.allow_lo_out && rules.allow_lo_in6 && rules.allow_lo_out6;
 
     // The plugin owns its OWN named rules; the profile policy is host state it
     // does not own and cannot distinguish its own change to from an admin's or
@@ -795,7 +884,8 @@ StatusReadResult win_is_quarantined(yuzu::CommandContext& ctx, bool& status_forw
     // and it under-reports containment rather than over-reporting it. A
     // re-quarantine is idempotent; a false `active` is not recoverable by the
     // operator at all.
-    const bool any_yuzu_rule = rules.allow_lo_in || rules.allow_lo_out;
+    const bool any_yuzu_rule =
+        rules.allow_lo_in || rules.allow_lo_out || rules.allow_lo_in6 || rules.allow_lo_out6;
 
     StatusReadResult result;
     if (!reads_ok) {
@@ -823,6 +913,10 @@ StatusReadResult win_is_quarantined(yuzu::CommandContext& ctx, bool& status_forw
             missing.push_back(std::format("{}AllowLoopbackIn", kRulePrefix));
         if (!rules.allow_lo_out)
             missing.push_back(std::format("{}AllowLoopbackOut", kRulePrefix));
+        if (!rules.allow_lo_in6)
+            missing.push_back(std::format("{}AllowLoopbackIn6", kRulePrefix));
+        if (!rules.allow_lo_out6)
+            missing.push_back(std::format("{}AllowLoopbackOut6", kRulePrefix));
         std::string note = "missing: ";
         for (size_t i = 0; i < missing.size(); ++i) {
             if (i)
@@ -1975,17 +2069,26 @@ private:
         pc.storage_delete(kPriorPolicyKey);
     }
 
-    // Written unconditionally on every linux_quarantine call (never left
-    // stale from an earlier cycle) so a fresh `false` correctly overwrites
-    // a stale `true` from a prior quarantine where v6 genuinely was applied.
-    void store_linux_v6_applied(bool applied) {
+    // ORs `applied` into whatever marker is already stored, rather than
+    // overwriting it -- a re-quarantine cycle that finds v6 out of scope
+    // (IPv6 disabled since the FIRST quarantine, ip6tables uninstalled,
+    // etc.) does not itself redo or undo the earlier v6 chain: it just skips
+    // the v6 block on this call, leaving whatever the first quarantine
+    // installed untouched. Overwriting the marker with this call's own
+    // (false) v6_attempted would discard the memory that a real chain from
+    // an earlier cycle may still need tearing down at release. Once true,
+    // the marker only clears via clear_linux_v6_applied() on a fully clean
+    // release. Returns whether the write itself succeeded, so the caller can
+    // report an honest partial result rather than silently trusting a
+    // storage failure to have recorded anything.
+    bool store_linux_v6_applied(bool applied) {
         if (!plugin_ctx_)
-            return;
+            return false;
         yuzu::PluginContext pc{plugin_ctx_};
-        if (applied)
-            pc.storage_set(kLinuxV6AppliedKey, "1");
-        else
-            pc.storage_delete(kLinuxV6AppliedKey);
+        const bool combined = applied || load_linux_v6_applied();
+        if (combined)
+            return pc.storage_set(kLinuxV6AppliedKey, "1");
+        return pc.storage_delete(kLinuxV6AppliedKey);
     }
 
     bool load_linux_v6_applied() {
@@ -2027,39 +2130,48 @@ private:
             whitelist.emplace_back(server_ip);
         }
 
+        auto add_whitelist_ip = [&whitelist](std::string ip) {
+            for (const auto& existing : whitelist) {
+                if (existing == ip)
+                    return;
+            }
+            whitelist.push_back(std::move(ip));
+        };
+
         // The operator-supplied server_ip above is not always present — the
-        // MCP quarantine-on-write dispatch path never sets it (see the
-        // governance note at its call site in mcp_server.cpp). Fall back to
-        // the agent's OWN known connection target ("agent.server_address",
-        // threaded into every plugin's config by agent.cpp) whenever it's
-        // already an IP literal, so it's the whitelist-based accept rules
-        // below — not a blanket ESTABLISHED,RELATED hole — that keep a live
-        // management connection through quarantine. A hostname-configured
-        // server_address with no explicit server_ip param is a narrower
-        // residual gap than before this fix, not a new one: see
-        // linux_quarantine's comment on the removed blanket rule.
+        // MCP quarantine_device dispatch path (the ONLY live-isolation
+        // trigger; REST only records the intent) never sets it, despite its
+        // own tool description promising "whitelisting the management
+        // server" (see the governance note and tool description at its
+        // call site in mcp_server.cpp). Fall back to the agent's OWN known
+        // connection target ("agent.server_address", threaded into every
+        // plugin's config by agent.cpp) so it's the whitelist-based accept
+        // rules below — not a blanket ESTABLISHED,RELATED hole — that keep
+        // a live management connection through quarantine regardless of
+        // which dispatch path triggered it. Resolved via DNS when it's a
+        // hostname (the --server flag's own documented format, not an edge
+        // case) rather than only handling the IP-literal case: skipping
+        // resolution here would leave every hostname-configured deployment
+        // quarantined via MCP with NO rule permitting its own management
+        // server, a real regression from the over-permissive blanket rule
+        // this PR removes (which protected every configuration, including
+        // hostname ones, by being maximally broad).
         if (plugin_ctx_) {
             yuzu::PluginContext pc{plugin_ctx_};
             auto agent_server_host = extract_target_host(pc.get_config("agent.server_address"));
-            if (!agent_server_host.empty() && is_safe_ip(agent_server_host) &&
-                agent_server_host != server_ip) {
-                whitelist.push_back(std::move(agent_server_host));
+            if (!agent_server_host.empty()) {
+                if (is_safe_ip(agent_server_host)) {
+                    add_whitelist_ip(std::move(agent_server_host));
+                } else {
+                    for (auto& resolved : resolve_server_hostname_literals(agent_server_host))
+                        add_whitelist_ip(std::move(resolved));
+                }
             }
         }
 
         auto extra = split_ips(whitelist_csv);
-        for (auto& ip : extra) {
-            // Avoid duplicates with server_ip
-            bool dup = false;
-            for (const auto& existing : whitelist) {
-                if (existing == ip) {
-                    dup = true;
-                    break;
-                }
-            }
-            if (!dup)
-                whitelist.push_back(std::move(ip));
-        }
+        for (auto& ip : extra)
+            add_whitelist_ip(std::move(ip));
 
 #ifdef _WIN32
         {
@@ -2118,7 +2230,18 @@ private:
         {
             bool v6_applied = false;
             const int rc = linux_quarantine(ctx, whitelist, &v6_applied);
-            store_linux_v6_applied(v6_applied);
+            const bool marker_stored = store_linux_v6_applied(v6_applied);
+            // Same "only touch a clean success" discipline as the Windows
+            // branch's persisted_prior check above: rc != 0 already carries
+            // its own (worse) status from linux_quarantine, which this must
+            // not overwrite with a falsely rosier "contained, but..." one.
+            if (rc == 0 && v6_applied && !marker_stored) {
+                ctx.set_result_status(
+                    YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                    "quarantine:linux_quarantine contained, but the ip6tables-applied "
+                    "marker could not be stored — release may not know IPv6 teardown is "
+                    "owed");
+            }
             return rc;
         }
 #elif defined(__APPLE__)
