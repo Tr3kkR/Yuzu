@@ -25,6 +25,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
@@ -46,10 +47,15 @@ PasswdLookupResult make(PasswdLookupStatus st, std::string uid = {}, std::string
 } // namespace
 
 TEST_CASE("resolve_passwd_bounded returns a resolved record unchanged", "[passwd][agent]") {
-    auto res = resolve_passwd_bounded("alice", 5s, [](const std::string& u) {
-        REQUIRE(u == "alice");
+    // Capture the argument; do NOT assert on it here. Catch2's assertion
+    // macros are not thread-safe off the main thread, and this callable runs
+    // on bounded_call's worker.
+    auto seen = std::make_shared<std::string>();
+    auto res = resolve_passwd_bounded("alice", 5s, [seen](const std::string& u) {
+        *seen = u;
         return make(PasswdLookupStatus::kOk, "501", "/Users/alice");
     });
+    CHECK(*seen == "alice");
     REQUIRE(res.ok());
     CHECK(res.status == PasswdLookupStatus::kOk);
     CHECK(res.record.uid == "501");
@@ -81,9 +87,16 @@ TEST_CASE("resolve_passwd_bounded gives the caller its thread back when the look
     // captured by value keeps it alive for whoever finishes last -- a
     // stack-local flag here would be a use-after-free the moment we return.
     auto stop = std::make_shared<std::atomic<bool>>(false);
+    // Discriminator: kTimeout is ALSO what bounded_call returns when it refuses
+    // at its outstanding-thread ceiling, in which case the lookup never runs
+    // and this test would observe nothing. Proving the lookup was entered, and
+    // that we actually waited out the budget, is what makes the pass mean
+    // "the bound fired" rather than "the call was refused".
+    auto entered = std::make_shared<std::atomic<bool>>(false);
 
     auto started = std::chrono::steady_clock::now();
-    auto res = resolve_passwd_bounded("wedged", 200ms, [stop](const std::string&) {
+    auto res = resolve_passwd_bounded("wedged", 200ms, [stop, entered](const std::string&) {
+        entered->store(true, std::memory_order_relaxed);
         while (!stop->load(std::memory_order_relaxed))
             std::this_thread::sleep_for(5ms);
         return make(PasswdLookupStatus::kOk, "999", "/Users/wedged");
@@ -92,6 +105,8 @@ TEST_CASE("resolve_passwd_bounded gives the caller its thread back when the look
 
     CHECK(res.status == PasswdLookupStatus::kTimeout);
     CHECK_FALSE(res.ok());
+    CHECK(entered->load(std::memory_order_relaxed)); // the lookup really ran
+    CHECK(waited >= 150ms);                          // and we really waited the budget out
     // The point of the whole exercise: we did not block for the lookup's
     // duration. Generous upper bound -- this asserts "bounded", not a
     // scheduling guarantee, so it cannot flake on a loaded CI box.
@@ -127,7 +142,7 @@ TEST_CASE("resolve_passwd_bounded reports a throwing lookup as a non-arrival, no
          "[passwd][agent]") {
     // bounded_call runs the callable on a DETACHED thread; an exception
     // escaping it uncaught would std::terminate() the whole agent.
-    auto res = resolve_passwd_bounded("alice", 500ms, [](const std::string&) -> PasswdLookupResult {
+    auto res = resolve_passwd_bounded("alice", 50ms, [](const std::string&) -> PasswdLookupResult {
         throw std::runtime_error("directory services exploded");
     });
     CHECK(res.status == PasswdLookupStatus::kTimeout);
@@ -140,14 +155,21 @@ TEST_CASE("getpwnam_lookup resolves a real account and distinguishes a missing o
     // Against the host's own passwd database. root exists on every POSIX box
     // this suite runs on, so this is a stable assertion rather than a
     // machine-specific one.
-    auto root = yuzu::agent::getpwnam_lookup("root");
-    REQUIRE(root.status == PasswdLookupStatus::kOk);
+    // Through the BOUNDED wrapper, never the raw lookup: on a directory-joined
+    // build host the raw call is exactly the unbounded network read this whole
+    // change exists to bound, and it would hang the suite rather than fail it.
+    auto root = resolve_passwd_bounded("root", 5s);
+    if (root.status != PasswdLookupStatus::kOk) {
+        // A distroless/scratch container may genuinely have no passwd database.
+        WARN("skipping: 'root' did not resolve on this host");
+        return;
+    }
     CHECK(root.record.uid == "0");
     CHECK_FALSE(root.record.home_dir.empty());
 
     // rc == 0 with a null result pointer -- the "no such account" answer,
     // which must NOT be reported as kError.
-    auto missing = yuzu::agent::getpwnam_lookup("yuzu_test_no_such_account_zzz");
+    auto missing = resolve_passwd_bounded("yuzu_test_no_such_account_zzz", 5s);
     CHECK(missing.status == PasswdLookupStatus::kNotFound);
 }
 #endif

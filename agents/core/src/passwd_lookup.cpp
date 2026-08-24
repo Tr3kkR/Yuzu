@@ -39,7 +39,14 @@ PasswdLookupResult getpwnam_lookup(const std::string& username) {
             continue;
         }
         if (rc != 0) {
-            out.status = PasswdLookupStatus::kError;
+            // POSIX says "no such user" is rc==0 with a null result, and macOS
+            // does that. glibc does NOT always: getpwnam(3) documents ENOENT /
+            // ESRCH / EBADF / EPERM as ALSO meaning the user was not found.
+            // Mapping those to kError would report a definite negative as a
+            // lookup failure on Linux -- exactly the distinction this enum
+            // exists to preserve.
+            out.status = (rc == ENOENT || rc == ESRCH) ? PasswdLookupStatus::kNotFound
+                                                       : PasswdLookupStatus::kError;
             return out;
         }
         if (found == nullptr) {
@@ -72,24 +79,47 @@ PasswdLookupResult getpwnam_lookup(const std::string&) {
 
 #endif
 
+namespace {
+
+// The shared body. Kept in THIS translation unit so every byte the detached
+// thread runs -- the lambda, its invoker, its destructor -- is agent-core text.
+template <typename Fn>
+PasswdLookupResult bounded_impl(std::chrono::milliseconds timeout, Fn fn) {
+    PasswdLookupResult timed_out;
+    timed_out.status = PasswdLookupStatus::kTimeout;
+    if (timeout <= std::chrono::milliseconds::zero())
+        return timed_out; // budget already spent -- don't start what we can't wait for
+    auto result = yuzu::shared::bounded_call(timeout, std::move(fn));
+    if (!result)
+        return timed_out; // timed out, threw, or hit the outstanding-call ceiling
+    return *result;
+}
+
+} // namespace
+
+PasswdLookupResult resolve_passwd_bounded(const std::string& username,
+                                          std::chrono::milliseconds timeout) {
+    // No std::function anywhere on this path: the callable is a lambda whose
+    // closure type is defined HERE, so its invoker/destructor are emitted here
+    // too. See the header's note on why the former default argument was unsafe.
+    return bounded_impl(timeout, [username]() -> PasswdLookupResult {
+        return getpwnam_lookup(username);
+    });
+}
+
 PasswdLookupResult resolve_passwd_bounded(const std::string& username,
                                           std::chrono::milliseconds timeout,
                                           const PasswdLookupFn& lookup) {
     PasswdLookupResult timed_out;
     timed_out.status = PasswdLookupStatus::kTimeout;
 
-    if (timeout <= std::chrono::milliseconds::zero())
-        return timed_out; // budget already spent -- don't start a lookup we can't wait for
-
-    // Captured BY VALUE: the detached thread can outlive this call, so it must
-    // not touch this stack frame. Safe to detach from here specifically
-    // because this TU lives in agent-core and is never dlclose()'d.
-    auto result = yuzu::shared::bounded_call(
-        timeout, [lookup, username]() -> PasswdLookupResult { return lookup(username); });
-
-    if (!result)
-        return timed_out; // timed out, or at bounded_call's outstanding-thread ceiling
-    return *result;
+    (void)timed_out;
+    // Test-only overload. The injected std::function is COPIED into a lambda
+    // defined in this TU; a test's own target type is instantiated in the test
+    // binary, which is never dlclose()'d, so this path carries no unload risk.
+    return bounded_impl(timeout, [lookup, username]() -> PasswdLookupResult {
+        return lookup(username);
+    });
 }
 
 } // namespace yuzu::agent

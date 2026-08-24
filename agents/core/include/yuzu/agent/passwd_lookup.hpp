@@ -41,13 +41,11 @@
  * restores the property the child process used to provide.
  */
 
-#include <yuzu/plugin.h> // YUZU_EXPORT
-
 #include <chrono>
-#include <cstdint>
 #include <functional>
-#include <optional>
 #include <string>
+
+#include <yuzu/plugin.h> // YUZU_EXPORT
 
 namespace yuzu::agent {
 
@@ -64,8 +62,12 @@ enum class PasswdLookupStatus {
     kOk,       ///< record resolved
     kNotFound, ///< the lookup completed and the account does not exist
     kError,    ///< the lookup completed and failed (nonzero rc, or ERANGE twice)
-    kTimeout,  ///< the lookup did not complete within the budget, or the
-               ///< bounded-call thread ceiling was already reached
+    kTimeout,  ///< the lookup did not ARRIVE: the budget expired, the budget was
+               ///< already spent before the call, the bounded-call thread ceiling
+               ///< was reached, or the lookup THREW (bounded_call catches inside
+               ///< its detached thread, so a throw presents as a non-arrival).
+               ///< Deliberately one value -- to every caller these mean the same
+               ///< thing, "no answer came back", and none is a definite negative
 };
 
 struct PasswdLookupResult {
@@ -98,10 +100,38 @@ YUZU_EXPORT PasswdLookupResult getpwnam_lookup(const std::string& username);
  * result is discarded. The caller is never blocked past `timeout`. A
  * non-positive `timeout` returns kTimeout without starting a lookup at all.
  *
- * `lookup` is injectable purely for testing; production callers omit it.
+ * On timeout the underlying lookup is ABANDONED, not cancelled, and its
+ * detached thread occupies one of `bounded_call`'s PROCESS-GLOBAL
+ * `kMaxOutstandingBoundedCalls` slots until it finishes. That counter is shared
+ * with every other bounded_call consumer in the agent -- notably
+ * `server_address_resolver`'s reconnect-time `getaddrinfo` and discovery's
+ * reverse-DNS -- so a sustained directory-services black hole here can consume
+ * slots those need, and they degrade to their own nullopt (for the resolver, a
+ * spurious "could not resolve" at reconnect). Degraded-but-correct in every
+ * case, never a wrong answer, but it is a cross-subsystem coupling worth
+ * knowing about before raising this call's timeout or its call rate.
  */
-YUZU_EXPORT PasswdLookupResult resolve_passwd_bounded(
-    const std::string& username, std::chrono::milliseconds timeout,
-    const PasswdLookupFn& lookup = getpwnam_lookup);
+YUZU_EXPORT PasswdLookupResult resolve_passwd_bounded(const std::string& username,
+                                                      std::chrono::milliseconds timeout);
+
+/// Injectable overload, for tests only.
+///
+/// NOTE THE MISSING DEFAULT ARGUMENT, which is load-bearing rather than
+/// stylistic. This was originally ONE function with `lookup = getpwnam_lookup`
+/// as a default, and that silently defeated the whole agent-core placement: a
+/// default argument is evaluated in the CALLER's translation unit, so the
+/// `std::function` was constructed inside the certificates plugin, and
+/// constructing it instantiated libc++'s type-erasure thunks (`__func::__clone`
+/// / `__destroy` / the invoker) as vague-linkage symbols emitted into the
+/// PLUGIN's .so. No agent-core TU constructed that target type, so nothing
+/// existed for the loader to coalesce onto and the resolved code address was
+/// plugin-resident. The detached thread then invoked and destroyed through
+/// plugin text -- exactly the use-after-`dlclose()` this file's placement is
+/// supposed to prevent, and confirmed by `nm` on the built plugin before the
+/// split. Two out-of-line overloads keep every byte the detached thread
+/// touches inside agent-core. Do not reintroduce a default argument here.
+YUZU_EXPORT PasswdLookupResult resolve_passwd_bounded(const std::string& username,
+                                                      std::chrono::milliseconds timeout,
+                                                      const PasswdLookupFn& lookup);
 
 } // namespace yuzu::agent

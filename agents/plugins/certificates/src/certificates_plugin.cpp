@@ -678,6 +678,13 @@ std::vector<std::string> split_pem_blocks(const std::string& pem_stream) {
 // computes a wall-clock budget shared across everything IT does, and caps
 // how many certificates it will parse out of any single keychain.
 constexpr std::chrono::milliseconds kCertParseDeadline{5000};     // one openssl parse of one PEM block (local temp file -- no network)
+// The console user's passwd lookup. Deliberately its OWN constant rather than
+// borrowing kCertParseDeadline: that one is documented "no network", whereas
+// this budget covers a Directory Services round trip that on a domain-joined
+// Mac may leave the host entirely (#3406). Same 5s value today, but the two
+// are tuned against different failure modes and must move independently -- a
+// WAN-latent AD lookup is the case that would justify raising THIS one.
+constexpr std::chrono::milliseconds kPasswdLookupDeadline{5000};
 constexpr std::chrono::milliseconds kKeychainReadDeadline{15000}; // one `security find-certificate` keychain read (incl. the login-keychain launchctl/sudo hop)
 constexpr std::chrono::seconds kCertActionBudget{60};             // whole list/details/delete-verify action, across every keychain it reads
 constexpr std::size_t kMaxCertsPerKeychain = 2000;                // per-keychain parsed-certificate cap
@@ -1037,54 +1044,6 @@ struct PasswdEntry {
 };
 
 /**
- * Resolve `username`'s uid and home directory from ONE passwd-database read,
- * BOUNDED by `budget`.
- *
- * This is the same lookup a POSIX shell performs for `~username` tilde
- * expansion, so a relocated/mobile/network-home account resolves to the
- * identical path the previous `/bin/sh -c` + `~user` mechanism produced
- * (#3406 argv-ized the login-keychain read; this replaced the shell's one
- * remaining job). It ALSO subsumes the former `/usr/bin/id -u <username>`
- * subprocess: `id -u` answers exactly what `pw_uid` already carries here,
- * from the same database, so once this call existed on the path that spawn
- * was pure redundancy -- removing it drops one process spawn per macOS
- * list/details action and retires sink `certificates/resolve_console_user#2`
- * outright. Not a subprocess and not an interpreter: a directory-services
- * read, so it adds no rung under ADR-3002.
- *
- * WHY IT IS BOUNDED, AND WHY THE BOUND LIVES IN AGENT-CORE (adversarial
- * review, #3406): on a directory-joined Mac `getpwnam_r` can make a blocking
- * network Directory Services call with no timeout of its own. Both mechanisms
- * this replaced ran that lookup inside a CHILD PROCESS the bounded runner
- * could SIGKILL at a deadline, so argv-izing the read silently removed a
- * cancellation boundary -- an uncancellable blocking call on the agent's
- * bounded ThreadPool can pin a worker per request and eventually starve
- * unrelated commands. yuzu::agent::resolve_passwd_bounded() restores the
- * bound. It lives in agent-core rather than here because it abandons a
- * DETACHED thread on timeout, and a detached thread running code from a
- * dlclose()-able plugin is a use-after-unload crash -- see
- * passwd_lookup.hpp's header comment and server_address_resolver.cpp:121-128.
- *
- * Returns std::nullopt when the account cannot be resolved AT ALL (lookup
- * error, no such record, or the budget expired) -- the caller treats that
- * exactly as the old `id -u` failure was treated: no usable console user. A
- * record that resolves but carries an unusable pw_dir is NOT nullopt: uid is
- * still authoritative, so the entry is returned with an empty `home_dir` and
- * only the login-keychain leg degrades.
- */
-std::optional<PasswdEntry> resolve_passwd_entry(const std::string& username,
-                                                std::chrono::milliseconds budget) {
-    auto res = yuzu::agent::resolve_passwd_bounded(username, budget);
-    if (!res.ok())
-        return std::nullopt;
-    PasswdEntry entry;
-    entry.uid = std::move(res.record.uid);
-    if (yuzu::macos::is_valid_home_dir(res.record.home_dir))
-        entry.home_dir = std::move(res.record.home_dir);
-    return entry;
-}
-
-/**
  * Resolve the current console (GUI) user via subprocess. SystemConfiguration
  * IS linkable from this LaunchDaemon (see agents/shared/macos_console_user.hpp's
  * SCDynamicStoreCopyConsoleUser, already used by the users plugin) -- this
@@ -1109,11 +1068,38 @@ std::optional<PasswdEntry> resolve_passwd_entry(const std::string& username,
  * bail out to std::nullopt (same as "no console session") if the budget is
  * already exhausted before either can even be attempted.
  */
-std::optional<yuzu::macos::ConsoleUser> resolve_console_user(
+/// Why console-user resolution produced no user. The distinction is
+/// load-bearing and was added by an adversarial/governance finding: collapsing
+/// "nobody is logged in" together with "the lookup degraded" made a wedged
+/// Directory Service read as an EMPTY CONSOLE, which silently dropped the
+/// login-keychain leg -- `list` then presented a truncated inventory as
+/// complete and `details` answered a confident `status|not_found` for a
+/// certificate that was simply never looked for. Same defect class, and the
+/// same fix shape, as the Gate-6 SRE finding recorded at
+/// discovery_plugin.cpp:346-353 (a degraded reverse-DNS lookup that looked
+/// identical to a host with no PTR record).
+enum class ConsoleUserOutcome {
+    kResolved,  ///< a console user was identified and validated
+    kNoSession, ///< definitively nobody at the console (login window / headless)
+    kDegraded,  ///< the question could not be answered -- NEVER report as "no session"
+};
+
+struct ConsoleUserResolution {
+    ConsoleUserOutcome outcome = ConsoleUserOutcome::kNoSession;
+    std::optional<yuzu::macos::ConsoleUser> user;
+    /// Operator-facing reason, set iff kDegraded. A literal, so string_view-safe.
+    std::string_view degrade_reason;
+};
+
+ConsoleUserResolution resolve_console_user(
         std::chrono::steady_clock::time_point action_deadline) {
+    ConsoleUserResolution out;
     auto stat_deadline = clamp_to_action_budget(action_deadline, kCertParseDeadline);
-    if (stat_deadline <= std::chrono::milliseconds::zero())
-        return std::nullopt;
+    if (stat_deadline <= std::chrono::milliseconds::zero()) {
+        out.outcome = ConsoleUserOutcome::kDegraded;
+        out.degrade_reason = "console-user lookup skipped: action deadline exceeded";
+        return out;
+    }
     // sink: certificates/resolve_console_user#1 — rung-2 runner argv;
     // SystemConfiguration IS linkable here, deliberately not used (device-
     // vs session-owner semantics), see manifest
@@ -1121,12 +1107,25 @@ std::optional<yuzu::macos::ConsoleUser> resolve_console_user(
                                            yuzu::agent::SubprocessOptions{
                                                .deadline = stat_deadline},
                                            "console-user stat /dev/console");
-    auto username =
-        yuzu::macos::parse_console_user_output(stat_result.ok ? stat_result.output : std::string{});
-    if (yuzu::macos::is_no_console_user(username))
-        return std::nullopt;
-    if (!yuzu::macos::is_valid_username(username))
-        return std::nullopt;
+    if (!stat_result.ok) {
+        // The `stat` spawn itself failed/timed out -- we do not KNOW whether
+        // anyone is at the console, so we must not answer as though we do.
+        out.outcome = ConsoleUserOutcome::kDegraded;
+        out.degrade_reason = "console-user lookup failed (stat /dev/console)";
+        return out;
+    }
+    auto username = yuzu::macos::parse_console_user_output(stat_result.output);
+    if (yuzu::macos::is_no_console_user(username)) {
+        out.outcome = ConsoleUserOutcome::kNoSession; // a real, definite answer
+        return out;
+    }
+    if (!yuzu::macos::is_valid_username(username)) {
+        // A console owner exists but its name failed the allowlist. Refusing to
+        // use it is correct; calling that "no session" is not.
+        out.outcome = ConsoleUserOutcome::kDegraded;
+        out.degrade_reason = "console user name failed validation";
+        return out;
+    }
 
     // The uid and the home directory both come from ONE passwd read (#3406).
     // This replaced a second `/usr/bin/id -u <username>` subprocess that asked
@@ -1140,21 +1139,51 @@ std::optional<yuzu::macos::ConsoleUser> resolve_console_user(
     // with no timeout of its own (adversarial-review finding, #3406). Without
     // this clamp a single directory-joined host with a sick DS could pin a
     // plugin-host worker per request and starve unrelated commands.
-    auto pw_budget = clamp_to_action_budget(action_deadline, kCertParseDeadline);
-    if (pw_budget <= std::chrono::milliseconds::zero())
-        return std::nullopt;
-    auto pw = resolve_passwd_entry(username, pw_budget);
-    if (!pw)
-        return std::nullopt;
+    auto pw_budget = clamp_to_action_budget(action_deadline, kPasswdLookupDeadline);
+    if (pw_budget <= std::chrono::milliseconds::zero()) {
+        out.outcome = ConsoleUserOutcome::kDegraded;
+        out.degrade_reason = "passwd lookup skipped: action deadline exceeded";
+        return out;
+    }
+    // Each status is reported as itself. kNotFound is the ONLY one that is a
+    // definite negative, and even it is not "no console session" -- somebody is
+    // at the console, their account just did not resolve.
+    auto pw_res = yuzu::agent::resolve_passwd_bounded(username, pw_budget);
+    switch (pw_res.status) {
+    case yuzu::agent::PasswdLookupStatus::kTimeout:
+        out.outcome = ConsoleUserOutcome::kDegraded;
+        out.degrade_reason = "console user's directory lookup timed out";
+        return out;
+    case yuzu::agent::PasswdLookupStatus::kError:
+        out.outcome = ConsoleUserOutcome::kDegraded;
+        out.degrade_reason = "console user's directory lookup failed";
+        return out;
+    case yuzu::agent::PasswdLookupStatus::kNotFound:
+        out.outcome = ConsoleUserOutcome::kDegraded;
+        out.degrade_reason = "console user has no passwd record";
+        return out;
+    case yuzu::agent::PasswdLookupStatus::kOk:
+        break;
+    }
+    PasswdEntry pw_entry;
+    pw_entry.uid = std::move(pw_res.record.uid);
+    if (yuzu::macos::is_valid_home_dir(pw_res.record.home_dir))
+        pw_entry.home_dir = std::move(pw_res.record.home_dir);
+    auto* pw = &pw_entry;
     // Defensive: pw_uid is an integral uid_t, so a decimal format of it is
     // digits by construction and this can't fail -- kept because every value
     // this plugin carries into an argv passes its shared guard first, and a
     // future change to how uid is sourced must not silently skip it.
-    if (!yuzu::macos::is_valid_uid(pw->uid))
-        return std::nullopt;
+    if (!yuzu::macos::is_valid_uid(pw->uid)) {
+        out.outcome = ConsoleUserOutcome::kDegraded;
+        out.degrade_reason = "console user's uid failed validation";
+        return out;
+    }
 
-    return yuzu::macos::ConsoleUser{std::move(username), std::move(pw->uid),
-                                    std::move(pw->home_dir)};
+    out.outcome = ConsoleUserOutcome::kResolved;
+    out.user = yuzu::macos::ConsoleUser{std::move(username), std::move(pw->uid),
+                                        std::move(pw->home_dir)};
+    return out;
 }
 
 // canonical_thumbprint() moved to the shared __linux__/__APPLE__ block above
@@ -1210,13 +1239,25 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
     // own comment for how the per-keychain cap and this budget interact.
     const auto action_deadline = std::chrono::steady_clock::now() + kCertActionBudget;
 
-    auto console_user = resolve_console_user(action_deadline);
+    auto cu = resolve_console_user(action_deadline);
+    auto& console_user = cu.user;
     auto plan = yuzu::macos::resolve_store_plan(store_filter, console_user.has_value());
 
-    if (plan.sentinel_required) {
-        // store=login was explicitly requested and there is no console
-        // session to read it from -- never a silent empty (the header row
-        // above with zero rows following would read as "ran fine, no
+    if (cu.outcome == ConsoleUserOutcome::kDegraded) {
+        // We could not determine the console user, so the login keychain was
+        // NEVER LOOKED AT. Say so, on every store filter that would have
+        // included it. Without this the default/`all` path emits no sentinel
+        // at all (resolve_store_plan only sets sentinel_required for an
+        // explicit store=login) and the caller receives a login-less
+        // certificate list presented as complete.
+        if (store_filter != "System" && store_filter != "root") {
+            ctx.write_output(std::format("not_available|{}", cu.degrade_reason));
+            mark_result_partial(ctx, "login-keychain");
+        }
+    } else if (plan.sentinel_required) {
+        // store=login was explicitly requested and there is DEFINITELY no
+        // console session to read it from -- never a silent empty (the header
+        // row above with zero rows following would read as "ran fine, no
         // certs") and never a fabricated result.
         ctx.write_output("not_available|no console session");
         mark_result_partial(ctx, "login-keychain");
@@ -1354,14 +1395,21 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
     // (BR-03/fix-round finding FP-CERTS-03).
     const auto action_deadline = std::chrono::steady_clock::now() + kCertActionBudget;
 
-    auto console_user = resolve_console_user(action_deadline);
+    auto cu = resolve_console_user(action_deadline);
+    auto& console_user = cu.user;
     auto plan = yuzu::macos::resolve_store_plan(store_filter, console_user.has_value());
 
-    if (plan.sentinel_required) {
+    if (cu.outcome == ConsoleUserOutcome::kNoSession && plan.sentinel_required) {
         ctx.write_output("not_available|no console session");
         mark_result_partial(ctx, "login-keychain");
         return;
     }
+    // A DEGRADED resolution must not reach the `status|not_found` fall-through
+    // at the end of this function: that would report a completed, negative
+    // search over a keychain this call never opened. Seeding read_failed here
+    // is what makes the existing not_available/partial branch fire instead.
+    // (See that branch's own comment -- this is exactly the case it warns of.)
+    const bool console_user_degraded = (cu.outcome == ConsoleUserOutcome::kDegraded);
 
     // Canonicalized once so the loop below is a plain `==` against
     // parse_pem_block_macos's always-uppercase output -- the thumbprint
@@ -1433,13 +1481,13 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
     // if no match turns up. A match found in a store that DID read/scan
     // successfully is still reported normally, even if an earlier store
     // had already failed.
-    bool read_failed = false;
-    std::string_view failure_reason;
+    bool read_failed = console_user_degraded;
+    std::string_view failure_reason = console_user_degraded ? cu.degrade_reason : std::string_view{};
     // Which half of the hybrid read failed, for the ABI4 result seam below --
     // set together with failure_reason at every site (first failure wins), so
     // the machine-visible provenance can never name a different keychain from
     // the operator-visible reason.
-    std::string_view failure_provenance;
+    std::string_view failure_provenance = console_user_degraded ? "login-keychain" : std::string_view{};
 
     if (plan.want_system) {
         if (clamp_to_action_budget(action_deadline, kKeychainReadDeadline) <=

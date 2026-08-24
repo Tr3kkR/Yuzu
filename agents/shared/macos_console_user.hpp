@@ -11,7 +11,7 @@
 // either. `security` invoked directly therefore only ever sees the SYSTEM
 // keychains, never the interactively-logged-in user's login keychain --
 // that requires running the read INSIDE that user's per-user launchd/Aqua
-// session: `[sudo -n ]launchctl asuser <uid> sudo -n -u <user> security ...`
+// session: `[sudo -n -- ]launchctl asuser <uid> sudo -n -u <user> -- security ...`
 // (see build_login_keychain_read_argv()'s own comment for exactly when
 // the outer sudo applies).
 //
@@ -40,7 +40,7 @@
 // is_valid_username / is_valid_uid / is_valid_home_dir here BEFORE use.
 // With no shell there is no shell-metacharacter surface, but the allowlists
 // are kept as ARGUMENT-injection defence (an option-shaped username like
-// "-G" must never be read as a flag by sudo/id) and as defence in depth
+// "-G" must never be read as a flag by sudo) and as defence in depth
 // should a future caller regress the transport. build_login_keychain_
 // read_argv() re-validates defensively and returns an empty vector on
 // failure, so a missed guard upstream can never manufacture an executable
@@ -65,6 +65,8 @@
 #include <memory>
 #include <type_traits>
 #include <vector>
+
+#include <sudo_argv.hpp> // yuzu::shared::sudo_wrap -- THE canonical sudo argv form
 
 // SystemConfiguration is pulled in ONLY for console_user() below, and ONLY when the
 // consuming plugin's meson defines YUZU_HAVE_SYSTEMCONFIGURATION (users plugin does; the
@@ -420,16 +422,21 @@ inline std::vector<std::string> build_login_keychain_read_argv(std::string_view 
     auto keychain = login_keychain_path(home_dir); // re-validates home_dir, fails closed
     if (!keychain)
         return {};
-    std::vector<std::string> argv;
-    if (!caller_is_root) {
-        argv.emplace_back("/usr/bin/sudo");
-        argv.emplace_back("-n");
-        argv.emplace_back("--");
-    }
-    argv.insert(argv.end(), {"/bin/launchctl", "asuser", std::string(uid), "/usr/bin/sudo", "-n",
-                             "-u", std::string(username), "--", "/usr/bin/security",
-                             "find-certificate", "-a", "-p", *keychain});
-    return argv;
+    // The OUTER hop goes through yuzu::shared::sudo_wrap -- THE single builder
+    // for every sudo-governed rung-2 site in the tree (quarantine, services,
+    // network_actions), whose exact form is pinned by its own unit test and
+    // matched by the sudoers grants install-agent-user.sh writes. Hand-rolling
+    // a second copy here would be the drift class CLAUDE.md warns about: a
+    // later change to the canonical form would update sudo_argv.hpp and its
+    // pinning test while this site silently fell out of grant-match.
+    // The INNER `sudo -n -u <user> --` is NOT sudo_wrap's shape (it targets a
+    // non-root user and is unconditional), so it stays explicit.
+    std::vector<std::string> inner{"/bin/launchctl", "asuser",     std::string(uid),
+                                   "/usr/bin/sudo",  "-n",         "-u",
+                                   std::string(username), "--",    "/usr/bin/security",
+                                   "find-certificate", "-a",       "-p",
+                                   *keychain};
+    return yuzu::shared::sudo_wrap(std::move(inner), caller_is_root);
 }
 
 
