@@ -602,6 +602,13 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     launch_opts.exec_verify = {.enabled = opts.exec_verify.enabled,
                                .require_root_owned = opts.exec_verify.require_root_owned,
                                .expected_size = opts.exec_verify.expected_size};
+    // extra_env: SubprocessOptions::extra_env (vector<pair<string,string>>)
+    // and LaunchOptions::extra_env (vector<EnvVar>) are field-identical but
+    // SEPARATE types -- same reason as rlimits/exec_verify above -- so this
+    // is a manual element copy rather than a brace-init.
+    launch_opts.extra_env.reserve(opts.extra_env.size());
+    for (const auto& [key, value] : opts.extra_env)
+        launch_opts.extra_env.push_back({key, value});
 
     LaunchSpec spec = build_launch_spec(argv, launch_opts);
     if (spec.error != LaunchSpecError::none)
@@ -1495,6 +1502,13 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     launch_opts.exec_verify = {.enabled = opts.exec_verify.enabled,
                                .require_root_owned = opts.exec_verify.require_root_owned,
                                .expected_size = opts.exec_verify.expected_size};
+    // extra_env: SubprocessOptions::extra_env (vector<pair<string,string>>)
+    // and LaunchOptions::extra_env (vector<EnvVar>) are field-identical but
+    // SEPARATE types -- same reason as rlimits/exec_verify above -- so this
+    // is a manual element copy rather than a brace-init.
+    launch_opts.extra_env.reserve(opts.extra_env.size());
+    for (const auto& [key, value] : opts.extra_env)
+        launch_opts.extra_env.push_back({key, value});
 
     LaunchSpec spec = build_launch_spec(argv, launch_opts);
     if (spec.error != LaunchSpecError::none)

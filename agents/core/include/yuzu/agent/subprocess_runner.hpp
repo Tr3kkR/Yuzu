@@ -44,6 +44,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace yuzu::agent {
@@ -150,6 +151,30 @@ struct SubprocessOptions {
     // agent -- a failed delivery escalates straight to the hard kill rather
     // than waiting out the grace for a signal that can never arrive.
     std::chrono::milliseconds soft_terminate_grace{0};
+
+    // Caller-supplied environment allow-list additions (Alex plan-gate
+    // ruling, PLAN-04 option b: the runner freeze is lifted for exactly this
+    // one narrowly-scoped extension). This is a DELIBERATE, BOUNDED widening
+    // of ADR-3002 A5's clear-slate env policy -- the child still never
+    // inherits the parent process' environment wholesale; the caller must
+    // name each variable it wants forwarded explicitly, one entry at a time.
+    // An entry whose name matches an existing A5 allow-list entry REPLACES
+    // it in place (never appended as a second, ambiguous same-named entry);
+    // an entry with a new name is appended in caller order. Empty (the
+    // default) leaves every existing caller's LaunchSpec byte-identical to
+    // today's -- this field changes nothing unless a caller opts in.
+    //
+    // FAILS CLOSED: if any entry's name is denylisted (the LD_*/DYLD_*
+    // prefixes, or the exact names IFS/BASH_ENV/ENV/GCONV_PATH/NLSPATH/
+    // LOCPATH) or malformed (empty name, a name containing '=' or a NUL, or
+    // a value containing a NUL), the ENTIRE launch is refused
+    // (termination_reason == spawn_error, tool_ran == false, no OS call
+    // attempted) rather than proceeding with that one entry silently
+    // dropped -- a silently-ignored LD_PRELOAD request would hide a caller
+    // bug. See merge_launch_env() in subprocess_launch_spec.hpp for the pure
+    // merge/validation logic and LaunchSpecError::denied_env_var for the
+    // specific rejection reason.
+    std::vector<std::pair<std::string, std::string>> extra_env;
 
     // B3: optional per-invocation resource caps, OFF (nullopt) by default --
     // RLIMIT_AS in particular breaks mmap-heavy tools like `log show`, so
