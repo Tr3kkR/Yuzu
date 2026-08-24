@@ -44,7 +44,46 @@ enabled = true
 > `GET /api/v1/executions/{id}/visualization`, and the legacy `GET /api/responses/{id}`
 > / `/aggregate` / `/export` surfaces return **zero rows** (the legacy aggregate
 > returns `503`) on a corrupt store rather than reopening the cross-operator
-> fleet-wide read. **Not yet covered (#1634 follow-up — these still fail OPEN on a
+> fleet-wide read.
+>
+> **The dashboard's facet/scope surfaces are covered too, on a narrower anchor
+> (#1712, ADR-0017 —** `docs/adr/0017-management-group-confinement-list-reads.md`
+> **):** `GET /fragments/results/filter-bar` (facet dropdown values + line
+> counts) and `GET /fragments/create-group-form` (matching-agent count) scope
+> their aggregate queries in SQL against the caller's `Response:Read`-visible
+> agent set. `POST /api/dashboard/group-from-results` fetches its matching id
+> list unscoped, then intersects it in C++ against that same visible set
+> before materialising group membership, audits any ids the intersection
+> drops, and — if every id is dropped — returns the same "no agents match"
+> response as a genuine no-match (the caller cannot tell a filtered result
+> from an empty one). All three resolve the visible set via
+> `RbacStore::visible_agents_for_permission` (deny-aware, management-group
+> hierarchy expanded, permission-specific to `Response:Read`).
+>
+> A degraded management-group/RBAC store fails **closed** here too: an
+> empty visible set makes the two GETs return success-empty without the
+> query ever reaching the store, and makes `group-from-results` report "no
+> agents match." A degraded **response** store keeps its own distinct
+> existing rendering instead — a disabled "unavailable" dropdown on the
+> filter bar, "agent count unavailable (store degraded)" on the
+> create-group form, and `503` from `group-from-results` — since that
+> failure is orthogonal to agent visibility.
+>
+> **Admission on these three routes is unchanged (#1712 follow-up, tracked for
+> ADR-0017 PR-B).** Each route still gates on its own flat
+> `require_permission`, which never consults management groups: the filter
+> bar requires flat `Response:Read`; the two group routes require flat
+> `ManagementGroup:Write`. A caller whose only grant of a route's own gate
+> permission is management-group-scoped is denied at that route (`403`)
+> before the scoping above ever runs. But the two gates are different
+> permissions — a caller admitted to the group routes by a global
+> `ManagementGroup:Write` grant, who holds `Response:Read` only through a
+> management group, is admitted today and does observe the scoping (as does
+> any JIT-elevated session admitted without a global `Response:Read`
+> grant). Group-scoped-only admission becomes universal across all three
+> routes once they migrate onto the ADR-0017 list-read gate.
+>
+> **Not yet covered (#1634 follow-up — these still fail OPEN on a
 > corrupt store):** the dashboard `/fragments/results/…` table and the workflow
 > executions-drawer reader have no per-agent filter and will expose the whole
 > fleet's responses when the RBAC store is degraded. So a degraded store looks like "no
@@ -59,7 +98,12 @@ enabled = true
 > *normal* RBAC operation, currently **inert** — a holder of global `Response:Read`
 > sees all agents' responses; per-management-group scoping of these reads is not yet
 > effective (the gate change is tracked in #1634). Today the filter's only active
-> effect is the corrupt-store fail-closed described above.
+> effect is the corrupt-store fail-closed described above. The three facet surfaces
+> above are a partial exception: their scope filter is active for any caller
+> who clears that route's own flat gate, not only during a corrupt-store
+> degrade. It does not by itself make anyone admissible — a caller whose
+> only grant of a route's own gate permission is management-group-scoped is
+> still denied at the gate, unaffected by this filter.
 
 ## The authorization topology floor (#2376)
 
