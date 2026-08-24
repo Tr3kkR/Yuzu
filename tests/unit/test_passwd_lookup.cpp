@@ -1,0 +1,153 @@
+/**
+ * test_passwd_lookup.cpp -- yuzu::agent::resolve_passwd_bounded (#3406).
+ *
+ * These exist because of a specific defect class found in adversarial review:
+ * argv-izing the certificates plugin's login-keychain read moved a
+ * passwd/Directory-Services lookup out of a SIGKILL-able child process and
+ * into an in-process call. On a directory-joined Mac that call can block with
+ * no timeout of its own, and an uncancellable block on the agent's bounded
+ * ThreadPool pins a worker per request.
+ *
+ * The load-bearing case is therefore NOT "a lookup resolves" -- it is
+ * "a lookup that NEVER RETURNS still gives the caller its thread back inside
+ * the budget". A suite that only proved the happy path would leave the actual
+ * regression unobserved, which is exactly how the defect reached review.
+ *
+ * The injected-lookup seam these use is the same one that makes the real
+ * resolver's rc/ERANGE/no-record branches reachable at all; before it, they
+ * were file-local in the plugin .cpp and no test could touch them.
+ */
+
+#include <catch2/catch_test_macros.hpp>
+
+#include <yuzu/agent/passwd_lookup.hpp>
+
+#include <atomic>
+#include <chrono>
+#include <memory>
+#include <string>
+#include <thread>
+
+using namespace std::chrono_literals;
+using yuzu::agent::PasswdLookupResult;
+using yuzu::agent::PasswdLookupStatus;
+using yuzu::agent::resolve_passwd_bounded;
+
+namespace {
+
+PasswdLookupResult make(PasswdLookupStatus st, std::string uid = {}, std::string home = {}) {
+    PasswdLookupResult r;
+    r.status = st;
+    r.record.uid = std::move(uid);
+    r.record.home_dir = std::move(home);
+    return r;
+}
+
+} // namespace
+
+TEST_CASE("resolve_passwd_bounded returns a resolved record unchanged", "[passwd][agent]") {
+    auto res = resolve_passwd_bounded("alice", 5s, [](const std::string& u) {
+        REQUIRE(u == "alice");
+        return make(PasswdLookupStatus::kOk, "501", "/Users/alice");
+    });
+    REQUIRE(res.ok());
+    CHECK(res.status == PasswdLookupStatus::kOk);
+    CHECK(res.record.uid == "501");
+    CHECK(res.record.home_dir == "/Users/alice");
+}
+
+TEST_CASE("resolve_passwd_bounded preserves the not-found/error distinction", "[passwd][agent]") {
+    // These are different answers and callers are entitled to tell them apart:
+    // kNotFound is a definite negative, kError is a failed question.
+    auto nf = resolve_passwd_bounded("ghost", 5s,
+                                     [](const std::string&) {
+                                         return make(PasswdLookupStatus::kNotFound);
+                                     });
+    CHECK_FALSE(nf.ok());
+    CHECK(nf.status == PasswdLookupStatus::kNotFound);
+
+    auto err = resolve_passwd_bounded("alice", 5s, [](const std::string&) {
+        return make(PasswdLookupStatus::kError);
+    });
+    CHECK_FALSE(err.ok());
+    CHECK(err.status == PasswdLookupStatus::kError);
+}
+
+TEST_CASE("resolve_passwd_bounded gives the caller its thread back when the lookup never returns",
+         "[passwd][agent]") {
+    // THE regression test. `stop` outlives this scope deliberately: the
+    // detached lookup thread is still holding it after we stop waiting, which
+    // is precisely the abandonment the primitive promises. A shared_ptr
+    // captured by value keeps it alive for whoever finishes last -- a
+    // stack-local flag here would be a use-after-free the moment we return.
+    auto stop = std::make_shared<std::atomic<bool>>(false);
+
+    auto started = std::chrono::steady_clock::now();
+    auto res = resolve_passwd_bounded("wedged", 200ms, [stop](const std::string&) {
+        while (!stop->load(std::memory_order_relaxed))
+            std::this_thread::sleep_for(5ms);
+        return make(PasswdLookupStatus::kOk, "999", "/Users/wedged");
+    });
+    auto waited = std::chrono::steady_clock::now() - started;
+
+    CHECK(res.status == PasswdLookupStatus::kTimeout);
+    CHECK_FALSE(res.ok());
+    // The point of the whole exercise: we did not block for the lookup's
+    // duration. Generous upper bound -- this asserts "bounded", not a
+    // scheduling guarantee, so it cannot flake on a loaded CI box.
+    CHECK(waited < 10s);
+
+    stop->store(true, std::memory_order_relaxed); // let the detached thread retire
+}
+
+TEST_CASE("resolve_passwd_bounded refuses to start a lookup it cannot wait for",
+         "[passwd][agent]") {
+    // An already-exhausted action budget must not buy one more unbounded
+    // lookup -- the caller has no time left to give it.
+    std::atomic<bool> called{false};
+    auto called_marker = &called;
+    auto res = resolve_passwd_bounded("alice", 0ms, [called_marker](const std::string&) {
+        called_marker->store(true);
+        return make(PasswdLookupStatus::kOk, "501", "/Users/alice");
+    });
+    CHECK(res.status == PasswdLookupStatus::kTimeout);
+    CHECK_FALSE(called.load());
+
+    std::atomic<bool> neg_called{false};
+    auto neg_marker = &neg_called;
+    auto neg = resolve_passwd_bounded("alice", -5ms, [neg_marker](const std::string&) {
+        neg_marker->store(true);
+        return make(PasswdLookupStatus::kOk);
+    });
+    CHECK(neg.status == PasswdLookupStatus::kTimeout);
+    CHECK_FALSE(neg_called.load());
+}
+
+TEST_CASE("resolve_passwd_bounded reports a throwing lookup as a non-arrival, not a crash",
+         "[passwd][agent]") {
+    // bounded_call runs the callable on a DETACHED thread; an exception
+    // escaping it uncaught would std::terminate() the whole agent.
+    auto res = resolve_passwd_bounded("alice", 500ms, [](const std::string&) -> PasswdLookupResult {
+        throw std::runtime_error("directory services exploded");
+    });
+    CHECK(res.status == PasswdLookupStatus::kTimeout);
+    CHECK_FALSE(res.ok());
+}
+
+#if !defined(_WIN32)
+TEST_CASE("getpwnam_lookup resolves a real account and distinguishes a missing one",
+         "[passwd][agent]") {
+    // Against the host's own passwd database. root exists on every POSIX box
+    // this suite runs on, so this is a stable assertion rather than a
+    // machine-specific one.
+    auto root = yuzu::agent::getpwnam_lookup("root");
+    REQUIRE(root.status == PasswdLookupStatus::kOk);
+    CHECK(root.record.uid == "0");
+    CHECK_FALSE(root.record.home_dir.empty());
+
+    // rc == 0 with a null result pointer -- the "no such account" answer,
+    // which must NOT be reported as kError.
+    auto missing = yuzu::agent::getpwnam_lookup("yuzu_test_no_such_account_zzz");
+    CHECK(missing.status == PasswdLookupStatus::kNotFound);
+}
+#endif

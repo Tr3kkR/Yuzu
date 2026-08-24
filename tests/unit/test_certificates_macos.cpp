@@ -161,9 +161,11 @@ TEST_CASE("is_valid_username rejects empty and shell-metacharacter input",
 
 TEST_CASE("is_valid_username rejects option-like leading characters",
          "[certificates][macos]") {
-    // A leading '-' would let `id -u <username>` misread the value as one
-    // of its own flags rather than an account name to look up -- argument
-    // injection, distinct from the shell-metacharacter checks above.
+    // A leading '-' would let the value be misread as one of a downstream
+    // tool's own flags rather than an account name -- argument injection,
+    // distinct from the shell-metacharacter checks above. Today the value
+    // lands in `sudo -n -u <username>`; it formerly also reached
+    // `id -u <username>` (that spawn was retired in #3406).
     CHECK_FALSE(is_valid_username("-G"));
     CHECK_FALSE(is_valid_username("--help"));
     CHECK_FALSE(is_valid_username("-a"));
@@ -390,10 +392,14 @@ TEST_CASE("build_login_keychain_read_argv: caller already root -- no outer sudo 
     // run_bounded_subprocess execs this vector directly, no shell, so
     // every flag/value must be its own element (no `2>/dev/null` -- the
     // runner's merge_stderr=false default already discards child stderr).
+    // The `--` terminators are pinned here on purpose: ADR-3002 Decision 8
+    // makes them the canonical privileged-argv form, and the dormant #1455
+    // sudoers grant is written to match this exact token sequence -- so a
+    // silent drop must fail a test, not a future root-only deployment.
     auto argv = build_login_keychain_read_argv("501", "alice", "/Users/alice",
                                                /*caller_is_root=*/true);
     CHECK(argv == std::vector<std::string>{
-                     "/bin/launchctl", "asuser", "501", "/usr/bin/sudo", "-n", "-u", "alice",
+                     "/bin/launchctl", "asuser", "501", "/usr/bin/sudo", "-n", "-u", "alice", "--",
                      "/usr/bin/security", "find-certificate", "-a", "-p",
                      "/Users/alice/Library/Keychains/login.keychain-db"});
 }
@@ -406,8 +412,9 @@ TEST_CASE("build_login_keychain_read_argv: non-root caller escalates via an oute
     auto argv = build_login_keychain_read_argv("501", "alice", "/Users/alice",
                                                /*caller_is_root=*/false);
     CHECK(argv == std::vector<std::string>{
-                     "/usr/bin/sudo", "-n", "/bin/launchctl", "asuser", "501", "/usr/bin/sudo",
-                     "-n", "-u", "alice", "/usr/bin/security", "find-certificate", "-a", "-p",
+                     "/usr/bin/sudo", "-n", "--", "/bin/launchctl", "asuser", "501",
+                     "/usr/bin/sudo", "-n", "-u", "alice", "--", "/usr/bin/security",
+                     "find-certificate", "-a", "-p",
                      "/Users/alice/Library/Keychains/login.keychain-db"});
 }
 
@@ -707,20 +714,19 @@ TEST_CASE("FP-CERTS-R3: an exhausted action budget clamps the verify read's dead
 
 // ── parse_console_user_output + is_valid_uid: FP-CERTS-01 regression ────────
 //
-// resolve_console_user() (certificates_plugin.cpp) validates `id -u
-// <username>`'s captured output with is_valid_uid() before trusting it.
-// run_bounded_subprocess's SubprocessResult::output is the RAW captured
-// stream -- a trailing '\n' included -- and is_valid_uid() rejects any
-// non-digit character outright, so before this fix round every ordinary
-// `id -u` result ("501\n") failed validation and login-keychain reads were
-// silently disabled entirely. The fix reuses parse_console_user_output
-// (already proven to trim exactly this shape, see the section above) on the
-// uid capture too, before validation.
+// HISTORICAL as of #3406, kept deliberately. The uid no longer comes from an
+// `/usr/bin/id -u` capture at all -- it is getpwnam_r's pw_uid, formatted
+// in-process, so the trailing-newline shape below can no longer occur on the
+// production path. This vector is retained because it pins the CONTRACT the
+// fix established (is_valid_uid() rejects any non-digit, so any future
+// captured-text uid source must be trimmed before validation), which is the
+// property that would silently disable login-keychain reads again if a later
+// change reintroduced one. It does NOT describe current production flow.
 
-TEST_CASE("FP-CERTS-01: raw id -u output with its trailing newline fails uid validation "
-         "unless trimmed first",
+TEST_CASE("FP-CERTS-01 (historical): raw captured uid text with a trailing newline fails "
+         "uid validation unless trimmed first",
          "[certificates][macos]") {
-    const std::string raw_id_output = "501\n"; // ordinary `id -u alice` capture
+    const std::string raw_id_output = "501\n"; // shape of the retired `id -u alice` capture
     CHECK_FALSE(is_valid_uid(raw_id_output)); // the pre-fix bug: always rejected
     CHECK(is_valid_uid(parse_console_user_output(raw_id_output))); // the fix: trim first
     CHECK(parse_console_user_output(raw_id_output) == "501");

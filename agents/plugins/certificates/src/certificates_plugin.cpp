@@ -71,8 +71,7 @@
 // fail to resolve, since the nested `(anonymous namespace)::yuzu` has no
 // TempFile member.
 #include <unistd.h>
-#include <cerrno>                          // ERANGE (resolve_login_home's getpwnam_r retry)
-#include <pwd.h>                           // getpwnam_r -- in-process `~username` home resolution (#3406)
+#include <yuzu/agent/passwd_lookup.hpp>    // bounded passwd resolution -- replaces the shell's `~username` expansion (#3406)
 #include <macos_console_user.hpp>          // shared console-user + store/keychain mapping (#2277)
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (BR-03)
 #if defined(YUZU_HAVE_SECURITY_FRAMEWORK)
@@ -1038,8 +1037,8 @@ struct PasswdEntry {
 };
 
 /**
- * Look up `username` in-process via getpwnam_r, returning its uid and home
- * directory from ONE directory-services read.
+ * Resolve `username`'s uid and home directory from ONE passwd-database read,
+ * BOUNDED by `budget`.
  *
  * This is the same lookup a POSIX shell performs for `~username` tilde
  * expansion, so a relocated/mobile/network-home account resolves to the
@@ -1050,48 +1049,46 @@ struct PasswdEntry {
  * from the same database, so once this call existed on the path that spawn
  * was pure redundancy -- removing it drops one process spawn per macOS
  * list/details action and retires sink `certificates/resolve_console_user#2`
- * outright (ADR-3002 prefers eliminating a spawn over any rung it could
- * hold). Not a subprocess and not an interpreter: a plain
- * libc/directory-services read, so it adds no rung.
+ * outright. Not a subprocess and not an interpreter: a directory-services
+ * read, so it adds no rung under ADR-3002.
+ *
+ * WHY IT IS BOUNDED, AND WHY THE BOUND LIVES IN AGENT-CORE (adversarial
+ * review, #3406): on a directory-joined Mac `getpwnam_r` can make a blocking
+ * network Directory Services call with no timeout of its own. Both mechanisms
+ * this replaced ran that lookup inside a CHILD PROCESS the bounded runner
+ * could SIGKILL at a deadline, so argv-izing the read silently removed a
+ * cancellation boundary -- an uncancellable blocking call on the agent's
+ * bounded ThreadPool can pin a worker per request and eventually starve
+ * unrelated commands. yuzu::agent::resolve_passwd_bounded() restores the
+ * bound. It lives in agent-core rather than here because it abandons a
+ * DETACHED thread on timeout, and a detached thread running code from a
+ * dlclose()-able plugin is a use-after-unload crash -- see
+ * passwd_lookup.hpp's header comment and server_address_resolver.cpp:121-128.
  *
  * Returns std::nullopt when the account cannot be resolved AT ALL (lookup
- * error, no such record, or still ERANGE after the retry) -- the caller
- * treats that exactly as the old `id -u` failure was treated: no usable
- * console user. A record that resolves but carries an unusable pw_dir is
- * NOT nullopt: uid is still authoritative, so the entry is returned with an
- * empty `home_dir` and only the login-keychain leg degrades.
+ * error, no such record, or the budget expired) -- the caller treats that
+ * exactly as the old `id -u` failure was treated: no usable console user. A
+ * record that resolves but carries an unusable pw_dir is NOT nullopt: uid is
+ * still authoritative, so the entry is returned with an empty `home_dir` and
+ * only the login-keychain leg degrades.
  */
-std::optional<PasswdEntry> resolve_passwd_entry(const std::string& username) {
-    struct passwd pwd {};
-    struct passwd* result = nullptr;
-    long suggested = sysconf(_SC_GETPW_R_SIZE_MAX);
-    // _SC_GETPW_R_SIZE_MAX is a HINT and may be -1; 4096 covers any real
-    // macOS record, and the one ERANGE retry below covers a pathological one.
-    std::vector<char> buf(suggested > 0 ? static_cast<std::size_t>(suggested) : 4096);
-    for (int attempt = 0; attempt < 2; ++attempt) {
-        // rc, NOT errno, carries the getpwnam_r error (POSIX); rc == 0 with a
-        // null result is the distinct "no such account" case, not an error.
-        int rc = getpwnam_r(username.c_str(), &pwd, buf.data(), buf.size(), &result);
-        if (rc == ERANGE) {
-            buf.resize(buf.size() * 4);
-            continue;
-        }
-        if (rc != 0 || result == nullptr)
-            return std::nullopt;
-        PasswdEntry entry;
-        entry.uid = std::to_string(static_cast<unsigned long long>(result->pw_uid));
-        if (result->pw_dir != nullptr && yuzu::macos::is_valid_home_dir(result->pw_dir))
-            entry.home_dir = result->pw_dir;
-        return entry;
-    }
-    return std::nullopt; // still ERANGE after the retry -- treated as lookup failure
+std::optional<PasswdEntry> resolve_passwd_entry(const std::string& username,
+                                                std::chrono::milliseconds budget) {
+    auto res = yuzu::agent::resolve_passwd_bounded(username, budget);
+    if (!res.ok())
+        return std::nullopt;
+    PasswdEntry entry;
+    entry.uid = std::move(res.record.uid);
+    if (yuzu::macos::is_valid_home_dir(res.record.home_dir))
+        entry.home_dir = std::move(res.record.home_dir);
+    return entry;
 }
 
 /**
  * Resolve the current console (GUI) user via subprocess. SystemConfiguration
  * IS linkable from this LaunchDaemon (see agents/shared/macos_console_user.hpp's
  * SCDynamicStoreCopyConsoleUser, already used by the users plugin) -- this
- * shells out to `stat`/`id` by deliberate choice, not because the framework is
+ * shells out to `stat` by deliberate choice, not because the framework is
  * unavailable: `stat -f%Su /dev/console` reports the console DEVICE owner,
  * while SCDynamicStoreCopyConsoleUser reports the Aqua SESSION owner, and the
  * two diverge under fast user switching / screen sharing -- WHICH user's login
@@ -1107,10 +1104,10 @@ std::optional<PasswdEntry> resolve_passwd_entry(const std::string& username) {
  *
  * `action_deadline` is the CALLER's whole-action budget (BR-03/
  * FP-CERTS-03): this is the FIRST subprocess work any action performs, so
- * both calls below clamp to it via clamp_to_action_budget rather than the
- * raw kCertParseDeadline constant, and bail out to std::nullopt (same as
- * "no console session") if the budget is already exhausted before either
- * can even be attempted.
+ * both the `stat` spawn and the bounded passwd lookup below clamp to it via
+ * clamp_to_action_budget rather than the raw kCertParseDeadline constant, and
+ * bail out to std::nullopt (same as "no console session") if the budget is
+ * already exhausted before either can even be attempted.
  */
 std::optional<yuzu::macos::ConsoleUser> resolve_console_user(
         std::chrono::steady_clock::time_point action_deadline) {
@@ -1131,16 +1128,22 @@ std::optional<yuzu::macos::ConsoleUser> resolve_console_user(
     if (!yuzu::macos::is_valid_username(username))
         return std::nullopt;
 
-    // The uid and the home directory both come from ONE in-process
-    // getpwnam_r read (#3406). This replaced a second `/usr/bin/id -u
-    // <username>` subprocess that asked the same database for the same uid:
-    // once the login-keychain leg needed pw_dir from here anyway, that spawn
-    // was pure redundancy, so it is gone and sink
-    // `certificates/resolve_console_user#2` is retired. No deadline clamp is
-    // needed any more either -- a libc directory-services read is not a
-    // bounded-subprocess call, which is also why the whole-action budget now
-    // stretches further on this path than it did before.
-    auto pw = resolve_passwd_entry(username);
+    // The uid and the home directory both come from ONE passwd read (#3406).
+    // This replaced a second `/usr/bin/id -u <username>` subprocess that asked
+    // the same database for the same uid: once the login-keychain leg needed
+    // pw_dir from here anyway, that spawn was pure redundancy, so it is gone
+    // and sink `certificates/resolve_console_user#2` is retired.
+    //
+    // It STILL clamps to the action budget. Losing the subprocess lost the
+    // runner's SIGKILL-at-deadline, so the bound has to be re-imposed on the
+    // lookup itself -- `getpwnam_r` can block on a wedged Directory Services
+    // with no timeout of its own (adversarial-review finding, #3406). Without
+    // this clamp a single directory-joined host with a sick DS could pin a
+    // plugin-host worker per request and starve unrelated commands.
+    auto pw_budget = clamp_to_action_budget(action_deadline, kCertParseDeadline);
+    if (pw_budget <= std::chrono::milliseconds::zero())
+        return std::nullopt;
+    auto pw = resolve_passwd_entry(username, pw_budget);
     if (!pw)
         return std::nullopt;
     // Defensive: pw_uid is an integral uid_t, so a decimal format of it is
@@ -1311,8 +1314,8 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
                 // Pre-split argv through the bounded runner -- no shell
                 // (#3406, rung 2). The former "/bin/sh -c" hop existed for
                 // exactly two shell features, both now provided without
-                // one: `~username` tilde expansion (resolve_login_home's
-                // getpwnam_r lookup above -- the same lookup the shell
+                // one: `~username` tilde expansion (resolve_passwd_entry's
+                // bounded passwd lookup above -- the same lookup the shell
                 // performed) and a `2>/dev/null` redirect (the runner's
                 // merge_stderr=false default already discards child
                 // stderr). The launchctl/sudo/security session hop itself
@@ -1528,8 +1531,8 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
             } else {
                 // See list_certs_macos's matching comment: pre-split argv
                 // through the bounded runner, no shell (#3406, rung 2) --
-                // tilde expansion is replaced by resolve_login_home's
-                // getpwnam_r lookup above.
+                // tilde expansion is replaced by
+                // resolve_passwd_entry's bounded passwd lookup above.
                 // sink: certificates/details_cert_macos#1 — rung-2 runner argv (launchctl asuser + sudo -u session hop), see manifest
                 auto login_result = run_bounded_checked(
                     argv,

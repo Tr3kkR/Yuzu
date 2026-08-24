@@ -22,11 +22,13 @@
 // console session, `security`, or even to run on macOS at all -- same
 // header-for-testability pattern as
 // agents/plugins/installed_apps/src/installed_apps_inventory.hpp. The
-// certificates_plugin.cpp .cpp file keeps the bounded-runner calls (stat/id/
+// certificates_plugin.cpp .cpp file keeps the bounded-runner calls (stat/
 // launchctl/sudo/security, all routed through
 // yuzu::agent::run_bounded_subprocess -- see run_bounded_checked()) and the
-// console-user RESOLUTION (which does need a subprocess); this header only
-// ever sees strings it's handed.
+// console-user RESOLUTION (whose device-owner half does need a subprocess;
+// its uid/home half is a bounded passwd lookup since #3406, no longer the
+// `id -u` spawn this line used to list); this header only ever sees strings
+// it's handed.
 //
 // Deliberately framework-free: no SystemConfiguration
 // (SCDynamicStoreCopyConsoleUser), so a CLT-only box still compiles this
@@ -341,25 +343,36 @@ inline std::optional<std::string> resolve_delete_keychain_path(std::string_view 
 // this" (never fall back to running it anyway, never treat it as an
 // empty-but-safe command).
 //
-// NO `--` end-of-options terminator, deliberately. ADR-3002 Decision 8
-// names `--` canonical for sudo argv, and it was considered here and
-// REJECTED for this site on two grounds. (1) It buys nothing: Decision 6's
-// alternative is already fully satisfied -- the only two caller-derived
-// values downstream of a sudo are `uid` (is_valid_uid: digits only) and
-// `username` (is_valid_username: rejects a leading '-' outright), so
-// neither can present as an option however hostile the source. (2) It
-// carries a real deployment risk that outweighs the nil benefit: the
-// dormant #1455 sudoers grant is written as a fixed token sequence
-// (`... /usr/bin/sudo -n -u * /usr/bin/security find-certificate -a -p *`,
-// see below and docs/agent-privilege-model.md). Inserting `--` adds an
-// argument that grant does not name, and whether sudoers' wildcard
-// matching would still admit it depends on argument-joining behaviour this
-// change cannot verify without a root session to test against. Silently
-// falsifying a grant that only activates when #1455 lands -- long after
-// anyone would connect the failure to this line -- is a far worse outcome
-// than the defence-in-depth it would add. If `--` is wanted here, it must
-// land WITH the grant text updated in both places and exercised as root,
-// not as a drive-by on a transport migration.
+// `--` END-OF-OPTIONS TERMINATOR on both sudo invocations, per ADR-3002
+// Decision 8's canonical privileged-argv form. History worth keeping, because
+// the reasoning was corrected twice (#3406 adversarial review): this site
+// originally OMITTED `--` on the theory that inserting an argument the dormant
+// #1455 sudoers grant does not name might silently stop that grant matching.
+// That theory is WRONG, on two independently verified grounds:
+//   * For the OUTER sudo, `--` is sudo's OWN option and is consumed during its
+//     option parsing -- `man sudo`: "The -- is used to delimit the end of the
+//     sudo options." What sudoers matches is the COMMAND after it, so the
+//     grant string never sees the terminator at all.
+//   * For the INNER sudo, `--` DOES sit inside the command string the outer
+//     grant is matched against -- but sudoers wildcards are fnmatch-based and
+//     `man sudoers` is explicit that `*` "Matches any set of zero or more
+//     characters (including white space)", so `-u *` absorbs `<user> --`
+//     regardless. (The grant text below is nonetheless written with the
+//     terminators spelled out, so matching does not RELY on that subtlety.)
+// Verified empirically on this host: `sudo -n -- <cmd>` and
+// `sudo -n -u <user> -- <cmd>` both parse and reach the credential check
+// exactly as the bare forms do.
+//
+// Note what `--` does and does not buy here, so a later reader does not
+// over-credit it: the only values it protects are the COMMAND NAMES that
+// follow it (`/bin/launchctl`, `/usr/bin/security`), and both are
+// compile-time literals. Every caller-derived value on this line sits in an
+// option-ARGUMENT slot (`asuser <uid>`, `-u <username>`, `-p <path>`) that a
+// terminator cannot guard. Those are guarded instead by ADR-3002 Decision 6's
+// named alternative, which this header satisfies independently: is_valid_uid
+// (digits only), is_valid_username (rejects a leading '-'), and
+// is_valid_home_dir (forces a leading '/'). So `--` is defence in depth and
+// canonical-form conformance, NOT the control that closes option injection.
 //
 // `caller_is_root` mirrors the sudo_prefix() idiom already established in
 // quarantine_plugin.cpp (geteuid() == 0 -> no sudo round-trip needed) --
@@ -375,7 +388,7 @@ inline std::optional<std::string> resolve_delete_keychain_path(std::string_view 
 // this branch is dormant until #1455 lands) MUST escalate through its own
 // outer `sudo -n` first -- without it, the sudoers grant this needs
 // (`_yuzu ALL=(root) NOPASSWD: /bin/launchctl asuser * /usr/bin/sudo -n -u *
-// /usr/bin/security find-certificate -a -p *` -- handed to
+// -- /usr/bin/security find-certificate -a -p *` -- handed to
 // F-pf-provisioning as this package's provisioning note, to add when #1455
 // narrows the macOS agent off root; not required for this package's
 // acceptance criteria today) could never be exercised, because the command
@@ -411,10 +424,11 @@ inline std::vector<std::string> build_login_keychain_read_argv(std::string_view 
     if (!caller_is_root) {
         argv.emplace_back("/usr/bin/sudo");
         argv.emplace_back("-n");
+        argv.emplace_back("--");
     }
     argv.insert(argv.end(), {"/bin/launchctl", "asuser", std::string(uid), "/usr/bin/sudo", "-n",
-                             "-u", std::string(username), "/usr/bin/security", "find-certificate",
-                             "-a", "-p", *keychain});
+                             "-u", std::string(username), "--", "/usr/bin/security",
+                             "find-certificate", "-a", "-p", *keychain});
     return argv;
 }
 

@@ -1,0 +1,95 @@
+// passwd_lookup.cpp -- bounded passwd-database resolution (#3406).
+// See passwd_lookup.hpp for why this lives in agent-core rather than in the
+// plugin that consumes it (detached-thread lifetime vs plugin dlclose()).
+
+#include <yuzu/agent/passwd_lookup.hpp>
+
+#include <bounded_wait.hpp> // yuzu::shared::bounded_call (agents/shared)
+
+#include <cerrno>
+#include <cstddef>
+#include <vector>
+
+#ifndef _WIN32
+#include <pwd.h>
+#include <unistd.h>
+#endif
+
+namespace yuzu::agent {
+
+#ifndef _WIN32
+
+PasswdLookupResult getpwnam_lookup(const std::string& username) {
+    PasswdLookupResult out;
+    struct passwd pwd {};
+    struct passwd* found = nullptr;
+
+    // _SC_GETPW_R_SIZE_MAX is a HINT and may be -1; 4096 covers any real
+    // record, and the single ERANGE retry below covers a pathological one.
+    long suggested = ::sysconf(_SC_GETPW_R_SIZE_MAX);
+    std::vector<char> buf(suggested > 0 ? static_cast<std::size_t>(suggested) : 4096);
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        // POSIX: the error is the RETURN VALUE, not errno. A zero return with
+        // a null result pointer is the distinct "no such account" answer --
+        // a definite negative, not a failure.
+        int rc = ::getpwnam_r(username.c_str(), &pwd, buf.data(), buf.size(), &found);
+        if (rc == ERANGE) {
+            buf.resize(buf.size() * 4);
+            continue;
+        }
+        if (rc != 0) {
+            out.status = PasswdLookupStatus::kError;
+            return out;
+        }
+        if (found == nullptr) {
+            out.status = PasswdLookupStatus::kNotFound;
+            return out;
+        }
+        out.status = PasswdLookupStatus::kOk;
+        out.record.uid = std::to_string(static_cast<unsigned long long>(found->pw_uid));
+        // pw_dir may legitimately be null; the caller decides what an absent
+        // home means for its own action. Copied out before `buf` dies -- the
+        // struct's char* members point INTO that buffer.
+        if (found->pw_dir != nullptr)
+            out.record.home_dir = found->pw_dir;
+        return out;
+    }
+
+    out.status = PasswdLookupStatus::kError; // still ERANGE after the retry
+    return out;
+}
+
+#else // _WIN32
+
+PasswdLookupResult getpwnam_lookup(const std::string&) {
+    // No POSIX passwd database on Windows. The only consumer is macOS-only;
+    // this exists so the TU compiles in the shared agent-core build.
+    PasswdLookupResult out;
+    out.status = PasswdLookupStatus::kError;
+    return out;
+}
+
+#endif
+
+PasswdLookupResult resolve_passwd_bounded(const std::string& username,
+                                          std::chrono::milliseconds timeout,
+                                          const PasswdLookupFn& lookup) {
+    PasswdLookupResult timed_out;
+    timed_out.status = PasswdLookupStatus::kTimeout;
+
+    if (timeout <= std::chrono::milliseconds::zero())
+        return timed_out; // budget already spent -- don't start a lookup we can't wait for
+
+    // Captured BY VALUE: the detached thread can outlive this call, so it must
+    // not touch this stack frame. Safe to detach from here specifically
+    // because this TU lives in agent-core and is never dlclose()'d.
+    auto result = yuzu::shared::bounded_call(
+        timeout, [lookup, username]() -> PasswdLookupResult { return lookup(username); });
+
+    if (!result)
+        return timed_out; // timed out, or at bounded_call's outstanding-thread ceiling
+    return *result;
+}
+
+} // namespace yuzu::agent

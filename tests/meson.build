@@ -272,6 +272,10 @@ agent_test_exe = executable(
     'unit/test_certificates_macos.cpp',  # A-1.11 (INT-2 handoff): existed unregistered on the branch;
                                           # macos_console_user.hpp already reachable via the agents/shared
                                           # include_directories entry below.
+    'unit/test_passwd_lookup.cpp',       # #3406: bounded passwd resolution (agent-core seam). The
+                                          # load-bearing case injects a NEVER-RETURNING lookup and asserts
+                                          # the caller is released inside its budget -- the regression that
+                                          # argv-izing the login-keychain read introduced.
     'unit/agent/test_services_macos.cpp',     # C-1.12: launchctl print-disabled parser (P8)
     'unit/agent/test_msi_macos.cpp',          # C-1.21: pkgutil --pkg-info parser (P8)
     'unit/agent/test_bitlocker_macos.cpp',    # A-1.16: diskutil apfs list parser (P8)
