@@ -473,19 +473,33 @@ inline std::string frequency_to_channel(std::uint32_t frequency_mhz) {
     return "0";
 }
 
-// Best-effort NM80211ApSecurityFlags (NetworkManager's nm-dbus-interface.h)
-// WpaFlags/RsnFlags -> the plugin's SECURITY column vocabulary --
-// unverified against a live host (see the plugin's D-Bus type-signature
-// table). NM_802_11_AP_SEC_KEY_MGMT_802_1X (bit 0x200, present in either
-// flag word) takes priority over PSK; a non-zero RsnFlags implies WPA2; a
-// WPA-flags-only AP (RsnFlags == 0) implies WPA1; both zero is NONE (open).
-// This cannot distinguish a WEP-only AP from a genuinely open one -- WEP is
-// signalled by the AP's `Flags`/PRIVACY bit, a property this plugin does
-// not read (out of the spec's requested property list).
+// NM80211ApSecurityFlags WpaFlags/RsnFlags -> the plugin's SECURITY column
+// vocabulary. The bit values below are transcribed from NetworkManager's own
+// shipped `libnm/nm-dbus-interface.h` (NM 1.52), not inferred.
+//
+// Ordering is most-specific-first, and deliberately matches what the nmcli
+// rung-2 fallback prints in the same column, so a host that degrades from
+// D-Bus to nmcli does not silently change an AP's reported security:
+//   802.1X (enterprise, either flag word) > SAE/WPA3 > OWE > WPA2 > WPA1 > NONE.
+//
+// Known limit, unchanged: this cannot distinguish a WEP-only AP from a
+// genuinely open one -- WEP is signalled by the AP's `Flags`/PRIVACY bit, a
+// property this plugin does not read (out of the spec's requested property
+// list). An open AP and a WEP AP both report NONE.
 inline std::string nm_security_flags_to_string(std::uint32_t wpa_flags, std::uint32_t rsn_flags) {
     constexpr std::uint32_t kKeyMgmt8021X = 0x200; // NM_802_11_AP_SEC_KEY_MGMT_802_1X
-    if ((wpa_flags & kKeyMgmt8021X) != 0 || (rsn_flags & kKeyMgmt8021X) != 0)
+    constexpr std::uint32_t kKeyMgmtSae = 0x400;   // NM_802_11_AP_SEC_KEY_MGMT_SAE (WPA3-Personal)
+    constexpr std::uint32_t kKeyMgmtOwe = 0x800;   // NM_802_11_AP_SEC_KEY_MGMT_OWE (enhanced open)
+    const std::uint32_t either = wpa_flags | rsn_flags;
+    if ((either & kKeyMgmt8021X) != 0)
         return "802.1X";
+    // Without this, a WPA3-Personal AP reported as "WPA2" -- a security
+    // downgrade in the operator's own audit view, and a disagreement with
+    // the nmcli leg, which prints WPA3.
+    if ((either & kKeyMgmtSae) != 0)
+        return "WPA3";
+    if ((either & kKeyMgmtOwe) != 0)
+        return "OWE";
     if (rsn_flags != 0)
         return "WPA2";
     if (wpa_flags != 0)

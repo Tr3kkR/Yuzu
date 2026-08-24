@@ -296,6 +296,25 @@ TEST_CASE("wifi: nm_security_flags_to_string — 802.1X takes priority", "[wifi]
     CHECK(nm_security_flags_to_string(0, 0x300) == "802.1X");
 }
 
+// Bit values transcribed from NetworkManager's shipped libnm/nm-dbus-interface.h
+// (NM 1.52): SAE = 0x400, OWE = 0x800. Before this, a WPA3-Personal AP was
+// reported as "WPA2" -- a security downgrade in the operator's audit view and a
+// disagreement with the nmcli rung-2 fallback, which prints WPA3.
+TEST_CASE("wifi: nm_security_flags_to_string — WPA3/SAE is not reported as WPA2", "[wifi]") {
+    // RSN word carrying PSK+SAE, as a WPA2/WPA3 transition-mode AP advertises.
+    CHECK(nm_security_flags_to_string(0, 0x400) == "WPA3");
+    CHECK(nm_security_flags_to_string(0, 0x100 | 0x400) == "WPA3");
+    // Enterprise still outranks SAE (WPA3-Enterprise reports 802.1X).
+    CHECK(nm_security_flags_to_string(0, 0x200 | 0x400) == "802.1X");
+}
+
+TEST_CASE("wifi: nm_security_flags_to_string — OWE enhanced-open is distinct from open",
+          "[wifi]") {
+    CHECK(nm_security_flags_to_string(0, 0x800) == "OWE");
+    // ...and a genuinely open AP is still NONE, not OWE.
+    CHECK(nm_security_flags_to_string(0, 0) == "NONE");
+}
+
 TEST_CASE("wifi: nm_ap_to_row assembles a list_networks row from raw AP properties",
           "[wifi]") {
     NmAccessPointProps ap;

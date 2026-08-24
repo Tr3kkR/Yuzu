@@ -122,19 +122,30 @@ ToolOutcome run_tool(std::vector<std::string> argv, std::size_t max_lines = 0) {
 // ── Linux: NetworkManager (rung 1, bounded sd-bus) ──────────────────────
 //
 // ══════════════════════════════════════════════════════════════════════
-// D-BUS TYPE-SIGNATURE TABLE (audit this block against a live
-// NetworkManager host before trusting it -- see the package report's
-// "unverifiable without a Linux NM host" note; this leg has never been
-// compiled or run, only reasoned about against the published NM D-Bus
-// API). Every sd_bus read below carries a one-line comment citing its row
-// here.
+// D-BUS TYPE-SIGNATURE TABLE. Every sd_bus read below carries a one-line
+// comment citing its row here.
+//
+// Verification status (do not weaken without re-doing the work):
+//   * Rows 1-5 -- interface, member and wire shape confirmed by LIVE
+//     introspection of NetworkManager 1.52.1 (`gdbus introspect` +
+//     `Properties.Get` against a running NM). Row 4 was WRONG on first
+//     write: ActiveAccessPoint was read on ...Device, which answers
+//     org.freedesktop.DBus.Error.InvalidArgs ("No such property"); the
+//     property lives only on ...Device.Wireless. Corrected here.
+//   * Rows 6-11 (AccessPoint) are confirmed against NM's published
+//     introspection XML, but NOT runtime-confirmed: the verification host
+//     had no wireless device, so no AccessPoint object existed to query.
+//     Ssid really is 'ay' (a byte array that may hold non-UTF-8 and
+//     embedded NULs) and Strength really is 'y', not 'u' -- these are the
+//     two rows most likely to be mis-copied. Linux CI is the first venue
+//     that can execute them.
 //
 //  # | Call                | Interface                                   | Member           | Wire shape
 //  --|---------------------|----------------------------------------------|------------------|---------------------------------
 //  1 | method (not a prop) | org.freedesktop.NetworkManager                | GetDevices       | returns 'ao' directly (no variant)
 //  2 | Properties.Get      | org.freedesktop.NetworkManager.Device         | DeviceType       | 'v' wrapping 'u' (WIFI == 2)
 //  3 | Properties.Get      | org.freedesktop.NetworkManager.Device.Wireless| AccessPoints     | 'v' wrapping 'ao'
-//  4 | Properties.Get      | org.freedesktop.NetworkManager.Device         | ActiveAccessPoint| 'v' wrapping 'o' ("/" == none)
+//  4 | Properties.Get      | org.freedesktop.NetworkManager.Device.Wireless| ActiveAccessPoint| 'v' wrapping 'o' ("/" == none)
 //  5 | Properties.Get      | org.freedesktop.NetworkManager.Device         | Interface        | 'v' wrapping 's' (connected's col5 -- see deviation note in wifi_parsers.hpp)
 //  6 | Properties.Get      | org.freedesktop.NetworkManager.AccessPoint    | Ssid             | 'v' wrapping 'ay' (BYTE ARRAY, never 's')
 //  7 | Properties.Get      | org.freedesktop.NetworkManager.AccessPoint    | Strength         | 'v' wrapping 'y'
@@ -340,6 +351,10 @@ std::optional<std::vector<std::uint8_t>> nm_get_byte_array(sd_bus* bus, const ch
     std::size_t n = 0;
     if (sd_bus_message_read_array(reply.m, 'y', &ptr, &n) < 0)
         return std::nullopt;
+    // A zero-length 'ay' (a hidden AP's empty Ssid) can come back with
+    // ptr == nullptr; nullptr + 0 is formally UB, so short-circuit it.
+    if (!ptr || n == 0)
+        return std::vector<std::uint8_t>{};
     const auto* bytes = static_cast<const std::uint8_t*>(ptr);
     return std::vector<std::uint8_t>(bytes, bytes + n);
 }
@@ -488,7 +503,7 @@ NmConnectedResult query_nm_connected() {
         if (!session.arm_next_call())
             return result;
         auto active_ap =
-            nm_get_object_path(session.bus(), dev_path.c_str(), kNmDeviceIface,
+            nm_get_object_path(session.bus(), dev_path.c_str(), kNmWirelessIface,
                                "ActiveAccessPoint"); // table #4
         if (!active_ap)
             return result;
