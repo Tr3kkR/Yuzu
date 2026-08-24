@@ -121,6 +121,86 @@ TEST_CASE("parse_systemd_resolve_stats_lines returns empty when none of the thre
     CHECK(parse_systemd_resolve_stats_lines("nothing relevant here\n").empty());
 }
 
+// ── dedupe_preserve_order (PKG-NC fix round: macOS arp double-counting +
+//    dns_servers cross-service resolver overlap) ─────────────────────────
+
+TEST_CASE("dedupe_preserve_order drops repeats and keeps first-seen order",
+         "[network_config]") {
+    const std::vector<std::string> in = {"a", "b", "a", "c", "b", "b", "d"};
+    const auto out = dedupe_preserve_order(in);
+    REQUIRE(out.size() == 4);
+    CHECK(out[0] == "a");
+    CHECK(out[1] == "b");
+    CHECK(out[2] == "c");
+    CHECK(out[3] == "d");
+}
+
+TEST_CASE("dedupe_preserve_order is a no-op on an already-unique list", "[network_config]") {
+    const std::vector<std::string> in = {"x", "y", "z"};
+    CHECK(dedupe_preserve_order(in) == in);
+}
+
+TEST_CASE("dedupe_preserve_order handles an empty list", "[network_config]") {
+    CHECK(dedupe_preserve_order(std::vector<std::string>{}).empty());
+}
+
+TEST_CASE("dedupe_preserve_order simulates the macOS arp double-record regression",
+         "[network_config]") {
+    // Same shape as network_config_plugin.cpp's do_arp: formatted
+    // "arp|-|ip|mac|-" lines, some repeated because the PF_ROUTE dump can
+    // report the same neighbour twice.
+    const std::vector<std::string> lines = {
+        "arp|-|192.168.0.131|fc:34:97:65:1e:0a|-",
+        "arp|-|192.168.0.66|00:11:22:33:44:55|-",
+        "arp|-|192.168.0.131|fc:34:97:65:1e:0a|-", // duplicate
+        "arp|-|224.0.0.251|01:00:5e:00:00:fb|-",
+        "arp|-|224.0.0.251|01:00:5e:00:00:fb|-", // duplicate
+    };
+    const auto out = dedupe_preserve_order(lines);
+    REQUIRE(out.size() == 3);
+    CHECK(out[0] == "arp|-|192.168.0.131|fc:34:97:65:1e:0a|-");
+    CHECK(out[1] == "arp|-|192.168.0.66|00:11:22:33:44:55|-");
+    CHECK(out[2] == "arp|-|224.0.0.251|01:00:5e:00:00:fb|-");
+}
+
+// ── ipv4_prefix_length / ipv6_prefix_length (PKG-NC fix round: replaces
+//    the old macOS hex-netmask format with the Linux leg's prefix-length
+//    shape -- #3346-class consistency) ────────────────────────────────────
+
+TEST_CASE("ipv4_prefix_length converts common netmasks to their CIDR prefix length",
+         "[network_config]") {
+    CHECK(ipv4_prefix_length(0x00000000u) == 0);  // 0.0.0.0
+    CHECK(ipv4_prefix_length(0xff000000u) == 8);  // 255.0.0.0
+    CHECK(ipv4_prefix_length(0xffffff00u) == 24); // 255.255.255.0 -- the old hex-emitting case
+    CHECK(ipv4_prefix_length(0xffffffffu) == 32); // 255.255.255.255
+    CHECK(ipv4_prefix_length(0xfffffff8u) == 29); // 255.255.255.248
+}
+
+TEST_CASE("ipv6_prefix_length converts common netmasks to their CIDR prefix length",
+         "[network_config]") {
+    {
+        const unsigned char all_zero[16] = {0};
+        CHECK(ipv6_prefix_length(all_zero) == 0);
+    }
+    {
+        // /64 -- first 8 bytes all-1s, rest all-0.
+        const unsigned char slash64[16] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                                           0,    0,    0,    0,    0,    0,    0,    0};
+        CHECK(ipv6_prefix_length(slash64) == 64);
+    }
+    {
+        // /128 -- fully specified host route.
+        const unsigned char slash128[16] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                                            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+        CHECK(ipv6_prefix_length(slash128) == 128);
+    }
+    {
+        // /12 -- partial final byte (0xf0 == 4 leading 1-bits).
+        const unsigned char slash12[16] = {0xff, 0xf0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        CHECK(ipv6_prefix_length(slash12) == 12);
+    }
+}
+
 // ── rtnetlink message-set decode (Linux) ─────────────────────────────────
 
 #if defined(__linux__)

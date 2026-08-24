@@ -30,6 +30,7 @@
  */
 #pragma once
 
+#include <algorithm>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -198,6 +199,72 @@ inline std::string format_mac(const unsigned char* addr, std::size_t len) {
         out += kHex[addr[i] & 0x0F];
     }
     return out;
+}
+
+/**
+ * Dedupe a vector of equality-comparable values, preserving first-seen
+ * order. Pure -- O(n^2) worst case, which is fine for the small lists
+ * (a handful of DNS servers, a few dozen ARP entries) this exists for.
+ *
+ * Two production callers (PKG-NC fix round, live before/after parity diff):
+ *   - macOS arp: the PF_ROUTE NET_RT_FLAGS/RTF_LLINFO sysctl dump can report
+ *     the same {ip, mac} neighbour twice on a real host -- deduped on the
+ *     formatted `arp|...` output line.
+ *   - macOS dns_servers: unioning State:/Network/Global/DNS with every
+ *     State:/Network/Service/<id>/DNS key can repeat the same resolver
+ *     address across services -- deduped on the address string, global-
+ *     first (global is queried and appended before any per-service list).
+ */
+template <typename T>
+inline std::vector<T> dedupe_preserve_order(const std::vector<T>& items) {
+    std::vector<T> out;
+    out.reserve(items.size());
+    for (const auto& item : items) {
+        if (std::find(out.begin(), out.end(), item) == out.end())
+            out.push_back(item);
+    }
+    return out;
+}
+
+/**
+ * CIDR prefix length (count of leading 1-bits) of a HOST-byte-order IPv4
+ * netmask -- 0.0.0.0 -> 0, 255.255.255.0 -> 24, 255.255.255.255 -> 32. Pure.
+ *
+ * Replaces the old macOS `ip_addresses` leg's raw hex netmask ("0xffffff00")
+ * with the same prefix-length shape the Linux leg already emits (PKG-NC fix
+ * round: a deliberate cross-platform consistency fix, not an oversight --
+ * dashboard-side parsers have broken on exactly this shape mismatch before
+ * (#3346), so it is called out explicitly here and at the emit site).
+ *
+ * A malformed/non-contiguous mask (not a real netmask) still returns a
+ * numeric count of leading 1-bits rather than crashing -- real netmasks are
+ * always contiguous from the MSB, so this is exact for every value a kernel
+ * actually hands back; a non-contiguous input is a kernel/driver bug this
+ * function does not attempt to detect.
+ */
+inline unsigned int ipv4_prefix_length(std::uint32_t host_order_mask) {
+    unsigned int prefix = 0;
+    while (host_order_mask & 0x80000000u) {
+        ++prefix;
+        host_order_mask <<= 1;
+    }
+    return prefix;
+}
+
+/**
+ * Same, for a 16-byte IPv6 netmask in on-wire (network) byte order -- a
+ * byte array has no host/network distinction, so no conversion is needed
+ * before calling this (unlike ipv4_prefix_length's host-order `uint32_t`).
+ */
+inline unsigned int ipv6_prefix_length(const unsigned char (&mask)[16]) {
+    unsigned int prefix = 0;
+    for (unsigned char byte : mask) {
+        while (byte & 0x80) {
+            ++prefix;
+            byte <<= 1;
+        }
+    }
+    return prefix;
 }
 
 #if defined(__linux__)

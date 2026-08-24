@@ -276,6 +276,26 @@ std::string cfstring_to_utf8(CFStringRef s) {
     buf.resize(std::strlen(buf.c_str()));
     return buf;
 }
+
+// Extract the "ServerAddresses" CFArray-of-CFString from a State:/Network/
+// {Global,Service/<id>}/DNS dictionary (nullptr/absent-key safe -- a
+// service with no configured DNS has no "ServerAddresses" entry at all).
+std::vector<std::string> extract_server_addresses(CFDictionaryRef dict) {
+    std::vector<std::string> out;
+    if (!dict)
+        return out;
+    auto* servers = static_cast<CFArrayRef>(CFDictionaryGetValue(dict, CFSTR("ServerAddresses")));
+    if (!servers)
+        return out;
+    const CFIndex count = CFArrayGetCount(servers);
+    for (CFIndex i = 0; i < count; ++i) {
+        auto* item = static_cast<CFStringRef>(CFArrayGetValueAtIndex(servers, i));
+        auto server = cfstring_to_utf8(item);
+        if (!server.empty())
+            out.push_back(std::move(server));
+    }
+    return out;
+}
 #endif // YUZU_HAVE_SYSTEMCONFIGURATION
 #endif // __APPLE__
 
@@ -587,7 +607,12 @@ int do_adapters(yuzu::CommandContext& ctx) {
 
     // getifaddrs() returns one entry per (interface, address-family) pair —
     // collapse to one row per interface name, in first-seen order, matching
-    // the old ifconfig-parse's per-adapter grouping.
+    // the old ifconfig-parse's per-adapter grouping. Unlike ip_addresses
+    // below, loopback is NOT excluded here: the pre-migration `ifconfig -a`
+    // parse reported lo0 as a real adapter row (PKG-NC fix round — live
+    // before/after parity diff caught an earlier draft silently dropping
+    // it, which would have made adapters diverge from the Linux rtnetlink
+    // leg, which never filters loopback either).
     std::vector<std::string> order;
     std::map<std::string, std::string> mac_by_name;
     std::map<std::string, bool> up_by_name;
@@ -595,8 +620,6 @@ int do_adapters(yuzu::CommandContext& ctx) {
         if (!p->ifa_name)
             continue;
         const std::string name = p->ifa_name;
-        if (name == "lo0")
-            continue;
         if (std::find(order.begin(), order.end(), name) == order.end())
             order.push_back(name);
         const bool up = (p->ifa_flags & IFF_UP) != 0;
@@ -731,6 +754,15 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
         if (name == "lo0")
             continue;
 
+        // Netmasks are emitted as a CIDR prefix length ("24", "32"), NOT
+        // the old macOS leg's raw hex ("0xffffff00") -- a deliberate
+        // cross-platform consistency fix (PKG-NC fix round): the Linux
+        // rtnetlink leg already emits a prefix length (ifa_prefixlen), and
+        // the two legs previously disagreed on this field's SHAPE, not just
+        // its value. Dashboard-side parsers have broken on exactly this
+        // kind of shape mismatch before (#3346) -- called out here and in
+        // the PR report's behavior-change list, not left for a reviewer to
+        // discover independently.
         if (p->ifa_addr->sa_family == AF_INET) {
             struct sockaddr_in sin {};
             std::memcpy(&sin, p->ifa_addr, sizeof(sin));
@@ -740,11 +772,7 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
             if (p->ifa_netmask) {
                 struct sockaddr_in mask {};
                 std::memcpy(&mask, p->ifa_netmask, sizeof(mask));
-                std::uint32_t m = ntohl(mask.sin_addr.s_addr);
-                while (m & 0x80000000u) {
-                    ++prefix;
-                    m <<= 1;
-                }
+                prefix = yuzu::network_config::ipv4_prefix_length(ntohl(mask.sin_addr.s_addr));
             }
             ctx.write_output(std::format("ip|{}|{}|{}|{}", name, text_buf, prefix, default_gw));
         } else if (p->ifa_addr->sa_family == AF_INET6) {
@@ -759,12 +787,7 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
                 std::memcpy(&mask6, p->ifa_netmask,
                            std::min(sizeof(mask6),
                                     static_cast<std::size_t>(p->ifa_netmask->sa_len)));
-                for (unsigned char byte : mask6.sin6_addr.s6_addr) {
-                    while (byte & 0x80) {
-                        ++prefix;
-                        byte <<= 1;
-                    }
-                }
+                prefix = yuzu::network_config::ipv6_prefix_length(mask6.sin6_addr.s6_addr);
             }
             std::string addr = text_buf;
             const auto pct = addr.find('%');
@@ -829,22 +852,44 @@ int do_dns_servers(yuzu::CommandContext& ctx) {
 #if defined(YUZU_HAVE_SYSTEMCONFIGURATION)
     auto store = open_dynamic_store();
     if (store) {
-        yuzu::agent::ScopedCFRef<CFDictionaryRef> dns_dict(static_cast<CFDictionaryRef>(
-            SCDynamicStoreCopyValue(store.get(), CFSTR("State:/Network/Global/DNS"))));
-        if (dns_dict) {
-            auto* servers = static_cast<CFArrayRef>(
-                CFDictionaryGetValue(dns_dict.get(), CFSTR("ServerAddresses")));
-            if (servers) {
-                const CFIndex count = CFArrayGetCount(servers);
-                for (CFIndex i = 0; i < count; ++i) {
-                    auto* item = static_cast<CFStringRef>(CFArrayGetValueAtIndex(servers, i));
-                    auto server = cfstring_to_utf8(item);
-                    if (server.empty())
-                        continue;
-                    auto type = (server.find(':') != std::string::npos) ? "IPv6" : "IPv4";
-                    ctx.write_output(std::format("dns|system|{}|{}", server, type));
+        // State:/Network/Global/DNS alone only ever reports the primary
+        // resolver -- `scutil --dns` (the pre-migration mechanism) walks
+        // every configured network SERVICE's own resolver list too, and a
+        // host with supplemental/per-service DNS servers has them there,
+        // not in the global key. Reading only the global key silently
+        // dropped every supplemental resolver (PKG-NC fix round: live
+        // before/after parity diff found 2 of 4 real resolvers missing).
+        // Union global + every State:/Network/Service/<id>/DNS key,
+        // global-first, deduped (a resolver can legitimately appear under
+        // more than one service).
+        std::vector<std::string> all_servers;
+        {
+            yuzu::agent::ScopedCFRef<CFDictionaryRef> dns_dict(static_cast<CFDictionaryRef>(
+                SCDynamicStoreCopyValue(store.get(), CFSTR("State:/Network/Global/DNS"))));
+            auto global = extract_server_addresses(dns_dict.get());
+            all_servers.insert(all_servers.end(), global.begin(), global.end());
+        }
+        {
+            // SCDynamicStoreCopyKeyList's `pattern` argument is ALWAYS a
+            // POSIX regex match against store keys (unlike
+            // SCDynamicStoreCopyValue's exact-match `key`) -- no separate
+            // "is this a regex" flag exists.
+            yuzu::agent::ScopedCFRef<CFArrayRef> keys(static_cast<CFArrayRef>(
+                SCDynamicStoreCopyKeyList(store.get(), CFSTR("State:/Network/Service/.*/DNS"))));
+            if (keys) {
+                const CFIndex key_count = CFArrayGetCount(keys.get());
+                for (CFIndex i = 0; i < key_count; ++i) {
+                    auto* key = static_cast<CFStringRef>(CFArrayGetValueAtIndex(keys.get(), i));
+                    yuzu::agent::ScopedCFRef<CFDictionaryRef> svc_dict(
+                        static_cast<CFDictionaryRef>(SCDynamicStoreCopyValue(store.get(), key)));
+                    auto svc_servers = extract_server_addresses(svc_dict.get());
+                    all_servers.insert(all_servers.end(), svc_servers.begin(), svc_servers.end());
                 }
             }
+        }
+        for (const auto& server : yuzu::network_config::dedupe_preserve_order(all_servers)) {
+            auto type = (server.find(':') != std::string::npos) ? "IPv6" : "IPv4";
+            ctx.write_output(std::format("dns|system|{}|{}", server, type));
         }
     }
 #else
@@ -1237,9 +1282,18 @@ private:
         // mixes both without differentiating). Reused as-is (owned by an
         // earlier package); iface/type are honestly reported as unknown ("-")
         // rather than guessed.
-        for (const auto& rec : parsed.records) {
-            ctx.write_output(std::format("arp|-|{}|{}|-", rec.ip, rec.mac));
-        }
+        //
+        // The NET_RT_FLAGS/RTF_LLINFO sysctl dump can report the same
+        // {ip, mac} neighbour twice on a real host (PKG-NC fix round: live
+        // before/after parity diff caught duplicated rows) — dedupe on the
+        // formatted output line, preserving first-seen order, rather than
+        // trusting the sysctl walk to be 1:1 with distinct neighbours.
+        std::vector<std::string> lines;
+        lines.reserve(parsed.records.size());
+        for (const auto& rec : parsed.records)
+            lines.push_back(std::format("arp|-|{}|{}|-", rec.ip, rec.mac));
+        for (const auto& line : yuzu::network_config::dedupe_preserve_order(lines))
+            ctx.write_output(line);
         return 0;
 
 #else
