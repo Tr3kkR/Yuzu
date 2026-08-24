@@ -2268,7 +2268,7 @@ public:
                           "counter");
         metrics_.counter("yuzu_server_ca_reissue_blocked_total", {{"reason", "revoked_identity"}});
         metrics_.describe("yuzu_server_ca_revocation_sweep_read_failures_total",
-                          "Revocation-sweep tick's list_revoked_serials() read failed — that "
+                          "Revocation-sweep tick's list_revoked_serials() read failed - that "
                           "tick's sweep was skipped entirely rather than treating every live "
                           "agent as revoked (ADR-0053 UP-1). A sustained non-zero rate means "
                           "already-revoked agents' live streams may not be torn down promptly",
