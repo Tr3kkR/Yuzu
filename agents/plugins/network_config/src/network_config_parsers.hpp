@@ -33,8 +33,8 @@
  *     buffer aligned to at least NLMSG_ALIGNTO (production callers declare
  *     theirs
  *     `alignas(NLMSG_ALIGNTO)`, and so do the fixture tests). The variable-
- *     length PAYLOADS those headers describe -- ifinfomsg, ifaddrmsg, rtmsg
- *     and every attribute value -- are memcpy'd into locally-aligned objects
+ *     length PAYLOADS those headers describe — ifinfomsg, ifaddrmsg, rtmsg
+ *     and every attribute value — are memcpy'd into locally-aligned objects
  *     before any field is read. parse_default_route_dump() takes no such
  *     precondition: it memcpys throughout.
  */
@@ -56,7 +56,7 @@
 #include <span>
 
 #include <arpa/inet.h>
-#include <linux/if.h> // IFF_UP -- deliberately linux/if.h, not net/if.h, to avoid the
+#include <linux/if.h> // IFF_UP — deliberately linux/if.h, not net/if.h, to avoid the
                        // classic duplicate-struct conflict when mixed with
                        // linux/rtnetlink.h's own transitive includes.
 #include <linux/if_addr.h>
@@ -78,7 +78,7 @@ namespace yuzu::network_config {
 
 // ── /proc/net/arp (Linux arp leg) ────────────────────────────────────────
 
-/// One resolved row of /proc/net/arp -- `arp|iface|ip|mac|type` is the
+/// One resolved row of /proc/net/arp — `arp|iface|ip|mac|type` is the
 /// plugin's own emitted shape (see do_arp()).
 struct ProcNetArpEntry {
     std::string iface;
@@ -88,7 +88,7 @@ struct ProcNetArpEntry {
 };
 
 /**
- * Parse the text of /proc/net/arp into resolved entries. Pure -- no
+ * Parse the text of /proc/net/arp into resolved entries. Pure — no
  * ifstream, no I/O. Kernel format (net/ipv4/arp.c:arp_seq_show):
  *   IP address       HW type     Flags       HW address            Mask     Device
  *   192.168.1.1      0x1         0x2         aa:bb:cc:dd:ee:ff     *        eth0
@@ -121,7 +121,7 @@ inline std::vector<ProcNetArpEntry> parse_proc_net_arp(std::string_view text) {
         std::istringstream lss{line};
         std::string ip, hwtype, flags_str, mac, mask, device;
         if (!(lss >> ip >> hwtype >> flags_str >> mac >> mask >> device))
-            continue; // short/ragged/blank/truncated line -- skip, don't crash
+            continue; // short/ragged/blank/truncated line — skip, don't crash
 
         if (hwtype != "0x1")
             continue; // Ethernet only (ARPHRD_ETHER == 0x1)
@@ -132,7 +132,7 @@ inline std::vector<ProcNetArpEntry> parse_proc_net_arp(std::string_view text) {
         constexpr unsigned long kAtfCom = 0x2;
         constexpr unsigned long kAtfPerm = 0x4;
         if (errno == ERANGE || end == flags_str.c_str() || *end != '\0' || !(flags & kAtfCom))
-            continue; // incomplete/unresolved/overflowing -- no complete bit set
+            continue; // incomplete/unresolved/overflowing — no complete bit set
 
         if (mac.empty() || mac == "00:00:00:00:00:00")
             continue;
@@ -171,7 +171,7 @@ inline std::vector<std::string> parse_resolvectl_cache_lines(std::string_view ou
 /**
  * Filter `systemd-resolve --statistics` captured stdout down to the three
  * known cache-related lines ("Current Cache Size:", "Cache Hits:",
- * "Cache Misses:"), each trimmed of leading whitespace -- same selectivity
+ * "Cache Misses:"), each trimmed of leading whitespace — same selectivity
  * as the old inline loop, moved here unchanged.
  */
 inline std::vector<std::string> parse_systemd_resolve_stats_lines(std::string_view output) {
@@ -192,7 +192,7 @@ inline std::vector<std::string> parse_systemd_resolve_stats_lines(std::string_vi
 }
 
 /// Format a 6-byte Ethernet address as lowercase colon-separated hex.
-/// Returns an empty string for any other length -- callers treat that as
+/// Returns an empty string for any other length — callers treat that as
 /// "unresolved/non-Ethernet", never a fabricated MAC. Shared by the Linux
 /// rtnetlink IFLA_ADDRESS decode below and network_config_plugin.cpp's
 /// macOS getifaddrs/sockaddr_dl adapters leg.
@@ -213,16 +213,16 @@ inline std::string format_mac(const unsigned char* addr, std::size_t len) {
 
 /**
  * Dedupe a vector of equality-comparable values, preserving first-seen
- * order. Pure -- O(n^2) worst case, which is fine for the small lists
+ * order. Pure — O(n^2) worst case, which is fine for the small lists
  * (a handful of DNS servers, a few dozen ARP entries) this exists for.
  *
  * Two production callers (PKG-NC fix round, live before/after parity diff):
  *   - macOS arp: the PF_ROUTE NET_RT_FLAGS/RTF_LLINFO sysctl dump can report
- *     the same {ip, mac} neighbour twice on a real host -- deduped on the
+ *     the same {ip, mac} neighbour twice on a real host — deduped on the
  *     formatted `arp|...` output line.
  *   - macOS dns_servers: unioning State:/Network/Global/DNS with every
  *     State:/Network/Service/<id>/DNS key can repeat the same resolver
- *     address across services -- deduped on the address string, global-
+ *     address across services — deduped on the address string, global-
  *     first (global is queried and appended before any per-service list).
  */
 template <typename T>
@@ -247,7 +247,7 @@ inline std::vector<T> dedupe_preserve_order(const std::vector<T>& items) {
  * collapses to its first occurrence.
  *
  * This is the DECISION half of that leg, split out from the ACQUISITION half
- * (the SCDynamicStore key enumeration) so it can be fixture-tested -- the
+ * (the SCDynamicStore key enumeration) so it can be fixture-tested — the
  * "pure core, thin shell" discipline. The key enumeration itself remains
  * untested; it has no fixture surface.
  */
@@ -314,7 +314,7 @@ inline ProxySelection select_proxy(const std::vector<ProxyServiceConfig>& candid
 
 /**
  * CIDR prefix length (count of leading 1-bits) of a HOST-byte-order IPv4
- * netmask -- 0.0.0.0 -> 0, 255.255.255.0 -> 24, 255.255.255.255 -> 32. Pure.
+ * netmask — 0.0.0.0 -> 0, 255.255.255.0 -> 24, 255.255.255.255 -> 32. Pure.
  *
  * Replaces the old macOS `ip_addresses` leg's raw hex netmask ("0xffffff00")
  * with the same prefix-length shape the Linux leg already emits (PKG-NC fix
@@ -323,7 +323,7 @@ inline ProxySelection select_proxy(const std::vector<ProxyServiceConfig>& candid
  * (#3346), so it is called out explicitly here and at the emit site).
  *
  * A malformed/non-contiguous mask (not a real netmask) still returns a
- * numeric count of leading 1-bits rather than crashing -- real netmasks are
+ * numeric count of leading 1-bits rather than crashing — real netmasks are
  * always contiguous from the MSB, so this is exact for every value a kernel
  * actually hands back; a non-contiguous input is a kernel/driver bug this
  * function does not attempt to detect.
@@ -338,7 +338,7 @@ inline unsigned int ipv4_prefix_length(std::uint32_t host_order_mask) {
 }
 
 /**
- * Same, for a 16-byte IPv6 netmask in on-wire (network) byte order -- a
+ * Same, for a 16-byte IPv6 netmask in on-wire (network) byte order — a
  * byte array has no host/network distinction, so no conversion is needed
  * before calling this (unlike ipv4_prefix_length's host-order `uint32_t`).
  */
@@ -361,8 +361,8 @@ struct RtLinkRecord {
     int index = -1;
     std::string name;
     std::string mac; // empty when unresolved/non-Ethernet
-    bool up = false; // IFF_UP -- ADMINISTRATIVE state (link is configured up)
-    // IFLA_OPERSTATE -- RFC 2863 OPERATIONAL state, or -1 when the kernel did
+    bool up = false; // IFF_UP — ADMINISTRATIVE state (link is configured up)
+    // IFLA_OPERSTATE — RFC 2863 OPERATIONAL state, or -1 when the kernel did
     // not attach the attribute. These are NOT the same thing: a cable-unplugged
     // NIC is administratively up (IFF_UP) but operationally down
     // (IF_OPER_LOWERLAYERDOWN), and `ip link` prints the operational one.
@@ -372,15 +372,15 @@ struct RtLinkRecord {
 /// Map a link record to the `adapter|...|<status>` field exactly as the
 /// pre-migration `ip -o link show` parse did.
 ///
-/// The old leg read iproute2's `state <TOKEN>` field -- which iproute2 renders
-/// from IFLA_OPERSTATE, not from IFF_UP -- and normalised "UP" to "up" and
+/// The old leg read iproute2's `state <TOKEN>` field — which iproute2 renders
+/// from IFLA_OPERSTATE, not from IFF_UP — and normalised "UP" to "up" and
 /// EVERY other token ("DOWN", "UNKNOWN", "LOWERLAYERDOWN", "DORMANT", ...) to
 /// "down". Reporting IFF_UP here instead would silently flip a carrier-down
 /// NIC and every tun/tap/WireGuard device (which sit at IF_OPER_UNKNOWN) from
 /// "down" to "up", so operational state is what this returns.
 ///
 /// When the kernel omits IFLA_OPERSTATE there is no operational signal at all,
-/// and the old leg's `status` variable kept its initialiser, "unknown" -- so
+/// and the old leg's `status` variable kept its initialiser, "unknown" — so
 /// that is what is returned, rather than the administrative flag or a
 /// fabricated "down". In practice the kernel attaches IFLA_OPERSTATE to every
 /// RTM_NEWLINK (rtnl_fill_ifinfo), so this branch is defensive; it is written
@@ -410,8 +410,8 @@ struct RtRouteRecord {
 template <typename RecordT>
 struct RtNetlinkParseChunk {
     std::vector<RecordT> records;
-    bool done = false;      // NLMSG_DONE observed -- the dump is complete
-    bool error = false;     // NLMSG_ERROR observed -- the kernel refused/failed the dump
+    bool done = false;      // NLMSG_DONE observed — the dump is complete
+    bool error = false;     // NLMSG_ERROR observed — the kernel refused/failed the dump
     bool truncated = false; // a malformed/short record stopped the walk early
 };
 
@@ -425,7 +425,7 @@ using RtRouteParse = RtNetlinkParseChunk<RtRouteRecord>;
  * complete messages). `expected_seq` discards a stale reply left over from
  * a previous dump on the same socket (mirrors net_quality_sampler.cpp's
  * nlmsg_seq echo-check). Every multi-byte struct is memcpy'd into a local,
- * aligned object before any field is read -- never a cast dereference of
+ * aligned object before any field is read — never a cast dereference of
  * the raw buffer.
  */
 inline RtLinkParse parse_rtnetlink_link_chunk(std::span<const unsigned char> blob,
@@ -450,7 +450,7 @@ inline RtLinkParse parse_rtnetlink_link_chunk(std::span<const unsigned char> blo
         if (h->nlmsg_type != RTM_NEWLINK)
             continue;
         if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct ifinfomsg)))
-            continue; // truncated payload -- skip this record, not the whole chunk
+            continue; // truncated payload — skip this record, not the whole chunk
 
         struct ifinfomsg ifi {};
         std::memcpy(&ifi, NLMSG_DATA(h), sizeof(ifi));
@@ -479,8 +479,8 @@ inline RtLinkParse parse_rtnetlink_link_chunk(std::span<const unsigned char> blo
                 const auto payload = static_cast<std::size_t>(RTA_PAYLOAD(rta));
                 // EXACTLY 6, never ">= 6 then truncate": a non-Ethernet link
                 // (InfiniBand's 20-byte address, ip6tnl, ...) must come back
-                // unresolved, matching both the old leg -- which only read a
-                // MAC from iproute2's `link/ether ` prefix -- and format_mac's
+                // unresolved, matching both the old leg — which only read a
+                // MAC from iproute2's `link/ether ` prefix — and format_mac's
                 // own contract ("never a fabricated MAC"). Truncating here
                 // would defeat that guard by pre-shortening its input.
                 if (payload == 6) {
@@ -517,7 +517,7 @@ inline RtAddrParse parse_rtnetlink_addr_chunk(std::span<const unsigned char> blo
     auto len = static_cast<int>(blob.size());
     const auto* h = reinterpret_cast<const struct nlmsghdr*>(blob.data());
     for (; NLMSG_OK(h, len); h = reinterpret_cast<const struct nlmsghdr*>(NLMSG_NEXT(h, len))) {
-        // Sequence check FIRST -- see parse_rtnetlink_link_chunk().
+        // Sequence check FIRST — see parse_rtnetlink_link_chunk().
         if (h->nlmsg_seq != expected_seq)
             continue;
         if (h->nlmsg_type == NLMSG_DONE) {
@@ -585,7 +585,7 @@ inline RtAddrParse parse_rtnetlink_addr_chunk(std::span<const unsigned char> blo
 
 /**
  * Decode one RTM_GETROUTE dump reply chunk, keeping only IPv4 default
- * routes (rtm_dst_len == 0, an RTA_GATEWAY attribute present) -- the same
+ * routes (rtm_dst_len == 0, an RTA_GATEWAY attribute present) — the same
  * single value the old `ip route show default | via` parse extracted.
  * Multiple default routes (multi-homed hosts) may each yield a record; the
  * caller takes the first.
@@ -596,7 +596,7 @@ inline RtRouteParse parse_rtnetlink_route_chunk(std::span<const unsigned char> b
     auto len = static_cast<int>(blob.size());
     const auto* h = reinterpret_cast<const struct nlmsghdr*>(blob.data());
     for (; NLMSG_OK(h, len); h = reinterpret_cast<const struct nlmsghdr*>(NLMSG_NEXT(h, len))) {
-        // Sequence check FIRST -- see parse_rtnetlink_link_chunk().
+        // Sequence check FIRST — see parse_rtnetlink_link_chunk().
         if (h->nlmsg_seq != expected_seq)
             continue;
         if (h->nlmsg_type == NLMSG_DONE) {
@@ -641,7 +641,7 @@ inline RtRouteParse parse_rtnetlink_route_chunk(std::span<const unsigned char> b
         }
         // MAIN TABLE ONLY. An NLM_F_DUMP RTM_GETROUTE returns default routes
         // from EVERY routing table, and the kernel emits non-main tables
-        // FIRST -- so without this filter the caller's records.front() does
+        // FIRST — so without this filter the caller's records.front() does
         // not merely risk the wrong gateway, it actively prefers it. The
         // pre-migration leg ran unqualified `ip route show default`, which
         // shows the main table alone. Any host running WireGuard/wg-quick,
@@ -677,14 +677,14 @@ struct DefaultRouteParse {
 
 /**
  * Parse a NET_RT_DUMP/AF_INET routing-table blob into the default route's
- * gateway address, if any. Pure -- no I/O. Walk/bounds-check discipline is
+ * gateway address, if any. Pure — no I/O. Walk/bounds-check discipline is
  * the SAME as agents/shared/route_sysctl_arp.hpp's parse_rt_flags_llinfo:
  * every rtm_msglen is checked against the remaining buffer before use, an
  * unrecognised rtm_version stops the walk (Apple has changed routing-socket
  * layout across releases with no ABI promise), every sockaddr's sa_len is
  * bounds-checked before its bytes are read, the ROUNDUP unit is the fixed
  * 4-byte routing-socket alignment (NOT sizeof(long)), and every multi-byte
- * field is memcpy'd into a local aligned object -- never a cast dereference
+ * field is memcpy'd into a local aligned object — never a cast dereference
  * of the raw blob. Any malformation stops the walk and sets `truncated`
  * rather than looping or reading out of bounds.
  *
@@ -733,14 +733,14 @@ inline DefaultRouteParse parse_default_route_dump(std::span<const unsigned char>
 
             const std::size_t remaining = static_cast<std::size_t>(rec_end - p);
             if (remaining < 2)
-                break; // this record's address chain ends here -- not an overrun
+                break; // this record's address chain ends here — not an overrun
 
             const unsigned char sa_len = p[0];
             const unsigned char sa_family = p[1];
             constexpr std::size_t kRoutingSockaddrAlign = sizeof(std::uint32_t);
             const std::size_t entry_len = sa_len ? sa_len : kRoutingSockaddrAlign;
             if (remaining < entry_len) {
-                // This sockaddr claims more than the record has left -- an
+                // This sockaddr claims more than the record has left — an
                 // overrun, not a normal chain end. Mark the whole parse
                 // truncated (matching route_sysctl_arp.hpp's ArpParse
                 // contract) but keep walking subsequent records: whatever

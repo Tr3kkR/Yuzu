@@ -485,9 +485,8 @@ GRANDFATHERED = {
     # spawn primitives and their entries grandfathered nothing while masking any
     # regression that re-introduced one. Removing an entry moves the file from
     # the base-diff path onto the FULL scan, so it is strictly stricter.
-    # network_config stays -- it is still rung 3 and is PR4.1's to remove, the
-    # remaining half of #3405.
-    "agents/plugins/network_config/src/network_config_plugin.cpp",
+    # network_config's own entry is removed the same way by PR4.1, the
+    # remaining half of #3405 -- see that commit's message for why.
     "agents/plugins/script_exec/src/script_exec_plugin.cpp",
     "agents/plugins/software_actions/src/software_actions_plugin.cpp",
     "agents/plugins/tar/src/tar_mapdrive_collector.cpp",

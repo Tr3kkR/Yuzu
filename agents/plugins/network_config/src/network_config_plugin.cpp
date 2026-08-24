@@ -41,16 +41,16 @@
 #include <vector>
 
 #include <arpa/inet.h>
-#include <linux/if.h> // IFF_UP -- see network_config_parsers.hpp's own include comment
-#include <linux/if_addr.h> // struct ifaddrmsg -- named directly in fetch_addr_dump()'s request
-#include <linux/if_link.h> // struct ifinfomsg -- named directly in fetch_link_dump()'s request
+#include <linux/if.h> // IFF_UP — see network_config_parsers.hpp's own include comment
+#include <linux/if_addr.h> // struct ifaddrmsg — named directly in fetch_addr_dump()'s request
+#include <linux/if_link.h> // struct ifinfomsg — named directly in fetch_link_dump()'s request
 #include <linux/netlink.h>
-#include <linux/rtnetlink.h> // struct rtmsg / RTM_GET* / NLM_F_* -- named directly below
+#include <linux/rtnetlink.h> // struct rtmsg / RTM_GET* / NLM_F_* — named directly below
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <yuzu/agent/runner_status.hpp>     // classify_runner_failure / forward_runner_failure
-#include <yuzu/agent/scoped_fd.hpp>         // ScopedFd -- RAII netlink socket owner
+#include <yuzu/agent/scoped_fd.hpp>         // ScopedFd — RAII netlink socket owner
 #include <yuzu/agent/subprocess_runner.hpp> // run_bounded_subprocess / probe_tool_path (dns_cache argv legs only)
 #endif
 
@@ -58,9 +58,9 @@
 // SIOCGIFMEDIA is a native BSD socket ioctl (libc + kernel headers only, no
 // framework link) used to read a real adapter link speed for do_adapters().
 #include <net/if.h>
-#include <net/if_dl.h>  // sockaddr_dl -- getifaddrs' AF_LINK entries (adapters MAC)
+#include <net/if_dl.h>  // sockaddr_dl — getifaddrs' AF_LINK entries (adapters MAC)
 #include <net/if_media.h>
-#include <net/route.h>  // NET_RT_DUMP / RTF_GATEWAY -- default-route sysctl (ip_addresses)
+#include <net/route.h>  // NET_RT_DUMP / RTF_GATEWAY — default-route sysctl (ip_addresses)
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/sockio.h>
@@ -76,9 +76,9 @@
 #include <span>
 #include <vector>
 
-#include "route_sysctl_arp.hpp" // yuzu::shared::{fetch,parse}_rt_flags_llinfo -- reused as-is (arp leg)
+#include "route_sysctl_arp.hpp" // yuzu::shared::{fetch,parse}_rt_flags_llinfo — reused as-is (arp leg)
 
-#include <yuzu/agent/scoped_cfref.hpp> // ScopedCFRef -- RAII CF object owner (dns_servers/proxy)
+#include <yuzu/agent/scoped_cfref.hpp> // ScopedCFRef — RAII CF object owner (dns_servers/proxy)
 
 #if defined(YUZU_HAVE_SYSTEMCONFIGURATION)
 #include <CoreFoundation/CoreFoundation.h>
@@ -322,7 +322,7 @@ std::string cfstring_to_utf8(CFStringRef s) {
 }
 
 // Extract the "ServerAddresses" CFArray-of-CFString from a State:/Network/
-// {Global,Service/<id>}/DNS dictionary (nullptr/absent-key safe -- a
+// {Global,Service/<id>}/DNS dictionary (nullptr/absent-key safe — a
 // service with no configured DNS has no "ServerAddresses" entry at all).
 std::vector<std::string> extract_server_addresses(CFDictionaryRef dict) {
     std::vector<std::string> out;
@@ -331,8 +331,8 @@ std::vector<std::string> extract_server_addresses(CFDictionaryRef dict) {
     // Type-check before every CF cast. A CoreFoundation cast is an unchecked
     // pointer cast, so calling CFArray/CFString APIs on a different CF type is
     // undefined behaviour and in practice faults inside CoreFoundation. Any
-    // writer to State:/Network/Service/<id>/DNS -- a third-party VPN or
-    // network-extension bundle, a malformed configuration profile -- can put a
+    // writer to State:/Network/Service/<id>/DNS — a third-party VPN or
+    // network-extension bundle, a malformed configuration profile — can put a
     // non-conforming value here, and this action runs fleet-wide. do_proxy
     // below already guards every read this way; this path did not.
     const void* servers_v = CFDictionaryGetValue(dict, CFSTR("ServerAddresses"));
@@ -386,7 +386,7 @@ std::string sockaddr_to_string(LPSOCKADDR sa) {
 //
 // Thin impure shells: own the socket/send/recv mechanics only. Every byte
 // of decode logic lives in network_config_parsers.hpp's pure, span-based
-// parse_rtnetlink_*_chunk() functions -- these loops just hand each
+// parse_rtnetlink_*_chunk() functions — these loops just hand each
 // recvmsg() buffer to the decoder and accumulate its records.
 
 constexpr std::size_t kNetlinkRecvBufSize = 16384; // matches net_quality_sampler.cpp's convention
@@ -457,6 +457,18 @@ LinkDumpResult fetch_link_dump() {
         } while (n < 0 && errno == EINTR);
         if (n <= 0)
             return result; // ok stays false — an honest incomplete read
+        // Netlink unicast between USER sockets is permitted, so a reply
+        // arriving on this socket is not necessarily from the kernel. The
+        // auto-bound portid is the agent's pid (readable from /proc) and the
+        // sequence numbers below are fixed literals, so a local unprivileged
+        // process could otherwise inject forged RTM_NEW* records into
+        // fleet-reported adapters, addresses and the default gateway. The
+        // agent runs under its own account precisely so local users cannot
+        // influence it (docs/agent-privilege-model.md). Only the kernel sends
+        // from portid 0.
+        if (rsa.nl_pid != 0)
+            continue; // not from the kernel — discard, do not parse
+
         // MSG_TRUNC means the kernel discarded the tail of this datagram
         // because it exceeded our fixed buffer. If the retained prefix ends on
         // a valid netlink message boundary the parser cannot see the loss, and
@@ -529,6 +541,18 @@ AddrDumpResult fetch_addr_dump() {
         } while (n < 0 && errno == EINTR);
         if (n <= 0)
             return result;
+        // Netlink unicast between USER sockets is permitted, so a reply
+        // arriving on this socket is not necessarily from the kernel. The
+        // auto-bound portid is the agent's pid (readable from /proc) and the
+        // sequence numbers below are fixed literals, so a local unprivileged
+        // process could otherwise inject forged RTM_NEW* records into
+        // fleet-reported adapters, addresses and the default gateway. The
+        // agent runs under its own account precisely so local users cannot
+        // influence it (docs/agent-privilege-model.md). Only the kernel sends
+        // from portid 0.
+        if (rsa.nl_pid != 0)
+            continue; // not from the kernel — discard, do not parse
+
         // MSG_TRUNC means the kernel discarded the tail of this datagram
         // because it exceeded our fixed buffer. If the retained prefix ends on
         // a valid netlink message boundary the parser cannot see the loss, and
@@ -601,6 +625,18 @@ RouteDumpResult fetch_default_route_dump() {
         } while (n < 0 && errno == EINTR);
         if (n <= 0)
             return result;
+        // Netlink unicast between USER sockets is permitted, so a reply
+        // arriving on this socket is not necessarily from the kernel. The
+        // auto-bound portid is the agent's pid (readable from /proc) and the
+        // sequence numbers below are fixed literals, so a local unprivileged
+        // process could otherwise inject forged RTM_NEW* records into
+        // fleet-reported adapters, addresses and the default gateway. The
+        // agent runs under its own account precisely so local users cannot
+        // influence it (docs/agent-privilege-model.md). Only the kernel sends
+        // from portid 0.
+        if (rsa.nl_pid != 0)
+            continue; // not from the kernel — discard, do not parse
+
         // MSG_TRUNC means the kernel discarded the tail of this datagram
         // because it exceeded our fixed buffer. If the retained prefix ends on
         // a valid netlink message boundary the parser cannot see the loss, and
@@ -677,7 +713,7 @@ int do_adapters(yuzu::CommandContext& ctx) {
         }
 
         const std::string mac = rec.mac.empty() ? "-" : rec.mac;
-        // OPERATIONAL state, not the IFF_UP administrative flag -- see
+        // OPERATIONAL state, not the IFF_UP administrative flag — see
         // link_status_string()'s contract in network_config_parsers.hpp.
         ctx.write_output(std::format("adapter|{}|{}|{}|{}", rec.name, mac, speed,
                                      yuzu::network_config::link_status_string(rec)));
@@ -694,7 +730,7 @@ int do_adapters(yuzu::CommandContext& ctx) {
                               "network_config:getifaddrs_failed");
         return 0;
     }
-    // Adopt IMMEDIATELY -- everything below allocates and can throw.
+    // Adopt IMMEDIATELY — everything below allocates and can throw.
     IfAddrsGuard head_guard(raw_head);
     struct ifaddrs* const head = raw_head;
 
@@ -822,7 +858,7 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
         // DEVICE name first, IFA_LABEL only as a fallback. The pre-migration
         // leg read iproute2's second column, which is the device ("eth0"),
         // never the alias label ("eth0:1"). Preferring the label would rename
-        // every aliased row and -- worse -- let a loopback alias ("lo:1")
+        // every aliased row and — worse — let a loopback alias ("lo:1")
         // slip past the loopback filter below, which the old leg dropped.
         std::string name;
         if (auto it = name_by_index.find(rec.index); it != name_by_index.end())
@@ -852,7 +888,7 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
     const std::string default_gw = gw_result.gateway;
     if (!gw_result.ok || gw_result.truncated) {
         // The address rows below are still valid, so this is CONSTRAINED/
-        // PARTIAL rather than UNAVAILABLE -- but it must not be silent: a
+        // PARTIAL rather than UNAVAILABLE — but it must not be silent: a
         // gateway of "-" reported with an OK status is the positive claim
         // "this host has no default route".
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
@@ -865,7 +901,7 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
                               "network_config:getifaddrs_failed");
         return 0;
     }
-    // Adopt IMMEDIATELY -- everything below allocates and can throw.
+    // Adopt IMMEDIATELY — everything below allocates and can throw.
     IfAddrsGuard head_guard(raw_head);
     struct ifaddrs* const head = raw_head;
 
@@ -878,12 +914,12 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
             continue;
 
         // Netmasks are emitted as a CIDR prefix length ("24", "32"), NOT
-        // the old macOS leg's raw hex ("0xffffff00") -- a deliberate
+        // the old macOS leg's raw hex ("0xffffff00") — a deliberate
         // cross-platform consistency fix (PKG-NC fix round): the Linux
         // rtnetlink leg already emits a prefix length (ifa_prefixlen), and
         // the two legs previously disagreed on this field's SHAPE, not just
         // its value. Dashboard-side parsers have broken on exactly this
-        // kind of shape mismatch before (#3346) -- called out here and in
+        // kind of shape mismatch before (#3346) — called out here and in
         // the PR report's behavior-change list, not left for a reviewer to
         // discover independently.
         if (p->ifa_addr->sa_family == AF_INET) {
@@ -897,7 +933,7 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
                 // Clamp to the kernel's declared sa_len: an AF_INET netmask
                 // sockaddr is routinely SHORTER than sizeof(sockaddr_in) --
                 // measured 5 bytes (lo0), 7 (en0/en1) and 8 (utun4) on a live
-                // host -- because the trailing all-zero bytes are elided.
+                // host — because the trailing all-zero bytes are elided.
                 // Copying the full 16 bytes reads past the object; getifaddrs
                 // packs every sockaddr into one block so it usually goes
                 // unnoticed, but for the last sockaddr in that block it runs
@@ -992,7 +1028,7 @@ int do_dns_servers(yuzu::CommandContext& ctx) {
     auto store = open_dynamic_store();
     if (store) {
         // State:/Network/Global/DNS alone only ever reports the primary
-        // resolver -- `scutil --dns` (the pre-migration mechanism) walks
+        // resolver — `scutil --dns` (the pre-migration mechanism) walks
         // every configured network SERVICE's own resolver list too, and a
         // host with supplemental/per-service DNS servers has them there,
         // not in the global key. Reading only the global key silently
@@ -1012,14 +1048,17 @@ int do_dns_servers(yuzu::CommandContext& ctx) {
         {
             // SCDynamicStoreCopyKeyList's `pattern` argument is ALWAYS a
             // POSIX regex match against store keys (unlike
-            // SCDynamicStoreCopyValue's exact-match `key`) -- no separate
+            // SCDynamicStoreCopyValue's exact-match `key`) — no separate
             // "is this a regex" flag exists.
             yuzu::agent::ScopedCFRef<CFArrayRef> keys(static_cast<CFArrayRef>(
                 SCDynamicStoreCopyKeyList(store.get(), CFSTR("State:/Network/Service/.*/DNS"))));
             if (keys) {
                 const CFIndex key_count = CFArrayGetCount(keys.get());
                 for (CFIndex i = 0; i < key_count; ++i) {
-                    auto* key = static_cast<CFStringRef>(CFArrayGetValueAtIndex(keys.get(), i));
+                    const void* key_v = CFArrayGetValueAtIndex(keys.get(), i);
+                    if (!key_v || CFGetTypeID(key_v) != CFStringGetTypeID())
+                        continue; // type-check every CF cast, as the rest of this file does
+                    auto* key = static_cast<CFStringRef>(key_v);
                     yuzu::agent::ScopedCFRef<CFDictionaryRef> svc_dict(
                         static_cast<CFDictionaryRef>(SCDynamicStoreCopyValue(store.get(), key)));
                     server_groups.push_back(extract_server_addresses(svc_dict.get()));
@@ -1031,13 +1070,13 @@ int do_dns_servers(yuzu::CommandContext& ctx) {
             ctx.write_output(std::format("dns|system|{}|{}", server, type));
         }
     } else {
-        // The store could not be opened -- zero rows here would otherwise be
+        // The store could not be opened — zero rows here would otherwise be
         // indistinguishable from "this host has no resolvers configured".
         ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               "network_config:dynamic_store_unavailable");
     }
 #else
-    // Compiled without SystemConfiguration -- honest gap, no fabricated list.
+    // Compiled without SystemConfiguration — honest gap, no fabricated list.
     ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                           "network_config:no_systemconfiguration");
 #endif
@@ -1108,7 +1147,7 @@ int do_proxy(yuzu::CommandContext& ctx) {
     // primary service is Ethernet with the proxy configured on Wi-Fi, the
     // top-level read reports `none` where the old leg reported `http`. That is
     // a silent regression on an action tagged `compliance`, so the scoped
-    // services are enumerated too -- the same shape the dns_servers leg above
+    // services are enumerated too — the same shape the dns_servers leg above
     // already uses for its per-service resolver union.
     yuzu::agent::ScopedCFRef<CFDictionaryRef> proxies(SCDynamicStoreCopyProxies(nullptr));
     bool emitted = false;
@@ -1161,7 +1200,7 @@ int do_proxy(yuzu::CommandContext& ctx) {
 
         // "__SCOPED__" is an OBSERVED key, not a published one: it carries no
         // kSCPropNetProxies* constant in SCSchemaDefinitions.h on this SDK.
-        // Treated strictly as best-effort enrichment -- absent or wrongly
+        // Treated strictly as best-effort enrichment — absent or wrongly
         // typed, the code falls back to exactly the top-level-only behaviour,
         // so a future OS that drops or renames it degrades to the previous
         // result rather than failing. Every value is type-checked below.
@@ -1477,7 +1516,11 @@ private:
         }
         auto parsed = yuzu::shared::parse_rt_flags_llinfo(fetched.blob);
         if (parsed.truncated) {
-            ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_PARTIAL,
+            // CONSTRAINED, matching every other truncation path in this file
+            // (rtnetlink dumps, PF_ROUTE default route). OK+PARTIAL is legal
+            // per the SDK but was the odd one out.
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
+                                  YUZU_RESULT_COMPLETENESS_PARTIAL,
                                   "network_config:pf_route_arp_truncated");
         }
         // route_sysctl_arp.hpp's ArpRecord carries only {ip, mac} — no
@@ -1597,7 +1640,7 @@ private:
                 // through to the statistics fallback and ultimately to the
                 // `dns_cache|not_available` sentinel. Returning here on zero
                 // rows would instead hand back an empty, STATUS-OK response --
-                // no rows, no sentinel, no degradation signal -- which every
+                // no rows, no sentinel, no degradation signal — which every
                 // other dns_cache path on every other platform avoids.
                 if (emitted > 0)
                     return 0;
@@ -1626,6 +1669,11 @@ private:
             }
         }
 
+        // The ABI4 descriptor for this leg promises it "reports unavailable
+        // when resolvectl is absent" — so it must actually set the status,
+        // not just emit an in-band sentinel that leaves the result OK.
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "network_config:no_resolver_cache_tool");
         ctx.write_output("dns_cache|not_available|no systemd-resolved");
 
 #elif defined(__APPLE__)
