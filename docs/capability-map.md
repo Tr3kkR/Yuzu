@@ -375,14 +375,16 @@ Not implemented. Desktop interaction to enumerate visible application windows.
 
 ### 8.1 Installed Update Enumeration :white_check_mark: `T1`
 
-`windows_updates` plugin with `installed` action. Cross-platform: Windows (Get-HotFix), Linux (rpm/apt), macOS (system_profiler).
+`windows_updates` plugin with `installed` action. Cross-platform: Windows (bounded WMI `Win32_QuickFixEngineering` query, capped at 512 rows, unsorted — WQL has no `ORDER BY` for a data-class query, a disclosed behaviour change from the retired PowerShell path's 50-most-recent-sorted output), Linux (rpm/apt), macOS (system_profiler).
 
 ### 8.2 Pending Reboot Detection :white_check_mark: `T1`
 
 `windows_updates` plugin `pending_reboot` action. Cross-platform reboot-pending detection:
 Windows (3 registry keys: WindowsUpdate RebootRequired, CBS RebootPending, Session Manager PendingFileRenameOperations),
 Linux (reboot-required file + kernel version comparison + needs-restarting fallback),
-macOS (softwareupdate restart flag). Reports per-source status and aggregate boolean.
+macOS (softwareupdate restart flag, bounded to a 60s deadline — replaces the plugin's
+own prior unbounded `popen()` call, which could hang indefinitely on a headless/offline
+Mac). Reports per-source status and aggregate boolean.
 
 ### 8.3 Patch Deployment :white_check_mark: `T2`
 

@@ -1522,6 +1522,67 @@ Quarantine a device.
 > shape; REST matches the MCP `quarantine_device` twin's A5 behavior, not
 > its exact field path).
 
+> **This route records; it does NOT dispatch — and the twins have diverged
+> on the already-quarantined case (#3127).** `POST /api/v1/quarantine`
+> writes the quarantine record only. The live plugin isolation is dispatched
+> by the MCP `quarantine_device` tool, which has no REST twin. Two
+> consequences for a client that treats the two transports as
+> interchangeable:
+>
+> - A `201` here means **the record was written**, not that the device's
+>   firewall is enforcing anything. To isolate a device over REST, dispatch
+>   `quarantine.quarantine` through the normal execution routes as well —
+>   see [Security Hardening](security-hardening.md#device-quarantine).
+> - The MCP tool now treats an already-active record as a **retryable
+>   re-dispatch**, not a terminal error; this route still answers `400`,
+>   because with no dispatch of its own there is nothing for it to re-drive.
+>   The `400`-vs-`503` split above is unchanged and still mirrors the twin;
+>   the already-quarantined *outcome* no longer does.
+
+> **A quarantined device is refused at dispatch (#881).** Once a device is
+> quarantined, every dispatch route below — `POST /api/command`,
+> `POST /api/instructions/{id}/execute`, and the scope/group/broadcast arms —
+> drops that device before the command reaches the agent, increments
+> `yuzu_server_dispatch_target_rejected_total{reason="quarantined"}`, and
+> writes a `quarantine.dispatch_denied` audit row (`target_type=Security`;
+> `target_id` is the device, or `*` on a fail-closed denial **and** on the
+> summary row that follows a capped per-device fan-out — see
+> [Audit Log](audit-log.md)).
+>
+> **`POST /api/command` reports what it withheld.** The success body carries
+> `withheld_quarantined` — always present, `0` on a clean dispatch — so
+> `agents_reached: 97` on a 100-device group is distinguishable from three
+> devices being offline. The dashboard toast says the same.
+>
+> **Its `503` now names the cause.** Three conditions previously shared one
+> body ("failed to send command to any agent"), and one of them is a
+> fleet-wide policy state rather than a transport failure:
+>
+> | `error.reason` | Meaning | `retry_after_ms` |
+> |---|---|---|
+> | `containment_unreadable` | The gate is failing closed: containment state cannot be read, so **every** target on **every** dispatch is refused. A server condition, not a device one. | `5000` |
+> | `quarantined` | Every target named is contained. The dispatch was withheld, not attempted. | `null` — retrying will not help until the device is released |
+> | *(absent)* | Genuinely no agent reachable — the pre-existing meaning. | *(absent)* |
+>
+> `reason` is a top-level key on the error object, not part of the A4
+> `error.data` envelope. The versioned dispatch routes
+> (`POST /api/instructions/{id}/execute`, the bundle and result-set producers)
+> do **not** yet carry this split — they answer their existing
+> "no agents reached" shapes for all three conditions, because the shared
+> dispatch closure returns only a sent count. Tracked as #3424. The quarantine
+> plugin's own four actions (`quarantine`, `unquarantine`, `status`,
+> `whitelist`) are exempt so that release stays reachable, and so are three
+> server-internal pushes that are not operator dispatch —
+> `tar.fleet_snapshot`, `__guard__.push_rules` and `asset_tags.sync`, a closed
+> set counted (not per-event audited) by `yuzu_server_system_reserved_push_total`.
+> Nothing else is.
+> If containment
+> state becomes unreadable for longer than a 60-second last-known-good
+> window, dispatch fails **closed** and refuses every target fleet-wide —
+> alert on `yuzu_server_quarantine_gate_total{outcome="fail_closed"}`, which
+> is an outage signal rather than a quarantine one
+> (see [Metrics](metrics.md)).
+
 ---
 
 #### `DELETE /api/v1/quarantine/{agent_id}`
