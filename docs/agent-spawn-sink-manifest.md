@@ -33,6 +33,20 @@ in one function; IDs are never reused after a site is deleted).
 Populated as the migration reaches each site (and immediately for any new or
 interim site — ADR-3002 Decisions 1 and 2).
 
+> **Limitation of the lexical CI gate — read before relying on it.**
+> `scripts/ci/check-plugin-spawn-lexical.sh` scans for raw spawn TOKENS
+> (`popen`/`system`/`fork`/`CreateProcess`). It does **not** see an interpreter
+> payload routed through the shared bounded runner: an argv vector of the shape
+> `{"/bin/sh","-c", ...}` handed to `run_bounded_subprocess` passes the gate
+> clean. This was confirmed empirically — that exact shape was injected into a
+> migrated plugin and the gate still reported no findings. So the gate enforces
+> "no raw spawn primitive", NOT ADR-3002 Decision 5's "no interpreter", and a
+> future change can silently return a plugin to rung 3 without CI noticing.
+> Until the gate is extended, the only guard is per-plugin: `wifi` pins it with
+> pure argv-builder functions plus a unit test asserting no vector invokes an
+> interpreter (`argv_invokes_interpreter`, `tests/unit/test_wifi_parsers.cpp`).
+
+
 | Site ID | Location | Mechanism | Platform | Provenance | Mutating | Shell features | Privilege | Ladder review | Rung + evidence | Registration |
 |---|---|---|---|---|---|---|---|---|---|---|
 | `users/do_logged_on#1` | `agents/plugins/users/src/users_plugin.cpp:do_logged_on` | runner argv | macOS | compile-time literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
@@ -153,7 +167,7 @@ interim site — ADR-3002 Decisions 1 and 2).
 | `wifi/do_list_networks#2` | `agents/plugins/wifi/src/wifi_plugin.cpp:do_list_networks` | runner argv (`iw dev`), path via `probe_tool_path` | Linux | none — fixed literal argv | read-only | none — grep/awk pipeline replaced by pure `parse_iw_dev_interfaces` | none | tertiary fallback, reached only when D-Bus and nmcli are both unavailable | Rung 2 — direct argv; rung 1 passed over on the last-resort raw-text path | n/a |
 | `wifi/do_list_networks#3` | `agents/plugins/wifi/src/wifi_plugin.cpp:do_list_networks` | runner argv (`iwlist <iface> scan`), path via `probe_tool_path` | Linux | iface name from local `iw dev` enumeration output (not operator input) | read-only | none — grep replaced by pure `filter_iwlist_scan_lines` | none | same as #2 | Rung 2 — direct argv | n/a |
 | `wifi/do_list_networks#4` | `agents/plugins/wifi/src/wifi_plugin.cpp:do_list_networks` | runner argv (`airport -s`, fixed private-framework path) | macOS | none — fixed literal argv | read-only | none | none | no Location-Services-free scan API on macOS; native scan path owned by the user-context-bridge work | Rung 2 — direct argv, up from rung 3 (`/bin/sh -c`) before this migration | n/a |
-| `wifi/do_list_networks#5` | `agents/plugins/wifi/src/wifi_plugin.cpp:do_list_networks` | runner argv (`/usr/sbin/system_profiler SPAirPortDataType`) | macOS | none — fixed literal argv | read-only | none | none | same as #4 | Rung 2 — direct argv, up from rung 3 | n/a |
+| `wifi/do_list_networks#5` | `agents/plugins/wifi/src/wifi_plugin.cpp:do_list_networks` | runner argv (`/usr/sbin/system_profiler SPAirPortDataType -detailLevel basic`) | macOS | none — fixed literal argv | read-only | none | none | same as #4 | Rung 2 — direct argv, up from rung 3 | n/a |
 | `wifi/do_connected#1` | `agents/plugins/wifi/src/wifi_plugin.cpp:do_connected` | runner argv (`nmcli -t -f ACTIVE,SSID,SIGNAL,SECURITY,BSSID,DEVICE device wifi list`, ACTIVE row selected), path via `probe_tool_path` | Linux | none — fixed literal argv | read-only | none — line bound via the runner's max_lines | none | rung 1 (NetworkManager D-Bus) tried first; declared fallback | Rung 2 — direct argv, reached only on sd-bus failure | n/a |
 | `wifi/do_connected#2` | `agents/plugins/wifi/src/wifi_plugin.cpp:do_connected` | runner argv (`iwconfig`), path via `probe_tool_path` | Linux | none — fixed literal argv | read-only | none — grep replaced by pure `filter_iwconfig_essid_signal_lines` | none | tertiary fallback | Rung 2 — direct argv | n/a |
 

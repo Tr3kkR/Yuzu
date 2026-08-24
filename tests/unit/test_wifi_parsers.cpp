@@ -191,6 +191,35 @@ TEST_CASE("wifi: connected argv asks device wifi list, never the invalid device 
     CHECK(has_active);
 }
 
+// ADR-3002 Decision 6 is an explicit MUST: every migrated site handles option
+// injection, by `--` where the tool supports it or by rejecting leading-`-`
+// values. iwlist takes no `--`, so rejection is the mechanism and this is its
+// regression guard. The iface is the ONLY non-literal element in any wifi argv.
+TEST_CASE("wifi: iwlist argv rejects an interface name that could be read as a flag",
+          "[wifi]") {
+    CHECK(is_safe_iface_name("wlan0"));
+    CHECK(is_safe_iface_name("wlp3s0"));
+    CHECK(is_safe_iface_name("wlan0.100"));
+
+    // A leading '-' is the whole point: iwlist would read these as options.
+    CHECK_FALSE(is_safe_iface_name("-i"));
+    CHECK_FALSE(is_safe_iface_name("--help"));
+    // Shell/path metacharacters and whitespace have no place in an iface name.
+    CHECK_FALSE(is_safe_iface_name("wlan0;reboot"));
+    CHECK_FALSE(is_safe_iface_name("wlan0 scan"));
+    CHECK_FALSE(is_safe_iface_name("../../etc/passwd"));
+    CHECK_FALSE(is_safe_iface_name(""));
+    // IFNAMSIZ-1 = 15.
+    CHECK_FALSE(is_safe_iface_name("0123456789abcdef"));
+
+    // A rejected name yields an EMPTY argv, which run_tool() treats as a
+    // spawn_error -- so it degrades through the honest path rather than
+    // scanning something unintended.
+    CHECK(iwlist_scan_argv("/usr/sbin/iwlist", "-i").empty());
+    CHECK(iwlist_scan_argv("/usr/sbin/iwlist", "wlan0;reboot").empty());
+    CHECK_FALSE(iwlist_scan_argv("/usr/sbin/iwlist", "wlan0").empty());
+}
+
 TEST_CASE("wifi: iwlist scan argv carries the discovered interface", "[wifi]") {
     auto argv = iwlist_scan_argv("/usr/sbin/iwlist", "wlan1");
     REQUIRE(argv.size() == 3);
@@ -276,27 +305,54 @@ TEST_CASE("wifi: parse_airport_scan parses a fixed-width row", "[wifi]") {
 
 TEST_CASE("wifi: parse_system_profiler_wifi extracts networks under the section header",
           "[wifi]") {
-    // Network-name lines sit at exactly 14 leading spaces in real
-    // system_profiler output -- the indent the parser's fixed-column check
-    // requires (see the "              " (14-space) literal in
-    // wifi_parsers.hpp's parse_system_profiler_wifi).
+    // Indentation CAPTURED from a live `system_profiler SPAirPortDataType`
+    // run (Darwin 25.5): the section header sits at 10 spaces, each network
+    // NAME at 12, and its sub-fields at 14. The previous fixture put names at
+    // 14 to match a fixed-column check in the parser -- so it pinned the
+    // parser's own constant instead of the tool's real output, and hid the
+    // fact that the parser matched nothing on any real host.
     std::string blob =
-        "      Other Local Wi-Fi Networks:\n"
-        "              HomeNet:\n"
-        "                  Channel: 6\n"
-        "                  Signal / Noise: -40 dBm / -90 dBm\n"
-        "                  Security: WPA2 Personal\n"
-        "              Guest:\n"
-        "                  Channel: 11\n"
-        "                  Signal / Noise: -60 dBm / -90 dBm\n";
+        "          Other Local Wi-Fi Networks:\n"
+        "            HomeNet:\n"
+        "              PHY Mode: 802.11ax\n"
+        "              Channel: 6 (2GHz, 20MHz)\n"
+        "              Network Type: Infrastructure\n"
+        "              Security: WPA2 Personal\n"
+        "              Signal / Noise: -40 dBm / -90 dBm\n"
+        "            Guest:\n"
+        "              Channel: 149 (5GHz, 80MHz)\n";
     auto rows = parse_system_profiler_wifi(blob);
     REQUIRE(rows.size() == 2);
     CHECK(rows[0].ssid == "HomeNet");
+    // "6 (2GHz, 20MHz)" -> "6": the other legs emit a bare channel number, so
+    // the column has to mean the same thing on all of them.
     CHECK(rows[0].channel == "6");
     CHECK(rows[0].signal == "-40 dBm / -90 dBm");
     CHECK(rows[0].security == "WPA2 Personal");
     CHECK(rows[1].ssid == "Guest");
+    CHECK(rows[1].channel == "149");
     CHECK(rows[1].security == "Unknown"); // no Security line for this entry
+}
+
+// Regression guard for the indent bug specifically: a name at 12 must parse.
+// Under the old fixed 14-column rule this returned zero rows on every real
+// macOS host, and do_list_networks then blamed Location Services for it.
+TEST_CASE("wifi: parse_system_profiler_wifi does not depend on a fixed indent column",
+          "[wifi]") {
+    std::string shallow =
+        "      Other Local Wi-Fi Networks:\n"
+        "        NetA:\n"
+        "          Channel: 1\n";
+    std::string deep =
+        "            Other Local Wi-Fi Networks:\n"
+        "              NetA:\n"
+        "                Channel: 1\n";
+    auto a = parse_system_profiler_wifi(shallow);
+    auto b = parse_system_profiler_wifi(deep);
+    REQUIRE(a.size() == 1);
+    REQUIRE(b.size() == 1);
+    CHECK(a[0].ssid == "NetA");
+    CHECK(b[0].ssid == "NetA");
 }
 
 TEST_CASE("wifi: parse_system_profiler_wifi with no section header yields no rows", "[wifi]") {
@@ -351,13 +407,23 @@ TEST_CASE("wifi: frequency_to_channel — unrecognised frequency is honestly 0",
 // an unsecured AP as "Open". If the D-Bus leg disagreed, the SAME access point
 // would change its reported security string purely because the host degraded
 // from D-Bus to nmcli.
-TEST_CASE("wifi: nm_security_flags_to_string — open network matches the nmcli vocabulary",
-          "[wifi]") {
-    CHECK(nm_security_flags_to_string(0, 0) == "Open");
-    // Pin the cross-rung agreement directly: same AP, both acquisition paths.
+TEST_CASE("wifi: an open network reads the same on every acquisition rung", "[wifi]") {
+    // The whole point: the SAME access point must not change its reported
+    // security because the host degraded from D-Bus to nmcli to airport.
+    const std::string dbus = nm_security_flags_to_string(0, 0);
+    CHECK(dbus == "Open");
+
     auto nmcli_rows = parse_nmcli_wifi_list("OpenNet:70::6:AA");
     REQUIRE(nmcli_rows.size() == 1);
-    CHECK(nmcli_rows[0].security == nm_security_flags_to_string(0, 0));
+    CHECK(nmcli_rows[0].security == dbus);
+
+    // airport prints the literal "NONE" for an unsecured AP -- the leg the
+    // previous version of this test never touched, and the one that disagreed.
+    auto airport_rows = parse_airport_scan(
+        "                            SSID BSSID             RSSI CHANNEL HT CC SECURITY\n"
+        "                         OpenNet aa:bb:cc:dd:ee:ff  -40       6  Y  US NONE\n");
+    REQUIRE(airport_rows.size() == 1);
+    CHECK(airport_rows[0].security == dbus);
 }
 
 TEST_CASE("wifi: nm_security_flags_to_string — WPA1 only", "[wifi]") {

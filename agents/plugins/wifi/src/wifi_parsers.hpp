@@ -30,6 +30,7 @@
  * the plugin wire-safety helper.
  */
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <sstream>
@@ -166,7 +167,7 @@ inline std::optional<WifiConnectedRow> parse_nmcli_wifi_list_active(std::string_
         // change does not silently select nothing.
         auto& active = fields[0];
         const bool is_active =
-            active == "*" || active.size() == 3 && (active[0] == 'y' || active[0] == 'Y');
+            active == "*" || (active.size() == 3 && (active[0] == 'y' || active[0] == 'Y'));
         if (!is_active)
             continue;
         WifiConnectedRow row;
@@ -321,7 +322,10 @@ inline std::vector<WifiNetworkRow> parse_airport_scan(std::string_view raw) {
 
         if (ssid.empty())
             ssid = "<hidden>";
-        if (security.empty())
+        // airport prints the literal "NONE" for an unsecured AP where the
+        // nmcli, system_profiler and D-Bus legs all say "Open". Normalise, so
+        // the same AP does not change its reported security with the rung.
+        if (security.empty() || security == "NONE" || security == "none")
             security = "Open";
 
         WifiNetworkRow row;
@@ -371,11 +375,27 @@ inline std::vector<WifiNetworkRow> parse_system_profiler_wifi(std::string_view r
         }
         if (!in_others)
             continue;
-        if (line.size() > 14 && line.substr(0, 14) == "              " && line[14] != ' ' &&
-            line.back() == ':') {
-            flush();
-            ssid = line.substr(14, line.size() - 15);
-            continue;
+        // A network NAME is a line that is nothing but "<name>:" -- no value
+        // after the colon. Sub-fields ("Channel: 124 (5GHz, 80MHz)") always
+        // carry one, so the two are distinguishable without hardcoding a column.
+        //
+        // The previous rule required EXACTLY 14 leading spaces. Real
+        // system_profiler output (verified live on Darwin 25.5) indents the
+        // section at 10, the network NAME at 12 and its sub-fields at 14 -- so
+        // that rule matched no name on any real host, this parser returned zero
+        // rows every time, and do_list_networks then blamed Location Services
+        // in its sentinel. The bug PREDATES this change (base
+        // wifi_plugin.cpp:335 carried the identical constant); what this change
+        // added was a fixture that PINNED the wrong column, which is how it
+        // survived a rewrite. Indent is now relative -- only ordering matters.
+        const auto indent = line.find_first_not_of(' ');
+        if (indent != std::string::npos && line.back() == ':' && line.size() > indent + 1) {
+            const std::string body = line.substr(indent, line.size() - indent - 1);
+            if (body.find(':') == std::string::npos) {
+                flush();
+                ssid = body;
+                continue;
+            }
         }
         auto colon = line.find(':');
         if (colon == std::string::npos)
@@ -386,8 +406,12 @@ inline std::vector<WifiNetworkRow> parse_system_profiler_wifi(std::string_view r
             key.erase(0, 1);
         while (!val.empty() && val.front() == ' ')
             val.erase(0, 1);
-        if (key == "Channel")
-            channel = val;
+        if (key == "Channel") {
+            // Real output is "124 (5GHz, 80MHz)"; every other leg emits a bare
+            // channel number, so trim at the first space to keep the column
+            // meaning the same across rungs.
+            channel = val.substr(0, val.find(' '));
+        }
         else if (key == "Signal / Noise")
             rssi = val;
         else if (key == "Security")
@@ -581,7 +605,43 @@ inline std::vector<std::string> iw_dev_argv(std::string_view tool) {
     return {std::string{tool}, "dev"};
 }
 
+// ADR-3002 Decision 6 (an explicit MUST): "Every migrated site must handle
+// option injection (pass `--` before positional values where supported, or
+// reject leading-`-` values)". `iwlist` accepts no `--`, so the alternative
+// applies and this is where it lives.
+//
+// `iface` is the ONLY non-literal element in any wifi argv vector. It comes
+// from this host's own `iw dev` output rather than from an operator, but that
+// is a statement about today's caller, not a property of the value: an
+// interface named `-i` or `--help` would be read by iwlist as a FLAG, not as
+// the positional it is passed as. Validating in the pure builder means the
+// guard cannot be bypassed by a future second caller, and can be unit-tested
+// without spawning anything.
+//
+// Linux caps interface names at IFNAMSIZ-1 = 15 bytes; the kernel also
+// forbids '/' and whitespace. This accepts the conservative portable subset
+// and rejects everything else, including any leading '-'.
+inline bool is_safe_iface_name(std::string_view iface) {
+    if (iface.empty() || iface.size() > 15)
+        return false;
+    if (iface.front() == '-')
+        return false;
+    for (char c : iface) {
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-' || c == ':';
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
+// Returns an EMPTY vector for a rejected interface name. An empty argv is what
+// run_tool() already treats as a runtime-reject (spawn_error, tool_ran=false),
+// so a rejected name degrades through the same honest path as a missing tool
+// rather than silently scanning the wrong thing.
 inline std::vector<std::string> iwlist_scan_argv(std::string_view tool, std::string_view iface) {
+    if (!is_safe_iface_name(iface))
+        return {};
     return {std::string{tool}, std::string{iface}, "scan"};
 }
 

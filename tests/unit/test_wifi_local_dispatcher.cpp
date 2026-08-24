@@ -139,11 +139,13 @@ TEST_CASE("wifi plugin: list_networks reaches the real platform mechanism end to
 // acquisition path the binary cannot actually take.
 TEST_CASE("wifi plugin: capability descriptors state the rung this binary can actually reach",
           "[wifi][posix_actions][descriptor]") {
+    // REQUIRE, not a WARN-and-return: `load_wifi_plugin()` returns nullopt on a
+    // failed dlopen OR a null descriptor, and tests/meson.build's link_depends
+    // guarantees the artifact exists -- so the only remaining causes are
+    // exactly the ABI/descriptor regressions this test was written to catch.
+    // Skipping on them would make it pass vacuously in the one case that matters.
     auto plugin = load_wifi_plugin();
-    if (!plugin) {
-        WARN("wifi plugin library not found -- skipping descriptor contract test");
-        return;
-    }
+    REQUIRE(plugin.has_value());
 
     const auto* d = plugin->descriptor;
     REQUIRE(d->action_descriptors != nullptr);

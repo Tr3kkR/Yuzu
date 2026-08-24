@@ -738,6 +738,7 @@ int do_list_networks(yuzu::CommandContext& ctx) {
         auto iwlist_path =
             yuzu::agent::probe_tool_path({"/usr/sbin/iwlist", "/sbin/iwlist", "/usr/bin/iwlist"});
         bool any_scan_answered = false;
+        bool emitted_scan_output = false;
         bool status_forwarded = false;
         for (auto& iface : ifaces) {
             auto scan_res = run_tool(yuzu::wifi::iwlist_scan_argv(iwlist_path, iface));
@@ -747,6 +748,7 @@ int do_list_networks(yuzu::CommandContext& ctx) {
                 status_forwarded = yuzu::agent::forward_runner_failure(ctx, scan_res.res);
             auto filtered = yuzu::wifi::filter_iwlist_scan_lines(scan_res.output);
             if (!filtered.empty()) {
+                emitted_scan_output = true;
                 ctx.write_output(std::format("wifi|scan_output|{}", sof(filtered)));
             }
         }
@@ -760,6 +762,14 @@ int do_list_networks(yuzu::CommandContext& ctx) {
             }
             ctx.write_output("wifi|error|Wi-Fi scan failed on every discovered interface "
                              "(NetworkManager unreachable; nmcli and iwlist both failed)|0|0|none");
+        } else if (!emitted_scan_output) {
+            // Every iwlist run SUCCEEDED and none reported a network. That is a
+            // real observation of an empty airspace, so say so -- the reachable-NM
+            // branch above emits an explicit record for exactly this case, and
+            // returning silently here would leave the two siblings disagreeing
+            // about what "nothing found" looks like on the wire.
+            ctx.write_output("wifi|info|Wi-Fi scan completed on every discovered interface; "
+                             "no networks visible|0|0|none");
         }
         return 0;
     }
@@ -799,11 +809,20 @@ int do_list_networks(yuzu::CommandContext& ctx) {
     // result even when system_profiler then returned a complete scan --
     // stamping a good answer as a failed one. Only the rung that actually
     // produces (or fails to produce) the answer sets the status.
+    //
+    // Both macOS legs are gated on wifi_tool_answered() exactly as the Linux
+    // legs are. A tool that exits NONZERO after emitting partial stdout is
+    // invisible to forward_runner_failure (classify_runner_failure returns
+    // nullopt for TerminationReason::exited), so without this gate a truncated
+    // scan is written out as complete `wifi|SSID|...` records with an OK
+    // status and the caller cannot tell. This is the same defect the Linux
+    // legs already refuse; it was missed here because the earlier fix was
+    // applied only to the platform under review.
     auto airport_res = run_tool(
         {"/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport",
          "-s"});
-    if (!airport_res.output.empty()) {
-        yuzu::agent::forward_runner_failure(ctx, airport_res.res);
+    const bool airport_answered = yuzu::wifi::wifi_tool_answered(airport_res.res).answered;
+    if (airport_answered && !airport_res.output.empty()) {
         for (auto& row : yuzu::wifi::parse_airport_scan(airport_res.output)) {
             ctx.write_output(std::format("wifi|{}|{}|{}|{}|{}", sof(row.ssid), sof(row.signal),
                                          sof(row.security), sof(row.channel), sof(row.bssid)));
@@ -811,11 +830,12 @@ int do_list_networks(yuzu::CommandContext& ctx) {
     } else {
         // sink: wifi/do_list_networks#5 -- system_profiler SPAirPortDataType
         // (Location-Services-gated fallback)
-        auto sp_res =
-            run_tool({"/usr/sbin/system_profiler", "SPAirPortDataType", "-detailLevel", "basic"});
-        yuzu::agent::forward_runner_failure(ctx, sp_res.res);
-        auto sp_rows = sp_res.output.empty() ? std::vector<yuzu::wifi::WifiNetworkRow>{}
-                                             : yuzu::wifi::parse_system_profiler_wifi(sp_res.output);
+        auto sp_res = run_tool(
+            {"/usr/sbin/system_profiler", "SPAirPortDataType", "-detailLevel", "basic"});
+        const bool sp_answered = yuzu::wifi::wifi_tool_answered(sp_res.res).answered;
+        auto sp_rows = (!sp_answered || sp_res.output.empty())
+                           ? std::vector<yuzu::wifi::WifiNetworkRow>{}
+                           : yuzu::wifi::parse_system_profiler_wifi(sp_res.output);
         for (auto& row : sp_rows) {
             ctx.write_output(std::format("wifi|{}|{}|{}|{}|-", sof(row.ssid), sof(row.signal),
                                          sof(row.security), sof(row.channel)));
@@ -926,7 +946,14 @@ int do_connected(yuzu::CommandContext& ctx) {
     // fields outright (live nmcli 1.52.1: "invalid field 'WIFI.SSID'", exit
     // 2), which left this declared fallback dead on every host.
     auto nmcli_path = yuzu::agent::probe_tool_path({"/usr/bin/nmcli", "/bin/nmcli"});
-    auto nmcli_res = run_tool(yuzu::wifi::nmcli_connected_argv(nmcli_path), /*max_lines=*/64);
+    // NOT line-capped. This leg must SEARCH the whole list for the ACTIVE row,
+    // and a cap yields TerminationReason::line_limit, which wifi_tool_answered()
+    // correctly classifies as "did not answer" -- so a cap would discard the
+    // output unparsed and kill the rung on any host with a busy airspace, which
+    // is precisely where the row being searched for is most likely to be cut.
+    // The runner's wall-clock deadline remains the bound. Sibling
+    // do_list_networks is uncapped for the same reason.
+    auto nmcli_res = run_tool(yuzu::wifi::nmcli_connected_argv(nmcli_path));
     auto parsed = yuzu::wifi::wifi_tool_answered(nmcli_res.res).answered
                       ? yuzu::wifi::parse_nmcli_wifi_list_active(nmcli_res.output)
                       : std::nullopt;
@@ -1032,12 +1059,12 @@ int do_connected(yuzu::CommandContext& ctx) {
 // exist in that binary -- the same "declares a rung it cannot reach" defect
 // as reading a property off the wrong D-Bus interface, and it feeds the #2204
 // capability matrix.
-#if defined(YUZU_HAVE_LIBSYSTEMD)
-#define YUZU_WIFI_LINUX_RUNG 1
-#define YUZU_WIFI_LINUX_MECHANISM "NetworkManager D-Bus (sd-bus)"
+#if defined(__linux__) && defined(YUZU_HAVE_LIBSYSTEMD)
+constexpr std::uint8_t kWifiLinuxRung = 1;
+constexpr const char* kWifiLinuxMechanism = "NetworkManager D-Bus (sd-bus)";
 #else
-#define YUZU_WIFI_LINUX_RUNG 2
-#define YUZU_WIFI_LINUX_MECHANISM "nmcli via the argv runner (built without libsystemd)"
+constexpr std::uint8_t kWifiLinuxRung = 2;
+constexpr const char* kWifiLinuxMechanism = "nmcli via the argv runner (built without libsystemd)";
 #endif
 
 // Both Linux legs are CONSTRAINED, not SUPPORTED, and that is a deliberate
@@ -1059,13 +1086,13 @@ int do_connected(yuzu::CommandContext& ctx) {
 // end-to-end run on a Linux host with a real Wi-Fi radio that (a) returns at
 // least one AP through the D-Bus traversal, and (b) forces a D-Bus failure
 // and observes the nmcli rung answer. Nothing else about the code need change.
-#define YUZU_WIFI_LINUX_SUPPORT YUZU_SUPPORT_CONSTRAINED
+constexpr YuzuSupportLevel kWifiLinuxSupport = YUZU_SUPPORT_CONSTRAINED;
 
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "list_networks",
         /* .linux_leg   = */
-        {YUZU_WIFI_LINUX_SUPPORT, YUZU_WIFI_LINUX_RUNG, YUZU_WIFI_LINUX_MECHANISM,
+        {kWifiLinuxSupport, kWifiLinuxRung, kWifiLinuxMechanism,
          "reads NetworkManager's cached AccessPoints and does not itself initiate a scan "
          "(falls through to nmcli, which rescans, when NM reports no finished scan); then "
          "falls back to nmcli via the argv runner (rung 2), then an iw/iwlist text dump. "
@@ -1082,7 +1109,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "connected",
         /* .linux_leg   = */
-        {YUZU_WIFI_LINUX_SUPPORT, YUZU_WIFI_LINUX_RUNG, YUZU_WIFI_LINUX_MECHANISM,
+        {kWifiLinuxSupport, kWifiLinuxRung, kWifiLinuxMechanism,
          "reports the device interface (e.g. wlan0) in the connection column rather than "
          "the NetworkManager profile name; falls back to nmcli via the argv runner "
          "(rung 2), then an iwconfig ESSID/Signal blob. Not yet exercised against a real "
