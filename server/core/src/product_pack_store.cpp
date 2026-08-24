@@ -1230,6 +1230,16 @@ std::expected<std::string, std::string> ProductPackStore::install(
     // duplicate-item-id case this lambda is called from IS that scenario) — compensate each
     // item_id only once, so a second, already-deleted compensate_fn call doesn't manufacture a
     // false "partial" result/metric for content that was never actually left orphaned.
+    //
+    // Gate 8 review (#3481, security-guardian — verified with a live repro): keying the dedup
+    // set on item_id ALONE is wrong. PolicyStore::create_fragment/create_policy (and the other
+    // sibling create_* methods) honor a caller-supplied `id:` YAML field verbatim, so an
+    // attacker-controlled bundle can assign the SAME item_id to two documents of DIFFERENT
+    // kind (e.g. a PolicyFragment and a Policy) — both install_fn calls succeed (no PK
+    // collision, different tables), the duplicate-item-id check below fires, and the item_id-
+    // only dedup silently skipped compensating the second one: a real orphan, reported as
+    // "compensated 1/1" / metric result="ok". Keyed on (kind, item_id) instead — compensate_fn
+    // already dispatches on that same pair, so this matches its actual identity.
     auto compensate_and_fail = [&](const std::string& log_context,
                                    std::string error_message) -> std::unexpected<std::string> {
         std::size_t compensated = 0;
@@ -1237,7 +1247,7 @@ std::expected<std::string, std::string> ProductPackStore::install(
         if (compensate_fn) {
             std::unordered_set<std::string> already_compensated;
             for (auto it = items_to_store.rbegin(); it != items_to_store.rend(); ++it) {
-                if (!already_compensated.insert(it->item_id).second)
+                if (!already_compensated.insert(it->kind + '\x1f' + it->item_id).second)
                     continue;
                 ++attempted;
                 bool ok = false;
@@ -1249,7 +1259,7 @@ std::expected<std::string, std::string> ProductPackStore::install(
                         "for pack '{}': {} — orphaned sibling content requires "
                         "manual/operator cleanup",
                         it->kind, sanitize_for_log(it->item_id), log_context,
-                        sanitize_for_log(pack_name), e.what());
+                        sanitize_for_log(pack_name), sanitize_for_log(e.what()));
                 } catch (...) {
                     spdlog::error(
                         "ProductPackStore: install compensation THREW (unknown) for {} '{}' "

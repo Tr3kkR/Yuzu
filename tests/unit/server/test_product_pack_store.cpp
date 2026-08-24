@@ -45,6 +45,7 @@
 #include <nlohmann/json.hpp>
 #include <sqlite3.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -107,6 +108,28 @@ name: test-instruction-a
 apiVersion: yuzu.io/v1alpha1
 kind: InstructionDefinition
 name: test-instruction-b
+)";
+
+/// Two documents of DIFFERENT kind, both intended to resolve (via a test install_fn stub
+/// returning a FIXED id regardless of kind) to the SAME item_id — the cross-kind analogue of
+/// kUnsignedPackYamlDuplicateItems above (#3481, Gate 8 security-guardian finding: real sibling
+/// stores like PolicyStore honor a caller-supplied `id:` field verbatim, so this is reachable
+/// with a live PolicyFragment + Policy pair sharing an attacker-chosen id — this fixture proves
+/// the mechanism generically with two stub kinds, same as the reverse-order test above does for
+/// ordering).
+constexpr const char* kUnsignedPackYamlCrossKindDuplicateId = R"(apiVersion: yuzu.io/v1alpha1
+kind: ProductPack
+name: test-cross-kind-duplicate-id
+version: 1.0.0
+description: Two different-kind documents sharing one item id
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+name: test-instruction-cross
+---
+apiVersion: yuzu.io/v1alpha1
+kind: Workflow
+name: test-workflow-cross
 )";
 
 /// A second, content-distinct bundle — used only to prove idempotency-key reuse with a
@@ -554,6 +577,40 @@ TEST_CASE("ProductPackStore::install: a duplicate item id also triggers compensa
     CHECK(compensated[0].second == "item-id");
 }
 
+// Gate 8 finding (#3481, security-guardian, verified with a live PolicyStore repro): the
+// item_id-only dedup above silently skips compensating a SECOND item that shares the same
+// item_id but has a DIFFERENT kind — exactly the shape a caller-supplied `id:` YAML field on
+// two different sibling-store documents produces. Proves the (kind, item_id) fix compensates
+// BOTH, not just the first one seen.
+TEST_CASE("ProductPackStore::install: a duplicate item id shared across TWO DIFFERENT kinds "
+          "compensates both, not just one",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    std::vector<std::pair<std::string, std::string>> compensated;
+    auto compensate_fn = [&compensated](const std::string& kind,
+                                        const std::string& item_id) -> bool {
+        compensated.emplace_back(kind, item_id);
+        return true;
+    };
+
+    auto result = store.install(kUnsignedPackYamlCrossKindDuplicateId,
+                                make_accept_all_install_fn(), compensate_fn);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("duplicate item id") != std::string::npos);
+    // Both items compensated — one per kind — even though they share the same item_id.
+    REQUIRE(compensated.size() == 2);
+    CHECK(compensated[0].second == "item-id");
+    CHECK(compensated[1].second == "item-id");
+    std::vector<std::string> kinds{compensated[0].first, compensated[1].first};
+    CHECK(std::find(kinds.begin(), kinds.end(), "InstructionDefinition") != kinds.end());
+    CHECK(std::find(kinds.begin(), kinds.end(), "Workflow") != kinds.end());
+}
+
 // ── Compensating cleanup (F031/#3481) ───────────────────────────────────────
 //
 // Pool-contention fault injection technique (proven precedent:
@@ -672,6 +729,61 @@ TEST_CASE("ProductPackStore::install: a throwing compensate_fn is caught, logged
     REQUIRE(compensate_attempts.size() == 2);
     CHECK(compensate_attempts[0] == "item-id-2");
     CHECK(compensate_attempts[1] == "item-id-1");
+}
+
+// Gate 8 finding (#3481, quality-engineer): no test in this file wires set_metrics before
+// forcing a partial compensation, so the yuzu_server_product_pack_install_compensation_total
+// emission — including this round's own `compensated == attempted` label-selection change
+// (replacing `compensated == items_to_store.size()`, which the (kind, item_id) dedup fix just
+// above made a real distinction rather than always-equal) — had zero coverage. This proves
+// both label values a real partial-compensation run produces.
+TEST_CASE("ProductPackStore::install: a partial compensation increments the compensation "
+          "metric's partial series, a full one increments ok",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    {
+        auto unrelated_lease = pool.acquire();
+        REQUIRE(unrelated_lease);
+        int install_calls = 0;
+        // item-id-2 fails to compensate (ordinary `false`, not a throw — the metric must count
+        // both failure shapes as "partial" identically); item-id-1 succeeds.
+        auto compensate_fn = [](const std::string&, const std::string& item_id) -> bool {
+            return item_id != "item-id-2";
+        };
+        auto result = store.install(kUnsignedPackYamlDuplicateItems,
+                                    make_counting_install_fn(&install_calls), compensate_fn);
+        REQUIRE_FALSE(result.has_value());
+    }
+    CHECK(metrics.counter("yuzu_server_product_pack_install_compensation_total",
+                          {{"result", "partial"}})
+              .value() == 1);
+    CHECK(metrics.counter("yuzu_server_product_pack_install_compensation_total",
+                          {{"result", "ok"}})
+              .value() == 0);
+
+    {
+        auto unrelated_lease = pool.acquire();
+        REQUIRE(unrelated_lease);
+        int install_calls = 0;
+        auto compensate_fn = [](const std::string&, const std::string&) -> bool { return true; };
+        auto result = store.install(kUnsignedPackYamlDuplicateItems,
+                                    make_counting_install_fn(&install_calls), compensate_fn);
+        REQUIRE_FALSE(result.has_value());
+    }
+    CHECK(metrics.counter("yuzu_server_product_pack_install_compensation_total",
+                          {{"result", "ok"}})
+              .value() == 1);
+    // The prior partial event's series must not have been clobbered by this second install.
+    CHECK(metrics.counter("yuzu_server_product_pack_install_compensation_total",
+                          {{"result", "partial"}})
+              .value() == 1);
 }
 
 // ── Idempotency (F033/#3481) ─────────────────────────────────────────────────

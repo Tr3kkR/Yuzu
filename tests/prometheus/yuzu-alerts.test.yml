@@ -1970,3 +1970,68 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuQuarantineGateServingStaleState", alertstate="firing", severity="warning"}'
             value: 1
+
+  # CASE 67 -- #3481/Gate 8 (sre): pins the pre-seed's load-bearing role for
+  # YuzuProductPackCompensationPartial, empirically confirmed the hard way
+  # during Gate 8 review — an `increase()` query cannot detect a 0->1 step on
+  # a series whose FIRST-EVER sample is already 1 (no earlier zero to diff
+  # against), so a future edit that "simplifies" server.cpp's pre-seed loop
+  # into dead code would silently disarm this alert. The series here starts
+  # pre-seeded at 0 (t=0..30m), then one partial-compensation event bumps it
+  # to 1 at t=31m and it stays there (no second event) — `for: 0m` means it
+  # must fire on the very next eval after the step, not later.
+  - interval: 1m
+    name: product-pack compensation partial - a single event fires immediately (pre-seed pinned)
+    input_series:
+      - series: 'yuzu_server_product_pack_install_compensation_total{job="yuzu",instance="s1",result="partial"}'
+        values: "0x30 1+0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuProductPackCompensationPartial"}'
+        eval_time: 30m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuProductPackCompensationPartial", alertstate="firing"}'
+        eval_time: 32m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuProductPackCompensationPartial", alertstate="firing", instance="s1", job="yuzu", result="partial", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuProductPackCompensationPartial", alertstate="firing"}'
+        eval_time: 60m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuProductPackCompensationPartial", alertstate="firing", instance="s1", job="yuzu", result="partial", severity="warning"}'
+            value: 1
+
+  # CASE 68 -- companion to CASE 67: no compensation event ever occurs (the
+  # ordinary case — a healthy install path never needs compensation at all).
+  # A flat pre-seeded-at-0 series must never fire, at any eval time.
+  - interval: 1m
+    name: product-pack compensation partial - a flat zero series never fires
+    input_series:
+      - series: 'yuzu_server_product_pack_install_compensation_total{job="yuzu",instance="s1",result="partial"}'
+        values: "0x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuProductPackCompensationPartial"}'
+        eval_time: 2h
+        exp_samples: []
+
+  # CASE 69 -- the `increase(...[1h])` window self-clears once the single
+  # event ages out, even though the underlying orphan does NOT self-heal (the
+  # metrics.md doc note this pins: "a lone event... does not self-clear
+  # either" describes the ORPHAN, not the alert). Same series as CASE 67.
+  # Firing check well inside the 1h window (t=45m, 14m after the t=31m jump);
+  # cleared check well outside it (t=3h) — deliberately not pinned to the
+  # exact boundary minute, which is sensitive to promql's increase()
+  # extrapolation and not this rule's contract.
+  - interval: 1m
+    name: product-pack compensation partial - clears once the event ages out of the 1h window
+    input_series:
+      - series: 'yuzu_server_product_pack_install_compensation_total{job="yuzu",instance="s1",result="partial"}'
+        values: "0x30 1+0x150"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuProductPackCompensationPartial", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuProductPackCompensationPartial", alertstate="firing", instance="s1", job="yuzu", result="partial", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuProductPackCompensationPartial", alertstate="firing"}'
+        eval_time: 3h
+        exp_samples: []
