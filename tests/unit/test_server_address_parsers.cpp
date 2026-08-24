@@ -1,10 +1,12 @@
 /**
  * test_server_address_parsers.cpp — pure host:port / IP-literal helpers
- * (server_address_parsers.hpp, #3429 round 4). server_address_resolver.cpp
- * itself performs real DNS I/O and is deliberately NOT exercised end to end
- * here (same "no network in the unit suite" discipline as this repo's other
- * I/O-performing shells) — these two pure functions are its entire
- * testable core.
+ * (server_address_parsers.hpp, #3429 round 4). server_address_resolver.cpp's
+ * real getaddrinfo() call is deliberately NOT exercised end to end here
+ * (same "no network in the unit suite" discipline as this repo's other
+ * I/O-performing shells) — but its deadline-wrapper behavior IS covered,
+ * with the resolve step injected, in test_server_address_resolver.cpp
+ * (round 4's blocker fix). These two pure functions are the parsing layer's
+ * entire testable core.
  */
 #include <yuzu/agent/server_address_parsers.hpp>
 

@@ -24,12 +24,24 @@
  * Threaded into every plugin's config as "agent.server_address_resolved"
  * by Agent::Run() (agent.cpp), read by the quarantine plugin's
  * do_quarantine instead of resolving anything itself.
+ *
+ * Bounding note (#3429 round 4): the deadline is enforced by
+ * yuzu::shared::bounded_call() (agents/shared/bounded_wait.hpp), which runs
+ * the resolve on a detached thread and waits on a condition variable --
+ * NOT by a plain std::async(std::launch::async, ...)-obtained future's
+ * wait_for(), whose destructor blocks the CALLING thread until the task
+ * finishes even past a timed-out wait_for() ([futures.async]). That shape
+ * was this file's round-3 bug: the caller looked bounded but still hung on
+ * a wedged resolver until getaddrinfo() itself returned.
  */
 
 #include <yuzu/plugin.h> // YUZU_EXPORT
 
+#include <chrono>
+#include <functional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace yuzu::agent {
 
@@ -37,9 +49,23 @@ namespace yuzu::agent {
 /// portion resolves to. `target` is a gRPC-style "host:port" string (the
 /// agent's own --server config) -- an already-IP-literal host is returned
 /// as-is (no DNS round-trip); a hostname is resolved via a BOUNDED
-/// getaddrinfo() call on a background task, discarded on timeout. Empty on
+/// getaddrinfo() call on a detached thread, discarded on timeout. Empty on
 /// failure, timeout, or an unparseable target -- never blocks the caller
 /// past the bound.
 YUZU_EXPORT std::string resolve_server_address_literals(std::string_view target);
+
+namespace detail {
+
+/// Core of resolve_server_address_literals(), with the resolve step
+/// injected so a unit test can exercise the bounding behavior with a
+/// deterministic synthetic callable instead of a real DNS round-trip (this
+/// repo's "no network in unit tests" discipline). Production code always
+/// goes through resolve_server_address_literals(), which supplies the real
+/// getaddrinfo()-backed resolver and the live deadline.
+YUZU_EXPORT std::string
+resolve_bounded(std::string_view target, std::chrono::milliseconds deadline,
+                 const std::function<std::vector<std::string>(const std::string&)>& resolve);
+
+} // namespace detail
 
 } // namespace yuzu::agent
