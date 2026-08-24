@@ -1649,7 +1649,7 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
         // inaccessible keychain path, the cap/deadline hit mid-scan, an
         // unparseable block, ...). See list_certs_macos's matching comment.
         ctx.write_output(std::format("not_available|{}", failure_reason));
-        mark_result_partial(ctx, failure_provenance);
+        mark_result_partial(ctx, failure_provenance, failure_reason);
         return;
     }
 
