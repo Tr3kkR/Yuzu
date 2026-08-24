@@ -1217,12 +1217,48 @@ std::expected<std::string, std::string> ProductPackStore::install(
     // compensation failing is logged and does not abort compensating the rest. The original
     // (pre-compensation) duplicate-item-id early return orphaned items_to_store just like the
     // bug F031 was written to close — that gap was caught in Gate 2 review of this very PR.
+    //
+    // Gate 4 review (#3481, unhappy-path, R2): compensate_fn is caller-supplied (same as
+    // uninstall_fn) and gets no exception boundary anywhere else in this file either — but
+    // unlike uninstall_fn (#3482, deferred, pre-existing), this specific call site is new in
+    // this PR and pre-PR the failure paths below always reached workflow_routes.cpp's audit_fn
+    // uninterrupted. A throw here must not skip that: caught, logged, and counted the same as
+    // an ordinary `false` return so the rest of the reverse-order loop keeps running and
+    // install() still returns its normal std::unexpected.
+    //
+    // Gate 6 review (#3481, architect): items_to_store can carry the SAME item_id twice (the
+    // duplicate-item-id case this lambda is called from IS that scenario) — compensate each
+    // item_id only once, so a second, already-deleted compensate_fn call doesn't manufacture a
+    // false "partial" result/metric for content that was never actually left orphaned.
     auto compensate_and_fail = [&](const std::string& log_context,
                                    std::string error_message) -> std::unexpected<std::string> {
         std::size_t compensated = 0;
+        std::size_t attempted = 0;
         if (compensate_fn) {
+            std::unordered_set<std::string> already_compensated;
             for (auto it = items_to_store.rbegin(); it != items_to_store.rend(); ++it) {
-                if (compensate_fn(it->kind, it->item_id)) {
+                if (!already_compensated.insert(it->item_id).second)
+                    continue;
+                ++attempted;
+                bool ok = false;
+                try {
+                    ok = compensate_fn(it->kind, it->item_id);
+                } catch (const std::exception& e) {
+                    spdlog::error(
+                        "ProductPackStore: install compensation THREW for {} '{}' after {} "
+                        "for pack '{}': {} — orphaned sibling content requires "
+                        "manual/operator cleanup",
+                        it->kind, sanitize_for_log(it->item_id), log_context,
+                        sanitize_for_log(pack_name), e.what());
+                } catch (...) {
+                    spdlog::error(
+                        "ProductPackStore: install compensation THREW (unknown) for {} '{}' "
+                        "after {} for pack '{}' — orphaned sibling content requires "
+                        "manual/operator cleanup",
+                        it->kind, sanitize_for_log(it->item_id), log_context,
+                        sanitize_for_log(pack_name));
+                }
+                if (ok) {
                     ++compensated;
                 } else {
                     spdlog::error(
@@ -1236,12 +1272,11 @@ std::expected<std::string, std::string> ProductPackStore::install(
             if (metrics_)
                 metrics_
                     ->counter("yuzu_server_product_pack_install_compensation_total",
-                              {{"result", compensated == items_to_store.size() ? "ok" : "partial"}})
+                              {{"result", compensated == attempted ? "ok" : "partial"}})
                     .increment();
         }
         spdlog::error("ProductPackStore: {} for pack '{}' — compensated {}/{} item(s)",
-                     log_context, sanitize_for_log(pack_name), compensated,
-                     items_to_store.size());
+                     log_context, sanitize_for_log(pack_name), compensated, attempted);
         return std::unexpected(std::move(error_message));
     };
 

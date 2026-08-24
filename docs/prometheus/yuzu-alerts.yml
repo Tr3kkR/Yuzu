@@ -2968,6 +2968,37 @@ groups:
             Read the server BOOT log for the exact pack/item id and repair or
             move the losing replica's legacy file aside before restarting.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#product-packs-migrate-to-postgres-mandatory-backfill-productpackstore-adr-0054"
+      - alert: YuzuProductPackCompensationPartial
+        # #3481: install()'s best-effort compensating rollback (undoing
+        # already-installed sibling-store content after a late persist or
+        # duplicate-item-id failure) did not fully succeed at least once — a
+        # sibling delete itself failed (referential-integrity refusal outside
+        # the bundle's own dependency chain) or compensate_fn threw. Either
+        # way this is a KNOWN, NOT auto-retried gap (see the changelog
+        # fragment and product_pack_store.hpp) — a residual orphan needs
+        # manual/operator cleanup via that sibling store's own DELETE route
+        # (no bulk reconciliation sweep exists). RELIES ON THE PRE-SEED in
+        # server.cpp (describe() + zero-loop over ok/partial) so a single
+        # partial event is visible as a step, not lost inside an
+        # already-nonzero series. A single event is a cleanup task, not an
+        # incident — this fires on ANY occurrence (>0, not a rate threshold)
+        # because a residual orphan does not self-heal and does not age out.
+        expr: |
+          increase(yuzu_server_product_pack_install_compensation_total{result="partial"}[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ProductPack install compensation left residual orphaned sibling content"
+          description: >-
+            yuzu_server_product_pack_install_compensation_total{result="partial"}
+            increased: install() failed after already committing sibling-store
+            content, and best-effort compensation could not fully undo it.
+            Read the paired spdlog::error line for the exact kind/item id,
+            then delete it directly through that sibling store's own route
+            (DELETE /api/instructions/{id}, /api/policies/{id} or
+            /api/policy-fragments/{id}, /api/workflows/{id}).
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/metrics.md"
       - alert: YuzuInventoryIngestSlow
         # Leading indicator for ingest transaction-hold saturation: full-payload
         # ingests taking >10s. Distinct from the yuzu_pg_acquire_* family, which

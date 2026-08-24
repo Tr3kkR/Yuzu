@@ -42,6 +42,7 @@
 #include <openssl/evp.h>
 
 #include <libpq-fe.h>
+#include <nlohmann/json.hpp>
 #include <sqlite3.h>
 
 #include <atomic>
@@ -51,6 +52,7 @@
 #include <format>
 #include <thread>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -520,8 +522,14 @@ TEST_CASE("ProductPackStore::install: a duplicate item id in one bundle fails as
 // documents into sibling stores by that point — the exact orphan shape F031 exists to close.
 // The original fix only wired compensate_fn into the later with_txn_for failure path; this
 // proves it now ALSO fires here.
-TEST_CASE("ProductPackStore::install: a duplicate item id also triggers compensation "
-          "(not just the final persist path)",
+//
+// Gov Gate 6 finding (architect): both documents in this bundle share the SAME item_id (that
+// IS the duplicate being detected), so items_to_store carries it twice — compensate_fn must be
+// called for that id only ONCE, not twice; a second call against already-deleted content would
+// either be a harmless no-op the sibling store can't distinguish from a real failure, or a
+// false "partial" result/metric for content that was never actually left orphaned.
+TEST_CASE("ProductPackStore::install: a duplicate item id also triggers compensation, exactly "
+          "once per unique id (not just the final persist path)",
           "[product_pack_store][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -541,9 +549,9 @@ TEST_CASE("ProductPackStore::install: a duplicate item id also triggers compensa
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().find("duplicate item id") != std::string::npos);
     CHECK(result.error().find(yuzu::server::kProductPackDbErrorPrefix) == std::string::npos);
-    REQUIRE(compensated.size() == 2);
+    REQUIRE(compensated.size() == 1);
     CHECK(compensated[0].first == "InstructionDefinition");
-    CHECK(compensated[1].first == "InstructionDefinition");
+    CHECK(compensated[0].second == "item-id");
 }
 
 // ── Compensating cleanup (F031/#3481) ───────────────────────────────────────
@@ -622,6 +630,48 @@ TEST_CASE("ProductPackStore::install: compensation runs in reverse install order
     REQUIRE(compensated_ids.size() == 2);
     CHECK(compensated_ids[0] == "item-id-2");
     CHECK(compensated_ids[1] == "item-id-1");
+}
+
+// Gov Gate 4 finding (#3481, unhappy-path, R2): compensate_fn is caller-supplied — same as
+// uninstall_fn — and pre-PR every failure path below always reached workflow_routes.cpp's
+// audit_fn uninterrupted. This proves a THROWING compensate_fn (as opposed to an ordinary
+// `false` return, already covered above) does not unwind past install(): the throw is caught,
+// logged as a failed compensation, and the reverse-order loop keeps going to the remaining
+// item(s) rather than skipping them and the caller's own error handling / audit call.
+TEST_CASE("ProductPackStore::install: a throwing compensate_fn is caught, logged as a failed "
+          "compensation, and does not abort compensating the rest of the bundle",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    auto unrelated_lease = pool.acquire();
+    REQUIRE(unrelated_lease);
+
+    int install_calls = 0;
+    std::vector<std::string> compensate_attempts;
+    auto compensate_fn = [&compensate_attempts](const std::string&,
+                                                const std::string& item_id) -> bool {
+        compensate_attempts.push_back(item_id);
+        if (item_id == "item-id-2")
+            throw std::runtime_error("simulated sibling-store delete failure");
+        return true;
+    };
+
+    auto result = store.install(kUnsignedPackYamlDuplicateItems,
+                                make_counting_install_fn(&install_calls), compensate_fn);
+    REQUIRE_FALSE(result.has_value());
+    // The throw must not propagate out of install() — the caller (workflow_routes.cpp) still
+    // gets its normal std::unexpected (the late-persist failure, via pool contention below) and
+    // runs its own error handling / audit call unimpeded.
+    CHECK(result.error().starts_with(yuzu::server::kProductPackDbErrorPrefix));
+    // Both items attempted, in reverse order — the throw on the first (item-id-2) did not skip
+    // the second (item-id-1).
+    REQUIRE(compensate_attempts.size() == 2);
+    CHECK(compensate_attempts[0] == "item-id-2");
+    CHECK(compensate_attempts[1] == "item-id-1");
 }
 
 // ── Idempotency (F033/#3481) ─────────────────────────────────────────────────
@@ -1514,4 +1564,78 @@ TEST_CASE("REST: a not-found rejection is echoed verbatim in both the response a
     CHECK(target_id == "does-not-exist");
     CHECK(detail.starts_with("not_found:"));
     CHECK(detail.find("does-not-exist") != std::string::npos);
+}
+
+// Gov Gate 6 findings (quality-engineer + consistency-auditor, both independently, #3481): the
+// store-level F033 tests above prove ProductPackStore::install()'s idempotency contract
+// directly; nothing before this point drives a real HTTP POST through WorkflowRoutes' header
+// parsing (length bound, missing-header default) or its threading of idempotency_key into
+// install(). A metadata-only bundle (no item documents) avoids needing live
+// InstructionStore/PolicyStore/WorkflowEngine — this harness leaves those null, same as the
+// other REST-level tests above.
+TEST_CASE("REST: POST /api/product-packs honors Idempotency-Key end to end (replay, conflict, "
+          "and the length bound)",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    ProductPackRestHarness h{&store};
+
+    constexpr const char* kMetaOnlyBundle = R"(apiVersion: yuzu.io/v1alpha1
+kind: ProductPack
+name: test-rest-idempotency
+version: 1.0.0
+description: Metadata-only bundle, no item documents
+)";
+    constexpr const char* kMetaOnlyBundleAlt = R"(apiVersion: yuzu.io/v1alpha1
+kind: ProductPack
+name: test-rest-idempotency-alt
+version: 1.0.0
+description: A different metadata-only bundle
+)";
+
+    auto first =
+        h.sink.dispatch("POST", "/api/product-packs", kMetaOnlyBundle, "text/plain",
+                        {{"Idempotency-Key", "rest-key-1"}});
+    REQUIRE(first);
+    REQUIRE(first->status == 201);
+    auto first_id = nlohmann::json::parse(first->body).value("id", std::string{});
+    REQUIRE_FALSE(first_id.empty());
+
+    // Replay: same key, same body -> same id, no second row (still exactly one audit row for
+    // the whole test so far — a replay must audit success, not silently skip it, per the
+    // AskUserQuestion-confirmed "re-fire audit+emit on replay" decision).
+    auto replay =
+        h.sink.dispatch("POST", "/api/product-packs", kMetaOnlyBundle, "text/plain",
+                        {{"Idempotency-Key", "rest-key-1"}});
+    REQUIRE(replay);
+    CHECK(replay->status == 201);
+    CHECK(nlohmann::json::parse(replay->body).value("id", std::string{}) == first_id);
+
+    // Same key, different body -> 400, not a retryable db_error.
+    auto conflict =
+        h.sink.dispatch("POST", "/api/product-packs", kMetaOnlyBundleAlt, "text/plain",
+                        {{"Idempotency-Key", "rest-key-1"}});
+    REQUIRE(conflict);
+    CHECK(conflict->status == 400);
+    CHECK(conflict->body.find("different") != std::string::npos);
+
+    // Header too long -> 400, rejected before install() is ever called (not audited, per
+    // rest-api.md/audit-log.md).
+    auto too_long = h.sink.dispatch("POST", "/api/product-packs", kMetaOnlyBundle, "text/plain",
+                                    {{"Idempotency-Key", std::string(201, 'k')}});
+    REQUIRE(too_long);
+    CHECK(too_long->status == 400);
+    CHECK(too_long->body.find("too long") != std::string::npos);
+
+    // Exactly two accepted installs (first + replay) audited as success/denied appropriately;
+    // the too-long rejection above must NOT have added a third "denied" row.
+    int install_audit_rows = 0;
+    for (const auto& row : h.audit_rows)
+        if (std::get<0>(row) == "product_pack.install")
+            ++install_audit_rows;
+    CHECK(install_audit_rows == 3); // first (success) + replay (success) + conflict (denied)
 }

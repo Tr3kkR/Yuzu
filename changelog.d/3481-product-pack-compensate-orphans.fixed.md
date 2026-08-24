@@ -8,7 +8,11 @@
   store's own delete can itself fail (e.g. a referential-integrity refusal outside the bundle's
   own dependency chain); a residual orphan from that is logged at `spdlog::error` and counted in
   the new `yuzu_server_product_pack_install_compensation_total{result}` metric for operator
-  follow-up, not automatically retried.
+  follow-up, not automatically retried. A client that retries the install after a partial
+  compensation failure gets a fresh `install_fn` pass over the whole bundle rather than a repair
+  of just the residual item — the surviving orphan and the retry's new copy can coexist as
+  duplicate sibling-store content, which the compensation metric surfaces for operator cleanup
+  but does not itself prevent.
 - `uninstall()`'s mirror-image gap — its metadata-delete transaction failing after sibling
   content has already been removed — is accepted as a store-scoped residual risk (documented in
   `product_pack_store.hpp` alongside the existing retry-self-heals mitigant, since no
