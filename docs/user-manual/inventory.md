@@ -56,8 +56,10 @@ cadences.
   result. (Deep verification — `SecStaticCodeCheckValidity` — is not performed;
   adding it would turn this into a validity verdict and need a third state, an
   open contract decision.) `publisher` is empty for ad-hoc-signed and unsigned
-  apps. Enrichment covers the first 500 located apps per collection, and the
-  agent logs a warning when that cap truncates the set.
+  apps. Enrichment covers up to 5000 located apps per collection; that guard is
+  a runaway bound rather than a routine limit, and reaching it makes the agent
+  report the collection degraded (see below) instead of publishing rows whose
+  signature fields silently went blank.
 
   **macOS `pkg` rows** are `pkgutil` receipts — system installer packages
   (Command Line Tools, XProtect payloads, vendor `.pkg` installs) that never
@@ -66,7 +68,20 @@ cadences.
   display name. `install_date` is the receipt's raw **UNIX epoch seconds**,
   the only form `pkgutil --pkg-info` reports — deliberately carried through
   verbatim under the honest-empty contract rather than reformatted into a
-  precision the receipt never recorded. Capped at 500 receipts per collection.
+  precision the receipt never recorded. Bounded at 5000 receipts per collection,
+  again a runaway guard rather than a routine limit.
+
+  **Degraded collections are skipped, not published.** If any acquisition step
+  does not complete on its own terms -- a timeout, a spawn failure, a killed
+  child, a capture truncation, a nonzero exit from a top-level enumerator, a
+  tool that runs and reports nothing, or either runaway guard above -- the
+  agent reports the whole collection as degraded and the daily sync SKIPS that
+  cycle. The previous inventory is retained. This is deliberate: an incomplete
+  snapshot is indistinguishable from a complete one once it reaches the server,
+  so the omissions would be read as uninstalls. A stale inventory is recoverable;
+  a confidently wrong one is not. Degraded cycles are logged as warnings, and a
+  host that degrades every day will stop updating -- treat repeated warnings as
+  actionable.
 - **Changes for rpm fleets vs the v1 (4-field) contract:** `publisher` is now
   the rpm **PACKAGER** tag (was VENDOR), and `version` is the upstream version
   only — the release moved to its own `release` column (was fused

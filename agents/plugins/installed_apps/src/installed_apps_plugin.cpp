@@ -100,11 +100,20 @@ namespace parsers = yuzu::installed_apps::parsers;
 // binding limit (the runner clamps to 16 MiB).
 constexpr std::size_t kToolOutputCap = 8u * 1024u * 1024u;
 
-// Whole-collection budget. Each child already has its own deadline, but 500
-// per-item calls x a 20 s deadline is ~2.8 h in aggregate, and the daily-sync
+// Whole-collection budget. Each child already has its own deadline, but the
+// per-item calls multiplied out to hours in aggregate, and the daily-sync
 // thread is JOINED on every transient reconnect -- so an aggregate bound is
 // what actually protects agent liveness (adversarial review, found by both
-// reviewers). Checked between items, never mid-child.
+// reviewers).
+//
+// KNOWN RESIDUAL, accepted deliberately: this is checked BETWEEN items, never
+// mid-item, so the true worst case is the budget plus one item -- a 20 s child
+// deadline, or one synchronous CFBundle/SecStaticCode call, which has no
+// cancellation or deadline facility at all. Bounding a native CF read would
+// mean moving enrichment onto its own cancellable thread, a structural change
+// well beyond this PR. The hours-scale exposure is closed; a single stalled
+// native read remains theoretically unbounded and is recorded here rather than
+// papered over.
 constexpr std::chrono::seconds kCollectionBudget{120};
 
 struct ToolOutcome {
@@ -120,8 +129,18 @@ struct ToolOutcome {
     bool ran = false;
 };
 
+// `tolerate_nonzero_exit` marks the ONE call shape where a nonzero exit is
+// benign and expected: a per-ID `pkgutil --pkg-info <id>` whose receipt was
+// removed between the enumerating `--pkgs` call and this lookup exits 1
+// (verified on macOS 26: a nonexistent receipt id gives rc=1). That is a
+// single missing row, not a truncated enumeration. Every TOP-LEVEL enumerator
+// leaves it false: dpkg-query -W, rpm -qa, pacman -Q, apk info, brew list,
+// system_profiler and pkgutil --pkgs all exit 0 on a healthy host (verified),
+// so a nonzero exit there means the enumeration did not complete and its
+// output is a prefix -- which must never be published as the whole truth.
 ToolOutcome run_tool(std::vector<std::string> argv,
-                     std::chrono::seconds deadline = std::chrono::seconds{20}) {
+                     std::chrono::seconds deadline = std::chrono::seconds{20},
+                     bool tolerate_nonzero_exit = false) {
     if (argv.empty() || argv.front().empty())
         return {};
     auto res = yuzu::agent::run_bounded_subprocess(
@@ -142,12 +161,20 @@ ToolOutcome run_tool(std::vector<std::string> argv,
     //   line_limit -- a deliberate bounded stop.
     // Each yields a TRUNCATED enumeration that would have been published as
     // the host's complete software set. `exited` is the only outcome that
-    // means the tool finished on its own terms -- and it deliberately covers
-    // ANY exit code, because several inventory tools exit nonzero benignly
-    // and gating on the code would make a healthy host skip forever. Death by
-    // signal is not an exit code, so this keeps that narrowing principled.
-    const bool degraded =
-        res.termination_reason != yuzu::agent::TerminationReason::exited || res.output_truncated;
+    // means the tool finished on its own terms.
+    //
+    // A nonzero exit ALSO degrades, except on the per-ID shape above. An
+    // earlier cut excluded exit_code wholesale on the reasoning that "several
+    // inventory tools exit nonzero benignly" -- that was asserted, not
+    // measured, and measurement did not support it: every top-level enumerator
+    // this plugin runs exits 0 on a healthy host, and the only genuine benign
+    // nonzero is the per-ID pkg-info lookup, which is now marked explicitly
+    // instead of weakening the rule for everything.
+    const bool abnormal_exit =
+        !tolerate_nonzero_exit && res.termination_reason == yuzu::agent::TerminationReason::exited &&
+        res.exit_code != 0;
+    const bool degraded = res.termination_reason != yuzu::agent::TerminationReason::exited ||
+                          abnormal_exit || res.output_truncated;
     if (degraded) {
         spdlog::warn("installed_apps: degraded run (reason={}, timed_out={}, tool_ran={}, "
                      "truncated={}, exit_code={}): {}",
@@ -524,12 +551,18 @@ std::vector<inv::InvRecord> get_inventory_linux(bool& degraded) {
 // a daily-sync collector (ADR-0016), not an interactive action, and a deep
 // per-app scan is inherently more expensive than the one system_profiler
 // call it decorates.
-constexpr std::size_t kMaxEnrichApps = 500;
-// Bound the number of `pkgutil --pkg-info` round trips a single
-// list_inventory gather issues -- same discipline as msi_packages_plugin.cpp's
-// established kMaxPackages precedent (a receipt DB can legitimately hold
-// hundreds of entries).
-constexpr std::size_t kMaxPkgutilPackages = 500;
+// These two are MEMORY/RUNAWAY guards, not routine limits, and that
+// distinction is deliberate. Hitting either now DEGRADES the cycle (a
+// knowingly-incomplete inventory must not be published as authoritative -- the
+// server would read the omissions as uninstalls), so a cap set near normal
+// volumes would freeze a legitimate host's inventory forever. Both are
+// therefore set far above any plausible real host: measured on macOS 26, a
+// pkgutil round trip is ~6 ms (100 in 0.59 s) and a native enrichment is
+// faster still, so 5000 of each stays well inside kCollectionBudget, which is
+// the bound that actually protects liveness. Reaching 5000 means something is
+// wrong, which is exactly when degrading is right.
+constexpr std::size_t kMaxEnrichApps = 5000;
+constexpr std::size_t kMaxPkgutilPackages = 5000;
 
 std::vector<inv::InvRecord> get_inventory_macos(bool& degraded) {
     std::vector<inv::InvRecord> recs;
@@ -612,9 +645,12 @@ std::vector<inv::InvRecord> get_inventory_macos(bool& degraded) {
                          kCollectionBudget.count(), enriched, apps.size());
             degraded = true;
         } else if (apps.size() > enriched && enriched >= kMaxEnrichApps) {
-            spdlog::warn("installed_apps: enrichment capped at {} apps ({} present) -- the "
-                         "remainder carry empty publisher/signature_status",
+            spdlog::warn("installed_apps: enrichment hit the {}-app guard ({} present) -- the "
+                         "remainder would carry empty publisher/signature_status, so this "
+                         "collection is reported degraded rather than published with the "
+                         "security-posture fields silently blank",
                          kMaxEnrichApps, apps.size());
+            degraded = true;
         }
     }
 
@@ -627,10 +663,20 @@ std::vector<inv::InvRecord> get_inventory_macos(bool& degraded) {
         if (pkgs.degraded)
             degraded = true;
         auto ids = parsers::parse_pkgutil_pkgs(pkgs.output);
+        // Same reasoning as the system_profiler leg: macOS always has installer
+        // receipts, so pkgutil running and listing none is a tool failure, not
+        // an empty machine.
+        if (pkgs.ran && ids.empty()) {
+            spdlog::warn("installed_apps: pkgutil ran but listed zero receipts -- treating as "
+                         "a degraded collection rather than an empty receipt set");
+            degraded = true;
+        }
         if (ids.size() > kMaxPkgutilPackages) {
-            spdlog::warn("installed_apps: pkgutil receipts capped at {} of {} -- the remainder "
-                         "are absent from this inventory",
+            spdlog::warn("installed_apps: pkgutil receipts hit the {}-receipt guard ({} present) "
+                         "-- omitting the remainder would read downstream as uninstalls, so "
+                         "this collection is reported degraded instead",
                          kMaxPkgutilPackages, ids.size());
+            degraded = true;
             ids.resize(kMaxPkgutilPackages);
         }
 
@@ -656,7 +702,13 @@ std::vector<inv::InvRecord> get_inventory_macos(bool& degraded) {
             // installed_apps/get_inventory_macos#3 -- one call per receipt,
             // same bounded per-id loop shape as msi_packages_plugin.cpp's
             // established `list` action.
-            auto pkginfo = run_tool({path, "--pkg-info", id});
+            // tolerate_nonzero_exit: a receipt forgotten between the --pkgs
+            // enumeration and this lookup makes pkgutil exit 1 (verified). That
+            // is one missing row in a race, not a truncated enumeration, so it
+            // must not degrade the whole cycle. This is the ONLY call here that
+            // gets the exception.
+            auto pkginfo = run_tool({path, "--pkg-info", id}, std::chrono::seconds{20},
+                                    /*tolerate_nonzero_exit=*/true);
             if (pkginfo.degraded)
                 degraded = true;
             auto info = parsers::parse_pkgutil_pkg_info(pkginfo.output);
