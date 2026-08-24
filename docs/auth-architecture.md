@@ -2450,6 +2450,16 @@ header, so these names stay rejected on client ingress permanently.
 - **API tokens** — Bearer token and `X-Yuzu-Token` header auth for automation. MCP tokens (see `docs/mcp-server.md`) use the same table with mandatory expiration (max 90 days).
 - **Ownership-scoped revocation** — `DELETE /api/v1/tokens/{id}` and `DELETE /api/settings/api-tokens/{id}` both require the caller to own the token; the global `admin` role is the sole bypass. Cross-user revoke returns `404 token not found` (identical to unknown-id, to prevent enumeration). Denied attempts are recorded with `result=denied`, `detail=owner=<principal>`. See #222 and `docs/user-manual/server-admin.md` "Upgrade Notes".
 
+### Device tokens (`DeviceTokenStore`, ADR-0052, capability 18.8) — currently dormant, docs/user-manual/rest-api.md "Device Tokens"
+
+Standing invariant: **token presenter MUST equal token subject** — a device token's `device_id`
+(the agent it is bound to) is the only identity `validate_token` checks a presenter against;
+`principal_id` (the operator who issued it) is never part of that check. #823's re-registration
+defence — every token bound to an agent's `device_id` is revoked when that agent re-registers,
+closing the window an mTLS-disabled impersonation (#779) could otherwise exploit to replay a
+stolen token — is keyed on this same `device_id` column (`revoke_by_device`, #3401). Fails closed
+on a genuine revoke failure (ADR-0012 §1): the registration is refused, not merely logged.
+
 ### Service-scoped token fleet-wide confinement — durable default-deny (guardian-confinement-2298 PR 3, "the flip")
 
 A **service-scoped API token** is bound to one IT service's agents (`session->token_scope_service` non-empty on the resolved session) — created so an integration's credential reaches only the devices tagged to its own service, not the whole fleet. A recurring gap closed across several earlier branches: a confinement check keyed on username, role, or resource ownership never actually consulted the token's *own* service-tag scope, so a service-scoped token could reach fleet-wide data or, on a few mutating surfaces, fleet-wide actions. Those earlier fixes (PR 1 role cap, PR 2 Phase 0 primitives, PR 2 gate renames) capped the blast radius and built the primitives; **this PR flips the underlying security posture from admit-by-default to deny-by-default**, closing the pattern structurally rather than instance-by-instance.
