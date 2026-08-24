@@ -199,7 +199,7 @@ HTTP status codes follow standard conventions: `200` for success, `201` for reso
 | `correlation_id` | yes | A `req-<hex-ms>-<hex-seq>` token, also echoed on the `X-Correlation-Id` response header — join the response to server logs / audit rows by grepping this token. |
 | `retry_after_ms` | yes (nullable) | `null` unless the condition is retryable, in which case it advises how many milliseconds to back off (e.g. a `503` warm-up returns `5000`). |
 | `remediation` | when a hint exists | Natural-language self-recovery hint. Key is **omitted** when there is no hint (absence carries the same "no recovery available" meaning). |
-| `permission` | on permission denials | The `"SecurableType:Operation"` the caller was denied (e.g. `"Tag:Write"`) — the §A4 *kPermissionDenied* specialisation. Absent on whole-route admin gates that are not tied to a single securable, and absent on most service-scoped-token confinement denials even where the route IS tied to one — the caller is denied regardless of grant, so naming one would be a false self-remediation claim (`docs/adr/1006-service-scope-default-deny.md`). One documented exception: a confinement denial that fires *after* the route's own permission gate already confirmed the caller holds that exact grant still names it — there `.permission` is informational, not a remediation hint (`.claude/routed-concerns-access-control.md`, "Service-scoped API token confinement" clause 5(a)). `GET /api/v1/inventory/software` no longer illustrates this — its after-gate deny was retired (#3290, provably dead: it fired after `perm_fn`, and the route migrated onto `require_fleet_read` entirely). No live example currently exists: an exhaustive check of every remaining `deny_fleet_wide_service_scoped` call site (20 in `rest_api_v1.cpp`, 6 in `mcp_server.cpp`) plus `deny_service_scoped_schedule`'s 4 sites found none currently match this exception's shape (`.claude/routed-concerns-access-control.md`, "Service-scoped API token confinement" clause 5) — the exception clause still governs the next one that appears. |
+| `permission` | on permission denials | The `"SecurableType:Operation"` the caller was denied (e.g. `"Tag:Write"`) — the §A4 *kPermissionDenied* specialisation. Absent on whole-route admin gates that are not tied to a single securable, and absent on most service-scoped-token confinement denials even where the route IS tied to one — the caller is denied regardless of grant, so naming one would be a false self-remediation claim (`docs/adr/1006-service-scope-default-deny.md`). One documented exception: a confinement denial that fires *after* the route's own permission gate already confirmed the caller holds that exact grant still names it — there `.permission` is informational, not a remediation hint (`.claude/routed-concerns-access-control.md`, "Service-scoped API token confinement" clause 5(a)). `GET /api/v1/inventory/software` no longer illustrates this — its after-gate deny was retired (#3290, provably dead: it fired after `perm_fn`, and the route migrated onto `require_fleet_read` entirely). No live example currently exists: an exhaustive check of every remaining `deny_fleet_wide_service_scoped` call site (20 in `rest_api_v1.cpp`, 5 in `mcp_server.cpp` as of #3290 Phase 2 bucket 1a) found none currently match this exception's shape (`.claude/routed-concerns-access-control.md`, "Service-scoped API token confinement" clause 5) — `deny_service_scoped_schedule` and the one MCP site that did fire after its gate (`get_dex_group_app_perf`) were retired outright, not left as non-matching candidates. The exception clause still governs the next one that appears. |
 | `approval_id` + `status_url` | reserved | The §A4 *kApprovalRequired* specialisation. Reserved for the Phase-2 approval re-dispatch flow; not populated by current denials (an approval-gated operation is denied with `permission` + `remediation` today, because no pollable approval exists yet). `status_url` points at `GET /api/v1/approvals/{id}`. |
 
 The R2 A4 completion (2026-07) routed the RBAC/tier denial gates (`require_admin`, `require_permission`, and the service-scope denials in the auth layer) and the ~156 legacy `error_json` sites in `rest_api_v1.cpp` through this one envelope. It does **not** yet cover literally every path — `compliance_routes.cpp` and several `auth_routes.cpp` MFA-flow branches still emit legacy shapes (tracked as #1552) — so automation crossing surfaces should treat the enrichment fields as present-when-available.
@@ -1521,6 +1521,67 @@ Quarantine a device.
 > hint (REST's envelope has no nested `data` object — that's MCP's JSON-RPC
 > shape; REST matches the MCP `quarantine_device` twin's A5 behavior, not
 > its exact field path).
+
+> **This route records; it does NOT dispatch — and the twins have diverged
+> on the already-quarantined case (#3127).** `POST /api/v1/quarantine`
+> writes the quarantine record only. The live plugin isolation is dispatched
+> by the MCP `quarantine_device` tool, which has no REST twin. Two
+> consequences for a client that treats the two transports as
+> interchangeable:
+>
+> - A `201` here means **the record was written**, not that the device's
+>   firewall is enforcing anything. To isolate a device over REST, dispatch
+>   `quarantine.quarantine` through the normal execution routes as well —
+>   see [Security Hardening](security-hardening.md#device-quarantine).
+> - The MCP tool now treats an already-active record as a **retryable
+>   re-dispatch**, not a terminal error; this route still answers `400`,
+>   because with no dispatch of its own there is nothing for it to re-drive.
+>   The `400`-vs-`503` split above is unchanged and still mirrors the twin;
+>   the already-quarantined *outcome* no longer does.
+
+> **A quarantined device is refused at dispatch (#881).** Once a device is
+> quarantined, every dispatch route below — `POST /api/command`,
+> `POST /api/instructions/{id}/execute`, and the scope/group/broadcast arms —
+> drops that device before the command reaches the agent, increments
+> `yuzu_server_dispatch_target_rejected_total{reason="quarantined"}`, and
+> writes a `quarantine.dispatch_denied` audit row (`target_type=Security`;
+> `target_id` is the device, or `*` on a fail-closed denial **and** on the
+> summary row that follows a capped per-device fan-out — see
+> [Audit Log](audit-log.md)).
+>
+> **`POST /api/command` reports what it withheld.** The success body carries
+> `withheld_quarantined` — always present, `0` on a clean dispatch — so
+> `agents_reached: 97` on a 100-device group is distinguishable from three
+> devices being offline. The dashboard toast says the same.
+>
+> **Its `503` now names the cause.** Three conditions previously shared one
+> body ("failed to send command to any agent"), and one of them is a
+> fleet-wide policy state rather than a transport failure:
+>
+> | `error.reason` | Meaning | `retry_after_ms` |
+> |---|---|---|
+> | `containment_unreadable` | The gate is failing closed: containment state cannot be read, so **every** target on **every** dispatch is refused. A server condition, not a device one. | `5000` |
+> | `quarantined` | Every target named is contained. The dispatch was withheld, not attempted. | `null` — retrying will not help until the device is released |
+> | *(absent)* | Genuinely no agent reachable — the pre-existing meaning. | *(absent)* |
+>
+> `reason` is a top-level key on the error object, not part of the A4
+> `error.data` envelope. The versioned dispatch routes
+> (`POST /api/instructions/{id}/execute`, the bundle and result-set producers)
+> do **not** yet carry this split — they answer their existing
+> "no agents reached" shapes for all three conditions, because the shared
+> dispatch closure returns only a sent count. Tracked as #3424. The quarantine
+> plugin's own four actions (`quarantine`, `unquarantine`, `status`,
+> `whitelist`) are exempt so that release stays reachable, and so are three
+> server-internal pushes that are not operator dispatch —
+> `tar.fleet_snapshot`, `__guard__.push_rules` and `asset_tags.sync`, a closed
+> set counted (not per-event audited) by `yuzu_server_system_reserved_push_total`.
+> Nothing else is.
+> If containment
+> state becomes unreadable for longer than a 60-second last-known-good
+> window, dispatch fails **closed** and refuses every target fleet-wide —
+> alert on `yuzu_server_quarantine_gate_total{outcome="fail_closed"}`, which
+> is an outage signal rather than a quarantine one
+> (see [Metrics](metrics.md)).
 
 ---
 

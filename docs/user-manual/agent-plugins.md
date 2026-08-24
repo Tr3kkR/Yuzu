@@ -358,7 +358,7 @@ Plugins for software inventory, Windows-specific package management, update stat
 
 | Action | Description |
 |---|---|
-| `installed` | List installed updates/hotfixes with KB number, date, and type. |
+| `installed` | List installed updates/hotfixes with KB number, date, and type. On Windows, sourced from a bounded WMI `Win32_QuickFixEngineering` query, capped at 512 rows with **no sort order** — WQL has no `ORDER BY` for a data-class query, so this no longer matches the retired PowerShell path's 50-most-recent-by-install-date behavior. |
 | `missing` | List updates that are available but not yet installed. |
 | `pending_reboot` | Detect whether the endpoint requires a reboot after updates. Checks Windows registry keys, Linux reboot-required file and kernel version, macOS softwareupdate restart flag. |
 
@@ -396,14 +396,15 @@ Plugins for antivirus, firewall, disk encryption, event logs, vulnerability scan
 
 | | |
 |---|---|
-| **Version** | v0.2.0 |
+| **Version** | v0.3.0 |
 | **Platforms** | W L M |
-| **Description** | Antivirus product detection and status. |
+| **Description** | Antivirus product detection, status, and (Windows) configured exclusions. Windows acquisition is in-process WMI/registry (rung 1); macOS/Linux read via the bounded subprocess runner. |
 
 | Action | Description |
 |---|---|
-| `products` | List detected antivirus products as `av\|<name>\|<state>` rows. Windows: SecurityCenter2 registered products (state is the raw productState code). Linux: process/directory detection. macOS: XProtect probed via its definition bundle (an `xprotect_version\|…` row rides alongside; `av\|XProtect\|unknown` means the bundle was unreadable — never assumed active) plus endpoint-security system extensions for third-party EDR/AV (each also emits `edr\|<bundle id>\|<version>`), with process detection as fallback. |
-| `status` | Windows: Defender real-time protection, signature version, last update, last quick scan. macOS: XProtect definition version, definition freshness (`last_update`), and Remediator/MRT engine versions — no real-time-protection row (macOS exposes no queryable equivalent); `status\|unknown` means the definition bundle was unreadable. Linux: `status\|not_available`. |
+| `products` | List detected antivirus products. Windows: SecurityCenter2 registered products as `av\|<name>\|<state>\|<definitions>` rows — the productState code is decoded into `enabled`/`snoozed`/`disabled` and a `current`/`stale` definitions-freshness field (`unknown\|unknown` when it cannot be decoded). Linux/macOS: 3-field `av\|<name>\|<state>` rows. Linux: process/directory detection. macOS: XProtect probed via its definition bundle (an `xprotect_version\|…` row rides alongside; `av\|XProtect\|unknown` means the bundle was unreadable — never assumed active) plus endpoint-security system extensions for third-party EDR/AV (each also emits `edr\|<bundle id>\|<version>`), with process detection as fallback. |
+| `status` | Windows: Defender real-time protection, signature version, last update, last quick scan. macOS: XProtect definition version, definition freshness (`last_update`), and Remediator/MRT engine versions — no real-time-protection row (macOS exposes no queryable equivalent); `status\|unknown` means the definition bundle was unreadable. Linux: `av\|ClamAV\|running` or `not_running` (plus `last_update\|<ISO-8601>` from the signature database's mtime when clamd is running), and presence-only `av\|CrowdStrike Falcon\|detected`/`not_detected` and `av\|Sophos\|detected`/`not_detected` — no definitions data is reported for those two. |
+| `av_exclusions` | Windows-only. Lists Defender's configured exclusions (paths, processes, file extensions) from both the operator-editable local hive and the GPO/MDM-managed policy hive, merged with provenance so an operator can tell which plane an exclusion came from. A `partial` result means the enumeration could not be confirmed complete (a registry read was truncated or transiently failed) — the exclusions returned are real, but there may be more that weren't collected. Other platforms report `unsupported`. |
 
 ### firewall
 
@@ -421,13 +422,13 @@ Plugins for antivirus, firewall, disk encryption, event logs, vulnerability scan
 
 | | |
 |---|---|
-| **Version** | v0.1.0 |
+| **Version** | v0.2.0 |
 | **Platforms** | W L M |
-| **Description** | Disk encryption status. Reports BitLocker on Windows, LUKS on Linux, and FileVault on macOS. |
+| **Description** | Disk encryption status. Reports BitLocker on Windows (in-process WMI, `Win32_EncryptableVolume`), LUKS on Linux (`libblkid` + `/sys/class/block/dm-*`), and FileVault on macOS (`fdesetup`/`diskutil` via the bounded subprocess runner). |
 
 | Action | Description |
 |---|---|
-| `state` | Encryption status per volume (encrypted, decrypted, encrypting, protection on/off). |
+| `state` | Encryption status per volume (encrypted, decrypted, encrypting, protection on/off). A host with more encryptable volumes than the query's row cap reports a `partial` completeness signal rather than silently omitting the excess volumes. |
 
 ### event_logs
 

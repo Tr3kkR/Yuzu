@@ -78,7 +78,7 @@ duplicates.
 | **Live — disk space** | ✅ | ✅ | ✅ | `disk_space` plugin `free` action; `GetDiskFreeSpaceExW` on Windows, `statvfs` on POSIX |
 | **Live — Wi-Fi current connection** | ✅ | ✅ | 🟡 | `wifi/connected` — Win `WlanQueryInterface`, Linux `nmcli`/`iwconfig`, macOS `wifi_corewlan.mm` `corewlan_current_connection` (CoreWLAN `CWWiFiClient`/`CWInterface`, first `.mm` TU; pure `format_connected_record` in `wifi_corewlan.hpp`). macOS 🟡: association/RSSI/channel/security read, but SSID/BSSID are withheld from a background daemon by Location Services on 14+ (`<ssid-withheld>`) — replaces the dead `airport -I` path |
 | **━━ Security posture & file/certificate surfaces ━━** | | | | Posture reads + signed-artifact/certificate actions; each row cites its per-OS legs |
-| **Antivirus posture** (`antivirus` plugin: `products` + `status`) | ✅ SecurityCenter2 products + Defender status | 🟡 process/dir detection only (ClamAV/CrowdStrike/Sophos; no `status` leg) | 🟡 `products`: XProtect bundle version + endpoint-security system-extension enumeration (`systemextensionsctl`, unprivileged) + process fallback; `status`: XProtect definition version + bundle mtime + Remediator/MRT — **no real-time-protection state** (macOS exposes no queryable equivalent), `av\|XProtect\|active` is a definitions-readable proxy, not a running-protection read | `agents/plugins/antivirus/src/antivirus_plugin.cpp` (`list_av_products_macos`/`xprotect_status_macos`); pure parsers `antivirus_parsers.hpp` (`parse_plist_version`/`parse_sysext_list`/`sysext_av_state`) tested every host |
+| **Antivirus posture** (`antivirus` plugin: `products` + `status` + `av_exclusions`) | ✅ SecurityCenter2 products + Defender status (in-process WMI) + Defender exclusion lists (in-process registry) | 🟡 process/dir detection + `status` now has a real leg (ClamAV liveness + rung-1 definitions mtime; CrowdStrike/Sophos presence-only) | 🟡 `products`: XProtect bundle version + endpoint-security system-extension enumeration (`systemextensionsctl`, unprivileged) + process fallback; `status`: XProtect definition version + bundle mtime + Remediator/MRT — **no real-time-protection state** (macOS exposes no queryable equivalent), `av\|XProtect\|active` is a definitions-readable proxy, not a running-protection read; `av_exclusions` unsupported (Windows-only concept) | `agents/plugins/antivirus/src/antivirus_plugin.cpp`; pure parsers/renderers `antivirus_parsers.hpp` (`parse_plist_version`/`parse_sysext_list`/`sysext_av_state`/`decode_wsc_product_state`/`render_wsc_products`/`render_defender_status`/`render_exclusion_lines`) tested every host |
 | **Firewall posture** (`firewall` plugin: `state` + `rules`) | ✅ per-profile via `INetFwPolicy2` COM (rung 1, native — no `netsh` shell-out) | ✅ backend autodetect, firewalld (rung 1, bounded sd-bus) → nftables (not yet implemented — falls through) → ufw → iptables (rung 2, `run_bounded_subprocess` argv, structured per-backend rows) | 🟡 `state`: Application Firewall primary (`socketfilterfw --getglobalstate`, unprivileged; `mode\|block_all` when State = 2) + pf secondary (`pfctl -s info`, root — `unknown` without it); `rules`: pf only (`pfctl -s rules`, root; no Application Firewall per-app list yet) — both via `run_bounded_subprocess` (rung 2, no shell) | `agents/plugins/firewall/src/firewall_plugin.cpp` `state`/`rules` legs; pure parsers `firewall_parsers.hpp` (tested every host) |
 | **Digital-signature verification** (`filesystem.get_signature`) | ✅ | ⛔ | ✅ | Win: WinVerifyTrust (Authenticode: valid/invalid/unsigned/untrusted) in `filesystem_plugin.cpp`. macOS: `codesign --verify --deep --strict` mapped to valid/unsigned/invalid/unknown by `classify_codesign_result` in `agents/plugins/filesystem/src/filesystem_macos_sig.hpp` (macOS `valid` = seal integrity, not Gatekeeper/notarization trust). Linux emits platform-unsupported |
 | **File version info** (`filesystem.get_version_info`) | ✅ | ⛔ | ✅ | Win: `GetFileVersionInfoW`/`VerQueryValueW` (VS_FIXEDFILEINFO + string table) in `filesystem_plugin.cpp`. macOS: CFBundleShortVersionString/CFBundleVersion from the bundle Info.plist via `plutil -extract`, mapped by `classify_plutil_extract` in `filesystem_macos_sig.hpp` (binary + XML plists; `version_status\|not_available` when absent). Linux emits platform-unsupported |
@@ -89,9 +89,9 @@ duplicates.
 | **━━ Agent plugins (49) — per-plugin build/availability ━━** | | | | Per-OS via platform macros / per-OS TUs (`agents/plugins/*/src/*`). 42 fully cross-platform, 4 Windows-only (`rdp_control`, `registry`, `sccm`, `wmi`), 2 uneven (`tar` — richest on Windows; `msi_packages` — Win+macOS, no Linux), 1 macOS-constrained (`interaction` — GUI-less daemon). "Full" = the plugin builds and its core actions work on that OS; a plugin can be cross-platform yet expose a few OS-specific actions (noted) |
 | agent_actions | ✅ | ✅ | ✅ | portable — no platform macros |
 | agent_logging | ✅ | ✅ | ✅ | `_WIN32`/`__APPLE__`/Linux branches all implemented |
-| antivirus | ✅ | ✅ | ✅ | Defender/WMI · ClamAV+Falcon+Sophos · macOS real probes — XProtect bundle version + endpoint-security system-extension enumeration (`antivirus_plugin.cpp`, parsers `antivirus_parsers.hpp`), no longer a hardcoded assertion (posture depth: the **Antivirus posture** row) |
+| antivirus | ✅ | ✅ | ✅ | Defender/WMI (in-process, no more `powershell`) + exclusion-registry read · ClamAV+Falcon+Sophos with a real `status` leg · macOS real probes — XProtect bundle version + endpoint-security system-extension enumeration (`antivirus_plugin.cpp`, parsers `antivirus_parsers.hpp`), no longer a hardcoded assertion (posture depth: the **Antivirus posture** row) |
 | asset_tags | ✅ | ✅ | ✅ | portable — `std::filesystem` only |
-| bitlocker | ✅ | ✅ | ✅ | BitLocker `manage-bde` · LUKS `cryptsetup` · FileVault `fdesetup` + per-APFS-volume `diskutil apfs list` (encrypted/not_encrypted/unknown, parser `bitlocker_macos_apfs.hpp`) |
+| bitlocker | ✅ | ✅ | ✅ | BitLocker via in-process Win32_EncryptableVolume WMI (rung 1, no subprocess) · LUKS via in-process libblkid + `/sys/class/block/dm-*/dm/uuid` reads (rung 1, no subprocess) · FileVault `fdesetup` + per-APFS-volume `diskutil apfs list` via direct argv through the bounded runner (rung 2; encrypted/not_encrypted/unknown, parser `bitlocker_macos_apfs.hpp`) |
 | certificates | ✅ | ✅ | ✅ | full per-OS blocks (`_WIN32`/`__linux__`/`__APPLE__`); Linux now parses in-process via libcrypto (rung 1); macOS System/SystemRoot keychains read natively via SecItem (rung 1), login keychain stays on its registered Decision-7 governed-shell path; macOS depth — login-keychain read + verified SIP-aware delete — in the **Security posture** section rows |
 | chargen | ✅ | ✅ | ✅ | portable — RFC 864 generator |
 | content_dist | ✅ | ✅ | ✅ | `_WIN32` vs POSIX; HTTPS gated on OpenSSL build option, not OS |
@@ -193,12 +193,15 @@ implementation is.
 | agent_logging | get_key_files | linux | supported | 1 | /proc/self/exe symlink + std::filesystem metadata | - |
 | agent_logging | get_key_files | macos | supported | 1 | _NSGetExecutablePath + realpath(3) + std::filesystem metadata | - |
 | agent_logging | get_key_files | windows | supported | 1 | GetModuleFileNameA + std::filesystem metadata | - |
-| antivirus | products | linux | supported | 3 | pgrep+filesystem_probe | - |
-| antivirus | products | macos | supported | 3 | plistbuddy+systemextensionsctl | - |
-| antivirus | products | windows | supported | 3 | powershell_cim_securitycenter2 | - |
-| antivirus | status | linux | unsupported | - | - | - |
-| antivirus | status | macos | supported | 3 | plistbuddy+stat | - |
-| antivirus | status | windows | supported | 3 | powershell_defender_status | - |
+| antivirus | products | linux | supported | 2 | pgrep+filesystem_probe | - |
+| antivirus | products | macos | supported | 2 | plistbuddy+systemextensionsctl+pgrep | - |
+| antivirus | products | windows | supported | 1 | wmi_securitycenter2 | - |
+| antivirus | status | linux | supported | 2 | pgrep+stat | ClamAV liveness+definitions mtime; CrowdStrike/Sophos presence-only |
+| antivirus | status | macos | supported | 2 | plistbuddy+stat | - |
+| antivirus | status | windows | supported | 1 | wmi_defender_status | - |
+| antivirus | av_exclusions | linux | unsupported | - | - | Windows-only concept |
+| antivirus | av_exclusions | macos | unsupported | - | - | Windows-only concept |
+| antivirus | av_exclusions | windows | supported | 1 | win32_registry | permission_denied sentinel on ACL'd key, never a silent empty list |
 | asset_tags | sync | linux | supported | 1 | local_json_store | - |
 | asset_tags | sync | macos | supported | 1 | local_json_store | - |
 | asset_tags | sync | windows | supported | 1 | local_json_store | - |
@@ -211,9 +214,9 @@ implementation is.
 | asset_tags | changes | linux | supported | 1 | local_json_store | - |
 | asset_tags | changes | macos | supported | 1 | local_json_store | - |
 | asset_tags | changes | windows | supported | 1 | local_json_store | - |
-| bitlocker | state | linux | supported | 3 | lsblk+cryptsetup | - |
-| bitlocker | state | macos | supported | 3 | fdesetup+diskutil | - |
-| bitlocker | state | windows | supported | 3 | manage_bde | - |
+| bitlocker | state | linux | supported | 1 | libblkid+sysfs | - |
+| bitlocker | state | macos | supported | 2 | fdesetup+diskutil | - |
+| bitlocker | state | windows | supported | 1 | wmi_encryptable_volume | - |
 | certificates | list | linux | supported | 1 | libcrypto X509 (in-process PEM parse) | - |
 | certificates | list | macos | supported | 3 | SecItem (System/root, in-process) + security find-certificate via governed shell (login) | System.keychain and SystemRootCertificates.keychain are read natively via SecItemCopyMatching (rung 1); the login keychain still requires the launchctl/sudo ~user hop (Decision-7 governed-shell exception) |
 | certificates | list | windows | supported | 1 | CryptoAPI (CertEnumCertificatesInStore) | - |
@@ -528,10 +531,10 @@ implementation is.
 | registry | list_profiles | windows | supported | 1 | win32_registry | - |
 | sccm | client_version | linux | unsupported | - | - | - |
 | sccm | client_version | macos | unsupported | - | - | - |
-| sccm | client_version | windows | supported | 3 | registry+sc_query | - |
+| sccm | client_version | windows | supported | 1 | registry+scm | - |
 | sccm | site | linux | unsupported | - | - | - |
 | sccm | site | macos | unsupported | - | - | - |
-| sccm | site | windows | supported | 3 | registry+powershell_com | - |
+| sccm | site | windows | supported | 1 | registry+com_dispatch | - |
 | script_exec | exec | linux | supported | 2 | fork_execvp | - |
 | script_exec | exec | macos | supported | 2 | fork_execvp | - |
 | script_exec | exec | windows | supported | 2 | create_process | - |
@@ -703,14 +706,14 @@ implementation is.
 | wifi | connected | linux | constrained | 3 | nmcli via governed shell runner | falls back to a raw iwconfig text blob (ESSID/Signal only) when nmcli reports no SSID |
 | wifi | connected | macos | constrained | 1 | CoreWLAN | Location Services (macOS 14+) may withhold SSID/BSSID from a background daemon |
 | wifi | connected | windows | supported | 1 | WlanQueryInterface | - |
-| windows_updates | installed | linux | supported | 3 | rpm+apt | - |
-| windows_updates | installed | macos | supported | 3 | system_profiler | - |
-| windows_updates | installed | windows | supported | 3 | powershell_gethotfix | - |
-| windows_updates | missing | linux | supported | 3 | apt+yum | - |
-| windows_updates | missing | macos | supported | 3 | softwareupdate | - |
-| windows_updates | missing | windows | supported | 3 | powershell_update_session | - |
-| windows_updates | pending_reboot | linux | supported | 3 | filesystem+uname+needs_restarting | - |
-| windows_updates | pending_reboot | macos | constrained | 3 | softwareupdate | unbounded network call -- may take 30-120s or hang on an offline/headless Mac |
+| windows_updates | installed | linux | supported | 2 | rpm+apt | - |
+| windows_updates | installed | macos | supported | 2 | system_profiler | - |
+| windows_updates | installed | windows | supported | 1 | wmi_bounded_query | - |
+| windows_updates | missing | linux | supported | 2 | apt+yum | - |
+| windows_updates | missing | macos | supported | 2 | softwareupdate | - |
+| windows_updates | missing | windows | supported | 1 | wua_com_async_search | - |
+| windows_updates | pending_reboot | linux | supported | 3 | filesystem+uname+vmlinuz_ls+needs_restarting | - |
+| windows_updates | pending_reboot | macos | constrained | 2 | softwareupdate | bounded (60s deadline) since this migration, but still a slow network call -- no longer able to hang indefinitely on an offline/headless Mac |
 | windows_updates | pending_reboot | windows | supported | 1 | registry | - |
 | windows_updates | patch_connectivity | linux | supported | 1 | raw_sockets | - |
 | windows_updates | patch_connectivity | macos | supported | 1 | raw_sockets | - |
