@@ -579,6 +579,78 @@ TEST_CASE("ProductPackStore::install: compensation runs in reverse install order
     CHECK(compensated_ids[1] == "item-id-1");
 }
 
+// ── Accepted-risk residual (F032/#3481) ──────────────────────────────────────
+
+TEST_CASE("ProductPackStore::uninstall: a retried DELETE after a late metadata-delete failure "
+          "eventually converges",
+          "[product_pack_store][pg]") {
+    // F032 is specifically the metadata-delete TRANSACTION failing AFTER uninstall_fn already
+    // ran against sibling content — NOT get() failing before anything happens. A single pinned
+    // connection (the technique used for F031 above) starves get() too, since uninstall() calls
+    // get() first to fetch pack.items — that would prove the wrong thing. Instead, reuse the
+    // erasure-coordination-lock test's technique below: hold kErasureCoordLockSql open on a
+    // second connection from the SAME pool, and give the pool a short lock_timeout_ms so
+    // uninstall()'s own attempt to take that lock (the first statement inside its with_txn_for,
+    // AFTER uninstall_fn has already run) genuinely fails with a real Postgres lock-timeout
+    // error — a deterministic, real failure at exactly the point F032 describes.
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 500}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    auto installed = store.install(kUnsignedPackYaml, make_accept_all_install_fn());
+    REQUIRE(installed.has_value());
+    const std::string pack_id = *installed;
+
+    // Hold the SAME advisory lock uninstall() takes, uncommitted, on a separate connection —
+    // must match kErasureCoordLockSql in product_pack_store.cpp exactly (private to that
+    // translation unit, so hard-coded here, same as the erasure-coordination-lock test above).
+    auto lease_a = pool.acquire();
+    REQUIRE(lease_a);
+    REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "SELECT pg_advisory_xact_lock(2037545589, "
+                            "hashtext('product_pack_store:erasure_coordination'))",
+                            std::vector<std::string>{})
+                .ok());
+
+    int first_uninstall_calls = 0;
+    auto first =
+        store.uninstall(pack_id, [&first_uninstall_calls](const std::string&,
+                                                           const std::string&) {
+            ++first_uninstall_calls;
+            return true;
+        });
+    REQUIRE_FALSE(first.has_value());
+    CHECK(first.error().starts_with(yuzu::server::kProductPackDbErrorPrefix));
+    CHECK(first_uninstall_calls == 1);
+
+    // The pack must still be listed as installed — the metadata delete never committed, even
+    // though uninstall_fn already ran against (fake) sibling content above.
+    auto still_there = store.get(pack_id);
+    REQUIRE(still_there.has_value());
+    REQUIRE(still_there->has_value());
+
+    // Releasing an open-transaction lease rolls it back defensively (PgPool contract), freeing
+    // the advisory lock.
+    lease_a.reset();
+
+    int second_uninstall_calls = 0;
+    auto second =
+        store.uninstall(pack_id, [&second_uninstall_calls](const std::string&,
+                                                            const std::string&) {
+            ++second_uninstall_calls;
+            return true;
+        });
+    REQUIRE(second.has_value());
+    CHECK(second_uninstall_calls == 1);
+
+    auto gone = store.get(pack_id);
+    REQUIRE(gone.has_value());
+    CHECK_FALSE(gone->has_value());
+}
+
 // ── Backfill (ADR-0009/0054) ─────────────────────────────────────────────────
 
 namespace {

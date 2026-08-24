@@ -1414,8 +1414,20 @@ std::expected<void, std::string> ProductPackStore::uninstall(const std::string& 
             return false;
         return true;
     });
-    if (!ok)
+    if (!ok) {
+        // F032/#3481: uninstall_fn already removed real sibling-store content (see the file
+        // header — no lease of ours was held across that loop, and this txn is what's failing
+        // NOW, after that already happened). Accepted, store-scoped residual: no compensating
+        // action is possible (nothing to restore), but a retried DELETE self-heals — re-running
+        // uninstall_fn against already-gone items is idempotent-ish, then this transaction runs
+        // again.
+        spdlog::error(
+            "ProductPackStore: uninstall failed to persist metadata delete for pack '{}' AFTER "
+            "{}/{} sibling item(s) were already removed — pack remains listed as installed, "
+            "pointing at deleted/partially-deleted content; retry this DELETE to complete cleanup",
+            sanitize_for_log(id), removed, pack.items.size());
         return std::unexpected(std::string(kProductPackDbErrorPrefix) + "uninstall failed");
+    }
 
     spdlog::info("ProductPackStore: uninstalled '{}', removed {} items",
                  sanitize_for_log(pack.name), removed);

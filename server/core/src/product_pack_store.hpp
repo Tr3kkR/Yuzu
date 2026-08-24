@@ -61,6 +61,25 @@
 /// `ResultSetStore`'s per-owner quota/pin-limit soft-enforcement is the ladder's precedent for
 /// recording this class of trade explicitly rather than silently.
 ///
+/// **Update (F032/#3481, 2026-08-24): `uninstall()`'s final metadata-delete transaction can
+/// likewise fail AFTER `uninstall_fn` has already removed the real sibling-store content** — the
+/// pack stays listed as installed, pointing at content that no longer exists. Unlike F031 above,
+/// this gap is accepted as a store-scoped residual risk rather than closed, because there is no
+/// symmetric fix: the sibling content is already gone, and re-creating deleted content to satisfy
+/// a rollback would itself be a hazard (resurrecting content an operator explicitly asked to
+/// remove, from no fresh operator input). Accepted on two grounds: (1) a plain client retry
+/// self-heals it — re-issuing the DELETE re-runs `uninstall_fn` against items that are already
+/// gone (idempotent no-ops for every sibling store's delete-by-id), then the metadata-delete
+/// transaction runs again and, absent a repeat failure, succeeds; (2) the blast radius is the same
+/// operator-authored-catalog-metadata classification ADR-0009's `ProductPackStore`/ADR-0054 update
+/// note already applies to this store, not personal or regulated subject/device data. **What this
+/// does NOT close:** between the failure and a successful retry, `get()`/`list()` show a pack
+/// pointing at deleted content, and a lookup that follows one of its item ids into another
+/// endpoint 404s — expected during that window, not a new fault, but genuinely visible to a caller
+/// that doesn't retry. This reasoning is store-scoped and MUST be re-derived, not copied, by any
+/// future store whose own uninstall path can leave metadata dangling over content that cannot be
+/// safely restored.
+///
 /// No secrets (ADR-0010 N/A): `yaml_source` is pack content — verified against
 /// `docs/Instruction-Engine.md` / `docs/yaml-dsl-spec.md`, neither of which defines a
 /// secret-typed/credential-bearing YAML field; the only crypto-adjacent fields are the public
