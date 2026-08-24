@@ -132,4 +132,66 @@ TEST_CASE("wifi plugin: list_networks reaches the real platform mechanism end to
     CHECK(result.captured.find("wifi|") != std::string::npos);
 }
 
+// The ABI4 capability descriptor is the machine-readable claim the #2204
+// capability matrix is generated from, and nothing else asserted it -- stale
+// or untrue rung/mechanism metadata passed the whole suite. This is the
+// regression guard for the class of defect where the descriptor advertises an
+// acquisition path the binary cannot actually take.
+TEST_CASE("wifi plugin: capability descriptors state the rung this binary can actually reach",
+          "[wifi][posix_actions][descriptor]") {
+    auto plugin = load_wifi_plugin();
+    if (!plugin) {
+        WARN("wifi plugin library not found -- skipping descriptor contract test");
+        return;
+    }
+
+    const auto* d = plugin->descriptor;
+    REQUIRE(d->action_descriptors != nullptr);
+    REQUIRE(d->action_descriptor_count == 2);
+
+    const YuzuActionDescriptor* list_networks = nullptr;
+    const YuzuActionDescriptor* connected = nullptr;
+    for (std::size_t i = 0; i < d->action_descriptor_count; ++i) {
+        const auto& a = d->action_descriptors[i];
+        REQUIRE(a.action != nullptr);
+        if (std::string_view{a.action} == "list_networks")
+            list_networks = &a;
+        else if (std::string_view{a.action} == "connected")
+            connected = &a;
+    }
+    REQUIRE(list_networks != nullptr);
+    REQUIRE(connected != nullptr);
+
+    // macOS scan is CONSTRAINED rung 2 by roadmap decision -- the native
+    // Location-gated scan belongs to the user-context-bridge programme, not
+    // here. A silent promotion to "supported" would be a false capability
+    // claim to every operator reading the matrix.
+    CHECK(list_networks->macos_leg.support == YUZU_SUPPORT_CONSTRAINED);
+    CHECK(list_networks->macos_leg.rung == 2);
+
+    // macOS connected is the shipped CoreWLAN native leg (rung 1), left
+    // untouched by this migration -- still CONSTRAINED because Location
+    // Services can withhold SSID/BSSID from a background daemon.
+    CHECK(connected->macos_leg.support == YUZU_SUPPORT_CONSTRAINED);
+    CHECK(connected->macos_leg.rung == 1);
+
+    // The Linux rung is a build-time fact: without libsystemd the whole
+    // sd-bus body is compiled out and the honest answer is rung 2.
+#if defined(YUZU_HAVE_LIBSYSTEMD)
+    constexpr int kExpectedLinuxRung = 1;
+#else
+    constexpr int kExpectedLinuxRung = 2;
+#endif
+    CHECK(list_networks->linux_leg.rung == kExpectedLinuxRung);
+    CHECK(connected->linux_leg.rung == kExpectedLinuxRung);
+
+    // Both Linux legs must name their argv fallback: the roadmap requires the
+    // nmcli rung-2 descent be DECLARED, not merely implemented.
+    REQUIRE(list_networks->linux_leg.fallback != nullptr);
+    REQUIRE(connected->linux_leg.fallback != nullptr);
+    CHECK(std::string_view{list_networks->linux_leg.fallback}.find("nmcli") !=
+          std::string_view::npos);
+    CHECK(std::string_view{connected->linux_leg.fallback}.find("nmcli") != std::string_view::npos);
+}
+
 #endif // !_WIN32

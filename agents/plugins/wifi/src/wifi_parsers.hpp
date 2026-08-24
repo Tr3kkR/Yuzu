@@ -490,6 +490,7 @@ inline std::string nm_security_flags_to_string(std::uint32_t wpa_flags, std::uin
     constexpr std::uint32_t kKeyMgmt8021X = 0x200; // NM_802_11_AP_SEC_KEY_MGMT_802_1X
     constexpr std::uint32_t kKeyMgmtSae = 0x400;   // NM_802_11_AP_SEC_KEY_MGMT_SAE (WPA3-Personal)
     constexpr std::uint32_t kKeyMgmtOwe = 0x800;   // NM_802_11_AP_SEC_KEY_MGMT_OWE (enhanced open)
+    constexpr std::uint32_t kKeyMgmtOweTm = 0x1000; // NM_802_11_AP_SEC_KEY_MGMT_OWE_TM
     const std::uint32_t either = wpa_flags | rsn_flags;
     if ((either & kKeyMgmt8021X) != 0)
         return "802.1X";
@@ -498,13 +499,48 @@ inline std::string nm_security_flags_to_string(std::uint32_t wpa_flags, std::uin
     // the nmcli leg, which prints WPA3.
     if ((either & kKeyMgmtSae) != 0)
         return "WPA3";
-    if ((either & kKeyMgmtOwe) != 0)
+    if ((either & (kKeyMgmtOwe | kKeyMgmtOweTm)) != 0)
         return "OWE";
     if (rsn_flags != 0)
         return "WPA2";
     if (wpa_flags != 0)
         return "WPA1";
-    return "NONE";
+    // "Open", NOT "NONE": the nmcli, airport and system_profiler legs all
+    // render an unsecured AP as "Open" (see parse_nmcli_wifi_list,
+    // parse_airport_scan, parse_system_profiler_wifi). Emitting "NONE" here
+    // would mean the SAME access point changed its reported security string
+    // purely because the host degraded from D-Bus to nmcli -- exactly the
+    // cross-rung inconsistency the ordering above exists to prevent.
+    return "Open";
+}
+
+// Did an argv rung actually ANSWER the question, or did it merely fail?
+//
+// This is the difference between "the tool ran and told us there is no Wi-Fi
+// connection" and "no tool ever produced an answer". Only the first justifies
+// emitting a definitive `connected|none|Not connected` / empty-scan record.
+//
+// The distinction cannot be read off `forward_runner_failure` alone:
+// `classify_runner_failure` deliberately returns nullopt for
+// TerminationReason::exited, because whether a nonzero exit is an error is the
+// caller's domain (ADR-3002 leaves exit-code semantics to the plugin). For
+// wifi, a nonzero exit from nmcli/iw/iwlist/iwconfig means the query FAILED --
+// it is never evidence of an absent network. Without this, a host where nmcli
+// and iwconfig both exit nonzero reports a confident "Not connected" while
+// nothing was actually determined: the fabricated-success class that shipped
+// twice in Wave 3 (BitLocker encryption state, firewall false-safe "inactive").
+//
+// `exited` + exit_code == 0 is the only outcome that answers the question.
+// spawn_error (tool absent), deadline, cancelled, signaled and any nonzero
+// exit are all "unknown", never "negative".
+struct WifiToolVerdict {
+    bool answered = false; // the tool ran to completion and succeeded
+};
+
+template <typename SubprocessResultT>
+inline WifiToolVerdict wifi_tool_answered(const SubprocessResultT& r) {
+    using RT = decltype(r.termination_reason);
+    return WifiToolVerdict{r.termination_reason == RT::exited && r.exit_code == 0};
 }
 
 // Assembles a list_networks row from one AP's raw properties, applying the

@@ -19,6 +19,13 @@
 
 #include "wifi_parsers.hpp"
 
+// wifi_parsers.hpp stays pure (wifi_tool_answered is a template over the
+// result's own termination_reason type, so the header takes no runner
+// dependency). The TEST pulls the real enum in deliberately, so a rename or
+// a reordering of TerminationReason breaks here rather than silently
+// re-tuning the honest-degradation decision against a local copy.
+#include <yuzu/agent/subprocess_runner.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 using namespace yuzu::wifi;
@@ -279,8 +286,17 @@ TEST_CASE("wifi: frequency_to_channel — unrecognised frequency is honestly 0",
     CHECK(frequency_to_channel(2413) == "0"); // off the 5MHz grid
 }
 
-TEST_CASE("wifi: nm_security_flags_to_string — open network", "[wifi]") {
-    CHECK(nm_security_flags_to_string(0, 0) == "NONE");
+// "Open", not "NONE": the nmcli, airport and system_profiler legs all render
+// an unsecured AP as "Open". If the D-Bus leg disagreed, the SAME access point
+// would change its reported security string purely because the host degraded
+// from D-Bus to nmcli.
+TEST_CASE("wifi: nm_security_flags_to_string — open network matches the nmcli vocabulary",
+          "[wifi]") {
+    CHECK(nm_security_flags_to_string(0, 0) == "Open");
+    // Pin the cross-rung agreement directly: same AP, both acquisition paths.
+    auto nmcli_rows = parse_nmcli_wifi_list("OpenNet:70::6:AA");
+    REQUIRE(nmcli_rows.size() == 1);
+    CHECK(nmcli_rows[0].security == nm_security_flags_to_string(0, 0));
 }
 
 TEST_CASE("wifi: nm_security_flags_to_string — WPA1 only", "[wifi]") {
@@ -311,8 +327,47 @@ TEST_CASE("wifi: nm_security_flags_to_string — WPA3/SAE is not reported as WPA
 TEST_CASE("wifi: nm_security_flags_to_string — OWE enhanced-open is distinct from open",
           "[wifi]") {
     CHECK(nm_security_flags_to_string(0, 0x800) == "OWE");
-    // ...and a genuinely open AP is still NONE, not OWE.
-    CHECK(nm_security_flags_to_string(0, 0) == "NONE");
+    // OWE transition mode (0x1000) must not fall through to the bare
+    // "non-zero RsnFlags implies WPA2" branch.
+    CHECK(nm_security_flags_to_string(0, 0x1000) == "OWE");
+    // ...and a genuinely open AP is still Open, not OWE.
+    CHECK(nm_security_flags_to_string(0, 0) == "Open");
+}
+
+// ── honest degradation: a failed query is never a negative answer ──────────
+//
+// Regression guard for the fabricated-success class that shipped twice in
+// Wave 3. `classify_runner_failure` deliberately returns nullopt for a normal
+// exit, so a nonzero-exiting nmcli/iwconfig is invisible to the ABI status
+// seam; without wifi_tool_answered(), `connected` reported a confident
+// "Not connected" when in fact nothing had been determined.
+namespace {
+struct FakeResult {
+    yuzu::agent::TerminationReason termination_reason =
+        yuzu::agent::TerminationReason::exited;
+    int exit_code = 0;
+};
+} // namespace
+
+TEST_CASE("wifi: wifi_tool_answered — only a clean successful exit answers the question",
+          "[wifi]") {
+    using TR = yuzu::agent::TerminationReason;
+
+    // The one outcome that is a real answer.
+    CHECK(wifi_tool_answered(FakeResult{TR::exited, 0}).answered);
+
+    // A tool that ran but FAILED has told us nothing -- this is the exact
+    // case that produced a fabricated "Not connected".
+    CHECK_FALSE(wifi_tool_answered(FakeResult{TR::exited, 1}).answered);
+    CHECK_FALSE(wifi_tool_answered(FakeResult{TR::exited, 7}).answered);
+    CHECK_FALSE(wifi_tool_answered(FakeResult{TR::exited, 127}).answered);
+
+    // Nor has a tool that never ran, was killed, or timed out.
+    CHECK_FALSE(wifi_tool_answered(FakeResult{TR::spawn_error, -1}).answered);
+    CHECK_FALSE(wifi_tool_answered(FakeResult{TR::deadline, -1}).answered);
+    CHECK_FALSE(wifi_tool_answered(FakeResult{TR::cancelled, -1}).answered);
+    CHECK_FALSE(wifi_tool_answered(FakeResult{TR::signaled, -1}).answered);
+    CHECK_FALSE(wifi_tool_answered(FakeResult{TR::line_limit, -1}).answered);
 }
 
 TEST_CASE("wifi: nm_ap_to_row assembles a list_networks row from raw AP properties",

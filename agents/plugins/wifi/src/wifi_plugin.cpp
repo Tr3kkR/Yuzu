@@ -432,6 +432,13 @@ std::optional<yuzu::wifi::NmAccessPointProps> nm_read_ap(NmBusSession& session,
 
 struct NmListResult {
     bool reachable = false; // false -> caller falls through to nmcli, never "no wifi"
+    // NetworkManager answered, but reported no device of type WIFI at all.
+    // That is "this host has no Wi-Fi hardware NM manages", which is NOT the
+    // same statement as "no networks are visible" -- and NM can also be
+    // managing nothing on a host where iw/iwlist would still scan. Reported
+    // separately so the caller can fall through to the argv rungs instead of
+    // announcing an empty airspace.
+    bool saw_wifi_device = false;
     std::vector<yuzu::wifi::WifiNetworkRow> rows;
 };
 
@@ -455,6 +462,7 @@ NmListResult query_nm_list_networks() {
             return result;
         if (*dtype != kNmDeviceTypeWifi)
             continue;
+        result.saw_wifi_device = true;
 
         if (!session.arm_next_call())
             return result;
@@ -625,7 +633,10 @@ int do_list_networks(yuzu::CommandContext& ctx) {
 
 #elif defined(__linux__)
 #if defined(YUZU_HAVE_LIBSYSTEMD)
-    if (auto nm = query_nm_list_networks(); nm.reachable) {
+    // `saw_wifi_device` gates the definitive answer: a reachable NM that
+    // manages no Wi-Fi device has told us nothing about the airspace, so we
+    // fall through to iw/iwlist rather than announce an empty scan.
+    if (auto nm = query_nm_list_networks(); nm.reachable && nm.saw_wifi_device) {
         if (nm.rows.empty()) {
             // A confirmed, definitive answer from a reachable NetworkManager
             // (not the ambiguous "empty output" nmcli's own leg below has to
@@ -645,44 +656,66 @@ int do_list_networks(yuzu::CommandContext& ctx) {
     // -> fall through to the nmcli argv rung (D-Bus failure is never
     // "no wifi").
 #endif
-    bool status_forwarded = false;
     // sink: wifi/do_list_networks#1 -- nmcli device wifi list (rung 2 argv;
     // replaces the deleted sh -c pipeline)
     auto nmcli_path = yuzu::agent::probe_tool_path({"/usr/bin/nmcli", "/bin/nmcli"});
     auto nmcli_res =
         run_tool({nmcli_path, "-t", "-f", "SSID,SIGNAL,SECURITY,CHAN,BSSID", "device", "wifi", "list"});
-    status_forwarded = yuzu::agent::forward_runner_failure(ctx, nmcli_res.res);
     if (!nmcli_res.output.empty()) {
+        yuzu::agent::forward_runner_failure(ctx, nmcli_res.res); // carries line_limit PARTIAL
         for (auto& row : yuzu::wifi::parse_nmcli_wifi_list(nmcli_res.output)) {
             ctx.write_output(std::format("wifi|{}|{}|{}|{}|{}", sof(row.ssid), sof(row.signal),
                                          sof(row.security), sof(row.channel), sof(row.bssid)));
         }
-    } else {
-        // sink: wifi/do_list_networks#2 -- iw dev (interface discovery for
-        // the iwlist fallback)
-        auto iw_path = yuzu::agent::probe_tool_path({"/usr/sbin/iw", "/sbin/iw", "/usr/bin/iw"});
-        auto iw_res = run_tool({iw_path, "dev"});
-        if (!status_forwarded)
-            status_forwarded = yuzu::agent::forward_runner_failure(ctx, iw_res.res);
-        auto ifaces = yuzu::wifi::parse_iw_dev_interfaces(iw_res.output);
-        if (!ifaces.empty()) {
-            // sink: wifi/do_list_networks#3 -- iwlist <iface> scan
-            // (per-interface raw scan text; one spawn per discovered iface)
-            auto iwlist_path =
-                yuzu::agent::probe_tool_path({"/usr/sbin/iwlist", "/sbin/iwlist", "/usr/bin/iwlist"});
-            for (auto& iface : ifaces) {
-                auto scan_res = run_tool({iwlist_path, iface, "scan"});
-                if (!status_forwarded)
-                    status_forwarded = yuzu::agent::forward_runner_failure(ctx, scan_res.res);
-                auto filtered = yuzu::wifi::filter_iwlist_scan_lines(scan_res.output);
-                if (!filtered.empty()) {
-                    ctx.write_output(std::format("wifi|scan_output|{}", sof(filtered)));
-                }
-            }
-        } else {
-            ctx.write_output("wifi|error|No wireless tools available (nmcli/iw)|0|0|none");
-        }
+        return 0;
     }
+
+    // sink: wifi/do_list_networks#2 -- iw dev (interface discovery for
+    // the iwlist fallback)
+    auto iw_path = yuzu::agent::probe_tool_path({"/usr/sbin/iw", "/sbin/iw", "/usr/bin/iw"});
+    auto iw_res = run_tool({iw_path, "dev"});
+    auto ifaces = yuzu::wifi::parse_iw_dev_interfaces(iw_res.output);
+    if (!ifaces.empty()) {
+        // sink: wifi/do_list_networks#3 -- iwlist <iface> scan
+        // (per-interface raw scan text; one spawn per discovered iface)
+        auto iwlist_path =
+            yuzu::agent::probe_tool_path({"/usr/sbin/iwlist", "/sbin/iwlist", "/usr/bin/iwlist"});
+        bool any_scan_answered = false;
+        bool status_forwarded = false;
+        for (auto& iface : ifaces) {
+            auto scan_res = run_tool({iwlist_path, iface, "scan"});
+            if (yuzu::wifi::wifi_tool_answered(scan_res.res).answered)
+                any_scan_answered = true;
+            if (!status_forwarded)
+                status_forwarded = yuzu::agent::forward_runner_failure(ctx, scan_res.res);
+            auto filtered = yuzu::wifi::filter_iwlist_scan_lines(scan_res.output);
+            if (!filtered.empty()) {
+                ctx.write_output(std::format("wifi|scan_output|{}", sof(filtered)));
+            }
+        }
+        // Interfaces exist but not one iwlist run succeeded: the scan failed,
+        // it did not observe an empty airspace. Say so instead of returning
+        // silently, which a consumer reads as "no networks".
+        if (!any_scan_answered) {
+            if (!status_forwarded) {
+                ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
+                                      YUZU_RESULT_COMPLETENESS_PARTIAL, "wifi:iwlist_scan_failed");
+            }
+            ctx.write_output("wifi|error|Wi-Fi scan failed on every discovered interface "
+                             "(NetworkManager unreachable; nmcli and iwlist both failed)|0|0|none");
+        }
+        return 0;
+    }
+
+    // No nmcli output and no interfaces from iw. Distinguish "the tools ran
+    // and there is no wireless interface" from "no tool ever ran".
+    if (!yuzu::agent::forward_runner_failure(ctx, nmcli_res.res) &&
+        !yuzu::agent::forward_runner_failure(ctx, iw_res.res) &&
+        !yuzu::wifi::wifi_tool_answered(iw_res.res).answered) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "wifi:no_wireless_tools");
+    }
+    ctx.write_output("wifi|error|No wireless tools available (nmcli/iw)|0|0|none");
 
 #elif defined(__APPLE__)
     // macOS: the `airport` utility was removed in macOS 14 (Sonoma). Try
@@ -692,14 +725,20 @@ int do_list_networks(yuzu::CommandContext& ctx) {
     // produces output we still return rc=0 with an info marker so the
     // dispatch test passes — the agent isn't broken, the host just
     // can't enumerate Wi-Fi without elevated privilege.
-    bool status_forwarded = false;
     // sink: wifi/do_list_networks#4 -- airport -s (legacy scan; absent on
     // macOS 14+)
+    //
+    // airport's failure is deliberately NOT forwarded here. It was REMOVED in
+    // macOS 14, so on every modern host this call is a guaranteed
+    // spawn_error; forwarding it eagerly latched UNAVAILABLE/PARTIAL onto the
+    // result even when system_profiler then returned a complete scan --
+    // stamping a good answer as a failed one. Only the rung that actually
+    // produces (or fails to produce) the answer sets the status.
     auto airport_res = run_tool(
         {"/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport",
          "-s"});
-    status_forwarded = yuzu::agent::forward_runner_failure(ctx, airport_res.res);
     if (!airport_res.output.empty()) {
+        yuzu::agent::forward_runner_failure(ctx, airport_res.res);
         for (auto& row : yuzu::wifi::parse_airport_scan(airport_res.output)) {
             ctx.write_output(std::format("wifi|{}|{}|{}|{}|{}", sof(row.ssid), sof(row.signal),
                                          sof(row.security), sof(row.channel), sof(row.bssid)));
@@ -709,8 +748,7 @@ int do_list_networks(yuzu::CommandContext& ctx) {
         // (Location-Services-gated fallback)
         auto sp_res =
             run_tool({"/usr/sbin/system_profiler", "SPAirPortDataType", "-detailLevel", "basic"});
-        if (!status_forwarded)
-            status_forwarded = yuzu::agent::forward_runner_failure(ctx, sp_res.res);
+        yuzu::agent::forward_runner_failure(ctx, sp_res.res);
         auto sp_rows = sp_res.output.empty() ? std::vector<yuzu::wifi::WifiNetworkRow>{}
                                              : yuzu::wifi::parse_system_profiler_wifi(sp_res.output);
         for (auto& row : sp_rows) {
@@ -718,6 +756,14 @@ int do_list_networks(yuzu::CommandContext& ctx) {
                                          sof(row.security), sof(row.channel)));
         }
         if (sp_rows.empty()) {
+            // The scan did not happen; it did not observe an empty airspace.
+            // The sentinel says so in words, and the ABI status must agree --
+            // this leg is declared CONSTRAINED precisely because a background
+            // daemon may lack the Location Services grant that makes SSIDs
+            // readable at all.
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
+                                  YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "wifi:macos_scan_requires_location_services");
             ctx.write_output("wifi|info|wi-fi scan unavailable; airport removed in macOS 14+ "
                              "and system_profiler requires Location Services|0|0|none");
         }
@@ -807,34 +853,53 @@ int do_connected(yuzu::CommandContext& ctx) {
     // NetworkManager D-Bus unreachable, or any call in the sequence failed
     // -> fall through to the nmcli argv rung.
 #endif
-    bool status_forwarded = false;
     // sink: wifi/do_connected#1 -- nmcli device show (rung 2 argv fallback)
     auto nmcli_path = yuzu::agent::probe_tool_path({"/usr/bin/nmcli", "/bin/nmcli"});
     auto nmcli_res = run_tool({nmcli_path, "-t", "-f",
                                "GENERAL.CONNECTION,WIFI.SSID,WIFI.SIGNAL,WIFI.SECURITY,WIFI.BSSID",
                                "device", "show"},
                               /*max_lines=*/20);
-    status_forwarded = yuzu::agent::forward_runner_failure(ctx, nmcli_res.res);
     auto parsed = yuzu::wifi::parse_nmcli_device_show(nmcli_res.output);
     if (parsed) {
+        yuzu::agent::forward_runner_failure(ctx, nmcli_res.res); // carries line_limit PARTIAL
         auto& row = *parsed;
         ctx.write_output(std::format("connected|{}|{}|{}|{}|{}", sof(row.ssid), sof(row.signal),
                                      sof(row.security), sof(row.bssid), sof(row.connection)));
-    } else {
-        // sink: wifi/do_connected#2 -- iwconfig (ESSID/Signal blob fallback)
-        auto iwconfig_path =
-            yuzu::agent::probe_tool_path({"/usr/sbin/iwconfig", "/sbin/iwconfig", "/usr/bin/iwconfig"});
-        auto iwconfig_res = run_tool({iwconfig_path});
-        if (!status_forwarded)
-            status_forwarded = yuzu::agent::forward_runner_failure(ctx, iwconfig_res.res);
-        auto filtered = yuzu::wifi::filter_iwconfig_essid_signal_lines(iwconfig_res.output);
-        auto essid = yuzu::wifi::parse_iwconfig_essid_blob(filtered);
-        if (essid) {
-            ctx.write_output(std::format("connected|{}|0|unknown|-|-", sof(*essid)));
-        } else {
-            ctx.write_output("connected|none|Not connected|0|none|none");
-        }
+        return 0;
     }
+
+    // sink: wifi/do_connected#2 -- iwconfig (ESSID/Signal blob fallback)
+    auto iwconfig_path =
+        yuzu::agent::probe_tool_path({"/usr/sbin/iwconfig", "/sbin/iwconfig", "/usr/bin/iwconfig"});
+    auto iwconfig_res = run_tool({iwconfig_path});
+    auto filtered = yuzu::wifi::filter_iwconfig_essid_signal_lines(iwconfig_res.output);
+    auto essid = yuzu::wifi::parse_iwconfig_essid_blob(filtered);
+    if (essid) {
+        yuzu::agent::forward_runner_failure(ctx, iwconfig_res.res);
+        ctx.write_output(std::format("connected|{}|0|unknown|-|-", sof(*essid)));
+        return 0;
+    }
+
+    // Neither rung produced a connection. That is only a genuine "not
+    // connected" if a tool actually RAN and SUCCEEDED while saying so --
+    // otherwise nothing was determined and we must say so rather than assert
+    // a disconnection nobody observed. See wifi_tool_answered().
+    const bool answered = yuzu::wifi::wifi_tool_answered(nmcli_res.res).answered ||
+                          yuzu::wifi::wifi_tool_answered(iwconfig_res.res).answered;
+    if (answered) {
+        ctx.write_output("connected|none|Not connected|0|none|none");
+        return 0;
+    }
+    // Report the concrete runner failure where there is one (spawn_error /
+    // deadline / signaled); a plain nonzero exit is invisible to
+    // classify_runner_failure, so set an explicit unavailable status for it.
+    if (!yuzu::agent::forward_runner_failure(ctx, nmcli_res.res) &&
+        !yuzu::agent::forward_runner_failure(ctx, iwconfig_res.res)) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "wifi:nmcli_and_iwconfig_failed");
+    }
+    ctx.write_output("connected|unknown|Wi-Fi connection state could not be determined "
+                     "(NetworkManager unreachable; nmcli and iwconfig both failed)|0|none|none");
 
 #elif defined(__APPLE__)
     // CoreWLAN, not `airport -I`: the private airport binary was removed in
@@ -888,11 +953,26 @@ int do_connected(yuzu::CommandContext& ctx) {
 // (wifi_corewlan.mm), a native framework — rung 1 — though Location
 // Services (macOS 14+) can withhold the SSID/BSSID from a background
 // daemon. Untouched by this migration.
+// The Linux rung is a BUILD-TIME fact, not just a runtime one: the whole
+// sd-bus body is compiled out without YUZU_HAVE_LIBSYSTEMD (libsystemd is a
+// soft dependency via the shared systemd_guard option). A descriptor that
+// hardcoded rung 1 would advertise a NetworkManager D-Bus path that does not
+// exist in that binary -- the same "declares a rung it cannot reach" defect
+// as reading a property off the wrong D-Bus interface, and it feeds the #2204
+// capability matrix.
+#if defined(YUZU_HAVE_LIBSYSTEMD)
+#define YUZU_WIFI_LINUX_RUNG 1
+#define YUZU_WIFI_LINUX_MECHANISM "NetworkManager D-Bus (sd-bus)"
+#else
+#define YUZU_WIFI_LINUX_RUNG 2
+#define YUZU_WIFI_LINUX_MECHANISM "nmcli via the argv runner (built without libsystemd)"
+#endif
+
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "list_networks",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 1, "NetworkManager D-Bus (sd-bus)",
+        {YUZU_SUPPORT_SUPPORTED, YUZU_WIFI_LINUX_RUNG, YUZU_WIFI_LINUX_MECHANISM,
          "falls back to nmcli via the argv runner (rung 2), then a raw iw/iwlist text dump "
          "when nmcli is unavailable"},
         /* .macos_leg   = */
@@ -907,7 +987,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "connected",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 1, "NetworkManager D-Bus (sd-bus)",
+        {YUZU_SUPPORT_SUPPORTED, YUZU_WIFI_LINUX_RUNG, YUZU_WIFI_LINUX_MECHANISM,
          "falls back to nmcli via the argv runner (rung 2), then a raw iwconfig "
          "ESSID/Signal blob when nmcli reports no SSID"},
         /* .macos_leg   = */
