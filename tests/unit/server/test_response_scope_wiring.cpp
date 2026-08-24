@@ -92,13 +92,37 @@ TEST_CASE("#1712: both new response readers are wired to response_agent_in_scope
     CHECK(src.find("bool response_agent_in_scope(") != std::string::npos);
 
     SECTION("DashboardRoutes /fragments/results is handed the predicate") {
-        // The registration passes a trailing lambda delegating to the helper.
-        // Matched loosely on the lambda body rather than the exact argument
-        // position, so a future reformat or added parameter does not break it.
+        // ANCHORED to the DashboardRoutes registration, deliberately.
+        //
+        // This section previously searched the WHOLE file for the bare lambda
+        // body. That text is not unique — the identical delegating lambda
+        // appears at four sites in server.cpp (the dashboard wiring, the
+        // WorkflowRoutes wiring, and two more) — so deleting the
+        // DashboardRoutes argument left `/fragments/results` unwired and
+        // fail-open while this guard still matched one of its siblings and
+        // stayed GREEN. Every behaviour test installs its own predicate, so
+        // they stayed green too: the exact false-green this file exists to
+        // prevent, reproduced inside the guard itself.
+        //
+        // Anchor on the registration call, then require the delegation within
+        // that call's own text.
+        // NB: `src` is comment-stripped, so both bounds must be CODE, not a
+        // section comment. `WorkflowRoutes::Deps` is the first statement after
+        // the dashboard registration closes, which makes it a stable end
+        // bound that excludes the workflow lambda.
+        const auto reg_at = src.find("dashboard_routes_->register_routes(");
+        REQUIRE(reg_at != std::string::npos);
+        const auto reg_end = src.find("WorkflowRoutes::Deps", reg_at);
+        REQUIRE(reg_end != std::string::npos);
+        REQUIRE(reg_end > reg_at);
+        const std::string dashboard_block = src.substr(reg_at, reg_end - reg_at);
+        // Guard the guard: if this block ever swallowed the workflow wiring,
+        // the section would be back to matching a sibling.
+        REQUIRE(dashboard_block.find("wf_deps.response_scope_fn") == std::string::npos);
         const std::regex dashboard_wiring(
             R"(\[this\]\(const std::string& username, const std::string& agent_id\) -> bool \{\s*return response_agent_in_scope\(username, agent_id\);)");
         std::smatch m;
-        CHECK(std::regex_search(src, m, dashboard_wiring));
+        CHECK(std::regex_search(dashboard_block, m, dashboard_wiring));
     }
 
     SECTION("WorkflowRoutes executions drawer is handed the predicate") {
@@ -114,11 +138,20 @@ TEST_CASE("#1712: both new response readers are wired to response_agent_in_scope
         // fail-OPEN this issue closed (a corrupt store leaves the RBAC flag
         // reading false, which an inlined check would treat as "RBAC off").
         // `response_agent_in_scope` is the ONE place that decision may live.
-        const std::string dashboard_marker = "wf_deps.response_scope_fn";
-        const auto at = src.find(dashboard_marker);
-        REQUIRE(at != std::string::npos);
-        const std::string wiring_block = src.substr(at, 400);
-        CHECK(wiring_block.find("check_scoped_permission") == std::string::npos);
-        CHECK(wiring_block.find("is_rbac_enabled") == std::string::npos);
+        // BOTH wiring sites, not one. This previously declared a variable
+        // named `dashboard_marker` whose value was the WORKFLOW marker
+        // ("wf_deps.response_scope_fn"), so the dashboard wiring was never
+        // inspected at all: a dashboard site that inlined
+        // `check_scoped_permission` would have passed this section unnoticed.
+        const std::string workflow_marker = "wf_deps.response_scope_fn";
+        const std::string dashboard_marker = "dashboard_routes_->register_routes(";
+        for (const auto& marker : {dashboard_marker, workflow_marker}) {
+            INFO("wiring site: " << marker);
+            const auto at = src.find(marker);
+            REQUIRE(at != std::string::npos);
+            const std::string wiring_block = src.substr(at, 400);
+            CHECK(wiring_block.find("check_scoped_permission") == std::string::npos);
+            CHECK(wiring_block.find("is_rbac_enabled") == std::string::npos);
+        }
     }
 }

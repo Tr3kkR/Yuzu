@@ -286,6 +286,43 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             const auto& exec = *exec_opt;
             auto agents = execution_tracker->get_agent_statuses(exec_id);
 
+            // #1712: the per-agent filter further down narrows only the
+            // collapsed RESPONSE rows. This status vector is the drawer's
+            // OTHER per-agent source, and it feeds every KPI strip count, the
+            // duration percentiles, the agent-grid tiles and the per-agent
+            // table — which render `agent_id`, `status`, `exit_code`, duration
+            // and the agent-returned `error_detail`. Filtering the responses
+            // but not this left the reader HALF-confined, and not merely in
+            // theory: this route's gate is a flat global `Execution:Read`, so
+            // a caller holding that globally while holding `Response:Read`
+            // only via one management group passes the gate, sees no
+            // out-of-scope response bodies, and still enumerates every
+            // out-of-scope agent by id with its status and error text.
+            //
+            // Filter HERE, before the KPI bucket loop below, so the aggregates
+            // and the rows describe the SAME set: ADR-0017 INV-3 requires
+            // counts be computed over the in-scope set only, and INV-12
+            // requires the visible set constrain EVERY per-agent source, not
+            // just the primary table. The legacy response fallback below keys
+            // its `in_set` off this same vector, so it inherits the narrowing
+            // instead of reintroducing it.
+            std::size_t roster_dropped = 0;
+            if (response_scope_fn) {
+                roster_dropped =
+                    filter_rows_in_scope(agents, session->username, response_scope_fn)
+                        .dropped_agents;
+            }
+            // CC7.2 evidence: ONE scope-drop row for this reader. Emitted here
+            // rather than beside the response filter because the roster is the
+            // superset (response rows are execution-bound, so every dropped
+            // response agent is a dropped roster agent) and because this site
+            // is outside the `response_store` availability branch — a drop is
+            // audited even when the response section itself cannot render.
+            if (roster_dropped > 0)
+                audit_fn(req, "response.read", "denied", "Execution", exec.id,
+                         "scope_dropped=" + std::to_string(roster_dropped) +
+                             " surface=executions_drawer");
+
             // -- Definition lookup -------------------------------------------
             std::string def_name = exec.definition_id;
             if (instruction_store && instruction_store->is_open() && !exec.definition_id.empty()) {
@@ -353,9 +390,20 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // listeners locate this strip via id and swap individual cell
             // values rather than re-rendering the whole strip.
             html += "<div class=\"exec-kpi-strip\" id=\"exec-kpi-" + html_escape(exec.id) + "\">";
+            // #1712: `agents_targeted` is read off the EXECUTION row, not off
+            // the (now filtered) status vector, so narrowing `agents` does not
+            // reconcile it — left alone it still tells a management-group-
+            // confined operator how many agents outside their scope this
+            // command targeted (the same cardinality disclosure the dashboard
+            // results summary reconciles). Recompute from the surviving roster
+            // whenever something was dropped; when nothing was, the stored
+            // value renders byte-identically to before.
+            const int64_t displayed_targeted = roster_dropped > 0
+                                                   ? static_cast<int64_t>(agents.size())
+                                                   : static_cast<int64_t>(exec.agents_targeted);
             html += std::format("<div class=\"exec-kpi\"><div class=\"exec-kpi-value\">{}</div>"
                                 "<div class=\"exec-kpi-label\">Total</div></div>",
-                                exec.agents_targeted);
+                                displayed_targeted);
             html += std::format(
                 "<div class=\"exec-kpi\"><div class=\"exec-kpi-value exec-kpi-value--ok\">{}</div>"
                 "<div class=\"exec-kpi-label\">Succeeded</div></div>",
@@ -605,17 +653,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 // (response_scope_filter.hpp), NOT a local copy — the
                 // dashboard `/fragments/results` reader applies the identical
                 // filter and a second copy is the drift it exists to prevent.
-                if (response_scope_fn) {
-                    const auto scope_result =
-                        filter_rows_in_scope(filtered, session->username, response_scope_fn);
-                    // CC7.2 evidence: a scope-drop is a security-relevant
-                    // filtering event (parity with the REST/MCP response
-                    // readers' audit rows, #1634 compliance review).
-                    if (scope_result.dropped_agents > 0)
-                        audit_fn(req, "response.read", "denied", "Execution", exec.id,
-                                "scope_dropped=" + std::to_string(scope_result.dropped_agents) +
-                                    " surface=executions_drawer");
-                }
+                // Defence in depth: the roster filter above already removed
+                // every out-of-scope agent, and response rows here are
+                // execution-bound, so this should be a no-op in practice. It
+                // stays because the two sources are fetched independently and
+                // a future change to either must not be able to reintroduce
+                // out-of-scope response bodies. The audit row for this reader
+                // is emitted ONCE at the roster filter (see there) — counting
+                // the same drop twice would overstate the withheld-agent
+                // number on the CC7.2 evidence chain.
+                if (response_scope_fn)
+                    (void)filter_rows_in_scope(filtered, session->username, response_scope_fn);
 
                 html += std::format("<details class=\"per-agent-responses\">"
                                     "<summary>Show responses ({})</summary>",

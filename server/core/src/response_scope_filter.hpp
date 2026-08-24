@@ -8,9 +8,20 @@
 #include <vector>
 
 /// @file response_scope_filter.hpp
-/// The ONE home for the per-agent Response-scope FILTER LOOP (#1712 / #1634
-/// class) — how a fan-out of response rows is narrowed to the agents a caller
-/// may see.
+/// The home the per-agent Response-scope FILTER LOOP (#1712 / #1634 class) is
+/// converging on — how a fan-out of response rows is narrowed to the agents a
+/// caller may see.
+///
+/// HONEST STATUS, because overstating this is worse than not having it: three
+/// hand-rolled copies of this loop PREDATE this header and are NOT yet
+/// migrated — `server.cpp`'s legacy `/api/responses/*` export and get readers,
+/// and MCP `query_responses` (`mcp_server.cpp`). They are semantically
+/// equivalent (memoize per distinct agent, keep admitted rows, count distinct
+/// drops) but structurally drifted, and a future change to the shared loop —
+/// drop-count semantics, exception behaviour — would silently miss them.
+/// Every reader this header is used by routes through it; migrating the other
+/// three is tracked as follow-up work, deliberately not folded into a security
+/// fix. Do NOT add a fourth copy: new readers use this function.
 ///
 /// TWO DIFFERENT THINGS, DELIBERATELY SPLIT, because conflating them is how
 /// this class of defect keeps recurring:

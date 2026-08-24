@@ -63,6 +63,11 @@ enabled = true
 > is scoped independently of the response-reader family above — an `agent_id`
 > outside the caller's management group renders identically to "Agent not
 > found" (never a distinct error), matching `summarize_working_set kind=agent`.
+> This closes the targeted probe against a *specific* `agent_id`, and with it
+> the tag/inventory disclosure. It is **not** a fleet-wide anonymity guarantee:
+> `list_agents` is gated on the same `Infrastructure:Read` securable and still
+> enumerates every agent's id, hostname, os and arch. Treat `Infrastructure:Read`
+> as fleet-visible until that is scoped too.
 
 ## The authorization topology floor (#2376)
 

@@ -1758,25 +1758,31 @@ std::string DashboardRoutes::render_results(
     // and a second copy is the drift that header exists to prevent.
     if (response_scope_fn_) {
         const auto scope_result = filter_rows_in_scope(responses, username, response_scope_fn_);
-        if (scope_result.dropped_agents > 0) {
-            // #1712: the SUMMARY COUNT must describe the same set as the rows.
-            // `total_agent_count` was computed above from the UNFILTERED read
-            // (`responses.size()` on the no-filter branch, `facet_agent_count`
-            // — a fleet-wide faceted count — on the filtered one), and it is
-            // rendered to the operator as "N results across M agents". Left
-            // alone it discloses, to a management-group-confined operator, how
-            // many agents outside their scope answered this command — the same
-            // cross-group disclosure #1712 exists to close, one step weaker
-            // (cardinality rather than content). The full deny-all case hides
-            // it incidentally (`total_lines == 0` skips the summary block),
-            // which is exactly why only the MIXED case exposed it. Recomputed
-            // from the post-filter rows, and only when something was actually
-            // dropped, so an unfiltered render is byte-identical to before.
-            std::unordered_set<std::string> visible_agents;
-            for (const auto& resp : responses)
-                visible_agents.insert(resp.agent_id);
-            total_agent_count = static_cast<int64_t>(visible_agents.size());
-        }
+        // Recompute whenever the filter is ACTIVE, not merely when it dropped
+        // something. On the faceted branch `total_agent_count` came from
+        // `facet_agent_count` (response_store.cpp), a scope-blind fleet-wide
+        // `COUNT(DISTINCT agent_id)` over `response_facets` that is computed by
+        // its OWN query and has no relationship to the rows actually loaded —
+        // so it can exceed the visible agent count with ZERO drops observed
+        // here, e.g. when the `facet_response_ids(..., 10000, 0)` cap truncates
+        // the out-of-scope agents' rows out of the loaded set. Keying the
+        // recompute on `dropped_agents > 0` (the "byte-identical when nothing
+        // was dropped" goal) is exactly what left that gap open.
+        // #1712: the SUMMARY COUNT must describe the same set as the rows.
+        // `total_agent_count` was computed above from the UNFILTERED read
+        // (`responses.size()` on the no-filter branch, `facet_agent_count` — a
+        // fleet-wide faceted count — on the filtered one), and it is rendered
+        // to the operator as "N results across M agents". Left alone it
+        // discloses, to a management-group-confined operator, how many agents
+        // outside their scope answered this command — the same cross-group
+        // disclosure #1712 exists to close, one step weaker (cardinality
+        // rather than content). The full deny-all case hides it incidentally
+        // (`total_lines == 0` skips the summary block), which is exactly why
+        // only the MIXED case exposed it.
+        std::unordered_set<std::string> visible_agents;
+        for (const auto& resp : responses)
+            visible_agents.insert(resp.agent_id);
+        total_agent_count = static_cast<int64_t>(visible_agents.size());
         // CC7.2 evidence: a scope-drop is a security-relevant filtering
         // event (parity with the REST/MCP response readers' audit rows,
         // #1634 compliance review). `req` is null only from the

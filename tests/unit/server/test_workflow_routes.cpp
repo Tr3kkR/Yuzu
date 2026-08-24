@@ -1018,6 +1018,16 @@ TEST_CASE("executions detail #1712: out-of-scope agent's response is dropped "
     CHECK(res->body.find("visible-output") != std::string::npos);
     CHECK(res->body.find("hidden-output") == std::string::npos);
 
+    // The out-of-scope agent's IDENTITY must be gone too, not just its
+    // response body. Asserting only on the response text is what let the
+    // drawer ship half-confined: the per-agent status table, the agent-grid
+    // tiles and the KPI strip all render from `get_agent_statuses`, a second
+    // per-agent source the response filter never touched, so "agent-out-of-
+    // scope" survived in the fragment with its status, exit code and error
+    // text while its output was correctly hidden (ADR-0017 INV-12).
+    CHECK(res->body.find("agent-out-of-scope") == std::string::npos);
+    CHECK(res->body.find("agent-in-scope") != std::string::npos);
+
     // CC7.2 evidence: the drop is audited (parity with the REST/MCP response
     // readers' scope_dropped audit rows, #1634 compliance review).
     bool found_denied_audit = false;
@@ -1029,6 +1039,86 @@ TEST_CASE("executions detail #1712: out-of-scope agent's response is dropped "
         }
     }
     CHECK(found_denied_audit);
+}
+
+TEST_CASE("executions detail #1712: the per-agent STATUS fan-out is scope-filtered too — "
+          "agent id, error text and the KPI total all describe only in-scope agents",
+          "[pg][workflow][executions][detail][1712]") {
+    // The drawer has TWO per-agent sources. `get_agent_statuses` feeds the KPI
+    // strip, the duration percentiles, the agent-grid tiles and the per-agent
+    // table (agent_id / status / exit_code / duration / error_detail); the
+    // response store feeds the collapsed output rows. Filtering only the
+    // latter left the former disclosing out-of-scope agents wholesale, on a
+    // route whose gate is a flat GLOBAL `Execution:Read` — so a caller holding
+    // that globally while holding `Response:Read` only via one management
+    // group reaches this fragment and enumerates the rest of the fleet.
+    // ADR-0017 INV-3 (aggregates over the in-scope set only) + INV-12 (the
+    // visible set constrains EVERY per-agent source).
+    //
+    // No response rows at all here, deliberately: this pins the status fan-out
+    // on its own, so a regression cannot hide behind the response filter.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-roster", "Roster");
+    auto eid = h.make_exec("def-roster", "completed", 2, 2, 0, /*dispatched_at=*/1735689600);
+    h.agent_status(eid, "roster-in", "success", 0, "", 1735689601);
+    h.agent_status(eid, "roster-out", "failure", 3, "EACCES on /etc/shadow", 1735689602);
+
+    h.response_scope_predicate = [](const std::string&, const std::string& agent_id) {
+        return agent_id == "roster-in";
+    };
+
+    auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    // Identity, and the agent-returned error text, must both be withheld.
+    CHECK(res->body.find("roster-out") == std::string::npos);
+    CHECK(res->body.find("EACCES on /etc/shadow") == std::string::npos);
+    // The in-scope agent is unaffected.
+    CHECK(res->body.find("roster-in") != std::string::npos);
+
+    // The KPI "Total" is sourced from the execution row (`agents_targeted`,
+    // = 2 here), NOT from the status vector, so filtering alone does not
+    // reconcile it — it must be recomputed from the surviving roster or it
+    // still reports the out-of-scope agent's existence as a count.
+    CHECK(res->body.find(">2</div>") == std::string::npos);
+    CHECK(res->body.find(">1</div>") != std::string::npos);
+}
+
+TEST_CASE("executions detail #1712: an admit-all scope predicate leaves the drawer roster "
+          "and its KPI total byte-unchanged",
+          "[pg][workflow][executions][detail][1712]") {
+    // The new roster filter must NARROW, never deny by default. Without this
+    // case the filter could be made unconditional-deny (or the KPI total
+    // could be recomputed unconditionally and drift from `agents_targeted`)
+    // and the two scoped cases above would still pass, since both install a
+    // deny-something predicate.
+    //
+    // NB this pins the ADMIT-ALL predicate, not an UNWIRED one: `ExecHarness`
+    // always wires `wf_deps.response_scope_fn` (it delegates to the mutable
+    // `response_scope_predicate` member, default admit-everyone), so the
+    // genuinely-unwired path is not reachable from this harness. The unwired
+    // contract is pinned on the MCP side instead ("get_agent_details is
+    // legacy-open when the scope predicate is unwired").
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-open", "Open");
+    auto eid = h.make_exec("def-open", "completed", 2, 2, 0, /*dispatched_at=*/1735689600);
+    h.agent_status(eid, "open-a", "success", 0, "", 1735689601);
+    h.agent_status(eid, "open-b", "failure", 3, "boom", 1735689602);
+    // response_scope_predicate deliberately left at its admit-everyone default.
+
+    auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("open-a") != std::string::npos);
+    CHECK(res->body.find("open-b") != std::string::npos);
+    CHECK(res->body.find("boom") != std::string::npos);
+    // Nothing dropped, so the KPI total keeps the stored `agents_targeted`.
+    CHECK(res->body.find(">2</div>") != std::string::npos);
 }
 
 // ── Gate-7 hardening regression net for PR 2 ──────────────────────────────

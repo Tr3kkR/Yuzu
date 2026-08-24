@@ -4771,8 +4771,21 @@ McpServer::HandlerFn McpServer::build_handler(
                 // existence of, and recover the hostname/os of, an agent in
                 // another group — hostname/os often encode role and site. An
                 // out-of-scope agent_id is rendered IDENTICALLY to not-found
-                // so existence itself does not leak. Unwired scope fn →
-                // legacy-open, matching query_responses/summarize_working_set.
+                // (same JSON-RPC code, same message, and neither path emits an
+                // mcp_audit row) so THIS tool cannot be used as an existence
+                // oracle. Unwired scope fn → legacy-open, matching
+                // query_responses/summarize_working_set.
+                //
+                // SCOPE OF THE CLAIM, deliberately narrow: this closes the
+                // targeted-probe shape and the tag/inventory disclosure for
+                // `get_agent_details`. It does NOT by itself make out-of-scope
+                // agents unenumerable, because `list_agents` above is gated on
+                // the SAME `Infrastructure:Read` securable and still returns
+                // the whole fleet's agent_id/hostname/os/arch — `agents_fn` is
+                // wired to the raw registry, not to the scope-filtered
+                // `get_visible_agents_json`. Closing that is tracked
+                // separately; do not read this gate as a fleet-wide existence
+                // guarantee it does not provide.
                 const bool in_scope =
                     !response_scope_fn || response_scope_fn(session->username, agent_id);
                 if (!in_scope) {
