@@ -702,10 +702,10 @@ implementation is.
 | vuln_scan | inventory | linux | supported | 3 | popen(dpkg-query/rpm/pacman/apk) | - |
 | vuln_scan | inventory | macos | supported | 3 | popen(system_profiler/brew) | - |
 | vuln_scan | inventory | windows | supported | 1 | win32_registry | - |
-| wifi | list_networks | linux | constrained | 3 | nmcli via governed shell runner | falls back to a raw, unstructured iw/iwlist text dump when nmcli is unavailable |
-| wifi | list_networks | macos | constrained | 3 | airport -s via governed shell runner | airport was removed in macOS 14 (Sonoma); the system_profiler SPAirPortDataType fallback needs Location Services authorisation a background daemon may lack, so an unauthorised modern host yields no networks and an honest wifi\|info sentinel |
+| wifi | list_networks | linux | supported | 1 | NetworkManager D-Bus (sd-bus) | falls back to nmcli via the argv runner (rung 2), then a raw iw/iwlist text dump when nmcli is unavailable |
+| wifi | list_networks | macos | constrained | 2 | airport -s / system_profiler via argv runner | airport was removed in macOS 14 (Sonoma); the system_profiler SPAirPortDataType fallback needs Location Services authorisation a background daemon may lack, so an unauthorised modern host yields no networks and an honest wifi\|info sentinel |
 | wifi | list_networks | windows | supported | 1 | WlanGetAvailableNetworkList | - |
-| wifi | connected | linux | constrained | 3 | nmcli via governed shell runner | falls back to a raw iwconfig text blob (ESSID/Signal only) when nmcli reports no SSID |
+| wifi | connected | linux | supported | 1 | NetworkManager D-Bus (sd-bus) | falls back to nmcli via the argv runner (rung 2), then a raw iwconfig ESSID/Signal blob when nmcli reports no SSID |
 | wifi | connected | macos | constrained | 1 | CoreWLAN | Location Services (macOS 14+) may withhold SSID/BSSID from a background daemon |
 | wifi | connected | windows | supported | 1 | WlanQueryInterface | - |
 | windows_updates | installed | linux | supported | 2 | rpm+apt | - |
