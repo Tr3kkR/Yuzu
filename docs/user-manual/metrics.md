@@ -178,7 +178,7 @@ and pre-seeded at boot, so `absent()` alerting stays meaningful.
 | `yuzu_mcp_approval_masked_denials_total{tool}` | counter | MCP approval-ticket recalls refused by a store fault at a point where the #2442 cross-surface/cross-submitter binding check could not run — the lookup step, or the consume step's own binding-check read (#2786 arm 1). A foreign-origin or foreign-submitter ticket is exactly as likely to be behind one of these refusals as an innocent one while the fault holds, so this counter is the signal that the forgery-detection event was not simply lost. Pre-seeded for every approval-gated tool. No `reason` label, same anti-oracle posture as `yuzu_mcp_approval_refused_total` — what this counter withholds is already withheld there. |
 | `yuzu_mcp_approval_precondition_denied_total{tool}` | counter | MCP approval-ticket recalls refused specifically by a pre-consume precondition (#2443) — a subset of `yuzu_mcp_approval_refused_total`, broken out because a precondition denial is already distinguishable to the caller from the response body (unlike `not_consumable`/`foreign_origin`/`foreign_submitter`, which must stay mutually indistinguishable; `store_error` is already distinguishable by response code, `-32603` vs `-32003`). Pre-seeded only for tools that actually have a precondition wired — today just `confirm_engine_rotation` — not the full approval-gated set, since the label's reachable set is narrower than the two counters above. |
 | `yuzu_mcp_approval_burned_total{tool,reason}` | counter | MCP approval-ticket recalls that SUCCESSFULLY consumed a one-time, human-approved ticket and then still failed at the tool handler (#2444 item 3) — args that passed the published `inputSchema` (`yuzu_mcp_tool_args_invalid_total` above did not fire) but failed the handler's own business/state check, plus any handler-side infra failure (e.g. a degraded store) discovered only after the ticket was already spent. Distinct from the three counters above, which all fire BEFORE a ticket is consumed; this one only fires after. Wired at one chokepoint that inspects the actual JSON-RPC response for every approval-gated tool's dispatch — not per-handler audit calls, since not every handler's business rejection routes through the generic `mcp.<tool>` audit verb. `reason` is a single literal today (`handler_reject`); pre-seeded for every approval-gated tool. Does not interact with the per-submitter 25-ticket pending cap: a ticket leaves the pending bucket at admin-approval time, before it can ever reach this class. |
-| `yuzu_server_dispatch_target_rejected_total{route,reason}` | counter | REST dispatch calls denied because a **supplied** targeting argument named nothing (#2500) — the twin of the targeting reasons above, deliberately a separate family so `yuzu_mcp_*` never counts a call that did not touch MCP. `route` is a closed set: `command` (`POST /api/command`), `instruction_execute` (`POST /api/instructions/{id}/execute`), `result_set_parent` (the `POST /api/v1/result-sets/from-*` producers, where `parent_id` is the targeting argument), `policy_remediate` (`POST /api/policies/{id}/remediate`, where an empty target means every non-compliant agent; it also refuses `scope` outright with `scope_unsupported`, since remediation selects targets by `agent_ids` only), and `dispatch_closure` (the shared dispatch closure's last-line-of-defence arm, reached only when a CALLER — route or background runner — names no target at all; a non-zero value there is a code defect, not a client one). `reason` is a closed set with two halves, both in `dispatch_target_shape.hpp`: `kTargetingShapeReasons` (`agent_ids_type`, `agent_ids_empty`, `agent_id_type`, `scope_type`, `scope_empty`, `target_conflict`) emitted by the shared shape check, and `kRouteRejectReasons` (`body_type`, `parent_id_type`, `parent_id_empty`, `closure_no_target`, `scope_unsupported`) emitted by the routes and the shared dispatch closure. Seeding is **per route, not the cross-product** — the dispatch routes can emit the five targeting reasons plus `body_type`; `result_set_parent` can emit only the two `parent_id_*` ones. Seeding the full product would publish series no code path can reach, which reads on a dashboard as "never happened" when the truth is "cannot happen". The paired audit row is `command.dispatch\|denied` (detail `reason=<reason> <plugin>:<action>`, both caller-supplied fields sanitised and capped at 128 bytes), `instruction.execute\|denied` (detail `reason=<reason>`) or `result_set.create\|denied` (detail `reason=<reason> source_kind=<kind>`). `dispatch_closure` is **counter-only** — that arm lives inside a closure with no request context and is reached by background runners as well as routes, so there is deliberately no audit row to correlate. Alert: `YuzuDispatchTargetRejected` fires when the 15-minute increase exceeds 3 (`>3/15m`) — deliberately NOT `>0`, because a single malformed request would page and the rule would be silenced within a week, taking the genuine near-miss with it. The per-event evidence is the audit row, not the alert. A non-zero rate here means a client believes it is targeting specific devices and is not — before this counter existed those calls dispatched to the whole fleet and reported success. |
+| `yuzu_server_dispatch_target_rejected_total{route,reason}` | counter | REST dispatch calls denied because a **supplied** targeting argument named nothing (#2500) — the twin of the targeting reasons above, deliberately a separate family so `yuzu_mcp_*` never counts a call that did not touch MCP. `route` is a closed set: `command` (`POST /api/command`), `legacy` (the legacy command-forwarding path, added with #881 and carrying **only** `reason="quarantined"` — it has no targeting-shape check of its own), `instruction_execute` (`POST /api/instructions/{id}/execute`), `result_set_parent` (the `POST /api/v1/result-sets/from-*` producers, where `parent_id` is the targeting argument), `policy_remediate` (`POST /api/policies/{id}/remediate`, where an empty target means every non-compliant agent; it also refuses `scope` outright with `scope_unsupported`, since remediation selects targets by `agent_ids` only), and `dispatch_closure` (the shared dispatch closure's last-line-of-defence arm, reached only when a CALLER — route or background runner — names no target at all; a non-zero value there is a code defect, not a client one). `reason` is a closed set with THREE halves, all in `dispatch_target_shape.hpp`. Two are targeting mistakes: `kTargetingShapeReasons` (`agent_ids_type`, `agent_ids_empty`, `agent_id_type`, `scope_type`, `scope_empty`, `target_conflict`) emitted by the shared shape check, and `kRouteRejectReasons` (`body_type`, `parent_id_type`, `parent_id_empty`, `closure_no_target`, `scope_unsupported`) emitted by the routes and the shared dispatch closure. Seeding is **per route, not the cross-product** — the dispatch routes can emit the five targeting reasons plus `body_type`; `result_set_parent` can emit only the two `parent_id_*` ones. Seeding the full product would publish series no code path can reach, which reads on a dashboard as "never happened" when the truth is "cannot happen". The paired audit row is `command.dispatch\|denied` (detail `reason=<reason> <plugin>:<action>`, both caller-supplied fields sanitised and capped at 128 bytes), `instruction.execute\|denied` (detail `reason=<reason>`) or `result_set.create\|denied` (detail `reason=<reason> source_kind=<kind>`). The third is `quarantined` (`kReasonQuarantined`, deliberately in NEITHER array — it is not a targeting mistake, it is the #881 containment gate withholding a device the caller named correctly), which is why the `YuzuDispatchTargetRejected` alert excludes it. `dispatch_closure` is counter-only **for the targeting reasons** — that arm lives inside a closure with no request context and is reached by background runners as well as routes, so a targeting mistake there has deliberately no audit row to correlate, and a non-zero `closure_no_target` value is a code defect. Neither statement extends to `reason="quarantined"`: that value IS audited on every route including `dispatch_closure` (as `quarantine.dispatch_denied`), and a non-zero value there means the containment gate is working, not that anything is wrong. Alert: `YuzuDispatchTargetRejected` fires when the 15-minute increase exceeds 3 (`>3/15m`) — deliberately NOT `>0`, because a single malformed request would page and the rule would be silenced within a week, taking the genuine near-miss with it. The per-event evidence is the audit row, not the alert. A non-zero rate here means a client believes it is targeting specific devices and is not — before this counter existed those calls dispatched to the whole fleet and reported success. |
 
 ## Audit-store metrics
 
@@ -665,6 +665,56 @@ metric is the signal, the audit row is the evidence. See
 `.successor_unused` rows this piece DOES ship (the sweep-driven auto-revoke
 and successor-unused-warning half of human token rotation, distinct from
 confirm).
+
+## MCP poll-rate metric (#3344)
+
+```
+# HELP yuzu_mcp_poll_total MCP result-poll tool calls by verdict (get_execution_status, query_responses, get_bundle_result). not_ready: the success payload carried a retry_after_ms poll hint; ready: served terminal/complete without one. Excludes pre-verdict denials.
+# TYPE yuzu_mcp_poll_total counter
+yuzu_mcp_poll_total{tool="get_execution_status",result="ready"} 0
+yuzu_mcp_poll_total{tool="get_execution_status",result="not_ready"} 0
+yuzu_mcp_poll_total{tool="query_responses",result="ready"} 0
+yuzu_mcp_poll_total{tool="query_responses",result="not_ready"} 0
+yuzu_mcp_poll_total{tool="get_bundle_result",result="ready"} 0
+yuzu_mcp_poll_total{tool="get_bundle_result",result="not_ready"} 0
+```
+
+Closed `tool` (the three success-shaped result-poll tools) x `result`
+(`ready`|`not_ready`) cross-product (6 series), pre-seeded to `0` at startup
+(`server.cpp`), symbol shared between the `describe()` site and the
+increment site via `mcp::kMcpPollTotalMetric` (`mcp_retry.hpp`) so the two
+cannot silently diverge into a shadow series — same precedent as
+`kApiTokenConfirmTotalMetric` above. **Scope contract:** counted only when a
+call reaches a served verdict — pre-verdict denials (tier, permission,
+invalid-params, not-found) are excluded, already visible via the existing
+denial counters and A4 envelopes, so the label set stays a fact about poll
+outcomes. For `query_responses` specifically, a call whose in-flight-ness
+could not be determined (an `instruction_id`-only query, or an
+`execution_id` the tracker can't resolve) increments **neither** series —
+it was never checked, so folding it into `ready` would understate the
+`not_ready` fraction. Deliberately **operational, not `event="security"`** —
+a high poll rate is expected agentic-worker behaviour, not an anomaly.
+
+**Purpose: data-driven re-tuning, not alerting.** The named `retry_after_ms`
+floor constants (`kMcpStoreFaultRetryMs`, `kMcpResultPollRetryMs`, etc. —
+`mcp_retry.hpp`) were shipped with a *mechanical* derivation (no
+dispatch-to-first-result latency histogram exists to measure from —
+`yuzu_command_duration_seconds` is full command completion, not
+first-result) rather than a measured one. This series' `not_ready` fraction
+is the data that lets a future change re-derive them from real evidence
+instead of guessing again — same "tuning signal, not an alert" posture as
+`yuzu_nvd_sync_failures_total` above; no alert rule is expected or wired.
+Example query for "is the floor for this tool too conservative or too
+aggressive":
+
+```promql
+sum(rate(yuzu_mcp_poll_total{result="not_ready"}[15m])) by (tool)
+/
+sum(rate(yuzu_mcp_poll_total[15m])) by (tool)
+```
+
+See [docs/mcp-server.md → `retry_after_ms` floors](../mcp-server.md#retry_after_ms-floors-3344)
+for the full constant table this metric exists to tune.
 
 ## Rotation-durability tamper/corruption gauges (#2961)
 
@@ -1315,6 +1365,27 @@ sum(rate(yuzu_server_tag_store_read_degrade_total[5m])) by (reason) > 0
 absent_over_time(yuzu_server_tag_store_backfill_total{result=~"success|fresh"}[15m])
 ```
 
+## Product pack store metrics (operator-installed content, ADR-0054)
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_product_pack_read_degrade_total{reason}` | counter | A `product_pack_store` read (`list()`/`get()`, including the per-pack item fetch) degraded instead of answering, and the caller FAILED CLOSED — `GET /api/product-packs`/`GET /api/product-packs/{id}` answer `503`, never a silently-empty pack list or a false "not found". `reason` ∈ `store_not_open` (store failed to open at boot), `pool_acquire_timeout` (no Postgres connection in time — correlates with `yuzu_pg_acquire_*`/`yuzu_pg_pool_waiters` saturation), `query_error` (covers both the pack-row query and the per-pack item-row query). Pre-seeded to 0 for all three reasons. Write-path failures (`install`/`uninstall`) are log-only — deliberately no per-store write counter (wave-level decision pending, matches `TagStore`'s own boundary). |
+| `yuzu_server_product_pack_backfill_total{result}` | counter | Outcome of the one-time `product-packs.db` → Postgres backfill at boot (ADR-0054). `result` ∈ `fresh` (no legacy DB, or an empty one), `success` (backfilled), `failed` (refused — the server **fails the boot closed** and retries next start; NOTE a refused boot never serves `/metrics`, so `failed` is effectively unscrapeable — alerting keys on the ABSENCE of `success|fresh` instead, which the pre-seed makes meaningful; see `YuzuProductPackBackfillNotCompleted`). A differently-valued pack/item conflict across replicas is a data-integrity signal, not just availability — see `docs/user-manual/upgrading.md`'s "Product packs migrate to Postgres" section. |
+
+**Useful PromQL queries:**
+
+```promql
+# Product-pack reads degrading → GET /api/product-packs* failing closed to 503.
+# (Shipped as YuzuProductPackReadDegraded.)
+sum(rate(yuzu_server_product_pack_read_degrade_total[5m])) by (reason) > 0
+
+# No server reporting a completed product-pack backfill → possible fail-closed
+# boot refusal loop. (Shipped as YuzuProductPackBackfillNotCompleted;
+# absent-success shape, NOT result="failed" — a refused boot never serves
+# /metrics.)
+absent_over_time(yuzu_server_product_pack_backfill_total{result=~"success|fresh"}[15m])
+```
+
 ## Quarantine store metrics (Guardian device-quarantine bookkeeping, ADR-0047)
 
 The `QuarantineStore` — which agents are network-isolated, who isolated them, why, and their
@@ -1324,8 +1395,10 @@ must never be misread as "not quarantined".
 
 | Metric | Type | Description |
 |---|---|---|
-| `yuzu_server_quarantine_read_degrade_total{reason}` | counter | A `list_quarantined`/`get_history` read degraded instead of returning a result. `reason` ∈ `store_not_open` (store failed to open at boot), `pool_acquire_timeout` (no Postgres connection available in time — correlates with `yuzu_pg_acquire_*` saturation), `query_error` (the query failed). **A non-zero rate means `GET /api/v1/quarantine` is answering 503, not that no devices are quarantined** — an active containment could still exist behind the degraded read. `get_status` reports its own degrade via `std::expected` (the `db_error:`-prefixed `unexpected` case) but does **not** emit this counter — it has no REST/MCP caller today (confirmed by repo-wide grep), so this is a documented gap in the metric family's coverage, not a live blind spot; re-derive if a caller lands. **Does NOT cover the route-layer per-record authorization-check 503** (`"authorization check unavailable — try again"`, `rest_api_v1.cpp`'s admit-then-filter loop failing closed on an anomalous scope-check outcome) — that failure mode is entirely store-external (RBAC/engine-principal-store, not `QuarantineStore`) and is documented, not metered, in `docs/user-manual/upgrading.md` and `docs/user-manual/rest-api.md`; a 503 with that message and a flat counter here is expected, not a metric bug. |
+| `yuzu_server_quarantine_read_degrade_total{reason}` | counter | A `list_quarantined`/`get_history` read degraded instead of returning a result. `reason` ∈ `read_concurrency_cap` (#881 — a **dispatch** waited for a containment-read slot and did not get one within its budget, so no store call was made. This value never means the store is unhealthy, and it does **not** degrade to the snapshot: a slot timeout **fails the dispatch CLOSED**, because serving stale state when nobody asked the store would under-enforce containment against a healthy one. The bound exists because a stalled backend would otherwise pin one pool connection per dispatching worker, and that pool is shared with every other store — measured, a frozen backend returns a successful query after 101s with neither `statement_timeout` nor `tcp_user_timeout` firing. A non-zero rate here means dispatch is being refused while Postgres may be answering correctly: check `yuzu_pg_acquire_wait_seconds` and `yuzu_pg_pool_in_use` for the stall), `store_not_open` (store failed to open at boot), `pool_acquire_timeout` (no Postgres connection available in time — correlates with `yuzu_pg_acquire_*` saturation), `query_error` (the query failed). All four series are pre-seeded at boot. **A non-zero rate on any of the three STORE reasons means `GET /api/v1/quarantine` is answering 503, not that no devices are quarantined** — an active containment could still exist behind the degraded read. `get_status` reports its own degrade via `std::expected` (the `db_error:`-prefixed `unexpected` case) but does **not** emit this counter — it has no REST/MCP caller today (confirmed by repo-wide grep), so this is a documented gap in the metric family's coverage, not a live blind spot; re-derive if a caller lands. **Does NOT cover the route-layer per-record authorization-check 503** (`"authorization check unavailable — try again"`, `rest_api_v1.cpp`'s admit-then-filter loop failing closed on an anomalous scope-check outcome) — that failure mode is entirely store-external (RBAC/engine-principal-store, not `QuarantineStore`) and is documented, not metered, in `docs/user-manual/upgrading.md` and `docs/user-manual/rest-api.md`; a 503 with that message and a flat counter here is expected, not a metric bug. |
 | `yuzu_server_quarantine_backfill_total{result}` | counter | Outcome of the one-time legacy `quarantine.db` → PostgreSQL backfill at boot (ADR-0047). `result` ∈ `fresh` (no legacy DB, or a legacy DB with no `quarantine_records` table — nothing to migrate), `completed` (backfill ran and reconciled), `failed` (backfill could not complete — corrupt/0-byte/oversized legacy file, an unrecognised or duplicated-active legacy `status` value, or a fingerprint mismatch/holder-side-verification failure on a multi-replica boot; the server **fails closed at boot** and retries on next start). **Not pre-seeded** (unlike `yuzu_server_audit_backfill_total`): the marker-present "already migrated, skipping" paths in `migrate_from_sqlite` return without emitting any `result` at all, so a healthy already-migrated server exports **no series** for this metric family — absence is the normal steady state after the first boot, not a gap. **`failed` is not scrapeable** for the same reason as the audit/mgmt-group families: a boot-time failure returns before the HTTP listener starts, so `/metrics` is never served on that path — the boot log naming the specific refusal reason is the signal. |
+| `yuzu_server_quarantine_gate_total{outcome}` | counter | One increment per **dispatch-time containment-gate evaluation** (#881) — the gate `dispatch_confined_arms` consults before it hands any `CommandRequest` to the registry. `outcome` is a closed four-value set, pre-seeded across all four at boot (`kQuarantineGateOutcomes`) so `absent()` cannot confuse "the gate has never had to fail closed" with "the gate never ran": `fresh` (the containment read succeeded — the normal path), `stale` (the read returned nothing and the gate served the last-known-good snapshot, which is trusted only while younger than **60s**), `fail_closed` (the store is durably unavailable, or the snapshot aged past that budget — the dispatch reaches **nobody**, on every arm including Broadcast, rather than guess who is contained), and `exempt_control_plugin` (the dispatch is the quarantine plugin's own control channel — `quarantine`/`unquarantine`/`status`/`whitelist` — which is never gated by the containment it administers, or release would be unreachable). **`fail_closed` is a fleet-wide dispatch outage, not a quarantine event**: it means instruction dispatch is refusing every target because containment state is unreadable. Alert on it. A sustained `stale` rate means the containment read is failing while the snapshot still covers it — the leading indicator of `fail_closed`. Per-denial evidence is the `quarantine.dispatch_denied` audit row plus `yuzu_server_dispatch_target_rejected_total{reason="quarantined"}`; this family counts gate EVALUATIONS, so a healthy fleet's `fresh` count rises with dispatch volume and means nothing on its own. |
+| `yuzu_server_system_reserved_push_total{capability,result}` | counter | One increment per **server-internal push** that reaches an agent WITHOUT passing the containment gate above (#3402). These are not operator dispatch — they are the server keeping its own state coherent — and gating them would stop a contained device receiving the enforcement rules that make containment meaningful, so the bypass is deliberate. This counter makes it COUNTABLE — note that it is not *auditable* in this repo's sense: `send_system_reserved` never consults the gate, so it cannot label a push as having reached a contained device, and there is no per-event audit row. "On date D, did the server push `__guard__.push_rules` to contained device X" is not answerable from what ships. Tracked as a follow-up. `capability` is a closed three-value set matching the `SystemReservedPush` enum: `tar.fleet_snapshot`, `__guard__.push_rules`, `asset_tags.sync`. `result` is `sent` (the registry accepted the frame — for a gateway-attached agent that is a QUEUE, not a delivery) or `undelivered`. **`undelivered` is the series that matters**: an undelivered `__guard__.push_rules` leaves a device unenforced, and before this counter existed that outcome fell on the floor at three of the four call sites. Both values of all three capabilities are pre-seeded at boot, because a zero you can alert on is worth more than an absent series you cannot. A new internal push cannot be added without adding an enumerator, so this family's label set cannot silently fall behind the code. **No alert rule ships for this family, deliberately.** `send_to` returns false whenever an agent's stream is null, which is what an ordinary suspended laptop looks like, and `tar.fleet_snapshot` fans out over the whole fleet on every visualization fetch — so a `> 0` rule is permanently firing on any real fleet, gets silenced, and takes the genuine "`__guard__.push_rules` never landed" signal with it. Query it during an investigation instead, and correlate an `undelivered` spike against agent connectivity before treating it as a server fault. |
 
 **Useful PromQL queries:**
 
@@ -1338,6 +1411,17 @@ sum(rate(yuzu_server_quarantine_read_degrade_total[5m])) by (reason) > 0
 # Absence of this series is normal on a healthy already-migrated server
 # (the metric is not pre-seeded); this query only fires on an ACTUAL failure sample.
 sum(rate(yuzu_server_quarantine_backfill_total{result="failed"}[15m])) > 0
+
+# Containment gate failing closed → instruction dispatch is reaching NOBODY
+# because containment state is unreadable. This is an outage, not a quarantine.
+sum(rate(yuzu_server_quarantine_gate_total{outcome="fail_closed"}[5m])) > 0
+
+# The leading indicator: the read is failing but the 60s snapshot still covers it.
+sum(rate(yuzu_server_quarantine_gate_total{outcome="stale"}[5m])) > 0
+
+# An internal push that bypasses containment failed to reach the agent.
+# For __guard__.push_rules that is a device left unenforced.
+sum(rate(yuzu_server_system_reserved_push_total{result="undelivered"}[15m])) by (capability) > 0
 ```
 
 ## RBAC store metrics (authorization substrate, ADR-0041)

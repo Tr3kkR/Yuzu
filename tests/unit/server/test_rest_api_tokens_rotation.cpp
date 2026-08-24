@@ -192,8 +192,18 @@ struct RestTokenRotationHarness {
         return sink.Post("/api/v1/tokens/" + token_id + "/rotate", body.dump());
     }
 
-    auto confirm(const std::string& token_id) {
-        return sink.Post("/api/v1/tokens/" + token_id + "/confirm", "{}");
+    // #3015 proof-of-possession: `secret` defaults to a fixed non-empty
+    // placeholder so every EXISTING gate-belt / pre-store-denial call site
+    // (403/401/404 tests that don't care what the secret's value is)
+    // keeps getting the status it tested for, rather than always landing on
+    // the new "secret required" 400 first. Pass the REAL raw successor
+    // secret (the preceding rotate() response's "data"."token" field) for
+    // any call expected to actually reach and succeed at the store.
+    auto confirm(const std::string& token_id,
+                 const std::string& secret = "placeholder-secret-value") {
+        nlohmann::json body = nlohmann::json::object();
+        body["secret"] = secret;
+        return sink.Post("/api/v1/tokens/" + token_id + "/confirm", body.dump());
     }
 
     auto list_tokens() { return sink.Get("/api/v1/tokens"); }
@@ -491,6 +501,43 @@ TEST_CASE("REST POST /api/v1/tokens/{id}/confirm: non-owner gets 404 (no oracle)
     CHECK(h.audit_log[0].detail == "owner=alice");
 }
 
+TEST_CASE("REST POST /api/v1/tokens/{id}/confirm: a non-owner presenting the CORRECT "
+          "secret still gets 404 — no cross-owner secret oracle (#3015)",
+          "[pg][rest][token][rotation][owner][idor][pop]") {
+    RestTokenRotationHarness h;
+    auto token_id = h.create_token_for("alice", "alice-key");
+    h.session_user = "alice";
+
+    auto rotate_res = h.rotate(token_id);
+    REQUIRE(rotate_res);
+    auto rotate_data = nlohmann::json::parse(rotate_res->body)["data"];
+    auto successor_id = rotate_data["token_id"].get<std::string>();
+    auto secret = rotate_data["token"].get<std::string>();
+
+    // bob is not alice, but somehow holds alice's REAL raw secret (e.g.
+    // observed in transit) — the ownership check must still win, and the
+    // outcome must be byte-identical to presenting no/a wrong secret.
+    h.session_user = "bob";
+    auto with_secret = h.confirm(successor_id, secret);
+    auto without_secret = h.confirm(successor_id);
+    REQUIRE(with_secret);
+    REQUIRE(without_secret);
+    CHECK(with_secret->status == 404);
+    CHECK(with_secret->status == without_secret->status);
+    // Same message content on both — correlation_id differs per request, so
+    // this compares the meaningful text, not a byte-identical body (mirrors
+    // the sibling "response body identical for unknown id and not-owner"
+    // test above).
+    CHECK(with_secret->body.find("token not found") != std::string::npos);
+    CHECK(without_secret->body.find("token not found") != std::string::npos);
+
+    // Nothing mutated, and alice's own confirm still works afterward.
+    h.session_user = "alice";
+    auto ok = h.confirm(successor_id, secret);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Happy path: rotate -> reveal audit -> successor shape -> confirm ->
 // predecessor revoked. successor_expires_at is never accepted from the
@@ -631,7 +678,7 @@ TEST_CASE("REST POST /api/v1/tokens/{id}/rotate: successor lookup is scoped to t
     // rotate(B) carried B's raw secret paired with A's successor token_id,
     // so confirming that id revoked A while B (the token whose secret the
     // caller actually holds) stayed live and unconfirmed.
-    auto confirm_b = h.confirm(successor_b);
+    auto confirm_b = h.confirm(successor_b, raw_b);
     REQUIRE(confirm_b);
     REQUIRE(confirm_b->status == 200);
 
@@ -829,10 +876,11 @@ TEST_CASE("REST tokens rotate/confirm: pin ApiToken:Rotate, never Security:Write
     SECTION("confirm") {
         auto rotate_res = h.rotate(token_id);
         REQUIRE(rotate_res);
-        auto successor_id =
-            nlohmann::json::parse(rotate_res->body)["data"]["token_id"].get<std::string>();
+        auto rotate_data = nlohmann::json::parse(rotate_res->body)["data"];
+        auto successor_id = rotate_data["token_id"].get<std::string>();
+        auto secret = rotate_data["token"].get<std::string>();
         h.perm_checks.clear();
-        auto res = h.confirm(successor_id);
+        auto res = h.confirm(successor_id, secret);
         REQUIRE(res);
         REQUIRE(res->status == 200);
         REQUIRE(h.perm_checks.size() == 1);
@@ -851,10 +899,12 @@ TEST_CASE("REST POST /api/v1/tokens/{id}/confirm: successor id in the path — 2
     auto rotate_res = h.rotate(token_id);
     REQUIRE(rotate_res);
     REQUIRE(rotate_res->status == 200);
-    auto successor_id = nlohmann::json::parse(rotate_res->body)["data"]["token_id"].get<std::string>();
+    auto rotate_data = nlohmann::json::parse(rotate_res->body)["data"];
+    auto successor_id = rotate_data["token_id"].get<std::string>();
+    auto secret = rotate_data["token"].get<std::string>();
     h.audit_log.clear();
 
-    auto confirm_res = h.confirm(successor_id);
+    auto confirm_res = h.confirm(successor_id, secret);
     REQUIRE(confirm_res);
     CHECK(confirm_res->status == 200);
     CHECK(nlohmann::json::parse(confirm_res->body)["data"]["confirmed"].get<bool>() == true);
@@ -880,15 +930,75 @@ TEST_CASE("REST POST /api/v1/tokens/{id}/confirm: replay after success is a "
 
     auto rotate_res = h.rotate(token_id);
     REQUIRE(rotate_res);
-    auto successor_id = nlohmann::json::parse(rotate_res->body)["data"]["token_id"].get<std::string>();
+    auto rotate_data = nlohmann::json::parse(rotate_res->body)["data"];
+    auto successor_id = rotate_data["token_id"].get<std::string>();
+    auto secret = rotate_data["token"].get<std::string>();
 
-    auto first_confirm = h.confirm(successor_id);
+    auto first_confirm = h.confirm(successor_id, secret);
     REQUIRE(first_confirm);
     REQUIRE(first_confirm->status == 200);
 
+    // Replay: the pair-state check (already confirmed) fires before PoP, so
+    // the placeholder default secret still reaches the intended 409.
     auto replay = h.confirm(successor_id);
     REQUIRE(replay);
     CHECK(replay->status == 409);
+}
+
+TEST_CASE("REST POST /api/v1/tokens/{id}/confirm: missing/empty secret is a "
+          "distinct 400, before the store is ever reached",
+          "[pg][rest][token][rotation][pop]") {
+    RestTokenRotationHarness h;
+    auto token_id = h.create_token_for("alice", "alice-key");
+    h.session_user = "alice";
+
+    auto rotate_res = h.rotate(token_id);
+    REQUIRE(rotate_res);
+    auto successor_id =
+        nlohmann::json::parse(rotate_res->body)["data"]["token_id"].get<std::string>();
+
+    // No "secret" key in the body at all.
+    auto missing = h.sink.Post("/api/v1/tokens/" + successor_id + "/confirm", "{}");
+    REQUIRE(missing);
+    CHECK(missing->status == 400);
+    CHECK(missing->body.find("secret required") != std::string::npos);
+
+    // Present but empty.
+    auto empty =
+        h.sink.Post("/api/v1/tokens/" + successor_id + "/confirm", R"({"secret":""})");
+    REQUIRE(empty);
+    CHECK(empty->status == 400);
+    CHECK(empty->body.find("secret required") != std::string::npos);
+
+    // Nothing mutated — the real secret still confirms afterward.
+    auto secret = nlohmann::json::parse(rotate_res->body)["data"]["token"].get<std::string>();
+    auto ok = h.confirm(successor_id, secret);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
+TEST_CASE("REST POST /api/v1/tokens/{id}/confirm: a WRONG secret is a distinct 403, "
+          "never the not-found (404) or missing-secret (400) outcome",
+          "[pg][rest][token][rotation][pop]") {
+    RestTokenRotationHarness h;
+    auto token_id = h.create_token_for("alice", "alice-key");
+    h.session_user = "alice";
+
+    auto rotate_res = h.rotate(token_id);
+    REQUIRE(rotate_res);
+    auto rotate_data = nlohmann::json::parse(rotate_res->body)["data"];
+    auto successor_id = rotate_data["token_id"].get<std::string>();
+    auto secret = rotate_data["token"].get<std::string>();
+
+    auto wrong = h.confirm(successor_id, "definitely-not-the-real-secret");
+    REQUIRE(wrong);
+    CHECK(wrong->status == 403);
+    CHECK(wrong->body.find("rotation secret mismatch") != std::string::npos);
+
+    // Nothing mutated — the real secret still confirms afterward.
+    auto ok = h.confirm(successor_id, secret);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
 }
 
 TEST_CASE("REST POST /api/v1/tokens/{id}/confirm: yuzu_api_token_confirm_total{surface=rest} "
@@ -905,7 +1015,9 @@ TEST_CASE("REST POST /api/v1/tokens/{id}/confirm: yuzu_api_token_confirm_total{s
 
     auto rotate_res = h.rotate(token_id);
     REQUIRE(rotate_res);
-    auto successor_id = nlohmann::json::parse(rotate_res->body)["data"]["token_id"].get<std::string>();
+    auto rotate_data = nlohmann::json::parse(rotate_res->body)["data"];
+    auto successor_id = rotate_data["token_id"].get<std::string>();
+    auto secret = rotate_data["token"].get<std::string>();
 
     // A pre-store denial (non-owner) must NOT touch the counter — same
     // scope contract as the engine confirm route.
@@ -916,7 +1028,7 @@ TEST_CASE("REST POST /api/v1/tokens/{id}/confirm: yuzu_api_token_confirm_total{s
     CHECK(h.metrics.counter("yuzu_api_token_confirm_total", success_labels).value() == 0.0);
 
     h.session_user = "alice";
-    auto first_confirm = h.confirm(successor_id);
+    auto first_confirm = h.confirm(successor_id, secret);
     REQUIRE(first_confirm);
     REQUIRE(first_confirm->status == 200);
     CHECK(h.metrics.counter("yuzu_api_token_confirm_total", success_labels).value() == 1.0);

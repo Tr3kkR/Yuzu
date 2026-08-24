@@ -44,7 +44,7 @@ CLAUDE.md keeps only the load-bearing invariants (embed point, tier-before-RBAC 
   - **JSON nesting is bounded at 32 levels**, rejected as a `-32700` parse error before the document is built. `nlohmann`'s `dump()` is recursive (its parser and destructor are not), so a ~0.95 MiB body of nested arrays — a quarter of the cap, comfortably admitted by it — segfaults the process, and callers `dump()` caller-supplied values. Guarding an individual `dump()` would miss every other recursive traversal, so the tree is never constructed. The deepest legitimate MCP request is `execute_bundle` at about seven levels.
   - **Deployment caveat:** a rejected body is never read off the socket. httplib stamps `Connection: close` on any status ≥ 400 so a conforming client closes, but if a **reverse proxy is ever placed in front of Yuzu**, an unread `Content-Length` body is a textbook request-smuggling primitive between proxy and origin. The shipped rigs expose the server directly; front it with care.
 - **Audit:** Every MCP tool call logged with `action: "mcp.<tool_name>"` and `mcp_tool` field on `AuditEvent`.
-- **Response-collection scope (`query_responses`) — #1634, PARTIAL.** A per-agent `check_scoped_permission` filter is applied to the returned rows, **but it is INERT under the current global `Response:Read` gate** — a holder of global `Response:Read` (the only principal that passes the gate) admits every agent, so no rows are dropped and a caller currently **does** see other operators' execution rows by id; a management-group-confined operator is 403'd at the gate before the filter runs. So this does **not** yet provide cross-operator isolation; its only active effect today is failing **closed** (zero rows) on a corrupt/load-failed `rbac.db`. Effective isolation needs the admit-then-filter gate change tracked in #1634. When a row IS dropped (the corrupt-store path), `query_responses` emits a **second** audit row `result=denied` (`detail` carries the distinct dropped-agent count) **in addition to** the `result=success` row — a SIEM rule must treat the two as a pair for one call (informational access-boundary evidence for CC6.1, not a failed call); under normal operation this `denied` row does not fire. RBAC-off → no filter (legacy-open). The result object carries `audit_persisted:false` if any of that call's audit rows could not persist, and `result_truncated_by_cap:true` if the raw query hit the row cap before filtering (incomplete page). *(The same inert per-agent filter + corrupt-store fail-closed now also covers `aggregate_responses`, REST `/executions/{id}/visualization` + `/api/responses/*`; the dashboard `/fragments/results` family and workflow execution-detail reader remain flat-`Response:Read` and **fail OPEN on a corrupt `rbac.db`** — all tracked in #1634.)*
+- **Response-collection scope (`query_responses`) — #1634, PARTIAL.** A per-agent `check_scoped_permission` filter is applied to the returned rows, **but it is INERT under the current global `Response:Read` gate** — a holder of global `Response:Read` (the only principal that passes the gate) admits every agent, so no rows are dropped and a caller currently **does** see other operators' execution rows by id; a management-group-confined operator is 403'd at the gate before the filter runs. So this does **not** yet provide cross-operator isolation; its only active effect today is failing **closed** (zero rows) on a corrupt/load-failed `rbac.db`. Effective isolation needs the admit-then-filter gate change tracked in #1634. When a row IS dropped (the corrupt-store path), `query_responses` emits a **second** audit row `result=denied` (`detail` carries the distinct dropped-agent count) **in addition to** the `result=success` row — a SIEM rule must treat the two as a pair for one call (informational access-boundary evidence for CC6.1, not a failed call); under normal operation this `denied` row does not fire. RBAC-off → no filter (legacy-open). The result object carries `audit_persisted:false` if any of that call's audit rows could not persist, and `result_truncated_by_cap:true` if the raw query hit the row cap before filtering (incomplete page). *(The same inert per-agent filter + corrupt-store fail-closed now also covers `aggregate_responses`, REST `/executions/{id}/visualization` + `/api/responses/*`; the dashboard `/fragments/results` family and workflow execution-detail reader remain flat-`Response:Read` and **fail OPEN on a corrupt `rbac.db`** — all tracked in #1634.)* **(#3344 note:** `query_responses`' `retry_after_ms` poll hint reads `execution_tracker` directly and is gated only by `Response:Read`, not `Execution:Read` — a caller with `Response:Read` alone gets a one-bit "is this execution_id non-terminal" oracle it wouldn't otherwise have via this tool. Marginal given the broader `Response:Read`-is-effectively-fleet-wide gap above; closes with the same #1634 fix.)
 
 ## Error envelope
 
@@ -60,10 +60,15 @@ JSON-RPC error responses from the denial paths (read-only mode, tier policy, app
 > with two extra fields:
 >
 > ```json
-> { "correlation_id": "req-<hex-ms>-<hex-seq>", "retry_after_ms": null,
+> { "correlation_id": "req-<hex-ms>-<hex-seq>", "retry_after_ms": 30000,
 >   "remediation": "an admin must approve this approval_id (see status_url), then re-call this tool with the approval_id argument to execute",
 >   "approval_id": "<32-hex>", "status_url": "/api/v1/approvals/<32-hex>" }
 > ```
+>
+> `retry_after_ms` is honest here, not `null` (#3344, `kMcpApprovalPollRetryMs`
+> in `mcp_retry.hpp`) — this IS retryable, on human timescales, and approval
+> minting is deduplicated so a recall before the ticket resolves returns the
+> same pending ticket rather than minting a second one.
 >
 > Before ANY of the below — mint, dedup, recall lookup, consume — the
 > arguments must pass the #2405 input-schema validation (Security Model
@@ -110,7 +115,34 @@ JSON-RPC error responses from the denial paths (read-only mode, tier policy, app
 > can mint→approve→then 403 (burning the ticket) — a rare consequence of the
 > deliberate tier-then-RBAC two-gate split.
 
-`correlation_id` is a per-error token (`req-<hex-ms>-<hex-seq>`, the same format as the REST `X-Correlation-Id` header) returned to the caller in the error body, so a client can cite a stable handle when reporting a failure. **It is not persisted to the audit log today** — the audit row for a denied call (`mcp.<tool>`) is written separately and does not carry the token — so server-side correlation relies on any `spdlog` line the handler emits at that moment, not on `audit.db`. Two exceptions stamp the SAME token into the audit detail (one-cid pattern): the #2383 misconfig deny (`... correlation_id=<cid>`) and the #2405 input-schema deny (`arguments do not match the tool input schema at '<path>' correlation_id=<cid>`). `retry_after_ms` is `null` on tier/approval-denial errors (the denial is not retryable as-is); `remediation` carries an actionable hint — escalate to a higher-tier token, or use the REST API / dashboard. Per-tool validation errors (e.g. the dex-perf tools) populate `correlation_id`, a `null` `retry_after_ms`, and a field-specific `remediation`. Parse `error.code` for the error class and `error.data.correlation_id` for client-side traceability.
+`correlation_id` is a per-error token (`req-<hex-ms>-<hex-seq>`, the same format as the REST `X-Correlation-Id` header) returned to the caller in the error body, so a client can cite a stable handle when reporting a failure. **It is not persisted to the audit log today** — the audit row for a denied call (`mcp.<tool>`) is written separately and does not carry the token — so server-side correlation relies on any `spdlog` line the handler emits at that moment, not on `audit.db`. Two exceptions stamp the SAME token into the audit detail (one-cid pattern): the #2383 misconfig deny (`... correlation_id=<cid>`) and the #2405 input-schema deny (`arguments do not match the tool input schema at '<path>' correlation_id=<cid>`). `retry_after_ms` is `null` on tier-denial errors (a token's tier is fixed — the denial is not retryable as-is), but non-null on approval-required (`-32006`, #3344: it IS retryable, on human timescales — see above); `remediation` carries an actionable hint — escalate to a higher-tier token, or use the REST API / dashboard. Per-tool validation errors (e.g. the dex-perf tools) populate `correlation_id`, a `null` `retry_after_ms`, and a field-specific `remediation`. Parse `error.code` for the error class and `error.data.correlation_id` for client-side traceability.
+
+### `retry_after_ms` floors (#3344)
+
+Every `retry_after_ms` emission — error-shaped (A4 `error.data`) and, for the
+three result-poll tools below, success-shaped (in the tool's own structured
+payload) — is a named constant in `server/core/src/mcp_retry.hpp`, each
+carrying a mechanical derivation comment (no dispatch-to-first-result latency
+histogram exists to measure from — `yuzu_command_duration_seconds` is full
+command completion, not first-result):
+
+| Constant | Value | Covers |
+|---|---|---|
+| `kMcpStoreFaultRetryMs` | 5000 | Generic transient store/subsystem fault on an error-shaped response (REST 503 parity) |
+| `kMcpStoreFaultShortRetryMs` | 2000 | Plugin-config / API-token rotation family (REST `Retry-After: 2` parity) |
+| `kMcpProviderWarmupRetryMs` | 5000 | A DEX/app-perf provider still initializing at server start |
+| `kMcpResultPollRetryMs` | 2000 | Success-shaped result-not-ready poll — `get_execution_status`, `query_responses`, `get_bundle_result` |
+| `kMcpApprovalPollRetryMs` | 30000 | Approval-ticket poll (`-32006`) — human-timescale, anti-amplification derived |
+
+Several constants share a numeric value with a neighbour — that is
+coincidental historical pricing, not a shared derivation, and each is kept a
+distinct symbol so one can be re-tuned later without dragging the other.
+
+The three result-poll tools are counted at `yuzu_mcp_poll_total{tool,result}`
+(`result` is `ready` or `not_ready`, per served verdict, excluding pre-verdict
+denials) so the floors above can be data-tuned from real poll-rate evidence
+instead of ossifying as guessed constants. See
+`docs/observability-conventions.md`.
 
 ## Phase 1 (Implemented)
 

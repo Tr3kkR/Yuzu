@@ -11,6 +11,7 @@
 #include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
 #include "mcp_transport.hpp"     // Streamable HTTP transport pre-checks (2f)
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (streamed POST, 3b)
+#include "quarantine_dispatch_decision.hpp" // pure write/response classification (#3127)
 #include "reserved_definition_id.hpp" // kMcpDefinitionPrefix (#2442 — the ONE reserved-namespace rule)
 #include "rotation_confirm_state.hpp" // classify_confirm_state (#2443 confirm_engine_rotation precondition)
 #include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric (shared REST/MCP metric symbol)
@@ -390,12 +391,16 @@ static const ToolDef kTools[] = {
      "both are given, execution_id wins. Returns up to `limit` rows (max 1000); an "
      "empty result can mean the dispatch is still in flight (responses not yet "
      "landed) — use get_execution_status to confirm a run reached a terminal state. "
+     "When execution_id is supplied, a result carrying retry_after_ms confirms the "
+     "dispatch is still in flight; a result without it (even with zero rows) means "
+     "no rows currently match, or (instruction_id-only queries) in-flight-ness "
+     "could not be determined. "
      "A per-agent management-group filter is applied but is INERT under the current "
      "global Response:Read gate (a normal holder receives rows for all agents; "
      "effective scoping needs the #1634 gate change); its active effect today is "
      "failing closed (zero rows) when the RBAC store is corrupt.",
      R"j({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID returned by execute_instruction; exact-correlation collect of just that dispatch. Takes precedence over instruction_id."},"instruction_id":{"type":"string","description":"Instruction ID (required when execution_id is omitted)"},"agent_id":{"type":"string"},"status":{"type":"integer","description":"CommandResponse status enum; omit or -1 for any"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}},"anyOf":[{"required":["execution_id"]},{"required":["instruction_id"]}]})j",
-     R"j({"type":"object","properties":{"responses":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"execution_id":{"type":"string"},"status":{"type":"integer"},"output":{"type":"string"},"timestamp":{"type":"integer"}},"required":["agent_id","execution_id","status","output","timestamp"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when more rows exist past the limit cap"}},"required":["responses"]})j"},
+     R"j({"type":"object","properties":{"responses":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"execution_id":{"type":"string"},"status":{"type":"integer"},"output":{"type":"string"},"timestamp":{"type":"integer"}},"required":["agent_id","execution_id","status","output","timestamp"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when more rows exist past the limit cap"},"retry_after_ms":{"type":"integer","description":"Present only when execution_id was supplied and its execution is confirmed non-terminal — minimum ms before polling again"}},"required":["responses"]})j"},
 
     {"aggregate_responses",
      "Aggregate response data (COUNT, SUM, AVG) grouped by a column. A per-agent management-group "
@@ -469,9 +474,14 @@ static const ToolDef kTools[] = {
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"groups":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"parent_id":{"type":"string"},"membership_type":{"type":"string"},"scope_expression":{"type":"string"}},"required":["id","name","description","parent_id","membership_type","scope_expression"]}}},"required":["groups"]})j"},
 
-    {"get_execution_status", "Check status of a running or completed command execution.",
+    {"get_execution_status",
+     "Check status of a running or completed command execution. While status is "
+     "non-terminal the result includes retry_after_ms, the minimum wait in "
+     "milliseconds before polling again. Prefer the streamed execute_instruction "
+     "response (or a GET resume by execution_id) when streaming is available; "
+     "poll this tool as the fallback when it is not.",
      R"({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID"}},"required":["execution_id"]})",
-     R"j({"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"scope_expression":{"type":"string"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_success":{"type":"integer"},"agents_failure":{"type":"integer"},"progress_pct":{"type":"integer"}},"required":["id","definition_id","status","scope_expression","dispatched_by","dispatched_at","agents_targeted","agents_responded","agents_success","agents_failure","progress_pct"]})j"},
+     R"j({"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"scope_expression":{"type":"string"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_success":{"type":"integer"},"agents_failure":{"type":"integer"},"progress_pct":{"type":"integer"},"retry_after_ms":{"type":"integer","description":"Present only while status is non-terminal — minimum ms before polling again"}},"required":["id","definition_id","status","scope_expression","dispatched_by","dispatched_at","agents_targeted","agents_responded","agents_success","agents_failure","progress_pct"]})j"},
 
     {"list_executions", "List recent command executions.",
      R"({"type":"object","properties":{"definition_id":{"type":"string"},"status":{"type":"string"},"limit":{"type":"integer","default":50}}})",
@@ -845,7 +855,10 @@ static const ToolDef kTools[] = {
      "{complete, received, succeeded, expected, steps[]} in request order, each step carrying its "
      "state (pending|responded|dispatch_failed), status, and output. complete=true once every step "
      "is terminal — NOT a success signal (a bundle to an offline device completes with "
-     "succeeded=0); check succeeded==expected for success. Mirrors GET /api/v1/bundles/{id}. "
+     "succeeded=0); check succeeded==expected for success. While complete=false the result includes "
+     "retry_after_ms, the minimum wait in milliseconds before polling again — bundles emit no "
+     "progress notifications, so polling at that cadence is the contract (see execute_bundle). "
+     "Mirrors GET /api/v1/bundles/{id}, plus this MCP-only retry_after_ms hint. "
      "Requires Response:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("bundle_id":{"type":"string","minLength":1,"description":"The bundle id (bundle-…) returned by execute_bundle"})j"
@@ -856,7 +869,8 @@ static const ToolDef kTools[] = {
      R"j("steps":{"type":"array","items":{"type":"object","properties":{)j"
      R"j("plugin":{"type":"string"},"action":{"type":"string"},"state":{"type":"string","enum":["pending","responded","dispatch_failed"]},)j"
      R"j("status":{"type":"integer","description":"CommandResponse::Status enum value, meaningful when state is responded"},"output":{"type":"string"})j"
-     R"j(},"required":["plugin","action","state","status","output"]}})j"
+     R"j(},"required":["plugin","action","state","status","output"]}},)j"
+     R"j("retry_after_ms":{"type":"integer","description":"Present only while complete=false — minimum ms before polling again"})j"
      R"j(},"required":["complete","received","succeeded","expected","steps"]})j"},
 
     // ── Internal-CA tools (MCP/REST parity for /api/v1/ca/*, PR4 B-2) ──────────
@@ -996,8 +1010,11 @@ static const ToolDef kTools[] = {
      "that closes the loop, gated behind its own Security:Write check rather than being inferred "
      "from a successful rotate call. Requires the successor token_id the rotate call returned — "
      "the confirm is pinned to that exact rotation and a stale or mismatched id is rejected with "
-     "no state change, so a blind retry can never confirm a later rotation. Replaying a confirm "
-     "after this rotation already resolved (a network-dropped success, a double-submit) returns a "
+     "no state change, so a blind retry can never confirm a later rotation. Also requires the raw "
+     "successor secret (#3015 proof of possession, SOC 2 CC6.3) — this call revokes the "
+     "predecessor on success, so it must not proceed on token_id alone; a wrong secret is refused "
+     "with a distinct error, checked only after every other admission gate has already passed. "
+     "Replaying a confirm after this rotation already resolved (a network-dropped success, a double-submit) returns a "
      "TERMINAL already-confirmed/already-resolved error (not a retryable one) - do not retry; "
      "re-rotate if a fresh rotation is needed. If confirm instead reports 'rotation confirmation "
      "unavailable' (the initiator binding is lost or in dispute), do NOT call "
@@ -1023,8 +1040,15 @@ static const ToolDef kTools[] = {
      // rejected by confirm_rotation's own lookup; the pattern now bounds the
      // exact shape so that rejection happens before a ticket is ever touched.
      R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"},)j"
-     R"j("token_id":{"type":"string","pattern":"^[0-9a-f]{24}$","maxLength":24,"description":"Successor token_id returned by rotate_engine_credential (24 lowercase hex) - pins the exact rotation being confirmed"})j"
-     R"j(},"required":["principal_id","token_id"]})j",
+     R"j("token_id":{"type":"string","pattern":"^[0-9a-f]{24}$","maxLength":24,"description":"Successor token_id returned by rotate_engine_credential (24 lowercase hex) - pins the exact rotation being confirmed"},)j"
+     // #3015 proof of possession: the raw successor secret rotate_engine_credential
+     // returned. A wrong secret is rejected with a distinct "rotation secret
+     // mismatch" outcome (kPermissionDenied) — reachable only after every
+     // other admission check (ownership, pair-state, the token_id pin, the
+     // initiator binding) already passed, so this is never an oracle over
+     // WHICH of those checks failed. Never logged/persisted server-side.
+     R"j("secret":{"type":"string","minLength":1,"maxLength":512,"description":"The raw successor secret returned by rotate_engine_credential - proof that the caller actually received the new credential before this call revokes the predecessor"})j"
+     R"j(},"required":["principal_id","token_id","secret"]})j",
      R"j({"type":"object","properties":{"confirmed":{"type":"boolean"},"principal_id":{"type":"string"}},"required":["confirmed","principal_id"]})j"},
 
     {"rotate_api_token",
@@ -1060,8 +1084,11 @@ static const ToolDef kTools[] = {
      "rather than being inferred from a successful rotate call. token_id here is the SUCCESSOR "
      "token_id the rotate call returned — the confirm is pinned to that exact rotation and a "
      "stale or mismatched id is rejected with no state change, so a blind retry can never "
-     "confirm a later rotation. Replaying a confirm after this rotation already resolved (a "
-     "network-dropped success, a double-submit) returns a TERMINAL already-confirmed/already-"
+     "confirm a later rotation. Also requires the raw successor secret (#3015 proof of "
+     "possession, SOC 2 CC6.3) — this call revokes the predecessor on success, so it must not "
+     "proceed on token_id alone; a wrong secret is refused with a distinct error, checked only "
+     "after every other admission gate has already passed. Replaying a confirm after this "
+     "rotation already resolved (a network-dropped success, a double-submit) returns a TERMINAL already-confirmed/already-"
      "resolved error (not a retryable one) — do not retry; rotate again if a fresh rotation is "
      "needed. If confirm instead reports 'rotation confirmation unavailable' (the initiator "
      "binding is lost or in dispute), revoke the SPECIFIC untrusted credential via "
@@ -1070,8 +1097,11 @@ static const ToolDef kTools[] = {
      "applies. Self-service ONLY, same owner-vs-nonexistent posture as rotate_api_token. Mirrors "
      "POST /api/v1/tokens/{id}/confirm. Destructive — requires ApiToken:Rotate.",
      R"j({"type":"object","properties":{)j"
-     R"j("token_id":{"type":"string","minLength":1,"maxLength":64,"description":"Successor token_id returned by rotate_api_token (pins the exact rotation being confirmed) — must be owned by the calling principal"})j"
-     R"j(},"required":["token_id"]})j",
+     R"j("token_id":{"type":"string","minLength":1,"maxLength":64,"description":"Successor token_id returned by rotate_api_token (pins the exact rotation being confirmed) — must be owned by the calling principal"},)j"
+     // #3015 proof of possession — same contract as confirm_engine_rotation's
+     // own "secret" field (see that schema's comment).
+     R"j("secret":{"type":"string","minLength":1,"maxLength":512,"description":"The raw successor secret returned by rotate_api_token - proof that the caller actually received the new credential before this call revokes the predecessor"})j"
+     R"j(},"required":["token_id","secret"]})j",
      R"j({"type":"object","properties":{"confirmed":{"type":"boolean"},"token_id":{"type":"string"}},"required":["confirmed","token_id"]})j"},
 
     {"transfer_engine_principal_owner",
@@ -1177,9 +1207,16 @@ static const ToolDef kTools[] = {
     {"quarantine_device",
      "Isolate a device from the network (records the quarantine AND dispatches the live "
      "quarantine-plugin isolation), whitelisting the management server. Mirrors POST "
-     "/api/v1/quarantine plus the isolation command. Destructive (Security:Execute): "
-     "approval-gated on the supervised tier — the first call returns an approval ticket, re-call "
-     "with the returned approval_id after an admin approves.",
+     "/api/v1/quarantine for the record; the dispatch has no REST twin. Destructive "
+     "(Security:Execute): approval-gated on the supervised tier — the first call returns an "
+     "approval ticket, re-call with the returned approval_id after an admin approves. #3127: a "
+     "result is returned ONLY when the isolation dispatch was accepted by at least one agent — "
+     "an offline/unreachable device (or a dispatch that threw) returns a retryable error instead, "
+     "with the record still persisted; retry the same call to re-drive dispatch, including when "
+     "the device was already quarantined by an earlier call. dispatch_confirmed means the plugin "
+     "registry ACCEPTED the isolation frame, NOT that the device is isolated — for a "
+     "gateway-attached agent the frame is only queued; confirming isolation requires a follow-up "
+     "`status` read returning state|active.",
      R"j({"type":"object","properties":{)j"
      // #2444 item 1: mirror the handler's own limits so an oversized/off-charset
      // reason or whitelist is refused by schema instead of burning an
@@ -1196,11 +1233,14 @@ static const ToolDef kTools[] = {
      R"j("approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after admin approval to execute"})j"
      R"j(},"required":["agent_id"]})j",
      R"j({"type":"object","properties":{)j"
-     R"j("command_id":{"type":"string","description":"Empty when the live isolation dispatch was never attempted or threw - the quarantine record is still persisted"},)j"
-     R"j("agents_reached":{"type":"integer","minimum":0,"description":"0 means recorded-only (device offline/unreachable) - NOT a failure, the record still persists"},)j"
-     R"j("quarantine_record":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"quarantined_by":{"type":"string"},"reason":{"type":"string"},"whitelist":{"type":"string"}},"required":["agent_id","status","quarantined_by","reason","whitelist"]},)j"
+     R"j("command_id":{"type":"string","description":"Id of the dispatched isolation command"},)j"
+     R"j("agents_reached":{"type":"integer","minimum":1,"description":"#3127: a result is returned ONLY when at least one agent accepted the isolation frame; agents_reached=0 (or a dispatch that threw) returns a retryable error instead, with the quarantine record still persisted"},)j"
+     R"j("dispatch_confirmed":{"const":true,"description":"#3127: the plugin registry ACCEPTED the isolation frame. NOT proof of isolation - for a gateway-attached agent the frame is only QUEUED. Confirming isolation requires a subsequent status read returning state|active"},)j"
+     R"j("record_pre_existing":{"type":"boolean","description":"#3127: true when an active quarantine record already existed and this call re-dispatched the STORED intent (reason/whitelist) rather than writing a new record from this request"},)j"
+     R"j("whitelist_request_ignored":{"type":"boolean","description":"#3127: true when this call supplied a whitelist that differs from the stored one; the STORED whitelist was dispatched and the request's was NOT applied"},)j"
+     R"j("quarantine_record":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"quarantined_by":{"type":"string"},"reason":{"type":"string"},"whitelist":{"type":"string"},"quarantined_at":{"type":"integer","description":"Present when record_pre_existing is true - the stored record's original creation time"}},"required":["agent_id","status","quarantined_by","reason","whitelist"]},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
-     R"j(},"required":["command_id","agents_reached","quarantine_record"]})j"},
+     R"j(},"required":["command_id","agents_reached","dispatch_confirmed","record_pre_existing","whitelist_request_ignored","quarantine_record"]})j"},
 
     // ── Engine principal role assignments (PR 4.2, design §4.1) — MCP twins of
     // POST/DELETE/GET /api/v1/engine-principals/{id}/roles. Closes the "no
@@ -2510,6 +2550,11 @@ int mcp_error_for_store_msg(const std::string& msg) {
         return kInvalidParams;
     case yuzu::server::detail::EngineStoreErrorClass::Transient:
         return kInternalError;
+    case yuzu::server::detail::EngineStoreErrorClass::SecretMismatch:
+        // #3015: reachable only after every other admission gate passed —
+        // the closest existing JSON-RPC vocabulary entry for "you don't get
+        // to do this", the same code the RBAC/tier denial sites use.
+        return kPermissionDenied;
     }
     return kInternalError; // unreachable — all enum cases return above
 }
@@ -2572,7 +2617,7 @@ KekFailureInfo kek_failure_info(const KekOpResult& result) {
         return {kInternalError, "KEK service unavailable",
                 "the Postgres substrate or secrets codec is not available; retry once the "
                 "server reports it is ready",
-                5000};
+                mcp::kMcpStoreFaultRetryMs};
     case KekOpResult::Failure::Conflict:
         // A conflict is RETRYABLE and is not the caller's fault: another KEK
         // operation holds the cluster-wide advisory lock. kInvalidParams would
@@ -2585,7 +2630,7 @@ KekFailureInfo kek_failure_info(const KekOpResult& result) {
         return {kInternalError, "another KEK operation is in progress",
                 "another rotation or re-wrap holds the KEK operation lock; retry once it "
                 "completes",
-                5000};
+                mcp::kMcpStoreFaultRetryMs};
     case KekOpResult::Failure::Cooldown: {
         // Mirrors the REST 429. Retryable with a real wait, and the remediation
         // must point at rewrap_secrets: an agentic caller recovering a
@@ -2687,12 +2732,16 @@ PluginConfigErrorInfo plugin_config_error_info(PluginConfigStore::Error err) {
         return {kInvalidParams, "invalid plugin/key/value/reason", nullptr, -1};
     case PluginConfigStore::Error::Unavailable:
         return {kInternalError, "plugin config store unavailable",
-                "retry once the server reports ready", 2000};
+                "retry once the server reports ready", mcp::kMcpStoreFaultShortRetryMs};
     case PluginConfigStore::Error::WriteFailed:
+        // #3344: -1/null stays correct — the store's own doc classifies this
+        // arm as a write that failed or affected zero rows "unexpectedly"
+        // (plugin_config_store.hpp), i.e. a logic/integrity fault, not the
+        // Unavailable/SecretUnavailable arms' routine transient condition.
         return {kInternalError, "write failed", nullptr, -1};
     case PluginConfigStore::Error::SecretUnavailable:
         return {kInternalError, "secret encryption unavailable",
-                "retry once the server reports ready", 2000};
+                "retry once the server reports ready", mcp::kMcpStoreFaultShortRetryMs};
     }
     return {kInternalError, "internal error", nullptr, -1};
 }
@@ -3897,6 +3946,12 @@ McpServer::HandlerFn McpServer::build_handler(
             // the two streamed-POST 500s, which are the only refusals raised AFTER
             // dispatch - the work is running, so the client needs the id to find it
             // rather than retry a mutating fleet command blind (Decision 15(g)).
+            //
+            // #3344: retry_after_ms stays null deliberately — retrying THIS
+            // request would re-dispatch the instruction (duplicate side
+            // effects). The honest recovery path is polling the execution_id
+            // this envelope hands back via get_execution_status, which now
+            // carries its own success-shaped retry_after_ms hint.
             auto a4_error_exec = [&id](int code, std::string_view message,
                                        std::string_view remediation,
                                        const std::string& execution_id,
@@ -3921,15 +3976,41 @@ McpServer::HandlerFn McpServer::build_handler(
             // `approval_id` is a server-generated 32-hex id (ApprovalManager) and
             // `status_url` is a server-built path, so both are raw-embedded like
             // correlation_id; `remediation` is JSON-escaped defensively.
+            //
+            // #3344: retry_after_ms is a populated kMcpApprovalPollRetryMs, not
+            // null — this IS retryable, just on human timescales. Approval
+            // minting is deduplicated (ApprovalManager::find_pending): a re-call
+            // before the ticket resolves returns the SAME pending ticket rather
+            // than minting a new one, so a hint here cannot cause a duplicate
+            // approval request — only wasted round trips if ignored.
             auto approval_required_error = [&id](const std::string& approval_id,
                                                  std::string_view remediation) {
                 const std::string cid = yuzu::server::detail::make_correlation_id();
                 std::string data = R"({"correlation_id":")" + cid +
-                                   R"(","retry_after_ms":null,"remediation":)" +
+                                   R"(","retry_after_ms":)" +
+                                   std::to_string(mcp::kMcpApprovalPollRetryMs) +
+                                   R"(,"remediation":)" +
                                    json_quoted_string(remediation) + R"(,"approval_id":")" +
                                    approval_id + R"(","status_url":")" +
                                    ("/api/v1/approvals/" + approval_id) + R"("})";
                 return error_response(id, kApprovalRequired, "operation requires approval", data);
+            };
+
+            // #3344: poll-rate signal for the three success-shaped
+            // result-not-ready poll tools — counts a served verdict (never a
+            // pre-verdict denial: tier/permission/invalid-params/not-found are
+            // already visible via the denial counters and A4 envelopes above).
+            // `result="not_ready"` means this exact response carried a
+            // retry_after_ms hint; modelled on count_denial's shape (nullptr
+            // guard, labels built INSIDE the try, noexcept — observability must
+            // never fail a tool call).
+            auto count_poll = [metrics](const char* tool, bool not_ready) noexcept {
+                if (metrics == nullptr) return;
+                try {
+                    yuzu::Labels labels{{"tool", tool}, {"result", not_ready ? "not_ready" : "ready"}};
+                    metrics->counter(mcp::kMcpPollTotalMetric, labels).increment();
+                } catch (...) { // NOLINT(bugprone-empty-catch)
+                }
             };
 
             // Canonical JSON of the tool arguments for approval-ticket binding
@@ -4275,9 +4356,19 @@ McpServer::HandlerFn McpServer::build_handler(
                             /*schedule_id=*/"", ApprovalOrigin::kMcp);
                         if (!submitted) {
                             mcp_audit("failure", "approval submit failed: " + submitted.error());
+                            // #3344: was a bare -1/null despite the remediation
+                            // already saying "retry later" — an oversight, not a
+                            // deliberate non-retryable classification.
+                            // ApprovalManager::submit()'s only reachable failures
+                            // at this call site (definition_id and
+                            // session->username are both non-empty here) are
+                            // store-not-open, queue-full, or a SQLite
+                            // prepare/insert fault — the same transient-store-fault
+                            // class as the rest of this handler family.
                             res.set_content(
                                 a4_error(kInternalError, "failed to create approval request",
-                                         "retry later, or use the REST API / dashboard"),
+                                         "retry later, or use the REST API / dashboard",
+                                         mcp::kMcpStoreFaultRetryMs),
                                 "application/json");
                             return;
                         }
@@ -4980,6 +5071,32 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // #3344 (Gate 8 fold, unhappy-path UP-1): read the tracker's
+                // terminal status BEFORE the response-store query below, not
+                // after. The writer (agent_service_impl.cpp) stores a
+                // response row, THEN marks the execution terminal — reading
+                // rows first and the tracker second could observe a stale-
+                // short rows snapshot alongside an ALREADY-terminal tracker in
+                // the race window between those two writes, producing
+                // "no more rows are coming" for an execution whose last row
+                // just hadn't been visible to the first read yet. Checking
+                // the tracker first matches the writer's causal order: a
+                // terminal read here guarantees every row this execution will
+                // ever produce was already written before the response-store
+                // query below runs.
+                //
+                // Only when execution_id was supplied AND the tracker
+                // resolves it: an instruction_id-only query has no execution
+                // to check in-flight-ness against, so in-flight-ness is
+                // honestly unknowable — nullopt, not false, so neither the
+                // hint nor the poll-rate count below is emitted (sre, Gate 8
+                // fold: folding an unknowable call into "ready" would dilute
+                // the not_ready fraction the counter exists to measure).
+                std::optional<bool> poll_hint;
+                if (!exec_id.empty() && execution_tracker) {
+                    if (auto exec_for_hint = execution_tracker->get_execution(exec_id))
+                        poll_hint = !mcp::is_execution_terminal(exec_for_hint->status);
+                }
                 ResponseQuery rq;
                 rq.agent_id = param_str(args, "agent_id");
                 rq.status = param_int32(args, "status", -1);
@@ -5022,7 +5139,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     mcp_audit("failure", "store degraded; " + key);
                     res.set_content(
                         a4_error(kInternalError, "Response store degraded — query failed", {},
-                                 /*retry_after_ms=*/5000),
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -5101,6 +5218,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 // #1550 HIGH-2: observe the audit bool — a dropped evidence row on this
                 // SOC 2 read surface is surfaced to the caller via audit_persisted:false.
                 const bool audit_ok = mcp_audit("success", key) && denied_ok;
+                // poll_hint was computed above, before the response-store
+                // query (UP-1). Emit the count only when in-flight-ness was
+                // actually checked — an instruction_id-only call (nullopt)
+                // is neither ready nor not_ready, it was never evaluated.
+                if (poll_hint)
+                    count_poll("query_responses", *poll_hint);
+                const bool emit_poll_hint = poll_hint.value_or(false);
                 JObj result_obj;
                 result_obj.raw("content",
                                JArr().add(JObj().add("type", "text").add("text", arr.str())).str());
@@ -5113,6 +5237,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // shape — content[].text stays the bare rows array, unchanged).
                 if (hit_cap)
                     result_obj.raw("result_truncated_by_cap", "true");
+                if (emit_poll_hint)
+                    result_obj.add("retry_after_ms", mcp::kMcpResultPollRetryMs);
                 // #2712: structuredContent combines the same rows + the same two
                 // conditional flags into ONE schema-conformant object (content[].text
                 // above stays the legacy bare array + sibling-field shape, unchanged,
@@ -5123,6 +5249,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     structured.add("audit_persisted", false);
                 if (hit_cap)
                     structured.add("result_truncated_by_cap", true);
+                if (emit_poll_hint)
+                    structured.add("retry_after_ms", mcp::kMcpResultPollRetryMs);
                 result_obj.raw("structuredContent", structured.str());
                 res.set_content(success_response(id, result_obj.str()), "application/json");
                 return;
@@ -5364,7 +5492,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         res.set_content(
                             a4_error(kInternalError,
                                      "Response store degraded — aggregate failed", {},
-                                     /*retry_after_ms=*/5000),
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                             "application/json");
                         return;
                     }
@@ -5386,7 +5514,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     res.set_content(
                         a4_error(kInternalError,
                                  "Response store degraded — aggregate failed", {},
-                                 /*retry_after_ms=*/5000),
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -5606,7 +5734,12 @@ McpServer::HandlerFn McpServer::build_handler(
                     // the sibling query_installed_software audits its store-degrade the
                     // same way, and the REST drill persists a failure audit on 503.
                     mcp_audit("failure", "authorization subsystem unavailable (#1717 fail-closed)");
-                    res.set_content(a4_error(kInternalError, "authorization subsystem unavailable"),
+                    // #3344: was a bare -1/null despite this comment already
+                    // claiming REST parity — the REST twin (sle_gate_usable,
+                    // server.cpp) emits retry_after_ms:5000 on the identical
+                    // condition. An oversight, not a deliberate divergence.
+                    res.set_content(a4_error(kInternalError, "authorization subsystem unavailable",
+                                             {}, mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -5619,6 +5752,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 // Per-device SCOPED gate (SoftwareLicensing:Read + management group) —
                 // the SAME ancestor-aware confinement the REST drill takes (the set_tag
                 // precedent), NOT the global perm gate. Fail closed if it is unwired.
+                //
+                // #3344: -1/null (default) stays correct — `scoped_perm_fn` is
+                // wired once at server construction; if it is unset, no
+                // request on this build will ever find it set, so a retry
+                // hint would be dishonest (same class as the "tool security
+                // registration missing" misconfig above).
                 if (!scoped_perm_fn) {
                     res.set_content(a4_error(kInternalError, "scope gate not configured"),
                                     "application/json");
@@ -5629,7 +5768,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!software_licensing_store) {
                     mcp_audit("failure", "software licensing store unavailable; agent=" + agent_id);
                     res.set_content(a4_error(kInternalError, "Software licensing store unavailable",
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -5641,7 +5780,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     mcp_audit("failure", "detected-licence store degraded; agent=" + agent_id);
                     res.set_content(
                         a4_error(kInternalError, "detected-licence store unavailable — read failed",
-                                 "retry the request", /*retry_after_ms=*/5000),
+                                 "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -5933,6 +6072,15 @@ McpServer::HandlerFn McpServer::build_handler(
                         .add("agents_success", static_cast<int64_t>(exec->agents_success))
                         .add("agents_failure", static_cast<int64_t>(exec->agents_failure))
                         .add("progress_pct", static_cast<int64_t>(summary.progress_pct));
+                // #3344: retry_after_ms is emitted ONLY while non-terminal, via
+                // the shared mcp::is_execution_terminal() predicate (Gate 8
+                // fold: this and query_responses' poll-hint independently
+                // hand-rolled the same three-value set — see the predicate's
+                // own doc comment in mcp_retry.hpp for the fail-safe rationale).
+                const bool terminal = mcp::is_execution_terminal(exec->status);
+                if (!terminal)
+                    obj.add("retry_after_ms", mcp::kMcpResultPollRetryMs);
+                count_poll("get_execution_status", !terminal);
                 mcp_audit("success", exec_id);
                 res.set_content(success_response(id, tool_result(obj.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -6475,7 +6623,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!dex_perf_fn) {
                     res.set_content(
                         error_response(id, kInternalError, "Fleet perf provider unavailable",
-                                       a4_data(5000, "retry after server warmup; the fleet-perf "
+                                       a4_data(mcp::kMcpProviderWarmupRetryMs, "retry after server warmup; the fleet-perf "
                                                      "provider initialises during startup")),
                         "application/json");
                     return;
@@ -6725,7 +6873,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!app_perf_providers.apps) {
                         res.set_content(
                             error_response(id, kInternalError, "app-perf store provider unavailable",
-                                           a4_data(5000, "retry after server warmup; the app-perf "
+                                           a4_data(mcp::kMcpProviderWarmupRetryMs, "retry after server warmup; the app-perf "
                                                          "store provider initialises during startup")),
                             "application/json");
                         return;
@@ -6735,7 +6883,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!apps) { // AUTHORITATIVE read degrade — surface, never a silent empty
                         res.set_content(
                             error_response(id, kInternalError, "app-perf store read degraded",
-                                           a4_data(2000, "the app-perf store could not be read; "
+                                           a4_data(mcp::kMcpStoreFaultShortRetryMs, "the app-perf store could not be read; "
                                                          "retry shortly")),
                             "application/json");
                         return;
@@ -6751,7 +6899,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!app_perf_providers.fleet) {
                         res.set_content(
                             error_response(id, kInternalError, "app-perf store provider unavailable",
-                                           a4_data(5000, "retry after server warmup; the app-perf "
+                                           a4_data(mcp::kMcpProviderWarmupRetryMs, "retry after server warmup; the app-perf "
                                                          "store provider initialises during startup")),
                             "application/json");
                         return;
@@ -6785,7 +6933,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!rows) { // AUTHORITATIVE read degrade
                         res.set_content(
                             error_response(id, kInternalError, "app-perf store read degraded",
-                                           a4_data(2000, "the app-perf store could not be read; "
+                                           a4_data(mcp::kMcpStoreFaultShortRetryMs, "the app-perf store could not be read; "
                                                          "retry shortly")),
                             "application/json");
                         return;
@@ -6837,7 +6985,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!app_perf_providers.group) {
                         res.set_content(
                             error_response(id, kInternalError, "app-perf store provider unavailable",
-                                           a4_data(5000, "retry after server warmup; the app-perf "
+                                           a4_data(mcp::kMcpProviderWarmupRetryMs, "retry after server warmup; the app-perf "
                                                          "store provider initialises during startup")),
                             "application/json");
                         return;
@@ -6888,7 +7036,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!rows) { // AUTHORITATIVE degrade (member resolution OR aggregate read)
                         res.set_content(
                             error_response(id, kInternalError, "app-perf group read degraded",
-                                           a4_data(2000, "the app-perf store could not be read; "
+                                           a4_data(mcp::kMcpStoreFaultShortRetryMs, "the app-perf store could not be read; "
                                                          "retry shortly")),
                             "application/json");
                         return;
@@ -6978,7 +7126,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!app_perf_providers.cohort) {
                     res.set_content(
                         error_response(id, kInternalError, "app-perf store provider unavailable",
-                                       a4_data(5000, "retry after server warmup; the app-perf store "
+                                       a4_data(mcp::kMcpProviderWarmupRetryMs, "retry after server warmup; the app-perf store "
                                                      "provider initialises during startup")),
                         "application/json");
                     return;
@@ -7027,7 +7175,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!cohort) { // AUTHORITATIVE degrade
                     res.set_content(
                         error_response(id, kInternalError, "app-perf cohort read degraded",
-                                       a4_data(2000, "the app-perf store could not be read; retry "
+                                       a4_data(mcp::kMcpStoreFaultShortRetryMs, "the app-perf store could not be read; retry "
                                                      "shortly")),
                         "application/json");
                     return;
@@ -7888,7 +8036,27 @@ McpServer::HandlerFn McpServer::build_handler(
                             .add("agents_reached", 0)
                             .add("plugin", plugin)
                             .add("action", action)
-                            .add("message", "No agents reachable for command dispatch")
+                            // #881: "reachable" is no longer the only reason
+                            // this can be zero — a target that is QUARANTINED
+                            // is withheld by the containment gate before
+                            // dispatch, which is a permanent policy denial,
+                            // not transient unreachability. The dispatch
+                            // closure's return carries only (command_id,
+                            // sent), so this handler cannot yet tell the two
+                            // apart; saying so is better than asserting the
+                            // wrong one, because an agentic caller that reads
+                            // "unreachable" retries a denial forever. The
+                            // authoritative answer is the
+                            // quarantine.dispatch_denied audit row and
+                            // yuzu_server_dispatch_target_rejected_total
+                            // {reason="quarantined"}. A programmatic
+                            // discriminator needs a wider DispatchFn return —
+                            // tracked as a follow-up.
+                            .add("message",
+                                 "No agents reached: every target was either unreachable or "
+                                 "withheld by the quarantine containment gate. If the device is "
+                                 "quarantined this is a policy denial and retrying will not "
+                                 "help — check quarantine status before retrying.")
                             .str();
                     mcp_audit("failure",
                               std::string("no_agents_reached execution_id=") + execution_id);
@@ -8642,7 +8810,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // store-unavailable siblings above.
                     res.set_content(
                         a4_error(kInternalError, "Quarantine store unavailable",
-                                 "retry the request", /*retry_after_ms=*/5000),
+                                 "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -8689,9 +8857,16 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                {
-                    // Mirror the agent's is_safe_ip charset ([0-9a-fA-F.:], <=45)
-                    // so we reject anything the agent would silently drop, loudly.
+                // Mirror the agent's is_safe_ip charset ([0-9a-fA-F.:], <=45) so we
+                // reject anything the agent would silently drop, loudly. Factored
+                // into a lambda (not just this request's inline block) so the
+                // STORED whitelist read back on the already_active retry path
+                // (#3127) can clear the SAME check below before it reaches the
+                // agent's netsh/iptables/pf sink — the REST twin that can
+                // populate that row (rest_api_v1.cpp) performs no validation of
+                // its own, and this PR is what makes the sink reachable from a
+                // stored (not just a live-request) whitelist.
+                auto whitelist_tokens_safe = [](std::string_view wl) {
                     auto safe_ip = [](std::string_view tok) {
                         if (tok.empty() || tok.size() > 45)
                             return false;
@@ -8701,43 +8876,65 @@ McpServer::HandlerFn McpServer::build_handler(
                                 return false;
                         return true;
                     };
-                    bool bad = false;
                     size_t start = 0;
-                    while (start <= whitelist.size() && !bad) {
-                        size_t comma = whitelist.find(',', start);
-                        auto tok = whitelist.substr(
-                            start, comma == std::string::npos ? std::string::npos : comma - start);
+                    while (start <= wl.size()) {
+                        size_t comma = wl.find(',', start);
+                        auto tok = wl.substr(start, comma == std::string_view::npos
+                                                         ? std::string_view::npos
+                                                         : comma - start);
                         // trim surrounding spaces
                         auto b = tok.find_first_not_of(' ');
                         auto e = tok.find_last_not_of(' ');
-                        if (b != std::string::npos)
-                            tok = tok.substr(b, e - b + 1);
-                        else
-                            tok.clear();
+                        tok = (b != std::string_view::npos) ? tok.substr(b, e - b + 1)
+                                                             : std::string_view{};
                         if (!tok.empty() && !safe_ip(tok))
-                            bad = true;
-                        if (comma == std::string::npos)
+                            return false;
+                        if (comma == std::string_view::npos)
                             break;
                         start = comma + 1;
                     }
-                    if (bad) {
-                        res.set_content(
-                            error_response(id, kInvalidParams,
-                                           "whitelist must be comma-separated IPv4/IPv6 literals"),
-                            "application/json");
-                        return;
-                    }
+                    return true;
+                };
+                if (!whitelist_tokens_safe(whitelist)) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "whitelist must be comma-separated IPv4/IPv6 literals"),
+                        "application/json");
+                    return;
                 }
-                // NOTE (governance sec-LOW-1 / UP-6): live isolation preserves the
-                // agent's EXISTING management connection (iptables ESTABLISHED,RELATED
-                // etc.), so the agent can still receive the un-quarantine command over
-                // that link. It does NOT explicitly whitelist the server address for a
-                // fresh reconnect — a pre-existing quarantine-plugin design (the plugin
-                // takes no server_ip param), tracked as a follow-up, not introduced here.
+                // NOTE (governance sec-LOW-1 / UP-6): this call never sets qparams'
+                // server_ip — but live isolation still keeps the management channel
+                // reachable, because the agent independently derives its own server
+                // address once at STARTUP (agents/core/src/server_address_resolver.cpp,
+                // resolved via DNS when it's a hostname) and threads the result into
+                // every plugin's config, rather than depending on a caller-supplied
+                // one. Deliberately not resolved by the quarantine plugin itself at
+                // dispatch time -- see quarantine_plugin.cpp's do_quarantine comment
+                // on why that would let the host being quarantined steer its own
+                // containment exception via its own (possibly compromised) resolver.
                 // 1. Persist the quarantine record (store row only; mirror REST).
                 auto quar_res =
                     quarantine_store->quarantine_device(agent_id, session->username, reason, whitelist);
-                if (!quar_res) {
+                // #3127: classify the write onto the pure decision enum
+                // (quarantine_dispatch_decision.hpp). The store emits exactly
+                // one business/state error ("device is already quarantined",
+                // unprefixed) and prefixes every genuine store/pool/query
+                // failure with kQuarantineDbErrorPrefix — that string split IS
+                // the classification rule, so it stays here rather than in the
+                // pure (no-I/O) header.
+                const QuarantineRecordWrite write_result =
+                    quar_res ? QuarantineRecordWrite::created
+                    : quar_res.error().starts_with(kQuarantineDbErrorPrefix)
+                        ? QuarantineRecordWrite::store_error
+                        : QuarantineRecordWrite::already_active;
+                // Routed through quarantine_response_shape (rather than a raw
+                // write_result comparison) so this early return and the
+                // dispatch-outcome switch below share ONE classifier for
+                // "store_error is always retryable" — agents_reached/threw
+                // are irrelevant on this write outcome (see the header), so
+                // 0/false are safe placeholders.
+                if (quarantine_response_shape(write_result, 0, false) ==
+                    QuarantineResponse::store_error_retryable) {
                     // gov-fix(compliance-officer C-3): carry the actual store
                     // error, not just agent_id — REST's audit_fn call passes
                     // result.error() as a distinct field from the target id;
@@ -8749,37 +8946,102 @@ McpServer::HandlerFn McpServer::build_handler(
                     // one grep pattern extracts agent_id from every
                     // quarantine_device audit row.
                     mcp_audit("failure", "agent_id=" + agent_id + ", " + quar_res.error());
-                    // Mirrors the REST twin's 503-vs-400 classification
-                    // (is_quarantine_db_error, rest_api_v1.cpp): a genuine
-                    // store/pool/query failure is kInternalError, a
-                    // business/state error ("already quarantined") is
-                    // kInvalidParams.
                     // gov-fix(enterprise-readiness F5): a genuine store/pool
-                    // failure is retryable (A5) — carry retry_after_ms only
-                    // on that branch, matching the engine-principal-store
-                    // sibling above; a business/state error stays
-                    // non-retryable (null).
-                    if (quar_res.error().starts_with(kQuarantineDbErrorPrefix)) {
-                        res.set_content(a4_error(kInternalError, quar_res.error(),
-                                                 "retry the request", /*retry_after_ms=*/5000),
-                                        "application/json");
-                    } else {
-                        res.set_content(a4_error(kInvalidParams, quar_res.error()),
-                                        "application/json");
-                    }
+                    // failure is retryable (A5) — carry retry_after_ms,
+                    // matching the engine-principal-store sibling above.
+                    // #3344: named constant, not a bare literal. #3428 moved
+                    // the business/state-error ("already_active") case out of
+                    // this branch entirely (quarantine_response_shape() above
+                    // now gates entry here to store_error_retryable only), so
+                    // the old kQuarantineDbErrorPrefix re-check that used to
+                    // live here is dead code post-#3428, not a #3344 concern.
+                    res.set_content(a4_error(kInternalError, quar_res.error(),
+                                             "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
                     return;
+                }
+                // #3127 retry fix: on already_active the write above did NOT
+                // happen — the persisted record belongs to an EARLIER call, so
+                // THIS call's reason/whitelist were never stored. Dispatching
+                // this call's whitelist would let a caller silently rewrite a
+                // contained device's firewall allow-list with no store update
+                // and no audit trail: a state divergence, not an idempotent
+                // retry. So read the live row back and dispatch/report from
+                // IT, not from the request — see
+                // quarantine_dispatch_decision.hpp for why. This is a
+                // DELIBERATE divergence from the REST twin (POST
+                // /api/v1/quarantine is record-only and never dispatches, so
+                // it has no dispatch behaviour to stay in parity with); the
+                // repo's twin-parity convention is otherwise strict and a
+                // reviewer will ask.
+                const bool record_pre_existing = write_result == QuarantineRecordWrite::already_active;
+                std::string effective_by = session->username;
+                std::string effective_reason = reason;
+                std::string effective_whitelist = whitelist;
+                std::int64_t stored_quarantined_at = 0;
+                bool whitelist_request_ignored = false;
+                if (record_pre_existing) {
+                    auto status_res = quarantine_store->get_status(agent_id);
+                    // A read failure — or a success that comes back empty (the
+                    // record was released between the write conflict and this
+                    // read, a narrow race) — leaves nothing durable to
+                    // dispatch against. Both are treated like a store failure:
+                    // retry the whole request rather than dispatch or report
+                    // isolated on a record that turned out not to be there.
+                    if (!status_res || !status_res->has_value()) {
+                        const std::string detail =
+                            status_res ? std::string("quarantine record not found on retry read")
+                                       : status_res.error();
+                        mcp_audit("failure", "agent_id=" + agent_id + ", " + detail);
+                        res.set_content(a4_error(kInternalError, detail, "retry the request",
+                                                 /*retry_after_ms=*/5000),
+                                        "application/json");
+                        return;
+                    }
+                    const QuarantineRecord& stored = **status_res;
+                    effective_by = stored.quarantined_by;
+                    effective_reason = stored.reason;
+                    effective_whitelist = stored.whitelist;
+                    stored_quarantined_at = stored.quarantined_at;
+                    // The caller's params were not applied — tell it, rather
+                    // than silently discarding a whitelist it thought it was
+                    // setting.
+                    if (!whitelist.empty() && whitelist != stored.whitelist)
+                        whitelist_request_ignored = true;
+                    // #3127: the stored whitelist may have been written by the
+                    // REST twin (record-only, no charset/length validation of
+                    // its own) and is about to reach the agent's firewall sink
+                    // on this retry-dispatch path — it must clear the SAME
+                    // server-edge check the request path cleared above before
+                    // it dispatches.
+                    if (effective_whitelist.size() > 512 ||
+                        !whitelist_tokens_safe(effective_whitelist)) {
+                        mcp_audit("failure", "agent_id=" + agent_id +
+                                                 ", stored whitelist failed edge validation");
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "stored quarantine whitelist is not dispatchable"),
+                            "application/json");
+                        return;
+                    }
                 }
                 // 2. Dispatch the live isolation command (plugin quarantine,
                 //    action quarantine). Out-of-band (no ExecutionTracker row):
                 //    quarantine is not an executions-drawer producer. A dispatch
                 //    failure leaves the record persisted (the agent may be offline)
                 //    and is surfaced via agents_reached=0, not a fatal error.
+                //    should_dispatch_isolation is true for both created and
+                //    already_active reached here — store_error already
+                //    returned above — but the call stays explicit: this IS the
+                //    retry no longer dead-ending (#3127).
                 std::string command_id;
                 int agents_reached = 0;
-                if (dispatch_fn) {
+                bool dispatch_threw = false;
+                if (dispatch_fn && should_dispatch_isolation(write_result)) {
                     std::unordered_map<std::string, std::string> qparams;
-                    if (!whitelist.empty())
-                        qparams["whitelist_ips"] = whitelist;
+                    if (!effective_whitelist.empty())
+                        qparams["whitelist_ips"] = effective_whitelist;
                     try {
                         // governance UP-9: thread a set CONFINED to the single
                         // scope-gate-checked target, not an unfiltered VisibleSet{} —
@@ -8798,25 +9060,135 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .exec_visible = yuzu::server::authz::VisibleSet{
                                     std::unordered_set<std::string>{agent_id}}});
                     } catch (const std::exception& e) {
+                        dispatch_threw = true;
                         spdlog::error("MCP quarantine_device: isolation dispatch failed: {}",
                                       e.what());
                     }
                 }
+                // #3127: agents_reached>0 means the plugin registry ACCEPTED
+                // the frame — for a gateway-attached agent, send_to only
+                // QUEUES the command (server.cpp), it does not confirm
+                // execution. The response's dispatch_confirmed below means
+                // exactly that acceptance, never "the device is provably
+                // isolated": confirming isolation still requires a follow-up
+                // `status` read returning `state|active`.
+                const QuarantineResponse response_shape =
+                    quarantine_response_shape(write_result, agents_reached, dispatch_threw);
+                if (response_shape == QuarantineResponse::unconfirmed_retryable) {
+                    // #3127: the other half of the phantom-isolation bug — a
+                    // write that succeeded (or an already_active record that
+                    // re-dispatched) but whose dispatch was never confirmed
+                    // accepted must NOT return the success envelope.
+                    // gov-fix(consistency-auditor, Gate 8): "agent_id=<id>,
+                    // <message>" matches this handler's other mcp_audit detail
+                    // strings so one grep pattern extracts agent_id from every
+                    // quarantine_device audit row.
+                    // #3127 (Item C): record_persisted=1 is unconditional — this
+                    // branch is only reached on `created` or a re-read-confirmed
+                    // `already_active` (the store_error path already returned
+                    // above), so the record is durably written either way. Without
+                    // this marker the row would mislead an auditor in the OPPOSITE
+                    // direction from the bug this package fixes: it would look as
+                    // if nothing survived, when in fact the record did and a retry
+                    // can re-dispatch it.
+                    mcp_audit("failure",
+                              "agent_id=" + agent_id +
+                                  ", isolation unconfirmed command_id=" + command_id +
+                                  " agents_reached=" + std::to_string(agents_reached) +
+                                  (dispatch_threw ? " dispatch_threw=1" : "") +
+                                  (record_pre_existing ? " record_pre_existing=1" : "") +
+                                  (whitelist_request_ignored ? " whitelist_ignored=1" : "") +
+                                  " record_persisted=1");
+                    // #881 + #3127: the retry hint must not describe a STABLE
+                    // state as a transient one. `agents_reached == 0` on a
+                    // record that ALREADY existed means a previous call also
+                    // failed to reach this device — it is offline, not
+                    // momentarily busy — and an autonomous caller honouring a
+                    // 5s hint then performs a store write, a store read, a
+                    // dispatch attempt and an audit write every five seconds
+                    // for as long as the device stays down. Nothing changes
+                    // until the agent reconnects.
+                    //
+                    // A longer hint on that shape, and the message says what
+                    // the caller most needs to know: the record IS durable and
+                    // the server-side dispatch gate (#881) is ALREADY denying
+                    // every other command to this device, so containment at
+                    // the control plane is in force.
+                    //
+                    // And it says, explicitly, what does NOT happen — because
+                    // an earlier wording here promised "the endpoint firewall
+                    // applies when the agent reconnects" and nothing does that.
+                    // There is no reconnect hook that consults containment
+                    // state (verified: no `list_quarantined()` caller outside
+                    // `make_containment_gate` and the REST list route). A SOC
+                    // analyst who quarantines a powered-off laptop, reads that
+                    // sentence and closes the ticket gets a device that comes
+                    // back two days later with no endpoint containment at all
+                    // — and the #881 gate then refuses every command that would
+                    // have probed it. Recorded-but-not-enforced is exactly the
+                    // phantom-isolation class #3127 exists to eliminate, so the
+                    // message must not create a new one in the error text.
+                    // Automatic re-dispatch on reconnect is a real gap and is
+                    // tracked separately; until it exists the honest word is
+                    // "re-issue".
+                    //
+                    // A first-attempt failure keeps the 5s hint — there, a
+                    // retry genuinely can succeed.
+                    const bool device_durably_unreachable =
+                        record_pre_existing && agents_reached == 0 && !dispatch_threw;
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "quarantine recorded but isolation was not confirmed "
+                                 "(agents_reached=" + std::to_string(agents_reached) +
+                                     (dispatch_threw ? ", dispatch threw" : "") + ")" +
+                                     (device_durably_unreachable
+                                          ? ". The record is persisted and the server is already "
+                                            "denying dispatch to this device, so containment holds "
+                                            "at the control plane. The endpoint firewall is NOT "
+                                            "applied and nothing re-applies it automatically on "
+                                            "reconnect — re-issue this call once the agent is "
+                                            "back."
+                                          : ""),
+                                 device_durably_unreachable
+                                     ? "the device has not been reachable across attempts — "
+                                       "re-issue once it reconnects; the endpoint firewall is not "
+                                       "applied until a dispatch reaches it"
+                                     : "retry the request",
+                                 /*retry_after_ms=*/device_durably_unreachable ? 60000 : 5000),
+                        "application/json");
+                    return;
+                }
+                // response_shape == isolated here (store_error_retryable
+                // already returned above, before dispatch was ever attempted).
                 // Audit AFTER dispatch so the evidence row records whether the
                 // device was actually isolated (agents_reached>0) vs recorded-only
                 // (agents_reached=0, agent offline) — governance comp-SHOULD-1.
-                bool audit_ok = mcp_audit("success", "agent_id=" + agent_id + " command_id=" +
-                                                         command_id + " agents_reached=" +
-                                                         std::to_string(agents_reached));
+                bool audit_ok = mcp_audit(
+                    "success", "agent_id=" + agent_id + " command_id=" + command_id +
+                                   " agents_reached=" + std::to_string(agents_reached) +
+                                   (record_pre_existing ? " record_pre_existing=1" : "") +
+                                   (whitelist_request_ignored ? " whitelist_ignored=1" : ""));
                 JObj record_obj;
                 record_obj.add("agent_id", agent_id)
                     .add("status", "active")
-                    .add("quarantined_by", session->username)
-                    .add("reason", reason)
-                    .add("whitelist", whitelist);
+                    .add("quarantined_by", effective_by)
+                    .add("reason", effective_reason)
+                    .add("whitelist", effective_whitelist);
+                if (record_pre_existing)
+                    record_obj.add("quarantined_at", stored_quarantined_at);
                 JObj payload;
                 payload.add("command_id", command_id)
                     .add("agents_reached", agents_reached)
+                    // dispatch_confirmed, NOT isolation_confirmed: see the
+                    // comment above response_shape. A client that needs proof
+                    // of isolation reads `status` and checks for
+                    // state|active.
+                    .add("dispatch_confirmed", true)
+                    // Unconditional booleans (not present-only-when-true) so a
+                    // client can distinguish "false" from "this server
+                    // version doesn't send it" (#3127 F-14).
+                    .add("record_pre_existing", record_pre_existing)
+                    .add("whitelist_request_ignored", whitelist_request_ignored)
                     .raw("quarantine_record", record_obj.str());
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
@@ -8960,7 +9332,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         mcp_audit("failure", "response store degraded: " + bundle_id);
                         res.set_content(
                             a4_error(kInternalError, "Response store degraded", {},
-                                     /*retry_after_ms=*/5000),
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                             "application/json");
                         return;
                     }
@@ -8973,7 +9345,21 @@ McpServer::HandlerFn McpServer::build_handler(
                 // error_handler_t::replace (bundle_service.cpp) to survive invalid
                 // UTF-8 in untrusted plugin output (#1593) - wrap that string
                 // UNCHANGED through tool_result(), never reserialize it.
-                const std::string payload = aggregate_to_json(*agg);
+                std::string payload = aggregate_to_json(*agg);
+                // #3344: MCP-only string-splice, not a bundle_service.cpp change
+                // — aggregate_to_json() is shared verbatim with the REST twin
+                // (GET /api/v1/bundles/{id}), which stays byte-identical.
+                // Splicing (rather than reparsing+redumping) respects the
+                // never-reserialize rule above; the guarded rfind skips the
+                // hint rather than risk corrupting the replace-dumped payload
+                // if the shape ever changes.
+                if (!agg->complete) {
+                    if (const auto pos = payload.rfind('}'); pos != std::string::npos) {
+                        payload.insert(pos, ",\"retry_after_ms\":" +
+                                                std::to_string(mcp::kMcpResultPollRetryMs));
+                    }
+                }
+                count_poll("get_bundle_result", !agg->complete);
                 mcp_audit("success", std::string("bundle_id=") + bundle_id +
                                          " complete=" + (agg->complete ? "1" : "0"));
                 res.set_content(success_response(id, tool_result(payload, kObjectOutputSchema)),
@@ -9364,7 +9750,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 offset = std::clamp(offset, 0, 1000000);
                 // REST/MCP parity with GET /api/v1/ca/issued: probe limit+1 for a
                 // precise has_more so an agentic client can paginate deterministically.
-                auto records = ca_store->list_issued(limit + 1, offset);
+                auto records_or_err = ca_store->list_issued(limit + 1, offset);
+                if (!records_or_err) {
+                    res.set_content(error_response(id, kInternalError, "CA store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto records = std::move(*records_or_err);
                 const bool has_more = static_cast<int>(records.size()) > limit;
                 if (has_more)
                     records.resize(static_cast<std::size_t>(limit));
@@ -9434,7 +9826,27 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 for (auto& c : serial)
                     c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-                if (!ca_store->revoke(serial, reason)) {
+                auto revoked_or_err = ca_store->revoke(serial, reason);
+                if (!revoked_or_err) {
+                    // ADR-0053: a genuine DB/lease failure — distinct from "not found or
+                    // already revoked" (a business fact). Must NOT be audited "denied": that
+                    // would falsely record a database outage as a rejected revoke attempt.
+                    // Gate 4 consistency-auditor SHOULD (2026-08-21): this branch discarded the
+                    // audit_fn return value, unlike its "denied"/"success" siblings just below —
+                    // an agentic caller had no way to learn a dropped audit row accompanied this
+                    // 503, the same evidence-chain gap the other two branches already surface.
+                    const bool store_error_audit_ok =
+                        audit_fn(req, "ca.cert.revoked", "failure", "AgentCertificate", serial,
+                                 revoked_or_err.error());
+                    res.set_content(
+                        error_response(id, kInternalError, "CA store unavailable",
+                                       store_error_audit_ok
+                                           ? std::string_view{}
+                                           : std::string_view{R"({"audit_persisted":false})"}),
+                        "application/json");
+                    return;
+                }
+                if (!*revoked_or_err) {
                     // Idempotent reject-without-state-change → "denied" (matches REST).
                     // M1 (#1240): surface a dropped denied-row via the error data.
                     const bool denied_audit_ok = audit_fn(req, "ca.cert.revoked", "denied",
@@ -9500,7 +9912,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     res.set_content(a4_error(kInternalError, "KEK service unavailable",
                                              "the Postgres substrate or secrets codec is not "
                                              "available; retry once the server reports it is ready",
-                                             /*retry_after_ms=*/5000),
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -9549,7 +9961,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     res.set_content(a4_error(kInternalError, "KEK service unavailable",
                                              "the Postgres substrate or secrets codec is not "
                                              "available; retry once the server reports it is ready",
-                                             /*retry_after_ms=*/5000),
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -9591,7 +10003,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     res.set_content(a4_error(kInternalError, "KEK service unavailable",
                                              "the Postgres substrate or secrets codec is not "
                                              "available; retry once the server reports it is ready",
-                                             /*retry_after_ms=*/5000),
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -9690,7 +10102,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!plugin_config_store_ || !plugin_config_store_->is_open()) {
                     res.set_content(a4_error(kInternalError, "plugin config store unavailable",
                                              "retry once the server reports ready",
-                                             /*retry_after_ms=*/2000),
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                                     "application/json");
                     return;
                 }
@@ -9730,7 +10142,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!plugin_config_store_ || !plugin_config_store_->is_open()) {
                     res.set_content(a4_error(kInternalError, "plugin config store unavailable",
                                              "retry once the server reports ready",
-                                             /*retry_after_ms=*/2000),
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                                     "application/json");
                     return;
                 }
@@ -9745,7 +10157,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!rbac_store || !rbac_store->is_open()) {
                     res.set_content(a4_error(kInternalError, "authorization store unavailable",
                                              "retry once the server reports ready",
-                                             /*retry_after_ms=*/2000),
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                                     "application/json");
                     return;
                 }
@@ -9799,7 +10211,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!plugin_config_store_ || !plugin_config_store_->is_open()) {
                     res.set_content(a4_error(kInternalError, "plugin config store unavailable",
                                              "retry once the server reports ready",
-                                             /*retry_after_ms=*/2000),
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                                     "application/json");
                     return;
                 }
@@ -9886,7 +10298,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!plugin_config_store_ || !plugin_config_store_->is_open()) {
                     res.set_content(a4_error(kInternalError, "plugin config store unavailable",
                                              "retry once the server reports ready",
-                                             /*retry_after_ms=*/2000),
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                                     "application/json");
                     return;
                 }
@@ -9943,7 +10355,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!plugin_config_store_ || !plugin_config_store_->is_open()) {
                     res.set_content(a4_error(kInternalError, "plugin config store unavailable",
                                              "retry once the server reports ready",
-                                             /*retry_after_ms=*/2000),
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                                     "application/json");
                     return;
                 }
@@ -10009,7 +10421,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!plugin_config_store_ || !plugin_config_store_->is_open()) {
                     res.set_content(a4_error(kInternalError, "plugin config store unavailable",
                                              "retry once the server reports ready",
-                                             /*retry_after_ms=*/2000),
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                                     "application/json");
                     return;
                 }
@@ -10066,7 +10478,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!plugin_config_store_ || !plugin_config_store_->is_open()) {
                     res.set_content(a4_error(kInternalError, "plugin config store unavailable",
                                              "retry once the server reports ready",
-                                             /*retry_after_ms=*/2000),
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                                     "application/json");
                     return;
                 }
@@ -10107,7 +10519,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!plugin_config_store_ || !plugin_config_store_->is_open()) {
                     res.set_content(a4_error(kInternalError, "plugin config store unavailable",
                                              "retry once the server reports ready",
-                                             /*retry_after_ms=*/2000),
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                                     "application/json");
                     return;
                 }
@@ -10184,7 +10596,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!upload_grant_store_ || !upload_grant_store_->is_open()) {
                     res.set_content(a4_error(kInternalError, "upload grant store unavailable",
                                              "retry once the server reports ready",
-                                             /*retry_after_ms=*/2000),
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                                     "application/json");
                     return;
                 }
@@ -10208,7 +10620,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                                  ? std::string_view("retry once the server reports "
                                                                     "ready")
                                                  : std::string_view{},
-                                             retryable ? 2000 : -1),
+                                             retryable ? mcp::kMcpStoreFaultShortRetryMs : -1),
                                     "application/json");
                     return;
                 }
@@ -10239,7 +10651,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!upload_grant_store_ || !upload_grant_store_->is_open()) {
                     res.set_content(a4_error(kInternalError, "upload grant store unavailable",
                                              "retry once the server reports ready",
-                                             /*retry_after_ms=*/2000),
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                                     "application/json");
                     return;
                 }
@@ -10263,7 +10675,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!rows) {
                     res.set_content(a4_error(kInternalError, rows.error(),
                                              "retry once the server reports ready",
-                                             /*retry_after_ms=*/2000),
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                                     "application/json");
                     return;
                 }
@@ -10306,7 +10718,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!upload_grant_store_ || !upload_grant_store_->is_open()) {
                     res.set_content(a4_error(kInternalError, "upload grant store unavailable",
                                              "retry once the server reports ready",
-                                             /*retry_after_ms=*/2000),
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                                     "application/json");
                     return;
                 }
@@ -10323,7 +10735,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                    result.error());
                     res.set_content(a4_error(kInternalError, result.error(),
                                              "retry once the server reports ready",
-                                             /*retry_after_ms=*/2000),
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                                     "application/json");
                     return;
                 }
@@ -10615,7 +11027,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!engine_principal_store_ || !engine_principal_store_->is_open()) {
                     mcp_audit("failure", "engine principal store unavailable");
                     res.set_content(a4_error(kInternalError, "engine principal store unavailable",
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -10641,7 +11053,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!owner_exists_fn_) {
                     mcp_audit("failure", "owner existence check unavailable");
                     res.set_content(a4_error(kInternalError, "owner existence check unavailable",
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -10697,7 +11109,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!engine_principal_store_ || !engine_principal_store_->is_open()) {
                     mcp_audit("failure", "engine principal store unavailable");
                     res.set_content(a4_error(kInternalError, "engine principal store unavailable",
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -10744,7 +11156,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!engine_principal_store_ || !engine_principal_store_->is_open()) {
                     mcp_audit("failure", "engine principal store unavailable");
                     res.set_content(a4_error(kInternalError, "engine principal store unavailable",
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -10758,7 +11170,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!p_res) {
                     mcp_audit("failure", p_res.error());
                     res.set_content(a4_error(kInternalError, p_res.error(), "retry the request",
-                                             /*retry_after_ms=*/5000),
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -10811,7 +11223,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     mcp_audit("failure", "engine principal/credential store unavailable");
                     res.set_content(a4_error(kInternalError,
                                              "engine principal/credential store unavailable",
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -10833,7 +11245,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!existing_res) {
                     mcp_audit("failure", existing_res.error());
                     res.set_content(a4_error(kInternalError, existing_res.error(),
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -10862,7 +11274,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     (void)audit_fn(req, "engine_principal.revoke", "failure", "EnginePrincipal",
                                    principal_id, credentials_revoked_res.error());
                     res.set_content(a4_error(kInternalError, credentials_revoked_res.error(),
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -10873,7 +11285,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     (void)audit_fn(req, "engine_principal.revoke", "failure", "EnginePrincipal",
                                    principal_id, revoked_res.error());
                     res.set_content(a4_error(kInternalError, revoked_res.error(),
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -10896,7 +11308,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                    principal_id, "store_unavailable");
                     res.set_content(a4_error(kInternalError,
                                              "failed to revoke engine principal — try again",
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -10928,7 +11340,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!engine_credential_store_ || !engine_credential_store_->is_open()) {
                     mcp_audit("failure", "engine credential store unavailable");
                     res.set_content(a4_error(kInternalError, "engine credential store unavailable",
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -11029,7 +11441,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!engine_credential_store_ || !engine_credential_store_->is_open()) {
                     mcp_audit("failure", "engine credential store unavailable");
                     res.set_content(a4_error(kInternalError, "engine credential store unavailable",
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -11160,7 +11572,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     confirm_metric("transient"); // store unavailable at the open guard
                     mcp_audit("failure", "engine credential store unavailable");
                     res.set_content(a4_error(kInternalError, "engine credential store unavailable",
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -11181,8 +11593,18 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // #3015 proof-of-possession — never echoed into mcp_audit/
+                // a4_error strings (secret hygiene).
+                const auto presented_secret = param_str(args, "secret");
+                if (presented_secret.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "secret is required",
+                                             "pass the raw successor secret returned by "
+                                             "rotate_engine_credential"),
+                                    "application/json");
+                    return;
+                }
                 auto confirmed = engine_credential_store_->confirm_rotation(
-                    principal_id, confirm_token_id, session->username);
+                    principal_id, confirm_token_id, presented_secret, session->username);
                 if (!confirmed) {
                     // Increment BEFORE the audit emission so an audit-store
                     // failure cannot suppress the operational counter (#2404).
@@ -11247,7 +11669,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!engine_credential_store_ || !engine_credential_store_->is_open()) {
                     mcp_audit("failure", "api token store unavailable");
                     res.set_content(a4_error(kInternalError, "api token store unavailable",
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -11297,7 +11719,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!existing.has_value()) {
                     mcp_audit("failure", "token store unavailable");
                     res.set_content(a4_error(kInternalError, "token store unavailable — try again",
-                                             "retry the request", /*retry_after_ms=*/2000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                                     "application/json");
                     return;
                 }
@@ -11402,7 +11824,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         "— retry, or check GET /api/v1/tokens");
                     JObj err_data;
                     err_data.add("correlation_id", yuzu::server::detail::make_correlation_id())
-                        .add("retry_after_ms", 2000)
+                        .add("retry_after_ms", mcp::kMcpStoreFaultShortRetryMs)
                         .add("remediation", "retry, or check GET /api/v1/tokens");
                     if (!audit_ok)
                         err_data.add("audit_persisted", false);
@@ -11489,7 +11911,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     confirm_metric("transient"); // store unavailable at the open guard
                     mcp_audit("failure", "api token store unavailable");
                     res.set_content(a4_error(kInternalError, "api token store unavailable",
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -11497,6 +11919,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (token_id.empty()) {
                     res.set_content(a4_error(kInvalidParams, "token_id is required",
                                              "pass the token_id returned by rotate_api_token"),
+                                    "application/json");
+                    return;
+                }
+                // #3015 proof-of-possession — never echoed into mcp_audit/
+                // audit_fn/a4_error strings (secret hygiene).
+                const auto presented_secret = param_str(args, "secret");
+                if (presented_secret.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "secret is required",
+                                             "pass the raw successor secret returned by "
+                                             "rotate_api_token"),
                                     "application/json");
                     return;
                 }
@@ -11510,7 +11942,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!existing.has_value()) {
                     mcp_audit("failure", "token store unavailable");
                     res.set_content(a4_error(kInternalError, "token store unavailable — try again",
-                                             "retry the request", /*retry_after_ms=*/2000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                                     "application/json");
                     return;
                 }
@@ -11532,7 +11964,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // re-check of the authority-inheritance guard (governance
                 // Gate 7).
                 auto confirmed = engine_credential_store_->confirm_token_rotation(
-                    token_id, session->username, session->mcp_tier, session->token_scope_service);
+                    token_id, presented_secret, session->username, session->mcp_tier,
+                    session->token_scope_service);
                 if (!confirmed) {
                     // Increment BEFORE the audit emission so an audit-store
                     // failure cannot suppress the operational counter.
@@ -11576,7 +12009,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!engine_principal_store_ || !engine_principal_store_->is_open()) {
                     mcp_audit("failure", "engine principal store unavailable");
                     res.set_content(a4_error(kInternalError, "engine principal store unavailable",
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -11593,7 +12026,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!owner_exists_fn_) {
                     mcp_audit("failure", "owner existence check unavailable");
                     res.set_content(a4_error(kInternalError, "owner existence check unavailable",
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -11612,7 +12045,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     (void)audit_fn(req, "engine_principal.transfer_owner", "failure",
                                    "EnginePrincipal", principal_id, transfer_res.error());
                     res.set_content(a4_error(kInternalError, transfer_res.error(),
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -11667,7 +12100,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     mcp_audit("failure", "engine principal or rbac store unavailable");
                     res.set_content(a4_error(kInternalError,
                                              "engine principal or rbac store unavailable",
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -11709,7 +12142,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                    "no-admin", "rbac_resolution_failed");
                     res.set_content(a4_error(kInternalError,
                                              "rbac reference data unavailable — cannot verify",
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -11789,7 +12222,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     (void)audit_fn(req, "access_review.exported", "failure", "AccessReview", "",
                                    rows_res.error());
                     res.set_content(a4_error(kInternalError, rows_res.error(),
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -11843,7 +12276,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!access_review_store || !access_review_store->is_open()) {
                     mcp_audit("failure", "access review store unavailable");
                     res.set_content(a4_error(kInternalError, "access review store unavailable",
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -11860,7 +12293,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     (void)audit_fn(req, "access_review.campaign_opened", "failure", "AccessReview",
                                    "", rows_res.error());
                     res.set_content(a4_error(kInternalError, rows_res.error(),
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -11927,7 +12360,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!access_review_store || !access_review_store->is_open()) {
                     mcp_audit("failure", "access review store unavailable");
                     res.set_content(a4_error(kInternalError, "access review store unavailable",
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -12008,7 +12441,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!access_review_store || !access_review_store->is_open()) {
                     mcp_audit("failure", "access review store unavailable");
                     res.set_content(a4_error(kInternalError, "access review store unavailable",
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -12078,7 +12511,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!access_review_store || !access_review_store->is_open()) {
                     mcp_audit("failure", "access review store unavailable");
                     res.set_content(a4_error(kInternalError, "access review store unavailable",
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -12088,7 +12521,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     (void)audit_fn(req, "access_review.list", "failure", "AccessReview", "",
                                    rows_res.error());
                     res.set_content(a4_error(kInternalError, rows_res.error(),
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -12129,7 +12562,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!access_review_store || !access_review_store->is_open()) {
                     mcp_audit("failure", "access review store unavailable");
                     res.set_content(a4_error(kInternalError, "access review store unavailable",
-                                             "retry the request", /*retry_after_ms=*/5000),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }

@@ -4,9 +4,11 @@
 // (roadmap C-8) -- that header's own comment said it was "shaped for
 // extraction... ZERO plugin-specific dependencies", anticipating this move.
 //
-// Two unbounded `enumerator->Next(WBEM_INFINITE, ...)` call sites exist
-// elsewhere in the tree (hardware_plugin.cpp's file-private WmiQuery, and
-// the wmi plugin) -- this helper exists to stop that pattern propagating.
+// hardware_plugin.cpp's former file-private WmiQuery and the wmi plugin
+// both had an unbounded `enumerator->Next(WBEM_INFINITE, ...)` call site.
+// #3368 migrated the wmi plugin onto this helper; #3404 migrated
+// hardware_plugin.cpp onto it separately. This helper exists to stop
+// that unbounded-Next pattern propagating.
 // NEVER call Next(WBEM_INFINITE, ...); always bound both the per-Next wait
 // and the overall enumeration under BoundedQueryOptions.
 //
@@ -21,9 +23,12 @@
 // Windows-only by construction (#ifdef _WIN32); the header is empty
 // elsewhere.
 
-#pragma once
+#ifndef YUZU_SHARED_WMI_BOUNDED_HPP
+#define YUZU_SHARED_WMI_BOUNDED_HPP
 
 #ifdef _WIN32
+
+#pragma once
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -44,6 +49,8 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <vector>
+
 #include <utility>
 #include <vector>
 
@@ -67,8 +74,10 @@ struct BoundedQueryResult {
     std::vector<WmiRow> rows;
     bool truncated = false;  // row_cap reached — enumeration did NOT complete
     // Stable error token when the call failed; absent on success. Never a
-    // silent empty result on failure — see the token constants below (the
-    // ones ending in "_" are prefixes, followed by hr_hex(hr)).
+    // silent empty result on failure — see the token list below.
+    //   com_init_failed | wbem_locator_failed | wmi_connect_failed_<hr> |
+    //   wmi_query_failed_<hr> | wmi_next_timeout | wmi_deadline_exceeded |
+    //   wmi_next_failed_<hr>
     std::optional<std::string> error;
 };
 
@@ -419,3 +428,5 @@ inline BoundedQueryResult exec_object_method(const std::wstring& wmi_namespace,
 } // namespace yuzu::shared::wmi
 
 #endif // _WIN32
+
+#endif // YUZU_SHARED_WMI_BOUNDED_HPP

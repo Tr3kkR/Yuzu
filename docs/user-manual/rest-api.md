@@ -903,9 +903,19 @@ Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6
 
 #### `POST /api/v1/tokens/{token_id}/confirm`
 
-Explicit maker-checker confirmation that a rotation's successor secret has been received and installed. `{token_id}` in the path is the **successor's** id — the value the `rotate` response above returned — so, unlike the engine-principal confirm route, **no request body is needed at all**: the id in the URL pins the exact rotation being confirmed. On success, the predecessor token is revoked and the successor becomes the sole active token in the rotation group.
+Explicit maker-checker confirmation that a rotation's successor secret has been received and installed. `{token_id}` in the path is the **successor's** id — the value the `rotate` response above returned. On success, the predecessor token is revoked and the successor becomes the sole active token in the rotation group.
 
 **Permission:** `ApiToken:Rotate` (same distinct-operation rationale as `rotate` above)
+
+**Proof of possession (#3015, SOC 2 CC6.3) — BREAKING:** unlike before, a request body is now required — `{"secret": "<raw successor secret>"}`, the raw successor secret `rotate` returned. Confirm revokes the predecessor immediately, so it must never proceed on `token_id` alone — a caller who merely learned or guessed the (non-secret) successor `token_id` could otherwise force an immediate cutover without ever having received the new credential. A caller that previously confirmed with only the `{token_id}` path parameter now gets `400`. The check is performed immediately after auth/step-up, **before** the ownership/existence lookup below, so a missing secret is `400` even against an unowned or nonexistent token_id — it is never an enumeration oracle either way, since neither response discloses whether the token exists.
+
+**Request body (required):**
+
+```json
+{ "secret": "yzt_..." }
+```
+
+`secret` is verified last, strictly after the ownership check and every store-side admission check (pair-state, the successor pin, the authority-inheritance guard) have passed — via a constant-time hash comparison against the successor's stored hash, read fresh inside the same advisory-locked transaction as the rest of this call. It is never persisted, logged, or echoed into an audit/error string.
 
 **Ownership constraint:** the same self-service-only posture as `rotate` above — no admin bypass, `404 token not found` for both a nonexistent successor id and one owned by someone else, and the same `action=api_token.confirm`/`result=denied`/`detail=owner=<real owner>` audit row on a denied attempt.
 
@@ -919,6 +929,8 @@ Explicit maker-checker confirmation that a rotation's successor secret has been 
 ```
 
 **Errors:** the same state matrix as the engine-principal `credentials/confirm` route above (replay-after-success is a terminal `409`, an ambiguous empty/malformed-pair read is a retryable `503`, unresolved rotation metadata on the sole survivor is a terminal `409`), substituting `token is not a human-owned credential` / `principal has a non-human active credential` for the engine-kind equivalents. `401`/`403` follow the same step-up and permission rules as `rotate`. The same authority-inheritance `400` — `no such token to confirm` also applies here, as defence-in-depth only (see the `rotate` error matrix row above; the successor's tier/scope are fixed at mint time and cannot legitimately diverge from what the caller who initiated the rotation already held, so this path is not reachable today outside a future bypass of `rotate`'s own guard).
+
+`secret` missing, empty, or not a string is `400` — `secret required` (checked before the `404` ownership belt, see above). A wrong secret is `403` — `rotation secret mismatch — the presented secret does not verify against the pending successor` — distinct from every other outcome, reachable only after every other admission check has already passed. If the authoritative successor row cannot be re-read to verify the secret (should not happen under the lock already held), that's a fail-closed `503` — `failed to verify rotation secret`, folded into the general store-failure `503` row above.
 
 ---
 
@@ -1123,13 +1135,17 @@ Explicit maker-checker confirmation that a rotation's successor secret has been 
 
 **Permission:** `Security:Write`
 
+**Proof of possession (#3015, SOC 2 CC6.3) — BREAKING:** the request body now also requires `secret`, the raw successor secret `rotate` returned. Confirm revokes the predecessor immediately, so it must never proceed on `token_id` alone — a caller who merely learned or guessed the (non-secret) successor `token_id` could otherwise force an immediate cutover without ever having received the new credential. A caller that previously confirmed with only `token_id` now gets `400`. The presented secret is verified last, strictly after every other admission check (ownership, pair-state, the `token_id` pin, and the initiator binding below) has passed — so a wrong secret from a caller who fails an earlier check gets that check's own non-disclosing error, never a secret-specific one; only a caller who has already cleared every other gate can reach the mismatch outcome.
+
 **Request body:**
 
 ```json
-{ "token_id": "a1b2c3d4e5f60718293a4b5c" }
+{ "token_id": "a1b2c3d4e5f60718293a4b5c", "secret": "eng_..." }
 ```
 
 `token_id` (required) is the successor's token id **returned by the `rotate` response above** — it pins this confirm to that exact rotation. A stale or mismatched id (for example a blind retry of an old confirm after a *second* rotation has started) is rejected with `409` and **no state change**, so a replayed confirm can never resolve a later rotation early. The success audit row records the confirmed id (`token_id=<id>`).
+
+`secret` (required) is the raw successor secret from the `rotate` response — never persisted, logged, or echoed into an audit/error string. Missing, empty, or non-string is `400` — `secret required`. Verified via a constant-time hash comparison against the successor's stored hash, read fresh inside the same advisory-locked transaction as the rest of this call; a wrong secret is `403` — `rotation secret mismatch — the presented secret does not verify against the pending successor` — distinct from every other outcome below, since it is reachable only after every other gate has already passed.
 
 Replaying a confirm **after its own success** (a network-dropped `200`, a double-submit) is a terminal `409` conflict, not a retryable `503`: once the rotation has resolved the successor is the sole active credential, and the confirm returns an explicit `already confirmed` / `already resolved` answer with no state change. Treat it as done and stop retrying (rotate again only if you genuinely need a fresh rotation). See the error table below for the full state matrix.
 
@@ -1149,6 +1165,7 @@ Like `credentials/rotate` above, this route never looks up `{id}` via a `get()` 
 | Condition | Response |
 |---|---|
 | `token_id` missing from the body, empty, not a string, or the body is malformed/non-object JSON | `400` — `token_id required` |
+| `secret` missing from the body, empty, or not a string (#3015) | `400` — `secret required` — checked immediately after the `token_id` presence check, before the store is ever reached |
 | The supplied `token_id` is not the pending rotation's successor (stale id from an earlier rotation, or the predecessor's id passed by mistake) | `409` — `token_id does not match the pending rotation successor; pass the token_id returned by rotate`. No state change. |
 | Confirm attempted by a **different** operator than the one who initiated the rotation | `409` — `rotation in progress by a different operator` |
 | The initiating operator cannot be resolved from either source — the in-memory grace-cache entry is gone (different replica, or this replica restarted) **and** the durable `rotation_initiator` column on the successor row is empty (the pair started rotating before the durable-binding migration shipped) — or the two sources are both present but disagree | `409` — `rotation confirmation unavailable — fall back to revoke`. A plain same-replica restart mid-overlap no longer triggers this: the successor row's own `rotation_initiator`, stamped durably at mint time, resolves the identity check when the in-memory grace cache is gone. |
@@ -1158,6 +1175,8 @@ Like `credentials/rotate` above, this route never looks up `{id}` via a `get()` 
 | **More than two** active credentials for this principal (one minted outside the rotation path) | `400` — `more than two active credentials for this principal - resolve manually before confirming` |
 | No active credentials, or exactly two that aren't a recognized rotation pair | `503` — **not** `400`. Ambiguity-avoidance: an empty read can't be distinguished from a silently-failed read, and a malformed pair is kept conservative, so these stay retryable rather than a definitive client error. |
 | A non-engine-kind active credential is present for this principal (defensive check) | `400` — `principal has a non-engine active credential` |
+| **The presented `secret` does not hash-match the pending successor's stored secret (#3015 proof of possession)** — reached only after ownership/pair-state/the `token_id` pin/the initiator binding above have all passed | `403` — `rotation secret mismatch — the presented secret does not verify against the pending successor` |
+| The authoritative successor row could not be re-read to verify the secret (should not happen under the lock already held; fails closed rather than assume a match) | `503` — `failed to verify rotation secret` |
 | Advisory-lock acquire failure, or the confirm/predecessor-revoke/successor-clear write did not persist | `503` — retryable store failure |
 | MFA step-up not satisfied | `401` |
 | Missing `Security:Write`, or the caller's own session is engine-classed | `403` |
@@ -1522,6 +1541,67 @@ Quarantine a device.
 > shape; REST matches the MCP `quarantine_device` twin's A5 behavior, not
 > its exact field path).
 
+> **This route records; it does NOT dispatch — and the twins have diverged
+> on the already-quarantined case (#3127).** `POST /api/v1/quarantine`
+> writes the quarantine record only. The live plugin isolation is dispatched
+> by the MCP `quarantine_device` tool, which has no REST twin. Two
+> consequences for a client that treats the two transports as
+> interchangeable:
+>
+> - A `201` here means **the record was written**, not that the device's
+>   firewall is enforcing anything. To isolate a device over REST, dispatch
+>   `quarantine.quarantine` through the normal execution routes as well —
+>   see [Security Hardening](security-hardening.md#device-quarantine).
+> - The MCP tool now treats an already-active record as a **retryable
+>   re-dispatch**, not a terminal error; this route still answers `400`,
+>   because with no dispatch of its own there is nothing for it to re-drive.
+>   The `400`-vs-`503` split above is unchanged and still mirrors the twin;
+>   the already-quarantined *outcome* no longer does.
+
+> **A quarantined device is refused at dispatch (#881).** Once a device is
+> quarantined, every dispatch route below — `POST /api/command`,
+> `POST /api/instructions/{id}/execute`, and the scope/group/broadcast arms —
+> drops that device before the command reaches the agent, increments
+> `yuzu_server_dispatch_target_rejected_total{reason="quarantined"}`, and
+> writes a `quarantine.dispatch_denied` audit row (`target_type=Security`;
+> `target_id` is the device, or `*` on a fail-closed denial **and** on the
+> summary row that follows a capped per-device fan-out — see
+> [Audit Log](audit-log.md)).
+>
+> **`POST /api/command` reports what it withheld.** The success body carries
+> `withheld_quarantined` — always present, `0` on a clean dispatch — so
+> `agents_reached: 97` on a 100-device group is distinguishable from three
+> devices being offline. The dashboard toast says the same.
+>
+> **Its `503` now names the cause.** Three conditions previously shared one
+> body ("failed to send command to any agent"), and one of them is a
+> fleet-wide policy state rather than a transport failure:
+>
+> | `error.reason` | Meaning | `retry_after_ms` |
+> |---|---|---|
+> | `containment_unreadable` | The gate is failing closed: containment state cannot be read, so **every** target on **every** dispatch is refused. A server condition, not a device one. | `5000` |
+> | `quarantined` | Every target named is contained. The dispatch was withheld, not attempted. | `null` — retrying will not help until the device is released |
+> | *(absent)* | Genuinely no agent reachable — the pre-existing meaning. | *(absent)* |
+>
+> `reason` is a top-level key on the error object, not part of the A4
+> `error.data` envelope. The versioned dispatch routes
+> (`POST /api/instructions/{id}/execute`, the bundle and result-set producers)
+> do **not** yet carry this split — they answer their existing
+> "no agents reached" shapes for all three conditions, because the shared
+> dispatch closure returns only a sent count. Tracked as #3424. The quarantine
+> plugin's own four actions (`quarantine`, `unquarantine`, `status`,
+> `whitelist`) are exempt so that release stays reachable, and so are three
+> server-internal pushes that are not operator dispatch —
+> `tar.fleet_snapshot`, `__guard__.push_rules` and `asset_tags.sync`, a closed
+> set counted (not per-event audited) by `yuzu_server_system_reserved_push_total`.
+> Nothing else is.
+> If containment
+> state becomes unreadable for longer than a 60-second last-known-good
+> window, dispatch fails **closed** and refuses every target fleet-wide —
+> alert on `yuzu_server_quarantine_gate_total{outcome="fail_closed"}`, which
+> is an outage signal rather than a quarantine one
+> (see [Metrics](metrics.md)).
+
 ---
 
 #### `DELETE /api/v1/quarantine/{agent_id}`
@@ -1562,7 +1642,8 @@ inventory and revoke endpoints are gated by the `Security` securable.
 Download the CA root certificate (PEM) and add it to an OS/browser trust store.
 **Public** — no authentication. Returns `Content-Type: application/x-pem-file`,
 `Content-Disposition: attachment; filename="yuzu-ca.pem"`,
-`Cache-Control: public, max-age=86400`. `404` if no CA root exists.
+`Cache-Control: public, max-age=86400`. `404` if no CA root exists; `503` if the
+CA store is unavailable (a genuine database error, distinct from no-root).
 
 ```bash
 curl https://yuzu.example.com/api/v1/ca/root -o yuzu-ca.pem
@@ -1586,7 +1667,8 @@ openssl crl -inform DER -in yuzu.crl -noout -text
 
 List certificates issued by the internal CA. **Permission:** `Security:Read`.
 Query params `limit` (1–1000, default 200) and `offset` (default 0). The full
-certificate PEM and enrollment reference are intentionally omitted.
+certificate PEM and enrollment reference are intentionally omitted. `503` if
+the CA store is unavailable.
 
 `meta.has_more` is `true` when more rows exist beyond the current page; when it is,
 `meta.next_offset` carries the `offset` to pass for the next page. Iterate until
@@ -1616,8 +1698,8 @@ The MCP `list_issued_certs` tool mirrors this contract (same `has_more` / `next_
 #### `POST /api/v1/ca/revoke`
 
 Revoke a certificate by serial. **Permission:** `Security:Delete`. Revocation
-takes effect server-side **immediately** (the mTLS accept gate reads `ca.db`, not
-the CRL); the CRL is then republished. Request body (max 64 KB):
+takes effect server-side **immediately** (the mTLS accept gate reads `ca_store`,
+not the CRL); the CRL is then republished. Request body (max 64 KB):
 
 ```json
 { "serial_hex": "3A4B5C6D...", "reason": "key compromise" }
@@ -2625,7 +2707,7 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `quarantine.enable` | Device quarantined |
 | `quarantine.disable` | Device released from quarantine |
 | `ca.cert.issued` | Internal CA signed a per-agent client certificate at enrollment. `target_type=AgentCertificate`, `target_id=<serial>`, `result=success`. |
-| `ca.cert.revoked` | Certificate revoked via `POST /api/v1/ca/revoke`. `target_type=AgentCertificate`, `target_id=<serial>`. `result=success`, or `result=failure` with `detail="serial not found or already revoked"` for an unknown/already-revoked serial. |
+| `ca.cert.revoked` | Certificate revoked via `POST /api/v1/ca/revoke`. `target_type=AgentCertificate`, `target_id=<serial>`. `result=success`; `result=denied` with `detail="serial not found or already revoked"` for an unknown/already-revoked serial (reject without state change, matches every destructive sibling); `result=failure` (ADR-0053) for a genuine ca_store DB/lease error — kept distinct from `denied` so a database outage is never audited as a rejected revoke attempt. |
 | `ca.crl.published` | CRL (re)published after a revocation. `target_type=Security`, `target_id=<serial that triggered it>`. `result=success`, or `result=failure` when the CRL could not be rebuilt/recorded (the revocation still stands; the public CRL is momentarily stale). |
 | `ca.root_csr.exported` | The install CA's CSR was exported via `GET /api/v1/ca/root-csr` (subordinate-CA setup). `target_type=CaRoot`, `target_id=root`. `result=success`, or `result=failure` if generation failed. |
 | `ca.subordinate.imported` | An enterprise-signed intermediate was imported via `POST /api/v1/ca/import-chain` (or the dashboard wrapper). `target_type=CaRoot`, `target_id=root`. `result=success` on a validated switch to subordinate mode; `result=denied` when the uploaded material is rejected (not a CA / wrong key / does not chain); `result=failure` on a server-side persistence error. `detail` carries `reason=...` on rejection and `via=dashboard` for the panel path. |
@@ -4837,6 +4919,20 @@ Management](#license-management), `docs/adr/0052-device-token-store-postgres-mig
 Context), so these routes do not register today; documented for when a future change re-wires
 them.
 
+**`principal_id` vs `device_id`.** These are two different identities. `principal_id` is the
+**issuing operator's** username — set from the authenticated session at creation time, never
+supplied in the request body. `device_id` is the **agent** the token is bound to (set from the
+request body's `device_id` field) — this is the identity a presenting agent is validated against
+when the token is used, and the identity the re-registration revoke below acts on.
+
+**Re-registration revoke (#823/#3401).** When the agent named by a token's `device_id` re-registers
+with the server, every still-valid token bound to that `device_id` is revoked before the new
+session is installed — closing the window where a briefly-impersonated agent (an mTLS-disabled
+registration) could otherwise replay a token issued to the legitimate agent. This is independent
+of who issued the token (`principal_id`). If the revoke sweep itself fails (a database fault), the
+registration is refused rather than proceeding with stale tokens left live; the agent's normal
+reconnect/retry behavior applies.
+
 #### `GET /api/v1/device-tokens`
 
 List all device tokens.
@@ -4901,7 +4997,7 @@ Create a device-scoped token. The raw token value is returned exactly once at cr
 | Malformed JSON body | `400` — `invalid JSON` |
 | `name`/`device_id`/`definition_id` exceeds 256 chars | `400` — `invalid_input_length: ...` |
 | CSPRNG entropy exhaustion | `503` + `Retry-After: 5` — `CSPRNG unavailable: ...` |
-| A genuine database write failure | `503` + `Retry-After: 5` — `service unavailable` |
+| A genuine database write or token-hashing failure | `503` + `Retry-After: 5` — `service unavailable` |
 
 #### `DELETE /api/v1/device-tokens/{id}`
 
@@ -7333,13 +7429,15 @@ Install a product pack from a multi-document YAML bundle.
 
 **Response:**
 - `201 Created` `{"id": "<pack-id>", "status": "installed"}` on success.
-- `400 Bad Request` `{"error": "<message>"}` on rejection. Distinct error strings:
+- `400 Bad Request` — malformed YAML, missing required fields, item-install delegation failures, or a signature rejection. Distinct error messages:
   - `pack '<name>' is unsigned and signature enforcement is enabled (set --allow-unsigned-packs / YUZU_ALLOW_UNSIGNED_PACKS=1 to bypass)` — the install was refused because the pack carried no `signature:` field and the server is enforcing signatures (default since #802). Either sign the pack or set the escape-hatch flag.
   - `signature verification failed for pack '<name>' — content may have been tampered with` — the signature was present but did not verify against the supplied public key.
   - `pack '<name>' has signature but no publicKey — cannot verify` — the bundle carried a `signature:` field but no `publicKey:`.
-- Other 4xx for malformed YAML, missing required fields, or item-install delegation failures.
+  - `duplicate item id in bundle: '<item_id>'` — two documents in the bundle were assigned the same item id (by their `install_fn` delegate). Detected before any database interaction; this condition is deterministic, so a retry with the same bundle always fails the same way — never retry, fix the bundle instead.
+- `503 Service Unavailable` — the product pack store is unreachable (down/unmigrated) or a database error occurred persisting the pack. The response body carries only a generic `"service unavailable"` message; the specific database error is logged server-side, never echoed to the caller (migrated store — ADR-0054, mirrors `sw_deploy_client_message`/`device_token_client_message`'s established rationale for not leaking `PQerrorMessage()` fragments).
+- Both the `400` and `503` bodies use the standard **A4 error envelope** (`{"error": {"code", "message", "correlation_id", ...}, "meta": {"api_version": "v1"}}`, see [JSON Envelope](#json-envelope) above). **Breaking change (ADR-0054):** pre-migration, a rejected install returned a bare `{"error": "<message>"}` body — a client parsing that flat shape (rather than treating the body as opaque diagnostic text) must switch to reading `error.message`.
 
-**Audit:** Emits `product_pack.install` with `result=success` and `target_id=<pack-id>` on accepted install, or `result=denied` with `target_type=ProductPack`, empty `target_id`, and the rejection message in `detail` on any 400 rejection (closes the SOC 2 CC6.7 logging gap from W7.4 governance).
+**Audit:** Emits `product_pack.install` with `result=success` and `target_id=<pack-id>` on accepted install, or `result=denied` with `target_type=ProductPack`, empty `target_id`, and the rejection message in `detail` on any `400` or `503` rejection (closes the SOC 2 CC6.7 logging gap from W7.4 governance).
 
 #### `GET /api/product-packs`
 
@@ -7347,7 +7445,9 @@ List installed packs.
 
 **Permission:** `ProductPack:Read`.
 
-**Response:** JSON array of `{id, name, version, description, installed_at, verified}` objects.
+**Response:**
+- `200 OK` — JSON array of `{id, name, version, description, installed_at, verified}` objects.
+- `503 Service Unavailable` — the store is unreachable or the list query failed. A4 error envelope, generic message (see the `POST` route above for the no-raw-DB-error-to-caller rationale).
 
 #### `GET /api/product-packs/:id`
 
@@ -7355,7 +7455,10 @@ Get a single pack with its items.
 
 **Permission:** `ProductPack:Read`.
 
-**Response:** Single pack JSON object including the `items[]` array (each `{kind, item_id, name}`).
+**Response:**
+- `200 OK` — the pack JSON object including the `items[]` array (each `{kind, item_id, name}`).
+- `404 Not Found` — no pack with that id. A4 error envelope.
+- `503 Service Unavailable` — the store is unreachable or the read failed. A4 error envelope, generic message.
 
 #### `DELETE /api/product-packs/:id`
 
@@ -7363,7 +7466,12 @@ Uninstall a pack, removing all delegated items.
 
 **Permission:** `ProductPack:Delete`.
 
-**Audit:** Emits `product_pack.uninstall`.
+**Response:**
+- `200 OK` `{"status": "uninstalled"}` on success.
+- `404 Not Found` — no pack with that id. A4 error envelope. **Breaking change (ADR-0054):** the pre-migration route always returned a bare `{"error": "<message>"}` body at `400` for a missing id; automation that special-cased `400` or parsed the flat body shape on this route must switch to `404` + `error.message`.
+- `503 Service Unavailable` — the store is unreachable or the delete failed. A4 error envelope, generic message.
+
+**Audit:** Emits `product_pack.uninstall` with `result=success` and `target_id=<pack-id>` on success, or `result=denied` with `target_type=ProductPack`, `target_id=<pack-id>`, and the rejection message in `detail` on any `404`/`503` rejection (ADR-0054 — pre-migration, a rejected uninstall was not audited at all).
 
 ---
 
@@ -8124,7 +8232,7 @@ Structured JSON health check endpoint. This endpoint is **unauthenticated** and 
 | `uptime_seconds` | integer | Server uptime in seconds |
 | `agents.online` | integer | Number of currently connected agents |
 | `agents.pending` | integer | Number of agents awaiting enrollment approval |
-| `stores` | object | Health status of each data store (`"ok"` or `"error"`). Includes `ca` — the internal-CA store (`ca.db`) — which is load-bearing whenever default certs are active; `status` is `"degraded"` if it is down. |
+| `stores` | object | Health status of each data store (`"ok"` or `"error"`). Includes `ca` — the internal-CA store (`ca_store`, Postgres) — which is load-bearing whenever default certs are active; `status` is `"degraded"` if it is down. |
 | `tls.default_certs_active` | bool | `true` when running with built-in per-install default certs (replace before production — see security-hardening.md). Unauthenticated so monitoring can detect it. |
 | `tls.ca_fingerprint` | string | SHA-256 fingerprint of the active default CA (empty when not on default certs). Public. |
 | `tls.ca_expires_at` | integer | Unix timestamp of the default CA's expiry (`0` when not on default certs). |

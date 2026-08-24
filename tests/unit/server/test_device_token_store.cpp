@@ -42,14 +42,16 @@
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
 
+#include <atomic>
 #include <chrono>
-#include <cstdio>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using yuzu::server::DeviceAuthToken;
@@ -177,16 +179,47 @@ void write_legacy_sqlite_db(const std::filesystem::path& path,
         REQUIRE(sqlite3_prepare_v2(db.get(), sql, -1, s.addr(), nullptr) == SQLITE_OK);
         sqlite3_bind_text(s.get(), 1, r.token_id.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(s.get(), 2, r.token_hash.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(s.get(), 3, r.name.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(s.get(), 4, r.principal_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(s.get(), 5, r.device_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(s.get(), 6, r.definition_id.c_str(), -1, SQLITE_TRANSIENT);
+        // #3351: bind name/principal_id/device_id/definition_id with their REAL byte length
+        // (not -1/NUL-terminated) so a fixture value containing an embedded NUL is actually
+        // written whole — a -1 bind on a std::string::c_str() would silently truncate at the
+        // first NUL before SQLite ever saw the rest, making a NUL-embedded regression fixture
+        // impossible to construct. token_id/token_hash stay -1: they are always exact hex with
+        // no embedded NULs by construction (hex_id/hex_hash above).
+        sqlite3_bind_text(s.get(), 3, r.name.data(), static_cast<int>(r.name.size()),
+                          SQLITE_TRANSIENT);
+        sqlite3_bind_text(s.get(), 4, r.principal_id.data(),
+                          static_cast<int>(r.principal_id.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_text(s.get(), 5, r.device_id.data(), static_cast<int>(r.device_id.size()),
+                          SQLITE_TRANSIENT);
+        sqlite3_bind_text(s.get(), 6, r.definition_id.data(),
+                          static_cast<int>(r.definition_id.size()), SQLITE_TRANSIENT);
         sqlite3_bind_int64(s.get(), 7, r.created_at);
         sqlite3_bind_int64(s.get(), 8, r.expires_at);
         sqlite3_bind_int64(s.get(), 9, r.last_used_at);
         sqlite3_bind_int64(s.get(), 10, r.revoked ? 1 : 0);
         REQUIRE(sqlite3_step(s.get()) == SQLITE_DONE);
     }
+}
+
+// `n` deterministic, token_id-ascending fixture rows — %032x/%064x of 1..n, so the caller gets
+// rows already in the backfill's own ORDER BY token_id ASC scan order. Extracted from the
+// mid-scan-corruption test's original inline 3000-row builder (#3399) so other tests exercising
+// multi-batch/large-table behavior can reuse the same shape.
+std::vector<LegacyTokenFixture> make_bulk_fixture(int n, std::string_view name_prefix = "bulk-token-") {
+    std::vector<LegacyTokenFixture> bulk;
+    bulk.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        LegacyTokenFixture r;
+        r.token_id = std::format("{:032x}", i + 1);
+        r.token_hash = std::format("{:064x}", i + 1);
+        r.name = std::string(name_prefix) + std::to_string(i) +
+                "-padding-for-size-xxxxxxxxxxxxxxxxxxxxxx";
+        r.principal_id = "admin";
+        r.device_id = "device-bulk";
+        r.created_at = 1000 + i;
+        bulk.push_back(std::move(r));
+    }
+    return bulk;
 }
 
 } // namespace
@@ -241,6 +274,10 @@ TEST_CASE(
     CHECK_FALSE(revoke_by_res.has_value());
     CHECK(revoke_by_res.error().starts_with(yuzu::server::kDeviceTokenDbErrorPrefix));
 
+    auto revoke_by_device_res = store.revoke_by_device("endpoint-99");
+    CHECK_FALSE(revoke_by_device_res.has_value());
+    CHECK(revoke_by_device_res.error().starts_with(yuzu::server::kDeviceTokenDbErrorPrefix));
+
     CHECK_FALSE(store.migrate_from_sqlite("/nonexistent/does/not/matter"));
 }
 
@@ -255,6 +292,98 @@ TEST_CASE("create_token rejects an empty principal_id", "[device_token][pg]") {
     auto r = store.create_token("n", "", "d", "", 0);
     REQUIRE_FALSE(r.has_value());
     CHECK_FALSE(r.error().starts_with(yuzu::server::kDeviceTokenDbErrorPrefix));
+}
+
+// #3351: store-level length bound, matching the REST route's own 256-char clamp (rest_api_v1.cpp)
+// on name/device_id/definition_id, and the store's only bound at all on principal_id (which the
+// route never clamps — it comes from session->username). REST itself can never reach this
+// rejection (its own clamp fires first for the three clamped fields, and usernames are bounded
+// to 64 by auth_db.cpp) — this is defence-in-depth for a future non-REST caller.
+TEST_CASE("DeviceTokenStore: create_token rejects each free-text field exceeding 256 bytes, "
+          "accepts exactly 256",
+          "[device_token][3351][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_token_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string ok256(256, 'a');
+    const std::string over257(257, 'a');
+
+    SECTION("name exceeds 256") {
+        auto res = store.create_token(over257, "admin", "device-A", "", 0);
+        REQUIRE_FALSE(res.has_value());
+        CHECK(res.error().find("invalid_input_length") != std::string::npos);
+        CHECK(res.error().find("name") != std::string::npos);
+        auto tokens = store.list_tokens();
+        REQUIRE(tokens.has_value());
+        CHECK(tokens->empty());
+    }
+    SECTION("principal_id exceeds 256") {
+        auto res = store.create_token("n", over257, "device-A", "", 0);
+        REQUIRE_FALSE(res.has_value());
+        CHECK(res.error().find("invalid_input_length") != std::string::npos);
+        CHECK(res.error().find("principal_id") != std::string::npos);
+        auto tokens = store.list_tokens();
+        REQUIRE(tokens.has_value());
+        CHECK(tokens->empty());
+    }
+    SECTION("device_id exceeds 256") {
+        auto res = store.create_token("n", "admin", over257, "", 0);
+        REQUIRE_FALSE(res.has_value());
+        CHECK(res.error().find("invalid_input_length") != std::string::npos);
+        CHECK(res.error().find("device_id") != std::string::npos);
+        auto tokens = store.list_tokens();
+        REQUIRE(tokens.has_value());
+        CHECK(tokens->empty());
+    }
+    SECTION("definition_id exceeds 256") {
+        auto res = store.create_token("n", "admin", "device-A", over257, 0);
+        REQUIRE_FALSE(res.has_value());
+        CHECK(res.error().find("invalid_input_length") != std::string::npos);
+        CHECK(res.error().find("definition_id") != std::string::npos);
+        auto tokens = store.list_tokens();
+        REQUIRE(tokens.has_value());
+        CHECK(tokens->empty());
+    }
+    SECTION("exactly 256 bytes on every field is accepted") {
+        auto res = store.create_token(ok256, ok256, ok256, ok256, 0);
+        REQUIRE(res.has_value());
+        auto tokens = store.list_tokens();
+        REQUIRE(tokens.has_value());
+        REQUIRE(tokens->size() == 1);
+        CHECK((*tokens)[0].name.size() == 256);
+        CHECK((*tokens)[0].principal_id.size() == 256);
+        CHECK((*tokens)[0].device_id.size() == 256);
+        CHECK((*tokens)[0].definition_id.size() == 256);
+    }
+}
+
+// #3351: proves the linear rewrite still defangs correctly (embedded NULs -> U+FFFD) and that the
+// length bound is measured on RAW bytes BEFORE sanitize can grow the string — 256 raw NULs (which
+// would expand to 768 bytes of U+FFFD) must be accepted, not rejected as "over 256".
+TEST_CASE("DeviceTokenStore: create_token's NUL-embedded name is stored as U+FFFD, measured "
+          "pre-sanitize against the length bound",
+          "[device_token][3351][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_token_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string nul_dense(256, '\0');
+    auto created = store.create_token(nul_dense, "admin", "device-A", "", 0);
+    REQUIRE(created.has_value());
+
+    auto tokens = store.list_tokens();
+    REQUIRE(tokens.has_value());
+    REQUIRE(tokens->size() == 1);
+    const std::string expected_scrubbed = [] {
+        std::string out;
+        for (int i = 0; i < 256; ++i)
+            out += "\xEF\xBF\xBD";
+        return out;
+    }();
+    CHECK((*tokens)[0].name == expected_scrubbed);
 }
 
 TEST_CASE("DeviceTokenStore: create and validate round-trip", "[device_token][crud][pg]") {
@@ -466,6 +595,98 @@ TEST_CASE("DeviceTokenStore: revoke_by_principal is idempotent and skips already
     auto empty = store.revoke_by_principal("");
     REQUIRE(empty.has_value());
     CHECK(*empty == 0);
+}
+
+// ── #3401 — revoke_by_device (the actual #823 sweep; discriminates from revoke_by_principal) ──
+
+TEST_CASE("DeviceTokenStore: revoke_by_device revokes every still-valid token for the device, "
+          "across different operators, and leaves other devices' tokens alone",
+          "[device_token][823][3401][crud][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_token_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Two tokens for the SAME device, minted by DIFFERENT operators — the shape a
+    // principal-keyed sweep can never revoke together, and the shape revoke_by_device must.
+    auto a1 = store.create_token("alice-tok", "alice", "endpoint-99", "", 0);
+    auto a2 = store.create_token("bob-tok", "bob", "endpoint-99", "", 0);
+    // A token for a DIFFERENT device, same operator as one of the above — must survive.
+    auto other = store.create_token("alice-other", "alice", "endpoint-7", "", 0);
+    REQUIRE(a1.has_value());
+    REQUIRE(a2.has_value());
+    REQUIRE(other.has_value());
+
+    REQUIRE(store.validate_token(*a1, "endpoint-99").has_value());
+    REQUIRE(store.validate_token(*a2, "endpoint-99").has_value());
+    REQUIRE(store.validate_token(*other, "endpoint-7").has_value());
+
+    auto revoked = store.revoke_by_device("endpoint-99");
+    REQUIRE(revoked.has_value());
+    CHECK(*revoked == 2);
+
+    auto v1 = store.validate_token(*a1, "endpoint-99");
+    REQUIRE(!v1.has_value());
+    CHECK(v1.error().error == DeviceTokenValidateError::revoked);
+    CHECK(v1.error().bound_principal_id == "alice");
+
+    auto v2 = store.validate_token(*a2, "endpoint-99");
+    REQUIRE(!v2.has_value());
+    CHECK(v2.error().error == DeviceTokenValidateError::revoked);
+    CHECK(v2.error().bound_principal_id == "bob");
+
+    // Untouched: same operator (alice) as a revoked token, but a different device.
+    auto v3 = store.validate_token(*other, "endpoint-7");
+    REQUIRE(v3.has_value());
+
+    // The pre-#3401 bug, pinned as a regression check: sweeping by principal_id (an agent_id in
+    // production) must NOT touch these rows — they were minted with principal_id="alice"/"bob",
+    // never "endpoint-99".
+    auto by_principal = store.revoke_by_principal("endpoint-99");
+    REQUIRE(by_principal.has_value());
+    CHECK(*by_principal == 0);
+}
+
+TEST_CASE("DeviceTokenStore: revoke_by_device is idempotent, skips already-revoked rows, and "
+          "empty device_id is a no-op that never sweeps unbound tokens",
+          "[device_token][823][3401][crud][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_token_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto t = store.create_token("only", "alice", "endpoint-99", "", 0);
+    REQUIRE(t.has_value());
+    // An intentionally unbound token (empty device_id) — must never be swept by an empty input.
+    auto unbound = store.create_token("unbound", "alice", "", "", 0);
+    REQUIRE(unbound.has_value());
+
+    auto first = store.revoke_by_device("endpoint-99");
+    REQUIRE(first.has_value());
+    CHECK(*first == 1);
+    auto second = store.revoke_by_device("endpoint-99");
+    REQUIRE(second.has_value());
+    CHECK(*second == 0);
+
+    auto nobody = store.revoke_by_device("no-such-device");
+    REQUIRE(nobody.has_value());
+    CHECK(*nobody == 0);
+
+    auto empty = store.revoke_by_device("");
+    REQUIRE(empty.has_value());
+    CHECK(*empty == 0);
+
+    // The unbound token must have survived every call above, including the empty-string sweep.
+    auto list = store.list_tokens();
+    REQUIRE(list.has_value());
+    bool unbound_still_present = false;
+    for (const auto& tok : *list) {
+        if (tok.name == "unbound") {
+            unbound_still_present = true;
+            CHECK_FALSE(tok.revoked);
+        }
+    }
+    CHECK(unbound_still_present);
 }
 
 // ── Validate updates last_used_at ────────────────────────────────────────────
@@ -1104,10 +1325,48 @@ TEST_CASE("migrate_from_sqlite fails closed on a legacy row with a malformed tok
         CHECK_FALSE(store.migrate_from_sqlite(path));
     }
 
-    // Neither malformed row was stamped complete or partially inserted.
+    // #3351
+    SECTION("name exceeds 256 bytes") {
+        LegacyTokenFixture row;
+        row.token_id = hex_id("oversize1");
+        row.token_hash = hex_hash("oversize1");
+        row.name = std::string(257, 'a');
+        row.principal_id = "alice";
+        row.device_id = "device-A";
+        auto path =
+            yuzu::test::unique_temp_path("yuzu_test_devtoken_oversize") / "device-tokens.db";
+        std::filesystem::create_directories(path.parent_path());
+        write_legacy_sqlite_db(path, {row});
+        CHECK_FALSE(store.migrate_from_sqlite(path));
+    }
+
+    // #3351: proves the backfill DEFANGS an embedded NUL (U+FFFD) rather than silently
+    // truncating at it — the length-aware sqlite3_column_bytes read (not std::string(const
+    // char*)) is what makes this observable at all; a C-string read would have already dropped
+    // everything after the first NUL before this row ever reached sanitize_pg_text.
+    SECTION("embedded NUL in a legacy free-text field is defanged, not truncated") {
+        LegacyTokenFixture row;
+        row.token_id = hex_id("nulrow01");
+        row.token_hash = hex_hash("nulrow01");
+        row.name = std::string("before") + '\0' + "after";
+        row.principal_id = "alice";
+        row.device_id = "device-A";
+        auto path = yuzu::test::unique_temp_path("yuzu_test_devtoken_nulrow") / "device-tokens.db";
+        std::filesystem::create_directories(path.parent_path());
+        write_legacy_sqlite_db(path, {row});
+        REQUIRE(store.migrate_from_sqlite(path));
+
+        auto tokens = store.list_tokens();
+        REQUIRE(tokens.has_value());
+        REQUIRE(tokens->size() == 1);
+        CHECK((*tokens)[0].name == "before\xEF\xBF\xBD" "after");
+    }
+
+    // Neither malformed row from the SECTIONs above was stamped complete or partially inserted.
+    // (The NUL-embedded SECTION is a SUCCESS case and asserts its own row count separately.)
     auto tokens = store.list_tokens();
     REQUIRE(tokens.has_value());
-    CHECK(tokens->empty());
+    CHECK(tokens->size() <= 1); // 0 normally; 1 if the NUL SECTION ran (its own row survives)
 }
 
 TEST_CASE("migrate_from_sqlite aborts unstamped on a mid-scan legacy read failure",
@@ -1121,21 +1380,7 @@ TEST_CASE("migrate_from_sqlite aborts unstamped on a mid-scan legacy read failur
         yuzu::test::unique_temp_path("yuzu_test_devtoken_truncated") / "device-tokens.db";
     std::filesystem::create_directories(legacy_path.parent_path());
 
-    std::vector<LegacyTokenFixture> bulk;
-    for (int i = 0; i < 3000; ++i) {
-        LegacyTokenFixture r;
-        char idbuf[33];
-        std::snprintf(idbuf, sizeof(idbuf), "%032x", i + 1);
-        r.token_id = idbuf;
-        char hashbuf[65];
-        std::snprintf(hashbuf, sizeof(hashbuf), "%064x", i + 1);
-        r.token_hash = hashbuf;
-        r.name = "bulk-token-" + std::to_string(i) + "-padding-for-size-xxxxxxxxxxxxxxxxxxxxxx";
-        r.principal_id = "admin";
-        r.device_id = "device-bulk";
-        r.created_at = 1000 + i;
-        bulk.push_back(r);
-    }
+    std::vector<LegacyTokenFixture> bulk = make_bulk_fixture(3000);
     write_legacy_sqlite_db(legacy_path, bulk);
 
     auto full_size = std::filesystem::file_size(legacy_path);
@@ -1178,4 +1423,374 @@ TEST_CASE("migrate_from_sqlite aborts unstamped on a mid-scan legacy read failur
     auto tokens2 = store.list_tokens();
     REQUIRE(tokens2.has_value());
     CHECK(tokens2->size() == 1);
+}
+
+// ── #3399: v1 fingerprint stability (golden pin) ─────────────────────────────
+//
+// Pins the v1 canonical-fingerprint algorithm (sha256_hex(canonicalize_legacy_tokens(...)))
+// against a hardcoded digest, computed independently in Python from the same
+// length-prefixed-field / sorted-encoded-rows / "device-token-legacy-fingerprint-v1\n"-prefixed
+// scheme documented above migrate_from_sqlite. Exists so a future streaming rewrite of the
+// fingerprint computation (#3399) can be proven byte-identical to this value rather than merely
+// "still self-consistent" — a regression that silently changed the algorithm would still pass
+// every other backfill test (they never compare against an external oracle) but would orphan
+// every already-stamped marker in the field. Row order is deliberately NOT sorted-by-token_id in
+// the fixture, to prove the fingerprint does not depend on legacy scan/insertion order (the
+// canonicalizer's own std::sort — or an equivalent streaming digest fed in a different order,
+// since sorted-encoded order equals token_id-ASC scan order — is what makes that true).
+TEST_CASE("migrate_from_sqlite: v1 fingerprint is stable and independent of legacy row order",
+          "[device_token][pg][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_token_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    // token_id/token_hash are hand-written %032x/%064x of 1..3 (NOT the seed-mapped hex_id()/
+    // hex_hash() helpers) so the fixture matches the independently-computed Python oracle exactly.
+    LegacyTokenFixture c;
+    c.token_id = "00000000000000000000000000000003";
+    c.token_hash = "0000000000000000000000000000000000000000000000000000000000000003";
+    c.name = "fp-c";
+    c.principal_id = "alice";
+    c.device_id = "dev-c";
+    c.created_at = 300;
+
+    LegacyTokenFixture a;
+    a.token_id = "00000000000000000000000000000001";
+    a.token_hash = "0000000000000000000000000000000000000000000000000000000000000001";
+    a.name = "fp-a";
+    a.principal_id = "alice";
+    a.device_id = "dev-a";
+    a.created_at = 100;
+
+    LegacyTokenFixture b;
+    b.token_id = "00000000000000000000000000000002";
+    b.token_hash = "0000000000000000000000000000000000000000000000000000000000000002";
+    b.name = "fp-b";
+    b.principal_id = "bob";
+    b.device_id = "dev-b";
+    b.definition_id = "def-b";
+    b.created_at = 200;
+    b.expires_at = 999;
+    b.last_used_at = 150;
+    b.revoked = true;
+
+    constexpr const char* kExpectedFingerprint =
+        "98e611043d8a361bd017c3e00abec456b16986229e9830c159d9ee7aea01df6f";
+
+    // Written in insertion order [c, a, b] — deliberately not token_id-ascending.
+    auto path1 = yuzu::test::unique_temp_path("yuzu_test_devtoken_fpgolden1") / "device-tokens.db";
+    std::filesystem::create_directories(path1.parent_path());
+    write_legacy_sqlite_db(path1, {c, a, b});
+    REQUIRE(store.migrate_from_sqlite(path1));
+
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult r{PQexec(conn.get(),
+                          "SELECT fingerprint FROM device_token_store.sqlite_backfill_source")};
+        REQUIRE(r.ok());
+        REQUIRE(PQntuples(r.get()) == 1);
+        CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == kExpectedFingerprint);
+    }
+
+    // A second file holding the SAME three rows in a DIFFERENT insertion order [b, c, a] produces
+    // the SAME fingerprint, so this second call is a marker-skip, not a re-insert.
+    auto path2 = yuzu::test::unique_temp_path("yuzu_test_devtoken_fpgolden2") / "device-tokens.db";
+    std::filesystem::create_directories(path2.parent_path());
+    write_legacy_sqlite_db(path2, {b, c, a});
+
+    std::string captured;
+    {
+        LogCapture capture;
+        REQUIRE(store.migrate_from_sqlite(path2));
+        captured = capture.str();
+    }
+    CHECK(captured.find("fingerprint already processed, skipping") != std::string::npos);
+
+    auto tokens = store.list_tokens();
+    REQUIRE(tokens.has_value());
+    CHECK(tokens->size() == 3);
+}
+
+// ── #3399: multi-batch rollback fault injection ──────────────────────────────
+//
+// The "N rows committed within the transaction, row N+1 fails, ALL N must roll back" path was
+// untested before #3399: every existing fail-closed fixture above is either single-row or aborts
+// during the SQLITE SCAN itself, before the Postgres transaction is ever entered. This test
+// poisons the LAST row of a 3000-row fixture (well over kBackfillBatchRows, an anon-namespace
+// constant this test file cannot name directly) via a Postgres trigger, so several batch INSERT
+// statements succeed inside the (still-open) transaction before the poisoned final batch raises —
+// proving the whole transaction rolls back to zero rows and zero markers, not merely that one
+// statement fails.
+TEST_CASE("migrate_from_sqlite rolls back every batch when a later row fails, leaves no marker, "
+          "and the same file retries cleanly",
+          "[device_token][pg][backfill]") {
+    // DDL fault injection is deliberately isolated (own PgTestTemplate clone, not the shared
+    // fixture): the trigger is dropped at the end of this test, but a randomized/filtered run
+    // that skipped the drop would otherwise leak it onto a shared database.
+    YUZU_REQUIRE_PG_DB_TPL(db, device_token_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto bulk = make_bulk_fixture(3000, "rollback-");
+    const std::string poison_id = bulk.back().token_id;
+
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        // Predicate on the RAW token_id (never sanitize_pg_text'd) — matches what the batch
+        // INSERT actually binds for that column.
+        const std::string create_fn =
+            "CREATE FUNCTION device_token_store.yuzu_test_fault() RETURNS trigger "
+            "LANGUAGE plpgsql AS $fn$ BEGIN IF NEW.token_id = '" +
+            poison_id +
+            "' THEN RAISE EXCEPTION 'injected fault'; END IF; RETURN NEW; END $fn$";
+        PgResult fn{PQexec(conn.get(), create_fn.c_str())};
+        REQUIRE(fn.ok());
+        PgResult trg{PQexec(conn.get(),
+                            "CREATE TRIGGER yuzu_test_fault_trg BEFORE INSERT ON "
+                            "device_token_store.device_auth_tokens FOR EACH ROW EXECUTE "
+                            "FUNCTION device_token_store.yuzu_test_fault()")};
+        REQUIRE(trg.ok());
+    }
+
+    auto path = yuzu::test::unique_temp_path("yuzu_test_devtoken_rollback") / "device-tokens.db";
+    std::filesystem::create_directories(path.parent_path());
+    write_legacy_sqlite_db(path, bulk);
+
+    std::string captured;
+    {
+        LogCapture capture;
+        CHECK_FALSE(store.migrate_from_sqlite(path));
+        captured = capture.str();
+    }
+    CHECK(captured.find("batch insert of") != std::string::npos);
+    CHECK(captured.find("rolled back") != std::string::npos);
+    CHECK(captured.find("marker was NOT stamped") != std::string::npos);
+
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult counts{PQexec(
+            conn.get(), "SELECT (SELECT COUNT(*) FROM device_token_store.device_auth_tokens), "
+                       "(SELECT COUNT(*) FROM device_token_store.sqlite_backfill_source)")};
+        REQUIRE(counts.ok());
+        REQUIRE(PQntuples(counts.get()) == 1);
+        CHECK(std::string(PQgetvalue(counts.get(), 0, 0)) == "0");
+        CHECK(std::string(PQgetvalue(counts.get(), 0, 1)) == "0");
+
+        PgResult drop_trg{PQexec(conn.get(), "DROP TRIGGER yuzu_test_fault_trg ON "
+                                             "device_token_store.device_auth_tokens")};
+        REQUIRE(drop_trg.ok());
+        PgResult drop_fn{
+            PQexec(conn.get(), "DROP FUNCTION device_token_store.yuzu_test_fault()")};
+        REQUIRE(drop_fn.ok());
+    }
+
+    // Same file, same fingerprint — the marker was never stamped, so this retries the whole
+    // backfill and now succeeds (the trigger is gone).
+    REQUIRE(store.migrate_from_sqlite(path));
+    auto tokens = store.list_tokens();
+    REQUIRE(tokens.has_value());
+    CHECK(tokens->size() == 3000);
+}
+
+// ── #3399: batched restructuring regression guard (lambda-false path) ───────
+//
+// Distinct from the trigger-based test above (a STATEMENT-level Postgres error): here the batch
+// INSERT statement itself SUCCEEDS — `ON CONFLICT (token_id) DO NOTHING` silently skips the
+// conflicting row within that one statement, so the genuinely-new sibling row in the SAME batch
+// is inserted cleanly — and the failure is detected AFTERWARD, when flush_batch's post-statement
+// loop calls check_conflict() on the row `unnest`'s RETURNING didn't cover. Proves the
+// batch->conflict-set->read-back restructuring still rolls back a row that was, moment to moment,
+// successfully inserted within the (still-open) transaction.
+TEST_CASE("migrate_from_sqlite rolls back a same-batch sibling row when another row in the batch "
+          "conflicts with different IDENTITY",
+          "[device_token][pg][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_token_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    LegacyTokenFixture first;
+    first.token_id = hex_id("batchconflict1");
+    first.token_hash = hex_hash("batchconflict1hash");
+    first.name = "first-name";
+    first.principal_id = "alice";
+    first.device_id = "device-A";
+    first.created_at = 100;
+
+    auto path1 =
+        yuzu::test::unique_temp_path("yuzu_test_devtoken_batchconflict1") / "device-tokens.db";
+    std::filesystem::create_directories(path1.parent_path());
+    write_legacy_sqlite_db(path1, {first});
+    REQUIRE(store.migrate_from_sqlite(path1));
+
+    LegacyTokenFixture new_row;
+    new_row.token_id = hex_id("batchconflictnew");
+    new_row.token_hash = hex_hash("batchconflictnewhash");
+    new_row.name = "sibling";
+    new_row.principal_id = "alice";
+    new_row.device_id = "device-B";
+    new_row.created_at = 101;
+
+    LegacyTokenFixture conflicting = first;
+    conflicting.name = "different-name";
+
+    auto path2 =
+        yuzu::test::unique_temp_path("yuzu_test_devtoken_batchconflict2") / "device-tokens.db";
+    std::filesystem::create_directories(path2.parent_path());
+    write_legacy_sqlite_db(path2, {new_row, conflicting});
+
+    CHECK_FALSE(store.migrate_from_sqlite(path2));
+
+    // Only `first` (from path1) survives — the new sibling row did NOT persist even though its
+    // own row landed cleanly within the batch statement that also skipped `conflicting`.
+    auto tokens = store.list_tokens();
+    REQUIRE(tokens.has_value());
+    REQUIRE(tokens->size() == 1);
+    CHECK((*tokens)[0].name == "first-name");
+
+    // Corrected file (identity conflict removed) now succeeds — the marker was never stamped.
+    auto path3 =
+        yuzu::test::unique_temp_path("yuzu_test_devtoken_batchconflict3") / "device-tokens.db";
+    std::filesystem::create_directories(path3.parent_path());
+    write_legacy_sqlite_db(path3, {new_row, first});
+    REQUIRE(store.migrate_from_sqlite(path3));
+
+    auto tokens2 = store.list_tokens();
+    REQUIRE(tokens2.has_value());
+    CHECK(tokens2->size() == 2);
+}
+
+// ── #3399: batch boundary + idempotency ───────────────────────────────────────
+TEST_CASE("migrate_from_sqlite copies a legacy table spanning multiple batches, including a "
+          "partial final batch, and counts it in the success log",
+          "[device_token][pg][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_token_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    // 1201 = 2 full 500-row batches + one 201-row partial final flush (kBackfillBatchRows == 500,
+    // an anon-namespace constant this test file cannot name directly).
+    auto bulk = make_bulk_fixture(1201, "batchboundary-");
+    auto path =
+        yuzu::test::unique_temp_path("yuzu_test_devtoken_batchboundary") / "device-tokens.db";
+    std::filesystem::create_directories(path.parent_path());
+    write_legacy_sqlite_db(path, bulk);
+
+    std::string captured;
+    {
+        LogCapture capture;
+        REQUIRE(store.migrate_from_sqlite(path));
+        captured = capture.str();
+    }
+    CHECK(captured.find("backfill complete: 1201 inserted, 0 already present") !=
+          std::string::npos);
+
+    auto tokens = store.list_tokens();
+    REQUIRE(tokens.has_value());
+    CHECK(tokens->size() == 1201);
+
+    std::string captured2;
+    {
+        LogCapture capture;
+        REQUIRE(store.migrate_from_sqlite(path));
+        captured2 = capture.str();
+    }
+    CHECK(captured2.find("fingerprint already processed, skipping") != std::string::npos);
+
+    auto tokens2 = store.list_tokens();
+    REQUIRE(tokens2.has_value());
+    CHECK(tokens2->size() == 1201);
+}
+
+// ── #3398: busy_timeout behavioral proof ─────────────────────────────────────
+//
+// A regression here would be silent: nothing else in this file proves the pragma actually
+// changes behavior (as opposed to merely being present in the source) — every other backfill
+// test runs against an uncontended legacy file. Deliberately timing-coupled (the
+// std::thread/std::atomic pattern mirrors test_software_deployment_store.cpp's torn-read test —
+// Catch2 assertions are unsupported off the main thread, so the holder records failure via
+// atomic and the main thread REQUIREs it after join()); the 300ms hold vs. the pragma's 5000ms
+// budget is a >15x margin. Uses the DEFAULT rollback-journal mode (write_legacy_sqlite_db does
+// not enable WAL) so BEGIN EXCLUSIVE unconditionally blocks every other connection's first read —
+// the simplest, most deterministic proof that the pragma changes behavior at all.
+TEST_CASE("migrate_from_sqlite waits out a briefly-held exclusive lock instead of failing closed",
+          "[device_token][pg][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_token_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    LegacyTokenFixture row;
+    row.token_id = hex_id("busytimeout1");
+    row.token_hash = hex_hash("busytimeout1hash");
+    row.name = "contended";
+    row.principal_id = "alice";
+    row.device_id = "device-A";
+    row.created_at = 100;
+
+    auto path =
+        yuzu::test::unique_temp_path("yuzu_test_devtoken_busytimeout") / "device-tokens.db";
+    std::filesystem::create_directories(path.parent_path());
+    write_legacy_sqlite_db(path, {row});
+
+    std::atomic<bool> lock_held{false};
+    std::atomic<bool> holder_open_failed{false};
+    std::atomic<bool> holder_begin_failed{false};
+    std::thread holder([&] {
+        SqliteDb h;
+        if (sqlite3_open(path.string().c_str(), h.addr()) != SQLITE_OK) {
+            holder_open_failed = true;
+            return;
+        }
+        if (sqlite3_exec(h.get(), "BEGIN EXCLUSIVE", nullptr, nullptr, nullptr) != SQLITE_OK) {
+            holder_begin_failed = true;
+            return;
+        }
+        lock_held.store(true, std::memory_order_release);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        sqlite3_exec(h.get(), "COMMIT", nullptr, nullptr, nullptr);
+    });
+
+    // Bounded wait, not an unconditional spin: if the holder thread fails before ever setting
+    // lock_held (sqlite3_open/BEGIN EXCLUSIVE failing), an unconditional spin here would hang to
+    // the CI/meson timeout with zero diagnostic. Watch the failure flags too, and give up with an
+    // actionable FAIL well inside Catch2's own per-test timeout.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!lock_held.load(std::memory_order_acquire)) {
+        if (holder_open_failed.load() || holder_begin_failed.load()) {
+            holder.join();
+            FAIL("holder thread failed to open/lock the legacy file before signalling — see "
+                 "holder_open_failed/holder_begin_failed");
+        }
+        if (std::chrono::steady_clock::now() > deadline) {
+            holder.join();
+            FAIL("holder thread did not acquire the lock within 10s");
+        }
+        std::this_thread::yield();
+    }
+
+    std::string captured;
+    bool migrated = false;
+    {
+        LogCapture capture;
+        migrated = store.migrate_from_sqlite(path);
+        captured = capture.str();
+    }
+    holder.join();
+    REQUIRE_FALSE(holder_open_failed.load());
+    REQUIRE_FALSE(holder_begin_failed.load());
+
+    REQUIRE(migrated);
+    CHECK(captured.find("scan aborted mid-read") == std::string::npos);
+    CHECK(captured.find("schema probe failed") == std::string::npos);
+
+    auto tokens = store.list_tokens();
+    REQUIRE(tokens.has_value());
+    CHECK(tokens->size() == 1);
 }
