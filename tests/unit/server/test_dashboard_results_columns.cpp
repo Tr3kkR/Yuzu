@@ -471,4 +471,140 @@ TEST_CASE("render_filter_bar route: dispatched through TestRouteSink, the "
     CHECK_FALSE(contains(res->body, "value=\"unloaded\""));
 }
 
+// -- Branch-review finding BR-004: create-group-form had no route-dispatch
+// -- test, so a later refactor that drops the username resolution or reverts
+// -- to the legacy 2-arg facet_agent_count call would pass every existing
+// -- test while the displayed count silently became fleet-wide again. -------
+
+TEST_CASE("create-group-form route: dispatched through TestRouteSink, the "
+          "matching-agent count is confined to the resolved session's "
+          "visible scope",
+          "[pg][server][dashboard][create_group_form]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    const std::string command_id = "cmd-create-group-sink";
+
+    // Both agents share the SAME Output value so one filter (f_output=match)
+    // matches both -- unscoped count is 2, confined-to-agent-1 count is 1.
+    StoredResponse r1;
+    r1.instruction_id = command_id;
+    r1.agent_id = "agent-1";
+    r1.received_at_ms = 1000;
+    r1.status = 0;
+    r1.plugin = "registry";
+    r1.output = "match";
+    rs.store(r1);
+    StoredResponse r2;
+    r2.instruction_id = command_id;
+    r2.agent_id = "agent-2";
+    r2.received_at_ms = 1000;
+    r2.status = 0;
+    r2.plugin = "registry";
+    r2.output = "match";
+    rs.store(r2);
+
+    yuzu::MetricsRegistry metrics;
+
+    DashboardRoutes::VisibleSetFn visible_set_fn =
+        [](const std::string& username) -> std::optional<std::set<std::string>> {
+        if (username == "testuser") return std::set<std::string>{"agent-1"};
+        return std::set<std::string>{};
+    };
+    DashboardRoutes::AuthFn auth_fn =
+        [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "testuser";
+        s.role = auth::Role::admin;
+        return s;
+    };
+    DashboardRoutes::PermFn perm_fn =
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+          const std::string&) { return true; };
+    DashboardRoutes::AuditFn audit_fn =
+        [](const httplib::Request&, const std::string&, const std::string&,
+          const std::string&, const std::string&, const std::string&) {};
+
+    struct SinkHarness {
+        DashboardRoutes routes;
+        yuzu::server::test::TestRouteSink sink;
+    } h;
+
+    h.routes.register_routes(h.sink, auth_fn, perm_fn, audit_fn,
+                             &rs, /*mgmt_group_store=*/nullptr, /*registry=*/nullptr,
+                             /*tag_store=*/nullptr, /*event_bus=*/nullptr,
+                             /*agents_json_fn=*/[] { return std::string{"[]"}; },
+                             /*dispatch_fn=*/DashboardRoutes::DispatchFn{},
+                             /*caller_fn=*/DashboardRoutes::CallerFn{},
+                             /*resolve_fn=*/DashboardRoutes::ResolveFn{},
+                             &metrics, /*instruction_store=*/nullptr,
+                             visible_set_fn);
+
+    auto res = h.sink.Get("/fragments/create-group-form?command_id=" + command_id +
+                          "&plugin=registry&f_output=match");
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 200);
+    CHECK(contains(res->body, "1 agent will be added"));
+    CHECK_FALSE(contains(res->body, "2 agents will be added"));
+}
+
+// -- Branch-review finding BR-001: a JIT-elevated session must get the
+// -- full-fleet view, not a username-derived RBAC re-check that cannot see
+// -- the session's live (in-memory) elevation. -------------------------------
+
+TEST_CASE("render_filter_bar route: a JIT-elevated session sees every agent's "
+          "facet values even though it holds no visible-scope grant",
+          "[pg][server][dashboard][render_filter_bar][elevation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    const std::string command_id = "cmd-filter-sink-elevated";
+    store_two_agent_facet_responses(rs, command_id);
+
+    yuzu::MetricsRegistry metrics;
+
+    // Deny-all for every username -- an elevated caller must bypass this
+    // entirely, not merely resolve to an empty visible set through it.
+    DashboardRoutes::VisibleSetFn visible_set_fn =
+        [](const std::string&) -> std::optional<std::set<std::string>> {
+        return std::set<std::string>{};
+    };
+    DashboardRoutes::AuthFn auth_fn =
+        [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "elevated-admin";
+        s.role = auth::Role::user; // base role holds nothing; elevation carries it
+        s.elevated_until = std::chrono::steady_clock::now() + std::chrono::minutes(5);
+        return s;
+    };
+    DashboardRoutes::PermFn perm_fn =
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+          const std::string&) { return true; };
+    DashboardRoutes::AuditFn audit_fn =
+        [](const httplib::Request&, const std::string&, const std::string&,
+          const std::string&, const std::string&, const std::string&) {};
+
+    struct SinkHarness {
+        DashboardRoutes routes;
+        yuzu::server::test::TestRouteSink sink;
+    } h;
+
+    h.routes.register_routes(h.sink, auth_fn, perm_fn, audit_fn,
+                             &rs, /*mgmt_group_store=*/nullptr, /*registry=*/nullptr,
+                             /*tag_store=*/nullptr, /*event_bus=*/nullptr,
+                             /*agents_json_fn=*/[] { return std::string{"[]"}; },
+                             /*dispatch_fn=*/DashboardRoutes::DispatchFn{},
+                             /*caller_fn=*/DashboardRoutes::CallerFn{},
+                             /*resolve_fn=*/DashboardRoutes::ResolveFn{},
+                             &metrics, /*instruction_store=*/nullptr,
+                             visible_set_fn);
+
+    auto res = h.sink.Get("/fragments/results/filter-bar?command_id=" + command_id +
+                          "&plugin=registry");
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 200);
+    CHECK(contains(res->body, "value=\"loaded\""));
+    CHECK(contains(res->body, "value=\"unloaded\""));
+}
+
 } // namespace yuzu::server

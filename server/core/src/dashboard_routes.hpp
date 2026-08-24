@@ -214,7 +214,8 @@ private:
     std::string render_filter_bar(const std::string& command_id, const std::string& plugin,
                                    const std::string& definition_id = {},
                                    const std::string& template_id = {},
-                                   const std::string& username = {});
+                                   const std::string& username = {},
+                                   bool elevated = false);
 
     /// Render group creation form. `agent_count` nullopt (#2691, Doomgoose
     /// finding #7) renders an honest "count unavailable" hint instead of a

@@ -60,10 +60,13 @@ enabled = true
 > `RbacStore::visible_agents_for_permission` (deny-aware, management-group
 > hierarchy expanded, permission-specific to `Response:Read`).
 >
-> A degraded management-group/RBAC store fails **closed** here too: an
+> A degraded **management-group** store fails **closed** here too: an
 > empty visible set makes the two GETs return success-empty without the
-> query ever reaching the store, and makes `group-from-results` report "no
-> agents match." A degraded **response** store keeps its own distinct
+> query ever reaching the response store, and makes `group-from-results`
+> report "no agents match." A degraded **RBAC** store behaves differently —
+> it never reaches this scoping at all, because each route's own flat
+> admission gate (below) denies with `403` first, the same as any other
+> RBAC-store outage. A degraded **response** store keeps its own distinct
 > existing rendering instead — a disabled "unavailable" dropdown on the
 > filter bar, "agent count unavailable (store degraded)" on the
 > create-group form, and `503` from `group-from-results` — since that

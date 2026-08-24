@@ -384,7 +384,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 }
 
                 auto html = render_filter_bar(command_id, plugin, definition_id, template_id,
-                                              session->username);
+                                              session->username, auth::is_elevated(*session));
                 res.set_content(html, "text/html; charset=utf-8");
             });
 
@@ -473,7 +473,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 auto command_id = req.get_param_value("command_id");
                 auto plugin = req.get_param_value("plugin");
                 auto filters = parse_filters(req, plugin);
-                auto agent_scope = resolve_visible_scope(session->username);
+                // JIT-elevated: full-fleet view, not a username-derived RBAC
+                // re-check that can't see the session's live elevation (see
+                // render_filter_bar's identical comment).
+                auto agent_scope = auth::is_elevated(*session)
+                                        ? std::nullopt
+                                        : resolve_visible_scope(session->username);
 
                 // nullopt (unwired store, or filters.empty() with no store
                 // call attempted) renders the same as a genuine store
@@ -549,8 +554,11 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // scope before the empty check — the raw (unscoped) list
                  // never reaches the caller, and an all-dropped result falls
                  // straight into the pre-existing 422 below rather than a
-                 // bespoke error.
-                 auto agent_scope = resolve_visible_scope(session->username);
+                 // bespoke error. JIT-elevated: full-fleet view (see
+                 // render_filter_bar's identical comment).
+                 auto agent_scope = auth::is_elevated(*session)
+                                         ? std::nullopt
+                                         : resolve_visible_scope(session->username);
                  if (agent_scope) {
                      std::unordered_set<std::string> scope_set(agent_scope->begin(),
                                                                 agent_scope->end());
@@ -560,7 +568,11 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      });
                      std::size_t dropped = before - agent_ids.size();
                      if (dropped > 0) {
-                         audit_fn_(req, "response.read", "denied", "Response", command_id,
+                         // target_type "Execution" matches the existing response.read
+                         // denied-row convention (server.cpp's aggregate surface), not
+                         // "Response" — so SIEM rules filtering on the established
+                         // taxonomy see this row too.
+                         audit_fn_(req, "response.read", "denied", "Execution", command_id,
                                    "scope_dropped=" + std::to_string(dropped) +
                                        " surface=group_from_results");
                      }
@@ -2104,9 +2116,15 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
                                                 const std::string& plugin,
                                                 const std::string& definition_id,
                                                 const std::string& template_id,
-                                                const std::string& username) {
+                                                const std::string& username,
+                                                bool elevated) {
     auto& cols = columns_for_plugin(plugin);
-    auto agent_scope = resolve_visible_scope(username);
+    // JIT-elevated sessions get the full-fleet view (nullopt), matching
+    // auth_routes.cpp's is_elevated short-circuit: RBAC re-derivation from
+    // username alone cannot see the session's in-memory elevated_until, so
+    // it must never be consulted for an elevated caller (would otherwise
+    // silently scope an admin down to nothing rather than up to everything).
+    auto agent_scope = elevated ? std::nullopt : resolve_visible_scope(username);
 
     std::string html;
     html += "<form id=\"filter-bar\" class=\"filter-bar\" hx-sync=\"this:abort\">"
