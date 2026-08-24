@@ -566,9 +566,11 @@ bool try_firewalld_rules(yuzu::CommandContext&) { return false; }
 // the next request goes out on the same fd, so there is no cross-request
 // interleaving to guard against with a sequence-number check.
 //
-// Read-only by design (ADR-3002 Decision 8): only GET* dumps are ever sent;
-// a mutating leg needs a separately-approved brokered-elevation design and
-// is out of scope here.
+// Read-only by design for this status/listing plugin: only GET* dumps are
+// ever sent. A mutating leg would need a separately-approved brokered-
+// elevation design and is out of scope here — ADR-3002 Decision 8 governs
+// the privileged-execution boundary that design would have to satisfy, not
+// a mandate that this plugin stay read-only.
 //
 // Protocol assumption, now confirmed rather than merely asserted: a
 // GETTABLE/GETCHAIN/GETRULE dump with family=NFPROTO_UNSPEC and no further
@@ -589,16 +591,19 @@ namespace nft = yuzu::firewall::nft_raw;
 /// that as "backend unreachable", the same fall-through contract as
 /// query_firewalld's D-Bus-unreachable path above.
 yuzu::agent::ScopedFd open_nft_socket() {
-    int fd = ::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_NETFILTER);
-    if (fd < 0)
-        return yuzu::agent::ScopedFd{};
+    // Own the fd in a ScopedFd from creation, same discipline as
+    // tar_netqual_nstat.cpp's nstat socket open: every early return below
+    // closes it automatically via the destructor, so no call site here
+    // needs its own raw ::close() -- including any future one added between
+    // socket() and the bind check.
+    yuzu::agent::ScopedFd sock(::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_NETFILTER));
+    if (!sock)
+        return {};
     sockaddr_nl addr{};
     addr.nl_family = AF_NETLINK;
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(fd);
-        return yuzu::agent::ScopedFd{};
-    }
-    return yuzu::agent::ScopedFd{fd};
+    if (::bind(sock.get(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0)
+        return {};
+    return sock;
 }
 
 /// One bounded NLM_F_DUMP request/response round-trip for `msg_type`
@@ -654,8 +659,15 @@ bool nft_dump(int fd, std::uint16_t msg_type, std::vector<std::byte>& out,
         // far after each read rather than assuming one recv() == the whole
         // reply.
         for (const auto& m : nft::split_nlmsgs(out)) {
-            if (m.hdr.type == nft::kNlmsgDone)
+            if (m.hdr.type == nft::kNlmsgDone) {
+                // A concurrent ruleset mutation mid-dump tears the reply --
+                // the kernel flags that on the terminating DONE rather than
+                // failing the dump outright, so an unchecked DONE would
+                // accept a torn/inconsistent read as if it were complete.
+                if ((m.hdr.flags & nft::kNlmFDumpIntr) != 0)
+                    return false;
                 return true;
+            }
             if (m.hdr.type == nft::kNlmsgError)
                 return false;
         }
@@ -681,7 +693,7 @@ bool try_nftables_state(yuzu::CommandContext& ctx) {
         return false;
     std::vector<std::byte> table_buf;
     if (!nft_dump(table_sock.get(), nft::kNftMsgGettable, table_buf, deadline))
-        return false; // unreachable -- fall through to ufw/iptables
+        return false; // backend unreachable -- fall through to ufw/iptables
     table_sock.reset();
 
     auto chain_sock = open_nft_socket();
@@ -722,7 +734,7 @@ bool try_nftables_rules(yuzu::CommandContext& ctx) {
         return false;
     std::vector<std::byte> table_buf;
     if (!nft_dump(table_sock.get(), nft::kNftMsgGettable, table_buf, deadline))
-        return false; // unreachable -- fall through to ufw/iptables
+        return false; // backend unreachable -- fall through to ufw/iptables
     table_sock.reset();
 
     // Reachable even with zero tables -- report that honestly rather than
@@ -753,17 +765,11 @@ bool try_nftables_rules(yuzu::CommandContext& ctx) {
     for (const auto& c : yuzu::firewall::parse_nft_chains(chain_buf)) {
         if (!c.is_base_chain)
             continue; // regular chains carry no hook/policy of their own
-        ctx.write_output(std::format(
-            "rule|nftables|{}|{}|{}|{}|{}", yuzu::firewall::nft_family_name(c.family),
-            sanitize_field(c.table), sanitize_field(c.name),
-            yuzu::firewall::nft_hook_name(c.hooknum), yuzu::firewall::nft_policy_name(c.policy)));
+        ctx.write_output(yuzu::firewall::format_nft_chain_rule_row(c));
     }
 
     for (const auto& r : yuzu::firewall::parse_nft_rules(rule_buf)) {
-        ctx.write_output(std::format(
-            "rule|nftables|{}|{}|{}|handle|{}", yuzu::firewall::nft_family_name(r.family),
-            sanitize_field(r.table), sanitize_field(r.chain),
-            r.handle ? std::to_string(*r.handle) : "unknown"));
+        ctx.write_output(yuzu::firewall::format_nft_rule_handle_row(r));
     }
     return true;
 }

@@ -284,10 +284,13 @@ void push_attr_nested(std::vector<std::byte>& buf, std::uint16_t type,
 /// Wraps `body` (nfgenmsg + attributes, unpadded) in an nlmsghdr of the
 /// given message `type` and appends it (with its own alignment padding).
 void push_nlmsg(std::vector<std::byte>& out, std::uint16_t type,
-                std::span<const std::byte> body) {
+                std::span<const std::byte> body, std::uint16_t flags = 0) {
     push_u32(out, static_cast<std::uint32_t>(16 + body.size()));
     push_u16(out, type);
-    push_u16(out, 0); // flags -- unread by the parser under test
+    // flags defaults to 0 -- unread by the parse_nft_* functions under test,
+    // but split_nlmsgs() still decodes it verbatim (nft_dump()'s
+    // NLM_F_DUMP_INTR check reads it from that same decoded header).
+    push_u16(out, flags);
     push_u32(out, 0); // seq
     push_u32(out, 0); // pid
     out.insert(out.end(), body.begin(), body.end());
@@ -442,4 +445,76 @@ TEST_CASE("nft: family/hook/policy names — known values plus fallback for unre
     CHECK(nft_policy_name(std::optional<std::uint32_t>{nft_raw::kNftPolicyAccept}) == "accept");
     CHECK(nft_policy_name(std::optional<std::uint32_t>{5}) == "policy5");
     CHECK(nft_policy_name(std::nullopt) == "unknown");
+}
+
+TEST_CASE("nft: format_nft_chain_rule_row — exact field order/shape try_nftables_rules() emits",
+         "[firewall]") {
+    NftChainInfo c;
+    c.family = nft_raw::kNfprotoInet;
+    c.table = "filter";
+    c.name = "INPUT";
+    c.is_base_chain = true;
+    c.hooknum = std::optional<std::uint32_t>{1};
+    c.policy = std::optional<std::uint32_t>{nft_raw::kNftPolicyDrop};
+
+    CHECK(format_nft_chain_rule_row(c) == "rule|nftables|inet|filter|INPUT|input|drop");
+}
+
+TEST_CASE("nft: format_nft_chain_rule_row sanitizes pipe/newline/CR in table and chain names",
+         "[firewall]") {
+    NftChainInfo c;
+    c.family = nft_raw::kNfprotoIpv4;
+    c.table = "fil|ter";
+    c.name = "IN\nPUT\r";
+    c.is_base_chain = true;
+    c.hooknum = std::optional<std::uint32_t>{0};
+    c.policy = std::optional<std::uint32_t>{nft_raw::kNftPolicyAccept};
+
+    CHECK(format_nft_chain_rule_row(c) == "rule|nftables|ip|fil_ter|IN_PUT_|prerouting|accept");
+}
+
+TEST_CASE("nft: format_nft_rule_handle_row — exact field order/shape, handle present and absent",
+         "[firewall]") {
+    NftRuleInfo r;
+    r.family = nft_raw::kNfprotoIpv6;
+    r.table = "filter";
+    r.chain = "FORWARD";
+    r.handle = std::optional<std::uint64_t>{42};
+    CHECK(format_nft_rule_handle_row(r) == "rule|nftables|ip6|filter|FORWARD|handle|42");
+
+    r.handle = std::nullopt;
+    CHECK(format_nft_rule_handle_row(r) == "rule|nftables|ip6|filter|FORWARD|handle|unknown");
+}
+
+TEST_CASE("nft: format_nft_rule_handle_row sanitizes pipe/newline/CR in table and chain names",
+         "[firewall]") {
+    NftRuleInfo r;
+    r.family = nft_raw::kNfprotoInet;
+    r.table = "na|t";
+    r.chain = "chain\r\n";
+    r.handle = std::optional<std::uint64_t>{7};
+    CHECK(format_nft_rule_handle_row(r) == "rule|nftables|inet|na_t|chain__|handle|7");
+}
+
+TEST_CASE("nft: split_nlmsgs decodes NLM_F_DUMP_INTR on the terminating DONE message",
+         "[firewall]") {
+    // nft_dump() (firewall_plugin.cpp) treats a DONE message carrying this
+    // flag as a torn/inconsistent dump and fails the round-trip rather than
+    // trusting the partial buffer -- that branch does real socket I/O and
+    // isn't unit-testable directly (no live kernel in the unit suite), but
+    // split_nlmsgs() decoding the flag correctly is the testable half of
+    // the same defect: an unread/miscomputed flags field would make that
+    // check silently inert regardless of how nft_dump() branches on it.
+    std::vector<std::byte> torn;
+    push_nlmsg(torn, nft_raw::kNlmsgDone, std::span<const std::byte>{}, nft_raw::kNlmFDumpIntr);
+    auto torn_msgs = nft_raw::split_nlmsgs(torn);
+    REQUIRE(torn_msgs.size() == 1);
+    CHECK(torn_msgs[0].hdr.type == nft_raw::kNlmsgDone);
+    CHECK((torn_msgs[0].hdr.flags & nft_raw::kNlmFDumpIntr) != 0);
+
+    std::vector<std::byte> clean;
+    push_done(clean);
+    auto clean_msgs = nft_raw::split_nlmsgs(clean);
+    REQUIRE(clean_msgs.size() == 1);
+    CHECK((clean_msgs[0].hdr.flags & nft_raw::kNlmFDumpIntr) == 0);
 }

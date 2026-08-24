@@ -18,9 +18,11 @@
  * enabled/disabled or a fabricated rule.
  */
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <format>
 #include <optional>
 #include <span>
 #include <sstream>
@@ -332,6 +334,13 @@ constexpr std::size_t kNlaAlignTo = 4;
 constexpr std::uint16_t kNlmsgError = 0x2;
 constexpr std::uint16_t kNlmsgDone = 0x3;
 
+// linux/netlink.h NLM_F_DUMP_INTR: "Dump was inconsistent due to sequence
+// change" -- set by the kernel on the terminating NLMSG_DONE when a
+// concurrent ruleset mutation (another process editing nftables mid-dump)
+// tore the reply. Must be checked on DONE, not inferred from anything else:
+// a torn dump otherwise looks identical to a clean one.
+constexpr std::uint16_t kNlmFDumpIntr = 0x10;
+
 constexpr std::uint8_t kNfnlSubsysNftables = 10;
 constexpr std::uint16_t kNftMsgGettable = 1;
 constexpr std::uint16_t kNftMsgGetchain = 4;
@@ -387,7 +396,11 @@ struct RawNlMsg {
         const std::size_t aligned = (hdr.len + (kNlaAlignTo - 1)) & ~(kNlaAlignTo - 1);
         if (aligned == 0)
             break; // unreachable given the >= sizeof(NlMsgHdr) check above; defensive
-        off += aligned;
+        // Clamp rather than let off run past buf.size() by up to 3 padding
+        // bytes: the next loop guard would catch it either way, but this
+        // makes "truncated input decodes to as much as could be safely
+        // read" the literal post-condition instead of an incidental one.
+        off = std::min(buf.size(), off + aligned);
     }
     return msgs;
 }
@@ -647,6 +660,44 @@ struct NftRuleInfo {
     if (*policy == nft_raw::kNftPolicyDrop)
         return "drop";
     return "policy" + std::to_string(*policy);
+}
+
+/// Formats one base chain as the exact `rule|nftables|...` pipe-delimited
+/// row try_nftables_rules() (firewall_plugin.cpp) writes for it. Table/chain
+/// names are pipe/newline/CR-sanitized inline (mirrors firewall_plugin.cpp's
+/// file-local sanitize_field) so a hostile/unusual nftables name can't
+/// inject a synthetic field or row. Pulled out as its own pure function so
+/// the try_nftables_* -> output-row integration path — previously only
+/// exercised by manual live-kernel verification — is covered by a unit test
+/// against the actual field order/shape, not just the upstream parse_nft_*
+/// decoders.
+[[nodiscard]] inline std::string format_nft_chain_rule_row(const NftChainInfo& c) {
+    auto sanitize = [](std::string_view s) {
+        std::string out;
+        out.reserve(s.size());
+        for (char ch : s)
+            out += (ch == '|' || ch == '\n' || ch == '\r') ? '_' : ch;
+        return out;
+    };
+    return std::format("rule|nftables|{}|{}|{}|{}|{}", nft_family_name(c.family),
+                        sanitize(c.table), sanitize(c.name), nft_hook_name(c.hooknum),
+                        nft_policy_name(c.policy));
+}
+
+/// Formats one rule handle as the exact `rule|nftables|...|handle|...` row
+/// try_nftables_rules() writes for it -- same pull-out rationale as
+/// format_nft_chain_rule_row() above.
+[[nodiscard]] inline std::string format_nft_rule_handle_row(const NftRuleInfo& r) {
+    auto sanitize = [](std::string_view s) {
+        std::string out;
+        out.reserve(s.size());
+        for (char ch : s)
+            out += (ch == '|' || ch == '\n' || ch == '\r') ? '_' : ch;
+        return out;
+    };
+    return std::format("rule|nftables|{}|{}|{}|handle|{}", nft_family_name(r.family),
+                        sanitize(r.table), sanitize(r.chain),
+                        r.handle ? std::to_string(*r.handle) : "unknown");
 }
 
 } // namespace yuzu::firewall
