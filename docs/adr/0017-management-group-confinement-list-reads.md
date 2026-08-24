@@ -237,6 +237,26 @@ gate.
 - **Responses** — `query_responses` (#1550), `aggregate_responses` (filter-before-aggregate),
   REST `/executions/{id}/visualization`, `/api/responses/{id}` (GET list) + `/export`, dashboard
   `/fragments/results` + the scan fragment, workflow execution-detail.
+  - **dashboard `/fragments/results` table + workflow execution-detail's responses section AND
+    status grid/table: DONE (#1712, #3290 Phase 2 continuation)** — migrated onto
+    `require_fleet_read`, replacing `perm_fn`/`perm_fn_` as the sole gate; confinement is now
+    effective on all four (the status grid/table was a same-PR adversarial-review finding: the gate
+    migration itself admits a confined caller class the old flat gate denied outright, so the grid
+    needed the same filter as the responses section, not just the table). The scan fragment,
+    `query_responses`, `aggregate_responses`, and the REST endpoints above remain on the older,
+    still-largely-inert `response_scope_fn` mechanism (#1634) — not touched by this migration.
+    **NOT done, pre-existing (not introduced or worsened by #1712):** the SAME dashboard
+    results workflow's sidecar routes — `/fragments/results/filter-bar` (reads
+    `ResponseStore::facet_values`), `/fragments/create-group-form` (reads `facet_agent_count`), and
+    `POST /api/dashboard/group-from-results` (reads `facet_agent_ids` then adds every returned id as
+    a group member — a WRITE) — all still gate on flat `perm_fn_` and apply no scope predicate to
+    the underlying `response_store.response_facets` query. `filter-bar` is gated on the same
+    `Response:Read` securable as the now-migrated table, so a genuinely confined-only caller (the
+    `#1715(a)` additive-grant class) cannot reach it at all — latent, not active. `create-group-form`
+    /`group-from-results` gate on a *different* securable (`ManagementGroup:Write`), which has no
+    logical tie to a caller's `Response:Read` confinement — a real persona holding both (global
+    group-write + confined response-read) can use the unscoped facet query to discover and enroll
+    out-of-scope agents. Tracked as a follow-up, not fixed by #1712 — see #3525.
 - **Device list** — `/api/agents` (`server.cpp:5312`), `/fragments/devices/list`, the dashboard
   `get_visible_agents` callers (`dashboard_routes.cpp:989/1159/1889`, `server.cpp:7892`),
   `get_visible_agents_json` (`server.cpp:3784/8543`).
@@ -312,6 +332,24 @@ Two corrections are needed whether A or B is chosen and should ship independentl
   today" safe-harbour above covers ONLY the inert-confinement class (no confined operators exist to be
   under-restricted). It does **not** cover this fail-open, which discloses to *any* authenticated
   principal the moment `rbac.db` fails to load — independent of whether confined operators exist.
+
+  **RESOLVED, both halves, in two separate PRs:** the fail-open half closed codebase-wide (not
+  route-specific) via **#1717/#2472** — `require_permission`/`require_scoped_permission` now gate on
+  `rbac_enforcement_in_effect()` exactly as this finding proposed. The no-per-agent-filter half closed
+  for these two specific readers via **#1712/#3290 Phase 2 continuation** — both migrated onto
+  `require_fleet_read` (the admit-then-filter gate this ADR designed), replacing `perm_fn`/`perm_fn_`
+  outright rather than layering a filter under it: `dashboard_routes.cpp`'s `/fragments/results` and
+  `workflow_routes.cpp`'s executions-drawer detail route (`/fragments/executions/{id}/detail`'s
+  responses section AND its per-agent status grid/table, which reads a distinct store —
+  `ExecutionTracker`, not `ResponseStore` — and needed the identical filter for the same reason: the
+  gate migration itself admits a confined caller class the old flat gate denied outright, so leaving
+  the grid unfiltered would have widened disclosure rather than closing it). The other three items
+  under the "Responses" bullet below
+  (`query_responses`, `aggregate_responses`, the REST `/executions/{id}/visualization` +
+  `/api/responses` family, and the dashboard scan fragment) are **NOT** covered by either PR — they
+  still use the older, still-largely-inert `response_scope_fn`/`response_agent_in_scope` mechanism
+  (#1634), a distinct primitive from `require_fleet_read`; see `docs/user-manual/mcp.md`'s
+  `query_responses` row for that mechanism's current status.
 
 ## Consequences
 

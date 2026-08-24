@@ -1,0 +1,216 @@
+/**
+ * test_dashboard_results_fragment.cpp -- route-handler coverage for the
+ * GET /fragments/results dashboard fragment's fleet-read gate (#1712,
+ * #3290 Phase 2 continuation).
+ *
+ * `/fragments/results` previously gated on a flat `perm_fn_(req, res,
+ * "Response", "Read")` with no per-agent filter at all -- any operator
+ * holding Response:Read could see response data for agents outside their
+ * management-group confinement (the ADR-0017 "World A" gap). This file
+ * pins the route-level wiring of its replacement, `require_fleet_read`
+ * (via the injected `fleet_read_fn_`):
+ *   - unwired fleet_read_fn_ -> 503, fail closed (never falls through to
+ *     an unfiltered read),
+ *   - a real gate deny -> the gate's own status/body, no dispatch to
+ *     render_results at all,
+ *   - an admitted-but-scoped gate -> only in-scope agents' rows render,
+ *     and the "N agents" summary count reflects the FILTERED set, not the
+ *     pre-filter fleet-wide total (a confined caller must not learn an
+ *     out-of-scope agent exists via the count even with its row hidden).
+ *
+ * The filter LOGIC itself (render_results' scope param) is pinned more
+ * directly, without an HTTP round-trip, in
+ * test_dashboard_results_columns.cpp's "scope filter drops out-of-scope
+ * agents" test; this file proves the ROUTE wires the gate correctly, same
+ * division of labour as test_dashboard_tar_fragments.cpp (route wiring)
+ * vs. test_dashboard_tar_retention.cpp (render-time logic) for the TAR
+ * fragments.
+ */
+
+#include "dashboard_routes.hpp"
+#include "instruction_store.hpp"
+#include "pg/pg_pool.hpp"
+#include "response_store.hpp"
+#include "test_route_sink.hpp"
+
+#include "../test_helpers.hpp"
+
+#include <catch2/catch_test_macros.hpp>
+
+#include <string>
+#include <unordered_set>
+
+using namespace yuzu::server;
+using yuzu::server::pg::PgPool;
+
+namespace {
+
+// ResponseStore is a migrated Postgres store (ADR-0039) -- shares the
+// "responsestore" template key with test_dashboard_results_columns.cpp and
+// test_response_store.cpp (identical setup).
+yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    ResponseStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("responsestore template: store failed to migrate");
+}};
+
+bool contains(const std::string& hay, std::string_view needle) {
+    return hay.find(needle) != std::string::npos;
+}
+
+struct FragmentResultsHarness {
+    // MEMBER ORDER IS LOAD-BEARING (mirrors test_dashboard_tar_fragments.cpp):
+    // `sink` is declared LAST so it is destroyed FIRST, while the
+    // `DashboardRoutes` whose `this` its handlers captured is still alive.
+    yuzu::MetricsRegistry metrics;
+    DashboardRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+
+    explicit FragmentResultsHarness(ResponseStore* response_store) {
+        auto auth_fn = [](const httplib::Request&,
+                          httplib::Response&) -> std::optional<auth::Session> {
+            auth::Session s;
+            s.username = "frag-op";
+            s.role = auth::Role::admin;
+            return s;
+        };
+        // Never actually called by /fragments/results post-migration --
+        // present only because register_routes requires a PermFn for the
+        // routes in this file it did NOT migrate (e.g. filter-bar).
+        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                          const std::string&) -> bool { return true; };
+        auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                           const std::string&, const std::string&, const std::string&) {};
+
+        // fleet_read_fn_ is deliberately left UNWIRED here -- `routes` reads
+        // it live per-request (the handler captures `this`, not a snapshot
+        // at registration time), so a test wires it via
+        // `routes.set_fleet_read_fn(...)` directly, at any point before its
+        // `get()` call. Leaving it unset (as the "unwired" test does) pins
+        // production's genuine fail-closed contract, not a stand-in for it.
+
+        routes.register_routes(
+            sink, auth_fn, perm_fn, audit_fn, response_store,
+            /*mgmt_group_store=*/nullptr, /*registry=*/nullptr, /*tag_store=*/nullptr,
+            /*event_bus=*/nullptr,
+            /*agents_json_fn=*/[] { return std::string{"[]"}; },
+            /*dispatch_fn=*/DashboardRoutes::DispatchFn{},
+            /*caller_fn=*/DashboardRoutes::CallerFn{},
+            /*resolve_fn=*/[](const std::string&) { return std::pair<std::string, std::string>{}; },
+            &metrics, /*instruction_store=*/nullptr);
+    }
+
+    std::unique_ptr<httplib::Response> get(const std::string& path) { return sink.Get(path); }
+};
+
+} // namespace
+
+TEST_CASE("/fragments/results: unwired fleet_read_fn_ -> 503, fail closed",
+          "[server][dashboard][fragment][auth]") {
+    FragmentResultsHarness h(/*response_store=*/nullptr);
+    // set_fleet_read_fn is never called -- mirrors production's genuinely-
+    // unwired DashboardRoutes::fleet_read_fn_ state (a misconfigured call
+    // site, not a real deny).
+    auto res = h.get("/fragments/results?command_id=cmd-1&plugin=registry");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(contains(res->body, "Service unavailable"));
+}
+
+TEST_CASE("/fragments/results: a real gate deny is never reached by render_results",
+          "[server][dashboard][fragment][auth]") {
+    FragmentResultsHarness h(/*response_store=*/nullptr);
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response& res, const std::string&,
+          const std::string&) -> yuzu::server::authz::FleetReadGate {
+            res.status = 403;
+            res.set_content(R"({"error":"permission denied"})", "application/json");
+            return {false, yuzu::server::authz::deny_all()};
+        });
+    auto res = h.get("/fragments/results?command_id=cmd-1&plugin=registry");
+    REQUIRE(res);
+    // The gate's own response is passed through untouched -- same content-type
+    // (JSON) perm_fn_'s require_permission already wrote on this route
+    // pre-migration, not a behavior change for an HTMX consumer.
+    CHECK(res->status == 403);
+    CHECK(contains(res->body, "permission denied"));
+}
+
+TEST_CASE("/fragments/results: admitted + scoped gate hides out-of-scope rows "
+          "AND narrows the agent count",
+          "[pg][server][dashboard][fragment][auth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-scope-1";
+    StoredResponse in_resp;
+    in_resp.instruction_id = command_id;
+    in_resp.agent_id = "agent-in";
+    in_resp.received_at_ms = 1000;
+    in_resp.status = 0;
+    in_resp.output = "in-scope fragment output";
+    rs.store(in_resp);
+    StoredResponse out_resp;
+    out_resp.instruction_id = command_id;
+    out_resp.agent_id = "agent-out";
+    out_resp.received_at_ms = 1000;
+    out_resp.status = 0;
+    out_resp.output = "out-of-scope fragment output";
+    rs.store(out_resp);
+
+    FragmentResultsHarness h(&rs);
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+          const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, std::unordered_set<std::string>{"agent-in"}};
+        });
+    auto res = h.get("/fragments/results?command_id=" + command_id + "&plugin=registry");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(contains(res->body, "in-scope fragment output"));
+    CHECK_FALSE(contains(res->body, "out-of-scope fragment output"));
+    // The out-of-band #result-summary count must be recomputed from the
+    // filtered set, not the pre-filter fleet-wide total.
+    CHECK(contains(res->body, "1 agent"));
+    CHECK_FALSE(contains(res->body, "2 agents"));
+}
+
+TEST_CASE("/fragments/results: admitted + unfiltered (TOP) gate shows every agent",
+          "[pg][server][dashboard][fragment][auth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-unfiltered-1";
+    StoredResponse r1;
+    r1.instruction_id = command_id;
+    r1.agent_id = "agent-a";
+    r1.received_at_ms = 1000;
+    r1.status = 0;
+    r1.output = "output a";
+    rs.store(r1);
+    StoredResponse r2;
+    r2.instruction_id = command_id;
+    r2.agent_id = "agent-b";
+    r2.received_at_ms = 1000;
+    r2.status = 0;
+    r2.output = "output b";
+    rs.store(r2);
+
+    FragmentResultsHarness h(&rs);
+    // nullopt scope == TOP == unfiltered -- a global grant or RBAC-off,
+    // byte-identical to the pre-#1712 path for that caller class.
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+          const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, std::nullopt};
+        });
+    auto res = h.get("/fragments/results?command_id=" + command_id + "&plugin=registry");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(contains(res->body, "output a"));
+    CHECK(contains(res->body, "output b"));
+    CHECK(contains(res->body, "2 agents"));
+}

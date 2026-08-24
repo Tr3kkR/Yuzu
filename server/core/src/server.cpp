@@ -19327,6 +19327,11 @@ private:
         // handlers capture `this` at registration and read the member per
         // request, so setting it afterwards would never reach a live route.
         dashboard_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
+        // #1712 / #3290 Phase 2 — same conversion lambda already wired into
+        // McpServer's query_installed_software (fleet_read_fn, defined
+        // above); wiring it here too so /fragments/results migrates onto
+        // require_fleet_read as its sole gate.
+        dashboard_routes_->set_fleet_read_fn(fleet_read_fn);
         dashboard_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, audit_fn, response_store_.get(),
             mgmt_group_store_.get(), &registry_, tag_store_.get(), &event_bus_,
@@ -19430,6 +19435,10 @@ private:
         WorkflowRoutes::Deps wf_deps;
         wf_deps.auth_fn = auth_fn;
         wf_deps.perm_fn = perm_fn;
+        // #1712 / #3290 Phase 2 — same conversion lambda already wired into
+        // McpServer's query_installed_software and DashboardRoutes above;
+        // used only by the executions-drawer detail route.
+        wf_deps.fleet_read_fn = fleet_read_fn;
         wf_deps.audit_fn = audit_fn;
         wf_deps.emit_fn = [this](const std::string& event_type, const httplib::Request& req) {
             emit_event(event_type, req);

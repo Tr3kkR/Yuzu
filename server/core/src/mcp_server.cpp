@@ -1793,7 +1793,14 @@ struct ToolSecurityEntry {
 static const ToolSecurityEntry kToolSecurityRows[] = {
     // Phase 1 read-only tools
     {"list_agents", {"Infrastructure", "Read"}},
-    {"get_agent_details", {"Infrastructure", "Read"}},
+    // #1700 / #3290 Phase 2: migrated onto require_fleet_read, which gives
+    // this tool a REAL confinement mechanism (meet(management-group,
+    // service-scope)) — reclassified from the default `denied` to
+    // `confined`, same as query_installed_software below, so a correctly-
+    // confined service-scoped token gets a real, filtered answer instead of
+    // a blanket 403 (routed-concern clause 3: a `confined` label needs a
+    // real mechanism, and conversely a tool that HAS one should carry it).
+    {"get_agent_details", {"Infrastructure", "Read", ServiceScopeClass::confined}},
     {"query_audit_log", {"AuditLog", "Read"}},
     {"list_definitions", {"InstructionDefinition", "Read"}},
     {"get_definition", {"InstructionDefinition", "Read"}},
@@ -4851,27 +4858,42 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── get_agent_details ─────────────────────────────────────────
+            // #1700 / #3290 Phase 2 — migrated onto require_fleet_read
+            // (fleet_read_fn_), mirroring query_installed_software exactly:
+            // fleet_read_fn_ is now the SOLE gate — it already covers
+            // mcp_tier internally (require_fleet_read's own caller-class
+            // ladder) and RBAC, so no separate tier_allows/perm_fn call here
+            // (stacking either would be the BLOCKING defect require_fleet_read's
+            // doc comment warns against).
             if (tool_name == "get_agent_details") {
-                if (!tier_allows(tier, "Infrastructure", "Read")) {
-                    res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
-                        "application/json");
+                if (!fleet_read_fn_) {
+                    spdlog::error("get_agent_details: fleet_read_fn_ unwired — "
+                                  "misconfigured call site; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Infrastructure", "Read"))
-                    return;
+                auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status.
                 auto agent_id = param_str(args, "agent_id");
                 if (agent_id.empty()) {
                     res.set_content(error_response(id, kInvalidParams, "agent_id is required"),
                                     "application/json");
                     return;
                 }
-                // Find agent in registry
+                // Find agent in registry. An out-of-scope agent collapses to
+                // the SAME "not found" response as a genuinely nonexistent
+                // one (#1700) — the existence probe (hostname/os disclosure
+                // for an agent outside the caller's confinement) IS the
+                // vulnerability this migration closes, so the response must
+                // not distinguish "doesn't exist" from "exists, not yours".
                 const auto& agents = get_agents();
                 JObj agent_obj;
                 bool found = false;
                 for (const auto& a : agents) {
-                    if (a.value("agent_id", "") == agent_id) {
+                    if (a.value("agent_id", "") == agent_id &&
+                        authz::in_scope(gate.scope, agent_id)) {
                         agent_obj.add("agent_id", a.value("agent_id", ""))
                             .add("hostname", a.value("hostname", ""))
                             .add("os", a.value("os", ""))

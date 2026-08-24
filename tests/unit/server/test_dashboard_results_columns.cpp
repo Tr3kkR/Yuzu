@@ -37,6 +37,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
+#include <unordered_set>
 
 namespace yuzu::server {
 
@@ -75,6 +76,15 @@ struct DashboardResultsColumnsTestAccess {
         return routes.render_results(command_id, plugin, /*sort_col=*/"agent",
                                      /*sort_dir=*/"asc", /*page=*/1, /*per_page=*/50,
                                      /*filters=*/{}, /*text_query=*/"", definition_id);
+    }
+    // #1712 / #3290 Phase 2 — the fleet-read gate's composed
+    // meet(management-group, service-scope) VisibleSet.
+    std::string render_scoped(const std::string& command_id, const std::string& plugin,
+                              const yuzu::server::authz::VisibleSet& scope) {
+        return routes.render_results(command_id, plugin, /*sort_col=*/"agent",
+                                     /*sort_dir=*/"asc", /*page=*/1, /*per_page=*/50,
+                                     /*filters=*/{}, /*text_query=*/"", /*definition_id=*/"",
+                                     /*template_id=*/"", /*visible_columns=*/{}, scope);
     }
     std::string render_filter_bar(const std::string& command_id, const std::string& plugin) {
         return routes.render_filter_bar(command_id, plugin);
@@ -214,6 +224,57 @@ TEST_CASE("render_results: no definition_id falls back to columns_for_plugin "
 
     CHECK(contains(html, ">Output<"));
     CHECK_FALSE(contains(html, "profile_name"));
+}
+
+// #1712 / #3290 Phase 2: the fleet-read gate's scope filter is applied
+// BEFORE total_agent_count is computed — a confined caller must see neither
+// the out-of-scope agent's row NOR a fleet-wide count that reveals it exists.
+TEST_CASE("render_results: scope filter drops out-of-scope agents from both "
+          "the rows and the agent count",
+          "[server][dashboard][render_results]") {
+    InstructionStore is{":memory:"};
+    REQUIRE(is.is_open());
+
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    const std::string command_id = "cmd-scope-filter-1";
+    StoredResponse in_resp;
+    in_resp.instruction_id = command_id;
+    in_resp.agent_id = "agent-in";
+    in_resp.received_at_ms = 1000;
+    in_resp.status = 0;
+    in_resp.output = "in-scope output line";
+    rs.store(in_resp);
+    StoredResponse out_resp;
+    out_resp.instruction_id = command_id;
+    out_resp.agent_id = "agent-out";
+    out_resp.received_at_ms = 1000;
+    out_resp.status = 0;
+    out_resp.output = "out-of-scope output line";
+    rs.store(out_resp);
+
+    DashboardResultsColumnsTestAccess acc;
+    acc.set_stores(&is, &rs);
+
+    // Unfiltered (nullopt = TOP) — both agents visible, sanity baseline.
+    const std::string unfiltered = acc.render_scoped(command_id, "registry", std::nullopt);
+    CHECK(contains(unfiltered, "agent-in"));
+    CHECK(contains(unfiltered, "agent-out"));
+    CHECK(contains(unfiltered, "2 agents"));
+
+    // Scoped to agent-in only.
+    const std::string scoped = acc.render_scoped(
+        command_id, "registry",
+        yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}});
+    CHECK(contains(scoped, "agent-in"));
+    CHECK_FALSE(contains(scoped, "agent-out"));
+    CHECK_FALSE(contains(scoped, "out-of-scope output line"));
+    // The count must be recomputed from the filtered set, not the pre-filter
+    // fleet-wide total — else a confined caller learns an out-of-scope agent
+    // exists via the "N agents" summary even with its row hidden.
+    CHECK(contains(scoped, "1 agent"));
+    CHECK_FALSE(contains(scoped, "2 agents"));
 }
 
 // #2691 (Doomgoose finding #7): a degraded response-store read must render

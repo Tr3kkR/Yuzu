@@ -234,7 +234,27 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     // -- GET /fragments/results -----------------------------------------------
     sink.Get("/fragments/results",
             [this](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn_(req, res, "Response", "Read")) return;
+                // #1712 / #3290 Phase 2 — migrated onto require_fleet_read
+                // (fleet_read_fn_), mirroring query_installed_software: the
+                // gate is now the SOLE authorization check (never stacked
+                // with perm_fn_ — the BLOCKING defect require_fleet_read's
+                // own doc comment warns against).
+                if (!fleet_read_fn_) {
+                    spdlog::error("/fragments/results: fleet_read_fn_ unwired — "
+                                  "misconfigured call site; failing closed");
+                    res.status = 503;
+                    res.set_content(
+                        "<tbody id=\"results-tbody\"><tr><td class=\"empty-state\">"
+                        "Service unavailable.</td></tr></tbody>",
+                        "text/html; charset=utf-8");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Response", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
+                            // (JSON — same shape perm_fn_'s require_permission
+                            // already wrote on this route pre-migration; not a
+                            // content-type change for an HTMX consumer).
 
                 auto command_id = req.get_param_value("command_id");
                 auto plugin = req.get_param_value("plugin");
@@ -342,7 +362,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 auto html = render_results(command_id, plugin, sort_col, sort_dir,
                                            page, per_page, filters, text_query,
                                            definition_id, template_id,
-                                           visible_columns);
+                                           visible_columns, gate.scope);
                 res.set_content(html, "text/html; charset=utf-8");
             });
 
@@ -1671,7 +1691,8 @@ std::string DashboardRoutes::render_results(
     const std::string& text_query,
     const std::string& definition_id,
     const std::string& template_id,
-    const std::vector<std::string>& visible_columns) {
+    const std::vector<std::string>& visible_columns,
+    const authz::VisibleSet& scope) {
 
     if (!response_store_) {
         return "<tbody id=\"results-tbody\"><tr><td class=\"empty-state\">"
@@ -1740,6 +1761,25 @@ std::string DashboardRoutes::render_results(
         auto count_opt = response_store_->facet_agent_count(command_id, filters);
         store_degraded = store_degraded || !count_opt.has_value();
         total_agent_count = count_opt.value_or(0);
+    }
+
+    // #1712 / #3290 Phase 2 — scope filter (the gate's composed
+    // meet(management-group, service-scope) VisibleSet), applied BEFORE
+    // total_agent_count is used anywhere below: a fleet-wide count served
+    // to a confined caller is the same disclosure class this migration
+    // closes, so `total_agent_count` is recomputed from the filtered set
+    // rather than left at its pre-filter (facet_agent_count/response-count)
+    // value. nullopt (TOP) ⇒ unfiltered, byte-identical to the pre-#1712
+    // path for that caller class.
+    if (scope) {
+        std::vector<StoredResponse> visible;
+        visible.reserve(responses.size());
+        for (auto& r : responses) {
+            if (authz::in_scope(scope, r.agent_id))
+                visible.push_back(std::move(r));
+        }
+        responses.swap(visible);
+        total_agent_count = static_cast<int64_t>(responses.size());
     }
 
     // Phase 2: parse output lines, apply per-line filters and text search

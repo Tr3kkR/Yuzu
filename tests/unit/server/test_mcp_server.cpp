@@ -5596,6 +5596,64 @@ TEST_CASE("MCP Integration: tools/call get_agent_details unknown agent", "[mcp][
     CHECK(body["error"]["message"].get<std::string>().find("no-such-agent") != std::string::npos);
 }
 
+// #1700 / #3290 Phase 2: get_agent_details migrated onto require_fleet_read
+// (mirrors query_installed_software's fake-gate scope test). An out-of-scope
+// agent must collapse to the SAME "not found" response as a genuinely
+// nonexistent one — the existence probe (hostname/os for an agent outside
+// the caller's confinement) IS the vulnerability this migration closes.
+TEST_CASE("MCP get_agent_details: out-of-scope agent collapses to not-found",
+          "[mcp][auth]") {
+    McpTestServer ts;
+    // Caller may see agent-001, never agent-002 (the gate's own composed
+    // meet(management-group, service-scope) VisibleSet, #3290 — fake twin of
+    // require_fleet_read admitting a scoped, not unfiltered, witness).
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, std::unordered_set<std::string>{"agent-001"}};
+    };
+    ts.start();
+
+    auto in_scope = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":19,"params":{"name":"get_agent_details","arguments":{"agent_id":"agent-001"}}})");
+    REQUIRE(in_scope);
+    CHECK(in_scope->status == 200);
+    auto in_body = nlohmann::json::parse(in_scope->body);
+    REQUIRE(in_body.contains("result"));
+
+    auto out_of_scope = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":20,"params":{"name":"get_agent_details","arguments":{"agent_id":"agent-002"}}})");
+    REQUIRE(out_of_scope);
+    CHECK(out_of_scope->status == 200);
+    auto out_body = nlohmann::json::parse(out_of_scope->body);
+    // Same shape as the genuinely-nonexistent-agent case above — never a
+    // distinct "forbidden"/"exists but out of scope" response.
+    REQUIRE(out_body.contains("error"));
+    CHECK(out_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(out_body["error"]["message"].get<std::string>().find("agent-002") != std::string::npos);
+}
+
+// require_fleet_read's own doc comment: unwired = misconfiguration, FAILS
+// CLOSED (503) — never silently falls back to an unfiltered read. Mirrors
+// query_installed_software's "unwired fleet_read_fn_" test (#3290) — the
+// fixture default (fleet_read_fn_for_test) always admits unfiltered, so no
+// prior test exercised production's genuinely-empty McpServer::fleet_read_fn_
+// state on this tool.
+TEST_CASE("MCP get_agent_details: unwired fleet_read_fn_ -> fail-closed",
+          "[mcp][auth]") {
+    McpTestServer ts;
+    ts.fleet_read_fn_for_test = {}; // genuinely empty std::function
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":19,"params":{"name":"get_agent_details","arguments":{"agent_id":"agent-001"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // JSON-RPC envelope stays 200; the error is inside the body
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+}
+
 // ── 21. preview_scope_targets via HTTP ──────────────────────────────────────
 
 TEST_CASE("MCP Integration: tools/call preview_scope_targets", "[mcp][integration]") {

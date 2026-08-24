@@ -6,6 +6,7 @@
 #include <yuzu/server/auth.hpp>
 
 #include "approval_manager.hpp"
+#include "authz_gates.hpp" // yuzu::server::authz::FleetReadGate (#1712 / #3290 Phase 2)
 #include "authz_model.hpp" // yuzu::server::authz::VisibleSet (K-R7-02 / #1788)
 #include "custom_properties_store.hpp"
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
@@ -79,6 +80,22 @@ public:
     using CallerFn =
         std::function<yuzu::server::DispatchCaller(const httplib::Request&)>;
 
+    /// #1712 / #3290 Phase 2 — the injected-callback twin of
+    /// `AuthRoutes::require_fleet_read`, backing the executions-drawer
+    /// detail route's real per-agent/service confinement (same shape as
+    /// `McpServer::FleetReadFn`/`RestApiV1::FleetReadFn`/
+    /// `DashboardRoutes::FleetReadFn` — server.cpp wires the SAME
+    /// conversion lambda into all of them so they cannot drift). MUST be
+    /// that route's SOLE authorization gate — never stacked with `perm_fn`
+    /// for the same `(securable_type, operation)` (the BLOCKING defect
+    /// `require_fleet_read`'s own doc comment warns against). Default-
+    /// constructed (empty `Deps` field) ⇒ the route fails CLOSED (503
+    /// "unwired"), mirroring the sibling surfaces' identical contract.
+    using FleetReadFn =
+        std::function<authz::FleetReadGate(const httplib::Request&, httplib::Response&,
+                                           const std::string& securable_type,
+                                           const std::string& operation)>;
+
     /// PR 2.5 — deps-struct refactor (#670).
     ///
     /// `register_routes` had grown to 16 arguments across two overloads.
@@ -97,6 +114,11 @@ public:
         yuzu::server::detail::StreamBudget* stream_budget{nullptr};
         AuthFn auth_fn;
         PermFn perm_fn;
+        /// #1712 / #3290 Phase 2 — see FleetReadFn's doc comment above.
+        /// Used ONLY by the executions-drawer detail route
+        /// (/fragments/executions/{id}/detail); every other route in this
+        /// file keeps using `perm_fn` above unchanged.
+        FleetReadFn fleet_read_fn;
         AuditFn audit_fn;
         EmitEventFn emit_fn;
         ScopeEstimateFn scope_fn;
