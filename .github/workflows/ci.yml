@@ -808,13 +808,43 @@ jobs:
         # attributable error — the 90-minute budget also covers checkout and
         # build time before Test even starts, so a slow build can still leave
         # less than 30 minutes of headroom when the wait begins.
+        #
+        # Split into 3 invocations, cheap-first (fail-fast — bash -e aborts the
+        # remaining lines on the first non-zero exit): the ~26 agent/docs/proto/
+        # tar tests and the 3 non-pg server tests run UNCAPPED (no --num-processes
+        # at all), since they don't touch Postgres and were never the contention
+        # source. Only the 8 pg shards go through with-test-slot.sh + a cap — and
+        # ONLY those 8, by exact name, so they get the full cap dedicated to them
+        # instead of sharing it with cheap tests. This is not a hypothetical
+        # optimization: a live run (PR #3582, 2026-08-24) hit shard E/G TIMEOUT at
+        # 600.51s/600.54s (SIGKILL'd) despite acquiring the cross-job slot in 0s —
+        # i.e. with NO cross-job contention at all, the WITHIN-job cap alone still
+        # weakened when a cheap docs/agent/tar test occupied one of only 2 slots
+        # partway through, extending the pg shards' own effective queue. Isolating
+        # them removes that interference. --num-processes 3 (not the previous 2)
+        # is deliberate now that the pool is pg-only: 2 had zero margin even
+        # uncontended by other suites, and 8 shards at 3-wide is 3 rounds instead
+        # of 4. The cross-job slot count in with-test-slot.sh below stays at 2,
+        # unchanged — that number specifically fixes cross-job box saturation
+        # (#3443 AC4); raising it would reopen the problem it exists to solve,
+        # which is a different axis from the within-job pg-only pool size above.
+        #
+        # Telemetry note: each invocation overwrites meson's single
+        # testlog.junit.xml, so only the LAST one's results survive for the
+        # "Finish persistent CI telemetry" step's unmodified default import. The
+        # pg-gated call runs last on purpose — it's the shard timing this whole
+        # investigation has cared about. The two cheap-suite calls do still gate
+        # the job (their own exit code, via bash -e); they just don't get an
+        # individual per-suite ci_test_suites row for this specific job.
         env:
           YUZU_TEST_SLOT_DIR: /tmp/yuzu-bigtam-test-slots
           YUZU_TEST_SLOT_NAME: yuzu-bigtam-heavy
           YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
         run: |
+          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --suite agent --suite docs --suite proto --suite tar --suite gateway
+          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs "server unit tests shard A" "server unit tests shard B" "mcp bridge teardown allocation budget"
           bash scripts/ci/with-test-slot.sh 2 -- \
-            python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2
+            python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 3 "server pg unit tests shard A" "server pg unit tests shard H" "server pg unit tests shard B" "server pg unit tests shard D" "server pg unit tests shard E" "server pg unit tests shard G" "server pg unit tests shard F" "server pg unit tests shard C"
 
       # Break-glass MFA-reset CLI contract (#1226) — exit codes + JSON output of
       # `yuzu-server --mfa-reset` are not exercisable by the Catch2 suite (which

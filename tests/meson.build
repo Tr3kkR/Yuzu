@@ -998,6 +998,16 @@ if build_server
   #     meson-junit names by longest substring match) — 'shard A'/'shard B'/
   #     'shard C'/'shard D'/'shard E'/'shard F'/'shard G'/'shard H' and 'server
   #     unit tests' are pairwise non-substring.
+  #   - `.github/workflows/ci.yml`'s Linux Test step HARDCODES the full list of
+  #     server pg shard names (to isolate them into their own with-test-slot.sh
+  #     invocation, separate from the cheap suites) and separately hardcodes the
+  #     3 non-pg server test names. Renaming/adding/removing a shard, or adding a
+  #     new server test() entry (pg or not), or adding a new top-level `suite:`
+  #     anywhere in the build (tests/meson.build or the root meson.build — see
+  #     the 'gateway' suite, registered there, not here) needs a matching update
+  #     to that step, or the new/renamed test silently stops running in CI. No
+  #     automated check enforces this yet — verify with meson test --list against
+  #     each of the 3 invocations before trusting a change to either side.
   # If a quiet leg pushes a shard past the #2093 80%-of-budget warning, the first
   # move is the concurrency gate / per-op cost (Defender TEMP exclusion, RAM disk),
   # then split or rebalance — raising the number is the last resort, not the first.

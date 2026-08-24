@@ -433,6 +433,34 @@ and carry NEITHER fix — tracked as the remaining open item on #3443. Full
 diagnosis: the `tests/meson.build` server-shard comment (shard E/G split
 history) + #3443.
 
+**Suite isolation (fixed third, same day):** even with the cross-job gate live
+and uncontested — a real run acquired its cross-job slot in 0s, no other job
+competing — shards E and G still TIMEOUT'd at 600.51s/600.54s (SIGKILL'd). The
+within-job `--num-processes` pool was shared by ALL ~32 registered tests, not
+just the 8 pg shards: the Linux Test step ran one `meson test` invocation with
+no `--suite`/name filter at all, so a cheap `agent`/`docs`/`proto`/`tar`/
+`gateway` test occupying one of only 2 slots partway through could extend the
+pg shards' own effective queue even with zero cross-job interference. Fix:
+split the Test step into 3 `flake-retry.py` invocations, cheap-first
+(fail-fast) — the ~24 non-pg tests (5 suites, uncapped, no DB dependency, were
+never the contention source) run first; the 8 pg shards, isolated by exact
+name into their own `with-test-slot.sh`-gated call, run last, now with the
+cross-job pool dedicated entirely to them. `--num-processes` for that isolated
+pool went from 2 to 3 — safe now that it has no cheap-test competition, and
+justified by the same live run: 2 had already proven to have zero margin even
+uncontended. The cross-job slot count in `with-test-slot.sh` stays at 2,
+unchanged — a different axis (box-wide job saturation, #3443 AC4), raising it
+would reopen that problem.
+
+**Drift risk, not yet automated:** the 3-way split hardcodes the 8 pg shard
+names and the 3 non-pg server test names directly in `ci.yml`. A new/renamed
+server test() entry or a new top-level `suite:` (`tests/meson.build` or the
+root `meson.build` — the `gateway` suite lives there, not in `tests/
+meson.build`, and was nearly missed entirely while writing this split) needs a
+matching update on both sides or silently stops running in CI. See the
+cross-reference comment at the shard-naming-invariant block in
+`tests/meson.build`.
+
 ### Persistent runner-local test history
 
 Every self-hosted runner agent owns a separate `test-runs.db` outside its
