@@ -6193,7 +6193,13 @@ TEST_CASE("MCP Integration: execute_instruction zero agents reached",
     REQUIRE(content.size() >= 1);
 
     auto text_str = content[0]["text"].get<std::string>();
-    CHECK(text_str.find("No agents reachable") != std::string::npos);
+    // #881: the message no longer ASSERTS unreachability, because a target can
+    // also be withheld by the containment gate — a permanent policy denial an
+    // agentic caller must not retry. Pin the two halves that carry that
+    // meaning rather than a prefix, so a future reword cannot quietly drop
+    // either one back to the old single-cause claim.
+    CHECK(text_str.find("No agents reached") != std::string::npos);
+    CHECK(text_str.find("quarantine containment gate") != std::string::npos);
 
     // #2712: structuredContent mirrors content[0].text for the zero-agents
     // oneOf branch - status is the stable discriminator, agents_reached is
@@ -12123,16 +12129,24 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
     sqlite3_close(raw);
 }
 
-TEST_CASE("MCP quarantine_device records-only (agents_reached=0) is still a SUCCESS, "
-          "never a failure - pins the schema's minimum:0, not minimum:1",
+TEST_CASE("MCP quarantine_device records-only (agents_reached=0) returns a RETRYABLE "
+          "ERROR, never a success envelope - #3127 pins the schema's minimum:1",
           "[mcp][integration][quarantine][approval][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
-    // #2712: an offline/unreachable device still gets recorded (the isolation
-    // dispatch just never lands) - this is NOT a failure path, and the schema
-    // must accept agents_reached==0 as a valid success value. A naive copy of
-    // execute_instruction's normal-branch minimum:1 onto this tool would be
-    // exactly the wrong constraint here (Fable's review of the #2712 batch 3
-    // plan flagged this as the natural mistake to avoid).
+    // #3127: this test USED to pin the opposite judgement - "records-only is
+    // still a SUCCESS, the schema's minimum:0 not minimum:1" - on the theory
+    // that a naive copy of execute_instruction's minimum:1 would be the wrong
+    // constraint here (Fable's review of the #2712 batch 3 plan flagged that
+    // as the natural mistake to avoid). #3127 inverted that judgement: a
+    // record that is active but whose isolation dispatch was never confirmed
+    // accepted is NOT the same terminal state as genuinely isolated, and a
+    // success envelope for it is the exact phantom-isolated result this issue
+    // is about. The record still persists — an offline/unreachable device is
+    // legitimately recorded, and persisting it is what lets a retry
+    // re-dispatch the stored intent later (see the already_active retry-
+    // contract test below) — but the response no longer claims success over
+    // it; it returns a retryable error instead, and the caller retries the
+    // same call to re-drive dispatch.
     yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
     yuzu::server::QuarantineStore quar(qpool);
     REQUIRE(quar.is_open());
@@ -12179,18 +12193,71 @@ TEST_CASE("MCP quarantine_device records-only (agents_reached=0) is still a SUCC
     auto res2 = ts.call(recall);
     REQUIRE(res2);
     auto body2 = nlohmann::json::parse(res2->body);
-    REQUIRE(body2.contains("result")); // SUCCESS, not an error - recording still worked
-    auto payload2 = write_tool_payload(res2);
-    CHECK(payload2["agents_reached"] == 0);
-    CHECK(payload2["command_id"].get<std::string>().empty());
-    // The record still persisted despite no live dispatch.
+    // #3127: the write succeeded (a new record) but the isolation dispatch
+    // was never confirmed accepted - a RETRYABLE ERROR, never a success
+    // envelope.
+    REQUIRE(body2.contains("error"));
+    CHECK_FALSE(body2.contains("result"));
+    CHECK(body2["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body2["error"]["data"]["retry_after_ms"] == 5000);
+    // The record still persisted despite no confirmed dispatch - that's the
+    // whole point: it survives so a later retry can re-dispatch it (see the
+    // already_active retry-contract test below), the response just refuses
+    // to claim isolation over it.
     auto rec = quar.get_status("agent-offline");
     REQUIRE(rec.has_value()); // read succeeded
     REQUIRE(rec->has_value()); // and found an active record
     CHECK((*rec)->status == "active");
-    // #2712: structuredContent mirrors content[0].text exactly, including the
-    // agents_reached:0 value the schema must accept (minimum:0).
-    CHECK(write_tool_structured(res2) == payload2);
+    // #3127: the audit row is a FAILURE, not a success - the requested
+    // operation was isolation and isolation was not achieved. record_persisted=1
+    // keeps the row honest in the OPPOSITE direction too: an auditor greps it
+    // and can see the record survived (Item C).
+    CHECK(ts.audit_log.back() == "mcp.quarantine_device|failure");
+    REQUIRE_FALSE(ts.audit_details.empty());
+    CHECK(ts.audit_details.back().find("agent_id=agent-offline") != std::string::npos);
+    CHECK(ts.audit_details.back().find("agents_reached=0") != std::string::npos);
+    CHECK(ts.audit_details.back().find("record_persisted=1") != std::string::npos);
+
+    // ── The retry hint must not describe a STABLE state as a transient one ──
+    //
+    // A SECOND recall against the same still-unreachable device. The record
+    // now exists, so this takes the already_active re-dispatch path — and
+    // reaches zero agents again, because the device is offline rather than
+    // momentarily busy. An autonomous caller honouring the 5s hint above would
+    // perform a store write, a store read, a dispatch attempt and an audit
+    // write every five seconds for as long as the device stays down, and
+    // nothing changes until the agent reconnects.
+    //
+    // So the hint backs off, and the message says the thing that actually
+    // resolves the caller's uncertainty: the record is durable and the #881
+    // server-side gate is ALREADY denying every other command to this device,
+    // so containment at the control plane is in force — only the endpoint's
+    // own firewall is still unapplied.
+    auto mint2 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":244,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-offline","reason":"malware"}}})");
+    REQUIRE(mint2);
+    std::string approval_id2 =
+        nlohmann::json::parse(mint2->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id2, "reviewer-bob", ""));
+    std::string recall2 =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":245,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-offline","reason":"malware","approval_id":")" +
+        approval_id2 + R"("}}})";
+    auto res3 = ts.call(recall2);
+    REQUIRE(res3);
+    auto body3 = nlohmann::json::parse(res3->body);
+    REQUIRE(body3.contains("error"));
+    CHECK(body3["error"]["code"] == yuzu::server::mcp::kInternalError);
+    // The discriminator: a FIRST failure keeps 5000 (asserted above, on the
+    // same device, in the same test — so this pair cannot both drift), a
+    // repeat against an already-recorded device backs off.
+    CHECK(body3["error"]["data"]["retry_after_ms"] == 60000);
+    CHECK(body3["error"]["message"].get<std::string>().find(
+              "already denying dispatch to this device") != std::string::npos);
+    // And it must say what does NOT happen. An earlier wording promised the
+    // endpoint firewall would apply on reconnect; nothing does that, and a SOC
+    // analyst who believes it closes the ticket on an uncontained device.
+    CHECK(body3["error"]["message"].get<std::string>().find(
+              "nothing re-applies it automatically on reconnect") != std::string::npos);
 }
 
 TEST_CASE("MCP write tools are advertised in tools/list", "[mcp][integration][tag]") {
@@ -12319,7 +12386,17 @@ TEST_CASE("MCP quarantine_device enforces the per-device scope gate",
         }
         return true;
     };
-    ts.start();
+    // #3127: agents_reached=0 is no longer a success shape - wire a dispatch
+    // stub so the in-scope arm below still reaches a result envelope; this
+    // test is about the scope gate, not the dispatch outcome.
+    auto dispatch = [](const std::string&, const std::string&,
+                       const std::vector<std::string>&, const std::string&,
+                       const std::unordered_map<std::string, std::string>&,
+                       const std::string&,
+                       const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+        return {"cmd-scope", 1};
+    };
+    ts.start_with_dispatch(dispatch);
 
     // Out-of-scope device → denied, no record, no isolation.
     auto denied = ts.call(
@@ -12335,7 +12412,7 @@ TEST_CASE("MCP quarantine_device enforces the per-device scope gate",
     CHECK(calls[0].op == "Execute");
     CHECK(calls[0].agent_id == "agent-outside");
 
-    // In-scope device → recorded (no dispatch_fn wired → record-only).
+    // In-scope device → recorded and dispatched.
     auto ok = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":265,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-inside","reason":"sus"}}})");
     auto payload = write_tool_payload(ok);
@@ -12395,22 +12472,58 @@ TEST_CASE("MCP quarantine_device classifies store failure vs business error "
     ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
                                     const std::string&, const std::string&,
                                     const std::string&) -> bool { return true; };
-    ts.start(); // default tier: no approval gate, single-call round-trip
+    // #3127: the already-quarantined retry section below needs dispatch
+    // wired (agents_reached==1) to reach a result envelope; harmless to the
+    // store-failure section, which returns before dispatch is ever attempted.
+    // `dispatch_calls` is what MAKES that second clause an assertion rather
+    // than a comment — a store failure means the record never persisted, so a
+    // dispatch on that path would isolate a device with nothing durable behind
+    // it and no way for a retry to find the record it should re-drive.
+    int dispatch_calls = 0;
+    auto dispatch = [&](const std::string& plugin, const std::string& action,
+                        const std::vector<std::string>& agent_ids, const std::string&,
+                        const std::unordered_map<std::string, std::string>& params,
+                        const std::string&,
+                        const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+        ++dispatch_calls;
+        ts.last_dispatch_plugin = plugin;
+        ts.last_dispatch_action = action;
+        ts.last_dispatch_agent_ids = agent_ids;
+        ts.last_dispatch_params = params;
+        return {"cmd-retry", 1};
+    };
+    ts.start_with_dispatch(dispatch); // default tier: no approval gate, single-call round-trip
 
-    SECTION("business error: agent already quarantined -> kInvalidParams, no retry") {
-        REQUIRE(quar.quarantine_device("agent-dup", "seed", "pre-seeded", "").has_value());
+    SECTION("retry on an already-quarantined device re-dispatches the STORED intent (#3127)") {
+        // #3127: DELIBERATE divergence from the REST twin — POST
+        // /api/v1/quarantine is record-only and never dispatches, so there is
+        // no dispatch behaviour to keep in parity with (matching the comment
+        // on the handler's already_active branch in mcp_server.cpp).
+        REQUIRE(
+            quar.quarantine_device("agent-dup", "seed", "pre-seeded", "10.0.0.9").has_value());
         auto res = ts.call(
-            R"({"jsonrpc":"2.0","method":"tools/call","id":267,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-dup","reason":"dup"}}})");
+            R"({"jsonrpc":"2.0","method":"tools/call","id":267,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-dup","reason":"dup","whitelist":"10.0.0.42"}}})");
         REQUIRE(res);
         auto body = nlohmann::json::parse(res->body);
-        REQUIRE(body.contains("error"));
-        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
-        CHECK(body["error"]["message"] == "device is already quarantined");
-        // Non-retryable business error: no retry_after_ms hint.
-        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        REQUIRE(body.contains("result")); // re-dispatch succeeded, NOT a terminal error
+        CHECK_FALSE(body.contains("error"));
+        auto payload = write_tool_payload(res);
+        CHECK(payload["record_pre_existing"] == true);
+        CHECK(payload["dispatch_confirmed"] == true);
+        // The STORED whitelist ("10.0.0.9") reached dispatch, never the retry
+        // call's own unpersisted one ("10.0.0.42") - dispatching the
+        // request's value would silently rewrite the device's firewall
+        // allow-list with no store update and no audit trail.
+        CHECK(ts.last_dispatch_params.at("whitelist_ips") == "10.0.0.9");
+        CHECK(payload["quarantine_record"]["whitelist"] == "10.0.0.9");
+        CHECK(payload["whitelist_request_ignored"] == true);
         REQUIRE_FALSE(ts.audit_details.empty());
-        CHECK(ts.audit_details.back().find("agent_id=agent-dup, device is already quarantined") !=
-              std::string::npos);
+        CHECK(ts.audit_details.back().find("record_pre_existing=1") != std::string::npos);
+        CHECK(ts.audit_details.back().find("whitelist_ignored=1") != std::string::npos);
+        // The positive twin of the store-failure section's assertion: this
+        // path DOES dispatch, exactly once. Both sections share one counter so
+        // neither can pass by the dispatch stub simply never being wired.
+        CHECK(dispatch_calls == 1);
     }
 
     SECTION("store failure: schema dropped -> kInternalError, retryable") {
@@ -12434,6 +12547,13 @@ TEST_CASE("MCP quarantine_device classifies store failure vs business error "
         CHECK(ts.audit_details.back().find("agent_id=agent-degraded, ") != std::string::npos);
         CHECK(ts.audit_details.back().find(yuzu::server::kQuarantineDbErrorPrefix) !=
               std::string::npos);
+        // The half the error envelope alone cannot show: nothing was
+        // dispatched. `should_dispatch_isolation(store_error)` is false in the
+        // decision core, and this is the production path proving the handler
+        // honours it — an isolation dispatched against a write that never
+        // landed leaves a contained device with no record to release it by.
+        CHECK(dispatch_calls == 0);
+        CHECK(ts.last_dispatch_plugin.empty());
     }
 }
 
