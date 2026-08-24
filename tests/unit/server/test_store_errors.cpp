@@ -81,3 +81,54 @@ TEST_CASE("strip_conflict_prefix handles boundary inputs without underflow",
     // is_conflict_error matches the prefix even if the body contains NULs.
     CHECK(is_conflict_error(nul_after_prefix));
 }
+
+// #753: kind_mismatch_error()/kind_missing_error() unify the kind-validation
+// wording across PolicyStore, WorkflowEngine and ProductPackStore. These
+// pin the exact byte output so a refactor of either helper can't silently
+// drift what operators see.
+TEST_CASE("kind_mismatch_error produces the exact two-argument message",
+          "[store_errors]") {
+    CHECK(kind_mismatch_error("Workflow", "Policy") ==
+          "kind must be 'Workflow', got 'Policy'. yaml_source must be a "
+          "complete YAML document including 'apiVersion: yuzu.io/v1alpha1' "
+          "and 'kind: Workflow'.");
+}
+
+TEST_CASE("kind_missing_error produces the exact message", "[store_errors]") {
+    CHECK(kind_missing_error() ==
+          "kind is required. yaml_source must be a complete YAML document "
+          "including 'apiVersion: yuzu.io/v1alpha1' and a 'kind:' field.");
+}
+
+TEST_CASE("kind_mismatch_error wording agrees across stores modulo the "
+          "substituted kind",
+          "[store_errors]") {
+    // Cross-store wording agreement asserted mechanically: swap the
+    // expected kind for the substring that would differ, and the three
+    // results must then be byte-identical.
+    auto fragment_msg = kind_mismatch_error("PolicyFragment", "X");
+    auto policy_msg = kind_mismatch_error("Policy", "X");
+    auto workflow_msg = kind_mismatch_error("Workflow", "X");
+
+    auto normalize = [](std::string s, std::string_view kind) {
+        std::string placeholder = "<KIND>";
+        std::string::size_type pos = 0;
+        while ((pos = s.find(kind, pos)) != std::string::npos) {
+            s.replace(pos, kind.size(), placeholder);
+            pos += placeholder.size();
+        }
+        return s;
+    };
+
+    auto fragment_norm = normalize(fragment_msg, "PolicyFragment");
+    auto policy_norm = normalize(policy_msg, "Policy");
+    auto workflow_norm = normalize(workflow_msg, "Workflow");
+
+    CHECK(fragment_norm == policy_norm);
+    CHECK(policy_norm == workflow_norm);
+
+    // Sanity: the un-normalized messages actually differ (otherwise the
+    // check above would be vacuous).
+    CHECK(fragment_msg != policy_msg);
+    CHECK(policy_msg != workflow_msg);
+}
