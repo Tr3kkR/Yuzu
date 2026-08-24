@@ -13,7 +13,7 @@ if host_machine.system() == 'darwin'
     network_config_deps += network_config_sc_dep
     network_config_cpp_args += ['-DYUZU_HAVE_SYSTEMCONFIGURATION']
   else
-    message('NETWORK_CONFIG: SystemConfiguration framework not found -- dns_servers/proxy '
+    warning('NETWORK_CONFIG: SystemConfiguration framework not found -- dns_servers/proxy '
             + 'compile as an honest UNAVAILABLE fallback.')
   endif
 endif

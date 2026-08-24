@@ -201,6 +201,47 @@ TEST_CASE("ipv6_prefix_length converts common netmasks to their CIDR prefix leng
     }
 }
 
+// ── format_mac: the non-6-byte guard IS the anti-fabrication fix ───────────
+//
+// The Linux decoder now refuses a non-6-byte IFLA_ADDRESS, but the guard lives
+// in format_mac itself and on macOS every caller passes exactly 6, so nothing
+// exercised it at any level on this host. These pin the contract directly.
+
+TEST_CASE("format_mac formats exactly six bytes and refuses any other length",
+          "[network_config][mac]") {
+    const unsigned char six[6] = {0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff};
+    CHECK(yuzu::network_config::format_mac(six, 6) == "aa:bb:cc:dd:ee:ff");
+
+    // Lowercase hex, zero-padded — a leading-zero byte must not collapse.
+    const unsigned char padded[6] = {0x00, 0x01, 0x02, 0x0a, 0x0b, 0x0c};
+    CHECK(yuzu::network_config::format_mac(padded, 6) == "00:01:02:0a:0b:0c");
+
+    // Never a fabricated MAC: not truncated from longer, not padded from
+    // shorter, not produced from nothing.
+    const unsigned char twenty[20] = {0x80, 0x00, 0x02, 0x08, 0xfe, 0x80, 0x00, 0x00, 0x00, 0x00,
+                                      0x00, 0x00, 0xf4, 0x52, 0x14, 0x03, 0x00, 0x7b, 0xcb, 0xa1};
+    CHECK(yuzu::network_config::format_mac(twenty, 20).empty());
+    CHECK(yuzu::network_config::format_mac(twenty, 8).empty());
+    CHECK(yuzu::network_config::format_mac(six, 5).empty());
+    CHECK(yuzu::network_config::format_mac(six, 0).empty());
+}
+
+// ── join_bypass_list: the macOS `bypass|` row, present on nearly every Mac ──
+
+TEST_CASE("join_bypass_list comma-joins entries and drops empties", "[network_config][proxy]") {
+    using yuzu::network_config::join_bypass_list;
+    // The default macOS exception list, verbatim from a live host.
+    CHECK(join_bypass_list({"*.local", "169.254/16"}) == "*.local,169.254/16");
+    CHECK(join_bypass_list({"a"}) == "a");
+    // An empty element must not produce a doubled or trailing comma.
+    CHECK(join_bypass_list({"a", "", "b"}) == "a,b");
+    CHECK(join_bypass_list({"", "a"}) == "a");
+    CHECK(join_bypass_list({"a", ""}) == "a");
+    // Nothing survivable -> empty, and the caller then emits no row at all.
+    CHECK(join_bypass_list({}).empty());
+    CHECK(join_bypass_list({"", ""}).empty());
+}
+
 // ── REGRESSION PIN: macOS proxy service selection (portable, pure) ─────────
 //
 // SCDynamicStoreCopyProxies returns the PRIMARY service's settings at the top
@@ -211,9 +252,16 @@ TEST_CASE("ipv6_prefix_length converts common netmasks to their CIDR prefix leng
 // `compliance`.
 //
 // select_proxy is the DECISION half, split from the CF ACQUISITION half so it
-// can be fixture-tested at all (pure core, thin shell). NOTE the untested
-// remainder: the __SCOPED__ key enumeration itself has no fixture surface and
-// is NOT covered by these cases.
+// can be fixture-tested at all (pure core, thin shell).
+//
+// DECLARED UNTESTED REMAINDER for the whole macOS proxy/DNS surface, so the
+// pure-function coverage below is not read as more than it proves:
+//   - the __SCOPED__ per-service key enumeration (a live CF dictionary walk);
+//   - the SCDynamicStoreCopyKeyList service-key enumeration behind the DNS
+//     union;
+//   - the CF decode of each proxy dictionary into ProxyServiceConfig.
+// Each is a live CoreFoundation read with no fixture surface. The DECISIONS
+// they feed (select_proxy, union_dns_servers, join_bypass_list) are pinned.
 
 TEST_CASE("select_proxy reports a non-primary service's proxy when the primary has none",
           "[network_config][proxy]") {

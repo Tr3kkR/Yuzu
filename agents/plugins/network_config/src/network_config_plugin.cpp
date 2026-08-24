@@ -391,6 +391,11 @@ std::string sockaddr_to_string(LPSOCKADDR sa) {
 
 constexpr std::size_t kNetlinkRecvBufSize = 16384; // matches net_quality_sampler.cpp's convention
 
+// How many non-kernel datagrams a dump will discard before giving up. Small:
+// on a healthy host this is always 0, and the only thing that produces them is
+// a local process writing to our netlink socket.
+constexpr int kMaxForeignDatagrams = 64;
+
 yuzu::agent::ScopedFd open_rtnetlink_socket() {
     yuzu::agent::ScopedFd fd{::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)};
     if (fd.get() >= 0) {
@@ -438,11 +443,16 @@ LinkDumpResult fetch_link_dump() {
     m.msg_namelen = sizeof(sa);
     m.msg_iov = &iov;
     m.msg_iovlen = 1;
-    if (::sendmsg(fd.get(), &m, 0) <= 0)
+    ssize_t sent;
+    do {
+        sent = ::sendmsg(fd.get(), &m, 0);
+    } while (sent < 0 && errno == EINTR); // symmetry with the recvmsg loop below
+    if (sent <= 0)
         return result;
 
     alignas(NLMSG_ALIGNTO) unsigned char buf[kNetlinkRecvBufSize];
     bool truncated = false;
+    int foreign_datagrams = 0;
     for (;;) {
         struct sockaddr_nl rsa {};
         struct iovec riov {buf, sizeof(buf)};
@@ -466,8 +476,17 @@ LinkDumpResult fetch_link_dump() {
         // agent runs under its own account precisely so local users cannot
         // influence it (docs/agent-privilege-model.md). Only the kernel sends
         // from portid 0.
-        if (rsa.nl_pid != 0)
+        if (rsa.nl_pid != 0) {
+            // BOUNDED discard. SO_RCVTIMEO only fires on SILENCE, so an
+            // unbounded `continue` here would let the same local process the
+            // origin check defends against pin this thread indefinitely by
+            // simply keeping the socket busy — trading a spoofing defect for
+            // an availability one. Give up after a small budget and report an
+            // incomplete read.
+            if (++foreign_datagrams > kMaxForeignDatagrams)
+                return result; // ok stays false — honest incomplete read
             continue; // not from the kernel — discard, do not parse
+        }
 
         // MSG_TRUNC means the kernel discarded the tail of this datagram
         // because it exceeded our fixed buffer. If the retained prefix ends on
@@ -522,11 +541,16 @@ AddrDumpResult fetch_addr_dump() {
     m.msg_namelen = sizeof(sa);
     m.msg_iov = &iov;
     m.msg_iovlen = 1;
-    if (::sendmsg(fd.get(), &m, 0) <= 0)
+    ssize_t sent;
+    do {
+        sent = ::sendmsg(fd.get(), &m, 0);
+    } while (sent < 0 && errno == EINTR); // symmetry with the recvmsg loop below
+    if (sent <= 0)
         return result;
 
     alignas(NLMSG_ALIGNTO) unsigned char buf[kNetlinkRecvBufSize];
     bool truncated = false;
+    int foreign_datagrams = 0;
     for (;;) {
         struct sockaddr_nl rsa {};
         struct iovec riov {buf, sizeof(buf)};
@@ -550,8 +574,17 @@ AddrDumpResult fetch_addr_dump() {
         // agent runs under its own account precisely so local users cannot
         // influence it (docs/agent-privilege-model.md). Only the kernel sends
         // from portid 0.
-        if (rsa.nl_pid != 0)
+        if (rsa.nl_pid != 0) {
+            // BOUNDED discard. SO_RCVTIMEO only fires on SILENCE, so an
+            // unbounded `continue` here would let the same local process the
+            // origin check defends against pin this thread indefinitely by
+            // simply keeping the socket busy — trading a spoofing defect for
+            // an availability one. Give up after a small budget and report an
+            // incomplete read.
+            if (++foreign_datagrams > kMaxForeignDatagrams)
+                return result; // ok stays false — honest incomplete read
             continue; // not from the kernel — discard, do not parse
+        }
 
         // MSG_TRUNC means the kernel discarded the tail of this datagram
         // because it exceeded our fixed buffer. If the retained prefix ends on
@@ -606,11 +639,16 @@ RouteDumpResult fetch_default_route_dump() {
     m.msg_namelen = sizeof(sa);
     m.msg_iov = &iov;
     m.msg_iovlen = 1;
-    if (::sendmsg(fd.get(), &m, 0) <= 0)
+    ssize_t sent;
+    do {
+        sent = ::sendmsg(fd.get(), &m, 0);
+    } while (sent < 0 && errno == EINTR); // symmetry with the recvmsg loop below
+    if (sent <= 0)
         return result;
 
     alignas(NLMSG_ALIGNTO) unsigned char buf[kNetlinkRecvBufSize];
     bool truncated = false;
+    int foreign_datagrams = 0;
     for (;;) {
         struct sockaddr_nl rsa {};
         struct iovec riov {buf, sizeof(buf)};
@@ -634,8 +672,17 @@ RouteDumpResult fetch_default_route_dump() {
         // agent runs under its own account precisely so local users cannot
         // influence it (docs/agent-privilege-model.md). Only the kernel sends
         // from portid 0.
-        if (rsa.nl_pid != 0)
+        if (rsa.nl_pid != 0) {
+            // BOUNDED discard. SO_RCVTIMEO only fires on SILENCE, so an
+            // unbounded `continue` here would let the same local process the
+            // origin check defends against pin this thread indefinitely by
+            // simply keeping the socket busy — trading a spoofing defect for
+            // an availability one. Give up after a small budget and report an
+            // incomplete read.
+            if (++foreign_datagrams > kMaxForeignDatagrams)
+                return result; // ok stays false — honest incomplete read
             continue; // not from the kernel — discard, do not parse
+        }
 
         // MSG_TRUNC means the kernel discarded the tail of this datagram
         // because it exceeded our fixed buffer. If the retained prefix ends on
@@ -850,8 +897,17 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
 
     auto route = fetch_default_route_dump();
     std::string default_gw = "-";
-    if (!route.records.empty())
-        default_gw = route.records.front().gateway;
+    bool gateway_unresolved = false;
+    for (const auto& r : route.records) {
+        if (!r.gateway.empty()) {
+            default_gw = r.gateway;
+            break;
+        }
+        // A main-table default route WAS present but its gateway sits in a
+        // nexthop form this leg cannot resolve. Emitting "-" unqualified would
+        // claim the host has no default route.
+        gateway_unresolved = true;
+    }
 
     auto addrs = fetch_addr_dump();
     for (const auto& rec : addrs.records) {
@@ -881,6 +937,9 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
     if (!links.ok || !addrs.ok || !route.ok) {
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               "network_config:rtnetlink_dump_incomplete");
+    } else if (gateway_unresolved) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "network_config:default_gateway_unresolved_nexthop");
     }
 
 #elif defined(__APPLE__)
@@ -1041,9 +1100,16 @@ int do_dns_servers(yuzu::CommandContext& ctx) {
         // list. The ordered union/dedupe is the pure half (union_dns_servers).
         std::vector<std::vector<std::string>> server_groups;
         {
-            yuzu::agent::ScopedCFRef<CFDictionaryRef> dns_dict(static_cast<CFDictionaryRef>(
-                SCDynamicStoreCopyValue(store.get(), CFSTR("State:/Network/Global/DNS"))));
-            server_groups.push_back(extract_server_addresses(dns_dict.get()));
+            // SCDynamicStoreCopyValue returns CFPropertyListRef — type-check
+            // the DICTIONARY itself, not only the ServerAddresses value inside
+            // it. CFRelease is type-agnostic so ScopedCFRef stays correct
+            // either way; the cast is what would be unsound.
+            yuzu::agent::ScopedCFRef<CFPropertyListRef> dns_v(
+                SCDynamicStoreCopyValue(store.get(), CFSTR("State:/Network/Global/DNS")));
+            if (dns_v && CFGetTypeID(dns_v.get()) == CFDictionaryGetTypeID()) {
+                server_groups.push_back(extract_server_addresses(
+                    static_cast<CFDictionaryRef>(dns_v.get())));
+            }
         }
         {
             // SCDynamicStoreCopyKeyList's `pattern` argument is ALWAYS a
@@ -1059,9 +1125,12 @@ int do_dns_servers(yuzu::CommandContext& ctx) {
                     if (!key_v || CFGetTypeID(key_v) != CFStringGetTypeID())
                         continue; // type-check every CF cast, as the rest of this file does
                     auto* key = static_cast<CFStringRef>(key_v);
-                    yuzu::agent::ScopedCFRef<CFDictionaryRef> svc_dict(
-                        static_cast<CFDictionaryRef>(SCDynamicStoreCopyValue(store.get(), key)));
-                    server_groups.push_back(extract_server_addresses(svc_dict.get()));
+                    yuzu::agent::ScopedCFRef<CFPropertyListRef> svc_v(
+                        SCDynamicStoreCopyValue(store.get(), key));
+                    if (!svc_v || CFGetTypeID(svc_v.get()) != CFDictionaryGetTypeID())
+                        continue; // same type-identity guard as the global key
+                    server_groups.push_back(extract_server_addresses(
+                        static_cast<CFDictionaryRef>(svc_v.get())));
                 }
             }
         }
@@ -1205,6 +1274,15 @@ int do_proxy(yuzu::CommandContext& ctx) {
         // so a future OS that drops or renames it degrades to the previous
         // result rather than failing. Every value is type-checked below.
         const void* scoped_v = CFDictionaryGetValue(proxies.get(), CFSTR("__SCOPED__"));
+        if (!scoped_v || CFGetTypeID(scoped_v) != CFDictionaryGetTypeID()) {
+            // Falling back to top-level-only is exactly the regression the
+            // scoped walk exists to fix (an Ethernet-primary Mac with a Wi-Fi
+            // proxy reads as none). It is the right fallback, but it must not
+            // be silent — if a future macOS drops or renames this key we want
+            // a trace rather than a quiet return to the old behaviour.
+            spdlog::debug("network_config: proxies dictionary has no usable __SCOPED__ entry; "
+                          "reporting the primary service only");
+        }
         if (scoped_v && CFGetTypeID(scoped_v) == CFDictionaryGetTypeID()) {
             auto* scoped = static_cast<CFDictionaryRef>(scoped_v);
             const CFIndex n = CFDictionaryGetCount(scoped);
@@ -1240,18 +1318,17 @@ int do_proxy(yuzu::CommandContext& ctx) {
                                 : nullptr;
         if (bypass_list) {
             const CFIndex count = CFArrayGetCount(bypass_list);
-            std::string joined;
+            std::vector<std::string> entries;
+            entries.reserve(static_cast<std::size_t>(count));
             for (CFIndex i = 0; i < count; ++i) {
                 const void* item_v = CFArrayGetValueAtIndex(bypass_list, i);
                 if (!item_v || CFGetTypeID(item_v) != CFStringGetTypeID())
                     continue; // never call CFString APIs on a non-string element
-                auto s = cfstring_to_utf8(static_cast<CFStringRef>(item_v));
-                if (s.empty())
-                    continue;
-                if (!joined.empty())
-                    joined += ',';
-                joined += s;
+                entries.push_back(cfstring_to_utf8(static_cast<CFStringRef>(item_v)));
             }
+            // Formatting is the pure half (join_bypass_list); the CF walk above
+            // is the acquisition half.
+            const std::string joined = yuzu::network_config::join_bypass_list(entries);
             if (!joined.empty())
                 ctx.write_output(std::format("bypass|{}", joined));
         }
@@ -1307,17 +1384,35 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "dns_servers",
         /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/etc/resolv.conf read", nullptr},
+#if defined(__APPLE__) && !defined(YUZU_HAVE_SYSTEMCONFIGURATION)
+        // Built without SystemConfiguration: the leg returns UNAVAILABLE, so
+        // the descriptor must not advertise it as supported.
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr,
+         "built without the SystemConfiguration framework"},
+#else
         /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "SCDynamicStore", nullptr},
+#endif
         /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetAdaptersAddresses", nullptr},
     },
     {
         /* .action      = */ "proxy",
-        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "environment variables", nullptr},
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 1, "environment variables",
+         "reads the *_proxy variables from the agent process's own environment only; a "
+         "system-wide, desktop-session or package-manager proxy the agent did not inherit is "
+         "not reported"},
+#if defined(__APPLE__) && !defined(YUZU_HAVE_SYSTEMCONFIGURATION)
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr,
+         "built without the SystemConfiguration framework"},
+#else
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 1, "SCDynamicStoreCopyProxies",
          "reports the HTTP proxy and PAC URL, checking the primary network service first and "
          "then each scoped per-interface service; HTTPS/SOCKS/FTP proxies are not reported, so "
          "a host configured with only those reads as none"},
+#endif
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "WinHttpGetIEProxyConfigForCurrentUser", nullptr},
     },

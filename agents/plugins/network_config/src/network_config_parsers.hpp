@@ -11,10 +11,13 @@
  *
  * Three families:
  *   - /proc/net/arp text parsing (Linux arp leg). A standalone copy, not a
- *     re-include of discovery_parsers.hpp — docs/cpp-conventions.md forbids
- *     reaching across plugin directories; same kernel format, independently
- *     maintained, own field set (this plugin's arp action needs the
- *     interface name and a static/dynamic type discovery.hpp doesn't).
+ *     re-include of discovery_parsers.hpp — the two decoders read the same
+ *     kernel format but produce DIFFERENT field sets (this plugin's arp
+ *     action needs the interface name and a static/dynamic type that
+ *     discovery's does not), so neither is a superset of the other. If the
+ *     two ever need to converge, the shared core belongs in agents/shared/
+ *     as a zero-dependency header-only leaf — where this plugin already gets
+ *     route_sysctl_arp.hpp from — with the two field-set wrappers on top.
  *   - resolvectl-cache / systemd-resolve-statistics captured-stdout line
  *     parsers (Linux dns_cache legs), moved here from the old inline
  *     istringstream loops in network_config_plugin.cpp.
@@ -37,6 +40,12 @@
  *     and every attribute value — are memcpy'd into locally-aligned objects
  *     before any field is read. parse_default_route_dump() takes no such
  *     precondition: it memcpys throughout.
+ *
+ *     The fixture tests satisfy the same precondition by a DIFFERENT
+ *     mechanism: they build messages in a std::vector<unsigned char>, whose
+ *     allocator returns storage aligned to at least alignof(max_align_t),
+ *     which exceeds NLMSG_ALIGNTO. They do not declare alignas themselves —
+ *     an earlier version of this comment said they did, which was false.
  */
 #pragma once
 
@@ -199,7 +208,7 @@ inline std::vector<std::string> parse_systemd_resolve_stats_lines(std::string_vi
 inline std::string format_mac(const unsigned char* addr, std::size_t len) {
     if (len != 6)
         return {};
-    static const char* kHex = "0123456789abcdef";
+    static constexpr char kHex[] = "0123456789abcdef";
     std::string out;
     out.reserve(17);
     for (std::size_t i = 0; i < 6; ++i) {
@@ -257,6 +266,26 @@ union_dns_servers(const std::vector<std::vector<std::string>>& groups) {
     for (const auto& g : groups)
         all.insert(all.end(), g.begin(), g.end());
     return dedupe_preserve_order(all);
+}
+
+/**
+ * Join a proxy exception list into the `bypass|<list>` row's payload. Pure.
+ *
+ * Empty and whitespace-only entries are dropped; the result is empty when
+ * nothing survives, and the caller then emits no row at all. Split out from
+ * the CoreFoundation array walk so the formatting has a fixture surface —
+ * this row appears on essentially every Mac, and previously had none.
+ */
+inline std::string join_bypass_list(const std::vector<std::string>& entries) {
+    std::string joined;
+    for (const auto& e : entries) {
+        if (e.empty())
+            continue;
+        if (!joined.empty())
+            joined += ',';
+        joined += e;
+    }
+    return joined;
 }
 
 /// One network service's proxy configuration, decoded from whichever
@@ -338,17 +367,28 @@ inline unsigned int ipv4_prefix_length(std::uint32_t host_order_mask) {
 }
 
 /**
- * Same, for a 16-byte IPv6 netmask in on-wire (network) byte order — a
- * byte array has no host/network distinction, so no conversion is needed
- * before calling this (unlike ipv4_prefix_length's host-order `uint32_t`).
+ * Count of LEADING 1-bits in a 16-byte IPv6 netmask, in on-wire (network)
+ * byte order — a byte array has no host/network distinction, so no
+ * conversion is needed before calling this (unlike ipv4_prefix_length's
+ * host-order `uint32_t`).
+ *
+ * "Leading" is literal: the walk stops at the first byte that is not 0xFF,
+ * after counting that byte's own leading run. An earlier version summed each
+ * byte's run independently, which returned 16 for a non-contiguous mask like
+ * ff:00:ff:… where the IPv4 function would correctly return 8. Real netmasks
+ * are contiguous so no shipped host could tell the difference, but the two
+ * functions now agree by construction rather than by luck.
  */
 inline unsigned int ipv6_prefix_length(const unsigned char (&mask)[16]) {
     unsigned int prefix = 0;
     for (unsigned char byte : mask) {
+        const bool full = (byte == 0xFF);
         while (byte & 0x80) {
             ++prefix;
             byte <<= 1;
         }
+        if (!full)
+            break; // stop at the first non-0xFF byte — see the note above
     }
     return prefix;
 }
@@ -401,8 +441,9 @@ struct RtAddrRecord {
 };
 
 struct RtRouteRecord {
-    std::string gateway; // the default route's RTA_GATEWAY, formatted
+    std::string gateway; // the default route's gateway, formatted
 };
+
 
 /// One recvmsg()-sized chunk's decode result. `records` accumulates across
 /// chunks in the caller's (impure) drain loop; `done`/`error`/`truncated`
@@ -626,6 +667,7 @@ inline RtRouteParse parse_rtnetlink_route_chunk(std::span<const unsigned char> b
         // RTA_TABLE attribute and rtm_table holds RT_TABLE_UNSPEC/COMPAT
         // instead. RTA_TABLE therefore OVERRIDES rtm_table when present.
         std::uint32_t table = rtm.rtm_table;
+        bool saw_nexthop_form = false;
         for (; RTA_OK(rta, rta_len); rta = RTA_NEXT(rta, rta_len)) {
             if (rta->rta_type == RTA_GATEWAY && RTA_PAYLOAD(rta) >= 4) {
                 unsigned char addr_bytes[4]{};
@@ -633,7 +675,46 @@ inline RtRouteParse parse_rtnetlink_route_chunk(std::span<const unsigned char> b
                 char text[INET_ADDRSTRLEN]{};
                 if (::inet_ntop(AF_INET, addr_bytes, text, sizeof(text)))
                     gw = text;
-            } else if (rta->rta_type == RTA_TABLE && RTA_PAYLOAD(rta) >= sizeof(std::uint32_t)) {
+            } else if (rta->rta_type == RTA_MULTIPATH) {
+                // An ECMP / multi-uplink default route carries NO top-level
+                // RTA_GATEWAY: each nexthop sits in an rtnexthop array with
+                // its own. The pre-migration leg searched the whole
+                // `ip route show default` blob for "via ", which matched the
+                // first `nexthop via …` line, so those hosts DID report a
+                // gateway. Decoding only RTA_GATEWAY would silently regress
+                // every ECMP host to "-". Take the first nexthop's gateway,
+                // matching the oracle's first-match behaviour.
+                saw_nexthop_form = true;
+                int nh_len = static_cast<int>(RTA_PAYLOAD(rta));
+                const auto* nh = static_cast<const struct rtnexthop*>(RTA_DATA(rta));
+                while (gw.empty() && RTNH_OK(nh, nh_len)) {
+                    int sub_len = static_cast<int>(nh->rtnh_len) -
+                                  static_cast<int>(sizeof(struct rtnexthop));
+                    if (sub_len > 0) {
+                        const auto* sub = reinterpret_cast<const struct rtattr*>(
+                            reinterpret_cast<const unsigned char*>(nh) +
+                            NLMSG_ALIGN(sizeof(struct rtnexthop)));
+                        for (; RTA_OK(sub, sub_len); sub = RTA_NEXT(sub, sub_len)) {
+                            if (sub->rta_type == RTA_GATEWAY && RTA_PAYLOAD(sub) >= 4) {
+                                unsigned char nb[4]{};
+                                std::memcpy(nb, RTA_DATA(sub), 4);
+                                char ntext[INET_ADDRSTRLEN]{};
+                                if (::inet_ntop(AF_INET, nb, ntext, sizeof(ntext)))
+                                    gw = ntext;
+                                break;
+                            }
+                        }
+                    }
+                    nh = RTNH_NEXT(nh);
+                }
+            } else if (rta->rta_type == RTA_NH_ID) {
+                // An `ip nexthop`-object route references a nexthop group by
+                // id; resolving it needs a separate RTM_GETNEXTHOP dump this
+                // leg does not perform. Flag it so the caller degrades
+                // honestly instead of claiming there is no gateway.
+                saw_nexthop_form = true;
+            } else if (rta->rta_type == RTA_TABLE &&
+                       static_cast<std::size_t>(RTA_PAYLOAD(rta)) >= sizeof(std::uint32_t)) {
                 std::uint32_t t = 0;
                 std::memcpy(&t, RTA_DATA(rta), sizeof(t));
                 table = t;
@@ -652,7 +733,12 @@ inline RtRouteParse parse_rtnetlink_route_chunk(std::span<const unsigned char> b
         // 172.17.0.1, the unfiltered dump returned the table-100 route first.
         if (table != RT_TABLE_MAIN)
             continue;
-        if (!gw.empty()) {
+        // A main-table default route in a nexthop form this parser cannot
+        // resolve (an `ip nexthop` object, or a multipath array carrying no
+        // IPv4 RTA_GATEWAY) is pushed with an EMPTY gateway. The caller takes
+        // the first non-empty one and, finding none, reports a degraded read
+        // instead of the positive claim "this host has no default gateway".
+        if (!gw.empty() || saw_nexthop_form) {
             RtRouteRecord rec;
             rec.gateway = std::move(gw);
             out.records.push_back(std::move(rec));

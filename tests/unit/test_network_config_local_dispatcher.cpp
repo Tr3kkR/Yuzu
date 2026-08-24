@@ -65,6 +65,20 @@ std::vector<std::string> rows_with_prefix(const std::string& captured, const std
     return out;
 }
 
+// The plugin is resolved by a path relative to the build root, so running the
+// test binary from another cwd finds nothing. That is a legitimate skip for a
+// developer invoking the binary by hand — but under `meson test`, which always
+// sets MESON_BUILD_ROOT and runs from the right place, a missing plugin means
+// the build is genuinely broken and must NOT report "All tests passed".
+void require_plugin_or_skip() {
+    if (std::getenv("MESON_BUILD_ROOT") != nullptr) {
+        FAIL("network_config plugin library not found under meson test — the plugin did not "
+             "build, or link_depends is not forcing it to build before this test runs");
+    }
+    WARN("network_config plugin library not found -- skipping LocalDispatcher round-trip test "
+         "(run from the build root, or via `meson test`, to exercise it)");
+}
+
 std::vector<std::string> split_fields(const std::string& row) {
     std::vector<std::string> out;
     std::string cur;
@@ -132,7 +146,7 @@ TEST_CASE("network_config plugin: adapters lists at least one real interface via
          "[network_config][posix_actions]") {
     auto plugin = load_network_config_plugin();
     if (!plugin) {
-        WARN("network_config plugin library not found -- skipping LocalDispatcher round-trip test");
+        require_plugin_or_skip();
         return;
     }
 
@@ -145,12 +159,26 @@ TEST_CASE("network_config plugin: adapters lists at least one real interface via
     // on the OUTPUT so a broken or reverted leg actually turns this red.
     const auto rows = rows_with_prefix(result.captured, "adapter|");
 
+    // NOT platform-gated, deliberately. Every supported host has at least one
+    // interface this leg reports: macOS reports lo0, and a Linux host — even a
+    // bare container — has at least `lo` plus its own interface, of which the
+    // Linux leg reports everything except `lo`. An empty row set therefore
+    // means the leg failed, and it must fail the test on EVERY platform.
+    //
+    // This assertion was originally written inside the __APPLE__ block below,
+    // which made the whole case degenerate to `CHECK(rc == 0)` plus a loop
+    // over an empty vector on Linux — one assertion, and green against a
+    // completely broken rtnetlink leg, since do_adapters() returns 0 on
+    // getifaddrs failure and on an incomplete dump alike. Linux is the only
+    // platform where the new rtnetlink code actually executes, so gating the
+    // one load-bearing guard behind macOS inverted the test's purpose.
+    REQUIRE_FALSE(rows.empty());
+
 #if defined(__APPLE__)
     // macOS always has lo0, and the pre-migration `ifconfig -a` leg reported
     // it as a real adapter row. An early migration draft copied a loopback
     // skip here from do_ip_addresses and silently dropped it -- caught only
     // by a live before/after parity diff. This pins that regression.
-    REQUIRE_FALSE(rows.empty());
     bool saw_lo0 = false;
     for (const auto& r : rows) {
         if (r.rfind("adapter|lo0|", 0) == 0)
@@ -176,7 +204,7 @@ TEST_CASE("network_config plugin: arp exercises the real native leg without erro
          "[network_config][posix_actions]") {
     auto plugin = load_network_config_plugin();
     if (!plugin) {
-        WARN("network_config plugin library not found -- skipping");
+        require_plugin_or_skip();
         return;
     }
 
