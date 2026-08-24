@@ -564,10 +564,17 @@ TEST_CASE("link_status_string reports up only for IF_OPER_UP", "[network_config]
         CHECK(std::string{link_status_string(rec)} == "down");
     }
 
-    // Attribute absent: iproute2 printed "UNKNOWN", which the old leg mapped
-    // to "down". Deliberately NOT the administrative flag.
+    // Attribute ABSENT (oper_state == -1) is a different case from an
+    // ATTACHED IF_OPER_UNKNOWN value (0), tested above. The kernel always
+    // attaches IFLA_OPERSTATE in practice, so this is defensive: the old
+    // leg's `status` variable kept its own initialiser, "unknown", when no
+    // `state` token appeared at all -- link_status_string matches that
+    // initialiser exactly, not the administrative flag and not a fabricated
+    // "down" (see the CLA-9 finding: an earlier version of this function and
+    // this test both asserted "down" here on an unverified claim about how
+    // iproute2 renders a missing attribute).
     rec.oper_state = -1;
-    CHECK(std::string{link_status_string(rec)} == "down");
+    CHECK(std::string{link_status_string(rec)} == "unknown");
 }
 
 TEST_CASE("parse_rtnetlink_link_chunk never fabricates a MAC from a non-6-byte IFLA_ADDRESS",
@@ -664,6 +671,71 @@ TEST_CASE("parse_rtnetlink_addr_chunk decodes an IPv6 address without a label",
     CHECK(parsed.records[0].label.empty());
     CHECK(parsed.records[0].is_ipv6);
 }
+
+// Builds a default route with NO top-level RTA_GATEWAY, carrying an
+// RTA_MULTIPATH attribute instead: an array of rtnexthop structs, each
+// optionally followed by its own nested RTA_GATEWAY. A nullptr entry models a
+// nexthop that itself carries no gateway (skipped when searching for the
+// first resolvable one).
+std::vector<unsigned char>
+build_multipath_route_message(std::uint32_t seq, const std::vector<const unsigned char*>& gateways,
+                              unsigned char table = RT_TABLE_MAIN) {
+    std::vector<unsigned char> buf;
+    struct nlmsghdr nlh {};
+    nlh.nlmsg_type = RTM_NEWROUTE;
+    nlh.nlmsg_flags = NLM_F_MULTI;
+    nlh.nlmsg_seq = seq;
+    append_bytes(buf, &nlh, sizeof(nlh));
+
+    struct rtmsg rtm {};
+    rtm.rtm_family = AF_INET;
+    rtm.rtm_dst_len = 0;
+    rtm.rtm_table = table;
+    append_bytes(buf, &rtm, sizeof(rtm));
+
+    std::vector<unsigned char> mp;
+    for (const auto* gw : gateways) {
+        std::vector<unsigned char> nh_attrs;
+        if (gw)
+            append_rtattr(nh_attrs, RTA_GATEWAY, gw, 4);
+        struct rtnexthop rtnh {};
+        rtnh.rtnh_len = static_cast<unsigned short>(sizeof(rtnh) + nh_attrs.size());
+        append_bytes(mp, &rtnh, sizeof(rtnh));
+        mp.insert(mp.end(), nh_attrs.begin(), nh_attrs.end());
+        while (mp.size() % 4)
+            mp.push_back(0);
+    }
+    append_rtattr(buf, RTA_MULTIPATH, mp.data(), mp.size());
+
+    auto* hdr = reinterpret_cast<struct nlmsghdr*>(buf.data());
+    hdr->nlmsg_len = static_cast<std::uint32_t>(buf.size());
+    return buf;
+}
+
+// Builds an `ip nexthop`-object default route: RTA_NH_ID referencing a
+// nexthop group by id, with no embedded gateway of any form.
+std::vector<unsigned char> build_nh_id_route_message(std::uint32_t seq, std::uint32_t nh_id,
+                                                      unsigned char table = RT_TABLE_MAIN) {
+    std::vector<unsigned char> buf;
+    struct nlmsghdr nlh {};
+    nlh.nlmsg_type = RTM_NEWROUTE;
+    nlh.nlmsg_flags = NLM_F_MULTI;
+    nlh.nlmsg_seq = seq;
+    append_bytes(buf, &nlh, sizeof(nlh));
+
+    struct rtmsg rtm {};
+    rtm.rtm_family = AF_INET;
+    rtm.rtm_dst_len = 0;
+    rtm.rtm_table = table;
+    append_bytes(buf, &rtm, sizeof(rtm));
+
+    append_rtattr(buf, RTA_NH_ID, &nh_id, sizeof(nh_id));
+
+    auto* hdr = reinterpret_cast<struct nlmsghdr*>(buf.data());
+    hdr->nlmsg_len = static_cast<std::uint32_t>(buf.size());
+    return buf;
+}
+
 
 TEST_CASE("parse_rtnetlink_route_chunk keeps only the IPv4 default route with a gateway",
          "[network_config][rtnetlink]") {
@@ -788,6 +860,69 @@ TEST_CASE("parse_rtnetlink_link_chunk emits the kernel name, never iproute2's @p
     REQUIRE(parsed.records.size() == 1);
     CHECK(parsed.records[0].name == "eth0"); // NOT "eth0@if2"
     CHECK(parsed.records[0].name.find('@') == std::string::npos);
+}
+
+// ── REGRESSION PIN: multipath / nexthop-object default routes ──────────────
+//
+// A route decoder reading only the top-level RTA_GATEWAY silently regresses
+// every ECMP or `ip nexthop`-object host to "-": neither form carries a
+// top-level RTA_GATEWAY. The pre-migration leg searched the whole
+// `ip route show default` TEXT for "via ", which matches the first
+// `nexthop via ...` line of a multipath route's iproute2 rendering, so those
+// hosts DID report a gateway before. Cross-platform review (gate 3) found
+// this as the seventh silent regression on this branch.
+
+TEST_CASE("parse_rtnetlink_route_chunk resolves the first nexthop's gateway in a "
+          "multipath default route",
+          "[network_config][rtnetlink]") {
+    constexpr std::uint32_t kSeq = 20;
+    const unsigned char gw1[4] = {10, 0, 0, 1};
+    const unsigned char gw2[4] = {10, 0, 0, 2};
+    auto msg = build_multipath_route_message(kSeq, {gw1, gw2});
+    auto done = build_done_message(kSeq);
+    std::vector<unsigned char> blob(msg.begin(), msg.end());
+    blob.insert(blob.end(), done.begin(), done.end());
+
+    const auto parsed = parse_rtnetlink_route_chunk(std::span{blob}, kSeq);
+    CHECK(parsed.done);
+    REQUIRE(parsed.records.size() == 1);
+    // Pre-fix (RTA_GATEWAY only) this record never made it into the output at
+    // all -- the route was silently dropped, and do_ip_addresses fell back to
+    // "-" with a complete status.
+    CHECK(parsed.records[0].gateway == "10.0.0.1");
+}
+
+TEST_CASE("parse_rtnetlink_route_chunk skips a gateway-less nexthop and resolves the next",
+          "[network_config][rtnetlink]") {
+    constexpr std::uint32_t kSeq = 21;
+    const unsigned char gw2[4] = {10, 0, 0, 2};
+    // First nexthop carries no RTA_GATEWAY of its own (nullptr); the decoder
+    // must not stop there.
+    auto msg = build_multipath_route_message(kSeq, {nullptr, gw2});
+    auto done = build_done_message(kSeq);
+    std::vector<unsigned char> blob(msg.begin(), msg.end());
+    blob.insert(blob.end(), done.begin(), done.end());
+
+    const auto parsed = parse_rtnetlink_route_chunk(std::span{blob}, kSeq);
+    REQUIRE(parsed.records.size() == 1);
+    CHECK(parsed.records[0].gateway == "10.0.0.2");
+}
+
+TEST_CASE("parse_rtnetlink_route_chunk pushes a gateway-less marker for an "
+          "`ip nexthop`-object route",
+          "[network_config][rtnetlink]") {
+    constexpr std::uint32_t kSeq = 22;
+    auto msg = build_nh_id_route_message(kSeq, /*nh_id=*/1);
+    auto done = build_done_message(kSeq);
+    std::vector<unsigned char> blob(msg.begin(), msg.end());
+    blob.insert(blob.end(), done.begin(), done.end());
+
+    const auto parsed = parse_rtnetlink_route_chunk(std::span{blob}, kSeq);
+    // A record IS pushed (so the caller learns a main-table default route
+    // exists) but its gateway is empty (so the caller does not silently
+    // report "-" with a complete status -- it must degrade instead).
+    REQUIRE(parsed.records.size() == 1);
+    CHECK(parsed.records[0].gateway.empty());
 }
 
 #endif // __linux__
