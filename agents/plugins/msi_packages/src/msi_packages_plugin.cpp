@@ -48,6 +48,7 @@ static constexpr const char* kInstallLocation = "InstallLocation";
 #include <vector>
 
 #include <spdlog/spdlog.h>
+#include <subprocess_degradation.hpp> // yuzu::shared::is_degraded_run (Gate-8 remediation) -- the acquisition-health decision shared with installed_apps
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess / probe_tool_path (Wave 4 PR4.3a, ADR-3002 rung 2)
 
 #include "msi_packages_macos.hpp"
@@ -121,22 +122,35 @@ std::string get_product_info(const char* product_code, const char* property) {
 // carries a hard per-call deadline. Internal newlines in the captured
 // output are preserved for the pure per-line parsers in
 // msi_packages_macos.hpp.
-std::string run_command(const std::vector<std::string>& argv) {
+// Result + health together, same shape and reasoning as installed_apps'
+// ToolOutcome: the health flag has to travel with the data because a
+// cut-short receipt scan is otherwise indistinguishable from a genuinely
+// small one at the call site.
+struct CommandOutcome {
+    std::string output;
+    bool degraded = false;
+};
+
+CommandOutcome run_command(const std::vector<std::string>& argv) {
     if (argv.empty() || argv.front().empty())
         return {};
     auto res = yuzu::agent::run_bounded_subprocess(
         argv, yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{15}});
     // A cut-short pkgutil returns empty/partial output that parses as "no
     // packages" — a silent false-negative. Warn so an operator can tell a
-    // degraded scan from a genuinely empty receipt DB (sre-M1).
-    //
-    // The discriminator is termination_reason, not the individual flags: the
-    // enum has six states and `signaled` (OOM kill), `cancelled` (shutdown) and
-    // `line_limit` all leave timed_out/tool_ran/output_truncated clear while
-    // still truncating the output. Kept identical to installed_apps'
-    // `is_degraded_run` so the two plugins cannot drift.
-    if (res.termination_reason != yuzu::agent::TerminationReason::exited ||
-        res.output_truncated) {
+    // degraded scan from a genuinely empty receipt DB (sre-M1). Shares
+    // installed_apps' `is_degraded_run` (agents/shared/subprocess_degradation.hpp)
+    // rather than a hand-duplicated inline check -- an earlier copy of this
+    // check omitted the nonzero-exit branch entirely, so it never degraded on
+    // a clean exit with a nonzero code, while claiming in comment to be
+    // identical to the shared logic. Sharing the function is what makes that
+    // claim true instead of merely stating it. `tolerate_nonzero_exit=false`:
+    // unlike installed_apps' per-ID pkgutil lookup, nothing here has a
+    // documented benign-nonzero case.
+    const bool degraded = yuzu::shared::is_degraded_run(
+        res.termination_reason == yuzu::agent::TerminationReason::exited, res.exit_code,
+        res.output_truncated, /*tolerate_nonzero_exit=*/false);
+    if (degraded) {
         spdlog::warn("msi_packages: degraded run (reason={}, timed_out={}, tool_ran={}, "
                      "truncated={}, exit_code={}): {}",
                      static_cast<int>(res.termination_reason), res.timed_out, res.tool_ran,
@@ -145,7 +159,21 @@ std::string run_command(const std::vector<std::string>& argv) {
     std::string result = res.output;
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
         result.pop_back();
-    return result;
+    return CommandOutcome{std::move(result), degraded};
+}
+
+// Emit an honest failure row instead of falling through to the empty-result
+// sentinel. Matches installed_apps_plugin.cpp's report_if_degraded — kept as
+// its own tiny helper here rather than shared, since the two plugins' wire
+// formats and CommandContext usage differ enough that sharing would cost more
+// than it saves; the SHARED part (the health DECISION) already is.
+void report_degraded(yuzu::CommandContext& ctx, std::string_view action) {
+    spdlog::warn("msi_packages: '{}' acquisition was degraded -- reporting an error rather "
+                 "than presenting a partial or empty list as authoritative",
+                 action);
+    ctx.write_output("error|msi_packages: acquisition degraded (pkgutil timed out, was killed, "
+                     "failed to start, exited nonzero, or its output was truncated) -- result "
+                     "withheld rather than reported as complete");
 }
 
 // pkgutil --pkg-info loops are sequential and per-package; a receipt DB can
@@ -179,13 +207,23 @@ int do_list(yuzu::CommandContext& ctx) {
 
     // msi_packages/do_list#1 (docs/agent-spawn-sink-manifest.md)
     auto pkgutil_path = yuzu::agent::probe_tool_path({"/usr/sbin/pkgutil"});
-    auto ids = parse_pkg_ids(run_command({pkgutil_path, "--pkgs"}));
+    auto pkgs = run_command({pkgutil_path, "--pkgs"});
+    bool degraded = pkgs.degraded;
+    auto ids = parse_pkg_ids(pkgs.output);
     const std::size_t total_seen = ids.size();
     const bool truncated = total_seen > kMaxPackages;
     if (truncated)
         ids.resize(kMaxPackages);
 
-    int count = 0;
+    // Buffered locally rather than written to `ctx` as the loop runs:
+    // yuzu_ctx_write_output only APPENDS (agent.cpp's CommandContextImpl::
+    // append_output), with no way to retract what has already gone in. A
+    // receipt walk can degrade partway through -- checking only after the
+    // loop, with rows already committed to `ctx`, would leave the final
+    // output a MIX of real rows and an error line, not the withheld result
+    // report_degraded's own text promises. Buffer first, decide once, emit
+    // once.
+    std::vector<std::string> rows;
     for (const auto& id : ids) {
         // A receipt id is a reverse-domain name; one starting with '-' would be
         // eaten by pkgutil's OWN option parser as a flag. No shell is involved
@@ -197,10 +235,23 @@ int do_list(yuzu::CommandContext& ctx) {
         }
         // msi_packages/do_list#2 -- one call per receipt, id passed as its
         // own argv element (no shell, so no quoting is needed at all).
-        auto info = parse_pkg_info(run_command({pkgutil_path, "--pkg-info", id}), id);
-        ctx.write_output(sanitize_utf8(yuzu::msi_packages::macos::format_msi_row(info)));
-        ++count;
+        auto pkginfo = run_command({pkgutil_path, "--pkg-info", id});
+        degraded = degraded || pkginfo.degraded;
+        auto info = parse_pkg_info(pkginfo.output, id);
+        rows.push_back(sanitize_utf8(yuzu::msi_packages::macos::format_msi_row(info)));
     }
+
+    // Same reasoning as installed_apps: a killed or timed-out pkgutil must
+    // never render as "No packages found" -- a wrong result presented as
+    // correct (I3). Checked against the WHOLE walk (the initial `--pkgs`
+    // enumeration and every per-id lookup), before anything is committed.
+    if (degraded) {
+        report_degraded(ctx, "list");
+        return 1;
+    }
+
+    for (auto& row : rows)
+        ctx.write_output(std::move(row));
     if (truncated) {
         // Honest truncation sentinel: the receipt DB held more packages than
         // kMaxPackages, so the inventory above is incomplete. The "__truncated__"
@@ -208,7 +259,7 @@ int do_list(yuzu::CommandContext& ctx) {
         // positional downstream parser can distinguish this from a real row.
         ctx.write_output(std::format("msi|__truncated__|{}|-|-", total_seen));
     }
-    if (count == 0) {
+    if (rows.empty()) {
         ctx.write_output("msi|No packages found|-|-|-");
     }
 #else
@@ -241,8 +292,17 @@ int do_product_codes(yuzu::CommandContext& ctx) {
     // msi_packages_macos.hpp), so this action never needs the per-package
     // --pkg-info round trip that `list` does.
     // msi_packages/do_product_codes#1 (docs/agent-spawn-sink-manifest.md)
-    auto ids =
-        parse_pkg_ids(run_command({yuzu::agent::probe_tool_path({"/usr/sbin/pkgutil"}), "--pkgs"}));
+    auto pkgs =
+        run_command({yuzu::agent::probe_tool_path({"/usr/sbin/pkgutil"}), "--pkgs"});
+    // Only one acquisition call on this action (no per-id round trip -- see
+    // the comment above), so the health verdict is known before anything is
+    // written; no buffer-then-emit restructuring needed here the way `list`
+    // required.
+    if (pkgs.degraded) {
+        report_degraded(ctx, "product_codes");
+        return 1;
+    }
+    auto ids = parse_pkg_ids(pkgs.output);
     int count = 0;
     for (const auto& id : ids) {
         ctx.write_output(sanitize_utf8(yuzu::msi_packages::macos::format_product_code_row(id)));

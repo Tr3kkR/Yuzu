@@ -14,7 +14,16 @@ cadences.
   the `installed_apps` plugin via its `list_inventory` action (Windows: `HKLM` +
   the agent service account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`;
   macOS: `system_profiler`). The operator-facing `list` action keeps its
-  original 4-column output — automation built on it is unaffected.
+  original 4-column `app|...` row shape for every successful acquisition —
+  automation built on parsing that shape is unaffected. On Linux/macOS, a
+  degraded acquisition (timeout, kill, spawn failure, truncation, or a
+  nonzero exit) now emits a single `error|installed_apps: acquisition
+  degraded (...)` row and a nonzero result instead of an empty or partial
+  `app|` list — see "Degraded collections are skipped, not published" below.
+  Automation that only parses `app|` rows and ignores `error|` is
+  unaffected; automation that assumed `list` always succeeds needs an
+  update. See `docs/user-manual/agent-plugins.md`'s `installed_apps`/
+  `msi_packages` entries for the exact per-action wording.
 - **The honest-empty contract:** a field the ecosystem does not store is the
   empty string, **never synthesised** (no `-` placeholders, no guessed `0`
   epoch). Per-ecosystem availability:
