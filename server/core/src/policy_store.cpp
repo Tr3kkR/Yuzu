@@ -1287,8 +1287,18 @@ PolicyStore::claim_due_policies(int64_t now, int64_t default_interval_seconds,
 
         for (const auto& pid : due_ids) {
             auto p = read_policy_by_id(conn, pid);
-            if (!p || !*p) {
-                failure = "failed to load claimed policy " + pid;
+            if (!p) {
+                failure = "degraded read for claimed policy " + pid;
+                degraded = true;
+                return false;
+            }
+            if (!*p) {
+                // Not reachable today (pid was just read in the due-policy
+                // query above and the claim UPSERT above has an FK to it,
+                // all in this same transaction) — classified separately
+                // from a genuine DB error for accurate logging if that
+                // invariant is ever weakened by a future refactor.
+                failure = "claimed policy " + pid + " vanished mid-transaction";
                 degraded = true;
                 return false;
             }

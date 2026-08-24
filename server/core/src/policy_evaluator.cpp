@@ -345,10 +345,21 @@ std::string PolicyEvaluator::evaluate_now(const std::string& policy_id) {
     // manual check's network call even returns. Stamping unconditionally,
     // even if dispatch below ends up failing, matches the original: a
     // failed manual check still consumed the interval slot.
+    // If the stamp itself fails, do NOT dispatch (adversarial review,
+    // 2026-08-24): the correction above only closed "dispatch succeeded but
+    // the stamp was never attempted" — a failed record_dispatch call is the
+    // same durable-claim-blind outcome by a different path (the operator's
+    // check would still run, still return 202, and the very next automatic
+    // tick would see no row and re-claim/re-dispatch it immediately). This
+    // is a plain runtime store error on an authoritative write (ADR-0012
+    // §1) — surface it as "did not dispatch," never as silent success.
     auto r = d_.policy_store->record_dispatch(policy_id, now());
-    if (!r)
-        spdlog::warn("policy_evaluator: evaluate_now: record_dispatch failed for {}: {}",
+    if (!r) {
+        spdlog::warn("policy_evaluator: evaluate_now: record_dispatch failed for {}: {} — "
+                    "not dispatching (would leave the durable claim blind)",
                     policy_id, r.error());
+        return "";
+    }
     auto execid = kickoff_check(**p_res); // dispatch runs without mu_ held
     return execid;
 }

@@ -399,6 +399,25 @@ said the design was, not new design questions.
 None of the three needed a design change — each is the implementation not doing what the Decision
 already committed to. Regression tests for both backfill fixes were added alongside them.
 
+**Third correction (adversarial review round 2 — Kimi + Codex, fresh Phase 1 on the fix commits,
+2026-08-24):** the round-2 reviewers re-verified all three round-1 fixes against the code and found
+each correctly implemented (including the two new regression tests genuinely exercising the fixed
+paths). Codex found one new HIGH, unrelated to the round-1 findings: `evaluate_now()`'s call to
+`record_dispatch()` (the fix from the FIRST correction, above) only logged a warning on failure and
+still proceeded to `kickoff_check` regardless — so a `record_dispatch` failure (a plain transient
+store error, not a design gap) reproduced the exact "manual dispatch leaves the durable claim blind"
+bug the first correction fixed, by a different path: the check still dispatches and returns success
+to the operator, but with no `policy_dispatch_state` row, so the very next automatic tick sees
+nothing claimed and re-dispatches immediately. Fixed: `evaluate_now()` now returns `""` (not
+dispatched) instead of proceeding when `record_dispatch` fails. Kimi found two LOW items in the same
+round: no dedicated regression test existed for the second correction's detail-query-degrade fix
+(added: a test that drops `policy_triggers` and asserts `get_policy`/`query_policies` degrade rather
+than returning a partial policy), and `claim_due_policies`' failure branch conflated "degraded read"
+with "claimed policy vanished mid-transaction" in its logging (split for clarity; not reachable
+today given the transaction/FK guarantees, but cheap to make precise). A regression test for the
+`record_dispatch`-failure fix was added alongside it (`test_policy_evaluator.cpp`, drops
+`policy_dispatch_state` and asserts `evaluate_now()` returns empty with zero dispatch calls).
+
 ### Construction — fail-closed (this store lacked it even on SQLite)
 
 `server.cpp:4979-4986` constructs `PolicyStore` and only logs on failure today — unlike
