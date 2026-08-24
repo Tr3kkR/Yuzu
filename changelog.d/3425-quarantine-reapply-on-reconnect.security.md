@@ -10,11 +10,13 @@
   (now extracted into a shared chokepoint, `quarantine_reapply.hpp`, so both callers share one
   copy of the stored-whitelist-only invariant). Dispatch acceptance alone is not treated as
   proof of containment: a follow-up `quarantine.status` read must report `state|active` before
-  the device is marked confirmed, and a previously-confirmed device re-verifies via `status`
-  first rather than blindly re-applying on either of two independent signals: its live agent
-  session changes (a reboot, a service restart), or its active record is replaced (released,
-  then requarantined, possibly with a different whitelist, while the agent stayed connected
-  the whole time). A confirm is also checked against the session that was live when the
+  the device is marked confirmed, and a previously-confirmed device re-verifies on either of two
+  independent signals: its live agent session changes (a reboot, a service restart — re-verifies
+  via `status` first, rather than blindly re-applying), or its active record is replaced
+  (released, then requarantined, possibly with a different whitelist, while the agent stayed
+  connected the whole time — resets straight to a fresh apply instead, since a status read would
+  prove nothing about whether the NEW record's whitelist was ever applied). A confirm is also
+  checked against the session that was live when the
   verifying status dispatch was actually sent, not just whichever session is live at confirm
   time, closing a narrow reboot window in between. The trigger deliberately does NOT hook agent
   registration — the gRPC command stream is not yet established at that point, so a dispatch

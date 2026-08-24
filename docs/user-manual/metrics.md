@@ -1353,6 +1353,16 @@ sum(rate(yuzu_server_quarantine_gate_total{outcome="stale"}[5m])) > 0
 # An internal push that bypasses containment failed to reach the agent.
 # For __guard__.push_rules that is a device left unenforced.
 sum(rate(yuzu_server_system_reserved_push_total{result="undelivered"}[15m])) by (capability) > 0
+
+# Reconnect re-application outcomes by result — a rising validation_failed or
+# degraded share, correlated against yuzu_server_quarantine_read_degrade_total,
+# points at root cause faster than the gauge below alone.
+sum(rate(yuzu_server_quarantine_reapply_total[5m])) by (result) > 0
+
+# Reachable devices whose endpoint containment is not yet confirmed — the
+# genuine divergence signal (never sum() across replicas; max() picks the
+# replica that actually holds the live session).
+max by (instance) (yuzu_server_quarantine_endpoint_unconfirmed{reachability="connected"})
 ```
 
 ## RBAC store metrics (authorization substrate, ADR-0041)

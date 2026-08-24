@@ -460,13 +460,14 @@ quarantine record whose endpoint containment is not yet confirmed:
   not key off `last_confirmed_at`, so a false confirmation narrows to false operator/audit
   assurance rather than widening what commands can reach that device. This is the same trust
   boundary #3127's MCP `already_active` retry path already relies on, not new to this feature. A
-  previously-confirmed device re-verifies via `status` first, rather than blindly re-applying, on
-  either of two independent signals checked every tick: its live agent session changes (a reboot,
-  a service restart — the firewall rules from before the restart are gone), or its active
-  `QuarantineStore` record is replaced (released, then requarantined — possibly with a different
-  whitelist — while the agent stayed connected the whole time, so a session change alone would
-  never have caught it; a record replacement resets straight to a fresh apply instead, since a
-  status check would say nothing about whether the NEW record's whitelist was ever applied). A
+  previously-confirmed device re-verifies on either of two independent signals checked every
+  tick: its live agent session changes (a reboot, a service restart — the firewall rules from
+  before the restart are gone — re-verifies via `status` first, rather than blindly
+  re-applying), or its active `QuarantineStore` record is replaced (released, then
+  requarantined — possibly with a different whitelist — while the agent stayed connected the
+  whole time, so a session change alone would never have caught it — resets straight to a fresh
+  apply instead, since a status check would say nothing about whether the NEW record's whitelist
+  was ever applied). A
   confirm is additionally checked against the session that was live when the verifying `status`
   dispatch was actually sent, not just whatever session is live at confirm time, closing a narrow
   reboot window in between that would otherwise attribute a stale session's status read to a new
