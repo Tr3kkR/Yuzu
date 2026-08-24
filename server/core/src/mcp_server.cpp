@@ -4891,19 +4891,54 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto& agents = get_agents();
                 JObj agent_obj;
                 bool found = false;
+                bool exists_out_of_scope = false;
                 for (const auto& a : agents) {
-                    if (a.value("agent_id", "") == agent_id &&
-                        authz::in_scope(gate.scope, agent_id)) {
+                    if (a.value("agent_id", "") != agent_id)
+                        continue;
+                    if (authz::in_scope(gate.scope, agent_id)) {
                         agent_obj.add("agent_id", a.value("agent_id", ""))
                             .add("hostname", a.value("hostname", ""))
                             .add("os", a.value("os", ""))
                             .add("arch", a.value("arch", ""))
                             .add("agent_version", a.value("agent_version", ""));
                         found = true;
-                        break;
+                        break; // only the in-scope match short-circuits the scan.
                     }
+                    // Gate 8 re-review finding: an out-of-scope match must NOT
+                    // break here -- doing so would let scan length itself
+                    // distinguish "exists, out of scope" (early break, at this
+                    // agent's position) from "genuinely nonexistent" (full
+                    // scan), a timing signal the ORIGINAL pre-#1700 loop never
+                    // had (it only ever broke on match-AND-in-scope, so an
+                    // out-of-scope match fell through and scanned to the end
+                    // exactly like a nonexistent one). Record the fact and
+                    // keep scanning so both !found sub-cases stay scan-length
+                    // symmetric, matching that original behavior.
+                    exists_out_of_scope = true;
                 }
                 if (!found) {
+                    // #1700 / Gate 6 sre finding: the RESPONSE never
+                    // distinguishes "genuinely nonexistent" from "exists,
+                    // out of scope" (that collapse IS the fix), but the
+                    // server-side audit trail should -- same Pattern-D
+                    // discipline as every other 404-collapse in this
+                    // codebase, and the scope-drop half mirrors
+                    // query_installed_software's "denied" audit row.
+                    //
+                    // Gate 8 re-review finding: mcp_audit (try_persist_audit)
+                    // is a SYNCHRONOUS write, so calling it on only ONE of
+                    // the two !found sub-cases would reopen a (much weaker)
+                    // echo of the exact existence-probe #1700 closes -- a
+                    // caller measuring response latency across many requests
+                    // could distinguish "exists, out of scope" (audit write)
+                    // from "genuinely nonexistent" (no write) even though the
+                    // response body is byte-identical. Audit UNCONDITIONALLY
+                    // on !found; only the server-side detail string (never
+                    // sent to the caller) varies by which sub-case it was.
+                    mcp_audit("denied", exists_out_of_scope
+                                             ? "scope: agent out of caller's fleet-read scope: " +
+                                                   agent_id
+                                             : "not found: " + agent_id);
                     res.set_content(
                         error_response(id, kInvalidParams, "Agent not found: " + agent_id),
                         "application/json");

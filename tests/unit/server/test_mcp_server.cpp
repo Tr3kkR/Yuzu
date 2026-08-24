@@ -5631,6 +5631,38 @@ TEST_CASE("MCP get_agent_details: out-of-scope agent collapses to not-found",
     REQUIRE(out_body.contains("error"));
     CHECK(out_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
     CHECK(out_body["error"]["message"].get<std::string>().find("agent-002") != std::string::npos);
+
+    // A genuinely nonexistent agent_id -- distinct from agent-002 above,
+    // which exists in the registry but is out of scope.
+    auto nonexistent = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":21,"params":{"name":"get_agent_details","arguments":{"agent_id":"agent-999"}}})");
+    REQUIRE(nonexistent);
+    CHECK(nonexistent->status == 200);
+    auto nonexistent_body = nlohmann::json::parse(nonexistent->body);
+    REQUIRE(nonexistent_body.contains("error"));
+
+    // Gate 6 sre finding: the RESPONSE collapses "out of scope" into "not
+    // found" (by design, above), but the server-side audit trail must still
+    // record the real reason -- same Pattern-D discipline as every other
+    // 404-collapse in this codebase, mirroring query_installed_software's
+    // "denied" audit row on a scope drop.
+    //
+    // Gate 8 re-review finding: mcp_audit's try_persist_audit is a
+    // SYNCHRONOUS write, so auditing only ONE of the two !found sub-cases
+    // would itself be a (weaker) timing side-channel echoing the exact
+    // existence-probe #1700 closes. Both agent-002 (out-of-scope) and
+    // agent-999 (nonexistent) must audit "denied" -- same code path, same
+    // cost, no distinguishing signal.
+    int denied_count = 0;
+    bool saw_success = false;
+    for (const auto& a : ts.audit_log) {
+        if (a == "mcp.get_agent_details|denied")
+            ++denied_count;
+        if (a == "mcp.get_agent_details|success")
+            saw_success = true;
+    }
+    CHECK(denied_count == 2);  // agent-002 (out-of-scope) + agent-999 (nonexistent)
+    CHECK(saw_success);        // the in-scope agent-001 lookup
 }
 
 // require_fleet_read's own doc comment: unwired = misconfiguration, FAILS

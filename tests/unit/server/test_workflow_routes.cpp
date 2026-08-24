@@ -711,6 +711,15 @@ TEST_CASE("executions detail: status grid + per-agent table drop out-of-scope "
     // must count only the in-scope agent, not both.
     CHECK(res->body.find("exec-kpi-value exec-kpi-value--ok\">1<") != std::string::npos);
     CHECK(res->body.find("exec-kpi-value exec-kpi-value--ok\">2<") == std::string::npos);
+    // Gate 4 unhappy-path finding UP-1: the "Total" KPI must ALSO recompute
+    // from the filtered set for a scoped caller -- exec.agents_targeted is 2
+    // (dispatch-time), but only 1 agent is in scope. Total staying at 2 while
+    // the grid/table show only 1 agent would disclose that an out-of-scope
+    // agent exists by simple subtraction, even with its identity hidden.
+    // (exact match: the Total cell's class is plain "exec-kpi-value" with no
+    // --ok/--err modifier, so this substring is unique to it.)
+    CHECK(res->body.find("exec-kpi-value\">1<") != std::string::npos);
+    CHECK(res->body.find("exec-kpi-value\">2<") == std::string::npos);
 }
 
 TEST_CASE("executions detail: per-agent table sorts failed first",

@@ -426,9 +426,20 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // listeners locate this strip via id and swap individual cell
             // values rather than re-rendering the whole strip.
             html += "<div class=\"exec-kpi-strip\" id=\"exec-kpi-" + html_escape(exec.id) + "\">";
+            // #1712 adversarial-review + Gate 4 unhappy-path finding UP-1: for
+            // an unscoped caller this must stay exec.agents_targeted (the
+            // legitimate mid-dispatch total, byte-identical to pre-migration
+            // -- see the SSE live-update path in instruction_ui.cpp's
+            // execApplyProgress, which pushes this same field and must not
+            // regress for that caller class). For a scoped caller, using the
+            // unfiltered dispatch total here -- while Succeeded/Failed/the
+            // grid are all correctly filtered -- discloses how many
+            // out-of-scope agents exist by simple subtraction, the same
+            // disclosure class dashboard_routes.cpp's render_results()
+            // guards against by recomputing total_agent_count post-filter.
             html += std::format("<div class=\"exec-kpi\"><div class=\"exec-kpi-value\">{}</div>"
                                 "<div class=\"exec-kpi-label\">Total</div></div>",
-                                exec.agents_targeted);
+                                gate.scope ? agents.size() : static_cast<std::size_t>(exec.agents_targeted));
             html += std::format(
                 "<div class=\"exec-kpi\"><div class=\"exec-kpi-value exec-kpi-value--ok\">{}</div>"
                 "<div class=\"exec-kpi-label\">Succeeded</div></div>",

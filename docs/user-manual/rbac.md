@@ -44,22 +44,42 @@ enabled = true
 > `GET /api/v1/executions/{id}/visualization`, and the legacy `GET /api/responses/{id}`
 > / `/aggregate` / `/export` surfaces return **zero rows** (the legacy aggregate
 > returns `503`) on a corrupt store rather than reopening the cross-operator
-> fleet-wide read. **Not yet covered (#1634 follow-up — these still fail OPEN on a
-> corrupt store):** the dashboard `/fragments/results/…` table and the workflow
-> executions-drawer reader have no per-agent filter and will expose the whole
-> fleet's responses when the RBAC store is degraded. So a degraded store looks like "no
-> agents in scope" / "no responses" **on the covered surfaces, but is a visibility
-> leak via those two uncovered ones** — check the server startup log for `RbacStore`
-> errors, the `/health` store status, and `yuzu_server_rbac_read_degrade_total`,
-> then restore PostgreSQL (`rbac_store`) availability
-> immediately. (If Grafana panels or scripted aggregate consumers show zero
-> rows after an upgrade or restart, check for `RbacStore` open/migrate errors first.)
+> fleet-wide read. **Now also covered (#1712, #3290 Phase 2 continuation):** the
+> dashboard `/fragments/results` table and the workflow executions-drawer reader
+> (both its responses section and its per-agent status grid/table) migrated onto
+> `require_fleet_read` — same fail-closed posture as everything else on this
+> page: a degraded `rbac_store`/`mgmt_group_store` returns `503`, and a healthy
+> store applies a real per-agent filter rather than exposing the whole fleet.
+> **Still not covered, but NOT a fail-open-on-degrade risk** — these remaining
+> readers gate on `perm_fn_`/`require_permission`, which has been deny-on-degrade
+> since ADR-0041 regardless of confinement, so a corrupt store 403s them rather
+> than exposing anything. Their gap is a *different* shape: a caller who holds
+> the flat permission (globally, not confined) still gets an unscoped read/write
+> with no per-agent filter. Dashboard `/fragments/results/filter-bar`,
+> `/fragments/create-group-form`, and `POST /api/dashboard/group-from-results`
+> (tracked #3525); REST `GET /api/v1/execution-statistics/agents` and the
+> workflow executions LIST fragment `/fragments/executions` (tracked #3526). So
+> a degraded store looks like "no agents in scope" / "no responses" / `503`
+> across every reader on this page now — check the server startup log for
+> `RbacStore` errors, the `/health` store status, and
+> `yuzu_server_rbac_read_degrade_total`, then restore PostgreSQL (`rbac_store`)
+> availability immediately. (If Grafana panels or scripted aggregate consumers
+> show zero rows after an upgrade or restart, check for `RbacStore` open/migrate
+> errors first.)
 >
-> **Note (#1634):** the per-agent filter on the covered response readers is, under
-> *normal* RBAC operation, currently **inert** — a holder of global `Response:Read`
-> sees all agents' responses; per-management-group scoping of these reads is not yet
-> effective (the gate change is tracked in #1634). Today the filter's only active
-> effect is the corrupt-store fail-closed described above.
+> **Note (#1634):** the per-agent filter on `query_responses`/`aggregate_responses`/the
+> REST visualization+responses endpoints is, under *normal* RBAC operation, currently
+> **inert** — a holder of global `Response:Read` sees all agents' responses;
+> per-management-group scoping of these specific reads is not yet effective (the
+> gate change is tracked in #1634; this is a *different*, older primitive
+> [`response_scope_fn`] than `require_fleet_read` below). Today that filter's only
+> active effect is the corrupt-store fail-closed described above.
+>
+> **This does NOT apply to `/fragments/results` or the workflow executions-drawer**
+> (#1712) — both migrated onto `require_fleet_read`, a *different* primitive whose
+> per-agent filter is real and effective under normal RBAC operation, not inert:
+> a management-group-confined or correctly service-scoped caller genuinely sees only
+> their in-scope agents' data on those two readers today.
 
 ## The authorization topology floor (#2376)
 
