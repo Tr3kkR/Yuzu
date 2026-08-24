@@ -1003,6 +1003,12 @@ containment was never independently confirmed). See `docs/user-manual/security-h
 `yuzu_server_quarantine_endpoint_unconfirmed{reachability}` / `yuzu_server_quarantine_reapply_total{result}`
 metrics.
 
+`QuarantineContainmentReconciler` is **always on, with no configuration surface** — no CLI flag or
+env var disables or tunes it (matching the #881 dispatch gate it complements, which is the same
+way). Its cadence (20s tick), per-agent timing (60s minimum reapply interval, 15-minute backoff
+cap), and per-tick dispatch cap (50 agents) are fixed `constexpr` constants in
+`quarantine_containment_reconciler.hpp`, not runtime-configurable.
+
 ### vNEXT — the rotation sweep now carries the full clock-guarded-retention shape (#2964)
 
 **What changed.** `ApiTokenStore::sweep_expired_rotations` — the 60-second

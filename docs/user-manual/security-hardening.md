@@ -437,7 +437,7 @@ an operator noticed and manually re-issued the quarantine after the device came 
 quarantine record whose endpoint containment is not yet confirmed:
 
 - **Trigger.** A heartbeat from the device (the fast path — the reconciler no longer holds a
-  reconnecting device to a stale offline-tick's claim window, governance Gate 4, so the first
+  reconnecting device to a stale offline-tick's claim window, so the first
   post-reconnect heartbeat is eligible to dispatch immediately) or a periodic ~20-second tick (the
   backstop — catches anything the heartbeat path missed, and everything before the reconciler's
   heartbeat hook was wired). Deliberately **not** agent registration/reconnect itself: the gRPC
@@ -463,7 +463,12 @@ quarantine record whose endpoint containment is not yet confirmed:
   A previously-confirmed
   device whose live agent session changes (a reboot, a service restart — the firewall rules from
   before the restart are gone) drops confirmation and re-verifies via `status` first, rather than
-  blindly re-applying.
+  blindly re-applying. **Confirmation is point-in-time, not continuous**: once confirmed, a
+  device is not asked again unless its session churns — if
+  something *other* than a session change clears its firewall rules out-of-band (an OS firewall
+  daemon restart, an unrelated admin `iptables -F`/`netsh advfirewall reset`), this component does
+  not notice and does not re-verify. Ongoing drift detection outside the reconnect/session-churn
+  case is Guardian/DEX's domain, not this component's.
 - **Concurrency.** The shipped agent-side quarantine plugin's `do_status` currently answers only
   `active`/`inactive` — a `status|busy` response (from a mutation-serialization gate on the plugin's
   mutating actions) cannot occur until that agent-side work lands (open, unmerged issue #3429). The
@@ -473,8 +478,12 @@ quarantine record whose endpoint containment is not yet confirmed:
   a 15-minute cap on repeated non-confirmation, reset on confirm) elapses.
 - **Audit.** A system-initiated re-application is audited under `quarantine.reapply`
   (`principal: system`), distinct from an operator-initiated `quarantine.enable`/`quarantine.disable`
-  — detail carries `command_id` and `trigger=tick|heartbeat`, or `CONFIRMED command_id=...` once
-  containment is verified.
+  — detail carries `record_id=<id> command_id=<id> trigger=tick|heartbeat`, or
+  `CONFIRMED record_id=<id> command_id=<id>` once containment is verified. `record_id` is the
+  internal `QuarantineRecord::id` the reapply cycle was built from — it keeps a
+  release-then-requarantine race for the same device distinguishable across the two quarantine
+  episodes in the audit trail, matching the record-identity scoping the store write itself
+  already applies.
 - **Observability.** `yuzu_server_quarantine_endpoint_unconfirmed{reachability="connected"|"offline"}`
   is a per-replica gauge — never sum it across server instances — counting active records not yet
   confirmed contained. `reachability="offline"` is expected and not alerted on (a device quarantined
@@ -489,10 +498,23 @@ it is redundant with the automatic reconciler, never required, and never harmful
 
 **Known limitation.** A device released (`DELETE /api/v1/quarantine/{agent_id}`) at the exact moment
 the reconciler is mid-reapply for it can end up re-firewalled just after its record becomes released —
-a narrow timing window, not a routine occurrence. This is over-containment, not a containment gap: the
-device stays isolated a cycle longer than intended, never less isolated than the record says. If you
-release a device that was actively reconnecting, a follow-up `quarantine.status` check is a reasonable
-sanity step. Tracked for a proper fix (a claim/generation token on the active record).
+a narrow timing window, not a routine occurrence. If nothing else happens to the device, this is
+over-containment, not a containment gap: the device stays isolated a cycle longer than intended, never
+less isolated than the record says.
+
+If the device is instead **immediately re-quarantined with a different whitelist** — not just
+released — the guarantee weakens: the reconciler already read the OLD record's whitelist and may
+dispatch it to the endpoint after the NEW record (a different reason, a different whitelist)
+becomes active. The store write is still safe (the id-scoped guarded update refuses to stamp
+the stale dispatch onto the new record, and the `quarantine.reapply` audit row now names the OLD
+record's `record_id` so the episode is distinguishable after the fact) —
+but for up to one reconciler cycle the *endpoint* can be enforcing a whitelist that is looser or
+tighter than the one the active record currently states, until the next tick/heartbeat notices the
+new record is unconfirmed and re-dispatches its real whitelist. If you release and immediately
+re-quarantine the same device with a different whitelist, a follow-up `quarantine.status` check is a
+reasonable sanity step until this closes. Tracked for a proper fix (a claim/generation token on the
+active record, extended to cover this dispatch-time case as well as the store-write case it was
+originally scoped for).
 
 ## IOC Checking
 

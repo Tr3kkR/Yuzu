@@ -16687,6 +16687,10 @@ private:
                 .audit_store = audit_store_.get(),
                 .dispatch_fn = command_dispatch_fn,
                 .now_fn = {},
+                // governance Gate 5 (chaos-injector, Finding 4b): lets a
+                // shutdown request stop tick()'s reconcile loop from
+                // starting further agents once stop_requested_ flips.
+                .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
             });
         // Heartbeat-triggered fast path (the ONLY event-driven trigger that
         // is dispatch-safe — Register returns before Subscribe establishes

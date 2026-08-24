@@ -1480,10 +1480,12 @@ list entirely, not merely hidden from write access.
 > confirmation state written by `QuarantineContainmentReconciler`, the background component that
 > re-applies a device's own firewall on reconnect. `last_applied_at` means a system re-dispatch of
 > the stored whitelist was accepted (`agents_reached > 0`) — NOT proof of containment (a
-> gateway-attached agent's `send_to` only queues the frame). `last_confirmed_at` is the one field
-> that means the endpoint firewall is provably applied: it is set only after a follow-up
-> `quarantine.status` read reports `state|active`. See `docs/user-manual/security-hardening.md`
-> "Reconnect re-application (#3425)".
+> gateway-attached agent's `send_to` only queues the frame). `last_confirmed_at` is set only after
+> a follow-up `quarantine.status` read reports `state|active` — but that read is the target
+> agent's own self-report (cert-bound to its identity, not independently corroborated by any
+> network-side signal), so treat it as strong operational evidence of containment, not proof. See
+> `docs/user-manual/security-hardening.md` "Reconnect re-application (#3425)" for the full trust
+> boundary.
 
 ---
 
@@ -1533,17 +1535,37 @@ Quarantine a device.
 > shape; REST matches the MCP `quarantine_device` twin's A5 behavior, not
 > its exact field path).
 
-> **This route records; it does NOT dispatch — and the twins have diverged
-> on the already-quarantined case (#3127).** `POST /api/v1/quarantine`
-> writes the quarantine record only. The live plugin isolation is dispatched
-> by the MCP `quarantine_device` tool, which has no REST twin. Two
-> consequences for a client that treats the two transports as
+> **This route records; it does NOT itself dispatch — and the twins have
+> diverged on the already-quarantined case (#3127).** `POST /api/v1/quarantine`
+> writes the quarantine record only, synchronously. The live plugin isolation
+> is dispatched by the MCP `quarantine_device` tool, which has no REST twin.
+> Two consequences for a client that treats the two transports as
 > interchangeable:
 >
 > - A `201` here means **the record was written**, not that the device's
->   firewall is enforcing anything. To isolate a device over REST, dispatch
->   `quarantine.quarantine` through the normal execution routes as well —
->   see [Security Hardening](security-hardening.md#device-quarantine).
+>   firewall is enforcing anything **yet**. To isolate a device immediately,
+>   dispatch `quarantine.quarantine` through the normal execution routes as
+>   well — see [Security Hardening](security-hardening.md#device-quarantine).
+>   **As of #3425, "yet" is load-bearing: this route no longer leaves a
+>   record permanently unenforced.** `QuarantineContainmentReconciler`
+>   reconciles every active record regardless of which surface created it —
+>   a record written here for a device that is (or later becomes) connected
+>   is automatically dispatched the stored whitelist typically within one
+>   reconciler tick (~20s) of the device being connected, without a second
+>   call — a brand-new record isn't in the heartbeat fast path's cache until
+>   the next periodic tick populates it, so a heartbeat arriving in that
+>   narrow window doesn't shortcut the wait. A record created here for a
+>   reachable device does not stay dormant — the one exception is a stored
+>   `whitelist` the re-dispatch validator refuses (this route does no
+>   charset/length validation of its own): every reconcile attempt then
+>   counts `validation_failed` and nothing is ever dispatched. That failure
+>   is loud, not silent — the device stays in
+>   `yuzu_server_quarantine_endpoint_unconfirmed{reachability="connected"}`
+>   and trips `YuzuQuarantineEndpointUnconfirmed` after 15 minutes — but it
+>   is a real way for a record to go permanently unenforced through this
+>   route. If record-only-without-live-isolation is the intent (e.g.
+>   flagging for review), enforce it at the caller/workflow level; do not
+>   rely on this route's absence of its own dispatch.
 > - The MCP tool now treats an already-active record as a **retryable
 >   re-dispatch**, not a terminal error; this route still answers `400`,
 >   because with no dispatch of its own there is nothing for it to re-drive.

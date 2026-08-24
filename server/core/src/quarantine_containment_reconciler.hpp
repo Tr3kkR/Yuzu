@@ -150,6 +150,17 @@ public:
         AuditStore* audit_store{nullptr}; // nullable — tests may omit
         CommandDispatchFn dispatch_fn;
         NowFn now_fn; // unset = system clock
+        // governance Gate 5 (chaos-injector, Finding 4b): tick()'s reconcile
+        // loop had NO interior cancellation check — once started, a single
+        // tick() call could sequentially work through up to
+        // kMaxDispatchesPerTick agents' worth of store/dispatch I/O with no
+        // way to interrupt it, compounding with the thread-join step in
+        // ServerImpl::stop() ahead of it. Checked once per loop iteration
+        // (not mid-reconcile_one — an in-flight per-agent I/O sequence still
+        // completes cleanly, this only stops the loop from STARTING another
+        // one). Unset (default) = never stop, matching every existing
+        // production/test Deps that predates this field.
+        std::function<bool()> should_stop;
         // Timing overrides — tests only. Defaults (0) mean "use the
         // production constant" (kMinReapplyInterval/kResponseWait/
         // kVerifyGrace below); a non-zero override lets a test drive the
@@ -168,7 +179,8 @@ public:
     /// since the last tick, detects session churn on previously-confirmed
     /// agents, publishes the divergence gauge, refreshes the cache
     /// `notify_agent_heartbeat` reads, then reconciles up to
-    /// `kMaxDispatchesPerTick` unconfirmed agents.
+    /// `kMaxDispatchesPerTick` unconfirmed agents — checking `Deps::should_stop`
+    /// once per agent so a shutdown request bounds how many more it starts.
     void tick();
 
     /// Heartbeat fast path: O(1) cache lookup; a miss (no active
@@ -230,16 +242,25 @@ private:
     void count(const char* result) const;
     void audit_event(const std::string& agent_id, const std::string& detail,
                      const char* result) const;
-    void audit_reapply(const std::string& agent_id, const std::string& command_id,
-                       std::string_view trigger) const;
-    void audit_confirmed(const std::string& agent_id, const std::string& command_id) const;
+    // record_id (governance Gate 6, compliance-officer Finding 2): the
+    // QuarantineRecord::id this reapply cycle was built from, threaded into
+    // the audit detail string so a release-then-requarantine race for the
+    // same agent_id leaves an unambiguous trail across the two episodes —
+    // the store-level write is already scoped by id (Gate 4 Finding A); the
+    // audit row now carries the same key rather than only agent_id + wall
+    // clock ordering.
+    void audit_reapply(const std::string& agent_id, std::int64_t record_id,
+                       const std::string& command_id, std::string_view trigger) const;
+    void audit_confirmed(const std::string& agent_id, std::int64_t record_id,
+                         const std::string& command_id) const;
     // #3425 governance Gate 2 (security-guardian): the observable agent-facing
     // action named by `what` already happened (dispatch accepted / status read
     // confirmed state|active) even though the durable stamp write failed — this
     // records that fact with result="failure" so a transient store outage never
     // produces a silent audit gap. See the two call sites for the full rationale.
-    void audit_unstamped(const std::string& agent_id, const std::string& command_id,
-                         std::string_view what, const std::string& store_error) const;
+    void audit_unstamped(const std::string& agent_id, std::int64_t record_id,
+                         const std::string& command_id, std::string_view what,
+                         const std::string& store_error) const;
     [[nodiscard]] std::int64_t now_epoch() const;
     [[nodiscard]] std::chrono::milliseconds min_reapply_interval() const;
     [[nodiscard]] std::chrono::milliseconds response_wait() const;

@@ -882,6 +882,10 @@ TEST_CASE("QuarantineContainmentReconciler: a release racing mark_endpoint_appli
     QuarantineStore qstore{qpool};
     REQUIRE(qstore.is_open());
     REQUIRE(qstore.quarantine_device("agent-1", "admin", "malware", "").has_value());
+    auto pre_status = qstore.get_status("agent-1");
+    REQUIRE(pre_status.has_value());
+    REQUIRE(pre_status->has_value());
+    const std::int64_t record_id = (*pre_status)->id;
 
     YUZU_REQUIRE_PG_DB_TPL(adb, quarantine_recon_audit_tpl);
     PgPool apool{{.conninfo = adb.dsn(), .size = 4}};
@@ -922,6 +926,12 @@ TEST_CASE("QuarantineContainmentReconciler: a release racing mark_endpoint_appli
     CHECK(events->front().target_id == "agent-1");
     CHECK(events->front().detail.find("dispatch accepted") != std::string::npos);
     CHECK(events->front().detail.find("device is not quarantined") != std::string::npos);
+    // governance Gate 6 (compliance-officer, Finding 2): the audit detail
+    // must carry the same record identity the store-level guarded UPDATE is
+    // scoped by, so a release-then-requarantine race leaves an unambiguous
+    // audit trail across the two quarantine episodes for this agent_id.
+    CHECK(events->front().detail.find("record_id=" + std::to_string(record_id)) !=
+          std::string::npos);
 }
 
 // #3425 governance Gate 4 (unhappy-path, Finding A, 2026-08-24): a
@@ -993,4 +1003,65 @@ TEST_CASE("QuarantineContainmentReconciler: a release+requarantine race does not
     reconciler.tick();
     REQUIRE(dispatch.calls.size() == 2);
     CHECK(dispatch.calls[1].parameters.at("whitelist_ips") == "99.99.99.99");
+}
+
+// #3425 governance Gate 5 (chaos-injector, Finding 4b, 2026-08-24): tick()'s
+// reconcile loop had NO interior cancellation check — once started, a single
+// tick() call could sequentially work through every eligible agent (up to
+// kMaxDispatchesPerTick) with no way to interrupt it before returning,
+// compounding with the thread-join step in ServerImpl::stop() that runs
+// before it. Deps::should_stop closes this: checked once per loop
+// iteration, so a shutdown request bounds how many MORE agents one tick()
+// call starts (an already-in-flight reconcile_one still completes cleanly —
+// this only stops the NEXT one from starting).
+TEST_CASE("QuarantineContainmentReconciler: tick() stops starting further agents once "
+          "should_stop() reports true, deferring the rest to the next tick",
+          "[pg][quarantine][reconciler]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_recon_tpl);
+    PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineStore qstore{qpool};
+    REQUIRE(qstore.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry{bus, metrics};
+    for (int i = 1; i <= 5; ++i) {
+        const std::string agent_id = "agent-" + std::to_string(i);
+        REQUIRE(qstore.quarantine_device(agent_id, "admin", "malware", "").has_value());
+        registry.register_agent(make_info(agent_id));
+    }
+
+    MockDispatch dispatch;
+    QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
+        .quarantine_store = &qstore,
+        .response_store = nullptr,
+        .registry = &registry,
+        .metrics = &metrics,
+        .audit_store = nullptr,
+        .dispatch_fn = dispatch.fn(),
+        .now_fn = {},
+        // Stop signals true once 2 of the 5 eligible agents have already
+        // been dispatched — proving the loop actually checks should_stop()
+        // and exits early rather than pushing through all 5.
+        .should_stop = [&dispatch] { return dispatch.calls.size() >= 2; },
+    });
+
+    reconciler.tick();
+
+    REQUIRE(dispatch.calls.size() == 2); // NOT 5 — the loop stopped early
+    for (const auto& call : dispatch.calls)
+        CHECK(call.action == "quarantine"); // the 2 that did go out were real, correct dispatches
+
+    // Exactly 2 of the 5 records were stamped applied — the other 3 are
+    // completely untouched (no partial state), proving this is a clean
+    // defer, not a lost or corrupted record.
+    int applied_count = 0;
+    for (int i = 1; i <= 5; ++i) {
+        auto status = qstore.get_status("agent-" + std::to_string(i));
+        REQUIRE(status.has_value());
+        REQUIRE(status->has_value());
+        if ((*status)->last_applied_at > 0)
+            ++applied_count;
+    }
+    CHECK(applied_count == 2);
 }

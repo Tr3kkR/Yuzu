@@ -84,18 +84,25 @@ void QuarantineContainmentReconciler::audit_event(const std::string& agent_id,
 }
 
 void QuarantineContainmentReconciler::audit_reapply(const std::string& agent_id,
+                                                     std::int64_t record_id,
                                                      const std::string& command_id,
                                                      std::string_view trigger) const {
-    audit_event(agent_id, "command_id=" + command_id + " trigger=" + std::string(trigger),
+    audit_event(agent_id,
+               "record_id=" + std::to_string(record_id) + " command_id=" + command_id +
+                   " trigger=" + std::string(trigger),
                "success");
 }
 
 void QuarantineContainmentReconciler::audit_confirmed(const std::string& agent_id,
+                                                       std::int64_t record_id,
                                                        const std::string& command_id) const {
-    audit_event(agent_id, "CONFIRMED command_id=" + command_id, "success");
+    audit_event(agent_id,
+               "CONFIRMED record_id=" + std::to_string(record_id) + " command_id=" + command_id,
+               "success");
 }
 
 void QuarantineContainmentReconciler::audit_unstamped(const std::string& agent_id,
+                                                       std::int64_t record_id,
                                                        const std::string& command_id,
                                                        std::string_view what,
                                                        const std::string& store_error) const {
@@ -109,8 +116,8 @@ void QuarantineContainmentReconciler::audit_unstamped(const std::string& agent_i
     // "success") because the DURABLE record disagrees — audit and store
     // must never both claim more than what actually landed.
     audit_event(agent_id,
-               std::string(what) + " command_id=" + command_id +
-                   " but the durable stamp failed: " + store_error,
+               std::string(what) + " record_id=" + std::to_string(record_id) +
+                   " command_id=" + command_id + " but the durable stamp failed: " + store_error,
                "failure");
 }
 
@@ -186,6 +193,18 @@ void QuarantineContainmentReconciler::tick() {
 
     std::size_t dispatched = 0;
     for (std::size_t i = 0; i < to_reconcile.size(); ++i) {
+        // governance Gate 5 (chaos-injector, Finding 4b): checked once per
+        // iteration so a shutdown request can stop the loop from starting
+        // ANOTHER agent's I/O sequence, rather than the loop being
+        // uninterruptible for the whole tick — the in-flight reconcile_one
+        // call itself still runs to completion, this only bounds how many
+        // MORE of them one tick() call can start after a stop is requested.
+        if (d_.should_stop && d_.should_stop()) {
+            spdlog::info("QuarantineContainmentReconciler: tick stopping early on shutdown — "
+                        "{} unconfirmed record(s) deferred",
+                        to_reconcile.size() - i);
+            break;
+        }
         if (dispatched >= kMaxDispatchesPerTick) {
             spdlog::warn("QuarantineContainmentReconciler: tick hit kMaxDispatchesPerTick ({}) — "
                         "{} unconfirmed record(s) deferred to the next tick",
@@ -331,14 +350,14 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
                 // real fact regardless of whether the stamp landed, and
                 // must not vanish with no audit trail just because the
                 // store write failed. Outside the lock, matching K10.
-                audit_unstamped(agent_id, pending_command_id, "status read confirmed state|active",
-                                mark_res.error());
+                audit_unstamped(agent_id, pending_record_id, pending_command_id,
+                                "status read confirmed state|active", mark_res.error());
                 count("degraded");
                 return false;
             }
             auto sess = d_.registry ? d_.registry->get_session(agent_id) : nullptr;
             const std::string confirmed_session_id = sess ? sess->session_id : std::string{};
-            audit_confirmed(agent_id, pending_command_id);
+            audit_confirmed(agent_id, pending_record_id, pending_command_id);
             {
                 std::lock_guard<std::mutex> lk(mu_);
                 auto& st = state_[agent_id];
@@ -527,11 +546,12 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
         // accepted (agents_reached>0, checked above) — a real containment-
         // affecting system action already happened and must not vanish
         // with no audit trail just because the store stamp failed.
-        audit_unstamped(agent_id, reapply_res->command_id, "dispatch accepted", mark_res.error());
+        audit_unstamped(agent_id, stored.id, reapply_res->command_id, "dispatch accepted",
+                        mark_res.error());
         count("degraded");
         return true; // the dispatch itself was still attempted
     }
-    audit_reapply(agent_id, reapply_res->command_id, trigger);
+    audit_reapply(agent_id, stored.id, reapply_res->command_id, trigger);
     {
         std::lock_guard<std::mutex> lk(mu_);
         auto& st = state_[agent_id];

@@ -1601,8 +1601,8 @@ distinguishes them, since only one is covered by the existing metric:
 (`completed` / `fresh` / `failed`).
 
 **Verify:** after the server reports ready, confirm the migration actually moved
-your data — `GET /api/v1/quarantine` (or the dashboard Guardian → Quarantine view)
-should show the same active quarantine records you had before upgrading, and
+your data — `GET /api/v1/quarantine` (quarantine has no dashboard surface — REST/MCP
+only) should show the same active quarantine records you had before upgrading, and
 `SELECT value FROM quarantine_store.quarantine_meta WHERE key = 'backfill_row_count';`
 against the Postgres database should match the row count you'd have gotten from
 `sqlite3 quarantine.db.migrated-<epoch> "SELECT count(*) FROM quarantine_records;"`
