@@ -99,8 +99,12 @@ namespace yuzu::server {
 /// Closed label set for `yuzu_server_quarantine_reapply_total{result}`,
 /// pre-seeded at boot (server.cpp) so `absent()` on any value can never be
 /// confused with "the reconciler has never ticked" (the `kQuarantineGateOutcomes`
-/// discipline, `dispatch_confined_arms.hpp`). Every value has exactly one
-/// emit site in `quarantine_containment_reconciler.cpp`.
+/// discipline, `dispatch_confined_arms.hpp`). Several values have more than
+/// one `count(...)` call site in `quarantine_containment_reconciler.cpp` —
+/// e.g. `degraded` and `not_reached` are each reachable from multiple
+/// distinct failure branches — but every site for a given value emits the
+/// same semantic outcome, and the SET itself stays closed/exhaustive (grep
+/// `count("` to enumerate).
 inline constexpr std::array<std::string_view, 11> kQuarantineReapplyResults{
     "reapplied",         // an apply or status dispatch was accepted (agents_reached > 0)
     "confirmed",         // a status read reported state|active

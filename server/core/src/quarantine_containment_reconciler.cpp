@@ -457,6 +457,18 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
                                      // (K8/CDX-P1-01, the disclosed residual TOCTOU — see
                                      // the "KNOWN RESIDUAL RACE" note in the header) but
                                      // there is nothing left here to track as pending.
+        } else {
+            // #3425 governance Gate 3 (cpp-safety, finding C): mirror the
+            // confirm branch's backoff escalation below — without this, a
+            // sustained QuarantineStore write outage re-dispatches a fresh
+            // "quarantine apply" command every fixed kMinReapplyInterval
+            // (~60s prod) instead of backing off exponentially like every
+            // other repeated-failure path in this state machine.
+            const auto steady_now = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> lk(mu_);
+            auto& st = state_[agent_id];
+            st.backoff = next_backoff(st.backoff, kMaxBackoff);
+            st.next_eligible_at = steady_now + st.backoff;
         }
         // #3425 governance Gate 2 (security-guardian): the dispatch WAS
         // accepted (agents_reached>0, checked above) — a real containment-
