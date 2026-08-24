@@ -5997,7 +5997,7 @@ public:
         std::shared_ptr<grpc::ServerCredentials> mgmt_creds = grpc::InsecureServerCredentials();
         if (cfg_.tls_enabled) {
             auto tls = build_tls_credentials(cfg_.tls_server_cert, cfg_.tls_server_key,
-                                             cfg_.tls_ca_cert, cfg_.allow_one_way_tls,
+                                             cfg_.tls_ca_cert, cfg_.insecure_skip_client_verify,
                                              /*require_client_cert=*/!cfg_.using_default_agent_certs,
                                              "agent listener");
             if (tls) {
@@ -6019,7 +6019,7 @@ public:
                 // unauthenticated peer on the management plane.
                 auto mgmt_tls = build_tls_credentials(
                     cfg_.mgmt_tls_server_cert, cfg_.mgmt_tls_server_key, cfg_.mgmt_tls_ca_cert,
-                    cfg_.allow_one_way_tls, /*require_client_cert=*/true, "management listener");
+                    cfg_.insecure_skip_client_verify, /*require_client_cert=*/true, "management listener");
                 if (!mgmt_tls) {
                     spdlog::error("Management TLS credentials are invalid; refusing to start");
                     startup_failed_ = true;
@@ -6039,7 +6039,7 @@ public:
                 // so the gateway-upstream listener still connects.
                 auto mgmt_tls = build_tls_credentials(
                     cfg_.tls_server_cert, cfg_.tls_server_key, cfg_.tls_ca_cert,
-                    cfg_.allow_one_way_tls, /*require_client_cert=*/true, "management listener");
+                    cfg_.insecure_skip_client_verify, /*require_client_cert=*/true, "management listener");
                 if (!mgmt_tls) {
                     spdlog::error("Management TLS credentials (strict, default certs) are invalid; "
                                   "refusing to start");
@@ -6903,7 +6903,7 @@ public:
         // so SOC 2 CC7.2 evidence is collected for the duration the server runs
         // in a degraded posture (otherwise spdlog-only output would not survive
         // log rotation or land in audit.db).
-        const bool insecure_skip_verify_active = cfg_.tls_enabled && cfg_.allow_one_way_tls;
+        const bool insecure_skip_verify_active = cfg_.tls_enabled && cfg_.insecure_skip_client_verify;
         const bool no_tls_active = !cfg_.tls_enabled;
         const bool default_certs_active = cfg_.using_default_certs;
         if (insecure_skip_verify_active || no_tls_active || default_certs_active) {
@@ -8245,7 +8245,7 @@ private:
     [[nodiscard]] std::shared_ptr<grpc::ServerCredentials>
     build_tls_credentials(const std::filesystem::path& cert_path,
                           const std::filesystem::path& key_path,
-                          const std::filesystem::path& ca_path, bool allow_one_way_tls,
+                          const std::filesystem::path& ca_path, bool insecure_skip_client_verify,
                           bool require_client_cert, std::string_view listener_name) const {
         if (cert_path.empty() || key_path.empty()) {
             spdlog::error("{} TLS requires certificate and key", listener_name);
@@ -8285,7 +8285,7 @@ private:
                 require_client_cert ? GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY
                                     : GRPC_SSL_REQUEST_CLIENT_CERTIFICATE_AND_VERIFY;
         } else {
-            if (!allow_one_way_tls) {
+            if (!insecure_skip_client_verify) {
                 spdlog::error("{} TLS requires --ca-cert (or enable "
                               "--insecure-skip-client-verify with YUZU_ALLOW_INSECURE_TLS=1)",
                               listener_name);
