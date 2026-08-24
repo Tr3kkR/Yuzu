@@ -238,19 +238,63 @@ int mac_link_speed_mbps(const std::string& name) {
 // replacing the old `route -n get default | grep gateway` shell pipe. The
 // impure sysctl fetch stays here; the bounds-checked walk lives in
 // network_config_parsers.hpp's parse_default_route_dump().
-std::string mac_default_gateway() {
+// RAII owner for a getifaddrs() list. cpp-conventions.md §Resource ownership
+// requires an owner rather than manual cleanup for a new acquisition, and
+// CommandContext::write_output / std::format / the containers below can all
+// throw between acquisition and release. Mirrors agents/shared/icmp_probe.hpp's
+// AddrInfoGuard; kept local because no shared ifaddrs owner exists in-tree yet
+// (a shared one alongside AddrInfoGuard is a sensible later consolidation --
+// there are three call sites across the repo).
+struct IfAddrsGuard {
+    struct ifaddrs* p{nullptr};
+    IfAddrsGuard() = default;
+    explicit IfAddrsGuard(struct ifaddrs* ptr) : p(ptr) {}
+    ~IfAddrsGuard() {
+        if (p)
+            ::freeifaddrs(p);
+    }
+    IfAddrsGuard(const IfAddrsGuard&) = delete;
+    IfAddrsGuard& operator=(const IfAddrsGuard&) = delete;
+    IfAddrsGuard(IfAddrsGuard&& o) noexcept : p(o.p) { o.p = nullptr; }
+    IfAddrsGuard& operator=(IfAddrsGuard&& o) noexcept {
+        if (this != &o) {
+            if (p)
+                ::freeifaddrs(p);
+            p = o.p;
+            o.p = nullptr;
+        }
+        return *this;
+    }
+};
+
+// Gateway plus the honesty bits the caller needs: a failed or truncated
+// PF_ROUTE read must not be emitted as the positive assertion "this host has
+// no default gateway". This was the only degradation path in the plugin that
+// stayed silent.
+struct MacGatewayResult {
+    std::string gateway = "-";
+    bool ok = false;
+    bool truncated = false;
+};
+
+MacGatewayResult mac_default_gateway() {
+    MacGatewayResult out;
     int mib[6] = {CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_DUMP, 0};
     std::size_t needed = 0;
     if (::sysctl(mib, 6, nullptr, &needed, nullptr, 0) != 0 || needed == 0)
-        return "-";
+        return out;
     std::vector<unsigned char> buf(needed);
     if (::sysctl(mib, 6, buf.data(), &needed, nullptr, 0) != 0)
-        return "-";
+        return out;
     buf.resize(needed);
     auto parsed = yuzu::network_config::parse_default_route_dump(buf);
+    out.ok = true;
+    out.truncated = parsed.truncated;
     if (parsed.truncated)
         spdlog::warn("network_config: PF_ROUTE default-route dump was truncated");
-    return parsed.found ? parsed.gateway : "-";
+    if (parsed.found)
+        out.gateway = parsed.gateway;
+    return out;
 }
 
 #if defined(YUZU_HAVE_SYSTEMCONFIGURATION)
@@ -284,13 +328,23 @@ std::vector<std::string> extract_server_addresses(CFDictionaryRef dict) {
     std::vector<std::string> out;
     if (!dict)
         return out;
-    auto* servers = static_cast<CFArrayRef>(CFDictionaryGetValue(dict, CFSTR("ServerAddresses")));
-    if (!servers)
+    // Type-check before every CF cast. A CoreFoundation cast is an unchecked
+    // pointer cast, so calling CFArray/CFString APIs on a different CF type is
+    // undefined behaviour and in practice faults inside CoreFoundation. Any
+    // writer to State:/Network/Service/<id>/DNS -- a third-party VPN or
+    // network-extension bundle, a malformed configuration profile -- can put a
+    // non-conforming value here, and this action runs fleet-wide. do_proxy
+    // below already guards every read this way; this path did not.
+    const void* servers_v = CFDictionaryGetValue(dict, CFSTR("ServerAddresses"));
+    if (!servers_v || CFGetTypeID(servers_v) != CFArrayGetTypeID())
         return out;
+    auto* servers = static_cast<CFArrayRef>(servers_v);
     const CFIndex count = CFArrayGetCount(servers);
     for (CFIndex i = 0; i < count; ++i) {
-        auto* item = static_cast<CFStringRef>(CFArrayGetValueAtIndex(servers, i));
-        auto server = cfstring_to_utf8(item);
+        const void* item_v = CFArrayGetValueAtIndex(servers, i);
+        if (!item_v || CFGetTypeID(item_v) != CFStringGetTypeID())
+            continue; // skip a non-string element, never fault on it
+        auto server = cfstring_to_utf8(static_cast<CFStringRef>(item_v));
         if (!server.empty())
             out.push_back(std::move(server));
     }
@@ -403,6 +457,13 @@ LinkDumpResult fetch_link_dump() {
         } while (n < 0 && errno == EINTR);
         if (n <= 0)
             return result; // ok stays false — an honest incomplete read
+        // MSG_TRUNC means the kernel discarded the tail of this datagram
+        // because it exceeded our fixed buffer. If the retained prefix ends on
+        // a valid netlink message boundary the parser cannot see the loss, and
+        // a later NLMSG_DONE would then set ok=true over a short record set.
+        // The syscall's own truncation signal is authoritative.
+        if ((rm.msg_flags & MSG_TRUNC) != 0)
+            return result; // ok stays false — records were dropped
 
         auto chunk = yuzu::network_config::parse_rtnetlink_link_chunk(
             std::span<const unsigned char>(buf, static_cast<std::size_t>(n)), kSeq);
@@ -468,6 +529,13 @@ AddrDumpResult fetch_addr_dump() {
         } while (n < 0 && errno == EINTR);
         if (n <= 0)
             return result;
+        // MSG_TRUNC means the kernel discarded the tail of this datagram
+        // because it exceeded our fixed buffer. If the retained prefix ends on
+        // a valid netlink message boundary the parser cannot see the loss, and
+        // a later NLMSG_DONE would then set ok=true over a short record set.
+        // The syscall's own truncation signal is authoritative.
+        if ((rm.msg_flags & MSG_TRUNC) != 0)
+            return result; // ok stays false — records were dropped
 
         auto chunk = yuzu::network_config::parse_rtnetlink_addr_chunk(
             std::span<const unsigned char>(buf, static_cast<std::size_t>(n)), kSeq);
@@ -533,6 +601,13 @@ RouteDumpResult fetch_default_route_dump() {
         } while (n < 0 && errno == EINTR);
         if (n <= 0)
             return result;
+        // MSG_TRUNC means the kernel discarded the tail of this datagram
+        // because it exceeded our fixed buffer. If the retained prefix ends on
+        // a valid netlink message boundary the parser cannot see the loss, and
+        // a later NLMSG_DONE would then set ok=true over a short record set.
+        // The syscall's own truncation signal is authoritative.
+        if ((rm.msg_flags & MSG_TRUNC) != 0)
+            return result; // ok stays false — records were dropped
 
         auto chunk = yuzu::network_config::parse_rtnetlink_route_chunk(
             std::span<const unsigned char>(buf, static_cast<std::size_t>(n)), kSeq);
@@ -613,12 +688,15 @@ int do_adapters(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(__APPLE__)
-    struct ifaddrs* head = nullptr;
-    if (::getifaddrs(&head) != 0) {
+    struct ifaddrs* raw_head = nullptr;
+    if (::getifaddrs(&raw_head) != 0) {
         ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               "network_config:getifaddrs_failed");
         return 0;
     }
+    // Adopt IMMEDIATELY -- everything below allocates and can throw.
+    IfAddrsGuard head_guard(raw_head);
+    struct ifaddrs* const head = raw_head;
 
     // getifaddrs() returns one entry per (interface, address-family) pair —
     // collapse to one row per interface name, in first-seen order, matching
@@ -672,7 +750,6 @@ int do_adapters(yuzu::CommandContext& ctx) {
             }
         }
     }
-    ::freeifaddrs(head);
 
     for (const auto& name : order) {
         auto mac_it = mac_by_name.find(name);
@@ -771,14 +848,26 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(__APPLE__)
-    const std::string default_gw = mac_default_gateway();
+    const auto gw_result = mac_default_gateway();
+    const std::string default_gw = gw_result.gateway;
+    if (!gw_result.ok || gw_result.truncated) {
+        // The address rows below are still valid, so this is CONSTRAINED/
+        // PARTIAL rather than UNAVAILABLE -- but it must not be silent: a
+        // gateway of "-" reported with an OK status is the positive claim
+        // "this host has no default route".
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "network_config:pf_route_default_dump_incomplete");
+    }
 
-    struct ifaddrs* head = nullptr;
-    if (::getifaddrs(&head) != 0) {
+    struct ifaddrs* raw_head = nullptr;
+    if (::getifaddrs(&raw_head) != 0) {
         ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               "network_config:getifaddrs_failed");
         return 0;
     }
+    // Adopt IMMEDIATELY -- everything below allocates and can throw.
+    IfAddrsGuard head_guard(raw_head);
+    struct ifaddrs* const head = raw_head;
 
     char text_buf[INET6_ADDRSTRLEN];
     for (auto* p = head; p != nullptr; p = p->ifa_next) {
@@ -842,7 +931,6 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
             ctx.write_output(std::format("ip|{}|{}|{}|{}", name, addr, prefix, default_gw));
         }
     }
-    ::freeifaddrs(head);
 #endif
     return 0;
 }
@@ -913,12 +1001,13 @@ int do_dns_servers(yuzu::CommandContext& ctx) {
         // Union global + every State:/Network/Service/<id>/DNS key,
         // global-first, deduped (a resolver can legitimately appear under
         // more than one service).
-        std::vector<std::string> all_servers;
+        // Groups in priority order: global first, then each per-service
+        // list. The ordered union/dedupe is the pure half (union_dns_servers).
+        std::vector<std::vector<std::string>> server_groups;
         {
             yuzu::agent::ScopedCFRef<CFDictionaryRef> dns_dict(static_cast<CFDictionaryRef>(
                 SCDynamicStoreCopyValue(store.get(), CFSTR("State:/Network/Global/DNS"))));
-            auto global = extract_server_addresses(dns_dict.get());
-            all_servers.insert(all_servers.end(), global.begin(), global.end());
+            server_groups.push_back(extract_server_addresses(dns_dict.get()));
         }
         {
             // SCDynamicStoreCopyKeyList's `pattern` argument is ALWAYS a
@@ -933,12 +1022,11 @@ int do_dns_servers(yuzu::CommandContext& ctx) {
                     auto* key = static_cast<CFStringRef>(CFArrayGetValueAtIndex(keys.get(), i));
                     yuzu::agent::ScopedCFRef<CFDictionaryRef> svc_dict(
                         static_cast<CFDictionaryRef>(SCDynamicStoreCopyValue(store.get(), key)));
-                    auto svc_servers = extract_server_addresses(svc_dict.get());
-                    all_servers.insert(all_servers.end(), svc_servers.begin(), svc_servers.end());
+                    server_groups.push_back(extract_server_addresses(svc_dict.get()));
                 }
             }
         }
-        for (const auto& server : yuzu::network_config::dedupe_preserve_order(all_servers)) {
+        for (const auto& server : yuzu::network_config::union_dns_servers(server_groups)) {
             auto type = (server.find(':') != std::string::npos) ? "IPv6" : "IPv4";
             ctx.write_output(std::format("dns|system|{}|{}", server, type));
         }
@@ -1012,62 +1100,98 @@ int do_proxy(yuzu::CommandContext& ctx) {
 
 #elif defined(__APPLE__)
 #if defined(YUZU_HAVE_SYSTEMCONFIGURATION)
-    // SCDynamicStoreCopyProxies covers every network service, not only
-    // Wi-Fi -- a disclosed behavior improvement over the old
-    // `networksetup -getwebproxy Wi-Fi` / `-getautoproxyurl Wi-Fi` pair,
-    // which only ever inspected one interface.
+    // SCDynamicStoreCopyProxies returns the CURRENT/PRIMARY service's proxy
+    // settings at the top level and puts every OTHER configured service in a
+    // __SCOPED__ sub-dictionary keyed by interface. Reading only the top level
+    // is NOT a superset of the pre-migration leg, which asked for the Wi-Fi
+    // service BY NAME (`networksetup -getwebproxy Wi-Fi`): on a Mac whose
+    // primary service is Ethernet with the proxy configured on Wi-Fi, the
+    // top-level read reports `none` where the old leg reported `http`. That is
+    // a silent regression on an action tagged `compliance`, so the scoped
+    // services are enumerated too -- the same shape the dns_servers leg above
+    // already uses for its per-service resolver union.
     yuzu::agent::ScopedCFRef<CFDictionaryRef> proxies(SCDynamicStoreCopyProxies(nullptr));
     bool emitted = false;
     if (proxies) {
-        auto get_bool = [&](CFStringRef key) -> bool {
-            const void* v = CFDictionaryGetValue(proxies.get(), key);
-            if (!v)
+        // Decode one proxy dictionary (top-level or scoped) into the pure
+        // ProxyServiceConfig the decision function consumes. Acquisition here,
+        // decision in network_config_parsers.hpp.
+        auto decode = [&](CFDictionaryRef d, std::string service) {
+            auto get_bool = [&](CFStringRef key) -> bool {
+                const void* v = CFDictionaryGetValue(d, key);
+                if (!v)
+                    return false;
+                if (CFGetTypeID(v) == CFBooleanGetTypeID())
+                    return CFBooleanGetValue(static_cast<CFBooleanRef>(v));
+                if (CFGetTypeID(v) == CFNumberGetTypeID()) {
+                    int val = 0;
+                    CFNumberGetValue(static_cast<CFNumberRef>(v), kCFNumberIntType, &val);
+                    return val != 0;
+                }
                 return false;
-            if (CFGetTypeID(v) == CFBooleanGetTypeID())
-                return CFBooleanGetValue(static_cast<CFBooleanRef>(v));
-            if (CFGetTypeID(v) == CFNumberGetTypeID()) {
+            };
+            auto get_string = [&](CFStringRef key) -> std::string {
+                const void* v = CFDictionaryGetValue(d, key);
+                if (!v || CFGetTypeID(v) != CFStringGetTypeID())
+                    return {};
+                return cfstring_to_utf8(static_cast<CFStringRef>(v));
+            };
+            auto get_int = [&](CFStringRef key) -> int {
+                const void* v = CFDictionaryGetValue(d, key);
+                if (!v || CFGetTypeID(v) != CFNumberGetTypeID())
+                    return 0;
                 int val = 0;
                 CFNumberGetValue(static_cast<CFNumberRef>(v), kCFNumberIntType, &val);
-                return val != 0;
-            }
-            return false;
-        };
-        auto get_string = [&](CFStringRef key) -> std::string {
-            const void* v = CFDictionaryGetValue(proxies.get(), key);
-            if (!v || CFGetTypeID(v) != CFStringGetTypeID())
-                return {};
-            return cfstring_to_utf8(static_cast<CFStringRef>(v));
-        };
-        auto get_int = [&](CFStringRef key) -> int {
-            const void* v = CFDictionaryGetValue(proxies.get(), key);
-            if (!v || CFGetTypeID(v) != CFNumberGetTypeID())
-                return 0;
-            int val = 0;
-            CFNumberGetValue(static_cast<CFNumberRef>(v), kCFNumberIntType, &val);
-            return val;
+                return val;
+            };
+            yuzu::network_config::ProxyServiceConfig c;
+            c.service = std::move(service);
+            c.http_enabled = get_bool(kSCPropNetProxiesHTTPEnable);
+            c.http_host = get_string(kSCPropNetProxiesHTTPProxy);
+            c.http_port = get_int(kSCPropNetProxiesHTTPPort);
+            c.pac_enabled = get_bool(kSCPropNetProxiesProxyAutoConfigEnable);
+            c.pac_url = get_string(kSCPropNetProxiesProxyAutoConfigURLString);
+            return c;
         };
 
-        // HTTP first, then PAC. This is the pre-migration precedence: the old
-        // leg tested `networksetup -getwebproxy` in the IF branch and only
-        // reached `-getautoproxyurl` in its ELSE, so on a host with BOTH a web
-        // proxy and a PAC URL configured it reported `http`. Checking PAC
-        // first would silently flip that host's proxy_type to `pac`.
-        if (get_bool(kSCPropNetProxiesHTTPEnable)) {
-            auto host = get_string(kSCPropNetProxiesHTTPProxy);
-            const int port = get_int(kSCPropNetProxiesHTTPPort);
-            if (!host.empty()) {
-                ctx.write_output("proxy_type|http");
-                ctx.write_output(std::format("proxy_address|{}:{}", host, port));
-                emitted = true;
+        // Primary/current service FIRST so it still wins when it has a proxy;
+        // scoped services are consulted only when it does not.
+        std::vector<yuzu::network_config::ProxyServiceConfig> candidates;
+        candidates.push_back(decode(proxies.get(), std::string{}));
+
+        // "__SCOPED__" is an OBSERVED key, not a published one: it carries no
+        // kSCPropNetProxies* constant in SCSchemaDefinitions.h on this SDK.
+        // Treated strictly as best-effort enrichment -- absent or wrongly
+        // typed, the code falls back to exactly the top-level-only behaviour,
+        // so a future OS that drops or renames it degrades to the previous
+        // result rather than failing. Every value is type-checked below.
+        const void* scoped_v = CFDictionaryGetValue(proxies.get(), CFSTR("__SCOPED__"));
+        if (scoped_v && CFGetTypeID(scoped_v) == CFDictionaryGetTypeID()) {
+            auto* scoped = static_cast<CFDictionaryRef>(scoped_v);
+            const CFIndex n = CFDictionaryGetCount(scoped);
+            std::vector<const void*> keys(static_cast<std::size_t>(n));
+            std::vector<const void*> vals(static_cast<std::size_t>(n));
+            if (n > 0)
+                CFDictionaryGetKeysAndValues(scoped, keys.data(), vals.data());
+            for (CFIndex i = 0; i < n; ++i) {
+                if (!vals[static_cast<std::size_t>(i)] ||
+                    CFGetTypeID(vals[static_cast<std::size_t>(i)]) != CFDictionaryGetTypeID())
+                    continue;
+                std::string name;
+                if (keys[static_cast<std::size_t>(i)] &&
+                    CFGetTypeID(keys[static_cast<std::size_t>(i)]) == CFStringGetTypeID())
+                    name = cfstring_to_utf8(
+                        static_cast<CFStringRef>(keys[static_cast<std::size_t>(i)]));
+                candidates.push_back(decode(
+                    static_cast<CFDictionaryRef>(vals[static_cast<std::size_t>(i)]), name));
             }
         }
-        if (!emitted && get_bool(kSCPropNetProxiesProxyAutoConfigEnable)) {
-            auto url = get_string(kSCPropNetProxiesProxyAutoConfigURLString);
-            if (!url.empty()) {
-                ctx.write_output("proxy_type|pac");
-                ctx.write_output(std::format("proxy_address|{}", url));
-                emitted = true;
-            }
+
+        const auto choice = yuzu::network_config::select_proxy(candidates);
+        if (choice.found) {
+            ctx.write_output(std::format("proxy_type|{}", choice.type));
+            ctx.write_output(std::format("proxy_address|{}", choice.address));
+            emitted = true;
         }
 
         const void* bypass_v =
@@ -1152,8 +1276,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "environment variables", nullptr},
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 1, "SCDynamicStoreCopyProxies",
-         "reports the HTTP proxy and PAC URL across all network services; HTTPS/SOCKS/FTP "
-         "proxies are not reported, so a host configured with only those reads as none"},
+         "reports the HTTP proxy and PAC URL, checking the primary network service first and "
+         "then each scoped per-interface service; HTTPS/SOCKS/FTP proxies are not reported, so "
+         "a host configured with only those reads as none"},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "WinHttpGetIEProxyConfigForCurrentUser", nullptr},
     },
@@ -1172,7 +1297,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     },
     {
         /* .action      = */ "arp",
-        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/proc/net/arp", nullptr},
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 1, "/proc/net/arp",
+         "IPv4 ARP entries only; /proc/net/arp carries no IPv6 neighbours (they live in the "
+         "RTM_GETNEIGH table), and non-Ethernet or incomplete entries are not reported"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 1, "PF_ROUTE sysctl RTF_LLINFO",
          "ip and mac only; the interface name and static/dynamic type are not carried by the "
@@ -1457,15 +1585,27 @@ private:
             if (yuzu::agent::forward_runner_failure(ctx, res))
                 return 0; // status already set — an honest CONSTRAINED/UNAVAILABLE, not silence
             if (res.tool_ran && res.exit_code == 0) {
+                int emitted = 0;
                 for (const auto& line :
                     yuzu::network_config::parse_resolvectl_cache_lines(res.output)) {
                     ctx.write_output(std::format("cache_entry|{}", line));
+                    ++emitted;
                 }
-                return 0;
+                // Only claim the action if something was actually reported.
+                // The pre-migration leg guarded this branch on non-empty
+                // output, so a successful-but-empty `resolvectl cache` fell
+                // through to the statistics fallback and ultimately to the
+                // `dns_cache|not_available` sentinel. Returning here on zero
+                // rows would instead hand back an empty, STATUS-OK response --
+                // no rows, no sentinel, no degradation signal -- which every
+                // other dns_cache path on every other platform avoids.
+                if (emitted > 0)
+                    return 0;
             }
             // resolvectl ran but exited nonzero (e.g. no systemd-resolved
-            // running) — fall through to the systemd-resolve statistics
-            // fallback, same behaviour as the pre-migration shell-out.
+            // running), or produced no cache rows — fall through to the
+            // systemd-resolve statistics fallback, same behaviour as the
+            // pre-migration shell-out.
         }
 
         auto systemd_resolve_path =

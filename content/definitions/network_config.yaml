@@ -22,7 +22,10 @@ metadata:
     (RTM_GETLINK) plus sysfs speed and skips loopback; on macOS reads
     getifaddrs and SIOCGIFMEDIA and reports loopback (lo0) as a real
     adapter. The loopback difference between Linux and macOS is
-    long-standing behaviour, not an oversight.
+    long-standing behaviour, not an oversight. On Linux the adapter name is
+    the kernel interface name, so devices with a parent link (veth, VLAN,
+    tunnel) are reported as eth0 rather than iproute2's display form
+    eth0@if74.
   tags: [network, inventory, hardware]
 
 spec:
@@ -86,7 +89,9 @@ metadata:
     On Windows uses GetAdaptersAddresses with GAA_FLAG_INCLUDE_GATEWAYS,
     on Linux reads rtnetlink (RTM_GETADDR/RTM_GETROUTE), on macOS reads
     getifaddrs plus a PF_ROUTE sysctl for the default route. Loopback is
-    excluded on Linux and macOS.
+    excluded on Linux and macOS. The Linux default gateway is taken from the
+    main routing table only, matching ip route show default; policy-routing
+    tables installed by VPNs are ignored.
   tags: [network, inventory, addressing]
 
 spec:
@@ -212,10 +217,12 @@ metadata:
     (none, http, pac, auto_detect), proxy address, and bypass list.
     On Windows reads WinHTTP IE proxy config. On Linux checks
     http_proxy/https_proxy/all_proxy/no_proxy environment variables.
-    On macOS reads SCDynamicStoreCopyProxies, covering every network
-    service rather than Wi-Fi alone. Only the HTTP proxy and PAC URL are
-    reported: a host configured with only an HTTPS, SOCKS or FTP proxy
-    reads as none.
+    On macOS reads SCDynamicStoreCopyProxies, checking the primary network
+    service first and then each scoped per-interface service, so a proxy
+    configured on a service that is not currently active is still reported.
+    Only the HTTP proxy and PAC URL are reported: a host configured with
+    only an HTTPS, SOCKS or FTP proxy reads as none. macOS results also
+    include a bypass row listing the proxy exception list.
   tags: [network, inventory, proxy, compliance]
 
 spec:

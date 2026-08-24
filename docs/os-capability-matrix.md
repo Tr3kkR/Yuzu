@@ -73,7 +73,7 @@ duplicates.
 | **Device-identity inventory** (serial, UUID, BIOS, CPU/RAM/disk, MAC, OS) | ✅ | ✅ | ✅ | `sync_source_device_ci.cpp` reuses `hardware`/`device_identity`/`os_info`/`network_config`. `hardware` `system`: Win WMI `Win32_BIOS`/`Win32_ComputerSystemProduct`; Linux `/sys/class/dmi/id/product_{serial,uuid}` (0400 → needs `cap_dac_read_search`; `unknown` without it); macOS native IOKit `IOPlatformExpertDevice` (`IOServiceGetMatchingService`/`IORegistryEntryCreateCFProperty`; `IOPlatformUUID` ≠ SMBIOS UUID). Machine-scope only. Server `DeviceInventoryStore` |
 | **━━ Live device snapshot ("Get live info") ━━** | | | | Device page dispatch-and-poll snapshot; each kind has its own `device.live.<kind>` audit verb. `docs/user-manual/device-management.md` |
 | **Live — process tree + per-process connections** | ✅ tree + conn join | 🟡 tree; conn join absent | 🟡 tree | `processes/list_tree` (`proc\|pid\|ppid\|name\|sha256\|path`, all OSes) joined by PID to `network_diag/connections` (owning PID via `GetExtendedTcpTable`, Windows). Linux `/proc/net/tcp` exposes inode not pid → no join |
-| **Live — ARP / neighbour table** | ✅ | ✅ | ⚠️ | `network_config/arp`: Windows `GetIpNetTable2`; Linux `/proc/net/arp`; macOS PF_ROUTE `RTF_LLINFO` sysctl, de-duplicated — constrained because that dump carries no interface name or static/dynamic type, both emitted as `-` |
+| **Live — ARP / neighbour table** | ✅ | ⚠️ | ⚠️ | `network_config/arp`: Windows `GetIpNetTable2`; Linux `/proc/net/arp` — constrained: IPv4 ARP only, no IPv6 neighbours (those live in `RTM_GETNEIGH`) and no incomplete entries; macOS PF_ROUTE `RTF_LLINFO` sysctl, de-duplicated — constrained because that dump carries no interface name or static/dynamic type, both emitted as `-` |
 | **Live — DNS resolver cache** | ✅ | ⛔ (no portable resolver cache) | ⛔ (OS exposes no resolver-cache contents; `dscacheutil -cachedump` defunct on macOS 26) | `network_config/dns_cache` (`DnsGetCacheDataTable` on Windows; macOS returns an honest `dns_cache\|unsupported` sentinel, no shell-out — see `darwin-compat.md`) |
 | **Live — disk space** | ✅ | ✅ | ✅ | `disk_space` plugin `free` action; `GetDiskFreeSpaceExW` on Windows, `statvfs` on POSIX |
 | **Live — Wi-Fi current connection** | ✅ | ✅ | 🟡 | `wifi/connected` — Win `WlanQueryInterface`, Linux `nmcli`/`iwconfig`, macOS `wifi_corewlan.mm` `corewlan_current_connection` (CoreWLAN `CWWiFiClient`/`CWInterface`, first `.mm` TU; pure `format_connected_record` in `wifi_corewlan.hpp`). macOS 🟡: association/RSSI/channel/security read, but SSID/BSSID are withheld from a background daemon by Location Services on 14+ (`<ssid-withheld>`) — replaces the dead `airport -I` path |
@@ -442,12 +442,12 @@ implementation is.
 | network_config | dns_servers | macos | supported | 1 | SCDynamicStore | - |
 | network_config | dns_servers | windows | supported | 1 | GetAdaptersAddresses | - |
 | network_config | proxy | linux | supported | 1 | environment variables | - |
-| network_config | proxy | macos | constrained | 1 | SCDynamicStoreCopyProxies | reports the HTTP proxy and PAC URL across all network services; HTTPS/SOCKS/FTP proxies are not reported, so a host configured with only those reads as none |
+| network_config | proxy | macos | constrained | 1 | SCDynamicStoreCopyProxies | reports the HTTP proxy and PAC URL, checking the primary network service first and then each scoped per-interface service; HTTPS/SOCKS/FTP proxies are not reported, so a host configured with only those reads as none |
 | network_config | proxy | windows | supported | 1 | WinHttpGetIEProxyConfigForCurrentUser | - |
 | network_config | dns_cache | linux | constrained | 2 | resolvectl via direct-argv runner | falls back to systemd-resolve statistics, or reports unavailable, when resolvectl is absent |
 | network_config | dns_cache | macos | unsupported | - | - | - |
 | network_config | dns_cache | windows | supported | 1 | DnsGetCacheDataTable (dnsapi.dll) | - |
-| network_config | arp | linux | supported | 1 | /proc/net/arp | - |
+| network_config | arp | linux | constrained | 1 | /proc/net/arp | IPv4 ARP entries only; /proc/net/arp carries no IPv6 neighbours (they live in the RTM_GETNEIGH table), and non-Ethernet or incomplete entries are not reported |
 | network_config | arp | macos | constrained | 1 | PF_ROUTE sysctl RTF_LLINFO | ip and mac only; the interface name and static/dynamic type are not carried by the RTF_LLINFO dump and are emitted as '-' |
 | network_config | arp | windows | supported | 1 | GetIpNetTable2 | - |
 | network_diag | listening | linux | supported | 1 | /proc/net/tcp[6] | - |

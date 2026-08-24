@@ -201,6 +201,116 @@ TEST_CASE("ipv6_prefix_length converts common netmasks to their CIDR prefix leng
     }
 }
 
+// ── REGRESSION PIN: macOS proxy service selection (portable, pure) ─────────
+//
+// SCDynamicStoreCopyProxies returns the PRIMARY service's settings at the top
+// level and every other configured service under __SCOPED__. The pre-migration
+// leg asked for the Wi-Fi service BY NAME, so a top-level-only read is not a
+// superset of it: an Ethernet-primary Mac with the proxy on Wi-Fi flipped from
+// `proxy_type|http` to `proxy_type|none`, STATUS OK, on an action tagged
+// `compliance`.
+//
+// select_proxy is the DECISION half, split from the CF ACQUISITION half so it
+// can be fixture-tested at all (pure core, thin shell). NOTE the untested
+// remainder: the __SCOPED__ key enumeration itself has no fixture surface and
+// is NOT covered by these cases.
+
+TEST_CASE("select_proxy reports a non-primary service's proxy when the primary has none",
+          "[network_config][proxy]") {
+    yuzu::network_config::ProxyServiceConfig primary; // Ethernet, nothing configured
+    yuzu::network_config::ProxyServiceConfig wifi;
+    wifi.service = "en1";
+    wifi.http_enabled = true;
+    wifi.http_host = "proxy.corp.example";
+    wifi.http_port = 8080;
+
+    const auto choice = yuzu::network_config::select_proxy({primary, wifi});
+    // Pre-fix this returned found == false -> "proxy_type|none".
+    REQUIRE(choice.found);
+    CHECK(choice.type == "http");
+    CHECK(choice.address == "proxy.corp.example:8080");
+}
+
+TEST_CASE("select_proxy prefers the primary service over a scoped one", "[network_config][proxy]") {
+    yuzu::network_config::ProxyServiceConfig primary;
+    primary.http_enabled = true;
+    primary.http_host = "primary.example";
+    primary.http_port = 3128;
+    yuzu::network_config::ProxyServiceConfig scoped;
+    scoped.service = "en1";
+    scoped.http_enabled = true;
+    scoped.http_host = "other.example";
+    scoped.http_port = 8080;
+
+    const auto choice = yuzu::network_config::select_proxy({primary, scoped});
+    REQUIRE(choice.found);
+    CHECK(choice.address == "primary.example:3128");
+}
+
+TEST_CASE("select_proxy checks HTTP before PAC within one service", "[network_config][proxy]") {
+    // The old leg tested -getwebproxy in its IF and reached -getautoproxyurl
+    // only in the ELSE, so a host with both configured reported `http`.
+    yuzu::network_config::ProxyServiceConfig both;
+    both.http_enabled = true;
+    both.http_host = "web.example";
+    both.http_port = 8080;
+    both.pac_enabled = true;
+    both.pac_url = "http://pac.example/proxy.pac";
+
+    const auto choice = yuzu::network_config::select_proxy({both});
+    REQUIRE(choice.found);
+    CHECK(choice.type == "http"); // pre-fix ordering returned "pac"
+}
+
+TEST_CASE("select_proxy falls to PAC when HTTP is enabled but hostless, and to none when empty",
+          "[network_config][proxy]") {
+    yuzu::network_config::ProxyServiceConfig pac_only;
+    pac_only.http_enabled = true; // enabled but no host -> not usable
+    pac_only.pac_enabled = true;
+    pac_only.pac_url = "http://pac.example/proxy.pac";
+    const auto pac = yuzu::network_config::select_proxy({pac_only});
+    REQUIRE(pac.found);
+    CHECK(pac.type == "pac");
+
+    CHECK_FALSE(yuzu::network_config::select_proxy({}).found);
+    CHECK_FALSE(
+        yuzu::network_config::select_proxy({yuzu::network_config::ProxyServiceConfig{}}).found);
+}
+
+// ── REGRESSION PIN: macOS dns_servers supplemental-resolver union ──────────
+//
+// State:/Network/Global/DNS holds ONLY the primary resolver. The pre-migration
+// `scutil --dns` walked every service's own resolver list, so reading the
+// global key alone silently dropped VPN split-DNS and secondary-interface
+// resolvers -- measured live as 2 of 4 real resolvers missing.
+//
+// union_dns_servers is the DECISION half. UNTESTED REMAINDER: the
+// SCDynamicStoreCopyKeyList enumeration that produces these groups.
+
+TEST_CASE("union_dns_servers keeps supplemental resolvers, global first, deduped",
+          "[network_config][dns]") {
+    const std::vector<std::vector<std::string>> groups{
+        {"100.100.100.100", "fd7a:115c:a1e0::53"}, // global (primary only)
+        {"194.168.4.100", "194.168.8.100"},        // a service's own resolvers
+        {"194.168.4.100", "100.100.100.100"},      // another service, overlapping
+    };
+    const auto out = yuzu::network_config::union_dns_servers(groups);
+    // Pre-fix (global key only) this was just the first two entries.
+    REQUIRE(out.size() == 4);
+    CHECK(out[0] == "100.100.100.100"); // global first
+    CHECK(out[1] == "fd7a:115c:a1e0::53");
+    CHECK(out[2] == "194.168.4.100");
+    CHECK(out[3] == "194.168.8.100");
+}
+
+TEST_CASE("union_dns_servers handles empty and single-group inputs", "[network_config][dns]") {
+    CHECK(yuzu::network_config::union_dns_servers({}).empty());
+    CHECK(yuzu::network_config::union_dns_servers({{}, {}}).empty());
+    const auto one = yuzu::network_config::union_dns_servers({{"1.1.1.1", "1.1.1.1"}});
+    REQUIRE(one.size() == 1);
+    CHECK(one[0] == "1.1.1.1");
+}
+
 // ── rtnetlink message-set decode (Linux) ─────────────────────────────────
 
 #if defined(__linux__)
@@ -292,8 +402,12 @@ std::vector<unsigned char> build_addr_message(std::uint32_t seq, unsigned char f
     return buf;
 }
 
+// `table` is the 8-bit rtm_table field; `rta_table` (when >= 0) additionally
+// attaches an RTA_TABLE attribute, which overrides rtm_table for ids > 255.
 std::vector<unsigned char> build_route_message(std::uint32_t seq, unsigned char dst_len,
-                                                unsigned int flags, const unsigned char* gateway4) {
+                                                unsigned int flags, const unsigned char* gateway4,
+                                                unsigned char table = RT_TABLE_MAIN,
+                                                long rta_table = -1) {
     std::vector<unsigned char> buf;
     struct nlmsghdr nlh {};
     nlh.nlmsg_type = RTM_NEWROUTE;
@@ -305,10 +419,15 @@ std::vector<unsigned char> build_route_message(std::uint32_t seq, unsigned char 
     rtm.rtm_family = AF_INET;
     rtm.rtm_dst_len = dst_len;
     rtm.rtm_flags = flags;
+    rtm.rtm_table = table;
     append_bytes(buf, &rtm, sizeof(rtm));
 
     if (gateway4)
         append_rtattr(buf, RTA_GATEWAY, gateway4, 4);
+    if (rta_table >= 0) {
+        const auto t = static_cast<std::uint32_t>(rta_table);
+        append_rtattr(buf, RTA_TABLE, &t, sizeof(t));
+    }
 
     auto* hdr = reinterpret_cast<struct nlmsghdr*>(buf.data());
     hdr->nlmsg_len = static_cast<std::uint32_t>(buf.size());
@@ -520,6 +639,107 @@ TEST_CASE("parse_rtnetlink_route_chunk keeps only the IPv4 default route with a 
     CHECK(parsed.done);
     REQUIRE(parsed.records.size() == 1); // the /24 route (no dst_len==0) never qualifies
     CHECK(parsed.records[0].gateway == "192.168.1.1");
+}
+
+// ── REGRESSION PIN: main-table-only default-route selection ────────────────
+//
+// An NLM_F_DUMP RTM_GETROUTE returns default routes from EVERY routing table,
+// and the kernel emits non-main tables FIRST -- verified live: with
+// `ip route add default via 172.17.0.99 table 100` alongside main's
+// 172.17.0.1, the unfiltered dump returned the table-100 route at index 0.
+// The caller takes records.front(), so an unfiltered decoder does not merely
+// risk the wrong gateway, it actively prefers it, and stamps that VPN/policy
+// gateway onto every emitted ip| row. The pre-migration leg ran unqualified
+// `ip route show default`, which shows the main table alone.
+//
+// The non-main route is deliberately placed FIRST in this fixture: in
+// main-first order the test would pass with or without the filter and would
+// therefore prove nothing.
+
+TEST_CASE("parse_rtnetlink_route_chunk ignores a policy-table default that precedes main's",
+          "[network_config][rtnetlink]") {
+    constexpr std::uint32_t kSeq = 11;
+    const unsigned char vpn_gw[4] = {172, 17, 0, 99};  // table 100 (policy)
+    const unsigned char main_gw[4] = {172, 17, 0, 1};  // table main
+
+    // Non-main FIRST, exactly as the kernel dumps it.
+    auto policy_route =
+        build_route_message(kSeq, /*dst_len=*/0, /*flags=*/0, vpn_gw, /*table=*/100);
+    auto main_route =
+        build_route_message(kSeq, /*dst_len=*/0, /*flags=*/0, main_gw, /*table=*/RT_TABLE_MAIN);
+    auto done = build_done_message(kSeq);
+
+    std::vector<unsigned char> blob(policy_route.begin(), policy_route.end());
+    blob.insert(blob.end(), main_route.begin(), main_route.end());
+    blob.insert(blob.end(), done.begin(), done.end());
+
+    const auto parsed = parse_rtnetlink_route_chunk(std::span{blob}, kSeq);
+    CHECK(parsed.done);
+    REQUIRE(parsed.records.size() == 1);
+    // Pre-fix this was "172.17.0.99" -- the tunnel endpoint.
+    CHECK(parsed.records[0].gateway == "172.17.0.1");
+}
+
+TEST_CASE("parse_rtnetlink_route_chunk honours an RTA_TABLE override above 255",
+          "[network_config][rtnetlink]") {
+    constexpr std::uint32_t kSeq = 12;
+    const unsigned char big_table_gw[4] = {10, 8, 0, 1};
+    const unsigned char main_gw[4] = {192, 168, 0, 1};
+
+    // rtm_table cannot hold 51820 (WireGuard's default), so the kernel sets
+    // rtm_table to RT_TABLE_UNSPEC and carries the real id in RTA_TABLE.
+    // Reading rtm_table alone would see UNSPEC != MAIN and drop it correctly
+    // here -- but the mirror case matters: a route whose rtm_table says
+    // RT_TABLE_MAIN while RTA_TABLE overrides it to a policy table must be
+    // dropped on the ATTRIBUTE, which is why the override is read at all.
+    auto wg_route = build_route_message(kSeq, /*dst_len=*/0, /*flags=*/0, big_table_gw,
+                                        /*table=*/RT_TABLE_MAIN, /*rta_table=*/51820);
+    auto main_route =
+        build_route_message(kSeq, /*dst_len=*/0, /*flags=*/0, main_gw, /*table=*/RT_TABLE_MAIN);
+    auto done = build_done_message(kSeq);
+
+    std::vector<unsigned char> blob(wg_route.begin(), wg_route.end());
+    blob.insert(blob.end(), main_route.begin(), main_route.end());
+    blob.insert(blob.end(), done.begin(), done.end());
+
+    const auto parsed = parse_rtnetlink_route_chunk(std::span{blob}, kSeq);
+    REQUIRE(parsed.records.size() == 1);
+    CHECK(parsed.records[0].gateway == "192.168.0.1");
+}
+
+// ── REGRESSION PIN: veth/VLAN adapter name carries no iproute2 @peer suffix ─
+//
+// The pre-migration leg took the adapter name from `ip -o link show`'s second
+// column, which iproute2 renders as "<name>@<parent>" whenever IFLA_LINK is
+// set -- so a container's veth read as "eth0@if74" and a VLAN as
+// "eth0.100@eth0". This branch emits IFLA_IFNAME, which never carries the
+// suffix, and that is the DELIBERATE, DISCLOSED choice: "eth0@if74" is
+// iproute2 display syntax, not a name the kernel or any other data source
+// recognises, and the old sysfs speed lookup at /sys/class/net/eth0@if74/speed
+// could never resolve. This pins the decision so a future "restore parity"
+// change cannot silently reintroduce the suffix.
+TEST_CASE("parse_rtnetlink_link_chunk emits the kernel name, never iproute2's @peer form",
+          "[network_config][rtnetlink]") {
+    constexpr std::uint32_t kSeq = 13;
+    const unsigned char mac[6] = {0xce, 0xb6, 0x11, 0x22, 0x33, 0x44};
+    // IFLA_LINK present is exactly the condition under which iproute2 renders
+    // the suffix; the decoder must still report the bare name.
+    auto msg = build_link_message(kSeq, 74, "eth0", mac, /*up=*/true, IF_OPER_UP, /*mac_len=*/6);
+    {
+        // Append IFLA_LINK (parent ifindex) to the message and re-patch len.
+        const std::uint32_t parent = 2;
+        append_rtattr(msg, IFLA_LINK, &parent, sizeof(parent));
+        auto* hdr = reinterpret_cast<struct nlmsghdr*>(msg.data());
+        hdr->nlmsg_len = static_cast<std::uint32_t>(msg.size());
+    }
+    auto done = build_done_message(kSeq);
+    std::vector<unsigned char> blob(msg.begin(), msg.end());
+    blob.insert(blob.end(), done.begin(), done.end());
+
+    const auto parsed = parse_rtnetlink_link_chunk(std::span{blob}, kSeq);
+    REQUIRE(parsed.records.size() == 1);
+    CHECK(parsed.records[0].name == "eth0"); // NOT "eth0@if2"
+    CHECK(parsed.records[0].name.find('@') == std::string::npos);
 }
 
 #endif // __linux__

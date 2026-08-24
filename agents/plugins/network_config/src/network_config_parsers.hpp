@@ -237,6 +237,82 @@ inline std::vector<T> dedupe_preserve_order(const std::vector<T>& items) {
 }
 
 /**
+ * Ordered union of resolver lists, first-seen order preserved.
+ *
+ * The macOS `dns_servers` leg must report the primary resolver AND every
+ * supplemental per-service resolver: State:/Network/Global/DNS holds only the
+ * primary, so reading it alone silently drops VPN split-DNS and secondary-
+ * interface resolvers. Callers pass the global list FIRST, then each
+ * per-service list; a resolver legitimately appearing under several services
+ * collapses to its first occurrence.
+ *
+ * This is the DECISION half of that leg, split out from the ACQUISITION half
+ * (the SCDynamicStore key enumeration) so it can be fixture-tested -- the
+ * "pure core, thin shell" discipline. The key enumeration itself remains
+ * untested; it has no fixture surface.
+ */
+inline std::vector<std::string>
+union_dns_servers(const std::vector<std::vector<std::string>>& groups) {
+    std::vector<std::string> all;
+    for (const auto& g : groups)
+        all.insert(all.end(), g.begin(), g.end());
+    return dedupe_preserve_order(all);
+}
+
+/// One network service's proxy configuration, decoded from whichever
+/// dictionary it came from. `service` is empty for the top-level (primary /
+/// current-effective) dictionary and carries the interface/service key for a
+/// scoped one; it is descriptive only and does not affect selection.
+struct ProxyServiceConfig {
+    std::string service;
+    bool http_enabled = false;
+    std::string http_host;
+    int http_port = 0;
+    bool pac_enabled = false;
+    std::string pac_url;
+};
+
+/// The row `do_proxy` should emit: `found == false` means `proxy_type|none`.
+struct ProxySelection {
+    bool found = false;
+    std::string type;    // "http" | "pac"
+    std::string address; // "host:port" | the PAC URL
+};
+
+/**
+ * Choose the proxy row from an ordered candidate list. Pure.
+ *
+ * Two properties this pins, both of which were regressions:
+ *
+ *  1. HTTP BEFORE PAC, within a single service. The pre-migration leg tested
+ *     `networksetup -getwebproxy` in its IF branch and only reached
+ *     `-getautoproxyurl` in the ELSE, so a host with both configured reported
+ *     `http`. Checking PAC first silently flips such a host to `pac`.
+ *
+ *  2. A NON-PRIMARY SERVICE IS STILL REPORTED. SCDynamicStoreCopyProxies
+ *     returns the primary/current service's settings at the top level and
+ *     puts every other service under __SCOPED__. The pre-migration leg asked
+ *     for the Wi-Fi service BY NAME, so reading only the top level is not a
+ *     superset of it: an Ethernet-primary Mac with the proxy configured on
+ *     Wi-Fi went from `proxy_type|http` to `proxy_type|none`. Callers pass the
+ *     top-level config first, then each scoped service, so the primary still
+ *     wins when it has one and a scoped service is consulted only otherwise.
+ *
+ * Selection is first-match over the ordered list; the caller owns the order.
+ */
+inline ProxySelection select_proxy(const std::vector<ProxyServiceConfig>& candidates) {
+    for (const auto& c : candidates) {
+        if (c.http_enabled && !c.http_host.empty()) {
+            return {true, "http", c.http_host + ":" + std::to_string(c.http_port)};
+        }
+        if (c.pac_enabled && !c.pac_url.empty()) {
+            return {true, "pac", c.pac_url};
+        }
+    }
+    return {};
+}
+
+/**
  * CIDR prefix length (count of leading 1-bits) of a HOST-byte-order IPv4
  * netmask -- 0.0.0.0 -> 0, 255.255.255.0 -> 24, 255.255.255.255 -> 32. Pure.
  *
@@ -303,11 +379,16 @@ struct RtLinkRecord {
 /// NIC and every tun/tap/WireGuard device (which sit at IF_OPER_UNKNOWN) from
 /// "down" to "up", so operational state is what this returns.
 ///
-/// When the kernel omits IFLA_OPERSTATE there is no operational signal at all;
-/// iproute2 prints "UNKNOWN" in that case, which the old leg mapped to "down",
-/// so that is what is returned -- deliberately faithful to the old output
-/// rather than substituting the administrative flag.
+/// When the kernel omits IFLA_OPERSTATE there is no operational signal at all,
+/// and the old leg's `status` variable kept its initialiser, "unknown" -- so
+/// that is what is returned, rather than the administrative flag or a
+/// fabricated "down". In practice the kernel attaches IFLA_OPERSTATE to every
+/// RTM_NEWLINK (rtnl_fill_ifinfo), so this branch is defensive; it is written
+/// to match the oracle's initialiser exactly rather than to model any
+/// particular iproute2 rendering, which this code does not depend on.
 inline const char* link_status_string(const RtLinkRecord& rec) {
+    if (rec.oper_state < 0)
+        return "unknown";
     return rec.oper_state == IF_OPER_UP ? "up" : "down";
 }
 
@@ -541,6 +622,10 @@ inline RtRouteParse parse_rtnetlink_route_chunk(std::span<const unsigned char> b
         const auto* rta = reinterpret_cast<const struct rtattr*>(
             static_cast<const unsigned char*>(NLMSG_DATA(h)) + NLMSG_ALIGN(sizeof(rtm)));
         std::string gw;
+        // rtm_table is only 8 bits, so a table id above 255 is carried in an
+        // RTA_TABLE attribute and rtm_table holds RT_TABLE_UNSPEC/COMPAT
+        // instead. RTA_TABLE therefore OVERRIDES rtm_table when present.
+        std::uint32_t table = rtm.rtm_table;
         for (; RTA_OK(rta, rta_len); rta = RTA_NEXT(rta, rta_len)) {
             if (rta->rta_type == RTA_GATEWAY && RTA_PAYLOAD(rta) >= 4) {
                 unsigned char addr_bytes[4]{};
@@ -548,8 +633,25 @@ inline RtRouteParse parse_rtnetlink_route_chunk(std::span<const unsigned char> b
                 char text[INET_ADDRSTRLEN]{};
                 if (::inet_ntop(AF_INET, addr_bytes, text, sizeof(text)))
                     gw = text;
+            } else if (rta->rta_type == RTA_TABLE && RTA_PAYLOAD(rta) >= sizeof(std::uint32_t)) {
+                std::uint32_t t = 0;
+                std::memcpy(&t, RTA_DATA(rta), sizeof(t));
+                table = t;
             }
         }
+        // MAIN TABLE ONLY. An NLM_F_DUMP RTM_GETROUTE returns default routes
+        // from EVERY routing table, and the kernel emits non-main tables
+        // FIRST -- so without this filter the caller's records.front() does
+        // not merely risk the wrong gateway, it actively prefers it. The
+        // pre-migration leg ran unqualified `ip route show default`, which
+        // shows the main table alone. Any host running WireGuard/wg-quick,
+        // Tailscale, strongSwan or systemd-networkd RoutingPolicyRule has a
+        // second table, and every emitted ip| row would otherwise carry that
+        // tunnel's gateway. Verified against a live kernel: with
+        // `ip route add default via 172.17.0.99 table 100` alongside main's
+        // 172.17.0.1, the unfiltered dump returned the table-100 route first.
+        if (table != RT_TABLE_MAIN)
+            continue;
         if (!gw.empty()) {
             RtRouteRecord rec;
             rec.gateway = std::move(gw);
