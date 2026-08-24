@@ -8160,7 +8160,13 @@ void RestApiV1::register_routes(
                 // migrated store can also fail on a Postgres blip. Classify before assuming
                 // "entropy exhausted": mislabeling a DB fault as csprng_unavailable would both
                 // misinform SIEM and increment the wrong Prometheus counter.
-                if (result.error().starts_with(yuzu::server::kDeviceTokenDbErrorPrefix)) {
+                //
+                // #3351: "internal_error: " (hash_token's checked-EVP failure path) joins this
+                // same non-CSPRNG arm — a hashing fault is exactly as much "not entropy
+                // exhaustion" as a DB fault is, and must not increment
+                // yuzu_secure_random_failure_total either.
+                if (result.error().starts_with(yuzu::server::kDeviceTokenDbErrorPrefix) ||
+                    result.error().starts_with("internal_error: ")) {
                     bool audit_emitted = false;
                     try {
                         audit_emitted = audit_fn(req, "device_token.create", "failure",
@@ -8185,6 +8191,44 @@ void RestApiV1::register_routes(
                         .add("audit_emitted", audit_emitted)
                         .raw("meta", R"({"api_version":"v1"})");
                     res.set_content(envelope.str(), "application/json");
+                    return;
+                }
+                // gov Gate 4 (consistency-auditor, C-1): a store-level input-validation failure
+                // (`invalid_input_length:` or the pre-existing empty-principal_id guard) is a
+                // client error, not a service fault or CSPRNG exhaustion — the prior two-way
+                // classifier fell through to the CSPRNG arm below by elimination, which would
+                // have reported 503 + a misleading "CSPRNG unavailable" message/audit-reason and
+                // incremented yuzu_secure_random_failure_total for what is actually a 400.
+                // Unreachable via REST today (name/device_id/definition_id are pre-clamped at
+                // 256 chars above; principal_id is session->username, bounded by AuthDB's 64-char
+                // limit) — defence-in-depth for a future non-REST caller the store's own doc
+                // comment anticipates (e.g. an MCP twin).
+                //
+                // gov Gate 8 (consistency-auditor): uses the canonical detail::a4_error envelope
+                // (correlation_id, matches this endpoint's OWN pre-clamp 400s just above) rather
+                // than the hand-rolled shape the sibling 503 arms below use — two different 400s
+                // from the same endpoint should look the same. Sec-Audit-Failed header only (no
+                // audit_emitted body field), matching the same convention already used where an
+                // audited failure returns an A4-enveloped body elsewhere in this file (e.g.
+                // dex.device.view's audit fail-closed branch).
+                if (result.error().starts_with("invalid_input_length:") ||
+                    result.error() == "principal_id cannot be empty") {
+                    bool audit_emitted = false;
+                    try {
+                        audit_emitted = audit_fn(req, "device_token.create", "failure",
+                                                 "DeviceToken", device_id,
+                                                 "invalid_input: " + result.error());
+                    } catch (const std::exception& ex) {
+                        spdlog::error("device_token.create audit emission threw: {}", ex.what());
+                        audit_emitted = false;
+                    } catch (...) {
+                        spdlog::error("device_token.create audit emission threw unknown");
+                        audit_emitted = false;
+                    }
+                    if (!audit_emitted)
+                        res.set_header("Sec-Audit-Failed", "true");
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, result.error()), "application/json");
                     return;
                 }
                 // sre-1: Prometheus signal for CSPRNG failure (see
