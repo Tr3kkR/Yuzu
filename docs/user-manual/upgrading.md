@@ -118,6 +118,24 @@ login** (mirrors OIDC's `group_count_exceeded` behaviour) — see "SAML Fine-Gra
 RBAC" in `authentication.md` for the full detail, including the practical httplib
 form-body-size caveat on how large an assertion can realistically reach `/saml/acs`.
 
+## Behaviour change: token-rotation confirm now requires proof of possession (#3015)
+
+`confirm` on a rotation — REST `POST /api/v1/tokens/{id}/confirm` and `POST /api/v1/engine-principals/{id}/credentials/confirm`, plus the MCP twins `confirm_api_token_rotation`/`confirm_engine_rotation` — previously admitted on caller identity plus the successor's `token_id` alone. A caller who recovered an unknown successor's `token_id` out-of-band (a support ticket, a log line) could confirm — and thereby revoke the predecessor for — a rotation whose secret they never actually received. All four confirm surfaces now additionally require the raw successor secret itself in the request body/args, verified with a constant-time hash comparison against the successor's stored hash, checked LAST — strictly after ownership, pair-state, the `token_id` pin, tier, scope, and the initiator binding have all already passed — before the predecessor is touched.
+
+**Who this affects:** any caller (human or automation) confirming a rotation with only the `token_id`, and any caller confirming with the wrong secret.
+
+- **REST:** a confirm body carrying no `secret` field (or an empty one) now gets `400` instead of succeeding; a wrong `secret` gets `403`.
+- **MCP:** `confirm_api_token_rotation`/`confirm_engine_rotation` called without a `secret` arg now get `kInvalidParams`; a wrong one gets `kPermissionDenied`.
+
+Correctly-implemented automation already holds the secret — it's the same raw value the `rotate` response returns exactly once (REST `data.token`) — so a caller that installs the successor from that response and passes it straight through to `confirm` sees no change in behavior.
+
+**What to do if you lose the rotate response before confirming:** you can no longer confirm — there's no way to manufacture the secret from the `token_id` alone. Two recovery paths, and neither is new — this change makes the mechanism enforce guidance already documented in [`authentication.md`](authentication.md#rotating-a-token) "Rotating a Token" (don't look the successor up and confirm blind):
+
+1. **Wait for the automatic overlap-window sweep.** Proof of possession gates this immediate, explicit `confirm` call only — the 60-second background sweep is unaffected by this change and still auto-revokes the predecessor on its own schedule with no secret required, provided the successor secret was actually installed and presented (used) at least once.
+2. **Revoke the unknown successor and start a new rotation.** This keeps the predecessor working immediately, at the cost of restarting the rotation.
+
+See [`authentication.md`](authentication.md#rotating-a-token) and [`engine-principals.md`](engine-principals.md) for the full detail, and [`rest-api.md`](rest-api.md) for the exact REST error bodies.
+
 ## Behaviour change: MCP approval-store permanent failures now say don't retry (#2786)
 
 An MCP approval-ticket recall that hits a store fault has always returned `-32603` with a `retry_after_ms` hint. Previously that hint was `5000` (retry after 5 seconds) for every store fault except a never-opened store, including one that was open but failing in a way no amount of retrying clears — SQLite corruption, not-a-database, a read-only filesystem, or a full disk. Those four cases now correctly get `retry_after_ms: null` (the same "escalate to an operator" response a never-opened store gets) instead of the transient retry hint.
@@ -683,9 +701,79 @@ What to expect / do:
   Agents that previously connected over plaintext must switch to TLS — point them
   at the CA with `--ca-cert <ca-dir>/default-ca.pem`.
 - **To keep the legacy refuse-to-start behaviour**, pass `--no-default-certs`.
-- **Back up `<ca-dir>/default-ca.key` (0600) and the new `ca.db`** in `--data-dir`
-  — losing the CA key forces a full fleet re-enrollment.
+- **Back up `<ca-dir>/default-ca.key` (0600) and the `ca_store` Postgres schema**
+  (`pg_dump`/`pg_restore`, ADR-0053) — losing the CA key forces a full fleet
+  re-enrollment.
 - Relocate the cert directory with `--ca-dir` (e.g. a dedicated container volume).
+
+## ⚠️ Behaviour change: internal-CA store moves to Postgres (ADR-0053)
+
+`CaStore` (internal-CA root metadata, issued-certificate inventory, CRL version
+history — everything the mTLS-accept revocation gate and `GET /api/v1/ca/*`
+read) moves from the SQLite `ca.db` file to the server's PostgreSQL substrate
+in this release (schema `ca_store`). The private CA root key is unaffected —
+it was never in `ca.db` and stays a local file behind `KeyProvider` (`--ca-dir`).
+
+- **Mandatory, automatic backfill on first boot.** The legacy `ca.db` (if
+  present) is read once at startup and its full issued-cert inventory + CRL
+  history is copied into `ca_store`, fingerprint-verified. The legacy file is
+  left in place, read-only, for one release as a rollback reference — it is
+  never deleted or written to.
+- **New fail-closed-at-boot behaviour.** A genuine Postgres error while wiring
+  the per-agent mTLS revocation checker at boot now refuses to start the
+  server, rather than starting with revocation enforcement silently unwired.
+  If the server previously started cleanly on a working Postgres connection,
+  this changes nothing observable; it only changes what happens during a
+  Postgres outage at exactly that boot step, from "starts degraded" to
+  "refuses to start."
+- **`GET`/`POST /api/v1/ca/*` and the CA MCP tools now return a `503`/internal
+  error on a genuine database error**, instead of a silently-empty or
+  silently-false result.
+- Every other CA behavior — revocation semantics, CRL numbering, the single
+  `sign_agent_csr` chokepoint — is unchanged. Detail: `docs/pki-architecture.md`,
+  `docs/adr/0053-ca-store-postgres-migration.md`.
+- **New: an established, already-running default-cert install can now self-heal
+  its own listener leaves without operator action.** This is not limited to a
+  first-boot crash window — any boot where the on-disk `--ca-dir` default
+  leaves are missing, corrupt, or a leaf was later lost (a bad partial restore,
+  a lost volume file) hits the same path, as long as `ca_store` already holds
+  a root and this instance's local CA key file still matches it. When that
+  holds, the server automatically **re-mints its own https/server/gateway
+  leaves with fresh private keys** under the existing root and resumes,
+  instead of refusing to start. It never touches the CA root itself or any
+  agent-issued certificate. Every occurrence logs a `spdlog::warn` line, but
+  there is currently no dedicated audit-log row for it (unlike enrollment-time
+  `ca.cert.issued`) — tracked as a follow-up, not fixed in this release.
+- **HA note: a losing first-boot replica self-heals within the same boot attempt
+  (UP-3), bounded.** Multiple server instances sharing one `--ca-dir` cert
+  volume and one `ca_store` Postgres substrate is not an officially supported
+  deployment topology today (see ADR-0053's Decision section) — this note
+  describes what happens if it's done anyway, safely, not a recommendation to
+  do it. If two instances start against the same fresh `ca_store` at once,
+  exactly one wins the root race and generates the live default certs; the
+  other polls the shared cert directory for up to 15s for the winner's
+  complete set to land (it only adopts a fully-written set — the winner's
+  completion marker is written last, so a partial/in-flight write is never
+  picked up) and, on success, continues booting on the winner's certs without
+  a restart. If the winner hasn't finished within that window (a slow
+  Postgres, lock contention, or a winner that's itself still starting up), the
+  loser falls back to the original behavior: it **exits** (refuses to start,
+  non-zero) rather than serving with its own discarded material — it does not
+  reach a running-but-unready state, so a readiness-probe-driven restart never
+  applies here. Recovery in that case is a plain process-supervisor restart
+  (systemd `Restart=on-failure`, Kubernetes `restartPolicy`) once the winner's
+  certs are in place, so the losing instance picks them up from disk on its
+  next boot attempt. On systemd specifically, a slow winner (e.g. Postgres
+  itself under load) can interact with the crash-loop guard
+  (`StartLimitBurst`/`StartLimitIntervalSec`) — a losing replica that exhausts
+  its restart budget first lands in the service's "failed" state and needs a
+  manual `systemctl reset-failed` once the winner has actually finished,
+  rather than retrying forever on its own. Diagnosing a bootstrap that seems
+  permanently stuck (neither replica ever finishes): check `pg_locks` for a
+  lingering `yuzu:default_certs_bootstrap` session advisory lock with no live
+  backend behind it (a host crash or network partition can leave one held
+  until Postgres notices the dead session) and `pg_terminate_backend` it — see
+  `docs/pki-architecture.md`'s operator runbook.
 
 ## ⚠️ Behaviour change: response history resets on Postgres cutover (ADR-0039)
 
@@ -1736,6 +1824,223 @@ the device page) shows the same tags as before the upgrade, and
 `yuzu_server_tag_store_backfill_total{result="success"}` confirms the backfill
 outcome (alert `YuzuTagStoreBackfillNotCompleted` keys on the ABSENCE of a
 success/fresh sample — a refused boot never serves `/metrics` at all).
+
+## ⚠️ Behaviour change: quarantine containment now covers IPv6, and reports honestly (#3282, #3283, #3284, #3285, #3286, #3260)
+
+Six issues close against the `quarantine` agent plugin across Windows, Linux and macOS. Every
+one is the same class: an outcome reported as success when it was partial, failed, or unknown.
+**Read §1 before quarantining a dual-stack Linux host — it needs operator action.**
+
+The server-side dispatch enforcement (#881) and the MCP tool's honesty fixes (#3127) ship
+separately and have their own upgrade note.
+
+### 1. Linux containment now covers IPv6 (#3282)
+
+The Linux leg installed its `yuzu-quarantine` chain in `iptables` only. On a dual-stack or
+IPv6-capable host the device stayed fully reachable over IPv6 while reporting a clean
+`status|quarantined` — containment that was not containing. The plugin now mirrors the chain into
+`ip6tables`, and a failure on either family is reported (`status|quarantined_partial`), never
+counted as applied.
+
+**Action required for dual-stack fleets.** Whitelist entries are routed to the chain matching
+their own family, so a **v4-only whitelist now leaves IPv6 contained**. There is no blanket
+"keep existing connections alive" rule on either family — only a whitelisted address survives,
+in any connection state. The agent automatically whitelists its own configured server address
+(an IP literal directly, a hostname resolved to its address(es) **once, at agent startup** —
+never at quarantine time, and using the endpoint's own resolver), so most fleets need no manual
+action here. Prefer an IP-literal `--server` config for endpoints where containment integrity
+matters most, since that removes DNS from the equation entirely. If your agents reach the
+server over IPv6 through a path DNS resolution of the configured address wouldn't reproduce
+(split-horizon DNS, a manually pinned route), or if the server's address changes after an agent
+was last started, **add the server's address to the whitelist explicitly**. See
+[Security Hardening](security-hardening.md#whitelisting-on-a-dual-stack-host-read-this-before-quarantining-one).
+
+### 2. Reporting is more conservative again (#3283, #3285, #3286, #3260)
+
+As with the Wave-2 argv migration before it, **nothing got more broken — the reporting got more
+honest**, so expect these to fire more often after upgrading:
+
+- **macOS**: a blocking pf ruleset that is loaded while pf itself is **disabled** now reads
+  `state|degraded` (traffic is not actually blocked); a pf status read that returns nothing
+  recognisable reads `state|uncertain` (#3283).
+- **`quarantine.status` exits non-zero** on `degraded` and `uncertain`, and sets the ABI result
+  status to `UNAVAILABLE`/`PARTIAL`. A consumer that only inspects the return code can no longer
+  read an unenforced or unreadable host as a clean status (#3285).
+- **Windows**: containment now sets the profile default policy rather than relying on rule
+  precedence alone, and the pre-quarantine profile policy is captured **write-once** — a
+  re-quarantine no longer overwrites the genuine capture with the quarantine's own
+  block/block policy, which previously made release replay it and strand the host while
+  reporting `status|released` (#3284).
+- **Concurrent mutations are serialised** — two overlapping `quarantine`/`unquarantine`/
+  `whitelist` actions on one host can no longer interleave firewall mutations (#3286).
+
+### No migration, no schema change
+
+Rollback is data-safe. A mixed fleet is safe: an older agent simply keeps the older, less
+honest plugin reporting until it is upgraded.
+## Product packs migrate to Postgres (mandatory backfill, ProductPackStore, ADR-0054)
+
+The `ProductPackStore` — operator-installed product packs behind `POST/GET/DELETE
+/api/product-packs*` — moves from the SQLite `product-packs.db` file to the server's
+PostgreSQL substrate in this release (ADR-0006), schema `product_pack_store`, on the
+existing shared pool. Product packs are **authoritative operator-authored content**
+(build-time-seeded packs plus operator additions), not a cache, so the backfill is
+mandatory and fails closed rather than degrading silently — same posture class as
+`DiscoveryStore`/`QuarantineStore`.
+
+- **What is preserved:** every pack row (id, name, version, description, YAML source,
+  install time, signature-verified flag) and every item row it contains, unchanged. A
+  legacy `product-packs.db` written before 7.13 (predating the `verified` column)
+  backfills correctly, defaulting `verified=false` for that vintage — matching the
+  pre-migration `ALTER TABLE ... DEFAULT 0` shim it replaces.
+- **Fail-closed boot, retried each start.** A backfill that cannot complete —
+  unreadable/corrupt `product-packs.db`, a half-schema file (only one of
+  `product_packs`/`product_pack_items` present — never producible by a shipped binary),
+  a mid-scan read error, a SHA-256 hashing failure, a Postgres write error, or a
+  differently-valued row conflict (below) — **refuses the boot** and retries on the next
+  start. The boot log's `ProductPackStore::migrate_from_sqlite:` lines carry the
+  specific refusal and, for a row conflict, the exact pack or item id involved.
+- **Fingerprint-verified marker, whole-file** (the `DiscoveryStore`/`QuarantineStore`
+  shape — a single SHA-256 over the legacy file's full canonicalized content, not
+  `TagStore`'s per-row `updated_at`-direction comparison): a completed backfill is
+  recorded once per distinct fingerprint, so re-running against the same unchanged file
+  is a fast no-op on every subsequent boot.
+- **Differently-valued conflicts refuse the boot; identical-content conflicts are a
+  benign no-op.** Every pack and item column is write-once (no runtime method ever
+  updates one after install), so if Postgres already holds a row for a pack/item id
+  this backfill is about to insert, the two are compared: byte-identical content
+  (a replayed/cloned legacy file, or two replicas that happened to install the same
+  pack independently) is a silent skip; ANY difference **refuses the boot** — this is
+  a genuine multi-replica divergence and there is no principled way to pick a side
+  automatically. Treat it as a data-integrity incident: the log names the exact pack
+  or item id; decide which replica's legacy file is authoritative, then repair or move
+  the losing file aside and restart.
+- **The legacy file is NOT moved aside after a successful backfill** (unlike
+  `TagStore`/`QuarantineStore`) — `product-packs.db` stays in place; the fingerprint
+  marker alone makes repeat boots against it idempotent, so there is nothing to clean
+  up before the next start.
+- **An uninstalled pack is never resurrected by a later backfill.** Because the legacy
+  file is never mutated, a redeployed or newly-joined replica may still carry a legacy
+  `product-packs.db` written before a pack was uninstalled elsewhere. `uninstall()`
+  records the deleted pack id in Postgres (`deleted_pack_ids`, in the same transaction
+  as the delete); `migrate_from_sqlite` checks it before treating an unmatched legacy
+  pack id as fresh content, so this case is a logged skip (not a boot refusal) rather
+  than a resurrection — matches `RbacStore`'s `revoked_seed_defaults` suppression-table
+  precedent for the same class of hazard. **Caveat (ADR-0009 update note):** this closes
+  the cross-replica case only. If you roll the server *binary* back to the pre-migration
+  release during the one-release rollback window, that binary reads `product-packs.db`
+  directly and does not know Postgres or the tombstone table exist — an uninstalled
+  pack's catalog listing can reappear for the duration of the rollback. The pack's
+  actual content is not restored — it was already deleted from its own separate stores
+  by `uninstall()` (a `PolicyFragment` still referenced by another policy is the one
+  documented exception, logged and non-fatal to the pack's own uninstall) — so this is a
+  stale listing, not reinstated content: a lookup that follows one of that listing's item
+  ids elsewhere (fetching or executing an instruction by id, for example) will 404
+  against content that's already gone, which is expected during the window, not a new
+  fault. It self-corrects on the next roll-forward.
+
+**Operator-visible behaviour changes.**
+
+- `GET /api/product-packs`, `GET /api/product-packs/{id}`, and
+  `DELETE /api/product-packs/{id}` now return **HTTP 503** on a genuine database outage
+  instead of a misleadingly-empty pack list or a false "not found". Watch the new
+  `yuzu_server_product_pack_read_degrade_total{reason}` counter (alert
+  `YuzuProductPackReadDegraded`) — while it fires, `GET /api/product-packs`/
+  `GET /api/product-packs/{id}` are failing closed rather than returning a
+  silently-wrong result; see `docs/user-manual/metrics.md`'s "Product pack store
+  metrics" section for the `reason` label vocabulary.
+- **`DELETE /api/product-packs/{id}` on a missing id now returns 404** (previously 400).
+- **Breaking — the error body on a rejected `POST /api/product-packs` or
+  `DELETE /api/product-packs/{id}` is now the standard A4 envelope**
+  (`{"error":{"code","message","correlation_id",...}}`) instead of the previous flat
+  `{"error": "<message>"}` — a client parsing the old flat shape must switch to reading
+  `error.message`. A genuine database error no longer echoes raw driver text to the
+  caller (logged server-side instead; see `docs/user-manual/rest-api.md`'s Product
+  Packs section).
+- Installing a bundle whose documents assign the same item id twice now fails the whole
+  install as a **400 validation error** instead of silently discarding the duplicate
+  item (a pre-migration bug, not a preserved behavior) — detected before any Postgres
+  interaction, so unlike a genuine database error this is **not retryable**: the same
+  bundle always fails the same way.
+- No change to the `#802`/W7.4 signed-pack enforcement default, the Ed25519 signature
+  verification path, or the `--allow-unsigned-packs` / `YUZU_ALLOW_UNSIGNED_PACKS`
+  operator escape hatch.
+
+**Verify:** after the server reports ready, `GET /api/product-packs` shows the same
+packs as before the upgrade, and `SELECT count(*) FROM product_pack_store.product_packs;`
+against Postgres matches `sqlite3 product-packs.db "SELECT count(*) FROM
+product_packs;"`. `yuzu_server_product_pack_backfill_total{result="success"}` advancing
+(or `"fresh"` on an install with no legacy data) confirms this boot's backfill outcome —
+both label values are pre-seeded to 0 at construction, so the series exists on every
+healthy boot; a genuinely fast-skipped restart (fingerprint already processed) leaves
+both at 0 too, which is expected and not a failure signal. The actual alerting
+shape (`YuzuProductPackBackfillNotCompleted`) keys on the ABSENCE of any
+`success`/`fresh` sample across a 15-minute window, not on any single value — a
+refused boot never serves `/metrics` at all, so no server in the window reporting
+either outcome is itself the signal of a fail-closed boot-refusal loop.
+
+## Guardian Baselines migrate to Postgres (mandatory backfill, BaselineStore, ADR-0055)
+
+`BaselineStore` — Guardian's deployable Baseline unit (`/guardian` → Baselines,
+`GET /api/v1/guaranteed-state/device-compliance`) — moves from the SQLite
+`guardian-baselines.db` file to the server's PostgreSQL substrate in this release,
+schema `baseline_store`, on the existing shared pool. A **Baseline** is the only
+deployable unit in Guardian: what a deploy enforces across the fleet is read from
+each Baseline's `deployed_snapshot`, never its live member set — so, like every
+other store feeding an enforcement decision, the backfill is mandatory and fails
+closed rather than degrading silently.
+
+- **What is preserved:** every Baseline (`baselines`), its member Guards
+  (`baseline_rules`), and its assignment of included/excluded management groups
+  (`baseline_groups`) — read inside one deferred SQLite transaction so the parent
+  and its children fingerprint against the same instant. A Baseline already live
+  in Postgres (a second replica booting against shared state, or a re-run after a
+  partial pass) keeps its own current members/assignment untouched by the legacy
+  backfill — only a freshly-inserted parent's children are copied.
+- **Fail-closed boot, retried each start.** A backfill that cannot complete —
+  an unreadable/corrupt legacy file, a SHA-256 fingerprint failure, a Postgres
+  write error, an invalid legacy `lifecycle`/assignment `disposition` value, a
+  name collision against a different already-live baseline_id, or a row-direction
+  conflict (below) — **refuses the boot** and retries on the next start. The boot
+  log's `BaselineStore: migrate_from_sqlite:` lines carry the specific refusal,
+  naming the offending Baseline id.
+- **Fingerprint-verified whole-file marker, with per-row direction-aware
+  conflicts.** A completed backfill is recorded once per distinct SHA-256
+  fingerprint over the legacy file's full canonicalized content (the
+  `DiscoveryStore`/`ProductPackStore` shape — a later-booting replica still
+  holding its own legacy file re-verifies against the recorded fingerprint before
+  trusting an already-set completion marker). Independently, if Postgres already
+  holds a row for a legacy Baseline's id, that ROW is compared on `updated_at`
+  (the `TagStore` shape): Postgres strictly ahead, or identical content, is a
+  benign skip; the legacy side strictly ahead (or tied with differing content)
+  **refuses the boot** — the legacy file demonstrably holds a later write that
+  silently keeping Postgres's value would discard. Treat this refusal as a
+  data-integrity incident, not an availability one: the log names the exact
+  Baseline id and both `updated_at` values; decide which side is authoritative
+  before restarting.
+- **Legacy file moved aside after a verified backfill**
+  (`guardian-baselines.db.migrated-<epoch>`), same one-release rollback window as
+  the sibling stores.
+- **Fresh installs are unaffected** — no legacy file, nothing to migrate.
+
+**Operator-visible behaviour changes (fail-closed reads).** A degraded read on
+the enforcement-feeding path (`deployed_member_rule_ids()` — the source for the
+push fan-out, the heartbeat reconcile, and the per-device compliance view) now
+returns a distinguishable failure that the caller resolves to an explicit
+abort/503, never a silent empty/"fully compliant" enforced set. `GET
+/api/v1/guaranteed-state/device-compliance` returns **503** rather than a
+misleadingly-empty or false-compliant result when the underlying read degrades;
+Guardian deploy/delete dashboard actions show a degraded-modal rather than
+reporting success. There is no dedicated backfill-outcome metric for this store
+(matching its own precedent stores, `GuaranteedStateStore`/`DeviceTokenStore`,
+which also rely on the boot log + `/readyz` rather than a Prometheus counter for
+a boot-fatal event) — a refused boot never serves `/metrics` at all, so the boot
+log and `/readyz` are the channels to watch during an upgrade.
+
+**Verify:** after the server reports ready, `/guardian` shows the same Baselines
+(and each one's members/assignment) as before the upgrade, and
+`SELECT count(*) FROM baseline_store.baselines;` against Postgres matches
+`sqlite3 guardian-baselines.db.migrated-<epoch> "SELECT count(*) FROM baselines;"`.
 
 ## ⚠️ Behaviour change: quarantine is now enforced at instruction dispatch (#881, #3127)
 

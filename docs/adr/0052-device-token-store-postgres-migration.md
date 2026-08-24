@@ -90,9 +90,11 @@ construction site's argument).
 ### Secrets (ADR-0010) — Wave 3 classification resolved
 
 **Verify-only hash, no `SecretCodec` involvement.** `token_hash` is a SHA-256 hash of the raw
-token (`hash_token()` — BCrypt on Windows, OpenSSL elsewhere, kept cross-platform-identical to
-the pre-migration store); the raw token (`ydt_<64 hex chars>`) is generated, hashed, and returned
-to the caller ONCE at `create_token` time — it is never persisted. This is the same posture as
+token (`hash_token()` — checked EVP SHA-256 on every platform since #3351; originally a
+BCrypt-on-Windows/OpenSSL-elsewhere split, kept cross-platform-identical to the pre-migration
+store — see the 2026-08-22 amendment below); the raw token (`ydt_<64 hex chars>`) is generated,
+hashed, and returned to the caller ONCE at `create_token` time — it is never persisted. This is
+the same posture as
 `LicenseStore`'s `license_key_hash` (ADR-0048) and `ApiTokenStore`'s token hash (PR 4.1) — this
 is exactly why this Wave 3 store is migratable now without waiting on any further secrets-seam
 work: the ladder's "verify/hash (confirm in ADR)" placeholder is confirmed here, against the
@@ -147,7 +149,12 @@ auth-credential store, not durability-on-top:
   sub-second fail-fast budget and confirm pool sizing against anticipated validation QPS (the
   `PgPool`'s `Options` are shared cross-store today, no per-store knob). Mitigating factor: distinct
   tokens hash to distinct rows, so lock contention serializes per-device, not globally — a chatty
-  single device only ever serializes against itself.
+  single device only ever serializes against itself. **Extension (#3401, gov Gate 6 sre round 2)**:
+  the same acquire-vs-lock-wait exposure applies to `register_agent`'s `revoke_by_device` call, on
+  the gRPC thread pool rather than httplib's — a synchronized mass-reconnect (e.g. a gateway
+  bounce, agents retrying with no initial jitter) drives concurrent `revoke_by_device` calls
+  against the same shared `PgPool` on the registration path specifically. The wiring PR's capacity
+  review should cover both paths, not just `validate_token`.
 - **ADR-1005 note for the future wiring PR (gov Gate 4, round 3)** — wiring this store live makes
   its capability reachable for the first time, which triggers ADR-1005's REST+MCP parity
   requirement: every device-token behavior must be reachable via versioned REST *and* MCP, or
@@ -374,3 +381,172 @@ migration follows the sharing one since all four files' setup is byte-identical)
   commit with `LicenseStore`/`SoftwareDeploymentStore` — is now a recorded, verified fact (this
   ADR + the ladder row) rather than a kickoff-doc guess a future reader would have to
   re-archaeology or, worse, propagate uncorrected.
+
+## Amendment — 2026-08-21: `revoke_by_device` closes the #823 gap (#3401); input bound + checked hashing (#3351)
+
+`revoke_by_principal` was never the #823 re-registration sweep it was documented as; registration
+now fails closed on a revoke failure; and #3351's activation-gating hardening lands alongside it.
+
+Doomgoose's external review of this migration (round 3) surfaced `#3401`: `revoke_by_principal`'s
+own doc comment above (and this ADR's own "closed by typing it" bullet) describes it as *"the
+#823 re-registration defence"* — that description was wrong from the day #823 shipped, not
+introduced by this migration. `AgentRegistry::register_agent` calls it with `info.agent_id()`, but
+`principal_id` is the *issuing operator's username* (`DeviceAuthToken::principal_id`, "Username who
+created it") on every production issuance path (`rest_api_v1.cpp`'s `POST /api/v1/device-tokens`
+writes `session->username` there) — never an agent_id. The sweep therefore matched zero rows on
+every real re-registration; the existing test suite masked this because its fixtures set
+`principal_id == device_id == agent_id`, a shape no production path produces.
+
+The fix adds `revoke_by_device(device_id)` — same shape as `revoke_by_principal`
+(`std::expected<int64_t, std::string>`, empty-input no-op, `WHERE device_id = $1 AND revoked =
+false RETURNING token_id`), no schema change (the existing `idx_device_token_device` index gets
+its first query consumer) — and retargets `AgentRegistry::register_agent`'s call site to it.
+`revoke_by_principal` is kept: it is a legitimate owner-scoped bulk revoke ("every token I,
+personally, issued"), just never the #823 mechanism; its doc comment is corrected rather than the
+method removed.
+
+`register_agent` also now fails CLOSED on a genuine revoke failure (ADR-0012 §1) — refusing the
+registration rather than installing a session the sweep could not clear stale tokens for — and the
+revoke call moves OFF the registry mutex (two-phase: snapshot prior-entry-exists + the store
+pointer under `mu_`, revoke off-lock, re-verify and install under `mu_` again), following
+`sweep_revoked`'s snapshot-off-lock precedent in the same file. The prior comment's claim that
+holding `mu_` across the call gave an "atomicity" guarantee was itself overstated — nothing else in
+`AgentRegistry` reads `device_auth_tokens`, so the lock never actually serialized anything against
+it; the real invariant (`revoke commits before install`) holds under the two-phase structure
+without the lock. Both gRPC callers (`agent_service_impl.cpp` `Register`, `gateway_service_impl.cpp`
+`ProxyRegister`) surface a refusal as `grpc::Status(UNAVAILABLE, ...)`, never `accepted=false` —
+the agent's reconnect loop (`agents/core/src/agent.cpp`) treats the latter as a **permanent**
+rejection, not a retryable one.
+
+Bundled in the same PR, `#3351` (filed alongside `#3401` during this migration's original
+governance round, same activation-gating posture): `sanitize_pg_text` was rewritten to the linear
+reserve-and-append shape (`#2691` precedent, `response_store.cpp`) rather than its prior O(n²)
+find+replace loop; `create_token` and `migrate_from_sqlite`'s legacy-field reads now reject (never
+silently clamp) any free-text field exceeding 256 raw bytes, measured before sanitization can grow
+the string; the legacy SQLite read switched from a NUL-truncating C-string read to a length-aware
+`sqlite3_column_bytes` read (mirrors `audit_store.cpp`) so an embedded NUL is defanged to U+FFFD
+rather than silently dropping everything after it; and `hash_token`'s Windows-only, four-call,
+entirely unchecked BCrypt branch (a failure anywhere in that chain silently produced the hex of 32
+zero bytes — a constant hash for every input) is removed outright in favor of a single checked EVP
+SHA-256 call (`sha256_hex`) on every platform — OpenSSL is a required dependency on Windows
+regardless of linkage (see this repo's vcpkg notes), so the platform split no longer has a reason
+to exist. Output bytes are identical (both were SHA-256), so no previously-hashed token is
+invalidated.
+
+All of the above remains dormant-store defence-in-depth: `server.cpp` still passes
+`/*device_token_store=*/nullptr`, so none of this is reachable in production today. It closes
+before the wiring PR, per this ADR's original dormancy record above and `#3422`'s still-open
+question of what mechanically enforces that ordering.
+
+## Amendment — 2026-08-22: hardening round (Gate 5/6 findings on the above)
+
+Governance's unhappy-path/chaos passes on the `#3401` fix identified one race the two-phase
+restructure itself introduces (not present before it), which this round fixes; three
+observability/correctness follow-ups from the same passes; and confirms several other findings as
+pre-existing, out of scope, or already covered.
+
+**Fixed here — supersede detection (Gate 4 unhappy-path UP-1, Gate 5 CH-1a).** Splitting the
+revoke off `mu_` opened a window the OLD single-locked implementation did not have: because
+`register_agent` used to hold `mu_` across the ENTIRE call (revoke included), two concurrent calls
+for the same `agent_id` were fully serialized end to end — install order always matched lock-
+acquisition order. With the revoke off-lock, a second call for the same `agent_id` can now run its
+own phase 1, revoke, and phase 2 to completion (install a session, map a live stream) entirely
+within a first, slower call's revoke window. Without a check, the slower call's phase 2 would then
+overwrite the map with a fresh, unmapped session — silently orphaning the winner's live stream, a
+dispatch black hole. The fix: phase 1 now snapshots the *session itself* (`shared_ptr`, not a bool)
+under `mu_`; phase 2 re-reads and compares by pointer identity before touching anything. A
+mismatch means a newer registration already won — this call yields (`std::unexpected`, same
+retryable-`UNAVAILABLE` path already built for a revoke failure, its own `reason` label) rather than
+overwriting a live session with a stale one. An entry that was instead *removed* (not replaced)
+between phase 1 and phase 2 is not "superseded" — nothing live to protect — and installs normally.
+This **restores** the old implementation's ordering guarantee; it does not add a new one, and it
+does not touch the separate, pre-existing register→Subscribe gap (a registration landing after
+phase 2 but before the caller's own `Subscribe` call) — that gap is unchanged by this diff, exactly
+as it was before. Verified by a deterministic test-only interleave hook
+(`set_register_agent_interleave_hook_for_test`, `test_agent_registry_token_revocation.cpp`) that
+fires a second `register_agent` call synchronously inside the first call's revoke-to-install
+window — chosen over a real-thread race because the property under test is "what does phase 2 do
+when the entry changed under it," not "can we reproduce OS scheduling," and a timing-based test
+would be flaky for no additional coverage. The realistic-timing variant (an actual `pg_sleep`-held
+row lock racing real threads) is tracked as a follow-up chaos scenario (CH-1b), not a merge gate.
+
+**Fixed here — REST create-token error classifier, three-way (Gate 4 consistency-auditor C-1).**
+The POST `/api/v1/device-tokens` handler's own classifier was two-way (`kDeviceTokenDbErrorPrefix`/
+`internal_error:` → 503 fault; everything else assumed CSPRNG exhaustion), so the store's
+`invalid_input_length:`/`principal_id cannot be empty` validation errors fell into the CSPRNG arm
+by elimination — wrong audit reason, wrong Prometheus counter, and (unlike the other two arms,
+which agree on 503) a real status-code error, since a validation failure is a 400, not a 503.
+Unreachable via REST today (the route pre-clamps `name`/`device_id`/`definition_id` at 256 bytes,
+and the harness's own `auth_fn` refuses an empty `session_user` outright, matching production —
+`principal_id` can never be empty through a real session). Verified by inspection against
+`device_token_store.cpp`'s enumerated `create_token` error strings plus the store-level pinned-
+string tests already added for #3351, not a full REST round-trip — forcing an empty principal_id
+through the harness would require defeating `auth_fn`'s own gate in a way no production path can,
+which would be a false-representative test, not real coverage.
+
+**Fixed here — metric naming + pre-seed (Gate 6 sre).** `yuzu_agent_registration_refused_total`
+(singular) is renamed to `yuzu_agents_registration_refused_total`, matching its siblings
+`yuzu_agents_registered_total`/`yuzu_agents_connected` added in the same function; both reason
+values (`device_token_revoke_failed`, `superseded_by_concurrent_registration`) are now pre-seeded
+at construction (`kNvdCountedReasons` precedent) so `absent()`-style alerting has a series to watch
+from a healthy boot rather than only after the first failure.
+
+**Also fixed — capacity note extension (Gate 6 sre).** The existing "Capacity note for the future
+wiring PR" above covered only `validate_token`'s httplib-worker-starvation risk; it now also names
+`register_agent`'s `revoke_by_device` call on the gRPC thread pool as the same acquire-vs-lock-wait
+exposure, on the registration path specifically.
+
+**Confirmed, not fixed here — tracked as follow-ups:**
+- **Sequential impostor-evasion of the sweep (UP-2)** — `prior_exists` (does an `agents_` entry
+  currently exist) is the only gate on running the revoke; an identity holder disconnecting before
+  the legitimate device's next `Register` skips it entirely. Pre-existing (not introduced by this
+  diff, not addressed by it), a genuine design tension between preserving the pre-issuance
+  operator workflow and closing disconnect-evasion, not a same-PR-fixable bug — files as a decision
+  issue.
+- **Reconnect-storm / gRPC-thread-pinning compound (UP-3/UP-4, Gate 5 CH-2)** — pre-existing agent
+  backoff (no jitter) and gRPC thread-pool sizing characteristics, unrelated to this diff's own
+  correctness; tracked as a pre-release follow-up (P1), not a merge gate.
+- **Migration fail-closed abort is all-or-nothing (UP-6)** — matches this same function's
+  pre-existing hex-format-validation precedent (already aborts the whole migration on one
+  malformed row); the new length-bound check adds one more reason using an already-established
+  philosophy, not a new failure class. Rejected as a design change; noted for the wiring-PR
+  checklist.
+- **No `audit_log` row for the automated revoke sweep (Gate 6 compliance-officer)** — the REST-
+  driven `device_token.create`/`device_token.revoke` routes emit an audit row; the automatic #823
+  sweep inside `register_agent` emits only an `spdlog` line and a counter (the registry holds no
+  `AuditStore` reference — see `sweep_revoked`'s own comment on the same point). `E6`-capped today
+  (the store is dormant), real once live — close before the wiring PR, alongside `#3422`.
+- **No `audit_log` row for the supersede refusal either (Gate 8 security-guardian) — and this one
+  is live today, not `E6`-capped.** Same gap, same underlying cause (`AgentRegistry` has no
+  `AuditStore` reference at all), but the supersede check runs regardless of store wiring, so this
+  is a real, present audit-trail gap, derived MEDIUM (non-blocking — MEDIUM doesn't meet the
+  BLOCKING bar, and fixing it means threading an `AuditStore` dependency into `AgentRegistry`, a
+  real architectural addition disproportionate to this hardening round). Track as its own,
+  higher-priority item alongside the dormant one above — do not let the two share one disposition.
+- **Straggler revoke can sweep a later, unrelated re-issued token (Gate 8 unhappy-path UP-12)** —
+  `revoke_by_device` is unscoped in time: a pathologically delayed loser's revoke (stuck behind a
+  `FOR UPDATE` wait — see the capacity note above) can commit after an operator has legitimately
+  reissued a fresh token for a subsequent reconnection of the same device, silently revoking it.
+  `E6`-capped today (the store is dormant); add to the wiring-PR capacity/correctness checklist
+  alongside the existing pool-contention note.
+- **Customer-assurance framing (Gate 6 enterprise-readiness)** — any security-questionnaire or
+  pilot-readiness answer about this history should name `#3422` explicitly (what mechanically
+  enforces closing these gates before the store goes live) rather than resting on "dormant" alone,
+  and should lead with the fix's rigor (external review, root-caused, converted to fail-closed)
+  rather than "it didn't matter because nothing called it."
+
+**Correction to "dormant" (docs-writer + Gate 8 unhappy-path UP-13):** most of the above remains
+dormant-store defence-in-depth like the round above — the revoke-failure refusal path, the
+input-length bound, the linear sanitize, and the checked hashing are all gated on a wired
+`DeviceTokenStore` (`server.cpp` still passes `nullptr`). The supersede check is not: phase 2's
+pointer-identity compare runs on every `register_agent` call, store or no store, so a genuine
+concurrent-registration race is caught in production today, and its
+`yuzu_agents_registration_refused_total{reason="superseded_by_concurrent_registration"}` series
+is exposed on every server's `/metrics` right now, pre-seeded at 0. The only live-today surface
+this round adds is that refusal-and-retry path and its metric — restoring the ordering the old
+single-locked implementation already gave for free, not a new capability. (Correction to the
+Gate 8 docs-writer finding that prompted this paragraph: `docs/user-manual/metrics.md` does not
+in fact catalog `yuzu_agents_registered_total`/`yuzu_agents_connected` either — the doc is a
+curated query/dashboard reference, not an exhaustive metrics catalog — so this is a pre-existing
+gap affecting the whole `yuzu_agents_*` family, not one this round newly introduces; a metrics
+catalog pass is a separate, larger piece of work.)

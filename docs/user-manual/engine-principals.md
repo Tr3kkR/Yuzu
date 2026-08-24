@@ -161,16 +161,22 @@ loop explicitly instead of waiting for the sweep:
 curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce/credentials/confirm \
   -H "Cookie: $COOKIE" \
   -H "Content-Type: application/json" \
-  -d '{"token_id": "<token_id from the rotate response>"}'
+  -d '{"token_id": "<token_id from the rotate response>", "secret": "<the raw successor secret from the rotate response>"}'
 ```
 
 This revokes the predecessor immediately and promotes the successor to the
 principal's sole active credential. `confirm` is a **separate attestation**
 from the `rotate` reveal — the server never infers "installed" from "the
-rotate call returned 200." The required `token_id` is the successor id the
-rotate response returned: it pins the confirm to that exact rotation, so a
-blind retry of an old confirm can never resolve a **later** rotation early
-(a stale or mismatched id gets a `409` and changes nothing).
+rotate call returned 200." Confirm now requires **proof of possession** of
+the successor: alongside the `token_id`, you must present the raw `secret`
+the rotate response returned, which the server verifies against the stored
+hash (a missing/empty `secret` is a `400`; a wrong one is a `403` and
+changes nothing). The `token_id` still pins the confirm to that exact
+rotation, so a blind retry of an old confirm can never resolve a **later**
+rotation early (a stale or mismatched id gets a `409` and changes nothing).
+Because possession of the secret is required, a lost rotate response can no
+longer be used to confirm — revoke the unknown successor and rotate again
+instead (see the callout below).
 
 `confirm`'s check that you're the same operator who called `rotate` is
 stored durably, not just in memory, so a server restart no longer blocks

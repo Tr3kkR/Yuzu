@@ -159,6 +159,7 @@
 #include "fleet_topology_store.hpp"
 #include "heartbeat_ingestion.hpp"
 #include "fleet_topology_types.hpp"
+#include "mcp_retry.hpp"  // kMcpPollTotalMetric (#3344) — direct, not transitive
 #include "mcp_server.hpp"
 #include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
 #include "stream_budget.hpp" // shared held-open-SSE admission budget (2f PR 2, Decision 15(h))
@@ -463,6 +464,22 @@ public:
                           "gauge");
         metrics_.describe("yuzu_agents_registered_total", "Total number of agent registrations",
                           "counter");
+        // #3401: a re-registration was refused, either because the W1.5/#823 device-token
+        // revoke-by-device sweep itself failed (fail-closed, ADR-0012 §1) or because a
+        // concurrent registration for the same agent_id already won (see register_agent's
+        // phase-2 supersede check) — either way the agent retries on its normal reconnect
+        // backoff. Pre-seed both reason values so absent()-style alerting works from a healthy
+        // boot (kNvdCountedReasons precedent above). Dormant today for the revoke-failure reason
+        // (device_token_store_ is never wired live); the supersede reason is live regardless.
+        metrics_.describe("yuzu_agents_registration_refused_total",
+                          "Agent registration refused because a required pre-install step "
+                          "failed, or because a concurrent registration for the same agent_id "
+                          "already won. Labelled reason.",
+                          "counter");
+        for (const char* reason :
+             {"device_token_revoke_failed", "superseded_by_concurrent_registration"}) {
+            metrics_.counter("yuzu_agents_registration_refused_total", {{"reason", reason}});
+        }
         metrics_.describe("yuzu_commands_dispatched_total",
                           "Total number of commands dispatched to agents", "counter");
         metrics_.describe("yuzu_commands_completed_total",
@@ -714,6 +731,21 @@ public:
                           "mcp_server.cpp for the exact scope. Does not interact with the "
                           "kMcpSubmitterPendingCap 25-slot cap: a ticket leaves the pending "
                           "bucket at admin-approval time, before it can ever reach this class",
+                          "counter");
+        // #3344: poll-rate signal for the three success-shaped result-poll
+        // tools, so the named retry_after_ms floors (mcp_retry.hpp) can be
+        // data-tuned instead of ossifying as guessed constants. not_ready:
+        // the response carried a retry_after_ms hint (execution non-terminal,
+        // bundle incomplete, or query_responses rows still in flight); ready:
+        // served terminal/complete without one. Excludes pre-verdict denials
+        // (tier/permission/invalid-params/not-found) — those are already
+        // visible via the denial counters and A4 envelopes above. Both labels
+        // are closed sets (3 tools x 2 results), pre-seeded below.
+        metrics_.describe(mcp::kMcpPollTotalMetric,
+                          "MCP result-poll tool calls by verdict (get_execution_status, "
+                          "query_responses, get_bundle_result). not_ready: the success payload "
+                          "carried a retry_after_ms poll hint; ready: served terminal/complete "
+                          "without one. Excludes pre-verdict denials.",
                           "counter");
         // Progress bridge core (2f PR 3a). Same closed-set posture: every reject/
         // degrade reason is a static literal inside the bridge, never derived
@@ -1044,6 +1076,15 @@ public:
             // pattern instead of introducing an unseeded one.
             metrics_.counter("yuzu_mcp_approval_burned_total",
                              {{"tool", tool}, {"reason", "handler_reject"}});
+        }
+        // #3344: yuzu_mcp_poll_total — the closed set is exactly the three
+        // success-shaped result-poll tools x the two verdicts, so every
+        // combination is pre-seeded here for absent() to stay meaningful.
+        for (const auto tool :
+             {"get_execution_status", "query_responses", "get_bundle_result"}) {
+            for (const auto result : {"ready", "not_ready"}) {
+                metrics_.counter(mcp::kMcpPollTotalMetric, {{"tool", tool}, {"result", result}});
+            }
         }
         // yuzu_mcp_approval_precondition_denied_total's reachable label set is
         // NARROWER than the two above: kPrecondition can only fire for a tool
@@ -2226,7 +2267,7 @@ public:
                           "#1118). Labelled event=security (SIEM-routing tag)",
                           "counter");
         // PKI PR3: an agent-initiated RPC rejected because the presented client
-        // leaf's serial is on the internal CA's revocation list (ca.db). A revoked
+        // leaf's serial is on the internal CA's revocation list (ca_store). A revoked
         // agent that keeps calling is a decommissioned/compromised-credential
         // signal. Labelled by rpc (subscribe|heartbeat|download_update) so an
         // operator can see a revoked agent trying every surface, not just the
@@ -2243,14 +2284,37 @@ public:
                           "enrollment (PKI PR3). Labelled purpose (agent)",
                           "counter");
         // PKI PR4 (gov sre/unhappy SHOULD): the CRL could not be (re)built/signed —
-        // the public CRL is stale relative to ca.db. Alert on >0 since a revocation,
+        // the public CRL is stale relative to ca_store. Alert on >0 since a revocation,
         // since server-side enforcement is live but external consumers are not
         // seeing the revocation. The audit row (ca.crl.published failure) is the
         // forensic pair; this counter is the real-time alert source.
+        // ADR-0053 UP-1 (gov sre F1, Gate 6, 2026-08-21): describe() alone populates a
+        // description entry but MetricsRegistry::serialize() only emits # TYPE/# HELP for
+        // a name already present in the counters_ map — without a matching .counter() call
+        // this series is entirely ABSENT from /metrics (not present-at-0) until its first
+        // failure ever fires, which makes an absent()-based alert useless (can't distinguish
+        // "healthy" from "never registered"). All three CA-family failure counters below are
+        // pre-seeded at 0 for this reason (the sibling two had the same gap, found while
+        // writing this family's alert rules).
         metrics_.describe("yuzu_server_ca_crl_publish_failures_total",
                           "Internal-CA CRL (re)publish failures (key load / build / record). A "
                           "non-zero value since a revocation means the public CRL is stale (PKI PR4)",
                           "counter");
+        (void)metrics_.counter("yuzu_server_ca_crl_publish_failures_total");
+        metrics_.describe("yuzu_server_ca_reissue_blocked_total",
+                          "Agent CSR re-issuance refused because a revoked, non-expired cert "
+                          "already exists for that identity (sign_agent_csr's revocation-bypass "
+                          "guard). A sustained non-zero rate may indicate a revoked agent "
+                          "repeatedly attempting to re-provision.",
+                          "counter");
+        metrics_.counter("yuzu_server_ca_reissue_blocked_total", {{"reason", "revoked_identity"}});
+        metrics_.describe("yuzu_server_ca_revocation_sweep_read_failures_total",
+                          "Revocation-sweep tick's list_revoked_serials() read failed — that "
+                          "tick's sweep was skipped entirely rather than treating every live "
+                          "agent as revoked (ADR-0053 UP-1). A sustained non-zero rate means "
+                          "already-revoked agents' live streams may not be torn down promptly",
+                          "counter");
+        (void)metrics_.counter("yuzu_server_ca_revocation_sweep_read_failures_total");
         // #1128: a peer-IP mismatch that was TOLERATED (not rejected) because a
         // NAT-aware accommodation applied. Paired with _peer_mismatch_total
         // (rejects): a spike here without a matching reject spike is benign
@@ -2852,11 +2916,13 @@ public:
         // forensics. One describe site only (#2446 last-write-wins on dup).
         metrics_.describe("yuzu_engine_principal_confirm_total",
                           "Engine-credential rotation confirm outcomes by surface (rest|mcp) and "
-                          "result (success|conflict|client_error|transient); store-reaching calls "
-                          "only, pre-store denials excluded (#2404)",
+                          "result (success|conflict|client_error|transient|secret_mismatch); "
+                          "store-reaching calls only, pre-store denials excluded (#2404; "
+                          "secret_mismatch added #3015 proof-of-possession)",
                           "counter");
         for (auto surface : {"rest", "mcp"}) {
-            for (auto result : {"success", "conflict", "client_error", "transient"}) {
+            for (auto result :
+                {"success", "conflict", "client_error", "transient", "secret_mismatch"}) {
                 metrics_.counter("yuzu_engine_principal_confirm_total",
                                  {{"surface", surface}, {"result", result}});
             }
@@ -2901,12 +2967,14 @@ public:
         // diverge into a shadow series.
         metrics_.describe(kApiTokenConfirmTotalMetric,
                           "Human API-token rotation confirm outcomes by surface (rest|mcp) and "
-                          "result (success|conflict|client_error|transient); store-reaching calls "
-                          "only, pre-store denials excluded - the human-owned twin of "
-                          "yuzu_engine_principal_confirm_total",
+                          "result (success|conflict|client_error|transient|secret_mismatch); "
+                          "store-reaching calls only, pre-store denials excluded - the "
+                          "human-owned twin of yuzu_engine_principal_confirm_total "
+                          "(secret_mismatch added #3015 proof-of-possession)",
                           "counter");
         for (auto surface : {"rest", "mcp"}) {
-            for (auto result : {"success", "conflict", "client_error", "transient"}) {
+            for (auto result :
+                {"success", "conflict", "client_error", "transient", "secret_mismatch"}) {
                 metrics_.counter(kApiTokenConfirmTotalMetric,
                                  {{"surface", surface}, {"result", result}});
             }
@@ -4052,9 +4120,32 @@ public:
                     }
                 }
             }
-            // Internal-CA store (ca.db) — cert inventory + CRL versions. The CA
-            // root key itself is a 0600 file via default_certs, never in this DB.
-            ca_store_ = std::make_unique<CaStore>(cfg_.db_dir() / "ca.db");
+            // Internal-CA store — PostgreSQL (ADR-0053, schema ca_store): cert inventory + CRL
+            // versions. The CA root key itself is a 0600 file via default_certs, never in this
+            // DB. Born-on-PG like the other migrated stores: fail-closed on open, then a
+            // MANDATORY backfill of the legacy ca.db (issued-cert + CRL history is compliance
+            // evidence, ADR-0053 — refuse boot rather than serve a knowingly-incomplete trail).
+            if (pg_pool_ && !startup_failed_) {
+                ca_store_ = std::make_unique<CaStore>(*pg_pool_);
+                if (!ca_store_->is_open()) {
+                    spdlog::error("[PG] Refusing to start: ca store migration/open failed "
+                                  "(database reachable but the ca_store schema could not be "
+                                  "created/opened)");
+                    startup_failed_ = true;
+                } else {
+                    auto ca_db = cfg_.db_dir() / "ca.db";
+                    if (!ca_store_->migrate_from_sqlite(ca_db)) {
+                        spdlog::error("[PG] Refusing to start: ca store backfill from legacy {} "
+                                      "failed (ADR-0009 mandatory-backfill fail-closed; see prior "
+                                      "log lines). The issued-cert/CRL evidence chain must be "
+                                      "complete before serving; the next boot retries. Operator "
+                                      "remediation: repair the file, or quarantine it aside if it "
+                                      "is unrecoverable.",
+                                      ca_db.string());
+                        startup_failed_ = true;
+                    }
+                }
+            }
             // PR 10 hardening — wire AuditStore into FleetTopologyStore
             // so push success (first-per-agent) and rejections emit
             // AuditEvents (F-1 / CC6.1 / CC7.3 evidence chain). Must
@@ -4366,14 +4457,46 @@ public:
                         }
                         return;
                     }
-                    // Per-agent filtering as the fan-out (M4): only rules that target
-                    // this agent's OS and name it in scope. Cache scope membership
-                    // across rules sharing a scope_expr within this one reconcile.
                     // Baseline gate (docs/guardian-baseline-model.md): the rule source
                     // is the union of member Guards of *deployed* Baselines, so an
                     // enabled-but-undeployed Guard is never reconciled onto an agent.
+                    // ADR-0055 catastrophic-read set: a degraded read MUST abort this
+                    // reconcile, never fan out an empty deployed-set it cannot
+                    // distinguish from "nothing deployed" — mirrors the list_rules
+                    // degrade handling immediately above.
+                    auto deployed_result = deployed_member_rule_ids();
+                    if (!deployed_result) {
+                        metrics_
+                            .counter("yuzu_server_guardian_reconciles_total",
+                                     {{"result", "degraded"}})
+                            .increment();
+                        spdlog::warn("Guardian heartbeat reconcile: deployed_member_rule_ids "
+                                     "degraded ({}) — aborting re-push for agent_id={}",
+                                     deployed_result.error(), agent_id);
+                        if (audit_store_ && audit_store_->is_open()) {
+                            AuditEvent ev;
+                            ev.timestamp =
+                                std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+                            ev.principal = "system";
+                            ev.action = "guaranteed_state.reconcile";
+                            ev.target_type = "GuaranteedState";
+                            ev.target_id = agent_id;
+                            ev.detail = "heartbeat reconcile ABORTED — baseline store degraded (" +
+                                        deployed_result.error() +
+                                        "); agent rules did not converge (generation " +
+                                        std::to_string(agent_gen) + ")";
+                            ev.result = "degraded";
+                            (void)audit_store_->log(ev);
+                        }
+                        return;
+                    }
+                    // Per-agent filtering as the fan-out (M4): only rules that target
+                    // this agent's OS and name it in scope. Cache scope membership
+                    // across rules sharing a scope_expr within this one reconcile.
                     const auto rules =
-                        guardian::filter_deployed_members(*rules_result, deployed_member_rule_ids());
+                        guardian::filter_deployed_members(*rules_result, *deployed_result);
                     std::unordered_map<std::string, bool> scope_member;
                     auto push = guardian::build_agent_push(
                         rules, sess->os,
@@ -5187,11 +5310,39 @@ public:
         // Guardian Baselines — the deployable collection of Guards (M:N members +
         // included/excluded management-group assignment). Control-plane only; the
         // agent never hears the word "Baseline". See docs/guardian-baseline-model.md.
-        {
-            auto bl_db = cfg_.db_dir() / "guardian-baselines.db";
-            baseline_store_ = std::make_unique<BaselineStore>(bl_db);
-            if (baseline_store_ && baseline_store_->is_open())
-                spdlog::info("BaselineStore initialized at {}", bl_db.string());
+        // Migrated Postgres store (ADR-0006/0055, schema `baseline_store`) —
+        // construction fail-CLOSED per ADR-0012 §1 (same template as
+        // GuaranteedStateStore above, its closest Guardian-domain sibling): a
+        // reachable database whose schema can't migrate/open is a fatal startup
+        // error, never a serve-degraded state. `migrate_from_sqlite` runs the
+        // one-time, idempotent legacy-`guardian-baselines.db` backfill (ADR-0009)
+        // — every table here is AUTHORITATIVE operator-authored enforcement
+        // config, so a backfill failure is ALSO fatal (never serve on top of a
+        // partially-migrated Baseline set).
+        if (pg_pool_ && !startup_failed_) {
+            baseline_store_ = std::make_unique<BaselineStore>(*pg_pool_);
+            if (!baseline_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: baseline store migration/open failed "
+                              "(database reachable but the baseline_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                auto bl_db = cfg_.db_dir() / "guardian-baselines.db";
+                if (!baseline_store_->migrate_from_sqlite(bl_db)) {
+                    spdlog::error(
+                        "[PG] Refusing to start: Guardian Baseline legacy-SQLite backfill failed "
+                        "(see prior log lines) — Baselines are authoritative enforcement config "
+                        "and must not serve partially-migrated data. Operator remediation: "
+                        "repair {} or move it aside to skip the backfill (Baselines in it will "
+                        "NOT carry over)",
+                        bl_db.string());
+                    startup_failed_ = true;
+                } else {
+                    spdlog::info("BaselineStore initialized (schema baseline_store; legacy "
+                                 "backfill source {})",
+                                 bl_db.string());
+                }
+            }
         }
 
         // Phase 7: Runtime Configuration + Custom Properties
@@ -5244,26 +5395,78 @@ public:
             }
         }
 
-        // Phase 7: Product Pack Store
-        {
-            auto pack_db = cfg_.db_dir() / "product-packs.db";
-            product_pack_store_ = std::make_unique<ProductPackStore>(pack_db);
-            if (product_pack_store_ && product_pack_store_->is_open()) {
-                spdlog::info("ProductPackStore initialized at {}", pack_db.string());
-                // #802 / W7.4: enforce signed-pack-by-default. Default
-                // ProductPackStore ctor sets require_signed_packs_=true; we
-                // invert only when the operator opts in via the flag, and
-                // make the relaxed posture loud in operator logs + audit
-                // (audit emission deferred to post-audit_store_-construction
-                // block below to mirror the viz_disable pattern).
-                product_pack_store_->set_require_signed_packs(!cfg_.allow_unsigned_packs);
-                if (cfg_.allow_unsigned_packs) {
-                    spdlog::warn("[SECURITY] product pack signature enforcement DISABLED "
-                                 "by configuration (--allow-unsigned-packs / "
-                                 "YUZU_ALLOW_UNSIGNED_PACKS). Unsigned packs will be "
-                                 "accepted at install — this exposes the fleet to "
-                                 "arbitrary instruction/plugin execution. Sign packs and "
-                                 "remove the flag as soon as feasible.");
+        // Phase 7: Product Pack Store — Migrated Postgres store (ADR-0006/0009/0054, schema
+        // `product_pack_store`). Construction fail-CLOSED per ADR-0012 §1 (same template as
+        // CustomPropertiesStore/NotificationStore above): a reachable database whose schema
+        // can't migrate/open is a fatal startup error, never a serve-degraded pack catalog.
+        // `migrate_from_sqlite` runs the one-time, idempotent legacy-`product-packs.db` backfill
+        // (ADR-0009) — AUTHORITATIVE operator-installed content means a backfill failure is ALSO
+        // fatal (never serve on top of partially-migrated packs).
+        if (pg_pool_ && !startup_failed_) {
+            product_pack_store_ = std::make_unique<ProductPackStore>(*pg_pool_);
+            if (!product_pack_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: product pack store migration/open failed "
+                              "(database reachable but the product_pack_store schema could not "
+                              "be created/opened)");
+                startup_failed_ = true;
+            } else {
+                spdlog::info("ProductPackStore initialized (schema product_pack_store)");
+                // #3261/#3294 class: set_metrics BEFORE migrate_from_sqlite, so the
+                // backfill-result counter is live on the one pass that matters — a
+                // registry wired only after the (one-shot, idempotent) backfill call
+                // would leave that specific pass permanently uncounted.
+                product_pack_store_->set_metrics(&metrics_);
+                // Pre-seed both bounded-label families to 0 (governance arch-F2, per
+                // docs/observability-conventions.md, TagStore precedent above) so
+                // absent()-based alerting stays meaningful before the first
+                // degrade/backfill event — load-bearing here specifically because a
+                // backfill failure sets startup_failed_ (refused boot never serves
+                // /metrics at all), so an alert on THIS store's backfill result must
+                // be able to fire on the ABSENCE of a success/fresh sample, which
+                // requires the label set to already exist.
+                metrics_.describe("yuzu_server_product_pack_read_degrade_total",
+                                  "ProductPackStore reads that degraded instead of answering, by "
+                                  "reason",
+                                  "counter");
+                for (auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"}) {
+                    metrics_.counter("yuzu_server_product_pack_read_degrade_total",
+                                     {{"reason", reason}});
+                }
+                metrics_.describe("yuzu_server_product_pack_backfill_total",
+                                  "One-time legacy product-packs.db backfill outcome (ADR-0054)",
+                                  "counter");
+                for (auto result : {"fresh", "success", "failed"}) {
+                    metrics_.counter("yuzu_server_product_pack_backfill_total",
+                                     {{"result", result}});
+                }
+                auto pack_db = cfg_.db_dir() / "product-packs.db";
+                if (!product_pack_store_->migrate_from_sqlite(pack_db)) {
+                    spdlog::error(
+                        "[PG] Refusing to start: product-pack legacy-SQLite backfill failed "
+                        "(see prior log lines) — product_pack_store is the AUTHORITATIVE pack "
+                        "catalog and must not serve partially-migrated data. Operator "
+                        "remediation: repair {} or move it aside to skip the backfill (packs "
+                        "in it will NOT carry over)",
+                        pack_db.string());
+                    startup_failed_ = true;
+                } else {
+                    // #802 / W7.4: enforce signed-pack-by-default. Default ProductPackStore
+                    // ctor sets require_signed_packs_=true; we invert only when the operator
+                    // opts in via the flag, and make the relaxed posture loud in operator logs
+                    // + audit (audit emission deferred to post-audit_store_-construction block
+                    // below to mirror the viz_disable pattern). #3261/#3294 class: this call
+                    // MUST stay inside the same fail-closed guard as construction — a
+                    // null-guarded call sitting outside it is the silent-skip-wiring bug class
+                    // that shipped three dead integrations.
+                    product_pack_store_->set_require_signed_packs(!cfg_.allow_unsigned_packs);
+                    if (cfg_.allow_unsigned_packs) {
+                        spdlog::warn("[SECURITY] product pack signature enforcement DISABLED "
+                                     "by configuration (--allow-unsigned-packs / "
+                                     "YUZU_ALLOW_UNSIGNED_PACKS). Unsigned packs will be "
+                                     "accepted at install — this exposes the fleet to "
+                                     "arbitrary instruction/plugin execution. Sign packs and "
+                                     "remove the flag as soon as feasible.");
+                    }
                 }
             }
         }
@@ -5645,7 +5848,7 @@ public:
         const std::filesystem::path dir =
             cfg_.ca_dir.empty() ? auth::default_cert_dir() : cfg_.ca_dir;
         if (!ca_store_ || !ca_store_->is_open())
-            spdlog::warn("default_certs: ca.db is not open — cert-inventory recording will fail and "
+            spdlog::warn("default_certs: ca_store is not open — cert-inventory recording will fail and "
                          "generation will refuse (surfacing the DB-open failure)");
         if (!ensure_default_certs(dir, detect_hostname(), ca_store_.get(), default_cert_set_,
                                   cfg_.cert_sans, cfg_.cert_group)) {
@@ -5674,7 +5877,7 @@ public:
             // INVARIANT: using_default_agent_certs ⟹ using_default_certs (it is set
             // inside this `if (https_needs/agent_needs)` block, only after
             // using_default_certs is set above). The /healthz ca-store check keys on
-            // the broader using_default_certs (ca.db is needed whenever ANY default
+            // the broader using_default_certs (ca_store is needed whenever ANY default
             // surface is active); the listener relaxation keys on the agent-specific
             // flag. Keep them in sync if a future mixed-mode is introduced.
             cfg_.using_default_agent_certs = true;
@@ -5796,74 +5999,101 @@ public:
         agent_service_.set_require_client_identity(cfg_.tls_enabled && !cfg_.tls_ca_cert.empty());
         // Only an install with our OWN issuing CA (built-in defaults today,
         // subordinate in PR6) signs agent CSRs. When the operator brought their
-        // own certs there is no root in ca.db → no signer, and agents must carry
+        // own certs there is no root in ca_store → no signer, and agents must carry
         // operator-minted client certs (the pre-PKI contract). The revocation
         // checker is wired whenever a CA root exists so a revoked leaf is refused
         // even on an operator-supplied-cert install that still uses our CA.
-        if (ca_store_ && ca_store_->is_open() && ca_store_->has_root()) {
-            // LIFETIME: these [this]-capturing lambdas are invoked from gRPC worker
-            // threads and dereference ca_store_/agent_ca_cert_pem_/csr_issue_*. That
-            // is safe only because stop() (run from ~ServerImpl) calls
-            // agent_server_->Shutdown(deadline) — draining/cancelling all in-flight
-            // RPCs — BEFORE any member is destroyed, even though ca_store_ is
-            // declared after agent_service_/agent_server_ (destructs first). Same
-            // shutdown-before-destruct contract as execution_tracker_. agent_ca_cert_pem_
-            // is written ONCE here, before BuildAndStart accepts traffic (publish-
-            // before-start), so the worker-thread reads are race-free; do not re-wire
-            // the CA at runtime without adding synchronisation.
-            // Cache the issuing-CA cert PEM so is_yuzu_issued() can signature-verify
-            // a presented client leaf against OUR CA specifically (Hermes CRITICAL-1
-            // / LOW-5 — a foreign cert in a multi-CA trust bundle must not be
-            // mistaken for a Yuzu agent identity or a revoked Yuzu serial).
-            if (auto r = ca_store_->get_root())
-                agent_ca_cert_pem_ = r->cert_pem;
-            // ONE guarded signer, shared by the direct (AgentServiceImpl) and
-            // gateway-proxied (GatewayUpstreamServiceImpl::ProxyRegister, PR5d)
-            // Register paths — so an agent enrolling through the gateway receives a
-            // per-agent client cert too, with the SAME CA / rate-limit / ca_issued
-            // recording / CSR-size cap (one chokepoint, cannot drift). The
-            // try/catch enforces sign_agent_csr's documented "nullopt on any
-            // failure" contract even if it throws (e.g. bad_alloc) — an uncaught
-            // exception out of a sync gRPC handler on the exposed one-way-TLS agent
-            // edge would otherwise terminate the server (Hermes pass-2 MEDIUM).
-            std::function<std::optional<std::pair<std::string, std::string>>(
-                const std::string&, const std::string&, CertIssuanceSource)>
-                cert_signer = [this](const std::string& csr_pem, const std::string& agent_id,
-                                     CertIssuanceSource src)
-                -> std::optional<std::pair<std::string, std::string>> {
-                try {
-                    return sign_agent_csr(csr_pem, agent_id, src);
-                } catch (const std::exception& e) {
-                    spdlog::error("PKI: agent CSR signing threw ({}) for {} — non-fatal", e.what(),
-                                  agent_id);
-                    return std::nullopt;
-                } catch (...) {
-                    spdlog::error("PKI: agent CSR signing threw (unknown) for {} — non-fatal",
-                                  agent_id);
-                    return std::nullopt;
-                }
-            };
-            agent_service_.set_agent_cert_signer(cert_signer);
-            if (gateway_service_)
-                gateway_service_->set_agent_cert_signer(cert_signer);
-            agent_service_.set_revocation_checker(
-                [this](const std::string& peer_cert_pem) { return is_peer_cert_revoked(peer_cert_pem); });
-            // Recognizer: lets the Register re-auth gate treat ONLY Yuzu-issued
-            // certs as agent identities (foreign certs fall through to bootstrap).
-            agent_service_.set_peer_cert_recognizer(
-                [this](const std::string& peer_cert_pem) { return is_yuzu_issued(peer_cert_pem); });
-            spdlog::info("PKI: per-agent mTLS issuance active (CA {})",
-                         default_cert_set_.ca_fingerprint_sha256.empty()
-                             ? std::string("operator-supplied")
-                             : default_cert_set_.ca_fingerprint_sha256);
-            // Hermes M1: pre-publish the CRL at startup so the PUBLIC GET
-            // /api/v1/ca/crl serves a cached, already-signed CRL and never loads
-            // the CA key for an anonymous caller (the public handler is
-            // serve-or-503, it does NOT build). Best-effort: a failure just means
-            // /ca/crl returns 503 until the next revoke republishes.
-            if (!publish_crl())
-                spdlog::warn("PKI: initial CRL publish failed; GET /api/v1/ca/crl will 503 until "
-                             "the next revocation republishes");
+        if (ca_store_ && ca_store_->is_open()) {
+            // ADR-0036/ADR-0053 (adversarial-review HIGH, 2026-08-20): get_root()
+            // directly, NOT has_root() — this one-shot decision wires (or skips) the
+            // revocation checker/signer/recognizer for the rest of the process's
+            // life, with no retry. has_root() folds a genuine Postgres lease/query
+            // failure into "no root", so a transient blip here used to skip wiring
+            // SILENTLY — the server would keep serving with revoked Yuzu-issued
+            // agent certs unchecked until the next restart, exactly the fail-open
+            // ADR-0053 documents has_root() as unsafe for outside the CRL-freshness
+            // tick and /readyz. Fail the boot instead on a genuine error: run()'s
+            // existing startup_failed_ recheck after start_web_server() (same shape
+            // as the SCIM boot-failure case above) tears down the already-
+            // BuildAndStart'd gRPC listeners before any RPC is served.
+            auto root_or_err = ca_store_->get_root();
+            if (!root_or_err) {
+                spdlog::error("PKI: get_root() failed while wiring per-agent mTLS at boot ({}) — "
+                              "refusing to start rather than serve with revocation enforcement "
+                              "unwired",
+                              root_or_err.error());
+                startup_failed_ = true;
+                // Bare return, not fall-through: nothing has called BuildAndStart yet at this
+                // point in run() (same precedent as the TLS-credential failures a few dozen
+                // lines below) — no listener is up to tear down, so there is nothing stop()
+                // would additionally need to do here that ~ServerImpl won't already do.
+                return;
+            } else if (root_or_err->has_value()) {
+                // LIFETIME: these [this]-capturing lambdas are invoked from gRPC worker
+                // threads and dereference ca_store_/agent_ca_cert_pem_/csr_issue_*. That
+                // is safe only because stop() (run from ~ServerImpl) calls
+                // agent_server_->Shutdown(deadline) — draining/cancelling all in-flight
+                // RPCs — BEFORE any member is destroyed, even though ca_store_ is
+                // declared after agent_service_/agent_server_ (destructs first). Same
+                // shutdown-before-destruct contract as execution_tracker_. agent_ca_cert_pem_
+                // is written ONCE here, before BuildAndStart accepts traffic (publish-
+                // before-start), so the worker-thread reads are race-free; do not re-wire
+                // the CA at runtime without adding synchronisation.
+                // Cache the issuing-CA cert PEM so is_yuzu_issued() can signature-verify
+                // a presented client leaf against OUR CA specifically (Hermes CRITICAL-1
+                // / LOW-5 — a foreign cert in a multi-CA trust bundle must not be
+                // mistaken for a Yuzu agent identity or a revoked Yuzu serial).
+                agent_ca_cert_pem_ = (*root_or_err)->cert_pem;
+                // ONE guarded signer, shared by the direct (AgentServiceImpl) and
+                // gateway-proxied (GatewayUpstreamServiceImpl::ProxyRegister, PR5d)
+                // Register paths — so an agent enrolling through the gateway receives a
+                // per-agent client cert too, with the SAME CA / rate-limit / ca_issued
+                // recording / CSR-size cap (one chokepoint, cannot drift). The
+                // try/catch enforces sign_agent_csr's documented "nullopt on any
+                // failure" contract even if it throws (e.g. bad_alloc) — an uncaught
+                // exception out of a sync gRPC handler on the exposed one-way-TLS agent
+                // edge would otherwise terminate the server (Hermes pass-2 MEDIUM).
+                std::function<std::optional<std::pair<std::string, std::string>>(
+                    const std::string&, const std::string&, CertIssuanceSource)>
+                    cert_signer = [this](const std::string& csr_pem, const std::string& agent_id,
+                                         CertIssuanceSource src)
+                    -> std::optional<std::pair<std::string, std::string>> {
+                    try {
+                        return sign_agent_csr(csr_pem, agent_id, src);
+                    } catch (const std::exception& e) {
+                        spdlog::error("PKI: agent CSR signing threw ({}) for {} — non-fatal", e.what(),
+                                      agent_id);
+                        return std::nullopt;
+                    } catch (...) {
+                        spdlog::error("PKI: agent CSR signing threw (unknown) for {} — non-fatal",
+                                      agent_id);
+                        return std::nullopt;
+                    }
+                };
+                agent_service_.set_agent_cert_signer(cert_signer);
+                if (gateway_service_)
+                    gateway_service_->set_agent_cert_signer(cert_signer);
+                agent_service_.set_revocation_checker(
+                    [this](const std::string& peer_cert_pem) { return is_peer_cert_revoked(peer_cert_pem); });
+                // Recognizer: lets the Register re-auth gate treat ONLY Yuzu-issued
+                // certs as agent identities (foreign certs fall through to bootstrap).
+                agent_service_.set_peer_cert_recognizer(
+                    [this](const std::string& peer_cert_pem) { return is_yuzu_issued(peer_cert_pem); });
+                spdlog::info("PKI: per-agent mTLS issuance active (CA {})",
+                             default_cert_set_.ca_fingerprint_sha256.empty()
+                                 ? std::string("operator-supplied")
+                                 : default_cert_set_.ca_fingerprint_sha256);
+                // Hermes M1: pre-publish the CRL at startup so the PUBLIC GET
+                // /api/v1/ca/crl serves a cached, already-signed CRL and never loads
+                // the CA key for an anonymous caller (the public handler is
+                // serve-or-503, it does NOT build). Best-effort: a failure just means
+                // /ca/crl returns 503 until the next revoke republishes.
+                if (!publish_crl())
+                    spdlog::warn("PKI: initial CRL publish failed; GET /api/v1/ca/crl will 503 until "
+                                 "the next revocation republishes");
+            }
+            // else: nullopt — genuinely no root (operator brought their own certs) —
+            // no signer/recognizer/revocation-checker wiring, same as before.
         }
 
         grpc::EnableDefaultHealthCheckService(true);
@@ -6426,27 +6656,65 @@ public:
                         }
                     }
                 }
+                // UP-1 (Gate 4 unhappy-path, 2026-08-21): build the revoked set ONCE per
+                // tick from a typed serials-only read and ABORT the sweep on a degraded
+                // read, rather than calling the per-request is_peer_cert_revoked() (which
+                // fails CLOSED = revoked, by design, for the mTLS-accept gate) once per
+                // live agent. Reusing the per-request gate here made a transient PG outage
+                // indistinguishable from "every enrolled agent was just revoked": every
+                // Subscribe stream got torn down AND a session.cert_revoked|denied audit
+                // row written for each — a false compliance record, not just an
+                // availability blip, since nothing was actually revoked.
+                //
+                // Gate 8 fix (unhappy-path, 2026-08-21): reads list_revoked_serials(), NOT
+                // list_revoked() — the full-row query (cert_pem blobs, ORDER BY, no cap,
+                // nothing ever prunes ca_issued) is measurably heavier than the point-lookup
+                // is_revoked() the per-request gate uses, so sharing it here opened a
+                // narrower but real corridor: a load/lock-contention pattern specific to the
+                // heavier query could fail THIS read while is_revoked() kept succeeding —
+                // new connections still correctly gated, but the ONLY mechanism that tears
+                // down an already-live stream silently doing nothing, indefinitely, with no
+                // "DB is down" to point to. list_revoked_serials() hits the same
+                // idx_ca_issued_status partial index at point-lookup-equivalent cost, closing
+                // that asymmetry. Same abort-never-empty contract either way (mirrored by the
+                // CRL publish caller below, which still needs the full rows).
                 if (ca_store_ && ca_store_->is_open()) {
-                    const auto swept = registry_.sweep_revoked(
-                        [this](const std::string& pem) { return is_peer_cert_revoked(pem); });
-                    if (!swept.empty()) {
-                        spdlog::warn("Revocation sweep cancelled {} Subscribe stream(s)",
-                                     swept.size());
-                        // HIGH-1 (#1239 Hermes): a revocation-driven access termination
-                        // is a durable SOC 2 CC6.3/CC7.2 event, not just a metric/log.
-                        // The sweep is low-frequency (fires only on actual revocations),
-                        // so a WAL row per cancelled stream is not a flood risk.
-                        if (audit_store_ && audit_store_->is_open()) {
-                            for (const auto& aid : swept) {
-                                (void)audit_store_->log(
-                                    {.timestamp = std::time(nullptr),
-                                     .principal = "agent:" + aid,
-                                     .principal_role = "agent",
-                                     .action = "session.cert_revoked",
-                                     .target_type = "Session",
-                                     .target_id = aid,
-                                     .detail = "reason=revoked_client_cert source=stream_sweep",
-                                     .result = "denied"});
+                    auto revoked_or_err = ca_store_->list_revoked_serials();
+                    if (!revoked_or_err) {
+                        spdlog::error("PKI: revocation sweep skipped this tick — "
+                                      "list_revoked_serials() failed ({}); live Subscribe "
+                                      "streams left untouched rather than treated as "
+                                      "mass-revoked",
+                                      revoked_or_err.error());
+                        metrics_.counter("yuzu_server_ca_revocation_sweep_read_failures_total")
+                            .increment();
+                    } else {
+                        std::unordered_set<std::string> revoked_serials(revoked_or_err->begin(),
+                                                                        revoked_or_err->end());
+                        const auto swept = registry_.sweep_revoked(
+                            [this, &revoked_serials](const std::string& pem) {
+                                return is_peer_cert_revoked_in(pem, revoked_serials);
+                            });
+                        if (!swept.empty()) {
+                            spdlog::warn("Revocation sweep cancelled {} Subscribe stream(s)",
+                                         swept.size());
+                            // HIGH-1 (#1239 Hermes): a revocation-driven access termination
+                            // is a durable SOC 2 CC6.3/CC7.2 event, not just a metric/log.
+                            // The sweep is low-frequency (fires only on actual revocations),
+                            // so a WAL row per cancelled stream is not a flood risk.
+                            if (audit_store_ && audit_store_->is_open()) {
+                                for (const auto& aid : swept) {
+                                    (void)audit_store_->log(
+                                        {.timestamp = std::time(nullptr),
+                                         .principal = "agent:" + aid,
+                                         .principal_role = "agent",
+                                         .action = "session.cert_revoked",
+                                         .target_type = "Session",
+                                         .target_id = aid,
+                                         .detail =
+                                             "reason=revoked_client_cert source=stream_sweep",
+                                         .result = "denied"});
+                                }
                             }
                         }
                     }
@@ -7512,10 +7780,17 @@ public:
         // from Register/Subscribe/Heartbeat/CheckForUpdate/DownloadUpdate. The
         // drain above guarantees no handler is mid-invocation; null them for the
         // same belt-and-braces reason as the tracker so a stray late call cannot
-        // touch released CA state.
+        // touch released CA state. gateway_service_ is wired with the SAME
+        // cert_signer lambda at boot (server.cpp's PKI wiring block) — null its
+        // copy too, matching the blast-radius-detector/dex-alert-router parity
+        // above (governance Gate 3 cpp-safety, 2026-08-21). gateway_service_
+        // registers on the same agent_server_ builder, so the drain already
+        // covers it; this closes the belt-and-braces gap, not a proven UAF.
         agent_service_.set_agent_cert_signer(nullptr);
         agent_service_.set_revocation_checker(nullptr);
         agent_service_.set_peer_cert_recognizer(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_agent_cert_signer(nullptr);
 
         // 2f PR 3a: the bridge borrows the bus (unsubscribe on teardown) and the
         // session registry - shut it down and release it BEFORE the tracker/bus
@@ -8054,6 +8329,12 @@ public:
         // concurrent access — analytics_store_.reset() below is what
         // expires it, atomically, for every locker regardless of thread.
         analytics_store_.reset();
+        // CaStore (ADR-0053) borrows pg_pool_ — its PKI callbacks (signer/revocation
+        // checker/recognizer) are already nulled above; drop the store explicitly
+        // before the pool rather than relying on declaration-order destruction alone
+        // (adversarial-review MEDIUM, 2026-08-20 — matches the sibling stores' own
+        // explicit-reset discipline in this function).
+        ca_store_.reset();
         pg_pool_.reset();
 
         // ONLY on full completion — a path above that escalates via std::_Exit(1)
@@ -8270,9 +8551,15 @@ private:
         const char* const via = to_audit_via(src);
         if (!ca_store_ || !ca_store_->is_open())
             return std::nullopt;
-        auto root = ca_store_->get_root();
+        auto root_or_err = ca_store_->get_root();
+        if (!root_or_err) {
+            spdlog::error("PKI: agent CSR signing aborted — ca_store read failed: {}",
+                          root_or_err.error());
+            return std::nullopt;
+        }
+        auto& root = *root_or_err;
         if (!root) {
-            spdlog::warn("PKI: agent CSR signing requested but ca.db has no root");
+            spdlog::warn("PKI: agent CSR signing requested but ca_store has no root");
             return std::nullopt;
         }
         // PR5d / Hermes LOW: bound the attacker-supplied CSR before any parse or
@@ -8309,8 +8596,17 @@ private:
         // (fine at realistic revocation counts; a subject-indexed query is the
         // follow-up if it ever grows).
         {
+            auto revoked_or_err = ca_store_->list_revoked();
+            if (!revoked_or_err) {
+                // ADR-0036: a silently-empty read here would silently BYPASS the HIGH-2
+                // revocation-bypass guard below — fail closed (refuse to issue) rather than
+                // treat "couldn't read the revoked set" as "nothing is revoked".
+                spdlog::error("PKI: agent CSR signing aborted — list_revoked failed: {}",
+                              revoked_or_err.error());
+                return std::nullopt;
+            }
             const auto now_epoch = static_cast<int64_t>(std::time(nullptr));
-            for (const auto& rev : ca_store_->list_revoked()) {
+            for (const auto& rev : *revoked_or_err) {
                 if (rev.subject == agent_id && rev.not_after > now_epoch) {
                     spdlog::warn("PKI: refusing to re-issue for agent {} — a revoked, "
                                  "non-expired cert (serial {}) exists; an operator must clear "
@@ -8338,10 +8634,10 @@ private:
         }
         // Hermes MEDIUM-4: per-agent issuance rate-limit. A holder of a valid
         // enrollment credential could otherwise spam Register-with-CSR, each call
-        // burning an ECDSA sign + a ca.db row. A legitimate agent issues once per
+        // burning an ECDSA sign + a ca_store row. A legitimate agent issues once per
         // provisioning (it then re-Registers WITHOUT a CSR) and again only at the
         // ~8-month renewal, so this floor never affects the happy path; it also
-        // bounds the ca.db rows a bounded agent retry (Hermes HIGH-2) can create.
+        // bounds the ca_store rows a bounded agent retry (Hermes HIGH-2) can create.
         {
             // gov UP-1: CHECK only here; the timestamp is recorded AFTER a
             // successful issuance (below), so a transient server-side failure
@@ -8397,7 +8693,7 @@ private:
         lp.usage = pki::LeafUsage{.client_auth = true};
         // Install-scoped URI SAN (defence in depth + forensic identity). The CA
         // fingerprint (colon-stripped → a valid URI authority) is the per-install
-        // id; fall back to the ca.db root fingerprint on an operator-supplied set.
+        // id; fall back to the ca_store root fingerprint on an operator-supplied set.
         std::string install = default_cert_set_.ca_fingerprint_sha256.empty()
                                   ? root->fingerprint_sha256
                                   : default_cert_set_.ca_fingerprint_sha256;
@@ -8411,7 +8707,7 @@ private:
             return std::nullopt;
         }
 
-        // Record the issued leaf so it can be revoked / inventoried (ca.db).
+        // Record the issued leaf so it can be revoked / inventoried (ca_store).
         IssuedCertRecord rec;
         rec.serial_hex = issued->serial_hex;
         rec.subject = agent_id;
@@ -8430,10 +8726,11 @@ private:
         if (auto kid = pki::issuer_key_id(root->cert_pem))
             rec.issuer_key_id = *kid;
         rec.issuer_fingerprint = root->fingerprint_sha256;
-        if (!ca_store_->record_issued(rec)) {
+        if (auto rec_result = ca_store_->record_issued(rec); !rec_result) {
             // Fail closed: an unrecorded cert can't be revoked, so don't hand it
             // out — the agent stays on the bootstrap posture and retries.
-            spdlog::error("PKI: failed to record issued agent cert for {} — not issuing", agent_id);
+            spdlog::error("PKI: failed to record issued agent cert for {} — not issuing: {}",
+                          agent_id, rec_result.error());
             return std::nullopt;
         }
 
@@ -8478,9 +8775,15 @@ private:
     std::optional<std::string> export_ca_csr() {
         if (!ca_store_ || !ca_store_->is_open())
             return std::nullopt;
-        auto root = ca_store_->get_root();
+        auto root_or_err = ca_store_->get_root();
+        if (!root_or_err) {
+            spdlog::error("PKI: CA CSR export aborted — ca_store read failed: {}",
+                          root_or_err.error());
+            return std::nullopt;
+        }
+        auto& root = *root_or_err;
         if (!root) {
-            spdlog::warn("PKI: CA CSR export requested but ca.db has no root");
+            spdlog::warn("PKI: CA CSR export requested but ca_store has no root");
             return std::nullopt;
         }
         const std::filesystem::path dir =
@@ -8522,7 +8825,13 @@ private:
                                                      const std::string& parent_chain_pem) {
         if (!ca_store_ || !ca_store_->is_open())
             return CaRoutes::ImportOutcome::StoreError;
-        auto root = ca_store_->get_root();
+        auto root_or_err = ca_store_->get_root();
+        if (!root_or_err) {
+            spdlog::error("PKI: subordinate import aborted — ca_store read failed: {}",
+                          root_or_err.error());
+            return CaRoutes::ImportOutcome::StoreError;
+        }
+        auto& root = *root_or_err;
         if (!root)
             return CaRoutes::ImportOutcome::NoRoot;
 
@@ -8584,8 +8893,9 @@ private:
         updated.not_after = std::chrono::duration_cast<std::chrono::seconds>(
                                 details->not_after.time_since_epoch())
                                 .count();
-        if (!ca_store_->set_root(updated)) {
-            spdlog::error("PKI: subordinate import validated but set_root failed");
+        if (auto set_result = ca_store_->set_root(updated); !set_result) {
+            spdlog::error("PKI: subordinate import validated but set_root failed: {}",
+                          set_result.error());
             return CaRoutes::ImportOutcome::StoreError;
         }
         spdlog::warn("PKI: issuing identity switched to SUBORDINATE — intermediate {} now chains "
@@ -8595,38 +8905,62 @@ private:
         return CaRoutes::ImportOutcome::Ok;
     }
 
-    /// True iff the presented client leaf is one of OURS and its serial is revoked
-    /// in ca.db. Issuer-scoped (is_yuzu_issued) so a foreign cert whose serial
-    /// happens to collide with a revoked Yuzu serial is not falsely rejected
-    /// (Hermes LOW-5). Reads only the CA store (its own mutex) — safe off the
-    /// agent-plane lock.
-    bool is_peer_cert_revoked(const std::string& peer_cert_pem) {
-        if (!ca_store_ || !ca_store_->is_open() || !is_yuzu_issued(peer_cert_pem))
-            return false;
-        // gov/sre: the serial is IMMUTABLE for a given leaf PEM, so cache the
-        // PEM→serial parse (mirrors yuzu_issued_cache_) — the per-heartbeat
-        // revocation gate would otherwise pay an X509 PEM parse on every call,
-        // fleet-wide. CRITICAL: the is_revoked() lookup below stays LIVE — caching
-        // the revocation *result* would let a revoked agent keep talking until the
-        // cache expired (a security bug). Only the parse is memoised.
-        std::string serial;
+    /// Issuer-scoped (is_yuzu_issued) PEM→serial resolution, shared by the live
+    /// per-request revocation gate and the tick-scoped sweep below. Empty return
+    /// means "not one of ours" (foreign cert or unparseable) — callers must NOT
+    /// treat that as revoked, only as "this gate has no opinion".
+    ///
+    /// gov/sre: the serial is IMMUTABLE for a given leaf PEM, so cache the
+    /// PEM→serial parse (mirrors yuzu_issued_cache_) — the per-heartbeat
+    /// revocation gate would otherwise pay an X509 PEM parse on every call,
+    /// fleet-wide. CRITICAL: only the parse is memoised — the revocation
+    /// lookup itself must stay live at the caller (caching it would let a
+    /// revoked agent keep talking until the cache expired).
+    std::string resolve_yuzu_peer_serial(const std::string& peer_cert_pem) {
+        if (!is_yuzu_issued(peer_cert_pem))
+            return {};
         {
             std::lock_guard<std::mutex> lk(peer_serial_cache_mu_);
             if (auto it = peer_serial_cache_.find(peer_cert_pem);
                 it != peer_serial_cache_.end())
-                serial = it->second;
+                return it->second;
         }
-        if (serial.empty()) {
-            auto details = pki::parse_certificate(peer_cert_pem);
-            if (!details || details->serial_hex.empty())
-                return false; // unparseable → not our cert; the identity gate handles it
-            serial = details->serial_hex;
-            std::lock_guard<std::mutex> lk(peer_serial_cache_mu_);
-            if (peer_serial_cache_.size() > 16384)
-                peer_serial_cache_.clear(); // crude bound; certs are stable → low churn
-            peer_serial_cache_[peer_cert_pem] = serial;
-        }
-        return ca_store_->is_revoked(serial);
+        auto details = pki::parse_certificate(peer_cert_pem);
+        if (!details || details->serial_hex.empty())
+            return {}; // unparseable → not our cert; the identity gate handles it
+        const std::string& serial = details->serial_hex;
+        std::lock_guard<std::mutex> lk(peer_serial_cache_mu_);
+        if (peer_serial_cache_.size() > 16384)
+            peer_serial_cache_.clear(); // crude bound; certs are stable → low churn
+        peer_serial_cache_[peer_cert_pem] = serial;
+        return serial;
+    }
+
+    /// True iff the presented client leaf is one of OURS and its serial is revoked
+    /// in ca_store. Issuer-scoped (is_yuzu_issued) so a foreign cert whose serial
+    /// happens to collide with a revoked Yuzu serial is not falsely rejected
+    /// (Hermes LOW-5). Reads only the CA store (its own mutex) — safe off the
+    /// agent-plane lock. Per-request gate: deliberately fails CLOSED (see
+    /// CaStore::is_revoked) on a degraded read — the documented exception to
+    /// UP-1's abort-on-degraded rule below, since a single mTLS accept refusing
+    /// to admit is bounded, unlike a fleet-wide sweep tick.
+    bool is_peer_cert_revoked(const std::string& peer_cert_pem) {
+        if (!ca_store_ || !ca_store_->is_open())
+            return false;
+        const std::string serial = resolve_yuzu_peer_serial(peer_cert_pem);
+        return !serial.empty() && ca_store_->is_revoked(serial);
+    }
+
+    /// Set-membership variant for the revocation sweep tick (UP-1, Gate 4
+    /// unhappy-path, 2026-08-21): checks against a revoked-serial set read ONCE
+    /// per tick via the typed list_revoked_serials(), instead of calling the
+    /// fail-closed is_peer_cert_revoked() once per live agent — see the
+    /// sweep-tick comment in run() for why. Never touches ca_store_ directly, so
+    /// it has no degraded-read behavior of its own to get wrong.
+    bool is_peer_cert_revoked_in(const std::string& peer_cert_pem,
+                                  const std::unordered_set<std::string>& revoked_serials) {
+        const std::string serial = resolve_yuzu_peer_serial(peer_cert_pem);
+        return !serial.empty() && revoked_serials.contains(serial);
     }
 
     /// PKI PR4: build + record a new CRL version over the current revoked set,
@@ -8640,7 +8974,13 @@ private:
         std::lock_guard<std::mutex> publish_lock(crl_publish_mu_);
         if (!ca_store_ || !ca_store_->is_open())
             return std::nullopt;
-        auto root = ca_store_->get_root();
+        auto root_or_err = ca_store_->get_root();
+        if (!root_or_err) {
+            spdlog::error("PKI: CRL publish aborted — ca_store read failed: {}",
+                          root_or_err.error());
+            return std::nullopt;
+        }
+        auto& root = *root_or_err;
         if (!root)
             return std::nullopt;
         const std::filesystem::path dir =
@@ -8654,15 +8994,34 @@ private:
         }
         detail::ScopedKeyZero ca_key_zero{*ca_key};
 
+        auto revoked_or_err = ca_store_->list_revoked();
+        if (!revoked_or_err) {
+            // ADR-0036/ADR-0053: never build a CRL over a possibly-incomplete revoked set — a
+            // degraded read here would publish a CRL that silently un-revokes every real
+            // revocation in every cache that trusts it. Abort the whole publish instead.
+            spdlog::error("PKI: CRL publish aborted — list_revoked failed: {}",
+                          revoked_or_err.error());
+            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
+            return std::nullopt;
+        }
         std::vector<pki::CrlRevocation> revoked;
-        for (const auto& r : ca_store_->list_revoked()) {
+        for (const auto& r : *revoked_or_err) {
             revoked.push_back(
                 {r.serial_hex,
                  std::chrono::system_clock::time_point{std::chrono::seconds{r.revoked_at}}});
         }
         const auto now = std::chrono::system_clock::now();
         const pki::Validity validity{now, now + std::chrono::hours(24 * 7)}; // 7-day nextUpdate
-        const std::uint64_t number = ca_store_->next_crl_number();
+        auto number_or_err = ca_store_->next_crl_number();
+        if (!number_or_err) {
+            // ADR-0053: never substitute a default number on error — see next_crl_number()'s
+            // doc comment for why the pre-migration "silently return 1" default is unsafe here.
+            spdlog::error("PKI: CRL publish aborted — next_crl_number failed: {}",
+                          number_or_err.error());
+            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
+            return std::nullopt;
+        }
+        const std::uint64_t number = *number_or_err;
         auto der = pki::build_crl(root->cert_pem, *ca_key, revoked, validity, number);
         if (!der) {
             spdlog::error("PKI: build_crl failed");
@@ -11430,11 +11789,11 @@ private:
             // as offload_target above; webhook_store was missing from this
             // probe even though its sibling was already covered.
             bool webhook_ok = webhook_store_ && webhook_store_->is_open();
-            // #1238 B-3: ca.db is load-bearing whenever default certs are active
+            // #1238 B-3: ca_store is load-bearing whenever default certs are active
             // (issuance / revocation / CRL). It was wired into /readyz but missing
-            // here, so /healthz could report "healthy" with a dead ca.db. Mirrors
+            // here, so /healthz could report "healthy" with a dead ca_store. Mirrors
             // the /readyz conjunction; trivially true when not on default certs
-            // (the operator brought their own, so ca.db isn't required).
+            // (the operator brought their own, so ca_store isn't required).
             bool ca_ok = !cfg_.using_default_certs || (ca_store_ && ca_store_->is_open());
             // Born-on-Postgres stores (ADR-0012). They were wired into /readyz but
             // not here, so /healthz could report "healthy" with a degraded store —
@@ -11789,7 +12148,7 @@ private:
                 // authoritative store on this ladder (all of which are wired in
                 // here) as belt-and-braces against a runtime is_open() flip.
                 {"deployment_store", deployment_store_ && deployment_store_->is_open()},
-                // PKI PR2: ca.db is load-bearing only when the install is on
+                // PKI PR2: ca_store is load-bearing only when the install is on
                 // built-in default certs (PR3+ make it load-bearing for mTLS
                 // issuance/revocation). When the operator brought their own certs
                 // it is not on the request path, so report ok.
@@ -19049,8 +19408,19 @@ private:
                 // Baseline gate: push only Guards that are members of a *deployed*
                 // Baseline (docs/guardian-baseline-model.md). With nothing deployed
                 // the set is empty and a full_sync converges agents to zero guards.
+                // ADR-0055 catastrophic-read set: a degraded read MUST abort the
+                // push, never fan out an empty deployed-set indistinguishable from
+                // "nothing deployed" — same -2 sentinel as the list_rules degrade
+                // just above, so the REST caller maps it to 503.
+                auto deployed_result = deployed_member_rule_ids();
+                if (!deployed_result) {
+                    spdlog::warn("Guardian push: deployed_member_rule_ids degraded ({}) — "
+                                 "aborting push (scope={})",
+                                 deployed_result.error(), scope);
+                    return -2;
+                }
                 const auto rules =
-                    guardian::filter_deployed_members(*rules_result, deployed_member_rule_ids());
+                    guardian::filter_deployed_members(*rules_result, *deployed_result);
 
                 // Resolve the agent set this push is ADDRESSED to. H1 scopes a single
                 // toggle to the affected rule's scope_expr (was the whole fleet); an
@@ -20107,12 +20477,16 @@ private:
     // fan-out and the heartbeat reconcile filter their rule source through this via
     // guardian::filter_deployed_members. Empty when nothing is deployed — a
     // full_sync push then converges agents to zero guards (correct by model).
-    // Delegates to BaselineStore (one shared lock; the store owns the snapshot
+    // Delegates to BaselineStore (one pool lease; the store owns the snapshot
     // format) so an edit to a deployed Baseline's members does not change what the
     // fleet enforces until a Push-gated re-deploy rewrites the snapshot.
-    std::unordered_set<std::string> deployed_member_rule_ids() const {
+    // CATASTROPHIC-READ SET (CLAUDE.md Guardian invariant, ADR-0055): typed
+    // `std::expected` — a degraded read is `std::unexpected`, NEVER a silent
+    // empty set. Every caller MUST abort (503 / no-op push) on `!result`,
+    // mirroring how `list_rules()`'s degrade is handled just above.
+    std::expected<std::unordered_set<std::string>, std::string> deployed_member_rule_ids() const {
         if (!baseline_store_)
-            return {};
+            return std::unexpected("baseline store not wired");
         return baseline_store_->deployed_member_rule_ids();
     }
 

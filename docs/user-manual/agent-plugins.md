@@ -523,14 +523,14 @@ Supported indicator types for the `check` action:
 | | |
 |---|---|
 | **Platforms** | W L M |
-| **Description** | Network quarantine for compromised or suspicious devices. Uses `netsh` on Windows, `iptables`/`nftables` on Linux, and `pfctl` on macOS. |
+| **Description** | Network quarantine for compromised or suspicious devices. Uses `netsh` on Windows, `iptables` **and `ip6tables`** on Linux, and `pfctl` on macOS. There is no `nftables` path — an earlier version of this line claimed one. On a dual-stack Linux host both families are contained, so a whitelist must name the management server's IPv6 address as well as its IPv4 one or the device can be stranded on its next reconnect; see [Security Hardening](security-hardening.md#whitelisting-on-a-dual-stack-host-read-this-before-quarantining-one). |
 
 | Action | Description |
 |---|---|
 | `quarantine` | Isolate the device by blocking all network traffic except the Yuzu server connection. |
-| `unquarantine` | Remove quarantine rules and restore normal network access. |
+| `unquarantine` | Remove quarantine rules and restore normal network access. Reports `release_uncertain` rather than `released` when the teardown could not be confirmed. |
 | `status` | Check whether quarantine is currently active. |
-| `whitelist` | Add an IP or CIDR range to the quarantine exception list. |
+| `whitelist` | Add an IP or CIDR range to the quarantine exception list — the repair path for a contained device whose whitelist is wrong. **On macOS this action is itself a quarantine-time operation**: it rebuilds and reloads the whole pf ruleset, which includes the `block all` default-deny, and enables pf — so dispatching it at a device that is not already quarantined will isolate it. Check `status` first if unsure. |
 
 ---
 

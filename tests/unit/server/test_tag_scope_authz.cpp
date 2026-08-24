@@ -94,8 +94,8 @@ TEST_CASE("evaluate_scope: tag:<key> resolves preloaded store values",
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    registry.register_agent(info("agent-win"));
-    registry.register_agent(info("agent-lin"));
+    (void)registry.register_agent(info("agent-win"));
+    (void)registry.register_agent(info("agent-lin"));
 
     REQUIRE(store.set_tag("agent-win", "env", "prod").has_value());
     REQUIRE(store.set_tag("agent-lin", "env", "staging").has_value());
@@ -113,7 +113,7 @@ TEST_CASE("evaluate_scope: tag:<key> resolves preloaded store values",
     SECTION("an operator store row wins over a conflicting in-memory self-report (#3295)") {
         auto shadowed = info("agent-shadow");
         (*shadowed.mutable_scopable_tags())["env"] = "prod";
-        registry.register_agent(shadowed);
+        (void)registry.register_agent(shadowed);
         REQUIRE(store.set_tag("agent-shadow", "env", "staging").has_value());
 
         auto matches_env = [&](const char* value) {
@@ -131,7 +131,7 @@ TEST_CASE("evaluate_scope: tag:<key> resolves preloaded store values",
             "agents never sync_agent_tags — #3295)") {
         auto gw = info("agent-gw");
         (*gw.mutable_scopable_tags())["env"] = "prod";
-        registry.register_agent(gw); // no store.set_tag() for agent-gw at all
+        (void)registry.register_agent(gw); // no store.set_tag() for agent-gw at all
 
         auto expr = yuzu::scope::parse(R"(tag:env == "prod")");
         REQUIRE(expr.has_value());
@@ -145,7 +145,7 @@ TEST_CASE("evaluate_scope: tag:<key> resolves preloaded store values",
             "(#3295 — dropped at register_agent ingest)") {
         auto claimant = info("agent-claim");
         (*claimant.mutable_scopable_tags())["service"] = "printers";
-        registry.register_agent(claimant); // no store row for "service" on agent-claim
+        (void)registry.register_agent(claimant); // no store row for "service" on agent-claim
 
         auto eq_expr = yuzu::scope::parse(R"(tag:service == "printers")");
         REQUIRE(eq_expr.has_value());
@@ -172,7 +172,7 @@ TEST_CASE("evaluate_scope: tag:<key> resolves preloaded store values",
     SECTION("an empty in-memory value cannot mask a non-empty store row (#3295)") {
         auto empty_claim = info("agent-empty");
         (*empty_claim.mutable_scopable_tags())["env"] = "";
-        registry.register_agent(empty_claim);
+        (void)registry.register_agent(empty_claim);
         REQUIRE(store.set_tag("agent-empty", "env", "prod").has_value());
 
         auto exists_expr = yuzu::scope::parse(R"(EXISTS tag:env)");
@@ -192,7 +192,7 @@ TEST_CASE("evaluate_scope: tag:<key> resolves preloaded store values",
             "the inverse of the empty-in-memory case above)") {
         auto claim = info("agent-empty-store");
         (*claim.mutable_scopable_tags())["env"] = "prod";
-        registry.register_agent(claim);
+        (void)registry.register_agent(claim);
         REQUIRE(store.set_tag("agent-empty-store", "env", "").has_value());
 
         // The store row (even empty) is found first and short-circuits before
@@ -215,7 +215,7 @@ TEST_CASE("evaluate_scope: tag:<key> resolves preloaded store values",
             "in-memory claim — store stays authoritative, self-heals on next sync (#3295)") {
         auto stale = info("agent-stale-sync");
         (*stale.mutable_scopable_tags())["env"] = "fresh-claim";
-        registry.register_agent(stale);
+        (void)registry.register_agent(stale);
         REQUIRE(store.set_tag("agent-stale-sync", "env", "stale-agent-row", "agent")
                     .has_value());
 
@@ -252,8 +252,8 @@ TEST_CASE("evaluate_scope: a degraded TagStore ABORTS — never expands a NOT-in
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    registry.register_agent(info("agent-win"));
-    registry.register_agent(info("agent-lin"));
+    (void)registry.register_agent(info("agent-win"));
+    (void)registry.register_agent(info("agent-lin"));
 
     REQUIRE(store.set_tag("agent-win", "env", "prod").has_value());
 
@@ -298,8 +298,8 @@ TEST_CASE("evaluate_scope: tag:<key> with a NULL TagStore resolves from in-memor
 
     auto tagged = info("agent-mem");
     (*tagged.mutable_scopable_tags())["env"] = "prod";
-    registry.register_agent(tagged);
-    registry.register_agent(info("agent-bare"));
+    (void)registry.register_agent(tagged);
+    (void)registry.register_agent(info("agent-bare"));
 
     auto expr = yuzu::scope::parse(R"(tag:env == "prod")");
     REQUIRE(expr.has_value());
@@ -340,7 +340,7 @@ TEST_CASE("register_agent: ingest filter drops invalid/service scopable_tags",
     (*tags)[std::string(65, 'a')] = "too-long-key";      // dropped — validate_key: max 64
     (*tags)["bad key!"] = "invalid-chars";               // dropped — validate_key: charset
     (*tags)["oversized"] = std::string(449, 'x');         // dropped — validate_value: max 448
-    registry.register_agent(claimant);
+    (void)registry.register_agent(claimant);
 
     auto session = registry.get_session("agent-ingest");
     REQUIRE(session != nullptr);
@@ -406,8 +406,8 @@ TEST_CASE("evaluate_scope: LEN/STARTSWITH over a store-persisted tag resolve thr
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    registry.register_agent(info("agent-tagged"));
-    registry.register_agent(info("agent-bare"));
+    (void)registry.register_agent(info("agent-tagged"));
+    (void)registry.register_agent(info("agent-bare"));
 
     // Store-only tag: NOT in any session's in-memory scopable_tags — the
     // pre-fix collector missed synthetic forms, so these resolved "" and
@@ -469,9 +469,9 @@ TEST_CASE("evaluate_scope: a single expression mixing tag: and props. atoms runs
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    registry.register_agent(info("agent-both"));
-    registry.register_agent(info("agent-tag-only"));
-    registry.register_agent(info("agent-neither"));
+    (void)registry.register_agent(info("agent-both"));
+    (void)registry.register_agent(info("agent-tag-only"));
+    (void)registry.register_agent(info("agent-neither"));
 
     REQUIRE(tags.set_tag("agent-both", "env", "prod").has_value());
     REQUIRE(tags.set_tag("agent-tag-only", "env", "prod").has_value());
