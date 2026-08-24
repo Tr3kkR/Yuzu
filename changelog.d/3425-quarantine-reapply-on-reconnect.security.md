@@ -33,4 +33,12 @@
   that keeps a busy or offline device from spinning the reconciler). `QuarantineStore` gains
   schema v2 (`last_applied_at`/`last_confirmed_at`, both defaulting to 0/never) so confirmation
   state is queryable and survives a restart. `GET /api/v1/quarantine` and the MCP
-  `quarantine_record` envelope now expose both fields.
+  `quarantine_record` envelope now expose both fields. `POST /api/v1/quarantine` now
+  validates `whitelist` at write time (≤512 characters total, each comma-separated token
+  ≤45 characters and drawn from `[0-9A-Fa-f.:]` — the same rule MCP's `quarantine_device`
+  already enforced) rather than writing it unchecked and only ever discovering the problem
+  as a repeating `validation_failed` outcome on every later reconciler tick: a malformed
+  value is rejected with `400` instead. A sustained `response_store` outage while a
+  dispatched command's response is being polled now escalates backoff like every other
+  repeated-failure path in the reconciler's state machine, instead of retrying at a flat
+  ~60s cadence for as long as the outage lasts.

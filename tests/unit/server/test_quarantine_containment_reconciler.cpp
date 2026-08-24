@@ -731,7 +731,7 @@ TEST_CASE("QuarantineContainmentReconciler: a sustained response_store outage es
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
-        .min_reapply_interval_override = std::chrono::milliseconds(20),
+        .min_reapply_interval_override = std::chrono::milliseconds(100),
         .response_wait_override = std::chrono::milliseconds(5000), // large: never let
                                                                     // timed_out fire —
                                                                     // isolates the !resp
@@ -747,23 +747,30 @@ TEST_CASE("QuarantineContainmentReconciler: a sustained response_store outage es
             .value();
     };
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(30)); // past the 20ms interval
-    reconciler.tick(); // 2: polls, response_store null -> degraded, backoff 20ms -> 40ms
+    // Margins match this file's own ~3x-over-threshold convention (see the
+    // 20ms/60ms pairing used throughout the file) rather than the original,
+    // much tighter 20ms/30ms pairing this test shipped with — cpp-safety and
+    // cpp-expert independently flagged the original margin as thin enough to
+    // risk a false-red (never false-green) under a contended CI runner.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // past the 100ms interval
+    reconciler.tick(); // 2: polls, response_store null -> degraded, backoff 100ms -> 200ms
     CHECK(degraded_count() == 1);
     CHECK(dispatch.calls.size() == 1); // no new dispatch — still the same pending command
 
-    // Only 25ms elapsed: past the OLD 20ms window (which the pre-fix code
-    // would still be using, since it never touched backoff on this branch)
-    // but short of the NEW 40ms window. Under the fix, this call must be
-    // rate_limited — no poll attempt, no second "degraded" count.
-    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    // 150ms elapsed: past the OLD 100ms window (which the pre-fix code would
+    // still be using, since it never touched backoff on this branch) but
+    // comfortably short of the NEW 200ms window (50ms slack either side).
+    // Under the fix, this call must be rate_limited — no poll attempt, no
+    // second "degraded" count.
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
     reconciler.tick(); // 3: rate_limited if backoff escalated; degraded again if it didn't
     CHECK(degraded_count() == 1); // unchanged — proves the wait window actually grew
 
-    // Now past the escalated 40ms window — the next poll attempt fires and
-    // escalates again (40ms -> 80ms), continuing the same exponential shape
-    // every other repeated-failure path in this state machine already uses.
-    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    // Now past the escalated 200ms window — the next poll attempt fires and
+    // escalates again (200ms -> 400ms), continuing the same exponential
+    // shape every other repeated-failure path in this state machine already
+    // uses.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
     reconciler.tick(); // 4
     CHECK(degraded_count() == 2);
     CHECK(dispatch.calls.size() == 1); // still no new dispatch — command is still pending

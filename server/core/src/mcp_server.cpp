@@ -8725,13 +8725,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 // reject anything the agent would silently drop, loudly.
                 // #3425: moved to quarantine_reapply.hpp
                 // (quarantine_whitelist_tokens_safe) — the SAME shared
-                // chokepoint the already_active retry path below and
-                // QuarantineContainmentReconciler both call, so this check
-                // exists in exactly one place rather than N hand-rolled
-                // copies. The REST twin that can populate a stored row
-                // (rest_api_v1.cpp) performs no validation of its own, and
-                // this is what makes the sink reachable from a stored (not
-                // just a live-request) whitelist.
+                // chokepoint the already_active retry path below,
+                // QuarantineContainmentReconciler, and the REST twin
+                // (rest_api_v1.cpp's POST /api/v1/quarantine) all call, so
+                // this check exists in exactly one place rather than N
+                // hand-rolled copies.
                 if (!quarantine_whitelist_tokens_safe(whitelist)) {
                     res.set_content(
                         error_response(id, kInvalidParams,

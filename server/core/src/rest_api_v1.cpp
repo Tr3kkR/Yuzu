@@ -4597,19 +4597,20 @@ void RestApiV1::register_routes(
         // creation path that skipped the charset/length check the reconciler
         // and MCP's already_active retry both apply before ever dispatching
         // a stored whitelist (quarantine_reapply.hpp — the single validator
-        // chokepoint, reused here rather than forked). Before this PR's
-        // reconciler, a record written with an unsafe whitelist was merely
-        // permanently undispatchable; now it also fails validation on every
-        // tick/heartbeat, forever, until replaced — reject it at write time
-        // instead so the operator finds out immediately, not via a repeating
-        // background counter.
+        // chokepoint, reused here rather than forked). Before #3425's
+        // reconciler shipped, a record written with an unsafe whitelist was
+        // merely permanently undispatchable; now it also fails validation on
+        // every tick/heartbeat, forever, until replaced — reject it at write
+        // time instead so the operator finds out immediately, not via a
+        // repeating background counter.
         if (whitelist.size() > kQuarantineWhitelistMaxLen ||
             !quarantine_whitelist_tokens_safe(whitelist)) {
             res.status = 400;
-            res.set_content(detail::a4_error(res, "whitelist rejected: exceeds " +
+            res.set_content(detail::a4_error(res, "whitelist rejected: total exceeds " +
                                                  std::to_string(kQuarantineWhitelistMaxLen) +
-                                                 " characters or contains a token outside "
-                                                 "[0-9A-Fa-f.:] (<=45 chars/token)"),
+                                                 " characters, a token exceeds 45 characters, "
+                                                 "or a token contains a character outside "
+                                                 "[0-9A-Fa-f.:]"),
                             "application/json");
             audit_fn(req, "quarantine.enable", "failure", "Security", agent_id,
                      "whitelist rejected by server-edge validation");
