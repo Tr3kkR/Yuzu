@@ -68,6 +68,23 @@ struct DashboardResultsColumnsTestAccess {
     void set_response_scope_fn(DashboardRoutes::ResponseScopeFn fn) {
         routes.response_scope_fn_ = std::move(fn);
     }
+    /// #1712: captured audit rows, so the scope-drop CC7.2 evidence branch is
+    /// reachable from this seam. `render_results` only audits when it is given
+    /// a non-null request AND an audit callback — `render()` below supplies
+    /// neither, which is why every pre-existing test in this file is
+    /// unaffected; `render_with_audit()` supplies both.
+    struct AuditCall {
+        std::string action, result, target_type, target_id, detail;
+    };
+    std::vector<AuditCall> audit_calls;
+
+    void capture_audit() {
+        routes.audit_fn_ = [this](const httplib::Request&, const std::string& action,
+                                  const std::string& result, const std::string& target_type,
+                                  const std::string& target_id, const std::string& detail) {
+            audit_calls.push_back({action, result, target_type, target_id, detail});
+        };
+    }
     std::string render(const std::string& command_id, const std::string& plugin,
                        const std::string& definition_id = {},
                        const std::string& username = {}) {
@@ -75,6 +92,15 @@ struct DashboardResultsColumnsTestAccess {
                                      /*sort_dir=*/"asc", /*page=*/1, /*per_page=*/50,
                                      /*filters=*/{}, /*text_query=*/"", definition_id,
                                      /*template_id=*/{}, /*visible_columns=*/{}, username);
+    }
+    /// Same render, but through the audit-capable path (non-null request).
+    std::string render_with_audit(const std::string& command_id, const std::string& plugin,
+                                  const std::string& username) {
+        httplib::Request req;
+        return routes.render_results(command_id, plugin, /*sort_col=*/"agent",
+                                     /*sort_dir=*/"asc", /*page=*/1, /*per_page=*/50,
+                                     /*filters=*/{}, /*text_query=*/"", /*definition_id=*/{},
+                                     /*template_id=*/{}, /*visible_columns=*/{}, username, &req);
     }
     std::string render_filter_bar(const std::string& command_id, const std::string& plugin) {
         return routes.render_filter_bar(command_id, plugin);
@@ -330,6 +356,100 @@ TEST_CASE("render_results #1712: out-of-scope agent's row is dropped while an "
     CHECK(contains(html, "visible-output"));
     CHECK_FALSE(contains(html, "hidden-output"));
     CHECK_FALSE(contains(html, "agent-out-of-scope"));
+}
+
+TEST_CASE("render_results #1712: a scope drop emits the CC7.2 denied audit row",
+          "[pg][server][dashboard][render_results][1712]") {
+    // Parity with the executions drawer, which already asserts its own
+    // scope_dropped audit row. Without this the dashboard's audit branch was
+    // unreachable from any test: the seam always passed a null request, so
+    // `dropped > 0 && req && audit_fn_` could never be true.
+    InstructionStore is{":memory:"};
+    REQUIRE(is.is_open());
+
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    const std::string command_id = "cmd-scope-audit";
+    for (const auto& [agent, out] : std::vector<std::pair<std::string, std::string>>{
+             {"agent-in-scope", "visible-output"},
+             {"agent-out-a", "hidden-a"},
+             {"agent-out-b", "hidden-b"}}) {
+        StoredResponse r;
+        r.instruction_id = command_id;
+        r.agent_id = agent;
+        r.received_at_ms = 1000;
+        r.status = 0;
+        r.output = out;
+        rs.store(r);
+    }
+
+    DashboardResultsColumnsTestAccess acc;
+    acc.set_stores(&is, &rs);
+    acc.capture_audit();
+    acc.set_response_scope_fn([](const std::string&, const std::string& agent_id) {
+        return agent_id == "agent-in-scope";
+    });
+    const std::string html =
+        acc.render_with_audit(command_id, "registry", /*username=*/"confined-operator");
+
+    CHECK(contains(html, "visible-output"));
+    CHECK_FALSE(contains(html, "hidden-a"));
+    CHECK_FALSE(contains(html, "hidden-b"));
+
+    bool found = false;
+    for (const auto& c : acc.audit_calls) {
+        if (c.action == "response.read" && c.result == "denied" && c.target_id == command_id &&
+            contains(c.detail, "surface=fragments_results")) {
+            found = true;
+            // TWO distinct agents were dropped across two rows — the count is
+            // per distinct agent, not per row.
+            CHECK(contains(c.detail, "scope_dropped=2"));
+        }
+    }
+    CHECK(found);
+}
+
+TEST_CASE("render_results #1712: the summary agent count describes only in-scope agents",
+          "[pg][server][dashboard][render_results][1712]") {
+    // The rows were filtered but `total_agent_count` was computed from the
+    // UNFILTERED read and rendered as "N results across M agents", disclosing
+    // to a confined operator how many agents outside their management group
+    // answered the command. The full deny-all case hid this incidentally
+    // (an empty result set skips the summary block entirely), so only the
+    // MIXED case exposes it — which is why this test is mixed-scope.
+    InstructionStore is{":memory:"};
+    REQUIRE(is.is_open());
+
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    const std::string command_id = "cmd-scope-count";
+    // One in-scope agent, four out-of-scope: an unreconciled count renders
+    // "across 5 agents"; the reconciled one renders "across 1 agent".
+    for (int i = 0; i < 5; ++i) {
+        StoredResponse r;
+        r.instruction_id = command_id;
+        r.agent_id = (i == 0) ? "agent-in-scope" : ("agent-out-" + std::to_string(i));
+        r.received_at_ms = 1000 + i;
+        r.status = 0;
+        r.output = (i == 0) ? "visible-output" : "hidden-output";
+        rs.store(r);
+    }
+
+    DashboardResultsColumnsTestAccess acc;
+    acc.set_stores(&is, &rs);
+    acc.set_response_scope_fn([](const std::string&, const std::string& agent_id) {
+        return agent_id == "agent-in-scope";
+    });
+    const std::string html = acc.render(command_id, "registry", /*definition_id=*/{},
+                                        /*username=*/"confined-operator");
+
+    CHECK(contains(html, "visible-output"));
+    CHECK_FALSE(contains(html, "hidden-output"));
+    // The fleet-wide magnitude must not survive into the summary.
+    CHECK_FALSE(contains(html, "across 5 agents"));
+    CHECK_FALSE(contains(html, "Create Group from 5 Agents"));
 }
 
 } // namespace yuzu::server

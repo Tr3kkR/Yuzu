@@ -6,6 +6,7 @@
 #include "execution_event_bus.hpp"
 #include "http_route_sink.hpp"
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
+#include "response_scope_filter.hpp" // filter_rows_in_scope — the shared #1712 filter loop
 #include "rest_a4_envelope.hpp"     // detail::error_json_a4, make_correlation_id
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial (deny_service_scoped_scope_estimate) —
                                      // mints/reuses X-Correlation-Id so header and body agree
@@ -599,30 +600,20 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 // ResponseScopeFn contract) — when wired to
                 // `response_agent_in_scope` (server.cpp), a corrupt/
                 // load-failed rbac.db denies EVERY agent, so this yields
-                // zero rows rather than the whole fleet. Memoized per
-                // distinct agent_id so a wide fan-out doesn't re-run the
-                // RBAC check per row.
+                // zero rows rather than the whole fleet. The loop itself is
+                // the shared `filter_rows_in_scope` chokepoint
+                // (response_scope_filter.hpp), NOT a local copy — the
+                // dashboard `/fragments/results` reader applies the identical
+                // filter and a second copy is the drift it exists to prevent.
                 if (response_scope_fn) {
-                    std::unordered_map<std::string, bool> memo;
-                    std::vector<StoredResponse> visible;
-                    visible.reserve(filtered.size());
-                    std::size_t dropped = 0;
-                    for (auto& r : filtered) {
-                        auto [it, inserted] = memo.try_emplace(r.agent_id, false);
-                        if (inserted)
-                            it->second = response_scope_fn(session->username, r.agent_id);
-                        if (it->second)
-                            visible.push_back(std::move(r));
-                        else if (inserted) // count each DISTINCT dropped agent once
-                            ++dropped;
-                    }
-                    filtered.swap(visible);
+                    const auto scope_result =
+                        filter_rows_in_scope(filtered, session->username, response_scope_fn);
                     // CC7.2 evidence: a scope-drop is a security-relevant
                     // filtering event (parity with the REST/MCP response
                     // readers' audit rows, #1634 compliance review).
-                    if (dropped > 0)
+                    if (scope_result.dropped_agents > 0)
                         audit_fn(req, "response.read", "denied", "Execution", exec.id,
-                                "scope_dropped=" + std::to_string(dropped) +
+                                "scope_dropped=" + std::to_string(scope_result.dropped_agents) +
                                     " surface=executions_drawer");
                 }
 

@@ -5102,6 +5102,33 @@ TEST_CASE("MCP Integration: get_agent_details enforces management-group scope (#
     CHECK(unknown_body["error"]["code"] == out_body["error"]["code"]);
 }
 
+TEST_CASE("MCP Integration: get_agent_details is legacy-open when the scope predicate "
+          "is unwired (#1700)",
+          "[mcp][integration][scope][1700]") {
+    // The #1700 gate is `!response_scope_fn || response_scope_fn(...)` — an
+    // UNWIRED predicate applies no filter, matching query_responses' legacy
+    // posture (see "MCP query_responses: no filter when scope predicate is
+    // unwired"). Without this case the `!response_scope_fn ||` short-circuit
+    // could be deleted — turning every agent into "not found" for deployments
+    // that wire no RBAC at all — and every other [1700] assertion would stay
+    // green, because they all wire a predicate.
+    McpTestServer ts;
+    // response_scope_fn_for_test deliberately left empty (unwired).
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":703,"params":{"name":"get_agent_details","arguments":{"agent_id":"agent-002"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    // agent-002 is the one the scoped test above renders as "not found";
+    // unwired, it must resolve normally instead.
+    REQUIRE(body.contains("result"));
+    auto text = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(text["agent_id"] == "agent-002");
+    CHECK(text["hostname"] == "db-01");
+}
+
 TEST_CASE("MCP Agentic demo: summarize_working_set execution kind requires Execution:Read (G-S2)",
           "[mcp][integration][agentic-demo][scope][review-1653]") {
     auto db_path = yuzu::test::unique_temp_path("test-mcp-exec-scope-");

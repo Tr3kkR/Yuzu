@@ -754,6 +754,8 @@ if build_server
       'unit/server/test_store_wiring_order.cpp', # #3261: every agent_service_/gateway_service_ store setter runs after its member's construction, mechanically scanned from server.cpp at test run time
       'unit/server/test_store_worker_pool.cpp', # #3261: StoreWorkerPool submit/quiesce/backpressure/exception-firewall, no HTTP (avoids the unrelated TSan/glibc crash #2504)
       'unit/server/test_dispatch_confined_arms.cpp', # PR1.4: the production per-arm intersection, bound by exact-send-set assertions
+      'unit/server/test_response_scope_filter.cpp', # #1712: the shared per-agent Response-scope filter loop — pure (no store/PG/HTTP), incl. the CH-2 mid-iteration degrade shape
+      'unit/server/test_response_scope_wiring.cpp', # #1712: lexical guard that both new readers stay wired to response_agent_in_scope in server.cpp (ServerImpl is not unit-constructible)
       'unit/server/test_default_certs.cpp',
       'unit/server/test_mcp_server.cpp',
       'unit/server/test_mcp_session.cpp',

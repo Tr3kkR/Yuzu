@@ -21,6 +21,7 @@
 #include "http_route_sink.hpp"
 #include "instruction_store.hpp"
 #include "management_group_store.hpp"
+#include "response_scope_filter.hpp" // filter_rows_in_scope — the shared #1712 filter loop
 #include "response_store.hpp"
 #include "response_templates_engine.hpp"
 #include "visualization_engine.hpp"
@@ -1751,31 +1752,40 @@ std::string DashboardRoutes::render_results(
     // being wired at all (FAIL-OPEN-WHEN-UNWIRED, matching mcp_server.hpp's
     // ResponseScopeFn contract) — when wired to `response_agent_in_scope`
     // (server.cpp), a corrupt/load-failed rbac.db denies EVERY agent, so this
-    // yields zero rows rather than the whole fleet. Memoized per distinct
-    // agent_id so a wide fan-out doesn't re-run the RBAC check per row.
+    // yields zero rows rather than the whole fleet. The loop itself is the
+    // shared `filter_rows_in_scope` chokepoint (response_scope_filter.hpp),
+    // NOT a local copy — the executions drawer applies the identical filter
+    // and a second copy is the drift that header exists to prevent.
     if (response_scope_fn_) {
-        std::unordered_map<std::string, bool> memo;
-        std::vector<StoredResponse> visible;
-        visible.reserve(responses.size());
-        std::size_t dropped = 0;
-        for (auto& resp : responses) {
-            auto [it, inserted] = memo.try_emplace(resp.agent_id, false);
-            if (inserted)
-                it->second = response_scope_fn_(username, resp.agent_id);
-            if (it->second)
-                visible.push_back(std::move(resp));
-            else if (inserted) // count each DISTINCT dropped agent once
-                ++dropped;
+        const auto scope_result = filter_rows_in_scope(responses, username, response_scope_fn_);
+        if (scope_result.dropped_agents > 0) {
+            // #1712: the SUMMARY COUNT must describe the same set as the rows.
+            // `total_agent_count` was computed above from the UNFILTERED read
+            // (`responses.size()` on the no-filter branch, `facet_agent_count`
+            // — a fleet-wide faceted count — on the filtered one), and it is
+            // rendered to the operator as "N results across M agents". Left
+            // alone it discloses, to a management-group-confined operator, how
+            // many agents outside their scope answered this command — the same
+            // cross-group disclosure #1712 exists to close, one step weaker
+            // (cardinality rather than content). The full deny-all case hides
+            // it incidentally (`total_lines == 0` skips the summary block),
+            // which is exactly why only the MIXED case exposed it. Recomputed
+            // from the post-filter rows, and only when something was actually
+            // dropped, so an unfiltered render is byte-identical to before.
+            std::unordered_set<std::string> visible_agents;
+            for (const auto& resp : responses)
+                visible_agents.insert(resp.agent_id);
+            total_agent_count = static_cast<int64_t>(visible_agents.size());
         }
-        responses.swap(visible);
         // CC7.2 evidence: a scope-drop is a security-relevant filtering
         // event (parity with the REST/MCP response readers' audit rows,
         // #1634 compliance review). `req` is null only from the
         // test-only friend-access seam, which never wires
         // response_scope_fn_ — so this never fires there.
-        if (dropped > 0 && req && audit_fn_)
+        if (scope_result.dropped_agents > 0 && req && audit_fn_)
             audit_fn_(*req, "response.read", "denied", "Execution", command_id,
-                      "scope_dropped=" + std::to_string(dropped) + " surface=fragments_results");
+                      "scope_dropped=" + std::to_string(scope_result.dropped_agents) +
+                          " surface=fragments_results");
     }
 
     // Phase 2: parse output lines, apply per-line filters and text search
