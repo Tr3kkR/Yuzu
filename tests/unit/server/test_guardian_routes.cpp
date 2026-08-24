@@ -107,7 +107,7 @@ struct PushCall {
 };
 
 // Harness: real GuaranteedStateStore (Postgres, ADR-0038) + BaselineStore
-// (still SQLite) behind GuardianRoutes, dispatched through TestRouteSink.
+// (Postgres, ADR-0055) behind GuardianRoutes, dispatched through TestRouteSink.
 // `gs_db_pg`/`gs_pool` come FIRST (before `store`) so they outlive it even if
 // construction throws. Mirrors AuthDbPg's shape exactly
 // (test_auth_db_pg_helper.hpp): `gs_db_pg` stays `std::optional` and is
@@ -336,6 +336,35 @@ TEST_CASE("deploy_baseline is gated on GuaranteedState:Push (no push when denied
     auto enforced = h.baselines->deployed_member_rule_ids();
     REQUIRE(enforced.has_value());
     CHECK(enforced->empty());
+}
+
+TEST_CASE("deploy_baseline on a store degraded AFTER open reports degraded, never "
+          "\"Baseline not found\"",
+          "[pg][guardian_routes][baseline][deploy][degraded]") {
+    // Pins governance UP-3 / the store_ok fix: get_baseline's is_open() is a
+    // bool cached at construction, never re-probed, so a connection lost
+    // AFTER open (not before) reaches a REAL query failure, not the trivial
+    // "never opened" guard case. Pattern: test_access_review_model.cpp's R1
+    // (`engine_db.reset()` mid-test, dropping the database out from under an
+    // already-`is_open()==true` store). Also pins the compliance-officer
+    // finding that the "degraded" audit emission on deploy_baseline was
+    // itself untested.
+    Harness h;
+    h.seed_guard("g1", "GuardOne");
+    h.seed_baseline("bl1", "BL1", {"g1"}); // genuinely exists before the drop
+
+    h.bl_db_pg.reset(); // DROP DATABASE ... WITH (FORCE) — kills bl_pool's connections
+
+    auto res = h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/deploy", "",
+                               "application/x-www-form-urlencoded");
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 200); // errors render inline in the modal, not as an HTTP error
+    CHECK(res->body.find("degraded") != std::string::npos);
+    CHECK(res->body.find("not found") == std::string::npos); // must NOT misreport as absent
+
+    CHECK(h.audit_count("guaranteed_state.baseline.deploy", "degraded") == 1);
+    CHECK(h.audit_count("guaranteed_state.baseline.deploy", "denied") == 0);
+    CHECK(h.pushes.empty()); // never reached the push fan-out
 }
 
 TEST_CASE("editing a deployed Baseline does not change what the fleet enforces until re-deploy",

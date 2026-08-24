@@ -172,7 +172,14 @@ public:
     // supplied duplicate id) is reported with `kConflictPrefix` so REST handlers
     // map it to HTTP 409 via is_conflict_error() — see store_errors.hpp.
     std::expected<std::string, std::string> create_baseline(const Baseline& b);
-    std::optional<Baseline> get_baseline(const std::string& baseline_id) const;
+    // `store_ok` (optional out-param, same contract as get_baseline_by_name below)
+    // disambiguates a transient STORE FAULT (pool/lease/query error — set false)
+    // from a genuine NOT-FOUND (set true), so a caller gating a Guardian deploy/
+    // delete/edit action can 503-and-retry instead of misreporting "Baseline not
+    // found" for a baseline that still exists (governance UP-3 finding — the fix
+    // this pattern already applied to get_baseline_by_name, extended here).
+    std::optional<Baseline> get_baseline(const std::string& baseline_id,
+                                         bool* store_ok = nullptr) const;
     // Look up a Baseline by its unique human-authored name (names are unique —
     // create_baseline reports a dup with kConflictPrefix). Backs the name-keyed
     // per-device compliance REST view so an integration (ServiceNow) can reference

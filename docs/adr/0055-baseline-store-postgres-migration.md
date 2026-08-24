@@ -172,18 +172,28 @@ deserves the same explicit answer, not an assumption inherited silently:
   first wins the row; Postgres's row-level lock on a conflicting insert **serializes**
   the second racer's attempt (it blocks until the first commits, then resolves as a
   real conflict) — this is a property of Postgres's MVCC insert path, not a coin-flip
-  outcome dependent on CPU scheduling. The blocked racer's own `migrate_from_sqlite`
-  call refuses THAT pass (`PQcmdTuples()=="0"`, "concurrent writer inserted mid-backfill
-  — refusing (re-run will compare directions cleanly)") rather than trying to
-  re-derive the direction compare inline mid-transaction; an immediate single-threaded
-  retry (matching `server.cpp`'s existing "a failed backfill sets `startup_failed_`,
-  the orchestrator restarts that replica" contract — no new self-heal-without-restart
+  outcome dependent on CPU scheduling, **for the two racers that actually reach that
+  INSERT concurrently**. The blocked racer's own `migrate_from_sqlite` call refuses
+  THAT pass (`PQcmdTuples()=="0"`, "concurrent writer inserted mid-backfill — refusing
+  (re-run will compare directions cleanly)") rather than trying to re-derive the
+  direction compare inline mid-transaction; an immediate single-threaded retry
+  (matching `server.cpp`'s existing "a failed backfill sets `startup_failed_`, the
+  orchestrator restarts that replica" contract — no new self-heal-without-restart
   machinery was added, unlike `CaStore`'s operator-requested enhancement) then finds
-  the row already present with identical content and completes normally. Verified by a
-  genuine two-thread test (`test_baseline_store.cpp`, `[concurrency]`), not a sequential
-  simulation — 8/8 clean runs, no flake, and no bounded-retry-attempt loop needed
-  (unlike `CaStore`'s UP-3 test) precisely because the row lock makes the outcome
-  deterministic rather than schedule-dependent.
+  the row already present with identical content and completes normally.
+  **Correction (2026-08-24 governance re-review):** whether both racers reach the
+  contested INSERT at all is itself schedule-dependent — `migrate_from_sqlite` checks
+  the `backfill_complete` marker via a plain SELECT before the row-locked transaction;
+  a racer whose marker check lands after the other has already committed takes the
+  holder-side-verification "already complete" path instead, never reaching the INSERT.
+  So this IS the same class of scheduling uncertainty as `CaStore`'s UP-3 test, not a
+  guaranteed-deterministic exception to it — `test_baseline_store.cpp`'s `[concurrency]`
+  test now adopts the same bounded re-attempt-until-observed shape (30 attempts) rather
+  than asserting determinism a single unbarriered run can't prove. What IS deterministic,
+  and is the actual safety property this store relies on, is that *whichever* path a
+  racer takes — the row-lock refusal or the holder-side marker check — neither can ever
+  produce duplication or silent data loss; only which of the two accepted code paths
+  gets exercised on a given run is schedule-dependent.
 - **Two replicas backfilling from genuinely divergent legacy content** (a real
   deployment error — two different files ended up "the" legacy source for different
   replicas) is refused, not silently merged, whichever replica's fingerprint-stamp

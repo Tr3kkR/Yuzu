@@ -945,12 +945,23 @@ std::expected<std::string, std::string> BaselineStore::create_baseline(const Bas
     return id;
 }
 
-std::optional<Baseline> BaselineStore::get_baseline(const std::string& baseline_id) const {
-    if (!open_)
+std::optional<Baseline> BaselineStore::get_baseline(const std::string& baseline_id,
+                                                     bool* store_ok) const {
+    // Optimistic, same contract as get_baseline_by_name: only a store FAULT
+    // clears this; a genuine not-found leaves it true.
+    if (store_ok)
+        *store_ok = true;
+    if (!open_) {
+        if (store_ok)
+            *store_ok = false;
         return std::nullopt;
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
+    if (!lease) {
+        if (store_ok)
+            *store_ok = false;
         return std::nullopt;
+    }
     const std::string sql =
         std::string("SELECT ") + kBaselineCols + " FROM baseline_store.baselines WHERE baseline_id = $1";
     pg::PgResult res =
@@ -958,6 +969,8 @@ std::optional<Baseline> BaselineStore::get_baseline(const std::string& baseline_
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("BaselineStore::get_baseline: query failed: {}",
                       PQresultErrorMessage(res.get()));
+        if (store_ok)
+            *store_ok = false;
         return std::nullopt;
     }
     if (PQntuples(res.get()) == 0)
@@ -1088,24 +1101,33 @@ BaselineStore::set_members(const std::string& baseline_id_in,
         return std::unexpected("database not open");
     const std::string baseline_id = sanitize_pg_text(baseline_id_in);
 
-    // Existence check up front: an INSERT enforces the FK, but an EMPTY member
-    // set inserts nothing, so a clear() against a bogus baseline_id would
-    // silently "succeed". Verify here for a crisp, consistent error either way.
-    {
-        auto lease = pool_.try_acquire_for(kReadTimeout);
-        if (!lease)
-            return std::unexpected("no database connection: " + pool_.last_error());
-        pg::PgResult chk = pg::exec_params(
-            lease.get(), "SELECT 1 FROM baseline_store.baselines WHERE baseline_id = $1",
-            std::vector<std::string>{baseline_id});
-        if (chk.status() != PGRES_TUPLES_OK)
-            return std::unexpected("query failed: " + std::string(PQresultErrorMessage(chk.get())));
-        if (PQntuples(chk.get()) == 0)
-            return std::unexpected("not found: baseline_id '" + baseline_id + "'");
-    }
-
     std::string error;
+    bool not_found = false;
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        // Touch-and-lock FIRST, in the SAME transaction as the replace: an
+        // INSERT enforces the FK against a concurrent delete, but an EMPTY
+        // member set inserts nothing, so without this the existence check
+        // and the replace were racing as two separate acquisitions — a
+        // delete_baseline landing between them let an empty clear() report
+        // success against a since-deleted baseline (governance TOCTOU
+        // finding, three independent reviewers). The row lock this UPDATE
+        // takes is held for the rest of the transaction, so a concurrent
+        // delete_baseline either blocks behind it (this txn's 0-row result
+        // then correctly reports not-found) or has already committed (0
+        // rows here, same result) — no window remains.
+        pg::PgResult touch = pg::exec_params(
+            c,
+            "UPDATE baseline_store.baselines SET updated_at = $1::bigint "
+            "WHERE baseline_id = $2 RETURNING baseline_id",
+            std::vector<std::string>{std::to_string(now_epoch()), baseline_id});
+        if (touch.status() != PGRES_TUPLES_OK) {
+            error = "touch updated_at failed: " + std::string(PQerrorMessage(c));
+            return false;
+        }
+        if (PQntuples(touch.get()) == 0) {
+            not_found = true;
+            return false;
+        }
         pg::PgResult del = pg::exec_params(
             c, "DELETE FROM baseline_store.baseline_rules WHERE baseline_id = $1",
             std::vector<std::string>{baseline_id});
@@ -1130,15 +1152,10 @@ BaselineStore::set_members(const std::string& baseline_id_in,
                 return false;
             }
         }
-        pg::PgResult touch = pg::exec_params(
-            c, "UPDATE baseline_store.baselines SET updated_at = $1::bigint WHERE baseline_id = $2",
-            std::vector<std::string>{std::to_string(now_epoch()), baseline_id});
-        if (touch.status() != PGRES_COMMAND_OK) {
-            error = "touch updated_at failed: " + std::string(PQerrorMessage(c));
-            return false;
-        }
         return true;
     });
+    if (not_found)
+        return std::unexpected("not found: baseline_id '" + baseline_id + "'");
     if (!ok)
         return std::unexpected(error.empty() ? "transaction failed" : error);
     return {};
@@ -1230,21 +1247,27 @@ BaselineStore::set_assignment(const std::string& baseline_id_in,
         resolved[sanitize_pg_text(g.group_id)] = g.disposition;
     }
 
-    {
-        auto lease = pool_.try_acquire_for(kReadTimeout);
-        if (!lease)
-            return std::unexpected("no database connection: " + pool_.last_error());
-        pg::PgResult chk = pg::exec_params(
-            lease.get(), "SELECT 1 FROM baseline_store.baselines WHERE baseline_id = $1",
-            std::vector<std::string>{baseline_id});
-        if (chk.status() != PGRES_TUPLES_OK)
-            return std::unexpected("query failed: " + std::string(PQresultErrorMessage(chk.get())));
-        if (PQntuples(chk.get()) == 0)
-            return std::unexpected("not found: baseline_id '" + baseline_id + "'");
-    }
-
     std::string error;
+    bool not_found = false;
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        // Touch-and-lock FIRST, in the SAME transaction as the replace — see
+        // the identical comment in set_members for why (governance TOCTOU
+        // finding, three independent reviewers): the old separate existence
+        // check raced the replace transaction, letting an empty assignment
+        // clear() report success against a since-deleted baseline.
+        pg::PgResult touch = pg::exec_params(
+            c,
+            "UPDATE baseline_store.baselines SET updated_at = $1::bigint "
+            "WHERE baseline_id = $2 RETURNING baseline_id",
+            std::vector<std::string>{std::to_string(now_epoch()), baseline_id});
+        if (touch.status() != PGRES_TUPLES_OK) {
+            error = "touch updated_at failed: " + std::string(PQerrorMessage(c));
+            return false;
+        }
+        if (PQntuples(touch.get()) == 0) {
+            not_found = true;
+            return false;
+        }
         pg::PgResult del = pg::exec_params(
             c, "DELETE FROM baseline_store.baseline_groups WHERE baseline_id = $1",
             std::vector<std::string>{baseline_id});
@@ -1263,15 +1286,10 @@ BaselineStore::set_assignment(const std::string& baseline_id_in,
                 return false;
             }
         }
-        pg::PgResult touch = pg::exec_params(
-            c, "UPDATE baseline_store.baselines SET updated_at = $1::bigint WHERE baseline_id = $2",
-            std::vector<std::string>{std::to_string(now_epoch()), baseline_id});
-        if (touch.status() != PGRES_COMMAND_OK) {
-            error = "touch updated_at failed: " + std::string(PQerrorMessage(c));
-            return false;
-        }
         return true;
     });
+    if (not_found)
+        return std::unexpected("not found: baseline_id '" + baseline_id + "'");
     if (!ok)
         return std::unexpected(error.empty() ? "transaction failed" : error);
     return {};
@@ -1367,11 +1385,27 @@ BaselineStore::deployed_member_rule_ids() const {
             continue; // never-deployed / empty snapshot contributes nothing (fail-closed)
         // allow_exceptions=false: a malformed snapshot is skipped, not thrown on.
         const auto parsed = nlohmann::json::parse(snap, nullptr, /*allow_exceptions=*/false);
-        if (!parsed.is_array())
+        if (!parsed.is_array()) {
+            // Not a corruption this store can repair — deploy_baseline only
+            // ever writes an array — but silently zeroing a deployed
+            // Baseline's enforced set is a coverage-shrink an operator has
+            // no other signal for (governance UP-4 finding); at least log it.
+            spdlog::warn("BaselineStore::deployed_member_rule_ids: deployed_snapshot is not a "
+                         "JSON array (row {}) — contributing 0 rule_ids for this baseline",
+                         i);
             continue;
-        for (const auto& rid : parsed)
+        }
+        std::size_t dropped = 0;
+        for (const auto& rid : parsed) {
             if (rid.is_string())
                 ids.insert(rid.get<std::string>());
+            else
+                ++dropped;
+        }
+        if (dropped > 0)
+            spdlog::warn("BaselineStore::deployed_member_rule_ids: deployed_snapshot array (row "
+                         "{}) had {} non-string element(s) — dropped, not enforced",
+                         i, dropped);
     }
     return ids;
 }
@@ -1403,10 +1437,24 @@ BaselineStore::deployed_member_rule_ids(const std::string& baseline_id) const {
         if (!snap.empty()) {
             // allow_exceptions=false: a malformed snapshot is skipped, not thrown on.
             const auto parsed = nlohmann::json::parse(snap, nullptr, /*allow_exceptions=*/false);
-            if (parsed.is_array())
-                for (const auto& rid : parsed)
+            if (!parsed.is_array()) {
+                // See the fleet-wide overload's identical note (governance UP-4).
+                spdlog::warn("BaselineStore::deployed_member_rule_ids({}): deployed_snapshot is "
+                             "not a JSON array — contributing 0 rule_ids",
+                             baseline_id);
+            } else {
+                std::size_t dropped = 0;
+                for (const auto& rid : parsed) {
                     if (rid.is_string())
                         ids.push_back(rid.get<std::string>());
+                    else
+                        ++dropped;
+                }
+                if (dropped > 0)
+                    spdlog::warn("BaselineStore::deployed_member_rule_ids({}): deployed_snapshot "
+                                 "array had {} non-string element(s) — dropped, not enforced",
+                                 baseline_id, dropped);
+            }
         }
     }
     std::sort(ids.begin(), ids.end());

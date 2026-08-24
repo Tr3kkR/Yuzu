@@ -37,6 +37,7 @@
 #include "pg/pg_raii.hpp"
 #include "store_errors.hpp"
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -345,6 +346,29 @@ TEST_CASE("set_members on a non-existent baseline is not-found", "[pg][baseline_
     auto r = store.set_members("nope", {"r1"});
     REQUIRE_FALSE(r.has_value());
     CHECK_FALSE(is_conflict_error(r.error()));
+}
+
+TEST_CASE("set_members/set_assignment with an EMPTY payload against a non-existent baseline "
+          "is not-found, not a silent success",
+          "[pg][baseline_store]") {
+    // Pins the governance TOCTOU fix (three independent reviewers): a
+    // non-empty payload was already caught by the FK constraint on INSERT,
+    // but an empty payload skips the INSERT entirely, so before the fix the
+    // only remaining statement was a row-count-blind touch-UPDATE that
+    // reported PGRES_COMMAND_OK on 0 matched rows — success against a
+    // baseline that was never there. The fix moves a RETURNING-checked
+    // touch-UPDATE to the front of both transactions.
+    YUZU_REQUIRE_PG_DB_TPL(db, baselinestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BaselineStore store{pool};
+
+    auto members_r = store.set_members("nope", {});
+    REQUIRE_FALSE(members_r.has_value());
+    CHECK_FALSE(is_conflict_error(members_r.error()));
+
+    auto assignment_r = store.set_assignment("nope", {});
+    REQUIRE_FALSE(assignment_r.has_value());
+    CHECK_FALSE(is_conflict_error(assignment_r.error()));
 }
 
 TEST_CASE("Assignment include/exclude round-trip and validation", "[pg][baseline_store]") {
@@ -772,6 +796,53 @@ TEST_CASE("BaselineStore::migrate_from_sqlite fails closed and unstamped when a 
           "0");
 }
 
+TEST_CASE("BaselineStore::migrate_from_sqlite fails closed and unstamped on an invalid legacy "
+          "lifecycle or assignment disposition",
+          "[pg][baseline_store][backfill]") {
+    // The backfill's own validation predates this PR (unlike the live-write
+    // path's, which K2 fixed to match it) but was itself never under test —
+    // governance quality-engineer finding. A raw legacy write bypasses the
+    // live-write enum check entirely, so this is the only way to construct
+    // an invalid value in the fixture.
+    YUZU_REQUIRE_PG_DB_TPL(db, baselinestore_tpl);
+    {
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        BaselineStore store(pool);
+        REQUIRE(store.is_open());
+
+        auto path = yuzu::test::unique_temp_path("yuzu_test_baseline_bad_lifecycle") /
+                   "guardian-baselines.db";
+        std::filesystem::create_directories(path.parent_path());
+        LegacyBaselineFixture bad;
+        bad.baseline_id = "bad-lifecycle-id";
+        bad.lifecycle = "active"; // not draft/deployed
+        write_legacy_db(path, {bad});
+
+        CHECK_FALSE(store.migrate_from_sqlite(path));
+        CHECK(store.baseline_count() == 0);
+        CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM baseline_store.baseline_store_meta") ==
+              "0");
+    }
+    {
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        BaselineStore store(pool);
+        REQUIRE(store.is_open());
+
+        auto path = yuzu::test::unique_temp_path("yuzu_test_baseline_bad_disposition") /
+                   "guardian-baselines.db";
+        std::filesystem::create_directories(path.parent_path());
+        LegacyBaselineFixture bad;
+        bad.baseline_id = "bad-disposition-id";
+        bad.groups = {{"g1", "maybe"}}; // not include/exclude
+        write_legacy_db(path, {bad});
+
+        CHECK_FALSE(store.migrate_from_sqlite(path));
+        CHECK(store.baseline_count() == 0);
+        CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM baseline_store.baseline_store_meta") ==
+              "0");
+    }
+}
+
 TEST_CASE("BaselineStore::migrate_from_sqlite fails closed on a live baseline_id/name conflict",
           "[pg][baseline_store][backfill]") {
     YUZU_REQUIRE_PG_DB_TPL(db, baselinestore_tpl);
@@ -845,74 +916,107 @@ TEST_CASE("BaselineStore::migrate_from_sqlite: two genuinely concurrent replicas
     // PQcmdTuples()=="0" concurrent-writer refusal, and the monotonic-
     // promotion stamp all exist to make safe (see the header doc comment).
     //
-    // More deterministic than a typical thread-racing test, not less: unlike
-    // a CPU-scheduling race, Postgres's row-level lock on
-    // `INSERT ... ON CONFLICT (baseline_id) DO NOTHING` SERIALIZES two
-    // concurrent inserts of the SAME baseline_id — the second blocks until
-    // the first commits, then resolves as a real conflict
-    // (`PQcmdTuples()=="0"`), not a coin-flip outcome. So this test doesn't
-    // need CA-store's (#3475/UP-3) bounded scheduling-attempt retry loop: the
-    // "one racer hits the concurrent-writer refusal" outcome is the expected
-    // common case here, not a rare branch to chase.
-    YUZU_REQUIRE_PG_DB_TPL(db, baselinestore_tpl);
-    PgPool pool_a{{.conninfo = db.dsn(), .size = 4}};
-    PgPool pool_b{{.conninfo = db.dsn(), .size = 4}};
-    BaselineStore store_a(pool_a);
-    BaselineStore store_b(pool_b);
-    REQUIRE(store_a.is_open());
-    REQUIRE(store_b.is_open());
+    // NOT guaranteed-deterministic (correction, governance re-review): the
+    // row-lock argument only holds for the racers that actually reach the
+    // row-locked `INSERT ... ON CONFLICT` concurrently. `migrate_from_sqlite`
+    // checks the `backfill_complete` marker via a plain SELECT BEFORE that
+    // point — if one racer's marker check lands after the other has already
+    // committed, it takes the holder-side-verification "already complete"
+    // path instead, and the contested INSERT is never reached by either
+    // thread that attempt. So whether this run exercises the
+    // concurrent-writer refusal at all is scheduling-dependent, same class of
+    // uncertainty as CA-store's first-boot root race (#3475/UP-3) — this test
+    // now adopts that same bounded re-attempt-until-observed shape rather
+    // than asserting determinism a single unbarriered run can't prove.
+    // 30, not CA-store's 15: an empirical run on this box alone used 10 of 15
+    // attempts once — CA-store's own bound started at 5 and had to widen to
+    // 15 under CI load (#3475), so this starts with more headroom rather
+    // than repeating that discovery.
+    constexpr int kMaxSchedulingAttempts = 30;
+    for (int attempt = 0;; ++attempt) {
+        INFO("scheduling attempt " << attempt << ": did one racer's marker check land after "
+             "the other already committed? (legitimate, just doesn't exercise the contested "
+             "INSERT — retrying for a genuine row-lock collision)");
+        REQUIRE(attempt < kMaxSchedulingAttempts);
 
-    // Two DISTINCT legacy files (SQLite files are per-path) with BYTE-
-    // IDENTICAL row content — neither racer can legitimately see the other
-    // as "ahead" or "contradicting" (the fixture is otherwise no different
-    // from a plain single-replica backfill; only the concurrency is new).
-    LegacyBaselineFixture fixture;
-    fixture.baseline_id = "race-baseline-1";
-    fixture.name = "Race Baseline";
-    fixture.members = {"race-rule-a", "race-rule-b"};
-    fixture.groups = {{"race-group", kAssignInclude}};
-    auto path_a =
-        yuzu::test::unique_temp_path("yuzu_test_baseline_race_a") / "guardian-baselines.db";
-    auto path_b =
-        yuzu::test::unique_temp_path("yuzu_test_baseline_race_b") / "guardian-baselines.db";
-    std::filesystem::create_directories(path_a.parent_path());
-    std::filesystem::create_directories(path_b.parent_path());
-    write_legacy_db(path_a, {fixture});
-    write_legacy_db(path_b, {fixture});
+        YUZU_REQUIRE_PG_DB_TPL(db, baselinestore_tpl);
+        PgPool pool_a{{.conninfo = db.dsn(), .size = 4}};
+        PgPool pool_b{{.conninfo = db.dsn(), .size = 4}};
+        BaselineStore store_a(pool_a);
+        BaselineStore store_b(pool_b);
+        REQUIRE(store_a.is_open());
+        REQUIRE(store_b.is_open());
 
-    bool ok_a = false, ok_b = false;
-    {
-        // Deliberately no start barrier — CA-store's #3475 finding: a barrier
-        // that synchronizes thread LAUNCH but not the connect/query work
-        // after it measured WORSE under load than natural OS scheduling
-        // jitter on that box. Natural jitter is sufficient here since the
-        // serialization this test relies on happens at the Postgres row
-        // lock, not at thread start.
-        std::thread ta([&] { ok_a = store_a.migrate_from_sqlite(path_a); });
-        std::thread tb([&] { ok_b = store_b.migrate_from_sqlite(path_b); });
-        ta.join();
-        tb.join();
+        // Two DISTINCT legacy files (SQLite files are per-path) with BYTE-
+        // IDENTICAL row content — neither racer can legitimately see the
+        // other as "ahead" or "contradicting" (the fixture is otherwise no
+        // different from a plain single-replica backfill; only the
+        // concurrency is new). Fresh per attempt — a completed backfill
+        // can't be re-raced.
+        LegacyBaselineFixture fixture;
+        fixture.baseline_id = "race-baseline-1";
+        fixture.name = "Race Baseline";
+        fixture.members = {"race-rule-a", "race-rule-b"};
+        fixture.groups = {{"race-group", kAssignInclude}};
+        auto path_a = yuzu::test::unique_temp_path("yuzu_test_baseline_race_a") /
+                     "guardian-baselines.db";
+        auto path_b = yuzu::test::unique_temp_path("yuzu_test_baseline_race_b") /
+                     "guardian-baselines.db";
+        std::filesystem::create_directories(path_a.parent_path());
+        std::filesystem::create_directories(path_b.parent_path());
+        write_legacy_db(path_a, {fixture});
+        write_legacy_db(path_b, {fixture});
+
+        bool ok_a = false, ok_b = false;
+        std::string logs;
+        {
+            // Deliberately no start barrier — CA-store's #3475 finding: a
+            // barrier that synchronizes thread LAUNCH but not the
+            // connect/query work after it measured WORSE under load than
+            // natural OS scheduling jitter on that box.
+            yuzu::test::LogCapture log;
+            std::thread ta([&] { ok_a = store_a.migrate_from_sqlite(path_a); });
+            std::thread tb([&] { ok_b = store_b.migrate_from_sqlite(path_b); });
+            ta.join();
+            tb.join();
+            log.stop();
+            logs = log.text();
+        }
+
+        const bool exercised_contested_insert =
+            logs.find("concurrent writer inserted baseline") != std::string::npos;
+        if (!exercised_contested_insert) {
+            // Neither racer hit the row lock this attempt (one saw the
+            // other's marker already stamped) — both may have succeeded
+            // cleanly, which is a legitimate but uninteresting outcome for
+            // THIS test's claim. Retry for a genuine collision.
+            continue;
+        }
+        INFO("captured backfill logs from the attempt that exercised the contested INSERT:\n"
+             << logs);
+
+        // A loser from the row-lock refusal self-heals on an immediate
+        // single-threaded retry (no concurrent racer left to re-trigger it)
+        // — verified below, not asserted away, so an unrelated, unexplained
+        // failure still fails loudly via REQUIRE.
+        if (!ok_a)
+            REQUIRE(store_a.migrate_from_sqlite(path_a));
+        if (!ok_b)
+            REQUIRE(store_b.migrate_from_sqlite(path_b));
+
+        // Whichever interleaving occurred, the end state is exactly one
+        // Baseline with exactly its fixture's children — never duplicated,
+        // never partial.
+        CHECK(store_a.baseline_count() == 1);
+        CHECK(store_a.get_members("race-baseline-1") ==
+              std::vector<std::string>{"race-rule-a", "race-rule-b"});
+        CHECK(store_a.get_assignment("race-baseline-1").size() == 1);
+
+        // Both replicas' own connection converges to the SAME row — not a
+        // store_a-local artifact.
+        auto from_b = store_b.get_baseline("race-baseline-1");
+        REQUIRE(from_b.has_value());
+        CHECK(from_b->name == "Race Baseline");
+        break;
     }
-
-    // A loser from the accepted concurrent-writer-refusal window self-heals
-    // on an immediate single-threaded retry (no concurrent racer left to
-    // re-trigger it) — verified below, not asserted away, so an unrelated,
-    // unexplained failure still fails loudly via REQUIRE.
-    if (!ok_a)
-        REQUIRE(store_a.migrate_from_sqlite(path_a));
-    if (!ok_b)
-        REQUIRE(store_b.migrate_from_sqlite(path_b));
-
-    // Whichever interleaving occurred, the end state is exactly one Baseline
-    // with exactly its fixture's children — never duplicated, never partial.
-    CHECK(store_a.baseline_count() == 1);
-    CHECK(store_a.get_members("race-baseline-1") ==
-          std::vector<std::string>{"race-rule-a", "race-rule-b"});
-    CHECK(store_a.get_assignment("race-baseline-1").size() == 1);
-
-    // Both replicas' own connection converges to the SAME row — not a
-    // store_a-local artifact.
-    auto from_b = store_b.get_baseline("race-baseline-1");
-    REQUIRE(from_b.has_value());
-    CHECK(from_b->name == "Race Baseline");
 }

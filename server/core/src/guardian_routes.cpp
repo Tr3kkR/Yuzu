@@ -1240,8 +1240,21 @@ void GuardianRoutes::deploy_baseline(const httplib::Request& req, httplib::Respo
         res.set_content(panel("Baseline store unavailable."), "text/html; charset=utf-8");
         return;
     }
-    auto b = baseline_store_->get_baseline(baseline_id);
+    bool baseline_store_ok = true;
+    auto b = baseline_store_->get_baseline(baseline_id, &baseline_store_ok);
     if (!b) {
+        // store_ok disambiguates a transient store fault from a genuine
+        // not-found (governance UP-3 finding) — a pool-lease timeout must
+        // not be misreported as "Baseline not found" and audit-logged
+        // "denied" for a baseline that still exists.
+        if (!baseline_store_ok) {
+            audit_fn_(req, "guaranteed_state.baseline.deploy", "degraded", "GuaranteedState",
+                      baseline_id, "baseline read degraded");
+            res.set_content(
+                panel("Deploy failed: baseline store degraded, could not read the baseline. Retry."),
+                "text/html; charset=utf-8");
+            return;
+        }
         audit_fn_(req, "guaranteed_state.baseline.deploy", "denied", "GuaranteedState", baseline_id,
                   "no such baseline");
         res.set_content(panel("Baseline not found."), "text/html; charset=utf-8");
