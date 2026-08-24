@@ -515,6 +515,37 @@ TEST_CASE("ProductPackStore::install: a duplicate item id in one bundle fails as
         CHECK(p.name != "test-duplicate-items");
 }
 
+// Gov Gate 2 finding (security-guardian, this PR's own review): the duplicate-item-id check
+// above returns BEFORE the persist transaction, but install_fn has ALREADY committed both
+// documents into sibling stores by that point — the exact orphan shape F031 exists to close.
+// The original fix only wired compensate_fn into the later with_txn_for failure path; this
+// proves it now ALSO fires here.
+TEST_CASE("ProductPackStore::install: a duplicate item id also triggers compensation "
+          "(not just the final persist path)",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    std::vector<std::pair<std::string, std::string>> compensated;
+    auto compensate_fn = [&compensated](const std::string& kind,
+                                        const std::string& item_id) -> bool {
+        compensated.emplace_back(kind, item_id);
+        return true;
+    };
+
+    auto result = store.install(kUnsignedPackYamlDuplicateItems, make_accept_all_install_fn(),
+                                compensate_fn);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("duplicate item id") != std::string::npos);
+    CHECK(result.error().find(yuzu::server::kProductPackDbErrorPrefix) == std::string::npos);
+    REQUIRE(compensated.size() == 2);
+    CHECK(compensated[0].first == "InstructionDefinition");
+    CHECK(compensated[1].first == "InstructionDefinition");
+}
+
 // ── Compensating cleanup (F031/#3481) ───────────────────────────────────────
 //
 // Pool-contention fault injection technique (proven precedent:

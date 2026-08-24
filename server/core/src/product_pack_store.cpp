@@ -1207,6 +1207,44 @@ std::expected<std::string, std::string> ProductPackStore::install(
         return std::unexpected("no items installed: " + errors[0]);
     }
 
+    // F031/#3481 (gov Gate 2 finding, security-guardian): factored out so every failure path
+    // reachable AFTER install_fn has already committed real content into sibling stores —
+    // not just the final persist-transaction failure below, but ALSO the duplicate-item-id
+    // check immediately following — best-effort compensates every already-installed item, in
+    // REVERSE install order (a Policy must be compensated before the PolicyFragment it
+    // references, since PolicyStore::delete_fragment refuses while a Policy still references
+    // it — forward order would spuriously fail to clean up the fragment). A single item's
+    // compensation failing is logged and does not abort compensating the rest. The original
+    // (pre-compensation) duplicate-item-id early return orphaned items_to_store just like the
+    // bug F031 was written to close — that gap was caught in Gate 2 review of this very PR.
+    auto compensate_and_fail = [&](const std::string& log_context,
+                                   std::string error_message) -> std::unexpected<std::string> {
+        std::size_t compensated = 0;
+        if (compensate_fn) {
+            for (auto it = items_to_store.rbegin(); it != items_to_store.rend(); ++it) {
+                if (compensate_fn(it->kind, it->item_id)) {
+                    ++compensated;
+                } else {
+                    spdlog::error(
+                        "ProductPackStore: install compensation FAILED for {} '{}' after {} "
+                        "for pack '{}' — orphaned sibling content requires manual/operator "
+                        "cleanup",
+                        it->kind, sanitize_for_log(it->item_id), log_context,
+                        sanitize_for_log(pack_name));
+                }
+            }
+            if (metrics_)
+                metrics_
+                    ->counter("yuzu_server_product_pack_install_compensation_total",
+                              {{"result", compensated == items_to_store.size() ? "ok" : "partial"}})
+                    .increment();
+        }
+        spdlog::error("ProductPackStore: {} for pack '{}' — compensated {}/{} item(s)",
+                     log_context, sanitize_for_log(pack_name), compensated,
+                     items_to_store.size());
+        return std::unexpected(std::move(error_message));
+    };
+
     // Gate 8 review (Fable, external): a bundle whose documents assign the same item id
     // twice would otherwise reach the persist transaction below, violate
     // product_pack_items' (pack_id, item_id) PK, and fail with kProductPackDbErrorPrefix —
@@ -1222,7 +1260,9 @@ std::expected<std::string, std::string> ProductPackStore::install(
         std::unordered_set<std::string> seen_item_ids;
         for (const auto& item : items_to_store) {
             if (!seen_item_ids.insert(item.item_id).second)
-                return std::unexpected("duplicate item id in bundle: '" + item.item_id + "'");
+                return compensate_and_fail(
+                    "duplicate item id detected",
+                    "duplicate item id in bundle: '" + item.item_id + "'");
         }
     }
 
@@ -1264,36 +1304,10 @@ std::expected<std::string, std::string> ProductPackStore::install(
         return true;
     });
     if (!ok) {
-        // F031/#3481: install_fn already committed items_to_store into their sibling stores
-        // before this transaction ran (see the file header — no lease of ours was held across
-        // that loop). Best-effort undo each one via compensate_fn, in REVERSE install order (a
-        // Policy must be compensated before the PolicyFragment it references, since
-        // PolicyStore::delete_fragment refuses while a Policy still references it — forward order
-        // would spuriously fail to clean up the fragment). A single item's compensation failing
-        // is logged and does not abort compensating the rest.
-        std::size_t compensated = 0;
-        if (compensate_fn) {
-            for (auto it = items_to_store.rbegin(); it != items_to_store.rend(); ++it) {
-                if (compensate_fn(it->kind, it->item_id)) {
-                    ++compensated;
-                } else {
-                    spdlog::error(
-                        "ProductPackStore: install compensation FAILED for {} '{}' after late "
-                        "persist failure for pack '{}' — orphaned sibling content requires "
-                        "manual/operator cleanup",
-                        it->kind, sanitize_for_log(it->item_id), sanitize_for_log(pack_name));
-                }
-            }
-            if (metrics_)
-                metrics_
-                    ->counter("yuzu_server_product_pack_install_compensation_total",
-                              {{"result", compensated == items_to_store.size() ? "ok" : "partial"}})
-                    .increment();
-        }
-        spdlog::error("ProductPackStore: failed to persist pack '{}' — compensated {}/{} item(s)",
-                     sanitize_for_log(pack_name), compensated, items_to_store.size());
-        return std::unexpected(std::string(kProductPackDbErrorPrefix) +
-                               "failed to persist pack '" + pack_name + "'");
+        return compensate_and_fail(
+            "failed to persist pack transaction",
+            std::string(kProductPackDbErrorPrefix) + "failed to persist pack '" + pack_name +
+                "'");
     }
 
     spdlog::info("ProductPackStore: installed '{}' v{} ({}), {} items, {} errors",
