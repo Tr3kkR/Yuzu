@@ -111,9 +111,13 @@ public:
 
     // Server shutdown close-signal (#3042): stickily refuse every future mint()
     // (reject_reason "shutdown") and close every currently-live stream
-    // (kSessionTerminated) so their pumps drain instead of riding the shutdown
-    // write-loop to its next check. Idempotent — a second call closes nothing and
-    // returns 0. NOT a full close-all guarantee: a caller that already holds a
+    // (kSessionTerminated). A GET pump has its sink IN the closed McpStreamState,
+    // so this wakes it immediately; a streamed-POST pump's sink is separate and
+    // untouched by the close, so it instead drains by riding its own next tick
+    // check (session_alive_) to discover the registry is gone — both land well
+    // inside the shutdown grace bound, just via different mechanisms.
+    // Idempotent — a second call closes nothing and returns 0. NOT a full
+    // close-all guarantee: a caller that already holds a
     // `stream_for()` result and attaches a fresh sink after this returns will
     // still get a stream, but one now emptied from the registry — its pump's
     // first `session_alive_` re-check (one tick, ~3s) finds the session gone and

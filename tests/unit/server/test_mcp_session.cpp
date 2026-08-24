@@ -212,6 +212,27 @@ TEST_CASE("MCP session: shutdown is idempotent — a second call closes nothing"
     CHECK(reg.shutdown() == 0);
 }
 
+TEST_CASE("MCP session: two threads calling shutdown() simultaneously — exactly one closes",
+          "[mcp][session]") {
+    // Not reachable via the real call site today: ServerImpl::stop() has its own
+    // completion barrier serializing a second concurrent stop() before it ever
+    // reaches mcp_sessions_->shutdown() (governance quality-engineer finding,
+    // #3042) — but shutdown()'s own doc comment publishes idempotency as a
+    // contract independent of caller count, so pin it directly against the
+    // registry rather than relying on that external guarantee.
+    McpSessionRegistry reg;
+    for (int i = 0; i < 5; ++i) {
+        REQUIRE(reg.mint("p" + std::to_string(i)).ok);
+    }
+    std::atomic<int> total_closed{0};
+    std::thread a([&] { total_closed += reg.shutdown(); });
+    std::thread b([&] { total_closed += reg.shutdown(); });
+    a.join();
+    b.join();
+    CHECK(total_closed.load() == 5); // exactly one caller saw the live set
+    CHECK(reg.active_count() == 0);
+}
+
 TEST_CASE("MCP session: shutdown with no live sessions closes zero and still latches",
           "[mcp][session]") {
     McpSessionRegistry reg;

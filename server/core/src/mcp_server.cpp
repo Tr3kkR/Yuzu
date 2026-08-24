@@ -3145,8 +3145,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     // reason once ServerImpl::stop() has begun draining sessions — a
                     // distinct, transient condition from the cap reject below (no session
                     // to end, no timeout to wait out; the whole server is going away). No
-                    // retry_after_ms: this process has no visibility into when a
-                    // replacement instance will be reachable.
+                    // retry_after_ms: this process has no visibility into when the
+                    // server will be back.
                     if (mint.reject_reason == "shutdown") {
                         res.status = 503;
                         res.set_content(

@@ -7457,10 +7457,13 @@ public:
         // between provider calls, so a healthy MCP stream would drain within
         // about one tick (~3s) even without this — but that path is a bare
         // connection drop, no close frame, no reason. mcp_sessions_->shutdown()
-        // stickily refuses new mints and wakes every live pump's own wait
-        // predicate immediately (McpStreamState::close(), same mechanism a
-        // DELETE or idle-GC uses), so the pump exits promptly with a clean
-        // `session_terminated` close frame instead of riding out the tick to a
+        // stickily refuses new mints and closes every live session's stream
+        // state (McpStreamState::close(), same mechanism a DELETE or idle-GC
+        // uses) — a GET pump has that state as its own sink, so it wakes its
+        // wait predicate immediately; a streamed-POST pump's sink is a separate
+        // SseSinkState this close() never touches, so it instead notices on its
+        // own next tick via session_alive_(). Either way the pump exits with a
+        // clean `session_terminated` close frame instead of riding out to a
         // silent drop. What this does NOT fix: a stream whose pump is blocked
         // *inside* a single write (a blackholed or drip-feeding peer, bounded
         // by the write timeout, not the tick) never sees the flip until that

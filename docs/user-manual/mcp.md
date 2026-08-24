@@ -1236,9 +1236,9 @@ then closed by the same drain a moment later — same outcome, no client-visible
 difference, just not literally "refused.") This is a narrow, transient window
 (seconds, not the deploy's whole grace period).
 
-**Fix**: Reconnect and re-`initialize` once the replacement instance is
-reachable — no `retry_after_ms` is given, since this process has no
-visibility into when that will be. A session that was already live when
+**Fix**: Reconnect and re-`initialize` once the server is back — no
+`retry_after_ms` is given, since this process has no visibility into
+when that will be. A session that was already live when
 shutdown began instead receives a `notifications/yuzu.stream_closed` frame
 with `reason: session_terminated` (see that entry above) and should
 re-`initialize` the same way.

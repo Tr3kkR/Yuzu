@@ -5,6 +5,8 @@
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
+#include <spdlog/spdlog.h>
+
 #include <utility>
 
 namespace yuzu::server::mcp {
@@ -105,13 +107,26 @@ std::size_t McpSessionRegistry::shutdown() noexcept {
         if (entry.stream) {
             try {
                 entry.stream->close(McpStreamClose::kSessionTerminated);
-            } catch (...) {  // NOLINT(bugprone-empty-catch) — best-effort signal only
+            } catch (...) {
+                // Mirror poison_close_contained's posture (mcp_stream.cpp): a swallowed
+                // close failure must not also be a swallowed diagnostic, or an operator
+                // sees a lower "close-signalled" count than sessions actually existed
+                // with no explanation. The log call itself is the one thing here that
+                // could still throw (spdlog's formatter allocates), so it gets its own
+                // net — nothing left to safely do if even that fails.
+                try {
+                    spdlog::warn("MCP sessions: close of session [{}] failed and was "
+                                 "contained during shutdown; the client may see a bare "
+                                 "connection drop instead of a close frame",
+                                 id.substr(0, 8));
+                } catch (...) {  // NOLINT(bugprone-empty-catch)
+                }
             }
         }
     }
     try {
         publish_active_gauge(0);
-    } catch (...) {  // NOLINT(bugprone-empty-catch)
+    } catch (...) {  // NOLINT(bugprone-empty-catch) — nothing left we could safely do
     }
     return grabbed.size();
 }

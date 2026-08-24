@@ -1269,18 +1269,28 @@ TEST_CASE("McpSessionRegistry: shutdown wakes a live GET pump immediately, not a
         },
         cfg};
 
-    std::atomic<bool> returned{false};
+    // #2382-style handshake, not a sleep: the discriminator is TIMING, and a
+    // sleep-then-join proves only that the pump eventually returned — a
+    // regression to tick-bound wakeup would still pass every CHECK here, just
+    // 30s late (cpp-expert governance finding). `long_tick` makes a tick-driven
+    // wake blow well past the safety window below, and the assertion is "the
+    // pump returned within 5s", not merely "returned". Never false-RED: if
+    // shutdown() somehow ran before the pump reached wait_for, the predicate
+    // would simply be true on entry and the pump would return fast anyway.
     FakeWire wire;
-    std::thread pumper([&] {
-        pump.pump_once(wire.writer());
-        returned.store(true);
+    std::atomic<bool> about_to_pump{false};
+    auto pumped = std::async(std::launch::async, [&] {
+        about_to_pump.store(true, std::memory_order_release);
+        return pump.pump_once(wire.writer());
     });
+    while (!about_to_pump.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(50)); // let the pump reach its wait
     CHECK(reg.shutdown() == 1); // ServerImpl::stop()'s call, in miniature
-    pumper.join();
+    REQUIRE(pumped.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
 
-    CHECK(returned.load());
+    CHECK_FALSE(pumped.get()); // pump_once returns false: the response is done
     CHECK(attached.sink->close_reason.load() == mcp::McpStreamClose::kSessionTerminated);
 }
 
@@ -1320,6 +1330,36 @@ TEST_CASE("McpSessionRegistry: shutdown closes a live streamed-POST pump within 
     // Next tick: session_alive_() now reads the drained registry and fails.
     CHECK_FALSE(pump.pump_once(wire.writer()));
     CHECK(pump.close_reason() == mcp::McpStreamClose::kSessionTerminated);
+}
+
+// close() only reads live_ — this pins the invariant that makes that safe: a
+// draining_ sink from an in-progress takeover was ALREADY closed (kSuperseded) at
+// the moment it became draining_, so shutdown() reaching a session mid-handover
+// needs no special case for it. If a future change ever deferred the takeover's
+// own close-signal, this test would catch the reintroduced unsignalled sink.
+TEST_CASE("McpSessionRegistry: shutdown mid-handover closes only the new live sink; "
+          "the superseded one is already closed",
+          "[mcp][session][stream][race]") {
+    mcp::McpSessionRegistry reg;
+    const auto minted = reg.mint("alice");
+    REQUIRE(minted.ok);
+    auto stream = reg.stream_for(minted.session_id, "alice");
+    REQUIRE(stream);
+
+    auto first = stream->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(first.status == mcp::McpStreamState::AttachStatus::kAttached);
+    auto second = stream->attach_and_replay(0, nullptr, "alice"); // takeover
+    REQUIRE(second.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    // The superseded sink is closed synchronously by the takeover itself, before
+    // shutdown() ever runs — this is the invariant close() relies on.
+    CHECK(first.sink->close_reason.load() == mcp::McpStreamClose::kSuperseded);
+
+    CHECK(reg.shutdown() == 1);
+
+    CHECK(second.sink->close_reason.load() == mcp::McpStreamClose::kSessionTerminated);
+    // Unaffected by shutdown() — first-wins CAS, and close() never touches draining_.
+    CHECK(first.sink->close_reason.load() == mcp::McpStreamClose::kSuperseded);
 }
 
 // ── Concurrency (TSan net) ──────────────────────────────────────────────────
