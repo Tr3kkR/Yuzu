@@ -226,8 +226,8 @@ inline int degrade_severity(YuzuResultStatus status) {
 }
 
 /**
- * Secondary tie-break rank for a same-severity worst_of() merge, consulted
- * ONLY when degrade_severity() ties — every other pair keeps the original
+ * Secondary tie-break for a same-severity worst_of() merge, consulted ONLY
+ * when degrade_severity() ties — every other pair keeps the original
  * "earliest-accumulated report wins" rule unchanged (governance-deferred
  * #3253).
  *
@@ -235,26 +235,27 @@ inline int degrade_severity(YuzuResultStatus status) {
  * didn't run") is strictly more actionable than `arp:table_truncated`
  * ("some cached neighbours are missing") when both are CONSTRAINED — but
  * plain accumulation order let the ARP condition win because Step 1
- * (ARP read) always runs before Step 4 (the scan deadline). Ranking
- * `arp:table_truncated` below the default flips that ONE pair so the
- * timeout wins regardless of accumulation order, without touching any other
- * same-severity pair — e.g. `icmp:transmit_blocked` still beats a later
- * `scan:timeout` on a tie (see worst_of's own test), because "the sweep
- * couldn't transmit at all" is not the data-completeness case #3253 is
- * about. Extend this table deliberately, one named pair at a time, rather
- * than inventing a general actionability ordering nobody has asked for yet.
+ * (ARP read) always runs before Step 4 (the scan deadline).
+ *
+ * Checks that ONE named pair explicitly, rather than ranking
+ * `arp:table_truncated` below every other reason: a scalar rank would also
+ * silently demote `arp:table_truncated` against `icmp:ping_group_range` and
+ * `dns:hostname_lookup_degraded` — both real CONSTRAINED-severity reasons
+ * that can tie with it in the very same scan_subnet call — which #3253
+ * never asked for. Extend this deliberately, one named pair at a time,
+ * rather than inventing a general actionability ordering nobody has asked
+ * for yet.
  */
-inline int degrade_tie_rank(std::string_view reason) {
-    if (reason == "arp:table_truncated")
-        return -1;
-    return 0;
+inline bool degrade_tie_prefers_candidate(std::string_view current_reason,
+                                          std::string_view candidate_reason) {
+    return current_reason == "arp:table_truncated" && candidate_reason == "scan:timeout";
 }
 
 /**
  * Keep `current` if it is at least as severe as `candidate`; otherwise adopt
- * `candidate`. A same-severity tie is broken by degrade_tie_rank() (#3253);
- * a tie on THAT rank too keeps `current` — the earliest-reported reason —
- * exactly as before.
+ * `candidate`. A same-severity tie is broken by
+ * degrade_tie_prefers_candidate() (#3253); every other tie keeps `current`
+ * — the earliest-reported reason — exactly as before.
  */
 inline MaybeDegrade worst_of(MaybeDegrade current, const MaybeDegrade& candidate) {
     if (!candidate.has_report)
@@ -267,7 +268,7 @@ inline MaybeDegrade worst_of(MaybeDegrade current, const MaybeDegrade& candidate
     if (candidate_sev != current_sev)
         return candidate_sev > current_sev ? candidate : current;
 
-    if (degrade_tie_rank(candidate.report.reason) > degrade_tie_rank(current.report.reason))
+    if (degrade_tie_prefers_candidate(current.report.reason, candidate.report.reason))
         return candidate;
     return current;
 }

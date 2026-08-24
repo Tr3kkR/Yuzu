@@ -222,11 +222,17 @@ TEST_CASE("is_resolved_arp_row rejects Unreachable and Incomplete regardless of 
 TEST_CASE("is_resolved_arp_row rejects an unrecognised/out-of-range state",
          "[agent][discovery_parsers]") {
     using yuzu::discovery::is_resolved_arp_row;
+    using yuzu::discovery::kNlnsMaximum;
     // A value the enum has never defined (a hypothetical future SDK state,
     // or corrupt/garbage input) must fail closed via the `default:` branch,
     // not be silently accepted.
     CHECK_FALSE(is_resolved_arp_row(/*state=*/99, /*phys_len=*/6));
     CHECK_FALSE(is_resolved_arp_row(/*state=*/-1, /*phys_len=*/6));
+    // kNlnsMaximum is NL_NEIGHBOR_STATE's own published sentinel/bound value,
+    // not a real neighbour state — reject it explicitly rather than relying
+    // only on the mirror-value pin test below to notice a switch that
+    // accidentally grew a `case kNlnsMaximum:` arm.
+    CHECK_FALSE(is_resolved_arp_row(kNlnsMaximum, 6));
 }
 
 TEST_CASE("is_resolved_arp_row rejects a short physical address on an otherwise-resolved row",
