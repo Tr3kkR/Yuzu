@@ -727,7 +727,13 @@ private:
         // timeout) has been accumulated above by severity. Apply the worst one
         // to the ABI4 result seam exactly once, here — never at the individual
         // sites — so an earlier, more specific reason can't be silently
-        // overwritten by a later, less specific one.
+        // overwritten by a later, less specific one. Two same-severity pairs
+        // are the deliberate exception, applied inside worst_of() by
+        // degrade_tie_prefers_candidate(): a later scan:timeout DOES displace
+        // an earlier arp:table_truncated or dns:hostname_lookup_degraded,
+        // because a scan-level timeout is the more actionable reason of the
+        // two, not the less (#3253). Every condition still writes its own
+        // status|warning line above regardless of which one wins here.
         if (worst_degrade.has_report) {
             ctx.set_result_status(worst_degrade.report.status, worst_degrade.report.completeness,
                                   worst_degrade.report.reason);

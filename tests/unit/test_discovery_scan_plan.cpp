@@ -433,18 +433,109 @@ TEST_CASE("worst_of: an arp:table_truncated tie against a NON-timeout reason kee
           "dns:hostname_lookup_degraded");
 }
 
-TEST_CASE("degrade_tie_prefers_candidate: true ONLY for arp:table_truncated -> scan:timeout",
+TEST_CASE("worst_of: a scan-level timeout dominates a DNS-degrade tie, either order",
           "[agent][discovery_scan_plan]") {
+    // The SECOND instance of #3253's defect shape, in the same function: in
+    // do_scan_subnet the hostname-loop's dns:hostname_lookup_degraded is
+    // accumulated immediately BEFORE that same loop's own scan:timeout, so on
+    // a clean-ARP scan where reverse-DNS degrades AND the hostname loop hits
+    // the deadline, plain earliest-wins silently dropped "the scan didn't
+    // finish" in favour of "some hostnames are missing". Same principle as the
+    // ARP pair — a scan-level timeout dominates a data-completeness degrade —
+    // so it is closed here rather than left behind as new debt.
+    const auto dns_degraded = MaybeDegrade{true, hostname_lookup_degraded()};
+    const auto timeout = MaybeDegrade{true, timeout_degrade()};
+    CHECK(degrade_severity(dns_degraded.report.status) == degrade_severity(timeout.report.status));
+
+    const auto dns_then_timeout = worst_of(worst_of(MaybeDegrade{}, dns_degraded), timeout);
+    REQUIRE(dns_then_timeout.has_report);
+    CHECK(std::string_view{dns_then_timeout.report.reason} == "scan:timeout");
+
+    const auto timeout_then_dns = worst_of(worst_of(MaybeDegrade{}, timeout), dns_degraded);
+    REQUIRE(timeout_then_dns.has_report);
+    CHECK(std::string_view{timeout_then_dns.report.reason} == "scan:timeout");
+}
+
+TEST_CASE("worst_of: the fold is order-dependent — three-way outcomes are pinned, not assumed",
+          "[agent][discovery_scan_plan]") {
+    // worst_of is applied PAIRWISE and the named-pair tie-break is NOT
+    // transitive, so a three-condition scan's reported reason depends on the
+    // order do_scan_subnet accumulates in. Nothing in the plugin pins that
+    // order, so these cases exist to make a future reordering VISIBLE: if
+    // someone moves the ICMP-session check above the ARP read, or the DNS
+    // degrade past the deadline check, one of these flips and says so.
+    // They document current behaviour; they are not an argument that this
+    // behaviour is the only defensible one.
+    const auto truncated = degrade_for_arp(/*ok=*/true, /*complete=*/false);
+    const auto blocked = degrade_for_sweep(SweepTally{2, 2, 0});
+    const auto timeout = MaybeDegrade{true, timeout_degrade()};
+    REQUIRE(truncated.has_report);
+    REQUIRE(blocked.has_report);
+
+    // do_scan_subnet's real order: ARP (Step 1) -> sweep-blocked -> deadline.
+    // arp vs blocked -> tie, candidate is not scan:timeout -> keeps arp.
+    // arp vs timeout -> the named pair -> scan:timeout.
+    const auto arp_blocked_timeout =
+        worst_of(worst_of(worst_of(MaybeDegrade{}, truncated), blocked), timeout);
+    CHECK(std::string_view{arp_blocked_timeout.report.reason} == "scan:timeout");
+
+    // Drop the ARP condition and the SAME remaining two invert: blocked is
+    // not a named pair, so earliest-wins keeps it. This is the concrete
+    // non-transitivity — an unrelated third condition changes the answer.
+    const auto blocked_timeout = worst_of(worst_of(MaybeDegrade{}, blocked), timeout);
+    CHECK(std::string_view{blocked_timeout.report.reason} == "icmp:transmit_blocked");
+
+    // The probe-loop timeout accumulates BEFORE the DNS degrade, so on that
+    // path scan:timeout is already `current` and survives as such — the DNS
+    // pair does not need to fire for the right answer to come out.
+    const auto dns_degraded = MaybeDegrade{true, hostname_lookup_degraded()};
+    const auto timeout_then_dns = worst_of(worst_of(MaybeDegrade{}, timeout), dns_degraded);
+    CHECK(std::string_view{timeout_then_dns.report.reason} == "scan:timeout");
+}
+
+TEST_CASE("degrade_tie_prefers_candidate: true ONLY for the two named "
+          "data-completeness -> scan:timeout pairs",
+          "[agent][discovery_scan_plan]") {
+    // The complete truth table. Two named pairs prefer; everything else keeps
+    // earliest-wins. If this ever grows a third pair, add BOTH its true case
+    // here AND its own worst_of test above — the named-pair style is the whole
+    // point (a scalar rank was gate 1's HIGH finding).
     CHECK(degrade_tie_prefers_candidate("arp:table_truncated", "scan:timeout"));
+    CHECK(degrade_tie_prefers_candidate("dns:hostname_lookup_degraded", "scan:timeout"));
+
     // Reverse direction: worst_of only ever calls this as (current, candidate)
     // in real accumulation order, but a reversed pair must not also prefer —
     // checked for completeness, not because worst_of calls it this way.
     CHECK_FALSE(degrade_tie_prefers_candidate("scan:timeout", "arp:table_truncated"));
+    CHECK_FALSE(degrade_tie_prefers_candidate("scan:timeout", "dns:hostname_lookup_degraded"));
+
+    // Not-widened: a preferred `current` against a non-timeout `candidate`
+    // must still keep earliest-wins. This is what pins the fix to
+    // scan:timeout specifically rather than to "anything that arrives later".
     CHECK_FALSE(degrade_tie_prefers_candidate("arp:table_truncated", "icmp:transmit_blocked"));
     CHECK_FALSE(degrade_tie_prefers_candidate("arp:table_truncated", "icmp:ping_group_range"));
     CHECK_FALSE(degrade_tie_prefers_candidate("arp:table_truncated",
                                               "dns:hostname_lookup_degraded"));
+    CHECK_FALSE(degrade_tie_prefers_candidate("dns:hostname_lookup_degraded",
+                                              "icmp:transmit_blocked"));
+    CHECK_FALSE(degrade_tie_prefers_candidate("dns:hostname_lookup_degraded",
+                                              "arp:table_truncated"));
+
+    // Not-widened on the other axis: scan:timeout does NOT beat every reason,
+    // only the two named ones. icmp:* stay on earliest-wins.
+    CHECK_FALSE(degrade_tie_prefers_candidate("icmp:transmit_blocked", "scan:timeout"));
+    CHECK_FALSE(degrade_tie_prefers_candidate("icmp:ping_group_range", "scan:timeout"));
     CHECK_FALSE(degrade_tie_prefers_candidate("anything:unrecognised", "scan:timeout"));
+
+    // The two UNAVAILABLE-severity reasons. worst_of never reaches the
+    // tie-break with either of them against a CONSTRAINED reason (the
+    // severities differ, so the earlier branch decides), but pin them anyway:
+    // if a future change ever reclassified one to CONSTRAINED it would move
+    // into this classifier's reach, and silently defaulting is exactly the
+    // failure mode an explicit named-pair rule exists to prevent.
+    CHECK_FALSE(degrade_tie_prefers_candidate("arp:read_failed", "scan:timeout"));
+    CHECK_FALSE(degrade_tie_prefers_candidate("icmp:socket_error", "scan:timeout"));
+    CHECK_FALSE(degrade_tie_prefers_candidate("arp:read_failed", "icmp:socket_error"));
 }
 
 TEST_CASE("degrade_severity: exhaustive ranking, UNAVAILABLE worst, OK/UNDECLARED least",

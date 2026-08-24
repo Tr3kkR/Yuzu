@@ -2,8 +2,8 @@
  * discovery_parsers.hpp — pure ARP-data parsing/formatting for discovery
  * (Wave-2 PR2.1, WP-C). Portable and header-only: this file and its test
  * TU (test_discovery_parsers.cpp) carry no platform guard and run on every
- * leg. Two consumers in discovery_plugin.cpp: parse_proc_net_arp() on the
- * Linux leg, and format_mac48() on the Windows leg.
+ * leg. Three consumers in discovery_plugin.cpp: parse_proc_net_arp() on the
+ * Linux leg, and format_mac48() + is_resolved_arp_row() on the Windows leg.
  *
  * Kernel format (`net/ipv4/arp.c:arp_seq_show`):
  *   IP address       HW type     Flags       HW address            Mask     Device
@@ -116,9 +116,8 @@ inline std::vector<ArpEntry> parse_proc_net_arp(std::string_view text) {
  * Mirrors Win32's NL_NEIGHBOR_STATE (netioapi.h / nldef.h) as plain named
  * ints so the accept/reject predicate below needs no Windows header — it
  * compiles and is fixture-tested on every leg, this Mac included, where
- * <netioapi.h> does not exist. Values are the enum's own published, stable
- * numeric ABI (unchanged since GetIpNetTable2 shipped) — never re-derive
- * them elsewhere; discovery_plugin.cpp's real _WIN32 call site carries a
+ * <netioapi.h> does not exist. Values are the enum's own published numeric
+ * ABI — never re-derive them elsewhere; discovery_plugin.cpp's real _WIN32 call site carries a
  * static_assert pinning these against the actual enum, so a future SDK
  * changing them would fail that build loudly rather than silently
  * misclassify rows here.
@@ -145,10 +144,18 @@ enum ArpRowStateMirror : int {
  * platform's unresolved-entry filtering.
  *
  * Accepts only a resolved/reachable-ish neighbour — Reachable, Stale, Delay,
- * Probe, or Permanent, equivalent to the old MIB_IPNET_TYPE_DYNAMIC |
- * MIB_IPNET_TYPE_STATIC filter this replaced — with a full 6-byte Ethernet
- * MAC. Rejects an Unreachable/Incomplete (in-flight probe, no answer yet)
- * row or a short/absent physical address.
+ * Probe, or Permanent — carrying at least a full 6-byte physical address.
+ * Note "at least": the length test is `>= 6`, not `== 6`, so a longer
+ * non-Ethernet hardware address (FireWire EUI-64, 20-byte IPoIB) is also
+ * accepted and format_mac48 then renders only its first 6 bytes. That is
+ * byte-faithful to the filter this replaced and is deliberately NOT changed
+ * here; the macOS leg requires exactly 6 and the Linux leg filters to
+ * ARPHRD_ETHER, so the three legs genuinely disagree — tracked separately
+ * rather than silently converged in an extraction change. Rejects an
+ * Unreachable/Incomplete (in-flight probe, no answer yet) row or a
+ * short/absent physical address. This is byte-faithful to the inline
+ * `switch (row.State)` it replaces, which was itself the successor to an
+ * older MIB_IPNET_TYPE_DYNAMIC | MIB_IPNET_TYPE_STATIC filter.
  *
  * `state` and `phys_len` are plain ints rather than NL_NEIGHBOR_STATE/USHORT
  * so this header stays platform-neutral like its Linux/macOS siblings; the

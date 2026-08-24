@@ -229,26 +229,55 @@ inline int degrade_severity(YuzuResultStatus status) {
  * Secondary tie-break for a same-severity worst_of() merge, consulted ONLY
  * when degrade_severity() ties — every other pair keeps the original
  * "earliest-accumulated report wins" rule unchanged (governance-deferred
- * #3253).
+ * #3253, extended to the DNS pair in the same governance round).
  *
- * The gap #3253 found: `scan:timeout` ("the whole back half of the scan
- * didn't run") is strictly more actionable than `arp:table_truncated`
- * ("some cached neighbours are missing") when both are CONSTRAINED — but
- * plain accumulation order let the ARP condition win because Step 1
- * (ARP read) always runs before Step 4 (the scan deadline).
+ * The shared principle behind both named pairs: **a scan-level timeout
+ * dominates a data-completeness degrade.** `scan:timeout` says "the back
+ * half of the scan didn't run at all", which is strictly more actionable
+ * than "the part that did run returned less data than it might have" —
+ * and it is the reason an operator needs in order to know the result is
+ * not merely thinner but truncated in scope. Plain accumulation order
+ * loses it in both cases, because on the path each pair was filed for the
+ * data-completeness condition is observed FIRST (this is NOT universal —
+ * the probe loop's own timeout accumulates before the DNS degrade — but
+ * that ordering is harmless, since only `scan:timeout` is ever a preferred
+ * candidate and it therefore survives as `current` either way):
  *
- * Checks that ONE named pair explicitly, rather than ranking
- * `arp:table_truncated` below every other reason: a scalar rank would also
- * silently demote `arp:table_truncated` against `icmp:ping_group_range` and
- * `dns:hostname_lookup_degraded` — both real CONSTRAINED-severity reasons
- * that can tie with it in the very same scan_subnet call — which #3253
- * never asked for. Extend this deliberately, one named pair at a time,
- * rather than inventing a general actionability ordering nobody has asked
- * for yet.
+ *   - `arp:table_truncated` (Step 1, the ARP read) accumulates before any
+ *     `scan:timeout` — the gap #3253 filed.
+ *   - `dns:hostname_lookup_degraded` accumulates before the hostname
+ *     loop's own `scan:timeout` a few lines later in do_scan_subnet —
+ *     the identical defect shape in the same function, closed here rather
+ *     than left as new debt behind #3253's fix.
+ *
+ * Note on which deadline actually fires: the probe loop's own timeout is
+ * near-unreachable in practice (its budget ceiling is well under
+ * kScanTimeoutSeconds), so the `scan:timeout` that reaches worst_of is
+ * almost always the HOSTNAME loop's. That is also why the DNS pair matters
+ * more than it looks — see the reachability note in the tests.
+ *
+ * Known, deliberately NOT closed here: `icmp:transmit_blocked` and
+ * `icmp:ping_group_range` can also tie with a later `scan:timeout` and
+ * still lose it under earliest-wins. Whether an ICMP-blocked sweep is a
+ * "data-completeness" degrade in this principle's sense is a genuine
+ * judgment call rather than an oversight, so it is tracked as a follow-up
+ * rather than widened silently in the same round.
+ *
+ * Both are checked as EXPLICIT NAMED PAIRS rather than by ranking the
+ * data-completeness reasons below every other reason. A scalar rank would
+ * silently demote `arp:table_truncated` against `icmp:ping_group_range`
+ * and `dns:hostname_lookup_degraded` — both real CONSTRAINED-severity
+ * reasons that can tie with it in the very same scan_subnet call — which
+ * neither #3253 nor this extension asked for. Keep extending it one named
+ * pair at a time, with the pair's own regression test, rather than
+ * inventing a general actionability ordering nobody has asked for yet.
  */
 inline bool degrade_tie_prefers_candidate(std::string_view current_reason,
                                           std::string_view candidate_reason) {
-    return current_reason == "arp:table_truncated" && candidate_reason == "scan:timeout";
+    if (candidate_reason != "scan:timeout")
+        return false;
+    return current_reason == "arp:table_truncated" ||
+           current_reason == "dns:hostname_lookup_degraded";
 }
 
 /**
