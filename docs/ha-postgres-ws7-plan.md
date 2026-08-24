@@ -140,12 +140,12 @@ pins containers, not hosts; co-locating all three voids the RPO=0-across-host-fa
 ## 6. File inventory (slice 1)
 ```
 deploy/docker/ha-postgres/Dockerfile.postgres-ha      # FROM yuzu-postgres + pinned Patroni
-deploy/docker/ha-postgres/patroni.yml.tmpl            # Patroni config (env-templated bootstrap)
-deploy/docker/ha-postgres/patroni-entrypoint.sh       # renders config, runs our init on bootstrap
+deploy/docker/ha-postgres/patroni-entrypoint.sh       # GENERATES the Patroni config from env +
+                                                      #   runs the shipped init on bootstrap (post_init)
 deploy/docker/ha-postgres/haproxy.cfg                 # :5432 → primary (Patroni REST health check)
 deploy/docker/docker-compose.ha-postgres.yml          # the opt-in profile: 3×pg + etcd + haproxy
-scripts/ha/ha-pg-smoke.sh                             # WS-9 seed: bring up, kill primary, prove
-                                                      #   failover + zero acknowledged-write loss
+scripts/ha/ha-pg-smoke.sh                             # WS-9 seed: single failover + concurrent-writer RPO
+scripts/ha/ha-pg-failover-cycles.sh                  # WS-9 seed: repeated-failover soak
 docs/user-manual/ha-postgres.md                       # operator setup + BYO-vs-shipped + failure domains
 docs/ha-postgres-ws7-plan.md                          # this plan
 changelog.d/<PR#>-ha-postgres-profile.added.md        # fragment
@@ -164,6 +164,22 @@ scripts/check-compose-versions.sh                     # add the new compose to F
   WS-7. This plan does not delete or replace it.
 - **WS-11 HA-state observability** (leader identity/epoch, replica lag, quorum state metrics) — its
   own workstream.
+- **In-cluster control-plane hardening for untrusted/multi-host networks** — etcd client/peer TLS +
+  auth, Patroni REST auth/TLS, `hostssl` Postgres, and a two-network split (etcd + PG nodes on an
+  `internal` backend behind HAProxy). As shipped the coordination services are unauthenticated but
+  reachable only within the cluster's Docker network (no host ports published); the operator manual's
+  "Production requirements" states the hardening obligation. Doing it *in the shipped profile* is a
+  follow-on once a customer needs a cross-host deployment.
+- **`synchronous_mode_strict` is OPT-IN (`YUZU_PG_SYNC_STRICT`, default off), and its failover timing
+  needs validation — a real ADR-2002 §11 tension the kickoff surfaced.** The ADR calls for
+  fail-closed-on-quorum-loss (strict). But kickoff measurement found that with strict mode *on*, writes
+  did **not** resume within a 5-minute window after even a *single*-node failover — the promoted primary
+  blocks until its surviving standby re-establishes synchronous replication. Default-**off** keeps
+  single-failover recovery fast (RTO ~30 s; RPO=0 while ≥1 standby is available) and degrades to async
+  only on *total* standby loss (a double failure). Whether strict mode can be made to recover promptly
+  (Patroni tuning, or a version/behaviour issue) — plus a test asserting the intended write-stall on
+  true quorum loss and an async-profile RPO characterisation — is a WS-9 item. The ADR assumes strict
+  is operationally clean; this measurement says it needs a closer look before it can be the default.
 - **The two routed-concern moves ADR-2002 §14 flags** (AuthDB in-memory sessions; the clock-guard
   `auth_db`-sweep single-writer rule → shared PG rows under an ADR-0012 advisory lock) — these are
   server-tier / coordination concerns, not storage delivery.
@@ -177,17 +193,26 @@ The stack was brought up and failover proven end-to-end with `scripts/ha/ha-pg-s
   (…)`), both standbys streaming with lag 0; the shipped two-password/pgvector init runs via
   Patroni's `post_init` hook (byte-identical to the single-node image).
 - **Single failover** — kill the primary → a caught-up standby is promoted, and writes resume through
-  the **unchanged** HAProxy endpoint. **RTO ≈ 36 s, RPO = 0** (all pre-kill committed rows survived).
+  the **unchanged** HAProxy endpoint. **RTO ≈ 30–37 s, RPO = 0** (all acknowledged pre-kill rows
+  survived) under the default (`YUZU_PG_SYNC_STRICT=false`) quorum profile.
 - **Repeated-failover soak** — 3 consecutive failovers, each killing a *different* primary, with a
-  full pg_rewind rejoin between cycles: **RTOs 36.5 / 29.6 / 36.4 s, RPO = 0 throughout**.
+  node rejoin between cycles (via pg_rewind or reclone — the harness asserts the node re-streams):
+  **RTOs ~30–37 s, RPO = 0 throughout**.
 
-Three harness bugs were found and fixed during validation (recorded so the WS-9 harness carries the
-lessons): (1) the failover test must wait for a **caught-up sync standby** before killing the primary
-— killing mid-`pg_basebackup` leaves no promotable node; (2) **static IPs are load-bearing** — Docker
-purges a stopped container's DNS record, turning Patroni's leader-race probe into a resolution
-failure that deadlocks promotion in quorum mode; real deployments (stable addresses) don't hit this,
-and static IPs mirror them; (3) every DB probe needs a hard `timeout` — a connection opened during the
-brief "HAProxy has no backend" window can stall on a backend that died mid-handshake.
+Harness lessons found and fixed during validation (so the WS-9 harness carries them): (1) wait for
+**both** standbys caught up before the kill — under strict mode a lone caught-up standby leaves the
+promoted survivor blocked, and even under the default it makes failover cleaner; (2) **static IPs are
+load-bearing** — Docker purges a stopped container's DNS record, turning Patroni's leader-race probe
+into a resolution failure that deadlocks promotion in quorum mode (real deployments with stable
+addresses don't hit this; static IPs mirror them); (3) every DB probe needs a hard `timeout` — a
+connection opened during the brief "HAProxy has no backend" window can stall on a backend that died
+mid-handshake; (4) the strict-mode finding above (§7) — the most important outcome of the kickoff.
+
+An adversarial concurrent-load RPO test (commit rows continuously across the kill, verify the exact
+acknowledged set) was prototyped but is deferred to WS-9: it entangles with the strict-mode
+write-blocking behaviour and needs the strict-mode timing resolved first. The shipped harness proves
+RPO=0 on the acknowledged pre-kill set, which is a valid guarantee for the default quorum profile
+(an acknowledged write is on a synchronous standby by construction).
 
 The measured ~36 s end-to-end RTO is Patroni's default 30 s `ttl` plus HAProxy convergence; it is
 tunable lower (§4 / operator manual). This exceeds the ADR's "~10–30 s" Patroni-internal figure
@@ -201,3 +226,11 @@ but adds a `docker-publish` job and a supply-chain surface. Building locally in 
 keeps the release matrix unchanged but ships a Dockerfile the customer builds. **Recommendation:**
 publish it (`yuzu-postgres-ha`) for parity with the shipped-image model — flagged for
 `release-deploy` + `build-ci`.
+
+**If we publish, the publish path must:** (a) add a `docker-publish-postgres-ha` job to
+`release.yml` mirroring `docker-publish-postgres` (cosign keyless + SLSA provenance + SBOM); (b) switch
+the compose's `HA_BASE` default and the `yuzu-postgres-ha` reference to `${YUZU_VERSION:-X.Y.Z}` GHCR
+tags — `check-compose-versions.sh`'s regex was **already extended to match `yuzu-postgres-ha`** in this
+change, so the tag will be version-gated the moment it appears; (c) install the Python deps with
+`--require-hashes` from a hash-locked requirements file (the Dockerfile pins exact versions today;
+hashes are the release-grade step). etcd + HAProxy are now digest-pinned in the compose.

@@ -17,6 +17,8 @@
 #   YUZU_DB_USER/NAME/PASSWORD    app role/db/password — consumed by the
 #                            inherited post_init init script, NOT here  [required]
 #   YUZU_PG_DURABILITY       quorum3 (default) | sync2 | async          [default: quorum3]
+#   YUZU_PG_SYNC_STRICT      fail-closed on total standby loss          [default: false]
+#   YUZU_PG_TRUST_CIDR       CIDR allowed host (TCP) connections        [default: 0.0.0.0/0]
 set -euo pipefail
 
 : "${PATRONI_SCOPE:?PATRONI_SCOPE is required}"
@@ -27,6 +29,20 @@ set -euo pipefail
 POSTGRES_USER="${POSTGRES_USER:-postgres}"
 PATRONI_CONNECT_HOST="${PATRONI_CONNECT_HOST:-$PATRONI_NAME}"
 YUZU_PG_DURABILITY="${YUZU_PG_DURABILITY:-quorum3}"
+# CIDR permitted to open host (TCP) connections — replication + app. Defaults
+# OPEN so a bring-your-own network works out of the box; the shipped compose
+# pins it to the cluster subnet (defence in depth behind scram + the container
+# network boundary — the compose publishes no host ports).
+YUZU_PG_TRUST_CIDR="${YUZU_PG_TRUST_CIDR:-0.0.0.0/0}"
+[[ "${YUZU_PG_TRUST_CIDR}" == "0.0.0.0/0" ]] && \
+  echo "patroni-entrypoint: WARNING — YUZU_PG_TRUST_CIDR is open (0.0.0.0/0); host connections are scram-authed but NOT network-scoped. The shipped compose pins the cluster subnet; set YUZU_PG_TRUST_CIDR for a bring-your-own network." >&2
+
+# YAML-quote a scalar so a password containing YAML-significant characters
+# (: # newline etc.) cannot break the generated config or inject keys. A single-
+# quoted YAML scalar escapes an embedded quote by doubling it.
+yq_scalar() { printf "'%s'" "${1//\'/\'\'}"; }
+POSTGRES_PASSWORD_Y="$(yq_scalar "${POSTGRES_PASSWORD}")"
+REPL_PASSWORD_Y="$(yq_scalar "${YUZU_PG_REPLICATION_PASSWORD}")"
 
 # PGDATA at the base image's version-pinned subdir; the PARENT is the mounted
 # volume (never mount .../data — PG18 reads it as an un-migrated upgrade).
@@ -34,15 +50,28 @@ PGDATA_DIR="/var/lib/postgresql/18/docker"
 PG_BIN_DIR="/usr/lib/postgresql/18/bin"
 
 # ── Durability profile → Patroni synchronous settings (ADR-2002 §11) ──────
-# quorum3 (default): ANY 1 of the standbys must confirm → RPO=0 while ≥1 up,
-#   writes stall only if BOTH standbys are lost. (Patroni quorum commit.)
+# quorum3 (default): ANY 1 of the standbys must confirm → RPO=0 while ≥1 sync
+#   standby is available (the normal case, incl. after a single failover).
 # sync2: FIRST 1 — one designated sync standby; single-standby loss stalls
 #   writes (the §11 footgun; offered, not default).
 # async: no synchronous standby — max availability, bounded data loss.
+#
+# synchronous_mode_strict (YUZU_PG_SYNC_STRICT, default FALSE): what happens when
+# NO eligible sync standby remains (total standby loss — a double failure on a
+# 3-node cluster). OFF (default): Patroni clears synchronous_standby_names and
+# the lone primary continues in DEGRADED async mode — availability over
+# durability, a bounded-loss window until a standby returns. ON: the primary
+# BLOCKS writes (fail-closed on quorum loss, ADR-2002 §11 / ADR-0007 intent) —
+# but this can also EXTEND post-failover write-unavailability while the surviving
+# standby re-establishes sync, so VALIDATE failover timing in your environment
+# before enabling (kickoff testing measured a materially longer write-resume with
+# it on; see docs/ha-postgres-ws7-plan.md). Off by default so single-failover
+# recovery stays fast and reliable. async is never strict.
+YUZU_PG_SYNC_STRICT="${YUZU_PG_SYNC_STRICT:-false}"
 case "${YUZU_PG_DURABILITY}" in
-  quorum3) SYNC_MODE="quorum"; SYNC_COUNT=1 ;;
-  sync2)   SYNC_MODE="true";   SYNC_COUNT=1 ;;
-  async)   SYNC_MODE="false";  SYNC_COUNT=0 ;;
+  quorum3) SYNC_MODE="quorum"; SYNC_COUNT=1; SYNC_STRICT="${YUZU_PG_SYNC_STRICT}" ;;
+  sync2)   SYNC_MODE="true";   SYNC_COUNT=1; SYNC_STRICT="${YUZU_PG_SYNC_STRICT}" ;;
+  async)   SYNC_MODE="false";  SYNC_COUNT=0; SYNC_STRICT="false" ;;
   *) echo "patroni-entrypoint: unknown YUZU_PG_DURABILITY='${YUZU_PG_DURABILITY}' (want quorum3|sync2|async)" >&2; exit 1 ;;
 esac
 
@@ -75,6 +104,7 @@ bootstrap:
     retry_timeout: 10
     maximum_lag_on_failover: 1048576
     synchronous_mode: ${SYNC_MODE}
+    synchronous_mode_strict: ${SYNC_STRICT}
     synchronous_node_count: ${SYNC_COUNT}
     postgresql:
       use_pg_rewind: true
@@ -92,13 +122,17 @@ bootstrap:
   initdb:
     - encoding: UTF8
     - data-checksums
-  # pg_hba the cluster bootstraps with. local trust lets the post_init hook run
-  # the inherited app-init over the unix socket (container-internal only);
-  # TCP always requires scram.
+  # pg_hba the cluster bootstraps with. Local trust is scoped to the SUPERUSER
+  # only (the post_init hook runs the inherited app-init over the unix socket);
+  # every other principal — local or TCP — needs scram. Host connections are
+  # scoped to YUZU_PG_TRUST_CIDR, with an explicit reject fallthrough.
   pg_hba:
-    - local all all trust
-    - host replication replicator 0.0.0.0/0 scram-sha-256
-    - host all all 0.0.0.0/0 scram-sha-256
+    - local all ${POSTGRES_USER} trust
+    - local all all scram-sha-256
+    - host replication replicator ${YUZU_PG_TRUST_CIDR} scram-sha-256
+    - host all all ${YUZU_PG_TRUST_CIDR} scram-sha-256
+    - host all all 0.0.0.0/0 reject
+    - host all all ::/0 reject
   # Re-invoke the SHIPPED first-boot init (same script as the single-node
   # image) on the bootstrap primary — creates the app role/db + pgvector with
   # the byte-identical two-password contract. Runs once, cluster-wide.
@@ -113,13 +147,13 @@ postgresql:
   authentication:
     superuser:
       username: ${POSTGRES_USER}
-      password: ${POSTGRES_PASSWORD}
+      password: ${POSTGRES_PASSWORD_Y}
     replication:
       username: replicator
-      password: ${YUZU_PG_REPLICATION_PASSWORD}
+      password: ${REPL_PASSWORD_Y}
     rewind:
       username: ${POSTGRES_USER}
-      password: ${POSTGRES_PASSWORD}
+      password: ${POSTGRES_PASSWORD_Y}
   parameters:
     unix_socket_directories: /var/run/postgresql
 
@@ -129,6 +163,14 @@ tags:
   clonefrom: false
   nosync: false
 EOF
+
+# The generated config holds three plaintext passwords — keep it owner-only, and
+# fail fast if it is not valid YAML (e.g. a password the quoting above somehow
+# did not tame) rather than launching Patroni against a broken file. The venv's
+# python has PyYAML (a Patroni dependency).
+chmod 600 "${CONFIG}"
+python -c 'import yaml,sys; yaml.safe_load(open(sys.argv[1]))' "${CONFIG}" \
+  || { echo "patroni-entrypoint: generated ${CONFIG} is not valid YAML — refusing to start" >&2; exit 1; }
 
 # Ownership: the mounted volume parent + runtime dirs must be writable by the
 # postgres OS user that Patroni (and PG) run as.

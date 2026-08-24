@@ -23,8 +23,8 @@
 #
 # Release: published as ghcr.io/<owner>/yuzu-postgres-ha:<version> alongside
 # the other images (cosign + SLSA + SBOM) — see docs/ha-postgres-ws7-plan.md §9.
-# The Patroni pin below is a range for the kickoff; a release build MUST pin an
-# exact version + hash (mirroring the pgvector commit-pin discipline).
+# The Patroni/psycopg2 pins below are EXACT; a release build MUST additionally
+# install with --require-hashes (mirroring the pgvector commit-pin discipline).
 
 ARG HA_BASE=yuzu-postgres:local
 FROM ${HA_BASE}
@@ -34,14 +34,18 @@ FROM ${HA_BASE}
 # build toolchain (prebuilt wheel), so the layer stays lean.
 #   - patroni[etcd3]: the v3 etcd API (v2 is deprecated/disabled by default in
 #     etcd 3.4+).
-#   - Range pin for kickoff; a release build pins exact + digest.
+#   - EXACT pins (the versions this profile was built and failover-validated
+#     against). A release build should additionally install with --require-hashes
+#     from a hash-locked requirements file (tracked, plan §9).
+#   - curl is a RUNTIME dependency, not build-only: the failover harness probes
+#     each node's Patroni REST API via `docker exec <node> curl :8008/primary`.
 USER root
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends python3 python3-venv curl; \
     python3 -m venv /opt/patroni; \
     /opt/patroni/bin/pip install --no-cache-dir --upgrade pip; \
-    /opt/patroni/bin/pip install --no-cache-dir 'patroni[etcd3]>=4.0,<4.1' 'psycopg2-binary>=2.9,<3'; \
+    /opt/patroni/bin/pip install --no-cache-dir 'patroni[etcd3]==4.0.11' 'psycopg2-binary==2.9.12'; \
     rm -rf /var/lib/apt/lists/*
 ENV PATH=/opt/patroni/bin:$PATH
 

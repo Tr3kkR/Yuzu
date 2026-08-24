@@ -31,10 +31,17 @@ ROWS="${ROWS:-200}"
 KEEP=0
 [[ "${1:-}" == "--keep" ]] && KEEP=1
 
-# App credentials — must match the compose defaults (or the env you overrode).
+# App credentials. The compose REQUIRES all three passwords (no insecure
+# defaults); export dev values here for the harness (overridable from the env).
 APP_USER="${YUZU_DB_USER:-yuzu}"
 APP_DB="${YUZU_DB_NAME:-yuzu}"
 APP_PASS="${YUZU_DB_PASSWORD:-yuzu-app-dev}"
+export YUZU_SUPERUSER_PASSWORD="${YUZU_SUPERUSER_PASSWORD:-yuzu-super-dev}"
+export YUZU_PG_REPLICATION_PASSWORD="${YUZU_PG_REPLICATION_PASSWORD:-yuzu-repl-dev}"
+export YUZU_DB_PASSWORD="${APP_PASS}"
+
+[[ "${ROWS}" =~ ^[0-9]+$ && "${ROWS}" -gt 0 ]] \
+  || { echo "ROWS must be a positive integer (got '${ROWS}')" >&2; exit 1; }
 
 # The HA image builds `FROM yuzu-postgres:local` (a local-only tag). That
 # resolves only on a buildx builder that shares the local image store — the
@@ -112,18 +119,28 @@ done
 # refuses ("not healthy enough for leader race") and the cluster stalls. Only
 # once a standby is STREAMING in the sync/quorum set is a failover survivable
 # with RPO=0. (This is a real property any failover test must assert.)
-say "Waiting for a synchronous standby to catch up (failover-safety gate)"
+# Require BOTH standbys caught up, not just one. Under synchronous_mode_strict,
+# the node that gets promoted must have a caught-up sync standby before it will
+# accept writes; if we kill while a standby is still cloning, the survivor that
+# promotes is left waiting on the behind standby and writes stall far longer than
+# a real failover. Waiting for all N-1 standbys guarantees the survivor is synced.
+NEED_SYNC=$(( ${#NODES[@]} - 1 ))
+say "Waiting for both synchronous standbys to catch up (failover-safety gate)"
 for i in $(seq 1 90); do
   synced="$(timeout 15 docker exec "${primary}" psql -U "${YUZU_SUPERUSER_NAME:-postgres}" -d postgres -tAc \
     "SELECT count(*) FROM pg_stat_replication WHERE state='streaming' AND sync_state IN ('sync','quorum')" 2>/dev/null || echo 0)"
-  if [[ "${synced:-0}" -ge 1 ]]; then ok "synchronous standby streaming and caught up (${synced})"; break; fi
+  if [[ "${synced:-0}" -ge "${NEED_SYNC}" ]]; then ok "both synchronous standbys streaming and caught up (${synced})"; break; fi
   sleep 2
-  [[ "${i}" -eq 90 ]] && die "no synchronous standby caught up within 180s"
+  [[ "${i}" -eq 90 ]] && die "both synchronous standbys not caught up within 180s (strict mode needs the survivor already synced for a fast failover)"
 done
 
 # ── 2. pre-kill writes (each its own committed txn) ───────────────────────
 say "Writing ${ROWS} committed rows through the server-facing endpoint"
-appsql "CREATE TABLE IF NOT EXISTS ha_smoke(id bigserial primary key, ts timestamptz default now())" >/dev/null
+# DROP first so the run is deterministic even if a prior cluster left the volume
+# behind. Static rows take ids 1..ROWS via the sequence, so the concurrent
+# DEFAULT VALUES writes below (nextval) start at ROWS+1 — no PK collision.
+appsql "DROP TABLE IF EXISTS ha_smoke" >/dev/null
+appsql "CREATE TABLE ha_smoke(id bigserial primary key, ts timestamptz default now())" >/dev/null
 appsql "INSERT INTO ha_smoke SELECT nextval('ha_smoke_id_seq') FROM generate_series(1, ${ROWS})" >/dev/null
 before="$(appsql 'SELECT count(*) FROM ha_smoke')"
 [[ "${before}" == "${ROWS}" ]] || die "expected ${ROWS} rows pre-kill, got ${before}"
@@ -131,18 +148,15 @@ ok "${before} rows committed and acknowledged"
 
 # ── 3. kill the primary, measure failover ─────────────────────────────────
 say "Killing the primary (${primary}) — simulating a host/node loss"
-# Disable the restart policy first so the SIGKILL sticks — otherwise
-# `restart: unless-stopped` treats the kill as a crash and Docker brings the
-# node straight back, and no failover is ever triggered.
+# Disable restart first so the SIGKILL sticks (else restart:unless-stopped revives it).
 docker update --restart=no "${primary}" >/dev/null 2>&1 || true
 kill_ts="$(date +%s.%N)"
 docker kill "${primary}" >/dev/null
 
-# Measure RTO as the operator-visible quantity: time from the kill until writes
-# flow again through the unchanged HAProxy endpoint. Wall-clock deadline (not an
-# iteration count) so per-probe latency can't skew the budget.
+# Wait until writes flow again through the unchanged HAProxy endpoint. Wall-clock
+# deadline; RTO is the operator-visible time to write-resumption.
 say "Waiting for automatic failover (writes resume via HAProxy)"
-deadline=$(( $(date +%s) + 120 ))
+deadline=$(( $(date +%s) + 180 ))
 new_primary=""
 while [[ "$(date +%s)" -lt "${deadline}" ]]; do
   if [[ "$(appsql 'SELECT NOT pg_is_in_recovery()' 2>/dev/null || true)" == "t" ]]; then
@@ -151,18 +165,20 @@ while [[ "$(date +%s)" -lt "${deadline}" ]]; do
   fi
   sleep 2
 done
-[[ -n "${new_primary}" ]] || die "no write-capable primary via HAProxy within 120s"
+[[ -n "${new_primary}" && "${new_primary}" != "${primary}" ]] || die "no write-capable new primary via HAProxy within 180s"
 rto="$(awk "BEGIN{printf \"%.1f\", $(date +%s.%N) - ${kill_ts}}")"
 ok "failover complete: new primary ${new_primary}, writes resumed, RTO ≈ ${rto}s"
 
-# ── 4. RPO=0 + writes resume ──────────────────────────────────────────────
+# ── 4. RPO=0 — every acknowledged pre-kill row survives ────────────────────
 say "Verifying zero acknowledged-write loss (RPO=0) and resumed writes"
 after="$(appsql 'SELECT count(*) FROM ha_smoke')"
-[[ "${after}" == "${ROWS}" ]] || die "RPO VIOLATION: ${before} rows before, ${after} after failover"
-ok "all ${after} pre-kill rows survived the failover (RPO=0)"
+[[ "${after}" == "${ROWS}" ]] || die "RPO VIOLATION: ${ROWS} acknowledged rows before, ${after} after failover"
+ok "all ${after} acknowledged pre-kill rows survived the failover (RPO=0)"
+
+# one more committed write proves the new primary accepts application writes end-to-end
 appsql "INSERT INTO ha_smoke DEFAULT VALUES" >/dev/null
 resumed="$(appsql 'SELECT count(*) FROM ha_smoke')"
-[[ "${resumed}" -gt "${after}" ]] || die "writes did not resume after failover"
-ok "writes resumed on the new primary (${resumed} rows total)"
+[[ "${resumed}" -gt "${after}" ]] || die "application writes did not resume on the new primary"
+ok "application writes resumed on the new primary (${resumed} rows total)"
 
-say "SMOKE PASSED — automatic failover, RTO ≈ ${rto}s, RPO=0"
+say "SMOKE PASSED — automatic failover, RTO ≈ ${rto}s, RPO=0 (${ROWS} acknowledged rows preserved)"

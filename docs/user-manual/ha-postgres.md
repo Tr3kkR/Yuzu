@@ -67,11 +67,28 @@ Selected with `YUZU_PG_DURABILITY` on the Postgres nodes:
 | `sync2` | 1 primary + 1 designated sync standby | Writes **stall** if that one standby is lost | None while the standby is up |
 | `async` | No synchronous standby | Maximum — writes never wait on a standby | Up to the replication lag at the moment of failure |
 
-**Why `quorum3` is the default:** it gives RPO = 0 without the `sync2` footgun, where losing the
-single standby stalls *all* writes. With `quorum3`, writes only stall if **both** standbys are lost —
-at which point the cluster deliberately blocks writes rather than risk acknowledging a write it
-cannot protect (fail-closed, consistent with ADR-0007). **Losing quorum blocks writes; it never
-loses acknowledged data.**
+**Why `quorum3` is the default:** it gives RPO = 0 without the `sync2` footgun (losing the single
+standby stalls *all* writes). With `quorum3`, **RPO = 0 holds while at least one synchronous standby
+is available** — including after an ordinary single-node failover.
+
+**Behaviour on total standby loss** (both standbys gone — a double failure on a 3-node cluster) is
+**selectable** via `YUZU_PG_SYNC_STRICT`:
+
+- **`false` (default)** — the lone primary continues in **degraded async mode**: it keeps accepting
+  writes (availability over durability), opening a bounded data-loss window until a standby returns.
+  Single-node failover recovers quickly and reliably.
+- **`true`** — the primary **blocks writes** when no synchronous standby is available (fail-closed on
+  quorum loss — the ADR-2002 §11 / ADR-0007 intent; it never acknowledges a write it cannot protect).
+  **Validate failover timing before enabling:** kickoff testing measured a materially longer time for
+  writes to resume after even a *single* failover with strict mode on (the promoted primary blocks
+  until its surviving standby re-establishes synchronous replication). It is off by default so that
+  ordinary failover stays fast; enable it where a bounded-loss window is unacceptable and the extra
+  failover latency is acceptable.
+
+> **Set the profile before first boot.** `YUZU_PG_DURABILITY` is applied at cluster
+> **initialization** (it seeds Patroni's DCS `bootstrap.dcs`). Changing it on an already-initialized
+> cluster has no effect through this variable — adjust a running cluster through Patroni's config API
+> (`patronictl edit-config`), or re-initialize.
 
 ## Production requirements (read before deploying)
 
@@ -85,8 +102,21 @@ production-grade. You **must**:
    host the profile is for testing only.
 3. **Supply real, distinct secrets** for all three roles: the superuser password
    (`YUZU_SUPERUSER_PASSWORD`), the application role password (`YUZU_DB_PASSWORD`), and the
-   replication password (`YUZU_PG_REPLICATION_PASSWORD`). The application-role init **refuses to run**
-   if the app password equals the superuser password.
+   replication password (`YUZU_PG_REPLICATION_PASSWORD`). These are **required** — the profile ships
+   with no default passwords — and the application-role init **refuses to run** if the app password
+   equals the superuser password. Prefer Docker secrets or an `.env` file over inline values.
+4. **Run HAProxy redundantly.** The shipped profile runs a single HAProxy — itself a single point of
+   failure in front of the cluster. Run it behind a VIP (e.g. keepalived), or use the libpq multi-host
+   DSN (the "Bring your own" option above) so a lost HAProxy does not take the database offline.
+5. **Harden the control plane before any untrusted network.** As shipped, the coordination services
+   are **unauthenticated** and reachable only from within the cluster's Docker network (the compose
+   publishes **no host ports**): **etcd** (`:2379`, no auth/TLS) and each node's **Patroni REST API**
+   (`:8008`, no auth) — and Patroni REST exposes *mutating* endpoints (`/switchover`, `/failover`,
+   `/restart`, config changes), so a compromised peer container on that network can drive the cluster.
+   Postgres and replication traffic are likewise plaintext, and `pg_hba` host rules are scoped to the
+   cluster subnet (`YUZU_PG_TRUST_CIDR`). Before running across hosts or on a shared network, enable
+   etcd client/peer TLS + auth, Patroni REST auth/TLS, and `hostssl` for Postgres, and segment etcd +
+   the PG nodes onto an `internal` network behind HAProxy.
 
 ## What the server experiences during a failover
 
@@ -108,8 +138,9 @@ runbook lands, continue to take backups per your existing disaster-recovery proc
 
 ## Monitoring
 
-- **HAProxy stats** are exposed inside the cluster network on port `7000` (which node is primary,
-  backend up/down).
+- **HAProxy stats** are bound to `127.0.0.1:7000` inside the haproxy container (which node is primary,
+  backend up/down) — reach them with `docker exec yuzu-ha-haproxy wget -qO- http://127.0.0.1:7000/`.
+  They are container-local so peer containers cannot read the backend topology.
 - **Patroni REST API** on each node's port `8008`: `GET /primary` (200 on the leader), `GET /replica`
   (200 on a running replica), `GET /health`, `GET /cluster` (full topology).
 - Prometheus metrics for leader identity, replica lag, and quorum state are delivered separately

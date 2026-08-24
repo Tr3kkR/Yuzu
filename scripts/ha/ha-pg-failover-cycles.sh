@@ -5,7 +5,8 @@
 # RELIABLY and repeatedly: it kills the current primary, verifies promotion +
 # RPO=0 through the unchanged HAProxy endpoint, restarts the killed node, waits
 # for full 3-node health, and repeats — so successive cycles kill different
-# nodes and exercise pg_rewind rejoin. Reports per-cycle RTO.
+# nodes and exercise node rejoin (via pg_rewind or a reclone; the harness asserts
+# the node re-streams, not which path Patroni took). Reports per-cycle RTO.
 #
 # Usage:
 #   bash scripts/ha/ha-pg-failover-cycles.sh            # 3 cycles, tears down
@@ -25,6 +26,11 @@ export BUILDX_BUILDER="${YUZU_HA_BUILDER:-default}"
 
 APP_USER="${YUZU_DB_USER:-yuzu}"; APP_DB="${YUZU_DB_NAME:-yuzu}"; APP_PASS="${YUZU_DB_PASSWORD:-yuzu-app-dev}"
 SUPER="${YUZU_SUPERUSER_NAME:-postgres}"
+# The compose REQUIRES all three passwords (no insecure defaults) — export dev
+# values for the harness (overridable from the env).
+export YUZU_SUPERUSER_PASSWORD="${YUZU_SUPERUSER_PASSWORD:-yuzu-super-dev}"
+export YUZU_PG_REPLICATION_PASSWORD="${YUZU_PG_REPLICATION_PASSWORD:-yuzu-repl-dev}"
+export YUZU_DB_PASSWORD="${APP_PASS}"
 
 say() { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
 ok()  { printf '\033[1;32m  ✓ %s\033[0m\n' "$*"; }
@@ -90,8 +96,13 @@ for i in $(seq 1 60); do
   fi
   sleep 2; [[ "${i}" -eq 60 ]] && die "cluster not write-ready within 120s"
 done
+# Require BOTH standbys caught up before the first kill — under
+# synchronous_mode_strict the promoted survivor must already have a synced sync
+# standby or it blocks writes far longer than a real failover (the per-cycle
+# rejoin below waits for the same full health).
+wait_full_health "${primary}" "$(( ${#NODES[@]} - 1 ))" >/dev/null || die "not all standbys caught up"
 wait_sync_standby "${primary}" >/dev/null || die "no sync standby caught up"
-ok "cluster healthy, primary=${primary}"
+ok "cluster healthy (all standbys synced), primary=${primary}"
 
 appsql "CREATE TABLE IF NOT EXISTS ha_cycles(id bigserial primary key, cycle int, note text, ts timestamptz default now())" >/dev/null
 appsql "INSERT INTO ha_cycles(cycle,note) SELECT 0,'baseline' FROM generate_series(1,100)" >/dev/null
