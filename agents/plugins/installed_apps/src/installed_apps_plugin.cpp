@@ -23,8 +23,6 @@
 #include <yuzu/plugin.hpp>
 
 #include <algorithm>
-#include <array>
-#include <cstdio>
 #include <format>
 #include <string>
 #include <string_view>
@@ -33,9 +31,21 @@
 // Pure parse/format helpers for the list_inventory action (v2 rows). In a
 // header so the unit test exercises the same code (pattern: #1662).
 #include "installed_apps_inventory.hpp"
+// Pure parse helpers for list/query/list_per_user's acquisition legs, plus
+// the #2273 macOS pkgutil enrichment's own parsers (Wave 4 PR4.3a).
+#include "installed_apps_parsers.hpp"
 
 #if defined(__linux__) || defined(__APPLE__)
+#include <chrono>
 #include <sstream>
+
+#include <spdlog/spdlog.h>
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess / probe_tool_path (Wave 4 PR4.3a, ADR-3002 rung 2)
+#endif
+
+#ifdef __APPLE__
+// #2273: native CFBundle/SecStaticCode per-app enrichment for list_inventory.
+#include "installed_apps_macos_enrich.hpp"
 #endif
 
 #ifdef __linux__
@@ -68,28 +78,41 @@
 
 namespace {
 
+namespace parsers = yuzu::installed_apps::parsers;
+
 // ── subprocess helper (Linux / macOS) ──────────────────────────────────────
-
+//
+// Direct-argv, shell-free replacement for the old popen()-based run_command/
+// command_exists helpers (Wave 4 PR4.3a, ADR-3002 rung 2): argv[0] is exec'd
+// directly through the bounded runner -- no `/bin/sh -c` hop, so no
+// shell-quoting/injection surface, and every call now carries a real
+// deadline. probe_tool_path() replaces command_exists() (a stat-based probe,
+// never a spawned `command -v`). Every query format string below is
+// byte-for-byte what the old shell command line built -- see each call
+// site's own comment for the exact escaping preserved.
 #if defined(__linux__) || defined(__APPLE__)
-std::string run_command(const char* cmd) {
-    std::string result;
-    std::array<char, 256> buf{};
-    FILE* pipe = popen(cmd, "r");
-    if (!pipe)
-        return result;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        result += buf.data();
-    }
-    pclose(pipe);
-    while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
-        result.pop_back();
-    }
-    return result;
-}
+struct ToolOutcome {
+    std::string output;
+    yuzu::agent::SubprocessResult res;
+};
 
-bool command_exists(const char* cmd) {
-    auto check = std::string("command -v ") + cmd + " >/dev/null 2>&1";
-    return system(check.c_str()) == 0;
+ToolOutcome run_tool(std::vector<std::string> argv,
+                     std::chrono::seconds deadline = std::chrono::seconds{20}) {
+    if (argv.empty() || argv.front().empty())
+        return ToolOutcome{std::string{}, yuzu::agent::SubprocessResult{}};
+    auto res = yuzu::agent::run_bounded_subprocess(
+        argv, yuzu::agent::SubprocessOptions{.deadline = deadline});
+    // A cut-short enumeration returns empty/partial output that parses as "0
+    // apps/packages" -- a silent false-negative. Warn so an operator can tell
+    // a degraded enumeration from a genuinely empty one (sre-M1, matches
+    // services_plugin.cpp's run_tool precedent).
+    if (res.timed_out || !res.tool_ran || res.output_truncated) {
+        spdlog::warn(
+            "installed_apps: degraded run (timed_out={}, tool_ran={}, truncated={}): {}",
+            res.timed_out, res.tool_ran, res.output_truncated, argv.front());
+    }
+    std::string output = res.output;
+    return ToolOutcome{std::move(output), std::move(res)};
 }
 #endif
 
@@ -279,56 +302,39 @@ std::vector<AppInfo> get_installed_apps_windows() {
 std::vector<AppInfo> get_installed_apps_linux() {
     std::vector<AppInfo> apps;
 
-    if (command_exists("dpkg-query")) {
-        // Debian/Ubuntu
-        auto out = run_command(
-            "dpkg-query -W -f='${Package}|${Version}|${Maintainer}|${Status}\\n' 2>/dev/null");
-        std::istringstream ss(out);
-        std::string line;
-        while (std::getline(ss, line)) {
-            // Only include fully installed packages
-            if (line.find("install ok installed") == std::string::npos)
-                continue;
-
-            std::istringstream ls(line);
-            std::string name, version, publisher;
-            std::getline(ls, name, '|');
-            std::getline(ls, version, '|');
-            std::getline(ls, publisher, '|');
-
-            apps.push_back({name, version, publisher, "-"});
+    if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/dpkg-query", "/bin/dpkg-query"});
+        !path.empty()) {
+        // installed_apps/get_installed_apps_linux#1 (docs/agent-spawn-sink-manifest.md)
+        // Debian/Ubuntu. Format-string byte-for-byte matches the old shell
+        // command's single-quoted argument: the "\n" below is the LITERAL
+        // two-byte escape dpkg-query's own format interpreter expands (not a
+        // real newline byte) -- contrast get_inventory_linux's tab-separated
+        // sibling call, which embeds real tab/newline bytes instead.
+        auto out =
+            run_tool({path, "-W", "-f=${Package}|${Version}|${Maintainer}|${Status}\\n"}).output;
+        for (auto& rec : parsers::parse_dpkg_list(out)) {
+            // parse_dpkg_list already filters to "install ok installed" rows.
+            apps.push_back({std::move(rec.name), std::move(rec.version),
+                            std::move(rec.publisher), "-"});
         }
-    } else if (command_exists("rpm")) {
-        // RHEL/Fedora/SUSE
-        auto out = run_command(
-            "rpm -qa --queryformat "
-            "'%{NAME}|%{VERSION}-%{RELEASE}|%{VENDOR}|%{INSTALLTIME:date}\\n' 2>/dev/null");
-        std::istringstream ss(out);
-        std::string line;
-        while (std::getline(ss, line)) {
-            std::istringstream ls(line);
-            std::string name, version, publisher, date;
-            std::getline(ls, name, '|');
-            std::getline(ls, version, '|');
-            std::getline(ls, publisher, '|');
-            std::getline(ls, date, '|');
-
-            if (publisher == "(none)")
-                publisher = "-";
-            apps.push_back({name, version, publisher, date});
+    } else if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/rpm", "/bin/rpm"});
+              !path.empty()) {
+        // installed_apps/get_installed_apps_linux#2
+        // RHEL/Fedora/SUSE.
+        auto out = run_tool({path, "-qa", "--queryformat",
+                             "%{NAME}|%{VERSION}-%{RELEASE}|%{VENDOR}|%{INSTALLTIME:date}\\n"})
+                       .output;
+        for (auto& rec : parsers::parse_rpm_list(out)) {
+            apps.push_back({std::move(rec.name), std::move(rec.version),
+                            std::move(rec.publisher), std::move(rec.install_date)});
         }
-    } else if (command_exists("pacman")) {
-        // Arch Linux
-        auto out = run_command("pacman -Q 2>/dev/null");
-        std::istringstream ss(out);
-        std::string line;
-        while (std::getline(ss, line)) {
-            // Format: "name version"
-            auto sp = line.find(' ');
-            if (sp != std::string::npos) {
-                apps.push_back({line.substr(0, sp), line.substr(sp + 1), "-", "-"});
-            }
-        }
+    } else if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/pacman", "/bin/pacman"});
+              !path.empty()) {
+        // installed_apps/get_installed_apps_linux#3
+        // Arch Linux. Format: "name version".
+        auto out = run_tool({path, "-Q"}).output;
+        for (auto& rec : parsers::parse_pacman_list(out))
+            apps.push_back({std::move(rec.name), std::move(rec.version), "-", "-"});
     }
 
     std::sort(apps.begin(), apps.end(),
@@ -343,38 +349,18 @@ std::vector<AppInfo> get_installed_apps_linux() {
 std::vector<AppInfo> get_installed_apps_macos() {
     std::vector<AppInfo> apps;
 
-    // GUI applications from system_profiler
-    auto out = run_command("system_profiler SPApplicationsDataType -detailLevel mini 2>/dev/null"
-                           " | grep -E '^ {4}\\w|Version:|Last Modified:' ");
-    if (!out.empty()) {
-        std::istringstream ss(out);
-        std::string line;
-        std::string current_name;
-        std::string current_version;
-        std::string current_date;
-        while (std::getline(ss, line)) {
-            // Trim leading whitespace
-            auto start = line.find_first_not_of(" \t");
-            if (start == std::string::npos)
-                continue;
-            line = line.substr(start);
-
-            if (line.find("Version:") == 0) {
-                current_version = line.substr(line.find(':') + 2);
-            } else if (line.find("Last Modified:") == 0) {
-                current_date = line.substr(line.find(':') + 2);
-            } else if (!line.empty() && line.back() == ':') {
-                // Emit previous app
-                if (!current_name.empty()) {
-                    apps.push_back({current_name, current_version, "-", current_date});
-                }
-                current_name = line.substr(0, line.size() - 1);
-                current_version.clear();
-                current_date.clear();
-            }
-        }
-        if (!current_name.empty()) {
-            apps.push_back({current_name, current_version, "-", current_date});
+    // installed_apps/get_installed_apps_macos#1 (docs/agent-spawn-sink-manifest.md)
+    // GUI applications from system_profiler. The `| grep` pipe stage is gone
+    // (rung 2: clean argv, no shell) -- parsers::parse_system_profiler_apps
+    // replicates the old grep's exact three-way line selection in-process
+    // (see that function's own header comment), so this action's emitted
+    // rows are byte-identical to before.
+    if (auto path = yuzu::agent::probe_tool_path({"/usr/sbin/system_profiler"});
+        !path.empty()) {
+        auto out = run_tool({path, "SPApplicationsDataType", "-detailLevel", "mini"}).output;
+        for (auto& rec : parsers::parse_system_profiler_apps(out)) {
+            apps.push_back(
+                {std::move(rec.name), std::move(rec.version), "-", std::move(rec.install_date)});
         }
     }
 
@@ -412,8 +398,8 @@ std::vector<inv::InvRecord> get_inventory_windows() {
 std::vector<inv::InvRecord> get_inventory_linux() {
     std::vector<inv::InvRecord> recs;
 
-    const auto collect = [&recs](const char* cmd, auto parse_line) {
-        auto out = run_command(cmd);
+    const auto collect = [&recs](std::vector<std::string> argv, auto parse_line) {
+        auto out = run_tool(std::move(argv)).output;
         std::istringstream ss(out);
         std::string line;
         while (std::getline(ss, line)) {
@@ -422,7 +408,9 @@ std::vector<inv::InvRecord> get_inventory_linux() {
         }
     };
 
-    if (command_exists("dpkg-query")) {
+    if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/dpkg-query", "/bin/dpkg-query"});
+        !path.empty()) {
+        // installed_apps/get_inventory_linux#1 (docs/agent-spawn-sink-manifest.md)
         // ${db:Status-Abbrev} (want+status, 2 chars) keeps installed AND held
         // packages via its 2nd char == 'i' ("ii" want=install, "hi" want=hold)
         // — matches vuln_scan's vuln_identity.hpp (PR #1804) exactly, so the
@@ -430,26 +418,36 @@ std::vector<inv::InvRecord> get_inventory_linux() {
         // (removed, config-files) and "un" (unknown) are correctly excluded;
         // this also supersedes the legacy `list` filter's narrower
         // "install ok installed" substring check, which excludes held.
-        collect("dpkg-query -W -f='${Package}\\t${db:Status-Abbrev}\\t${Version}\\t"
-                "${Architecture}\\t${Maintainer}\\n' 2>/dev/null",
+        // The tabs/newline below are REAL bytes (single-backslash \t/\n,
+        // compiled by C++ into actual TAB/LF characters) -- contrast the
+        // legacy list format's literal two-byte "\n" escape above, which
+        // dpkg-query's own interpreter expands instead.
+        collect({path, "-W",
+                "-f=${Package}\t${db:Status-Abbrev}\t${Version}\t${Architecture}\t${Maintainer}\n"},
                 inv::parse_dpkg_inv_line);
-    } else if (command_exists("rpm")) {
+    } else if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/rpm", "/bin/rpm"});
+              !path.empty()) {
+        // installed_apps/get_inventory_linux#2
         // Raw SIGPGP (payload) + RSAHEADER (header) signature tags; signed vs
         // unsigned is computed in C++ by parse_rpm_inv_line/rpm_sig_present —
         // matches vuln_scan's vuln_identity.hpp (PR #1804) exactly, so the two
         // collectors agree on this field for the same rpm. Never a live
         // `rpm -K` verification. PACKAGER per the v2 spec (`list` keeps VENDOR
         // for its stable operator contract).
-        collect("rpm -qa --queryformat '%{NAME}\\t%{EPOCH}\\t%{VERSION}\\t%{RELEASE}\\t"
-                "%{ARCH}\\t%{PACKAGER}\\t%{INSTALLTIME:date}\\t%{SIGPGP}\\t%{RSAHEADER}\\n' "
-                "2>/dev/null",
+        collect({path, "-qa", "--queryformat",
+                "%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\t%{PACKAGER}\t"
+                "%{INSTALLTIME:date}\t%{SIGPGP}\t%{RSAHEADER}\n"},
                 inv::parse_rpm_inv_line);
-    } else if (command_exists("pacman")) {
-        collect("pacman -Q 2>/dev/null", inv::parse_pacman_inv_line);
-    } else if (command_exists("apk")) {
+    } else if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/pacman", "/bin/pacman"});
+              !path.empty()) {
+        // installed_apps/get_inventory_linux#3
+        collect({path, "-Q"}, inv::parse_pacman_inv_line);
+    } else if (auto path = yuzu::agent::probe_tool_path({"/sbin/apk", "/usr/sbin/apk", "/bin/apk"});
+              !path.empty()) {
+        // installed_apps/get_inventory_linux#4
         // Alpine — first apk enumeration on the sync path (the legacy `list`
         // has no apk branch; precedent is vuln_scan's enumerator).
-        collect("apk info -v 2>/dev/null", inv::parse_apk_inv_line);
+        collect({path, "info", "-v"}, inv::parse_apk_inv_line);
     }
 
     // Host-level distro identity, read once and stamped on every row (v2
@@ -472,23 +470,86 @@ std::vector<inv::InvRecord> get_inventory_linux() {
 #endif
 
 #ifdef __APPLE__
+// #2273: bound the native CFBundle/SecStaticCode enrichment calls -- this is
+// a daily-sync collector (ADR-0016), not an interactive action, and a deep
+// per-app scan is inherently more expensive than the one system_profiler
+// call it decorates.
+constexpr std::size_t kMaxEnrichApps = 500;
+// Bound the number of `pkgutil --pkg-info` round trips a single
+// list_inventory gather issues -- same discipline as msi_packages_plugin.cpp's
+// established kMaxPackages precedent (a receipt DB can legitimately hold
+// hundreds of entries).
+constexpr std::size_t kMaxPkgutilPackages = 500;
+
 std::vector<inv::InvRecord> get_inventory_macos() {
     std::vector<inv::InvRecord> recs;
-    for (auto& app : get_installed_apps_macos()) {
-        inv::InvRecord r;
-        r.name = std::move(app.name);
-        r.version = std::move(app.version);
-        // system_profiler mini exposes no publisher; the legacy collector
-        // stores a "-" placeholder which must NOT leak into v2 rows.
-        if (app.publisher != "-")
-            r.publisher = std::move(app.publisher);
-        r.install_date = std::move(app.install_date); // Last Modified
-        r.kind = "app";
-        r.ecosystem = "macos";
-        // "homebrew" stays a reserved ecosystem value: brew is per-user
-        // (list_per_user) and out of machine-scope this slice.
-        recs.push_back(std::move(r));
+
+    // installed_apps/get_inventory_macos#1 (docs/agent-spawn-sink-manifest.md)
+    // App records: acquired separately from get_installed_apps_macos()
+    // (list/list_inventory are independent dispatches, so there's no result
+    // to share across them) so this leg can keep the "Location:" field the
+    // legacy list/query wire format never carried.
+    if (auto path = yuzu::agent::probe_tool_path({"/usr/sbin/system_profiler"});
+        !path.empty()) {
+        auto out = run_tool({path, "SPApplicationsDataType", "-detailLevel", "mini"}).output;
+        auto apps = parsers::parse_system_profiler_apps(out);
+
+        std::size_t enriched = 0;
+        for (auto& app : apps) {
+            inv::InvRecord r;
+            r.name = std::move(app.name);
+            r.version = std::move(app.version);
+            r.install_date = std::move(app.install_date); // Last Modified
+            r.kind = "app";
+            r.ecosystem = "macos";
+            // #2273 native enrichment: CFBundle + SecStaticCode, in-process,
+            // no subprocess (installed_apps_macos_enrich.hpp). Fills ONLY the
+            // pre-existing, currently-honest-empty publisher/signature_status
+            // fields -- ADR-0016: the hashed 12-field row is NEVER
+            // added-to/reordered. bundle_id has no home in this row; see that
+            // header's comment.
+            if (!app.location.empty() && enriched < kMaxEnrichApps) {
+                ++enriched;
+                auto enrich = yuzu::installed_apps::macos_enrich::enrich_app(app.location);
+                if (!enrich.publisher.empty())
+                    r.publisher = std::move(enrich.publisher);
+                if (!enrich.signature_status.empty())
+                    r.signature_status = std::move(enrich.signature_status);
+            }
+            recs.push_back(std::move(r));
+        }
     }
+
+    // installed_apps/get_inventory_macos#2 (docs/agent-spawn-sink-manifest.md)
+    // #2273: pkgutil receipts as additional inventory records -- system
+    // installer packages (Command Line Tools, XProtect payloads, ...) that
+    // never appear in system_profiler's GUI-app enumeration above.
+    if (auto path = yuzu::agent::probe_tool_path({"/usr/sbin/pkgutil"}); !path.empty()) {
+        auto ids = parsers::parse_pkgutil_pkgs(run_tool({path, "--pkgs"}).output);
+        if (ids.size() > kMaxPkgutilPackages)
+            ids.resize(kMaxPkgutilPackages);
+
+        for (const auto& id : ids) {
+            // installed_apps/get_inventory_macos#3 -- one call per receipt,
+            // same bounded per-id loop shape as msi_packages_plugin.cpp's
+            // established `list` action.
+            auto info =
+                parsers::parse_pkgutil_pkg_info(run_tool({path, "--pkg-info", id}).output);
+            inv::InvRecord r;
+            r.name = id; // honest reverse-domain identifier -- never a
+                         // derived "friendly" name (msi_packages precedent)
+            r.version = info.version;
+            r.install_date = info.install_time; // raw UNIX-epoch-seconds string --
+                                                 // pkgutil's only time representation
+                                                 // for a receipt; not reformatted so as
+                                                 // not to synthesise a shape it doesn't
+                                                 // natively carry.
+            r.kind = "pkg";
+            r.ecosystem = "macos_pkgutil";
+            recs.push_back(std::move(r));
+        }
+    }
+
     return recs;
 }
 #endif
@@ -582,37 +643,37 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
 // ABI4 capability declarations (#2204). Windows reads the registry
 // Uninstall key(s) natively for all four actions (including the
 // RegLoadKeyW-mounted per-user hive walk in "list_per_user") — rung 1.
-// Linux and macOS collect through this plugin's local popen()-based
-// run_command()/system() (dpkg-query/rpm/pacman/apk, and
-// system_profiler/brew respectively) for every action — an ungoverned
-// rung-3 shell exec per ADR-3002's "27 of 49 plugins ... sit at an
-// ungoverned rung 3" (not yet migrated onto the shared argv runner).
+// Linux and macOS now collect through the shared bounded argv runner
+// (yuzu::agent::run_bounded_subprocess, ADR-3002 rung 2) — dpkg-query/rpm/
+// pacman/apk on Linux, system_profiler(+brew for list_per_user)(+pkgutil +
+// native SecCode/CFBundle enrichment for list_inventory) on macOS — Wave 4
+// PR4.3a's de-shell migration off the prior ungoverned rung-3 popen()/
+// system() acquisition.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "list",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "popen(dpkg-query / rpm / pacman)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2, "dpkg-query/rpm/pacman via bounded argv runner", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "popen(system_profiler SPApplicationsDataType)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2, "system_profiler via bounded argv runner", nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "Reg*W enumeration of the Uninstall key(s)", nullptr},
     },
     {
         /* .action      = */ "query",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "popen(dpkg-query / rpm / pacman)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2, "dpkg-query/rpm/pacman via bounded argv runner", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "popen(system_profiler SPApplicationsDataType)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2, "system_profiler via bounded argv runner", nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "Reg*W enumeration of the Uninstall key(s)", nullptr},
     },
     {
         /* .action      = */ "list_per_user",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "popen(dpkg-query / rpm / pacman)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2, "dpkg-query/rpm/pacman via bounded argv runner", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3,
-         "popen(system_profiler SPApplicationsDataType) + popen(brew list --versions)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2, "system_profiler + brew via bounded argv runner", nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "Reg*W enumeration of HKU\\<SID>'s Uninstall key, mounting NTUSER.DAT via "
@@ -622,9 +683,12 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "list_inventory",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "popen(dpkg-query / rpm / pacman / apk)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2, "dpkg-query/rpm/pacman/apk via bounded argv runner", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "popen(system_profiler SPApplicationsDataType)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2,
+         "system_profiler + pkgutil via bounded argv runner + native SecCode/CFBundle "
+         "enrichment",
+         nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "Reg*W enumeration of the Uninstall key(s)", nullptr},
     },
@@ -782,19 +846,15 @@ private:
                             app.install_date.empty() ? "-" : app.install_date)));
         }
 
-        // Try Homebrew per-user (runs under current user)
-        if (command_exists("brew")) {
-            auto brew_out = run_command("brew list --versions 2>/dev/null");
-            if (!brew_out.empty()) {
-                std::istringstream ss(brew_out);
-                std::string line;
-                while (std::getline(ss, line)) {
-                    auto sp = line.find(' ');
-                    std::string name = (sp != std::string::npos) ? line.substr(0, sp) : line;
-                    std::string version = (sp != std::string::npos) ? line.substr(sp + 1) : "-";
-                    ctx.write_output(sanitize_utf8(
-                        std::format("user_app|brew|{}|{}|-|-", name, version)));
-                }
+        // installed_apps/do_list_per_user#1 (docs/agent-spawn-sink-manifest.md)
+        // Try Homebrew per-user (runs under current user).
+        if (auto brew_path =
+                yuzu::agent::probe_tool_path({"/opt/homebrew/bin/brew", "/usr/local/bin/brew"});
+            !brew_path.empty()) {
+            auto brew_out = run_tool({brew_path, "list", "--versions"}).output;
+            for (auto& rec : parsers::parse_brew_list(brew_out)) {
+                ctx.write_output(sanitize_utf8(std::format(
+                    "user_app|brew|{}|{}|-|-", rec.name, rec.version.empty() ? "-" : rec.version)));
             }
         }
         return 0;
