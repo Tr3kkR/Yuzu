@@ -705,7 +705,17 @@ inline RtRouteParse parse_rtnetlink_route_chunk(std::span<const unsigned char> b
                             }
                         }
                     }
+                    // RTNH_NEXT, unlike RTA_NEXT, is single-argument and does
+                    // NOT decrement a length variable as a side effect -- the
+                    // caller must. Without this, RTNH_OK's bound check on
+                    // every nexthop after the first compares against the
+                    // ORIGINAL total length rather than what is actually
+                    // left, so a crafted rtnh_len on a later nexthop can pass
+                    // the check while pointing past the real payload -- an
+                    // out-of-bounds read, not merely an unfuzzed code path.
+                    const int consumed = RTNH_ALIGN(nh->rtnh_len);
                     nh = RTNH_NEXT(nh);
+                    nh_len -= consumed;
                 }
             } else if (rta->rta_type == RTA_NH_ID) {
                 // An `ip nexthop`-object route references a nexthop group by

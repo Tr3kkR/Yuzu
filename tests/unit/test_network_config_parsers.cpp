@@ -737,6 +737,45 @@ std::vector<unsigned char> build_nh_id_route_message(std::uint32_t seq, std::uin
 }
 
 
+// Builds a RAW (possibly malformed) RTA_MULTIPATH payload from a list of
+// (rtnh_len, ifindex) pairs -- no padding, no validation, exactly the bytes
+// given. Lets a test construct a payload the real encoder could never
+// produce, to prove the decoder degrades honestly against one anyway.
+// Writes ONLY the raw rtnexthop headers back to back -- no fake payload
+// padded out to match a lying rtnh_len. This is the real attack shape: a
+// header whose declared length overclaims relative to what is ACTUALLY
+// allocated after it. Padding to the claimed length (an earlier version of
+// this builder did) would back the lie with real bytes and defeat the very
+// out-of-bounds condition the fixture exists to create.
+std::vector<unsigned char> build_raw_multipath_route(std::uint32_t seq,
+                                                      const std::vector<unsigned short>& nh_lens) {
+    std::vector<unsigned char> buf;
+    struct nlmsghdr nlh {};
+    nlh.nlmsg_type = RTM_NEWROUTE;
+    nlh.nlmsg_flags = NLM_F_MULTI;
+    nlh.nlmsg_seq = seq;
+    append_bytes(buf, &nlh, sizeof(nlh));
+
+    struct rtmsg rtm {};
+    rtm.rtm_family = AF_INET;
+    rtm.rtm_dst_len = 0;
+    rtm.rtm_table = RT_TABLE_MAIN;
+    append_bytes(buf, &rtm, sizeof(rtm));
+
+    std::vector<unsigned char> mp;
+    for (auto len : nh_lens) {
+        struct rtnexthop rtnh {};
+        rtnh.rtnh_len = len; // may lie -- no payload is written to back it
+        append_bytes(mp, &rtnh, sizeof(rtnh));
+    }
+    append_rtattr(buf, RTA_MULTIPATH, mp.data(), mp.size());
+
+    auto* hdr = reinterpret_cast<struct nlmsghdr*>(buf.data());
+    hdr->nlmsg_len = static_cast<std::uint32_t>(buf.size());
+    return buf;
+}
+
+
 TEST_CASE("parse_rtnetlink_route_chunk keeps only the IPv4 default route with a gateway",
          "[network_config][rtnetlink]") {
     constexpr std::uint32_t kSeq = 9;
@@ -921,6 +960,91 @@ TEST_CASE("parse_rtnetlink_route_chunk pushes a gateway-less marker for an "
     // A record IS pushed (so the caller learns a main-table default route
     // exists) but its gateway is empty (so the caller does not silently
     // report "-" with a complete status -- it must degrade instead).
+    REQUIRE(parsed.records.size() == 1);
+    CHECK(parsed.records[0].gateway.empty());
+}
+
+// ── REGRESSION PIN: malformed RTA_MULTIPATH must degrade, never overread ───
+//
+// RTNH_NEXT, unlike RTA_NEXT, does not decrement a length variable as a side
+// effect -- the caller must. An earlier draft of the multipath decode above
+// did not, so RTNH_OK's bound check on every nexthop after the first
+// compared against the ORIGINAL total length rather than what was actually
+// left: a crafted rtnh_len on a later nexthop could pass the check while
+// pointing past the real payload. Fixed by tracking the remaining length
+// explicitly. These three cases exercise exactly the malformed shapes that
+// would have exploited the bug, plus the two RTNH_OK already rejects
+// unconditionally.
+
+TEST_CASE("parse_rtnetlink_route_chunk stops cleanly when a later nexthop's "
+          "rtnh_len would overrun the real remaining payload",
+          "[network_config][rtnetlink]") {
+    constexpr std::uint32_t kSeq = 23;
+    // Reproduces the exact bug shape: a well-formed first nexthop (rtnh_len=8,
+    // no sub-attributes, genuinely 8 bytes on the wire) followed by a second
+    // whose rtnh_len (12) claims 4 bytes of sub-attribute payload that were
+    // NEVER WRITTEN -- build_raw_multipath_route writes raw headers only, no
+    // padding to match a lying length, so those 4 bytes plus the outer
+    // rtattr's own 4-byte header the decoder tries to read genuinely do not
+    // exist in this allocation.
+    //
+    // No NLMSG_DONE is appended and the span covers exactly this message's
+    // bytes: the old bug's overread would land past this vector's actual
+    // heap allocation, not merely into adjacent-but-still-allocated data, so
+    // ASan's heap-buffer-overflow detector is a real witness here, not a
+    // no-op. (An earlier version of this fixture padded the buffer out to
+    // match the claimed length and appended a trailing DONE message, which
+    // silently defeated itself -- the "attack" bytes were always genuinely
+    // allocated, so ASan had nothing to catch. Recorded so the mistake is
+    // not repeated.)
+    const auto grown = build_raw_multipath_route(kSeq, {8, 12});
+    // build_raw_multipath_route assembles its result via push_back/insert, so
+    // the vector's CAPACITY is very likely larger than its SIZE -- growth
+    // slack that is allocated but unpoisoned, so a 1-2 byte overread past the
+    // logical end would silently land there and ASan would report nothing,
+    // proving nothing either way. Copy into a vector sized to exactly fit: a
+    // single-shot allocation of a known size has no such slack, so a real
+    // heap-buffer-overflow is guaranteed to fall in ASan's redzone.
+    const std::vector<unsigned char> msg(grown.begin(), grown.end());
+    REQUIRE(msg.capacity() < msg.size() + 16); // sanity: this really is tight
+
+    // Must not crash, hang, or (under ASan) report an out-of-bounds read.
+    // Fixed: RTNH_OK on the second entry now correctly sees only the 8 bytes
+    // actually left after consuming the first (12 > 8), rejects it, and the
+    // walk stops with no gateway resolved from either nexthop. `done` stays
+    // false since no NLMSG_DONE was supplied -- irrelevant to this fixture.
+    const auto parsed = parse_rtnetlink_route_chunk(std::span{msg}, kSeq);
+    REQUIRE(parsed.records.size() == 1);
+    CHECK(parsed.records[0].gateway.empty());
+}
+
+TEST_CASE("parse_rtnetlink_route_chunk rejects an rtnh_len shorter than sizeof(rtnexthop)",
+          "[network_config][rtnetlink]") {
+    constexpr std::uint32_t kSeq = 24;
+    // RTNH_OK's own built-in check (rtnh_len >= sizeof(rtnexthop)) rejects
+    // this regardless of the length-tracking fix; pinned so a future change
+    // to that check is also caught.
+    auto msg = build_raw_multipath_route(kSeq, {4}); // sizeof(rtnexthop) is 8
+    auto done = build_done_message(kSeq);
+    std::vector<unsigned char> blob(msg.begin(), msg.end());
+    blob.insert(blob.end(), done.begin(), done.end());
+
+    const auto parsed = parse_rtnetlink_route_chunk(std::span{blob}, kSeq);
+    REQUIRE(parsed.records.size() == 1);
+    CHECK(parsed.records[0].gateway.empty());
+}
+
+TEST_CASE("parse_rtnetlink_route_chunk rejects an rtnh_len of zero", "[network_config][rtnetlink]") {
+    constexpr std::uint32_t kSeq = 25;
+    // rtnh_len == 0 is also caught by RTNH_OK's >= sizeof(rtnexthop) check;
+    // the real hazard it additionally guards against is an infinite loop --
+    // a zero advance would never make RTNH_NEXT progress.
+    auto msg = build_raw_multipath_route(kSeq, {0});
+    auto done = build_done_message(kSeq);
+    std::vector<unsigned char> blob(msg.begin(), msg.end());
+    blob.insert(blob.end(), done.begin(), done.end());
+
+    const auto parsed = parse_rtnetlink_route_chunk(std::span{blob}, kSeq);
     REQUIRE(parsed.records.size() == 1);
     CHECK(parsed.records[0].gateway.empty());
 }

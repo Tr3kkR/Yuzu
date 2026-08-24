@@ -444,7 +444,7 @@ implementation is.
 | network_config | dns_servers | linux | supported | 1 | /etc/resolv.conf read | - |
 | network_config | dns_servers | macos | supported | 1 | SCDynamicStore | - |
 | network_config | dns_servers | windows | supported | 1 | GetAdaptersAddresses | - |
-| network_config | proxy | linux | supported | 1 | environment variables | - |
+| network_config | proxy | linux | constrained | 1 | environment variables | reads the *_proxy variables from the agent process's own environment only; a system-wide, desktop-session or package-manager proxy the agent did not inherit is not reported |
 | network_config | proxy | macos | constrained | 1 | SCDynamicStoreCopyProxies | reports the HTTP proxy and PAC URL, checking the primary network service first and then each scoped per-interface service; HTTPS/SOCKS/FTP proxies are not reported, so a host configured with only those reads as none |
 | network_config | proxy | windows | supported | 1 | WinHttpGetIEProxyConfigForCurrentUser | - |
 | network_config | dns_cache | linux | constrained | 2 | resolvectl via direct-argv runner | falls back to systemd-resolve statistics, or reports unavailable, when resolvectl is absent |

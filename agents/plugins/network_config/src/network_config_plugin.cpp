@@ -1497,11 +1497,14 @@ private:
     // agents/shared/route_sysctl_arp.hpp, reused as-is. Mirrors the proven
     // enumeration in tar_arp_collector.cpp (reimplemented here — the TAR plugin
     // internals aren't linked into network_config).
+    // Cap entries so a large or forged neighbour table can't produce an
+    // unbounded response (mirrors the TAR collector's posture). Shared by all
+    // three platform legs -- /proc/net/arp and the PF_ROUTE RTF_LLINFO dump
+    // are just as capable of an oversized or spoofed table as GetIpNetTable2.
+    static constexpr std::size_t kArpEntryCap = 20000;
+
     static int do_arp(yuzu::CommandContext& ctx) {
 #ifdef _WIN32
-        // Cap entries so a large/forged neighbour cache can't produce an unbounded
-        // response (mirrors the TAR collector's kArpEntryCap posture).
-        constexpr ULONG kArpEntryCap = 20000;
 
         auto state_to_type = [](NL_NEIGHBOR_STATE st) -> const char* {
             switch (st) {
@@ -1596,8 +1599,13 @@ private:
             ctx.write_output("arp|not_available");
             return 0;
         }
-        for (const auto& e : yuzu::network_config::parse_proc_net_arp(contents.str())) {
+        const auto entries = yuzu::network_config::parse_proc_net_arp(contents.str());
+        std::size_t emitted = 0;
+        for (const auto& e : entries) {
+            if (emitted >= kArpEntryCap)
+                break;
             ctx.write_output(std::format("arp|{}|{}|{}|{}", e.iface, e.ip, e.mac, e.type));
+            ++emitted;
         }
         return 0;
 
@@ -1633,8 +1641,14 @@ private:
         lines.reserve(parsed.records.size());
         for (const auto& rec : parsed.records)
             lines.push_back(std::format("arp|-|{}|{}|-", rec.ip, rec.mac));
-        for (const auto& line : yuzu::network_config::dedupe_preserve_order(lines))
+        const auto deduped = yuzu::network_config::dedupe_preserve_order(lines);
+        std::size_t emitted = 0;
+        for (const auto& line : deduped) {
+            if (emitted >= kArpEntryCap)
+                break;
             ctx.write_output(line);
+            ++emitted;
+        }
         return 0;
 
 #else
