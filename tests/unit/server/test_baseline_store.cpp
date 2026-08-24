@@ -409,9 +409,15 @@ TEST_CASE("set_members correctly reports not-found when a concurrent DELETE wins
     // semantics), then see the row is genuinely gone once we commit.
     bool set_members_ok = false;
     std::string set_members_error;
-    const auto call_start = std::chrono::steady_clock::now();
     std::chrono::steady_clock::duration call_duration{};
     std::thread t([&] {
+        // Timestamped INSIDE the thread, not before spawning it — a
+        // pre-spawn timestamp would still pass the >=150ms check below even
+        // if the thread were scheduled so late it only reached the
+        // touch-UPDATE after COMMIT already ran (quality-engineer, Gate 8
+        // round 2: catches the already-deleted fast-path silently satisfying
+        // the same assertion meant to prove the blocked-then-re-evaluate path).
+        const auto call_start = std::chrono::steady_clock::now();
         auto r = store.set_members(id, {});
         call_duration = std::chrono::steady_clock::now() - call_start;
         set_members_ok = r.has_value();
@@ -423,11 +429,16 @@ TEST_CASE("set_members correctly reports not-found when a concurrent DELETE wins
     // actually reach and block on the lock before we resolve it, rather than
     // committing before the thread has even started.
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    {
-        pg::PgResult r{PQexec(locker.get(), "COMMIT")};
-        REQUIRE(r.ok());
-    }
+    // Join BEFORE any assertion that could throw (quality-engineer, Gate 8
+    // round 2): a REQUIRE between spawning `t` and joining it would unwind
+    // past a still-joinable std::thread on failure and call std::terminate,
+    // aborting the whole shard instead of failing one test.
+    pg::PgResult commit_result{PQexec(locker.get(), "COMMIT")};
+    const bool commit_ok = commit_result.ok();
+    const std::string commit_error = commit_ok ? "" : PQresultErrorMessage(commit_result.get());
     t.join();
+    REQUIRE(commit_ok);
+    INFO(commit_error);
 
     // Self-verifying against a future regression that weakens the row lock
     // (e.g. a read-committed lookup instead of the locking UPDATE): if
