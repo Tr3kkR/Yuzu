@@ -1162,9 +1162,18 @@ std::expected<std::string, std::string> ProductPackStore::install(
             "SELECT id, yaml_source FROM product_pack_store.product_packs "
             "WHERE idempotency_key = $1",
             std::vector<std::string>{sanitize_pg_text(idempotency_key)});
-        if (res.status() != PGRES_TUPLES_OK)
+        if (res.status() != PGRES_TUPLES_OK) {
+            // Gate 2 review (docs-writer/#3481): unlike list()/get() (read paths, never
+            // audited), this failure reaches workflow_routes.cpp's audit_fn as a RAW,
+            // unfiltered `detail` — install()'s OTHER db_error messages ("database not
+            // open", "failed to persist pack '<name>'") were deliberately kept clean of
+            // PQerrorMessage() for exactly this reason; this one wasn't. Log the specific
+            // driver detail server-side instead of embedding it in the returned string.
+            spdlog::error("ProductPackStore: idempotency lookup failed: {}",
+                         PQerrorMessage(lease.get()));
             return std::unexpected(std::string(kProductPackDbErrorPrefix) +
-                                   "idempotency lookup failed: " + PQerrorMessage(lease.get()));
+                                   "idempotency lookup failed");
+        }
         if (PQntuples(res.get()) > 0) {
             std::string existing_id = text_col(res.get(), 0, 0);
             std::string existing_yaml = text_col(res.get(), 0, 1);

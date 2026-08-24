@@ -334,9 +334,10 @@ public:
     /// admission-protocol dedupe, which exists for a different, multi-principal threat model. A
     /// narrow race remains (two concurrent installs, same key, both pass the pre-check) — left to
     /// surface as an ordinary unique-violation on the persist INSERT, which the loser's own F031
-    /// compensation path already handles; a client retry then re-hits the pre-check and converges
-    /// on the winner's id. Same class of accepted race already documented for concurrent
-    /// `uninstall()` above.
+    /// compensation path already handles; see the CHAOS-3 note above for exactly where a client
+    /// retry converges to (the winner's id if the retried body matches the winner's, the
+    /// documented 400 if it differs — NOT unconditionally the winner's id). Same class of
+    /// accepted race already documented for concurrent `uninstall()` above.
     ///
     /// `partial_result` (#3479): when non-null, populated with per-document failure detail —
     /// on EITHER outcome, a total failure (every document's error, not just the first) or a

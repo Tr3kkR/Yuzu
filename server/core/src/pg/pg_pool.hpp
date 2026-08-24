@@ -249,8 +249,12 @@ public:
     /// on the WRONG assumption ("false always means nothing landed") can delete data that is
     /// actually there (gov Gate 5 CHAOS-1, #3481 — `ProductPackStore::install`'s compensating
     /// rollback is the first consumer: acquire via `try_acquire_for` first, and only treat a
-    /// subsequent `with_txn_on` failure as "safe to compensate" after a fresh existence check
-    /// confirms the row is genuinely absent).
+    /// subsequent `with_txn_on` failure as "safe to compensate" after CONFIRMING via
+    /// `pg_xact_status()` (see `ProductPackStore::check_transaction_outcome`) — NOT via a
+    /// fresh row-existence read, which CHAOS-1b (gov Gate 8) found is itself unreliable: the
+    /// client-observed connection failure that triggers this check is not ordered relative to
+    /// the backend's own commit progress, so row-absence can mean "aborted" OR "not yet
+    /// committed" — the exact ambiguity this whole mechanism exists to resolve).
     ///
     /// Gov Gate 8 review (architect): unlike `with_txn_for`, the bounded-acquire discipline
     /// (ADR-0012 §2a) is NOT baked into this call — it depends entirely on the CALLER acquiring
