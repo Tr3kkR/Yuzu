@@ -22,6 +22,7 @@
 #include <atomic> // rate-limited truncation warn
 #include <format>
 #include <string>
+#include <utility> // std::move
 #include <vector>
 
 #ifdef _WIN32
@@ -221,8 +222,16 @@ std::vector<ArpEntry> enumerate_arp() {
     }
     std::ostringstream buf;
     buf << f.rdbuf();
+    if (f.bad()) {
+        // Parity with the discovery plugin's get_arp_table() (Linux leg,
+        // discovery_plugin.cpp): a mid-stream read failure is a distinct
+        // outcome from a genuinely empty table and must not feed a partial
+        // snapshot into the diff as authoritative.
+        spdlog::warn("TAR arp: read error mid-stream on /proc/net/arp");
+        return {};
+    }
 
-    const auto parsed = parse_proc_net_arp(buf.str(), kArpEntryCap);
+    auto parsed = parse_proc_net_arp(buf.str(), kArpEntryCap);
 
     // Rate-limit the cap-truncation warn (UP-7), exactly mirroring the
     // Windows leg's s_arp_cap_warned pattern above: once when it begins,
@@ -237,7 +246,7 @@ std::vector<ArpEntry> enumerate_arp() {
         s_arp_cap_warned.store(false);
     }
 
-    return parsed.entries;
+    return std::move(parsed.entries);
 }
 
 #endif

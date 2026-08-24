@@ -23,10 +23,12 @@
 #include <route_sysctl_arp.hpp> // agents/shared — yuzu::shared::ArpRecord
 #endif
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdlib> // std::strtoul (Flags column, base-0 so "0x2" auto-detects)
 #include <sstream>
 #include <string>
+#include <utility> // std::move
 #include <vector>
 
 namespace yuzu::tar {
@@ -101,10 +103,14 @@ inline ProcNetArpParse parse_proc_net_arp(const std::string& text,
         if (!(cols >> ip >> hw_type >> flags_str >> mac >> mask >> device))
             continue; // short/malformed row — tolerate, skip
 
+        if (flags_str.front() == '-')
+            continue; // negative token — strtoul would silently wrap it unsigned, skip instead
+
         char* endp = nullptr;
+        errno = 0;
         const unsigned long flags = std::strtoul(flags_str.c_str(), &endp, 0);
-        if (endp == flags_str.c_str())
-            continue; // Flags column wasn't a parseable number — malformed, skip
+        if (endp == flags_str.c_str() || *endp != '\0' || errno == ERANGE)
+            continue; // not a fully-consumed, in-range number — malformed, skip
 
         if (out.entries.size() >= cap) {
             out.truncated = true;
