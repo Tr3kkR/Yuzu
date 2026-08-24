@@ -143,3 +143,145 @@ TEST_CASE("build_launch_spec precomputes the Windows handle policy from merge_st
     CHECK(default_spec.windows_handles.inherit_stdout_write);
     CHECK_FALSE(default_spec.windows_handles.inherit_stderr_write);
 }
+
+// --- merge_launch_env() / SubprocessOptions::extra_env (Alex plan-gate ruling,
+// PLAN-04 option b: a bounded, opt-in widening of A5's clear-slate env) ---
+
+TEST_CASE("merge_launch_env replaces a same-named base entry in place, never appends a duplicate",
+          "[subprocess][launch_spec][extra_env]") {
+    using namespace yuzu::agent;
+    std::vector<EnvVar> base = {{"PATH", "/usr/bin:/bin"}, {"LC_ALL", "C"}};
+    std::vector<EnvVar> extra = {{"PATH", "/opt/tool/bin"}};
+
+    EnvMergeResult merged = merge_launch_env(base, extra, /*windows=*/false);
+    CHECK(merged.rejected.empty());
+    REQUIRE(merged.env.size() == 2); // still 2 -- PATH replaced, not duplicated
+    CHECK(merged.env[0].key == "PATH");
+    CHECK(merged.env[0].value == "/opt/tool/bin"); // replaced value
+    CHECK(merged.env[1].key == "LC_ALL");
+    CHECK(merged.env[1].value == "C"); // untouched
+}
+
+TEST_CASE("merge_launch_env appends a new name in caller order, preserving base order",
+          "[subprocess][launch_spec][extra_env]") {
+    using namespace yuzu::agent;
+    std::vector<EnvVar> base = {{"PATH", "/usr/bin:/bin"}, {"LC_ALL", "C"}};
+    std::vector<EnvVar> extra = {{"HOME", "/home/op"}, {"USER", "op"}};
+
+    EnvMergeResult merged = merge_launch_env(base, extra, /*windows=*/false);
+    CHECK(merged.rejected.empty());
+    REQUIRE(merged.env.size() == 4);
+    CHECK(merged.env[0].key == "PATH"); // base order preserved
+    CHECK(merged.env[1].key == "LC_ALL");
+    CHECK(merged.env[2].key == "HOME"); // new names appended in caller order
+    CHECK(merged.env[2].value == "/home/op");
+    CHECK(merged.env[3].key == "USER");
+    CHECK(merged.env[3].value == "op");
+}
+
+TEST_CASE("merge_launch_env rejects every LD_*/DYLD_* prefix and each exact denylisted name",
+          "[subprocess][launch_spec][extra_env]") {
+    using namespace yuzu::agent;
+    const std::vector<EnvVar> base = default_launch_env(/*windows=*/false, std::nullopt);
+
+    for (const std::string& denied : {std::string("LD_PRELOAD"), std::string("LD_LIBRARY_PATH"),
+                                       std::string("DYLD_INSERT_LIBRARIES"), std::string("DYLD_LIBRARY_PATH"),
+                                       std::string("IFS"), std::string("BASH_ENV"), std::string("ENV"),
+                                       std::string("GCONV_PATH"), std::string("NLSPATH"),
+                                       std::string("LOCPATH")}) {
+        EnvMergeResult merged = merge_launch_env(base, {{denied, "x"}}, /*windows=*/false);
+        INFO("denylisted name: " << denied);
+        REQUIRE(merged.rejected.size() == 1);
+        CHECK(merged.rejected[0] == denied);
+        // and never applied -- base is returned unchanged.
+        CHECK(merged.env == base);
+    }
+}
+
+TEST_CASE("merge_launch_env rejects malformed names and values", "[subprocess][launch_spec][extra_env]") {
+    using namespace yuzu::agent;
+    const std::vector<EnvVar> base = default_launch_env(/*windows=*/false, std::nullopt);
+
+    // Empty name.
+    CHECK(merge_launch_env(base, {{"", "x"}}, false).rejected == std::vector<std::string>{""});
+    // '=' in name (ambiguous once serialized as "KEY=VALUE").
+    CHECK(merge_launch_env(base, {{"FOO=BAR", "x"}}, false).rejected ==
+          std::vector<std::string>{"FOO=BAR"});
+    // NUL in name.
+    CHECK(merge_launch_env(base, {{std::string("FO\0O", 4), "x"}}, false).rejected.size() == 1);
+    // NUL in value.
+    CHECK(merge_launch_env(base, {{"FOO", std::string("ba\0r", 4)}}, false).rejected ==
+          std::vector<std::string>{"FOO"});
+}
+
+TEST_CASE("empty extra_env leaves default_launch_env's output byte-identical (no-regression guard)",
+          "[subprocess][launch_spec][extra_env]") {
+    using namespace yuzu::agent;
+    const std::vector<EnvVar> base = default_launch_env(/*windows=*/false, std::optional<std::string>("UTC"));
+    EnvMergeResult merged = merge_launch_env(base, /*extra=*/{}, /*windows=*/false);
+    CHECK(merged.rejected.empty());
+    CHECK(merged.env == base);
+
+    // Same guarantee through the full build_launch_spec() path: an unset
+    // extra_env must produce the identical LaunchSpec::env every existing
+    // caller already gets today.
+    LaunchOptions opts;
+    opts.tz = std::string("UTC");
+    LaunchSpec with_default_extra = build_launch_spec({"/bin/echo"}, opts);
+    REQUIRE(with_default_extra.error == LaunchSpecError::none);
+
+    LaunchOptions opts_explicit_empty = opts;
+    opts_explicit_empty.extra_env = {}; // explicit, still empty
+    LaunchSpec with_explicit_empty = build_launch_spec({"/bin/echo"}, opts_explicit_empty);
+    REQUIRE(with_explicit_empty.error == LaunchSpecError::none);
+
+    CHECK(with_default_extra.env == with_explicit_empty.env);
+#ifdef _WIN32
+    constexpr bool kThisTargetIsWindows = true;
+#else
+    constexpr bool kThisTargetIsWindows = false;
+#endif
+    CHECK(with_default_extra.env == default_launch_env(kThisTargetIsWindows, opts.tz));
+}
+
+TEST_CASE("build_launch_spec fails closed with denied_env_var and no spec on a denied extra_env name",
+          "[subprocess][launch_spec][extra_env]") {
+    using namespace yuzu::agent;
+    LaunchOptions opts;
+    opts.extra_env = {{"HOME", "/home/op"}, {"LD_PRELOAD", "/evil.so"}};
+
+    LaunchSpec spec = build_launch_spec({"/bin/echo"}, opts);
+    CHECK(spec.error == LaunchSpecError::denied_env_var);
+    // The whole launch is refused -- env is not "HOME applied, LD_PRELOAD
+    // skipped"; build_launch_spec returns before assembling anything past
+    // the error (spec.argv is left unset, same as every other error path).
+    CHECK(spec.argv.empty());
+}
+
+TEST_CASE("merge_launch_env's REPLACE matching is case-sensitive on POSIX, case-insensitive on Windows",
+          "[subprocess][launch_spec][extra_env]") {
+    using namespace yuzu::agent;
+    const std::vector<EnvVar> base = {{"PATH", "/usr/bin:/bin"}};
+
+    // POSIX target: differently-cased name is a NEW variable, coexisting
+    // alongside base "PATH" (real POSIX env names are case-sensitive).
+    EnvMergeResult posix_merged = merge_launch_env(base, {{"Path", "/opt/bin"}}, /*windows=*/false);
+    CHECK(posix_merged.rejected.empty());
+    REQUIRE(posix_merged.env.size() == 2);
+    CHECK(posix_merged.env[0].key == "PATH");
+    CHECK(posix_merged.env[0].value == "/usr/bin:/bin"); // untouched
+    CHECK(posix_merged.env[1].key == "Path"); // appended as a distinct name
+
+    // Windows target: differently-cased name REPLACES the base entry (real
+    // Windows environment blocks are case-insensitive -- CreateProcessW
+    // would otherwise be handed two entries the OS treats as one).
+    EnvMergeResult win_merged = merge_launch_env(base, {{"Path", "/opt/bin"}}, /*windows=*/true);
+    CHECK(win_merged.rejected.empty());
+    REQUIRE(win_merged.env.size() == 1); // replaced, not appended
+    CHECK(win_merged.env[0].key == "PATH"); // original casing kept -- REPLACE
+                                             // updates the existing entry's
+                                             // value in place, it does not
+                                             // rename the key to the extra
+                                             // entry's casing.
+    CHECK(win_merged.env[0].value == "/opt/bin");
+}

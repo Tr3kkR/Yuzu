@@ -38,6 +38,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace yuzu::agent {
@@ -50,6 +51,10 @@ enum class LaunchSpecError {
     relative_argv0,
     embedded_nul,
     banned_windows_extension, // .bat/.cmd/.com as argv[0] (CVE-2024-24576; ADR-3002:537-606)
+    denied_env_var, // LaunchOptions::extra_env named a denylisted or malformed
+                     // variable (see merge_launch_env) -- the launch is
+                     // refused whole rather than proceeding with that one
+                     // entry silently dropped.
 };
 
 /** One assembled environment variable, KEY and VALUE kept separate so a test
@@ -121,6 +126,13 @@ struct LaunchOptions {
     std::optional<std::string> tz; // passed through from the parent's TZ, if set
     LaunchSpec::Rlimits rlimits;
     LaunchSpec::ExecVerification exec_verify;
+
+    // Mirror of SubprocessOptions::extra_env (subprocess_runner.hpp) -- see
+    // that field's doc comment for the full contract (bounded widening of
+    // A5, replace-in-place semantics, fail-closed denylist). Empty by
+    // default. Merged onto the A5 allow-list by build_launch_spec() via
+    // merge_launch_env() below.
+    std::vector<EnvVar> extra_env;
 };
 
 /** The bare outcome a Spawner reports for a LaunchSpec. Deliberately minimal
@@ -154,6 +166,51 @@ namespace detail {
 
 inline bool contains_nul(const std::string& s) {
     return s.find('\0') != std::string::npos;
+}
+
+inline std::string to_upper_ascii(const std::string& s) {
+    std::string out = s;
+    for (char& c : out)
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return out;
+}
+
+/** True iff `name` is refused outright by the ADR-3002 A5 strip list --
+ *  default_launch_env's own comment enumerates the same set: the LD_ and
+ *  DYLD_ dynamic-linker-injection prefixes, and the exact interpreter/locale-hijack
+ *  names IFS, BASH_ENV, ENV, GCONV_PATH, NLSPATH, LOCPATH. Matched
+ *  case-insensitively regardless of target: POSIX env names ARE
+ *  case-sensitive, but rejecting e.g. "ld_preload" as well as "LD_PRELOAD"
+ *  is strictly more conservative, never less, so one rule safely serves both
+ *  targets here (unlike the base/extra REPLACE matching in
+ *  merge_launch_env(), where case-sensitivity changes which entry wins and
+ *  so must track the real target OS -- see that function's comment). */
+inline bool is_denied_env_name(const std::string& name) {
+    const std::string upper = to_upper_ascii(name);
+    if (upper.rfind("LD_", 0) == 0 || upper.rfind("DYLD_", 0) == 0)
+        return true;
+    static constexpr std::string_view kDeniedExact[] = {"IFS",        "BASH_ENV", "ENV",
+                                                         "GCONV_PATH", "NLSPATH",  "LOCPATH"};
+    for (const auto& denied : kDeniedExact) {
+        if (upper == denied)
+            return true;
+    }
+    return false;
+}
+
+/** Malformed per build_launch_spec's extra_env contract: an empty name, a
+ *  name containing '=' (ambiguous once serialized as "KEY=VALUE") or a NUL,
+ *  or a value containing a NUL. */
+inline bool is_malformed_env_entry(const EnvVar& v) {
+    if (v.key.empty())
+        return true;
+    if (v.key.find('=') != std::string::npos)
+        return true;
+    if (contains_nul(v.key))
+        return true;
+    if (contains_nul(v.value))
+        return true;
+    return false;
 }
 
 /** POSIX ('/...') or Windows ('C:\...', 'C:/...', '\\server\share') absolute
@@ -223,6 +280,64 @@ inline std::vector<EnvVar> default_launch_env(bool windows,
     if (tz && !tz->empty())
         env.push_back({"TZ", *tz});
     return env;
+}
+
+/** Outcome of merge_launch_env(): the merged environment (accepted entries
+ *  only), plus the names of any `extra` entries that were refused outright.
+ *  build_launch_spec() treats a non-empty `rejected` as fatal -- see
+ *  LaunchSpecError::denied_env_var -- but the merge itself still reports
+ *  which name(s) triggered it rather than just a bool, so a caller/test can
+ *  pin down exactly what was refused. */
+struct EnvMergeResult {
+    std::vector<EnvVar> env;
+    std::vector<std::string> rejected;
+};
+
+/// Merges `extra` (caller-supplied, e.g. SubprocessOptions::extra_env) onto
+/// `base` (e.g. default_launch_env()'s A5 allow-list): an extra entry whose
+/// name matches an existing base entry REPLACES it in place -- base order is
+/// otherwise preserved, and a same-named entry is NEVER appended as a second,
+/// duplicate entry (duplicate env names are ambiguous to execve/
+/// CreateProcessW alike); an entry with a new name is appended in caller
+/// order. Every `extra` entry is validated first (see is_denied_env_name/
+/// is_malformed_env_entry) -- a denylisted or malformed entry is NOT applied
+/// and its name is added to the returned `rejected` list instead; the caller
+/// (build_launch_spec) is expected to treat any non-empty `rejected` as
+/// fatal for the WHOLE launch (fail closed), never apply the other,
+/// individually-valid entries as a partial success.
+///
+/// `windows` selects the REPLACE-matching rule, and must match the target
+/// default_launch_env() was built for: real POSIX environment names are
+/// case-sensitive (an extra "path" would coexist alongside a base "PATH" as
+/// two distinct variables), so POSIX matching is exact-case; real Windows
+/// environment blocks are case-insensitive (MSDN: CreateProcess's
+/// lpEnvironment "must be sorted alphabetically... case-insensitively", and
+/// the OS itself treats "Path"/"PATH" as the same variable), so leaving a
+/// Windows merge case-sensitive would let an extra "Path" survive alongside
+/// base "PATH" as two entries in spec.env that the real OS collapses to one
+/// on the other side of CreateProcessW -- silently ambiguous in exactly the
+/// way the "replace, never duplicate" contract exists to prevent. Windows
+/// matching here is therefore case-insensitive, matching the OS it targets.
+inline EnvMergeResult merge_launch_env(const std::vector<EnvVar>& base, const std::vector<EnvVar>& extra,
+                                       bool windows) {
+    EnvMergeResult result;
+    result.env = base;
+    for (const auto& entry : extra) {
+        if (detail::is_malformed_env_entry(entry) || detail::is_denied_env_name(entry.key)) {
+            result.rejected.push_back(entry.key);
+            continue;
+        }
+        auto it = std::find_if(result.env.begin(), result.env.end(), [&](const EnvVar& existing) {
+            if (windows)
+                return detail::to_upper_ascii(existing.key) == detail::to_upper_ascii(entry.key);
+            return existing.key == entry.key;
+        });
+        if (it != result.env.end())
+            it->value = entry.value; // replace in place -- never a second, ambiguous same-named entry
+        else
+            result.env.push_back(entry); // new name -- appended in caller order
+    }
+    return result;
 }
 
 /**
@@ -300,6 +415,32 @@ inline LaunchSpec build_launch_spec(const std::vector<std::string>& argv, const 
         return spec;
     }
 
+    // A5: clear-and-allow-list env target for this compile (CDX-P2-008:
+    // Windows must not inherit the POSIX shape) -- computed here, ahead of
+    // any field population below, so both the extra_env pre-check right
+    // after this and the later default_launch_env()/merge_launch_env() calls
+    // share the one definition.
+#ifdef _WIN32
+    constexpr bool kWindowsEnv = true;
+#else
+    constexpr bool kWindowsEnv = false;
+#endif
+
+    // Bounded widening of A5 (Alex plan-gate ruling, PLAN-04 option b):
+    // pre-validate opts.extra_env BEFORE populating anything else on spec,
+    // so a denied/malformed entry fails closed with the SAME clean, bare
+    // spec (only .error set) every other rejection above returns -- never a
+    // spec left half-populated from work this function abandons. The base
+    // passed here is irrelevant to what gets rejected (is_denied_env_name/
+    // is_malformed_env_entry look only at each `extra` entry), so an empty
+    // placeholder base is fine; the real merge against the actual A5
+    // allow-list happens again below once we know every entry is clean.
+    if (!opts.extra_env.empty() &&
+        !merge_launch_env({}, opts.extra_env, kWindowsEnv).rejected.empty()) {
+        spec.error = LaunchSpecError::denied_env_var;
+        return spec;
+    }
+
     spec.argv = argv;
     spec.merge_stderr = opts.merge_stderr;
     spec.working_dir = opts.working_dir.value_or(std::string("/"));
@@ -307,15 +448,15 @@ inline LaunchSpec build_launch_spec(const std::vector<std::string>& argv, const 
     spec.rlimits = opts.rlimits;
     spec.exec_verify = opts.exec_verify;
 
-    // A5: clear-and-allow-list env, built here from nothing for the compile
-    // target (CDX-P2-008: Windows must not inherit the POSIX shape). The
-    // per-OS list lives in the pure, host-testable default_launch_env().
-#ifdef _WIN32
-    constexpr bool kWindowsEnv = true;
-#else
-    constexpr bool kWindowsEnv = false;
-#endif
+    // The per-OS allow-list lives in the pure, host-testable
+    // default_launch_env(); extra_env (already validated above -- nothing
+    // here can be rejected) is merged onto it, replacing same-named entries
+    // in place. Skipped entirely when empty so every existing caller's
+    // spec.env is untouched byte-for-byte (required no-regression
+    // contract).
     spec.env = default_launch_env(kWindowsEnv, opts.tz);
+    if (!opts.extra_env.empty())
+        spec.env = merge_launch_env(spec.env, opts.extra_env, kWindowsEnv).env;
 
     for (std::size_t i = 0; i < spec.argv.size(); ++i) {
         if (i)
