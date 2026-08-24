@@ -274,6 +274,38 @@ TEST_CASE("REST POST /api/v1/quarantine rejects a malformed JSON body (400, no d
     CHECK_FALSE(h.is_quarantined("agent-B"));
 }
 
+TEST_CASE("REST POST /api/v1/quarantine rejects an unsafe whitelist (400, no write) "
+          "(#3425 gate3-rest-whitelist-validation-gap)",
+          "[rest][quarantine][authz][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineRouteHarness h(qpool);
+    h.scope_allow = true;
+    SECTION("unsafe charset (a CIDR slash)") {
+        auto res = h.post(R"({"agent_id":"agent-B","reason":"test","whitelist":"10.0.0.0/24"})");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.scope_fn_called); // scope gate runs before the validator, same order as agent_id
+        CHECK_FALSE(h.is_quarantined("agent-B")); // rejected, never written
+    }
+    SECTION("oversized (over kQuarantineWhitelistMaxLen)") {
+        const std::string oversized(600, '1');
+        const std::string body = R"({"agent_id":"agent-B","reason":"test","whitelist":")" +
+                                 oversized + R"("})";
+        auto res = h.post(body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK_FALSE(h.is_quarantined("agent-B"));
+    }
+    SECTION("a valid whitelist still succeeds (201)") {
+        auto res = h.post(
+            R"({"agent_id":"agent-B","reason":"test","whitelist":"10.0.0.1,10.0.0.2"})");
+        REQUIRE(res);
+        CHECK(res->status == 201);
+        CHECK(h.is_quarantined("agent-B"));
+    }
+}
+
 TEST_CASE("REST POST/DELETE /api/v1/quarantine audit the unwired-scope-gate 500 (gov-fix)",
           "[rest][quarantine][authz][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);

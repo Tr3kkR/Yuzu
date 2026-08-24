@@ -1515,7 +1515,7 @@ Quarantine a device.
 |---|---|---|---|
 | `agent_id` | string | Yes | Target device ID |
 | `reason` | string | No | Human-readable reason for quarantine |
-| `whitelist` | string | No | Comma-separated IPs still allowed to communicate |
+| `whitelist` | string | No | Comma-separated IPs still allowed to communicate. Validated server-side (#3425): ≤512 characters total, each token ≤45 characters and drawn from `[0-9A-Fa-f.:]` — the same charset the reconciler and MCP's `quarantine_device` retry path require before ever dispatching a stored whitelist. Rejected with `400`, not written. |
 
 **Response (201):**
 
@@ -1527,8 +1527,9 @@ Quarantine a device.
 ```
 
 > **`400` vs `503` (ADR-0047).** A `400` means a business/state error (a
-> missing `agent_id`, or the device is already quarantined) — retrying the
-> identical request will not succeed, and `error.retry_after_ms` is
+> missing `agent_id`, the device is already quarantined, or `whitelist` fails
+> server-edge validation) — retrying the identical request will not succeed,
+> and `error.retry_after_ms` is
 > `null`. A `503` means a genuine store/pool failure — retrying is
 > reasonable, and `error.retry_after_ms` carries a concrete `5000`
 > hint (REST's envelope has no nested `data` object — that's MCP's JSON-RPC
