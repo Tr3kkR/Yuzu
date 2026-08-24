@@ -314,13 +314,16 @@ sites. macOS: `fdesetup`/`diskutil` stay on the bounded runner, promoted
 from a `/bin/sh -c` shell wrapper to direct argv, rung 2 — see Registered
 sites above).
 
-**Migrated off raw spawn (Wave 4, PR4.3b):** `software_actions` (0 spawn
-sites remaining on Windows: `list_upgradable`'s winget call and
-`installed_count`'s prior `powershell -Command` registry-count call are BOTH
-gone — installed_count is now a native Reg\*W subkey count, rung 1, no
-subprocess at all, replacing a payload ADR-3002 Decision 5 pins at rung 3
-forever; Linux/macOS moved from `popen()`/`_popen()` to direct runner argv
-for both actions — see Registered sites above) and a **partial** migration of
+**Migrated off raw spawn (Wave 4, PR4.3b):** `software_actions` (0 **raw**
+spawn sites remaining on any OS — no `popen`/`_popen`/`std::system` left in
+the plugin. On Windows the two former raw sites diverged: `installed_count`'s
+`powershell -Command` registry-count call is gone OUTRIGHT — it is now a
+native Reg\*W subkey count, rung 1, no subprocess at all, replacing a payload
+ADR-3002 Decision 5 pins at rung 3 forever — while `list_upgradable`'s winget
+call SURVIVES as a migrated rung-2 site, registered above as
+`software_actions/list_upgradable_windows#1`. Linux/macOS moved from
+`popen()`/`_popen()` to direct runner argv for both actions — see Registered
+sites above) and a **partial** migration of
 `license_scan`: only the Linux leg (`licensing_linux.cpp`) moved off
 `popen()`/`std::system()` onto the runner (Windows/macOS were already
 rung-1 native and untouched). This is also a deliberate DEMOTION, not a

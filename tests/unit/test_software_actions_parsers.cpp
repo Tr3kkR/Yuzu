@@ -216,6 +216,74 @@ TEST_CASE("installed_count: a negative sentinel emits NO count line, never a fab
     CHECK(*installed_count_line(214) == "count|214");
 }
 
+TEST_CASE("winget upgrade: a data row that cannot be mapped is counted, never borrowed-from",
+          "[software_actions]") {
+    // Row 2's Id runs straight into the Version column with no gap at all, so
+    // the column boundary cannot be trusted. It must NOT be emitted with a
+    // value taken from a neighbouring column -- but it must not vanish
+    // silently either.
+    constexpr std::string_view out =
+        "Name               Id                        Version      Available    Source\n"
+        "-----------------------------------------------------------------------------\n"
+        "Git                Git.Git                   2.40.0       2.42.0       winget\n"
+        "Bad                Some.Very.Long.Identifier.That.Overflows 1.0 2.0     winget\n";
+    auto parsed = parse_winget_upgrade(out);
+    REQUIRE(parsed.rows.size() == 1);
+    CHECK(parsed.rows[0].name == "Git");
+    CHECK(parsed.unmapped_lines == 1);
+}
+
+TEST_CASE("winget upgrade: trailer lines are never counted as dropped data rows",
+          "[software_actions]") {
+    auto parsed = parse_winget_upgrade(kRealWingetCapture);
+    // Both trailers are recognised as trailers, so the real capture reports a
+    // fully clean parse rather than a spurious CONSTRAINED result.
+    CHECK(parsed.unmapped_lines == 0);
+}
+
+TEST_CASE("winget upgrade: unreadable header does not turn the footer into a package",
+          "[software_actions]") {
+    constexpr std::string_view out =
+        "-----------------------------------------------------------------------------\n"
+        "Git                Git.Git                   2.40.0       2.42.0       winget\n"
+        "1 package(s) have version numbers that cannot be determined.\n";
+    auto parsed = parse_winget_upgrade(out);
+    CHECK(parsed.header_unrecognized);
+    REQUIRE(parsed.rows.size() == 1);
+    CHECK(parsed.rows[0].name == "Git");
+}
+
+// ── macOS: softwareupdate label extraction edge cases ──────────────────────
+
+TEST_CASE("softwareupdate -l: a bare 'Label:' never throws and yields no label",
+          "[software_actions]") {
+    // substr(find(':') + 2) on this line runs past the end and throws
+    // std::out_of_range, which would cross the plugin's C ABI boundary.
+    CHECK(parse_softwareupdate_list("* Label:\n").empty());
+    CHECK(parse_softwareupdate_list("* Label:   \n").empty());
+}
+
+TEST_CASE("softwareupdate -l: the label is taken after 'Label:', not after the first colon",
+          "[software_actions]") {
+    auto labels = parse_softwareupdate_list("* Label: macOS Sequoia 15.6.1-24G90\n");
+    REQUIRE(labels.size() == 1);
+    CHECK(labels[0] == "macOS Sequoia 15.6.1-24G90");
+}
+
+// ── capture completeness (pure seam) ───────────────────────────────────────
+
+TEST_CASE("capture_is_complete: only a clean, untruncated, accepted run is usable",
+          "[software_actions]") {
+    CHECK(capture_is_complete(/*tool_ran=*/true, /*timed_out=*/false,
+                              /*output_truncated=*/false, /*exit_ok=*/true));
+    // A truncated capture silently undercounts, so it is never usable for a
+    // count -- the same reasoning license_scan applies to a truncated rpm -qa.
+    CHECK_FALSE(capture_is_complete(true, false, /*output_truncated=*/true, true));
+    CHECK_FALSE(capture_is_complete(/*tool_ran=*/false, false, false, true));
+    CHECK_FALSE(capture_is_complete(true, /*timed_out=*/true, false, true));
+    CHECK_FALSE(capture_is_complete(true, false, false, /*exit_ok=*/false));
+}
+
 // ── Linux: apt list --upgradable ───────────────────────────────────────────
 
 TEST_CASE("apt list --upgradable: real-format lines with from-version — reconstructed",

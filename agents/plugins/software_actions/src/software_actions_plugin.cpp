@@ -73,12 +73,24 @@ struct HKeyCloser {
 
 // software_actions/installed_count_windows — NOT a spawn site (rung 1, no
 // subprocess): a native RegOpenKeyExW + RegQueryInfoKeyW subkey count of the
-// default (non-redirected) view of the Uninstall key, mirroring the exact
-// semantics of the powershell one-liner it replaces (that script also read
-// only the default view via Get-ItemProperty against the bare
-// HKLM:\...\Uninstall\* path — no WOW6432Node, no HKCU). Returns -1 on any
-// registry failure so the caller can report an honest degrade rather than a
-// fabricated zero.
+// default (non-redirected) view of the Uninstall key.
+//
+// Same KEY and same VIEW as the `powershell -Command` one-liner it replaces
+// (that script also read only the default view via Get-ItemProperty against
+// the bare HKLM:\...\Uninstall\* path — no WOW6432Node, no HKCU), but NOT a
+// byte-identical number: this is a raw subkey count, whereas
+// `(Get-ItemProperty ...).Count` counted property-bearing objects, so a
+// value-less subkey contributed nothing there and contributes 1 here. The
+// count is a fleet-inventory gauge, not a reconciled figure, and the honest
+// read is "programs registered under Uninstall".
+//
+// KNOWN LIMITATION, unchanged from the payload replaced: the 64-bit view omits
+// 32-bit applications registered under WOW6432Node. Reading both views would
+// change the reported number on every Windows host, so it is deliberately NOT
+// bundled into this migration.
+//
+// Returns -1 on any registry failure so the caller can report an honest
+// degrade rather than a fabricated zero.
 int registry_uninstall_subkey_count() {
     HKEY hkey{};
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
@@ -92,6 +104,9 @@ int registry_uninstall_subkey_count() {
                          nullptr, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) {
         return -1;
     }
+    // DWORD -> int: an Uninstall key cannot approach INT_MAX subkeys, and the
+    // signed type is what carries the -1 "read failed" sentinel. Explicit so a
+    // future -Wconversion sweep reads as deliberate.
     return static_cast<int>(subkey_count);
 }
 
@@ -116,6 +131,42 @@ std::string resolve_winget_path() {
 
 #endif // _WIN32
 
+// forward_runner_failure() returns true for line_limit too, which the seam
+// deliberately classifies as YUZU_RESULT_STATUS_OK -- "Not a failure". Keying
+// execute()'s integer return off "a status was set" would flatten that back
+// into a failure, which is precisely the narrowing ADR-3002's honest-
+// termination rule names the plugin return as. So the return code keys off the
+// classified STATUS, never off "something was reported".
+[[nodiscard]] bool runner_status_is_failure(const yuzu::agent::SubprocessResult& res) {
+    const auto s = yuzu::agent::classify_runner_failure(res);
+    return s.has_value() && s->status != YUZU_RESULT_STATUS_OK;
+}
+
+// A capture output may honestly be derived from: the child ran, the runner did
+// not cut it short, the capture was not truncated, and the exit code is one the
+// caller accepts (exit-code semantics are the caller's domain per
+// runner_status.hpp, so each site passes its own verdict). A truncated capture
+// matters as much as a failed one here: both count actions COUNT LINES, so a
+// capture that stopped early silently undercounts -- the same false-negative
+// reasoning licensing_linux.cpp applies to a truncated `rpm -qa`.
+[[nodiscard]] bool capture_usable(const yuzu::agent::SubprocessResult& res, bool exit_ok) {
+    return yuzu::software_actions::capture_is_complete(res.tool_ran, res.timed_out,
+                                                       res.output_truncated, exit_ok) &&
+           !runner_status_is_failure(res);
+}
+
+// Report a degrade for a tool that produced nothing usable, and NEVER emit a
+// data line alongside it. Prefers the runner's own provenance (spawn error,
+// deadline, truncation); falls back to `reason` when the tool merely ran and
+// returned a failing exit code, which the runner does not classify.
+void degrade(yuzu::CommandContext& ctx, const yuzu::agent::SubprocessResult& res,
+             const char* reason) {
+    if (!yuzu::agent::forward_runner_failure(ctx, res)) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              reason);
+    }
+}
+
 // ── list_upgradable action ─────────────────────────────────────────────────
 
 int do_list_upgradable(yuzu::CommandContext& ctx) {
@@ -136,6 +187,14 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
         yuzu::agent::SubprocessOptions{.deadline = kSlowToolDeadline});
     bool status_forwarded = yuzu::agent::forward_runner_failure(ctx, res);
     auto parsed = yuzu::software_actions::parse_winget_upgrade(res.output);
+    if (parsed.unmapped_lines > 0 && !status_forwarded && !parsed.header_unrecognized) {
+        // Some post-separator line looked like data but did not fit the
+        // header's columns, so it was dropped rather than emitted with values
+        // borrowed from a neighbouring column. A vanished package must not be
+        // indistinguishable from a host with fewer upgrades.
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "software_actions:winget_rows_unmapped");
+    }
     if (parsed.header_unrecognized && !status_forwarded) {
         // The table was found but its header did not yield the five expected
         // column origins, so every row below is reported name-only. Say so —
@@ -158,9 +217,9 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
 
 #elif defined(__linux__)
     bool found = false;
-    bool status_forwarded = false;
     yuzu::agent::SubprocessResult apt_res, yum_res;
-    bool apt_tried = false, yum_tried = false, yum_success = false;
+    bool apt_tried = false, yum_tried = false;
+    bool apt_ok = false, yum_ok = false;
 
     auto apt = yuzu::agent::probe_tool_path({"/usr/bin/apt", "/bin/apt"});
     if (!apt.empty()) {
@@ -169,9 +228,13 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
         apt_res = yuzu::agent::run_bounded_subprocess(
             {apt, "list", "--upgradable"},
             yuzu::agent::SubprocessOptions{.deadline = kQuickToolDeadline});
-        for (const auto& r : yuzu::software_actions::parse_apt_list_upgradable(apt_res.output)) {
-            ctx.write_output(std::format("upgradable|{}|{}|{}", r.name, r.old_version, r.new_version));
-            found = true;
+        apt_ok = capture_usable(apt_res, apt_res.exit_code == 0);
+        if (apt_ok) {
+            for (const auto& r : yuzu::software_actions::parse_apt_list_upgradable(apt_res.output)) {
+                ctx.write_output(
+                    std::format("upgradable|{}|{}|{}", r.name, r.old_version, r.new_version));
+                found = true;
+            }
         }
     }
     if (!found) {
@@ -181,13 +244,13 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
             // software_actions/list_upgradable_linux#2 (docs/agent-spawn-sink-manifest.md)
             yum_res = yuzu::agent::run_bounded_subprocess(
                 {yum, "check-update"}, yuzu::agent::SubprocessOptions{.deadline = kQuickToolDeadline});
-            // yum/dnf check-update exits 100 when updates ARE available — a
+            // yum/dnf check-update exits 100 when updates ARE available -- a
             // success-with-data exit code, never a failure (see
-            // yum_checkupdate_is_success's doc comment). The old popen-based
-            // code never inspected the exit code at all; this must not
-            // regress into treating 100 as an error.
-            if (yuzu::software_actions::yum_checkupdate_is_success(yum_res.exit_code)) {
-                yum_success = true;
+            // yum_checkupdate_is_success's doc comment; confirmed against a
+            // real fedora:40 run, which exits 100 with a leading blank line).
+            yum_ok = capture_usable(
+                yum_res, yuzu::software_actions::yum_checkupdate_is_success(yum_res.exit_code));
+            if (yum_ok) {
                 for (const auto& r : yuzu::software_actions::parse_yum_checkupdate(yum_res.output)) {
                     ctx.write_output(std::format("upgradable|{}|-|{}", r.name, r.new_version));
                     found = true;
@@ -195,36 +258,66 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
             }
         }
     }
-    if (!found) {
-        // Report the runner-level degrade of whichever attempt is
-        // authoritative for the empty result — never overwrite an earlier
-        // degrade, and never report a degrade for an attempt a successful
-        // fallback already rescued.
-        if (yum_tried && !yum_success)
-            status_forwarded = yuzu::agent::forward_runner_failure(ctx, yum_res);
-        if (!status_forwarded && apt_tried)
-            status_forwarded = yuzu::agent::forward_runner_failure(ctx, apt_res);
-        ctx.write_output("upgradable|none|System is up to date|-");
+    if (found)
+        return 0;
+
+    // Nothing was emitted. Say WHY. "System is up to date" is a positive
+    // assertion about the host and must be reserved for the one case that
+    // actually justifies it -- a package manager that RAN CLEAN and reported
+    // nothing. A tool that failed, or that was never found, produces a
+    // degraded status and no reassuring line: reporting a broken query as
+    // "up to date" is the Wave-3 firewall false-safe shape.
+    if (yum_tried && !yum_ok) {
+        degrade(ctx, yum_res, "software_actions:yum_check_update_failed");
+        return 1;
     }
-    return status_forwarded ? 1 : 0;
+    if (apt_tried && !apt_ok) {
+        degrade(ctx, apt_res, "software_actions:apt_list_upgradable_failed");
+        return 1;
+    }
+    if (!apt_tried && !yum_tried) {
+        // Neither package manager is present (Alpine/apk, Arch/pacman, a SUSE
+        // image without rpm at the probed paths). Nothing was enumerated, so
+        // nothing can be claimed about this host's upgrades.
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "software_actions:no_supported_package_manager");
+        return 1;
+    }
+    ctx.write_output("upgradable|none|System is up to date|-");
+    return 0;
 
 #elif defined(__APPLE__)
     auto tool = yuzu::agent::probe_tool_path({"/usr/sbin/softwareupdate"});
-    std::vector<std::string> argv;
-    if (!tool.empty())
-        argv = {tool, "-l"};
+    if (tool.empty()) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "software_actions:softwareupdate_not_present");
+        return 1;
+    }
     // software_actions/list_upgradable_macos#1 (docs/agent-spawn-sink-manifest.md)
     auto res = yuzu::agent::run_bounded_subprocess(
-        argv, yuzu::agent::SubprocessOptions{.deadline = kSlowToolDeadline});
-    bool status_forwarded = yuzu::agent::forward_runner_failure(ctx, res);
+        {tool, "-l"}, yuzu::agent::SubprocessOptions{.deadline = kSlowToolDeadline});
+    // The exit code is deliberately NOT part of the usability test here:
+    // `softwareupdate -l` has varied its exit status across macOS releases, so
+    // inventing a failure from it would be its own dishonesty. Runner-level
+    // outcomes and truncation still disqualify the capture.
+    if (!capture_usable(res, /*exit_ok=*/true)) {
+        degrade(ctx, res, "software_actions:softwareupdate_failed");
+        return 1;
+    }
     auto labels = yuzu::software_actions::parse_softwareupdate_list(res.output);
     if (labels.empty()) {
+        if (res.exit_code != 0) {
+            // Nothing parsed AND a failing exit: no basis to claim the host is
+            // up to date.
+            degrade(ctx, res, "software_actions:softwareupdate_failed");
+            return 1;
+        }
         ctx.write_output("upgradable|none|System is up to date|-");
-    } else {
-        for (const auto& label : labels)
-            ctx.write_output(std::format("upgradable|{}|-|-", label));
+        return 0;
     }
-    return status_forwarded ? 1 : 0;
+    for (const auto& label : labels)
+        ctx.write_output(std::format("upgradable|{}|-|-", label));
+    return 0;
 
 #else
     ctx.write_output("error|platform not supported");
@@ -254,42 +347,63 @@ int do_installed_count(yuzu::CommandContext& ctx) {
     return 0;
 
 #elif defined(__linux__)
+    // Every branch below obeys one rule, the same one the Windows leg states:
+    // a `count|` line is a factual claim about this host, so it is emitted ONLY
+    // for a complete, trustworthy capture. A failed, truncated or absent tool
+    // yields a degraded status and NO count line -- `count|0` would assert
+    // "zero installed programs", the false-clean shape the antivirus plugin's
+    // `exclusion_count|0` invariant forbids.
     auto dpkg = yuzu::agent::probe_tool_path({"/usr/bin/dpkg-query", "/bin/dpkg-query"});
     if (!dpkg.empty()) {
         // software_actions/installed_count_linux#1 (docs/agent-spawn-sink-manifest.md)
         auto res = yuzu::agent::run_bounded_subprocess(
             {dpkg, "-W", "-f=${db:Status-Abbrev}\\n"},
             yuzu::agent::SubprocessOptions{.deadline = kQuickToolDeadline});
-        bool status_forwarded = yuzu::agent::forward_runner_failure(ctx, res);
+        if (!capture_usable(res, res.exit_code == 0)) {
+            degrade(ctx, res, "software_actions:dpkg_query_failed");
+            return 1;
+        }
         ctx.write_output(std::format(
             "count|{}", yuzu::software_actions::count_dpkg_status_abbrev_installed(res.output)));
-        return status_forwarded ? 1 : 0;
+        return 0;
     }
     auto rpm = yuzu::agent::probe_tool_path({"/usr/bin/rpm", "/bin/rpm"});
     if (!rpm.empty()) {
         // software_actions/installed_count_linux#2 (docs/agent-spawn-sink-manifest.md)
         auto res = yuzu::agent::run_bounded_subprocess(
             {rpm, "-qa"}, yuzu::agent::SubprocessOptions{.deadline = kQuickToolDeadline});
-        bool status_forwarded = yuzu::agent::forward_runner_failure(ctx, res);
+        if (!capture_usable(res, res.exit_code == 0)) {
+            degrade(ctx, res, "software_actions:rpm_query_failed");
+            return 1;
+        }
         ctx.write_output(
             std::format("count|{}", yuzu::software_actions::count_nonempty_lines(res.output)));
-        return status_forwarded ? 1 : 0;
+        return 0;
     }
-    ctx.write_output("count|0");
-    return 0;
+    // Neither package manager present (Alpine/apk, Arch/pacman, SUSE without
+    // rpm at the probed paths) -- installed_apps already treats such hosts as
+    // in-fleet, so this is a reachable state, not a theoretical one.
+    ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                          "software_actions:no_supported_package_manager");
+    return 1;
 
 #elif defined(__APPLE__)
     auto tool = yuzu::agent::probe_tool_path({"/usr/sbin/pkgutil"});
-    std::vector<std::string> argv;
-    if (!tool.empty())
-        argv = {tool, "--pkgs"};
+    if (tool.empty()) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "software_actions:pkgutil_not_present");
+        return 1;
+    }
     // software_actions/installed_count_macos#1 (docs/agent-spawn-sink-manifest.md)
     auto res = yuzu::agent::run_bounded_subprocess(
-        argv, yuzu::agent::SubprocessOptions{.deadline = kQuickToolDeadline});
-    bool status_forwarded = yuzu::agent::forward_runner_failure(ctx, res);
+        {tool, "--pkgs"}, yuzu::agent::SubprocessOptions{.deadline = kQuickToolDeadline});
+    if (!capture_usable(res, res.exit_code == 0)) {
+        degrade(ctx, res, "software_actions:pkgutil_failed");
+        return 1;
+    }
     ctx.write_output(
         std::format("count|{}", yuzu::software_actions::count_nonempty_lines(res.output)));
-    return status_forwarded ? 1 : 0;
+    return 0;
 
 #else
     ctx.write_output("error|platform not supported");

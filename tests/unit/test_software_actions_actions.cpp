@@ -23,8 +23,11 @@
 #include "local_dispatcher.hpp"
 
 #include <cctype>
+#include <cstdlib>
 #include <filesystem>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -117,6 +120,10 @@ TEST_CASE("software_actions plugin: installed_count reports a real digit count v
     for (char c : rest) {
         CHECK(std::isdigit(static_cast<unsigned char>(c)));
     }
+    // Any dev or CI host has dpkg/rpm/pkgutil records. Without this the case
+    // is satisfied by `count|0` -- the exact fabricated zero the degrade paths
+    // were changed to stop emitting.
+    CHECK(std::stoll(rest) > 0);
 }
 
 #else // _WIN32

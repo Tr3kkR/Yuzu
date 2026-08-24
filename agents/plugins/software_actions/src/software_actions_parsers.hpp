@@ -85,6 +85,12 @@ namespace detail {
 
 /// winget upgrade renders five columns: Name / Id / Version / Available /
 /// Source.
+///
+/// Positional slicing removes the dependency on the header TEXT, so a
+/// translated header still parses -- but it assumes each localised column name
+/// is a SINGLE token. A translation using a two-word column name yields more
+/// than five origins and drops the table into the name-only degrade path. That
+/// is an honest degrade, not a mis-parse, but it is not "localisation solved".
 inline constexpr std::size_t kWingetColumnCount = 5;
 
 struct WingetUpgradeRow {
@@ -103,6 +109,12 @@ struct WingetUpgradeParse {
     // date" line) — the same two-shape distinction the original popen-based
     // code made via `lines.empty()` vs `!found_any`.
     bool separator_found = false;
+    // Post-separator lines that looked like data but could not be mapped onto
+    // the header's columns. Trailer prose lands here too, so a nonzero value is
+    // not by itself an error -- but a row silently vanishing from an upgrade
+    // report IS, so the caller reports PARTIAL completeness once any line is
+    // dropped beyond the trailers it recognises.
+    std::size_t unmapped_lines = 0;
     // True when the header line above the separator did NOT yield exactly
     // kWingetColumnCount column origins, so positional slicing was not
     // possible and rows were emitted name-only (`name|-|-`). Never means a
@@ -112,6 +124,20 @@ struct WingetUpgradeParse {
     // version columns".
     bool header_unrecognized = false;
 };
+
+/// winget's post-table trailer lines ("23 upgrades available.", "N package(s)
+/// have version numbers that cannot be determined. …"). Recognised so they are
+/// never counted as dropped data rows, and never emitted as a phantom package
+/// in the degraded name-only path. English-only by nature -- winget localises
+/// these too -- so it is used ONLY to classify lines already rejected as data,
+/// never to admit one.
+[[nodiscard]] inline bool is_winget_trailer(const std::string& line) {
+    const bool upgrades_available =
+        line.find("upgrade") != std::string::npos && line.find("available") != std::string::npos;
+    const bool undetermined_versions = line.find("package(s)") != std::string::npos &&
+                                       line.find("version") != std::string::npos;
+    return upgrades_available || undetermined_versions;
+}
 
 /// Parse `winget upgrade --accept-source-agreements` output.
 ///
@@ -175,8 +201,7 @@ struct WingetUpgradeParse {
             // always begins at offset 0, so the text before the first run of
             // 2+ spaces is genuinely the name; the version columns are
             // reported as "-" rather than guessed.
-            if (line.find("upgrade") != std::string::npos &&
-                line.find("available") != std::string::npos)
+            if (is_winget_trailer(line))
                 continue;
             const auto gap = line.find("  ");
             auto name = detail::slice_trimmed(line, 0, gap == std::string::npos ? line.size() : gap);
@@ -197,8 +222,15 @@ struct WingetUpgradeParse {
                 break;
             }
         }
-        if (!aligned)
+        if (!aligned) {
+            // Either trailer prose (which overflows its columns) or a genuine
+            // row whose padding this parser could not follow. It is NOT emitted
+            // with borrowed values -- but it is counted, so a dropped package
+            // cannot vanish silently.
+            if (!is_winget_trailer(line))
+                ++result.unmapped_lines;
             continue;
+        }
 
         auto name = detail::slice_trimmed(line, origins[0], origins[1]);
         const auto id = detail::slice_trimmed(line, origins[1], origins[2]);
@@ -317,8 +349,15 @@ struct YumUpgradeRow {
         if (trimmed.starts_with("Software Update") || trimmed.starts_with("Finding") ||
             trimmed.starts_with("No new"))
             continue;
-        if (trimmed.find("Label:") != std::string::npos) {
-            labels.push_back(trimmed.substr(trimmed.find(':') + 2));
+        if (const auto label_pos = trimmed.find("Label:"); label_pos != std::string::npos) {
+            // Take the text after THIS "Label:" -- not after the first colon in
+            // the line, which need not be the same one. An unguarded
+            // substr(find(':') + 2) also throws std::out_of_range on a bare
+            // "Label:" line, and that exception would cross the plugin's C ABI
+            // boundary out of execute(), which has no catch.
+            const auto value = trimmed.find_first_not_of(" \t", label_pos + 6);
+            if (value != std::string::npos)
+                labels.push_back(trimmed.substr(value));
         } else if (!trimmed.starts_with("Title:") && !trimmed.starts_with("Size:") &&
                    !trimmed.starts_with("Recommended:") && !trimmed.starts_with("Action:")) {
             labels.push_back(trimmed);
@@ -346,6 +385,16 @@ struct YumUpgradeRow {
 /// Generic "one record per non-empty line" count (`rpm -qa`, `pkgutil --pkgs`).
 [[nodiscard]] inline std::size_t count_nonempty_lines(std::string_view output) {
     return detail::split_nonblank_lines(output).size();
+}
+
+/// Whether one tool invocation produced a COMPLETE, trustworthy capture that
+/// a count or a row list may honestly be derived from. `exit_ok` is the
+/// caller's own verdict on the exit code (runner_status.hpp leaves exit-code
+/// semantics to the caller: yum/dnf's 100 is a success, most tools' nonzero is
+/// not). Pure so every combination is unit-testable without a spawn.
+[[nodiscard]] constexpr bool capture_is_complete(bool tool_ran, bool timed_out,
+                                                 bool output_truncated, bool exit_ok) {
+    return tool_ran && !timed_out && !output_truncated && exit_ok;
 }
 
 // ── installed_count emit decision (pure seam) ──────────────────────────────

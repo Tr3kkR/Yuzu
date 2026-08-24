@@ -25,8 +25,11 @@
 
 #include "local_dispatcher.hpp"
 
+#include <cstdlib>
 #include <filesystem>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 

@@ -380,9 +380,10 @@ agent_test_exe = executable(
                                                 # discrimination (macOS-only; a no-op TU elsewhere)
     'unit/test_software_actions_parsers.cpp', # Wave 4 PR4.3b: software_actions' FIRST tests --
                                                 # pure winget/apt/yum/softwareupdate/dpkg-query parsers
-    'unit/test_software_actions_actions.cpp', # Wave 4 PR4.3b: real software_actions.dylib/.so driven
-                                                # end to end via LocalDispatcher (installed_count only;
-                                                # POSIX-only, a no-op TU on Windows via #ifndef _WIN32)
+    'unit/test_software_actions_actions.cpp', # Wave 4 PR4.3b: real software_actions.dylib/.so/.dll
+                                                # driven end to end via LocalDispatcher
+                                                # (installed_count only; the Windows leg covers the
+                                                # native rung-1 Uninstall-key registry read)
     'unit/test_license_scan_actions.cpp',     # Wave 4 PR4.3b: real license_scan.dylib/.so driven
                                                 # end to end via LocalDispatcher after the Linux-leg
                                                 # runner migration (POSIX-only, a no-op TU on Windows)
