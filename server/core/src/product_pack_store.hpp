@@ -176,8 +176,15 @@ struct ProductPackQuery {
 /// `partial_result` out-param. `install_fn` tolerates a single document failing without failing
 /// the whole bundle — this is how a caller learns WHICH documents failed and why, instead of
 /// only a bare pack id (success) or the first of potentially several failure reasons (total
-/// failure). Populated on BOTH outcomes: a total failure (`install()` returns `unexpected`) and
-/// a partial success (`install()` returns the pack id with some documents still having failed).
+/// failure). Populated at every `install()` return point that carries an `install_fn` outcome —
+/// a total failure after the document loop ran, or a success (clean or partial). Gov Gate 4
+/// finding (consistency-auditor, #3481): NOT populated on a return BEFORE the document loop
+/// runs (store-not-open, missing `install_fn`, a malformed bundle, a signature rejection, an
+/// idempotency-key conflict/replay) — there is no install_fn outcome to report yet, and
+/// structurally can't be: the populating lambda and its captured locals don't exist at that
+/// point in `install()`. A caller reading only this comment should not assume "always
+/// populated on any `unexpected`" — see `install()`'s own `partial_result` doc for the precise
+/// carve-out.
 struct InstallPartialResult {
     std::vector<std::string> errors; ///< One entry per document install_fn rejected, in
                                      ///< document order — kind + install_fn's own error string.
@@ -200,6 +207,23 @@ enum class TransactionOutcome {
     kAborted,   ///< The backend confirms the transaction genuinely aborted — safe to compensate.
     kUnknown    // Could not determine either way — the ONLY safe read is "do not compensate".
 };
+
+/// Gov Gate 4 (unhappy-path UP-2, UP-5), on `kUnknown` specifically: if the underlying
+/// transaction had in fact genuinely ABORTED (not merely undetermined), the sibling-store
+/// content install_fn already wrote in THIS attempt is now an unlinked orphan — no pack_id was
+/// ever persisted to reference it, and — unlike the confirmed-orphan `kAborted` shape — nothing
+/// was compensated. A keyed retry's pre-check finds no committed row and re-runs install_fn for
+/// the WHOLE bundle: a document with an explicit, retry-stable `id:` collides against attempt
+/// 1's already-created row (surfaces as a new errors[] entry); an auto-id document silently
+/// creates a full second copy under a NEW pack_id, orphaning attempt 1's content with no
+/// pack_id, no audit row, and no metric distinguishing it from an ordinary kUnknown. Also:
+/// `check_transaction_outcome` leases from the SAME pool_ whose exhaustion or a Postgres outage
+/// is a common cause of the persist failure it exists to diagnose — under correlated failure
+/// (pool saturation, a DB outage window), kUnknown becomes the DEFAULT outcome fleet-wide
+/// precisely when resolution matters most, each one independently vulnerable to the retry
+/// hazard above. Neither is fixed here — the fail-toward-`kUnknown` design is still the
+/// correct, safe choice (never guess `kAborted`); this documents the residual so an operator
+/// investigating a kUnknown spike during an outage window knows what it can compound into.
 
 // ── Callbacks for delegating item install/uninstall to existing stores ────────
 
@@ -344,9 +368,11 @@ public:
     /// `partial_result` (#3479): when non-null, populated with per-document failure detail —
     /// on EITHER outcome, a total failure (every document's error, not just the first) or a
     /// partial success (which documents failed and why, alongside the ones that installed).
-    /// Defaults to null — preserves existing callers' behavior exactly; the idempotency
-    /// pre-check's short-circuit return (a replay) does NOT populate it, since install_fn never
-    /// ran on that call.
+    /// Defaults to null — preserves existing callers' behavior exactly. NOT populated on ANY
+    /// return that happens BEFORE the document loop runs — not just the idempotency pre-check's
+    /// short-circuit replay, but also the store-not-open/missing-install_fn/malformed-bundle/
+    /// signature-rejection/idempotency-conflict checks: `install_fn` never ran on any of those
+    /// calls, so there is no per-document outcome yet to report.
     std::expected<std::string, std::string> install(const std::string& yaml_bundle,
                                                     ItemInstallFn install_fn,
                                                     ItemUninstallFn compensate_fn = {},

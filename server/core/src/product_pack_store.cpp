@@ -1370,9 +1370,21 @@ std::expected<std::string, std::string> ProductPackStore::install(
         std::unordered_set<std::string> seen_item_ids;
         for (const auto& item : items_to_store) {
             if (!seen_item_ids.insert(item.item_id).second)
+                // Gate 4 finding (#3481, unhappy-path, UP-3): item.item_id can be
+                // attacker-controlled arbitrary text for PolicyFragment/Policy documents
+                // (unlike InstructionStore, PolicyStore applies no charset check to a
+                // caller-supplied `id:` field) — this message reaches BOTH the client
+                // response body (no kProductPackDbErrorPrefix, so product_pack_client_message
+                // never genericizes it) and the audit `detail` unfiltered. json_escape (the
+                // hand-rolled A4-envelope serializer) passes bytes >=0x20 through without
+                // UTF-8 validation (pre-existing, documented gap — see on_behalf_guard.hpp's
+                // truncation-helper comment, #2500) — invalid UTF-8 in an unsanitized id
+                // would ship an invalid-UTF-8 JSON response. sanitize_pg_text (already used
+                // throughout this file) fixes both this and the "gratuitous raw content in
+                // the audit trail" concern compensate_and_fail's own doc comment raises.
                 return compensate_and_fail(
                     "duplicate item id detected",
-                    "duplicate item id in bundle: '" + item.item_id + "'");
+                    "duplicate item id in bundle: '" + sanitize_pg_text(item.item_id) + "'");
         }
     }
 

@@ -24,16 +24,18 @@
   refuses a duplicate *name*, independent of any explicit `id:` — and for any kind whose bundle
   hard-codes a retry-stable explicit `id:`, the retry's re-creation of that ONE document instead
   FAILS outright; if every OTHER document in the bundle still installs, the pre-existing
-  (unrelated to this PR) per-document error tolerance means the pack still reports `201`
-  installed with no per-item error surfaced to the caller, and any other document that
-  cross-references the failed one by id (e.g. a `Policy`'s `spec.fragment`) silently resolves
-  against the STALE residual rather than a freshly tracked copy — the resulting pack can end up
-  depending on content that isn't listed among its own items, invisible to that pack's own
-  future uninstall. The compensation metric surfaces the originating partial-compensation event
-  for operator cleanup but does not itself prevent either outcome; closing the second one is an
-  open design question (surface per-item install errors in the response, or make the whole
-  install all-or-nothing on ANY post-loop document failure) intentionally left open by this PR
-  rather than decided unilaterally.
+  (unrelated to this PR) per-document error tolerance means the pack still reports `201`, and
+  any other document that cross-references the failed one by id (e.g. a `Policy`'s
+  `spec.fragment`) silently resolves against the STALE residual rather than a freshly tracked
+  copy — the resulting pack can end up depending on content that isn't listed among its own
+  items, invisible to that pack's own future uninstall. **Since this same PR (#3479, a
+  separate fragment): the `201` is no longer silent** — the response body now names every
+  document that failed to (re-)install and why, so this specific hazard is now VISIBLE to the
+  caller rather than requiring a cross-reference to notice. What's still open, and was the
+  actual design question: whether the platform should go further and make the whole install
+  all-or-nothing on ANY post-loop document failure (rejecting the retry outright instead of
+  reporting a visible partial success) — deliberately left open rather than decided
+  unilaterally, since it changes pre-existing API semantics beyond a late-Postgres-failure fix.
 - `uninstall()`'s mirror-image gap — its metadata-delete transaction failing after sibling
   content has already been removed — is accepted as a store-scoped residual risk (documented in
   `product_pack_store.hpp` alongside the existing retry-self-heals mitigant, since no
