@@ -92,7 +92,7 @@ mechanism, not just the warning.
 
 ## Orphan `policy_status` rows — discarded, not a refusal
 
-Log line (info-level, not a refusal): `PolicyStore: migrate_from_sqlite: N of
+Log line (`warn`-level, not a refusal): `PolicyStore: migrate_from_sqlite: N of
 M legacy policy_status rows were orphan debris (no matching policy in the
 legacy file) and were discarded, not migrated`.
 

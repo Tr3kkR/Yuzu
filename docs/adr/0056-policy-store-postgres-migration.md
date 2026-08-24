@@ -668,6 +668,14 @@ relying on declaration order to prove it).
 
 ## Follow-ups
 
+- `get_fleet_compliance()`'s lost-invalidation race (Ninth correction, 2026-08-24): `compute_fleet_compliance()`
+  runs outside `cache_mtx_`; a reader's DB query that straddles a concurrent writer's status-change +
+  cache-invalidation can store a pre-write value under a fresh timestamp on its own store-back,
+  overwriting the invalidation and serving stale compliance data for up to the remaining 60s TTL. LOW
+  (`I3`/`E5`) — narrow window, self-heals on the next write or TTL expiry. Fix shape: a monotonic
+  generation counter, incremented by every invalidation, captured by the reader before its query and
+  checked before its store-back is allowed to write (skip the store-back, not just the value, if the
+  generation moved).
 - `policy_inputs`/`policy_fragments` free-form-text secret exposure — flagged, not fixed (see
   Secrets above); needs a `security-guardian` assessment of whether read-time redaction is
   warranted.
@@ -888,3 +896,57 @@ session ever rested on skip-mode-only evidence: the Sixth correction's UP-3 fix 
 pre-compaction, in a segment where the DSN was genuinely set (confirmed via that run's own
 `SharedPgDbRegistry` drain lines and 13,865-assertion total); the Seventh correction's BLOCKING finding
 was a documentation gap, not a code path the PG suite could exercise either way.
+
+**Ninth correction** (2026-08-24, bounded Gate-8-style re-review of the Eighth correction's own merge
++ fix diff — `security-guardian` + `cpp-expert`, scoped to `aadc550a7` plus the three follow-up commits
+that landed the adversarial-review fixes, not the whole branch): `cpp-expert` gave a clean **PASS** —
+verified the merged `server.cpp` retains exactly one correct Postgres construction/teardown block for
+both `PolicyStore` and the colleague's parallel `BaselineStore` (PR #3517), confirmed the `with_txn_for`
+signature and the `run_in_txn`-returns-false-before-callback empty-lease behavior the K1 fix depends on,
+and confirmed no lock-ordering or lifetime issue in `invalidate_fleet_compliance_cache()`'s three call
+sites. Two non-blocking notes, neither requiring a code change here: `BaselineStore` has no explicit
+`.reset()` in `stop()` before `pg_pool_.reset()`, unlike every sibling Postgres-backed store in this
+file — confirmed pre-existing on `origin/dev` at `168d37d89`, inherited from PR #3517 unchanged, not
+touched by this branch's merge or diff; worth a follow-up issue against that store (the `CaStore`
+ladder-row precedent is the template), not this ADR's concern. The `create_policy` fallback message text
+("failed to create policy") differing cosmetically from sibling mutators' degrade wording is
+functionally correct (both share the `kPolicyDbErrorPrefix` prefix `is_db_error()` matches on) — already
+recorded as a deferred nit above, not reopened.
+
+`security-guardian` gave an overall **PASS**, no CRITICAL/HIGH, but found one real gap in the Eighth
+correction's own fix: **`delete_policy()` CASCADEs into `policy_status` (this migration's new FK) —
+a fourth write path into the same data `get_fleet_compliance()`'s cache aggregates — that the Eighth
+correction's cache-invalidation fix missed**, having wired only the three status-writing functions
+(`update_agent_status`, `invalidate_policy`, `invalidate_all_policies`). This is the same failure shape
+the Follow-ups section already names elsewhere in this ADR (fix the SINK, not the enumerated instances)
+recurring one level in: "the three functions that write `policy_status`" was never the actual sink —
+"anything that mutates `policy_status`, including a CASCADE" was, and a fix responding to external
+review reproduced the same enumeration mistake it was itself correcting. Fixed: `delete_policy()` now
+calls `invalidate_fleet_compliance_cache()` on a successful delete, guarded on `deleted == true` (a
+failed or no-op DELETE wrote nothing, so nothing to invalidate — not an oversight to later "fix" to
+unconditional). Regression test added, same shape as the Eighth correction's K7 test: populate the
+cache, delete the policy, confirm the very next read (inside the 60s TTL) reflects zero rather than the
+stale cached total. Second finding: the new runbook section's summary line was labeled "info-level, not
+a refusal" when the code (added by the Eighth correction) actually emits `spdlog::warn` — a doc/code
+wording mismatch, fixed (the per-row line in the same section already correctly said `warn`; the mislabel
+was isolated to the summary-line header).
+
+**Residual, deferred, not fixed this round:** re-reading `get_fleet_compliance()`/`compute_fleet_compliance()`
+directly while investigating the delete_policy gap surfaced one more real gap in the cache-invalidation
+fix, not caught by either external reviewer or either bounded-re-review agent — the query itself
+(`compute_fleet_compliance()`, `policy_store.cpp:1076-1117`) runs OUTSIDE `cache_mtx_`; only the
+cache-check (before the query) and the store-back (after it) are locked. A reader that misses the cache
+and begins the query can have its query observe pre-write state, then have a concurrent writer's status
+change AND cache invalidation both land before the reader's store-back completes — the reader then
+overwrites the just-invalidated cache with a stale value stamped with a fresh timestamp, silently
+un-doing the invalidation for up to the remaining TTL window. Narrow (one DB round-trip's width,
+self-heals on the next write or at 60s regardless), LOW under this ADR's severity scheme (`I3`/`E5`), and
+the correct fix — a monotonic generation counter checked against the query's start generation before
+the store-back is allowed to write — is a small, separable piece of work, not a one-liner alongside three
+other fixes. Added to Follow-ups below rather than fixed inline, to avoid landing a fourth stacked
+same-day fix on the same 60s cache this ADR has now touched three times without a chance to see whether
+the simpler fixes hold up first.
+
+Fixed this round, all PG-backed-suite-verified after a clean rebuild (DSN exported in the same command
+as the test invocation, per the Empiricism-correction note above): `[policy_store]` 557 assertions / 64
+cases, up from 548/63 after the Eighth correction (one new test case, nine new assertions).
