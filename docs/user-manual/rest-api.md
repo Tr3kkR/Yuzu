@@ -1623,7 +1623,8 @@ inventory and revoke endpoints are gated by the `Security` securable.
 Download the CA root certificate (PEM) and add it to an OS/browser trust store.
 **Public** — no authentication. Returns `Content-Type: application/x-pem-file`,
 `Content-Disposition: attachment; filename="yuzu-ca.pem"`,
-`Cache-Control: public, max-age=86400`. `404` if no CA root exists.
+`Cache-Control: public, max-age=86400`. `404` if no CA root exists; `503` if the
+CA store is unavailable (a genuine database error, distinct from no-root).
 
 ```bash
 curl https://yuzu.example.com/api/v1/ca/root -o yuzu-ca.pem
@@ -1647,7 +1648,8 @@ openssl crl -inform DER -in yuzu.crl -noout -text
 
 List certificates issued by the internal CA. **Permission:** `Security:Read`.
 Query params `limit` (1–1000, default 200) and `offset` (default 0). The full
-certificate PEM and enrollment reference are intentionally omitted.
+certificate PEM and enrollment reference are intentionally omitted. `503` if
+the CA store is unavailable.
 
 `meta.has_more` is `true` when more rows exist beyond the current page; when it is,
 `meta.next_offset` carries the `offset` to pass for the next page. Iterate until
@@ -1677,8 +1679,8 @@ The MCP `list_issued_certs` tool mirrors this contract (same `has_more` / `next_
 #### `POST /api/v1/ca/revoke`
 
 Revoke a certificate by serial. **Permission:** `Security:Delete`. Revocation
-takes effect server-side **immediately** (the mTLS accept gate reads `ca.db`, not
-the CRL); the CRL is then republished. Request body (max 64 KB):
+takes effect server-side **immediately** (the mTLS accept gate reads `ca_store`,
+not the CRL); the CRL is then republished. Request body (max 64 KB):
 
 ```json
 { "serial_hex": "3A4B5C6D...", "reason": "key compromise" }
@@ -2686,7 +2688,7 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `quarantine.enable` | Device quarantined |
 | `quarantine.disable` | Device released from quarantine |
 | `ca.cert.issued` | Internal CA signed a per-agent client certificate at enrollment. `target_type=AgentCertificate`, `target_id=<serial>`, `result=success`. |
-| `ca.cert.revoked` | Certificate revoked via `POST /api/v1/ca/revoke`. `target_type=AgentCertificate`, `target_id=<serial>`. `result=success`, or `result=failure` with `detail="serial not found or already revoked"` for an unknown/already-revoked serial. |
+| `ca.cert.revoked` | Certificate revoked via `POST /api/v1/ca/revoke`. `target_type=AgentCertificate`, `target_id=<serial>`. `result=success`; `result=denied` with `detail="serial not found or already revoked"` for an unknown/already-revoked serial (reject without state change, matches every destructive sibling); `result=failure` (ADR-0053) for a genuine ca_store DB/lease error — kept distinct from `denied` so a database outage is never audited as a rejected revoke attempt. |
 | `ca.crl.published` | CRL (re)published after a revocation. `target_type=Security`, `target_id=<serial that triggered it>`. `result=success`, or `result=failure` when the CRL could not be rebuilt/recorded (the revocation still stands; the public CRL is momentarily stale). |
 | `ca.root_csr.exported` | The install CA's CSR was exported via `GET /api/v1/ca/root-csr` (subordinate-CA setup). `target_type=CaRoot`, `target_id=root`. `result=success`, or `result=failure` if generation failed. |
 | `ca.subordinate.imported` | An enterprise-signed intermediate was imported via `POST /api/v1/ca/import-chain` (or the dashboard wrapper). `target_type=CaRoot`, `target_id=root`. `result=success` on a validated switch to subordinate mode; `result=denied` when the uploaded material is rejected (not a CA / wrong key / does not chain); `result=failure` on a server-side persistence error. `detail` carries `reason=...` on rejection and `via=dashboard` for the panel path. |
@@ -7408,13 +7410,15 @@ Install a product pack from a multi-document YAML bundle.
 
 **Response:**
 - `201 Created` `{"id": "<pack-id>", "status": "installed"}` on success.
-- `400 Bad Request` `{"error": "<message>"}` on rejection. Distinct error strings:
+- `400 Bad Request` — malformed YAML, missing required fields, item-install delegation failures, or a signature rejection. Distinct error messages:
   - `pack '<name>' is unsigned and signature enforcement is enabled (set --allow-unsigned-packs / YUZU_ALLOW_UNSIGNED_PACKS=1 to bypass)` — the install was refused because the pack carried no `signature:` field and the server is enforcing signatures (default since #802). Either sign the pack or set the escape-hatch flag.
   - `signature verification failed for pack '<name>' — content may have been tampered with` — the signature was present but did not verify against the supplied public key.
   - `pack '<name>' has signature but no publicKey — cannot verify` — the bundle carried a `signature:` field but no `publicKey:`.
-- Other 4xx for malformed YAML, missing required fields, or item-install delegation failures.
+  - `duplicate item id in bundle: '<item_id>'` — two documents in the bundle were assigned the same item id (by their `install_fn` delegate). Detected before any database interaction; this condition is deterministic, so a retry with the same bundle always fails the same way — never retry, fix the bundle instead.
+- `503 Service Unavailable` — the product pack store is unreachable (down/unmigrated) or a database error occurred persisting the pack. The response body carries only a generic `"service unavailable"` message; the specific database error is logged server-side, never echoed to the caller (migrated store — ADR-0054, mirrors `sw_deploy_client_message`/`device_token_client_message`'s established rationale for not leaking `PQerrorMessage()` fragments).
+- Both the `400` and `503` bodies use the standard **A4 error envelope** (`{"error": {"code", "message", "correlation_id", ...}, "meta": {"api_version": "v1"}}`, see [JSON Envelope](#json-envelope) above). **Breaking change (ADR-0054):** pre-migration, a rejected install returned a bare `{"error": "<message>"}` body — a client parsing that flat shape (rather than treating the body as opaque diagnostic text) must switch to reading `error.message`.
 
-**Audit:** Emits `product_pack.install` with `result=success` and `target_id=<pack-id>` on accepted install, or `result=denied` with `target_type=ProductPack`, empty `target_id`, and the rejection message in `detail` on any 400 rejection (closes the SOC 2 CC6.7 logging gap from W7.4 governance).
+**Audit:** Emits `product_pack.install` with `result=success` and `target_id=<pack-id>` on accepted install, or `result=denied` with `target_type=ProductPack`, empty `target_id`, and the rejection message in `detail` on any `400` or `503` rejection (closes the SOC 2 CC6.7 logging gap from W7.4 governance).
 
 #### `GET /api/product-packs`
 
@@ -7422,7 +7426,9 @@ List installed packs.
 
 **Permission:** `ProductPack:Read`.
 
-**Response:** JSON array of `{id, name, version, description, installed_at, verified}` objects.
+**Response:**
+- `200 OK` — JSON array of `{id, name, version, description, installed_at, verified}` objects.
+- `503 Service Unavailable` — the store is unreachable or the list query failed. A4 error envelope, generic message (see the `POST` route above for the no-raw-DB-error-to-caller rationale).
 
 #### `GET /api/product-packs/:id`
 
@@ -7430,7 +7436,10 @@ Get a single pack with its items.
 
 **Permission:** `ProductPack:Read`.
 
-**Response:** Single pack JSON object including the `items[]` array (each `{kind, item_id, name}`).
+**Response:**
+- `200 OK` — the pack JSON object including the `items[]` array (each `{kind, item_id, name}`).
+- `404 Not Found` — no pack with that id. A4 error envelope.
+- `503 Service Unavailable` — the store is unreachable or the read failed. A4 error envelope, generic message.
 
 #### `DELETE /api/product-packs/:id`
 
@@ -7438,7 +7447,12 @@ Uninstall a pack, removing all delegated items.
 
 **Permission:** `ProductPack:Delete`.
 
-**Audit:** Emits `product_pack.uninstall`.
+**Response:**
+- `200 OK` `{"status": "uninstalled"}` on success.
+- `404 Not Found` — no pack with that id. A4 error envelope. **Breaking change (ADR-0054):** the pre-migration route always returned a bare `{"error": "<message>"}` body at `400` for a missing id; automation that special-cased `400` or parsed the flat body shape on this route must switch to `404` + `error.message`.
+- `503 Service Unavailable` — the store is unreachable or the delete failed. A4 error envelope, generic message.
+
+**Audit:** Emits `product_pack.uninstall` with `result=success` and `target_id=<pack-id>` on success, or `result=denied` with `target_type=ProductPack`, `target_id=<pack-id>`, and the rejection message in `detail` on any `404`/`503` rejection (ADR-0054 — pre-migration, a rejected uninstall was not audited at all).
 
 ---
 
@@ -8199,7 +8213,7 @@ Structured JSON health check endpoint. This endpoint is **unauthenticated** and 
 | `uptime_seconds` | integer | Server uptime in seconds |
 | `agents.online` | integer | Number of currently connected agents |
 | `agents.pending` | integer | Number of agents awaiting enrollment approval |
-| `stores` | object | Health status of each data store (`"ok"` or `"error"`). Includes `ca` — the internal-CA store (`ca.db`) — which is load-bearing whenever default certs are active; `status` is `"degraded"` if it is down. |
+| `stores` | object | Health status of each data store (`"ok"` or `"error"`). Includes `ca` — the internal-CA store (`ca_store`, Postgres) — which is load-bearing whenever default certs are active; `status` is `"degraded"` if it is down. |
 | `tls.default_certs_active` | bool | `true` when running with built-in per-install default certs (replace before production — see security-hardening.md). Unauthenticated so monitoring can detect it. |
 | `tls.ca_fingerprint` | string | SHA-256 fingerprint of the active default CA (empty when not on default certs). Public. |
 | `tls.ca_expires_at` | integer | Unix timestamp of the default CA's expiry (`0` when not on default certs). |

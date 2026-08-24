@@ -1315,6 +1315,27 @@ sum(rate(yuzu_server_tag_store_read_degrade_total[5m])) by (reason) > 0
 absent_over_time(yuzu_server_tag_store_backfill_total{result=~"success|fresh"}[15m])
 ```
 
+## Product pack store metrics (operator-installed content, ADR-0054)
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_product_pack_read_degrade_total{reason}` | counter | A `product_pack_store` read (`list()`/`get()`, including the per-pack item fetch) degraded instead of answering, and the caller FAILED CLOSED — `GET /api/product-packs`/`GET /api/product-packs/{id}` answer `503`, never a silently-empty pack list or a false "not found". `reason` ∈ `store_not_open` (store failed to open at boot), `pool_acquire_timeout` (no Postgres connection in time — correlates with `yuzu_pg_acquire_*`/`yuzu_pg_pool_waiters` saturation), `query_error` (covers both the pack-row query and the per-pack item-row query). Pre-seeded to 0 for all three reasons. Write-path failures (`install`/`uninstall`) are log-only — deliberately no per-store write counter (wave-level decision pending, matches `TagStore`'s own boundary). |
+| `yuzu_server_product_pack_backfill_total{result}` | counter | Outcome of the one-time `product-packs.db` → Postgres backfill at boot (ADR-0054). `result` ∈ `fresh` (no legacy DB, or an empty one), `success` (backfilled), `failed` (refused — the server **fails the boot closed** and retries next start; NOTE a refused boot never serves `/metrics`, so `failed` is effectively unscrapeable — alerting keys on the ABSENCE of `success|fresh` instead, which the pre-seed makes meaningful; see `YuzuProductPackBackfillNotCompleted`). A differently-valued pack/item conflict across replicas is a data-integrity signal, not just availability — see `docs/user-manual/upgrading.md`'s "Product packs migrate to Postgres" section. |
+
+**Useful PromQL queries:**
+
+```promql
+# Product-pack reads degrading → GET /api/product-packs* failing closed to 503.
+# (Shipped as YuzuProductPackReadDegraded.)
+sum(rate(yuzu_server_product_pack_read_degrade_total[5m])) by (reason) > 0
+
+# No server reporting a completed product-pack backfill → possible fail-closed
+# boot refusal loop. (Shipped as YuzuProductPackBackfillNotCompleted;
+# absent-success shape, NOT result="failed" — a refused boot never serves
+# /metrics.)
+absent_over_time(yuzu_server_product_pack_backfill_total{result=~"success|fresh"}[15m])
+```
+
 ## Quarantine store metrics (Guardian device-quarantine bookkeeping, ADR-0047)
 
 The `QuarantineStore` — which agents are network-isolated, who isolated them, why, and their

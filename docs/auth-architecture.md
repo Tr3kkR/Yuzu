@@ -2981,7 +2981,7 @@ A fresh install no longer refuses to start without operator certs. On first boot
 the server generates a per-install internal CA (ECDSA P-384, 10-year) and P-256
 leaves for the HTTPS, agent-gRPC, and management-gRPC listeners under the cert
 directory (`auth::default_cert_dir()`; override with `--ca-dir`), recorded in
-`ca.db`. Implementation: `default_certs.{hpp,cpp}` on the
+`ca_store` (Postgres, ADR-0053). Implementation: `default_certs.{hpp,cpp}` on the
 `x509_ca`/`key_provider`/`ca_store` engine. Behaviour:
 
 - **Per-surface, partial-override.** Defaults fill only the surfaces the
@@ -3032,7 +3032,7 @@ cert on first boot, but the data plane requires one. Resolution:
    **and** the built-in CA is active, the server verifies the CSR's
    proof-of-possession, signs a client leaf — `CN=<agent_id>` + URI SAN
    `yuzu://<ca-fingerprint>/agent/<agent_id>` — sized to ≤ the CA's `notAfter`,
-   records it in `ca.db` (`purpose=agent`), and returns it in
+   records it in `ca_store` (`purpose=agent`), and returns it in
    `RegisterResponse.issued_certificate` + `issued_ca_chain`. **The CSR's own
    subject/SAN are ignored** — identity is set by the server from the
    authenticated enrollment, never from attacker-controlled CSR fields (this is
@@ -3080,7 +3080,7 @@ per-agent mTLS rolls out without breaking a heterogeneous or mid-upgrade fleet:
   non-PKI deployment stores nothing. PR4's operator-revoke handler calls the same
   sweep immediately so a dashboard/REST revoke tears the stream down promptly
   rather than waiting for the next tick. The revocation predicate runs off the
-  per-session lock (it reads `ca.db`), and teardown re-checks the cert is
+  per-session lock (it reads `ca_store`), and teardown re-checks the cert is
   unchanged so a reconnection mid-sweep is not cancelled by mistake.
 - `require_client_identity_` is recomputed *after* the default-cert bootstrap
   (`tls_enabled && !tls_ca_cert.empty()`), since it is baked at construction
@@ -3100,7 +3100,7 @@ follow-up (today they are enforced at `Register`, `Subscribe`, `Heartbeat`,
 **Custody & renewal.** The CA issuing key is loaded transiently per signature via
 `FileKeyProvider` and zeroed (RAII) so the crown jewel is not resident for the
 process lifetime. Server issuance is fail-closed: a cert that cannot be recorded
-in `ca.db` (so it could never be revoked) is not handed out, and per-agent
+in `ca_store` (so it could never be revoked) is not handed out, and per-agent
 issuance is rate-limited (one signature per `agent_id` per 30 s) so a holder of a
 valid enrollment credential cannot spam the signer. Agent leaves are ~1-year and
 auto-renew once two-thirds of their lifetime has elapsed (evaluated at agent
@@ -3142,13 +3142,13 @@ flow — e.g. when supplying an operator-minted client cert via `--client-cert` 
 (the issued leaf), and `agent-ca.pem` (the issuing CA chain the agent pins the
 server against). Deleting these files makes the agent **auto-re-provision** on
 its next enrollment: it generates a fresh keypair + CSR and the server signs a
-NEW leaf with a NEW serial. The previously-issued serial stays in `ca.db`
+NEW leaf with a NEW serial. The previously-issued serial stays in `ca_store`
 inventory as a now-orphaned `agent` row that no live agent holds — harmless, but
 operators reconciling the issued-cert inventory should expect one orphan row per
 key-loss event (revoke the orphan if a strict inventory is required).
 **Revocation-bypass guard (#1239 H-2):** auto-re-provision is refused when the
 agent's prior cert is *revoked* (not merely orphaned). `sign_agent_csr` scans
-`ca.db` for a revoked, non-expired cert with `subject==agent_id` and, if found,
+`ca_store` for a revoked, non-expired cert with `subject==agent_id` and, if found,
 returns `nullopt` (audit `ca.cert.reissue_blocked`, metric
 `yuzu_server_ca_reissue_blocked_total{reason=revoked_identity}`) — so a
 compromised endpoint cannot drop its key and re-enroll its way back onto the data
@@ -3168,7 +3168,7 @@ agent's leaf — so the server-side revocation gate and the open-stream sweep ab
 never see the proxied agent's serial, and a revoked agent behind a gateway stays
 functional on the data plane. PR5d closes the *issuance* half of this gap
 (gateway-proxied agents now obtain a per-agent leaf via `ProxyRegister`
-CSR-signing, so the identity exists and is recorded/revocable in `ca.db`), but
+CSR-signing, so the identity exists and is recorded/revocable in `ca_store`), but
 *enforcing* that revocation at the gateway edge is future work: durable
 cryptographic through-gateway identity (and therefore through-gateway revocation)
 arrives with the QUIC single-connection migration (#376). Until then, to revoke a

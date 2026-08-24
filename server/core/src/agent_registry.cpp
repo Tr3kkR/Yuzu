@@ -302,7 +302,7 @@ AgentRegistry::sweep_revoked(const std::function<bool(const std::string&)>& is_r
                 continue;
             pem = session->peer_cert_pem;
         }
-        // Evaluate revocation OFF stream_mu — is_revoked() reads ca.db under its
+        // Evaluate revocation OFF stream_mu — is_revoked() reads ca_store under its
         // own mutex, and holding a per-session lock across a cross-store query is
         // the lock-discipline footgun gov #1117 forbids.
         if (!is_revoked(pem))
