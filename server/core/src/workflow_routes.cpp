@@ -58,6 +58,28 @@ static std::string product_pack_client_message(const char* op, const std::string
     return err;
 }
 
+// F031/#3481: the same per-kind delete dispatch is needed in two places now — DELETE
+// /api/product-packs/:id's uninstall_fn (unchanged behavior), and POST /api/product-packs's new
+// compensate_fn (best-effort undo of items install_fn already committed, on a late persist
+// failure). Factored out so the two call sites can't drift.
+static ItemUninstallFn make_item_delete_fn(InstructionStore* instruction_store,
+                                           PolicyStore* policy_store,
+                                           WorkflowEngine* workflow_engine) {
+    return [instruction_store, policy_store, workflow_engine](
+               const std::string& kind, const std::string& item_id) -> bool {
+        if (kind == "InstructionDefinition") {
+            return instruction_store && instruction_store->delete_definition(item_id);
+        } else if (kind == "PolicyFragment") {
+            return policy_store && policy_store->delete_fragment(item_id);
+        } else if (kind == "Policy") {
+            return policy_store && policy_store->delete_policy(item_id);
+        } else if (kind == "Workflow") {
+            return workflow_engine && workflow_engine->delete_workflow(item_id);
+        }
+        return false;
+    };
+}
+
 // Production overload — wraps the Server in an HttplibRouteSink and forwards
 // to the sink-based body. Defined first so callers see a familiar signature.
 void WorkflowRoutes::register_routes(httplib::Server& svr, Deps deps) {
@@ -2016,7 +2038,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
         };
 
-        auto result = product_pack_store->install(yaml_bundle, install_fn);
+        // F031/#3481: best-effort undo of whatever install_fn already committed, if the final
+        // persist transaction below fails.
+        auto compensate_fn = make_item_delete_fn(instruction_store, policy_store, workflow_engine);
+        auto result = product_pack_store->install(yaml_bundle, install_fn, compensate_fn);
         if (!result) {
             // gov W7.4 R1 UP-1 / compliance CC6.7 / sre B2: SOC 2 CC6.7
             // requires "all access decisions logged". The pack-install
@@ -2124,19 +2149,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         auto id = req.matches[1].str();
 
         // Uninstall callback: delegate to the appropriate store
-        auto uninstall_fn = [instruction_store, policy_store, workflow_engine](
-                                const std::string& kind, const std::string& item_id) -> bool {
-            if (kind == "InstructionDefinition") {
-                return instruction_store && instruction_store->delete_definition(item_id);
-            } else if (kind == "PolicyFragment") {
-                return policy_store && policy_store->delete_fragment(item_id);
-            } else if (kind == "Policy") {
-                return policy_store && policy_store->delete_policy(item_id);
-            } else if (kind == "Workflow") {
-                return workflow_engine && workflow_engine->delete_workflow(item_id);
-            }
-            return false;
-        };
+        auto uninstall_fn = make_item_delete_fn(instruction_store, policy_store, workflow_engine);
 
         auto result = product_pack_store->uninstall(id, uninstall_fn);
         if (!result) {

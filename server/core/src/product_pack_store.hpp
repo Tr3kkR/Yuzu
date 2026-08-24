@@ -28,11 +28,27 @@
 /// sibling stores draw from the SAME shared `PgPool`, so holding our own lease while they try to
 /// acquire theirs risks starving a saturated pool). This was never a genuine cross-store
 /// transaction even pre-migration: `install_fn`'s callees write to THEIR OWN `db_`/pool, never
-/// ours, so a rollback of our own txn never undid an already-succeeded sibling install either.
-/// The new shape preserves that same atomicity boundary explicitly: `install_fn` is called with
-/// no lease of ours held; once every document has been resolved, the pack row + its successfully-
-/// installed item rows are written in ONE `pool_` transaction (parent-before-child, satisfying the
-/// FK). A total-failure install (zero items installed) never touches Postgres at all.
+/// ours. The new shape preserves that same atomicity boundary explicitly: `install_fn` is called
+/// with no lease of ours held; once every document has been resolved, the pack row + its
+/// successfully-installed item rows are written in ONE `pool_` transaction (parent-before-child,
+/// satisfying the FK). A total-failure install (zero items installed) never touches Postgres at
+/// all.
+///
+/// **Update (F031/#3481, 2026-08-24): a late failure of that final persist transaction — AFTER
+/// `install_fn` already committed one or more documents into sibling stores — is no longer a
+/// silent orphan.** `install()` now accepts `compensate_fn` (see its doc comment below) and, on
+/// that failure, walks every already-installed item in REVERSE install order, calling
+/// `compensate_fn(kind, item_id)` on each as a best-effort undo. Reverse order matters: a bundle
+/// can install a `PolicyFragment` followed by a `Policy` that references it (bundle order is
+/// dependency order — `PolicyStore::create_policy` validates the fragment exists at creation
+/// time), and `PolicyStore::delete_fragment` refuses while any `Policy` still references it —
+/// compensating forward would spuriously fail to clean up the fragment. This is best-effort, not
+/// a guarantee: a sibling store's own delete can itself fail for a reason unrelated to ordering
+/// (a `PolicyFragment` referenced by some OTHER, unrelated policy is the same tolerated exception
+/// documented for `uninstall()` below) — a residual orphan from a failed compensation is logged
+/// at `spdlog::error` (naming the exact kind/item id) and counted in
+/// `yuzu_server_product_pack_install_compensation_total{result}`, for operator follow-up, not
+/// automatically retried.
 ///
 /// **No `mtx_` (the pre-migration `shared_mutex` is dropped).** Postgres's MVCC + the pool's own
 /// connection-level concurrency replace the SQLite single-writer mutex, matching every other
@@ -213,8 +229,18 @@ public:
     ///
     /// `install_fn` is invoked with NO `pool_` lease of ours held (see the file header) — it is
     /// free to call into its own sibling stores without risking pool starvation.
+    ///
+    /// `compensate_fn` (F031/#3481): if the final persist transaction fails AFTER one or more
+    /// documents were already installed via `install_fn`, this callback is invoked once per
+    /// already-installed item, in REVERSE install order, to best-effort undo it — same
+    /// `bool(kind, item_id)` shape as `uninstall_fn` (in practice callers pass the identical
+    /// per-kind delete dispatch). A single item's compensation failing is logged and does not
+    /// abort compensating the rest. Defaults to an empty callback (no compensation attempted) —
+    /// existing callers are unaffected until they opt in. See the file header for the full
+    /// rationale and the reverse-order requirement.
     std::expected<std::string, std::string> install(const std::string& yaml_bundle,
-                                                    ItemInstallFn install_fn);
+                                                    ItemInstallFn install_fn,
+                                                    ItemUninstallFn compensate_fn = {});
 
     /// List installed product packs, newest-installed first. `unexpected(msg)` (prefixed
     /// `kProductPackDbErrorPrefix`) is a genuine read failure — never treat it as "no packs

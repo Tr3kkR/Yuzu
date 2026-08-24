@@ -501,6 +501,84 @@ TEST_CASE("ProductPackStore::install: a duplicate item id in one bundle fails as
         CHECK(p.name != "test-duplicate-items");
 }
 
+// ── Compensating cleanup (F031/#3481) ───────────────────────────────────────
+//
+// Pool-contention fault injection technique (proven precedent:
+// test_api_token_store.cpp's "failed_pairs counts a POOL-CONTENTION ACQUIRE failure" test) — a
+// size-1 pool, pinned by an unrelated held lease AFTER construction/migration has already
+// released its own lease, leaves nothing for install()'s own with_txn_for to acquire. This is a
+// REAL Postgres-level failure (a genuine bounded acquire timeout), not a mock.
+
+TEST_CASE("ProductPackStore::install: a late persist failure (pool-contention) triggers "
+          "best-effort compensation for every already-installed item",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    auto unrelated_lease = pool.acquire();
+    REQUIRE(unrelated_lease);
+
+    int install_calls = 0;
+    std::vector<std::pair<std::string, std::string>> compensated;
+    auto compensate_fn = [&compensated](const std::string& kind,
+                                        const std::string& item_id) -> bool {
+        compensated.emplace_back(kind, item_id);
+        return true;
+    };
+
+    auto result = store.install(kUnsignedPackYaml, make_counting_install_fn(&install_calls),
+                                compensate_fn);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().starts_with(yuzu::server::kProductPackDbErrorPrefix));
+    CHECK(install_calls == 1);
+    REQUIRE(compensated.size() == 1);
+    CHECK(compensated[0].first == "InstructionDefinition");
+    CHECK(compensated[0].second == "item-id-1");
+
+    unrelated_lease.reset();
+    auto listed = store.list();
+    REQUIRE(listed.has_value());
+    for (const auto& p : *listed)
+        CHECK(p.name != "test-unsigned");
+}
+
+TEST_CASE("ProductPackStore::install: compensation runs in reverse install order",
+          "[product_pack_store][pg]") {
+    // Reverse order matters when a bundle's documents have an install-order dependency — e.g. a
+    // PolicyFragment installed before a Policy that references it (bundle order is dependency
+    // order: PolicyStore::create_policy validates the fragment exists at creation time), and
+    // PolicyStore::delete_fragment refuses while any Policy still references it. Compensating
+    // forward would spuriously fail to clean up the fragment. This store's own unit tests don't
+    // wire a live PolicyStore, so this proves the ordering mechanism generically with two stub
+    // items, asserting compensation visits them in the reverse of install_fn's call order.
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    auto unrelated_lease = pool.acquire();
+    REQUIRE(unrelated_lease);
+
+    int install_calls = 0;
+    std::vector<std::string> compensated_ids;
+    auto compensate_fn = [&compensated_ids](const std::string&,
+                                            const std::string& item_id) -> bool {
+        compensated_ids.push_back(item_id);
+        return true;
+    };
+
+    auto result = store.install(kUnsignedPackYamlDuplicateItems,
+                                make_counting_install_fn(&install_calls), compensate_fn);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(compensated_ids.size() == 2);
+    CHECK(compensated_ids[0] == "item-id-2");
+    CHECK(compensated_ids[1] == "item-id-1");
+}
+
 // ── Backfill (ADR-0009/0054) ─────────────────────────────────────────────────
 
 namespace {

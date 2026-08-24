@@ -1016,7 +1016,8 @@ bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
 // ── Install ─────────────────────────────────────────────────────────────────
 
 std::expected<std::string, std::string> ProductPackStore::install(const std::string& yaml_bundle,
-                                                                  ItemInstallFn install_fn) {
+                                                                  ItemInstallFn install_fn,
+                                                                  ItemUninstallFn compensate_fn) {
     if (!open_)
         return std::unexpected(std::string(kProductPackDbErrorPrefix) + "database not open");
     if (!install_fn)
@@ -1218,6 +1219,34 @@ std::expected<std::string, std::string> ProductPackStore::install(const std::str
         return true;
     });
     if (!ok) {
+        // F031/#3481: install_fn already committed items_to_store into their sibling stores
+        // before this transaction ran (see the file header — no lease of ours was held across
+        // that loop). Best-effort undo each one via compensate_fn, in REVERSE install order (a
+        // Policy must be compensated before the PolicyFragment it references, since
+        // PolicyStore::delete_fragment refuses while a Policy still references it — forward order
+        // would spuriously fail to clean up the fragment). A single item's compensation failing
+        // is logged and does not abort compensating the rest.
+        std::size_t compensated = 0;
+        if (compensate_fn) {
+            for (auto it = items_to_store.rbegin(); it != items_to_store.rend(); ++it) {
+                if (compensate_fn(it->kind, it->item_id)) {
+                    ++compensated;
+                } else {
+                    spdlog::error(
+                        "ProductPackStore: install compensation FAILED for {} '{}' after late "
+                        "persist failure for pack '{}' — orphaned sibling content requires "
+                        "manual/operator cleanup",
+                        it->kind, sanitize_for_log(it->item_id), sanitize_for_log(pack_name));
+                }
+            }
+            if (metrics_)
+                metrics_
+                    ->counter("yuzu_server_product_pack_install_compensation_total",
+                              {{"result", compensated == items_to_store.size() ? "ok" : "partial"}})
+                    .increment();
+        }
+        spdlog::error("ProductPackStore: failed to persist pack '{}' — compensated {}/{} item(s)",
+                     sanitize_for_log(pack_name), compensated, items_to_store.size());
         return std::unexpected(std::string(kProductPackDbErrorPrefix) +
                                "failed to persist pack '" + pack_name + "'");
     }
