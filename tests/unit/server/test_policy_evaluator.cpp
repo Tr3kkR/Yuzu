@@ -382,13 +382,62 @@ TEST_CASE("policy evaluator: remediation attempt cap -> error after 3 fixing tra
     // Drive remediation with an explicit (in-scope) agent list. Each call marks
     // the agent 'fixing'; PolicyStore caps fix attempts at 3 and forces 'error'
     // on the transition that would exceed it. Verify the cap is reached.
+    //
+    // Governance UP-3 (2026-08-24): remediate() now refuses a second call
+    // while the prior attempt's FixWait is still outstanding (closes a
+    // double-dispatch / double-attempt-count hazard), so each attempt must
+    // mature — advance time past grace, tick() — before the next call. This
+    // is the realistic shape anyway: an operator waits for one fix attempt to
+    // resolve before retrying.
     for (int i = 0; i < 4; ++i) {
         auto rr = ev.remediate(pid, {"agentA"});
         // The first three dispatch the fix; the 4th still dispatches but the
         // status write trips the cap. remediate reports dispatch success either way.
         REQUIRE(rr.ok);
+        if (i < 3) {
+            // Mature this attempt's FixWait (clearing it from in_flight_) so the
+            // NEXT remediate() call isn't refused as already-in-flight. Skip
+            // this on the 4th/final call — collect_ready()'s own verify-phase
+            // write (no canned "agentA|verifyp" response here -> non-responder
+            // -> "unknown") would otherwise overwrite the cap's "error" write
+            // this assertion is checking for.
+            h.fake_now += 20;
+            ev.tick();
+        }
     }
     CHECK(h.status_of(pid, "agentA") == "error");
+}
+
+TEST_CASE("policy evaluator: remediate refuses a second call while a FixWait is already "
+          "in flight for the policy (governance UP-3, 2026-08-24)",
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "")}; // non_compliant
+    auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
+    h.canned["agentA|fixp"] = {1, "ok"};
+
+    PolicyEvaluator ev(h.deps());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    h.fake_now += 20;
+    ev.tick();
+    REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
+
+    auto rr1 = ev.remediate(pid, {"agentA"});
+    REQUIRE(rr1.ok);
+    const int calls_after_first = h.dispatch_calls;
+
+    // NO tick() here — the first call's FixWait entry is still in in_flight_
+    // (collect_ready() is the only thing that clears it, and its grace
+    // window hasn't elapsed). A second call for the SAME policy must be
+    // refused rather than dispatching another fix and burning a second
+    // attempt against the retry cap on top of the first.
+    auto rr2 = ev.remediate(pid, {"agentA"});
+    CHECK_FALSE(rr2.ok);
+    CHECK_FALSE(rr2.degraded); // this is a business rejection, not a store degrade
+    CHECK(rr2.error.find("already in flight") != std::string::npos);
+    CHECK(h.dispatch_calls == calls_after_first); // no second dispatch happened
 }
 
 TEST_CASE("policy evaluator: verify dispatch failure -> error", "[pg][policy][evaluator]") {
