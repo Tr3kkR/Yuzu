@@ -46,6 +46,34 @@ TEST_CASE("netsh_allow_in_rule_argv builds the exact add-rule argv, IP threaded 
     CHECK(argv == expected);
 }
 
+TEST_CASE("netsh_set_firewall_policy_argv builds the exact set-policy argv for "
+         "win_quarantine's #3284 branch-A block, using kWinFirewallPolicyBlockBoth",
+         "[agent][quarantine_argv]") {
+    const auto argv = netsh_set_firewall_policy_argv("C:\\Windows\\System32\\netsh.exe",
+                                                      kWinFirewallPolicyBlockBoth);
+    const std::vector<std::string> expected{
+        "C:\\Windows\\System32\\netsh.exe", "advfirewall",   "set",
+        "allprofiles",                     "firewallpolicy", "blockinbound,blockoutbound",
+    };
+    CHECK(argv == expected);
+}
+
+TEST_CASE("netsh_set_firewall_policy_argv builds the exact restore-policy argv "
+         "win_unquarantine issues at teardown, using kWinFirewallPolicyDefault -- "
+         "identical shape to the set call above, only the policy value differs",
+         "[agent][quarantine_argv]") {
+    const auto argv = netsh_set_firewall_policy_argv("C:\\Windows\\System32\\netsh.exe",
+                                                      kWinFirewallPolicyDefault);
+    const std::vector<std::string> expected{
+        "C:\\Windows\\System32\\netsh.exe", "advfirewall",   "set",
+        "allprofiles",                     "firewallpolicy", "blockinbound,allowoutbound",
+    };
+    CHECK(argv == expected);
+    // The two policy constants themselves must never collide -- a typo that
+    // made them equal would make win_unquarantine's restore a silent no-op.
+    CHECK(kWinFirewallPolicyBlockBoth != kWinFirewallPolicyDefault);
+}
+
 // ── Linux: iptables + sudo wrap ─────────────────────────────────────────
 
 #ifndef _WIN32
@@ -68,6 +96,36 @@ TEST_CASE("iptables_accept_source_argv builds the exact per-IP ACCEPT argv, and 
     // argument silently dropped or reordered by the wrap.
     for (size_t i = 0; i < tool_argv.size(); ++i)
         CHECK(wrapped[3 + i] == tool_argv[i]);
+}
+
+TEST_CASE("iptables_accept_source_argv builds the exact per-IPv6 ACCEPT argv when "
+         "called with an ip6tables path, and sudo_wrap applies the canonical form "
+         "identically to the iptables case -- no cross-family leakage in the argv "
+         "shape (#3282)",
+         "[agent][quarantine_argv]") {
+    const auto tool_argv = iptables_accept_source_argv("/usr/sbin/ip6tables", "fe80::1");
+    const std::vector<std::string> expected_tool{"/usr/sbin/ip6tables", "-A", "yuzu-quarantine",
+                                                 "-s", "fe80::1",       "-j", "ACCEPT"};
+    CHECK(tool_argv == expected_tool);
+
+    const auto wrapped = yuzu::shared::sudo_wrap(tool_argv, /*euid_is_root=*/false);
+    REQUIRE(wrapped.size() == tool_argv.size() + 3);
+    CHECK(wrapped[0] == "/usr/bin/sudo");
+    CHECK(wrapped[1] == "-n");
+    CHECK(wrapped[2] == "--");
+    for (size_t i = 0; i < tool_argv.size(); ++i)
+        CHECK(wrapped[3 + i] == tool_argv[i]);
+
+    // No cross-family leakage: the same builder called with the iptables
+    // path and an IPv4 literal never produces the ip6tables argv above (and
+    // an IPv6 literal is routed by ip_family() to this path, never that
+    // one) -- the family is decided entirely by the caller-supplied tool
+    // path and IP, not guessed by this function.
+    const auto v4_argv = iptables_accept_source_argv("/usr/sbin/iptables", "10.0.0.5");
+    CHECK(v4_argv != tool_argv);
+    CHECK(v4_argv[0] == "/usr/sbin/iptables");
+    CHECK(ip_family("fe80::1") == IpFamily::v6);
+    CHECK(ip_family("10.0.0.5") == IpFamily::v4);
 }
 
 // ── macOS: pfctl + sudo wrap ─────────────────────────────────────────────
