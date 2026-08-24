@@ -103,6 +103,36 @@ inline IpFamily ip_family(std::string_view ip) {
 }
 
 /**
+ * Extracts the host portion from a gRPC-style "host:port" target string —
+ * the agent config's own `server_address` (e.g. "10.0.0.5:50051" or
+ * "server.example.com:50051"), threaded into every plugin's config as
+ * "agent.server_address" — so a caller can test the result with
+ * is_safe_ip() before using it as a firewall-rule literal (never assume the
+ * result IS an IP; a hostname-configured deployment returns the hostname
+ * unchanged). Handles bracketed IPv6 ("[::1]:50051" -> "::1"); a bracket-
+ * less IPv6 literal with no port is returned whole, since a port suffix on
+ * one is ambiguous (gRPC itself requires brackets for that combination) and
+ * splitting on the last ':' would truncate it. A target with no ':' at all
+ * (a bare host, no port) is returned unchanged.
+ */
+inline std::string extract_target_host(std::string_view target) {
+    if (target.empty())
+        return {};
+    if (target.front() == '[') {
+        const auto close = target.find(']');
+        if (close != std::string_view::npos)
+            return std::string{target.substr(1, close - 1)};
+        return {}; // malformed bracket -- no safe host to extract
+    }
+    const auto last_colon = target.rfind(':');
+    if (last_colon == std::string_view::npos)
+        return std::string{target}; // no port suffix
+    if (target.substr(0, last_colon).find(':') != std::string_view::npos)
+        return std::string{target}; // bracket-less IPv6 -- don't truncate it
+    return std::string{target.substr(0, last_colon)};
+}
+
+/**
  * Honest attempted-vs-succeeded accounting for a sequence of mutating
  * firewall calls, replacing the `rules_applied > 0` success gate (#3282).
  * A caller records every COUNTING mutation attempt (never a best-effort/

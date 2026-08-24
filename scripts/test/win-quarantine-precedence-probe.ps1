@@ -637,6 +637,8 @@ try {
     }
     & netsh.exe advfirewall firewall add rule name="${RulePrefix}AllowLoopbackIn" dir=in action=allow enable=yes remoteip=127.0.0.1 | Out-Null
     & netsh.exe advfirewall firewall add rule name="${RulePrefix}AllowLoopbackOut" dir=out action=allow enable=yes remoteip=127.0.0.1 | Out-Null
+    & netsh.exe advfirewall firewall add rule name="${RulePrefix}AllowLoopbackIn6" dir=in action=allow enable=yes remoteip=::1 | Out-Null
+    & netsh.exe advfirewall firewall add rule name="${RulePrefix}AllowLoopbackOut6" dir=out action=allow enable=yes remoteip=::1 | Out-Null
 
     $whitelist = @($physical.Ip)
     if ($BragaTailscaleAddress) { $whitelist += $BragaTailscaleAddress }
@@ -657,6 +659,13 @@ try {
     $loopbackResult = if ($loopbackPort) {
         Test-NetConnection -ComputerName '127.0.0.1' -Port $loopbackPort -InformationLevel Detailed -WarningAction SilentlyContinue
     } else { $null }
+    # #3429 should-fix: the IPv4 loopback rules above proved "loopback stayed
+    # reachable" for 127.0.0.1 only -- this measures the ::1 Allow rules
+    # added alongside them so the same claim is actually verified for IPv6,
+    # not just assumed to mirror the v4 result.
+    $loopback6Result = if ($loopbackPort) {
+        Test-NetConnection -ComputerName '::1' -Port $loopbackPort -InformationLevel Detailed -WarningAction SilentlyContinue
+    } else { $null }
 
     $bragaResult = $null
     if ($BragaTailscaleAddress) {
@@ -667,6 +676,7 @@ try {
     Write-Log "  physical whitelisted $($physical.Ip):$($physical.Port) [ifIndex $($physical.IfIndex)] -> TcpTestSucceeded=$($physicalResult.TcpTestSucceeded)"
     Write-Log "  non-whitelisted control $ControlTarget:443 -> TcpTestSucceeded=$($controlResult.TcpTestSucceeded) (expected: False)"
     Write-Log "  loopback 127.0.0.1:$loopbackPort -> TcpTestSucceeded=$($loopbackResult.TcpTestSucceeded)"
+    Write-Log "  loopback [::1]:$loopbackPort -> TcpTestSucceeded=$($loopback6Result.TcpTestSucceeded)"
     if ($bragaResult) {
         Write-Log "  [INFORMATIONAL ONLY, overlay-confounded] braga $BragaTailscaleAddress:443 -> TcpTestSucceeded=$($bragaResult.TcpTestSucceeded)"
     }

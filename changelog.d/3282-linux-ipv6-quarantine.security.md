@@ -10,10 +10,20 @@
   never got that far." A host with no IPv6 stack at all reports full `quarantined` containment
   with an explanatory note rather than a permanent false "partial"; a host with an IPv6 stack but
   no `ip6tables` installed correctly reports a partial containment gap instead of a clean
-  "quarantined" that silently leaves IPv6 traffic unblocked. On a dual-stack fleet, whitelist the
-  management server's IPv6 address as well as its IPv4 address — the two chains are independent,
-  and a live connection held open only by IPv4's `ESTABLISHED,RELATED` rule can be dropped by the
-  IPv6 chain on the next reconnect if only the v4 address was whitelisted.
+  "quarantined" that silently leaves IPv6 traffic unblocked. Neither chain accepts a blanket
+  `ESTABLISHED,RELATED` connection anymore — that rule accepted any pre-existing established/
+  related flow, Yuzu or not, letting an attacker's already-open connection survive quarantine
+  untouched. `quarantine` now always tries to include the Yuzu server's own address in the
+  whitelist automatically (the agent's own configured server address, when it's an IP literal, in
+  addition to any operator-supplied `server_ip`), and it's that per-IP whitelist rule — accepting
+  any connection state, not just established — that keeps the management connection alive on
+  both chains. On a dual-stack fleet, still whitelist the management server's IPv6 address as well
+  as its IPv4 address if it isn't already covered by the agent's own auto-detected server address:
+  the two chains are independent, and only a whitelisted address survives quarantine on either
+  one. Release (`unquarantine`) now tracks whether the IPv6 chain was actually installed at
+  quarantine time rather than re-checking the current IPv6 stack state, so a host whose IPv6 stack
+  gets disabled between quarantine and release no longer leaves an orphaned `ip6tables` chain
+  behind while still reporting a clean `released`.
 - **The `quarantine` action's success gate no longer treats any single applied rule as "quarantined"
   (#3260).** `rules_applied > 0` — true even when the loopback ACCEPT rule was the ONLY rule that
   applied and every containment rule after it failed — is replaced with an honest

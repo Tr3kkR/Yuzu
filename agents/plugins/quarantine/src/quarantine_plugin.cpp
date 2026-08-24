@@ -81,6 +81,7 @@
 
 namespace {
 
+using yuzu::quarantine::extract_target_host;
 using yuzu::quarantine::is_safe_ip;
 using yuzu::quarantine::kRulePrefix;
 using yuzu::quarantine::QuarStatus;
@@ -530,6 +531,21 @@ int win_quarantine(yuzu::CommandContext& ctx, const std::vector<std::string>& wh
           std::format("name={}AllowLoopbackOut", kRulePrefix), "dir=out", "action=allow",
           "enable=yes", "remoteip=127.0.0.1"});
 
+    // IPv6 loopback mirror — the IPv4 rules above only cover 127.0.0.1, so
+    // under the branch-A profile-default-block posture ::1 had no matching
+    // Allow rule at all. Separately named (not "...LoopbackIn"/"...Out")
+    // so netsh_base_rules_present's exact-match read of the v4 rule names
+    // stays unambiguous about what it's reporting.
+    // sink: quarantine/win_quarantine#3b — rung-2 runner argv, MUTATING
+    apply({netsh_path(), "advfirewall", "firewall", "add", "rule",
+          std::format("name={}AllowLoopbackIn6", kRulePrefix), "dir=in", "action=allow",
+          "enable=yes", "remoteip=::1"});
+
+    // sink: quarantine/win_quarantine#4b — rung-2 runner argv, MUTATING
+    apply({netsh_path(), "advfirewall", "firewall", "add", "rule",
+          std::format("name={}AllowLoopbackOut6", kRulePrefix), "dir=out", "action=allow",
+          "enable=yes", "remoteip=::1"});
+
     for (const auto& ip : whitelist_ips) {
         // sink: quarantine/win_quarantine#5 — rung-2 runner argv, MUTATING,
         // operator-supplied IP validated by is_safe_ip before reaching here.
@@ -867,7 +883,8 @@ struct WhitelistRead {
     std::string note;
 };
 
-int linux_quarantine(yuzu::CommandContext& ctx, const std::vector<std::string>& whitelist_ips) {
+int linux_quarantine(yuzu::CommandContext& ctx, const std::vector<std::string>& whitelist_ips,
+                     bool* v6_applied_out = nullptr) {
     bool status_forwarded = false;
     yuzu::quarantine::MutationTally v4;
     yuzu::quarantine::MutationTally v6;
@@ -934,10 +951,21 @@ int linux_quarantine(yuzu::CommandContext& ctx, const std::vector<std::string>& 
     // sink: quarantine/linux_quarantine#4 — rung-2 sudo-governed runner argv, MUTATING
     apply_v4({kIptables, "-A", "yuzu-quarantine", "-o", "lo", "-j", "ACCEPT"});
 
-    // Allow established/related connections (keeps management connection alive)
-    // sink: quarantine/linux_quarantine#5 — rung-2 sudo-governed runner argv, MUTATING
-    apply_v4({kIptables, "-A", "yuzu-quarantine", "-m", "state", "--state", "ESTABLISHED,RELATED",
-             "-j", "ACCEPT"});
+    // NO blanket "-m state --state ESTABLISHED,RELATED -j ACCEPT" here (site
+    // #5, removed) — that accepted ANY pre-existing established/related
+    // flow, Yuzu or not, so an attacker's C2/exfil session already open on a
+    // host at quarantine time survived containment untouched. The
+    // management connection is instead kept alive by the whitelist-based
+    // rules just below: do_quarantine always tries to put the Yuzu server's
+    // own address into whitelist_ips (operator-supplied server_ip, or the
+    // agent's own known agent.server_address when that's already an IP
+    // literal) before calling here, and a whitelist rule accepts ANY state
+    // (not just established) for that IP, so the return leg of an already-
+    // open management connection to a whitelisted peer keeps flowing. A
+    // host whose agent.server_address is a hostname AND whose caller never
+    // supplied server_ip is a narrower residual gap than before this fix,
+    // not a new one -- see mcp_server.cpp's governance note at its one
+    // known instance.
 
     // Allow each whitelisted IPv4 address. IPv6 literals are routed to the
     // ip6tables sequence below via ip_family() — never handed to iptables,
@@ -984,7 +1012,10 @@ int linux_quarantine(yuzu::CommandContext& ctx, const std::vector<std::string>& 
     // iptables package installed has the tool and no stack, so every call
     // below would fail and the verdict would read `quarantined_partial` with
     // a note blaming the flush — on a host whose containment is complete.
-    if (yuzu::quarantine::v6_in_scope(v6env)) {
+    const bool v6_attempted = yuzu::quarantine::v6_in_scope(v6env);
+    if (v6_applied_out)
+        *v6_applied_out = v6_attempted;
+    if (v6_attempted) {
         auto apply_v6 = [&](std::vector<std::string> tool_argv) {
             auto argv = yuzu::shared::sudo_wrap(std::move(tool_argv));
             auto out = run_tool(argv, kQuarantineMutateDeadline, /*merge_stderr=*/true);
@@ -1012,9 +1043,12 @@ int linux_quarantine(yuzu::CommandContext& ctx, const std::vector<std::string>& 
         // sink: quarantine/linux_quarantine#16 — rung-2 sudo-governed runner argv, MUTATING
         apply_v6({kIp6tables, "-A", "yuzu-quarantine", "-o", "lo", "-j", "ACCEPT"});
 
-        // sink: quarantine/linux_quarantine#17 — rung-2 sudo-governed runner argv, MUTATING
-        apply_v6({kIp6tables, "-A", "yuzu-quarantine", "-m", "state", "--state",
-                 "ESTABLISHED,RELATED", "-j", "ACCEPT"});
+        // NO blanket ESTABLISHED,RELATED accept here either (site #17,
+        // removed) — same reasoning as the IPv4 leg above: it accepted ANY
+        // pre-existing established/related flow, not just the Yuzu
+        // management connection, so it's the whitelist rules below that
+        // must carry connection continuity instead. See the IPv4 comment
+        // above for the full rationale.
 
         for (const auto& ip : whitelist_ips) {
             if (yuzu::quarantine::ip_family(ip) != yuzu::quarantine::IpFamily::v6)
@@ -1136,7 +1170,7 @@ int linux_quarantine(yuzu::CommandContext& ctx, const std::vector<std::string>& 
     return 1;
 }
 
-int linux_unquarantine(yuzu::CommandContext& ctx) {
+int linux_unquarantine(yuzu::CommandContext& ctx, bool v6_was_applied) {
     bool status_forwarded = false;
     // Clean-failure tracker for the genuine teardown steps (flush + delete
     // chain) — see win_unquarantine's identical-purpose comment. Distinct
@@ -1170,17 +1204,23 @@ int linux_unquarantine(yuzu::CommandContext& ctx) {
     // sink: quarantine/linux_unquarantine#4 — rung-2 sudo-governed runner argv, MUTATING
     apply_v4({kIptables, "-X", "yuzu-quarantine"});
 
-    // Mirror onto ip6tables — but only when the binary is actually present.
-    // Deliberate asymmetry (#3282 item 5): an ABSENT ip6tables has nothing
-    // to tear down — it never applied anything in the first place, whether
-    // because IPv6 was off on this host or because linux_quarantine itself
-    // skipped it for the same reason — so that case must NOT flip
-    // teardown_failed. A PRESENT-but-failing ip6tables, on the other hand,
-    // means a real teardown attempt was made and refused, exactly like the
-    // iptables case above — that MUST flip teardown_failed.
-    if (yuzu::quarantine::v6_in_scope(
-            {.tool_present = (::access(kIp6tables, F_OK) == 0),
-             .stack_present = linux_ipv6_stack_present()})) {
+    // Mirror onto ip6tables — driven by v6_was_applied (whether
+    // linux_quarantine actually attempted the v6 sequence, persisted across
+    // the quarantine->release call boundary), NOT by re-probing the CURRENT
+    // stack state here. A fresh stack_present read at release time can
+    // disagree with what was true at quarantine time -- e.g. the operator
+    // disabled IPv6 in between -- and gating on it left v6 rules installed
+    // at quarantine time undeleted (orphaned, reactivating if IPv6 comes
+    // back) while still reporting `released`. Deliberate asymmetry (#3282
+    // item 5) preserved for the OTHER direction: v6_was_applied false means
+    // nothing was ever installed (out of scope at quarantine time, whether
+    // for no tool or no stack), so THAT case must still not flip
+    // teardown_failed. Applied-but-the-tool-is-gone-now is a genuine
+    // "can't verify release" case, not a silent skip.
+    const bool v6_tool_present = (::access(kIp6tables, F_OK) == 0);
+    if (v6_was_applied && !v6_tool_present) {
+        teardown_failed = true;
+    } else if (v6_was_applied) {
         auto apply_ignore_v6 = [&](std::vector<std::string> tool_argv) {
             auto argv = yuzu::shared::sudo_wrap(std::move(tool_argv));
             auto out = run_tool(argv, kQuarantineMutateDeadline, /*merge_stderr=*/true);
@@ -1831,6 +1871,17 @@ private:
     /// declared unconditionally so the key name has one definition.
     static constexpr const char* kPriorPolicyKey = "win.prior_firewall_policy";
 
+    /// Whether linux_quarantine actually attempted the ip6tables sequence on
+    /// the current quarantine cycle — read back by linux_unquarantine so
+    /// release-time teardown is driven by what was truly installed, not by
+    /// a fresh (and possibly now-disagreeing) stack_present probe. Written
+    /// on every quarantine call (never left stale from a prior cycle);
+    /// cleared only once release fully succeeds — see do_unquarantine's
+    /// clear_prior_policy for the identical retry-safety reasoning on
+    /// Windows. Linux-only in use; declared unconditionally so the key name
+    /// has one definition.
+    static constexpr const char* kLinuxV6AppliedKey = "linux.v6_applied";
+
     /// Non-owning; the host owns the context and outlives the plugin. Null
     /// only if init() was never called, which the host contract forbids —
     /// every accessor below still tolerates it rather than dereferencing.
@@ -1923,6 +1974,33 @@ private:
         yuzu::PluginContext pc{plugin_ctx_};
         pc.storage_delete(kPriorPolicyKey);
     }
+
+    // Written unconditionally on every linux_quarantine call (never left
+    // stale from an earlier cycle) so a fresh `false` correctly overwrites
+    // a stale `true` from a prior quarantine where v6 genuinely was applied.
+    void store_linux_v6_applied(bool applied) {
+        if (!plugin_ctx_)
+            return;
+        yuzu::PluginContext pc{plugin_ctx_};
+        if (applied)
+            pc.storage_set(kLinuxV6AppliedKey, "1");
+        else
+            pc.storage_delete(kLinuxV6AppliedKey);
+    }
+
+    bool load_linux_v6_applied() {
+        if (!plugin_ctx_)
+            return false;
+        yuzu::PluginContext pc{plugin_ctx_};
+        return pc.storage_get(kLinuxV6AppliedKey) == "1";
+    }
+
+    void clear_linux_v6_applied() {
+        if (!plugin_ctx_)
+            return;
+        yuzu::PluginContext pc{plugin_ctx_};
+        pc.storage_delete(kLinuxV6AppliedKey);
+    }
     static constexpr const char* kVersion = "1.0.0";
 
     // ── quarantine action ────────────────────────────────────────────────────
@@ -1947,6 +2025,26 @@ private:
 
         if (!server_ip.empty() && is_safe_ip(server_ip)) {
             whitelist.emplace_back(server_ip);
+        }
+
+        // The operator-supplied server_ip above is not always present — the
+        // MCP quarantine-on-write dispatch path never sets it (see the
+        // governance note at its call site in mcp_server.cpp). Fall back to
+        // the agent's OWN known connection target ("agent.server_address",
+        // threaded into every plugin's config by agent.cpp) whenever it's
+        // already an IP literal, so it's the whitelist-based accept rules
+        // below — not a blanket ESTABLISHED,RELATED hole — that keep a live
+        // management connection through quarantine. A hostname-configured
+        // server_address with no explicit server_ip param is a narrower
+        // residual gap than before this fix, not a new one: see
+        // linux_quarantine's comment on the removed blanket rule.
+        if (plugin_ctx_) {
+            yuzu::PluginContext pc{plugin_ctx_};
+            auto agent_server_host = extract_target_host(pc.get_config("agent.server_address"));
+            if (!agent_server_host.empty() && is_safe_ip(agent_server_host) &&
+                agent_server_host != server_ip) {
+                whitelist.push_back(std::move(agent_server_host));
+            }
         }
 
         auto extra = split_ips(whitelist_csv);
@@ -2017,7 +2115,12 @@ private:
             return rc;
         }
 #elif defined(__linux__)
-        return linux_quarantine(ctx, whitelist);
+        {
+            bool v6_applied = false;
+            const int rc = linux_quarantine(ctx, whitelist, &v6_applied);
+            store_linux_v6_applied(v6_applied);
+            return rc;
+        }
 #elif defined(__APPLE__)
         return macos_quarantine(ctx, whitelist);
 #else
@@ -2057,7 +2160,18 @@ private:
             return rc;
         }
 #elif defined(__linux__)
-        return linux_unquarantine(ctx);
+        {
+            const bool v6_was_applied = load_linux_v6_applied();
+            const int rc = linux_unquarantine(ctx, v6_was_applied);
+            // Clear only on a clean release — same retry-safety reasoning
+            // as clear_prior_policy above: on release_uncertain the v6
+            // chain may not have been fully torn down, so the marker stays
+            // for the retry (dropping it would make the next attempt skip
+            // the v6 teardown it still owes).
+            if (rc == 0)
+                clear_linux_v6_applied();
+            return rc;
+        }
 #elif defined(__APPLE__)
         return macos_unquarantine(ctx);
 #else

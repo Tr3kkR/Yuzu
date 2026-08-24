@@ -44,6 +44,26 @@ TEST_CASE("ip_family classifies validated IPv4/IPv6 literals and reports unknown
     CHECK(ip_family("deadbeef") == IpFamily::unknown); // no '.' or ':' -- callers skip it
 }
 
+// ── extract_target_host ─────────────────────────────────────────────────
+
+TEST_CASE("extract_target_host strips a port suffix from a gRPC-style target, "
+         "handling bracketed and bracket-less IPv6",
+         "[agent][quarantine_parsers]") {
+    CHECK(extract_target_host("10.0.0.5:50051") == "10.0.0.5");
+    CHECK(extract_target_host("server.example.com:50051") == "server.example.com");
+    CHECK(extract_target_host("[::1]:50051") == "::1");
+    CHECK(extract_target_host("[2001:db8::1]:50051") == "2001:db8::1");
+    // Bracket-less IPv6 with no port -- splitting on the last ':' would
+    // truncate it, so the whole string is returned instead.
+    CHECK(extract_target_host("2001:db8::1") == "2001:db8::1");
+    CHECK(extract_target_host("::1") == "::1");
+    // No ':' at all -- a bare host, returned unchanged.
+    CHECK(extract_target_host("localhost") == "localhost");
+    CHECK(extract_target_host("") == "");
+    // Malformed bracket (no closing ']') -- no safe host to extract.
+    CHECK(extract_target_host("[::1:50051") == "");
+}
+
 // ── MutationTally / status tokens ───────────────────────────────────────
 
 TEST_CASE("MutationTally.record tallies attempts and successes, and complete() is "
