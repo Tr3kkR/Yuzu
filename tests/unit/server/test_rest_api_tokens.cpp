@@ -17,22 +17,28 @@
  * thread for TSan to fight with.
  */
 
+#include "agent_registry.hpp"
 #include "api_token_store.hpp"
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
 #include "device_token_store.hpp"
+#include "event_bus.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "rest_api_v1.hpp"
 #include "secure_random.hpp"
 #include "test_route_sink.hpp"
 
+#include "agent.pb.h"
+
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <httplib.h>
+#include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include "../test_helpers.hpp"
@@ -43,6 +49,13 @@
 #include <vector>
 
 using namespace yuzu::server;
+using yuzu::server::detail::AgentRegistry;
+using yuzu::server::detail::EventBus;
+// `pb` is already bound to `::yuzu::agent::v1` by agent_registry.hpp inside
+// `namespace yuzu::server::detail` — use `agent_pb` here to avoid
+// "redefinition of 'pb'" (same workaround as
+// test_agent_registry_token_revocation.cpp).
+namespace agent_pb = ::yuzu::agent::v1;
 
 namespace {
 
@@ -907,4 +920,67 @@ TEST_CASE("REST tokens: unopened token DB returns 503 on every route, never 404"
     // The guard runs before any token is touched — no audit rows, no
     // half-completed mutations to report.
     CHECK(h.audit_log.empty());
+}
+
+// #3401: end-to-end proof that the #823 re-registration defence actually closes the gap for a
+// REST-issued token — the shape every production issuance path produces (operator username in
+// principal_id, target device_id in device_id; rest_api_v1.cpp:8134). Constructs a real
+// AgentRegistry alongside the harness's DeviceTokenStore (the harness itself has no registry —
+// REST issuance and the registry sweep are independently-wired components in production too;
+// server.cpp wires both against the same store instance).
+TEST_CASE("REST-issued device token is revoked when the target device re-registers (#823/#3401 "
+          "end-to-end)",
+          "[pg][rest][token][823][3401]") {
+    RestTokensHarness h;
+    h.session_user = "alice";
+    h.session_role = auth::Role::user;
+
+    EventBus bus;
+    yuzu::MetricsRegistry registry_metrics;
+    AgentRegistry registry(bus, registry_metrics);
+    registry.set_device_token_store(h.device_token_store.get());
+
+    agent_pb::AgentInfo info;
+    info.set_agent_id("endpoint-99");
+    info.set_hostname("legit.local");
+    REQUIRE(registry.register_agent(info).has_value());
+
+    // Mint through the REST route, exactly as an operator would: principal_id becomes
+    // session->username ("alice"), NOT the agent_id — the shape #3401 was filed against.
+    auto res = h.sink.Post(
+        "/api/v1/device-tokens",
+        R"({"name":"ops-token","device_id":"endpoint-99","definition_id":""})");
+    REQUIRE(res);
+    REQUIRE(res->status == 201);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("data"));
+    REQUIRE(body["data"].contains("raw_token"));
+    std::string raw_token = body["data"]["raw_token"];
+
+    // The REST-minted row carries the issuing operator as principal_id — no existing test pins
+    // this; assert it directly against the store rather than just the wire response.
+    auto listed = h.device_token_store->list_tokens();
+    REQUIRE(listed.has_value());
+    auto it = std::find_if(listed->begin(), listed->end(),
+                           [](const DeviceAuthToken& t) { return t.name == "ops-token"; });
+    REQUIRE(it != listed->end());
+    CHECK(it->principal_id == "alice");
+    CHECK(it->device_id == "endpoint-99");
+
+    // The token validates for the device it names, before any re-registration.
+    REQUIRE(h.device_token_store->validate_token(raw_token, "endpoint-99").has_value());
+
+    // Target device re-registers (the #779 threat model — an attacker briefly impersonating
+    // endpoint-99 without mTLS). The #823 defence must revoke the REST-issued token here.
+    agent_pb::AgentInfo reinfo;
+    reinfo.set_agent_id("endpoint-99");
+    reinfo.set_hostname("attacker.local");
+    REQUIRE(registry.register_agent(reinfo).has_value());
+
+    auto reval = h.device_token_store->validate_token(raw_token, "endpoint-99");
+    REQUIRE_FALSE(reval.has_value());
+    CHECK(reval.error().error == DeviceTokenValidateError::revoked);
+    CHECK(reval.error().bound_principal_id == "alice");
+    CHECK(reval.error().bound_device_id == "endpoint-99");
 }
