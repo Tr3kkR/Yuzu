@@ -356,7 +356,7 @@ overlap, and a 22–25 % timeout rate on the `server ~[pg]`/`tar` suites overall
 `fork()`/VFS/page-cache and no AV minifilter keep Big Tam's (Linux) per-op cost
 lower than Wee Tam's — but a prior revision of this section claimed Big Tam
 "scales flat" and needed no gate at all, which was never actually true; see
-"Linux within-job concurrency cap" below.
+"Linux concurrency caps (within-job + cross-job)" below.
 
 `ci.yml`'s Windows **Test** step therefore wraps the run in
 [`scripts/ci/with-test-slot.sh`](../scripts/ci/with-test-slot.sh) — a crash-safe
@@ -368,14 +368,15 @@ count is the first knob to revisit (→3) once per-op cost is cut (Defender `%TE
 exclusion, RAM-disk data dirs). Full diagnosis: the `tests/meson.build`
 server-shard comment.
 
-### Linux within-job concurrency cap
+### Linux concurrency caps (within-job + cross-job)
 
 Big Tam's 4 runners are also CCD-pinned (16 logical CPUs each, "Self-hosted
 runner topology" above), and each runner agent's `Ensure Postgres (server
 tests)` step idempotently (re)uses one persistent `yuzu-ci-postgres-<n>`
-container scoped to that agent — so unlike Wee Tam, Big Tam was never
-suffering primarily from OTHER, concurrently-running jobs sharing the box. The
-bottleneck was **within one job**: `ci.yml`'s Linux `Test` step invoked
+container scoped to that agent. Two independent contention mechanisms turned
+out to be stacked here, not one — fixed in two rounds.
+
+**Within-job (fixed first):** `ci.yml`'s Linux `Test` step invoked
 `scripts/ci/flake-retry.py` with no `--num-processes` cap. meson's own default
 worker count is an uncapped, non-affinity-aware `cpu_count()` — the job's
 execution is genuinely confined to 16 logical CPUs via cgroup, but meson's own
@@ -392,29 +393,45 @@ artifact, not a shard's own baseline.
 
 Each pg shard carries `timeout: 600` as a hard per-test meson kwarg (not the
 job-level budget). Shard E hit it dead-on — 600.11–600.60 s, repeatedly —
-under this same uncapped fan-out before the 2026-08-19 E→E+G split (#3322);
-the post-split E/G pair was still measured at 86–96% of that ceiling across
-several runs, as
-recently as this week, i.e. the box was never actually scaling flat — the
-separate shard A→A+H split (#3434) addressed a different pair and only moved
-which shard sat closest to the ceiling, it didn't touch this mechanism. The
-fix: `--num-processes 2` on the Linux Test step, mirroring the already-proven
-Windows value — chosen over a larger number specifically because E/G had no
-measured headroom to spend on a guess.
+under this same uncapped fan-out before the 2026-08-19 E→E+G split (#3322).
+The fix: `--num-processes 2` on the Linux Test step, mirroring the
+already-proven Windows value — chosen over a larger number specifically
+because E/G had no measured headroom to spend on a guess.
+
+**Cross-job (fixed second, #3443 AC4):** the within-job fix alone left
+cross-job contention explicitly unmeasured at merge time, and it turned out
+NOT to be a rare edge case: the post-split E/G pair was still measured at
+86–96% of that ceiling across several runs the same week `--num-processes 2`
+shipped, and a subsequent push to `dev` timed E out again at exactly 600.01s.
+The mechanism: a single push to `dev` launches its own 4-way Linux matrix
+(gcc-15/clang-21 × debug/release) **simultaneously**, saturating all 4 Big Tam
+runners by itself — so Big Tam was never suffering primarily from OTHER
+unrelated jobs the way Wee Tam does, but its OWN push-triggered matrix is
+enough on its own. A concurrently-queued PR's Linux job was directly observed
+waiting **35 minutes** for a free runner during exactly this window. The fix:
+`ci.yml`'s Linux Test step now also wraps in `with-test-slot.sh 2`, the same
+box-wide slot gate Wee Tam already used — capping concurrent heavy test
+*phases* to 2 per box (the build phase stays 4-wide). Three Linux-specific
+settings were required, unlike Windows which uses the script's defaults for
+all of them: `YUZU_TEST_SLOT_DIR` is set explicitly to a genuinely box-wide
+path (`/tmp/yuzu-bigtam-test-slots`, following the same proven pattern as
+`/tmp/yuzu-ci-apt.lock` above) because Big Tam's `RUNNER_TOOL_CACHE` is
+per-agent, not box-wide like Wee Tam's shared `D:\ci\tool_cache` — the
+script's own default would have silently no-op'd, each runner gating against
+its own private lock dir and never actually contending with the others.
+`YUZU_TEST_SLOT_NAME` is set to keep the two platforms' slot namespaces
+distinct in logs. `YUZU_TEST_SLOT_TIMEOUT_MIN=30` is set short relative to
+the 90-minute job budget to REDUCE (not guarantee-away) the chance a starved
+job hits the ambiguous job-level timeout kill instead of the script's own
+attributable error — the 90-minute budget also covers checkout/build time
+before Test starts, so a slow build can still leave less than 30 minutes of
+headroom when the wait begins.
 
 `nightly.yml`'s Linux ASan/TSan/coverage legs and `sanitizer-tests.yml`'s
 ASan/TSan legs (the `/test --full` pre-push gate) invoke `meson test` directly
-with the identical uncapped-fan-out shape and are NOT fixed by this change —
-tracked in #3443 alongside the Linux cross-job gate below.
-
-A Linux cross-job gate via `with-test-slot.sh` (today Windows-only) is a
-candidate fast-follow if within-job capping alone proves insufficient; it isn't
-wired in yet because its default lock directory
-(`$RUNNER_TOOL_CACHE/yuzu-test-slots`) is per-agent on Big Tam, not box-wide
-like Wee Tam's shared `D:\ci\tool_cache` — bundling it would need an explicit
-shared `YUZU_TEST_SLOT_DIR` to actually gate cross-job, or it would silently
-no-op. Full diagnosis: the `tests/meson.build` server-shard comment (shard
-E/G split history) + #3443.
+and carry NEITHER fix — tracked as the remaining open item on #3443. Full
+diagnosis: the `tests/meson.build` server-shard comment (shard E/G split
+history) + #3443.
 
 ### Persistent runner-local test history
 

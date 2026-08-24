@@ -778,18 +778,43 @@ jobs:
         # 2026-08-19 E->E+G split (#3322), and the post-split E/G pair was still
         # measured at 86-96% of that ceiling across several runs this week — so
         # the box was never actually "scaling flat" (see the now-corrected claim in
-        # docs/ci-architecture.md's "Linux within-job concurrency cap" section +
+        # docs/ci-architecture.md's "Linux concurrency caps (within-job + cross-job)" section +
         # this step's Windows counterpart below). Solo/uncontended per-shard cost
         # is much lower — tests/meson.build's own recorded numbers run ~50-180s —
         # the ~600s figures are what full concurrent contention produces, not a
-        # shard's own baseline.
-        # 2, not a higher number: E/G have no measured margin to spend on a
-        # guess, and this mirrors the Windows Test step's already-proven
-        # `--num-processes 2` rather than deriving a Linux-specific value. A
-        # box-wide cross-job gate (with-test-slot.sh, Windows-only today) is a
-        # candidate fast-follow if per-job capping alone isn't enough — tracked
-        # in #3443, not bundled here without its own measurement.
-        run: python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2
+        # shard's own baseline. 2, not a higher number: E/G have no measured
+        # margin to spend on a guess, and this mirrors the Windows Test step's
+        # already-proven `--num-processes 2` rather than deriving a Linux-
+        # specific value.
+        #
+        # with-test-slot.sh (#3443 AC4): --num-processes 2 alone fixed
+        # WITHIN-job fan-out but left cross-job contention unmeasured. Now
+        # confirmed real, not just a theoretical risk: a single push to dev
+        # launches its own 4-way Linux matrix (gcc-15/clang-21 x debug/release)
+        # simultaneously, saturating all 4 Big Tam runners by itself, and a
+        # concurrently-queued PR's Linux job was observed waiting 35 minutes for
+        # a free runner while shard E timed out at exactly 600.01s under that
+        # same load. Mirrors the Windows Test step's already-proven pattern
+        # below: caps concurrent heavy test PHASES to 2 per box (crash-safe
+        # flock; the build phase stays 4-wide, unaffected). YUZU_TEST_SLOT_DIR
+        # is set explicitly because Big Tam's RUNNER_TOOL_CACHE is PER-AGENT
+        # (docs/ci-architecture.md), unlike Wee Tam's box-wide one — the
+        # script's own default would silently no-op here (each runner gating
+        # against its own private lock dir, never contending with the others)
+        # without this override. YUZU_TEST_SLOT_TIMEOUT_MIN=30 is deliberately
+        # short relative to the 90-minute job budget, to REDUCE (not
+        # guarantee-away) the chance a starved job hits the ambiguous
+        # job-level timeout kill instead of with-test-slot.sh's own
+        # attributable error — the 90-minute budget also covers checkout and
+        # build time before Test even starts, so a slow build can still leave
+        # less than 30 minutes of headroom when the wait begins.
+        env:
+          YUZU_TEST_SLOT_DIR: /tmp/yuzu-bigtam-test-slots
+          YUZU_TEST_SLOT_NAME: yuzu-bigtam-heavy
+          YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
+        run: |
+          bash scripts/ci/with-test-slot.sh 2 -- \
+            python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2
 
       # Break-glass MFA-reset CLI contract (#1226) — exit codes + JSON output of
       # `yuzu-server --mfa-reset` are not exercisable by the Catch2 suite (which
@@ -1163,12 +1188,12 @@ jobs:
           # c0 289s -> c4 603s). with-test-slot.sh caps concurrent heavy test
           # phases to 2 per box (crash-safe flock; build stays 4-wide), and
           # --num-processes 2 caps meson's own fan-out so the ~8 server pg
-          # shards don't pile onto one CCD+cluster. with-test-slot.sh (the
-          # cross-job piece) is Windows-only — Linux's own within-job fan-out gets
-          # the same --num-processes 2 cap on its Test step above; it was never
-          # actually scaling flat (docs/ci-architecture.md, tests/meson.build
-          # server-shard comment). A Linux cross-job gate is a candidate
-          # fast-follow tracked in #3443, not shipped here.
+          # shards don't pile onto one CCD+cluster. Linux's Test step now carries
+          # the same with-test-slot.sh + --num-processes 2 pair (#3443 AC4) — the
+          # two platforms differ in slot-dir/name/timeout tuning (Big Tam's
+          # RUNNER_TOOL_CACHE is per-agent, not box-wide like Wee Tam's, so its
+          # step sets these explicitly rather than using the script's Windows-
+          # tuned defaults; see that step's comment).
           bash scripts/ci/with-test-slot.sh 2 -- \
             python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2
 
