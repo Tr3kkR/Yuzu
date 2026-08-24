@@ -257,9 +257,28 @@ public:
     /// abort compensating the rest. Defaults to an empty callback (no compensation attempted) —
     /// existing callers are unaffected until they opt in. See the file header for the full
     /// rationale and the reverse-order requirement.
+    ///
+    /// `idempotency_key` (F033/#3481): when non-empty, a prior successful install with the SAME
+    /// key and an IDENTICAL `yaml_bundle` short-circuits before `install_fn` is invoked at all,
+    /// returning the original pack id — this is what stops a client retry from re-running
+    /// `install_fn` against every sibling store again (a dedup check only at the final persist
+    /// step would not: `install_fn` would still re-run on every attempt). The same key reused
+    /// with a DIFFERENT bundle is rejected as a plain validation error (never
+    /// `kProductPackDbErrorPrefix` — a 400, not a 503). Defaults to empty (no dedup) — preserves
+    /// today's behavior exactly; a caller that never sends a key gets no idempotency protection,
+    /// same as before this parameter existed. Namespaced globally (the key alone, not scoped to a
+    /// caller/principal) — `POST /api/product-packs` is `ProductPack:Write`-gated, effectively
+    /// operator-only against one fleet-wide catalog, unlike e.g. ADR-0032's per-credential
+    /// admission-protocol dedupe, which exists for a different, multi-principal threat model. A
+    /// narrow race remains (two concurrent installs, same key, both pass the pre-check) — left to
+    /// surface as an ordinary unique-violation on the persist INSERT, which the loser's own F031
+    /// compensation path already handles; a client retry then re-hits the pre-check and converges
+    /// on the winner's id. Same class of accepted race already documented for concurrent
+    /// `uninstall()` above.
     std::expected<std::string, std::string> install(const std::string& yaml_bundle,
                                                     ItemInstallFn install_fn,
-                                                    ItemUninstallFn compensate_fn = {});
+                                                    ItemUninstallFn compensate_fn = {},
+                                                    const std::string& idempotency_key = {});
 
     /// List installed product packs, newest-installed first. `unexpected(msg)` (prefixed
     /// `kProductPackDbErrorPrefix`) is a genuine read failure — never treat it as "no packs

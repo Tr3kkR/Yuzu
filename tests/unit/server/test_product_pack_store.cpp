@@ -107,6 +107,20 @@ kind: InstructionDefinition
 name: test-instruction-b
 )";
 
+/// A second, content-distinct bundle — used only to prove idempotency-key reuse with a
+/// DIFFERENT body is rejected (F033/#3481). Deliberately unrelated to kUnsignedPackYaml beyond
+/// both being minimal valid unsigned bundles.
+constexpr const char* kUnsignedPackYamlAlt = R"(apiVersion: yuzu.io/v1alpha1
+kind: ProductPack
+name: test-unsigned-alt
+version: 1.0.0
+description: A different bundle for the idempotency-key-reuse-with-different-body test
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+name: test-instruction-alt
+)";
+
 /// install_fn stub — accepts every item, returns a synthetic id. We don't
 /// care which items installed downstream because #802 is a pre-item-install
 /// reject check; the install_fn here is just to satisfy the signature.
@@ -577,6 +591,97 @@ TEST_CASE("ProductPackStore::install: compensation runs in reverse install order
     REQUIRE(compensated_ids.size() == 2);
     CHECK(compensated_ids[0] == "item-id-2");
     CHECK(compensated_ids[1] == "item-id-1");
+}
+
+// ── Idempotency (F033/#3481) ─────────────────────────────────────────────────
+
+TEST_CASE("ProductPackStore::install: the idempotency pre-check fails closed under pool "
+          "contention",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    auto unrelated_lease = pool.acquire();
+    REQUIRE(unrelated_lease);
+
+    int install_calls = 0;
+    auto result = store.install(kUnsignedPackYaml, make_counting_install_fn(&install_calls), {},
+                                "some-key");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().starts_with(yuzu::server::kProductPackDbErrorPrefix));
+    CHECK(install_calls == 0); // install_fn never reached — the pre-check failed first
+}
+
+TEST_CASE("ProductPackStore::install: a repeated Idempotency-Key with an identical bundle "
+          "returns the original pack id and does not re-invoke install_fn",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    int install_calls = 0;
+    auto first = store.install(kUnsignedPackYaml, make_counting_install_fn(&install_calls), {},
+                               "replay-key-1");
+    REQUIRE(first.has_value());
+    CHECK(install_calls == 1);
+
+    auto second = store.install(kUnsignedPackYaml, make_counting_install_fn(&install_calls), {},
+                                "replay-key-1");
+    REQUIRE(second.has_value());
+    CHECK(*second == *first);
+    CHECK(install_calls == 1);
+
+    auto listed = store.list();
+    REQUIRE(listed.has_value());
+    int matching = 0;
+    for (const auto& p : *listed)
+        if (p.name == "test-unsigned")
+            ++matching;
+    CHECK(matching == 1);
+}
+
+TEST_CASE("ProductPackStore::install: a repeated Idempotency-Key with a different bundle is "
+          "rejected as a plain validation error",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    int install_calls = 0;
+    auto first = store.install(kUnsignedPackYaml, make_counting_install_fn(&install_calls), {},
+                               "reuse-key-1");
+    REQUIRE(first.has_value());
+    CHECK(install_calls == 1);
+
+    auto second = store.install(kUnsignedPackYamlAlt, make_counting_install_fn(&install_calls),
+                                {}, "reuse-key-1");
+    REQUIRE_FALSE(second.has_value());
+    CHECK(second.error().find("idempotency key") != std::string::npos);
+    CHECK(second.error().find(yuzu::server::kProductPackDbErrorPrefix) == std::string::npos);
+    CHECK(install_calls == 1); // install_fn never invoked for the rejected second attempt
+}
+
+TEST_CASE("ProductPackStore::install: an empty idempotency_key preserves today's behavior (no "
+          "dedup)",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    auto first = store.install(kUnsignedPackYaml, make_accept_all_install_fn());
+    REQUIRE(first.has_value());
+    auto second = store.install(kUnsignedPackYaml, make_accept_all_install_fn());
+    REQUIRE(second.has_value());
+    CHECK(*first != *second);
 }
 
 // ── Accepted-risk residual (F032/#3481) ──────────────────────────────────────

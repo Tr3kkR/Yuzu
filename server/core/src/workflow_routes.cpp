@@ -1984,6 +1984,19 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             yaml_bundle = req.body;
         }
 
+        // F033/#3481: optional client-supplied dedup key. Missing header -> empty string ->
+        // install()'s existing unguarded behavior, unchanged. Length-bounded before it ever
+        // reaches the store — an unbounded header is an easy way to bloat the idempotency_key
+        // column/index for no functional benefit.
+        std::string idempotency_key = req.get_header_value("Idempotency-Key");
+        if (idempotency_key.size() > 200) {
+            res.status = 400;
+            res.set_content(
+                detail::a4_error(res, "Idempotency-Key header too long (max 200 characters)"),
+                "application/json");
+            return;
+        }
+
         // Install callback: delegate each document to the appropriate store
         auto install_fn =
             [instruction_store, policy_store, workflow_engine](
@@ -2041,7 +2054,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // F031/#3481: best-effort undo of whatever install_fn already committed, if the final
         // persist transaction below fails.
         auto compensate_fn = make_item_delete_fn(instruction_store, policy_store, workflow_engine);
-        auto result = product_pack_store->install(yaml_bundle, install_fn, compensate_fn);
+        auto result =
+            product_pack_store->install(yaml_bundle, install_fn, compensate_fn, idempotency_key);
         if (!result) {
             // gov W7.4 R1 UP-1 / compliance CC6.7 / sre B2: SOC 2 CC6.7
             // requires "all access decisions logged". The pack-install

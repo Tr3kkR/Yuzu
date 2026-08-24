@@ -342,6 +342,14 @@ const std::vector<pg::PgMigration>& migrations() {
          "CREATE TABLE deleted_pack_ids ("
          "  pack_id    TEXT PRIMARY KEY,"
          "  deleted_at BIGINT NOT NULL);"},
+        // F033/#3481: optional client-supplied Idempotency-Key dedup. NULL for every install that
+        // doesn't supply one — a plain (non-partial) unique index would work identically here
+        // (Postgres already treats every NULL as distinct in a unique index), but the partial
+        // form skips indexing the common keyless case.
+        {2,
+         "ALTER TABLE product_packs ADD COLUMN idempotency_key TEXT;"
+         "CREATE UNIQUE INDEX idx_product_packs_idempotency_key ON product_packs(idempotency_key) "
+         "WHERE idempotency_key IS NOT NULL;"},
     };
     return kMigrations;
 }
@@ -1015,9 +1023,9 @@ bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
 
 // ── Install ─────────────────────────────────────────────────────────────────
 
-std::expected<std::string, std::string> ProductPackStore::install(const std::string& yaml_bundle,
-                                                                  ItemInstallFn install_fn,
-                                                                  ItemUninstallFn compensate_fn) {
+std::expected<std::string, std::string> ProductPackStore::install(
+    const std::string& yaml_bundle, ItemInstallFn install_fn, ItemUninstallFn compensate_fn,
+    const std::string& idempotency_key) {
     if (!open_)
         return std::unexpected(std::string(kProductPackDbErrorPrefix) + "database not open");
     if (!install_fn)
@@ -1118,6 +1126,35 @@ std::expected<std::string, std::string> ProductPackStore::install(const std::str
                      sanitize_for_log(pack_name));
     }
 
+    // F033/#3481: idempotency pre-check, BEFORE install_fn touches any sibling store. A dedup
+    // check only at the final persist step would still re-run install_fn against every sibling
+    // store on every retry — this is what actually stops that. A prior install with the SAME key
+    // and an IDENTICAL bundle is a replay: return its pack id, no sibling-store calls at all. The
+    // same key with a DIFFERENT bundle is a plain validation error (never
+    // kProductPackDbErrorPrefix — 400, not 503). Fail-closed: any lookup failure here returns
+    // before install_fn is ever reached.
+    if (!idempotency_key.empty()) {
+        auto lease = pool_.try_acquire_for(kReadTimeout);
+        if (!lease)
+            return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                                   "database unavailable — try again");
+        pg::PgResult res = pg::exec_params(
+            lease.get(),
+            "SELECT id, yaml_source FROM product_pack_store.product_packs "
+            "WHERE idempotency_key = $1",
+            std::vector<std::string>{sanitize_pg_text(idempotency_key)});
+        if (res.status() != PGRES_TUPLES_OK)
+            return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                                   "idempotency lookup failed: " + PQerrorMessage(lease.get()));
+        if (PQntuples(res.get()) > 0) {
+            std::string existing_id = text_col(res.get(), 0, 0);
+            std::string existing_yaml = text_col(res.get(), 0, 1);
+            if (existing_yaml == sanitize_pg_text(yaml_bundle))
+                return existing_id;
+            return std::unexpected("idempotency key already used with a different request body");
+        }
+    }
+
     auto pack_id = gen_id();
     auto now = now_epoch();
 
@@ -1192,15 +1229,23 @@ std::expected<std::string, std::string> ProductPackStore::install(const std::str
     // Now persist the pack row + its successfully-installed item rows in ONE transaction
     // (parent-before-child for the product_pack_items -> product_packs FK).
     bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        // idempotency_key binds via the std::optional<std::string> overload — NOT the plain
+        // std::string overload, which would bind an empty key as "" rather than SQL NULL and
+        // break the partial unique index's NULL-exemption for every keyless install after the
+        // first (F033/#3481).
         pg::PgResult pres = pg::exec_params(
             conn,
             "INSERT INTO product_pack_store.product_packs "
-            "(id, name, version, description, yaml_source, installed_at, verified) "
-            "VALUES ($1,$2,$3,$4,$5,$6::bigint,$7::boolean)",
-            std::vector<std::string>{
+            "(id, name, version, description, yaml_source, installed_at, verified, "
+            "idempotency_key) "
+            "VALUES ($1,$2,$3,$4,$5,$6::bigint,$7::boolean,$8)",
+            std::vector<std::optional<std::string>>{
                 pack_id, sanitize_pg_text(pack_name), sanitize_pg_text(pack_version),
                 sanitize_pg_text(pack_description), sanitize_pg_text(yaml_bundle),
-                std::to_string(now), pack_verified ? "true" : "false"});
+                std::to_string(now), pack_verified ? "true" : "false",
+                idempotency_key.empty() ? std::nullopt
+                                        : std::optional<std::string>(
+                                              sanitize_pg_text(idempotency_key))});
         if (pres.status() != PGRES_COMMAND_OK)
             return false;
 
