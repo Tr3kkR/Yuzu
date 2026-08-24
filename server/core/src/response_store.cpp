@@ -1,6 +1,7 @@
 #include "response_store.hpp"
 
 #include <yuzu/audit_retention_rules.hpp>
+#include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
@@ -949,17 +950,31 @@ std::size_t ResponseStore::total_count() const {
 // -- Faceted query methods -----------------------------------------------------
 
 std::optional<std::vector<FacetValue>>
-ResponseStore::facet_values(const std::string& instruction_id, int col_idx) const {
+ResponseStore::facet_values(const std::string& instruction_id, int col_idx,
+                            const std::optional<std::vector<std::string>>& agent_scope) const {
+    // Engaged-empty scope (ADR-0017 INV-3 / #1712): zero visible agents means
+    // zero facet values, without touching the pool or issuing a query —
+    // success-empty, not degrade, even when the store is closed (#2691
+    // degrade-vs-empty distinguishability).
+    if (agent_scope.has_value() && agent_scope->empty())
+        return std::vector<FacetValue>{};
     static DegradeSampler sampler;
     return resp_read<std::vector<FacetValue>>(
         open_, pool_, metrics_, "facet_values", sampler,
         [&](PGconn* conn) -> std::optional<std::vector<FacetValue>> {
-            pg::PgResult res = pg::exec_params(
-                conn,
+            std::string sql =
                 "SELECT value, SUM(line_count) FROM response_store.response_facets WHERE "
-                "instruction_id = $1 AND col_idx = $2::integer GROUP BY value ORDER BY "
-                "SUM(line_count) DESC",
-                std::vector<std::string>{instruction_id, std::to_string(col_idx)});
+                "instruction_id = $1 AND col_idx = $2::integer";
+            std::vector<std::string> binds{instruction_id, std::to_string(col_idx)};
+            if (agent_scope.has_value()) {
+                // ADR-0017 INV-3: the visible set is applied IN SQL, before
+                // the aggregate — never a C++ post-filter.
+                std::vector<std::string_view> sv(agent_scope->begin(), agent_scope->end());
+                sql += " AND agent_id = ANY($3::text[])";
+                binds.push_back(pg::to_text_array(sv));
+            }
+            sql += " GROUP BY value ORDER BY SUM(line_count) DESC";
+            pg::PgResult res = pg::exec_params(conn, sql.c_str(), binds);
             if (res.status() != PGRES_TUPLES_OK)
                 return std::nullopt;
             std::vector<FacetValue> out;
@@ -1024,7 +1039,15 @@ ResponseStore::facet_agent_ids(const std::string& instruction_id,
 
 std::optional<int64_t>
 ResponseStore::facet_agent_count(const std::string& instruction_id,
-                                 const std::vector<FacetFilter>& filters) const {
+                                 const std::vector<FacetFilter>& filters,
+                                 const std::optional<std::vector<std::string>>& agent_scope) const {
+    // Engaged-empty scope (ADR-0017 INV-3 / #1712): zero visible agents means
+    // zero matching agents, without touching the pool or issuing a query —
+    // success-empty, not degrade, even when the store is closed (#2691
+    // degrade-vs-empty distinguishability). Checked before the open_/pool_
+    // checks below.
+    if (agent_scope.has_value() && agent_scope->empty())
+        return 0;
     // No filter is a genuine "no scoped count to report" — 0, not a degrade
     // (#2691, Doomgoose finding #7: distinct from the read-failure cases
     // below, which must NOT collapse to the same observable 0).
@@ -1040,6 +1063,13 @@ ResponseStore::facet_agent_count(const std::string& instruction_id,
     std::vector<std::string> binds{instruction_id};
     int idx = 2;
     append_facet_filters(sql, binds, idx, instruction_id, filters);
+    if (agent_scope.has_value()) {
+        // ADR-0017 INV-3: the visible set is applied IN SQL, before the
+        // aggregate — never a C++ post-filter.
+        std::vector<std::string_view> sv(agent_scope->begin(), agent_scope->end());
+        sql += " AND agent_id = ANY($" + std::to_string(idx++) + "::text[])";
+        binds.push_back(pg::to_text_array(sv));
+    }
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), binds);
     if (res.status() != PGRES_TUPLES_OK)
         return std::nullopt;
