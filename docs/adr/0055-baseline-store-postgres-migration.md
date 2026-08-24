@@ -256,3 +256,19 @@ concurrency replaces it. Mutate-and-return uses `RETURNING` (#1033); no
   management-group-delete cross-store cleanup hooks) remain unwired from any live
   caller — unchanged from pre-migration; wiring them is a later slice
   (`docs/guardian-baseline-model.md`).
+- **Adversarial-review findings, out of this PR's scope (pre-existing, unchanged by
+  this diff — verified via `git diff <merge-base>..HEAD`):**
+  - `guardian_routes.cpp`'s deploy/delete handlers call
+    `store_->bump_policy_generation()` (on `GuaranteedStateStore`, ADR-0038) and discard
+    the result; a failed bump leaves the policy generation un-advanced while the deploy
+    is reported success, so an offline/reconnecting agent may not be caught by the
+    heartbeat reconcile. HIGH, both reviewers confirmed. Belongs to
+    `guaranteed_state_store.*`, not `baseline_store.*` — already tracked as **#3281**
+    (filed from PR #3277's adversarial review, same finding, same both-reviewers/
+    adjudicated-pre-existing shape; no new issue needed).
+  - Same handlers treat `BaselineStore::get_baseline()` returning `nullopt` (which
+    conflates a degraded store with a genuine not-found) as "Baseline not found". LOW,
+    both reviewers confirmed; pre-dates the Postgres migration (the SQLite-era
+    `get_baseline` had the identical signature). A `get_baseline_checked`/`store_ok`
+    variant — the same pattern already used for `get_baseline_by_name` — would close
+    it if picked up.
