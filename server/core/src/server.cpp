@@ -2944,11 +2944,13 @@ public:
         // forensics. One describe site only (#2446 last-write-wins on dup).
         metrics_.describe("yuzu_engine_principal_confirm_total",
                           "Engine-credential rotation confirm outcomes by surface (rest|mcp) and "
-                          "result (success|conflict|client_error|transient); store-reaching calls "
-                          "only, pre-store denials excluded (#2404)",
+                          "result (success|conflict|client_error|transient|secret_mismatch); "
+                          "store-reaching calls only, pre-store denials excluded (#2404; "
+                          "secret_mismatch added #3015 proof-of-possession)",
                           "counter");
         for (auto surface : {"rest", "mcp"}) {
-            for (auto result : {"success", "conflict", "client_error", "transient"}) {
+            for (auto result :
+                {"success", "conflict", "client_error", "transient", "secret_mismatch"}) {
                 metrics_.counter("yuzu_engine_principal_confirm_total",
                                  {{"surface", surface}, {"result", result}});
             }
@@ -2993,12 +2995,14 @@ public:
         // diverge into a shadow series.
         metrics_.describe(kApiTokenConfirmTotalMetric,
                           "Human API-token rotation confirm outcomes by surface (rest|mcp) and "
-                          "result (success|conflict|client_error|transient); store-reaching calls "
-                          "only, pre-store denials excluded - the human-owned twin of "
-                          "yuzu_engine_principal_confirm_total",
+                          "result (success|conflict|client_error|transient|secret_mismatch); "
+                          "store-reaching calls only, pre-store denials excluded - the "
+                          "human-owned twin of yuzu_engine_principal_confirm_total "
+                          "(secret_mismatch added #3015 proof-of-possession)",
                           "counter");
         for (auto surface : {"rest", "mcp"}) {
-            for (auto result : {"success", "conflict", "client_error", "transient"}) {
+            for (auto result :
+                {"success", "conflict", "client_error", "transient", "secret_mismatch"}) {
                 metrics_.counter(kApiTokenConfirmTotalMetric,
                                  {{"surface", surface}, {"result", result}});
             }

@@ -1602,7 +1602,7 @@ This section enumerates the stable builtin primitives that content authors targe
 | `network.config.get` | `network_config` | Y | Y | Y | Verified |
 | `network.route.list` | `network_config` | Y | Y | Y | Verified |
 | `network.connection.list` | `netstat` | Y | Y | Y | Verified |
-| `network.socket.owner` | `sockwho` | Y | Y | Y | Verified |
+| `network.socket.owner` | `netstat` (`attribution` action) | Y | Y | Y | Verified |
 | `network.dns.flush` | `network_actions` | Y | Y | Y | Verified |
 | `network.diagnostics.run` | `network_diag` | Y | Y | Y | Verified |
 | `network.probe.icmp` | `netprobe` | Y | Y | Y | Verified |

@@ -1667,15 +1667,20 @@ TEST_CASE("MCP confirm_engine_rotation: token_id pin round-trip via tools/call",
     CHECK(missing->body.find("token_id is required") != std::string::npos);
 
     // Mismatched id -> Conflict-classed rejection, both credentials intact.
+    // #3015: a placeholder secret is supplied so this request clears the
+    // tool's own input-validation belt and actually reaches the store,
+    // where the pin-mismatch fires strictly before PoP is ever checked.
     auto mismatch = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":92,)"
-        R"("params":{"name":"confirm_engine_rotation","arguments":{"principal_id":"engine:mcp-confirm-pin","token_id":"feedfacefeedfacefeedface"}}})");
+        R"("params":{"name":"confirm_engine_rotation","arguments":{"principal_id":"engine:mcp-confirm-pin","token_id":"feedfacefeedfacefeedface","secret":"irrelevant-secret"}}})");
     REQUIRE(mismatch->status == 200);
     CHECK(mismatch->body.find("does not match the pending rotation") != std::string::npos);
     CHECK(store.list_active_for_principal(principal).size() == 2);
 
     // Correct id -> confirmed; predecessor revoked; the success audit detail
-    // binds the attestation to the confirmed credential id.
+    // binds the attestation to the confirmed credential id. #3015: the REAL
+    // raw secret rotate_engine_credential returned is required for PoP to pass.
+    const auto raw_secret = rot_payload["raw_token"].get<std::string>();
     auto ok = ts.call(
         nlohmann::json{
             {"jsonrpc", "2.0"},
@@ -1684,7 +1689,9 @@ TEST_CASE("MCP confirm_engine_rotation: token_id pin round-trip via tools/call",
             {"params",
              {{"name", "confirm_engine_rotation"},
               {"arguments",
-               {{"principal_id", principal}, {"token_id", successor_token_id}}}}}}
+               {{"principal_id", principal},
+                {"token_id", successor_token_id},
+                {"secret", raw_secret}}}}}}
             .dump());
     REQUIRE(ok->status == 200);
     auto ok_body = nlohmann::json::parse(ok->body);
@@ -1698,6 +1705,87 @@ TEST_CASE("MCP confirm_engine_rotation: token_id pin round-trip via tools/call",
         if (d.find("token_id=" + successor_token_id) != std::string::npos)
             audit_bound = true;
     CHECK(audit_bound);
+}
+
+TEST_CASE("MCP confirm_engine_rotation: a WRONG secret is kPermissionDenied, distinct "
+          "from token_id-mismatch's kInvalidParams (#3015)",
+          "[mcp][pg][engine_principal][confirm][pop]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:mcp-confirm-pop-wrong-secret";
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("svc", principal, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start();
+
+    auto rot = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":90,)"
+        R"("params":{"name":"rotate_engine_credential","arguments":{"principal_id":"engine:mcp-confirm-pop-wrong-secret"}}})");
+    REQUIRE(rot->status == 200);
+    auto rot_payload = nlohmann::json::parse(
+        nlohmann::json::parse(rot->body)["result"]["content"][0]["text"].get<std::string>());
+    const auto successor_token_id = rot_payload["token_id"].get<std::string>();
+    REQUIRE_FALSE(successor_token_id.empty());
+
+    // Missing "secret" entirely -> kInvalidParams (input validation), not
+    // kPermissionDenied.
+    auto missing = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 91},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments",
+           {{"principal_id", principal}, {"token_id", successor_token_id}}}}}}
+                                .dump());
+    REQUIRE(missing->status == 200);
+    CHECK(missing->body.find("secret is required") != std::string::npos);
+    CHECK(missing->body.find("-32602") != std::string::npos); // kInvalidParams
+
+    // Wrong secret, every OTHER gate passes -> the distinct kPermissionDenied
+    // outcome.
+    auto wrong = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 92},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments",
+           {{"principal_id", principal},
+            {"token_id", successor_token_id},
+            {"secret", "not-the-real-secret"}}}}}}
+                              .dump());
+    REQUIRE(wrong->status == 200);
+    auto wrong_body = nlohmann::json::parse(wrong->body);
+    REQUIRE(wrong_body.contains("error"));
+    CHECK(wrong_body["error"]["code"].get<int>() == yuzu::server::mcp::kPermissionDenied);
+    CHECK(wrong->body.find("rotation secret mismatch") != std::string::npos);
+    CHECK(store.list_active_for_principal(principal).size() == 2); // nothing mutated
+
+    // The correct secret still confirms afterward.
+    const auto raw_secret = rot_payload["raw_token"].get<std::string>();
+    auto ok = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 93},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments",
+           {{"principal_id", principal},
+            {"token_id", successor_token_id},
+            {"secret", raw_secret}}}}}}
+                            .dump());
+    REQUIRE(ok->status == 200);
+    CHECK(nlohmann::json::parse(ok->body).contains("result"));
 }
 
 TEST_CASE("MCP confirm_engine_rotation: replay after success is kInvalidParams + a conflict "
@@ -1731,7 +1819,10 @@ TEST_CASE("MCP confirm_engine_rotation: replay after success is kInvalidParams +
     const auto successor_token_id = rot_payload["token_id"].get<std::string>();
     REQUIRE_FALSE(successor_token_id.empty());
 
-    const auto confirm_call = [&](int id) {
+    // #3015: the real successor secret, so the first confirm below actually
+    // passes PoP.
+    const auto raw_secret = rot_payload["raw_token"].get<std::string>();
+    const auto confirm_call = [&](int id, const std::string& secret) {
         return ts.call(nlohmann::json{{"jsonrpc", "2.0"},
                                       {"method", "tools/call"},
                                       {"id", id},
@@ -1739,7 +1830,8 @@ TEST_CASE("MCP confirm_engine_rotation: replay after success is kInvalidParams +
                                        {{"name", "confirm_engine_rotation"},
                                         {"arguments",
                                          {{"principal_id", principal},
-                                          {"token_id", successor_token_id}}}}}}
+                                          {"token_id", successor_token_id},
+                                          {"secret", secret}}}}}}
                            .dump());
     };
     const auto confirm_metric = [&](const char* result) {
@@ -1750,16 +1842,18 @@ TEST_CASE("MCP confirm_engine_rotation: replay after success is kInvalidParams +
     };
 
     // First confirm succeeds (the real cutover).
-    auto ok = confirm_call(93);
+    auto ok = confirm_call(93, raw_secret);
     REQUIRE(ok->status == 200);
     CHECK(nlohmann::json::parse(ok->body).contains("result"));
     CHECK(confirm_metric("success") == 1.0);
 
-    // The replay: SAME args. Before #2404 the store's "no in-flight rotation"
-    // classified kInternalError (-32603, "retryable") and an idempotent-hint-
-    // honouring client would loop forever. Now it is a TERMINAL kInvalidParams
-    // (-32602) already-confirmed conflict.
-    auto replay = confirm_call(94);
+    // The replay: SAME args (placeholder secret — the pair-state check fires
+    // before PoP, so a wrong secret cannot change this outcome). Before #2404
+    // the store's "no in-flight rotation" classified kInternalError (-32603,
+    // "retryable") and an idempotent-hint-honouring client would loop
+    // forever. Now it is a TERMINAL kInvalidParams (-32602) already-confirmed
+    // conflict.
+    auto replay = confirm_call(94, "irrelevant-secret");
     REQUIRE(replay->status == 200); // JSON-RPC error still rides a 200
     CHECK(replay->body.find("-32602") != std::string::npos);          // kInvalidParams
     CHECK(replay->body.find("-32603") == std::string::npos);          // NOT kInternalError
@@ -1846,10 +1940,17 @@ TEST_CASE("MCP rotate_api_token/confirm_api_token_rotation: self-service round t
             reveal_audited = true;
     CHECK(reveal_audited);
 
+    // #3015: the real raw successor secret rotate_api_token returned.
+    const auto raw_secret = rot_payload["raw_token"].get<std::string>();
     auto conf = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":951,)"
-        R"("params":{"name":"confirm_api_token_rotation","arguments":{"token_id":")" +
-        successor_token_id + R"("}}})");
+        nlohmann::json{{"jsonrpc", "2.0"},
+                       {"method", "tools/call"},
+                       {"id", 951},
+                       {"params",
+                        {{"name", "confirm_api_token_rotation"},
+                         {"arguments",
+                          {{"token_id", successor_token_id}, {"secret", raw_secret}}}}}}
+            .dump());
     REQUIRE(conf->status == 200);
     auto conf_body = nlohmann::json::parse(conf->body);
     REQUIRE(conf_body.contains("result"));
@@ -1999,10 +2100,10 @@ TEST_CASE("MCP rotate_api_token: successor lookup is scoped to the predecessor b
     // (the <=2-active ceiling is per ROTATION GROUP, never per principal).
     auto rot_b = rotate(token_b, 953);
     REQUIRE(rot_b->status == 200);
-    auto successor_b = nlohmann::json::parse(
-        nlohmann::json::parse(rot_b->body)["result"]["content"][0]["text"].get<std::string>())
-                            ["token_id"]
-                                .get<std::string>();
+    auto rot_b_payload = nlohmann::json::parse(
+        nlohmann::json::parse(rot_b->body)["result"]["content"][0]["text"].get<std::string>());
+    auto successor_b = rot_b_payload["token_id"].get<std::string>();
+    auto raw_b = rot_b_payload["raw_token"].get<std::string>();
 
     // The BLOCKING bug an unscoped scan would reproduce: matching "any"
     // linked row deterministically returns A's successor (minted first) even
@@ -2012,11 +2113,16 @@ TEST_CASE("MCP rotate_api_token: successor lookup is scoped to the predecessor b
     REQUIRE(b_row.has_value());
     CHECK(b_row->supersedes_token_id == token_b);
 
-    // Confirming B's successor must revoke ONLY B's predecessor.
+    // Confirming B's successor must revoke ONLY B's predecessor. #3015: B's
+    // own real raw secret is required for PoP.
     auto conf_b = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":954,)"
-        R"("params":{"name":"confirm_api_token_rotation","arguments":{"token_id":")" +
-        successor_b + R"("}}})");
+        nlohmann::json{{"jsonrpc", "2.0"},
+                       {"method", "tools/call"},
+                       {"id", 954},
+                       {"params",
+                        {{"name", "confirm_api_token_rotation"},
+                         {"arguments", {{"token_id", successor_b}, {"secret", raw_b}}}}}}
+            .dump());
     REQUIRE(conf_b->status == 200);
     REQUIRE(nlohmann::json::parse(conf_b->body).contains("result"));
 
@@ -2191,7 +2297,8 @@ TEST_CASE("MCP confirm_engine_rotation: a pre-consume precondition denies a drif
                 .has_value());
 
     // Mint the rotation pair directly at the store (not under test here).
-    REQUIRE(store.rotate_engine_credential(principal, 7 * 24 * 3600, now, "admin").has_value());
+    auto direct_rotated = store.rotate_engine_credential(principal, 7 * 24 * 3600, now, "admin");
+    REQUIRE(direct_rotated.has_value());
     std::string successor_token_id;
     for (const auto& t : store.list_active_for_principal(principal))
         if (!t.supersedes_token_id.empty())
@@ -2224,7 +2331,10 @@ TEST_CASE("MCP confirm_engine_rotation: a pre-consume precondition denies a drif
         {"id", 1},
         {"params",
          {{"name", "confirm_engine_rotation"},
-          {"arguments", {{"principal_id", principal}, {"token_id", successor_token_id}}}}}}
+          {"arguments",
+           {{"principal_id", principal},
+            {"token_id", successor_token_id},
+            {"secret", "irrelevant-secret"}}}}}}
                             .dump());
     REQUIRE(mint->status == 200);
     auto mint_body = nlohmann::json::parse(mint->body);
@@ -2239,7 +2349,8 @@ TEST_CASE("MCP confirm_engine_rotation: a pre-consume precondition denies a drif
     // 3. DRIFT: the rotation resolves out from under the ticket, through a
     // path that never touches the approval store - the same
     // `requesting_user` ("admin") that minted it confirms directly.
-    REQUIRE(store.confirm_rotation(principal, successor_token_id, "admin").has_value());
+    REQUIRE(store.confirm_rotation(principal, successor_token_id, *direct_rotated, "admin")
+                .has_value());
     REQUIRE(store.list_active_for_principal(principal).size() == 1);
 
     // 4. Recall. Must be denied - and must NOT be the pre-#2443 "approval
@@ -2257,7 +2368,8 @@ TEST_CASE("MCP confirm_engine_rotation: a pre-consume precondition denies a drif
           {"arguments",
            {{"approval_id", approval_id},
             {"principal_id", principal},
-            {"token_id", successor_token_id}}}}}}
+            {"token_id", successor_token_id},
+            {"secret", "irrelevant-secret"}}}}}}
                               .dump());
     REQUIRE(recall->status == 200);
     auto recall_body = nlohmann::json::parse(recall->body);
@@ -2350,7 +2462,10 @@ TEST_CASE("MCP confirm_engine_rotation: a NEWER rotation's mismatched pin is cau
         {"id", 1},
         {"params",
          {{"name", "confirm_engine_rotation"},
-          {"arguments", {{"principal_id", principal}, {"token_id", token_a}}}}}}
+          {"arguments",
+           {{"principal_id", principal},
+            {"token_id", token_a},
+            {"secret", "irrelevant-secret"}}}}}}
                             .dump());
     const std::string approval_id =
         nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
@@ -2377,7 +2492,10 @@ TEST_CASE("MCP confirm_engine_rotation: a NEWER rotation's mismatched pin is cau
         {"params",
          {{"name", "confirm_engine_rotation"},
           {"arguments",
-           {{"approval_id", approval_id}, {"principal_id", principal}, {"token_id", token_a}}}}}}
+           {{"approval_id", approval_id},
+            {"principal_id", principal},
+            {"token_id", token_a},
+            {"secret", "irrelevant-secret"}}}}}}
                               .dump());
     REQUIRE(recall->status == 200);
     auto recall_body = nlohmann::json::parse(recall->body);
@@ -2423,8 +2541,9 @@ TEST_CASE("MCP confirm_engine_rotation: precondition ALLOWS an undrifted recall 
     // sibling #2443 test rotates as "admin" because they all deny before
     // confirm_rotation's own Hermes F4/F5 initiator-binding check would ever
     // run; this is the one test where that check is live and must pass.
-    REQUIRE(
-        store.rotate_engine_credential(principal, 7 * 24 * 3600, now, "test-user").has_value());
+    auto direct_rotated =
+        store.rotate_engine_credential(principal, 7 * 24 * 3600, now, "test-user");
+    REQUIRE(direct_rotated.has_value());
     std::string successor_token_id;
     for (const auto& t : store.list_active_for_principal(principal))
         if (!t.supersedes_token_id.empty())
@@ -2455,14 +2574,20 @@ TEST_CASE("MCP confirm_engine_rotation: precondition ALLOWS an undrifted recall 
             .value();
     };
 
-    // Mint + approve. No drift between approve and recall.
+    // Mint + approve. No drift between approve and recall. #3015: the ticket
+    // binds to the CANONICALIZED args (including "secret" now), so mint and
+    // recall must present the SAME secret value here — the real raw one —
+    // or the recall would mismatch the ticket regardless of PoP.
     auto mint = ts.call(nlohmann::json{
         {"jsonrpc", "2.0"},
         {"method", "tools/call"},
         {"id", 1},
         {"params",
          {{"name", "confirm_engine_rotation"},
-          {"arguments", {{"principal_id", principal}, {"token_id", successor_token_id}}}}}}
+          {"arguments",
+           {{"principal_id", principal},
+            {"token_id", successor_token_id},
+            {"secret", *direct_rotated}}}}}}
                             .dump());
     const std::string approval_id =
         nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
@@ -2472,6 +2597,8 @@ TEST_CASE("MCP confirm_engine_rotation: precondition ALLOWS an undrifted recall 
     // Recall: active is still the clean {predecessor, successor} pair,
     // linked, pinned to successor_token_id - the precondition's kPair +
     // pair_matches_pin arm must return {} and let this reach the handler.
+    // #3015: the real raw secret is required for this recall to actually
+    // succeed at the handler (PoP is the last gate it must also clear).
     auto recall = ts.call(nlohmann::json{
         {"jsonrpc", "2.0"},
         {"method", "tools/call"},
@@ -2481,7 +2608,8 @@ TEST_CASE("MCP confirm_engine_rotation: precondition ALLOWS an undrifted recall 
           {"arguments",
            {{"approval_id", approval_id},
             {"principal_id", principal},
-            {"token_id", successor_token_id}}}}}}
+            {"token_id", successor_token_id},
+            {"secret", *direct_rotated}}}}}}
                               .dump());
     REQUIRE(recall->status == 200);
     auto recall_body = nlohmann::json::parse(recall->body);
@@ -2572,7 +2700,10 @@ TEST_CASE("MCP confirm_engine_rotation: a revoke-to-zero (kNoneActive) denies WI
         {"id", 1},
         {"params",
          {{"name", "confirm_engine_rotation"},
-          {"arguments", {{"principal_id", principal}, {"token_id", successor_token_id}}}}}}
+          {"arguments",
+           {{"principal_id", principal},
+            {"token_id", successor_token_id},
+            {"secret", "irrelevant-secret"}}}}}}
                             .dump());
     const std::string approval_id =
         nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
@@ -2594,7 +2725,8 @@ TEST_CASE("MCP confirm_engine_rotation: a revoke-to-zero (kNoneActive) denies WI
           {"arguments",
            {{"approval_id", approval_id},
             {"principal_id", principal},
-            {"token_id", successor_token_id}}}}}}
+            {"token_id", successor_token_id},
+            {"secret", "irrelevant-secret"}}}}}}
                               .dump());
     REQUIRE(recall->status == 200);
     auto recall_body = nlohmann::json::parse(recall->body);
@@ -2665,7 +2797,8 @@ TEST_CASE("MCP confirm_engine_rotation: a closed/unwired engine-credential store
         {"params",
          {{"name", "confirm_engine_rotation"},
           {"arguments", {{"principal_id", "engine:mcp-confirm-closed-store"},
-                         {"token_id", "deadbeefdeadbeefdeadbeef"}}}}}}
+                         {"token_id", "deadbeefdeadbeefdeadbeef"},
+                         {"secret", "irrelevant-secret"}}}}}}
                             .dump());
     REQUIRE(mint->status == 200);
     auto mint_body = nlohmann::json::parse(mint->body);
@@ -2683,7 +2816,8 @@ TEST_CASE("MCP confirm_engine_rotation: a closed/unwired engine-credential store
           {"arguments",
            {{"approval_id", approval_id},
             {"principal_id", "engine:mcp-confirm-closed-store"},
-            {"token_id", "deadbeefdeadbeefdeadbeef"}}}}}}
+            {"token_id", "deadbeefdeadbeefdeadbeef"},
+            {"secret", "irrelevant-secret"}}}}}}
                               .dump());
     REQUIRE(recall->status == 200);
     auto recall_body = nlohmann::json::parse(recall->body);
@@ -11753,9 +11887,10 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
         // #2444 item 1: token_id must satisfy the schema's ^[0-9a-f]{24}$
         // pattern (24 lowercase hex, mirroring ApiTokenStore's
         // sha256_hex(...).substr(0,24) token_id shape).
+        // #3015: "secret" is now a required field too.
         {"confirm_engine_rotation",
          nlohmann::json::parse(
-             R"({"principal_id":"engine:v","token_id":"aaaaaaaaaaaaaaaaaaaaaaaa"})")},
+             R"({"principal_id":"engine:v","token_id":"aaaaaaaaaaaaaaaaaaaaaaaa","secret":"s"})")},
         {"assign_engine_role",
          nlohmann::json::parse(R"({"principal_id":"vuln-viewer","role":"Operator"})")},
         {"unassign_engine_role",
@@ -11876,12 +12011,14 @@ TEST_CASE("MCP 2444: item 1 schema tightenings reject at compile-validate on the
     {
         auto c = compile_input_schema(schemas.at("confirm_engine_rotation"));
         REQUIRE(c);
+        // #3015: "secret" is now a required field too — supplied here so
+        // this stays isolated to the token_id pattern under test.
         CHECK_FALSE(c->validate(nlohmann::json::parse(
-            R"({"principal_id":"engine:v","token_id":"aaaaaaaaaaaaaaaaaaaaaaaa"})")));
+            R"({"principal_id":"engine:v","token_id":"aaaaaaaaaaaaaaaaaaaaaaaa","secret":"s"})")));
         CHECK(c->validate(nlohmann::json::parse(
-            R"({"principal_id":"engine:v","token_id":"AAAAAAAAAAAAAAAAAAAAAAAA"})"))); // uppercase
+            R"({"principal_id":"engine:v","token_id":"AAAAAAAAAAAAAAAAAAAAAAAA","secret":"s"})"))); // uppercase
         CHECK(c->validate(nlohmann::json::parse(
-            R"({"principal_id":"engine:v","token_id":"aaaa"})"))); // too short
+            R"({"principal_id":"engine:v","token_id":"aaaa","secret":"s"})"))); // too short
     }
     // quarantine_device.reason (<=1024) / whitelist (<=512, charset).
     {
@@ -11934,7 +12071,10 @@ TEST_CASE("MCP 2444: item 2 minLength:1 sweep — one field per tool family reje
         {"create_engine_principal", "display_name",
          R"("principal_id":"engine:v","owner_username":"o","justification":"j","classification":"internal")"},
         {"rotate_api_token", "token_id", ""},
-        {"confirm_api_token_rotation", "token_id", ""},
+        // #3015: "secret" is now a required field too — supplied here so
+        // the "missing required" check (which runs before per-property
+        // validation) can't mask the token_id minLength violation under test.
+        {"confirm_api_token_rotation", "token_id", R"("secret":"s")"},
         {"transfer_engine_principal_owner", "new_owner", R"("principal_id":"engine:v")"},
         {"unassign_engine_role", "role", R"("principal_id":"vuln")"},
         {"classify_operational_question", "question", ""},
@@ -12001,9 +12141,12 @@ TEST_CASE("MCP 2405: real gated schemas enforce enum, bounds and maxLength at th
             "'/ttl_days'");
         // maxLength (#2444 item 1 tightened this to 24, alongside the new
         // ^[0-9a-f]{24}$ pattern — a 65-char value still exceeds both).
+        // #3015: "secret" supplied so the missing-required check for it
+        // (which runs before per-property validation) can't mask the
+        // /token_id violation under test.
         deny((std::string(
                   R"({"jsonrpc":"2.0","method":"tools/call","id":322,"params":{"name":"confirm_engine_rotation","arguments":{"principal_id":"engine:v","token_id":")") +
-              std::string(65, 'a') + R"("}}})")
+              std::string(65, 'a') + R"(","secret":"s"}}})")
                  .c_str(),
              "'/token_id'");
         CHECK(appr.pending_count() == 0);

@@ -4,9 +4,11 @@
 // (roadmap C-8) -- that header's own comment said it was "shaped for
 // extraction... ZERO plugin-specific dependencies", anticipating this move.
 //
-// Two unbounded `enumerator->Next(WBEM_INFINITE, ...)` call sites exist
-// elsewhere in the tree (hardware_plugin.cpp's file-private WmiQuery, and
-// the wmi plugin) -- this helper exists to stop that pattern propagating.
+// hardware_plugin.cpp's former file-private WmiQuery and the wmi plugin
+// both had an unbounded `enumerator->Next(WBEM_INFINITE, ...)` call site.
+// #3368 migrated the wmi plugin onto this helper; #3404 migrated
+// hardware_plugin.cpp onto it separately. This helper exists to stop
+// that unbounded-Next pattern propagating.
 // NEVER call Next(WBEM_INFINITE, ...); always bound both the per-Next wait
 // and the overall enumeration under BoundedQueryOptions.
 //
