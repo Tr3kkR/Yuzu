@@ -467,6 +467,19 @@ std::string ProductPackStore::extract_yaml_value(const std::string& yaml, const 
     return {};
 }
 
+PackExistenceCheck ProductPackStore::check_pack_row_exists(pg::PgPool& pool,
+                                                            const std::string& pack_id) {
+    auto lease = pool.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return PackExistenceCheck::kUnavailable;
+    pg::PgResult res = pg::exec_params(
+        lease.get(), "SELECT 1 FROM product_pack_store.product_packs WHERE id = $1",
+        std::vector<std::string>{pack_id});
+    if (res.status() != PGRES_TUPLES_OK)
+        return PackExistenceCheck::kUnavailable;
+    return PQntuples(res.get()) > 0 ? PackExistenceCheck::kExists : PackExistenceCheck::kAbsent;
+}
+
 std::vector<std::string> ProductPackStore::split_yaml_documents(const std::string& bundle) {
     std::vector<std::string> docs;
     std::string::size_type pos = 0;
@@ -1287,6 +1300,17 @@ std::expected<std::string, std::string> ProductPackStore::install(
         }
         spdlog::error("ProductPackStore: {} for pack '{}' — compensated {}/{} item(s)",
                      log_context, sanitize_for_log(pack_name), compensated, attempted);
+        // Gate 6 finding (#3481, compliance-officer): workflow_routes.cpp's audit_fn call
+        // passes this returned message straight into the audit `detail` field — without this,
+        // an auditor reconstructing a denied install from the audit store alone had no way to
+        // tell whether compensation fully succeeded, partially succeeded, or was never
+        // attempted (compensate_fn omitted). The kind/item_id of a specific FAILED item stays
+        // in the spdlog::error line above only — appending it here would put attacker-supplied
+        // YAML content into the audit trail's `detail`, which the not_found/validation-message
+        // passthrough above already accepts for OTHER reasons but a raw item_id should not be
+        // added to gratuitously.
+        if (attempted > 0)
+            error_message += std::format(" (compensated {}/{} item(s))", compensated, attempted);
         return std::unexpected(std::move(error_message));
     };
 
@@ -1313,7 +1337,22 @@ std::expected<std::string, std::string> ProductPackStore::install(
 
     // Now persist the pack row + its successfully-installed item rows in ONE transaction
     // (parent-before-child for the product_pack_items -> product_packs FK).
-    bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+    //
+    // Gov Gate 5 CHAOS-1 (#3481, verified): acquire the write lease OURSELVES first, via
+    // try_acquire_for + with_txn_on, rather than the one-call with_txn_for — this is what lets
+    // the failure branch below tell apart "the lease was never acquired, the transaction never
+    // started" (nothing ambiguous, safe to compensate exactly as before) from "the lease was
+    // held and the transaction itself reported failure" (ambiguous: could be a genuine
+    // rollback, OR a lost COMMIT-response network fault after Postgres actually committed —
+    // with_txn_for's single bool return cannot distinguish these, and compensating on the
+    // latter would ACTIVELY DELETE real, already-persisted sibling-store content, which is
+    // worse than the orphan #3481 exists to close). The existing pool-starvation compensation
+    // tests pin the pool's only connection BEFORE calling install() — that failure mode is
+    // caught here as a with_txn_lease acquire failure and compensates exactly as before; those
+    // tests are unaffected.
+    auto with_txn_lease = pool_.try_acquire_for(kWriteTimeout);
+    bool write_lease_acquired = static_cast<bool>(with_txn_lease);
+    bool ok = pool_.with_txn_on(std::move(with_txn_lease), [&](PGconn* conn) -> bool {
         // idempotency_key binds via the std::optional<std::string> overload — NOT the plain
         // std::string overload, which would bind an empty key as "" rather than SQL NULL and
         // break the partial unique index's NULL-exemption for every keyless install after the
@@ -1349,6 +1388,41 @@ std::expected<std::string, std::string> ProductPackStore::install(
         return true;
     });
     if (!ok) {
+        if (write_lease_acquired) {
+            // The lease was held and the transaction body itself reported failure — this is
+            // the ambiguous case (genuine rollback, OR a lost COMMIT-response ack after
+            // Postgres actually committed). Re-verify on a FRESH connection before deciding.
+            switch (check_pack_row_exists(pool_, pack_id)) {
+            case PackExistenceCheck::kExists:
+                // The commit landed; only the ack was lost. Do NOT compensate — that would
+                // delete real, already-persisted sibling-store content. Report success.
+                spdlog::error(
+                    "ProductPackStore: install for pack '{}' ({}) reported a transaction "
+                    "failure but the pack row EXISTS on re-check — an ambiguous "
+                    "COMMIT-acknowledgment loss, not a real failure. Treating as success; no "
+                    "compensation run.",
+                    sanitize_for_log(pack_name), pack_id);
+                return pack_id;
+            case PackExistenceCheck::kUnavailable:
+                // Cannot verify either way. The only safe read is "do not compensate" — never
+                // risk deleting content that might actually be there.
+                spdlog::error(
+                    "ProductPackStore: install for pack '{}' failed to persist AND the "
+                    "post-failure existence re-check itself failed — cannot confirm whether "
+                    "the pack actually committed. Skipping compensation as unsafe; this pack "
+                    "id may be a residual orphan requiring manual/operator verification.",
+                    sanitize_for_log(pack_name));
+                if (metrics_)
+                    metrics_
+                        ->counter("yuzu_server_product_pack_install_compensation_total",
+                                  {{"result", "partial"}})
+                        .increment();
+                return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                                       "failed to persist pack '" + pack_name + "'");
+            case PackExistenceCheck::kAbsent:
+                break; // Genuinely never committed — fall through to compensate as before.
+            }
+        }
         return compensate_and_fail(
             "failed to persist pack transaction",
             std::string(kProductPackDbErrorPrefix) + "failed to persist pack '" + pack_name +

@@ -238,6 +238,21 @@ public:
     bool with_txn_for(std::chrono::milliseconds timeout,
                       const std::function<bool(PGconn*)>& fn);
 
+    /// As `with_txn`/`with_txn_for`, but the caller supplies an ALREADY-ACQUIRED lease
+    /// instead of this call doing its own acquire. Exists so a caller can tell apart "the
+    /// connection was never acquired, nothing ambiguous" from "a connection was held and the
+    /// transaction itself reported failure" — the two `with_txn*` overloads collapse both into
+    /// one `false`, which is fine for callers that only need to know success/failure, but is
+    /// NOT safe for a caller whose failure-handling includes a DESTRUCTIVE step (e.g. undoing
+    /// prior side effects): a lost COMMIT response after Postgres actually committed reports
+    /// `false` here exactly like a genuine rollback does, and destructive failure-handling built
+    /// on the WRONG assumption ("false always means nothing landed") can delete data that is
+    /// actually there (gov Gate 5 CHAOS-1, #3481 — `ProductPackStore::install`'s compensating
+    /// rollback is the first consumer: acquire via `try_acquire_for` first, and only treat a
+    /// subsequent `with_txn_on` failure as "safe to compensate" after a fresh existence check
+    /// confirms the row is genuinely absent).
+    bool with_txn_on(Lease lease, const std::function<bool(PGconn*)>& fn);
+
     /// False when the conninfo failed to parse at construction.
     [[nodiscard]] bool valid() const noexcept { return valid_; }
 

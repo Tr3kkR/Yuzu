@@ -786,6 +786,95 @@ TEST_CASE("ProductPackStore::install: a partial compensation increments the comp
               .value() == 1);
 }
 
+// ── Ambiguous-commit-ack safety (Gate 5 CHAOS-1, #3481) ──────────────────────
+//
+// A real network fault landing between Postgres processing COMMIT and the client reading
+// PGRES_COMMAND_OK is a genuine hazard that cannot be reproduced deterministically without a
+// connection-level fault-injecting proxy this test suite doesn't have. What IS directly
+// testable, and what these three cases prove instead: the check_pack_row_exists decision seam
+// itself — the exact mechanism install()'s final-persist failure path now consults before
+// deciding whether compensating is safe. Recorded as `likely`, not `verified`, in governance
+// terms: verified against this seam, reasoned (not fault-injection-proven) for the full
+// ambiguous-commit integration.
+
+TEST_CASE("ProductPackStore::check_pack_row_exists: kExists for a row that's actually there",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    pg::PgResult ins = pg::exec_params(
+        lease.get(),
+        "INSERT INTO product_pack_store.product_packs (id, name, yaml_source) "
+        "VALUES ($1, 'seam-test', 'seam-test-yaml')",
+        std::vector<std::string>{"seam-test-pack-id"});
+    REQUIRE(ins.status() == PGRES_COMMAND_OK);
+    lease.reset();
+
+    CHECK(ProductPackStore::check_pack_row_exists(pool, "seam-test-pack-id") ==
+         yuzu::server::PackExistenceCheck::kExists);
+}
+
+TEST_CASE("ProductPackStore::check_pack_row_exists: kAbsent for an id that was never installed",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+
+    CHECK(ProductPackStore::check_pack_row_exists(pool, "definitely-never-installed") ==
+         yuzu::server::PackExistenceCheck::kAbsent);
+}
+
+TEST_CASE("ProductPackStore::check_pack_row_exists: kUnavailable when the pool can't be reached, "
+          "never guessed as kAbsent",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto unrelated_lease = pool.acquire();
+    REQUIRE(unrelated_lease);
+    CHECK(ProductPackStore::check_pack_row_exists(pool, "irrelevant-id") ==
+         yuzu::server::PackExistenceCheck::kUnavailable);
+}
+
+// Gate 5 CHAOS-1 regression net at the install() level: a write-lease ACQUIRE failure (the
+// existing pool-starvation technique — pin the pool's only connection BEFORE calling install())
+// must still compensate exactly as before, since the transaction never started and there is
+// nothing ambiguous to verify. This is the same scenario the "late persist failure
+// (pool-contention)" test above exercises; restated here explicitly as the CHAOS-1 regression
+// guard so a future reader doesn't have to infer it from that test's unrelated name.
+TEST_CASE("ProductPackStore::install: a write-lease ACQUIRE failure (not a txn failure) still "
+          "compensates directly, no existence re-check needed",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    auto unrelated_lease = pool.acquire();
+    REQUIRE(unrelated_lease);
+
+    int install_calls = 0;
+    std::vector<std::string> compensated_ids;
+    auto compensate_fn = [&compensated_ids](const std::string&,
+                                            const std::string& item_id) -> bool {
+        compensated_ids.push_back(item_id);
+        return true;
+    };
+    auto result = store.install(kUnsignedPackYaml, make_counting_install_fn(&install_calls),
+                                compensate_fn);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().starts_with(yuzu::server::kProductPackDbErrorPrefix));
+    REQUIRE(compensated_ids.size() == 1);
+}
+
 // ── Idempotency (F033/#3481) ─────────────────────────────────────────────────
 
 TEST_CASE("ProductPackStore::install: the idempotency pre-check fails closed under pool "

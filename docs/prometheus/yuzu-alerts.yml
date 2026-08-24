@@ -2997,7 +2997,11 @@ groups:
             Read the paired spdlog::error line for the exact kind/item id,
             then delete it directly through that sibling store's own route
             (DELETE /api/instructions/{id}, /api/policies/{id} or
-            /api/policy-fragments/{id}, /api/workflows/{id}).
+            /api/policy-fragments/{id}, /api/workflows/{id}). This alert
+            AUTO-RESOLVES ~1h after the event ages out of the increase()
+            window even if the orphan is never cleaned up — resolved alert
+            state here is NOT confirmation of remediation. The raw counter
+            (never decreases) is the durable tracking signal, not alert state.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/metrics.md"
       - alert: YuzuInventoryIngestSlow
         # Leading indicator for ingest transaction-hold saturation: full-payload

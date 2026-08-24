@@ -42,13 +42,38 @@
 /// can install a `PolicyFragment` followed by a `Policy` that references it (bundle order is
 /// dependency order — `PolicyStore::create_policy` validates the fragment exists at creation
 /// time), and `PolicyStore::delete_fragment` refuses while any `Policy` still references it —
-/// compensating forward would spuriously fail to clean up the fragment. This is best-effort, not
+/// compensating forward would spuriously fail to clean up the fragment. **This safety argument
+/// is `PolicyStore`-specific and holds only when the bundle itself respects dependency order**
+/// (gov Gate 5 CHAOS-4) — `WorkflowEngine::create_workflow` performs NO existence check on the
+/// `InstructionDefinition` ids its steps reference at creation time, so a bundle placing a
+/// `Workflow` document BEFORE the `InstructionDefinition` it references produces a brief window,
+/// scoped to the remaining length of the SAME compensation loop, where the `Workflow` row (not
+/// yet reached by the reverse walk) points at an already-compensated `InstructionDefinition` —
+/// self-heals when the loop reaches it moments later, but is a real, undocumented-until-now gap
+/// in the "reverse order is always safe" framing. This is best-effort, not
 /// a guarantee: a sibling store's own delete can itself fail for a reason unrelated to ordering
 /// (a `PolicyFragment` referenced by some OTHER, unrelated policy is the same tolerated exception
 /// documented for `uninstall()` below) — a residual orphan from a failed compensation is logged
 /// at `spdlog::error` (naming the exact kind/item id) and counted in
 /// `yuzu_server_product_pack_install_compensation_total{result}`, for operator follow-up, not
 /// automatically retried.
+///
+/// **Gate 6 review (#3481, sre): the metric/log/audit trail for a compensation attempt is
+/// written only after the reverse-order loop completes** — a process crash or forced restart
+/// DURING the loop (including immediately after its last, successful iteration but before the
+/// trailing emit) leaves that install attempt with NO metric sample, NO summary log line, and
+/// NO audit row at all — the request handler never resumes to call `audit_fn`. This is not a
+/// regression versus pre-#3481 behavior (every late failure silently orphaned content
+/// unconditionally, with the same absent observability) — it degrades to exactly the bug F031
+/// exists to close, in the rare window a crash coincides with an already-rare late-install
+/// failure. Operator guidance: a restart around the time of a large pack install, with no
+/// matching `YuzuProductPackCompensationPartial` alert or `spdlog::error` line for that attempt,
+/// is not proof compensation ran cleanly — check the submitted bundle against sibling-store
+/// content manually in that specific window. Not closed here; a fast-follow could increment the
+/// metric at the FIRST failed item rather than after the loop (never pre-increment — Prometheus
+/// counters can't decrement, so a pre-increment-then-correct pattern would false-alarm on every
+/// clean compensation), but that changes exactly the emission-point semantics Gate 8 verified
+/// with `promtool test rules` and would need its own re-verification, not a casual patch.
 ///
 /// **No `mtx_` (the pre-migration `shared_mutex` is dropped).** Postgres's MVCC + the pool's own
 /// connection-level concurrency replace the SQLite single-writer mutex, matching every other
@@ -143,6 +168,14 @@ struct ProductPack {
 struct ProductPackQuery {
     std::string name_filter;
     int limit{100};
+};
+
+/// Outcome of a post-failure existence re-check on `product_packs` (gov Gate 5 CHAOS-1,
+/// #3481) — see `ProductPackStore::check_pack_row_exists`'s doc comment.
+enum class PackExistenceCheck {
+    kExists,     ///< The row is there — a prior "failed" persist actually committed.
+    kAbsent,     ///< The row is genuinely not there — safe to compensate.
+    kUnavailable // Could not verify either way — the ONLY safe read is "do not compensate".
 };
 
 // ── Callbacks for delegating item install/uninstall to existing stores ────────
@@ -266,7 +299,13 @@ public:
     /// `install_fn` against every sibling store again (a dedup check only at the final persist
     /// step would not: `install_fn` would still re-run on every attempt). The same key reused
     /// with a DIFFERENT bundle is rejected as a plain validation error (never
-    /// `kProductPackDbErrorPrefix` — a 400, not a 503). Defaults to empty (no dedup) — preserves
+    /// `kProductPackDbErrorPrefix` — a 400, not a 503) EXCEPT inside the narrow race window
+    /// documented below: the LOSER of two concurrent installs racing the same not-yet-used key
+    /// (with genuinely different bodies) never reaches the pre-check's differing-body branch at
+    /// all — it hits the persist INSERT's unique-violation instead, which IS
+    /// `kProductPackDbErrorPrefix`/503 (retryable), and only converges to the documented 400 on
+    /// a subsequent retry once the pre-check can see the winner's committed row (gov Gate 5
+    /// CHAOS-3). Defaults to empty (no dedup) — preserves
     /// today's behavior exactly; a caller that never sends a key gets no idempotency protection,
     /// same as before this parameter existed. Namespaced globally (the key alone, not scoped to a
     /// caller/principal) — `POST /api/product-packs` is `ProductPack:Write`-gated, effectively
@@ -302,6 +341,20 @@ public:
 
     // Minimal YAML value extraction — public so install callbacks can use it
     static std::string extract_yaml_value(const std::string& yaml, const std::string& key);
+
+    /// Gov Gate 5 CHAOS-1 (#3481, verified: a fault landing between Postgres processing COMMIT
+    /// and the client reading `PGRES_COMMAND_OK` — a lost ack, not a rollback — is
+    /// indistinguishable from a genuine failure at the `with_txn_on`/`with_txn_for` call site).
+    /// Before `install()`'s compensating rollback runs on a final-persist failure, it uses this
+    /// to tell "the transaction never landed" (safe to compensate — the pre-#3481 behavior) from
+    /// "it actually committed and only the ack was lost" (compensating would ACTIVELY DELETE
+    /// real, already-persisted content — worse than the orphan #3481 exists to close). Public
+    /// (not file-local) specifically so this exact decision seam is unit-testable without
+    /// connection-level fault injection: pre-insert a row with a known id on a live store, call
+    /// this directly, and assert `kExists` — the seam a live network-partition repro would also
+    /// exercise, without needing a fault-injecting proxy this test suite doesn't have.
+    /// `kUnavailable` on ANY doubt (lease unavailable, query error) — never guess `kAbsent`.
+    static PackExistenceCheck check_pack_row_exists(pg::PgPool& pool, const std::string& pack_id);
 
     /// Verify an Ed25519 signature over content.
     /// Uses OpenSSL EVP_DigestVerify on every platform (see the .cpp file header for the
