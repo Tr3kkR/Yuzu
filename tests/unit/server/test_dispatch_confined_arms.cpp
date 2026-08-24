@@ -538,7 +538,7 @@ TEST_CASE("wire_and_dispatch_confined: the Ids arm intersects exec_visible again
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
     for (const auto& id : {"dev-A", "dev-B", "dev-C"}) {
-        registry.register_agent(make_wiring_test_info(id));
+        (void)registry.register_agent(make_wiring_test_info(id));
         // Gateway-pending path: send_to() queues onto drain_gateway_pending()
         // and returns true with NO live gRPC stream needed — the observable
         // hook this test uses to see exactly who was targeted.
