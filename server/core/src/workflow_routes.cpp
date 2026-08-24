@@ -28,6 +28,36 @@
 
 namespace yuzu::server {
 
+// Mirrors rest_api_v1.cpp's license_error_status/sw_deploy_error_status shape: ProductPackStore
+// widened list()/get() to std::expected and uninstall() now returns a machine-checkable
+// "not_found: " prefix (product_pack_store.hpp) as part of its PG migration — this classifier
+// keeps the REST surface's status codes correct instead of collapsing every failure to the
+// pre-migration 400/503-by-is_open()-only split. `kProductPackDbErrorPrefix` (a genuine DB/lease
+// failure) -> 503; `"not_found:"` -> 404 (a REST contract change for DELETE — the pre-migration
+// route always returned 400 for a missing id); anything else (signature rejection, validation,
+// business-rule error) -> 400.
+static int product_pack_error_status(const std::string& err) {
+    if (err.starts_with("not_found:"))
+        return 404;
+    if (err.starts_with(yuzu::server::kProductPackDbErrorPrefix))
+        return 503;
+    return 400;
+}
+
+// Mirrors rest_api_v1.cpp's sw_deploy_client_message/device_token_client_message: a
+// kProductPackDbErrorPrefix error carries a raw PQerrorMessage() fragment (connection string
+// detail, occasionally host:port) that is internal implementation detail, not caller-actionable
+// feedback (gov Gate 2 security-guardian). Logs the real error server-side and returns a generic
+// constant instead. A not_found/validation error (never carries the prefix) is safe to echo
+// verbatim — it's operator-authored request feedback, not database internals.
+static std::string product_pack_client_message(const char* op, const std::string& err) {
+    if (err.starts_with(yuzu::server::kProductPackDbErrorPrefix)) {
+        spdlog::error("{}: {}", op, err);
+        return "service unavailable";
+    }
+    return err;
+}
+
 // Production overload — wraps the Server in an HttplibRouteSink and forwards
 // to the sink-based body. Defined first so callers see a familiar signature.
 void WorkflowRoutes::register_routes(httplib::Server& svr, Deps deps) {
@@ -1872,7 +1902,16 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        auto packs = product_pack_store->list(q);
+        auto packs_result = product_pack_store->list(q);
+        if (!packs_result) {
+            res.status = product_pack_error_status(packs_result.error());
+            res.set_content(detail::a4_error(res, product_pack_client_message(
+                                                       "GET /api/product-packs",
+                                                       packs_result.error())),
+                            "application/json");
+            return;
+        }
+        auto& packs = *packs_result;
         nlohmann::json arr = nlohmann::json::array();
         for (const auto& p : packs) {
             nlohmann::json items_arr = nlohmann::json::array();
@@ -1994,8 +2033,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // attacker-influenced audit key); the pack name is recoverable
             // from the request body if forensics need it.
             audit_fn(req, "product_pack.install", "denied", "ProductPack", "", result.error());
-            res.status = 400;
-            res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+            res.status = product_pack_error_status(result.error());
+            res.set_content(detail::a4_error(res, product_pack_client_message(
+                                                       "POST /api/product-packs", result.error())),
+                            "application/json");
             return;
         }
         // gov W7.4 R2 sec-MEDIUM: target_type "ProductPack" matches the
@@ -2027,14 +2068,23 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         auto id = req.matches[1].str();
-        auto pack = product_pack_store->get(id);
-        if (!pack) {
+        auto pack_result = product_pack_store->get(id);
+        if (!pack_result) {
+            res.status = product_pack_error_status(pack_result.error());
+            res.set_content(detail::a4_error(res, product_pack_client_message(
+                                                       "GET /api/product-packs/:id",
+                                                       pack_result.error())),
+                            "application/json");
+            return;
+        }
+        if (!*pack_result) {
             res.status = 404;
             res.set_content(
                 R"({"error":{"code":404,"message":"product pack not found"},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }
+        auto& pack = *pack_result;
 
         nlohmann::json items_arr = nlohmann::json::array();
         for (const auto& item : pack->items) {
@@ -2090,8 +2140,27 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         auto result = product_pack_store->uninstall(id, uninstall_fn);
         if (!result) {
-            res.status = 400;
-            res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+            // gov W7.4 R1 UP-1 parity (see install's denied branch above): a
+            // rejected uninstall — not-found, or a mid-uninstall DB failure —
+            // is an access decision SOC 2 CC6.7 requires logged. Pre-fix, this
+            // branch returned without ever calling audit_fn, so a probe of a
+            // nonexistent/unreachable pack id left zero audit rows. "denied"
+            // (not a distinct "error" result) matches install's own vocabulary
+            // for this same three-way not-found/validation/db-error split.
+            //
+            // gov Gate 8 round-2 (security-guardian + docs-writer, independently):
+            // uninstall()'s not_found check reads via get() first, whose own
+            // query-error branch can embed a raw PQerrorMessage() fragment —
+            // unlike install()'s db-error branch, which never does. Genericize
+            // ONCE and reuse the result for both the audit `detail` and the
+            // client response, rather than calling product_pack_client_message
+            // twice (it spdlog::errors as a side effect — calling it twice would
+            // double-log the same failure).
+            const std::string client_msg = product_pack_client_message(
+                "DELETE /api/product-packs/:id", result.error());
+            audit_fn(req, "product_pack.uninstall", "denied", "ProductPack", id, client_msg);
+            res.status = product_pack_error_status(result.error());
+            res.set_content(detail::a4_error(res, client_msg), "application/json");
             return;
         }
         // gov W7.4 R2 sec-MEDIUM: target_type "ProductPack" sibling parity

@@ -683,9 +683,79 @@ What to expect / do:
   Agents that previously connected over plaintext must switch to TLS — point them
   at the CA with `--ca-cert <ca-dir>/default-ca.pem`.
 - **To keep the legacy refuse-to-start behaviour**, pass `--no-default-certs`.
-- **Back up `<ca-dir>/default-ca.key` (0600) and the new `ca.db`** in `--data-dir`
-  — losing the CA key forces a full fleet re-enrollment.
+- **Back up `<ca-dir>/default-ca.key` (0600) and the `ca_store` Postgres schema**
+  (`pg_dump`/`pg_restore`, ADR-0053) — losing the CA key forces a full fleet
+  re-enrollment.
 - Relocate the cert directory with `--ca-dir` (e.g. a dedicated container volume).
+
+## ⚠️ Behaviour change: internal-CA store moves to Postgres (ADR-0053)
+
+`CaStore` (internal-CA root metadata, issued-certificate inventory, CRL version
+history — everything the mTLS-accept revocation gate and `GET /api/v1/ca/*`
+read) moves from the SQLite `ca.db` file to the server's PostgreSQL substrate
+in this release (schema `ca_store`). The private CA root key is unaffected —
+it was never in `ca.db` and stays a local file behind `KeyProvider` (`--ca-dir`).
+
+- **Mandatory, automatic backfill on first boot.** The legacy `ca.db` (if
+  present) is read once at startup and its full issued-cert inventory + CRL
+  history is copied into `ca_store`, fingerprint-verified. The legacy file is
+  left in place, read-only, for one release as a rollback reference — it is
+  never deleted or written to.
+- **New fail-closed-at-boot behaviour.** A genuine Postgres error while wiring
+  the per-agent mTLS revocation checker at boot now refuses to start the
+  server, rather than starting with revocation enforcement silently unwired.
+  If the server previously started cleanly on a working Postgres connection,
+  this changes nothing observable; it only changes what happens during a
+  Postgres outage at exactly that boot step, from "starts degraded" to
+  "refuses to start."
+- **`GET`/`POST /api/v1/ca/*` and the CA MCP tools now return a `503`/internal
+  error on a genuine database error**, instead of a silently-empty or
+  silently-false result.
+- Every other CA behavior — revocation semantics, CRL numbering, the single
+  `sign_agent_csr` chokepoint — is unchanged. Detail: `docs/pki-architecture.md`,
+  `docs/adr/0053-ca-store-postgres-migration.md`.
+- **New: an established, already-running default-cert install can now self-heal
+  its own listener leaves without operator action.** This is not limited to a
+  first-boot crash window — any boot where the on-disk `--ca-dir` default
+  leaves are missing, corrupt, or a leaf was later lost (a bad partial restore,
+  a lost volume file) hits the same path, as long as `ca_store` already holds
+  a root and this instance's local CA key file still matches it. When that
+  holds, the server automatically **re-mints its own https/server/gateway
+  leaves with fresh private keys** under the existing root and resumes,
+  instead of refusing to start. It never touches the CA root itself or any
+  agent-issued certificate. Every occurrence logs a `spdlog::warn` line, but
+  there is currently no dedicated audit-log row for it (unlike enrollment-time
+  `ca.cert.issued`) — tracked as a follow-up, not fixed in this release.
+- **HA note: a losing first-boot replica self-heals within the same boot attempt
+  (UP-3), bounded.** Multiple server instances sharing one `--ca-dir` cert
+  volume and one `ca_store` Postgres substrate is not an officially supported
+  deployment topology today (see ADR-0053's Decision section) — this note
+  describes what happens if it's done anyway, safely, not a recommendation to
+  do it. If two instances start against the same fresh `ca_store` at once,
+  exactly one wins the root race and generates the live default certs; the
+  other polls the shared cert directory for up to 15s for the winner's
+  complete set to land (it only adopts a fully-written set — the winner's
+  completion marker is written last, so a partial/in-flight write is never
+  picked up) and, on success, continues booting on the winner's certs without
+  a restart. If the winner hasn't finished within that window (a slow
+  Postgres, lock contention, or a winner that's itself still starting up), the
+  loser falls back to the original behavior: it **exits** (refuses to start,
+  non-zero) rather than serving with its own discarded material — it does not
+  reach a running-but-unready state, so a readiness-probe-driven restart never
+  applies here. Recovery in that case is a plain process-supervisor restart
+  (systemd `Restart=on-failure`, Kubernetes `restartPolicy`) once the winner's
+  certs are in place, so the losing instance picks them up from disk on its
+  next boot attempt. On systemd specifically, a slow winner (e.g. Postgres
+  itself under load) can interact with the crash-loop guard
+  (`StartLimitBurst`/`StartLimitIntervalSec`) — a losing replica that exhausts
+  its restart budget first lands in the service's "failed" state and needs a
+  manual `systemctl reset-failed` once the winner has actually finished,
+  rather than retrying forever on its own. Diagnosing a bootstrap that seems
+  permanently stuck (neither replica ever finishes): check `pg_locks` for a
+  lingering `yuzu:default_certs_bootstrap` session advisory lock with no live
+  backend behind it (a host crash or network partition can leave one held
+  until Postgres notices the dead session) and `pg_terminate_backend` it — see
+  `docs/pki-architecture.md`'s operator runbook.
 
 ## ⚠️ Behaviour change: response history resets on Postgres cutover (ADR-0039)
 
@@ -1736,6 +1806,107 @@ the device page) shows the same tags as before the upgrade, and
 `yuzu_server_tag_store_backfill_total{result="success"}` confirms the backfill
 outcome (alert `YuzuTagStoreBackfillNotCompleted` keys on the ABSENCE of a
 success/fresh sample — a refused boot never serves `/metrics` at all).
+
+## Product packs migrate to Postgres (mandatory backfill, ProductPackStore, ADR-0054)
+
+The `ProductPackStore` — operator-installed product packs behind `POST/GET/DELETE
+/api/product-packs*` — moves from the SQLite `product-packs.db` file to the server's
+PostgreSQL substrate in this release (ADR-0006), schema `product_pack_store`, on the
+existing shared pool. Product packs are **authoritative operator-authored content**
+(build-time-seeded packs plus operator additions), not a cache, so the backfill is
+mandatory and fails closed rather than degrading silently — same posture class as
+`DiscoveryStore`/`QuarantineStore`.
+
+- **What is preserved:** every pack row (id, name, version, description, YAML source,
+  install time, signature-verified flag) and every item row it contains, unchanged. A
+  legacy `product-packs.db` written before 7.13 (predating the `verified` column)
+  backfills correctly, defaulting `verified=false` for that vintage — matching the
+  pre-migration `ALTER TABLE ... DEFAULT 0` shim it replaces.
+- **Fail-closed boot, retried each start.** A backfill that cannot complete —
+  unreadable/corrupt `product-packs.db`, a half-schema file (only one of
+  `product_packs`/`product_pack_items` present — never producible by a shipped binary),
+  a mid-scan read error, a SHA-256 hashing failure, a Postgres write error, or a
+  differently-valued row conflict (below) — **refuses the boot** and retries on the next
+  start. The boot log's `ProductPackStore::migrate_from_sqlite:` lines carry the
+  specific refusal and, for a row conflict, the exact pack or item id involved.
+- **Fingerprint-verified marker, whole-file** (the `DiscoveryStore`/`QuarantineStore`
+  shape — a single SHA-256 over the legacy file's full canonicalized content, not
+  `TagStore`'s per-row `updated_at`-direction comparison): a completed backfill is
+  recorded once per distinct fingerprint, so re-running against the same unchanged file
+  is a fast no-op on every subsequent boot.
+- **Differently-valued conflicts refuse the boot; identical-content conflicts are a
+  benign no-op.** Every pack and item column is write-once (no runtime method ever
+  updates one after install), so if Postgres already holds a row for a pack/item id
+  this backfill is about to insert, the two are compared: byte-identical content
+  (a replayed/cloned legacy file, or two replicas that happened to install the same
+  pack independently) is a silent skip; ANY difference **refuses the boot** — this is
+  a genuine multi-replica divergence and there is no principled way to pick a side
+  automatically. Treat it as a data-integrity incident: the log names the exact pack
+  or item id; decide which replica's legacy file is authoritative, then repair or move
+  the losing file aside and restart.
+- **The legacy file is NOT moved aside after a successful backfill** (unlike
+  `TagStore`/`QuarantineStore`) — `product-packs.db` stays in place; the fingerprint
+  marker alone makes repeat boots against it idempotent, so there is nothing to clean
+  up before the next start.
+- **An uninstalled pack is never resurrected by a later backfill.** Because the legacy
+  file is never mutated, a redeployed or newly-joined replica may still carry a legacy
+  `product-packs.db` written before a pack was uninstalled elsewhere. `uninstall()`
+  records the deleted pack id in Postgres (`deleted_pack_ids`, in the same transaction
+  as the delete); `migrate_from_sqlite` checks it before treating an unmatched legacy
+  pack id as fresh content, so this case is a logged skip (not a boot refusal) rather
+  than a resurrection — matches `RbacStore`'s `revoked_seed_defaults` suppression-table
+  precedent for the same class of hazard. **Caveat (ADR-0009 update note):** this closes
+  the cross-replica case only. If you roll the server *binary* back to the pre-migration
+  release during the one-release rollback window, that binary reads `product-packs.db`
+  directly and does not know Postgres or the tombstone table exist — an uninstalled
+  pack's catalog listing can reappear for the duration of the rollback. The pack's
+  actual content is not restored — it was already deleted from its own separate stores
+  by `uninstall()` (a `PolicyFragment` still referenced by another policy is the one
+  documented exception, logged and non-fatal to the pack's own uninstall) — so this is a
+  stale listing, not reinstated content: a lookup that follows one of that listing's item
+  ids elsewhere (fetching or executing an instruction by id, for example) will 404
+  against content that's already gone, which is expected during the window, not a new
+  fault. It self-corrects on the next roll-forward.
+
+**Operator-visible behaviour changes.**
+
+- `GET /api/product-packs`, `GET /api/product-packs/{id}`, and
+  `DELETE /api/product-packs/{id}` now return **HTTP 503** on a genuine database outage
+  instead of a misleadingly-empty pack list or a false "not found". Watch the new
+  `yuzu_server_product_pack_read_degrade_total{reason}` counter (alert
+  `YuzuProductPackReadDegraded`) — while it fires, `GET /api/product-packs`/
+  `GET /api/product-packs/{id}` are failing closed rather than returning a
+  silently-wrong result; see `docs/user-manual/metrics.md`'s "Product pack store
+  metrics" section for the `reason` label vocabulary.
+- **`DELETE /api/product-packs/{id}` on a missing id now returns 404** (previously 400).
+- **Breaking — the error body on a rejected `POST /api/product-packs` or
+  `DELETE /api/product-packs/{id}` is now the standard A4 envelope**
+  (`{"error":{"code","message","correlation_id",...}}`) instead of the previous flat
+  `{"error": "<message>"}` — a client parsing the old flat shape must switch to reading
+  `error.message`. A genuine database error no longer echoes raw driver text to the
+  caller (logged server-side instead; see `docs/user-manual/rest-api.md`'s Product
+  Packs section).
+- Installing a bundle whose documents assign the same item id twice now fails the whole
+  install as a **400 validation error** instead of silently discarding the duplicate
+  item (a pre-migration bug, not a preserved behavior) — detected before any Postgres
+  interaction, so unlike a genuine database error this is **not retryable**: the same
+  bundle always fails the same way.
+- No change to the `#802`/W7.4 signed-pack enforcement default, the Ed25519 signature
+  verification path, or the `--allow-unsigned-packs` / `YUZU_ALLOW_UNSIGNED_PACKS`
+  operator escape hatch.
+
+**Verify:** after the server reports ready, `GET /api/product-packs` shows the same
+packs as before the upgrade, and `SELECT count(*) FROM product_pack_store.product_packs;`
+against Postgres matches `sqlite3 product-packs.db "SELECT count(*) FROM
+product_packs;"`. `yuzu_server_product_pack_backfill_total{result="success"}` advancing
+(or `"fresh"` on an install with no legacy data) confirms this boot's backfill outcome —
+both label values are pre-seeded to 0 at construction, so the series exists on every
+healthy boot; a genuinely fast-skipped restart (fingerprint already processed) leaves
+both at 0 too, which is expected and not a failure signal. The actual alerting
+shape (`YuzuProductPackBackfillNotCompleted`) keys on the ABSENCE of any
+`success`/`fresh` sample across a 15-minute window, not on any single value — a
+refused boot never serves `/metrics` at all, so no server in the window reporting
+either outcome is itself the signal of a fail-closed boot-refusal loop.
 
 ## ⚠️ Behaviour change: quarantine is now enforced at instruction dispatch (#881, #3127)
 
