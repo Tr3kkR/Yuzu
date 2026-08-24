@@ -1291,6 +1291,11 @@ std::expected<std::string, std::string> ProductPackStore::install(
     // already dispatches on that same pair, so this matches its actual identity.
     auto compensate_and_fail = [&](const std::string& log_context,
                                    std::string error_message) -> std::unexpected<std::string> {
+        // Gate 3 finding (#3479/#3481, cpp-safety): both call sites (duplicate-item-id,
+        // final-persist failure) are a "total failure" outcome for #3479's purposes just like
+        // the installed_count==0 early return above — populate here so a caller always sees
+        // every install_fn error, not just the ones surfaced via the OTHER early return.
+        populate_partial_result();
         std::size_t compensated = 0;
         std::size_t attempted = 0;
         if (compensate_fn) {
@@ -1466,11 +1471,17 @@ std::expected<std::string, std::string> ProductPackStore::install(
                     "as unsafe; this pack id may be a residual orphan requiring manual/operator "
                     "verification.",
                     sanitize_for_log(pack_name), current_xact_id);
-                if (metrics_)
+                // Gate 3 finding (#3481, cpp-expert): gated on compensate_fn, matching
+                // compensate_and_fail's own gating — a direct caller that never supplied
+                // compensate_fn never attempted compensation, so this counter (whose own
+                // description says it's only emitted when an attempt was possible) should
+                // stay untouched for that caller, same as every other emission site.
+                if (metrics_ && compensate_fn)
                     metrics_
                         ->counter("yuzu_server_product_pack_install_compensation_total",
                                   {{"result", "partial"}})
                         .increment();
+                populate_partial_result();
                 return std::unexpected(std::string(kProductPackDbErrorPrefix) +
                                        "failed to persist pack '" + pack_name + "'");
             case TransactionOutcome::kAborted:

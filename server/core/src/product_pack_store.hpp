@@ -31,8 +31,10 @@
 /// ours. The new shape preserves that same atomicity boundary explicitly: `install_fn` is called
 /// with no lease of ours held; once every document has been resolved, the pack row + its
 /// successfully-installed item rows are written in ONE `pool_` transaction (parent-before-child,
-/// satisfying the FK). A total-failure install (zero items installed) never touches Postgres at
-/// all.
+/// satisfying the FK). A total-failure install (zero items installed) never WRITES to Postgres —
+/// gov Gate 3 (cpp-expert, #3481): a keyed install's F033 idempotency pre-check runs one
+/// read-only `SELECT` before `install_fn` is ever reached, so "never touches Postgres at all"
+/// stopped being literally true once that pre-check landed.
 ///
 /// **Update (F031/#3481, 2026-08-24): a late failure of that final persist transaction — AFTER
 /// `install_fn` already committed one or more documents into sibling stores — is no longer a

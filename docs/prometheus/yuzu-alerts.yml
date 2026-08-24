@@ -2993,15 +2993,23 @@ groups:
           description: >-
             yuzu_server_product_pack_install_compensation_total{result="partial"}
             increased: install() failed after already committing sibling-store
-            content, and best-effort compensation could not fully undo it.
-            Read the paired spdlog::error line for the exact kind/item id,
-            then delete it directly through that sibling store's own route
-            (DELETE /api/instructions/{id}, /api/policies/{id} or
-            /api/policy-fragments/{id}, /api/workflows/{id}). This alert
-            AUTO-RESOLVES ~1h after the event ages out of the increase()
-            window even if the orphan is never cleaned up — resolved alert
-            state here is NOT confirmation of remediation. The raw counter
-            (never decreases) is the durable tracking signal, not alert state.
+            content, and best-effort compensation either could not fully undo
+            it OR was never attempted because the transaction's true outcome
+            couldn't be confirmed. READ THE PAIRED spdlog::error LINE FIRST —
+            it distinguishes the two shapes. If it names a specific kind/item
+            id ("compensation FAILED for <kind> '<item_id>'"), that item is a
+            confirmed orphan: delete it directly through that sibling store's
+            own route (DELETE /api/instructions/{id}, /api/policies/{id} or
+            /api/policy-fragments/{id}, /api/workflows/{id}). If it instead
+            says "outcome could not be confirmed" (no item named), do NOT
+            delete anything by guessing ids from the submitted bundle — first
+            confirm via GET /api/product-packs/{id} whether the pack actually
+            committed (a live, successfully-installed pack looks identical to
+            an orphan from this alert alone). This alert AUTO-RESOLVES ~1h
+            after the event ages out of the increase() window even if nothing
+            is resolved — resolved alert state here is NOT confirmation of
+            remediation. The raw counter (never decreases) is the durable
+            tracking signal, not alert state.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/metrics.md"
       - alert: YuzuInventoryIngestSlow
         # Leading indicator for ingest transaction-hold saturation: full-payload
