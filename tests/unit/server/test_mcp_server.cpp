@@ -1935,7 +1935,7 @@ TEST_CASE("MCP rotate_api_token: a committed mint whose successor read-back fail
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
     CHECK(body["error"]["message"].get<std::string>().find("could not be read back") !=
           std::string::npos);
-    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == 2000); // A5: genuinely retryable
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == mcp::kMcpStoreFaultShortRetryMs); // A5: genuinely retryable
 
     // THE ASSERTION THIS TEST EXISTS FOR: "partial", never "failure" — the
     // domain-specific row AND the generic MCP gate-level row both reflect
@@ -3127,7 +3127,7 @@ TEST_CASE("MCP Integration: discover_plugins wired vs unwired", "[mcp][integrati
     p->set_version("1.0");
     p->set_description("Process enumeration");
     p->add_capabilities("list");
-    registry.register_agent(info);
+    (void)registry.register_agent(info);
 
     McpTestServer ts;
     ts.agent_registry_for_test = &registry;
@@ -3197,6 +3197,17 @@ TEST_CASE("MCP: #2986 tools carry real typed outputSchema, not the kObjectOutput
          {"classification", "rationale", "recommended_next_tools"}},
         {"get_incident_playbook", {"scenario", "expected_first_tool", "steps", "safety"}},
         {"summarize_working_set", {"narrative", "resource_links", "recommended_next_tools"}},
+        // #3344: also closes these three tools' typed-ness gap — they were
+        // absent from this map even though they already used real per-field
+        // outputSchemas, so nothing was regression-guarding them.
+        {"get_execution_status",
+         {"id", "definition_id", "status", "scope_expression", "dispatched_by", "dispatched_at",
+          "agents_targeted", "agents_responded", "agents_success", "agents_failure",
+          "progress_pct", "retry_after_ms"}},
+        {"query_responses",
+         {"responses", "audit_persisted", "result_truncated_by_cap", "retry_after_ms"}},
+        {"get_bundle_result",
+         {"complete", "received", "succeeded", "expected", "steps", "retry_after_ms"}},
     };
 
     std::set<std::string> seen;
@@ -5102,6 +5113,76 @@ TEST_CASE("MCP Agentic demo: summarize_working_set execution kind requires Execu
     CHECK(res->status == 403); // denied at the Execution:Read gate, before tracker read
 }
 
+// #3344: get_execution_status had zero prior unit coverage.
+TEST_CASE("MCP get_execution_status: #3344 retry_after_ms present only while non-terminal",
+          "[mcp][integration][execution]") {
+    auto db_path = yuzu::test::unique_temp_path("test-mcp-exec-status-poll-");
+    std::filesystem::remove(db_path);
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(db_path.string().c_str(), &db) == SQLITE_OK);
+    struct Guard {
+        sqlite3* h;
+        std::filesystem::path p;
+        ~Guard() {
+            if (h)
+                sqlite3_close(h);
+            std::error_code ec;
+            std::filesystem::remove(p, ec);
+            std::filesystem::remove(p.string() + "-wal", ec);
+            std::filesystem::remove(p.string() + "-shm", ec);
+        }
+    } guard{db, db_path};
+    yuzu::server::ExecutionTracker tracker(db);
+    tracker.create_tables();
+
+    yuzu::server::Execution exec;
+    exec.definition_id = "def-poll-status";
+    exec.scope_expression = "ostype = 'windows'";
+    exec.dispatched_by = "operator";
+    exec.status = "running";
+    auto created = tracker.create_execution(exec);
+    REQUIRE(created.has_value());
+    const std::string exec_id = *created;
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.metrics_for_test = &reg;
+    ts.start("operator");
+
+    auto running = ts.call(
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":720,)"
+                    R"("params":{"name":"get_execution_status","arguments":{"execution_id":")") +
+        exec_id + R"("}}})");
+    REQUIRE(running);
+    auto running_sc = nlohmann::json::parse(running->body)["result"]["structuredContent"];
+    CHECK(running_sc["status"] == "running");
+    REQUIRE(running_sc.contains("retry_after_ms"));
+    CHECK(running_sc["retry_after_ms"] == mcp::kMcpResultPollRetryMs);
+    CHECK(reg.counter("yuzu_mcp_poll_total",
+                      {{"tool", "get_execution_status"}, {"result", "not_ready"}})
+              .value() == 1.0);
+
+    tracker.mark_cancelled(exec_id, "operator");
+    auto terminal = ts.call(
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":721,)"
+                    R"("params":{"name":"get_execution_status","arguments":{"execution_id":")") +
+        exec_id + R"("}}})");
+    REQUIRE(terminal);
+    auto terminal_sc = nlohmann::json::parse(terminal->body)["result"]["structuredContent"];
+    CHECK(terminal_sc["status"] == "cancelled");
+    CHECK_FALSE(terminal_sc.contains("retry_after_ms"));
+    CHECK(reg.counter("yuzu_mcp_poll_total",
+                      {{"tool", "get_execution_status"}, {"result", "ready"}})
+              .value() == 1.0);
+
+    auto missing = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":722,"params":{"name":"get_execution_status","arguments":{"execution_id":"exec-does-not-exist"}}})");
+    REQUIRE(missing);
+    auto missing_body = nlohmann::json::parse(missing->body);
+    CHECK(missing_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+}
+
 TEST_CASE("MCP Agentic demo: ceo_demo prompt is live-only and ignores injected args (ADR-0016)",
           "[mcp][integration][agentic-demo][prompt-injection][review-1653]") {
     McpTestServer ts;
@@ -6476,6 +6557,8 @@ TEST_CASE("MCP Integration: execute_instruction supervised tier mints approval t
     REQUIRE(body["error"].contains("data"));
     CHECK(body["error"]["data"].contains("approval_id"));
     CHECK(body["error"]["data"]["status_url"].get<std::string>().rfind("/api/v1/approvals/", 0) == 0);
+    // #3344: honest, non-null poll hint — approval is retryable on human timescales.
+    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpApprovalPollRetryMs);
     // A ticket was minted, NOT executed.
     CHECK_FALSE(dispatched);
     CHECK(appr.pending_count() == 1);
@@ -6797,6 +6880,108 @@ TEST_CASE("MCP query_responses: full execute_instruction -> collect-by-execution
     CHECK(rows[0]["execution_id"] == exec_id);
     CHECK(rows[0]["agent_id"] == "agent-1");
     CHECK(rows[0]["output"] == "Windows 11");
+}
+
+TEST_CASE("MCP query_responses: #3344 retry_after_ms confirms in-flight, absent once terminal",
+          "[pg][mcp][integration][response][fanout][execute]") {
+    auto db_path = yuzu::test::unique_temp_path("test-mcp-query-poll-hint-");
+    std::filesystem::remove(db_path);
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(db_path.string().c_str(), &db) == SQLITE_OK);
+    struct Guard {
+        sqlite3* h;
+        std::filesystem::path p;
+        ~Guard() {
+            if (h)
+                sqlite3_close(h);
+            std::error_code ec;
+            std::filesystem::remove(p, ec);
+            std::filesystem::remove(p.string() + "-wal", ec);
+            std::filesystem::remove(p.string() + "-shm", ec);
+        }
+    } guard{db, db_path};
+
+    yuzu::server::ExecutionTracker tracker(db);
+    tracker.create_tables();
+    YUZU_REQUIRE_PG_DB_TPL(pgdb, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = pgdb.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.response_store_for_test = &store;
+    ts.metrics_for_test = &reg;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+        return {"cmd-poll-hint", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto disp = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":710,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(disp);
+    auto exec_id = nlohmann::json::parse(
+                       nlohmann::json::parse(disp->body)["result"]["content"][0]["text"]
+                           .get<std::string>())["execution_id"]
+                       .get<std::string>();
+    REQUIRE(!exec_id.empty());
+
+    // No response has landed yet — the tracker still reads "running". Zero
+    // rows AND a poll hint: this is the case the hint exists to disambiguate
+    // from "no rows matched" (which would carry no hint).
+    auto inflight = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":711,)"
+                                        R"("params":{"name":"query_responses","arguments":)") +
+                            R"({"execution_id":")" + exec_id + R"("}}})");
+    REQUIRE(inflight);
+    auto inflight_body = nlohmann::json::parse(inflight->body);
+    auto inflight_rows = nlohmann::json::parse(
+        inflight_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(inflight_rows.empty());
+    REQUIRE(inflight_body["result"].contains("retry_after_ms"));
+    CHECK(inflight_body["result"]["retry_after_ms"] == mcp::kMcpResultPollRetryMs);
+    REQUIRE(inflight_body["result"]["structuredContent"].contains("retry_after_ms"));
+    CHECK(inflight_body["result"]["structuredContent"]["retry_after_ms"] ==
+          mcp::kMcpResultPollRetryMs);
+    CHECK(reg.counter("yuzu_mcp_poll_total",
+                      {{"tool", "query_responses"}, {"result", "not_ready"}})
+              .value() == 1.0);
+
+    // Drive to terminal. The hint disappears even though the row count is
+    // still zero — the earlier zero-rows response was never a lie, only
+    // incomplete, and this one is now the honest final answer.
+    tracker.mark_cancelled(exec_id, "test-user");
+    auto terminal = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":712,)"
+                                        R"("params":{"name":"query_responses","arguments":)") +
+                            R"({"execution_id":")" + exec_id + R"("}}})");
+    REQUIRE(terminal);
+    auto terminal_body = nlohmann::json::parse(terminal->body);
+    CHECK_FALSE(terminal_body["result"].contains("retry_after_ms"));
+    CHECK_FALSE(terminal_body["result"]["structuredContent"].contains("retry_after_ms"));
+    CHECK(reg.counter("yuzu_mcp_poll_total",
+                      {{"tool", "query_responses"}, {"result", "ready"}})
+              .value() == 1.0);
+
+    // instruction_id-only: in-flight-ness is unknowable, so no hint either way.
+    auto instr_only = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":713,"params":{"name":"query_responses","arguments":{"instruction_id":"instr-poll-hint-unrelated"}}})");
+    REQUIRE(instr_only);
+    auto instr_only_body = nlohmann::json::parse(instr_only->body);
+    CHECK_FALSE(instr_only_body["result"].contains("retry_after_ms"));
+    // #3344 Gate 8 fold (sre): an unknowable call is neither ready nor
+    // not_ready — it was never checked, so it must not be counted as either,
+    // or the "checked and found done" fraction the counter exists to
+    // measure gets diluted by calls that could never have been not_ready.
+    // Both series stay at their pre-call values (1.0 not_ready, 1.0 ready
+    // from the two calls above).
+    CHECK(reg.counter("yuzu_mcp_poll_total",
+                      {{"tool", "query_responses"}, {"result", "ready"}})
+              .value() == 1.0);
+    CHECK(reg.counter("yuzu_mcp_poll_total",
+                      {{"tool", "query_responses"}, {"result", "not_ready"}})
+              .value() == 1.0);
 }
 
 // ── #1550 HIGH-1/HIGH-2 + review hardening ───────────────────────────────────
@@ -8749,6 +8934,72 @@ TEST_CASE("MCP get_bundle_result collates the responses in request order", "[pg]
     CHECK(bundle_structured(get) == p);
 }
 
+TEST_CASE("MCP get_bundle_result: #3344 retry_after_ms present only while complete=false",
+          "[pg][mcp][bundle]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.metrics_for_test = &reg;
+    ts.start_with_dispatch(fake_bundle_dispatch());
+
+    auto disp = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":830,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-1","steps":[{"plugin":"os_info","action":"uptime"},{"plugin":"os_info","action":"os_name"}]}}})");
+    auto bundle_id = bundle_payload(disp)["bundle_id"].get<std::string>();
+
+    // Only ONE of the two steps has responded — the bundle is incomplete.
+    yuzu::server::StoredResponse r;
+    r.execution_id = bundle_id;
+    r.instruction_id = "cmd-os_info-uptime";
+    r.agent_id = "agent-1";
+    r.status = 1;
+    r.output = "up 3d";
+    r.timestamp = 100;
+    store.store(r);
+
+    auto incomplete = ts.call(
+        std::string(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":831,"params":{"name":"get_bundle_result","arguments":{"bundle_id":")") +
+        bundle_id + R"("}}})");
+    auto ip = bundle_payload(incomplete);
+    CHECK(ip["complete"] == false);
+    REQUIRE(ip.contains("retry_after_ms"));
+    CHECK(ip["retry_after_ms"] == mcp::kMcpResultPollRetryMs);
+    // The splice must land identically in content[0].text AND structuredContent
+    // — the #2712 invariant this splice was written to preserve, not just the
+    // pre-existing fields.
+    CHECK(bundle_structured(incomplete) == ip);
+    CHECK(reg.counter("yuzu_mcp_poll_total",
+                      {{"tool", "get_bundle_result"}, {"result", "not_ready"}})
+              .value() == 1.0);
+
+    // The second step responds — now complete, and the hint disappears.
+    yuzu::server::StoredResponse r2;
+    r2.execution_id = bundle_id;
+    r2.instruction_id = "cmd-os_info-os_name";
+    r2.agent_id = "agent-1";
+    r2.status = 1;
+    r2.output = "os_name|Win";
+    r2.timestamp = 101;
+    store.store(r2);
+
+    auto complete = ts.call(
+        std::string(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":832,"params":{"name":"get_bundle_result","arguments":{"bundle_id":")") +
+        bundle_id + R"("}}})");
+    auto cp = bundle_payload(complete);
+    CHECK(cp["complete"] == true);
+    CHECK_FALSE(cp.contains("retry_after_ms"));
+    CHECK(bundle_structured(complete) == cp);
+    CHECK(reg.counter("yuzu_mcp_poll_total",
+                      {{"tool", "get_bundle_result"}, {"result", "ready"}})
+              .value() == 1.0);
+}
+
 TEST_CASE("MCP get_bundle_result enforces ownership (IDOR)", "[pg][mcp][bundle]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -10237,7 +10488,7 @@ TEST_CASE("MCP approval recall: a store fault at the lookup rung is a retryable 
     CHECK(fbody["error"]["code"] == yuzu::server::mcp::kInternalError);
     CHECK(fbody["error"]["message"] == "approval store temporarily unavailable");
     REQUIRE(fbody["error"]["data"].contains("retry_after_ms"));
-    CHECK(fbody["error"]["data"]["retry_after_ms"] == 5000);
+    CHECK(fbody["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
 
     CHECK(reg.counter("yuzu_mcp_approval_refused_total", {{"tool", "delete_tag"}}).value() == 1.0);
     // #2786: a lookup-rung fault means the origin check two rungs down never
@@ -10487,7 +10738,7 @@ TEST_CASE("MCP approval recall: a store fault at the CONSUME rung is caught too,
     // silently, and the audit token (no " (lookup)" suffix, unlike rung 1's)
     // is the one thing that actually distinguishes the two rungs.
     REQUIRE(fbody["error"]["data"].contains("retry_after_ms"));
-    CHECK(fbody["error"]["data"]["retry_after_ms"] == 5000);
+    CHECK(fbody["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
     CHECK(reg.counter("yuzu_mcp_approval_refused_total", {{"tool", "delete_tag"}}).value() == 1.0);
     // Negative control: this fault hit only the CAS, AFTER the binding check
     // already passed (the MCP mint declares ApprovalOrigin::kMcp, and this
@@ -10597,7 +10848,7 @@ TEST_CASE("MCP approval recall: a store fault AT the origin check masks a foreig
     CHECK(fbody["error"]["code"] == yuzu::server::mcp::kInternalError);
     CHECK(fbody["error"]["message"] == "approval store temporarily unavailable");
     REQUIRE(fbody["error"]["data"].contains("retry_after_ms"));
-    CHECK(fbody["error"]["data"]["retry_after_ms"] == 5000);
+    CHECK(fbody["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
     CHECK(reg.counter("yuzu_mcp_approval_refused_total", {{"tool", "delete_tag"}}).value() == 1.0);
     CHECK(reg.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", "delete_tag"}})
               .value() == 1.0);
@@ -10715,11 +10966,16 @@ TEST_CASE("MCP approval mint dedups identical pending requests",
 
     const char* call =
         R"({"jsonrpc":"2.0","method":"tools/call","id":240,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role"}}})";
-    auto id1 = nlohmann::json::parse(ts.call(call)->body)["error"]["data"]["approval_id"]
-                   .get<std::string>();
-    auto id2 = nlohmann::json::parse(ts.call(call)->body)["error"]["data"]["approval_id"]
-                   .get<std::string>();
+    auto body1 = nlohmann::json::parse(ts.call(call)->body);
+    auto body2 = nlohmann::json::parse(ts.call(call)->body);
+    auto id1 = body1["error"]["data"]["approval_id"].get<std::string>();
+    auto id2 = body2["error"]["data"]["approval_id"].get<std::string>();
     CHECK(id1 == id2);              // same ticket handed back
+    // #3344: the poll hint is stable across dedup re-calls too — a caller
+    // polling faster than this floor wastes round trips, never mints a
+    // second ticket.
+    CHECK(body1["error"]["data"]["retry_after_ms"] == mcp::kMcpApprovalPollRetryMs);
+    CHECK(body2["error"]["data"]["retry_after_ms"] == mcp::kMcpApprovalPollRetryMs);
     CHECK(appr.pending_count() == 1); // exactly one row, not two
     sqlite3_close(raw);
 }
@@ -12555,7 +12811,7 @@ TEST_CASE("MCP quarantine_device classifies store failure vs business error "
         CHECK(body["error"]["message"].get<std::string>().starts_with(
             yuzu::server::kQuarantineDbErrorPrefix));
         // Retryable store failure: A5 requires an honest retry_after_ms.
-        CHECK(body["error"]["data"]["retry_after_ms"] == 5000);
+        CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
         REQUIRE_FALSE(ts.audit_details.empty());
         CHECK(ts.audit_details.back().find("agent_id=agent-degraded, ") != std::string::npos);
         CHECK(ts.audit_details.back().find(yuzu::server::kQuarantineDbErrorPrefix) !=

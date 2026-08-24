@@ -666,6 +666,56 @@ metric is the signal, the audit row is the evidence. See
 and successor-unused-warning half of human token rotation, distinct from
 confirm).
 
+## MCP poll-rate metric (#3344)
+
+```
+# HELP yuzu_mcp_poll_total MCP result-poll tool calls by verdict (get_execution_status, query_responses, get_bundle_result). not_ready: the success payload carried a retry_after_ms poll hint; ready: served terminal/complete without one. Excludes pre-verdict denials.
+# TYPE yuzu_mcp_poll_total counter
+yuzu_mcp_poll_total{tool="get_execution_status",result="ready"} 0
+yuzu_mcp_poll_total{tool="get_execution_status",result="not_ready"} 0
+yuzu_mcp_poll_total{tool="query_responses",result="ready"} 0
+yuzu_mcp_poll_total{tool="query_responses",result="not_ready"} 0
+yuzu_mcp_poll_total{tool="get_bundle_result",result="ready"} 0
+yuzu_mcp_poll_total{tool="get_bundle_result",result="not_ready"} 0
+```
+
+Closed `tool` (the three success-shaped result-poll tools) x `result`
+(`ready`|`not_ready`) cross-product (6 series), pre-seeded to `0` at startup
+(`server.cpp`), symbol shared between the `describe()` site and the
+increment site via `mcp::kMcpPollTotalMetric` (`mcp_retry.hpp`) so the two
+cannot silently diverge into a shadow series — same precedent as
+`kApiTokenConfirmTotalMetric` above. **Scope contract:** counted only when a
+call reaches a served verdict — pre-verdict denials (tier, permission,
+invalid-params, not-found) are excluded, already visible via the existing
+denial counters and A4 envelopes, so the label set stays a fact about poll
+outcomes. For `query_responses` specifically, a call whose in-flight-ness
+could not be determined (an `instruction_id`-only query, or an
+`execution_id` the tracker can't resolve) increments **neither** series —
+it was never checked, so folding it into `ready` would understate the
+`not_ready` fraction. Deliberately **operational, not `event="security"`** —
+a high poll rate is expected agentic-worker behaviour, not an anomaly.
+
+**Purpose: data-driven re-tuning, not alerting.** The named `retry_after_ms`
+floor constants (`kMcpStoreFaultRetryMs`, `kMcpResultPollRetryMs`, etc. —
+`mcp_retry.hpp`) were shipped with a *mechanical* derivation (no
+dispatch-to-first-result latency histogram exists to measure from —
+`yuzu_command_duration_seconds` is full command completion, not
+first-result) rather than a measured one. This series' `not_ready` fraction
+is the data that lets a future change re-derive them from real evidence
+instead of guessing again — same "tuning signal, not an alert" posture as
+`yuzu_nvd_sync_failures_total` above; no alert rule is expected or wired.
+Example query for "is the floor for this tool too conservative or too
+aggressive":
+
+```promql
+sum(rate(yuzu_mcp_poll_total{result="not_ready"}[15m])) by (tool)
+/
+sum(rate(yuzu_mcp_poll_total[15m])) by (tool)
+```
+
+See [docs/mcp-server.md → `retry_after_ms` floors](../mcp-server.md#retry_after_ms-floors-3344)
+for the full constant table this metric exists to tune.
+
 ## Rotation-durability tamper/corruption gauges (#2961)
 
 ```

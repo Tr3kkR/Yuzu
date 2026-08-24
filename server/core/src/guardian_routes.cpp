@@ -1240,11 +1240,40 @@ void GuardianRoutes::deploy_baseline(const httplib::Request& req, httplib::Respo
         res.set_content(panel("Baseline store unavailable."), "text/html; charset=utf-8");
         return;
     }
-    auto b = baseline_store_->get_baseline(baseline_id);
+    bool baseline_store_ok = true;
+    auto b = baseline_store_->get_baseline(baseline_id, &baseline_store_ok);
     if (!b) {
+        // store_ok disambiguates a transient store fault from a genuine
+        // not-found (governance UP-3 finding) — a pool-lease timeout must
+        // not be misreported as "Baseline not found" and audit-logged
+        // "denied" for a baseline that still exists.
+        if (!baseline_store_ok) {
+            audit_fn_(req, "guaranteed_state.baseline.deploy", "degraded", "GuaranteedState",
+                      baseline_id, "baseline read degraded");
+            res.set_content(
+                panel("Deploy failed: baseline store degraded, could not read the baseline. Retry."),
+                "text/html; charset=utf-8");
+            return;
+        }
         audit_fn_(req, "guaranteed_state.baseline.deploy", "denied", "GuaranteedState", baseline_id,
                   "no such baseline");
         res.set_content(panel("Baseline not found."), "text/html; charset=utf-8");
+        return;
+    }
+
+    // Read the live member set via the degrade-DISTINGUISHABLE twin
+    // (get_members_checked, not the plain get_members()) — this read is about
+    // to be written into a DURABLE enforced snapshot below, so a pool-lease
+    // timeout or query error here MUST abort the deploy, never persist an
+    // empty "[]" snapshot (a durable fleet-wide disarm of this Baseline).
+    // ADR-0055 (baseline_store.hpp get_members_checked doc).
+    auto members_result = baseline_store_->get_members_checked(baseline_id);
+    if (!members_result) {
+        audit_fn_(req, "guaranteed_state.baseline.deploy", "degraded", "GuaranteedState",
+                  baseline_id, "member read degraded: " + members_result.error());
+        res.set_content(panel("Deploy failed: baseline store degraded, could not read the "
+                              "current member set. Retry."),
+                        "text/html; charset=utf-8");
         return;
     }
 
@@ -1259,7 +1288,7 @@ void GuardianRoutes::deploy_baseline(const httplib::Request& req, httplib::Respo
     // deploy — Re-deploy to apply" (baseline_members_drifted); re-deploy refreshes
     // it, clearing the flag and converging the fleet to the new set. Format: a JSON
     // array of rule_id strings (parsed back in baseline_store.cpp).
-    b->deployed_snapshot = nlohmann::json(baseline_store_->get_members(baseline_id)).dump();
+    b->deployed_snapshot = nlohmann::json(*members_result).dump();
     if (auto session = auth_fn_(req, res)) {
         b->deployed_by = session->username;
         b->updated_by = session->username;

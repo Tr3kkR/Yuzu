@@ -922,9 +922,12 @@ ADR-0041). Tests: `tests/unit/server/test_oidc_principal_key.cpp`.
 `/auth-and-authz` skill gap matrix P1 #6. Thin first slice: SP-initiated login
 against a single, statically-pinned IdP. Mirrors the OIDC SSO session seam
 (same cookie / `auth_source` / RBAC funnel) but uses the SAML 2.0 protocol.
-**Linux and macOS only — SAML is unsupported on Windows builds and fails closed
-there** (a Windows server logs an error at startup and does not enable SAML
-regardless of flag values).
+**Linux and macOS only — SAML is unsupported on Windows *server* builds and
+fails closed there** (a Windows server logs an error at startup and does not
+enable SAML regardless of flag values). This is a deliberate non-gap, not
+unfinished work: running the Yuzu **server** on Windows is out of scope, so a
+Windows-server SAML port is not planned. (The Yuzu **agent** on managed
+Windows endpoints is a separate binary and is unaffected.)
 
 ### Configuration
 
@@ -1162,9 +1165,13 @@ key. Design:
   assertion attributes are stored or surfaced.
 - **SP metadata endpoint.** No `GET /saml/metadata` endpoint is provided; IdP
   registration uses the manual flag values.
-- **Windows support.** SAML depends on an XML processing library whose Windows
-  build is not yet wired in the vcpkg manifest. The server detects Windows at
-  startup, logs an error, and does not enable the SAML routes.
+- **Windows server support — out of scope, not deferred.** Running the Yuzu
+  server on Windows is not a targeted deployment, so SAML on a Windows server
+  is intentionally not built: the server detects Windows at startup, logs an
+  error, and does not enable the SAML routes. (Correction: this was previously
+  documented as blocked on an XML processing library missing from the vcpkg
+  manifest — that is inaccurate; libxml2/xmlsec are already in the manifest.
+  The exclusion is a product-scope decision, not a dependency gap.)
 - **IdP-metadata auto-fetch.** The IdP cert and SSO URL are supplied statically
   via flags; SAML metadata XML auto-discovery is not implemented.
 - **Settings-UI runtime reconfigure.** SAML can only be configured via CLI
@@ -2442,6 +2449,16 @@ header, so these names stay rejected on client ingress permanently.
 
 - **API tokens** — Bearer token and `X-Yuzu-Token` header auth for automation. MCP tokens (see `docs/mcp-server.md`) use the same table with mandatory expiration (max 90 days).
 - **Ownership-scoped revocation** — `DELETE /api/v1/tokens/{id}` and `DELETE /api/settings/api-tokens/{id}` both require the caller to own the token; the global `admin` role is the sole bypass. Cross-user revoke returns `404 token not found` (identical to unknown-id, to prevent enumeration). Denied attempts are recorded with `result=denied`, `detail=owner=<principal>`. See #222 and `docs/user-manual/server-admin.md` "Upgrade Notes".
+
+### Device tokens (`DeviceTokenStore`, ADR-0052, capability 18.8) — currently dormant, docs/user-manual/rest-api.md "Device Tokens"
+
+Standing invariant: **token presenter MUST equal token subject** — a device token's `device_id`
+(the agent it is bound to) is the only identity `validate_token` checks a presenter against;
+`principal_id` (the operator who issued it) is never part of that check. #823's re-registration
+defence — every token bound to an agent's `device_id` is revoked when that agent re-registers,
+closing the window an mTLS-disabled impersonation (#779) could otherwise exploit to replay a
+stolen token — is keyed on this same `device_id` column (`revoke_by_device`, #3401). Fails closed
+on a genuine revoke failure (ADR-0012 §1): the registration is refused, not merely logged.
 
 ### Service-scoped token fleet-wide confinement — durable default-deny (guardian-confinement-2298 PR 3, "the flip")
 
