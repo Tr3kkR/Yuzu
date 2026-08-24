@@ -60,12 +60,14 @@ void ExecutionEventBus::unsubscribe(const std::string& execution_id, std::size_t
 }
 
 void ExecutionEventBus::publish(const std::string& execution_id, const std::string& event_type,
-                                const std::string& data, bool is_terminal) {
+                                const std::string& data, bool is_terminal,
+                                const std::string& agent_id) {
     auto ch = get_or_create(execution_id);
 
     ExecutionEvent ev;
     ev.event_type = event_type;
     ev.data = data;
+    ev.agent_id = agent_id;
     ev.timestamp_ms = now_ms();
 
     {

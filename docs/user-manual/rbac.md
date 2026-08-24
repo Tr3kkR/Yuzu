@@ -45,7 +45,10 @@ enabled = true
 > / `/aggregate` / `/export` surfaces, the dashboard `/fragments/results/…` table,
 > and the workflow executions-drawer reader all return **zero rows** (the legacy
 > aggregate returns `503`) on a corrupt store rather than reopening the
-> cross-operator fleet-wide read — so a degraded store looks like "no agents in
+> cross-operator fleet-wide read. The drawer's **live channel**
+> (`GET /sse/executions/{id}`) applies the same predicate per event: on a corrupt
+> store it streams **no per-agent transitions at all**, only the execution-wide
+> progress/completion frames, which name no agent. So a degraded store looks like "no agents in
 > scope" / "no responses" everywhere, never a visibility leak. Check the server
 > startup log for `RbacStore` errors, the `/health` store status, and
 > `yuzu_server_rbac_read_degrade_total`, then restore PostgreSQL (`rbac_store`)

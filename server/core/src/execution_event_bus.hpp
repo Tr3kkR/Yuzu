@@ -54,6 +54,29 @@ struct ExecutionEvent {
     std::string event_type;
     /// SSE `data:` payload — typically a one-line JSON object.
     std::string data;
+    /// #1712: the agent this event is ATTRIBUTABLE to, as a first-class
+    /// field rather than a value buried in the opaque `data` JSON.
+    ///
+    /// Why a field and not a parse: a scope-confined consumer has to decide
+    /// admission per event, and the only other way to reach the id is to
+    /// parse every publisher payload on every connection — a throwing parse
+    /// on a hot path, per subscriber, to recover something the publisher
+    /// already knew. The field is on the SHARED event, not on a
+    /// consumer-specific event shape: `docs/executions-history-ladder.md`'s
+    /// one-bus/one-taxonomy invariant is about not splitting the TAXONOMY
+    /// (no consumer-private event types), and every consumer sees this field
+    /// identically.
+    ///
+    /// EMPTY MEANS EXECUTION-SCOPED, not "unknown": the publisher taxonomy
+    /// splits cleanly into per-agent events (`agent-transition`) and
+    /// execution-wide ones (`execution-progress`, `execution-completed`),
+    /// and the latter name no agent by construction. Do NOT read an empty
+    /// value as "admit by default" — `execution_event_scope.hpp` classifies
+    /// by event type and fails CLOSED, so an `agent-transition` that reaches
+    /// a confined consumer without an `agent_id` is dropped rather than
+    /// delivered. That is what keeps this parameter's convenience default
+    /// from becoming a fail-open hole in a future publisher.
+    std::string agent_id;
 };
 
 class ExecutionEventBus {
@@ -237,8 +260,17 @@ public:
     /// `is_terminal` marks the execution as having reached completion;
     /// the channel keeps the buffer for `kRetentionAfterTerminalSec` so
     /// late reconnects can replay, then is GC'd on next sweep.
+    ///
+    /// `agent_id` (#1712) is the agent this event is attributable to, or
+    /// empty for an execution-scoped event — see `ExecutionEvent::agent_id`.
+    /// It is defaulted so the ~150 existing call sites (almost all of them
+    /// tests publishing execution-scoped frames) stay unchanged; the
+    /// fail-closed half of that trade lives in `execution_event_scope.hpp`,
+    /// which drops an agent-attributed event type carrying no `agent_id`
+    /// rather than admitting it.
     void publish(const std::string& execution_id, const std::string& event_type,
-                 const std::string& data, bool is_terminal = false);
+                 const std::string& data, bool is_terminal = false,
+                 const std::string& agent_id = {});
 
     /// Replay buffered events with `id > since_id` in arrival order.
     /// Used by the SSE handler on connect when the client supplied a

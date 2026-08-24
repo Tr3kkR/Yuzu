@@ -454,7 +454,12 @@ void ExecutionTracker::update_agent_status(const std::string& execution_id,
     } // mtx_ released here — publish below runs lock-free.
 
     if (should_publish) {
-        event_bus_->publish(execution_id, "agent-transition", payload.dump());
+        // #1712: the agent this transition belongs to travels as a
+        // first-class field, not only inside the payload JSON. The SSE
+        // consumers filter on it (`execution_event_scope.hpp`) and cannot
+        // parse `data` per event per connection to recover it.
+        event_bus_->publish(execution_id, "agent-transition", payload.dump(),
+                            /*is_terminal=*/false, /*agent_id=*/s.agent_id);
     }
 
     // UAT 2026-05-06: chain refresh_counts so the parent executions row's
@@ -563,13 +568,17 @@ void ExecutionTracker::refresh_counts(const std::string& execution_id) {
         }
     } // mtx_ released — publishes below run lock-free.
 
+    // #1712: both frames are EXECUTION-scoped — they carry the parent row's
+    // aggregate counts and name no agent — so `agent_id` is deliberately
+    // empty. Stated explicitly rather than left to the default so the next
+    // author of a publisher here has to make the same classification.
     if (publish_progress) {
         event_bus_->publish(execution_id, "execution-progress", progress_payload.dump(),
-                            transitioned_terminal_was);
+                            transitioned_terminal_was, /*agent_id=*/"");
     }
     if (publish_terminal) {
         event_bus_->publish(execution_id, "execution-completed", terminal_payload.dump(),
-                            /*is_terminal=*/true);
+                            /*is_terminal=*/true, /*agent_id=*/"");
     }
 }
 
@@ -636,7 +645,10 @@ void ExecutionTracker::mark_cancelled(const std::string& id, const std::string& 
     if (should_publish) {
         nlohmann::json payload;
         payload["status"] = "cancelled";
-        event_bus_->publish(id, "execution-completed", payload.dump(), /*is_terminal=*/true);
+        // #1712: execution-scoped (a cancellation is a property of the whole
+        // execution, not of any one agent) — empty `agent_id`, stated.
+        event_bus_->publish(id, "execution-completed", payload.dump(), /*is_terminal=*/true,
+                            /*agent_id=*/"");
     }
 }
 

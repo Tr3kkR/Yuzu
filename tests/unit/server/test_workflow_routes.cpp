@@ -1791,6 +1791,159 @@ TEST_CASE("SSE handler: 403 perm-deny does NOT emit live_subscribe audit",
     }
 }
 
+// ── #1712: the LIVE channel is scope-confined too ─────────────────────────
+//
+// The static fragment filters both of its per-agent sources (see the drawer
+// cases above). The stream on the same surface, gated by the same flat global
+// `Execution:Read`, re-disclosed exactly what the fragment withheld: every
+// out-of-scope agent's id, status, exit code and agent-returned error text,
+// pushed live. These cases drive the chunked content provider directly — the
+// handler-attach assertions above stop at "a provider was attached", which is
+// green whether or not the provider filters anything.
+//
+// The assertion that matters is on IDENTITY, not on rendered text: asserting
+// only that a payload string is absent is what let the drawer ship
+// half-confined the first time.
+
+namespace {
+/// Run the attached SSE chunked content provider once and return the bytes it
+/// wrote. The queue is non-empty by the time these tests call it, so the
+/// provider's 3 s condition-variable wait returns immediately — no sleep, no
+/// timing assumption (CLAUDE.md test-efficiency discipline).
+std::string drain_sse_once(httplib::Response& res) {
+    std::string out;
+    httplib::DataSink sink;
+    sink.write = [&out](const char* d, size_t n) {
+        out.append(d, n);
+        return true;
+    };
+    sink.is_writable = [] { return true; };
+    REQUIRE(res.content_provider_);
+    (void)res.content_provider_(0, 0, sink);
+    return out;
+}
+} // namespace
+
+TEST_CASE("SSE stream #1712: an out-of-scope agent's transition never reaches the client",
+          "[pg][workflow][executions][pr3][sse][1712]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-sse-scope", "SseScope");
+    auto exec_id = h.make_exec("def-sse-scope", "running", 2, 0, 0);
+
+    // Only one of the two agents is in the caller's management group.
+    h.response_scope_predicate = [](const std::string&, const std::string& agent_id) {
+        return agent_id == "sse-visible";
+    };
+
+    auto res = h.sink.Get("/sse/executions/" + exec_id);
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+
+    h.event_bus->publish(exec_id, "agent-transition",
+                         R"({"agent_id":"sse-visible","status":"running"})",
+                         /*is_terminal=*/false, /*agent_id=*/"sse-visible");
+    h.event_bus->publish(
+        exec_id, "agent-transition",
+        R"({"agent_id":"sse-hidden","status":"failure","error_detail":"EACCES on /etc/shadow"})",
+        /*is_terminal=*/false, /*agent_id=*/"sse-hidden");
+
+    const auto body = drain_sse_once(*res);
+    // IDENTITY, not just payload text: the out-of-scope agent must not be
+    // enumerable from this stream at all.
+    CHECK(body.find("sse-hidden") == std::string::npos);
+    CHECK(body.find("EACCES on /etc/shadow") == std::string::npos);
+    // The in-scope agent is unaffected — the filter narrows, it does not
+    // break the drawer.
+    CHECK(body.find("sse-visible") != std::string::npos);
+}
+
+TEST_CASE("SSE stream #1712: a deny-all scope (corrupt-rbac simulation) streams zero agent "
+          "events, never the fleet",
+          "[pg][workflow][executions][pr3][sse][1712]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-sse-deny", "SseDeny");
+    auto exec_id = h.make_exec("def-sse-deny", "running", 2, 0, 0);
+
+    // What `response_agent_in_scope` returns for EVERY agent when
+    // rbac_enforcement_in_effect is true and the store cannot be read.
+    h.response_scope_predicate = [](const std::string&, const std::string&) { return false; };
+
+    auto res = h.sink.Get("/sse/executions/" + exec_id);
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+
+    h.event_bus->publish(exec_id, "agent-transition", R"({"agent_id":"deny-a","status":"running"})",
+                         /*is_terminal=*/false, /*agent_id=*/"deny-a");
+    h.event_bus->publish(exec_id, "agent-transition", R"({"agent_id":"deny-b","status":"success"})",
+                         /*is_terminal=*/false, /*agent_id=*/"deny-b");
+    // Execution-scoped frames name no agent and still flow — the terminal
+    // frame is what closes the browser's EventSource.
+    h.event_bus->publish(exec_id, "execution-progress", R"({"agents_responded":2})",
+                         /*is_terminal=*/false, /*agent_id=*/"");
+
+    const auto body = drain_sse_once(*res);
+    CHECK(body.find("deny-a") == std::string::npos);
+    CHECK(body.find("deny-b") == std::string::npos);
+    CHECK(body.find("execution-progress") != std::string::npos);
+}
+
+TEST_CASE("SSE stream #1712: an agent-transition published without an agent_id is dropped",
+          "[pg][workflow][executions][pr3][sse][1712]") {
+    // `ExecutionEventBus::publish`'s `agent_id` parameter is defaulted so the
+    // ~150 existing call sites stay unchanged. This pins the fail-closed half
+    // of that trade: an agent-attributed event type with nothing to attribute
+    // it to is withheld, not admitted — so a future publisher that forgets the
+    // argument loses live updates rather than leaking them.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-sse-unattr", "SseUnattr");
+    auto exec_id = h.make_exec("def-sse-unattr", "running", 1, 0, 0);
+    // Admit-everyone: the drop below is the CLASSIFICATION failing closed,
+    // not the predicate denying.
+    h.response_scope_predicate = [](const std::string&, const std::string&) { return true; };
+
+    auto res = h.sink.Get("/sse/executions/" + exec_id);
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+
+    h.event_bus->publish(exec_id, "agent-transition",
+                         R"({"agent_id":"unattributed-leak","status":"running"})");
+
+    const auto body = drain_sse_once(*res);
+    CHECK(body.find("unattributed-leak") == std::string::npos);
+}
+
+TEST_CASE("SSE stream #1712: an admit-all scope leaves every agent event on the stream",
+          "[pg][workflow][executions][pr3][sse][1712]") {
+    // The filter must NARROW, never deny by default. Without this case the
+    // provider could drop every agent event unconditionally and the three
+    // cases above would still pass.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-sse-open", "SseOpen");
+    auto exec_id = h.make_exec("def-sse-open", "running", 2, 0, 0);
+    // response_scope_predicate left at its admit-everyone default.
+
+    auto res = h.sink.Get("/sse/executions/" + exec_id);
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+
+    h.event_bus->publish(exec_id, "agent-transition", R"({"agent_id":"open-a","status":"running"})",
+                         /*is_terminal=*/false, /*agent_id=*/"open-a");
+    h.event_bus->publish(exec_id, "agent-transition", R"({"agent_id":"open-b","status":"success"})",
+                         /*is_terminal=*/false, /*agent_id=*/"open-b");
+
+    const auto body = drain_sse_once(*res);
+    CHECK(body.find("open-a") != std::string::npos);
+    CHECK(body.find("open-b") != std::string::npos);
+}
+
 // ── #2500: supplied-but-names-nothing targeting must never widen ──────────
 //
 // The REST twin of #2492. Before this, POST /api/instructions/{id}/execute

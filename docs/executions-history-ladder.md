@@ -305,6 +305,35 @@ add a consumer-specific event type** - that would split the taxonomy and
 break the A3 invariant that a single deterministic step name appears on
 every channel.
 
+**Per-agent attribution is a FIELD on the shared event (#1712).**
+`ExecutionEvent::agent_id` names the agent an event belongs to, empty for
+the execution-wide frames. It is on the bus, not on any consumer's private
+shape, so it does not split the taxonomy - it is the same "add it on the
+bus side first" rule the paragraph above states, applied to a field rather
+than a type. It exists because a scope-confined consumer has to decide
+admission per event, and the alternative is parsing every publisher payload
+on every connection. Publishers: `update_agent_status` sets it
+(`agent-transition`); `refresh_counts` and `mark_cancelled` deliberately
+leave it empty (`execution-progress` / `execution-completed` are
+execution-wide and name no agent).
+
+The admission rule that reads it is `server/core/src/execution_event_scope.hpp`,
+shared by any consumer that is scope-confined, and it is FAIL-CLOSED in two
+directions: an event type outside the taxonomy above is never delivered to a
+confined consumer, and an `agent-transition` carrying no `agent_id` is
+dropped rather than admitted. **A new event type must be classified there**
+as agent-attributed or execution-scoped when it is added to the bus -
+otherwise it is correctly, but silently, withheld from confined operators.
+The scope DECISION itself is not re-implemented there: it is
+`ServerImpl::response_agent_in_scope`, the same predicate the drawer's
+static fragment and the REST/MCP response readers use.
+
+Today the dashboard SSE route (`GET /sse/executions/{id}`) is the consumer
+that applies it - it is the drawer's live half, and the static half is
+scope-filtered (#1712). `GET /api/v1/events` and the MCP progress bridge
+carry the field through unchanged and are unfiltered as before; scoping them
+is follow-up work, not a behaviour change made here.
+
 The agentic route's audit verb is `api.v1.events.subscribe` (separate
 from `execution.live_subscribe` so SIEM filters can distinguish browser
 vs agentic consumers). Same no-dedup deferral applies (#700 Deferred-5).

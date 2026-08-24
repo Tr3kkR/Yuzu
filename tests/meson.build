@@ -756,6 +756,7 @@ if build_server
       'unit/server/test_dispatch_confined_arms.cpp', # PR1.4: the production per-arm intersection, bound by exact-send-set assertions
       'unit/server/test_response_scope_filter.cpp', # #1712: the shared per-agent Response-scope filter loop — pure (no store/PG/HTTP), incl. the CH-2 mid-iteration degrade shape
       'unit/server/test_response_scope_wiring.cpp', # #1712: lexical guard that both new readers stay wired to response_agent_in_scope in server.cpp (ServerImpl is not unit-constructible)
+      'unit/server/test_execution_event_scope.cpp', # #1712: per-event admission for scope-confined ExecutionEventBus consumers — pure (no store/PG/HTTP), fail-closed on an unclassified event type
       'unit/server/test_default_certs.cpp',
       'unit/server/test_mcp_server.cpp',
       'unit/server/test_mcp_session.cpp',

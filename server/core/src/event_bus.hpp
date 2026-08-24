@@ -36,6 +36,20 @@ struct SseEvent {
     /// callback, which httplib runs on an UNGUARDED worker task — an escaped
     /// exception there is `std::terminate`, not a 500 (#2037's failure class).
     std::uint64_t id = 0;
+    /// #1712: the `ExecutionEvent::agent_id` this frame was queued from, carried
+    /// through the per-connection queue so a scope-confined route can decide
+    /// admission on the CONTENT-PROVIDER thread rather than inside the bus
+    /// listener — the listener runs under the publisher's channel mutex, and the
+    /// scope predicate reaches the (PostgreSQL) RBAC store, so deciding there
+    /// would put a database round-trip on the path of every publish. Empty for
+    /// every route that does not carry it, and for execution-scoped frames; the
+    /// admission rule that reads it is `execution_event_scope.hpp`, which fails
+    /// closed rather than treating empty as "admit".
+    ///
+    /// Default-member-initialized (like `id` above) so the existing
+    /// aggregate-init call sites that name only the first two or three
+    /// members stay warning-free under `-Wmissing-field-initializers`.
+    std::string agent_id{};
 };
 
 // -- SSE Event Bus ------------------------------------------------------------

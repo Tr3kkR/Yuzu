@@ -4,6 +4,7 @@
 #include "dispatch_target_shape.hpp" // check_targeting_shape — the omitted-vs-supplied rule (#2500)
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
+#include "execution_event_scope.hpp" // execution_event_in_scope — per-event admission (#1712)
 #include "http_route_sink.hpp"
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
 #include "response_scope_filter.hpp" // filter_rows_in_scope — the shared #1712 filter loop
@@ -20,6 +21,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <expected>
 #include <format>
 #include <map>
@@ -777,8 +779,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // `execution.detail.view`.
     auto* stream_budget = deps.stream_budget;
     sink.Get(R"(/sse/executions/([A-Za-z0-9_-]{1,128}))",
-             [auth_fn, perm_fn, audit_fn, execution_tracker, execution_event_bus,
-              stream_budget](const httplib::Request& req, httplib::Response& res) {
+             [auth_fn, perm_fn, audit_fn, execution_tracker, execution_event_bus, stream_budget,
+              response_scope_fn](const httplib::Request& req, httplib::Response& res) {
                  auto session = auth_fn(req, res);
                  if (!session)
                      return;
@@ -869,6 +871,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                      exec_id, since_id, [sink_state](const ExecutionEvent& ev) {
                          detail::SseEvent sse;
                          sse.event_type = ev.event_type;
+                         // #1712: carry the attribution through the queue; the
+                         // admission decision happens on the provider thread
+                         // (see the drain below), never here — this callback
+                         // runs under the bus channel mutex.
+                         sse.agent_id = ev.agent_id;
                          // Browser MUST see `id:` so it can populate
                          // Last-Event-ID on the next reconnect. The
                          // existing format_sse helper emits event/data only —
@@ -888,6 +895,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                      bus->subscribe(exec_id, [sink_state](const ExecutionEvent& ev) {
                          detail::SseEvent sse;
                          sse.event_type = ev.event_type;
+                         sse.agent_id = ev.agent_id; // #1712 — see the replay listener
                          sse.data = std::to_string(ev.id) + "\n" + ev.data;
                          {
                              std::lock_guard<std::mutex> lk(sink_state->mu);
@@ -902,28 +910,89 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                  // survives for the stream's actual lifetime instead of
                  // releasing early at post-routing (see is_streaming_path /
                  // adopt_quota_slot_into_stream in principal_quota_gate.hpp).
+                 // #1712: the per-connection scope state. `viewer` is copied
+                 // (the session does not outlive the handler); `scope_memo`
+                 // memoizes the predicate per distinct agent_id for the life
+                 // of the stream, the same "first answer for an agent applies"
+                 // property `filter_rows_in_scope` documents — a store that
+                 // degrades mid-stream can never retroactively widen an agent
+                 // already admitted, nor admit one already denied. Only the
+                 // content-provider thread touches it, so it needs no lock.
+                 const std::string viewer = session->username;
+                 auto scope_memo = std::make_shared<std::unordered_map<std::string, bool>>();
                  res.set_chunked_content_provider(
                      "text/event-stream",
-                     [sink_state, stream_budget](size_t offset, httplib::DataSink& s) -> bool {
+                     [sink_state, stream_budget, response_scope_fn, viewer,
+                      scope_memo](size_t offset, httplib::DataSink& s) -> bool {
                          // Re-implement the existing sse_content_provider in-line
                          // with id-aware framing. We can't reuse `format_sse`
                          // verbatim because it doesn't emit `id:`; the prefixed
                          // `<id>\n<data>` payload we queued above carries the id
                          // we need to peel off here.
-                         std::unique_lock<std::mutex> lk(sink_state->mu);
-                         // #2703 Gate 7 item 2: shutdown close-signal, same
-                         // predicate shape as the /events and /api/v1/events
-                         // siblings — see StreamBudget::closing()'s doc comment.
-                         sink_state->cv.wait_for(lk, std::chrono::seconds(3), [&] {
-                             return !sink_state->queue.empty() || sink_state->closed.load() ||
-                                    (stream_budget && stream_budget->closing());
-                         });
-                         if (sink_state->closed.load() ||
-                             (stream_budget && stream_budget->closing()))
-                             return false;
-                         while (!sink_state->queue.empty()) {
-                             auto ev = std::move(sink_state->queue.front());
-                             sink_state->queue.pop_front();
+                         // #1712: take the whole pending batch under the queue
+                         // mutex, then RELEASE it before deciding scope and
+                         // writing. Two reasons, both load-bearing: the scope
+                         // predicate reaches the (PostgreSQL) RBAC store, and
+                         // the bus listener takes this same mutex while it is
+                         // itself holding the publisher's channel mutex — so
+                         // deciding or writing under `mu` would put a database
+                         // round-trip (and a socket write to a possibly-stalled
+                         // client) on the path of every publish for this
+                         // execution. Ordering is unchanged: one provider
+                         // thread drains this queue.
+                         std::deque<detail::SseEvent> batch;
+                         {
+                             std::unique_lock<std::mutex> lk(sink_state->mu);
+                             // #2703 Gate 7 item 2: shutdown close-signal, same
+                             // predicate shape as the /events and /api/v1/events
+                             // siblings — see StreamBudget::closing()'s doc comment.
+                             sink_state->cv.wait_for(lk, std::chrono::seconds(3), [&] {
+                                 return !sink_state->queue.empty() || sink_state->closed.load() ||
+                                        (stream_budget && stream_budget->closing());
+                             });
+                             if (sink_state->closed.load() ||
+                                 (stream_budget && stream_budget->closing()))
+                                 return false;
+                             batch.swap(sink_state->queue);
+                         }
+                         // Memoized view of the ONE scope decision helper. The
+                         // classification stays per-event (it depends on the
+                         // event TYPE); only the "may this user see this agent"
+                         // answer is cached, which is what makes the cache safe
+                         // to key on agent_id alone.
+                         ResponseScopePredicate memoized_scope =
+                             [&response_scope_fn, &scope_memo](const std::string& user,
+                                                               const std::string& aid) {
+                                 auto [it, inserted] = scope_memo->try_emplace(aid, false);
+                                 if (inserted)
+                                     it->second = response_scope_fn(user, aid);
+                                 return it->second;
+                             };
+                         while (!batch.empty()) {
+                             auto ev = std::move(batch.front());
+                             batch.pop_front();
+
+                             // #1712: per-event scope admission — the OTHER
+                             // per-agent source on this surface. The static
+                             // fragment filters its roster and its response
+                             // rows; without this the live channel re-disclosed
+                             // exactly what the fragment withheld, on a route
+                             // gated by a flat global `Execution:Read`. The
+                             // DECISION is `response_agent_in_scope` (wired in
+                             // server.cpp — the same predicate the fragment
+                             // uses, not a second scope path); the per-event
+                             // mechanics are `execution_event_in_scope`, which
+                             // fails closed on an unclassified event type and
+                             // on an agent-attributed event carrying no
+                             // agent_id. Unwired predicate = no filter, the
+                             // deliberate legacy-open case (workflow_routes.hpp).
+                             if (response_scope_fn) {
+                                 ExecutionEvent probe;
+                                 probe.event_type = ev.event_type;
+                                 probe.agent_id = ev.agent_id;
+                                 if (!execution_event_in_scope(probe, viewer, memoized_scope))
+                                     continue;
+                             }
 
                              // Split <id>\n<data>
                              std::string id_part, data_part;
