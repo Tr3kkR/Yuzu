@@ -4,8 +4,9 @@
 ##
 ## Sources by platform:
 ##   Windows: IP Helper API (GetAdaptersAddresses), WinHTTP proxy API, dnsapi.dll
-##   Linux:   ip(8), /etc/resolv.conf, resolvectl, sysfs, environment variables
-##   macOS:   ifconfig, scutil, networksetup, dscacheutil
+##   Linux:   rtnetlink (RTM_GETLINK/RTM_GETADDR/RTM_GETROUTE), /proc/net/arp,
+##            /etc/resolv.conf, sysfs, environment variables, resolvectl (dns_cache only)
+##   macOS:   getifaddrs, SIOCGIFMEDIA, PF_ROUTE sysctl, SCDynamicStore
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -16,9 +17,12 @@ metadata:
   version: 1.0.0
   description: >
     Lists network adapters with MAC address, link speed, and
-    operational status. Skips loopback and tunnel interfaces.
-    On Windows uses GetAdaptersAddresses, on Linux reads ip-link
-    and sysfs speed, on macOS parses ifconfig output.
+    operational status. On Windows uses GetAdaptersAddresses and skips
+    loopback and tunnel interfaces; on Linux reads rtnetlink
+    (RTM_GETLINK) plus sysfs speed and skips loopback; on macOS reads
+    getifaddrs and SIOCGIFMEDIA and reports loopback (lo0) as a real
+    adapter. The loopback difference between Linux and macOS is
+    long-standing behaviour, not an oversight.
   tags: [network, inventory, hardware]
 
 spec:
@@ -80,8 +84,9 @@ metadata:
     Lists assigned IP addresses per adapter with subnet prefix length
     and default gateway. Returns both IPv4 and IPv6 unicast addresses.
     On Windows uses GetAdaptersAddresses with GAA_FLAG_INCLUDE_GATEWAYS,
-    on Linux parses ip-addr and ip-route, on macOS parses ifconfig and
-    route output.
+    on Linux reads rtnetlink (RTM_GETADDR/RTM_GETROUTE), on macOS reads
+    getifaddrs plus a PF_ROUTE sysctl for the default route. Loopback is
+    excluded on Linux and macOS.
   tags: [network, inventory, addressing]
 
 spec:
@@ -143,8 +148,10 @@ metadata:
     Lists configured DNS servers per adapter, including address
     family (IPv4/IPv6). On Windows enumerates per-adapter DNS
     server addresses via GetAdaptersAddresses. On Linux reads
-    /etc/resolv.conf nameserver entries. On macOS parses scutil
-    --dns output.
+    /etc/resolv.conf nameserver entries. On macOS reads SCDynamicStore,
+    unioning the global resolver key with every per-service resolver key
+    so supplemental (VPN split-DNS, secondary-interface) resolvers are
+    included, de-duplicated in first-seen order.
   tags: [network, inventory, dns]
 
 spec:
@@ -205,7 +212,10 @@ metadata:
     (none, http, pac, auto_detect), proxy address, and bypass list.
     On Windows reads WinHTTP IE proxy config. On Linux checks
     http_proxy/https_proxy/all_proxy/no_proxy environment variables.
-    On macOS queries networksetup for web proxy and auto-proxy URL.
+    On macOS reads SCDynamicStoreCopyProxies, covering every network
+    service rather than Wi-Fi alone. Only the HTTP proxy and PAC URL are
+    reported: a host configured with only an HTTPS, SOCKS or FTP proxy
+    reads as none.
   tags: [network, inventory, proxy, compliance]
 
 spec:

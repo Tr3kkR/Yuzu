@@ -5,8 +5,17 @@
  * and drives it through yuzu::agent::LocalDispatcher -- the same pattern
  * test_users_posix_actions.cpp established. This exercises the real
  * rtnetlink/getifaddrs/PF_ROUTE/proc-net-arp legs end to end against the
- * actual kernel on the test host: every assertion below would fail if a
- * migrated leg's syscalls were wrong or silently reverted to a shell-out.
+ * actual kernel on the test host.
+ *
+ * What these tests can and cannot catch: do_adapters() and do_arp() both
+ * return 0 on EVERY path, including getifaddrs failure and an incomplete
+ * rtnetlink dump, so `rc == 0` is close to vacuous on its own. The load-
+ * bearing assertions are therefore on emitted-row SHAPE (field count,
+ * non-empty key fields, known status values), on macOS loopback presence,
+ * and on arp de-duplication -- three properties that a broken or reverted
+ * leg actually violates. Row COUNT is deliberately not asserted: an empty
+ * ARP table and a container with no non-loopback interface are both
+ * legitimate host states, not migration failures.
  *
  * POSIX-only (macOS + Linux) -- Windows already reads every leg through
  * native Win32 APIs untouched by this package, so there is nothing new to
@@ -31,12 +40,39 @@
 #include <cstdlib>
 #include <filesystem>
 #include <optional>
+#include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
 namespace fs = std::filesystem;
 
 namespace {
+
+// Captured plugin output is newline-separated `field|field|...` rows. These
+// two helpers let the tests assert on SHAPE rather than only on rc, which
+// do_adapters()/do_arp() return as 0 on every path including failure.
+std::vector<std::string> rows_with_prefix(const std::string& captured, const std::string& prefix) {
+    std::vector<std::string> out;
+    std::istringstream ss(captured);
+    std::string line;
+    while (std::getline(ss, line)) {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (line.rfind(prefix, 0) == 0)
+            out.push_back(line);
+    }
+    return out;
+}
+
+std::vector<std::string> split_fields(const std::string& row) {
+    std::vector<std::string> out;
+    std::string cur;
+    std::istringstream ss(row);
+    while (std::getline(ss, cur, '|'))
+        out.push_back(cur);
+    return out;
+}
 
 #if defined(__APPLE__)
 constexpr const char* kPluginExt = ".dylib";
@@ -103,15 +139,36 @@ TEST_CASE("network_config plugin: adapters lists at least one real interface via
     yuzu::agent::LocalDispatcher dispatcher;
     auto result = dispatcher.run(plugin->descriptor, "adapters");
     CHECK(result.rc == 0);
-    // A reverted/broken migration (wrong socket family, a rtnetlink dump
-    // that never reaches NLMSG_DONE, a getifaddrs call site typo) either
-    // fails this call outright or produces no "adapter|" rows at all -- a
-    // real build host always has at least loopback plus one more interface
-    // reachable, and this plugin's own do_adapters() already excludes
-    // loopback (lo/lo0), so at least one row proves the real native leg ran.
-    if (result.captured.find("adapter|") == std::string::npos) {
-        WARN("no 'adapter|' rows -- host may have no non-loopback interface up; rc==0 above "
-             "already confirms the native leg executed without error");
+
+    // rc alone proves nothing: do_adapters() returns 0 on every path,
+    // including getifaddrs failure and an incomplete rtnetlink dump. Assert
+    // on the OUTPUT so a broken or reverted leg actually turns this red.
+    const auto rows = rows_with_prefix(result.captured, "adapter|");
+
+#if defined(__APPLE__)
+    // macOS always has lo0, and the pre-migration `ifconfig -a` leg reported
+    // it as a real adapter row. An early migration draft copied a loopback
+    // skip here from do_ip_addresses and silently dropped it -- caught only
+    // by a live before/after parity diff. This pins that regression.
+    REQUIRE_FALSE(rows.empty());
+    bool saw_lo0 = false;
+    for (const auto& r : rows) {
+        if (r.rfind("adapter|lo0|", 0) == 0)
+            saw_lo0 = true;
+    }
+    CHECK(saw_lo0); // do_adapters must NOT filter loopback on macOS
+#endif
+
+    // Shape contract, portable: every row is `adapter|name|mac|speed|status`
+    // with a non-empty name and a status drawn from the known set. A leg that
+    // emits a wrong field count or an unmapped status fails here.
+    for (const auto& r : rows) {
+        const auto f = split_fields(r);
+        CHECK(f.size() == 5);
+        if (f.size() == 5) {
+            CHECK_FALSE(f[1].empty());
+            CHECK((f[4] == "up" || f[4] == "down" || f[4] == "unknown"));
+        }
     }
 }
 
@@ -126,12 +183,27 @@ TEST_CASE("network_config plugin: arp exercises the real native leg without erro
     yuzu::agent::LocalDispatcher dispatcher;
     auto result = dispatcher.run(plugin->descriptor, "arp");
     CHECK(result.rc == 0);
-    // An empty ARP/neighbour table is a legitimate state on a freshly-booted
-    // or sandboxed CI runner (nothing has been resolved yet) -- the plugin's
-    // own honest-degrade path still emits nothing but sets a CONSTRAINED/
-    // UNAVAILABLE result status rather than an "arp|" row in that case, so
-    // this test only asserts rc==0 (the real /proc/net/arp read or PF_ROUTE
-    // sysctl executed without crashing), not row content.
+
+    // An empty ARP/neighbour table is legitimate on a freshly-booted or
+    // sandboxed runner, so row COUNT is not asserted. Row SHAPE is: every
+    // emitted row must be `arp|iface|ip|mac|type` with a non-empty ip and
+    // mac. The macOS leg honestly reports iface and type as "-" (the
+    // RTF_LLINFO dump does not carry them); it must still emit five fields.
+    for (const auto& r : rows_with_prefix(result.captured, "arp|")) {
+        const auto f = split_fields(r);
+        CHECK(f.size() == 5);
+        if (f.size() == 5) {
+            CHECK_FALSE(f[2].empty()); // ip
+            CHECK_FALSE(f[3].empty()); // mac
+        }
+    }
+
+    // Duplicate (ip, mac) rows were a real regression on macOS: the
+    // PF_ROUTE dump can report the same neighbour twice and the first draft
+    // emitted both. Deduplication is part of the contract.
+    const auto rows = rows_with_prefix(result.captured, "arp|");
+    std::set<std::string> unique(rows.begin(), rows.end());
+    CHECK(unique.size() == rows.size());
 }
 
 #endif // !_WIN32

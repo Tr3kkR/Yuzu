@@ -338,7 +338,20 @@ std::string sockaddr_to_string(LPSOCKADDR sa) {
 constexpr std::size_t kNetlinkRecvBufSize = 16384; // matches net_quality_sampler.cpp's convention
 
 yuzu::agent::ScopedFd open_rtnetlink_socket() {
-    return yuzu::agent::ScopedFd{::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)};
+    yuzu::agent::ScopedFd fd{::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)};
+    if (fd.get() >= 0) {
+        // Bound the recvmsg wait, matching the two existing netlink sites in
+        // this tree (agents/core/src/net_quality_sampler.cpp,
+        // agents/plugins/tar/src/tar_network_collector.cpp). Without this a
+        // dump the kernel never terminates with NLMSG_DONE wedges the agent's
+        // command-execution thread forever; the drain loops below treat the
+        // resulting EAGAIN as an incomplete dump and report CONSTRAINED.
+        struct timeval tv {
+            2, 0
+        }; // 2 s
+        ::setsockopt(fd.get(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+    return fd;
 }
 
 struct LinkDumpResult {
@@ -589,8 +602,10 @@ int do_adapters(yuzu::CommandContext& ctx) {
         }
 
         const std::string mac = rec.mac.empty() ? "-" : rec.mac;
-        ctx.write_output(
-            std::format("adapter|{}|{}|{}|{}", rec.name, mac, speed, rec.up ? "up" : "down"));
+        // OPERATIONAL state, not the IFF_UP administrative flag -- see
+        // link_status_string()'s contract in network_config_parsers.hpp.
+        ctx.write_output(std::format("adapter|{}|{}|{}|{}", rec.name, mac, speed,
+                                     yuzu::network_config::link_status_string(rec)));
     }
     if (!links.ok) {
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
@@ -610,9 +625,15 @@ int do_adapters(yuzu::CommandContext& ctx) {
     // the old ifconfig-parse's per-adapter grouping. Unlike ip_addresses
     // below, loopback is NOT excluded here: the pre-migration `ifconfig -a`
     // parse reported lo0 as a real adapter row (PKG-NC fix round — live
-    // before/after parity diff caught an earlier draft silently dropping
-    // it, which would have made adapters diverge from the Linux rtnetlink
-    // leg, which never filters loopback either).
+    // before/after parity diff caught an earlier draft silently dropping it).
+    //
+    // NOTE the deliberate per-OS asymmetry: the Linux leg above DOES filter
+    // loopback, because the pre-migration Linux leg did too (`ip -o link
+    // show` parse, `if (name == "lo") continue;` at 819bf395a:296-298) while
+    // the macOS leg never did. That asymmetry PREDATES this migration and is
+    // preserved here on purpose — verified against both pre-migration legs.
+    // Do not "align" the two without a deliberate behavior-change decision;
+    // changing either side silently alters what the fleet reports.
     std::vector<std::string> order;
     std::map<std::string, std::string> mac_by_name;
     std::map<std::string, bool> up_by_name;
@@ -721,12 +742,25 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
 
     auto addrs = fetch_addr_dump();
     for (const auto& rec : addrs.records) {
-        std::string name = !rec.label.empty() ? rec.label : std::string{};
-        if (name.empty()) {
-            auto it = name_by_index.find(rec.index);
-            name = (it != name_by_index.end()) ? it->second : std::format("if{}", rec.index);
-        }
-        if (name == "lo")
+        // DEVICE name first, IFA_LABEL only as a fallback. The pre-migration
+        // leg read iproute2's second column, which is the device ("eth0"),
+        // never the alias label ("eth0:1"). Preferring the label would rename
+        // every aliased row and -- worse -- let a loopback alias ("lo:1")
+        // slip past the loopback filter below, which the old leg dropped.
+        std::string name;
+        if (auto it = name_by_index.find(rec.index); it != name_by_index.end())
+            name = it->second;
+        else if (!rec.label.empty())
+            name = rec.label; // link dump incomplete; best remaining signal
+        else
+            name = std::format("if{}", rec.index);
+
+        // Match the old leg's loopback filter, plus two cases it never had to
+        // survive: an alias label, and an unresolved name (link dump failed),
+        // where the loopback address itself is the only signal left.
+        if (name == "lo" || name.starts_with("lo:"))
+            continue;
+        if (rec.address == "127.0.0.1" || rec.address == "::1")
             continue;
         ctx.write_output(std::format("ip|{}|{}|{}|{}", name, rec.address,
                                      static_cast<unsigned int>(rec.prefix_len), default_gw));
@@ -765,13 +799,25 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
         // discover independently.
         if (p->ifa_addr->sa_family == AF_INET) {
             struct sockaddr_in sin {};
-            std::memcpy(&sin, p->ifa_addr, sizeof(sin));
+            std::memcpy(&sin, p->ifa_addr,
+                        std::min(sizeof(sin), static_cast<std::size_t>(p->ifa_addr->sa_len)));
             if (!::inet_ntop(AF_INET, &sin.sin_addr, text_buf, sizeof(text_buf)))
                 continue;
             unsigned int prefix = 0;
             if (p->ifa_netmask) {
+                // Clamp to the kernel's declared sa_len: an AF_INET netmask
+                // sockaddr is routinely SHORTER than sizeof(sockaddr_in) --
+                // measured 5 bytes (lo0), 7 (en0/en1) and 8 (utun4) on a live
+                // host -- because the trailing all-zero bytes are elided.
+                // Copying the full 16 bytes reads past the object; getifaddrs
+                // packs every sockaddr into one block so it usually goes
+                // unnoticed, but for the last sockaddr in that block it runs
+                // off the allocation. The zero-initialised `mask` supplies the
+                // elided trailing zero bytes, which is exactly the right value.
                 struct sockaddr_in mask {};
-                std::memcpy(&mask, p->ifa_netmask, sizeof(mask));
+                std::memcpy(&mask, p->ifa_netmask,
+                            std::min(sizeof(mask),
+                                     static_cast<std::size_t>(p->ifa_netmask->sa_len)));
                 prefix = yuzu::network_config::ipv4_prefix_length(ntohl(mask.sin_addr.s_addr));
             }
             ctx.write_output(std::format("ip|{}|{}|{}|{}", name, text_buf, prefix, default_gw));
@@ -846,6 +892,11 @@ int do_dns_servers(yuzu::CommandContext& ctx) {
                 ctx.write_output(std::format("dns|system|{}|{}", server, type));
             }
         }
+    } else {
+        // Unreadable resolv.conf must not read as "this host has no
+        // resolvers" under a SUPPORTED rung-1 descriptor.
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "network_config:resolv_conf_unreadable");
     }
 
 #elif defined(__APPLE__)
@@ -891,6 +942,11 @@ int do_dns_servers(yuzu::CommandContext& ctx) {
             auto type = (server.find(':') != std::string::npos) ? "IPv6" : "IPv4";
             ctx.write_output(std::format("dns|system|{}|{}", server, type));
         }
+    } else {
+        // The store could not be opened -- zero rows here would otherwise be
+        // indistinguishable from "this host has no resolvers configured".
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "network_config:dynamic_store_unavailable");
     }
 #else
     // Compiled without SystemConfiguration -- honest gap, no fabricated list.
@@ -991,16 +1047,12 @@ int do_proxy(yuzu::CommandContext& ctx) {
             return val;
         };
 
-        // PAC first, matching the old auto-proxy branch's priority.
-        if (get_bool(kSCPropNetProxiesProxyAutoConfigEnable)) {
-            auto url = get_string(kSCPropNetProxiesProxyAutoConfigURLString);
-            if (!url.empty()) {
-                ctx.write_output("proxy_type|pac");
-                ctx.write_output(std::format("proxy_address|{}", url));
-                emitted = true;
-            }
-        }
-        if (!emitted && get_bool(kSCPropNetProxiesHTTPEnable)) {
+        // HTTP first, then PAC. This is the pre-migration precedence: the old
+        // leg tested `networksetup -getwebproxy` in the IF branch and only
+        // reached `-getautoproxyurl` in its ELSE, so on a host with BOTH a web
+        // proxy and a PAC URL configured it reported `http`. Checking PAC
+        // first would silently flip that host's proxy_type to `pac`.
+        if (get_bool(kSCPropNetProxiesHTTPEnable)) {
             auto host = get_string(kSCPropNetProxiesHTTPProxy);
             const int port = get_int(kSCPropNetProxiesHTTPPort);
             if (!host.empty()) {
@@ -1009,15 +1061,28 @@ int do_proxy(yuzu::CommandContext& ctx) {
                 emitted = true;
             }
         }
+        if (!emitted && get_bool(kSCPropNetProxiesProxyAutoConfigEnable)) {
+            auto url = get_string(kSCPropNetProxiesProxyAutoConfigURLString);
+            if (!url.empty()) {
+                ctx.write_output("proxy_type|pac");
+                ctx.write_output(std::format("proxy_address|{}", url));
+                emitted = true;
+            }
+        }
 
-        auto* bypass_list = static_cast<CFArrayRef>(
-            CFDictionaryGetValue(proxies.get(), kSCPropNetProxiesExceptionsList));
+        const void* bypass_v =
+            CFDictionaryGetValue(proxies.get(), kSCPropNetProxiesExceptionsList);
+        auto* bypass_list = (bypass_v && CFGetTypeID(bypass_v) == CFArrayGetTypeID())
+                                ? static_cast<CFArrayRef>(bypass_v)
+                                : nullptr;
         if (bypass_list) {
             const CFIndex count = CFArrayGetCount(bypass_list);
             std::string joined;
             for (CFIndex i = 0; i < count; ++i) {
-                auto* item = static_cast<CFStringRef>(CFArrayGetValueAtIndex(bypass_list, i));
-                auto s = cfstring_to_utf8(item);
+                const void* item_v = CFArrayGetValueAtIndex(bypass_list, i);
+                if (!item_v || CFGetTypeID(item_v) != CFStringGetTypeID())
+                    continue; // never call CFString APIs on a non-string element
+                auto s = cfstring_to_utf8(static_cast<CFStringRef>(item_v));
                 if (s.empty())
                     continue;
                 if (!joined.empty())
@@ -1027,6 +1092,12 @@ int do_proxy(yuzu::CommandContext& ctx) {
             if (!joined.empty())
                 ctx.write_output(std::format("bypass|{}", joined));
         }
+    } else {
+        // SCDynamicStoreCopyProxies failed. Falling through to the
+        // `proxy_type|none` below unqualified would turn an API failure into
+        // the positive assertion "this host has no proxy configured".
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "network_config:proxy_copy_failed");
     }
     if (!emitted)
         ctx.write_output("proxy_type|none");
@@ -1080,7 +1151,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .action      = */ "proxy",
         /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "environment variables", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 1, "SCDynamicStoreCopyProxies", nullptr},
+        {YUZU_SUPPORT_CONSTRAINED, 1, "SCDynamicStoreCopyProxies",
+         "reports the HTTP proxy and PAC URL across all network services; HTTPS/SOCKS/FTP "
+         "proxies are not reported, so a host configured with only those reads as none"},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "WinHttpGetIEProxyConfigForCurrentUser", nullptr},
     },
@@ -1101,7 +1174,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .action      = */ "arp",
         /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/proc/net/arp", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 1, "PF_ROUTE sysctl RTF_LLINFO", nullptr},
+        {YUZU_SUPPORT_CONSTRAINED, 1, "PF_ROUTE sysctl RTF_LLINFO",
+         "ip and mac only; the interface name and static/dynamic type are not carried by the "
+         "RTF_LLINFO dump and are emitted as '-'"},
         /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetIpNetTable2", nullptr},
     },
 };

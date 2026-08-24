@@ -232,8 +232,13 @@ void append_rtattr(std::vector<unsigned char>& buf, unsigned short type, const v
 // (optionally) IFLA_ADDRESS. nlmsg_len is patched in at the end to the
 // message's true total size (already 4-aligned, since append_rtattr keeps
 // the buffer 4-aligned throughout).
+// `oper_state` < 0 omits IFLA_OPERSTATE entirely (the "kernel did not tell us"
+// case); `mac_len` lets a test attach a non-6-byte IFLA_ADDRESS, which is what
+// a non-Ethernet link (InfiniBand, ip6tnl) really sends.
 std::vector<unsigned char> build_link_message(std::uint32_t seq, int index, const char* name,
-                                              const unsigned char* mac, bool up) {
+                                              const unsigned char* mac, bool up,
+                                              int oper_state = IF_OPER_UP,
+                                              std::size_t mac_len = 6) {
     std::vector<unsigned char> buf;
     struct nlmsghdr nlh {};
     nlh.nlmsg_type = RTM_NEWLINK;
@@ -250,7 +255,11 @@ std::vector<unsigned char> build_link_message(std::uint32_t seq, int index, cons
 
     append_rtattr(buf, IFLA_IFNAME, name, std::strlen(name) + 1);
     if (mac)
-        append_rtattr(buf, IFLA_ADDRESS, mac, 6);
+        append_rtattr(buf, IFLA_ADDRESS, mac, mac_len);
+    if (oper_state >= 0) {
+        const auto st = static_cast<unsigned char>(oper_state);
+        append_rtattr(buf, IFLA_OPERSTATE, &st, 1);
+    }
 
     auto* hdr = reinterpret_cast<struct nlmsghdr*>(buf.data());
     hdr->nlmsg_len = static_cast<std::uint32_t>(buf.size());
@@ -342,6 +351,77 @@ TEST_CASE("parse_rtnetlink_link_chunk decodes two interfaces then NLMSG_DONE",
     CHECK(parsed.records[0].up);
     CHECK(parsed.records[1].name == "lo");
     CHECK(parsed.records[1].mac.empty()); // no IFLA_ADDRESS attached
+}
+
+// ── adapters `status` must be OPERATIONAL state, not the IFF_UP admin flag ──
+//
+// Gate regression: the first migration draft reported `ifi_flags & IFF_UP`.
+// The pre-migration leg parsed iproute2's `state <TOKEN>`, which iproute2
+// renders from IFLA_OPERSTATE. The two disagree on exactly the hosts that
+// matter -- a cable-unplugged NIC and every tun/tap/WireGuard device are
+// administratively UP but operationally not -- so the flag would have flipped
+// them from "down" to "up" fleet-wide, with every row count unchanged.
+
+TEST_CASE("parse_rtnetlink_link_chunk records IFLA_OPERSTATE separately from IFF_UP",
+          "[network_config][rtnetlink]") {
+    constexpr std::uint32_t kSeq = 7;
+    const unsigned char mac1[6] = {0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff};
+    // Administratively UP, operationally LOWERLAYERDOWN: the carrier-down NIC.
+    auto msg = build_link_message(kSeq, 2, "eth0", mac1, /*up=*/true,
+                                  /*oper_state=*/IF_OPER_LOWERLAYERDOWN);
+    auto done = build_done_message(kSeq);
+    std::vector<unsigned char> blob;
+    blob.insert(blob.end(), msg.begin(), msg.end());
+    blob.insert(blob.end(), done.begin(), done.end());
+
+    const auto parsed = parse_rtnetlink_link_chunk(std::span{blob}, kSeq);
+    REQUIRE(parsed.records.size() == 1);
+    CHECK(parsed.records[0].up); // IFF_UP is set ...
+    CHECK(parsed.records[0].oper_state == IF_OPER_LOWERLAYERDOWN); // ... but carrier is down
+    // The emitted field must follow the OPERATIONAL state.
+    CHECK(std::string{link_status_string(parsed.records[0])} == "down");
+}
+
+TEST_CASE("link_status_string reports up only for IF_OPER_UP", "[network_config][rtnetlink]") {
+    yuzu::network_config::RtLinkRecord rec;
+    rec.up = true; // admin-up throughout: only oper_state may move the answer
+
+    rec.oper_state = IF_OPER_UP;
+    CHECK(std::string{link_status_string(rec)} == "up");
+
+    // Every other operational state mapped to "down" in the old leg, including
+    // IF_OPER_UNKNOWN, which is what tun/tap/WireGuard devices report.
+    for (int st : {IF_OPER_UNKNOWN, IF_OPER_NOTPRESENT, IF_OPER_DOWN, IF_OPER_LOWERLAYERDOWN,
+                   IF_OPER_TESTING, IF_OPER_DORMANT}) {
+        rec.oper_state = st;
+        CHECK(std::string{link_status_string(rec)} == "down");
+    }
+
+    // Attribute absent: iproute2 printed "UNKNOWN", which the old leg mapped
+    // to "down". Deliberately NOT the administrative flag.
+    rec.oper_state = -1;
+    CHECK(std::string{link_status_string(rec)} == "down");
+}
+
+TEST_CASE("parse_rtnetlink_link_chunk never fabricates a MAC from a non-6-byte IFLA_ADDRESS",
+          "[network_config][rtnetlink]") {
+    constexpr std::uint32_t kSeq = 9;
+    // A 20-byte InfiniBand hardware address. Truncating it to 6 bytes would
+    // emit a plausible-looking MAC that is not this interface's address; the
+    // old leg reported "-" because it only read iproute2's `link/ether`.
+    const unsigned char ib[20] = {0x80, 0x00, 0x02, 0x08, 0xfe, 0x80, 0x00, 0x00, 0x00, 0x00,
+                                  0x00, 0x00, 0xf4, 0x52, 0x14, 0x03, 0x00, 0x7b, 0xcb, 0xa1};
+    auto msg = build_link_message(kSeq, 3, "ib0", ib, /*up=*/true, /*oper_state=*/IF_OPER_UP,
+                                  /*mac_len=*/sizeof(ib));
+    auto done = build_done_message(kSeq);
+    std::vector<unsigned char> blob;
+    blob.insert(blob.end(), msg.begin(), msg.end());
+    blob.insert(blob.end(), done.begin(), done.end());
+
+    const auto parsed = parse_rtnetlink_link_chunk(std::span{blob}, kSeq);
+    REQUIRE(parsed.records.size() == 1);
+    CHECK(parsed.records[0].name == "ib0");
+    CHECK(parsed.records[0].mac.empty()); // unresolved, never a truncated guess
 }
 
 TEST_CASE("parse_rtnetlink_link_chunk discards a reply whose nlmsg_seq doesn't match",

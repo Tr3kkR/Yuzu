@@ -24,9 +24,19 @@
  *     is checked against the buffer before the corresponding bytes are
  *     dereferenced, a malformed/short record stops the walk rather than
  *     looping or reading out of bounds, and the caller learns about
- *     truncation instead of silently receiving a partial result. Every
- *     multi-byte field is read via memcpy into a locally-aligned object,
- *     never through a cast dereference of the raw buffer.
+ *     truncation instead of silently receiving a partial result.
+ *
+ *     ALIGNMENT CONTRACT (rtnetlink decoders only): the nlmsghdr/rtattr walk
+ *     reads its header fields through the kernel's own NLMSG_ and RTA_
+ *     macros, which cast into the caller's buffer rather than copying.
+ *     Callers of the parse_rtnetlink chunk decoders must therefore pass a
+ *     buffer aligned to at least NLMSG_ALIGNTO (production callers declare
+ *     theirs
+ *     `alignas(NLMSG_ALIGNTO)`, and so do the fixture tests). The variable-
+ *     length PAYLOADS those headers describe -- ifinfomsg, ifaddrmsg, rtmsg
+ *     and every attribute value -- are memcpy'd into locally-aligned objects
+ *     before any field is read. parse_default_route_dump() takes no such
+ *     precondition: it memcpys throughout.
  */
 #pragma once
 
@@ -275,8 +285,31 @@ struct RtLinkRecord {
     int index = -1;
     std::string name;
     std::string mac; // empty when unresolved/non-Ethernet
-    bool up = false;
+    bool up = false; // IFF_UP -- ADMINISTRATIVE state (link is configured up)
+    // IFLA_OPERSTATE -- RFC 2863 OPERATIONAL state, or -1 when the kernel did
+    // not attach the attribute. These are NOT the same thing: a cable-unplugged
+    // NIC is administratively up (IFF_UP) but operationally down
+    // (IF_OPER_LOWERLAYERDOWN), and `ip link` prints the operational one.
+    int oper_state = -1;
 };
+
+/// Map a link record to the `adapter|...|<status>` field exactly as the
+/// pre-migration `ip -o link show` parse did.
+///
+/// The old leg read iproute2's `state <TOKEN>` field -- which iproute2 renders
+/// from IFLA_OPERSTATE, not from IFF_UP -- and normalised "UP" to "up" and
+/// EVERY other token ("DOWN", "UNKNOWN", "LOWERLAYERDOWN", "DORMANT", ...) to
+/// "down". Reporting IFF_UP here instead would silently flip a carrier-down
+/// NIC and every tun/tap/WireGuard device (which sit at IF_OPER_UNKNOWN) from
+/// "down" to "up", so operational state is what this returns.
+///
+/// When the kernel omits IFLA_OPERSTATE there is no operational signal at all;
+/// iproute2 prints "UNKNOWN" in that case, which the old leg mapped to "down",
+/// so that is what is returned -- deliberately faithful to the old output
+/// rather than substituting the administrative flag.
+inline const char* link_status_string(const RtLinkRecord& rec) {
+    return rec.oper_state == IF_OPER_UP ? "up" : "down";
+}
 
 struct RtAddrRecord {
     int index = -1;
@@ -320,6 +353,11 @@ inline RtLinkParse parse_rtnetlink_link_chunk(std::span<const unsigned char> blo
     auto len = static_cast<int>(blob.size());
     const auto* h = reinterpret_cast<const struct nlmsghdr*>(blob.data());
     for (; NLMSG_OK(h, len); h = reinterpret_cast<const struct nlmsghdr*>(NLMSG_NEXT(h, len))) {
+        // Sequence check FIRST: a stale DONE/ERROR left over from an earlier
+        // dump on this socket must be discarded like any other stale reply,
+        // not allowed to terminate (or fail) the current walk.
+        if (h->nlmsg_seq != expected_seq)
+            continue; // stale reply from an earlier dump on this socket
         if (h->nlmsg_type == NLMSG_DONE) {
             out.done = true;
             break;
@@ -328,8 +366,6 @@ inline RtLinkParse parse_rtnetlink_link_chunk(std::span<const unsigned char> blo
             out.error = true;
             break;
         }
-        if (h->nlmsg_seq != expected_seq)
-            continue; // stale reply from an earlier dump on this socket
         if (h->nlmsg_type != RTM_NEWLINK)
             continue;
         if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct ifinfomsg)))
@@ -360,10 +396,22 @@ inline RtLinkParse parse_rtnetlink_link_chunk(std::span<const unsigned char> blo
                 rec.name.assign(data, name_len);
             } else if (rta->rta_type == IFLA_ADDRESS) {
                 const auto payload = static_cast<std::size_t>(RTA_PAYLOAD(rta));
-                if (payload >= 6) {
+                // EXACTLY 6, never ">= 6 then truncate": a non-Ethernet link
+                // (InfiniBand's 20-byte address, ip6tnl, ...) must come back
+                // unresolved, matching both the old leg -- which only read a
+                // MAC from iproute2's `link/ether ` prefix -- and format_mac's
+                // own contract ("never a fabricated MAC"). Truncating here
+                // would defeat that guard by pre-shortening its input.
+                if (payload == 6) {
                     unsigned char mac[6];
                     std::memcpy(mac, RTA_DATA(rta), 6);
                     rec.mac = format_mac(mac, 6);
+                }
+            } else if (rta->rta_type == IFLA_OPERSTATE) {
+                if (static_cast<std::size_t>(RTA_PAYLOAD(rta)) >= 1) {
+                    unsigned char st = 0;
+                    std::memcpy(&st, RTA_DATA(rta), 1);
+                    rec.oper_state = static_cast<int>(st);
                 }
             }
         }
@@ -388,6 +436,9 @@ inline RtAddrParse parse_rtnetlink_addr_chunk(std::span<const unsigned char> blo
     auto len = static_cast<int>(blob.size());
     const auto* h = reinterpret_cast<const struct nlmsghdr*>(blob.data());
     for (; NLMSG_OK(h, len); h = reinterpret_cast<const struct nlmsghdr*>(NLMSG_NEXT(h, len))) {
+        // Sequence check FIRST -- see parse_rtnetlink_link_chunk().
+        if (h->nlmsg_seq != expected_seq)
+            continue;
         if (h->nlmsg_type == NLMSG_DONE) {
             out.done = true;
             break;
@@ -396,8 +447,6 @@ inline RtAddrParse parse_rtnetlink_addr_chunk(std::span<const unsigned char> blo
             out.error = true;
             break;
         }
-        if (h->nlmsg_seq != expected_seq)
-            continue;
         if (h->nlmsg_type != RTM_NEWADDR)
             continue;
         if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct ifaddrmsg)))
@@ -466,6 +515,9 @@ inline RtRouteParse parse_rtnetlink_route_chunk(std::span<const unsigned char> b
     auto len = static_cast<int>(blob.size());
     const auto* h = reinterpret_cast<const struct nlmsghdr*>(blob.data());
     for (; NLMSG_OK(h, len); h = reinterpret_cast<const struct nlmsghdr*>(NLMSG_NEXT(h, len))) {
+        // Sequence check FIRST -- see parse_rtnetlink_link_chunk().
+        if (h->nlmsg_seq != expected_seq)
+            continue;
         if (h->nlmsg_type == NLMSG_DONE) {
             out.done = true;
             break;
@@ -474,8 +526,6 @@ inline RtRouteParse parse_rtnetlink_route_chunk(std::span<const unsigned char> b
             out.error = true;
             break;
         }
-        if (h->nlmsg_seq != expected_seq)
-            continue;
         if (h->nlmsg_type != RTM_NEWROUTE)
             continue;
         if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct rtmsg)))
