@@ -349,6 +349,13 @@ agent_test_exe = executable(
     'unit/test_bitlocker_local_dispatcher.cpp', # Wave 3 gate remediation: real bitlocker.dll driven
                                                 # end to end via LocalDispatcher (Windows-only; a no-op
                                                 # TU elsewhere via the file's own #ifdef _WIN32 guard)
+    'unit/test_installed_apps_parsers.cpp',   # Wave 4 PR4.3a: pure dpkg/rpm/pacman/system_profiler/
+                                                # brew/pkgutil parsers (installed_apps_parsers.hpp)
+    'unit/test_installed_apps_actions.cpp',   # Wave 4 PR4.3a remediation: real installed_apps.dylib/.so
+                                                # driven end to end via LocalDispatcher (POSIX-only; a
+                                                # no-op TU on Windows via the file's own #ifndef _WIN32 guard)
+    'unit/test_msi_packages_actions.cpp',     # Wave 4 PR4.3a remediation: real msi_packages.dylib driven
+                                                # end to end via LocalDispatcher (Darwin-only, self-gated)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -412,11 +419,16 @@ agent_test_exe = executable(
   # windows_updates_plugin_lib / sccm_plugin_lib: same reasoning for
   # test_windows_updates_{posix,win}_actions.cpp / test_sccm_win_actions.cpp
   # (Wave 3 PR33d code-review remediation).
+  # installed_apps_plugin_lib / msi_packages_plugin_lib
+  # (agents/plugins/{installed_apps,msi_packages}/meson.build):
+  # test_installed_apps_actions.cpp / test_msi_packages_actions.cpp load both
+  # real plugins by path for the identical reason (Wave 4 PR4.3a remediation).
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin,
                 users_plugin_lib, os_info_plugin_lib, processes_plugin_lib,
                 network_diag_plugin_lib, ioc_plugin_lib,
                 hardware_plugin_lib, device_identity_plugin_lib, netstat_plugin_lib,
-                windows_updates_plugin_lib, sccm_plugin_lib],
+                windows_updates_plugin_lib, sccm_plugin_lib,
+                installed_apps_plugin_lib, msi_packages_plugin_lib],
 )
 # Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
 # threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it

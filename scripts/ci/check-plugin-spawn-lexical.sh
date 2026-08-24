@@ -480,7 +480,6 @@ GRANDFATHERED = {
     "agents/plugins/content_dist/src/content_dist_plugin.cpp",
     "agents/plugins/event_logs/src/event_logs_plugin.cpp",
     "agents/plugins/firewall/src/firewall_plugin.cpp",
-    "agents/plugins/installed_apps/src/installed_apps_plugin.cpp",
     "agents/plugins/license_scan/src/licensing_linux.cpp",
     "agents/plugins/msi_packages/src/msi_packages_plugin.cpp",
     "agents/plugins/network_config/src/network_config_plugin.cpp",

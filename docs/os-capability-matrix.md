@@ -369,17 +369,17 @@ implementation is.
 | http_client | head | linux | supported | 1 | cpp-httplib (native sockets) | - |
 | http_client | head | macos | supported | 1 | cpp-httplib (native sockets) | - |
 | http_client | head | windows | supported | 1 | cpp-httplib (native sockets) | - |
-| installed_apps | list | linux | supported | 3 | popen(dpkg-query / rpm / pacman) | - |
-| installed_apps | list | macos | supported | 3 | popen(system_profiler SPApplicationsDataType) | - |
+| installed_apps | list | linux | supported | 2 | dpkg-query/rpm/pacman via bounded argv runner | - |
+| installed_apps | list | macos | supported | 2 | system_profiler via bounded argv runner | - |
 | installed_apps | list | windows | supported | 1 | Reg*W enumeration of the Uninstall key(s) | - |
-| installed_apps | query | linux | supported | 3 | popen(dpkg-query / rpm / pacman) | - |
-| installed_apps | query | macos | supported | 3 | popen(system_profiler SPApplicationsDataType) | - |
+| installed_apps | query | linux | supported | 2 | dpkg-query/rpm/pacman via bounded argv runner | - |
+| installed_apps | query | macos | supported | 2 | system_profiler via bounded argv runner | - |
 | installed_apps | query | windows | supported | 1 | Reg*W enumeration of the Uninstall key(s) | - |
-| installed_apps | list_per_user | linux | supported | 3 | popen(dpkg-query / rpm / pacman) | - |
-| installed_apps | list_per_user | macos | supported | 3 | popen(system_profiler SPApplicationsDataType) + popen(brew list --versions) | - |
+| installed_apps | list_per_user | linux | supported | 2 | dpkg-query/rpm/pacman via bounded argv runner | - |
+| installed_apps | list_per_user | macos | supported | 2 | system_profiler + brew via bounded argv runner | - |
 | installed_apps | list_per_user | windows | supported | 1 | Reg*W enumeration of HKU\\<SID>'s Uninstall key, mounting NTUSER.DAT via RegLoadKeyW when not already loaded | - |
-| installed_apps | list_inventory | linux | supported | 3 | popen(dpkg-query / rpm / pacman / apk) | - |
-| installed_apps | list_inventory | macos | supported | 3 | popen(system_profiler SPApplicationsDataType) | - |
+| installed_apps | list_inventory | linux | supported | 2 | dpkg-query/rpm/pacman/apk via bounded argv runner | - |
+| installed_apps | list_inventory | macos | supported | 2 | system_profiler + pkgutil via bounded argv runner + native SecCode/CFBundle enrichment | - |
 | installed_apps | list_inventory | windows | supported | 1 | Reg*W enumeration of the Uninstall key(s) | - |
 | interaction | notify | linux | supported | 2 | notify_send | - |
 | interaction | notify | macos | constrained | 3 | osascript | no reachable GUI session under a headless/root LaunchDaemon |
@@ -406,10 +406,10 @@ implementation is.
 | license_scan | surfaces | macos | constrained | 1 | filesystem_probe(glob+plist) | binary (bplist00) Info.plist files are not parsed; falls back to the bundle name with an empty version |
 | license_scan | surfaces | windows | supported | 1 | wmi+win32_registry | - |
 | msi_packages | list | linux | unsupported | - | - | - |
-| msi_packages | list | macos | supported | 3 | pkgutil | - |
+| msi_packages | list | macos | supported | 2 | pkgutil via bounded argv runner | - |
 | msi_packages | list | windows | supported | 1 | msi_api | - |
 | msi_packages | product_codes | linux | unsupported | - | - | - |
-| msi_packages | product_codes | macos | supported | 3 | pkgutil | - |
+| msi_packages | product_codes | macos | supported | 2 | pkgutil via bounded argv runner | - |
 | msi_packages | product_codes | windows | supported | 1 | msi_api | - |
 | netprobe | icmp | linux | constrained | 1 | SOCK_DGRAM ICMP ping socket | requires net.ipv4.ping_group_range to admit the process group; reports not-permitted otherwise |
 | netprobe | icmp | macos | supported | 1 | SOCK_DGRAM ICMP ping socket | - |
