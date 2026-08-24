@@ -1468,6 +1468,147 @@ TEST_CASE("migrate_from_sqlite never rewinds a status Postgres has already advan
     CHECK((*after)->last_check_at == advanced_last_check);
 }
 
+TEST_CASE("migrate_from_sqlite fails closed on a legacy-ahead status row (adversarial review)",
+          "[policy_store][pg][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    PolicyFragment frag;
+    frag.id = "bfrag-legacy-ahead-1";
+    frag.name = "Legacy-Ahead Fragment";
+    frag.yaml_source = "kind: PolicyFragment";
+    frag.check_instruction = "get_service_status";
+    frag.check_compliance = "result.status == 'running'";
+    frag.check_parameters = "{}";
+    frag.fix_parameters = "{}";
+    frag.post_check_parameters = "{}";
+    frag.created_at = 1000;
+    frag.updated_at = 1000;
+
+    Policy pol;
+    pol.id = "bpol-legacy-ahead-1";
+    pol.name = "Legacy-Ahead Policy";
+    pol.yaml_source = "kind: Policy";
+    pol.fragment_id = frag.id;
+    pol.scope_expression = "ostype == \"windows\"";
+    pol.enabled = true;
+    pol.created_at = 1001;
+    pol.updated_at = 1001;
+
+    // First backfill: identity only, no status row — lands the policy in
+    // Postgres so update_agent_status (FK'd to policies) can write to it.
+    auto legacy_path =
+        yuzu::test::unique_temp_path("yuzu_test_polstore_legacy_ahead") / "policies.db";
+    std::filesystem::create_directories(legacy_path.parent_path());
+    write_legacy_policy_sqlite_db(legacy_path, {frag}, {pol}, {}, {}, {}, {});
+    REQUIRE(store.migrate_from_sqlite(legacy_path));
+
+    // Postgres accumulates live evaluator status via ordinary traffic.
+    REQUIRE(store.update_agent_status(pol.id, "agent-1", "compliant"));
+    auto seeded = store.get_agent_status(pol.id, "agent-1");
+    REQUIRE(seeded.has_value());
+    REQUIRE(seeded->has_value());
+    CHECK((*seeded)->status == "compliant");
+    const int64_t seeded_last_check = (*seeded)->last_check_at;
+
+    // A second legacy file (SAME fragment/policy content — same fingerprint,
+    // so the identity block is skipped as already-processed; only the
+    // status merge runs) carries a status row whose last_check_at is far
+    // ahead of what Postgres just wrote — simulating an independently
+    // advanced or restored legacy snapshot.
+    LegacyStatusRow ahead_status;
+    ahead_status.policy_id = pol.id;
+    ahead_status.agent_id = "agent-1";
+    ahead_status.status = "non_compliant";
+    ahead_status.last_check_at = seeded_last_check + 1'000'000; // far ahead
+    ahead_status.check_result = "{}";
+    ahead_status.fix_attempt_count = 0;
+
+    auto legacy_path2 =
+        yuzu::test::unique_temp_path("yuzu_test_polstore_legacy_ahead2") / "policies.db";
+    std::filesystem::create_directories(legacy_path2.parent_path());
+    write_legacy_policy_sqlite_db(legacy_path2, {frag}, {pol}, {}, {}, {}, {ahead_status});
+
+    // Must fail closed — never silently overwrite live post-cutover status
+    // with an independently-advanced or restored legacy snapshot.
+    CHECK_FALSE(store.migrate_from_sqlite(legacy_path2));
+
+    auto after = store.get_agent_status(pol.id, "agent-1");
+    REQUIRE(after.has_value());
+    REQUIRE(after->has_value());
+    CHECK((*after)->status == "compliant");
+    CHECK((*after)->last_check_at == seeded_last_check);
+}
+
+TEST_CASE("migrate_from_sqlite fails closed when a differently-fingerprinted legacy file "
+          "diverges from an already-landed backfill (adversarial review)",
+          "[policy_store][pg][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    PolicyFragment frag_a;
+    frag_a.id = "bfrag-holder-1";
+    frag_a.name = "Holder Fragment A";
+    frag_a.yaml_source = "kind: PolicyFragment";
+    frag_a.check_instruction = "get_service_status";
+    frag_a.check_compliance = "result.status == 'running'";
+    frag_a.check_parameters = "{}";
+    frag_a.fix_parameters = "{}";
+    frag_a.post_check_parameters = "{}";
+    frag_a.created_at = 1000;
+    frag_a.updated_at = 1000;
+
+    Policy pol_a;
+    pol_a.id = "bpol-holder-1";
+    pol_a.name = "Holder Policy A";
+    pol_a.yaml_source = "kind: Policy";
+    pol_a.fragment_id = frag_a.id;
+    pol_a.scope_expression = "ostype == \"windows\"";
+    pol_a.enabled = true;
+    pol_a.created_at = 1001;
+    pol_a.updated_at = 1001;
+
+    PolicyTrigger trg_a;
+    trg_a.policy_id = pol_a.id;
+    trg_a.trigger_type = "interval";
+    trg_a.config_json = R"({"interval_seconds":600})";
+
+    auto path_a = yuzu::test::unique_temp_path("yuzu_test_polstore_holder_a") / "policies.db";
+    std::filesystem::create_directories(path_a.parent_path());
+    write_legacy_policy_sqlite_db(path_a, {frag_a}, {pol_a}, {}, {trg_a}, {}, {});
+    REQUIRE(store.migrate_from_sqlite(path_a));
+
+    // A second, DIFFERENT legacy file — different fragment content (so a
+    // different fingerprint), simulating a sibling replica with genuinely
+    // different legacy content for the same store. Must be refused, not
+    // silently merged (which would otherwise no-op the fragment/policy
+    // identity rows and, worse, APPEND a second, duplicate trigger row for
+    // pol_a since policy_triggers has no conflict target).
+    PolicyFragment frag_b = frag_a;
+    frag_b.description = "diverged content changes the fingerprint";
+
+    PolicyTrigger trg_b;
+    trg_b.policy_id = pol_a.id;
+    trg_b.trigger_type = "interval";
+    trg_b.config_json = R"({"interval_seconds":900})";
+
+    auto path_b = yuzu::test::unique_temp_path("yuzu_test_polstore_holder_b") / "policies.db";
+    std::filesystem::create_directories(path_b.parent_path());
+    write_legacy_policy_sqlite_db(path_b, {frag_b}, {pol_a}, {}, {trg_b}, {}, {});
+
+    CHECK_FALSE(store.migrate_from_sqlite(path_b));
+
+    // The original trigger must be the ONLY one — no duplicate/appended row
+    // from the refused second file.
+    auto got_pol = store.get_policy(pol_a.id);
+    REQUIRE(got_pol.has_value());
+    REQUIRE(got_pol->has_value());
+    REQUIRE((*got_pol)->triggers.size() == 1);
+    CHECK((*got_pol)->triggers[0].config_json == trg_a.config_json);
+}
+
 TEST_CASE("migrate_from_sqlite tolerates a legacy file predating the fix_attempt_count "
           "ALTER-wart column (G4-UHP-POL-003)",
           "[policy_store][pg][backfill]") {
