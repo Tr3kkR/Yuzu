@@ -217,6 +217,22 @@ TEST_CASE("login_keychain_path builds the keychain path from a resolved home dir
          "/Volumes/Homes/bob.smith/Library/Keychains/login.keychain-db");
 }
 
+TEST_CASE("login_keychain_path fails closed on a home directory it would reject",
+         "[certificates][macos]") {
+    // The function returns std::optional and re-checks is_valid_home_dir
+    // itself, so it can never hand back a path built from a rejected value
+    // -- matching every other guard in this header. The relative case is the
+    // one that matters: #3406 changed this function's parameter MEANING from
+    // a username to a home directory without changing its type, so a stale
+    // caller passing "alice" would otherwise have silently produced the
+    // RELATIVE path "alice/Library/Keychains/login.keychain-db", resolved
+    // against the daemon's own cwd.
+    CHECK_FALSE(login_keychain_path("").has_value());
+    CHECK_FALSE(login_keychain_path("alice").has_value());
+    CHECK_FALSE(login_keychain_path("Users/alice").has_value());
+    CHECK_FALSE(login_keychain_path("~alice").has_value());
+}
+
 TEST_CASE("is_valid_home_dir accepts absolute paths only", "[certificates][macos]") {
     CHECK(is_valid_home_dir("/Users/alice"));
     CHECK(is_valid_home_dir("/var/empty"));

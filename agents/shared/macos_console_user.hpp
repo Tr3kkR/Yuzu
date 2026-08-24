@@ -84,6 +84,13 @@ namespace yuzu::macos {
 struct ConsoleUser {
     std::string username;
     std::string uid;
+    // The account's home directory, from the SAME passwd lookup that produced
+    // `uid` (#3406). EMPTY means the lookup succeeded but returned a pw_dir
+    // that is not a usable absolute path -- the console user is still validly
+    // identified (username + uid are good), only the login-keychain leg is
+    // unavailable, and the caller must emit an honest sentinel for that leg
+    // rather than guessing a path. Never treat empty as "use the default".
+    std::string home_dir;
 };
 
 namespace detail {
@@ -152,10 +159,15 @@ inline bool is_valid_username(std::string_view username) {
     return true;
 }
 
-// Injection guard for `id -u <username>` output: numeric-only,
-// non-empty. (uid 0 would mean the console user is root, which
-// is_no_console_user() already excludes upstream via the username check --
-// this function is purely a SYNTACTIC guard, not a semantic one.)
+// Injection guard for the console user's uid: numeric-only, non-empty.
+// (uid 0 would mean the console user is root, which is_no_console_user()
+// already excludes upstream via the username check -- this function is
+// purely a SYNTACTIC guard, not a semantic one.) Since #3406 the uid is a
+// decimal format of getpwnam_r's pw_uid rather than the output of an
+// `/usr/bin/id -u <username>` subprocess, so it is digits by construction
+// and this guard is defensive; it is kept deliberately, because it is the
+// shared gate every value entering the argv must pass and a future change
+// to how the uid is sourced must not silently bypass it.
 inline bool is_valid_uid(std::string_view uid) {
     if (uid.empty())
         return false;
@@ -198,7 +210,22 @@ inline bool is_valid_home_dir(std::string_view home_dir) {
 // the whole read become a pre-split rung-2 argv.) `home_dir` MUST already
 // be validated (is_valid_home_dir) before reaching here, same as every
 // other value this header places into an argv element.
-inline std::string login_keychain_path(std::string_view home_dir) {
+//
+// Returns std::nullopt -- never a string -- when `home_dir` fails
+// is_valid_home_dir, so this FAILS CLOSED like every other guard in this
+// header rather than handing back a path built from a rejected value. The
+// optional return is also deliberate API hygiene: #3406 changed this
+// function's PARAMETER MEANING (it took a USERNAME before, and built a
+// `~username/...` string for a shell to expand) without changing its
+// arity or its string_view type, so a stale caller still passing a
+// username would otherwise have compiled silently and produced the
+// RELATIVE path "alice/Library/Keychains/login.keychain-db" -- resolved
+// against the daemon's own cwd, exactly the failure is_valid_home_dir
+// exists to prevent. Returning an optional breaks any such caller at
+// compile time instead.
+inline std::optional<std::string> login_keychain_path(std::string_view home_dir) {
+    if (!is_valid_home_dir(home_dir))
+        return std::nullopt;
     return std::format("{}/Library/Keychains/login.keychain-db", home_dir);
 }
 
@@ -314,6 +341,26 @@ inline std::optional<std::string> resolve_delete_keychain_path(std::string_view 
 // this" (never fall back to running it anyway, never treat it as an
 // empty-but-safe command).
 //
+// NO `--` end-of-options terminator, deliberately. ADR-3002 Decision 8
+// names `--` canonical for sudo argv, and it was considered here and
+// REJECTED for this site on two grounds. (1) It buys nothing: Decision 6's
+// alternative is already fully satisfied -- the only two caller-derived
+// values downstream of a sudo are `uid` (is_valid_uid: digits only) and
+// `username` (is_valid_username: rejects a leading '-' outright), so
+// neither can present as an option however hostile the source. (2) It
+// carries a real deployment risk that outweighs the nil benefit: the
+// dormant #1455 sudoers grant is written as a fixed token sequence
+// (`... /usr/bin/sudo -n -u * /usr/bin/security find-certificate -a -p *`,
+// see below and docs/agent-privilege-model.md). Inserting `--` adds an
+// argument that grant does not name, and whether sudoers' wildcard
+// matching would still admit it depends on argument-joining behaviour this
+// change cannot verify without a root session to test against. Silently
+// falsifying a grant that only activates when #1455 lands -- long after
+// anyone would connect the failure to this line -- is a far worse outcome
+// than the defence-in-depth it would add. If `--` is wanted here, it must
+// land WITH the grant text updated in both places and exercised as root,
+// not as a drive-by on a transport migration.
+//
 // `caller_is_root` mirrors the sudo_prefix() idiom already established in
 // quarantine_plugin.cpp (geteuid() == 0 -> no sudo round-trip needed) --
 // passed in rather than queried here via geteuid() so this function stays a
@@ -355,7 +402,10 @@ inline std::vector<std::string> build_login_keychain_read_argv(std::string_view 
                                                                std::string_view username,
                                                                std::string_view home_dir,
                                                                bool caller_is_root) {
-    if (!is_valid_uid(uid) || !is_valid_username(username) || !is_valid_home_dir(home_dir))
+    if (!is_valid_uid(uid) || !is_valid_username(username))
+        return {};
+    auto keychain = login_keychain_path(home_dir); // re-validates home_dir, fails closed
+    if (!keychain)
         return {};
     std::vector<std::string> argv;
     if (!caller_is_root) {
@@ -364,7 +414,7 @@ inline std::vector<std::string> build_login_keychain_read_argv(std::string_view 
     }
     argv.insert(argv.end(), {"/bin/launchctl", "asuser", std::string(uid), "/usr/bin/sudo", "-n",
                              "-u", std::string(username), "/usr/bin/security", "find-certificate",
-                             "-a", "-p", login_keychain_path(home_dir)});
+                             "-a", "-p", *keychain});
     return argv;
 }
 

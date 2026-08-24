@@ -1029,21 +1029,39 @@ bool caller_is_root() {
     return is_root;
 }
 
+/// One passwd record, reduced to the two fields this plugin needs.
+/// `home_dir` is EMPTY when the record's pw_dir is not a usable absolute
+/// path -- see ConsoleUser::home_dir for what that means to the caller.
+struct PasswdEntry {
+    std::string uid;      // pw_uid, decimal-formatted
+    std::string home_dir; // pw_dir, "" if it failed is_valid_home_dir
+};
+
 /**
- * Resolve `username`'s home directory in-process via getpwnam_r -- the
- * same directory-services lookup a POSIX shell performs for `~username`
- * tilde expansion, so a relocated/mobile/network-home account resolves to
- * the identical path the previous `/bin/sh -c` + `~user` mechanism
- * produced (#3406 argv-ized the login-keychain read; this lookup replaced
- * the shell's one remaining job). Not a subprocess and not an interpreter:
- * a plain libc/directory-services read, so it adds no rung under ADR-3002.
+ * Look up `username` in-process via getpwnam_r, returning its uid and home
+ * directory from ONE directory-services read.
  *
- * Returns std::nullopt on any lookup failure, a missing account entry, or
- * a pw_dir that fails is_valid_home_dir (empty/relative) -- the caller
- * treats that exactly like argv construction failing: an honest
- * "command construction failed" sentinel, never a guessed path.
+ * This is the same lookup a POSIX shell performs for `~username` tilde
+ * expansion, so a relocated/mobile/network-home account resolves to the
+ * identical path the previous `/bin/sh -c` + `~user` mechanism produced
+ * (#3406 argv-ized the login-keychain read; this replaced the shell's one
+ * remaining job). It ALSO subsumes the former `/usr/bin/id -u <username>`
+ * subprocess: `id -u` answers exactly what `pw_uid` already carries here,
+ * from the same database, so once this call existed on the path that spawn
+ * was pure redundancy -- removing it drops one process spawn per macOS
+ * list/details action and retires sink `certificates/resolve_console_user#2`
+ * outright (ADR-3002 prefers eliminating a spawn over any rung it could
+ * hold). Not a subprocess and not an interpreter: a plain
+ * libc/directory-services read, so it adds no rung.
+ *
+ * Returns std::nullopt when the account cannot be resolved AT ALL (lookup
+ * error, no such record, or still ERANGE after the retry) -- the caller
+ * treats that exactly as the old `id -u` failure was treated: no usable
+ * console user. A record that resolves but carries an unusable pw_dir is
+ * NOT nullopt: uid is still authoritative, so the entry is returned with an
+ * empty `home_dir` and only the login-keychain leg degrades.
  */
-std::optional<std::string> resolve_login_home(const std::string& username) {
+std::optional<PasswdEntry> resolve_passwd_entry(const std::string& username) {
     struct passwd pwd {};
     struct passwd* result = nullptr;
     long suggested = sysconf(_SC_GETPW_R_SIZE_MAX);
@@ -1051,17 +1069,20 @@ std::optional<std::string> resolve_login_home(const std::string& username) {
     // macOS record, and the one ERANGE retry below covers a pathological one.
     std::vector<char> buf(suggested > 0 ? static_cast<std::size_t>(suggested) : 4096);
     for (int attempt = 0; attempt < 2; ++attempt) {
+        // rc, NOT errno, carries the getpwnam_r error (POSIX); rc == 0 with a
+        // null result is the distinct "no such account" case, not an error.
         int rc = getpwnam_r(username.c_str(), &pwd, buf.data(), buf.size(), &result);
         if (rc == ERANGE) {
             buf.resize(buf.size() * 4);
             continue;
         }
-        if (rc != 0 || result == nullptr || result->pw_dir == nullptr)
+        if (rc != 0 || result == nullptr)
             return std::nullopt;
-        std::string home = result->pw_dir;
-        if (!yuzu::macos::is_valid_home_dir(home))
-            return std::nullopt;
-        return home;
+        PasswdEntry entry;
+        entry.uid = std::to_string(static_cast<unsigned long long>(result->pw_uid));
+        if (result->pw_dir != nullptr && yuzu::macos::is_valid_home_dir(result->pw_dir))
+            entry.home_dir = result->pw_dir;
+        return entry;
     }
     return std::nullopt; // still ERANGE after the retry -- treated as lookup failure
 }
@@ -1110,32 +1131,27 @@ std::optional<yuzu::macos::ConsoleUser> resolve_console_user(
     if (!yuzu::macos::is_valid_username(username))
         return std::nullopt;
 
-    // `username` is already allowlist-validated above -- run_bounded_subprocess
-    // execs argv directly (no shell), so this was never a shell-injection
-    // vector even before, but the validate-before-use order is unchanged.
-    auto id_deadline = clamp_to_action_budget(action_deadline, kCertParseDeadline);
-    if (id_deadline <= std::chrono::milliseconds::zero())
+    // The uid and the home directory both come from ONE in-process
+    // getpwnam_r read (#3406). This replaced a second `/usr/bin/id -u
+    // <username>` subprocess that asked the same database for the same uid:
+    // once the login-keychain leg needed pw_dir from here anyway, that spawn
+    // was pure redundancy, so it is gone and sink
+    // `certificates/resolve_console_user#2` is retired. No deadline clamp is
+    // needed any more either -- a libc directory-services read is not a
+    // bounded-subprocess call, which is also why the whole-action budget now
+    // stretches further on this path than it did before.
+    auto pw = resolve_passwd_entry(username);
+    if (!pw)
         return std::nullopt;
-    // sink: certificates/resolve_console_user#2 — rung-2 runner argv, same
-    // constraint as #1, see manifest
-    auto id_result = run_bounded_checked({"/usr/bin/id", "-u", username},
-                                         yuzu::agent::SubprocessOptions{
-                                             .deadline = id_deadline},
-                                         "console-user id -u");
-    // parse_console_user_output is a plain leading/trailing-whitespace trim
-    // (see its own doc comment) -- reused here for `id -u`'s output too
-    // (fix-round finding FP-CERTS-01): run_bounded_subprocess's `.output`
-    // is the raw captured stream, trailing '\n' included, and
-    // is_valid_uid() rejects any non-digit character outright, so an
-    // untrimmed "501\n" always failed validation and this branch always
-    // returned std::nullopt -- silently disabling login-keychain reads
-    // entirely for every real console user.
-    auto uid = yuzu::macos::parse_console_user_output(id_result.ok ? id_result.output
-                                                                   : std::string{});
-    if (!yuzu::macos::is_valid_uid(uid))
+    // Defensive: pw_uid is an integral uid_t, so a decimal format of it is
+    // digits by construction and this can't fail -- kept because every value
+    // this plugin carries into an argv passes its shared guard first, and a
+    // future change to how uid is sourced must not silently skip it.
+    if (!yuzu::macos::is_valid_uid(pw->uid))
         return std::nullopt;
 
-    return yuzu::macos::ConsoleUser{std::move(username), std::move(uid)};
+    return yuzu::macos::ConsoleUser{std::move(username), std::move(pw->uid),
+                                    std::move(pw->home_dir)};
 }
 
 // canonical_thumbprint() moved to the shared __linux__/__APPLE__ block above
@@ -1266,19 +1282,24 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
     if (plan.want_login) {
         // console_user is guaranteed engaged here: resolve_store_plan only
         // sets want_login when has_console_user was true.
-        auto login_home = resolve_login_home(console_user->username);
-        auto argv = login_home ? yuzu::macos::build_login_keychain_read_argv(
-                                     console_user->uid, console_user->username, *login_home,
-                                     caller_is_root())
-                               : std::vector<std::string>{};
-        if (argv.empty()) {
-            // resolve_console_user() already validated uid/username before
-            // console_user was populated, so the realistic path here is
-            // resolve_login_home() failing for the resolved console user
-            // (getpwnam_r failure / no account record / non-absolute
-            // pw_dir); build_login_keychain_read_argv()'s own re-validation
-            // is defensive only. Either way: an honest sentinel rather
-            // than a silent no-op or a guessed keychain path.
+        // Two DISTINCT failures, reported distinctly. An empty home_dir means
+        // the console user resolved but their passwd record carried no usable
+        // absolute pw_dir -- the realistic failure, and the one an operator can
+        // actually act on. An empty argv after a good home_dir would mean
+        // build_login_keychain_read_argv()'s own re-validation rejected a
+        // uid/username resolve_console_user() had already validated: defensive
+        // only, and a genuinely different (internal) fault. Reporting both as
+        // "command construction failed" told the operator the wrong thing.
+        auto argv = console_user->home_dir.empty()
+                        ? std::vector<std::string>{}
+                        : yuzu::macos::build_login_keychain_read_argv(
+                              console_user->uid, console_user->username,
+                              console_user->home_dir, caller_is_root());
+        if (console_user->home_dir.empty()) {
+            ctx.write_output(
+                "not_available|login keychain home directory unresolved for console user");
+            mark_result_partial(ctx, "login-keychain");
+        } else if (argv.empty()) {
             ctx.write_output("not_available|login keychain command construction failed");
             mark_result_partial(ctx, "login-keychain");
         } else {
@@ -1480,15 +1501,20 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
     }
 
     if (plan.want_login) {
-        auto login_home = resolve_login_home(console_user->username);
-        auto argv = login_home ? yuzu::macos::build_login_keychain_read_argv(
-                                     console_user->uid, console_user->username, *login_home,
-                                     caller_is_root())
-                               : std::vector<std::string>{};
+        // See list_certs_macos's matching comment: home-resolution failure and
+        // a defensive argv-construction failure are distinct faults and are
+        // reported as such.
+        auto argv = console_user->home_dir.empty()
+                        ? std::vector<std::string>{}
+                        : yuzu::macos::build_login_keychain_read_argv(
+                              console_user->uid, console_user->username,
+                              console_user->home_dir, caller_is_root());
         if (argv.empty()) {
             if (!read_failed) {
                 read_failed = true;
-                failure_reason = "login keychain command construction failed";
+                failure_reason = console_user->home_dir.empty()
+                                     ? "login keychain home directory unresolved for console user"
+                                     : "login keychain command construction failed";
                 failure_provenance = "login-keychain";
             }
         } else {

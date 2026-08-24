@@ -403,7 +403,13 @@ removes its spawn from the picture entirely.
    truly required), it is exec'd **through the runner** with the
    script/expression as a single argv element built from validated or
    compile-time-constant parts — the shape `certificates` already uses on the
-   branch. The outer spawn is safe and bounded; the embedded script content
+   branch. (Dated note: that `certificates` exemplar no longer exists. #3406
+   argv-ized the login-keychain hop by resolving the home directory in-process
+   via `getpwnam_r`, which removed the `~username` expansion this clause cites
+   as its example of a genuinely-required shell capability. The clause itself
+   is unchanged and still governs — the example is simply now historical, and
+   worth reading as evidence that a "truly required" shell capability is worth
+   re-testing before it is accepted.) The outer spawn is safe and bounded; the embedded script content
    remains code and stays a per-site security review concern. Decision-5
    interpreter sites are **registered in the same call-identity ledger as
    Decision-7 exceptions**, so the "argv'd interpreter" population is
