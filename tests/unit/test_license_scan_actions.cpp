@@ -83,11 +83,12 @@ std::optional<LoadedPlugin> load_license_scan_plugin() {
 
 TEST_CASE("license_scan plugin: surfaces reports probe_status diagnostics via LocalDispatcher",
           "[license_scan]") {
+    // Deliberately NOT a WARN-and-skip -- see the same note in
+    // test_software_actions_actions.cpp. tests/meson.build links this plugin
+    // in, so a load failure is a real defect and must go red rather than
+    // pass with zero assertions.
     auto plugin = load_license_scan_plugin();
-    if (!plugin) {
-        WARN("license_scan plugin library not found -- skipping LocalDispatcher round-trip test");
-        return;
-    }
+    REQUIRE(plugin.has_value());
 
     yuzu::agent::LocalDispatcher dispatcher;
     auto result = dispatcher.run(plugin->descriptor, "surfaces");

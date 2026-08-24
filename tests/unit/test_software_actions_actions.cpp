@@ -85,12 +85,14 @@ std::optional<LoadedPlugin> load_software_actions_plugin() {
 TEST_CASE("software_actions plugin: installed_count reports a real digit count via "
           "dpkg-query/rpm/pkgutil argv",
           "[software_actions]") {
+    // Deliberately NOT a WARN-and-skip. tests/meson.build links the
+    // software_actions plugin into this executable, so it is always present
+    // when this case runs; a skip would let a plugin-load failure -- exactly
+    // what a broken migration looks like -- pass as green with ZERO
+    // assertions, which the repo treats as a policy-floor violation when
+    // offered as closure evidence.
     auto plugin = load_software_actions_plugin();
-    if (!plugin) {
-        WARN("software_actions plugin library not found -- skipping LocalDispatcher round-trip "
-             "test");
-        return;
-    }
+    REQUIRE(plugin.has_value());
 
     yuzu::agent::LocalDispatcher dispatcher;
     auto result = dispatcher.run(plugin->descriptor, "installed_count");
