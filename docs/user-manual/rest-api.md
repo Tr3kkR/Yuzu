@@ -7396,13 +7396,15 @@ Install a product pack from a multi-document YAML bundle.
 
 **Response:**
 - `201 Created` `{"id": "<pack-id>", "status": "installed"}` on success.
-- `400 Bad Request` `{"error": "<message>"}` on rejection. Distinct error strings:
+- `400 Bad Request` — malformed YAML, missing required fields, item-install delegation failures, or a signature rejection. Distinct error messages:
   - `pack '<name>' is unsigned and signature enforcement is enabled (set --allow-unsigned-packs / YUZU_ALLOW_UNSIGNED_PACKS=1 to bypass)` — the install was refused because the pack carried no `signature:` field and the server is enforcing signatures (default since #802). Either sign the pack or set the escape-hatch flag.
   - `signature verification failed for pack '<name>' — content may have been tampered with` — the signature was present but did not verify against the supplied public key.
   - `pack '<name>' has signature but no publicKey — cannot verify` — the bundle carried a `signature:` field but no `publicKey:`.
-- Other 4xx for malformed YAML, missing required fields, or item-install delegation failures.
+  - `duplicate item id in bundle: '<item_id>'` — two documents in the bundle were assigned the same item id (by their `install_fn` delegate). Detected before any database interaction; this condition is deterministic, so a retry with the same bundle always fails the same way — never retry, fix the bundle instead.
+- `503 Service Unavailable` — the product pack store is unreachable (down/unmigrated) or a database error occurred persisting the pack. The response body carries only a generic `"service unavailable"` message; the specific database error is logged server-side, never echoed to the caller (migrated store — ADR-0054, mirrors `sw_deploy_client_message`/`device_token_client_message`'s established rationale for not leaking `PQerrorMessage()` fragments).
+- Both the `400` and `503` bodies use the standard **A4 error envelope** (`{"error": {"code", "message", "correlation_id", ...}, "meta": {"api_version": "v1"}}`, see [JSON Envelope](#json-envelope) above). **Breaking change (ADR-0054):** pre-migration, a rejected install returned a bare `{"error": "<message>"}` body — a client parsing that flat shape (rather than treating the body as opaque diagnostic text) must switch to reading `error.message`.
 
-**Audit:** Emits `product_pack.install` with `result=success` and `target_id=<pack-id>` on accepted install, or `result=denied` with `target_type=ProductPack`, empty `target_id`, and the rejection message in `detail` on any 400 rejection (closes the SOC 2 CC6.7 logging gap from W7.4 governance).
+**Audit:** Emits `product_pack.install` with `result=success` and `target_id=<pack-id>` on accepted install, or `result=denied` with `target_type=ProductPack`, empty `target_id`, and the rejection message in `detail` on any `400` or `503` rejection (closes the SOC 2 CC6.7 logging gap from W7.4 governance).
 
 #### `GET /api/product-packs`
 
@@ -7410,7 +7412,9 @@ List installed packs.
 
 **Permission:** `ProductPack:Read`.
 
-**Response:** JSON array of `{id, name, version, description, installed_at, verified}` objects.
+**Response:**
+- `200 OK` — JSON array of `{id, name, version, description, installed_at, verified}` objects.
+- `503 Service Unavailable` — the store is unreachable or the list query failed. A4 error envelope, generic message (see the `POST` route above for the no-raw-DB-error-to-caller rationale).
 
 #### `GET /api/product-packs/:id`
 
@@ -7418,7 +7422,10 @@ Get a single pack with its items.
 
 **Permission:** `ProductPack:Read`.
 
-**Response:** Single pack JSON object including the `items[]` array (each `{kind, item_id, name}`).
+**Response:**
+- `200 OK` — the pack JSON object including the `items[]` array (each `{kind, item_id, name}`).
+- `404 Not Found` — no pack with that id. A4 error envelope.
+- `503 Service Unavailable` — the store is unreachable or the read failed. A4 error envelope, generic message.
 
 #### `DELETE /api/product-packs/:id`
 
@@ -7426,7 +7433,12 @@ Uninstall a pack, removing all delegated items.
 
 **Permission:** `ProductPack:Delete`.
 
-**Audit:** Emits `product_pack.uninstall`.
+**Response:**
+- `200 OK` `{"status": "uninstalled"}` on success.
+- `404 Not Found` — no pack with that id. A4 error envelope. **Breaking change (ADR-0054):** the pre-migration route always returned a bare `{"error": "<message>"}` body at `400` for a missing id; automation that special-cased `400` or parsed the flat body shape on this route must switch to `404` + `error.message`.
+- `503 Service Unavailable` — the store is unreachable or the delete failed. A4 error envelope, generic message.
+
+**Audit:** Emits `product_pack.uninstall` with `result=success` and `target_id=<pack-id>` on success, or `result=denied` with `target_type=ProductPack`, `target_id=<pack-id>`, and the rejection message in `detail` on any `404`/`503` rejection (ADR-0054 — pre-migration, a rejected uninstall was not audited at all).
 
 ---
 
