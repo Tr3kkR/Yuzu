@@ -194,6 +194,60 @@ TEST_CASE("system_profiler apps: non-ASCII and punctuation-leading names are emi
     CHECK(apps[2].name == "Normal");
 }
 
+TEST_CASE("system_profiler apps: an app named like an attribute key is its own row",
+          "[installed_apps]") {
+    // Gate-2 regression, found independently by BOTH adversarial reviewers.
+    // The attribute prefixes used to be tested before the 4-space header, so a
+    // real app named "Location" (or "Version" / "Last Modified") matched the
+    // attribute branch: it never flushed, so it vanished from list/query and
+    // the inventory, AND its fields landed on the PRECEDING app -- which, via
+    // the Location-driven #2273 enrichment, meant the impostor's bundle
+    // supplied a legitimate app's publisher and signature_status.
+    // Indent, not key name, decides.
+    constexpr std::string_view out = "    Keynote:\n"
+                                     "      Version: 14.0\n"
+                                     "      Location: /Applications/Keynote.app\n"
+                                     "    Location:\n"
+                                     "      Version: 6.6.6\n"
+                                     "      Location: /Applications/Location.app\n"
+                                     "    Safari:\n"
+                                     "      Version: 18\n"
+                                     "      Location: /Applications/Safari.app\n";
+    auto apps = parse_system_profiler_apps(out);
+    REQUIRE(apps.size() == 3);
+
+    // Keynote keeps its OWN version and path -- not the impostor's.
+    CHECK(apps[0].name == "Keynote");
+    CHECK(apps[0].version == "14.0");
+    CHECK(apps[0].location == "/Applications/Keynote.app");
+
+    // The app named "Location" is present, not concealed.
+    CHECK(apps[1].name == "Location");
+    CHECK(apps[1].version == "6.6.6");
+    CHECK(apps[1].location == "/Applications/Location.app");
+
+    CHECK(apps[2].name == "Safari");
+    CHECK(apps[2].version == "18");
+}
+
+TEST_CASE("system_profiler apps: an app named Version or Last Modified is its own row",
+          "[installed_apps]") {
+    constexpr std::string_view out = "    Version:\n"
+                                     "      Version: 1.0\n"
+                                     "    Last Modified:\n"
+                                     "      Version: 2.0\n"
+                                     "    Normal:\n"
+                                     "      Version: 3.0\n";
+    auto apps = parse_system_profiler_apps(out);
+    REQUIRE(apps.size() == 3);
+    CHECK(apps[0].name == "Version");
+    CHECK(apps[0].version == "1.0");
+    CHECK(apps[1].name == "Last Modified");
+    CHECK(apps[1].version == "2.0");
+    CHECK(apps[2].name == "Normal");
+    CHECK(apps[2].version == "3.0");
+}
+
 TEST_CASE("system_profiler apps: deeper-indented lines are never app headers",
           "[installed_apps]") {
     // The widening above loosens WHICH character may follow the 4 spaces, not

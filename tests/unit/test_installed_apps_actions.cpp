@@ -170,7 +170,23 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
     yuzu::agent::LocalDispatcher dispatcher;
     auto result = dispatcher.run(plugin->descriptor, "list_inventory");
 
-    CHECK(result.rc == 0);
+    // Two legal outcomes, and the test asserts the CONTRACT of whichever
+    // occurred rather than assuming a healthy host. Adversarial review
+    // reproduced `system_profiler` exiting 0 having written nothing, which made
+    // an unconditional "there are apps" assertion flaky in exactly the way a
+    // shared CI runner would hit. That degraded case is now a first-class
+    // outcome (rc=1, publish nothing), so assert THAT here instead of skipping:
+    // a partial inventory must never be emitted alongside a degraded result.
+    if (result.rc != 0) {
+        WARN("list_inventory reported a degraded acquisition (rc="
+             << result.rc << ") -- asserting the degraded contract instead");
+        CHECK(result.rc == 1);
+        // The whole point of the degraded path: nothing is published, so the
+        // daily sync skips the cycle rather than committing a partial set.
+        CHECK(result.captured.empty());
+        return;
+    }
+
     REQUIRE_FALSE(result.captured.empty());
 
     std::size_t app_rows = 0, pkg_rows = 0;

@@ -211,7 +211,26 @@ inline void strip_trailing_cr(std::string& line) {
             continue;
         const std::string_view trimmed = std::string_view(line).substr(start);
 
-        if (trimmed.starts_with("Version:")) {
+        // INDENT DECIDES, NOT THE KEY NAME. system_profiler puts app-name
+        // headers at exactly 4 spaces and attributes deeper, so the indent is
+        // an unambiguous discriminator -- and it must be tested FIRST.
+        //
+        // Testing the attribute prefixes first (as this did) misreads an app
+        // literally named "Location", "Version" or "Last Modified": its header
+        // line "    Location:" matches the attribute branch, so no flush()
+        // happens. Both adversarial reviewers found this independently, and it
+        // is worse than a dropped row: the app vanishes from list/query and the
+        // inventory entirely, AND its Version/Last Modified/Location values
+        // land on the PRECEDING app's record -- so that app is reported at the
+        // wrong version and, because `Location` drives the #2273 enrichment,
+        // with publisher and signature_status read from the impostor's bundle.
+        // An unprivileged user dropping "Location.app" into /Applications gets
+        // self-concealment plus attribution laundering onto a real app.
+        if (four_space_header && !trimmed.empty() && trimmed.back() == ':') {
+            flush();
+            current_name = std::string(trimmed.substr(0, trimmed.size() - 1));
+            have_current = true;
+        } else if (trimmed.starts_with("Version:")) {
             current_version = std::string(detail::value_after_colon(trimmed));
         } else if (trimmed.starts_with("Last Modified:")) {
             current_date = std::string(detail::value_after_colon(trimmed));

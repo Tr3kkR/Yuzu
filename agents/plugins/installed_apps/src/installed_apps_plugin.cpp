@@ -91,27 +91,55 @@ namespace parsers = yuzu::installed_apps::parsers;
 // byte-for-byte what the old shell command line built -- see each call
 // site's own comment for the exact escaping preserved.
 #if defined(__linux__) || defined(__APPLE__)
-// Returns the captured stdout only. The full SubprocessResult is deliberately
-// NOT surfaced: every call site here consumes stdout and nothing else, and the
-// one thing a caller might branch on -- a degraded run -- is already reported
-// centrally by the warn below, so handing back the struct would invite a
-// second, divergent degraded-run policy per call site.
-std::string run_tool(std::vector<std::string> argv,
+// The inner per-call capture cap. The runner's 1 MB default is BELOW the
+// 3.5 MiB capture cap sync_source_installed_software.cpp deliberately sets for
+// this very action, so the default would truncate a dense host's dpkg/rpm
+// enumeration *inside* the plugin -- before the outer cap that exists to
+// detect exactly that could ever see it, and the outer skip-the-cycle guard
+// would never fire. Sized above the outer cap so the OUTER one stays the
+// binding limit (the runner clamps to 16 MiB).
+constexpr std::size_t kToolOutputCap = 8u * 1024u * 1024u;
+
+// Whole-collection budget. Each child already has its own deadline, but 500
+// per-item calls x a 20 s deadline is ~2.8 h in aggregate, and the daily-sync
+// thread is JOINED on every transient reconnect -- so an aggregate bound is
+// what actually protects agent liveness (adversarial review, found by both
+// reviewers). Checked between items, never mid-child.
+constexpr std::chrono::seconds kCollectionBudget{120};
+
+struct ToolOutcome {
+    std::string output;
+    // True when the acquisition itself was cut short -- spawn failure, deadline,
+    // or capture truncation. NOT set for a nonzero exit code: several inventory
+    // tools exit nonzero for benign reasons, and treating that as degraded
+    // would make a healthy host skip its inventory cycle forever. The exit code
+    // is logged instead. Deliberate narrowing of the adversarial reviewers'
+    // proposed gate -- recorded here rather than silently dropped.
+    bool degraded = false;
+    // True when probe_tool_path found the binary AND it executed. Distinguishes
+    // "this ecosystem is absent" (normal: no dpkg on a Fedora box) from "the
+    // tool is here and told us nothing" (suspicious).
+    bool ran = false;
+};
+
+ToolOutcome run_tool(std::vector<std::string> argv,
                      std::chrono::seconds deadline = std::chrono::seconds{20}) {
     if (argv.empty() || argv.front().empty())
         return {};
     auto res = yuzu::agent::run_bounded_subprocess(
-        argv, yuzu::agent::SubprocessOptions{.deadline = deadline});
+        argv, yuzu::agent::SubprocessOptions{.deadline = deadline,
+                                             .output_cap_bytes = kToolOutputCap});
     // A cut-short enumeration returns empty/partial output that parses as "0
     // apps/packages" -- a silent false-negative. Warn so an operator can tell
     // a degraded enumeration from a genuinely empty one (sre-M1, matches
     // services_plugin.cpp's run_tool precedent).
-    if (res.timed_out || !res.tool_ran || res.output_truncated) {
+    const bool degraded = res.timed_out || !res.tool_ran || res.output_truncated;
+    if (degraded) {
         spdlog::warn(
             "installed_apps: degraded run (timed_out={}, tool_ran={}, truncated={}): {}",
             res.timed_out, res.tool_ran, res.output_truncated, argv.front());
     }
-    return std::move(res.output);
+    return ToolOutcome{std::move(res.output), degraded, res.tool_ran};
 }
 #endif
 
@@ -310,7 +338,7 @@ std::vector<AppInfo> get_installed_apps_linux() {
         // real newline byte) -- contrast get_inventory_linux's tab-separated
         // sibling call, which embeds real tab/newline bytes instead.
         auto out =
-            run_tool({path, "-W", "-f=${Package}|${Version}|${Maintainer}|${Status}\\n"});
+            run_tool({path, "-W", "-f=${Package}|${Version}|${Maintainer}|${Status}\\n"}).output;
         for (auto& rec : parsers::parse_dpkg_list(out)) {
             // parse_dpkg_list already filters to "install ok installed" rows.
             apps.push_back({std::move(rec.name), std::move(rec.version),
@@ -321,7 +349,7 @@ std::vector<AppInfo> get_installed_apps_linux() {
         // installed_apps/get_installed_apps_linux#2
         // RHEL/Fedora/SUSE.
         auto out = run_tool({path, "-qa", "--queryformat",
-                             "%{NAME}|%{VERSION}-%{RELEASE}|%{VENDOR}|%{INSTALLTIME:date}\\n"});
+                             "%{NAME}|%{VERSION}-%{RELEASE}|%{VENDOR}|%{INSTALLTIME:date}\\n"}).output;
         for (auto& rec : parsers::parse_rpm_list(out)) {
             apps.push_back({std::move(rec.name), std::move(rec.version),
                             std::move(rec.publisher), std::move(rec.install_date)});
@@ -330,7 +358,7 @@ std::vector<AppInfo> get_installed_apps_linux() {
               !path.empty()) {
         // installed_apps/get_installed_apps_linux#3
         // Arch Linux. Format: "name version".
-        auto out = run_tool({path, "-Q"});
+        auto out = run_tool({path, "-Q"}).output;
         for (auto& rec : parsers::parse_pacman_list(out))
             apps.push_back({std::move(rec.name), std::move(rec.version), "-", "-"});
     }
@@ -358,7 +386,7 @@ std::vector<AppInfo> get_installed_apps_macos() {
     // only; the one documented deviation from byte-identity).
     if (auto path = yuzu::agent::probe_tool_path({"/usr/sbin/system_profiler"});
         !path.empty()) {
-        auto out = run_tool({path, "SPApplicationsDataType", "-detailLevel", "mini"});
+        auto out = run_tool({path, "SPApplicationsDataType", "-detailLevel", "mini"}).output;
         for (auto& rec : parsers::parse_system_profiler_apps(out)) {
             apps.push_back(
                 {std::move(rec.name), std::move(rec.version), "-", std::move(rec.install_date)});
@@ -396,12 +424,18 @@ std::vector<inv::InvRecord> get_inventory_windows() {
 #endif
 
 #ifdef __linux__
-std::vector<inv::InvRecord> get_inventory_linux() {
+std::vector<inv::InvRecord> get_inventory_linux(bool& degraded) {
     std::vector<inv::InvRecord> recs;
 
-    const auto collect = [&recs](std::vector<std::string> argv, auto parse_line) {
-        auto out = run_tool(std::move(argv));
-        std::istringstream ss(out);
+    const auto collect = [&recs, &degraded](std::vector<std::string> argv, auto parse_line) {
+        auto res = run_tool(std::move(argv));
+        // A cut-short package-manager enumeration parses as "fewer packages",
+        // which the daily sync would otherwise commit as an authoritative
+        // shrink of the host's software set. Propagate it so the whole cycle
+        // is skipped instead.
+        if (res.degraded)
+            degraded = true;
+        std::istringstream ss(res.output);
         std::string line;
         while (std::getline(ss, line)) {
             if (auto r = parse_line(line))
@@ -482,8 +516,12 @@ constexpr std::size_t kMaxEnrichApps = 500;
 // hundreds of entries).
 constexpr std::size_t kMaxPkgutilPackages = 500;
 
-std::vector<inv::InvRecord> get_inventory_macos() {
+std::vector<inv::InvRecord> get_inventory_macos(bool& degraded) {
     std::vector<inv::InvRecord> recs;
+    const auto collection_start = std::chrono::steady_clock::now();
+    const auto over_budget = [collection_start]() {
+        return std::chrono::steady_clock::now() - collection_start > kCollectionBudget;
+    };
 
     // installed_apps/get_inventory_macos#1 (docs/agent-spawn-sink-manifest.md)
     // App records: acquired separately from get_installed_apps_macos()
@@ -492,8 +530,25 @@ std::vector<inv::InvRecord> get_inventory_macos() {
     // legacy list/query wire format never carried.
     if (auto path = yuzu::agent::probe_tool_path({"/usr/sbin/system_profiler"});
         !path.empty()) {
-        auto out = run_tool({path, "SPApplicationsDataType", "-detailLevel", "mini"});
-        auto apps = parsers::parse_system_profiler_apps(out);
+        auto res = run_tool({path, "SPApplicationsDataType", "-detailLevel", "mini"});
+        if (res.degraded)
+            degraded = true;
+        auto apps = parsers::parse_system_profiler_apps(res.output);
+
+        // OBSERVED during adversarial review: system_profiler can exit 0 having
+        // written nothing at all. Every real Mac has GUI applications under
+        // /System/Applications, so "the tool ran and found zero apps" is a
+        // transient tool failure, not a true empty inventory. Left ungated it
+        // publishes a pkgutil-only snapshot, and the daily sync replaces the
+        // host's whole app inventory -- signature posture included -- with it.
+        // Unlike a Linux package manager (an rpm-on-Debian box legitimately
+        // reports zero rpm packages), this leg has no honest-empty case, which
+        // is why the zero-row check is applied HERE and nowhere else.
+        if (res.ran && apps.empty()) {
+            spdlog::warn("installed_apps: system_profiler ran but reported zero applications "
+                         "-- treating as a degraded collection rather than an empty inventory");
+            degraded = true;
+        }
 
         std::size_t enriched = 0;
         for (auto& app : apps) {
@@ -509,7 +564,7 @@ std::vector<inv::InvRecord> get_inventory_macos() {
             // fields -- ADR-0016: the hashed 12-field row is NEVER
             // added-to/reordered. bundle_id has no home in this row; see that
             // header's comment.
-            if (!app.location.empty() && enriched < kMaxEnrichApps) {
+            if (!app.location.empty() && enriched < kMaxEnrichApps && !over_budget()) {
                 ++enriched;
                 auto enrich = yuzu::installed_apps::macos_enrich::enrich_app(app.location);
                 if (!enrich.publisher.empty())
@@ -519,6 +574,14 @@ std::vector<inv::InvRecord> get_inventory_macos() {
             }
             recs.push_back(std::move(r));
         }
+        // An un-enriched row's empty signature_status is indistinguishable from
+        // "we looked and could not tell", so say when the cap bit rather than
+        // leaving the gap silent.
+        if (apps.size() > enriched && enriched >= kMaxEnrichApps) {
+            spdlog::warn("installed_apps: enrichment capped at {} apps ({} present) -- the "
+                         "remainder carry empty publisher/signature_status",
+                         kMaxEnrichApps, apps.size());
+        }
     }
 
     // installed_apps/get_inventory_macos#2 (docs/agent-spawn-sink-manifest.md)
@@ -526,16 +589,43 @@ std::vector<inv::InvRecord> get_inventory_macos() {
     // installer packages (Command Line Tools, XProtect payloads, ...) that
     // never appear in system_profiler's GUI-app enumeration above.
     if (auto path = yuzu::agent::probe_tool_path({"/usr/sbin/pkgutil"}); !path.empty()) {
-        auto ids = parsers::parse_pkgutil_pkgs(run_tool({path, "--pkgs"}));
-        if (ids.size() > kMaxPkgutilPackages)
+        auto pkgs = run_tool({path, "--pkgs"});
+        if (pkgs.degraded)
+            degraded = true;
+        auto ids = parsers::parse_pkgutil_pkgs(pkgs.output);
+        if (ids.size() > kMaxPkgutilPackages) {
+            spdlog::warn("installed_apps: pkgutil receipts capped at {} of {} -- the remainder "
+                         "are absent from this inventory",
+                         kMaxPkgutilPackages, ids.size());
             ids.resize(kMaxPkgutilPackages);
+        }
 
         for (const auto& id : ids) {
+            // An id is a reverse-domain receipt name; one starting with '-'
+            // would be consumed by pkgutil's OWN option parser as a flag (no
+            // shell involved -- this is argv[2] reaching getopt). Skip rather
+            // than issue a call whose meaning we cannot predict.
+            if (id.front() == '-') {
+                spdlog::warn("installed_apps: skipping option-like pkgutil receipt id '{}'", id);
+                continue;
+            }
+            // Aggregate bound: the daily-sync thread is joined on every
+            // transient reconnect, and 500 per-item deadlines would otherwise
+            // add up to hours of unresponsiveness.
+            if (over_budget()) {
+                spdlog::warn("installed_apps: pkgutil receipt collection exceeded its {}s budget "
+                             "-- stopping early and reporting a degraded collection",
+                             kCollectionBudget.count());
+                degraded = true;
+                break;
+            }
             // installed_apps/get_inventory_macos#3 -- one call per receipt,
             // same bounded per-id loop shape as msi_packages_plugin.cpp's
             // established `list` action.
-            auto info =
-                parsers::parse_pkgutil_pkg_info(run_tool({path, "--pkg-info", id}));
+            auto pkginfo = run_tool({path, "--pkg-info", id});
+            if (pkginfo.degraded)
+                degraded = true;
+            auto info = parsers::parse_pkgutil_pkg_info(pkginfo.output);
             inv::InvRecord r;
             r.name = id; // honest reverse-domain identifier -- never a
                          // derived "friendly" name (msi_packages precedent)
@@ -556,14 +646,31 @@ std::vector<inv::InvRecord> get_inventory_macos() {
 #endif
 
 int do_list_inventory(yuzu::CommandContext& ctx) {
+    // A degraded acquisition yields a SMALLER-but-well-formed inventory, and
+    // the daily sync (ADR-0016) replaces the host's authoritative software set
+    // with whatever it receives. The server cannot tell an incomplete snapshot
+    // from a complete one -- it hashes bytes, not completeness -- so the only
+    // place this can be caught is here. sync_source_installed_software.cpp
+    // already skips the whole cycle on a nonzero rc; this reports into that
+    // existing contract rather than inventing a new signal.
+    [[maybe_unused]] bool degraded = false;
 #ifdef _WIN32
-    auto recs = get_inventory_windows();
+    auto recs = get_inventory_windows(); // native registry reads, no subprocess to degrade
 #elif defined(__linux__)
-    auto recs = get_inventory_linux();
+    auto recs = get_inventory_linux(degraded);
 #elif defined(__APPLE__)
-    auto recs = get_inventory_macos();
+    auto recs = get_inventory_macos(degraded);
 #else
     std::vector<inv::InvRecord> recs;
+#endif
+
+#if defined(__linux__) || defined(__APPLE__)
+    if (degraded) {
+        spdlog::warn("installed_apps: list_inventory acquisition was degraded -- reporting "
+                     "rc=1 so the daily sync skips this cycle instead of committing a "
+                     "partial inventory as authoritative");
+        return 1;
+    }
 #endif
 
     // No sentinel row: an empty result is empty output + rc 0. The sync
@@ -852,7 +959,7 @@ private:
         if (auto brew_path =
                 yuzu::agent::probe_tool_path({"/opt/homebrew/bin/brew", "/usr/local/bin/brew"});
             !brew_path.empty()) {
-            auto brew_out = run_tool({brew_path, "list", "--versions"});
+            auto brew_out = run_tool({brew_path, "list", "--versions"}).output;
             for (auto& rec : parsers::parse_brew_list(brew_out)) {
                 ctx.write_output(sanitize_utf8(std::format(
                     "user_app|brew|{}|{}|-|-", rec.name, rec.version.empty() ? "-" : rec.version)));

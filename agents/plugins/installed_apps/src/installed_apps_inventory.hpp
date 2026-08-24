@@ -37,10 +37,15 @@ struct InvRecord {
     std::string release;      // rpm RELEASE / deb revision / apk pkgrel
     std::string arch;
     std::string signature_status; // "signed"|"unsigned"; empty where unknown.
-                                  // Sourced from rpm's STORED signature tags, and
-                                  // (macOS `app` rows) from Security.framework's
-                                  // SecStaticCode seal -- integrity-at-creation,
-                                  // never a Gatekeeper/notarization trust verdict.
+                                  // PRESENCE of a signature, never its validity:
+                                  // rpm's STORED header tags, and (macOS `app`
+                                  // rows) the presence of SecStaticCode signing
+                                  // metadata. A bundle whose signature has been
+                                  // broken still reads "signed" -- and its
+                                  // `publisher` is then the ORIGINAL vendor's CN,
+                                  // so publisher is unverified attribution. Not a
+                                  // Gatekeeper/notarization verdict, and not
+                                  // tamper detection.
     std::string distro_id;        // /etc/os-release ID (Linux rows only)
     std::string distro_version;   // /etc/os-release VERSION_ID (Linux rows only)
 };

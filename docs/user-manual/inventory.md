@@ -44,11 +44,20 @@ cadences.
   through CoreFoundation + Security.framework (`CFBundleCreate`,
   `SecStaticCodeCreateWithPath`, `SecCodeCopySigningInformation`) — no
   `codesign` subprocess, and no deep `SecStaticCodeCheckValidity` verify. Like
-  rpm's, the verdict is **integrity-at-creation, not trust**: a bundle carrying
-  its own valid seal reads `signed` even when ad-hoc or self-signed, so this is
-  never a Gatekeeper or notarization result. `publisher` is the signing leaf
-  certificate's Common Name and is empty for ad-hoc-signed and unsigned apps.
-  Enrichment covers the first 500 located apps per collection.
+  rpm's, the field records that a signature is **present**, not that it is
+  valid. `signed` means signing metadata was found; it does **not** mean the
+  signature verifies. An ad-hoc or self-signed bundle reads `signed`, and so
+  does a bundle whose signature has since been **broken** — deleting a bundle's
+  `_CodeSignature` directory or modifying its executable leaves the recorded
+  identifier and certificates in place, so such a bundle still reads `signed`
+  and still reports the original vendor's Common Name as `publisher`. Treat
+  `publisher` as unverified attribution, never proof of origin, and do **not**
+  use `signature_status` as tamper detection or as a Gatekeeper/notarization
+  result. (Deep verification — `SecStaticCodeCheckValidity` — is not performed;
+  adding it would turn this into a validity verdict and need a third state, an
+  open contract decision.) `publisher` is empty for ad-hoc-signed and unsigned
+  apps. Enrichment covers the first 500 located apps per collection, and the
+  agent logs a warning when that cap truncates the set.
 
   **macOS `pkg` rows** are `pkgutil` receipts — system installer packages
   (Command Line Tools, XProtect payloads, vendor `.pkg` installs) that never

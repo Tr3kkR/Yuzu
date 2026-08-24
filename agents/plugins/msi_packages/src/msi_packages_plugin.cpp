@@ -178,6 +178,14 @@ int do_list(yuzu::CommandContext& ctx) {
 
     int count = 0;
     for (const auto& id : ids) {
+        // A receipt id is a reverse-domain name; one starting with '-' would be
+        // eaten by pkgutil's OWN option parser as a flag. No shell is involved
+        // -- this is argv[2] reaching getopt -- so quoting cannot help, and the
+        // call's meaning would be unpredictable. Skip it instead.
+        if (!id.empty() && id.front() == '-') {
+            spdlog::warn("msi_packages: skipping option-like pkgutil receipt id '{}'", id);
+            continue;
+        }
         // msi_packages/do_list#2 -- one call per receipt, id passed as its
         // own argv element (no shell, so no quoting is needed at all).
         auto info = parse_pkg_info(run_command({pkgutil_path, "--pkg-info", id}), id);

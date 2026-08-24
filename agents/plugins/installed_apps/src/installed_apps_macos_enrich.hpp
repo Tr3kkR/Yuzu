@@ -10,14 +10,34 @@
 // no fabricated verdict), though that header classifies an already-captured
 // `codesign` CLI result rather than calling Security.framework directly.
 //
-// Deliberately does NOT call SecStaticCodeCheckValidity (a deep, disk-reading
-// verify) -- per #2273's own bound, this runs across every app returned by
-// system_profiler (capped by the caller at kMaxEnrichApps), and a deep verify
-// per app would be far too slow for a daily inventory sync. What
-// SecCodeCopySigningInformation reports is therefore an INTEGRITY-at-creation
-// signal only (matching filesystem_macos_sig.hpp's `valid` caveat: an ad-hoc
-// or self-signed binary still reports "signed"), never a Gatekeeper/
-// notarization trust verdict.
+// SCOPE OF THE VERDICT -- read before trusting `signature_status`.
+// This calls SecCodeCopySigningInformation only. It deliberately does NOT call
+// SecStaticCodeCheckValidity (a deep, disk-reading verify). So what this
+// reports is the PRESENCE of signing metadata, NOT its validity:
+//   - an ad-hoc or self-signed bundle reads "signed";
+//   - a bundle whose signature has been BROKEN reads "signed" too. Measured
+//     during adversarial review: a copy of Calculator.app with
+//     Contents/_CodeSignature deleted, and separately one with bytes appended
+//     to its Mach-O, both still report an identifier and 3 certificates
+//     (SecStaticCodeCheckValidity returns -67023 for them), so this reports
+//     "signed" AND hands back the original vendor's leaf CN as `publisher`.
+//     Treat `publisher` here as UNVERIFIED attribution, never as proof of
+//     origin.
+// This is the same guarantee rpm's signature_status already carries in
+// installed_apps_inventory.hpp -- "a signature is recorded", read from stored
+// metadata, never a live cryptographic verification -- which is why the two
+// share one binary vocabulary. It is NOT a Gatekeeper or notarization verdict
+// and must not be presented as tamper detection.
+//
+// Deep verification was left OUT rather than ruled out. The measured cost is
+// not prohibitive (SecStaticCodeCheckValidity: Calculator 4 ms, Signal 31 ms,
+// Safari 70 ms, Docker 1304 ms; ~30 s across the 316 apps on the review host,
+// on a DAILY collector), so the original "far too slow" rationale does not
+// survive measurement. Adopting it would change signature_status from a
+// presence flag into a validity verdict -- a contract change for the server
+// and every consumer, and a third state for "signed but invalid". That is an
+// open decision for the repo owner, recorded here and in the gate report,
+// deliberately not taken unilaterally in this PR.
 //
 // ADR-0016 CRITICAL: the blob-v2 12-field row (installed_apps_inventory.hpp)
 // is hashed byte-identically on agent and server. This header hands its
@@ -66,8 +86,13 @@ inline std::string cfstring_to_utf8(CFStringRef s) {
     const CFIndex len = CFStringGetLength(s);
     if (len <= 0)
         return {};
-    const CFIndex max_bytes =
-        CFStringGetMaximumSizeForEncoding(len, kCFStringEncodingUTF8) + 1;
+    const CFIndex raw_max = CFStringGetMaximumSizeForEncoding(len, kCFStringEncodingUTF8);
+    // Documented to return kCFNotFound (-1) if the conversion size cannot be
+    // computed; +1 would then make a 0-sized buffer and CFStringGetCString
+    // would be handed a zero capacity.
+    if (raw_max <= 0)
+        return {};
+    const CFIndex max_bytes = raw_max + 1;
     std::string out(static_cast<std::size_t>(max_bytes), '\0');
     if (!CFStringGetCString(s, out.data(), max_bytes, kCFStringEncodingUTF8))
         return {};
@@ -141,9 +166,10 @@ inline EnrichResult enrich_app(const std::string& app_path) {
     //   unsigned  -> identifier ABSENT,  0 certs  => "unsigned"
     //   ad-hoc    -> identifier PRESENT, 0 certs  => "signed" (no publisher)
     //   Apple     -> identifier PRESENT, 3 certs  => "signed" + leaf CN
-    // Ad-hoc/self-signed still reads "signed": integrity-at-creation only,
-    // never a Gatekeeper/notarization trust verdict (the caveat this header's
-    // top comment and filesystem_macos_sig.hpp both already state).
+    // This is a PRESENCE test, not a validity test -- a bundle whose signature
+    // has been broken still has an identifier and still reads "signed". See
+    // this header's top comment for the measured cases and why deep
+    // verification is an open decision rather than an oversight.
     const bool has_identifier =
         CFDictionaryGetValue(info.get(), kSecCodeInfoIdentifier) != nullptr;
     out.signature_status = has_identifier ? "signed" : "unsigned";
