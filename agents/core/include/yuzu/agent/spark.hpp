@@ -75,6 +75,12 @@ inline constexpr std::uint32_t kGuardianLaneJitterPct = 20;         ///< +/- thi
 /// the input CONSTANTS above (without also sharing this formula) would still
 /// let the two drift apart on a rounding/behavior change to just one copy -
 /// this closes that gap for real (Gate 3 cpp-expert finding).
+///
+/// NOT the same thing as `guardian_jitter_offset()` (`guardian_outbox_drain_worker.hpp`)
+/// despite the near-identical name - that one draws a random `[0,upper)` SAMPLE
+/// from an RNG for outbox-maintenance paging; this one is a deterministic BOUND
+/// computation with no randomness at all (Gate 4 consistency-auditor: flagged as
+/// a future grep-collision risk, naming disambiguated here rather than renamed).
 [[nodiscard]] constexpr std::uint64_t guardian_jitter_span_ms(std::uint64_t cadence_ms,
                                                                std::uint32_t jitter_pct) noexcept {
     return (cadence_ms * jitter_pct) / 100;
