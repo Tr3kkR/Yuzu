@@ -4,7 +4,8 @@
 ##
 ## Sources by platform:
 ##   Windows: WlanEnumInterfaces + WlanGetAvailableNetworkList + WlanQueryInterface
-##   Linux:   nmcli device wifi list / nmcli device show (fallback: iw/iwlist)
+##   Linux:   NetworkManager D-Bus (sd-bus) primary; fallback nmcli device wifi list
+##            (ACTIVE row for `connected`), then iw/iwlist/iwconfig via the argv runner
 ##   macOS:   list_networks: airport -s (legacy) / system_profiler · connected: CoreWLAN
 
 ---
@@ -13,7 +14,7 @@ kind: InstructionDefinition
 metadata:
   id: device.wifi.list_networks
   displayName: List WiFi Networks
-  version: 1.0.0
+  version: 1.1.0
   description: >
     Scans for visible WiFi networks and reports each network's SSID,
     signal strength (0-100%), security type (WPA2-PSK, Open, etc.),
@@ -74,12 +75,13 @@ kind: InstructionDefinition
 metadata:
   id: device.wifi.connected
   displayName: Current WiFi Connection
-  version: 1.0.0
+  version: 1.1.0
   description: >
     Reports information about the currently connected WiFi network,
     including SSID, signal strength, security type, BSSID, and the
     wireless interface or channel. On Windows uses WlanQueryInterface,
-    on Linux uses nmcli or iwconfig, on macOS uses CoreWLAN (macOS 14+
+    on Linux reads NetworkManager over D-Bus and falls back to nmcli
+    then iwconfig, on macOS uses CoreWLAN (macOS 14+
     withholds SSID/BSSID behind Location Services, reported as
     "<ssid-withheld>" on an otherwise-live connection).
     Returns "Not connected" if no WiFi connection is active.

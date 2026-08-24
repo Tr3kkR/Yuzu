@@ -196,6 +196,33 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — the `wifi` plugin's Linux output changes shape (breaking)
+
+The `wifi` plugin moves to reading NetworkManager directly over D-Bus on Linux
+(plugin version 1.1.0). Three operator-visible changes to the records it emits:
+
+- **`connected` field 6 changes meaning on Linux.** It now carries the network
+  interface (for example `wlan0`). Earlier agents put the NetworkManager
+  *connection profile name* there. Any dashboard query, export or script that
+  reads that field as a profile name needs updating.
+- **Unsecured networks report `Open`, not `NONE`.** Previously the value
+  depended on which acquisition path answered; all paths now agree on `Open`.
+- **WPA3 and enhanced-open networks are reported distinctly.** They previously
+  appeared as `WPA2`, so a fleet may show WPA3 networks for the first time
+  after upgrading. This is a reporting change, not a change on the network.
+
+**During a staged rollout the two shapes are mixed, and the record does not say
+which one it is.** An un-upgraded agent reports the profile name in field 6 and
+an upgraded agent reports the interface, with no discriminator in the row —
+unlike the firewall change, where a `backend|` value distinguished per device.
+Until the fleet is fully upgraded, treat field 6 as free text: match on agent
+version rather than on the field's content, or defer any query that keys on it.
+`SELECT` on the plugin version, not on the value.
+
+A long-standing bug that made the macOS network scan return no results on
+macOS 14 and later is fixed in the same release; macOS hosts that reported an
+empty scan may begin reporting networks, subject to Location Services.
+
 ### vNEXT — `event_logs` acquires natively; Windows message text and `count` semantics change (breaking)
 
 The `event_logs` plugin now reads the event log **in-process** — wevtapi on

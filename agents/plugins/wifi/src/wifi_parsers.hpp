@@ -102,12 +102,22 @@ inline std::vector<WifiNetworkRow> parse_nmcli_wifi_list(std::string_view raw) {
         if (line.empty())
             continue;
         auto fields = split_nmcli_terse_line(line);
+        // A COMPLETE row has exactly the five fields the argv requested. A
+        // shorter one is a TRUNCATION -- nmcli killed mid-write, or the
+        // runner's line cap cutting the final line -- and must never be
+        // completed from defaults: doing so invents `<hidden>|0|Open|0|-`,
+        // i.e. a FABRICATED OPEN ACCESS POINT in an operator's security audit.
+        // An unsecured AP is signalled by a PRESENT-but-empty SECURITY field,
+        // which is a real observation; a MISSING field is not an observation
+        // at all. Drop the partial line rather than guess at it.
+        if (fields.size() < 5)
+            continue;
         WifiNetworkRow row;
-        row.ssid = fields.size() > 0 ? fields[0] : std::string{};
-        row.signal = fields.size() > 1 ? fields[1] : std::string{};
-        row.security = fields.size() > 2 ? fields[2] : std::string{};
-        row.channel = fields.size() > 3 ? fields[3] : std::string{};
-        row.bssid = fields.size() > 4 ? fields[4] : std::string{};
+        row.ssid = fields[0];
+        row.signal = fields[1];
+        row.security = fields[2];
+        row.channel = fields[3];
+        row.bssid = fields[4];
         if (row.ssid.empty())
             row.ssid = "<hidden>";
         if (row.security.empty())
@@ -170,12 +180,16 @@ inline std::optional<WifiConnectedRow> parse_nmcli_wifi_list_active(std::string_
             active == "*" || (active.size() == 3 && (active[0] == 'y' || active[0] == 'Y'));
         if (!is_active)
             continue;
+        // Same truncation rule as parse_nmcli_wifi_list: six fields were
+        // requested, so fewer than six is a cut line, not an observation.
+        if (fields.size() < 6)
+            continue;
         WifiConnectedRow row;
-        row.ssid = fields.size() > 1 ? fields[1] : std::string{};
-        row.signal = fields.size() > 2 ? fields[2] : std::string{};
-        row.security = fields.size() > 3 ? fields[3] : std::string{};
-        row.bssid = fields.size() > 4 ? fields[4] : std::string{};
-        row.connection = fields.size() > 5 ? fields[5] : std::string{};
+        row.ssid = fields[1];
+        row.signal = fields[2];
+        row.security = fields[3];
+        row.bssid = fields[4];
+        row.connection = fields[5];
         if (row.ssid.empty())
             row.ssid = "<hidden>";
         if (row.signal.empty())
@@ -194,6 +208,40 @@ inline std::optional<WifiConnectedRow> parse_nmcli_wifi_list_active(std::string_
 // ── iw / iwlist / iwconfig text filtering (replaces the deleted
 // `| grep ... | awk ...` shell pipelines) ───────────────────────────────
 
+// ADR-3002 Decision 6 (an explicit MUST): "Every migrated site must handle
+// option injection (pass `--` before positional values where supported, or
+// reject leading-`-` values)". `iwlist` accepts no `--`, so the alternative
+// applies and this is where it lives.
+//
+// `iface` is the ONLY non-literal element in any wifi argv vector. It comes
+// from this host's own `iw dev` output rather than from an operator, but that
+// is a statement about today's caller, not a property of the value: an
+// interface named `-i` or `--help` would be read by iwlist as a FLAG, not as
+// the positional it is passed as. Validating in the pure builder means the
+// guard cannot be bypassed by a future second caller, and can be unit-tested
+// without spawning anything.
+//
+// Linux caps interface names at IFNAMSIZ-1 = 15 bytes; the kernel also
+// forbids '/' and whitespace. This accepts the conservative portable subset
+// and rejects everything else, including any leading '-'.
+inline bool is_safe_iface_name(std::string_view iface) {
+    if (iface.empty() || iface.size() > 15)
+        return false;
+    if (iface.front() == '-')
+        return false;
+    for (char c : iface) {
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-' || c == ':';
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
+// Returns an EMPTY vector for a rejected interface name. An empty argv is what
+// run_tool() already treats as a runtime-reject (spawn_error, tool_ran=false),
+// so a rejected name degrades through the same honest path as a missing tool
+// rather than silently scanning the wrong thing.
 // Extracts interface names from `iw dev` output -- replaces
 // `iw dev | grep Interface | awk '{print $2}'`. Matches any line
 // containing "Interface" and takes that line's second whitespace-separated
@@ -203,14 +251,20 @@ inline std::vector<std::string> parse_iw_dev_interfaces(std::string_view raw) {
     std::istringstream ss{std::string{raw}};
     std::string line;
     while (std::getline(ss, line)) {
-        if (line.find("Interface") == std::string::npos)
-            continue;
         std::istringstream ls(line);
         std::vector<std::string> tokens;
         std::string tok;
         while (ls >> tok)
             tokens.push_back(tok);
-        if (tokens.size() >= 2)
+        // `iw dev` emits exactly "\tInterface <name>". Requiring the FIRST
+        // token to be the literal keyword, and the line to hold exactly two
+        // tokens, stops a line that merely CONTAINS the word from being read
+        // as an interface -- e.g. an SSID echoed in the same output. Each
+        // bogus name would otherwise cost a real 20s `iwlist` spawn.
+        if (tokens.size() != 2 || tokens[0] != "Interface")
+            continue;
+        // Belt and braces: never hand an unusable name downstream.
+        if (is_safe_iface_name(tokens[1]))
             ifaces.push_back(tokens[1]);
     }
     return ifaces;
@@ -605,40 +659,6 @@ inline std::vector<std::string> iw_dev_argv(std::string_view tool) {
     return {std::string{tool}, "dev"};
 }
 
-// ADR-3002 Decision 6 (an explicit MUST): "Every migrated site must handle
-// option injection (pass `--` before positional values where supported, or
-// reject leading-`-` values)". `iwlist` accepts no `--`, so the alternative
-// applies and this is where it lives.
-//
-// `iface` is the ONLY non-literal element in any wifi argv vector. It comes
-// from this host's own `iw dev` output rather than from an operator, but that
-// is a statement about today's caller, not a property of the value: an
-// interface named `-i` or `--help` would be read by iwlist as a FLAG, not as
-// the positional it is passed as. Validating in the pure builder means the
-// guard cannot be bypassed by a future second caller, and can be unit-tested
-// without spawning anything.
-//
-// Linux caps interface names at IFNAMSIZ-1 = 15 bytes; the kernel also
-// forbids '/' and whitespace. This accepts the conservative portable subset
-// and rejects everything else, including any leading '-'.
-inline bool is_safe_iface_name(std::string_view iface) {
-    if (iface.empty() || iface.size() > 15)
-        return false;
-    if (iface.front() == '-')
-        return false;
-    for (char c : iface) {
-        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                        (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-' || c == ':';
-        if (!ok)
-            return false;
-    }
-    return true;
-}
-
-// Returns an EMPTY vector for a rejected interface name. An empty argv is what
-// run_tool() already treats as a runtime-reject (spawn_error, tool_ran=false),
-// so a rejected name degrades through the same honest path as a missing tool
-// rather than silently scanning the wrong thing.
 inline std::vector<std::string> iwlist_scan_argv(std::string_view tool, std::string_view iface) {
     if (!is_safe_iface_name(iface))
         return {};

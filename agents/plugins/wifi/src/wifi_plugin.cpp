@@ -86,6 +86,24 @@ inline std::string sof(std::string_view v) { return yuzu::util::safe_output_fiel
 // run_command()/sh -c helper used.
 constexpr std::chrono::seconds kWifiCmdDeadline{20};
 
+// Aggregate wall-clock bound for ONE action across its whole fallback chain.
+// The per-tool deadline bounds a single spawn, not the ladder: D-Bus, then
+// nmcli, then `iw dev`, then one `iwlist scan` PER DISCOVERED INTERFACE, each
+// with its own 20s. A host with several radios could therefore spend well over
+// a minute inside a single action while every individual call stayed within
+// its own limit. This is the ladder's own ceiling; once it is spent the
+// remaining rungs are skipped and the action reports honestly rather than
+// running on.
+constexpr std::chrono::seconds kWifiActionBudget{45};
+
+// Monotonic; started once per action.
+struct WifiActionClock {
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    bool spent() const {
+        return (std::chrono::steady_clock::now() - start) >= kWifiActionBudget;
+    }
+};
+
 /// Outcome of run_tool(): captured output PLUS the raw runner result, so a
 /// caller can forward the latter through the ABI4 result seam
 /// (yuzu::agent::forward_runner_failure) itself instead of this helper
@@ -249,6 +267,14 @@ constexpr std::uint64_t kSdBusTotalBudgetUs = 5'000'000; // 5s
 class NmBusSession {
 public:
     NmBusSession() {
+        // NOTE: sd_bus_open_system performs the AUTH HANDSHAKE and is not
+        // covered by kSdBusTotalBudgetUs -- the budget only bounds method
+        // calls made afterwards. A stalled or half-open system bus therefore
+        // blocks here on libsystemd's own connect timeout BEFORE the 5s budget
+        // starts counting, so the action's real worst case exceeds its stated
+        // bound. Tracked as a known limitation; bounding it needs a non-blocking
+        // open plus an sd_bus_wait loop, which is a larger change than this
+        // migration should carry.
         if (sd_bus_open_system(&bus_.bus) < 0 || !bus_.bus)
             return; // D-Bus unreachable -> honest fall-through, never fabricate
         t_start_ = std::chrono::steady_clock::now();
@@ -633,6 +659,10 @@ const char* bss_type_to_string(DOT11_BSS_TYPE bss) {
 // ── list_networks action ──────────────────────────────────────────────────
 
 int do_list_networks(yuzu::CommandContext& ctx) {
+#if defined(__linux__) || defined(__APPLE__)
+    const WifiActionClock clock; // aggregate ladder bound; see kWifiActionBudget
+    (void)clock;
+#endif
 #ifdef _WIN32
     HANDLE client = nullptr;
     DWORD negotiated_version = 0;
@@ -691,8 +721,13 @@ int do_list_networks(yuzu::CommandContext& ctx) {
     // `saw_scan` additionally requires that some Wi-Fi device has actually
     // finished a scan; an empty never-scanned cache falls through to nmcli
     // (which rescans) instead of being reported as an empty airspace.
-    if (auto nm = query_nm_list_networks();
-        nm.reachable && nm.saw_wifi_device && (nm.saw_scan || !nm.rows.empty())) {
+    // `saw_scan` is required OUTRIGHT. An earlier version admitted the answer on
+    // `saw_scan || !rows.empty()`, which defeated the whole point: a device
+    // reporting LastScan == -1 (NEVER scanned) but holding a populated
+    // AccessPoints cache was still reported as a completed scan -- the exact
+    // cache-presented-as-observation this gate exists to stop. A non-empty
+    // cache is not evidence that a scan happened.
+    if (auto nm = query_nm_list_networks(); nm.reachable && nm.saw_wifi_device && nm.saw_scan) {
         if (nm.rows.empty()) {
             // A confirmed, definitive answer from a reachable NetworkManager
             // (not the ambiguous "empty output" nmcli's own leg below has to
@@ -711,16 +746,43 @@ int do_list_networks(yuzu::CommandContext& ctx) {
     // NetworkManager D-Bus unreachable, or any call in the sequence failed
     // -> fall through to the nmcli argv rung (D-Bus failure is never
     // "no wifi").
+    //
+    // Record the descent. Without this a successful D-Bus scan and a
+    // successful nmcli scan emit byte-identical rows, so a fleet that loses
+    // libsystemd -- or whose NetworkManager stops exposing the bus -- degrades
+    // to rung 2 permanently and SILENTLY. That matters most on exactly this
+    // plugin, whose descriptor already admits the rung-1 path has never run
+    // against a real radio: the marker is how an operator learns it never
+    // works here. OK/COMPLETE, because the answer that follows is complete --
+    // this is provenance, not a failure.
+    ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL,
+                          "wifi:nm_dbus_fallthrough");
 #endif
     // sink: wifi/do_list_networks#1 -- nmcli device wifi list (rung 2 argv;
     // replaces the deleted sh -c pipeline)
     auto nmcli_path = yuzu::agent::probe_tool_path({"/usr/bin/nmcli", "/bin/nmcli"});
     auto nmcli_res = run_tool(yuzu::wifi::nmcli_wifi_list_argv(nmcli_path));
-    if (yuzu::wifi::wifi_tool_answered(nmcli_res.res).answered && !nmcli_res.output.empty()) {
+    // An ANSWERED nmcli is definitive whether or not it printed anything: an
+    // idle radio, an rfkill'd interface or a genuinely empty airspace all exit
+    // 0 with empty stdout. Gating on `!output.empty()` fell through to the iw
+    // leg and -- with iw absent -- told the operator "No wireless tools
+    // available (nmcli/iw)" when nmcli had run perfectly and answered "no
+    // networks". do_connected already ORs both verdicts; this is that fix,
+    // applied to the sibling that lacked it.
+    if (yuzu::wifi::wifi_tool_answered(nmcli_res.res).answered) {
         yuzu::agent::forward_runner_failure(ctx, nmcli_res.res); // carries line_limit PARTIAL
+        std::size_t emitted = 0;
         for (auto& row : yuzu::wifi::parse_nmcli_wifi_list(nmcli_res.output)) {
+            ++emitted;
             ctx.write_output(std::format("wifi|{}|{}|{}|{}|{}", sof(row.ssid), sof(row.signal),
                                          sof(row.security), sof(row.channel), sof(row.bssid)));
+        }
+        if (emitted == 0) {
+            // Both sibling branches emit an explicit record here; silence is
+            // read by a consumer as "no networks" without saying who decided
+            // that. This was also the one path that falsified the dispatcher
+            // test's claim that every code path emits a `wifi|` line.
+            ctx.write_output("wifi|info|nmcli reported no Wi-Fi networks visible|0|0|none");
         }
         return 0;
     }
@@ -741,10 +803,27 @@ int do_list_networks(yuzu::CommandContext& ctx) {
         bool emitted_scan_output = false;
         bool status_forwarded = false;
         for (auto& iface : ifaces) {
+            if (clock.spent()) {
+                // Out of aggregate budget with interfaces still unscanned.
+                // Emit an explicit record: a short scan that silently stops is
+                // read as a complete one.
+                ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
+                                      YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                      "wifi:action_budget_exhausted");
+                ctx.write_output("wifi|info|Wi-Fi scan stopped at the action time budget; "
+                                 "some interfaces were not scanned|0|0|none");
+                break;
+            }
             auto scan_res = run_tool(yuzu::wifi::iwlist_scan_argv(iwlist_path, iface));
-            if (yuzu::wifi::wifi_tool_answered(scan_res.res).answered)
+            const bool this_answered = yuzu::wifi::wifi_tool_answered(scan_res.res).answered;
+            if (this_answered)
                 any_scan_answered = true;
-            if (!status_forwarded)
+            // Only forward a FAILURE from an interface that did not answer, and
+            // only while nothing has answered yet. First-wins latching stamped
+            // a failed radio's UNAVAILABLE onto a later interface's good scan
+            // -- the same "stale status latched onto a good answer" defect
+            // already fixed for macOS airport, not carried across at the time.
+            if (!this_answered && !any_scan_answered && !status_forwarded)
                 status_forwarded = yuzu::agent::forward_runner_failure(ctx, scan_res.res);
             auto filtered = yuzu::wifi::filter_iwlist_scan_lines(scan_res.output);
             if (!filtered.empty()) {
@@ -823,9 +902,16 @@ int do_list_networks(yuzu::CommandContext& ctx) {
          "-s"});
     const bool airport_answered = yuzu::wifi::wifi_tool_answered(airport_res.res).answered;
     if (airport_answered && !airport_res.output.empty()) {
+        std::size_t emitted = 0;
         for (auto& row : yuzu::wifi::parse_airport_scan(airport_res.output)) {
+            ++emitted;
             ctx.write_output(std::format("wifi|{}|{}|{}|{}|{}", sof(row.ssid), sof(row.signal),
                                          sof(row.security), sof(row.channel), sof(row.bssid)));
+        }
+        if (emitted == 0) {
+            // airport ran and printed something that parsed to nothing -- a
+            // header-only table. Same rule as every other leg: say so.
+            ctx.write_output("wifi|info|airport reported no Wi-Fi networks visible|0|0|none");
         }
     } else {
         // sink: wifi/do_list_networks#5 -- system_profiler SPAirPortDataType
@@ -863,9 +949,18 @@ int do_connected(yuzu::CommandContext& ctx) {
 #ifdef _WIN32
     HANDLE client = nullptr;
     DWORD negotiated_version = 0;
+    // A FAILED WLAN API call is not a disconnected station. Reporting
+    // "Not connected" when WlanOpenHandle or WlanEnumInterfaces failed is the
+    // same fabricated negative this plugin removed from the Linux and macOS
+    // legs; it survived on Windows because the sweep covered the legs the
+    // migration touched rather than every leg with the defect shape. The
+    // sibling do_list_networks already reports this failure honestly.
     DWORD result = WlanOpenHandle(2, nullptr, &negotiated_version, &client);
     if (result != ERROR_SUCCESS) {
-        ctx.write_output("connected|none|Not connected|0|none|none");
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "wifi:wlan_open_handle_failed");
+        ctx.write_output("connected|unknown|Wi-Fi connection state could not be determined "
+                         "(WlanOpenHandle failed)|0|none|none");
         return 0;
     }
 
@@ -873,7 +968,10 @@ int do_connected(yuzu::CommandContext& ctx) {
     result = WlanEnumInterfaces(client, nullptr, &iface_list);
     if (result != ERROR_SUCCESS || !iface_list) {
         WlanCloseHandle(client, nullptr);
-        ctx.write_output("connected|none|Not connected|0|none|none");
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "wifi:wlan_enum_interfaces_failed");
+        ctx.write_output("connected|unknown|Wi-Fi connection state could not be determined "
+                         "(WlanEnumInterfaces failed)|0|none|none");
         return 0;
     }
 
@@ -939,7 +1037,11 @@ int do_connected(yuzu::CommandContext& ctx) {
         return 0;
     }
     // NetworkManager D-Bus unreachable, or any call in the sequence failed
-    // -> fall through to the nmcli argv rung.
+    // -> fall through to the nmcli argv rung. Recorded, for the same reason
+    // do_list_networks records it: a permanent silent rung-1 death on a whole
+    // fleet is otherwise indistinguishable from rung 1 working.
+    ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL,
+                          "wifi:nm_dbus_fallthrough");
 #endif
     // sink: wifi/do_connected#1 -- nmcli device wifi list, ACTIVE row (rung 2
     // argv fallback). NOT `device show`: that command rejects the WIFI.*
@@ -1126,7 +1228,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
 class WifiPlugin final : public yuzu::Plugin {
 public:
     std::string_view name() const noexcept override { return "wifi"; }
-    std::string_view version() const noexcept override { return "1.0.0"; }
+    std::string_view version() const noexcept override { return "1.1.0"; }
     std::string_view description() const noexcept override {
         return "Scans visible WiFi networks and reports current connection status";
     }

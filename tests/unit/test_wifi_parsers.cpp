@@ -134,6 +134,25 @@ TEST_CASE("wifi: parse_nmcli_wifi_list_active — no active row means not connec
     CHECK_FALSE(parse_nmcli_wifi_list_active("").has_value());
 }
 
+// Regression guard: a line with FEWER than the six requested fields is a
+// truncated read (nmcli killed mid-write, or the runner's line cap cutting
+// the last line), not an observation. Completing it from defaults would
+// fabricate an open access point in an operator's security audit -- this is
+// exactly the class the truncation guard exists to stop.
+TEST_CASE("wifi: parse_nmcli_wifi_list_active — a truncated line is dropped, never completed",
+          "[wifi]") {
+    CHECK_FALSE(parse_nmcli_wifi_list_active("yes::::\n").has_value());   // 5 fields
+    CHECK_FALSE(parse_nmcli_wifi_list_active("yes:HomeNet\n").has_value()); // 2 fields
+    CHECK_FALSE(parse_nmcli_wifi_list_active("yes\n").has_value());         // 1 field
+}
+
+// Same rule, list-scan side: parse_nmcli_wifi_list requests five fields.
+TEST_CASE("wifi: parse_nmcli_wifi_list drops a truncated row instead of completing it",
+          "[wifi]") {
+    auto rows = parse_nmcli_wifi_list("HomeNet:78:WPA2\n"); // 3 of 5 fields
+    CHECK(rows.empty());
+}
+
 TEST_CASE("wifi: parse_nmcli_wifi_list_active — IN-USE '*' glyph also selects", "[wifi]") {
     auto row = parse_nmcli_wifi_list_active("*:HomeNet:70:WPA2:AA:wlan0\n");
     REQUIRE(row.has_value());
@@ -142,7 +161,11 @@ TEST_CASE("wifi: parse_nmcli_wifi_list_active — IN-USE '*' glyph also selects"
 
 TEST_CASE("wifi: parse_nmcli_wifi_list_active — missing optional fields default honestly",
           "[wifi]") {
-    auto row = parse_nmcli_wifi_list_active("yes::::\n");
+    // All SIX requested fields present but empty -- distinct from a TRUNCATED
+    // line (fewer than six fields), which is now rejected outright (see the
+    // truncation-guard test below): a genuinely empty field is an
+    // observation, a missing one is not.
+    auto row = parse_nmcli_wifi_list_active("yes:::::\n");
     REQUIRE(row.has_value());
     CHECK(row->ssid == "<hidden>");
     CHECK(row->signal == "0");
