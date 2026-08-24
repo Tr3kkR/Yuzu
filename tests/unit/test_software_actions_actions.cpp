@@ -8,15 +8,14 @@
  * isolation.
  *
  * ONLY `installed_count` is dispatched here — it is fast and fully local
- * (dpkg-query/rpm on Linux, pkgutil --pkgs on macOS). `list_upgradable` is
+ * (dpkg-query/rpm on Linux, pkgutil --pkgs on macOS, and on Windows a native
+ * registry read with no subprocess at all). `list_upgradable` is
  * deliberately NEVER dispatched from a unit test: on macOS it shells out to
  * `softwareupdate -l`, which hits Apple's catalog over the network and can
  * take tens of seconds — exactly the slow/network-dependent shape the repo's
  * test-efficiency discipline keeps out of the unit suites.
  */
 #include <catch2/catch_test_macros.hpp>
-
-#ifndef _WIN32
 
 #include <yuzu/agent/plugin_loader.hpp>
 #include <yuzu/plugin.h>
@@ -31,7 +30,9 @@ namespace fs = std::filesystem;
 
 namespace {
 
-#if defined(__APPLE__)
+#if defined(_WIN32)
+constexpr const char* kPluginExt = ".dll";
+#elif defined(__APPLE__)
 constexpr const char* kPluginExt = ".dylib";
 #else
 constexpr const char* kPluginExt = ".so";
@@ -52,6 +53,8 @@ fs::path find_software_actions_plugin() {
     candidates.emplace_back(fs::path{"build-macos"} / "agents" / "plugins" / "software_actions" /
                             lib_name);
     candidates.emplace_back(fs::path{"build-linux"} / "agents" / "plugins" / "software_actions" /
+                            lib_name);
+    candidates.emplace_back(fs::path{"build-windows"} / "agents" / "plugins" / "software_actions" /
                             lib_name);
 
     for (const auto& p : candidates) {
@@ -81,6 +84,8 @@ std::optional<LoadedPlugin> load_software_actions_plugin() {
 }
 
 } // namespace
+
+#ifndef _WIN32
 
 TEST_CASE("software_actions plugin: installed_count reports a real digit count via "
           "dpkg-query/rpm/pkgutil argv",
@@ -114,4 +119,42 @@ TEST_CASE("software_actions plugin: installed_count reports a real digit count v
     }
 }
 
-#endif // !_WIN32
+#else // _WIN32
+
+TEST_CASE("software_actions plugin: installed_count reads the Uninstall key natively (rung 1)",
+          "[software_actions]") {
+    // The Windows leg of installed_count is the ONLY rung-1 path in this
+    // plugin: RegOpenKeyExW + RegQueryInfoKeyW, zero subprocesses, replacing a
+    // `powershell -Command` shell-out. It is Windows-only code, so this is the
+    // only place it can be exercised end to end -- the pure
+    // installed_count_line() tests cover the emit decision but never touch the
+    // registry. Cheap and fully local (one registry open + one query), so it
+    // respects the unit-suite efficiency discipline: no subprocess, no
+    // network, no clock.
+    auto plugin = load_software_actions_plugin();
+    REQUIRE(plugin.has_value());
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto result = dispatcher.run(plugin->descriptor, "installed_count");
+
+    // rc 0 == the registry read succeeded. HKLM\...\Uninstall is readable by
+    // any user on every supported Windows, so a failure here is a real defect,
+    // not an environment quirk.
+    CHECK(result.rc == 0);
+
+    auto pos = result.captured.find("count|");
+    REQUIRE(pos != std::string::npos);
+    auto rest = result.captured.substr(pos + 6);
+    while (!rest.empty() && (rest.back() == '\n' || rest.back() == '\r'))
+        rest.pop_back();
+    REQUIRE_FALSE(rest.empty());
+    for (char c : rest) {
+        CHECK(std::isdigit(static_cast<unsigned char>(c)));
+    }
+    // A real Windows host always has Uninstall subkeys. A zero here would mean
+    // the native read silently returned nothing -- the fabricated-zero shape
+    // this plugin's degrade path was changed to avoid.
+    CHECK(std::stoll(rest) > 0);
+}
+
+#endif // _WIN32
