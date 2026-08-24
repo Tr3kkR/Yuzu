@@ -130,6 +130,9 @@ interim site — ADR-3002 Decisions 1 and 2).
 | `antivirus/xprotect_status_macos#3` | `agents/plugins/antivirus/src/antivirus_plugin.cpp:xprotect_status_macos` (via `read_plist_version`) | runner argv (`/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' <MRT.app Info.plist>`) | macOS | fixed literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none | no public API reads a bundle's CFBundleShortVersionString without linking CoreFoundation's plist parser directly into this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no in-tree CoreFoundation plist-parsing dependency for this plugin | n/a |
 | `bitlocker/report_filevault_status#1` | `agents/plugins/bitlocker/src/bitlocker_plugin.cpp:report_filevault_status` | runner argv (`/usr/bin/fdesetup status`) | macOS | none — fixed literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none beyond the LaunchDaemon's existing root context | No public rung-1 API reports FileVault's own on/off state (the SecItem/keychain APIs certificates.cpp uses answer a different question); `fdesetup` is Apple's own tool for this | Rung 2 — clean argv through the bounded subprocess runner (was rung 3, `/bin/sh -c "fdesetup status 2>/dev/null"`, before this migration) | n/a |
 | `bitlocker/report_filevault_status#2` | `agents/plugins/bitlocker/src/bitlocker_plugin.cpp:report_filevault_status` | runner argv (`/usr/bin/diskutil apfs list`) | macOS | none — fixed literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none beyond the LaunchDaemon's existing root context | No public rung-1 API for per-APFS-volume encryption state; `diskutil` is Apple's own tool for this | Rung 2 — clean argv through the bounded subprocess runner (was rung 3, `/bin/sh -c "diskutil apfs list 2>/dev/null"`, before this migration) | n/a |
+| `event_logs/do_errors#1` | `agents/plugins/event_logs/src/event_logs_plugin.cpp:do_errors` | runner argv (`/usr/bin/log show --predicate 'messageType == error' --last <N>h --style compact`) | macOS | compile-time literal argv; `<N>` is a clamped integer | read-only | none | none | no public rung-1 API for out-of-process unified-log reads (OSLog reader APIs are Swift/private; roadmap declares the M leg a rung-2 stuck leaf) | 2 — direct argv via yuzu::agent::run_bounded_subprocess (10s deadline, max_lines cap, stop_after_max_lines) | n/a |
+| `event_logs/do_query#1` | `agents/plugins/event_logs/src/event_logs_plugin.cpp:do_query` | runner argv (`/usr/bin/log show --predicate 'eventMessage contains "<filter>"' --last 24h --style compact`) | macOS | `<filter>` is allowlist-sanitized (alnum/space/./-/_//) and passed as ONE argv element — never shell text | read-only | none | none | same as `event_logs/do_errors#1` | 2 — direct argv via yuzu::agent::run_bounded_subprocess (10s deadline, max_lines cap, stop_after_max_lines) | n/a |
+| `event_logs/run_journalctl_fallback#1` | `agents/plugins/event_logs/src/event_logs_plugin.cpp:run_journalctl_fallback` | runner argv (`/usr/bin/journalctl -q ...` — errors and query argv variants built by the two callers) | Linux | numeric params clamped; `--grep=<filter>` value allowlist-sanitized and passed as ONE argv element | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none | declared FALLBACK below the rung-1 sd_journal leg (descriptor `fallback` field): runs only when libsystemd is compiled out (-Dsystemd_guard) or the journal is unreachable at runtime | Rung 2 — clean argv through the bounded subprocess runner (was rung 3, `/bin/sh -c "journalctl ... 2>/dev/null"`, before this migration) | n/a |
 
 ## Seed inventory — known spawn surfaces awaiting transcription
 
@@ -139,12 +142,22 @@ private helpers). Site-level transcription is #2380's first work item —
 these rows are pointers, not evidence.
 
 **Raw `popen`/`system` helpers:**
-device_identity, event_logs, hardware, installed_apps,
+device_identity, hardware, installed_apps,
 ioc, license_scan, network_config,
 network_diag, os_info, processes,
 software_actions, tar, vuln_scan, wifi, windows_updates.
 (`vuln_scan` carries code slated for retirement per ADR-0028/ADR-0018 —
 sequence that cleanup against migrating it, tracked in #2380.)
+
+**Migrated off raw spawn (Wave 4, PR4.2):** `event_logs` (Windows
+PowerShell `Get-WinEvent` via raw `_popen` promoted to rung-1 wevtapi
+`EvtQuery`/`EvtRender` with a bounded `EvtNext` wait — zero Windows
+subprocesses; Linux `journalctl` via `/bin/sh -c` promoted to a rung-1
+bounded `sd_journal` read behind the shared `systemd_guard` feature, with
+the declared rung-2 `journalctl` pre-split-argv fallback registered above
+as `event_logs/run_journalctl_fallback#1`; the macOS `log show` argv sites
+registered as `event_logs/do_errors#1` / `event_logs/do_query#1`. The
+grandfather-list entry is removed and will not return).
 
 **Migrated off raw spawn (Wave 2, PR2.1a):** `users` (Windows session
 history moved to wevtapi/EvtQuery, ProfileList to native enumeration; POSIX
