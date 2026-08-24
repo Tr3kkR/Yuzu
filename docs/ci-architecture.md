@@ -438,19 +438,48 @@ and uncontested — a real run acquired its cross-job slot in 0s, no other job
 competing — shards E and G still TIMEOUT'd at 600.51s/600.54s (SIGKILL'd). The
 within-job `--num-processes` pool was shared by ALL ~32 registered tests, not
 just the 8 pg shards: the Linux Test step ran one `meson test` invocation with
-no `--suite`/name filter at all, so a cheap `agent`/`docs`/`proto`/`tar`/
-`gateway` test occupying one of only 2 slots partway through could extend the
-pg shards' own effective queue even with zero cross-job interference. Fix:
-split the Test step into 3 `flake-retry.py` invocations, cheap-first
-(fail-fast) — the ~24 non-pg tests (5 suites, uncapped, no DB dependency, were
-never the contention source) run first; the 8 pg shards, isolated by exact
-name into their own `with-test-slot.sh`-gated call, run last, now with the
-cross-job pool dedicated entirely to them. `--num-processes` for that isolated
-pool went from 2 to 3 — safe now that it has no cheap-test competition, and
-justified by the same live run: 2 had already proven to have zero margin even
-uncontended. The cross-job slot count in `with-test-slot.sh` stays at 2,
-unchanged — a different axis (box-wide job saturation, #3443 AC4), raising it
-would reopen that problem.
+no `--suite`/name filter at all. Fix: split the Test step into 3
+`flake-retry.py` invocations, cheap-first (fail-fast via `bash -e`) — 21 tests
+across 5 cheap suites (`agent`/`docs`/`proto`/`tar`/`gateway`) run first, then
+the 3 non-pg server tests, both uncapped (neither touches Postgres); the 8 pg
+shards, isolated by exact name into their own `with-test-slot.sh`-gated call,
+run last with the pool dedicated entirely to them. 21+3+8 = 32, verified as an
+exact partition of the full registered test set before trusting it in CI.
+
+**Root cause, corrected.** The original theory — a cheap test stealing one of
+the 2 within-job slots — was superseded during governance re-review: back-
+computed start times from the actual failing run show shard E's real
+co-runners were shard D (~370s of overlap) then shard G (~230s), plain 2-wide
+FIFO over `tests/meson.build`'s declaration order; cheap tests hadn't even
+started by the time G timed out. The real mechanism is what this section's own
+earlier paragraphs already say — shard cost is a function of concurrent
+pg-shard count, and 8 shards at 2-wide inherently pairs some heavy ones for
+extended stretches. Isolating cheap tests from the pool is still a real, if
+smaller, improvement (it removes an incidental ~51s gap the same
+reconstruction found between shards A and H starting), but doesn't by itself
+explain or fix E/G's own margin. An earlier version of this fix also raised
+`--num-processes` to 3, reasoning the now-pg-only pool had "no competition to
+spend margin on" — reverted to 2 without a real run confirming it helped: at
+3-wide, FIFO over A,H,B,D,E,G,F,C predicts D, E, and G (three of the heaviest)
+running concurrently for a long stretch, plausibly worse than today's 2-wide
+pairing. `tests/meson.build`'s own shard-history comment states the house
+rule this broke: "raising the number is the last resort, not the first." The
+cross-job slot count in `with-test-slot.sh` stays at 2, unchanged — a
+different axis (box-wide job saturation, #3443 AC4); raising it would reopen
+that problem.
+
+**Two more disclosed tradeoffs from the split, neither affecting job pass/fail
+(each invocation gates on its own exit code via `bash -e`):** each invocation
+overwrites meson's single `testlog.junit.xml`, so only the pg-gated call's
+(last) per-suite telemetry survives the default import — and separately,
+`flake-retry.py` writes `meson-logs/flake-retry.json` unconditionally on every
+clean invocation, so a clean pg-shard pass can silently overwrite recovered-
+flake evidence the cheap-suite calls found earlier. And groups 1/2 now run
+entirely outside `with-test-slot.sh` — before this split, one gated invocation
+covered all 32 tests; up to 4 concurrent Linux jobs' cheap-suite phases can now
+overlap unrestrained. Judged low-risk (cheap suites measured ~1-2 min combined,
+no Postgres/heavy-CPU contention), but a real narrowing of what #3443 AC4's
+gate covers.
 
 **Drift risk, not yet automated:** the 3-way split hardcodes the 8 pg shard
 names and the 3 non-pg server test names directly in `ci.yml`. A new/renamed
@@ -479,6 +508,15 @@ each Meson test entry's result/duration/timeout, and any listed flake recovered
 by `flake-retry`. A cancelled job normally finalizes as `cancelled`; a hard kill
 that prevents post-steps intentionally leaves an `in_progress` row, which is
 itself evidence of runner/job termination rather than a fabricated result.
+
+**Linux-specific gap, since the "Suite isolation" split above:** the finalizer
+imports one `meson-logs/testlog.junit.xml`, and Linux's Test step now runs 3
+separate `meson test` invocations against the same builddir, each overwriting
+that file. Only the last (pg-shard) invocation's per-suite `ci_test_suites`
+rows and any `flake-retry` recovery it reports survive — the two earlier, cheap
+invocations still gate the job (their own exit code), but produce no queryable
+history via `test-db-query.sh ci-suite-stats`/`ci-flakes` for this job. Windows
+and macOS are unaffected (still one invocation each).
 
 Provisioning is versioned in
 [`deploy/linux/Provision-BigTam-Runner-Telemetry.sh`](../deploy/linux/Provision-BigTam-Runner-Telemetry.sh)
