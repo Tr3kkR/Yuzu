@@ -81,13 +81,14 @@ directly through `update_agent_status`'s effect (re-run the check via
 `POST /api/policies/:id/evaluate`, or fix the row with engineering support)
 before removing the legacy file.
 
-**"Move it aside" also drops status history, not just definitions.** The
-server's own remediation text ("move it aside to skip the backfill — policy
-definitions in it will NOT carry over") is correct but incomplete: moving the
-file aside sets `sourceless=true`, which empties `legacy_status` too — any
-per-agent compliance status history that only exists in the legacy file (not
-yet reflected in Postgres) is dropped along with the definitions, not just
-the definitions.
+**"Move it aside" also drops status history, not just definitions.** Moving
+the file aside sets `sourceless=true`, which empties `legacy_status` too —
+any per-agent compliance status history that only exists in the legacy file
+(not yet reflected in Postgres) is dropped along with the definitions, not
+just the definitions. The server's own boot-refusal log line already says so
+("policy definitions AND per-agent status history in it will NOT carry
+over") — this section spells out why, for an operator who wants the
+mechanism, not just the warning.
 
 ## After the backfill succeeds
 

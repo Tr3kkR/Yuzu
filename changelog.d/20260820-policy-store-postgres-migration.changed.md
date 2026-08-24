@@ -8,4 +8,8 @@
   automatically on first boot in the common case; the backfill refuses to
   boot (and logs why) if it finds two divergent legacy files or a status row
   Postgres has already advanced past — both require operator reconciliation,
-  by design, rather than a silent merge.
+  by design, rather than a silent merge. See `docs/user-manual/upgrading.md`
+  ("Compliance policy engine migrates to Postgres") for the pre-upgrade check
+  and operator-visible behaviour changes, and
+  `docs/ops-runbooks/policy-store-backfill-recovery.md` for backfill-refusal
+  recovery.

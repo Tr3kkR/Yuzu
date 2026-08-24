@@ -3320,7 +3320,10 @@ is remediated.
 ```
 
 **Response (404):** policy not found. **Response (409):** the fragment defines no
-`fix` instruction, or there are no non-compliant agents to remediate.
+`fix` instruction, there are no non-compliant agents to remediate, or a
+remediation for this policy is already in flight (dispatched but not yet past
+its `postCheck` — same-process dedup only, see the ADR-0056 Follow-ups for the
+cross-replica gap).
 **Response (503):** either the policy evaluator isn't wired ("policy evaluation
 not available"), or a genuine internal store failure occurred while resolving
 the policy or its remediation targets ("policy store degraded" / "policy store

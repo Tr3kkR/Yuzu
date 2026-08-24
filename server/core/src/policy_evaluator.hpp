@@ -36,7 +36,10 @@
 /// the fragment defines a fix_instruction: `remediate()` marks targets
 /// `fixing`, dispatches the fix, then (on a later tick) dispatches the
 /// post-check / check instruction and writes the true post-fix verdict. There
-/// is no automatic non_compliant -> fix loop.
+/// is no automatic non_compliant -> fix loop. A concurrent `remediate()` call
+/// for the same policy while one is already dispatching is rejected (error,
+/// same-process only via `remediating_`/`ReservationGuard` below — a
+/// cross-replica race is still possible, see the Multi-replica note above).
 ///
 /// Multi-replica note (ADR-0056): a stranded `fixing` row (the dispatching
 /// replica died mid-FixWait) is swept back to `unknown` by

@@ -497,15 +497,17 @@ Four more findings from the same pass, all fixed:
   `PolicyEvaluator::Deps` already carries for the fix/verify phases — zero new plumbing.
 
 **Documentation gap** (docs-writer HIGH, sre SHOULD — sre's read was the more operationally serious
-of the two: the "move it aside" remediation server.cpp already logged is technically correct but
+of the two: the "move it aside" remediation server.cpp logged at the time was technically correct but
 incomplete, since it also drops per-agent status history, not just definitions, and the
 `policy_status` legacy-ahead check re-runs on **every** boot for as long as the legacy file exists at
 its configured path — leaving it in place post-cutover as a "backup" reproduces the refusal, as a
-boot crash loop, on any later clock skew or restored-backup drift): added
+boot crash loop, on any later clock skew or restored-backup drift): fixed the log line itself to name
+both ("policy definitions AND per-agent status history in it will NOT carry over"), and added
 `docs/ops-runbooks/policy-store-backfill-recovery.md` (mirrors `tag-store-backfill-recovery.md`'s
-structure) covering both refusal shapes, the status-history caveat, and the every-boot re-check
-caveat; linked from the `server.cpp` refusal log line and the `docs/postgres-migration-ladder.md`
-ladder row. Also qualified `docs/user-manual/rest-api.md`'s `/evaluate`, `/remediate`,
+structure) covering both refusal shapes, the status-history caveat in full (why it's dropped, not just
+that it is), and the every-boot re-check caveat; linked from the `server.cpp` refusal log line and the
+`docs/postgres-migration-ladder.md` ladder row. Also qualified `docs/user-manual/rest-api.md`'s
+`/evaluate`, `/remediate`,
 `/api/compliance`, and `/api/compliance/{policy_id}` sections, which either omitted the 503 branches
 entirely or documented only one of several live 503 messages; and added a one-line pointer to the
 durable dispatch claim in the `.claude/routed-concerns.md` "Compliance evaluation pipeline" row,
@@ -745,3 +747,49 @@ relying on declaration order to prove it).
   Check sweep exists to match the stranded-Fix sweep `claim_due_policies` already has; a rolling
   multi-replica deploy has no way to distinguish "wait for operator" from "keep restarting" on a
   persistent boot refusal beyond the new runbook.
+
+**Seventh correction** (2026-08-24, Gate 5/6/8 batch — chaos-injector + compliance-officer +
+enterprise-readiness + security-guardian + docs-writer re-review of the Sixth correction diff):
+security-guardian gave a clean **PASS** (no CRITICAL/HIGH/MEDIUM), having verified the `ReservationGuard`/
+`remediating_` mechanism's lifetime/atomicity/correctness directly; it also recommended the new
+mutex-guarded reservation path get a run under `-Db_sanitize=thread` before this lands somewhere
+routinely exercised at scale, as ordinary due diligence for new shared-mutable-state — not a blocking
+finding. Not run standalone this round (deferred to the existing Tier 3 nightly TSan leg, which already
+covers this file; no separate ad hoc run scheduled). Fixed this round: the compliance dashboard's
+hardcoded "Last evaluated: just now" span asserted a freshness claim the server was not actually
+tracking — an I3 (wrong result presented as correct) finding once evaluation genuinely runs and can
+genuinely go stale (compliance-officer HIGH); removed rather than backed with real tracking, which
+would be a separate feature (see below). Five of the six mutator routes' new degrade-503 bodies used
+the flat legacy `{"error": "<string>"}` shape instead of the nested A4 envelope `remediate` alone used
+(enterprise-readiness); brought all six into the nested shape already used one branch above in the same
+routes for the "store not open" 503, without touching the pre-existing flat 400s (tracked separately,
+above). Added the missing `docs/user-manual/upgrading.md` section for this migration (enterprise-
+readiness BLOCKING — every sibling Postgres-store migration has one, this didn't); a dedicated
+`changelog.d/20260824-policy-store-degrade-classification.fixed.md` fragment for the 503-taxonomy
+change, mirroring the `custom-properties-degrade-classification` precedent, plus cross-references from
+the original migration fragment to `upgrading.md`/the runbook (enterprise-readiness SHOULD); the
+`docs/user-manual/audit-log.md` `policy.remediate` row's disposition list (missing `error`, enterprise-
+readiness SHOULD); the runbook's and this ADR's own stale narration of the server.cpp log line as
+"correct but incomplete" in the present tense, when the log line itself was already fixed to name both
+definitions and status history in the same round that added the runbook (compliance-officer HIGH,
+independently corroborated by docs-writer's Gate 8 pass — 2 reporters); `policy_evaluator.hpp`'s
+remediation doc paragraph and `docs/postgres-migration-ladder.md`'s `PolicyStore` row, both still
+carrying the unqualified "naturally idempotent" claim after the Sixth correction had already qualified
+it in one place but not the other (docs-writer); and `docs/user-manual/rest-api.md`'s `/remediate`
+section, still listing only the original two 409 causes after the Sixth correction added a third
+(docs-writer). Deferred, not fixed: `InstructionStore::get_definition` is not degrade-distinguishable
+(compliance-officer MEDIUM) — pre-existing, out of this migration's scope, not re-opened here. A real
+evaluation-health signal for the compliance dashboard (compliance-officer's underlying HIGH, once the
+false freshness claim itself is removed this degrades to a MEDIUM observability gap) — done properly
+this needs a REST twin per ADR-1005 (no UI-only capabilities), which is why it's feature-sized rather
+than a doc/one-liner fix; not built this round. `policies.db` is never renamed aside after a verified
+backfill, unlike `tags.db.migrated-<epoch>` and its siblings (enterprise-readiness SHOULD) — a real
+design divergence from the established ladder pattern, not a doc gap; needs its own small PR.
+PolicyStore-specific backfill Prometheus metrics (`yuzu_server_policy_store_backfill_total` or
+equivalent, matching every sibling store's alerting shape) do not exist yet (enterprise-readiness
+SHOULD) — feature-sized, not a doc fix. chaos-injector produced six chaos test-design scenarios
+(concurrent-replica dispatch-claim races, a killed-mid-backfill restart loop, a Postgres connection
+drop mid-`remediate()`, clock skew against the legacy-ahead check, a malformed `fix_attempt_count`
+column mid-backfill, and a stranded-`fixing` sweep racing a live remediation) — none blocking, drafted
+as candidate follow-up issues, not yet filed pending operator go-ahead and a dedupe pass against the
+existing issue tracker.
