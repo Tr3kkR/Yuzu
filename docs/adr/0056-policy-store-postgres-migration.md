@@ -376,15 +376,19 @@ every other authoritative store on the ladder.
 
 Today `policy_store_` owns a standalone `sqlite3*` with no shared dependency, so implicit
 declaration-order destruction in `~ServerImpl` was safe. Once it borrows `pg_pool_`, that stops
-being true — the same reasoning `server.cpp:7472-7490`'s `custom_properties_store_` comment
-documents (a sibling store the evaluator also holds a raw pointer to on its background thread) now
-extends to `policy_store_` itself: `stop()` already joins `policy_eval_thread_` early
-(`server.cpp:7149-7153`, ahead of every store teardown, unchanged by PR #3339's shutdown-watcher
-rework — verified against the current `stop()` sequence on this branch, not assumed from memory),
-so by the time any store is torn down the evaluator thread is provably not running. An explicit
-`policy_store_.reset()` is added immediately before `pg_pool_.reset()`, matching sibling discipline
-(belt-and-braces, not risk-bearing — the thread-join ordering already made this safe; the explicit
-reset just stops relying on declaration order to prove it).
+being true — the same reasoning `server.cpp`'s `custom_properties_store_` comment (immediately
+above the `policy_store_.reset()` site) documents (a sibling store the evaluator also holds a raw
+pointer to on its background thread) now extends to `policy_store_` itself: `stop()` already joins
+`policy_eval_thread_` early (`server.cpp:7470-7474`, well ahead of every store teardown near
+`server.cpp:7818-7831` — re-verified against `stop()`'s current sequence on this branch AFTER
+merging origin/dev's PR #3339 shutdown-watcher rework, not the pre-merge line numbers or assumed
+from memory: #3339 changed HOW `stop()` gets invoked, off the raw signal-handler context onto a
+dedicated watcher thread, main.cpp/server.cpp — it did not change the join-before-teardown
+ordering internal to `stop()` itself, which this store's teardown relies on), so by the time any
+store is torn down the evaluator thread is provably not running. An explicit `policy_store_.reset()`
+is added immediately before `pg_pool_.reset()`, matching sibling discipline (belt-and-braces, not
+risk-bearing — the thread-join ordering already made this safe; the explicit reset just stops
+relying on declaration order to prove it).
 
 ## Considered and rejected
 
@@ -434,3 +438,24 @@ reset just stops relying on declaration order to prove it).
   specific operator-triggered check/fix strands (no verdict ever recorded) until the operator
   retries. Accepted: narrow (operator-triggered only, not the routine tick path), and the operator
   already has a natural retry action (re-click evaluate/remediate).
+- **`legacy_status`'s backfill materializes the whole table into a `std::vector` before writing —
+  a deliberate, considered choice, not an oversight, checked directly against `DeviceTokenStore`'s
+  #3398/#3399 hardening (PR #3435, merged days before this store's dev-merge) since that precedent
+  is the freshest thing a reviewer would hold this backfill against.** `policy_status` is
+  `(policy_id, agent_id)`-keyed — fleet size × policy count, structurally the same scale class as
+  device-token's per-device rows — so the concern transfers in principle. Not ported here because
+  the two backfills differ in what actually costs memory: #3399's fix was a *streaming SHA-256
+  fingerprint* (a full sort-then-hash pass over a materialized copy) plus a batched copy pass;
+  `legacy_status` is **never fingerprinted at all** — it's excluded from the five-table identity
+  fingerprint by design (see Backfill above, direction-aware LIFECYCLE merge) — so only the
+  simpler "read fully, then loop-write" cost applies, not the sort-then-hash one, and it's a
+  transient one-shot boot-time allocation (freed once the loop completes), not a steady-state
+  pattern. Every OTHER mandatory-backfill store on the ladder (`DeploymentStore`, `LicenseStore`,
+  `CaStore`, `TagStore`, `NotificationStore`, `CustomPropertiesStore`, `ManagementGroupStore`,
+  `RbacStore`) materializes its legacy tables the same way and none needed the streaming
+  treatment — `DeviceTokenStore` is the one outlier so far, and its own ADR frames the fix as
+  proactive hardening on a then-dormant store, not a response to an observed failure. If a real
+  fleet's `policy_status` backfill memory footprint becomes a measured problem, the right fix is
+  the same shape as #3399's copy pass alone (chunked `LIMIT`/`OFFSET` read + batched
+  `INSERT ... SELECT FROM unnest(...)` write) without the fingerprint-streaming half, since there
+  is no fingerprint pass to make streaming here.

@@ -33,6 +33,7 @@
 #include <windows.h>
 
 #include "user_profile_model.hpp"
+#include "value_enumeration.hpp"
 #include "win_reg_handle.hpp"
 #include "win_str.hpp"
 
@@ -58,6 +59,22 @@ namespace yuzu::win {
 /// explicit ceiling.
 inline constexpr std::size_t kMaxProfiles = 512;
 inline constexpr DWORD kMaxRegValueBytes = 1u * 1024u * 1024u; // 1 MiB
+
+// Bound on enumerate_value_names()'s worst-case wall time: a key an
+// operator (or an attacker with write access to the hive) has stuffed with
+// an unbounded number of values must not pin the instruction worker
+// enumerating forever. 4096 is well beyond any real Defender exclusion list
+// this function was written for (antivirus/av_exclusions) while still being
+// a hard ceiling.
+inline constexpr DWORD kMaxEnumeratedValueNames = 4096;
+
+// A registry value NAME (as opposed to its data) is capped by Win32 at
+// 16383 WCHARs; this is a defensive ceiling on the name buffer this function
+// allocates, independent of whatever RegQueryInfoKeyW reports as the key's
+// actual max -- a corrupt or hostile hive should not make this function
+// allocate an unbounded buffer.
+inline constexpr DWORD kMaxValueNameChars = 16384;
+
 // A Windows path is at most 32767 wchars; 64 KiB bounds the two-pass
 // ProfileImagePath read without ever truncating a legitimate value.
 inline constexpr DWORD kMaxProfilePathBytes = 64u * 1024u;
@@ -217,6 +234,93 @@ inline std::vector<std::string> enumerate_hku_subkeys() {
         name_len = kNameBufLen;
     }
     return out;
+}
+
+// Result of enumerate_value_names(): the names actually collected, plus
+// whether the enumeration is known to be the COMPLETE set. `complete` is
+// false when a value name exists but could not be confirmed collected --
+// RegQueryInfoKeyW itself failed on an already-open key, the safety cap
+// (kMaxEnumeratedValueNames) cut the walk short, or RegEnumValueW failed
+// mid-enumeration. `names` is never fabricated: whatever is present is
+// real data, `complete=false` is purely an "there may be more" signal so a
+// caller doesn't present a possibly-truncated list as a verified-clean one
+// (security-relevant for callers like Defender exclusion enumeration,
+// where an under-reported list reads as a healthier posture than reality).
+struct ValueNameEnumeration {
+    std::vector<std::string> names;
+    bool complete = true;
+};
+
+// Enumerates every VALUE NAME directly under `key` (not the values'
+// data — some registry-driven configuration, e.g. Windows Defender's
+// exclusion lists, stores each entry AS the value name itself, with the
+// data unused). Returns an empty, complete result both when `key`
+// genuinely has no values and when `key` is null — callers that need to
+// distinguish "empty key" from "key could not be opened at all" check the
+// RegOpenKeyExW result themselves before calling this (this function only
+// ever sees an already-open key; a null `key` is therefore never itself a
+// completeness failure of THIS function).
+//
+// Two-pass, same spirit as read_reg_value()'s size-then-fill idiom: first
+// RegQueryInfoKeyW sizes the longest value name actually present so the
+// buffer is neither a truncating fixed guess (a value name here can be a
+// full filesystem path, unlike the short SID/profile key names
+// enumerate_profile_records/enumerate_hku_subkeys size for) nor an
+// unbounded allocation (kMaxValueNameChars caps it regardless of what the
+// key reports). Enumeration itself is bounded at kMaxEnumeratedValueNames
+// entries so a key stuffed with an unbounded number of values cannot pin
+// this call indefinitely -- that cap, and any other short-collection, is
+// reported via `complete`, never silently.
+inline ValueNameEnumeration enumerate_value_names(HKEY key) {
+    ValueNameEnumeration result;
+    if (!key)
+        return result;
+
+    DWORD value_count = 0;
+    DWORD max_name_len = 0; // WCHARs, NOT including the terminating NUL
+    if (RegQueryInfoKeyW(key, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &value_count,
+                         &max_name_len, nullptr, nullptr, nullptr) != ERROR_SUCCESS) {
+        result.complete = false;
+        return result;
+    }
+    if (value_count == 0)
+        return result;
+
+    if (max_name_len >= kMaxValueNameChars)
+        max_name_len = kMaxValueNameChars - 1;
+    std::vector<wchar_t> name_buf(static_cast<std::size_t>(max_name_len) + 1, L'\0');
+
+    const DWORD cap = value_count < kMaxEnumeratedValueNames ? value_count
+                                                             : kMaxEnumeratedValueNames;
+    result.names.reserve(cap);
+    DWORD idx = 0;
+    for (; idx < cap; ++idx) {
+        // RegEnumValueW's lpcchValueName is WCHAR count and MUST include
+        // room for the terminator on input, even though the count it writes
+        // back on success does not include it (mirrors RegEnumKeyExW's
+        // contract in enumerate_hku_subkeys above, just measured in the
+        // opposite unit from read_reg_value's byte-oriented RegQueryValueExW).
+        DWORD name_len = static_cast<DWORD>(name_buf.size());
+        const LSTATUS rc = RegEnumValueW(key, idx, name_buf.data(), &name_len, nullptr, nullptr,
+                                         nullptr, nullptr);
+        if (rc != ERROR_SUCCESS) {
+            // A value deleted mid-enumeration (index shifts under us) or any
+            // other transient failure -- stop rather than loop past what the
+            // key actually still has; whatever was collected so far is real.
+            break;
+        }
+        result.names.push_back(from_wide(name_buf.data(), static_cast<int>(name_len)));
+    }
+    // The DECISION (cap reached AND the walk reached it, vs cut short by
+    // either the cap or a mid-enumeration failure) is
+    // yuzu::win::value_enumeration_is_complete, extracted pure so it is
+    // unit-tested without a real registry (adversarial-review gate 2
+    // finding: the prior inline `complete = false` assignments above were
+    // never fixture-reachable). This Win32 shell's job is only to gather
+    // the three input facts: the provider's reported count, the cap we
+    // applied, and how far the walk actually got (`idx`).
+    result.complete = value_enumeration_is_complete(value_count, cap, idx);
+    return result;
 }
 
 // RAII scope that enables a token privilege the service account holds but

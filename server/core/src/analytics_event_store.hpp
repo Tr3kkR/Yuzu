@@ -111,11 +111,14 @@ public:
 
     /// Query recent events (for diagnostics / API), newest first.
     /// `nullopt` on a degraded read (store not open, pool timeout, query
-    /// error) — distinct from a genuinely empty buffer.
+    /// error) — distinct from a genuinely empty buffer. Stays answerable
+    /// after stop_drain() (unlike emit()/start_drain()) — see the
+    /// shutting_down_ member comment for why that's safe.
     [[nodiscard]] std::optional<std::vector<AnalyticsEvent>> query_recent(int limit = 50) const;
 
     /// Number of events waiting to be drained to sinks. `nullopt` on a
-    /// degraded read.
+    /// degraded read. Stays answerable after stop_drain() — see
+    /// query_recent() above.
     [[nodiscard]] std::optional<std::size_t> pending_count() const;
 
     /// Total events successfully emitted since this store was constructed
