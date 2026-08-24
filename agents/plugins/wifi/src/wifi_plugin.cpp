@@ -13,10 +13,15 @@
  *   Windows: WlanEnumInterfaces + WlanGetAvailableNetworkList / WlanQueryInterface
  *   Linux:   rung 1, bounded sd-bus to NetworkManager (org.freedesktop.
  *            NetworkManager) when built with libsystemd; ANY sd-bus failure
- *            falls through to rung 2, nmcli via the bounded argv runner; a
- *            missing/failing nmcli falls through to rung 3, a raw iw/iwlist
- *            (list_networks) or iwconfig (connected) text dump. No shell
- *            hop anywhere in this file (no shell interpreter is ever exec'd).
+ *            falls through to nmcli via the bounded argv runner; a
+ *            missing/failing nmcli falls through to an iw/iwlist
+ *            (list_networks) or iwconfig (connected) text dump. Those last
+ *            two legs are STILL RUNG 2, not rung 3: ADR-3002 Decision 5
+ *            grades a site by the deepest interpreter it intentionally
+ *            invokes, and these exec the tool directly. No shell hop
+ *            anywhere in this file (no interpreter is ever exec'd) -- see
+ *            the argv builders in wifi_parsers.hpp, which the unit tests
+ *            assert are interpreter-free.
  *   macOS:   list_networks — airport -s / system_profiler via the bounded
  *            argv runner (legacy; airport gone in 14+; unchanged scan
  *            behaviour, only the acquisition mechanism was argv-ized).
@@ -132,13 +137,14 @@ ToolOutcome run_tool(std::vector<std::string> argv, std::size_t max_lines = 0) {
 //     write: ActiveAccessPoint was read on ...Device, which answers
 //     org.freedesktop.DBus.Error.InvalidArgs ("No such property"); the
 //     property lives only on ...Device.Wireless. Corrected here.
-//   * Rows 6-11 (AccessPoint) are confirmed against NM's published
-//     introspection XML, but NOT runtime-confirmed: the verification host
-//     had no wireless device, so no AccessPoint object existed to query.
-//     Ssid really is 'ay' (a byte array that may hold non-UTF-8 and
-//     embedded NULs) and Strength really is 'y', not 'u' -- these are the
-//     two rows most likely to be mis-copied. Linux CI is the first venue
-//     that can execute them.
+//   * Rows 6-11 (AccessPoint) and row 12 are confirmed against NM's
+//     published introspection XML / GIR, but NOT runtime-confirmed: the
+//     verification host had no wireless device, so no AccessPoint object
+//     existed to query. Ssid really is 'ay' (a byte array that may hold
+//     non-UTF-8 and embedded NULs) and Strength really is 'y', not 'u' --
+//     these are the two rows most likely to be mis-copied. A host with a
+//     real radio is the first venue that can execute them, which is why
+//     both Linux legs are declared CONSTRAINED rather than SUPPORTED.
 //
 //  # | Call                | Interface                                   | Member           | Wire shape
 //  --|---------------------|----------------------------------------------|------------------|---------------------------------
@@ -151,6 +157,7 @@ ToolOutcome run_tool(std::vector<std::string> argv, std::size_t max_lines = 0) {
 //  7 | Properties.Get      | org.freedesktop.NetworkManager.AccessPoint    | Strength         | 'v' wrapping 'y'
 //  8 | Properties.Get      | org.freedesktop.NetworkManager.AccessPoint    | HwAddress        | 'v' wrapping 's'
 //  9 | Properties.Get      | org.freedesktop.NetworkManager.AccessPoint    | Frequency        | 'v' wrapping 'u' (MHz)
+// 12 | Properties.Get      | org.freedesktop.NetworkManager.Device.Wireless| LastScan         | 'v' wrapping 'x' (int64; -1 == NEVER scanned)
 // 10 | Properties.Get      | org.freedesktop.NetworkManager.AccessPoint    | WpaFlags         | 'v' wrapping 'u' (bitmask)
 // 11 | Properties.Get      | org.freedesktop.NetworkManager.AccessPoint    | RsnFlags         | 'v' wrapping 'u' (bitmask)
 //
@@ -282,6 +289,21 @@ std::optional<std::uint32_t> nm_get_u32(sd_bus* bus, const char* path, const cha
         return std::nullopt;
     std::uint32_t v = 0;
     if (sd_bus_message_read(reply.m, "u", &v) < 0)
+        return std::nullopt;
+    return v;
+}
+
+// Device.Wireless.LastScan -- 'x' (int64), CLOCK_BOOTTIME milliseconds of the
+// last FINISHED scan. NetworkManager's own GIR documents "A value of -1 means
+// the device never scanned for access points." Table row #12.
+std::optional<std::int64_t> nm_get_int64(sd_bus* bus, const char* path, const char* iface,
+                                         const char* member) {
+    SdBusErrorGuard err;
+    SdBusMessageGuard reply;
+    if (sd_bus_get_property(bus, kNmDest, path, iface, member, &err.err, &reply.m, "x") < 0)
+        return std::nullopt;
+    std::int64_t v = 0;
+    if (sd_bus_message_read(reply.m, "x", &v) < 0)
         return std::nullopt;
     return v;
 }
@@ -439,6 +461,10 @@ struct NmListResult {
     // separately so the caller can fall through to the argv rungs instead of
     // announcing an empty airspace.
     bool saw_wifi_device = false;
+    // At least one Wi-Fi device reported a finished scan (LastScan != -1), so
+    // its AccessPoints cache is a real observation of the airspace rather
+    // than a device that has simply never looked.
+    bool saw_scan = false;
     std::vector<yuzu::wifi::WifiNetworkRow> rows;
 };
 
@@ -464,6 +490,21 @@ NmListResult query_nm_list_networks() {
             continue;
         result.saw_wifi_device = true;
 
+        // AccessPoints is a CACHE, not a scan. `nmcli device wifi list` --
+        // the command this rung replaced -- guarantees results no older than
+        // 30s and triggers a scan when needed; reading the property does
+        // neither. If NM has never scanned on this device, an empty cache is
+        // not evidence of an empty airspace, so leave saw_scan false and let
+        // the caller fall through to the nmcli rung, which does scan.
+        if (!session.arm_next_call())
+            return result;
+        auto last_scan =
+            nm_get_int64(session.bus(), dev_path.c_str(), kNmWirelessIface, "LastScan"); // table #12
+        if (!last_scan)
+            return result;
+        if (*last_scan >= 0)
+            result.saw_scan = true;
+
         if (!session.arm_next_call())
             return result;
         auto ap_paths = nm_get_object_path_array(session.bus(), dev_path.c_str(), kNmWirelessIface,
@@ -484,6 +525,12 @@ NmListResult query_nm_list_networks() {
 
 struct NmConnectedResult {
     bool reachable = false; // false -> caller falls through to nmcli, never "no wifi"
+    // Same gate as NmListResult. Without it, a NetworkManager that manages
+    // only ethernet -- while the Wi-Fi interface is driven by iwd or a bare
+    // wpa_supplicant outside NM -- walks zero Wi-Fi devices, reports
+    // reachable, and the caller announces "Not connected" for a station that
+    // is actively associated. A fabricated negative.
+    bool saw_wifi_device = false;
     std::optional<yuzu::wifi::WifiConnectedRow> row; // nullopt + reachable -> genuinely not connected
 };
 
@@ -507,6 +554,7 @@ NmConnectedResult query_nm_connected() {
             return result;
         if (*dtype != kNmDeviceTypeWifi)
             continue;
+        result.saw_wifi_device = true;
 
         if (!session.arm_next_call())
             return result;
@@ -533,7 +581,11 @@ NmConnectedResult query_nm_connected() {
         result.row = yuzu::wifi::nm_ap_to_connected_row(*props, *iface_name);
         return result;
     }
-    result.reachable = true; // walked every wifi device; none associated -> genuinely not connected
+    // Walked every device NM manages. If at least one was Wi-Fi, "none
+    // associated" is a real answer; if none were, NM has told us nothing
+    // about this host's Wi-Fi and saw_wifi_device keeps the caller falling
+    // through to the argv rungs.
+    result.reachable = true;
     return result;
 }
 #endif // __linux__ && YUZU_HAVE_LIBSYSTEMD
@@ -636,7 +688,11 @@ int do_list_networks(yuzu::CommandContext& ctx) {
     // `saw_wifi_device` gates the definitive answer: a reachable NM that
     // manages no Wi-Fi device has told us nothing about the airspace, so we
     // fall through to iw/iwlist rather than announce an empty scan.
-    if (auto nm = query_nm_list_networks(); nm.reachable && nm.saw_wifi_device) {
+    // `saw_scan` additionally requires that some Wi-Fi device has actually
+    // finished a scan; an empty never-scanned cache falls through to nmcli
+    // (which rescans) instead of being reported as an empty airspace.
+    if (auto nm = query_nm_list_networks();
+        nm.reachable && nm.saw_wifi_device && (nm.saw_scan || !nm.rows.empty())) {
         if (nm.rows.empty()) {
             // A confirmed, definitive answer from a reachable NetworkManager
             // (not the ambiguous "empty output" nmcli's own leg below has to
@@ -659,9 +715,8 @@ int do_list_networks(yuzu::CommandContext& ctx) {
     // sink: wifi/do_list_networks#1 -- nmcli device wifi list (rung 2 argv;
     // replaces the deleted sh -c pipeline)
     auto nmcli_path = yuzu::agent::probe_tool_path({"/usr/bin/nmcli", "/bin/nmcli"});
-    auto nmcli_res =
-        run_tool({nmcli_path, "-t", "-f", "SSID,SIGNAL,SECURITY,CHAN,BSSID", "device", "wifi", "list"});
-    if (!nmcli_res.output.empty()) {
+    auto nmcli_res = run_tool(yuzu::wifi::nmcli_wifi_list_argv(nmcli_path));
+    if (yuzu::wifi::wifi_tool_answered(nmcli_res.res).answered && !nmcli_res.output.empty()) {
         yuzu::agent::forward_runner_failure(ctx, nmcli_res.res); // carries line_limit PARTIAL
         for (auto& row : yuzu::wifi::parse_nmcli_wifi_list(nmcli_res.output)) {
             ctx.write_output(std::format("wifi|{}|{}|{}|{}|{}", sof(row.ssid), sof(row.signal),
@@ -673,8 +728,10 @@ int do_list_networks(yuzu::CommandContext& ctx) {
     // sink: wifi/do_list_networks#2 -- iw dev (interface discovery for
     // the iwlist fallback)
     auto iw_path = yuzu::agent::probe_tool_path({"/usr/sbin/iw", "/sbin/iw", "/usr/bin/iw"});
-    auto iw_res = run_tool({iw_path, "dev"});
-    auto ifaces = yuzu::wifi::parse_iw_dev_interfaces(iw_res.output);
+    auto iw_res = run_tool(yuzu::wifi::iw_dev_argv(iw_path));
+    auto ifaces = yuzu::wifi::wifi_tool_answered(iw_res.res).answered
+                      ? yuzu::wifi::parse_iw_dev_interfaces(iw_res.output)
+                      : std::vector<std::string>{};
     if (!ifaces.empty()) {
         // sink: wifi/do_list_networks#3 -- iwlist <iface> scan
         // (per-interface raw scan text; one spawn per discovered iface)
@@ -683,7 +740,7 @@ int do_list_networks(yuzu::CommandContext& ctx) {
         bool any_scan_answered = false;
         bool status_forwarded = false;
         for (auto& iface : ifaces) {
-            auto scan_res = run_tool({iwlist_path, iface, "scan"});
+            auto scan_res = run_tool(yuzu::wifi::iwlist_scan_argv(iwlist_path, iface));
             if (yuzu::wifi::wifi_tool_answered(scan_res.res).answered)
                 any_scan_answered = true;
             if (!status_forwarded)
@@ -715,7 +772,15 @@ int do_list_networks(yuzu::CommandContext& ctx) {
         ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               "wifi:no_wireless_tools");
     }
-    ctx.write_output("wifi|error|No wireless tools available (nmcli/iw)|0|0|none");
+    if (yuzu::wifi::wifi_tool_answered(iw_res.res).answered) {
+        // `iw dev` ran and succeeded, it just listed no wireless interface.
+        // Saying "no wireless tools available" here would send an operator
+        // chasing a missing package on a host that simply has no Wi-Fi radio.
+        ctx.write_output("wifi|info|No wireless interfaces present (nmcli/iw ran and "
+                         "reported none)|0|0|none");
+    } else {
+        ctx.write_output("wifi|error|No wireless tools available (nmcli/iw)|0|0|none");
+    }
 
 #elif defined(__APPLE__)
     // macOS: the `airport` utility was removed in macOS 14 (Sonoma). Try
@@ -840,7 +905,10 @@ int do_connected(yuzu::CommandContext& ctx) {
 
 #elif defined(__linux__)
 #if defined(YUZU_HAVE_LIBSYSTEMD)
-    if (auto nm = query_nm_connected(); nm.reachable) {
+    // saw_wifi_device gates the definitive answer, mirroring do_list_networks:
+    // a reachable NM that manages no Wi-Fi device has said nothing about this
+    // host's association, so fall through rather than assert "Not connected".
+    if (auto nm = query_nm_connected(); nm.reachable && nm.saw_wifi_device) {
         if (nm.row) {
             auto& row = *nm.row;
             ctx.write_output(std::format("connected|{}|{}|{}|{}|{}", sof(row.ssid), sof(row.signal),
@@ -853,13 +921,15 @@ int do_connected(yuzu::CommandContext& ctx) {
     // NetworkManager D-Bus unreachable, or any call in the sequence failed
     // -> fall through to the nmcli argv rung.
 #endif
-    // sink: wifi/do_connected#1 -- nmcli device show (rung 2 argv fallback)
+    // sink: wifi/do_connected#1 -- nmcli device wifi list, ACTIVE row (rung 2
+    // argv fallback). NOT `device show`: that command rejects the WIFI.*
+    // fields outright (live nmcli 1.52.1: "invalid field 'WIFI.SSID'", exit
+    // 2), which left this declared fallback dead on every host.
     auto nmcli_path = yuzu::agent::probe_tool_path({"/usr/bin/nmcli", "/bin/nmcli"});
-    auto nmcli_res = run_tool({nmcli_path, "-t", "-f",
-                               "GENERAL.CONNECTION,WIFI.SSID,WIFI.SIGNAL,WIFI.SECURITY,WIFI.BSSID",
-                               "device", "show"},
-                              /*max_lines=*/20);
-    auto parsed = yuzu::wifi::parse_nmcli_device_show(nmcli_res.output);
+    auto nmcli_res = run_tool(yuzu::wifi::nmcli_connected_argv(nmcli_path), /*max_lines=*/64);
+    auto parsed = yuzu::wifi::wifi_tool_answered(nmcli_res.res).answered
+                      ? yuzu::wifi::parse_nmcli_wifi_list_active(nmcli_res.output)
+                      : std::nullopt;
     if (parsed) {
         yuzu::agent::forward_runner_failure(ctx, nmcli_res.res); // carries line_limit PARTIAL
         auto& row = *parsed;
@@ -871,8 +941,10 @@ int do_connected(yuzu::CommandContext& ctx) {
     // sink: wifi/do_connected#2 -- iwconfig (ESSID/Signal blob fallback)
     auto iwconfig_path =
         yuzu::agent::probe_tool_path({"/usr/sbin/iwconfig", "/sbin/iwconfig", "/usr/bin/iwconfig"});
-    auto iwconfig_res = run_tool({iwconfig_path});
-    auto filtered = yuzu::wifi::filter_iwconfig_essid_signal_lines(iwconfig_res.output);
+    auto iwconfig_res = run_tool(yuzu::wifi::iwconfig_argv(iwconfig_path));
+    auto filtered = yuzu::wifi::wifi_tool_answered(iwconfig_res.res).answered
+                        ? yuzu::wifi::filter_iwconfig_essid_signal_lines(iwconfig_res.output)
+                        : std::string{};
     auto essid = yuzu::wifi::parse_iwconfig_essid_blob(filtered);
     if (essid) {
         yuzu::agent::forward_runner_failure(ctx, iwconfig_res.res);
@@ -968,13 +1040,36 @@ int do_connected(yuzu::CommandContext& ctx) {
 #define YUZU_WIFI_LINUX_MECHANISM "nmcli via the argv runner (built without libsystemd)"
 #endif
 
+// Both Linux legs are CONSTRAINED, not SUPPORTED, and that is a deliberate
+// evidence judgement rather than a statement that the code is unfinished.
+//
+// The rule applied: a descriptor states what is DEMONSTRATED to work. The
+// D-Bus interface contract and every property signature here were verified
+// against a live NetworkManager 1.52.1 -- which is how two separate
+// dead-on-every-host defects in this very plugin were caught (ActiveAccessPoint
+// read on the wrong interface; an nmcli fallback whose fields that command
+// rejects outright). But that verification host was a container with NO RADIO,
+// so no AccessPoint object ever existed to read: the AP-property traversal
+// that both actions depend on has still never returned a real access point
+// anywhere. Spec conformance plus a hardware-less contract test is not the
+// same evidence as a working leg, and this plugin has now twice proven that
+// the gap is where the bugs live.
+//
+// To promote either leg to SUPPORTED, one thing is needed: a single
+// end-to-end run on a Linux host with a real Wi-Fi radio that (a) returns at
+// least one AP through the D-Bus traversal, and (b) forces a D-Bus failure
+// and observes the nmcli rung answer. Nothing else about the code need change.
+#define YUZU_WIFI_LINUX_SUPPORT YUZU_SUPPORT_CONSTRAINED
+
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "list_networks",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, YUZU_WIFI_LINUX_RUNG, YUZU_WIFI_LINUX_MECHANISM,
-         "falls back to nmcli via the argv runner (rung 2), then a raw iw/iwlist text dump "
-         "when nmcli is unavailable"},
+        {YUZU_WIFI_LINUX_SUPPORT, YUZU_WIFI_LINUX_RUNG, YUZU_WIFI_LINUX_MECHANISM,
+         "reads NetworkManager's cached AccessPoints and does not itself initiate a scan "
+         "(falls through to nmcli, which rescans, when NM reports no finished scan); then "
+         "falls back to nmcli via the argv runner (rung 2), then an iw/iwlist text dump. "
+         "Not yet exercised against a real Wi-Fi radio"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 2, "airport -s / system_profiler via argv runner",
          "airport was removed in macOS 14 (Sonoma); the system_profiler "
@@ -987,9 +1082,11 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "connected",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, YUZU_WIFI_LINUX_RUNG, YUZU_WIFI_LINUX_MECHANISM,
-         "falls back to nmcli via the argv runner (rung 2), then a raw iwconfig "
-         "ESSID/Signal blob when nmcli reports no SSID"},
+        {YUZU_WIFI_LINUX_SUPPORT, YUZU_WIFI_LINUX_RUNG, YUZU_WIFI_LINUX_MECHANISM,
+         "reports the device interface (e.g. wlan0) in the connection column rather than "
+         "the NetworkManager profile name; falls back to nmcli via the argv runner "
+         "(rung 2), then an iwconfig ESSID/Signal blob. Not yet exercised against a real "
+         "Wi-Fi radio"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 1, "CoreWLAN",
          "Location Services (macOS 14+) may withhold SSID/BSSID from a background daemon"},

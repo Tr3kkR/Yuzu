@@ -185,6 +185,14 @@ TEST_CASE("wifi plugin: capability descriptors state the rung this binary can ac
     CHECK(list_networks->linux_leg.rung == kExpectedLinuxRung);
     CHECK(connected->linux_leg.rung == kExpectedLinuxRung);
 
+    // Both Linux legs are CONSTRAINED, not SUPPORTED: the AP-property
+    // traversal has never returned a real access point on any host (the
+    // NetworkManager used to verify the D-Bus contract was a container with
+    // no radio). Promoting either without that evidence is the claim this
+    // assertion exists to block -- see the rationale at YUZU_WIFI_LINUX_SUPPORT.
+    CHECK(list_networks->linux_leg.support == YUZU_SUPPORT_CONSTRAINED);
+    CHECK(connected->linux_leg.support == YUZU_SUPPORT_CONSTRAINED);
+
     // Both Linux legs must name their argv fallback: the roadmap requires the
     // nmcli rung-2 descent be DECLARED, not merely implemented.
     REQUIRE(list_networks->linux_leg.fallback != nullptr);

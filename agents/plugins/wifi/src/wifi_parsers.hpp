@@ -122,43 +122,72 @@ inline std::vector<WifiNetworkRow> parse_nmcli_wifi_list(std::string_view raw) {
     return rows;
 }
 
-// Parses `nmcli -t -f GENERAL.CONNECTION,WIFI.SSID,WIFI.SIGNAL,
-// WIFI.SECURITY,WIFI.BSSID device show` output (KEY:VALUE lines) into a
-// connected row. A straight move of the plugin's existing key:value split
-// (first ':' only -- keys never contain one) with no new escape handling,
-// so this leg's output stays byte-for-byte identical to today's. Returns
-// std::nullopt when no WIFI.SSID value was found (mirrors the plugin's
-// existing "ssid.empty() -> fall through to iwconfig" branch).
-inline std::optional<WifiConnectedRow> parse_nmcli_device_show(std::string_view raw) {
-    std::string ssid, signal, security, bssid, connection;
+// Parses `nmcli -t -f ACTIVE,SSID,SIGNAL,SECURITY,BSSID,DEVICE device wifi
+// list` and returns the row nmcli marks ACTIVE (the association this host
+// currently holds), or nullopt when no row is active.
+//
+// WHY NOT `device show`: the previous implementation asked
+// `device show` for GENERAL.CONNECTION,WIFI.SSID,WIFI.SIGNAL,WIFI.SECURITY,
+// WIFI.BSSID. Those WIFI.* fields DO NOT EXIST on that command. Verified
+// against a live nmcli 1.52.1:
+//
+//   $ nmcli -t -f GENERAL.CONNECTION,WIFI.SSID,... device show
+//   Error: 'device show': invalid field 'WIFI.SSID'; allowed fields:
+//   GENERAL,CAPABILITIES,INTERFACE-FLAGS,WIFI-PROPERTIES,AP,
+//   WIRED-PROPERTIES,...                                    (exit 2)
+//
+// So the whole declared rung-2 fallback for `connected` exited 2 with empty
+// output on EVERY host -- the argv was inherited verbatim from the
+// pre-migration shell string, which is why byte-parity against the base was
+// preserved while the leg had never once worked. `device wifi list` is the
+// command that really carries AP fields; the field names below are the ones
+// that live probe reported as valid.
+//
+// ACTIVE (yes/no) is preferred over IN-USE, whose terse value is the glyph
+// "*"/empty and is far easier to mis-parse.
+//
+// Column 5 carries DEVICE (the interface, e.g. wlan0), NOT the connection
+// profile name the old GENERAL.CONNECTION supplied. That is deliberate and
+// now CONSISTENT: the D-Bus rung-1 leg emits Device.Interface in the same
+// column, so a host degrading from D-Bus to nmcli no longer changes the
+// meaning of the field -- the same reasoning applied to the security
+// vocabulary. Recorded as a disclosed behaviour change.
+inline std::optional<WifiConnectedRow> parse_nmcli_wifi_list_active(std::string_view raw) {
     std::istringstream ss{std::string{raw}};
     std::string line;
     while (std::getline(ss, line)) {
-        auto colon = line.find(':');
-        if (colon == std::string::npos)
+        if (line.empty())
             continue;
-        auto key = line.substr(0, colon);
-        auto val = line.substr(colon + 1);
-        if (key == "GENERAL.CONNECTION")
-            connection = val;
-        else if (key == "WIFI.SSID")
-            ssid = val;
-        else if (key == "WIFI.SIGNAL")
-            signal = val;
-        else if (key == "WIFI.SECURITY")
-            security = val;
-        else if (key == "WIFI.BSSID")
-            bssid = val;
+        auto fields = split_nmcli_terse_line(line);
+        if (fields.empty())
+            continue;
+        // nmcli prints the localised "yes"/"no"; match case-insensitively on
+        // the ASCII form and also accept the IN-USE "*" glyph so a field-set
+        // change does not silently select nothing.
+        auto& active = fields[0];
+        const bool is_active =
+            active == "*" || active.size() == 3 && (active[0] == 'y' || active[0] == 'Y');
+        if (!is_active)
+            continue;
+        WifiConnectedRow row;
+        row.ssid = fields.size() > 1 ? fields[1] : std::string{};
+        row.signal = fields.size() > 2 ? fields[2] : std::string{};
+        row.security = fields.size() > 3 ? fields[3] : std::string{};
+        row.bssid = fields.size() > 4 ? fields[4] : std::string{};
+        row.connection = fields.size() > 5 ? fields[5] : std::string{};
+        if (row.ssid.empty())
+            row.ssid = "<hidden>";
+        if (row.signal.empty())
+            row.signal = "0";
+        if (row.security.empty())
+            row.security = "Open";
+        if (row.bssid.empty())
+            row.bssid = "-";
+        if (row.connection.empty())
+            row.connection = "-";
+        return row;
     }
-    if (ssid.empty())
-        return std::nullopt;
-    WifiConnectedRow row;
-    row.ssid = ssid;
-    row.signal = signal.empty() ? "0" : signal;
-    row.security = security.empty() ? "Open" : security;
-    row.bssid = bssid.empty() ? "-" : bssid;
-    row.connection = connection.empty() ? "-" : connection;
-    return row;
+    return std::nullopt;
 }
 
 // ── iw / iwlist / iwconfig text filtering (replaces the deleted
@@ -512,6 +541,75 @@ inline std::string nm_security_flags_to_string(std::uint32_t wpa_flags, std::uin
     // purely because the host degraded from D-Bus to nmcli -- exactly the
     // cross-rung inconsistency the ordering above exists to prevent.
     return "Open";
+}
+
+// ── argv vectors, as pure data ────────────────────────────────────────────
+//
+// The exact command lines are built here rather than inline at the call
+// sites so a unit test can assert them without spawning anything. Two
+// invariants this buys, both of which were previously unguarded:
+//
+//   1. NO INTERPRETER. The whole point of this migration is that wifi
+//      reaches rung 2 (direct argv) and never rung 3 (a shell). The repo's
+//      lexical CI gate does NOT catch a regression here: it scans for raw
+//      spawn TOKENS (popen/system/fork/CreateProcess), and a
+//      {"/bin/sh","-c",...} payload handed to the shared bounded runner
+//      sails straight past it -- confirmed by deliberately injecting that
+//      exact shape and watching the gate report clean. A test over these
+//      builders is the guard.
+//   2. FIELD NAMES THAT REALLY EXIST. The `connected` fallback shipped an
+//      argv whose fields `nmcli device show` rejects outright, and nothing
+//      caught it because no test ever looked at the argv. Pinning the
+//      vector makes the field set reviewable and diffable.
+//
+// `tool` is the absolute path resolved by probe_tool_path (empty when the
+// tool is absent -- the runner rejects that as a spawn_error, which the
+// caller then reports honestly).
+inline std::vector<std::string> nmcli_wifi_list_argv(std::string_view tool) {
+    return {std::string{tool}, "-t", "-f", "SSID,SIGNAL,SECURITY,CHAN,BSSID",
+            "device",          "wifi", "list"};
+}
+
+// Field set verified valid against live nmcli 1.52.1; see
+// parse_nmcli_wifi_list_active for why `device show` cannot be used.
+inline std::vector<std::string> nmcli_connected_argv(std::string_view tool) {
+    return {std::string{tool}, "-t", "-f", "ACTIVE,SSID,SIGNAL,SECURITY,BSSID,DEVICE",
+            "device",          "wifi", "list"};
+}
+
+inline std::vector<std::string> iw_dev_argv(std::string_view tool) {
+    return {std::string{tool}, "dev"};
+}
+
+inline std::vector<std::string> iwlist_scan_argv(std::string_view tool, std::string_view iface) {
+    return {std::string{tool}, std::string{iface}, "scan"};
+}
+
+inline std::vector<std::string> iwconfig_argv(std::string_view tool) {
+    return {std::string{tool}};
+}
+
+// True when argv[0] names a command interpreter, i.e. the vector would be
+// rung 3 under ADR-3002 Decision 5 rather than the rung 2 this plugin
+// declares. Used by the tests to pin the zero-shell invariant.
+inline bool argv_invokes_interpreter(const std::vector<std::string>& argv) {
+    if (argv.empty())
+        return false;
+    std::string_view exe = argv[0];
+    if (auto slash = exe.find_last_of('/'); slash != std::string_view::npos)
+        exe = exe.substr(slash + 1);
+    for (std::string_view shell : {"sh", "bash", "dash", "zsh", "ksh", "csh", "tcsh", "fish",
+                                   "powershell", "pwsh", "cmd", "cmd.exe", "osascript", "python",
+                                   "python3", "perl", "ruby", "env"}) {
+        if (exe == shell)
+            return true;
+    }
+    // A `-c` payload is the other half of the rung-3 signature.
+    for (const auto& a : argv) {
+        if (a == "-c" || a == "-Command" || a == "/c")
+            return true;
+    }
+    return false;
 }
 
 // Did an argv rung actually ANSWER the question, or did it merely fail?

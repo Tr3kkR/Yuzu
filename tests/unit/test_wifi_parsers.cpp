@@ -28,6 +28,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+
 using namespace yuzu::wifi;
 
 // ── split_nmcli_terse_line / parse_nmcli_wifi_list ─────────────────────
@@ -103,39 +105,98 @@ TEST_CASE("wifi: parse_nmcli_wifi_list — blank lines are skipped", "[wifi]") {
     CHECK(rows.size() == 2);
 }
 
-// ── parse_nmcli_device_show ─────────────────────────────────────────────
+// ── parse_nmcli_wifi_list_active ────────────────────────────────────────
+//
+// Replaces the parse_nmcli_device_show tests. The command they covered
+// (`nmcli ... device show` asking for WIFI.SSID etc.) does not exist:
+// verified against live nmcli 1.52.1, it exits 2 with
+//   Error: 'device show': invalid field 'WIFI.SSID'
+// so that leg never produced a single row on any host. Those tests passed
+// only because they fed the parser hand-written text nmcli would never emit
+// -- a fixture that encodes a command's output must correspond to a command
+// that actually accepts those fields.
 
-TEST_CASE("wifi: parse_nmcli_device_show — a connected device", "[wifi]") {
-    auto row = parse_nmcli_device_show(
-        "GENERAL.CONNECTION:Home WiFi\n"
-        "WIFI.SSID:HomeNet\n"
-        "WIFI.SIGNAL:82\n"
-        "WIFI.SECURITY:WPA2\n"
-        "WIFI.BSSID:AA:BB:CC:DD:EE:FF\n");
+TEST_CASE("wifi: parse_nmcli_wifi_list_active — picks the ACTIVE row", "[wifi]") {
+    auto row = parse_nmcli_wifi_list_active(
+        "no:Neighbour:44:WPA2:AA\\:BB\\:CC\\:DD\\:EE\\:01:wlan0\n"
+        "yes:HomeNet:82:WPA2:AA\\:BB\\:CC\\:DD\\:EE\\:FF:wlan0\n"
+        "no:Other:20:WPA3:AA\\:BB\\:CC\\:DD\\:EE\\:02:wlan0\n");
     REQUIRE(row.has_value());
     CHECK(row->ssid == "HomeNet");
     CHECK(row->signal == "82");
     CHECK(row->security == "WPA2");
     CHECK(row->bssid == "AA:BB:CC:DD:EE:FF");
-    CHECK(row->connection == "Home WiFi");
+    CHECK(row->connection == "wlan0");
 }
 
-TEST_CASE("wifi: parse_nmcli_device_show — no WIFI.SSID means not connected", "[wifi]") {
-    auto row = parse_nmcli_device_show("GENERAL.CONNECTION:--\nWIFI.SSID:\n");
-    CHECK_FALSE(row.has_value());
+TEST_CASE("wifi: parse_nmcli_wifi_list_active — no active row means not connected", "[wifi]") {
+    CHECK_FALSE(parse_nmcli_wifi_list_active("no:Neighbour:44:WPA2:AA:wlan0\n").has_value());
+    CHECK_FALSE(parse_nmcli_wifi_list_active("").has_value());
 }
 
-TEST_CASE("wifi: parse_nmcli_device_show — missing optional fields default honestly", "[wifi]") {
-    auto row = parse_nmcli_device_show("WIFI.SSID:HomeNet\n");
+TEST_CASE("wifi: parse_nmcli_wifi_list_active — IN-USE '*' glyph also selects", "[wifi]") {
+    auto row = parse_nmcli_wifi_list_active("*:HomeNet:70:WPA2:AA:wlan0\n");
     REQUIRE(row.has_value());
+    CHECK(row->ssid == "HomeNet");
+}
+
+TEST_CASE("wifi: parse_nmcli_wifi_list_active — missing optional fields default honestly",
+          "[wifi]") {
+    auto row = parse_nmcli_wifi_list_active("yes::::\n");
+    REQUIRE(row.has_value());
+    CHECK(row->ssid == "<hidden>");
     CHECK(row->signal == "0");
     CHECK(row->security == "Open");
     CHECK(row->bssid == "-");
     CHECK(row->connection == "-");
 }
 
-TEST_CASE("wifi: parse_nmcli_device_show on empty input", "[wifi]") {
-    CHECK_FALSE(parse_nmcli_device_show("").has_value());
+// ── argv builders: the zero-shell invariant, pinned ─────────────────────
+//
+// The repo's lexical CI gate scans for raw spawn TOKENS, so a
+// {"/bin/sh","-c",...} payload handed to the shared bounded runner passes it
+// -- confirmed by injecting exactly that shape and watching the gate report
+// clean. These assertions are the actual guard.
+
+TEST_CASE("wifi: no argv vector invokes a command interpreter", "[wifi]") {
+    CHECK_FALSE(argv_invokes_interpreter(nmcli_wifi_list_argv("/usr/bin/nmcli")));
+    CHECK_FALSE(argv_invokes_interpreter(nmcli_connected_argv("/usr/bin/nmcli")));
+    CHECK_FALSE(argv_invokes_interpreter(iw_dev_argv("/usr/sbin/iw")));
+    CHECK_FALSE(argv_invokes_interpreter(iwlist_scan_argv("/usr/sbin/iwlist", "wlan0")));
+    CHECK_FALSE(argv_invokes_interpreter(iwconfig_argv("/usr/sbin/iwconfig")));
+
+    // The detector must actually detect -- otherwise the checks above are
+    // vacuously true and the guard is theatre.
+    CHECK(argv_invokes_interpreter({"/bin/sh", "-c", "nmcli device wifi list"}));
+    CHECK(argv_invokes_interpreter({"/bin/bash", "-c", "iw dev"}));
+    CHECK(argv_invokes_interpreter({"/usr/bin/env", "nmcli"}));
+}
+
+TEST_CASE("wifi: connected argv asks device wifi list, never the invalid device show fields",
+          "[wifi]") {
+    auto argv = nmcli_connected_argv("/usr/bin/nmcli");
+    // The exact regression: `device show` rejects WIFI.* outright (live
+    // nmcli 1.52.1, exit 2), which left this fallback dead on every host.
+    REQUIRE(argv.size() >= 4);
+    CHECK(argv[argv.size() - 2] == "wifi");
+    CHECK(argv.back() == "list");
+    for (const auto& a : argv)
+        CHECK(a.find("WIFI.") == std::string::npos);
+    CHECK(std::find(argv.begin(), argv.end(), "show") == argv.end());
+    // ACTIVE must be requested or no row can ever be selected.
+    bool has_active = false;
+    for (const auto& a : argv)
+        if (a.find("ACTIVE") != std::string::npos)
+            has_active = true;
+    CHECK(has_active);
+}
+
+TEST_CASE("wifi: iwlist scan argv carries the discovered interface", "[wifi]") {
+    auto argv = iwlist_scan_argv("/usr/sbin/iwlist", "wlan1");
+    REQUIRE(argv.size() == 3);
+    CHECK(argv[0] == "/usr/sbin/iwlist");
+    CHECK(argv[1] == "wlan1");
+    CHECK(argv[2] == "scan");
 }
 
 // ── iw / iwlist / iwconfig text filtering ───────────────────────────────
