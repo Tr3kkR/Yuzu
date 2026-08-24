@@ -5014,7 +5014,15 @@ void RestApiV1::register_routes(
                      return;
                  }
 
-                 auto defs = instruction_store->query_definitions();
+                 // ADR-0058: query_definitions now returns std::expected — a genuine
+                 // DB error 503s rather than silently rendering an empty list.
+                 auto defs_result = instruction_store->query_definitions();
+                 if (!defs_result) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                     return;
+                 }
+                 const auto& defs = *defs_result;
                  JArr arr;
                  for (size_t i = 0; i < defs.size(); ++i) {
                      const auto& d = defs[i];
@@ -5070,12 +5078,17 @@ void RestApiV1::register_routes(
         [instruction_store](
             const std::string& definition_id,
             const std::vector<ResponseTemplate>& templates) -> std::optional<std::string> {
-        auto def = instruction_store->get_definition(definition_id);
-        if (!def)
+        // ADR-0058: get_definition now returns std::expected<optional<...>, string> —
+        // distinguish a genuine DB error from "no such definition".
+        auto def_result = instruction_store->get_definition(definition_id);
+        if (!def_result)
+            return def_result.error();
+        if (!*def_result)
             return std::string("definition not found");
+        auto def = **def_result;
         ResponseTemplatesEngine engine;
-        def->response_templates_spec = engine.serialise(templates);
-        auto upd = instruction_store->update_definition(*def);
+        def.response_templates_spec = engine.serialise(templates);
+        auto upd = instruction_store->update_definition(def);
         if (!upd)
             return upd.error();
         return std::nullopt;
@@ -5098,14 +5111,22 @@ void RestApiV1::register_routes(
                                      "application/json");
                      return;
                  }
-                 auto def = instruction_store->get_definition(def_id);
-                 if (!def) {
+                 // ADR-0058: get_definition now returns std::expected — distinguish a
+                 // genuine DB error (503) from "no such definition" (404, unchanged).
+                 auto def_result = instruction_store->get_definition(def_id);
+                 if (!def_result) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                     return;
+                 }
+                 if (!*def_result) {
                      res.status = 404;
                      res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                      return;
                  }
+                 const auto& def = **def_result;
                  ResponseTemplatesEngine engine;
-                 auto parsed = engine.parse(def->response_templates_spec);
+                 auto parsed = engine.parse(def.response_templates_spec);
                  std::vector<ResponseTemplate> templates;
                  if (parsed)
                      templates = std::move(*parsed);
@@ -5119,7 +5140,7 @@ void RestApiV1::register_routes(
                      }
                  JArr arr;
                  if (!operator_has_default) {
-                     auto synth = engine.synthesise_default(def->result_schema, def->plugin);
+                     auto synth = engine.synthesise_default(def.result_schema, def.plugin);
                      arr.add_raw(engine.to_json(synth).dump());
                  }
                  for (const auto& t : templates) {
@@ -5148,14 +5169,22 @@ void RestApiV1::register_routes(
                      res.set_content(detail::a4_error(res, "malformed id"), "application/json");
                      return;
                  }
-                 auto def = instruction_store->get_definition(def_id);
-                 if (!def) {
+                 // ADR-0058: get_definition now returns std::expected — distinguish a
+                 // genuine DB error (503) from "no such definition" (404, unchanged).
+                 auto def_result = instruction_store->get_definition(def_id);
+                 if (!def_result) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                     return;
+                 }
+                 if (!*def_result) {
                      res.status = 404;
                      res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                      return;
                  }
+                 const auto& def = **def_result;
                  ResponseTemplatesEngine engine;
-                 auto parsed = engine.parse(def->response_templates_spec);
+                 auto parsed = engine.parse(def.response_templates_spec);
                  std::vector<ResponseTemplate> templates;
                  if (parsed)
                      templates = std::move(*parsed);
@@ -5167,7 +5196,7 @@ void RestApiV1::register_routes(
                      // dashboard shows when nothing is configured", and
                      // operators introspecting it shouldn't have to know
                      // which path they're on.
-                     auto synth = engine.synthesise_default(def->result_schema, def->plugin);
+                     auto synth = engine.synthesise_default(def.result_schema, def.plugin);
                      res.set_content(ok_json(engine.to_json(synth).dump()), "application/json");
                      return;
                  }
@@ -5217,16 +5246,26 @@ void RestApiV1::register_routes(
                                def_id, "reason=invalid_json");
                       return;
                   }
-                  auto def = instruction_store->get_definition(def_id);
-                  if (!def) {
+                  // ADR-0058: get_definition now returns std::expected — distinguish a
+                  // genuine DB error (503) from "no such definition" (404, unchanged).
+                  auto def_result = instruction_store->get_definition(def_id);
+                  if (!def_result) {
+                      res.status = 503;
+                      res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                      audit_fn(req, "response_template.create", "denied", "InstructionDefinition",
+                               def_id, "reason=store_unavailable");
+                      return;
+                  }
+                  if (!*def_result) {
                       res.status = 404;
                       res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                       audit_fn(req, "response_template.create", "denied", "InstructionDefinition",
                                def_id, "reason=definition_not_found");
                       return;
                   }
+                  const auto& def = **def_result;
                   ResponseTemplatesEngine engine;
-                  auto parsed = engine.parse(def->response_templates_spec);
+                  auto parsed = engine.parse(def.response_templates_spec);
                   std::vector<ResponseTemplate> templates;
                   if (parsed)
                       templates = std::move(*parsed);
@@ -5302,8 +5341,17 @@ void RestApiV1::register_routes(
                               def_id, "reason=invalid_json");
                      return;
                  }
-                 auto def = instruction_store->get_definition(def_id);
-                 if (!def) {
+                 // ADR-0058: get_definition now returns std::expected — distinguish a
+                 // genuine DB error (503) from "no such definition" (404, unchanged).
+                 auto def_result = instruction_store->get_definition(def_id);
+                 if (!def_result) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                     audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
+                              def_id, "reason=store_unavailable");
+                     return;
+                 }
+                 if (!*def_result) {
                      res.status = 404;
                      res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                      audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
@@ -5311,7 +5359,7 @@ void RestApiV1::register_routes(
                      return;
                  }
                  ResponseTemplatesEngine engine;
-                 auto parsed = engine.parse(def->response_templates_spec);
+                 auto parsed = engine.parse((*def_result)->response_templates_spec);
                  std::vector<ResponseTemplate> templates;
                  if (parsed)
                      templates = std::move(*parsed);
@@ -5389,8 +5437,17 @@ void RestApiV1::register_routes(
                          "reason=reserved_id");
                 return;
             }
-            auto def = instruction_store->get_definition(def_id);
-            if (!def) {
+            // ADR-0058: get_definition now returns std::expected — distinguish a genuine
+            // DB error (503) from "no such definition" (404, unchanged).
+            auto def_result = instruction_store->get_definition(def_id);
+            if (!def_result) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                audit_fn(req, "response_template.delete", "denied", "InstructionDefinition", def_id,
+                         "reason=store_unavailable");
+                return;
+            }
+            if (!*def_result) {
                 res.status = 404;
                 res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                 audit_fn(req, "response_template.delete", "denied", "InstructionDefinition", def_id,
@@ -5398,7 +5455,7 @@ void RestApiV1::register_routes(
                 return;
             }
             ResponseTemplatesEngine engine;
-            auto parsed = engine.parse(def->response_templates_spec);
+            auto parsed = engine.parse((*def_result)->response_templates_spec);
             std::vector<ResponseTemplate> templates;
             if (parsed)
                 templates = std::move(*parsed);
@@ -6825,15 +6882,25 @@ void RestApiV1::register_routes(
                 }
             }
 
-            auto def = instruction_store->get_definition(definition_id);
-            if (!def) {
+            // ADR-0058: get_definition now returns std::expected — distinguish a genuine
+            // DB error (503) from "no such definition" (404, unchanged).
+            auto def_result = instruction_store->get_definition(definition_id);
+            if (!def_result) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
+                         definition_id + " reason=store_unavailable");
+                return;
+            }
+            if (!*def_result) {
                 res.status = 404;
                 res.set_content(detail::a4_error(res, "instruction definition not found"), "application/json");
                 audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
                          definition_id + " reason=definition_not_found");
                 return;
             }
-            int chart_count = VisualizationEngine::count(def->visualization_spec);
+            const auto& def = **def_result;
+            int chart_count = VisualizationEngine::count(def.visualization_spec);
             if (chart_count == 0) {
                 res.status = 404;
                 res.set_content(detail::a4_error(res, "no visualization configured for this definition"),
@@ -6910,7 +6977,7 @@ void RestApiV1::register_routes(
 
             VisualizationEngine engine;
             auto result =
-                engine.transform_at(def->visualization_spec, chart_index, def->plugin, responses);
+                engine.transform_at(def.visualization_spec, chart_index, def.plugin, responses);
             if (!result.ok) {
                 res.status = 500;
                 auto parsed = nlohmann::json::parse(result.json, nullptr, false);
@@ -7777,11 +7844,18 @@ void RestApiV1::register_routes(
                           rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'instruction_id' is required");
                           return;
                       }
-                      auto def = instruction_store->get_definition(instruction_id);
-                      if (!def) {
+                      // ADR-0058: get_definition now returns std::expected — distinguish a
+                      // genuine DB error (503) from "no such instruction" (404, unchanged).
+                      auto def_result = instruction_store->get_definition(instruction_id);
+                      if (!def_result) {
+                          rs_err(res, 503, "instruction store not available");
+                          return;
+                      }
+                      if (!*def_result) {
                           rs_err(res, 404, "INSTRUCTION_NOT_FOUND: unknown instruction_id");
                           return;
                       }
+                      const auto& def = **def_result;
                       std::unordered_map<std::string, std::string> params;
                       if (body.contains("params") && body["params"].is_object())
                           for (auto& [k, v] : body["params"].items())
@@ -7798,7 +7872,7 @@ void RestApiV1::register_routes(
                           payload["matcher"] = body["matcher"];
                       if (body.contains("parent_id") && body["parent_id"].is_string())
                           payload["scope_input_id"] = body["parent_id"];
-                      run_async(req, res, *session, def->plugin, def->action, params,
+                      run_async(req, res, *session, def.plugin, def.action, params,
                                 source_kind::kInstructionResult, payload.dump(), matcher, body,
                                 body.value("name", ""));
                   });
@@ -7858,9 +7932,18 @@ void RestApiV1::register_routes(
                       } else if (orig->source_kind == source_kind::kInstructionResult) {
                           std::string instruction_id =
                               sp.is_object() ? sp.value("instruction_id", "") : "";
-                          auto def = instruction_store && instruction_store->is_open()
-                                         ? instruction_store->get_definition(instruction_id)
-                                         : std::nullopt;
+                          // ADR-0058: get_definition now returns std::expected — a genuine DB
+                          // error 503s distinctly; a not-found/store-unavailable/empty-id
+                          // condition keeps the pre-migration 400 collapse.
+                          std::optional<InstructionDefinition> def;
+                          if (instruction_store && instruction_store->is_open()) {
+                              auto def_result = instruction_store->get_definition(instruction_id);
+                              if (!def_result) {
+                                  rs_err(res, 503, "instruction store not available");
+                                  return;
+                              }
+                              def = *def_result;
+                          }
                           if (instruction_id.empty() || !def) {
                               rs_err(res, 400,
                                      "RESULT_SET_BAD_REQUEST: original instruction unavailable");

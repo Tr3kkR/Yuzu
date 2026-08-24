@@ -170,8 +170,11 @@ std::string verdict_for(const StoredResponse& r, const std::string& instruction_
 
     std::string schema;
     if (istore) {
-        if (auto def = istore->get_definition(instruction_id))
-            schema = def->result_schema;
+        // ADR-0058: get_definition now returns std::expected<optional<...>, string> —
+        // a DB error or a not-found id both leave schema empty, matching the
+        // pre-migration behaviour (parse_result tolerates an empty schema).
+        if (auto def_result = istore->get_definition(instruction_id); def_result && *def_result)
+            schema = (*def_result)->result_schema;
     }
     InstructionResult ir = parse_result(r.output, schema);
     // CEL resolves `result.<field>` by stripping the `result.` prefix and
@@ -272,13 +275,17 @@ PolicyEvaluator::dispatch_instruction(const std::string& instruction_id,
                                       const std::vector<std::string>& targets) {
     if (targets.empty() || !d_.instruction_store || !d_.dispatch_fn)
         return "";
-    auto def = d_.instruction_store->get_definition(instruction_id);
-    if (!def) {
+    // ADR-0058: get_definition now returns std::expected<optional<...>, string> — a
+    // genuine DB error and a not-found id both mean "cannot dispatch this check/fix",
+    // matching the pre-migration behaviour of treating both as the same skip.
+    auto def_result = d_.instruction_store->get_definition(instruction_id);
+    if (!def_result || !*def_result) {
         spdlog::warn("policy_evaluator: unknown check/fix instruction '{}'", instruction_id);
         return "";
     }
+    const auto& def = **def_result;
     auto execid = gen_execution_id();
-    d_.dispatch_fn(def->plugin, def->action, targets, /*scope_expr=*/"", parameters, execid);
+    d_.dispatch_fn(def.plugin, def.action, targets, /*scope_expr=*/"", parameters, execid);
     return execid;
 }
 

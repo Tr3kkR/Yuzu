@@ -4893,9 +4893,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 InstructionQuery iq;
                 iq.plugin_filter = param_str(args, "plugin");
                 iq.type_filter = param_str(args, "type");
-                auto defs = instruction_store->query_definitions(iq);
+                auto defs_result = instruction_store->query_definitions(iq);
+                if (!defs_result) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Instruction store unavailable"),
+                        "application/json");
+                    return;
+                }
                 JArr arr;
-                for (const auto& d : defs) {
+                for (const auto& d : *defs_result) {
                     arr.add(JObj()
                                 .add("id", d.id)
                                 .add("name", d.name)
@@ -4933,25 +4939,32 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto def_id = param_str(args, "id");
-                auto def = instruction_store->get_definition(def_id);
-                if (!def) {
+                auto def_result = instruction_store->get_definition(def_id);
+                if (!def_result) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Instruction store unavailable"),
+                        "application/json");
+                    return;
+                }
+                if (!*def_result) {
                     res.set_content(
                         error_response(id, kInvalidParams, "Definition not found: " + def_id),
                         "application/json");
                     return;
                 }
+                const auto& def = **def_result;
                 auto obj = JObj()
-                               .add("id", def->id)
-                               .add("name", def->name)
-                               .add("version", def->version)
-                               .add("type", def->type)
-                               .add("plugin", def->plugin)
-                               .add("action", def->action)
-                               .add("description", def->description)
-                               .add("approval_mode", def->approval_mode)
-                               .add("parameter_schema", def->parameter_schema)
-                               .add("result_schema", def->result_schema)
-                               .add("yaml_source", def->yaml_source);
+                               .add("id", def.id)
+                               .add("name", def.name)
+                               .add("version", def.version)
+                               .add("type", def.type)
+                               .add("plugin", def.plugin)
+                               .add("action", def.action)
+                               .add("description", def.description)
+                               .add("approval_mode", def.approval_mode)
+                               .add("parameter_schema", def.parameter_schema)
+                               .add("result_schema", def.result_schema)
+                               .add("yaml_source", def.yaml_source);
                 mcp_audit("success", def_id);
                 res.set_content(success_response(id, tool_result(obj.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -12464,7 +12477,22 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                auto doc = yuzu::server::build_instructions_catalog(*instruction_store);
+                yuzu::server::DiscoveryDoc doc;
+                try {
+                    doc = yuzu::server::build_instructions_catalog(*instruction_store);
+                } catch (const std::exception&) {
+                    // ADR-0058: query_definitions can now throw on a genuine
+                    // std::expected DB-error (a Postgres blip) — surface the same
+                    // JSON-RPC-shaped error this handler already uses for
+                    // store-unavailable above, rather than letting httplib's
+                    // uncaught-exception path fall through to a bare empty-body 500
+                    // (no server-wide set_exception_handler is installed on
+                    // web_server_ — see rest_api_v1.cpp's identical note).
+                    res.set_content(
+                        error_response(id, kInternalError, "Instruction store unavailable"),
+                        "application/json");
+                    return;
+                }
                 auto result = tool_result(doc.json, kObjectOutputSchema);
                 mcp_audit("success");
                 res.set_content(success_response(id, result), "application/json");
