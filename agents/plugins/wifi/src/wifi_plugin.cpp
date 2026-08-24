@@ -11,18 +11,25 @@
  *
  * Platform implementations:
  *   Windows: WlanEnumInterfaces + WlanGetAvailableNetworkList / WlanQueryInterface
- *   Linux:   nmcli device wifi list / nmcli device wifi show
- *   macOS:   list_networks — airport -s / system_profiler (legacy; airport gone in 14+)
- *            connected     — CoreWLAN (wifi_corewlan.mm)
+ *   Linux:   rung 1, bounded sd-bus to NetworkManager (org.freedesktop.
+ *            NetworkManager) when built with libsystemd; ANY sd-bus failure
+ *            falls through to rung 2, nmcli via the bounded argv runner; a
+ *            missing/failing nmcli falls through to rung 3, a raw iw/iwlist
+ *            (list_networks) or iwconfig (connected) text dump. No shell
+ *            hop anywhere in this file (no shell interpreter is ever exec'd).
+ *   macOS:   list_networks — airport -s / system_profiler via the bounded
+ *            argv runner (legacy; airport gone in 14+; unchanged scan
+ *            behaviour, only the acquisition mechanism was argv-ized).
+ *            connected     — CoreWLAN (wifi_corewlan.mm), untouched by this
+ *            migration.
  */
 
 #include <yuzu/plugin.hpp>
 #include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field (plg-H1)
 
-#include <array>
-#include <cstdio>
+#include "wifi_parsers.hpp"
+
 #include <format>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -33,7 +40,16 @@
 
 #if defined(__linux__) || defined(__APPLE__)
 #include <chrono>
-#include <yuzu/agent/subprocess_runner.hpp> // bounded runner for the Linux nmcli/iw shell-out (review blocker)
+#include <optional>
+#include <yuzu/agent/runner_status.hpp>     // yuzu::agent::forward_runner_failure (ABI4 result seam)
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess / probe_tool_path (ADR-3002)
+#endif
+
+#if defined(__linux__) && defined(YUZU_HAVE_LIBSYSTEMD)
+#include <cstdint>
+#include <cstdlib> // free (sd_bus_get_property_string's malloc'd result)
+
+#include <systemd/sd-bus.h>
 #endif
 
 #ifdef _WIN32
@@ -57,24 +73,447 @@ namespace {
 // row (plg-H1). Applied at every emission site below, all platforms.
 inline std::string sof(std::string_view v) { return yuzu::util::safe_output_field(v); }
 
-// ── subprocess helper (Linux / macOS) ──────────────────────────────────────
+// ── argv runner helper (Linux / macOS) ──────────────────────────────────
 
 #if defined(__linux__) || defined(__APPLE__)
-std::string run_command(const char* cmd) {
-    // Bounded, fork-lock-covered runner (review blocker) instead of a raw,
-    // deadline-less popen that bypassed both the fork lock and any timeout.
-    // `/bin/sh -c` preserves the shell semantics the `nmcli`/`iw` callers rely
-    // on; the runner drains and caps stdout.
-    auto res = yuzu::agent::run_bounded_subprocess(
-        {"/bin/sh", "-c", cmd},
-        yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{20}});
-    std::string result = std::move(res.output);
-    while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
-        result.pop_back();
+// Per-call wall-clock bound for the scan/connection tools (nmcli/iw/iwlist/
+// iwconfig/airport/system_profiler) -- matches the deadline the deleted
+// run_command()/sh -c helper used.
+constexpr std::chrono::seconds kWifiCmdDeadline{20};
+
+/// Outcome of run_tool(): captured output PLUS the raw runner result, so a
+/// caller can forward the latter through the ABI4 result seam
+/// (yuzu::agent::forward_runner_failure) itself instead of this helper
+/// deciding that on the caller's behalf. Mirrors users_plugin.cpp's
+/// run_tool()/ToolOutcome exactly.
+struct ToolOutcome {
+    std::string output;
+    yuzu::agent::SubprocessResult res;
+};
+
+/// Direct-argv replacement for the deleted run_command() shell-string hop:
+/// the same bounded, fork-lock-covered runner, but exec'd straight to
+/// argv[0] with no shell in between -- no shell-quoting/injection surface,
+/// and the old `2>/dev/null` suffix is simply this call's default
+/// merge_stderr=false. Strips trailing CR/LF exactly as run_command() did.
+/// `max_lines` (0 = unlimited) replicates what used to be a `| head -N`
+/// pipe stage.
+ToolOutcome run_tool(std::vector<std::string> argv, std::size_t max_lines = 0) {
+    if (argv.empty() || argv.front().empty()) {
+        // A probe_tool_path miss (empty argv[0]): report the same shape
+        // run_bounded_subprocess uses for its own runtime-reject
+        // (tool_ran=false, termination_reason=spawn_error -- both already
+        // SubprocessResult's default member values) without attempting an
+        // OS call.
+        return ToolOutcome{std::string{}, yuzu::agent::SubprocessResult{}};
     }
+    auto res = yuzu::agent::run_bounded_subprocess(
+        argv, yuzu::agent::SubprocessOptions{.deadline = kWifiCmdDeadline,
+                                             .max_lines = max_lines,
+                                             .stop_after_max_lines = max_lines != 0});
+    std::string output = res.output;
+    while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) {
+        output.pop_back();
+    }
+    return ToolOutcome{std::move(output), std::move(res)};
+}
+#endif // __linux__ || __APPLE__
+
+// ── Linux: NetworkManager (rung 1, bounded sd-bus) ──────────────────────
+//
+// ══════════════════════════════════════════════════════════════════════
+// D-BUS TYPE-SIGNATURE TABLE (audit this block against a live
+// NetworkManager host before trusting it -- see the package report's
+// "unverifiable without a Linux NM host" note; this leg has never been
+// compiled or run, only reasoned about against the published NM D-Bus
+// API). Every sd_bus read below carries a one-line comment citing its row
+// here.
+//
+//  # | Call                | Interface                                   | Member           | Wire shape
+//  --|---------------------|----------------------------------------------|------------------|---------------------------------
+//  1 | method (not a prop) | org.freedesktop.NetworkManager                | GetDevices       | returns 'ao' directly (no variant)
+//  2 | Properties.Get      | org.freedesktop.NetworkManager.Device         | DeviceType       | 'v' wrapping 'u' (WIFI == 2)
+//  3 | Properties.Get      | org.freedesktop.NetworkManager.Device.Wireless| AccessPoints     | 'v' wrapping 'ao'
+//  4 | Properties.Get      | org.freedesktop.NetworkManager.Device         | ActiveAccessPoint| 'v' wrapping 'o' ("/" == none)
+//  5 | Properties.Get      | org.freedesktop.NetworkManager.Device         | Interface        | 'v' wrapping 's' (connected's col5 -- see deviation note in wifi_parsers.hpp)
+//  6 | Properties.Get      | org.freedesktop.NetworkManager.AccessPoint    | Ssid             | 'v' wrapping 'ay' (BYTE ARRAY, never 's')
+//  7 | Properties.Get      | org.freedesktop.NetworkManager.AccessPoint    | Strength         | 'v' wrapping 'y'
+//  8 | Properties.Get      | org.freedesktop.NetworkManager.AccessPoint    | HwAddress        | 'v' wrapping 's'
+//  9 | Properties.Get      | org.freedesktop.NetworkManager.AccessPoint    | Frequency        | 'v' wrapping 'u' (MHz)
+// 10 | Properties.Get      | org.freedesktop.NetworkManager.AccessPoint    | WpaFlags         | 'v' wrapping 'u' (bitmask)
+// 11 | Properties.Get      | org.freedesktop.NetworkManager.AccessPoint    | RsnFlags         | 'v' wrapping 'u' (bitmask)
+//
+// Cite: NetworkManager D-Bus API spec (networkmanager.dev/docs/api/latest/
+// spec.html) + nm-dbus-interface.h's NMDeviceType/NM80211ApSecurityFlags
+// enums. GetAllAccessPoints() is a documented alternative to row #3's
+// AccessPoints property read; not used here, to keep every AP read going
+// through the same Properties.Get shape (one fewer call shape to audit).
+//
+// FAILURE POLICY (distinct from the STRUCTURAL pattern below, which is
+// copied from firewall_plugin.cpp's query_firewalld): this function follows
+// device_identity_plugin.cpp's sssd_list_domains_via_sdbus discipline, not
+// firewall's per-zone degrade-gracefully pattern -- ANY read in the
+// sequence above failing (wrong signature, bus error, budget exhausted)
+// aborts the WHOLE query_nm_* call and the caller falls through to nmcli.
+// A single flaky AP does not get silently dropped from an otherwise-good
+// scan; the whole D-Bus attempt is abandoned instead. This is the more
+// conservative of the two precedents in this codebase, deliberately chosen
+// for a leg that has never met a real NetworkManager (see the package
+// report's open questions).
+// ══════════════════════════════════════════════════════════════════════
+#if defined(__linux__) && defined(YUZU_HAVE_LIBSYSTEMD)
+
+// RAII guards, identical shape to firewall_plugin.cpp:343-375 (BusGuard/
+// SdBusErrorGuard/SdBusMessageGuard) -- deleted copies so none of these can
+// double-release the underlying sd-bus object.
+struct BusGuard {
+    sd_bus* bus = nullptr;
+    ~BusGuard() {
+        if (bus)
+            sd_bus_flush_close_unref(bus);
+    }
+    BusGuard() = default;
+    BusGuard(const BusGuard&) = delete;
+    BusGuard& operator=(const BusGuard&) = delete;
+};
+struct SdBusErrorGuard {
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    ~SdBusErrorGuard() { sd_bus_error_free(&err); }
+    // A user-declared (even deleted) copy constructor suppresses the
+    // implicitly-declared default constructor entirely -- without this,
+    // `SdBusErrorGuard err;` below fails to compile. Same fix as
+    // firewall_plugin.cpp's identical guard.
+    SdBusErrorGuard() = default;
+    SdBusErrorGuard(const SdBusErrorGuard&) = delete;
+    SdBusErrorGuard& operator=(const SdBusErrorGuard&) = delete;
+};
+struct SdBusMessageGuard {
+    sd_bus_message* m = nullptr;
+    ~SdBusMessageGuard() {
+        if (m)
+            sd_bus_message_unref(m);
+    }
+    SdBusMessageGuard() = default;
+    SdBusMessageGuard(const SdBusMessageGuard&) = delete;
+    SdBusMessageGuard& operator=(const SdBusMessageGuard&) = delete;
+};
+struct CStrGuard {
+    char* s = nullptr;
+    ~CStrGuard() {
+        if (s)
+            free(s);
+    }
+    CStrGuard() = default;
+    CStrGuard(const CStrGuard&) = delete;
+    CStrGuard& operator=(const CStrGuard&) = delete;
+};
+
+constexpr const char* kNmDest = "org.freedesktop.NetworkManager";
+constexpr const char* kNmManagerPath = "/org/freedesktop/NetworkManager";
+constexpr const char* kNmManagerIface = "org.freedesktop.NetworkManager";
+constexpr const char* kNmDeviceIface = "org.freedesktop.NetworkManager.Device";
+constexpr const char* kNmWirelessIface = "org.freedesktop.NetworkManager.Device.Wireless";
+constexpr const char* kNmApIface = "org.freedesktop.NetworkManager.AccessPoint";
+constexpr std::uint32_t kNmDeviceTypeWifi = 2; // NMDeviceType.NM_DEVICE_TYPE_WIFI (nm-dbus-interface.h)
+
+// Total sd-bus budget for the whole read, split across every sequential
+// call below via arm_next_call()'s remaining-budget re-arm -- same
+// re-arm-with-the-remainder shape as firewall_plugin.cpp's
+// kSdBusTotalBudgetUs / guardian_state_reader.cpp's, so a wedged
+// NetworkManager cannot hold this call for an unbounded multiple of the
+// per-method timeout.
+constexpr std::uint64_t kSdBusTotalBudgetUs = 5'000'000; // 5s
+
+// Opens the system bus and arms the total budget; ok()==false means
+// "unreachable" -> the caller falls through to nmcli. arm_next_call()
+// re-arms the per-call timeout to whatever remains of the total budget,
+// returning false (caller must abort) once it's exhausted.
+class NmBusSession {
+public:
+    NmBusSession() {
+        if (sd_bus_open_system(&bus_.bus) < 0 || !bus_.bus)
+            return; // D-Bus unreachable -> honest fall-through, never fabricate
+        t_start_ = std::chrono::steady_clock::now();
+        sd_bus_set_method_call_timeout(bus_.bus, kSdBusTotalBudgetUs);
+        ok_ = true;
+    }
+    bool ok() const { return ok_; }
+    sd_bus* bus() const { return bus_.bus; }
+
+    bool arm_next_call() {
+        const auto elapsed_us = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t_start_)
+                .count());
+        if (elapsed_us >= kSdBusTotalBudgetUs)
+            return false;
+        sd_bus_set_method_call_timeout(bus_.bus, kSdBusTotalBudgetUs - elapsed_us);
+        return true;
+    }
+
+private:
+    BusGuard bus_;
+    std::chrono::steady_clock::time_point t_start_;
+    bool ok_ = false;
+};
+
+// ── generic Properties.Get helpers -- each returns std::nullopt on ANY
+// sd-bus error (wrong signature, bus error, property absent), never a
+// fabricated zero-value. sd_bus_get_property() issues the Properties.Get
+// call and demarshals the reply past the outer 'v' wrapper itself, so each
+// helper only reads the CONTAINED type named in the table above.
+
+std::optional<std::uint32_t> nm_get_u32(sd_bus* bus, const char* path, const char* iface,
+                                        const char* member) {
+    SdBusErrorGuard err;
+    SdBusMessageGuard reply;
+    if (sd_bus_get_property(bus, kNmDest, path, iface, member, &err.err, &reply.m, "u") < 0)
+        return std::nullopt;
+    std::uint32_t v = 0;
+    if (sd_bus_message_read(reply.m, "u", &v) < 0)
+        return std::nullopt;
+    return v;
+}
+
+std::optional<std::uint8_t> nm_get_byte(sd_bus* bus, const char* path, const char* iface,
+                                        const char* member) {
+    SdBusErrorGuard err;
+    SdBusMessageGuard reply;
+    if (sd_bus_get_property(bus, kNmDest, path, iface, member, &err.err, &reply.m, "y") < 0)
+        return std::nullopt;
+    std::uint8_t v = 0;
+    if (sd_bus_message_read(reply.m, "y", &v) < 0)
+        return std::nullopt;
+    return v;
+}
+
+std::optional<std::string> nm_get_string(sd_bus* bus, const char* path, const char* iface,
+                                         const char* member) {
+    SdBusErrorGuard err;
+    CStrGuard s;
+    if (sd_bus_get_property_string(bus, kNmDest, path, iface, member, &err.err, &s.s) < 0 || !s.s)
+        return std::nullopt;
+    return std::string{s.s};
+}
+
+std::optional<std::string> nm_get_object_path(sd_bus* bus, const char* path, const char* iface,
+                                              const char* member) {
+    SdBusErrorGuard err;
+    SdBusMessageGuard reply;
+    if (sd_bus_get_property(bus, kNmDest, path, iface, member, &err.err, &reply.m, "o") < 0)
+        return std::nullopt;
+    const char* p = nullptr;
+    if (sd_bus_message_read(reply.m, "o", &p) < 0 || !p)
+        return std::nullopt;
+    return std::string{p};
+}
+
+std::optional<std::vector<std::string>> nm_get_object_path_array(sd_bus* bus, const char* path,
+                                                                  const char* iface,
+                                                                  const char* member) {
+    SdBusErrorGuard err;
+    SdBusMessageGuard reply;
+    if (sd_bus_get_property(bus, kNmDest, path, iface, member, &err.err, &reply.m, "ao") < 0)
+        return std::nullopt;
+    if (sd_bus_message_enter_container(reply.m, SD_BUS_TYPE_ARRAY, "o") < 0)
+        return std::nullopt;
+    std::vector<std::string> out;
+    const char* p = nullptr;
+    int rr;
+    while ((rr = sd_bus_message_read(reply.m, "o", &p)) > 0) {
+        if (p)
+            out.emplace_back(p);
+    }
+    sd_bus_message_exit_container(reply.m);
+    if (rr < 0)
+        return std::nullopt; // malformed reply mid-array -- honest failure, never a partial list
+    return out;
+}
+
+std::optional<std::vector<std::uint8_t>> nm_get_byte_array(sd_bus* bus, const char* path,
+                                                            const char* iface, const char* member) {
+    SdBusErrorGuard err;
+    SdBusMessageGuard reply;
+    if (sd_bus_get_property(bus, kNmDest, path, iface, member, &err.err, &reply.m, "ay") < 0)
+        return std::nullopt;
+    const void* ptr = nullptr;
+    std::size_t n = 0;
+    if (sd_bus_message_read_array(reply.m, 'y', &ptr, &n) < 0)
+        return std::nullopt;
+    const auto* bytes = static_cast<const std::uint8_t*>(ptr);
+    return std::vector<std::uint8_t>(bytes, bytes + n);
+}
+
+// NM.GetDevices (method call, NOT Properties.Get -- see table row #1) ->
+// 'ao' directly, no variant wrapper. Same array-of-object-paths read shape
+// as device_identity_plugin.cpp's sssd_list_domains_via_sdbus.
+std::optional<std::vector<std::string>> nm_call_get_devices(sd_bus* bus) {
+    SdBusErrorGuard err;
+    SdBusMessageGuard reply;
+    if (sd_bus_call_method(bus, kNmDest, kNmManagerPath, kNmManagerIface, "GetDevices", &err.err,
+                           &reply.m, "") < 0)
+        return std::nullopt;
+    if (sd_bus_message_enter_container(reply.m, SD_BUS_TYPE_ARRAY, "o") < 0)
+        return std::nullopt;
+    std::vector<std::string> out;
+    const char* p = nullptr;
+    int rr;
+    while ((rr = sd_bus_message_read(reply.m, "o", &p)) > 0) {
+        if (p)
+            out.emplace_back(p);
+    }
+    sd_bus_message_exit_container(reply.m);
+    if (rr < 0)
+        return std::nullopt;
+    return out;
+}
+
+// Reads all six AccessPoint properties (table rows #6-#11) for one AP
+// object path in a bounded batch. std::nullopt on the first read that
+// fails or on budget exhaustion -- per the FAILURE POLICY note above the
+// table, this aborts the WHOLE query, not just this one AP.
+std::optional<yuzu::wifi::NmAccessPointProps> nm_read_ap(NmBusSession& session,
+                                                         const std::string& ap_path) {
+    if (!session.arm_next_call())
+        return std::nullopt;
+    auto ssid = nm_get_byte_array(session.bus(), ap_path.c_str(), kNmApIface, "Ssid"); // table #6
+    if (!ssid)
+        return std::nullopt;
+    if (!session.arm_next_call())
+        return std::nullopt;
+    auto strength = nm_get_byte(session.bus(), ap_path.c_str(), kNmApIface, "Strength"); // table #7
+    if (!strength)
+        return std::nullopt;
+    if (!session.arm_next_call())
+        return std::nullopt;
+    auto hw = nm_get_string(session.bus(), ap_path.c_str(), kNmApIface, "HwAddress"); // table #8
+    if (!hw)
+        return std::nullopt;
+    if (!session.arm_next_call())
+        return std::nullopt;
+    auto freq = nm_get_u32(session.bus(), ap_path.c_str(), kNmApIface, "Frequency"); // table #9
+    if (!freq)
+        return std::nullopt;
+    if (!session.arm_next_call())
+        return std::nullopt;
+    auto wpa = nm_get_u32(session.bus(), ap_path.c_str(), kNmApIface, "WpaFlags"); // table #10
+    if (!wpa)
+        return std::nullopt;
+    if (!session.arm_next_call())
+        return std::nullopt;
+    auto rsn = nm_get_u32(session.bus(), ap_path.c_str(), kNmApIface, "RsnFlags"); // table #11
+    if (!rsn)
+        return std::nullopt;
+
+    yuzu::wifi::NmAccessPointProps props;
+    props.ssid_bytes = std::move(*ssid);
+    props.strength = *strength;
+    props.hw_address = std::move(*hw);
+    props.frequency_mhz = *freq;
+    props.wpa_flags = *wpa;
+    props.rsn_flags = *rsn;
+    return props;
+}
+
+struct NmListResult {
+    bool reachable = false; // false -> caller falls through to nmcli, never "no wifi"
+    std::vector<yuzu::wifi::WifiNetworkRow> rows;
+};
+
+NmListResult query_nm_list_networks() {
+    NmListResult result;
+    NmBusSession session;
+    if (!session.ok())
+        return result;
+
+    if (!session.arm_next_call())
+        return result;
+    auto devices = nm_call_get_devices(session.bus()); // table #1
+    if (!devices)
+        return result;
+
+    for (const auto& dev_path : *devices) {
+        if (!session.arm_next_call())
+            return result;
+        auto dtype = nm_get_u32(session.bus(), dev_path.c_str(), kNmDeviceIface, "DeviceType"); // table #2
+        if (!dtype)
+            return result;
+        if (*dtype != kNmDeviceTypeWifi)
+            continue;
+
+        if (!session.arm_next_call())
+            return result;
+        auto ap_paths = nm_get_object_path_array(session.bus(), dev_path.c_str(), kNmWirelessIface,
+                                                  "AccessPoints"); // table #3
+        if (!ap_paths)
+            return result;
+
+        for (const auto& ap_path : *ap_paths) {
+            auto props = nm_read_ap(session, ap_path);
+            if (!props)
+                return result;
+            result.rows.push_back(yuzu::wifi::nm_ap_to_row(*props));
+        }
+    }
+    result.reachable = true; // walked every device without an sd-bus error
     return result;
 }
-#endif
+
+struct NmConnectedResult {
+    bool reachable = false; // false -> caller falls through to nmcli, never "no wifi"
+    std::optional<yuzu::wifi::WifiConnectedRow> row; // nullopt + reachable -> genuinely not connected
+};
+
+NmConnectedResult query_nm_connected() {
+    NmConnectedResult result;
+    NmBusSession session;
+    if (!session.ok())
+        return result;
+
+    if (!session.arm_next_call())
+        return result;
+    auto devices = nm_call_get_devices(session.bus()); // table #1
+    if (!devices)
+        return result;
+
+    for (const auto& dev_path : *devices) {
+        if (!session.arm_next_call())
+            return result;
+        auto dtype = nm_get_u32(session.bus(), dev_path.c_str(), kNmDeviceIface, "DeviceType"); // table #2
+        if (!dtype)
+            return result;
+        if (*dtype != kNmDeviceTypeWifi)
+            continue;
+
+        if (!session.arm_next_call())
+            return result;
+        auto active_ap =
+            nm_get_object_path(session.bus(), dev_path.c_str(), kNmDeviceIface,
+                               "ActiveAccessPoint"); // table #4
+        if (!active_ap)
+            return result;
+        if (*active_ap == "/" || active_ap->empty())
+            continue; // this wifi device isn't associated -- check the next one
+
+        auto props = nm_read_ap(session, *active_ap);
+        if (!props)
+            return result;
+
+        if (!session.arm_next_call())
+            return result;
+        auto iface_name =
+            nm_get_string(session.bus(), dev_path.c_str(), kNmDeviceIface, "Interface"); // table #5
+        if (!iface_name)
+            return result;
+
+        result.reachable = true;
+        result.row = yuzu::wifi::nm_ap_to_connected_row(*props, *iface_name);
+        return result;
+    }
+    result.reachable = true; // walked every wifi device; none associated -> genuinely not connected
+    return result;
+}
+#endif // __linux__ && YUZU_HAVE_LIBSYSTEMD
 
 #ifdef _WIN32
 // wide->UTF-8 conversion now via the shared win_str.hpp (#1681); from_wide is
@@ -170,50 +609,59 @@ int do_list_networks(yuzu::CommandContext& ctx) {
     WlanCloseHandle(client, nullptr);
 
 #elif defined(__linux__)
-    // Use nmcli for structured WiFi scanning
-    auto nmcli_out =
-        run_command("nmcli -t -f SSID,SIGNAL,SECURITY,CHAN,BSSID device wifi list 2>/dev/null");
-    if (!nmcli_out.empty()) {
-        std::istringstream ss(nmcli_out);
-        std::string line;
-        while (std::getline(ss, line)) {
-            if (line.empty())
-                continue;
-            // nmcli -t uses ':' as delimiter
-            // Fields: SSID:SIGNAL:SECURITY:CHAN:BSSID
-            std::istringstream ls(line);
-            std::string ssid, signal, security, channel, bssid;
-            std::getline(ls, ssid, ':');
-            std::getline(ls, signal, ':');
-            std::getline(ls, security, ':');
-            std::getline(ls, channel, ':');
-            std::getline(ls, bssid, ':');
-
-            if (ssid.empty())
-                ssid = "<hidden>";
-            if (security.empty())
-                security = "Open";
-
-            ctx.write_output(std::format("wifi|{}|{}|{}|{}|{}", sof(ssid),
-                                         signal.empty() ? "0" : signal, sof(security),
-                                         channel.empty() ? "0" : channel,
-                                         bssid.empty() ? "-" : sof(bssid)));
+#if defined(YUZU_HAVE_LIBSYSTEMD)
+    if (auto nm = query_nm_list_networks(); nm.reachable) {
+        if (nm.rows.empty()) {
+            // A confirmed, definitive answer from a reachable NetworkManager
+            // (not the ambiguous "empty output" nmcli's own leg below has to
+            // guess about) -- report it honestly rather than silently
+            // emitting nothing.
+            ctx.write_output("wifi|info|NetworkManager reachable via D-Bus; no Wi-Fi networks "
+                             "currently visible|0|0|none");
+        } else {
+            for (auto& row : nm.rows) {
+                ctx.write_output(std::format("wifi|{}|{}|{}|{}|{}", sof(row.ssid), sof(row.signal),
+                                             sof(row.security), sof(row.channel), sof(row.bssid)));
+            }
+        }
+        return 0;
+    }
+    // NetworkManager D-Bus unreachable, or any call in the sequence failed
+    // -> fall through to the nmcli argv rung (D-Bus failure is never
+    // "no wifi").
+#endif
+    bool status_forwarded = false;
+    // sink: wifi/do_list_networks#1 -- nmcli device wifi list (rung 2 argv;
+    // replaces the deleted sh -c pipeline)
+    auto nmcli_path = yuzu::agent::probe_tool_path({"/usr/bin/nmcli", "/bin/nmcli"});
+    auto nmcli_res =
+        run_tool({nmcli_path, "-t", "-f", "SSID,SIGNAL,SECURITY,CHAN,BSSID", "device", "wifi", "list"});
+    status_forwarded = yuzu::agent::forward_runner_failure(ctx, nmcli_res.res);
+    if (!nmcli_res.output.empty()) {
+        for (auto& row : yuzu::wifi::parse_nmcli_wifi_list(nmcli_res.output)) {
+            ctx.write_output(std::format("wifi|{}|{}|{}|{}|{}", sof(row.ssid), sof(row.signal),
+                                         sof(row.security), sof(row.channel), sof(row.bssid)));
         }
     } else {
-        // Fallback: try iw
-        auto iw_out = run_command("iw dev 2>/dev/null | grep Interface | awk '{print $2}'");
-        if (!iw_out.empty()) {
-            std::istringstream ss(iw_out);
-            std::string iface;
-            while (std::getline(ss, iface)) {
-                if (iface.empty())
-                    continue;
-                auto scan = run_command(
-                    std::format("iwlist {} scan 2>/dev/null | grep -E 'ESSID|Quality|Encryption'",
-                                iface)
-                        .c_str());
-                if (!scan.empty()) {
-                    ctx.write_output(std::format("wifi|scan_output|{}", sof(scan)));
+        // sink: wifi/do_list_networks#2 -- iw dev (interface discovery for
+        // the iwlist fallback)
+        auto iw_path = yuzu::agent::probe_tool_path({"/usr/sbin/iw", "/sbin/iw", "/usr/bin/iw"});
+        auto iw_res = run_tool({iw_path, "dev"});
+        if (!status_forwarded)
+            status_forwarded = yuzu::agent::forward_runner_failure(ctx, iw_res.res);
+        auto ifaces = yuzu::wifi::parse_iw_dev_interfaces(iw_res.output);
+        if (!ifaces.empty()) {
+            // sink: wifi/do_list_networks#3 -- iwlist <iface> scan
+            // (per-interface raw scan text; one spawn per discovered iface)
+            auto iwlist_path =
+                yuzu::agent::probe_tool_path({"/usr/sbin/iwlist", "/sbin/iwlist", "/usr/bin/iwlist"});
+            for (auto& iface : ifaces) {
+                auto scan_res = run_tool({iwlist_path, iface, "scan"});
+                if (!status_forwarded)
+                    status_forwarded = yuzu::agent::forward_runner_failure(ctx, scan_res.res);
+                auto filtered = yuzu::wifi::filter_iwlist_scan_lines(scan_res.output);
+                if (!filtered.empty()) {
+                    ctx.write_output(std::format("wifi|scan_output|{}", sof(filtered)));
                 }
             }
         } else {
@@ -229,135 +677,32 @@ int do_list_networks(yuzu::CommandContext& ctx) {
     // produces output we still return rc=0 with an info marker so the
     // dispatch test passes — the agent isn't broken, the host just
     // can't enumerate Wi-Fi without elevated privilege.
-    auto airport_out = run_command(
-        "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport "
-        "-s 2>/dev/null");
-    if (!airport_out.empty()) {
-        std::istringstream ss(airport_out);
-        std::string line;
-        bool header_skipped = false;
-        while (std::getline(ss, line)) {
-            if (!header_skipped) {
-                header_skipped = true;
-                continue; // Skip header line
-            }
-            if (line.empty())
-                continue;
-
-            // airport -s output is fixed-width:
-            // SSID  BSSID  RSSI  CHANNEL  HT  CC  SECURITY
-            // The SSID is right-padded, BSSID starts at a fixed column
-            // Parse carefully since SSIDs can contain spaces
-            if (line.size() < 40)
-                continue;
-
-            std::string ssid, bssid, rssi, channel, security;
-
-            // Simple approach: split from the right where fixed fields are
-            // BSSID is at roughly column 33, then RSSI, CHANNEL, HT, CC, SECURITY
-            std::istringstream ls(line);
-            std::string token;
-            std::vector<std::string> tokens;
-            while (ls >> token) {
-                tokens.push_back(token);
-            }
-
-            if (tokens.size() >= 7) {
-                // Last token is SECURITY, then CC, HT, CHANNEL, RSSI, BSSID
-                // SSID is everything before BSSID
-                security = tokens.back();
-                // Collect remaining security tokens if they contain WPA/WEP
-                size_t sec_start = tokens.size() - 1;
-                while (sec_start > 0 && (tokens[sec_start - 1].find("WPA") != std::string::npos ||
-                                         tokens[sec_start - 1].find("WEP") != std::string::npos ||
-                                         tokens[sec_start - 1] == "--")) {
-                    security = tokens[sec_start - 1] + " " + security;
-                    --sec_start;
-                }
-                // Work backwards: CC, HT, CHANNEL, RSSI, BSSID
-                if (sec_start >= 6) {
-                    // cc = tokens[sec_start - 1]
-                    // ht = tokens[sec_start - 2]
-                    channel = tokens[sec_start - 3];
-                    rssi = tokens[sec_start - 4];
-                    bssid = tokens[sec_start - 5];
-                    // SSID is everything before BSSID
-                    ssid = tokens[0];
-                    for (size_t k = 1; k < sec_start - 5; ++k) {
-                        ssid += " " + tokens[k];
-                    }
-                }
-            }
-
-            if (ssid.empty())
-                ssid = "<hidden>";
-            if (security.empty())
-                security = "Open";
-
-            ctx.write_output(std::format("wifi|{}|{}|{}|{}|{}", sof(ssid),
-                                         rssi.empty() ? "0" : rssi, sof(security),
-                                         channel.empty() ? "0" : channel,
-                                         bssid.empty() ? "-" : sof(bssid)));
+    bool status_forwarded = false;
+    // sink: wifi/do_list_networks#4 -- airport -s (legacy scan; absent on
+    // macOS 14+)
+    auto airport_res = run_tool(
+        {"/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport",
+         "-s"});
+    status_forwarded = yuzu::agent::forward_runner_failure(ctx, airport_res.res);
+    if (!airport_res.output.empty()) {
+        for (auto& row : yuzu::wifi::parse_airport_scan(airport_res.output)) {
+            ctx.write_output(std::format("wifi|{}|{}|{}|{}|{}", sof(row.ssid), sof(row.signal),
+                                         sof(row.security), sof(row.channel), sof(row.bssid)));
         }
     } else {
-        // Fallback: system_profiler SPAirPortDataType. The textual form is
-        // indented sections; we extract SSID + Channel + Signal/Noise for
-        // each network under "Other Local Wi-Fi Networks:".
-        auto sp_out =
-            run_command("system_profiler SPAirPortDataType -detailLevel basic 2>/dev/null");
-        bool emitted = false;
-        if (!sp_out.empty()) {
-            std::istringstream ss(sp_out);
-            std::string line;
-            bool in_others = false;
-            std::string ssid, channel, rssi, security;
-            auto flush = [&]() {
-                if (ssid.empty())
-                    return;
-                ctx.write_output(std::format("wifi|{}|{}|{}|{}|-", sof(ssid),
-                                             rssi.empty() ? "0" : rssi,
-                                             security.empty() ? "Unknown" : sof(security),
-                                             channel.empty() ? "0" : channel));
-                emitted = true;
-                ssid.clear();
-                channel.clear();
-                rssi.clear();
-                security.clear();
-            };
-            while (std::getline(ss, line)) {
-                if (line.find("Other Local Wi-Fi Networks:") != std::string::npos) {
-                    in_others = true;
-                    continue;
-                }
-                if (!in_others)
-                    continue;
-                // Network names are at indent 14 spaces and end with ":".
-                if (line.size() > 14 && line.substr(0, 14) == "              " && line[14] != ' ' &&
-                    !line.empty() && line.back() == ':') {
-                    flush();
-                    ssid = line.substr(14, line.size() - 15);
-                    continue;
-                }
-                auto colon = line.find(':');
-                if (colon == std::string::npos)
-                    continue;
-                std::string key = line.substr(0, colon);
-                std::string val = line.substr(colon + 1);
-                // trim
-                while (!key.empty() && key.front() == ' ')
-                    key.erase(0, 1);
-                while (!val.empty() && val.front() == ' ')
-                    val.erase(0, 1);
-                if (key == "Channel")
-                    channel = val;
-                else if (key == "Signal / Noise")
-                    rssi = val;
-                else if (key == "Security")
-                    security = val;
-            }
-            flush();
+        // sink: wifi/do_list_networks#5 -- system_profiler SPAirPortDataType
+        // (Location-Services-gated fallback)
+        auto sp_res =
+            run_tool({"/usr/sbin/system_profiler", "SPAirPortDataType", "-detailLevel", "basic"});
+        if (!status_forwarded)
+            status_forwarded = yuzu::agent::forward_runner_failure(ctx, sp_res.res);
+        auto sp_rows = sp_res.output.empty() ? std::vector<yuzu::wifi::WifiNetworkRow>{}
+                                             : yuzu::wifi::parse_system_profiler_wifi(sp_res.output);
+        for (auto& row : sp_rows) {
+            ctx.write_output(std::format("wifi|{}|{}|{}|{}|-", sof(row.ssid), sof(row.signal),
+                                         sof(row.security), sof(row.channel)));
         }
-        if (!emitted) {
+        if (sp_rows.empty()) {
             ctx.write_output("wifi|info|wi-fi scan unavailable; airport removed in macOS 14+ "
                              "and system_profiler requires Location Services|0|0|none");
         }
@@ -433,50 +778,47 @@ int do_connected(yuzu::CommandContext& ctx) {
     WlanCloseHandle(client, nullptr);
 
 #elif defined(__linux__)
-    // Use nmcli to get current connection info
-    auto nmcli_out =
-        run_command("nmcli -t -f GENERAL.CONNECTION,WIFI.SSID,WIFI.SIGNAL,WIFI.SECURITY,WIFI.BSSID "
-                    "device show 2>/dev/null | head -20");
-    if (!nmcli_out.empty()) {
-        std::istringstream ss(nmcli_out);
-        std::string line;
-        std::string ssid, signal, security, bssid, connection;
-        while (std::getline(ss, line)) {
-            auto colon = line.find(':');
-            if (colon == std::string::npos)
-                continue;
-            auto key = line.substr(0, colon);
-            auto val = line.substr(colon + 1);
-            if (key == "GENERAL.CONNECTION")
-                connection = val;
-            else if (key == "WIFI.SSID")
-                ssid = val;
-            else if (key == "WIFI.SIGNAL")
-                signal = val;
-            else if (key == "WIFI.SECURITY")
-                security = val;
-            else if (key == "WIFI.BSSID")
-                bssid = val;
-        }
-
-        if (!ssid.empty()) {
-            ctx.write_output(
-                std::format("connected|{}|{}|{}|{}|{}", sof(ssid),
-                            signal.empty() ? "0" : signal,
-                            security.empty() ? "Open" : sof(security),
-                            bssid.empty() ? "-" : sof(bssid),
-                            connection.empty() ? "-" : sof(connection)));
+#if defined(YUZU_HAVE_LIBSYSTEMD)
+    if (auto nm = query_nm_connected(); nm.reachable) {
+        if (nm.row) {
+            auto& row = *nm.row;
+            ctx.write_output(std::format("connected|{}|{}|{}|{}|{}", sof(row.ssid), sof(row.signal),
+                                         sof(row.security), sof(row.bssid), sof(row.connection)));
         } else {
-            // Fallback: iwconfig
-            auto iw_out = run_command("iwconfig 2>/dev/null | grep -E 'ESSID|Signal'");
-            if (!iw_out.empty() && iw_out.find("ESSID:off") == std::string::npos) {
-                ctx.write_output(std::format("connected|{}|0|unknown|-|-", sof(iw_out)));
-            } else {
-                ctx.write_output("connected|none|Not connected|0|none|none");
-            }
+            ctx.write_output("connected|none|Not connected|0|none|none");
         }
+        return 0;
+    }
+    // NetworkManager D-Bus unreachable, or any call in the sequence failed
+    // -> fall through to the nmcli argv rung.
+#endif
+    bool status_forwarded = false;
+    // sink: wifi/do_connected#1 -- nmcli device show (rung 2 argv fallback)
+    auto nmcli_path = yuzu::agent::probe_tool_path({"/usr/bin/nmcli", "/bin/nmcli"});
+    auto nmcli_res = run_tool({nmcli_path, "-t", "-f",
+                               "GENERAL.CONNECTION,WIFI.SSID,WIFI.SIGNAL,WIFI.SECURITY,WIFI.BSSID",
+                               "device", "show"},
+                              /*max_lines=*/20);
+    status_forwarded = yuzu::agent::forward_runner_failure(ctx, nmcli_res.res);
+    auto parsed = yuzu::wifi::parse_nmcli_device_show(nmcli_res.output);
+    if (parsed) {
+        auto& row = *parsed;
+        ctx.write_output(std::format("connected|{}|{}|{}|{}|{}", sof(row.ssid), sof(row.signal),
+                                     sof(row.security), sof(row.bssid), sof(row.connection)));
     } else {
-        ctx.write_output("connected|none|Not connected|0|none|none");
+        // sink: wifi/do_connected#2 -- iwconfig (ESSID/Signal blob fallback)
+        auto iwconfig_path =
+            yuzu::agent::probe_tool_path({"/usr/sbin/iwconfig", "/sbin/iwconfig", "/usr/bin/iwconfig"});
+        auto iwconfig_res = run_tool({iwconfig_path});
+        if (!status_forwarded)
+            status_forwarded = yuzu::agent::forward_runner_failure(ctx, iwconfig_res.res);
+        auto filtered = yuzu::wifi::filter_iwconfig_essid_signal_lines(iwconfig_res.output);
+        auto essid = yuzu::wifi::parse_iwconfig_essid_blob(filtered);
+        if (essid) {
+            ctx.write_output(std::format("connected|{}|0|unknown|-|-", sof(*essid)));
+        } else {
+            ctx.write_output("connected|none|Not connected|0|none|none");
+        }
     }
 
 #elif defined(__APPLE__)
@@ -502,36 +844,44 @@ int do_connected(yuzu::CommandContext& ctx) {
 
 // ── ABI4 capability declarations (#2204) ────────────────────────────────────
 //
-// Windows is native WLAN API throughout (rung 1). Linux routes nmcli/iw
-// through the bounded subprocess runner, but run_command (above) hands the
-// command line to `/bin/sh -c` rather than an argv array — a governed
-// shell payload, ADR-3002 rung 3 — with a raw-text iw/iwlist fallback when
-// nmcli is absent. macOS's list_networks scan path is CONSTRAINED, not
-// unsupported: it really does run `airport -s` and then a
-// `system_profiler SPAirPortDataType` fallback through the same governed
-// shell (rung 3, exactly like the Linux leg — the mechanism is what sets
-// the rung, and both go through run_command), and it really does parse
-// results into `wifi|SSID|…` records. What it cannot promise is an ANSWER:
-// `airport` was removed in macOS 14 (Sonoma) and the system_profiler
-// fallback needs Location Services authorisation a background daemon may
-// not hold, so on a modern, unauthorised host both legs yield nothing and
-// the honest "wifi|info|…" sentinel is emitted. That is the definition of
-// CONSTRAINED — a real mechanism with a named limitation — whereas
-// UNSUPPORTED asserts the OS cannot supply the capability at all, which is
-// false for macOS ≤13 and for any host where Location Services is granted.
-// Declaring rung 0 with a null mechanism additionally understated a path
-// that spawns /bin/sh on every invocation. macOS connected instead ships via CoreWLAN
+// Windows is native WLAN API throughout (rung 1).
+//
+// Linux is now rung 1 for BOTH actions: a bounded sd-bus session to
+// NetworkManager (org.freedesktop.NetworkManager), zero processes spawned
+// when it succeeds. ANY sd-bus failure (no libsystemd at build time, no
+// system bus, NetworkManager not running, a signature mismatch never
+// verified against a live host) falls through to nmcli via the argv
+// runner (rung 2), which itself falls through to a raw iw/iwlist text dump
+// (list_networks) or an iwconfig ESSID/Signal blob (connected) when nmcli
+// is absent -- the SAME governed-shell-free argv discipline used
+// throughout this file now, replacing the single `run_command()` shell-
+// string hop every Linux (and macOS) call used to share.
+//
+// macOS's list_networks scan path is CONSTRAINED, not unsupported: it
+// really does run `airport -s` and then a `system_profiler
+// SPAirPortDataType` fallback, now via the bounded argv runner directly
+// (rung 2 -- no shell hop) rather than through a governed shell, and it
+// really does parse results into `wifi|SSID|…` records. What it cannot
+// promise is an ANSWER: `airport` was removed in macOS 14 (Sonoma) and the
+// system_profiler fallback needs Location Services authorisation a
+// background daemon may not hold, so on a modern, unauthorised host both
+// legs yield nothing and the honest "wifi|info|…" sentinel is emitted.
+// That is the definition of CONSTRAINED — a real mechanism with a named
+// limitation — whereas UNSUPPORTED asserts the OS cannot supply the
+// capability at all, which is false for macOS ≤13 and for any host where
+// Location Services is granted. macOS connected instead ships via CoreWLAN
 // (wifi_corewlan.mm), a native framework — rung 1 — though Location
 // Services (macOS 14+) can withhold the SSID/BSSID from a background
-// daemon.
+// daemon. Untouched by this migration.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "list_networks",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_CONSTRAINED, 3, "nmcli via governed shell runner",
-         "falls back to a raw, unstructured iw/iwlist text dump when nmcli is unavailable"},
+        {YUZU_SUPPORT_SUPPORTED, 1, "NetworkManager D-Bus (sd-bus)",
+         "falls back to nmcli via the argv runner (rung 2), then a raw iw/iwlist text dump "
+         "when nmcli is unavailable"},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_CONSTRAINED, 3, "airport -s via governed shell runner",
+        {YUZU_SUPPORT_CONSTRAINED, 2, "airport -s / system_profiler via argv runner",
          "airport was removed in macOS 14 (Sonoma); the system_profiler "
          "SPAirPortDataType fallback needs Location Services authorisation a "
          "background daemon may lack, so an unauthorised modern host yields no "
@@ -542,8 +892,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "connected",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_CONSTRAINED, 3, "nmcli via governed shell runner",
-         "falls back to a raw iwconfig text blob (ESSID/Signal only) when nmcli reports no SSID"},
+        {YUZU_SUPPORT_SUPPORTED, 1, "NetworkManager D-Bus (sd-bus)",
+         "falls back to nmcli via the argv runner (rung 2), then a raw iwconfig "
+         "ESSID/Signal blob when nmcli reports no SSID"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 1, "CoreWLAN",
          "Location Services (macOS 14+) may withhold SSID/BSSID from a background daemon"},
