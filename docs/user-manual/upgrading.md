@@ -1828,10 +1828,13 @@ counted as applied.
 their own family, so a **v4-only whitelist now leaves IPv6 contained**. There is no blanket
 "keep existing connections alive" rule on either family — only a whitelisted address survives,
 in any connection state. The agent automatically whitelists its own configured server address
-(an IP literal directly, a hostname resolved to its current address(es) at quarantine time), so
-most fleets need no manual action here. If your agents reach the server over IPv6 through a path
-DNS resolution of the configured address wouldn't reproduce (split-horizon DNS, a manually
-pinned route), **add the server's IPv6 address to the whitelist explicitly**. See
+(an IP literal directly, a hostname resolved to its address(es) **once, at agent startup** —
+never at quarantine time, and using the endpoint's own resolver), so most fleets need no manual
+action here. Prefer an IP-literal `--server` config for endpoints where containment integrity
+matters most, since that removes DNS from the equation entirely. If your agents reach the
+server over IPv6 through a path DNS resolution of the configured address wouldn't reproduce
+(split-horizon DNS, a manually pinned route), or if the server's address changes after an agent
+was last started, **add the server's address to the whitelist explicitly**. See
 [Security Hardening](security-hardening.md#whitelisting-on-a-dual-stack-host-read-this-before-quarantining-one).
 
 ### 2. Reporting is more conservative again (#3283, #3285, #3286, #3260)

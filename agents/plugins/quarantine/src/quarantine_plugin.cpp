@@ -76,104 +76,15 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <winsock2.h>
-#include <ws2tcpip.h> // getaddrinfo/freeaddrinfo/inet_ntop -- resolve_server_hostname_literals
 #include "win_str.hpp" // yuzu::win::from_wide (agents/shared, #1681)
-#pragma comment(lib, "ws2_32.lib")
-#else
-#include <arpa/inet.h> // inet_ntop -- resolve_server_hostname_literals
-#include <netdb.h>     // getaddrinfo/freeaddrinfo -- resolve_server_hostname_literals
-#include <sys/socket.h>
 #endif
 
 namespace {
 
-using yuzu::quarantine::extract_target_host;
 using yuzu::quarantine::is_safe_ip;
 using yuzu::quarantine::kRulePrefix;
 using yuzu::quarantine::QuarStatus;
 using yuzu::quarantine::quar_status_token;
-
-#ifdef _WIN32
-// Idempotent Winsock init (getaddrinfo requires it) -- same RAII-static
-// pattern as agents/core/src/cloud_identity.cpp's ensure_wsa(), duplicated
-// locally rather than shared: that one lives in agent-core and this call is
-// synchronous and self-contained (see resolve_server_hostname_literals
-// below), so there is no cross-module lifetime reason to route through it.
-void ensure_wsa_init() {
-    struct WsaInit {
-        WsaInit() {
-            WSADATA wsa;
-            WSAStartup(MAKEWORD(2, 2), &wsa);
-        }
-        ~WsaInit() { WSACleanup(); }
-    };
-    static WsaInit init;
-    (void)init;
-}
-#endif
-
-// Resolves a hostname to its IPv4/IPv6 literal address(es) via a
-// synchronous getaddrinfo() call -- do_quarantine's fallback for when
-// agent.server_address is configured as a hostname rather than an IP
-// literal (the common case per --server's own "host:port" help text), so
-// quarantine can still whitelist the management server instead of silently
-// skipping it. This closes the gap on the one LIVE quarantine dispatch
-// path, MCP's quarantine_device, which never supplies an explicit
-// server_ip and advertises "whitelisting the management server" as an
-// unconditional guarantee.
-//
-// Deliberately SYNCHRONOUS, not a detached thread: a blocking library call
-// on the calling thread has no ADR-3002 unload-race exposure at all -- the
-// plugin cannot be dlclose()'d while its own code is still on the call
-// stack, unlike a detached thread whose completion could run past unload
-// (the exact class of bug a sibling PR's WUA-callback fix closed the other
-// direction of). The only cost is latency, bounded by the OS resolver's own
-// configured timeout -- the same order of magnitude as this action's
-// existing multi-second sequential sudo-governed subprocess calls
-// (kQuarantineMutateDeadline below), not a new class of slowness. A
-// wedged/unreachable DNS server delays this one quarantine call; it does
-// not corrupt it -- an empty return here just means the caller's existing
-// hostname-not-whitelisted fallback behavior applies, same as before this
-// function existed.
-std::vector<std::string> resolve_server_hostname_literals(const std::string& host) {
-    std::vector<std::string> out;
-    if (host.empty())
-        return out;
-#ifdef _WIN32
-    ensure_wsa_init();
-#endif
-    struct addrinfo hints {};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    struct addrinfo* result = nullptr;
-    if (::getaddrinfo(host.c_str(), nullptr, &hints, &result) != 0 || !result)
-        return out;
-    for (auto* p = result; p != nullptr; p = p->ai_next) {
-        char buf[INET6_ADDRSTRLEN] = {};
-        const void* addr = nullptr;
-        if (p->ai_family == AF_INET)
-            addr = &reinterpret_cast<struct sockaddr_in*>(p->ai_addr)->sin_addr;
-        else if (p->ai_family == AF_INET6)
-            addr = &reinterpret_cast<struct sockaddr_in6*>(p->ai_addr)->sin6_addr;
-        else
-            continue;
-        if (::inet_ntop(p->ai_family, addr, buf, sizeof(buf))) {
-            std::string lit{buf};
-            bool dup = false;
-            for (const auto& existing : out) {
-                if (existing == lit) {
-                    dup = true;
-                    break;
-                }
-            }
-            if (!dup)
-                out.push_back(std::move(lit));
-        }
-    }
-    ::freeaddrinfo(result);
-    return out;
-}
 
 // ── Bounded-execution deadlines (ADR-3002 runner-idiom ceiling) ────────────
 //
@@ -2144,29 +2055,25 @@ private:
         // own tool description promising "whitelisting the management
         // server" (see the governance note and tool description at its
         // call site in mcp_server.cpp). Fall back to the agent's OWN known
-        // connection target ("agent.server_address", threaded into every
-        // plugin's config by agent.cpp) so it's the whitelist-based accept
-        // rules below — not a blanket ESTABLISHED,RELATED hole — that keep
-        // a live management connection through quarantine regardless of
-        // which dispatch path triggered it. Resolved via DNS when it's a
-        // hostname (the --server flag's own documented format, not an edge
-        // case) rather than only handling the IP-literal case: skipping
-        // resolution here would leave every hostname-configured deployment
-        // quarantined via MCP with NO rule permitting its own management
-        // server, a real regression from the over-permissive blanket rule
-        // this PR removes (which protected every configuration, including
-        // hostname ones, by being maximally broad).
+        // connection target -- but read it PRE-RESOLVED
+        // ("agent.server_address_resolved", computed once at agent startup
+        // by agent.cpp via yuzu::agent::resolve_server_address_literals,
+        // never here). Deliberately NOT resolved at quarantine-dispatch
+        // time: that would let the host BEING quarantined decide, via its
+        // own live DNS resolution, which address survives its own
+        // containment -- exactly the trust a possibly-already-compromised
+        // host must not be given (a poisoned /etc/hosts or local resolver
+        // could steer containment around an attacker-controlled address).
+        // Resolving once at boot, before quarantine is ever dispatched,
+        // narrows that window to "compromised before or at startup" and
+        // means this call performs no DNS I/O of its own at all -- comma-
+        // joined, so a hostname resolving to multiple addresses whitelists
+        // all of them.
         if (plugin_ctx_) {
             yuzu::PluginContext pc{plugin_ctx_};
-            auto agent_server_host = extract_target_host(pc.get_config("agent.server_address"));
-            if (!agent_server_host.empty()) {
-                if (is_safe_ip(agent_server_host)) {
-                    add_whitelist_ip(std::move(agent_server_host));
-                } else {
-                    for (auto& resolved : resolve_server_hostname_literals(agent_server_host))
-                        add_whitelist_ip(std::move(resolved));
-                }
-            }
+            auto resolved_csv = pc.get_config("agent.server_address_resolved");
+            for (auto& ip : split_ips(resolved_csv))
+                add_whitelist_ip(std::move(ip));
         }
 
         auto extra = split_ips(whitelist_csv);

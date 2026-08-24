@@ -8767,11 +8767,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 // NOTE (governance sec-LOW-1 / UP-6): this call never sets qparams'
                 // server_ip — but live isolation still keeps the management channel
-                // reachable, because the quarantine plugin now derives its own server
-                // address independently (agent.server_address, resolved via DNS when
-                // it's a hostname) rather than depending on a caller-supplied one. See
-                // quarantine_plugin.cpp's do_quarantine and
-                // resolve_server_hostname_literals.
+                // reachable, because the agent independently derives its own server
+                // address once at STARTUP (agents/core/src/server_address_resolver.cpp,
+                // resolved via DNS when it's a hostname) and threads the result into
+                // every plugin's config, rather than depending on a caller-supplied
+                // one. Deliberately not resolved by the quarantine plugin itself at
+                // dispatch time -- see quarantine_plugin.cpp's do_quarantine comment
+                // on why that would let the host being quarantined steer its own
+                // containment exception via its own (possibly compromised) resolver.
                 // 1. Persist the quarantine record (store row only; mirror REST).
                 auto quar_res =
                     quarantine_store->quarantine_device(agent_id, session->username, reason, whitelist);

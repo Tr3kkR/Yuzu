@@ -384,13 +384,22 @@ That is the correct posture — before this, an IPv6-capable host was never cont
   whitelisted address's traffic survives, in any connection state (new, reconnecting, or
   already established). The agent automatically whitelists its own configured server address
   (`--server`) for this: an IP literal is used directly, and a hostname is resolved to its
-  current address(es) at quarantine time, covering whichever families it resolves to.
+  address(es) **once, at agent startup** — never at quarantine time — covering whichever
+  families it resolves to at that point.
+- **Trust boundary: startup-time resolution uses the endpoint's own resolver.** This is a
+  deliberate improvement over resolving at quarantine time (which would let a host already
+  under active compromise steer its own containment exception via a poisoned `/etc/hosts` or
+  local resolver, right when quarantine is dispatched in response to that compromise) — but it
+  is not a trusted-channel guarantee against a resolver that was already compromised before or
+  at agent startup. For endpoints where containment integrity matters most, **configure `--server`
+  as an IP literal** rather than a hostname, removing DNS from the equation entirely.
 - If the agent's configured server address is a hostname that resolves to an IPv4 address but
   the agent actually reaches the server over IPv6 through some other path (a split-horizon DNS
-  setup, a manually pinned route), the automatic whitelisting will not cover that path — **add
-  the server's IPv6 address to the whitelist explicitly** in that case. The common case (the
-  configured address resolves to the address actually used) needs no manual whitelist entry for
-  the server at all.
+  setup, a manually pinned route), or if the server's address changes after the agent last
+  started, the automatic whitelisting will not cover that path — **add the server's address to
+  the whitelist explicitly** in that case. The common case (the configured address resolves to
+  the address actually used, and doesn't change between agent restarts) needs no manual
+  whitelist entry for the server at all.
 - Whitelist entries that are neither valid IPv4 nor valid IPv6 (a hostname, a malformed literal)
   are **skipped, and the skip is reported** — the plugin does not silently drop them and report a
   clean success.

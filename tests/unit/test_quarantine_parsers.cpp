@@ -44,26 +44,6 @@ TEST_CASE("ip_family classifies validated IPv4/IPv6 literals and reports unknown
     CHECK(ip_family("deadbeef") == IpFamily::unknown); // no '.' or ':' -- callers skip it
 }
 
-// ── extract_target_host ─────────────────────────────────────────────────
-
-TEST_CASE("extract_target_host strips a port suffix from a gRPC-style target, "
-         "handling bracketed and bracket-less IPv6",
-         "[agent][quarantine_parsers]") {
-    CHECK(extract_target_host("10.0.0.5:50051") == "10.0.0.5");
-    CHECK(extract_target_host("server.example.com:50051") == "server.example.com");
-    CHECK(extract_target_host("[::1]:50051") == "::1");
-    CHECK(extract_target_host("[2001:db8::1]:50051") == "2001:db8::1");
-    // Bracket-less IPv6 with no port -- splitting on the last ':' would
-    // truncate it, so the whole string is returned instead.
-    CHECK(extract_target_host("2001:db8::1") == "2001:db8::1");
-    CHECK(extract_target_host("::1") == "::1");
-    // No ':' at all -- a bare host, returned unchanged.
-    CHECK(extract_target_host("localhost") == "localhost");
-    CHECK(extract_target_host("") == "");
-    // Malformed bracket (no closing ']') -- no safe host to extract.
-    CHECK(extract_target_host("[::1:50051") == "");
-}
-
 // ── MutationTally / status tokens ───────────────────────────────────────
 
 TEST_CASE("MutationTally.record tallies attempts and successes, and complete() is "
@@ -289,6 +269,30 @@ Ok.
     // never surfaces (its rule name doesn't start with kRulePrefix).
     REQUIRE(ips.size() == 1);
     CHECK(ips[0] == "10.0.0.5");
+}
+
+TEST_CASE("netsh_whitelist_ips excludes the IPv6 loopback rule's ::1 RemoteIP "
+         "the same way it excludes 127.0.0.1, alongside a real IPv6 whitelist "
+         "entry which still surfaces",
+         "[agent][quarantine_parsers]") {
+    constexpr std::string_view kCapture = R"(
+Rule Name:                           YuzuQuarantine_AllowLoopbackIn6
+----------------------------------------------------------------------
+Enabled:                              Yes
+Direction:                            In
+RemoteIP:                             ::1
+Action:                               Allow
+
+Rule Name:                           YuzuQuarantine_AllowIn_fe80::1
+----------------------------------------------------------------------
+Enabled:                              Yes
+Direction:                            In
+RemoteIP:                             fe80::1
+Action:                               Allow
+)";
+    auto ips = netsh_whitelist_ips(kCapture);
+    REQUIRE(ips.size() == 1);
+    CHECK(ips[0] == "fe80::1");
 }
 
 TEST_CASE("netsh_matching_rule_names and netsh_whitelist_ips return empty "
