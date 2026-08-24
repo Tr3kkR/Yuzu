@@ -486,3 +486,72 @@ TEST_CASE("journal_message_matches: hit, case-insensitive hit, and miss",
     CHECK(journal_message_matches("Connection REFUSED", "refused"));
     CHECK_FALSE(journal_message_matches("all good", "refused"));
 }
+
+// ---------------------------------------------------------------------------
+// Real-capture fixture
+// ---------------------------------------------------------------------------
+
+TEST_CASE("parse_win_events: real wevtutil System-channel capture round-trips "
+          "- real capture (wevtutil qe System /f:xml, Windows 10 host, 2026-08-24)",
+          "[event_logs][parsers]") {
+    // First two events of a live `wevtutil qe System /c:3 /f:xml /rd:true`
+    // capture, byte-for-byte as rendered (single-quoted attributes, named
+    // <Data> values, blocks concatenated with NO separator between them --
+    // the exact shape EvtRenderEventXml hands the plugin).
+    constexpr std::string_view kCapture =
+        "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>"
+        "<Provider Name='Microsoft-Windows-IsolatedUserMode' "
+        "Guid='{73a33ab2-1966-4999-8add-868c41415269}'/><EventID>2</EventID>"
+        "<Version>0</Version><Level>4</Level><Task>0</Task><Opcode>0</Opcode>"
+        "<Keywords>0x8000400000000000</Keywords>"
+        "<TimeCreated SystemTime='2026-08-24T08:40:49.8306253Z'/>"
+        "<EventRecordID>22300</EventRecordID><Correlation/>"
+        "<Execution ProcessID='1808' ThreadID='9944'/><Channel>System</Channel>"
+        "<Computer>DESKTOP-04DNSIG</Computer><Security UserID='S-1-5-19'/></System>"
+        "<EventData><Data Name='TrustletIdentity'>6</Data>"
+        "<Data Name='NormalProcessId'>1808</Data><Data Name='Status'>0</Data>"
+        "</EventData></Event>"
+        "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>"
+        "<Provider Name='Microsoft-Windows-WindowsUpdateClient' "
+        "Guid='{945a8954-c147-4acd-923f-40c45405a658}'/><EventID>19</EventID>"
+        "<Version>1</Version><Level>4</Level><Task>1</Task><Opcode>13</Opcode>"
+        "<Keywords>0x8000000000000018</Keywords>"
+        "<TimeCreated SystemTime='2026-08-24T08:39:45.5505034Z'/>"
+        "<EventRecordID>22299</EventRecordID><Correlation/>"
+        "<Execution ProcessID='2788' ThreadID='13056'/><Channel>System</Channel>"
+        "<Computer>DESKTOP-04DNSIG</Computer><Security UserID='S-1-5-18'/></System>"
+        "<EventData><Data Name='updateTitle'>Security Intelligence Update for "
+        "Microsoft Defender Antivirus - KB2267602 (Version 1.457.316.0) - Current "
+        "Channel (Broad)</Data>"
+        "<Data Name='updateGuid'>{b9516b54-3e40-4e0d-a7c7-875960bd737a}</Data>"
+        "<Data Name='updateRevisionNumber'>200</Data>"
+        "<Data Name='serviceGuid'>{9482f4b4-e343-43b6-b170-9a65bc822c77}</Data>"
+        "</EventData></Event>";
+
+    const auto events = parse_win_events(kCapture);
+    REQUIRE(events.size() == 2);
+
+    CHECK(events[0].event_id == 2);
+    CHECK(events[0].level == 4);
+    CHECK(events[0].provider == "Microsoft-Windows-IsolatedUserMode");
+    CHECK(events[0].time_created == "2026-08-24T08:40:49.8306253Z");
+    CHECK(events[0].message == "6 1808 0"); // space-joined Data values
+
+    CHECK(events[1].event_id == 19);
+    CHECK(events[1].provider == "Microsoft-Windows-WindowsUpdateClient");
+    CHECK(events[1].time_created == "2026-08-24T08:39:45.5505034Z");
+    CHECK(events[1].message.find("Security Intelligence Update for Microsoft Defender "
+                                 "Antivirus") == 0);
+    CHECK(events[1].message.find("{b9516b54-3e40-4e0d-a7c7-875960bd737a}") !=
+          std::string::npos);
+
+    // Row shape from a real event: level 4 renders as Information.
+    const auto row = win_event_row(events[1]);
+    CHECK(row.find("event|2026-08-24T08:39:45.5505034Z|Information|19|"
+                   "Microsoft-Windows-WindowsUpdateClient|") == 0);
+
+    // The real capture also answers the keyword-filter question an operator
+    // would actually ask of it.
+    CHECK(win_event_matches(events[1], "defender"));
+    CHECK_FALSE(win_event_matches(events[0], "defender"));
+}
