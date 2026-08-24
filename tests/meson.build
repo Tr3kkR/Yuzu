@@ -282,6 +282,7 @@ agent_test_exe = executable(
     'unit/test_filesystem_macos_sig.cpp',     # #2273/1.14: pure codesign/plutil classifiers
     'unit/test_event_logs_macos.cpp',         # BR-08: pure `log show` SubprocessResult classifier
     'unit/test_event_logs_parsers.cpp',       # Wave 4 PR4.2: pure Windows event-XML / journal row parse+format helpers
+    'unit/test_event_logs_journalctl.cpp',    # Wave 4 PR4.2: pure Linux journalctl-fallback outcome classifier (runs on every host)
     'unit/test_event_logs_posix_actions.cpp', # Wave 4 PR4.2 remediation: real event_logs.dylib/.so driven
                                                 # end to end via LocalDispatcher (POSIX-only; a no-op
                                                 # TU on Windows via the file's own #ifndef _WIN32 guard)

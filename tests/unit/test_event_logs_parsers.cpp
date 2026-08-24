@@ -356,6 +356,55 @@ TEST_CASE("win_event_row: message truncated at the 200-char display cap",
     CHECK(msg_field == std::string(200, 'x'));
 }
 
+TEST_CASE("truncate_field: the cap never splits a multi-byte UTF-8 character",
+          "[event_logs][parsers]") {
+    // The cap is a BYTE index but log text is routinely non-ASCII (Windows
+    // event parameters are provider-localized; journal MESSAGE is arbitrary
+    // UTF-8). Cutting mid-sequence emits invalid UTF-8, which the server's
+    // Postgres-backed response store rejects -- losing the WHOLE result rather
+    // than one character. The PowerShell leg this replaces capped at 200
+    // CHARACTERS, so a byte cut is also a silent behaviour regression.
+    //
+    // 'é' is 2 bytes (0xC3 0xA9). 199 ASCII bytes + 'é' puts the character
+    // astride the 200-byte boundary: a naive cut keeps the lead byte 0xC3 and
+    // drops its continuation byte.
+    const std::string msg = std::string(199, 'a') + "\xC3\xA9" + std::string(50, 'b');
+    const std::string out = truncate_field(msg, kMessageDisplayCap);
+
+    CHECK(out.size() == 199); // backed off the split character entirely
+    CHECK(out == std::string(199, 'a'));
+    // No trailing lead byte left dangling.
+    CHECK(static_cast<unsigned char>(out.back()) < 0x80);
+
+    // A character that ENDS exactly on the boundary is kept whole.
+    const std::string aligned = std::string(198, 'a') + "\xC3\xA9" + std::string(50, 'b');
+    const std::string aligned_out = truncate_field(aligned, kMessageDisplayCap);
+    CHECK(aligned_out.size() == kMessageDisplayCap);
+    CHECK(aligned_out == std::string(198, 'a') + "\xC3\xA9");
+
+    // A 3-byte character (U+20AC EURO, 0xE2 0x82 0xAC) straddling the cap.
+    const std::string three = std::string(198, 'a') + "\xE2\x82\xAC" + std::string(50, 'b');
+    const std::string three_out = truncate_field(three, kMessageDisplayCap);
+    CHECK(three_out.size() == 198);
+    CHECK(three_out == std::string(198, 'a'));
+}
+
+TEST_CASE("decode_xml_entities: a stray '&' run is bounded, not a full-buffer rescan",
+          "[event_logs][parsers]") {
+    // A value of '&' with no ';' anywhere: the ';' search must stay inside the
+    // 12-byte entity window. Correctness pin for the bounded search (the
+    // unbounded version was quadratic on attacker-influenceable event text).
+    const std::string amps(4096, '&');
+    const std::string decoded = yuzu::event_logs_parsers::detail::decode_xml_entities(amps);
+    CHECK(decoded == amps); // every '&' passes through byte-for-byte
+
+    // A legal entity still decodes when it sits inside the window.
+    CHECK(yuzu::event_logs_parsers::detail::decode_xml_entities("a&amp;b") == "a&b");
+    // A ';' beyond the window is NOT treated as an entity terminator.
+    const std::string far = "&" + std::string(40, 'x') + ";";
+    CHECK(yuzu::event_logs_parsers::detail::decode_xml_entities(far) == far);
+}
+
 TEST_CASE("win_event_row: a message with '|'/CR/LF cannot forge extra fields",
           "[event_logs][parsers]") {
     WinEvent ev;

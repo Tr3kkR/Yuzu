@@ -33,6 +33,7 @@
  * event_logs_journal.hpp. This file is the thin OS-facing shell.
  */
 
+#include "event_logs_journalctl.hpp"
 #include "event_logs_macos.hpp"
 #include "event_logs_parsers.hpp"
 
@@ -230,6 +231,8 @@ EvtQueryOutcome query_win_events(const wchar_t* channel, const wchar_t* xpath, s
 
 #ifdef __linux__
 
+namespace journalctl = yuzu::event_logs_journalctl;
+
 // Wall-clock budget for one native journal read — matches the macOS
 // `log show` deadline; the journalctl argv fallback runs under the runner's
 // own 20s deadline.
@@ -316,46 +319,31 @@ int run_journalctl_fallback(yuzu::CommandContext& ctx, std::vector<std::string> 
                                              .max_lines = 500,
                                              .merge_stderr = false,
                                              .stop_after_max_lines = true});
-    if (!result.tool_ran) {
-        // journalctl absent (non-systemd distro with the native leg also
-        // unavailable): an honest typed status, never a fabricated
-        // "no events".
+    // Every reachable (termination_reason, exit_code, timed_out) combination is
+    // decided by the pure, fixture-tested classifier rather than inline here —
+    // the inline version shipped two successive honesty holes (a missing
+    // exit-code check, then a missing `signaled` check) precisely because it
+    // could not be tested. See event_logs_journalctl.hpp.
+    const auto classification = journalctl::classify_journalctl_result(result);
+
+    std::string_view sentinel_message = empty_message;
+    switch (classification.outcome) {
+    case journalctl::FallbackOutcome::unavailable:
+        spdlog::warn("event_logs: journalctl fallback unavailable — {}", classification.reason);
         ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               unavailable_provenance);
-        ctx.write_output(std::format("{}|none|-|{}", prefix, empty_message));
-        return 0;
-    }
-    if (result.timed_out) {
-        spdlog::warn("event_logs: journalctl fallback timed out (partial result)");
+        // NEVER the clean "none found" text: the event data is unknown, not
+        // absent, and an operator must be able to tell those apart.
+        sentinel_message = classification.reason;
+        break;
+    case journalctl::FallbackOutcome::constrained:
+        spdlog::warn("event_logs: journalctl fallback constrained — {}", classification.reason);
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               unavailable_provenance);
-    }
-
-    // A journalctl that LAUNCHED and then exited nonzero (no journal files on
-    // the host, an ACL denial for a process outside the `systemd-journal`
-    // group, an unsupported argument on an old build) must never be folded
-    // into the clean "none found" sentinel — a failure reading as an empty log
-    // is precisely the mode this migration exists to remove, and the honest
-    // typed status is the whole point of the rung-1 contract.
-    //
-    // Guarded on `exited` deliberately: `stop_after_max_lines` is set above, so
-    // on a busy host the runner KILLS the child after the cap, leaving
-    // termination_reason == line_limit and exit_code at the -1 kill sentinel
-    // (SubprocessResult's documented contract — never fabricated to 0). That is
-    // a clean bounded stop, not a failure; testing `exit_code != 0` alone would
-    // report every busy host as unavailable — the exact defect fixed on the
-    // macOS classifier in this same PR.
-    std::string failure_sentinel;
-    std::string_view sentinel_message = empty_message;
-    if (result.termination_reason == yuzu::agent::TerminationReason::exited &&
-        result.exit_code != 0) {
-        spdlog::warn("event_logs: journalctl fallback exited {} — reporting unavailable",
-                     result.exit_code);
-        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                              unavailable_provenance);
-        failure_sentinel =
-            std::format("journalctl exited {} (event data unavailable)", result.exit_code);
-        sentinel_message = failure_sentinel;
+        sentinel_message = classification.reason;
+        break;
+    case journalctl::FallbackOutcome::ok:
+        break;
     }
 
     if (result.lines.empty()) {

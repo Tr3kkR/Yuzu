@@ -68,7 +68,19 @@ inline std::string truncate_field(std::string_view value,
                                   std::size_t cap = kMessageDisplayCap) {
     if (value.size() <= cap)
         return std::string(value);
-    return std::string(value.substr(0, cap));
+    // Back off to a UTF-8 character boundary. `cap` is a BYTE index, and log
+    // messages are routinely non-ASCII (Windows event parameters are
+    // provider-localized; journal MESSAGE is arbitrary UTF-8), so cutting at a
+    // raw byte can split a multi-byte sequence and emit invalid UTF-8 —
+    // which the server's Postgres-backed response store rejects, losing the
+    // whole result rather than one character. The PowerShell leg this replaces
+    // capped at 200 CHARACTERS ([Math]::Min on a .NET string), so a bare byte
+    // cut would also be a silent behaviour regression on the Windows leg.
+    // Continuation bytes are 10xxxxxx; walk back off them to the lead byte.
+    std::size_t end = cap;
+    while (end > 0 && (static_cast<unsigned char>(value[end]) & 0xC0) == 0x80)
+        --end;
+    return std::string(value.substr(0, end));
 }
 
 // ASCII case-insensitive substring test (needle empty -> true). The
@@ -143,8 +155,13 @@ inline std::string decode_xml_entities(std::string_view s) {
         // unbounded scan on a stray '&'.
         constexpr std::size_t kMaxEntityLen = 12;
         const std::size_t window_end = std::min(s.size(), i + kMaxEntityLen);
-        auto semi = s.find(';', i);
-        if (semi == std::string_view::npos || semi >= window_end) {
+        // Search only INSIDE the window. A bare s.find(';', i) scans to the end
+        // of the buffer and merely discards an out-of-window hit afterwards,
+        // which makes a value full of stray '&' quadratic: a ~30 KB EventData
+        // parameter of '&' with no ';' costs ~5e8 byte-scans per event, times
+        // the 100-event cap. Bounded here, it is O(12) per '&'.
+        auto semi = s.substr(0, window_end).find(';', i);
+        if (semi == std::string_view::npos) {
             out.push_back(s[i++]);
             continue;
         }

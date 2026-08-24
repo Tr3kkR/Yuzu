@@ -114,6 +114,27 @@ inline std::string format_short_iso(std::uint64_t realtime_usec) {
 
 namespace detail {
 
+// sd_journal_open SUCCEEDS for a process that can read no journal files at all
+// -- it opens whichever files the caller's UID is permitted to see. The agent
+// runs as a dedicated `yuzu`/`_yuzu` account (docs/agent-privilege-model.md);
+// if that account is outside the `systemd-journal` group and the system journal
+// is not world-readable, the walk simply finds nothing and the leg would report
+// a clean, confident "no events" for a host it could not actually read -- the
+// exact failure-reads-as-empty-log mode this migration exists to remove, on the
+// leg the migration promotes to rung 1.
+//
+// sd_journal_get_cutoff_realtime_usec answers "are ANY entries visible to me?":
+// 1 when the journal has readable entries, 0 when it has none. Treat "none
+// visible" as unreachable rather than empty and let the caller fall through to
+// the journalctl fallback, which reports honestly (and which, on a genuinely
+// empty journal, simply also finds nothing -- costing one extra bounded spawn
+// in the rare empty case, in exchange for never lying about a denied one).
+inline bool journal_has_visible_entries(sd_journal* j) {
+    std::uint64_t from_usec = 0;
+    std::uint64_t to_usec = 0;
+    return ::sd_journal_get_cutoff_realtime_usec(j, &from_usec, &to_usec) > 0;
+}
+
 inline Entry read_current_entry(sd_journal* j, std::uint64_t realtime_usec) {
     Entry e;
     e.realtime_usec = realtime_usec;
@@ -145,6 +166,10 @@ inline ReadResult read_errors(int hours, std::size_t cap, std::chrono::milliseco
         if (::sd_journal_add_match(j.get(), match, 0) < 0)
             return {ReadStatus::kOpenFailed, false};
     if (::sd_journal_seek_tail(j.get()) < 0)
+        return {ReadStatus::kOpenFailed, false};
+    // An open that can see no entries at all is a denied read, not an empty
+    // log -- see detail::journal_has_visible_entries.
+    if (!detail::journal_has_visible_entries(j.get()))
         return {ReadStatus::kOpenFailed, false};
 
     const auto deadline = std::chrono::steady_clock::now() + budget;
@@ -192,6 +217,10 @@ inline ReadResult read_matches(std::string_view filter, std::size_t count, std::
         return {ReadStatus::kOpenFailed, false};
     JournalGuard j{raw};
     if (::sd_journal_seek_tail(j.get()) < 0)
+        return {ReadStatus::kOpenFailed, false};
+    // An open that can see no entries at all is a denied read, not an empty
+    // log -- see detail::journal_has_visible_entries.
+    if (!detail::journal_has_visible_entries(j.get()))
         return {ReadStatus::kOpenFailed, false};
 
     const auto deadline = std::chrono::steady_clock::now() + budget;
