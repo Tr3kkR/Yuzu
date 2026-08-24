@@ -59,6 +59,18 @@ classify_log_show_result(const yuzu::agent::SubprocessResult& result) {
     if (!result.tool_ran)
         return {LogShowOutcome::unavailable, "log show did not run"};
 
+    // A stop_after_max_lines stop is the runner's documented DELIBERATE
+    // clean bound (TerminationReason::line_limit -- "a clean bounded stop,
+    // not a failure"): the child is killed after the cap, so exit_code
+    // stays the -1 kill sentinel even though the collected lines are
+    // exactly the bounded result the caller asked for. Classify it ok
+    // BEFORE the exit-code check -- otherwise any Mac with more matching
+    // log lines than the cap (the common case on a busy box) reports a
+    // false "unavailable" + rc 1. Found by the Wave-4 PR4.2 action-
+    // dispatch-level test driving the real plugin on real hardware.
+    if (result.termination_reason == yuzu::agent::TerminationReason::line_limit)
+        return {LogShowOutcome::ok, {}};
+
     // log show ran and reported a real problem (bad predicate, permission
     // denial, etc) -- a nonzero exit is never silently treated as "no
     // matches".

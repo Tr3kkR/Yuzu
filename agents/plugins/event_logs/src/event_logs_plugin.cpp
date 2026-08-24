@@ -387,8 +387,13 @@ int do_errors(yuzu::CommandContext& ctx, yuzu::Params params) {
 
     // Surface degraded `log show` runs to operators: the sentinel row + rc are
     // honest but only visible by parsing returned rows, so a hung/failed/
-    // truncated shell-out would otherwise be silent in the agent log.
-    if (result.timed_out || !result.tool_ran || result.exit_code != 0 || result.output_truncated) {
+    // truncated shell-out would otherwise be silent in the agent log. A
+    // line_limit stop is the runner's deliberate clean bound (exit_code
+    // stays -1 for the killed child by contract) -- not a degradation.
+    const bool errors_line_limited =
+        result.termination_reason == yuzu::agent::TerminationReason::line_limit;
+    if (result.timed_out || !result.tool_ran ||
+        (result.exit_code != 0 && !errors_line_limited) || result.output_truncated) {
         spdlog::warn("event_logs errors: macOS 'log show' {} (timed_out={}, tool_ran={}, "
                      "exit_code={}, output_truncated={})",
                      result.timed_out         ? "timed out"
@@ -482,8 +487,13 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
 
     // Surface degraded `log show` runs to operators: the sentinel row + rc are
     // honest but only visible by parsing returned rows, so a hung/failed/
-    // truncated shell-out would otherwise be silent in the agent log.
-    if (result.timed_out || !result.tool_ran || result.exit_code != 0 || result.output_truncated) {
+    // truncated shell-out would otherwise be silent in the agent log. A
+    // line_limit stop is the runner's deliberate clean bound (exit_code
+    // stays -1 for the killed child by contract) -- not a degradation.
+    const bool query_line_limited =
+        result.termination_reason == yuzu::agent::TerminationReason::line_limit;
+    if (result.timed_out || !result.tool_ran ||
+        (result.exit_code != 0 && !query_line_limited) || result.output_truncated) {
         spdlog::warn("event_logs query: macOS 'log show' {} (timed_out={}, tool_ran={}, "
                      "exit_code={}, output_truncated={})",
                      result.timed_out         ? "timed out"
