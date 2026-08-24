@@ -15,6 +15,7 @@
 #include <spdlog/spdlog.h>
 
 #include <string>
+#include <utility> // std::move
 #include <vector>
 
 #ifdef _WIN32

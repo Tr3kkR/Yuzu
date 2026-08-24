@@ -25,6 +25,7 @@
 
 #include <cstddef>
 #include <string>
+#include <utility> // std::move
 #include <vector>
 
 namespace yuzu::tar {
