@@ -25,6 +25,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <cerrno>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -33,6 +34,7 @@ using namespace std::chrono_literals;
 using yuzu::agent::PasswdLookupResult;
 using yuzu::agent::PasswdLookupStatus;
 using yuzu::agent::resolve_passwd_bounded;
+using yuzu::agent::resolve_passwd_bounded_for_test;
 
 namespace {
 
@@ -51,7 +53,7 @@ TEST_CASE("resolve_passwd_bounded returns a resolved record unchanged", "[passwd
     // macros are not thread-safe off the main thread, and this callable runs
     // on bounded_call's worker.
     auto seen = std::make_shared<std::string>();
-    auto res = resolve_passwd_bounded("alice", 5s, [seen](const std::string& u) {
+    auto res = resolve_passwd_bounded_for_test("alice", 5s, [seen](const std::string& u) {
         *seen = u;
         return make(PasswdLookupStatus::kOk, "501", "/Users/alice");
     });
@@ -65,14 +67,14 @@ TEST_CASE("resolve_passwd_bounded returns a resolved record unchanged", "[passwd
 TEST_CASE("resolve_passwd_bounded preserves the not-found/error distinction", "[passwd][agent]") {
     // These are different answers and callers are entitled to tell them apart:
     // kNotFound is a definite negative, kError is a failed question.
-    auto nf = resolve_passwd_bounded("ghost", 5s,
+    auto nf = resolve_passwd_bounded_for_test("ghost", 5s,
                                      [](const std::string&) {
                                          return make(PasswdLookupStatus::kNotFound);
                                      });
     CHECK_FALSE(nf.ok());
     CHECK(nf.status == PasswdLookupStatus::kNotFound);
 
-    auto err = resolve_passwd_bounded("alice", 5s, [](const std::string&) {
+    auto err = resolve_passwd_bounded_for_test("alice", 5s, [](const std::string&) {
         return make(PasswdLookupStatus::kError);
     });
     CHECK_FALSE(err.ok());
@@ -95,7 +97,7 @@ TEST_CASE("resolve_passwd_bounded gives the caller its thread back when the look
     auto entered = std::make_shared<std::atomic<bool>>(false);
 
     auto started = std::chrono::steady_clock::now();
-    auto res = resolve_passwd_bounded("wedged", 200ms, [stop, entered](const std::string&) {
+    auto res = resolve_passwd_bounded_for_test("wedged", 200ms, [stop, entered](const std::string&) {
         entered->store(true, std::memory_order_relaxed);
         while (!stop->load(std::memory_order_relaxed))
             std::this_thread::sleep_for(5ms);
@@ -121,7 +123,7 @@ TEST_CASE("resolve_passwd_bounded refuses to start a lookup it cannot wait for",
     // lookup -- the caller has no time left to give it.
     std::atomic<bool> called{false};
     auto called_marker = &called;
-    auto res = resolve_passwd_bounded("alice", 0ms, [called_marker](const std::string&) {
+    auto res = resolve_passwd_bounded_for_test("alice", 0ms, [called_marker](const std::string&) {
         called_marker->store(true);
         return make(PasswdLookupStatus::kOk, "501", "/Users/alice");
     });
@@ -130,7 +132,7 @@ TEST_CASE("resolve_passwd_bounded refuses to start a lookup it cannot wait for",
 
     std::atomic<bool> neg_called{false};
     auto neg_marker = &neg_called;
-    auto neg = resolve_passwd_bounded("alice", -5ms, [neg_marker](const std::string&) {
+    auto neg = resolve_passwd_bounded_for_test("alice", -5ms, [neg_marker](const std::string&) {
         neg_marker->store(true);
         return make(PasswdLookupStatus::kOk);
     });
@@ -142,15 +144,35 @@ TEST_CASE("resolve_passwd_bounded reports a throwing lookup as a non-arrival, no
          "[passwd][agent]") {
     // bounded_call runs the callable on a DETACHED thread; an exception
     // escaping it uncaught would std::terminate() the whole agent.
-    auto res = resolve_passwd_bounded("alice", 50ms, [](const std::string&) -> PasswdLookupResult {
+    auto res = resolve_passwd_bounded_for_test("alice", 50ms, [](const std::string&) -> PasswdLookupResult {
         throw std::runtime_error("directory services exploded");
     });
     CHECK(res.status == PasswdLookupStatus::kTimeout);
     CHECK_FALSE(res.ok());
 }
 
+TEST_CASE("classify_getpwnam_rc maps the POSIX and glibc not-found spellings apart from errors",
+         "[passwd][agent]") {
+    using yuzu::agent::classify_getpwnam_rc;
+    // POSIX / macOS: success and the definite negative are both rc == 0.
+    CHECK(classify_getpwnam_rc(0, true) == PasswdLookupStatus::kOk);
+    CHECK(classify_getpwnam_rc(0, false) == PasswdLookupStatus::kNotFound);
+    // glibc also spells "no such user" as ENOENT/ESRCH. Reporting these as
+    // kError would turn a definite negative into a lookup failure on Linux,
+    // which is the distinction the enum exists to keep.
+    CHECK(classify_getpwnam_rc(ENOENT, false) == PasswdLookupStatus::kNotFound);
+    CHECK(classify_getpwnam_rc(ESRCH, false) == PasswdLookupStatus::kNotFound);
+    // Genuine faults stay errors -- deliberately including EPERM/EBADF, which
+    // getpwnam(3) also lists, because misreporting a fault as an authoritative
+    // "no such account" is the more dangerous direction.
+    CHECK(classify_getpwnam_rc(EPERM, false) == PasswdLookupStatus::kError);
+    CHECK(classify_getpwnam_rc(EBADF, false) == PasswdLookupStatus::kError);
+    CHECK(classify_getpwnam_rc(EIO, false) == PasswdLookupStatus::kError);
+    CHECK(classify_getpwnam_rc(ERANGE, false) == PasswdLookupStatus::kError);
+}
+
 #if !defined(_WIN32)
-TEST_CASE("getpwnam_lookup resolves a real account and distinguishes a missing one",
+TEST_CASE("the bounded passwd lookup resolves a real account and distinguishes a missing one",
          "[passwd][agent]") {
     // Against the host's own passwd database. root exists on every POSIX box
     // this suite runs on, so this is a stable assertion rather than a
@@ -159,11 +181,16 @@ TEST_CASE("getpwnam_lookup resolves a real account and distinguishes a missing o
     // build host the raw call is exactly the unbounded network read this whole
     // change exists to bound, and it would hang the suite rather than fail it.
     auto root = resolve_passwd_bounded("root", 5s);
-    if (root.status != PasswdLookupStatus::kOk) {
-        // A distroless/scratch container may genuinely have no passwd database.
-        WARN("skipping: 'root' did not resolve on this host");
+    // Skip ONLY on kTimeout -- a wedged directory service on the build host is
+    // an environment fact, not a defect. Every other status is a real failure
+    // and must FAIL: an earlier revision skipped on any non-kOk, which would
+    // have let a regression to kError pass as green and silently skipped the
+    // kNotFound assertion below too.
+    if (root.status == PasswdLookupStatus::kTimeout) {
+        WARN("skipping: passwd lookup for 'root' timed out on this host");
         return;
     }
+    REQUIRE(root.status == PasswdLookupStatus::kOk);
     CHECK(root.record.uid == "0");
     CHECK_FALSE(root.record.home_dir.empty());
 

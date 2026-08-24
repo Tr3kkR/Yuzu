@@ -38,22 +38,11 @@ PasswdLookupResult getpwnam_lookup(const std::string& username) {
             buf.resize(buf.size() * 4);
             continue;
         }
-        if (rc != 0) {
-            // POSIX says "no such user" is rc==0 with a null result, and macOS
-            // does that. glibc does NOT always: getpwnam(3) documents ENOENT /
-            // ESRCH / EBADF / EPERM as ALSO meaning the user was not found.
-            // Mapping those to kError would report a definite negative as a
-            // lookup failure on Linux -- exactly the distinction this enum
-            // exists to preserve.
-            out.status = (rc == ENOENT || rc == ESRCH) ? PasswdLookupStatus::kNotFound
-                                                       : PasswdLookupStatus::kError;
+        // Classification (incl. the glibc ENOENT/ESRCH divergence) lives in the
+        // header's pure classify_getpwnam_rc so it is unit-testable.
+        out.status = classify_getpwnam_rc(rc, found != nullptr);
+        if (out.status != PasswdLookupStatus::kOk)
             return out;
-        }
-        if (found == nullptr) {
-            out.status = PasswdLookupStatus::kNotFound;
-            return out;
-        }
-        out.status = PasswdLookupStatus::kOk;
         out.record.uid = std::to_string(static_cast<unsigned long long>(found->pw_uid));
         // pw_dir may legitimately be null; the caller decides what an absent
         // home means for its own action. Copied out before `buf` dies -- the
@@ -107,13 +96,9 @@ PasswdLookupResult resolve_passwd_bounded(const std::string& username,
     });
 }
 
-PasswdLookupResult resolve_passwd_bounded(const std::string& username,
-                                          std::chrono::milliseconds timeout,
-                                          const PasswdLookupFn& lookup) {
-    PasswdLookupResult timed_out;
-    timed_out.status = PasswdLookupStatus::kTimeout;
-
-    (void)timed_out;
+PasswdLookupResult resolve_passwd_bounded_for_test(const std::string& username,
+                                                   std::chrono::milliseconds timeout,
+                                                   const PasswdLookupFn& lookup) {
     // Test-only overload. The injected std::function is COPIED into a lambda
     // defined in this TU; a test's own target type is instantiated in the test
     // binary, which is never dlclose()'d, so this path carries no unload risk.

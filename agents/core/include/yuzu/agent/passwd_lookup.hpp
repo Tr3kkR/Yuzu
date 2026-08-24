@@ -41,6 +41,7 @@
  * restores the property the child process used to provide.
  */
 
+#include <cerrno>
 #include <chrono>
 #include <functional>
 #include <string>
@@ -83,6 +84,26 @@ struct PasswdLookupResult {
 /// WRAPPER's job, not the lookup's.
 using PasswdLookupFn = std::function<PasswdLookupResult(const std::string& username)>;
 
+/// Classify a `getpwnam_r` return code into a lookup status. PURE -- no
+/// syscall, no state -- so the platform divergence below is unit-testable
+/// without a passwd database to provoke it.
+///
+/// POSIX says "no such user" is `rc == 0` with a null result pointer, and
+/// macOS does exactly that. glibc does NOT always: getpwnam(3) documents
+/// ENOENT, ESRCH, EBADF and EPERM as ALSO meaning the user was not found.
+/// Reporting those as kError would turn a definite negative into a lookup
+/// failure on Linux, which is the one distinction this enum exists to keep.
+/// EBADF/EPERM are deliberately NOT folded in: unlike ENOENT/ESRCH they also
+/// occur for genuine faults, and misreporting a fault as an authoritative
+/// "no such account" is the more dangerous direction.
+inline PasswdLookupStatus classify_getpwnam_rc(int rc, bool have_result) {
+    if (rc == 0)
+        return have_result ? PasswdLookupStatus::kOk : PasswdLookupStatus::kNotFound;
+    if (rc == ENOENT || rc == ESRCH)
+        return PasswdLookupStatus::kNotFound;
+    return PasswdLookupStatus::kError;
+}
+
 /// Declared here; DEFINED OUT-OF-LINE in passwd_lookup.cpp so the body -- and
 /// in particular bounded_call's detached thread -- compiles only into the
 /// pinned agent-core image, never into a dlclose()-able plugin. Same reason
@@ -109,12 +130,17 @@ YUZU_EXPORT PasswdLookupResult getpwnam_lookup(const std::string& username);
  * slots those need, and they degrade to their own nullopt (for the resolver, a
  * spurious "could not resolve" at reconnect). Degraded-but-correct in every
  * case, never a wrong answer, but it is a cross-subsystem coupling worth
- * knowing about before raising this call's timeout or its call rate.
+ * knowing about before raising this call's timeout or its call rate. Note the
+ * ceiling is reached SILENTLY today -- `bounded_call` neither logs nor counts a
+ * refusal -- so exhaustion presents as unrelated subsystems degrading at once.
+ * Fixing that belongs in `OutstandingCallGuard::try_acquire`, one site covering
+ * all three consumers, not here.
  */
 YUZU_EXPORT PasswdLookupResult resolve_passwd_bounded(const std::string& username,
                                                       std::chrono::milliseconds timeout);
 
-/// Injectable overload, for tests only.
+/// Injectable variant, FOR TESTS ONLY -- and named so, because on this branch
+/// a documented-but-unenforced constraint has already been violated once.
 ///
 /// NOTE THE MISSING DEFAULT ARGUMENT, which is load-bearing rather than
 /// stylistic. This was originally ONE function with `lookup = getpwnam_lookup`
@@ -130,8 +156,15 @@ YUZU_EXPORT PasswdLookupResult resolve_passwd_bounded(const std::string& usernam
 /// supposed to prevent, and confirmed by `nm` on the built plugin before the
 /// split. Two out-of-line overloads keep every byte the detached thread
 /// touches inside agent-core. Do not reintroduce a default argument here.
-YUZU_EXPORT PasswdLookupResult resolve_passwd_bounded(const std::string& username,
-                                                      std::chrono::milliseconds timeout,
-                                                      const PasswdLookupFn& lookup);
+/// The `_for_test` suffix is the enforcement. A PLUGIN calling this would
+/// reproduce the very defect the split above fixed: the injected
+/// `std::function`'s own `__func<F>::destroy` is emitted wherever the CALLER
+/// constructed it, so a plugin-built callable is still destroyed through
+/// plugin text on the detached thread. Tests are linked into a binary that is
+/// never `dlclose()`d, so they are safe; production callers must use the
+/// two-argument overload.
+YUZU_EXPORT PasswdLookupResult resolve_passwd_bounded_for_test(const std::string& username,
+                                                               std::chrono::milliseconds timeout,
+                                                               const PasswdLookupFn& lookup);
 
 } // namespace yuzu::agent

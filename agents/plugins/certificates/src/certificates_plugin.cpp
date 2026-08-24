@@ -197,8 +197,19 @@ CertRecord to_cert_record(const yuzu::certificates_x509::CertFields& fields, std
 /// already spdlog::warn on their own failures, and the SecItem/libcrypto
 /// in-process read paths this PR added had no equivalent, silently invisible
 /// to anything watching the agent log rather than result-status metadata.
-void mark_result_partial(yuzu::CommandContext& ctx, std::string_view provenance) {
-    spdlog::warn("certificates: degraded read ({})", provenance);
+/// `reason` is the operator-facing detail, when there is one distinct from the
+/// provenance tag. The tag alone is not diagnosable: every console-user
+/// degradation shares the `login-keychain` provenance, so a timed-out directory
+/// lookup, an unresolvable account and a failed `stat` all logged the SAME
+/// line. That is the one case where the agent log has to distinguish them --
+/// the result row reaches the operator, but an on-call engineer reading only
+/// the log needs to know a wedged Directory Service is the cause.
+void mark_result_partial(yuzu::CommandContext& ctx, std::string_view provenance,
+                         std::string_view reason = {}) {
+    if (reason.empty())
+        spdlog::warn("certificates: degraded read ({})", provenance);
+    else
+        spdlog::warn("certificates: degraded read ({}): {}", provenance, reason);
     ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                           provenance);
 }
@@ -1250,9 +1261,11 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
         // at all (resolve_store_plan only sets sentinel_required for an
         // explicit store=login) and the caller receives a login-less
         // certificate list presented as complete.
-        if (store_filter != "System" && store_filter != "root") {
+        // Same question as details_cert_macos asks, via the same keyword table:
+        // would this store filter have read the login keychain at all?
+        if (yuzu::macos::resolve_store_plan(store_filter, /*has_console_user=*/true).want_login) {
             ctx.write_output(std::format("not_available|{}", cu.degrade_reason));
-            mark_result_partial(ctx, "login-keychain");
+            mark_result_partial(ctx, "login-keychain", cu.degrade_reason);
         }
     } else if (plan.sentinel_required) {
         // store=login was explicitly requested and there is DEFINITELY no
@@ -1404,12 +1417,23 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
         mark_result_partial(ctx, "login-keychain");
         return;
     }
+    // Would this request have read the login keychain AT ALL, had the console
+    // user resolved? Ask resolve_store_plan with has_console_user=true rather
+    // than comparing store keywords here: it owns the keyword table, so a
+    // future store name stays correctly classified instead of silently falling
+    // into the wrong branch.
+    const bool login_selected =
+        yuzu::macos::resolve_store_plan(store_filter, /*has_console_user=*/true).want_login;
     // A DEGRADED resolution must not reach the `status|not_found` fall-through
     // at the end of this function: that would report a completed, negative
     // search over a keychain this call never opened. Seeding read_failed here
     // is what makes the existing not_available/partial branch fire instead.
     // (See that branch's own comment -- this is exactly the case it warns of.)
-    const bool console_user_degraded = (cu.outcome == ConsoleUserOutcome::kDegraded);
+    // Gated on login_selected: a `store=System` request never selected the
+    // login keychain, so a degraded console-user lookup is irrelevant to it and
+    // must not attach a login-keychain sentinel to its result.
+    const bool console_user_degraded =
+        (cu.outcome == ConsoleUserOutcome::kDegraded) && login_selected;
 
     // Canonicalized once so the loop below is a plain `==` against
     // parse_pem_block_macos's always-uppercase output -- the thumbprint
@@ -1492,23 +1516,29 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
     if (plan.want_system) {
         if (clamp_to_action_budget(action_deadline, kKeychainReadDeadline) <=
             std::chrono::milliseconds::zero()) {
-            read_failed = true;
-            failure_reason = "System.keychain action deadline exceeded";
-            failure_provenance = "secitem:System.keychain";
+            if (!read_failed) {
+                read_failed = true;
+                failure_reason = "System.keychain action deadline exceeded";
+                failure_provenance = "secitem:System.keychain";
+            }
         } else {
             auto sys_result = read_keychain_secitem(yuzu::macos::system_keychain_path().c_str());
             if (!sys_result.ok) {
-                read_failed = true;
-                failure_reason = "System.keychain read failed";
-                failure_provenance = "secitem:System.keychain";
+                if (!read_failed) {
+                    read_failed = true;
+                    failure_reason = "System.keychain read failed";
+                    failure_provenance = "secitem:System.keychain";
+                }
             } else {
                 switch (check_secitem(sys_result, "System.keychain")) {
                 case ScanOutcome::kFound:
                     return;
                 case ScanOutcome::kIncomplete:
-                    read_failed = true;
-                    failure_reason = "System.keychain scan incomplete";
-                    failure_provenance = "secitem:System.keychain";
+                    if (!read_failed) {
+                        read_failed = true;
+                        failure_reason = "System.keychain scan incomplete";
+                        failure_provenance = "secitem:System.keychain";
+                    }
                     break;
                 case ScanOutcome::kNotFound:
                     break;

@@ -1,7 +1,10 @@
 // The Decision-8 canonical sudo argv FORM is what the sudoers grants from
 // scripts/install-agent-user.sh match — pinned here by test, not convention
-// (ADR-3002 :443-464). sudo_argv.hpp is POSIX-only, so this whole TU is
-// compiled out on the MSVC leg.
+// (ADR-3002 :443-464). sudo_argv.hpp's pure two-argument sudo_wrap is portable
+// as of #3406 (so macos_console_user.hpp, which compiles under MSVC, can use
+// THE canonical builder rather than a second copy of it); only the
+// one-argument geteuid() convenience is POSIX-only. This TU exercises both, so
+// it stays compiled out on the MSVC leg.
 #ifndef _WIN32
 
 #include <catch2/catch_test_macros.hpp>

@@ -326,7 +326,7 @@ inline std::optional<std::string> resolve_delete_keychain_path(std::string_view 
 
 // ── Command construction ─────────────────────────────────────────────────────
 
-// Build the `[sudo -n ]launchctl asuser <uid> sudo -n -u <username> security
+// Build the `[sudo -n -- ]launchctl asuser <uid> sudo -n -u <username> -- security
 // find-certificate -a -p <login keychain>` invocation that reads the console
 // user's login keychain from inside their per-user launchd/Aqua session
 // (see the file banner) -- as a PRE-SPLIT argv vector for
