@@ -148,6 +148,8 @@ interim site — ADR-3002 Decisions 1 and 2).
 | `msi_packages/do_list#1` | `agents/plugins/msi_packages/src/msi_packages_plugin.cpp:do_list` | runner argv (`pkgutil --pkgs`) | macOS | compile-time literal argv (probe_tool_path-resolved tool path) | read-only | none — the `/bin/sh -c` hop and its `shell_quote()` are gone entirely (direct argv, no shell to quote against) | none | no rung-1 API enumerates pkgutil receipts | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
 | `msi_packages/do_list#2` | `agents/plugins/msi_packages/src/msi_packages_plugin.cpp:do_list` | runner argv (`pkgutil --pkg-info <id>`), one call per receipt, bounded at `kMaxPackages` (500) | macOS | package identifier is `#1`'s own prior output (local-system enumeration, not operator input); passed as its own argv element, never shell-interpolated | read-only | none — `shell_quote()` deleted; no shell in the call path to quote against | none | no rung-1 API reads a single pkgutil receipt | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
 | `msi_packages/do_product_codes#1` | `agents/plugins/msi_packages/src/msi_packages_plugin.cpp:do_product_codes` | runner argv (`pkgutil --pkgs`) | macOS | compile-time literal argv (probe_tool_path-resolved tool path) | read-only | none — `/bin/sh -c` hop gone | none | no rung-1 API enumerates pkgutil receipts | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `network_config/do_dns_cache#1` | `agents/plugins/network_config/src/network_config_plugin.cpp:do_dns_cache` | runner argv (`resolvectl cache`), path resolved via `yuzu::agent::probe_tool_path` (no PATH search) | Linux | none — fixed literal argv | read-only | none — `/bin/sh -c` eliminated entirely | none | Reviewed — no public libsystemd/sd-bus API exposes resolved's cache contents; `resolvectl cache` is the only source | Rung 2 — direct argv via yuzu::agent::run_bounded_subprocess (was rung 3, `/bin/sh -c`, before this migration) | n/a |
+| `network_config/do_dns_cache#2` | `agents/plugins/network_config/src/network_config_plugin.cpp:do_dns_cache` | runner argv (`systemd-resolve --statistics`), path resolved via `yuzu::agent::probe_tool_path` | Linux | none — fixed literal argv | read-only | none — `/bin/sh -c` eliminated entirely | none | Reviewed — fallback for hosts where `resolvectl` is absent | Rung 2 — direct argv via yuzu::agent::run_bounded_subprocess (was rung 3) | n/a |
 
 ## Seed inventory — known spawn surfaces awaiting transcription
 
@@ -159,7 +161,7 @@ these rows are pointers, not evidence.
 **Raw `popen`/`system` helpers:**
 device_identity, hardware, installed_apps,
 device_identity, event_logs, hardware,
-ioc, license_scan, network_config,
+ioc, license_scan,
 network_diag, os_info, processes,
 software_actions, tar, vuln_scan, wifi, windows_updates.
 (`vuln_scan` carries code slated for retirement per ADR-0028/ADR-0018 —

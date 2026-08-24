@@ -432,23 +432,23 @@ implementation is.
 | network_actions | ping | linux | supported | 2 | system ping via bounded argv runner | - |
 | network_actions | ping | macos | supported | 2 | system ping via bounded argv runner | - |
 | network_actions | ping | windows | supported | 2 | system ping.exe via bounded argv runner | - |
-| network_config | adapters | linux | supported | 3 | ip(8) via governed shell runner | - |
-| network_config | adapters | macos | supported | 3 | ifconfig via governed shell runner | - |
+| network_config | adapters | linux | supported | 1 | rtnetlink (RTM_GETLINK) | - |
+| network_config | adapters | macos | supported | 1 | getifaddrs + SIOCGIFMEDIA | - |
 | network_config | adapters | windows | supported | 1 | GetAdaptersAddresses | - |
-| network_config | ip_addresses | linux | supported | 3 | ip(8) via governed shell runner | - |
-| network_config | ip_addresses | macos | supported | 3 | ifconfig/route via governed shell runner | - |
+| network_config | ip_addresses | linux | supported | 1 | rtnetlink (RTM_GETADDR/RTM_GETROUTE) | - |
+| network_config | ip_addresses | macos | supported | 1 | getifaddrs + PF_ROUTE sysctl | - |
 | network_config | ip_addresses | windows | supported | 1 | GetAdaptersAddresses | - |
 | network_config | dns_servers | linux | supported | 1 | /etc/resolv.conf read | - |
-| network_config | dns_servers | macos | supported | 3 | scutil via governed shell runner | - |
+| network_config | dns_servers | macos | supported | 1 | SCDynamicStore | - |
 | network_config | dns_servers | windows | supported | 1 | GetAdaptersAddresses | - |
 | network_config | proxy | linux | supported | 1 | environment variables | - |
-| network_config | proxy | macos | constrained | 3 | networksetup via governed shell runner | only the Wi-Fi network service is queried; other interfaces are not checked |
+| network_config | proxy | macos | supported | 1 | SCDynamicStoreCopyProxies | - |
 | network_config | proxy | windows | supported | 1 | WinHttpGetIEProxyConfigForCurrentUser | - |
-| network_config | dns_cache | linux | constrained | 3 | resolvectl via governed shell runner | falls back to systemd-resolve statistics, or reports unavailable, when resolvectl is absent |
+| network_config | dns_cache | linux | constrained | 2 | resolvectl via direct-argv runner | falls back to systemd-resolve statistics, or reports unavailable, when resolvectl is absent |
 | network_config | dns_cache | macos | unsupported | - | - | - |
 | network_config | dns_cache | windows | supported | 1 | DnsGetCacheDataTable (dnsapi.dll) | - |
-| network_config | arp | linux | unsupported | - | - | - |
-| network_config | arp | macos | unsupported | - | - | - |
+| network_config | arp | linux | supported | 1 | /proc/net/arp | - |
+| network_config | arp | macos | supported | 1 | PF_ROUTE sysctl RTF_LLINFO | - |
 | network_config | arp | windows | supported | 1 | GetIpNetTable2 | - |
 | network_diag | listening | linux | supported | 1 | /proc/net/tcp[6] | - |
 | network_diag | listening | macos | supported | 1 | libproc | a socket shared by more than one process (SO_REUSEPORT, prefork) surfaces under one arbitrarily-chosen owning PID, not one row per owner |
