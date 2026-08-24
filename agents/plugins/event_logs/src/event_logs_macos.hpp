@@ -22,6 +22,8 @@
 // fixture-testable on every CI host without a macOS box or the real `log`
 // binary.
 
+#include "event_logs_parsers.hpp" // truncate_field, kMessageDisplayCap
+
 #include <yuzu/agent/subprocess_runner.hpp>
 #include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field
 
@@ -31,6 +33,8 @@
 #include <vector>
 
 namespace yuzu::event_logs_macos {
+
+namespace parsers = yuzu::event_logs_parsers;
 
 enum class LogShowOutcome {
     ok,          // Completed normally; result.lines (possibly empty) is the
@@ -123,8 +127,12 @@ inline std::string format_log_show_line(std::string_view row_prefix, const std::
         process = rest.substr(0, second_space);
         message = rest.substr(second_space + 2);
     }
-    if (message.size() > 200)
-        message = message.substr(0, 200);
+    // Shared UTF-8-boundary-safe cap, not a raw substr: `log show` messages are
+    // arbitrary UTF-8 and a byte cut can split a multi-byte character, which the
+    // server's Postgres response store rejects — losing the whole result rather
+    // than one character. The Windows and Linux rows go through the same helper;
+    // one diff must not ship two answers to the same question.
+    message = parsers::truncate_field(message, parsers::kMessageDisplayCap);
     return std::format("{}|{}|{}|{}", row_prefix, yuzu::util::safe_output_field(timestamp),
                         yuzu::util::safe_output_field(process),
                         yuzu::util::safe_output_field(message));

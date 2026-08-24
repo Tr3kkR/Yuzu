@@ -25,7 +25,6 @@
 // behaviour change of this migration.
 
 #include <algorithm>
-#include <cctype>
 #include <charconv>
 #include <cstdlib>
 #include <format>
@@ -74,8 +73,10 @@ inline std::string truncate_field(std::string_view value,
     // raw byte can split a multi-byte sequence and emit invalid UTF-8 —
     // which the server's Postgres-backed response store rejects, losing the
     // whole result rather than one character. The PowerShell leg this replaces
-    // capped at 200 CHARACTERS ([Math]::Min on a .NET string), so a bare byte
-    // cut would also be a silent behaviour regression on the Windows leg.
+    // capped at 200 CHARACTERS ([Math]::Min on a .NET string). This is still a
+    // BYTE cap, merely backed off to a character boundary, so a non-ASCII
+    // message yields fewer than 200 characters -- a deliberate, disclosed
+    // difference from the PowerShell leg, not character parity.
     // Continuation bytes are 10xxxxxx; walk back off them to the lead byte.
     std::size_t end = cap;
     while (end > 0 && (static_cast<unsigned char>(value[end]) & 0xC0) == 0x80)
@@ -151,7 +152,7 @@ inline std::string decode_xml_entities(std::string_view s) {
             continue;
         }
         // Longest legal entity is a numeric hex ref like "&#x10FFFF;"
-        // (11 chars incl. delimiters) -- capping the ';' search avoids an
+        // (10 chars incl. delimiters) -- capping the ';' search avoids an
         // unbounded scan on a stray '&'.
         constexpr std::size_t kMaxEntityLen = 12;
         const std::size_t window_end = std::min(s.size(), i + kMaxEntityLen);

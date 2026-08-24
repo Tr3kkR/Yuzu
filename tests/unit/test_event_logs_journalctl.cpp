@@ -16,6 +16,8 @@
  */
 #include <catch2/catch_test_macros.hpp>
 
+#include <iterator> // std::size (enum/table binding static_assert)
+
 #include "../../agents/plugins/event_logs/src/event_logs_journalctl.hpp"
 
 #include <yuzu/agent/subprocess_runner.hpp>
@@ -73,11 +75,33 @@ TEST_CASE("classify_journalctl_result: a nonzero exit is unavailable, never clea
     // The first honesty hole: no journal files, or an ACL denial for a process
     // outside the systemd-journal group. journalctl exits nonzero with no
     // stdout; the pre-remediation code emitted "No error events found" rc 0.
+    //
+    // This mapping is only SAFE because the query leg no longer passes
+    // `--grep`: verified against a live journald (systemd 257), a `--grep` that
+    // matches nothing also exits 1, so with --grep in play this same rule would
+    // report every ordinary empty search as an acquisition failure. The filter
+    // is applied in-process instead, and `-p err` on an empty result exits 0
+    // (also verified), so a nonzero exit here is unambiguously a failure.
     auto r = ok_result();
     r.lines.clear();
     r.exit_code = 1;
     auto c = classify_journalctl_result(r);
     CHECK(c.outcome == FallbackOutcome::unavailable);
+    CHECK_FALSE(c.reason.empty());
+}
+
+TEST_CASE("classify_journalctl_result: a byte-cap truncation is constrained, not a clean ok",
+          "[event_logs][journalctl]") {
+    // The runner's output byte cap is independent of max_lines and the
+    // deadline, so a child can exit cleanly having had its capture cut short —
+    // a few very large entries (a kernel oops, a unit dump) reach the cap well
+    // inside 500 lines. Reporting that as ok emits partial rows as a complete
+    // result with no way for the caller to tell. The macOS sibling classifier
+    // checks the same flag; the two must not disagree.
+    auto r = ok_result();
+    r.output_truncated = true;
+    auto c = classify_journalctl_result(r);
+    CHECK(c.outcome == FallbackOutcome::constrained);
     CHECK_FALSE(c.reason.empty());
 }
 
@@ -167,6 +191,15 @@ TEST_CASE("classify_journalctl_result: every reachable termination reason is dec
         {TerminationReason::cancelled, -1, true, true, FallbackOutcome::constrained},
         {TerminationReason::line_limit, -1, false, true, FallbackOutcome::ok},
     };
+    // Binds the table to the enum: a 7th TerminationReason would otherwise be
+    // added upstream, fall through the classifier's if-chain to the exit-code
+    // branch, and escape this sweep silently. `line_limit` and `spawn_error`
+    // are the last two enumerators, so this also pins that nothing was
+    // appended after them without updating the cases above.
+    static_assert(static_cast<int>(TerminationReason::spawn_error) == 5,
+                  "TerminationReason gained an enumerator — add it to `cases` above and "
+                  "give classify_journalctl_result an explicit arm for it.");
+    static_assert(std::size(cases) == 7, "one case per reachable state, exited counted twice");
     for (const auto& c : cases) {
         SubprocessResult r;
         r.tool_ran = c.tool_ran;

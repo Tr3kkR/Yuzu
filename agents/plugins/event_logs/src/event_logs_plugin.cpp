@@ -258,7 +258,15 @@ void emit_journal_entries(yuzu::CommandContext& ctx, std::string_view prefix,
                               truncated_provenance);
     }
     if (entries.empty()) {
-        ctx.write_output(std::format("{}|none|-|{}", prefix, empty_message));
+        // A bounded stop that collected NOTHING must not claim absence: the walk
+        // ran out of budget or scan cap before it could answer, so the data is
+        // unknown, not empty. The journalctl fallback draws the same distinction
+        // — the two legs must not disagree about the one honesty rule this
+        // migration exists to enforce.
+        ctx.write_output(std::format(
+            "{}|none|-|{}", prefix,
+            truncated ? "journal read hit its bound before finding any entries (result incomplete)"
+                      : empty_message));
         return;
     }
     std::reverse(entries.begin(), entries.end());
@@ -311,9 +319,28 @@ bool try_journal_query(yuzu::CommandContext&, std::string_view, int) { return fa
 // shared runner, no shell, no redirection: the old leg's `2>/dev/null` is
 // merge_stderr=false and its shell string is gone). `-q` suppresses the
 // "-- No entries --" info line the old parser would have mis-read as a row.
+// `match_filter`, when non-empty, is applied IN-PROCESS to each parsed row's
+// message, keeping at most `match_cap` rows.
+//
+// It is deliberately not `journalctl --grep`. Two reasons, both load-bearing:
+//
+//  1. HONESTY. `journalctl --grep=<pat>` exits 1 when nothing matches — verified
+//     against a live journald (systemd 257): a matching pattern exits 0, a
+//     non-matching one exits 1 with a readable journal, while `-p err` on an
+//     empty result exits 0. Classifying a nonzero exit as unavailable (which we
+//     must, because journalctl also exits 1 on real errors and its stderr is not
+//     captured) would report every ordinary no-match query as an acquisition
+//     failure. The exit code cannot distinguish the two, so the fix is to stop
+//     asking it to.
+//  2. PARITY. The native sd_journal leg filters with a case-insensitive
+//     SUBSTRING match. `--grep` is a regex, so the two Linux legs answered the
+//     same query differently depending on a build flag. Filtering here with the
+//     same predicate the native leg uses removes that divergence.
 int run_journalctl_fallback(yuzu::CommandContext& ctx, std::vector<std::string> argv,
                             std::string_view prefix, std::string_view empty_message,
-                            const char* unavailable_provenance) {
+                            const char* unavailable_provenance,
+                            std::string_view match_filter = {},
+                            std::size_t match_cap = 0) {
     auto result = yuzu::agent::run_bounded_subprocess(
         argv, yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{20},
                                              .max_lines = 500,
@@ -346,15 +373,27 @@ int run_journalctl_fallback(yuzu::CommandContext& ctx, std::vector<std::string> 
         break;
     }
 
-    if (result.lines.empty()) {
-        ctx.write_output(std::format("{}|none|-|{}", prefix, sentinel_message));
-        return 0;
-    }
+    // Compose first, emit second: a filter that matches nothing must still reach
+    // the honest-empty sentinel below rather than emitting no rows at all.
+    std::vector<std::string> rows;
     for (const auto& line : result.lines) {
         if (line.empty())
             continue;
-        ctx.write_output(parsers::journal_row(prefix, parsers::parse_short_iso_line(line)));
+        auto parsed = parsers::parse_short_iso_line(line);
+        if (!match_filter.empty() &&
+            !parsers::journal_message_matches(parsed.message, match_filter))
+            continue;
+        rows.push_back(parsers::journal_row(prefix, parsed));
+        if (match_cap != 0 && rows.size() >= match_cap)
+            break;
     }
+
+    if (rows.empty()) {
+        ctx.write_output(std::format("{}|none|-|{}", prefix, sentinel_message));
+        return 0;
+    }
+    for (const auto& row : rows)
+        ctx.write_output(row);
     return 0;
 }
 
@@ -416,20 +455,16 @@ int do_errors(yuzu::CommandContext& ctx, yuzu::Params params) {
 
     // Surface degraded `log show` runs to operators: the sentinel row + rc are
     // honest but only visible by parsing returned rows, so a hung/failed/
-    // truncated shell-out would otherwise be silent in the agent log. A
-    // line_limit stop is the runner's deliberate clean bound (exit_code
-    // stays -1 for the killed child by contract) -- not a degradation.
-    const bool errors_line_limited =
-        result.termination_reason == yuzu::agent::TerminationReason::line_limit;
-    if (result.timed_out || !result.tool_ran ||
-        (result.exit_code != 0 && !errors_line_limited) || result.output_truncated) {
-        spdlog::warn("event_logs errors: macOS 'log show' {} (timed_out={}, tool_ran={}, "
-                     "exit_code={}, output_truncated={})",
-                     result.timed_out         ? "timed out"
-                     : !result.tool_ran       ? "unavailable"
-                     : result.exit_code != 0  ? "failed"
-                                              : "output truncated",
-                     result.timed_out, result.tool_ran, result.exit_code, result.output_truncated);
+    // truncated run would otherwise be silent in the agent log.
+    //
+    // The DECISION is classify_log_show_result's, not a second hand-written
+    // predicate: the previous inline copy had already drifted from it (on a
+    // line_limit stop that also set output_truncated the classifier says ok
+    // while the copy logged "failed"), which is exactly the second-copy drift
+    // this plugin's own headers argue against.
+    if (const auto classification = yuzu::event_logs_macos::classify_log_show_result(result);
+        classification.outcome != yuzu::event_logs_macos::LogShowOutcome::ok) {
+        spdlog::warn("event_logs errors: macOS 'log show' degraded -- {}", classification.reason);
     }
 
     // decide_log_show_output is the single source of truth for the
@@ -495,9 +530,13 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
         return 0;
     return run_journalctl_fallback(
         ctx,
-        {"/usr/bin/journalctl", "-q", std::format("--grep={}", filter), "-n",
-         std::format("{}", count), "--no-pager", "-o", "short-iso"},
-        "event", "No matching events found", "event_logs_journalctl:query_unavailable");
+        // No --grep: the filter is applied in-process (see run_journalctl_fallback).
+        // -n bounds the scan window rather than the match count, so `count`
+        // matches can still be found among recent entries; the runner's
+        // max_lines cap is the hard bound.
+        {"/usr/bin/journalctl", "-q", "-n", "500", "--no-pager", "-o", "short-iso"},
+        "event", "No matching events found", "event_logs_journalctl:query_unavailable", filter,
+        static_cast<std::size_t>(count));
 
 #elif defined(__APPLE__)
     std::vector<std::string> argv{"/usr/bin/log",
@@ -516,20 +555,16 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
 
     // Surface degraded `log show` runs to operators: the sentinel row + rc are
     // honest but only visible by parsing returned rows, so a hung/failed/
-    // truncated shell-out would otherwise be silent in the agent log. A
-    // line_limit stop is the runner's deliberate clean bound (exit_code
-    // stays -1 for the killed child by contract) -- not a degradation.
-    const bool query_line_limited =
-        result.termination_reason == yuzu::agent::TerminationReason::line_limit;
-    if (result.timed_out || !result.tool_ran ||
-        (result.exit_code != 0 && !query_line_limited) || result.output_truncated) {
-        spdlog::warn("event_logs query: macOS 'log show' {} (timed_out={}, tool_ran={}, "
-                     "exit_code={}, output_truncated={})",
-                     result.timed_out         ? "timed out"
-                     : !result.tool_ran       ? "unavailable"
-                     : result.exit_code != 0  ? "failed"
-                                              : "output truncated",
-                     result.timed_out, result.tool_ran, result.exit_code, result.output_truncated);
+    // truncated run would otherwise be silent in the agent log.
+    //
+    // The DECISION is classify_log_show_result's, not a second hand-written
+    // predicate: the previous inline copy had already drifted from it (on a
+    // line_limit stop that also set output_truncated the classifier says ok
+    // while the copy logged "failed"), which is exactly the second-copy drift
+    // this plugin's own headers argue against.
+    if (const auto classification = yuzu::event_logs_macos::classify_log_show_result(result);
+        classification.outcome != yuzu::event_logs_macos::LogShowOutcome::ok) {
+        spdlog::warn("event_logs query: macOS 'log show' degraded -- {}", classification.reason);
     }
 
     // decide_log_show_output is the single source of truth for the

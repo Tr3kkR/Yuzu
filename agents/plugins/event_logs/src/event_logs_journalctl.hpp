@@ -13,9 +13,9 @@
 // this header existed. The classifier is the tested part; the shell just emits
 // what it returns.
 
-#include <yuzu/agent/subprocess_runner.hpp>
-
 #include <string_view>
+
+#include <yuzu/agent/subprocess_runner.hpp>
 
 namespace yuzu::event_logs_journalctl {
 
@@ -61,6 +61,16 @@ classify_journalctl_result(const yuzu::agent::SubprocessResult& result) {
     // than relying on the -1 sentinel so the intent survives the next edit.
     if (result.termination_reason == yuzu::agent::TerminationReason::signaled)
         return {FallbackOutcome::unavailable, "journalctl was killed by a signal"};
+
+    // The runner's output byte cap is INDEPENDENT of max_lines and the deadline,
+    // so a child can exit cleanly (exited, rc 0, timed_out false) having had its
+    // capture cut short — a few very large entries (a kernel oops, a unit dump)
+    // reach the byte cap well inside 500 lines. Without this the partial rows
+    // are emitted as a complete result and the caller cannot tell. The macOS
+    // classifier checks exactly this; the two are written to the same shape and
+    // must not disagree about it.
+    if (result.output_truncated)
+        return {FallbackOutcome::constrained, "journalctl output was truncated (partial result)"};
 
     // Ran and reported a real problem: no journal files, an ACL denial for a
     // process outside the systemd-journal group, an unsupported argument.
