@@ -895,3 +895,60 @@ TEST_CASE("InstructionStore: trusted reseed RESURRECTS an operator-deleted bundl
     REQUIRE(after.has_value());
     CHECK(after->description == "original bundled description");
 }
+
+TEST_CASE("InstructionStore: trusted reseed of a CHANGED bundled envelope (release "
+          "upgrade) never updates an existing row, operator-touched or not",
+          "[instruction_store][seed]") {
+    InstructionStore store(":memory:");
+
+    const std::string v1_envelope = R"({
+        "id":"bundled.seed.probe",
+        "name":"Bundled Seed Probe",
+        "version":"1.0",
+        "type":"question",
+        "plugin":"os_info",
+        "action":"os_name",
+        "description":"v1 bundled description",
+        "yaml_source":"---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  id: bundled.seed.probe\n  version: v1\n"
+    })";
+    // A later release ships changed bundled content for the SAME id — this
+    // is the upgrade path the kickoff doc calls out as part of the same
+    // decision as seed-vs-live. Only description/yaml_source differ.
+    const std::string v2_envelope = R"({
+        "id":"bundled.seed.probe",
+        "name":"Bundled Seed Probe",
+        "version":"1.0",
+        "type":"question",
+        "plugin":"os_info",
+        "action":"os_name",
+        "description":"v2 bundled description, release upgrade",
+        "yaml_source":"---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  id: bundled.seed.probe\n  version: v2\n"
+    })";
+
+    auto seeded = store.import_definition_json_trusted(v1_envelope);
+    REQUIRE(seeded.has_value());
+
+    // Case (a): row untouched by any operator. A release upgrade replays the
+    // CHANGED envelope on next boot — still a conflict-skip (id-only check),
+    // so the untouched row stays frozen at v1 content.
+    auto upgrade_untouched = store.import_definition_json_trusted(v2_envelope);
+    REQUIRE_FALSE(upgrade_untouched.has_value());
+    CHECK(is_conflict_error(upgrade_untouched.error()));
+    auto after_untouched = store.get_definition(*seeded);
+    REQUIRE(after_untouched.has_value());
+    CHECK(after_untouched->description == "v1 bundled description");
+
+    // Case (b): operator has since edited the row. Same outcome — the
+    // upgrade's changed content still cannot reach an existing id.
+    auto live = store.get_definition(*seeded);
+    REQUIRE(live.has_value());
+    live->description = "operator-edited description";
+    REQUIRE(store.update_definition(*live).has_value());
+
+    auto upgrade_edited = store.import_definition_json_trusted(v2_envelope);
+    REQUIRE_FALSE(upgrade_edited.has_value());
+    CHECK(is_conflict_error(upgrade_edited.error()));
+    auto after_edited = store.get_definition(*seeded);
+    REQUIRE(after_edited.has_value());
+    CHECK(after_edited->description == "operator-edited description");
+}
