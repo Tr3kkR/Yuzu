@@ -1,7 +1,7 @@
 # Resource Ledger — `3425-quarantine-reconnect.u21SjI`
 
-Every owning boundary the C++ in `4c0bfe1e3..HEAD` (fix/3425-quarantine-reconnect,
-11 commits) acquires. Required by the Gate 1 contract on any C++ diff; recorded
+Every owning boundary the C++ in `4c0bfe1e3..HEAD` (fix/3425-quarantine-reconnect)
+acquires. Required by the Gate 1 contract on any C++ diff; recorded
 here rather than only in the run narrative so a later reader can check it
 against the code. Written retroactively during the Gate 3 fix round after
 cpp-safety's Gate 3 pass reported no ledger artifact existed for this change
@@ -25,6 +25,7 @@ or a mapped library.
 | `QuarantineContainmentReconciler::Deps::dispatch_fn`/`now_fn` (`std::function`) | `QuarantineContainmentReconciler` member (owned copy, not borrowed) | set at construction; `dispatch_fn` = the shared `command_dispatch_fn` (`server.cpp:16500-16513`), which captures `this` (`ServerImpl*`) by value | destroyed with the reconciler | none | `this` is guaranteed to outlive the reconciler (same object, torn down first, see the row above) — no dangling-capture risk. `now_fn` is empty in production (falls back to `default_now_epoch()`, no captures) |
 | PG pool leases (`pool_.try_acquire_for`, `kReadTimeout=2s`/`kWriteTimeout=4s`) | local, per call, in `QuarantineStore::get_status`/`mark_endpoint_applied`/`mark_endpoint_confirmed` | `try_acquire_for` at the top of each store call | RAII lease guard, scope exit | none | Pre-existing pattern (matches `release_device`'s precedent); the two new write APIs (`mark_endpoint_applied`/`mark_endpoint_confirmed`, this PR) reuse it unchanged. Bounded by construction — never held across a dispatch call (the lease is released before `redispatch_stored_containment` invokes `dispatch_fn`) |
 | `std::thread ingest_thread` / `std::thread set_thread` + `std::latch fn_started`/`fn_may_return` (test-only) | `test_heartbeat_ingestion.cpp`'s new regression test | test body | explicit `.join()` on both threads, unconditional, no early return between spawn and join | none | Test-local; not a production resource. Latches are single-use, single-count, no reset path needed for this test's shape |
+| `QuarantineContainmentReconciler::Deps::should_stop` (`std::function<bool()>`, **new in the Gate 5/6 fix round**) | `QuarantineContainmentReconciler` member (owned copy, not borrowed) | set at construction (`server.cpp:16693`); production value is `[this] { return stop_requested_.load(std::memory_order_acquire); }`, capturing `ServerImpl*` by value | destroyed with the reconciler | none | Same shape and same safety argument as the `dispatch_fn`/`now_fn` row above: `this` is guaranteed to outlive the reconciler, since the reconciler's sole call path to this callback (`tick()`, via `notify_agent_heartbeat`'s sibling `should_stop()` check) is only reachable from `quarantine_reconcile_thread_`, which is `.join()`'d (`server.cpp:7375-7376`) strictly before `quarantine_reconciler_.reset()` (`:7598`) — no invocation can occur after the reconciler is destroyed, and `ServerImpl` is guaranteed alive for the whole of its own `stop()` call. Default-unset (empty `std::function`) on every `Deps` construction that predates this field (all existing tests) — checked via `if (d_.should_stop && d_.should_stop())`, never an unchecked call on an empty function |
 
 **Adjudications recorded:** none required — no manual (non-RAII) resource
 cleanup was added anywhere in this diff; the one genuine lifetime defect found

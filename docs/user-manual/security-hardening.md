@@ -459,16 +459,15 @@ quarantine record whose endpoint containment is not yet confirmed:
   `state|active` regardless of its true firewall state; the `#881` dispatch-confinement gate does
   not key off `last_confirmed_at`, so a false confirmation narrows to false operator/audit
   assurance rather than widening what commands can reach that device. This is the same trust
-  boundary #3127's MCP `already_active` retry path already relies on, not new to this feature.
-  A previously-confirmed
-  device whose live agent session changes (a reboot, a service restart — the firewall rules from
-  before the restart are gone) drops confirmation and re-verifies via `status` first, rather than
-  blindly re-applying. **Confirmation is point-in-time, not continuous**: once confirmed, a
-  device is not asked again unless its session churns — if
-  something *other* than a session change clears its firewall rules out-of-band (an OS firewall
-  daemon restart, an unrelated admin `iptables -F`/`netsh advfirewall reset`), this component does
-  not notice and does not re-verify. Ongoing drift detection outside the reconnect/session-churn
-  case is Guardian/DEX's domain, not this component's.
+  boundary #3127's MCP `already_active` retry path already relies on, not new to this feature. A
+  previously-confirmed device whose live agent session changes (a reboot, a service restart — the
+  firewall rules from before the restart are gone) drops confirmation and re-verifies via `status`
+  first, rather than blindly re-applying. **Confirmation is point-in-time, not continuous**: once
+  confirmed, a device is not asked again unless its session churns — if something *other* than a
+  session change clears its firewall rules out-of-band (an OS firewall daemon restart, an
+  unrelated admin `iptables -F`/`netsh advfirewall reset`), this component does not notice and
+  does not re-verify. Ongoing drift detection outside the reconnect/session-churn case is
+  Guardian/DEX's domain, not this component's.
 - **Concurrency.** The shipped agent-side quarantine plugin's `do_status` currently answers only
   `active`/`inactive` — a `status|busy` response (from a mutation-serialization gate on the plugin's
   mutating actions) cannot occur until that agent-side work lands (open, unmerged issue #3429). The

@@ -902,8 +902,9 @@ groups:
             failing - check yuzu_server_quarantine_read_degrade_total and
             the Postgres pool, same triage as YuzuQuarantineGateFailClosed.
             The audited evidence trail is the quarantine.reapply verb
-            (system principal, detail carries command_id + trigger=tick|
-            heartbeat, or "CONFIRMED command_id=..." on success).
+            (system principal, detail carries record_id + command_id +
+            trigger=tick|heartbeat, or "CONFIRMED record_id=... command_id=..."
+            on success).
 
       - alert: YuzuDispatchTargetRejected
         expr: |
