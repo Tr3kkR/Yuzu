@@ -715,18 +715,14 @@ int do_list_networks(yuzu::CommandContext& ctx) {
 
 #elif defined(__linux__)
 #if defined(YUZU_HAVE_LIBSYSTEMD)
-    // `saw_wifi_device` gates the definitive answer: a reachable NM that
-    // manages no Wi-Fi device has told us nothing about the airspace, so we
+    // Two gates on the definitive answer. `saw_wifi_device`: a reachable NM
+    // that manages no Wi-Fi device has told us nothing about the airspace, so
     // fall through to iw/iwlist rather than announce an empty scan.
-    // `saw_scan` additionally requires that some Wi-Fi device has actually
-    // finished a scan; an empty never-scanned cache falls through to nmcli
-    // (which rescans) instead of being reported as an empty airspace.
-    // `saw_scan` is required OUTRIGHT. An earlier version admitted the answer on
-    // `saw_scan || !rows.empty()`, which defeated the whole point: a device
-    // reporting LastScan == -1 (NEVER scanned) but holding a populated
-    // AccessPoints cache was still reported as a completed scan -- the exact
-    // cache-presented-as-observation this gate exists to stop. A non-empty
-    // cache is not evidence that a scan happened.
+    // `saw_scan`, required OUTRIGHT (never `saw_scan || !rows.empty()` -- an
+    // earlier version of this gate admitted a non-empty cache as proof of a
+    // scan, which is exactly backwards): a device reporting LastScan == -1
+    // has never scanned, so its AccessPoints cache -- empty or not -- is not
+    // an observation of the airspace. Fall through to nmcli, which rescans.
     if (auto nm = query_nm_list_networks(); nm.reachable && nm.saw_wifi_device && nm.saw_scan) {
         if (nm.rows.empty()) {
             // A confirmed, definitive answer from a reachable NetworkManager
