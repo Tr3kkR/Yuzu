@@ -318,7 +318,9 @@ below the pre-fix ~17k/day this paragraph documents.
 fix scope never mention the Known/drift path - `guardian_emit_decider.hpp`'s `decide_emit`
 has no equivalent terminal-state dedup on the Drift branch, so a persistently-drifted rule
 still re-emits `drift.detected` on every convergence sweep (no fix landed for it here).
-Tracked as delta-registry row D3 and issue #3388 (F12, #3386) - not yet ruled.
+Tracked as delta-registry row D3 and issue #3388 (F12, #3386) - ruled 2026-08-23 (interim
+fix: a sweep-cadence-aware debounce default), fix drafted but not yet merged; see D3's
+own Ruling cell for the current state.
 
 **Landed (PARTIAL) 2026-07-20, commit `b30e93cf`:** the **transition-edge emission** + a
 **counted, sparse-heartbeat suppression signal** (`yuzu.guardian_unhealthy_suppressed`) shipped.
