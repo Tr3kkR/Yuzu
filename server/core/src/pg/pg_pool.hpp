@@ -251,6 +251,18 @@ public:
     /// rollback is the first consumer: acquire via `try_acquire_for` first, and only treat a
     /// subsequent `with_txn_on` failure as "safe to compensate" after a fresh existence check
     /// confirms the row is genuinely absent).
+    ///
+    /// Gov Gate 8 review (architect): unlike `with_txn_for`, the bounded-acquire discipline
+    /// (ADR-0012 §2a) is NOT baked into this call — it depends entirely on the CALLER acquiring
+    /// via `try_acquire_for` immediately beforehand, with nothing in between. Three rules for
+    /// any new caller: (1) acquire the lease via `try_acquire_for`, never the blocking
+    /// `acquire()` — this call has no timeout of its own to fall back on; (2) do NOTHING between
+    /// the acquire and this call — no I/O, no other store call, nothing that could block or run
+    /// its own transaction on the same lease first (a nested `BEGIN` on a connection already
+    /// mid-transaction only WARNs and silently continues the EXISTING transaction — this call's
+    /// COMMIT would then sweep in whatever was left uncommitted); (3) never reuse `lease` after
+    /// passing it here — it is consumed by value and MUST be a connection this call alone owns
+    /// for its lifetime.
     bool with_txn_on(Lease lease, const std::function<bool(PGconn*)>& fn);
 
     /// False when the conninfo failed to parse at construction.
