@@ -279,6 +279,15 @@ concurrency replaces it. Mutate-and-return uses `RETURNING` (#1033); no
   - Same handlers treat `BaselineStore::get_baseline()` returning `nullopt` (which
     conflates a degraded store with a genuine not-found) as "Baseline not found". LOW,
     both reviewers confirmed; pre-dates the Postgres migration (the SQLite-era
-    `get_baseline` had the identical signature). A `get_baseline_checked`/`store_ok`
-    variant — the same pattern already used for `get_baseline_by_name` — would close
-    it if picked up.
+    `get_baseline` had the identical signature). **Partially fixed** (governance
+    hardening round, commit `998db5eec`): `get_baseline` now takes an optional
+    `bool* store_ok` — the same pattern already used for `get_baseline_by_name` —
+    and `deploy_baseline` (the one call site this PR's own diff touches) is wired to
+    it, pinned by a handler-level test that kills the connection after open. The
+    other two call sites (`update_baseline_from_form`, `delete_baseline_action`) are
+    pre-existing code this diff never touches and remain on plain `get_baseline()`
+    with no `store_ok` — same out-of-scope reasoning as the `bump_policy_generation`
+    finding above. **Not yet filed as an issue** (governance Gate-8 unhappy-path
+    correction: unlike the `bump_policy_generation` finding, which already had #3281,
+    this specific residual has no tracking issue as of this commit) — pending
+    dedupe-and-file.

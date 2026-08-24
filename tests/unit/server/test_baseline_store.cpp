@@ -348,16 +348,19 @@ TEST_CASE("set_members on a non-existent baseline is not-found", "[pg][baseline_
     CHECK_FALSE(is_conflict_error(r.error()));
 }
 
-TEST_CASE("set_members/set_assignment with an EMPTY payload against a non-existent baseline "
-          "is not-found, not a silent success",
+TEST_CASE("set_members/set_assignment with an EMPTY payload against a baseline that never "
+          "existed is not-found, not a silent success",
           "[pg][baseline_store]") {
-    // Pins the governance TOCTOU fix (three independent reviewers): a
-    // non-empty payload was already caught by the FK constraint on INSERT,
-    // but an empty payload skips the INSERT entirely, so before the fix the
-    // only remaining statement was a row-count-blind touch-UPDATE that
-    // reported PGRES_COMMAND_OK on 0 matched rows — success against a
-    // baseline that was never there. The fix moves a RETURNING-checked
-    // touch-UPDATE to the front of both transactions.
+    // Regression test, NOT a TOCTOU race pin (governance Gate-8 re-review
+    // correction: quality-engineer found the original comment here
+    // overclaimed — a baseline_id that never existed was ALREADY caught by
+    // the pre-fix code's up-front existence check; this case was never
+    // racy). What this DOES pin: the post-fix touch-UPDATE's RETURNING-based
+    // not-found detection still works correctly for the never-existed case,
+    // now that the separate existence-check lease is gone. The actual TOCTOU
+    // race — a baseline that EXISTS at call time, concurrently deleted mid-
+    // operation — is pinned by the next test below, which holds the row lock
+    // deliberately rather than relying on thread-scheduling luck.
     YUZU_REQUIRE_PG_DB_TPL(db, baselinestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     BaselineStore store{pool};
@@ -369,6 +372,77 @@ TEST_CASE("set_members/set_assignment with an EMPTY payload against a non-existe
     auto assignment_r = store.set_assignment("nope", {});
     REQUIRE_FALSE(assignment_r.has_value());
     CHECK_FALSE(is_conflict_error(assignment_r.error()));
+}
+
+TEST_CASE("set_members correctly reports not-found when a concurrent DELETE wins the row-lock "
+          "race against the touch-UPDATE (genuine TOCTOU reproduction, not thread-timing luck)",
+          "[pg][baseline_store][concurrency]") {
+    // This is the race the TOCTOU fix actually closes: a baseline that
+    // EXISTS at call time, concurrently deleted mid-operation — NOT the
+    // never-existed case in the test above (governance Gate-8 correction;
+    // quality-engineer found that case was never racy). Uses a second,
+    // independent connection holding an uncommitted DELETE to deterministically
+    // force the interleaving via Postgres's own row lock, rather than hoping
+    // two threads happen to race: store's set_members call is made to
+    // genuinely BLOCK on the touch-UPDATE's row lock until this test resolves
+    // the locker's transaction, so the outcome is controlled, not probabilistic.
+    YUZU_REQUIRE_PG_DB_TPL(db, baselinestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BaselineStore store{pool};
+    const std::string id = *store.create_baseline(make_baseline("race-victim"));
+
+    pg::PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    {
+        pg::PgResult r{PQexec(locker.get(), "BEGIN")};
+        REQUIRE(r.ok());
+    }
+    {
+        pg::PgResult r{PQexec(
+            locker.get(),
+            ("DELETE FROM baseline_store.baselines WHERE baseline_id = '" + id + "'").c_str())};
+        REQUIRE(r.ok());
+        CHECK(std::string(PQcmdTuples(r.get())) == "1");
+    }
+    // The row is now deleted-but-uncommitted: a concurrent UPDATE targeting
+    // it must block until this transaction resolves (Postgres row-lock
+    // semantics), then see the row is genuinely gone once we commit.
+    bool set_members_ok = false;
+    std::string set_members_error;
+    const auto call_start = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::duration call_duration{};
+    std::thread t([&] {
+        auto r = store.set_members(id, {});
+        call_duration = std::chrono::steady_clock::now() - call_start;
+        set_members_ok = r.has_value();
+        if (!r)
+            set_members_error = r.error();
+    });
+    // Not load-bearing for correctness (the row lock forces the ordering
+    // regardless of timing) — only gives the thread a realistic chance to
+    // actually reach and block on the lock before we resolve it, rather than
+    // committing before the thread has even started.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    {
+        pg::PgResult r{PQexec(locker.get(), "COMMIT")};
+        REQUIRE(r.ok());
+    }
+    t.join();
+
+    // Self-verifying against a future regression that weakens the row lock
+    // (e.g. a read-committed lookup instead of the locking UPDATE): if
+    // set_members's touch-UPDATE did NOT block on the held lock, it would
+    // return almost immediately, well under the 200ms this test controls —
+    // proving the test exercised the intended blocking path, not just a
+    // coincidentally-correct fast race.
+    CHECK(call_duration >= std::chrono::milliseconds(150));
+
+    // The delete won the race: set_members must report not-found, never a
+    // silent success against the now-deleted baseline (the pre-fix defect —
+    // a row-count-blind touch-UPDATE reporting PGRES_COMMAND_OK on 0 rows).
+    REQUIRE_FALSE(set_members_ok);
+    CHECK(set_members_error.find("not found") != std::string::npos);
+    CHECK(store.get_baseline(id).has_value() == false);
 }
 
 TEST_CASE("Assignment include/exclude round-trip and validation", "[pg][baseline_store]") {

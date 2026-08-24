@@ -1373,14 +1373,16 @@ BaselineStore::deployed_member_rule_ids() const {
     // (one lease, no per-Baseline round-trip). The snapshot is what was
     // deployed; see the deployed_snapshot field doc + deploy_baseline().
     pg::PgResult res = pg::exec_params(
-        lease.get(), "SELECT deployed_snapshot FROM baseline_store.baselines WHERE lifecycle = $1",
+        lease.get(),
+        "SELECT baseline_id, deployed_snapshot FROM baseline_store.baselines WHERE lifecycle = $1",
         std::vector<std::string>{kBaselineDeployed});
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
     std::unordered_set<std::string> ids;
     const int n = PQntuples(res.get());
     for (int i = 0; i < n; ++i) {
-        const std::string snap = text_col(res.get(), i, 0);
+        const std::string row_baseline_id = text_col(res.get(), i, 0);
+        const std::string snap = text_col(res.get(), i, 1);
         if (snap.empty())
             continue; // never-deployed / empty snapshot contributes nothing (fail-closed)
         // allow_exceptions=false: a malformed snapshot is skipped, not thrown on.
@@ -1390,9 +1392,12 @@ BaselineStore::deployed_member_rule_ids() const {
             // ever writes an array — but silently zeroing a deployed
             // Baseline's enforced set is a coverage-shrink an operator has
             // no other signal for (governance UP-4 finding); at least log it.
-            spdlog::warn("BaselineStore::deployed_member_rule_ids: deployed_snapshot is not a "
-                         "JSON array (row {}) — contributing 0 rule_ids for this baseline",
-                         i);
+            // baseline_id included (governance Gate-8 compliance-officer
+            // finding — an unidentified row ordinal undercuts the log's own
+            // diagnostic value on this catastrophic-read chokepoint).
+            spdlog::warn("BaselineStore::deployed_member_rule_ids: baseline '{}' deployed_snapshot "
+                         "is not a JSON array — contributing 0 rule_ids for this baseline",
+                         row_baseline_id);
             continue;
         }
         std::size_t dropped = 0;
@@ -1403,9 +1408,9 @@ BaselineStore::deployed_member_rule_ids() const {
                 ++dropped;
         }
         if (dropped > 0)
-            spdlog::warn("BaselineStore::deployed_member_rule_ids: deployed_snapshot array (row "
-                         "{}) had {} non-string element(s) — dropped, not enforced",
-                         i, dropped);
+            spdlog::warn("BaselineStore::deployed_member_rule_ids: baseline '{}' deployed_snapshot "
+                         "array had {} non-string element(s) — dropped, not enforced",
+                         row_baseline_id, dropped);
     }
     return ids;
 }
