@@ -112,7 +112,6 @@ std::string ComplianceRoutes::render_compliance_summary_fragment() {
             "<div class=\"compliance-stats\">"
             "<span><strong>" + std::to_string(static_cast<int>(policies.size())) + "</strong> policies active</span>"
             "<span><strong>" + std::to_string(static_cast<int>(fc.total_checks)) + "</strong> device checks</span>"
-            "<span>Last evaluated: <strong>just now</strong></span>"
             "</div></div></div>";
 
     // Policy table
@@ -512,10 +511,18 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
                     audit_fn_(req, "policy_fragment.create", "denied",
                               "policy_fragment", attempted_name, "duplicate_name");
                 }
-                std::string body_msg = is_conflict ? std::string(strip_conflict_prefix(result.error()))
-                                      : is_degraded ? std::string(strip_db_error_prefix(result.error()))
-                                                    : result.error();
-                res.set_content(nlohmann::json({{"error", body_msg}}).dump(), "application/json");
+                if (is_degraded) {
+                    res.set_content(
+                        nlohmann::json({{"error", {{"code", 503},
+                                                    {"message", std::string(strip_db_error_prefix(result.error()))}}},
+                                        {"meta", {{"api_version", "v1"}}}})
+                            .dump(),
+                        "application/json");
+                } else {
+                    std::string body_msg = is_conflict ? std::string(strip_conflict_prefix(result.error()))
+                                                        : result.error();
+                    res.set_content(nlohmann::json({{"error", body_msg}}).dump(), "application/json");
+                }
                 return;
             }
             audit_fn_(req, "policy_fragment.create", "success", "policy_fragment", *result, "");
@@ -637,12 +644,16 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             if (!result) {
                 bool is_degraded = is_db_error(result.error());
                 res.status = is_degraded ? 503 : 400;
-                res.set_content(
-                    nlohmann::json({{"error", is_degraded
-                                                   ? std::string(strip_db_error_prefix(result.error()))
-                                                   : result.error()}})
-                        .dump(),
-                    "application/json");
+                if (is_degraded) {
+                    res.set_content(
+                        nlohmann::json({{"error", {{"code", 503},
+                                                    {"message", std::string(strip_db_error_prefix(result.error()))}}},
+                                        {"meta", {{"api_version", "v1"}}}})
+                            .dump(),
+                        "application/json");
+                } else {
+                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                }
                 return;
             }
             audit_fn_(req, "policy.create", "success", "policy", *result, "");
@@ -770,12 +781,16 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             if (!result) {
                 bool is_degraded = is_db_error(result.error());
                 res.status = is_degraded ? 503 : 400;
-                res.set_content(
-                    nlohmann::json({{"error", is_degraded
-                                                   ? std::string(strip_db_error_prefix(result.error()))
-                                                   : result.error()}})
-                        .dump(),
-                    "application/json");
+                if (is_degraded) {
+                    res.set_content(
+                        nlohmann::json({{"error", {{"code", 503},
+                                                    {"message", std::string(strip_db_error_prefix(result.error()))}}},
+                                        {"meta", {{"api_version", "v1"}}}})
+                            .dump(),
+                        "application/json");
+                } else {
+                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                }
                 return;
             }
             audit_fn_(req, "policy.enable", "success", "policy", id, "");
@@ -801,12 +816,16 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             if (!result) {
                 bool is_degraded = is_db_error(result.error());
                 res.status = is_degraded ? 503 : 400;
-                res.set_content(
-                    nlohmann::json({{"error", is_degraded
-                                                   ? std::string(strip_db_error_prefix(result.error()))
-                                                   : result.error()}})
-                        .dump(),
-                    "application/json");
+                if (is_degraded) {
+                    res.set_content(
+                        nlohmann::json({{"error", {{"code", 503},
+                                                    {"message", std::string(strip_db_error_prefix(result.error()))}}},
+                                        {"meta", {{"api_version", "v1"}}}})
+                            .dump(),
+                        "application/json");
+                } else {
+                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                }
                 return;
             }
             audit_fn_(req, "policy.disable", "success", "policy", id, "");
@@ -832,12 +851,16 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             if (!result) {
                 bool is_degraded = is_db_error(result.error());
                 res.status = is_degraded ? 503 : 400;
-                res.set_content(
-                    nlohmann::json({{"error", is_degraded
-                                                   ? std::string(strip_db_error_prefix(result.error()))
-                                                   : result.error()}})
-                        .dump(),
-                    "application/json");
+                if (is_degraded) {
+                    res.set_content(
+                        nlohmann::json({{"error", {{"code", 503},
+                                                    {"message", std::string(strip_db_error_prefix(result.error()))}}},
+                                        {"meta", {{"api_version", "v1"}}}})
+                            .dump(),
+                        "application/json");
+                } else {
+                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                }
                 return;
             }
             audit_fn_(req, "policy.invalidate", "success", "policy", id, "");
@@ -864,12 +887,16 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             if (!result) {
                 bool is_degraded = is_db_error(result.error());
                 res.status = is_degraded ? 503 : 500;
-                res.set_content(
-                    nlohmann::json({{"error", is_degraded
-                                                   ? std::string(strip_db_error_prefix(result.error()))
-                                                   : result.error()}})
-                        .dump(),
-                    "application/json");
+                if (is_degraded) {
+                    res.set_content(
+                        nlohmann::json({{"error", {{"code", 503},
+                                                    {"message", std::string(strip_db_error_prefix(result.error()))}}},
+                                        {"meta", {{"api_version", "v1"}}}})
+                            .dump(),
+                        "application/json");
+                } else {
+                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                }
                 return;
             }
             audit_fn_(req, "policy.invalidate_all", "success", "", "", "");
