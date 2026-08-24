@@ -6,8 +6,8 @@
  *   "ip_addresses" — Lists assigned IP addresses with subnet and gateway.
  *   "dns_servers"  — Lists configured DNS servers per adapter.
  *   "proxy"        — Returns system proxy configuration.
- *   "dns_cache"    — Returns the DNS resolver cache (Windows).
- *   "arp"          — Returns the host ARP / neighbour table (Windows):
+ *   "dns_cache"    — Returns the DNS resolver cache (Windows, Linux).
+ *   "arp"          — Returns the host ARP / neighbour table:
  *                    arp|iface|ip|mac|type.
  *
  * Output is pipe-delimited via write_output().
@@ -15,6 +15,7 @@
 
 #include <yuzu/plugin.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <format>
@@ -22,26 +23,67 @@
 #include <string>
 #include <string_view>
 
+#include "network_config_parsers.hpp"
+
 #if defined(__linux__) || defined(__APPLE__)
-#include <chrono>
 #include <spdlog/spdlog.h>
-#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (cpp-L2)
 #endif
 
 #if defined(__linux__)
-#include <cstdlib>
+#include <cerrno>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
 #include <fstream>
+#include <iterator> // std::make_move_iterator
+#include <map>
+#include <span>
+#include <vector>
+
+#include <arpa/inet.h>
+#include <linux/if.h> // IFF_UP -- see network_config_parsers.hpp's own include comment
+#include <linux/if_addr.h> // struct ifaddrmsg -- named directly in fetch_addr_dump()'s request
+#include <linux/if_link.h> // struct ifinfomsg -- named directly in fetch_link_dump()'s request
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h> // struct rtmsg / RTM_GET* / NLM_F_* -- named directly below
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <yuzu/agent/runner_status.hpp>     // classify_runner_failure / forward_runner_failure
+#include <yuzu/agent/scoped_fd.hpp>         // ScopedFd -- RAII netlink socket owner
+#include <yuzu/agent/subprocess_runner.hpp> // run_bounded_subprocess / probe_tool_path (dns_cache argv legs only)
 #endif
 
 #if defined(__APPLE__)
 // SIOCGIFMEDIA is a native BSD socket ioctl (libc + kernel headers only, no
 // framework link) used to read a real adapter link speed for do_adapters().
 #include <net/if.h>
+#include <net/if_dl.h>  // sockaddr_dl -- getifaddrs' AF_LINK entries (adapters MAC)
 #include <net/if_media.h>
+#include <net/route.h>  // NET_RT_DUMP / RTF_GATEWAY -- default-route sysctl (ip_addresses)
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/sockio.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
+
+#include <arpa/inet.h>
+#include <cstddef> // offsetof
+#include <cstring>
+#include <ifaddrs.h>
+#include <map>
+#include <netinet/in.h>
+#include <span>
+#include <vector>
+
+#include "route_sysctl_arp.hpp" // yuzu::shared::{fetch,parse}_rt_flags_llinfo -- reused as-is (arp leg)
+
+#include <yuzu/agent/scoped_cfref.hpp> // ScopedCFRef -- RAII CF object owner (dns_servers/proxy)
+
+#if defined(YUZU_HAVE_SYSTEMCONFIGURATION)
+#include <CoreFoundation/CoreFoundation.h>
+#include <SystemConfiguration/SystemConfiguration.h>
+#endif
 #endif
 
 #ifdef _WIN32
@@ -65,29 +107,6 @@
 #endif
 
 namespace {
-
-// ── subprocess helper (Linux / macOS) ──────────────────────────────────────
-
-#if defined(__linux__) || defined(__APPLE__)
-std::string run_command(const char* cmd) {
-    // Route through the bounded, fork-lock-covered runner instead of a raw,
-    // deadline-less popen (cpp-L2, same migration as the other macOS-parity
-    // plugins). `/bin/sh -c` preserves the shell semantics popen used (these
-    // commands use `2>/dev/null`), so the returned stdout blob is byte-identical
-    // — now with a hard deadline, an output cap, and the global fork-lock.
-    auto res = yuzu::agent::run_bounded_subprocess(
-        {"/bin/sh", "-c", cmd}, yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{15}});
-    if (res.timed_out || !res.tool_ran || res.output_truncated) {
-        spdlog::warn("network_config: degraded shell-out (timed_out={}, tool_ran={}, truncated={}): {}",
-                     res.timed_out, res.tool_ran, res.output_truncated, cmd);
-    }
-    std::string result = res.output;
-    while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
-        result.pop_back();
-    }
-    return result;
-}
-#endif
 
 #if defined(__APPLE__)
 // Real link speed via SIOCGIFMEDIA (a single ioctl on a throwaway datagram
@@ -214,7 +233,51 @@ int mac_link_speed_mbps(const std::string& name) {
         return 0; // unrecognised subtype — honest unknown, never fabricated
     }
 }
-#endif
+
+// Default-route gateway via the PF_ROUTE sysctl dump (NET_RT_DUMP/AF_INET),
+// replacing the old `route -n get default | grep gateway` shell pipe. The
+// impure sysctl fetch stays here; the bounds-checked walk lives in
+// network_config_parsers.hpp's parse_default_route_dump().
+std::string mac_default_gateway() {
+    int mib[6] = {CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_DUMP, 0};
+    std::size_t needed = 0;
+    if (::sysctl(mib, 6, nullptr, &needed, nullptr, 0) != 0 || needed == 0)
+        return "-";
+    std::vector<unsigned char> buf(needed);
+    if (::sysctl(mib, 6, buf.data(), &needed, nullptr, 0) != 0)
+        return "-";
+    buf.resize(needed);
+    auto parsed = yuzu::network_config::parse_default_route_dump(buf);
+    if (parsed.truncated)
+        spdlog::warn("network_config: PF_ROUTE default-route dump was truncated");
+    return parsed.found ? parsed.gateway : "-";
+}
+
+#if defined(YUZU_HAVE_SYSTEMCONFIGURATION)
+// One SCDynamicStore session per call — cheap, no persistent state, no
+// change-notification callback registered (dns_servers/proxy only ever read
+// a point-in-time snapshot).
+yuzu::agent::ScopedCFRef<SCDynamicStoreRef> open_dynamic_store() {
+    return yuzu::agent::ScopedCFRef<SCDynamicStoreRef>(
+        SCDynamicStoreCreate(kCFAllocatorDefault, CFSTR("com.yuzu.agent.network_config"), nullptr,
+                             nullptr));
+}
+
+std::string cfstring_to_utf8(CFStringRef s) {
+    if (!s)
+        return {};
+    const CFIndex len = CFStringGetLength(s);
+    if (len == 0)
+        return {};
+    const CFIndex max_size = CFStringGetMaximumSizeForEncoding(len, kCFStringEncodingUTF8) + 1;
+    std::string buf(static_cast<std::size_t>(max_size), '\0');
+    if (!CFStringGetCString(s, buf.data(), max_size, kCFStringEncodingUTF8))
+        return {};
+    buf.resize(std::strlen(buf.c_str()));
+    return buf;
+}
+#endif // YUZU_HAVE_SYSTEMCONFIGURATION
+#endif // __APPLE__
 
 #ifdef _WIN32
 // Format a MAC address from a byte array
@@ -242,6 +305,218 @@ std::string sockaddr_to_string(LPSOCKADDR sa) {
     return buf;
 }
 #endif
+
+#if defined(__linux__)
+
+// ── rtnetlink dump helpers (adapters/ip_addresses legs) ──────────────────
+//
+// Thin impure shells: own the socket/send/recv mechanics only. Every byte
+// of decode logic lives in network_config_parsers.hpp's pure, span-based
+// parse_rtnetlink_*_chunk() functions -- these loops just hand each
+// recvmsg() buffer to the decoder and accumulate its records.
+
+constexpr std::size_t kNetlinkRecvBufSize = 16384; // matches net_quality_sampler.cpp's convention
+
+yuzu::agent::ScopedFd open_rtnetlink_socket() {
+    return yuzu::agent::ScopedFd{::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)};
+}
+
+struct LinkDumpResult {
+    std::vector<yuzu::network_config::RtLinkRecord> records;
+    bool ok = false; // true iff the dump completed (NLMSG_DONE) without error/truncation
+};
+
+LinkDumpResult fetch_link_dump() {
+    LinkDumpResult result;
+    auto fd = open_rtnetlink_socket();
+    if (!fd)
+        return result;
+
+    constexpr std::uint32_t kSeq = 1;
+    struct {
+        struct nlmsghdr nlh;
+        struct ifinfomsg ifi;
+    } req{};
+    req.nlh.nlmsg_len = sizeof(req);
+    req.nlh.nlmsg_type = RTM_GETLINK;
+    req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    req.nlh.nlmsg_seq = kSeq;
+    req.ifi.ifi_family = AF_UNSPEC;
+
+    struct sockaddr_nl sa {};
+    sa.nl_family = AF_NETLINK;
+    struct iovec iov {&req, sizeof(req)};
+    struct msghdr m {};
+    m.msg_name = &sa;
+    m.msg_namelen = sizeof(sa);
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    if (::sendmsg(fd.get(), &m, 0) <= 0)
+        return result;
+
+    alignas(NLMSG_ALIGNTO) unsigned char buf[kNetlinkRecvBufSize];
+    bool truncated = false;
+    for (;;) {
+        struct sockaddr_nl rsa {};
+        struct iovec riov {buf, sizeof(buf)};
+        struct msghdr rm {};
+        rm.msg_name = &rsa;
+        rm.msg_namelen = sizeof(rsa);
+        rm.msg_iov = &riov;
+        rm.msg_iovlen = 1;
+        ssize_t n;
+        do {
+            n = ::recvmsg(fd.get(), &rm, 0);
+        } while (n < 0 && errno == EINTR);
+        if (n <= 0)
+            return result; // ok stays false — an honest incomplete read
+
+        auto chunk = yuzu::network_config::parse_rtnetlink_link_chunk(
+            std::span<const unsigned char>(buf, static_cast<std::size_t>(n)), kSeq);
+        result.records.insert(result.records.end(), std::make_move_iterator(chunk.records.begin()),
+                              std::make_move_iterator(chunk.records.end()));
+        if (chunk.truncated)
+            truncated = true;
+        if (chunk.error)
+            return result;
+        if (chunk.done) {
+            result.ok = !truncated;
+            return result;
+        }
+    }
+}
+
+struct AddrDumpResult {
+    std::vector<yuzu::network_config::RtAddrRecord> records;
+    bool ok = false;
+};
+
+AddrDumpResult fetch_addr_dump() {
+    AddrDumpResult result;
+    auto fd = open_rtnetlink_socket();
+    if (!fd)
+        return result;
+
+    constexpr std::uint32_t kSeq = 2;
+    struct {
+        struct nlmsghdr nlh;
+        struct ifaddrmsg ifa;
+    } req{};
+    req.nlh.nlmsg_len = sizeof(req);
+    req.nlh.nlmsg_type = RTM_GETADDR;
+    req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    req.nlh.nlmsg_seq = kSeq;
+    req.ifa.ifa_family = AF_UNSPEC;
+
+    struct sockaddr_nl sa {};
+    sa.nl_family = AF_NETLINK;
+    struct iovec iov {&req, sizeof(req)};
+    struct msghdr m {};
+    m.msg_name = &sa;
+    m.msg_namelen = sizeof(sa);
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    if (::sendmsg(fd.get(), &m, 0) <= 0)
+        return result;
+
+    alignas(NLMSG_ALIGNTO) unsigned char buf[kNetlinkRecvBufSize];
+    bool truncated = false;
+    for (;;) {
+        struct sockaddr_nl rsa {};
+        struct iovec riov {buf, sizeof(buf)};
+        struct msghdr rm {};
+        rm.msg_name = &rsa;
+        rm.msg_namelen = sizeof(rsa);
+        rm.msg_iov = &riov;
+        rm.msg_iovlen = 1;
+        ssize_t n;
+        do {
+            n = ::recvmsg(fd.get(), &rm, 0);
+        } while (n < 0 && errno == EINTR);
+        if (n <= 0)
+            return result;
+
+        auto chunk = yuzu::network_config::parse_rtnetlink_addr_chunk(
+            std::span<const unsigned char>(buf, static_cast<std::size_t>(n)), kSeq);
+        result.records.insert(result.records.end(), std::make_move_iterator(chunk.records.begin()),
+                              std::make_move_iterator(chunk.records.end()));
+        if (chunk.truncated)
+            truncated = true;
+        if (chunk.error)
+            return result;
+        if (chunk.done) {
+            result.ok = !truncated;
+            return result;
+        }
+    }
+}
+
+struct RouteDumpResult {
+    std::vector<yuzu::network_config::RtRouteRecord> records;
+    bool ok = false;
+};
+
+RouteDumpResult fetch_default_route_dump() {
+    RouteDumpResult result;
+    auto fd = open_rtnetlink_socket();
+    if (!fd)
+        return result;
+
+    constexpr std::uint32_t kSeq = 3;
+    struct {
+        struct nlmsghdr nlh;
+        struct rtmsg rtm;
+    } req{};
+    req.nlh.nlmsg_len = sizeof(req);
+    req.nlh.nlmsg_type = RTM_GETROUTE;
+    req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    req.nlh.nlmsg_seq = kSeq;
+    req.rtm.rtm_family = AF_INET;
+
+    struct sockaddr_nl sa {};
+    sa.nl_family = AF_NETLINK;
+    struct iovec iov {&req, sizeof(req)};
+    struct msghdr m {};
+    m.msg_name = &sa;
+    m.msg_namelen = sizeof(sa);
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    if (::sendmsg(fd.get(), &m, 0) <= 0)
+        return result;
+
+    alignas(NLMSG_ALIGNTO) unsigned char buf[kNetlinkRecvBufSize];
+    bool truncated = false;
+    for (;;) {
+        struct sockaddr_nl rsa {};
+        struct iovec riov {buf, sizeof(buf)};
+        struct msghdr rm {};
+        rm.msg_name = &rsa;
+        rm.msg_namelen = sizeof(rsa);
+        rm.msg_iov = &riov;
+        rm.msg_iovlen = 1;
+        ssize_t n;
+        do {
+            n = ::recvmsg(fd.get(), &rm, 0);
+        } while (n < 0 && errno == EINTR);
+        if (n <= 0)
+            return result;
+
+        auto chunk = yuzu::network_config::parse_rtnetlink_route_chunk(
+            std::span<const unsigned char>(buf, static_cast<std::size_t>(n)), kSeq);
+        result.records.insert(result.records.end(), std::make_move_iterator(chunk.records.begin()),
+                              std::make_move_iterator(chunk.records.end()));
+        if (chunk.truncated)
+            truncated = true;
+        if (chunk.error)
+            return result;
+        if (chunk.done) {
+            result.ok = !truncated;
+            return result;
+        }
+    }
+}
+
+#endif // __linux__
 
 // ── adapters action ───────────────────────────────────────────────────────
 
@@ -278,106 +553,89 @@ int do_adapters(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(__linux__)
-    auto ip_out = run_command("ip -o link show 2>/dev/null");
-    if (!ip_out.empty()) {
-        std::istringstream ss(ip_out);
-        std::string line;
-        while (std::getline(ss, line)) {
-            // Format: "2: eth0: <BROADCAST,...> mtu 1500 ... state UP ... link/ether
-            // aa:bb:cc:dd:ee:ff ..." Extract name
-            auto colon1 = line.find(':');
-            if (colon1 == std::string::npos)
-                continue;
-            auto colon2 = line.find(':', colon1 + 1);
-            if (colon2 == std::string::npos)
-                continue;
-            auto name = line.substr(colon1 + 2, colon2 - colon1 - 2);
+    auto links = fetch_link_dump();
+    for (const auto& rec : links.records) {
+        if (rec.name.empty() || rec.name == "lo")
+            continue;
 
-            // Skip loopback
-            if (name == "lo")
-                continue;
-
-            // Extract state
-            std::string status = "unknown";
-            auto state_pos = line.find("state ");
-            if (state_pos != std::string::npos) {
-                auto start = state_pos + 6;
-                auto end = line.find(' ', start);
-                status = line.substr(start, end - start);
-                // Normalize
-                if (status == "UP")
-                    status = "up";
-                else if (status == "DOWN")
-                    status = "down";
-                else
-                    status = "down";
-            }
-
-            // Extract MAC
-            std::string mac = "-";
-            auto ether_pos = line.find("link/ether ");
-            if (ether_pos != std::string::npos) {
-                auto start = ether_pos + 11;
-                auto end = line.find(' ', start);
-                mac = line.substr(start, end - start);
-            }
-
-            // Get speed from sysfs
-            std::string speed = "0";
-            std::ifstream speed_file("/sys/class/net/" + name + "/speed");
-            if (speed_file) {
-                std::getline(speed_file, speed);
-                if (speed.empty() || speed[0] == '-')
-                    speed = "0";
-            }
-
-            ctx.write_output(std::format("adapter|{}|{}|{}|{}", name, mac, speed, status));
+        // Speed via sysfs (native file read, unrelated to the rtnetlink
+        // dump above) — unchanged from the pre-migration implementation.
+        std::string speed = "0";
+        std::ifstream speed_file("/sys/class/net/" + rec.name + "/speed");
+        if (speed_file) {
+            std::getline(speed_file, speed);
+            if (speed.empty() || speed[0] == '-')
+                speed = "0";
         }
+
+        const std::string mac = rec.mac.empty() ? "-" : rec.mac;
+        ctx.write_output(
+            std::format("adapter|{}|{}|{}|{}", rec.name, mac, speed, rec.up ? "up" : "down"));
+    }
+    if (!links.ok) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "network_config:rtnetlink_link_dump_incomplete");
     }
 
 #elif defined(__APPLE__)
-    auto ifconfig = run_command("ifconfig -a 2>/dev/null");
-    if (!ifconfig.empty()) {
-        std::istringstream ss(ifconfig);
-        std::string line;
-        std::string current_name;
-        std::string mac = "-";
-        std::string status = "down";
-        bool first = true;
-        while (std::getline(ss, line)) {
-            if (!line.empty() && line[0] != '\t' && line[0] != ' ') {
-                // New adapter — emit previous
-                if (!first && !current_name.empty()) {
-                    ctx.write_output(std::format("adapter|{}|{}|{}|{}", current_name, mac,
-                                                 mac_link_speed_mbps(current_name), status));
-                }
-                first = false;
-                auto colon = line.find(':');
-                current_name = (colon != std::string::npos) ? line.substr(0, colon) : line;
-                mac = "-";
-                status = "down";
-                if (line.find("status: active") != std::string::npos ||
-                    line.find("UP") != std::string::npos) {
-                    status = "up";
-                }
-            } else {
-                // Trim
-                auto start = line.find_first_not_of(" \t");
-                if (start == std::string::npos)
-                    continue;
-                auto trimmed = line.substr(start);
-                if (trimmed.starts_with("ether ")) {
-                    mac = trimmed.substr(6, 17);
-                }
-                if (trimmed.find("status: active") != std::string::npos) {
-                    status = "up";
-                }
+    struct ifaddrs* head = nullptr;
+    if (::getifaddrs(&head) != 0) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "network_config:getifaddrs_failed");
+        return 0;
+    }
+
+    // getifaddrs() returns one entry per (interface, address-family) pair —
+    // collapse to one row per interface name, in first-seen order, matching
+    // the old ifconfig-parse's per-adapter grouping.
+    std::vector<std::string> order;
+    std::map<std::string, std::string> mac_by_name;
+    std::map<std::string, bool> up_by_name;
+    for (auto* p = head; p != nullptr; p = p->ifa_next) {
+        if (!p->ifa_name)
+            continue;
+        const std::string name = p->ifa_name;
+        if (name == "lo0")
+            continue;
+        if (std::find(order.begin(), order.end(), name) == order.end())
+            order.push_back(name);
+        const bool up = (p->ifa_flags & IFF_UP) != 0;
+        auto up_it = up_by_name.find(name);
+        up_by_name[name] = (up_it != up_by_name.end()) ? (up_it->second || up) : up;
+
+        if (p->ifa_addr && p->ifa_addr->sa_family == AF_LINK) {
+            // sockaddr_dl's real on-wire size (sa_len) routinely exceeds
+            // sizeof(struct sockaddr_dl): sdl_data is a fixed 12-byte
+            // placeholder array that only reliably holds the NAME; the
+            // trailing link-layer address bytes can land past it for a
+            // longer interface name. Same discipline as
+            // route_sysctl_arp.hpp's RTAX_GATEWAY handling: memcpy only the
+            // small fixed-offset header fields (sdl_nlen/sdl_alen) into a
+            // local struct for a safe read, then read the MAC bytes
+            // directly from the ORIGINAL buffer at their bounds-checked
+            // offset — never from the (possibly truncated) local copy.
+            const auto* raw = reinterpret_cast<const unsigned char*>(p->ifa_addr);
+            const auto sa_len = static_cast<std::size_t>(p->ifa_addr->sa_len);
+            struct sockaddr_dl sdl {};
+            std::memcpy(&sdl, raw, std::min(sizeof(sdl), sa_len));
+            const std::size_t needed = offsetof(struct sockaddr_dl, sdl_data) +
+                                       static_cast<std::size_t>(sdl.sdl_nlen) +
+                                       static_cast<std::size_t>(sdl.sdl_alen);
+            if (sdl.sdl_alen == 6 && sa_len >= needed) {
+                unsigned char mac[6];
+                std::memcpy(mac, raw + offsetof(struct sockaddr_dl, sdl_data) + sdl.sdl_nlen, 6);
+                mac_by_name[name] = yuzu::network_config::format_mac(mac, 6);
             }
         }
-        if (!current_name.empty()) {
-            ctx.write_output(std::format("adapter|{}|{}|{}|{}", current_name, mac,
-                                         mac_link_speed_mbps(current_name), status));
-        }
+    }
+    ::freeifaddrs(head);
+
+    for (const auto& name : order) {
+        auto mac_it = mac_by_name.find(name);
+        const std::string mac =
+            (mac_it != mac_by_name.end() && !mac_it->second.empty()) ? mac_it->second : "-";
+        ctx.write_output(std::format("adapter|{}|{}|{}|{}", name, mac, mac_link_speed_mbps(name),
+                                     up_by_name[name] ? "up" : "down"));
     }
 #endif
     return 0;
@@ -428,91 +686,94 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(__linux__)
-    auto ip_out = run_command("ip -o addr show 2>/dev/null");
-    if (!ip_out.empty()) {
-        // Get default gateway
-        auto gw_out = run_command("ip route show default 2>/dev/null");
-        std::string default_gw = "-";
-        if (!gw_out.empty()) {
-            auto via = gw_out.find("via ");
-            if (via != std::string::npos) {
-                auto start = via + 4;
-                auto end = gw_out.find(' ', start);
-                default_gw = gw_out.substr(start, end - start);
-            }
+    auto links = fetch_link_dump();
+    std::map<int, std::string> name_by_index;
+    for (const auto& r : links.records)
+        name_by_index[r.index] = r.name;
+
+    auto route = fetch_default_route_dump();
+    std::string default_gw = "-";
+    if (!route.records.empty())
+        default_gw = route.records.front().gateway;
+
+    auto addrs = fetch_addr_dump();
+    for (const auto& rec : addrs.records) {
+        std::string name = !rec.label.empty() ? rec.label : std::string{};
+        if (name.empty()) {
+            auto it = name_by_index.find(rec.index);
+            name = (it != name_by_index.end()) ? it->second : std::format("if{}", rec.index);
         }
-
-        std::istringstream ss(ip_out);
-        std::string line;
-        while (std::getline(ss, line)) {
-            // Format: "2: eth0    inet 192.168.1.100/24 ..."
-            std::istringstream ls(line);
-            std::string idx, name, family, addr_cidr;
-            ls >> idx >> name >> family >> addr_cidr;
-            if (family != "inet" && family != "inet6")
-                continue;
-            if (name == "lo")
-                continue;
-
-            // Split addr/prefix
-            auto slash = addr_cidr.find('/');
-            std::string addr = addr_cidr;
-            std::string prefix = "0";
-            if (slash != std::string::npos) {
-                addr = addr_cidr.substr(0, slash);
-                prefix = addr_cidr.substr(slash + 1);
-            }
-
-            ctx.write_output(std::format("ip|{}|{}|{}|{}", name, addr, prefix, default_gw));
-        }
+        if (name == "lo")
+            continue;
+        ctx.write_output(std::format("ip|{}|{}|{}|{}", name, rec.address,
+                                     static_cast<unsigned int>(rec.prefix_len), default_gw));
+    }
+    if (!links.ok || !addrs.ok || !route.ok) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "network_config:rtnetlink_dump_incomplete");
     }
 
 #elif defined(__APPLE__)
-    auto ifconfig = run_command("ifconfig 2>/dev/null");
-    auto gw_out = run_command("route -n get default 2>/dev/null | grep gateway");
-    std::string default_gw = "-";
-    if (!gw_out.empty()) {
-        auto colon = gw_out.find(':');
-        if (colon != std::string::npos) {
-            auto start = gw_out.find_first_not_of(" \t", colon + 1);
-            if (start != std::string::npos)
-                default_gw = gw_out.substr(start);
-        }
+    const std::string default_gw = mac_default_gateway();
+
+    struct ifaddrs* head = nullptr;
+    if (::getifaddrs(&head) != 0) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "network_config:getifaddrs_failed");
+        return 0;
     }
 
-    if (!ifconfig.empty()) {
-        std::istringstream ss(ifconfig);
-        std::string line;
-        std::string current_adapter;
-        while (std::getline(ss, line)) {
-            if (!line.empty() && line[0] != '\t' && line[0] != ' ') {
-                auto colon = line.find(':');
-                current_adapter = (colon != std::string::npos) ? line.substr(0, colon) : line;
-            } else if (current_adapter != "lo0") {
-                auto start = line.find_first_not_of(" \t");
-                if (start == std::string::npos)
-                    continue;
-                auto trimmed = line.substr(start);
-                if (trimmed.starts_with("inet ")) {
-                    std::istringstream ls(trimmed);
-                    std::string kw, addr, mask_kw, mask;
-                    ls >> kw >> addr >> mask_kw >> mask;
-                    ctx.write_output(
-                        std::format("ip|{}|{}|{}|{}", current_adapter, addr, mask, default_gw));
-                } else if (trimmed.starts_with("inet6 ")) {
-                    std::istringstream ls(trimmed);
-                    std::string kw, addr, prefix_kw, prefix;
-                    ls >> kw >> addr >> prefix_kw >> prefix;
-                    // Remove %scope from addr
-                    auto pct = addr.find('%');
-                    if (pct != std::string::npos)
-                        addr = addr.substr(0, pct);
-                    ctx.write_output(
-                        std::format("ip|{}|{}|{}|{}", current_adapter, addr, prefix, default_gw));
+    char text_buf[INET6_ADDRSTRLEN];
+    for (auto* p = head; p != nullptr; p = p->ifa_next) {
+        if (!p->ifa_name || !p->ifa_addr)
+            continue;
+        const std::string name = p->ifa_name;
+        if (name == "lo0")
+            continue;
+
+        if (p->ifa_addr->sa_family == AF_INET) {
+            struct sockaddr_in sin {};
+            std::memcpy(&sin, p->ifa_addr, sizeof(sin));
+            if (!::inet_ntop(AF_INET, &sin.sin_addr, text_buf, sizeof(text_buf)))
+                continue;
+            unsigned int prefix = 0;
+            if (p->ifa_netmask) {
+                struct sockaddr_in mask {};
+                std::memcpy(&mask, p->ifa_netmask, sizeof(mask));
+                std::uint32_t m = ntohl(mask.sin_addr.s_addr);
+                while (m & 0x80000000u) {
+                    ++prefix;
+                    m <<= 1;
                 }
             }
+            ctx.write_output(std::format("ip|{}|{}|{}|{}", name, text_buf, prefix, default_gw));
+        } else if (p->ifa_addr->sa_family == AF_INET6) {
+            struct sockaddr_in6 sin6 {};
+            std::memcpy(&sin6, p->ifa_addr,
+                       std::min(sizeof(sin6), static_cast<std::size_t>(p->ifa_addr->sa_len)));
+            if (!::inet_ntop(AF_INET6, &sin6.sin6_addr, text_buf, sizeof(text_buf)))
+                continue;
+            unsigned int prefix = 0;
+            if (p->ifa_netmask) {
+                struct sockaddr_in6 mask6 {};
+                std::memcpy(&mask6, p->ifa_netmask,
+                           std::min(sizeof(mask6),
+                                    static_cast<std::size_t>(p->ifa_netmask->sa_len)));
+                for (unsigned char byte : mask6.sin6_addr.s6_addr) {
+                    while (byte & 0x80) {
+                        ++prefix;
+                        byte <<= 1;
+                    }
+                }
+            }
+            std::string addr = text_buf;
+            const auto pct = addr.find('%');
+            if (pct != std::string::npos)
+                addr = addr.substr(0, pct);
+            ctx.write_output(std::format("ip|{}|{}|{}|{}", name, addr, prefix, default_gw));
         }
     }
+    ::freeifaddrs(head);
 #endif
     return 0;
 }
@@ -565,18 +826,32 @@ int do_dns_servers(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(__APPLE__)
-    auto dns_out =
-        run_command("scutil --dns 2>/dev/null | grep 'nameserver\\[' | awk '{print $3}'");
-    if (!dns_out.empty()) {
-        std::istringstream ss(dns_out);
-        std::string server;
-        while (std::getline(ss, server)) {
-            if (server.empty())
-                continue;
-            auto type = (server.find(':') != std::string::npos) ? "IPv6" : "IPv4";
-            ctx.write_output(std::format("dns|system|{}|{}", server, type));
+#if defined(YUZU_HAVE_SYSTEMCONFIGURATION)
+    auto store = open_dynamic_store();
+    if (store) {
+        yuzu::agent::ScopedCFRef<CFDictionaryRef> dns_dict(static_cast<CFDictionaryRef>(
+            SCDynamicStoreCopyValue(store.get(), CFSTR("State:/Network/Global/DNS"))));
+        if (dns_dict) {
+            auto* servers = static_cast<CFArrayRef>(
+                CFDictionaryGetValue(dns_dict.get(), CFSTR("ServerAddresses")));
+            if (servers) {
+                const CFIndex count = CFArrayGetCount(servers);
+                for (CFIndex i = 0; i < count; ++i) {
+                    auto* item = static_cast<CFStringRef>(CFArrayGetValueAtIndex(servers, i));
+                    auto server = cfstring_to_utf8(item);
+                    if (server.empty())
+                        continue;
+                    auto type = (server.find(':') != std::string::npos) ? "IPv6" : "IPv4";
+                    ctx.write_output(std::format("dns|system|{}|{}", server, type));
+                }
+            }
         }
     }
+#else
+    // Compiled without SystemConfiguration -- honest gap, no fabricated list.
+    ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                          "network_config:no_systemconfiguration");
+#endif
 #endif
     return 0;
 }
@@ -635,36 +910,86 @@ int do_proxy(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(__APPLE__)
-    auto http_proxy = run_command("networksetup -getwebproxy Wi-Fi 2>/dev/null");
-    if (!http_proxy.empty() && http_proxy.find("Enabled: Yes") != std::string::npos) {
-        // Extract server and port
-        std::istringstream ss(http_proxy);
-        std::string line;
-        std::string server, port;
-        while (std::getline(ss, line)) {
-            if (line.starts_with("Server: "))
-                server = line.substr(8);
-            if (line.starts_with("Port: "))
-                port = line.substr(6);
-        }
-        ctx.write_output("proxy_type|http");
-        ctx.write_output(std::format("proxy_address|{}:{}", server, port));
-    } else {
-        auto auto_proxy = run_command("networksetup -getautoproxyurl Wi-Fi 2>/dev/null");
-        if (!auto_proxy.empty() && auto_proxy.find("Enabled: Yes") != std::string::npos) {
-            std::istringstream ss(auto_proxy);
-            std::string line;
-            while (std::getline(ss, line)) {
-                if (line.starts_with("URL: ")) {
-                    ctx.write_output("proxy_type|pac");
-                    ctx.write_output(std::format("proxy_address|{}", line.substr(5)));
-                    break;
-                }
+#if defined(YUZU_HAVE_SYSTEMCONFIGURATION)
+    // SCDynamicStoreCopyProxies covers every network service, not only
+    // Wi-Fi -- a disclosed behavior improvement over the old
+    // `networksetup -getwebproxy Wi-Fi` / `-getautoproxyurl Wi-Fi` pair,
+    // which only ever inspected one interface.
+    yuzu::agent::ScopedCFRef<CFDictionaryRef> proxies(SCDynamicStoreCopyProxies(nullptr));
+    bool emitted = false;
+    if (proxies) {
+        auto get_bool = [&](CFStringRef key) -> bool {
+            const void* v = CFDictionaryGetValue(proxies.get(), key);
+            if (!v)
+                return false;
+            if (CFGetTypeID(v) == CFBooleanGetTypeID())
+                return CFBooleanGetValue(static_cast<CFBooleanRef>(v));
+            if (CFGetTypeID(v) == CFNumberGetTypeID()) {
+                int val = 0;
+                CFNumberGetValue(static_cast<CFNumberRef>(v), kCFNumberIntType, &val);
+                return val != 0;
             }
-        } else {
-            ctx.write_output("proxy_type|none");
+            return false;
+        };
+        auto get_string = [&](CFStringRef key) -> std::string {
+            const void* v = CFDictionaryGetValue(proxies.get(), key);
+            if (!v || CFGetTypeID(v) != CFStringGetTypeID())
+                return {};
+            return cfstring_to_utf8(static_cast<CFStringRef>(v));
+        };
+        auto get_int = [&](CFStringRef key) -> int {
+            const void* v = CFDictionaryGetValue(proxies.get(), key);
+            if (!v || CFGetTypeID(v) != CFNumberGetTypeID())
+                return 0;
+            int val = 0;
+            CFNumberGetValue(static_cast<CFNumberRef>(v), kCFNumberIntType, &val);
+            return val;
+        };
+
+        // PAC first, matching the old auto-proxy branch's priority.
+        if (get_bool(kSCPropNetProxiesProxyAutoConfigEnable)) {
+            auto url = get_string(kSCPropNetProxiesProxyAutoConfigURLString);
+            if (!url.empty()) {
+                ctx.write_output("proxy_type|pac");
+                ctx.write_output(std::format("proxy_address|{}", url));
+                emitted = true;
+            }
+        }
+        if (!emitted && get_bool(kSCPropNetProxiesHTTPEnable)) {
+            auto host = get_string(kSCPropNetProxiesHTTPProxy);
+            const int port = get_int(kSCPropNetProxiesHTTPPort);
+            if (!host.empty()) {
+                ctx.write_output("proxy_type|http");
+                ctx.write_output(std::format("proxy_address|{}:{}", host, port));
+                emitted = true;
+            }
+        }
+
+        auto* bypass_list = static_cast<CFArrayRef>(
+            CFDictionaryGetValue(proxies.get(), kSCPropNetProxiesExceptionsList));
+        if (bypass_list) {
+            const CFIndex count = CFArrayGetCount(bypass_list);
+            std::string joined;
+            for (CFIndex i = 0; i < count; ++i) {
+                auto* item = static_cast<CFStringRef>(CFArrayGetValueAtIndex(bypass_list, i));
+                auto s = cfstring_to_utf8(item);
+                if (s.empty())
+                    continue;
+                if (!joined.empty())
+                    joined += ',';
+                joined += s;
+            }
+            if (!joined.empty())
+                ctx.write_output(std::format("bypass|{}", joined));
         }
     }
+    if (!emitted)
+        ctx.write_output("proxy_type|none");
+#else
+    ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                          "network_config:no_systemconfiguration");
+    ctx.write_output("proxy_type|none");
+#endif
 #endif
     return 0;
 }
@@ -672,53 +997,52 @@ int do_proxy(yuzu::CommandContext& ctx) {
 // ── ABI4 capability declarations (#2204) ────────────────────────────────────
 //
 // Windows reads every leg through native, in-process Win32 APIs (rung 1).
-// Linux/macOS route through the bounded subprocess runner, but run_command
-// (above) hands the assembled command line to `/bin/sh -c` rather than an
-// argv array — a governed shell payload, ADR-3002 rung 3 — except
-// dns_servers on Linux, which reads /etc/resolv.conf directly (native file
-// I/O, zero processes, rung 1), and proxy on Linux, which reads environment
-// variables in-process (rung 1). macOS adapters/ip_addresses run
-// ifconfig/route through that same run_command rung-3 shell-out;
-// do_adapters additionally enriches link speed via the native SIOCGIFMEDIA
-// ioctl, but ifconfig itself remains the leg's defining mechanism. arp is
-// only implemented on Windows (GetIpNetTable2, rung 1) — Linux/macOS have
-// no arp leg at all today (do_arp's #else branch), so both are
-// UNDECLARED-free UNSUPPORTED, never a fabricated rung.
+// Linux reads adapters/ip_addresses via rtnetlink (RTM_GETLINK/RTM_GETADDR/
+// RTM_GETROUTE, AF_NETLINK SOCK_RAW), dns_servers/proxy via direct file/env
+// reads, and arp via a native /proc/net/arp read — all rung 1. dns_cache on
+// Linux is the one remaining spawn site, now a direct argv invocation of
+// `resolvectl`/`systemd-resolve` (no shell), rung 2. macOS reads
+// adapters/ip_addresses via getifaddrs + SIOCGIFMEDIA/PF_ROUTE sysctl,
+// dns_servers/proxy via SCDynamicStore, and arp via the PF_ROUTE
+// NET_RT_FLAGS/RTF_LLINFO sysctl (agents/shared/route_sysctl_arp.hpp) —
+// all rung 1, zero `/bin/sh` occurrences anywhere in this plugin. macOS
+// dns_cache stays a permanent OS capability gap (see do_dns_cache's own
+// comment): dscacheutil -cachedump was gutted upstream and there is nothing
+// left to shell out to.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "adapters",
-        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "ip(8) via governed shell runner", nullptr},
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "rtnetlink (RTM_GETLINK)", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "ifconfig via governed shell runner", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "getifaddrs + SIOCGIFMEDIA", nullptr},
         /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetAdaptersAddresses", nullptr},
     },
     {
         /* .action      = */ "ip_addresses",
-        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "ip(8) via governed shell runner", nullptr},
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "rtnetlink (RTM_GETADDR/RTM_GETROUTE)", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "ifconfig/route via governed shell runner", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "getifaddrs + PF_ROUTE sysctl", nullptr},
         /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetAdaptersAddresses", nullptr},
     },
     {
         /* .action      = */ "dns_servers",
         /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/etc/resolv.conf read", nullptr},
-        /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "scutil via governed shell runner", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "SCDynamicStore", nullptr},
         /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetAdaptersAddresses", nullptr},
     },
     {
         /* .action      = */ "proxy",
         /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "environment variables", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_CONSTRAINED, 3, "networksetup via governed shell runner",
-         "only the Wi-Fi network service is queried; other interfaces are not checked"},
+        {YUZU_SUPPORT_SUPPORTED, 1, "SCDynamicStoreCopyProxies", nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "WinHttpGetIEProxyConfigForCurrentUser", nullptr},
     },
     {
         /* .action      = */ "dns_cache",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_CONSTRAINED, 3, "resolvectl via governed shell runner",
+        {YUZU_SUPPORT_CONSTRAINED, 2, "resolvectl via direct-argv runner",
          "falls back to systemd-resolve statistics, or reports unavailable, when resolvectl is "
          "absent"},
         // macOS: no shell-out is even attempted — dscacheutil -cachedump was
@@ -730,10 +1054,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     },
     {
         /* .action      = */ "arp",
-        // Linux/macOS: do_arp's non-Windows branch always emits the
-        // `arp|not_available` sentinel — there is no arp leg here today.
-        /* .linux_leg   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
-        /* .macos_leg   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/proc/net/arp", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "PF_ROUTE sysctl RTF_LLINFO", nullptr},
         /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetIpNetTable2", nullptr},
     },
 };
@@ -787,12 +1110,11 @@ public:
 
 private:
     // arp|iface|ip|mac|type — the host ARP / IPv6-neighbour table. Windows reads the
-    // kernel neighbour cache via GetIpNetTable2(AF_UNSPEC); Linux/macOS are not yet
-    // implemented and emit the `arp|not_available` sentinel so the server-side
-    // device_routes/device_ui coupling renders an honest "not available on this
-    // platform" note instead of a fabricated empty table or a reported error.
-    // Mirrors the proven enumeration in tar_arp_collector.cpp (reimplemented here —
-    // the TAR plugin internals aren't linked into network_config).
+    // kernel neighbour cache via GetIpNetTable2(AF_UNSPEC); Linux reads /proc/net/arp
+    // natively; macOS reads the PF_ROUTE NET_RT_FLAGS/RTF_LLINFO sysctl via
+    // agents/shared/route_sysctl_arp.hpp, reused as-is. Mirrors the proven
+    // enumeration in tar_arp_collector.cpp (reimplemented here — the TAR plugin
+    // internals aren't linked into network_config).
     static int do_arp(yuzu::CommandContext& ctx) {
 #ifdef _WIN32
         // Cap entries so a large/forged neighbour cache can't produce an unbounded
@@ -876,11 +1198,52 @@ private:
         }
         return 0; // ~MibTableGuard frees the table on every path
 
+#elif defined(__linux__)
+        std::ifstream in("/proc/net/arp");
+        if (!in) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "network_config:proc_net_arp_unreadable");
+            ctx.write_output("arp|not_available");
+            return 0;
+        }
+        std::ostringstream contents;
+        contents << in.rdbuf();
+        if (in.bad()) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "network_config:proc_net_arp_read_error");
+            ctx.write_output("arp|not_available");
+            return 0;
+        }
+        for (const auto& e : yuzu::network_config::parse_proc_net_arp(contents.str())) {
+            ctx.write_output(std::format("arp|{}|{}|{}|{}", e.iface, e.ip, e.mac, e.type));
+        }
+        return 0;
+
+#elif defined(__APPLE__)
+        auto fetched = yuzu::shared::fetch_rt_flags_llinfo();
+        if (!fetched.ok) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "network_config:pf_route_arp_sysctl_failed");
+            ctx.write_output("arp|not_available");
+            return 0;
+        }
+        auto parsed = yuzu::shared::parse_rt_flags_llinfo(fetched.blob);
+        if (parsed.truncated) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "network_config:pf_route_arp_truncated");
+        }
+        // route_sysctl_arp.hpp's ArpRecord carries only {ip, mac} — no
+        // interface index and no static/dynamic distinction (RTF_LLINFO
+        // mixes both without differentiating). Reused as-is (owned by an
+        // earlier package); iface/type are honestly reported as unknown ("-")
+        // rather than guessed.
+        for (const auto& rec : parsed.records) {
+            ctx.write_output(std::format("arp|-|{}|{}|-", rec.ip, rec.mac));
+        }
+        return 0;
+
 #else
-        // Honest sentinel, not an error: the ARP table simply isn't implemented
-        // here yet. device_routes.cpp's arp parser requires >=5 pipe fields, so
-        // this 2-field line is dropped automatically and renders the empty-state
-        // note rather than a bogus row.
+        // Honest sentinel, not an error: no ARP mechanism on this platform.
         ctx.write_output("arp|not_available");
         return 0;
 #endif
@@ -953,36 +1316,48 @@ private:
         FreeLibrary(hDnsApi);
 
 #elif defined(__linux__)
-        auto result = run_command("resolvectl cache 2>/dev/null");
-        if (!result.empty() && result.find("not found") == std::string::npos) {
-            std::istringstream ss(result);
-            std::string line;
-            while (std::getline(ss, line)) {
-                if (!line.empty()) {
+        // Direct argv via the bounded runner (ADR-3002 rung 2) — no `/bin/sh
+        // -c`, argv[0] resolved by probe_tool_path so a missing binary is
+        // caught BEFORE exec rather than sniffed from captured text.
+        auto resolvectl_path =
+            yuzu::agent::probe_tool_path({"/usr/bin/resolvectl", "/bin/resolvectl"});
+        if (!resolvectl_path.empty()) {
+            auto res = yuzu::agent::run_bounded_subprocess(
+                {resolvectl_path, "cache"},
+                yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{15}});
+            if (yuzu::agent::forward_runner_failure(ctx, res))
+                return 0; // status already set — an honest CONSTRAINED/UNAVAILABLE, not silence
+            if (res.tool_ran && res.exit_code == 0) {
+                for (const auto& line :
+                    yuzu::network_config::parse_resolvectl_cache_lines(res.output)) {
                     ctx.write_output(std::format("cache_entry|{}", line));
                 }
+                return 0;
             }
-        } else {
-            // Fallback: try systemd-resolve --statistics
-            auto stats = run_command("systemd-resolve --statistics 2>/dev/null");
-            if (!stats.empty()) {
-                std::istringstream ss(stats);
-                std::string line;
-                while (std::getline(ss, line)) {
-                    auto trimmed = line;
-                    auto start = trimmed.find_first_not_of(" \t");
-                    if (start != std::string::npos)
-                        trimmed = trimmed.substr(start);
-                    if (trimmed.starts_with("Current Cache Size:") ||
-                        trimmed.starts_with("Cache Hits:") ||
-                        trimmed.starts_with("Cache Misses:")) {
-                        ctx.write_output(std::format("dns_stats|{}", trimmed));
-                    }
+            // resolvectl ran but exited nonzero (e.g. no systemd-resolved
+            // running) — fall through to the systemd-resolve statistics
+            // fallback, same behaviour as the pre-migration shell-out.
+        }
+
+        auto systemd_resolve_path =
+            yuzu::agent::probe_tool_path({"/usr/bin/systemd-resolve", "/bin/systemd-resolve"});
+        if (!systemd_resolve_path.empty()) {
+            auto res = yuzu::agent::run_bounded_subprocess(
+                {systemd_resolve_path, "--statistics"},
+                yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{15}});
+            if (yuzu::agent::forward_runner_failure(ctx, res))
+                return 0;
+            if (res.tool_ran && res.exit_code == 0) {
+                auto lines = yuzu::network_config::parse_systemd_resolve_stats_lines(res.output);
+                if (!lines.empty()) {
+                    for (const auto& line : lines)
+                        ctx.write_output(std::format("dns_stats|{}", line));
+                    return 0;
                 }
-            } else {
-                ctx.write_output("dns_cache|not_available|no systemd-resolved");
             }
         }
+
+        ctx.write_output("dns_cache|not_available|no systemd-resolved");
 
 #elif defined(__APPLE__)
         // macOS does not expose resolver-cache CONTENTS to userspace. dscacheutil
