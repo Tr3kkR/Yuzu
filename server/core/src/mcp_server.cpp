@@ -8881,12 +8881,16 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // NOTE (governance sec-LOW-1 / UP-6): live isolation preserves the
-                // agent's EXISTING management connection (iptables ESTABLISHED,RELATED
-                // etc.), so the agent can still receive the un-quarantine command over
-                // that link. It does NOT explicitly whitelist the server address for a
-                // fresh reconnect — a pre-existing quarantine-plugin design (the plugin
-                // takes no server_ip param), tracked as a follow-up, not introduced here.
+                // NOTE (governance sec-LOW-1 / UP-6): this call never sets qparams'
+                // server_ip — but live isolation still keeps the management channel
+                // reachable, because the agent independently derives its own server
+                // address once at STARTUP (agents/core/src/server_address_resolver.cpp,
+                // resolved via DNS when it's a hostname) and threads the result into
+                // every plugin's config, rather than depending on a caller-supplied
+                // one. Deliberately not resolved by the quarantine plugin itself at
+                // dispatch time -- see quarantine_plugin.cpp's do_quarantine comment
+                // on why that would let the host being quarantined steer its own
+                // containment exception via its own (possibly compromised) resolver.
                 // 1. Persist the quarantine record (store row only; mirror REST).
                 auto quar_res =
                     quarantine_store->quarantine_device(agent_id, session->username, reason, whitelist);
