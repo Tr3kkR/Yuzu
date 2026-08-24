@@ -31,11 +31,14 @@
 #include "instruction_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
+#include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <optional>
+#include <set>
 #include <string>
 
 namespace yuzu::server {
@@ -55,6 +58,14 @@ yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::stri
 
 // Test-only accessor for the private schema-aware column resolution +
 // render_results, and their store inputs (PR1.7 remediation, Gate 3).
+//
+// Extended (dashboard facet-scope confinement) with a visible_set_fn_ setter
+// and a username-taking render_filter_bar wrapper, so the renderer-level
+// confinement states (confined / deny-all / degraded / unwired-legacy-open)
+// can be driven directly without standing up a route sink. See the
+// SINK-DISPATCHED CONFINEMENT case below for the complementary
+// through-the-route dispatch, which wires visible_set_fn via
+// register_routes' own parameter instead of this friend seam.
 struct DashboardResultsColumnsTestAccess {
     DashboardRoutes routes;
 
@@ -62,14 +73,19 @@ struct DashboardResultsColumnsTestAccess {
         routes.instruction_store_ = is;
         routes.response_store_ = rs;
     }
+    void set_visible_set_fn(DashboardRoutes::VisibleSetFn fn) {
+        routes.visible_set_fn_ = std::move(fn);
+    }
     std::string render(const std::string& command_id, const std::string& plugin,
                        const std::string& definition_id = {}) {
         return routes.render_results(command_id, plugin, /*sort_col=*/"agent",
                                      /*sort_dir=*/"asc", /*page=*/1, /*per_page=*/50,
                                      /*filters=*/{}, /*text_query=*/"", definition_id);
     }
-    std::string render_filter_bar(const std::string& command_id, const std::string& plugin) {
-        return routes.render_filter_bar(command_id, plugin);
+    std::string render_filter_bar(const std::string& command_id, const std::string& plugin,
+                                   const std::string& username = {}) {
+        return routes.render_filter_bar(command_id, plugin, /*definition_id=*/{},
+                                        /*template_id=*/{}, username);
     }
 };
 
@@ -124,6 +140,33 @@ std::size_t count_occurrences(const std::string& hay, std::string_view needle) {
         pos += needle.size();
     }
     return n;
+}
+
+// Facet-scope fixture: two agents with DISTINCT values in the SAME column,
+// so a fleet-wide (unscoped) read is detectable against a confined one.
+// "registry" has no columns_for_plugin entry (falls back to kDefaultColumns
+// {"Agent","Output"}), and split_fields' default branch for a
+// no-pipe-delimiter output line yields a single field -- col_idx 0, which is
+// exactly what render_filter_bar's per-column loop resolves for the sole
+// non-Agent column ("Output").
+void store_two_agent_facet_responses(ResponseStore& rs, const std::string& command_id) {
+    StoredResponse r1;
+    r1.instruction_id = command_id;
+    r1.agent_id = "agent-1";
+    r1.received_at_ms = 1000;
+    r1.status = 0;
+    r1.plugin = "registry";
+    r1.output = "loaded";
+    rs.store(r1);
+
+    StoredResponse r2;
+    r2.instruction_id = command_id;
+    r2.agent_id = "agent-2";
+    r2.received_at_ms = 1000;
+    r2.status = 0;
+    r2.plugin = "registry";
+    r2.output = "unloaded";
+    rs.store(r2);
 }
 
 } // namespace
@@ -247,6 +290,185 @@ TEST_CASE("render_filter_bar: a degraded facet read disables the dropdown "
     CHECK(contains(html, "disabled"));
     CHECK(contains(html, "(unavailable)"));
     CHECK(contains(html, "response store degraded"));
+}
+
+// -- Filter-bar facet scoping (dashboard facet-scope confinement) -----------
+//
+// #2691's degrade-vs-empty distinguishability contract gets a THIRD state
+// here: deny-all (an operator whose Response:Read-visible agent set is
+// engaged-but-empty) must be its own genuinely-empty UI, never conflated
+// with the pre-existing degraded-store disabled state. Four seam-level cases
+// cover the renderer directly; a fifth dispatches through TestRouteSink to
+// pin that the route handler actually resolves the session and threads its
+// username into visible_set_fn -- a seam-only suite cannot detect a handler
+// that stopped doing either.
+
+TEST_CASE("render_filter_bar: visible_set_fn_ confines facet options to the "
+          "scoped agent's values only (CONFINED)",
+          "[pg][server][dashboard][render_filter_bar]") {
+    InstructionStore is{":memory:"};
+    REQUIRE(is.is_open());
+
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    const std::string command_id = "cmd-filter-confined";
+    store_two_agent_facet_responses(rs, command_id);
+
+    DashboardResultsColumnsTestAccess acc;
+    acc.set_stores(&is, &rs);
+    acc.set_visible_set_fn([](const std::string&) -> std::optional<std::set<std::string>> {
+        return std::set<std::string>{"agent-1"};
+    });
+    const std::string html = acc.render_filter_bar(command_id, "registry", "op-confined");
+
+    CHECK(contains(html, "value=\"loaded\""));
+    CHECK_FALSE(contains(html, "value=\"unloaded\""));
+    CHECK_FALSE(contains(html, "disabled"));
+    CHECK_FALSE(contains(html, "unavailable"));
+}
+
+TEST_CASE("render_filter_bar: visible_set_fn_ returning an engaged-empty set "
+          "denies all agents and renders a genuinely-empty dropdown, never "
+          "the degraded-store rendering (DENY-ALL != DEGRADE)",
+          "[pg][server][dashboard][render_filter_bar]") {
+    InstructionStore is{":memory:"};
+    REQUIRE(is.is_open());
+
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    const std::string command_id = "cmd-filter-deny-all";
+    store_two_agent_facet_responses(rs, command_id);
+
+    DashboardResultsColumnsTestAccess acc;
+    acc.set_stores(&is, &rs);
+    acc.set_visible_set_fn([](const std::string&) -> std::optional<std::set<std::string>> {
+        return std::set<std::string>{}; // engaged-empty: deny-all
+    });
+    const std::string html = acc.render_filter_bar(command_id, "registry", "op-deny-all");
+
+    // Genuinely empty: only "All", neither agent's value, select enabled.
+    CHECK(contains(html, "<option value=\"\">All</option>"));
+    CHECK_FALSE(contains(html, "value=\"loaded\""));
+    CHECK_FALSE(contains(html, "value=\"unloaded\""));
+    // NOT the degraded-store rendering (:2099-2101) -- deny-all and degrade
+    // are different UI states and must never be conflated.
+    CHECK_FALSE(contains(html, "disabled"));
+    CHECK_FALSE(contains(html, "(unavailable)"));
+    CHECK_FALSE(contains(html, "unavailable — response store degraded"));
+}
+
+TEST_CASE("render_filter_bar: a degraded store still renders the disabled "
+          "unavailable state even under a wired non-empty visible_set_fn_ "
+          "(regression pin: scoping must not swallow the #2691 degrade "
+          "rendering)",
+          "[server][dashboard][render_filter_bar]") {
+    InstructionStore is{":memory:"};
+    REQUIRE(is.is_open());
+
+    PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    ResponseStore bad_rs{bad_pool};
+    REQUIRE_FALSE(bad_rs.is_open());
+
+    DashboardResultsColumnsTestAccess acc;
+    acc.set_stores(&is, &bad_rs);
+    acc.set_visible_set_fn([](const std::string&) -> std::optional<std::set<std::string>> {
+        return std::set<std::string>{"agent-1"}; // non-empty: not the deny-all short-circuit
+    });
+    const std::string html = acc.render_filter_bar("cmd-degraded-scoped", "registry",
+                                                    "op-degraded");
+
+    CHECK(contains(html, "disabled"));
+    CHECK(contains(html, "(unavailable)"));
+    CHECK(contains(html, "response store degraded"));
+}
+
+TEST_CASE("render_filter_bar: visible_set_fn_ left unwired renders every "
+          "agent's facet values (UNWIRED LEGACY-OPEN)",
+          "[pg][server][dashboard][render_filter_bar]") {
+    InstructionStore is{":memory:"};
+    REQUIRE(is.is_open());
+
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    const std::string command_id = "cmd-filter-unwired";
+    store_two_agent_facet_responses(rs, command_id);
+
+    DashboardResultsColumnsTestAccess acc;
+    acc.set_stores(&is, &rs);
+    // visible_set_fn_ left default-constructed (unwired) -- legacy-open,
+    // even though a username is supplied.
+    const std::string html = acc.render_filter_bar(command_id, "registry", "op-unwired");
+
+    CHECK(contains(html, "value=\"loaded\""));
+    CHECK(contains(html, "value=\"unloaded\""));
+}
+
+// -- Through-the-sink dispatch: the handler must resolve + thread the
+// -- session, not just the renderer honour a directly-set field ------------
+
+TEST_CASE("render_filter_bar route: dispatched through TestRouteSink, the "
+          "handler resolves the session and threads its username into "
+          "visible_set_fn (SINK-DISPATCHED CONFINEMENT)",
+          "[pg][server][dashboard][render_filter_bar]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    const std::string command_id = "cmd-filter-sink-confined";
+    store_two_agent_facet_responses(rs, command_id);
+
+    yuzu::MetricsRegistry metrics;
+
+    // Confined to "agent-1" ONLY when the resolved session's username is
+    // exactly "testuser"; an empty or wrong username (a handler that stopped
+    // calling auth_fn_, or stopped threading session->username through)
+    // hits this engaged-EMPTY branch instead, and agent-1's option vanishes.
+    DashboardRoutes::VisibleSetFn visible_set_fn =
+        [](const std::string& username) -> std::optional<std::set<std::string>> {
+        if (username == "testuser") return std::set<std::string>{"agent-1"};
+        return std::set<std::string>{};
+    };
+    DashboardRoutes::AuthFn auth_fn =
+        [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "testuser";
+        s.role = auth::Role::admin;
+        return s;
+    };
+    DashboardRoutes::PermFn perm_fn =
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+          const std::string&) { return true; };
+    DashboardRoutes::AuditFn audit_fn =
+        [](const httplib::Request&, const std::string&, const std::string&,
+          const std::string&, const std::string&, const std::string&) {};
+
+    // MEMBER ORDER IS LOAD-BEARING (mirrors FragmentHarness,
+    // test_dashboard_tar_fragments.cpp:106-180): `sink` declared LAST so it
+    // is destroyed FIRST, while `routes` -- whose `this` its handlers
+    // captured -- is still alive.
+    struct SinkHarness {
+        DashboardRoutes routes;
+        yuzu::server::test::TestRouteSink sink;
+    } h;
+
+    h.routes.register_routes(h.sink, auth_fn, perm_fn, audit_fn,
+                             &rs, /*mgmt_group_store=*/nullptr, /*registry=*/nullptr,
+                             /*tag_store=*/nullptr, /*event_bus=*/nullptr,
+                             /*agents_json_fn=*/[] { return std::string{"[]"}; },
+                             /*dispatch_fn=*/DashboardRoutes::DispatchFn{},
+                             /*caller_fn=*/DashboardRoutes::CallerFn{},
+                             /*resolve_fn=*/DashboardRoutes::ResolveFn{},
+                             &metrics, /*instruction_store=*/nullptr,
+                             visible_set_fn);
+
+    auto res = h.sink.Get("/fragments/results/filter-bar?command_id=" + command_id +
+                          "&plugin=registry");
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 200);
+    CHECK(contains(res->body, "value=\"loaded\""));
+    CHECK_FALSE(contains(res->body, "value=\"unloaded\""));
 }
 
 } // namespace yuzu::server
