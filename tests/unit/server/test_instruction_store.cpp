@@ -778,3 +778,120 @@ TEST_CASE("InstructionStore: create_set duplicate uses kConflictPrefix",
     CHECK(is_conflict_error(second.error()));
     CHECK(second.error().find(kConflictPrefix) == 0);
 }
+
+// ── Trusted reseed / seed-vs-live (ADR-0058 pin) ────────────────────────────
+//
+// PostgreSQL migration prep (ADR-0058): these tests PIN the CURRENT SQLite
+// boot-reseed contract exercised by server.cpp's kBundledDefinitions loop
+// (each envelope re-imported via import_definition_json_trusted on every
+// boot; id-existence conflict = silent skip, never a merge). The Postgres
+// port must reproduce this EXACT behaviour under N concurrent replicas —
+// see the kickoff doc's "seed-vs-live semantics preserved exactly"
+// requirement. These tests assert what the store DOES today, not what it
+// SHOULD do, so a behaviour change during the port is a deliberate,
+// ADR-recorded decision rather than an accidental regression.
+//
+// Notably: the store's ONLY seed-vs-live signal is id existence. That
+// preserves an operator's in-place EDIT (case 2 below) but does NOT
+// preserve an operator's DELETE (case 3 below) — a deleted bundled id is
+// indistinguishable from a never-seeded one, so the next boot silently
+// recreates it. Whatever the kickoff doc's aspirational "must not be
+// resurrected" language intended, this is the behaviour actually shipping
+// today; ADR-0058 must explicitly decide whether to keep or change it.
+
+TEST_CASE("InstructionStore: trusted reseed of an untouched bundled definition "
+          "is a conflict-skip, not a re-import",
+          "[instruction_store][seed]") {
+    InstructionStore store(":memory:");
+
+    const std::string envelope = R"({
+        "id":"bundled.seed.probe",
+        "name":"Bundled Seed Probe",
+        "version":"1.0",
+        "type":"question",
+        "plugin":"os_info",
+        "action":"os_name",
+        "description":"original bundled description",
+        "yaml_source":"---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  id: bundled.seed.probe\n"
+    })";
+
+    // First boot: bundled content imports as trusted, unsigned content.
+    auto first = store.import_definition_json_trusted(envelope);
+    REQUIRE(first.has_value());
+    CHECK(*first == "bundled.seed.probe");
+
+    // Second boot replays the SAME bundled envelope (server.cpp does this on
+    // every startup, unconditionally, for every entry in kBundledDefinitions).
+    auto second = store.import_definition_json_trusted(envelope);
+    REQUIRE_FALSE(second.has_value());
+    CHECK(is_conflict_error(second.error()));
+}
+
+TEST_CASE("InstructionStore: trusted reseed does not clobber an operator edit to a "
+          "bundled definition",
+          "[instruction_store][seed]") {
+    InstructionStore store(":memory:");
+
+    const std::string envelope = R"({
+        "id":"bundled.seed.probe",
+        "name":"Bundled Seed Probe",
+        "version":"1.0",
+        "type":"question",
+        "plugin":"os_info",
+        "action":"os_name",
+        "description":"original bundled description",
+        "yaml_source":"---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  id: bundled.seed.probe\n"
+    })";
+    auto seeded = store.import_definition_json_trusted(envelope);
+    REQUIRE(seeded.has_value());
+
+    // Operator edits the seeded definition in place (e.g. dashboard YAML Save).
+    auto live = store.get_definition(*seeded);
+    REQUIRE(live.has_value());
+    live->description = "operator-edited description";
+    REQUIRE(store.update_definition(*live).has_value());
+
+    // Next boot replays the SAME bundled envelope — must not clobber the edit.
+    auto reseed = store.import_definition_json_trusted(envelope);
+    REQUIRE_FALSE(reseed.has_value());
+    CHECK(is_conflict_error(reseed.error()));
+
+    auto after = store.get_definition(*seeded);
+    REQUIRE(after.has_value());
+    CHECK(after->description == "operator-edited description");
+}
+
+TEST_CASE("InstructionStore: trusted reseed RESURRECTS an operator-deleted bundled "
+          "definition (current SQLite behaviour — ADR-0058 must decide whether to "
+          "keep this)",
+          "[instruction_store][seed]") {
+    InstructionStore store(":memory:");
+
+    const std::string envelope = R"({
+        "id":"bundled.seed.probe",
+        "name":"Bundled Seed Probe",
+        "version":"1.0",
+        "type":"question",
+        "plugin":"os_info",
+        "action":"os_name",
+        "description":"original bundled description",
+        "yaml_source":"---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  id: bundled.seed.probe\n"
+    })";
+    auto seeded = store.import_definition_json_trusted(envelope);
+    REQUIRE(seeded.has_value());
+
+    // Operator deletes the seeded definition outright.
+    REQUIRE(store.delete_definition(*seeded));
+    CHECK_FALSE(store.get_definition(*seeded).has_value());
+
+    // Next boot replays the SAME bundled envelope against the now-vacant id.
+    // The store's only seed-vs-live signal is id existence, so a deleted id
+    // is indistinguishable from a never-seeded one: the row comes back.
+    auto reseed = store.import_definition_json_trusted(envelope);
+    REQUIRE(reseed.has_value());
+    CHECK(*reseed == "bundled.seed.probe");
+
+    auto after = store.get_definition("bundled.seed.probe");
+    REQUIRE(after.has_value());
+    CHECK(after->description == "original bundled description");
+}
