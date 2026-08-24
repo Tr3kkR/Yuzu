@@ -22,6 +22,40 @@
 
 using namespace yuzu::installed_apps::parsers;
 
+// ── acquisition-health decision ─────────────────────────────────────────
+
+TEST_CASE("is_degraded_run: every abnormal termination degrades", "[installed_apps]") {
+    // Gate-3 remediation. This predicate decides whether a possibly-truncated
+    // enumeration is published as the host's authoritative software set, and
+    // it had no test because it lived in a static function in the .cpp.
+    // The bug it exists to prevent: an earlier cut tested the individual
+    // timed_out/tool_ran/output_truncated flags, which are ALL CLEAR for
+    // `signaled` (OOM kill), `cancelled` (shutdown) and `line_limit`.
+    constexpr bool kExited = true;
+    constexpr bool kAbnormal = false; // any termination_reason != exited
+
+    // Abnormal termination degrades regardless of exit code or tolerance.
+    CHECK(is_degraded_run(kAbnormal, 0, false, false));
+    CHECK(is_degraded_run(kAbnormal, 0, false, true));
+    CHECK(is_degraded_run(kAbnormal, 1, false, true));
+
+    // A clean, zero-exit, untruncated run is the ONLY healthy shape.
+    CHECK_FALSE(is_degraded_run(kExited, 0, false, false));
+    CHECK_FALSE(is_degraded_run(kExited, 0, false, true));
+
+    // Truncation degrades even on a clean exit, and tolerance does not excuse
+    // it -- tolerance is about exit codes, never about a cut-short capture.
+    CHECK(is_degraded_run(kExited, 0, true, false));
+    CHECK(is_degraded_run(kExited, 0, true, true));
+
+    // A nonzero exit degrades a top-level enumerator...
+    CHECK(is_degraded_run(kExited, 1, false, false));
+    CHECK(is_degraded_run(kExited, 127, false, false));
+    // ...but not the one opted-out call shape (per-ID `pkgutil --pkg-info` for
+    // a receipt removed between enumeration and lookup, which exits 1).
+    CHECK_FALSE(is_degraded_run(kExited, 1, false, true));
+}
+
 // ── Linux: dpkg-query ───────────────────────────────────────────────────
 
 TEST_CASE("dpkg list: installed package kept, non-installed dropped — documented-format reconstruction",

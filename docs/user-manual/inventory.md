@@ -30,7 +30,7 @@ cadences.
   | `arch` | ✓ | ✓ | — | — | — | — | — |
   | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — |
   | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds |
-  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned` | — |
+  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — |
   | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — |
 
   Notes: rpm `signature_status` reflects the **stored** signature header tags in
@@ -71,17 +71,29 @@ cadences.
   precision the receipt never recorded. Bounded at 5000 receipts per collection,
   again a runaway guard rather than a routine limit.
 
-  **Degraded collections are skipped, not published.** If any acquisition step
-  does not complete on its own terms -- a timeout, a spawn failure, a killed
-  child, a capture truncation, a nonzero exit from a top-level enumerator, a
-  tool that runs and reports nothing, or either runaway guard above -- the
-  agent reports the whole collection as degraded and the daily sync SKIPS that
-  cycle. The previous inventory is retained. This is deliberate: an incomplete
-  snapshot is indistinguishable from a complete one once it reaches the server,
-  so the omissions would be read as uninstalls. A stale inventory is recoverable;
-  a confidently wrong one is not. Degraded cycles are logged as warnings, and a
-  host that degrades every day will stop updating -- treat repeated warnings as
-  actionable.
+  **On Linux and macOS, degraded collections are skipped, not published.** If
+  any acquisition step does not complete on its own terms — a timeout, a spawn
+  failure, a killed child, a capture truncation, a nonzero exit from a
+  top-level enumerator, exhaustion of the 120-second whole-collection budget
+  mid-enrichment or mid-receipt-walk, either runaway guard above, or (macOS
+  only) `system_profiler` or `pkgutil` running successfully and reporting
+  nothing at all — the agent reports the whole collection as degraded and the
+  daily sync SKIPS that cycle. The previous inventory is retained. This is
+  deliberate: an incomplete snapshot is indistinguishable from a complete one
+  once it reaches the server, so the omissions would be read as uninstalls. A
+  stale inventory is recoverable; a confidently wrong one is not. Degraded
+  cycles are logged as warnings, and a host that degrades every day will stop
+  updating — treat repeated warnings as actionable.
+
+  The "ran but reported nothing" trigger is macOS-only by design: every Mac has
+  GUI applications and installer receipts, so zero means the tool failed. On
+  Linux an empty result is often honest — a host may legitimately have `rpm`
+  installed and no rpm packages — so that check is not applied there.
+
+  **Windows has no degraded signal today.** Its inventory is collected natively
+  from the registry rather than through the subprocess runner, so none of the
+  above applies: a partial registry walk publishes as complete. Tracked as a
+  known gap, not closed by this release.
 - **Changes for rpm fleets vs the v1 (4-field) contract:** `publisher` is now
   the rpm **PACKAGER** tag (was VENDOR), and `version` is the upstream version
   only — the release moved to its own `release` column (was fused

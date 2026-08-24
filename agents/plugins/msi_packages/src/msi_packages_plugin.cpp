@@ -129,9 +129,18 @@ std::string run_command(const std::vector<std::string>& argv) {
     // A cut-short pkgutil returns empty/partial output that parses as "no
     // packages" — a silent false-negative. Warn so an operator can tell a
     // degraded scan from a genuinely empty receipt DB (sre-M1).
-    if (res.timed_out || !res.tool_ran || res.output_truncated) {
-        spdlog::warn("msi_packages: degraded run (timed_out={}, tool_ran={}, truncated={}): {}",
-                     res.timed_out, res.tool_ran, res.output_truncated, argv.front());
+    //
+    // The discriminator is termination_reason, not the individual flags: the
+    // enum has six states and `signaled` (OOM kill), `cancelled` (shutdown) and
+    // `line_limit` all leave timed_out/tool_ran/output_truncated clear while
+    // still truncating the output. Kept identical to installed_apps'
+    // `is_degraded_run` so the two plugins cannot drift.
+    if (res.termination_reason != yuzu::agent::TerminationReason::exited ||
+        res.output_truncated) {
+        spdlog::warn("msi_packages: degraded run (reason={}, timed_out={}, tool_ran={}, "
+                     "truncated={}, exit_code={}): {}",
+                     static_cast<int>(res.termination_reason), res.timed_out, res.tool_ran,
+                     res.output_truncated, res.exit_code, argv.front());
     }
     std::string result = res.output;
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))

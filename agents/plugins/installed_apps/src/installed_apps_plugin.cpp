@@ -116,6 +116,19 @@ constexpr std::size_t kToolOutputCap = 8u * 1024u * 1024u;
 // papered over.
 constexpr std::chrono::seconds kCollectionBudget{120};
 
+// An operator reading a log cannot decode `reason=3`.
+constexpr const char* termination_reason_name(yuzu::agent::TerminationReason r) {
+    switch (r) {
+    case yuzu::agent::TerminationReason::exited:      return "exited";
+    case yuzu::agent::TerminationReason::signaled:    return "signaled";
+    case yuzu::agent::TerminationReason::deadline:    return "deadline";
+    case yuzu::agent::TerminationReason::cancelled:   return "cancelled";
+    case yuzu::agent::TerminationReason::line_limit:  return "line_limit";
+    case yuzu::agent::TerminationReason::spawn_error: return "spawn_error";
+    }
+    return "unknown";
+}
+
 struct ToolOutcome {
     std::string output;
     // True when the acquisition did not run to completion on its own terms --
@@ -170,15 +183,13 @@ ToolOutcome run_tool(std::vector<std::string> argv,
     // this plugin runs exits 0 on a healthy host, and the only genuine benign
     // nonzero is the per-ID pkg-info lookup, which is now marked explicitly
     // instead of weakening the rule for everything.
-    const bool abnormal_exit =
-        !tolerate_nonzero_exit && res.termination_reason == yuzu::agent::TerminationReason::exited &&
-        res.exit_code != 0;
-    const bool degraded = res.termination_reason != yuzu::agent::TerminationReason::exited ||
-                          abnormal_exit || res.output_truncated;
+    const bool degraded = parsers::is_degraded_run(
+        res.termination_reason == yuzu::agent::TerminationReason::exited, res.exit_code,
+        res.output_truncated, tolerate_nonzero_exit);
     if (degraded) {
         spdlog::warn("installed_apps: degraded run (reason={}, timed_out={}, tool_ran={}, "
                      "truncated={}, exit_code={}): {}",
-                     static_cast<int>(res.termination_reason), res.timed_out, res.tool_ran,
+                     termination_reason_name(res.termination_reason), res.timed_out, res.tool_ran,
                      res.output_truncated, res.exit_code, argv.front());
     }
     return ToolOutcome{std::move(res.output), degraded, res.tool_ran};
@@ -192,6 +203,20 @@ struct AppInfo {
     std::string version;
     std::string publisher;
     std::string install_date;
+};
+
+// Acquisition result + its health, returned together. `docs/cpp-conventions.md`
+// lists output parameters as forbidden in new code, and the health flag has to
+// travel with the data for the same reason list_inventory needs it: a
+// cut-short enumeration is indistinguishable from a small one at the call site.
+struct AppCollection {
+    std::vector<AppInfo> apps;
+    bool degraded = false;
+};
+
+struct InvCollection {
+    std::vector<yuzu::installed_apps::inventory::InvRecord> records;
+    bool degraded = false;
 };
 
 // Case-insensitive substring match
@@ -340,8 +365,12 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
     }
 }
 
-std::vector<AppInfo> get_installed_apps_windows() {
+AppCollection get_installed_apps_windows() {
     std::vector<AppInfo> apps;
+    // Native registry reads: no subprocess outcome to propagate. See
+    // do_list_inventory for why that is NOT a claim this leg cannot
+    // under-report.
+    const bool degraded = false;
     static const char* kUninstallKey = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
 
     // 64-bit HKLM
@@ -361,17 +390,18 @@ std::vector<AppInfo> get_installed_apps_windows() {
                            }),
                apps.end());
 
-    return apps;
+    return AppCollection{std::move(apps), degraded};
 }
 #endif
 
 // ── Linux: detect package manager and list packages ───────────────────────
 
 #ifdef __linux__
-std::vector<AppInfo> get_installed_apps_linux() {
+AppCollection get_installed_apps_linux() {
     std::vector<AppInfo> apps;
+    bool degraded = false;
 
-    if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/dpkg-query", "/bin/dpkg-query"});
+    if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/dpkg-query", "/bin/dpkg-query", "/usr/local/bin/dpkg-query"});
         !path.empty()) {
         // installed_apps/get_installed_apps_linux#1 (docs/agent-spawn-sink-manifest.md)
         // Debian/Ubuntu. Format-string byte-for-byte matches the old shell
@@ -379,43 +409,49 @@ std::vector<AppInfo> get_installed_apps_linux() {
         // two-byte escape dpkg-query's own format interpreter expands (not a
         // real newline byte) -- contrast get_inventory_linux's tab-separated
         // sibling call, which embeds real tab/newline bytes instead.
-        auto out =
-            run_tool({path, "-W", "-f=${Package}|${Version}|${Maintainer}|${Status}\\n"}).output;
+        auto res = run_tool({path, "-W", "-f=${Package}|${Version}|${Maintainer}|${Status}\\n"});
+        degraded = degraded || res.degraded;
+        auto out = std::move(res.output);
         for (auto& rec : parsers::parse_dpkg_list(out)) {
             // parse_dpkg_list already filters to "install ok installed" rows.
             apps.push_back({std::move(rec.name), std::move(rec.version),
                             std::move(rec.publisher), "-"});
         }
-    } else if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/rpm", "/bin/rpm"});
+    } else if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/rpm", "/bin/rpm", "/usr/local/bin/rpm"});
               !path.empty()) {
         // installed_apps/get_installed_apps_linux#2
         // RHEL/Fedora/SUSE.
-        auto out = run_tool({path, "-qa", "--queryformat",
-                             "%{NAME}|%{VERSION}-%{RELEASE}|%{VENDOR}|%{INSTALLTIME:date}\\n"}).output;
+        auto res = run_tool({path, "-qa", "--queryformat",
+                             "%{NAME}|%{VERSION}-%{RELEASE}|%{VENDOR}|%{INSTALLTIME:date}\\n"});
+        degraded = degraded || res.degraded;
+        auto out = std::move(res.output);
         for (auto& rec : parsers::parse_rpm_list(out)) {
             apps.push_back({std::move(rec.name), std::move(rec.version),
                             std::move(rec.publisher), std::move(rec.install_date)});
         }
-    } else if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/pacman", "/bin/pacman"});
+    } else if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/pacman", "/bin/pacman", "/usr/local/bin/pacman"});
               !path.empty()) {
         // installed_apps/get_installed_apps_linux#3
         // Arch Linux. Format: "name version".
-        auto out = run_tool({path, "-Q"}).output;
+        auto res = run_tool({path, "-Q"});
+        degraded = degraded || res.degraded;
+        auto out = std::move(res.output);
         for (auto& rec : parsers::parse_pacman_list(out))
             apps.push_back({std::move(rec.name), std::move(rec.version), "-", "-"});
     }
 
     std::sort(apps.begin(), apps.end(),
               [](const AppInfo& a, const AppInfo& b) { return a.name < b.name; });
-    return apps;
+    return AppCollection{std::move(apps), degraded};
 }
 #endif
 
 // ── macOS: list GUI apps and packages ─────────────────────────────────────
 
 #ifdef __APPLE__
-std::vector<AppInfo> get_installed_apps_macos() {
+AppCollection get_installed_apps_macos() {
     std::vector<AppInfo> apps;
+    bool degraded = false;
 
     // installed_apps/get_installed_apps_macos#1 (docs/agent-spawn-sink-manifest.md)
     // GUI applications from system_profiler. The `| grep` pipe stage is gone
@@ -428,8 +464,14 @@ std::vector<AppInfo> get_installed_apps_macos() {
     // only; the one documented deviation from byte-identity).
     if (auto path = yuzu::agent::probe_tool_path({"/usr/sbin/system_profiler"});
         !path.empty()) {
-        auto out = run_tool({path, "SPApplicationsDataType", "-detailLevel", "mini"}).output;
-        for (auto& rec : parsers::parse_system_profiler_apps(out)) {
+        auto res = run_tool({path, "SPApplicationsDataType", "-detailLevel", "mini"});
+        degraded = degraded || res.degraded;
+        auto parsed = parsers::parse_system_profiler_apps(res.output);
+        // Same reasoning as the inventory leg: every Mac has GUI applications,
+        // so the tool running and listing none is a tool failure.
+        if (res.ran && parsed.empty())
+            degraded = true;
+        for (auto& rec : parsed) {
             apps.push_back(
                 {std::move(rec.name), std::move(rec.version), "-", std::move(rec.install_date)});
         }
@@ -437,7 +479,7 @@ std::vector<AppInfo> get_installed_apps_macos() {
 
     std::sort(apps.begin(), apps.end(),
               [](const AppInfo& a, const AppInfo& b) { return a.name < b.name; });
-    return apps;
+    return AppCollection{std::move(apps), degraded};
 }
 #endif
 
@@ -446,9 +488,10 @@ std::vector<AppInfo> get_installed_apps_macos() {
 namespace inv = yuzu::installed_apps::inventory;
 
 #ifdef _WIN32
-std::vector<inv::InvRecord> get_inventory_windows() {
+InvCollection get_inventory_windows() {
     std::vector<inv::InvRecord> recs;
-    for (auto& app : get_installed_apps_windows()) {
+    auto win = get_installed_apps_windows();
+    for (auto& app : win.apps) {
         inv::InvRecord r;
         r.name = std::move(app.name);
         r.version = std::move(app.version);
@@ -461,12 +504,13 @@ std::vector<inv::InvRecord> get_inventory_windows() {
         // from which hive a key sat in would be synthesis, not storage.
         recs.push_back(std::move(r));
     }
-    return recs;
+    return InvCollection{std::move(recs), false};
 }
 #endif
 
 #ifdef __linux__
-std::vector<inv::InvRecord> get_inventory_linux(bool& degraded) {
+InvCollection get_inventory_linux() {
+    bool degraded = false;
     std::vector<inv::InvRecord> recs;
 
     const auto collect = [&recs, &degraded](std::vector<std::string> argv, auto parse_line) {
@@ -485,10 +529,12 @@ std::vector<inv::InvRecord> get_inventory_linux(bool& degraded) {
         }
     };
 
-    if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/dpkg-query", "/bin/dpkg-query"});
+    if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/dpkg-query", "/bin/dpkg-query", "/usr/local/bin/dpkg-query"});
         !path.empty()) {
         // installed_apps/get_inventory_linux#1 (docs/agent-spawn-sink-manifest.md)
-        // ${db:Status-Abbrev} (want+status, 2 chars) keeps installed AND held
+        // ${db:Status-Abbrev} (want+status+eflag, 3 chars incl. a trailing
+        // space for the usual empty eflag -- verified against debian:12, which
+        // emits "ii ") keeps installed AND held
         // packages via its 2nd char == 'i' ("ii" want=install, "hi" want=hold)
         // — matches vuln_scan's vuln_identity.hpp (PR #1804) exactly, so the
         // two collectors agree on which packages are present. "rc"
@@ -502,7 +548,7 @@ std::vector<inv::InvRecord> get_inventory_linux(bool& degraded) {
         collect({path, "-W",
                 "-f=${Package}\t${db:Status-Abbrev}\t${Version}\t${Architecture}\t${Maintainer}\n"},
                 inv::parse_dpkg_inv_line);
-    } else if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/rpm", "/bin/rpm"});
+    } else if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/rpm", "/bin/rpm", "/usr/local/bin/rpm"});
               !path.empty()) {
         // installed_apps/get_inventory_linux#2
         // Raw SIGPGP (payload) + RSAHEADER (header) signature tags; signed vs
@@ -515,11 +561,11 @@ std::vector<inv::InvRecord> get_inventory_linux(bool& degraded) {
                 "%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\t%{PACKAGER}\t"
                 "%{INSTALLTIME:date}\t%{SIGPGP}\t%{RSAHEADER}\n"},
                 inv::parse_rpm_inv_line);
-    } else if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/pacman", "/bin/pacman"});
+    } else if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/pacman", "/bin/pacman", "/usr/local/bin/pacman"});
               !path.empty()) {
         // installed_apps/get_inventory_linux#3
         collect({path, "-Q"}, inv::parse_pacman_inv_line);
-    } else if (auto path = yuzu::agent::probe_tool_path({"/sbin/apk", "/usr/sbin/apk", "/bin/apk"});
+    } else if (auto path = yuzu::agent::probe_tool_path({"/sbin/apk", "/usr/sbin/apk", "/bin/apk", "/usr/bin/apk", "/usr/local/bin/apk"});
               !path.empty()) {
         // installed_apps/get_inventory_linux#4
         // Alpine — first apk enumeration on the sync path (the legacy `list`
@@ -542,7 +588,7 @@ std::vector<inv::InvRecord> get_inventory_linux(bool& degraded) {
         r.distro_id = distro_id;
         r.distro_version = distro_version;
     }
-    return recs;
+    return InvCollection{std::move(recs), degraded};
 }
 #endif
 
@@ -564,7 +610,8 @@ std::vector<inv::InvRecord> get_inventory_linux(bool& degraded) {
 constexpr std::size_t kMaxEnrichApps = 5000;
 constexpr std::size_t kMaxPkgutilPackages = 5000;
 
-std::vector<inv::InvRecord> get_inventory_macos(bool& degraded) {
+InvCollection get_inventory_macos() {
+    bool degraded = false;
     std::vector<inv::InvRecord> recs;
     const auto collection_start = std::chrono::steady_clock::now();
     const auto over_budget = [collection_start]() {
@@ -589,9 +636,12 @@ std::vector<inv::InvRecord> get_inventory_macos(bool& degraded) {
         // transient tool failure, not a true empty inventory. Left ungated it
         // publishes a pkgutil-only snapshot, and the daily sync replaces the
         // host's whole app inventory -- signature posture included -- with it.
-        // Unlike a Linux package manager (an rpm-on-Debian box legitimately
-        // reports zero rpm packages), this leg has no honest-empty case, which
-        // is why the zero-row check is applied HERE and nowhere else.
+        // The Linux legs deliberately do NOT get this check. Their acquisition
+        // is a first-match-wins ladder, so a present-but-empty manager is
+        // unusual there too -- but an empty Linux parse is already caught one
+        // level up by sync_source_installed_software.cpp's empty-parse guard,
+        // and adding a second, stricter rule there would risk permanently
+        // freezing an unusual-but-legitimate host's inventory for no gain.
         if (res.ran && apps.empty()) {
             spdlog::warn("installed_apps: system_profiler ran but reported zero applications "
                          "-- treating as a degraded collection rather than an empty inventory");
@@ -680,6 +730,8 @@ std::vector<inv::InvRecord> get_inventory_macos(bool& degraded) {
             ids.resize(kMaxPkgutilPackages);
         }
 
+        std::size_t attempted = 0;
+        std::size_t empty_lookups = 0;
         for (const auto& id : ids) {
             // An id is a reverse-domain receipt name; one starting with '-'
             // would be consumed by pkgutil's OWN option parser as a flag (no
@@ -690,8 +742,9 @@ std::vector<inv::InvRecord> get_inventory_macos(bool& degraded) {
                 continue;
             }
             // Aggregate bound: the daily-sync thread is joined on every
-            // transient reconnect, and 500 per-item deadlines would otherwise
-            // add up to hours of unresponsiveness.
+            // transient reconnect, and per-item deadlines multiplied by the
+            // receipt guard would otherwise add up to hours of
+            // unresponsiveness. The budget, not the guard, is what bounds it.
             if (over_budget()) {
                 spdlog::warn("installed_apps: pkgutil receipt collection exceeded its {}s budget "
                              "-- stopping early and reporting a degraded collection",
@@ -711,7 +764,17 @@ std::vector<inv::InvRecord> get_inventory_macos(bool& degraded) {
                                     /*tolerate_nonzero_exit=*/true);
             if (pkginfo.degraded)
                 degraded = true;
+            ++attempted;
             auto info = parsers::parse_pkgutil_pkg_info(pkginfo.output);
+            // The tolerated nonzero exit is scoped by call SHAPE; on its own it
+            // is not scoped by RATE. One removed receipt is a benign race, but a
+            // systemic per-ID failure (receipts DB partly removed, reads denied)
+            // would emit every row with an empty version and still publish at
+            // rc=0 -- and under the honest-empty contract an empty version reads
+            // as "this ecosystem does not store one", which for a pkgutil
+            // receipt is false. Count the empties and degrade on a bad ratio.
+            if (info.version.empty() && info.install_time.empty())
+                ++empty_lookups;
             inv::InvRecord r;
             r.name = id; // honest reverse-domain identifier -- never a
                          // derived "friendly" name (msi_packages precedent)
@@ -725,9 +788,20 @@ std::vector<inv::InvRecord> get_inventory_macos(bool& degraded) {
             r.ecosystem = "macos_pkgutil";
             recs.push_back(std::move(r));
         }
+
+        // A handful of races is normal; most of the receipts coming back empty
+        // is a broken receipt store, not a fleet that uninstalled everything.
+        constexpr std::size_t kMinLookupsToJudge = 10;
+        if (attempted >= kMinLookupsToJudge && empty_lookups * 10 > attempted) {
+            spdlog::warn("installed_apps: {} of {} pkgutil receipt lookups returned nothing "
+                         "-- treating as a degraded collection rather than publishing receipts "
+                         "whose version and install date read as 'not stored'",
+                         empty_lookups, attempted);
+            degraded = true;
+        }
     }
 
-    return recs;
+    return InvCollection{std::move(recs), degraded};
 }
 #endif
 
@@ -739,7 +813,6 @@ int do_list_inventory(yuzu::CommandContext& ctx) {
     // place this can be caught is here. sync_source_installed_software.cpp
     // already skips the whole cycle on a nonzero rc; this reports into that
     // existing contract rather than inventing a new signal.
-    [[maybe_unused]] bool degraded = false;
 #ifdef _WIN32
     // Windows acquires natively (registry), so there is no SUBPROCESS outcome to
     // propagate and `degraded` stays false here. That is NOT a claim the Windows
@@ -749,17 +822,17 @@ int do_list_inventory(yuzu::CommandContext& ctx) {
     // pre-existing behaviour this PR does not touch or worsen, and closing it
     // needs its own change plus Windows-side testing -- flagged in the gate
     // report rather than silently implied to be covered here.
-    auto recs = get_inventory_windows();
+    auto collected = get_inventory_windows();
 #elif defined(__linux__)
-    auto recs = get_inventory_linux(degraded);
+    auto collected = get_inventory_linux();
 #elif defined(__APPLE__)
-    auto recs = get_inventory_macos(degraded);
+    auto collected = get_inventory_macos();
 #else
-    std::vector<inv::InvRecord> recs;
+    InvCollection collected;
 #endif
 
 #if defined(__linux__) || defined(__APPLE__)
-    if (degraded) {
+    if (collected.degraded) {
         spdlog::warn("installed_apps: list_inventory acquisition was degraded -- reporting "
                      "rc=1 so the daily sync skips this cycle instead of committing a "
                      "partial inventory as authoritative");
@@ -769,12 +842,31 @@ int do_list_inventory(yuzu::CommandContext& ctx) {
 
     // No sentinel row: an empty result is empty output + rc 0. The sync
     // source's empty-parse guard skips the cycle rather than wiping state.
-    for (const auto& r : recs) {
+    for (const auto& r : collected.records) {
         if (r.name.empty())
             continue; // contract: row dropped if name is empty
         ctx.write_output(sanitize_utf8(inv::format_inv_row(r)));
     }
     return 0;
+}
+
+// Emit an honest failure row for a degraded operator-facing action and tell
+// the caller to bail. Returns true when the collection is healthy and the
+// action should proceed. Kept as one helper so `list`, `query` and
+// `list_per_user` cannot drift apart on the wording or the rc.
+bool report_if_degraded([[maybe_unused]] yuzu::CommandContext& ctx, bool degraded,
+                        [[maybe_unused]] std::string_view action) {
+    if (!degraded)
+        return true;
+#if defined(__linux__) || defined(__APPLE__)
+    spdlog::warn("installed_apps: '{}' acquisition was degraded -- reporting an error rather "
+                 "than presenting a partial or empty list as authoritative",
+                 action);
+#endif
+    ctx.write_output("error|installed_apps: acquisition degraded (tool timed out, was killed, "
+                     "failed to start, exited nonzero, or its output was truncated) -- result "
+                     "withheld rather than reported as complete");
+    return false;
 }
 
 // ── list action ───────────────────────────────────────────────────────────
@@ -787,15 +879,23 @@ int do_list(yuzu::CommandContext& ctx) {
 #elif defined(__APPLE__)
     auto apps = get_installed_apps_macos();
 #else
-    std::vector<AppInfo> apps;
+    AppCollection apps;
 #endif
 
-    if (apps.empty()) {
+    // A degraded acquisition would otherwise render as the honest-empty
+    // sentinel -- "no applications" presented to an operator as authoritative
+    // when the tool was actually killed at its deadline or by the OOM killer.
+    // Report it instead, matching services_plugin.cpp's precedent. The emitted
+    // ROW format is untouched; only the failure signal is new.
+    if (!report_if_degraded(ctx, apps.degraded, "list"))
+        return 1;
+
+    if (apps.apps.empty()) {
         ctx.write_output("app|No applications found|-|-|-");
         return 0;
     }
 
-    for (const auto& app : apps) {
+    for (const auto& app : apps.apps) {
         ctx.write_output(sanitize_utf8(
             std::format("app|{}|{}|{}|{}", app.name, app.version.empty() ? "-" : app.version,
                         app.publisher.empty() ? "-" : app.publisher,
@@ -820,11 +920,16 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
 #elif defined(__APPLE__)
     auto apps = get_installed_apps_macos();
 #else
-    std::vector<AppInfo> apps;
+    AppCollection apps;
 #endif
 
+    // Same reasoning as `list`: "found|false" from a killed enumerator is a
+    // wrong answer presented as a correct one.
+    if (!report_if_degraded(ctx, apps.degraded, "query"))
+        return 1;
+
     bool found = false;
-    for (const auto& app : apps) {
+    for (const auto& app : apps.apps) {
         if (icontains(app.name, search)) {
             if (!found) {
                 ctx.write_output("found|true");
@@ -1027,7 +1132,9 @@ private:
         // List packages installed per-user via dpkg or per-user snap/flatpak
         // For dpkg-based systems, packages are system-wide. Report them as system.
         auto apps = get_installed_apps_linux();
-        for (const auto& app : apps) {
+        if (!report_if_degraded(ctx, apps.degraded, "list_per_user"))
+            return 1;
+        for (const auto& app : apps.apps) {
             ctx.write_output(sanitize_utf8(
                 std::format("user_app|system|{}|{}|{}|{}", app.name,
                             app.version.empty() ? "-" : app.version,
@@ -1040,7 +1147,9 @@ private:
         // On macOS, use brew list per user if Homebrew is installed
         // First list system apps
         auto apps = get_installed_apps_macos();
-        for (const auto& app : apps) {
+        if (!report_if_degraded(ctx, apps.degraded, "list_per_user"))
+            return 1;
+        for (const auto& app : apps.apps) {
             ctx.write_output(sanitize_utf8(
                 std::format("user_app|system|{}|{}|{}|{}", app.name,
                             app.version.empty() ? "-" : app.version,
@@ -1053,7 +1162,10 @@ private:
         if (auto brew_path =
                 yuzu::agent::probe_tool_path({"/opt/homebrew/bin/brew", "/usr/local/bin/brew"});
             !brew_path.empty()) {
-            auto brew_out = run_tool({brew_path, "list", "--versions"}).output;
+            auto brew_res = run_tool({brew_path, "list", "--versions"});
+            if (!report_if_degraded(ctx, brew_res.degraded, "list_per_user"))
+                return 1;
+            auto brew_out = std::move(brew_res.output);
             for (auto& rec : parsers::parse_brew_list(brew_out)) {
                 ctx.write_output(sanitize_utf8(std::format(
                     "user_app|brew|{}|{}|-|-", rec.name, rec.version.empty() ? "-" : rec.version)));

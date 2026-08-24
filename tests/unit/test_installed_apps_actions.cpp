@@ -275,9 +275,20 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
     CHECK(pkg_bad_ecosystem == 0);
     CHECK(pkg_non_numeric_date == 0);
 
-    // Caps hold (kMaxEnrichApps / kMaxPkgutilPackages are both 500).
-    CHECK(pkg_rows <= 500);
-    CHECK(signed_apps + unsigned_apps <= 500);
+    // Every classified app row is either signed or unsigned, and rows whose
+    // bundle had no Location: line carry neither -- so the classified count can
+    // never exceed the app-row count. A regression that double-counted or
+    // mis-bucketed would break this.
+    CHECK(signed_apps + unsigned_apps <= app_rows);
+
+    // NOTE: no cap assertion here, deliberately. An earlier revision asserted
+    // `<= 500` against constants that later became 5000 -- it could not observe
+    // the cap it claimed to verify (false green) and would have failed any Mac
+    // with more than 500 app bundles (false red). The guards are no longer
+    // observable from this seam at all: exceeding either one now DEGRADES the
+    // collection, so the run returns rc=1 and never reaches this branch. The
+    // degraded contract is asserted in the rc!=0 branch above; asserting a
+    // bound here would be asserting something unreachable by construction.
 }
 
 #endif // __APPLE__

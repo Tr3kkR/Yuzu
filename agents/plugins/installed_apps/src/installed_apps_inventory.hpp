@@ -217,7 +217,8 @@ inline std::string parse_os_release(std::string_view content, std::string_view k
 
 // One dpkg-query line:
 //   ${Package}\t${db:Status-Abbrev}\t${Version}\t${Architecture}\t${Maintainer}
-// Status-Abbrev is <want><status> (2 chars); the 2nd char 'i' == installed --
+// Status-Abbrev is <want><status><eflag> (3 chars -- dpkg emits a trailing
+// space for the usual empty eflag, e.g. "ii "); the 2nd char 'i' == installed --
 // matches vuln_identity.hpp::parse_dpkg_line (PR #1804) exactly. Covers "ii"
 // (want=install) AND "hi" (want=hold: apt-mark hold / kernel pin), so a
 // held-but-installed package is present and scannable -- the legacy `list`

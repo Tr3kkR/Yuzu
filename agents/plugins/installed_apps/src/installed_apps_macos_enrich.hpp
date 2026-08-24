@@ -111,6 +111,10 @@ inline EnrichResult enrich_app(const std::string& app_path) {
     EnrichResult out;
 
     yuzu::agent::ScopedCFRef<CFURLRef> url(CFURLCreateFromFileSystemRepresentation(
+        // reinterpret_cast char* -> const UInt8*: byte-type aliasing is the
+        // explicit exemption to the strict-aliasing rule, and `app_path` is a
+        // caller-owned lvalue that outlives this call, so the buffer stays
+        // valid for the whole of CFURLCreateFromFileSystemRepresentation.
         nullptr, reinterpret_cast<const UInt8*>(app_path.c_str()),
         static_cast<CFIndex>(app_path.size()), /*isDirectory=*/true));
     if (!url)
@@ -127,20 +131,28 @@ inline EnrichResult enrich_app(const std::string& app_path) {
     }
 
     // -- signer + integrity via SecStaticCode --
+    // ADOPT FIRST, TEST SECOND. Testing the status before adopting leaves a
+    // return statement between the +1 and its owner: if the API ever returns a
+    // non-success OSStatus while still having written the out-param, that
+    // reference is dropped on the floor -- and this runs across every bundle on
+    // the host, daily. ScopedCFRef adopts nullptr safely, so ordering the
+    // adoption first is a strict widening of the guard, never a narrowing.
     SecStaticCodeRef raw_code = nullptr;
     const OSStatus create_status =
         SecStaticCodeCreateWithPath(url.get(), kSecCSDefaultFlags, &raw_code);
-    if (create_status != errSecSuccess || !raw_code)
-        return out;
     yuzu::agent::ScopedCFRef<SecStaticCodeRef> code(raw_code);
+    if (create_status != errSecSuccess || !code)
+        return out;
 
     // SecCodeCopySigningInformation's declared parameter type (SecCode.h) is
     // SecStaticCodeRef -- it takes the static code object directly, no cast
     // to SecCodeRef needed or correct here.
+    // Adopt first, test second -- same reasoning as the block above.
     CFDictionaryRef raw_info = nullptr;
     const OSStatus info_status =
         SecCodeCopySigningInformation(code.get(), kSecCSSigningInformation, &raw_info);
-    if (info_status != errSecSuccess || !raw_info) {
+    yuzu::agent::ScopedCFRef<CFDictionaryRef> info(raw_info);
+    if (info_status != errSecSuccess || !info) {
         // errSecCSUnsigned is a POSITIVE "definitely has no signature at all"
         // -- report it honestly rather than folding it into the unknown
         // default. Any other failure (a locked/unreadable bundle, a Security
@@ -150,7 +162,6 @@ inline EnrichResult enrich_app(const std::string& app_path) {
         out.signature_status = (info_status == errSecCSUnsigned) ? "unsigned" : "";
         return out;
     }
-    yuzu::agent::ScopedCFRef<CFDictionaryRef> info(raw_info);
 
     // CALL SUCCESS IS NOT A SIGNATURE. Measured on macOS 26 (2026-08-24):
     // SecStaticCodeCreateWithPath AND SecCodeCopySigningInformation BOTH
@@ -179,7 +190,15 @@ inline EnrichResult enrich_app(const std::string& app_path) {
     if (auto* certs = static_cast<CFArrayRef>(
             CFDictionaryGetValue(info.get(), kSecCodeInfoCertificates));
         certs && CFArrayGetCount(certs) > 0) {
-        // Array element is a BORROWED (Get-rule) reference owned by `certs`.
+        // Array element is a BORROWED (Get-rule) reference owned by `certs`,
+        // which is itself borrowed from `info` -- so the leaf stays valid for
+        // as long as `info` does, which is this whole scope.
+        // const_cast: CFArrayGetValueAtIndex is typed `const void*` purely
+        // because CF has no const-qualified object model; the underlying
+        // SecCertificateRef is a genuinely non-const CF object, and
+        // SecCertificateCopyCommonName takes it by non-const ref. Nothing here
+        // writes through the pointer, so this removes a const the API added,
+        // never one the object actually had.
         auto leaf = static_cast<SecCertificateRef>(
             const_cast<void*>(CFArrayGetValueAtIndex(certs, 0)));
         CFStringRef raw_name = nullptr;

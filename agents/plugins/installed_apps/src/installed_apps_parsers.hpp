@@ -43,6 +43,39 @@ struct AppRecord {
     std::string location;
 };
 
+// ── acquisition-health decision (pure) ──────────────────────────────────────
+//
+// Whether a completed subprocess run should be treated as a DEGRADED
+// acquisition. Pure and header-resident so the decision is table-testable on
+// every host: it is the most security-relevant branch in this plugin -- it
+// decides whether a possibly-truncated enumeration is published as the host's
+// authoritative software set -- and it previously lived in a static function
+// in the .cpp where no test could reach it.
+//
+// `reason_is_exited` is `termination_reason == TerminationReason::exited`.
+// Taking a bool rather than the enum keeps this header free of an agent-core
+// include, so the pure parser tests do not have to link the runner.
+//
+// The rules, and why:
+//   - anything other than a clean `exited` is degraded. The enum has six
+//     states; testing the individual timed_out/tool_ran/truncated flags misses
+//     `signaled` (OOM kill), `cancelled` (shutdown) and `line_limit`, all of
+//     which leave those flags clear while truncating the output.
+//   - a truncated capture is degraded even on a clean exit.
+//   - a nonzero exit is degraded UNLESS the caller opted out. Every top-level
+//     enumerator this plugin runs exits 0 on a healthy host; the sole benign
+//     nonzero is a per-ID `pkgutil --pkg-info` for a receipt removed between
+//     enumeration and lookup, which is opted out at that one call site.
+[[nodiscard]] inline bool is_degraded_run(bool reason_is_exited, int exit_code,
+                                          bool output_truncated,
+                                          bool tolerate_nonzero_exit) {
+    if (!reason_is_exited)
+        return true;
+    if (output_truncated)
+        return true;
+    return !tolerate_nonzero_exit && exit_code != 0;
+}
+
 namespace detail {
 
 inline void strip_trailing_cr(std::string& line) {

@@ -27,13 +27,18 @@
  * site in installed_apps_macos_enrich.hpp.
  */
 
+// Included ABOVE the platform guard so this TU is never EMPTY off-Darwin:
+// `warning_level=3` maps to -Wpedantic, and an empty translation unit is an
+// ISO C++ diagnostic. Matches the sibling no-op TUs
+// (test_installed_apps_actions.cpp, test_msi_packages_actions.cpp,
+// test_bitlocker_local_dispatcher.cpp).
+#include <catch2/catch_test_macros.hpp>
+
 #if defined(__APPLE__)
 
 #include "installed_apps_macos_enrich.hpp"
 
 #include "test_helpers.hpp"
-
-#include <catch2/catch_test_macros.hpp>
 
 #include <filesystem>
 #include <fstream>

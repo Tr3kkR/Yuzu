@@ -481,10 +481,13 @@ GRANDFATHERED = {
     "agents/plugins/event_logs/src/event_logs_plugin.cpp",
     "agents/plugins/firewall/src/firewall_plugin.cpp",
     "agents/plugins/license_scan/src/licensing_linux.cpp",
-    # msi_packages removed (#3405): this PR argv-ised its last shell hop, so the
-    # file now has zero raw spawn primitives and the entry grandfathered nothing
-    # while masking a regression that re-introduced one. network_config stays --
-    # it is still rung 3 and is PR4.1's to remove, the other half of #3405.
+    # installed_apps AND msi_packages both removed here (#3405): this PR
+    # argv-ised the last shell hop in each, so both files now have zero raw
+    # spawn primitives and their entries grandfathered nothing while masking any
+    # regression that re-introduced one. Removing an entry moves the file from
+    # the base-diff path onto the FULL scan, so it is strictly stricter.
+    # network_config stays -- it is still rung 3 and is PR4.1's to remove, the
+    # remaining half of #3405.
     "agents/plugins/network_config/src/network_config_plugin.cpp",
     "agents/plugins/script_exec/src/script_exec_plugin.cpp",
     "agents/plugins/software_actions/src/software_actions_plugin.cpp",
