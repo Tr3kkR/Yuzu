@@ -110,23 +110,27 @@ int registry_uninstall_subkey_count() {
     return static_cast<int>(subkey_count);
 }
 
-// winget ships as a per-user App Execution Alias under
-// %LOCALAPPDATA%\Microsoft\WindowsApps\winget.exe — not on the machine-wide
-// PATH the runner refuses to search anyway. Resolve the env var natively and
-// hand the one candidate to probe_tool_path for the existence+executable
-// check; a missing/empty LOCALAPPDATA or a missing winget.exe both resolve
-// to "" (the honest "not present in this context" case the service-account
-// context can legitimately hit — App Execution Aliases are a per-user-session
-// mechanism).
-std::string resolve_winget_path() {
+// winget ships as a per-user App Execution Alias at
+// %LOCALAPPDATA%\\Microsoft\\WindowsApps\\winget.exe. That alias is a ZERO-BYTE
+// IO_REPARSE_TAG_APPEXECLINK reparse point, NOT a PE image -- verified on a
+// live Windows host: GetFileAttributesW reports 0x420 (ARCHIVE|REPARSE_POINT),
+// length 0, reparse tag 0x8000001b, and GetBinaryTypeW fails with
+// ERROR_CANT_ACCESS_FILE (1920).
+//
+// probe_tool_path()'s Windows backend gates on GetBinaryTypeW, so probing this
+// candidate ALWAYS returns "" and the whole winget leg would be dead code whose
+// failure was indistinguishable from the declared "alias not available" case.
+// The path is therefore handed straight to the runner: run_bounded_subprocess
+// is the authority on what it can actually spawn, and CreateProcess DOES follow
+// an APPEXECLINK. A genuinely absent winget then surfaces as the runner's own
+// spawn_error -> UNAVAILABLE, which is distinguishable from a winget that ran.
+std::string winget_candidate_path() {
     wchar_t buf[MAX_PATH]{};
     const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH);
-    std::vector<std::string> candidates;
-    if (n > 0 && n < MAX_PATH) {
-        candidates.push_back(yuzu::win::from_wide(buf, static_cast<int>(n)) +
-                             "\\Microsoft\\WindowsApps\\winget.exe");
-    }
-    return yuzu::agent::probe_tool_path(candidates);
+    if (n == 0 || n >= MAX_PATH)
+        return {};
+    return yuzu::win::from_wide(buf, static_cast<int>(n)) +
+           "\\Microsoft\\WindowsApps\\winget.exe";
 }
 
 #endif // _WIN32
@@ -171,15 +175,13 @@ void degrade(yuzu::CommandContext& ctx, const yuzu::agent::SubprocessResult& res
 
 int do_list_upgradable(yuzu::CommandContext& ctx) {
 #ifdef _WIN32
-    auto tool = resolve_winget_path();
+    auto tool = winget_candidate_path();
     if (tool.empty()) {
-        // winget's App Execution Alias is unavailable to the agent service
-        // context (no interactive user session) — an honest, expected
-        // CONSTRAINED result, not a runner failure.
-        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                              "software_actions:winget_not_present");
-        ctx.write_output("upgradable|unavailable|winget not present in this context|-");
-        return 0;
+        // No %LOCALAPPDATA% in this token's environment: the alias path cannot
+        // even be constructed, so nothing about this host's upgrades is known.
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "software_actions:localappdata_unset");
+        return 1;
     }
     // software_actions/list_upgradable_windows#1 (docs/agent-spawn-sink-manifest.md)
     auto res = yuzu::agent::run_bounded_subprocess(
@@ -262,6 +264,15 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
             }
         }
     }
+    if (apt_tried && apt_ok) {
+        // apt ran cleanly. Whatever it reported IS the answer for a dpkg host --
+        // falling through to dnf here would let an unrelated dnf failure
+        // overwrite apt's authoritative "nothing to upgrade" with a degrade.
+        if (found)
+            return 0;
+        ctx.write_output("upgradable|none|System is up to date|-");
+        return 0;
+    }
     if (!found) {
         auto yum = yuzu::agent::probe_tool_path({"/usr/bin/yum", "/usr/bin/dnf"});
         if (!yum.empty()) {
@@ -325,18 +336,15 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
     // `softwareupdate -l` has varied its exit status across macOS releases, so
     // inventing a failure from it would be its own dishonesty. Runner-level
     // outcomes and truncation still disqualify the capture.
-    if (!capture_usable(res, /*exit_ok=*/true)) {
+    // The exit-code check sits ABOVE the parse deliberately. Below it, a
+    // failing run whose diagnostic text happened to parse as an entry would be
+    // emitted as a package name -- `upgradable|<diagnostic>|-|-` at rc 0.
+    if (!capture_usable(res, res.exit_code == 0)) {
         degrade(ctx, res, "software_actions:softwareupdate_failed");
         return 1;
     }
     auto labels = yuzu::software_actions::parse_softwareupdate_list(res.output);
     if (labels.empty()) {
-        if (res.exit_code != 0) {
-            // Nothing parsed AND a failing exit: no basis to claim the host is
-            // up to date.
-            degrade(ctx, res, "software_actions:softwareupdate_failed");
-            return 1;
-        }
         ctx.write_output("upgradable|none|System is up to date|-");
         return 0;
     }
@@ -460,8 +468,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
      {YUZU_SUPPORT_SUPPORTED, 2, "softwareupdate -l via bounded argv runner", nullptr},
      /* windows = */
      {YUZU_SUPPORT_CONSTRAINED, 2, "winget via bounded argv runner",
-      "winget App-Execution-Alias may be unavailable to the agent service context; reports an "
-      "honest empty/unavailable result"}},
+      "winget is a PER-USER App Execution Alias under %LOCALAPPDATA%; under the shipped "
+      "LocalSystem service account that path does not exist, so this leg resolves only when the "
+      "agent runs in a user-session context. An unresolvable winget reports UNAVAILABLE, never a "
+      "clean empty result"}},
     {"installed_count",
      /* linux   = */
      {YUZU_SUPPORT_SUPPORTED, 2, "dpkg-query/rpm via bounded argv runner", nullptr},

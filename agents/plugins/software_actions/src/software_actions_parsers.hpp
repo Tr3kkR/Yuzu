@@ -52,16 +52,43 @@ namespace detail {
 [[nodiscard]] inline std::vector<std::size_t> column_origins(std::string_view header) {
     std::vector<std::size_t> origins;
     bool in_token = false;
+    std::size_t cell = 0;
     for (std::size_t i = 0; i < header.size(); ++i) {
-        const bool is_space = header[i] == ' ' || header[i] == '\t';
+        const auto ch = static_cast<unsigned char>(header[i]);
+        if ((ch & 0xC0) == 0x80)
+            continue; // UTF-8 continuation byte: same display cell
+        const bool is_space = ch == ' ' || ch == '\t';
         if (!is_space && !in_token) {
-            origins.push_back(i);
+            origins.push_back(cell);
             in_token = true;
         } else if (is_space) {
             in_token = false;
         }
+        ++cell;
     }
     return origins;
+}
+
+/// Byte index of the start of each display cell in `line`, plus a trailing
+/// entry for the end of the line.
+///
+/// winget pads its columns by DISPLAY width, so a header origin is a CELL
+/// index, not a byte offset. Slicing raw bytes at that number shifts every
+/// column right by one byte for each multi-byte character earlier in the row,
+/// which for a name like "Bitwarden Passwort-Manager" silently pushed the
+/// version column past its boundary and dropped the row. One cell per UTF-8
+/// code point is exact for Latin/accented text; genuinely double-width (CJK)
+/// code points still occupy two cells and are not modelled, so those rows fail
+/// the boundary check and degrade honestly rather than mis-map.
+[[nodiscard]] inline std::vector<std::size_t> cell_byte_offsets(std::string_view line) {
+    std::vector<std::size_t> cells;
+    cells.reserve(line.size() + 1);
+    for (std::size_t i = 0; i < line.size(); ++i) {
+        if ((static_cast<unsigned char>(line[i]) & 0xC0) != 0x80)
+            cells.push_back(i);
+    }
+    cells.push_back(line.size());
+    return cells;
 }
 
 /// `line[begin, end)` with surrounding blanks trimmed; empty when the slice
@@ -136,7 +163,9 @@ struct WingetUpgradeParse {
         line.find("upgrade") != std::string::npos && line.find("available") != std::string::npos;
     const bool undetermined_versions = line.find("package(s)") != std::string::npos &&
                                        line.find("version") != std::string::npos;
-    return upgrades_available || undetermined_versions;
+    // winget's own "nothing matched" message: not data, and not a dropped row.
+    const bool no_match = line.find("No installed package") != std::string::npos;
+    return upgrades_available || undetermined_versions || no_match;
 }
 
 /// Parse `winget upgrade --accept-source-agreements` output.
@@ -210,14 +239,25 @@ struct WingetUpgradeParse {
             continue;
         }
 
-        // A data row must respect every column boundary: the character
-        // immediately before each column origin is a space (or the row ends
-        // before that column). Trailer prose overflows its columns and fails
-        // this check, so it can never become a phantom row.
+        // Origins are DISPLAY-CELL indices; translate them to byte offsets
+        // for this row so a multi-byte character earlier in the line does not
+        // shift every later column.
+        const auto cells = detail::cell_byte_offsets(line);
+        auto byte_of = [&](std::size_t cell) {
+            return cell < cells.size() ? cells[cell] : line.size();
+        };
+
+        // A data row must respect every column boundary: the cell immediately
+        // before each column origin is a space (or the row ends before that
+        // column). Trailer prose overflows its columns and fails this check, so
+        // it can never become a phantom row.
         bool aligned = true;
         for (std::size_t c = 1; c < origins.size(); ++c) {
-            const std::size_t origin = origins[c];
-            if (origin < line.size() && line[origin - 1] != ' ') {
+            const std::size_t origin_byte = byte_of(origins[c]);
+            if (origin_byte >= line.size())
+                continue; // row ends before this column
+            const std::size_t prev_byte = byte_of(origins[c] - 1);
+            if (prev_byte >= line.size() || line[prev_byte] != ' ') {
                 aligned = false;
                 break;
             }
@@ -232,10 +272,10 @@ struct WingetUpgradeParse {
             continue;
         }
 
-        auto name = detail::slice_trimmed(line, origins[0], origins[1]);
-        const auto id = detail::slice_trimmed(line, origins[1], origins[2]);
-        auto current = detail::slice_trimmed(line, origins[2], origins[3]);
-        auto available = detail::slice_trimmed(line, origins[3], origins[4]);
+        auto name = detail::slice_trimmed(line, byte_of(origins[0]), byte_of(origins[1]));
+        const auto id = detail::slice_trimmed(line, byte_of(origins[1]), byte_of(origins[2]));
+        auto current = detail::slice_trimmed(line, byte_of(origins[2]), byte_of(origins[3]));
+        auto available = detail::slice_trimmed(line, byte_of(origins[3]), byte_of(origins[4]));
         // Id and Version are always populated on a genuine winget row; a
         // short trailer line ("23 upgrades available.") aligns trivially but
         // leaves them empty, which is what distinguishes it from data.
@@ -307,10 +347,23 @@ struct YumUpgradeRow {
 /// lines skipped.
 [[nodiscard]] inline std::vector<YumUpgradeRow> parse_yum_checkupdate(std::string_view output) {
     std::vector<YumUpgradeRow> rows;
+    bool in_obsoleting = false;
     for (const auto& line : detail::split_nonblank_lines(output)) {
         if (line.starts_with("Loaded") || line.starts_with("Loading"))
             continue;
         if (line.starts_with("Last metadata"))
+            continue;
+        // `dnf check-update` appends an "Obsoleting Packages" section after the
+        // update list. Its heading is not a package, and its indented rows are
+        // obsoletions rather than pending updates -- emitting either as an
+        // upgradable package invents an update that does not exist.
+        if (line.starts_with("Obsoleting"))
+            in_obsoleting = true;
+        if (in_obsoleting)
+            continue;
+        // A continuation line (leading whitespace) belongs to the previous
+        // record, not a new package.
+        if (line.front() == ' ' || line.front() == '\t')
             continue;
         std::string name, version;
         std::size_t pos = 0;
@@ -339,6 +392,15 @@ struct YumUpgradeRow {
 [[nodiscard]] inline std::vector<std::string> parse_softwareupdate_list(std::string_view output) {
     std::vector<std::string> labels;
     for (const auto& line : detail::split_nonblank_lines(output)) {
+        // Shape rule: only lines belonging to a "*"-marked entry are candidates.
+        // The former allow-by-default behaviour emitted ANY unrecognised line as
+        // a package name, so a diagnostic printed to stdout became
+        // `upgradable|<diagnostic text>|-|-`.
+        const auto marker = line.find_first_not_of(" \t");
+        const bool entry_line = marker != std::string::npos && line[marker] == '*';
+        const bool label_line = line.find("Label:") != std::string::npos;
+        if (!entry_line && !label_line)
+            continue;
         auto trimmed = line;
         auto start = trimmed.find_first_not_of(" \t*");
         if (start == std::string::npos)

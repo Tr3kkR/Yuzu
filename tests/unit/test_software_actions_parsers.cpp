@@ -66,9 +66,11 @@ TEST_CASE("winget upgrade: separator found but zero data rows is the up-to-date 
         "No installed package found matching input criteria.\n";
     auto parsed = parse_winget_upgrade(out);
     CHECK(parsed.separator_found);
-    // The footer/no-match line has fewer than 2 space-delimited columns, so
-    // it never becomes a row.
+    // The "no installed package" line is winget's own nothing-matched message.
+    // It is rejected as data because it does not respect the column boundaries,
+    // and recognised as a message so it is not counted as a DROPPED row either.
     CHECK(parsed.rows.empty());
+    CHECK(parsed.unmapped_lines == 0);
 }
 
 TEST_CASE("winget upgrade: empty output never finds the separator", "[software_actions]") {
@@ -253,7 +255,46 @@ TEST_CASE("winget upgrade: unreadable header does not turn the footer into a pac
     CHECK(parsed.rows[0].name == "Git");
 }
 
+TEST_CASE("winget upgrade: a non-ASCII package name does not drop the row",
+          "[software_actions]") {
+    // winget pads by DISPLAY width; slicing raw bytes shifted every column
+    // right by one byte per multi-byte character, pushing the version past its
+    // boundary so the row was dropped. Any non-en-US estate lost pending
+    // updates from the report.
+    constexpr std::string_view out =
+        "Name                                             Id                                     Version          Available        Source\n"
+        "--------------------------------------------------------------------------------------------------------------------------------\n"
+        "Bitwarden Passw\u00f6rd Manager                       Bitwarden.Bitwarden                    2024.1.0         2024.2.0         winget\n";
+    auto parsed = parse_winget_upgrade(out);
+    REQUIRE(parsed.rows.size() == 1);
+    CHECK(parsed.unmapped_lines == 0);
+    CHECK(parsed.rows[0].name == "Bitwarden Passw\u00f6rd Manager");
+    CHECK(parsed.rows[0].current_version == "2024.1.0");
+    CHECK(parsed.rows[0].available_version == "2024.2.0");
+}
+
+// ── Linux: dnf obsoletions are not pending updates ─────────────────────────
+
+TEST_CASE("yum check-update: the Obsoleting Packages section is not upgradable packages",
+          "[software_actions]") {
+    constexpr std::string_view out = "kernel.x86_64          6.1.0-2   updates\n"
+                                     "Obsoleting Packages\n"
+                                     "old-pkg.x86_64         1.0-1     updates\n"
+                                     "    replaced.x86_64    0.9-1     @System\n";
+    auto rows = parse_yum_checkupdate(out);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].name == "kernel.x86_64");
+}
+
 // ── macOS: softwareupdate label extraction edge cases ──────────────────────
+
+TEST_CASE("softwareupdate -l: a diagnostic line never becomes a package name",
+          "[software_actions]") {
+    // The parser used to emit ANY unrecognised line verbatim, so an error
+    // printed to stdout became `upgradable|<diagnostic>|-|-`.
+    CHECK(parse_softwareupdate_list("Error: Could not contact the update server.\n").empty());
+    CHECK(parse_softwareupdate_list("Software Update Tool\n\nSome stray diagnostic\n").empty());
+}
 
 TEST_CASE("softwareupdate -l: a bare 'Label:' never throws and yields no label",
           "[software_actions]") {

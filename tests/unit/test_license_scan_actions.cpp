@@ -6,15 +6,17 @@
  * runner migration (licensing_linux.cpp) and the CONSTRAINED/rung-2
  * descriptor demotion.
  *
- * Dispatches "surfaces" -- license_scan's cheapest read action on macOS
- * (licensing_macos.cpp's run_platform_surfaces is pure filesystem glob +
- * in-house XML-plist string parsing, no subprocess at all; "surfaces" also
- * emits only the probe_status diagnostics, skipping "list"'s lic| record
- * formatting/sanitisation). "surfaces" always returns rc 0 by design
- * (ADR-0024 D3: probe_status reporting never fails the call), and
- * licensing_macos.cpp's mas_receipt surface unconditionally appends one
- * ProbeOutcome, so at least one `probe_status|` line is guaranteed on every
- * host regardless of what is actually installed.
+ * SCOPE, stated honestly: on macOS this exercises NONE of the Linux runner
+ * migration -- licensing_macos.cpp's run_platform_surfaces is pure filesystem
+ * glob + plist parsing with no subprocess at all. There it is a load-and-
+ * dispatch smoke test: it proves the built plugin loads over the ABI and
+ * answers "surfaces", nothing more. The Linux assertion below is the part that
+ * covers migrated code, and it only runs on Linux (CI).
+ *
+ * "surfaces" always returns rc 0 by design (ADR-0024 D3: probe_status
+ * reporting never fails the call), and each platform's run_platform_surfaces
+ * appends at least one ProbeOutcome, so one `probe_status|` line is guaranteed
+ * on every host.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -97,6 +99,14 @@ TEST_CASE("license_scan plugin: surfaces reports probe_status diagnostics via Lo
     auto result = dispatcher.run(plugin->descriptor, "surfaces");
     CHECK(result.rc == 0);
     CHECK(result.captured.find("probe_status|") != std::string::npos);
+
+#ifdef __linux__
+    // Only on Linux does this dispatch reach the migrated code. pkg_metadata is
+    // the surface licensing_linux.cpp's runner migration rewrote, and
+    // run_pkg_metadata_surface pushes its outcome on EVERY path, so its absence
+    // means the migrated surface did not run at all.
+    CHECK(result.captured.find("probe_status|pkg_metadata") != std::string::npos);
+#endif
 }
 
 #endif // !_WIN32
