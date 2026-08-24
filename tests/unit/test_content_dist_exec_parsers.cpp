@@ -274,7 +274,7 @@ TEST_CASE("is_shebang_payload: '#' followed by a non-'!' byte is false",
 }
 
 TEST_CASE("is_shebang_payload: ELF magic is false", "[agent][content_dist][exec]") {
-    CHECK_FALSE(is_shebang_payload("\x7fELF"));
+    CHECK_FALSE(is_shebang_payload("\x7f" "ELF"));
 }
 
 TEST_CASE("is_shebang_payload: empty input is false", "[agent][content_dist][exec]") {
