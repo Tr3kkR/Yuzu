@@ -524,8 +524,81 @@ level — the underlying logic defects are covered by new tests in `test_policy_
 `test_policy_evaluator.cpp` at the store/evaluator layer, but the route-level classification code in
 `compliance_routes.cpp` (the 503-vs-400 mapping, the audit-disposition choice) has no direct test
 coverage and could regress silently on a future change. Retrofitting a PG-backed
-`ComplianceHarness` is a genuine, separate piece of work, not a drop-in addition to this round; filed
-as a follow-up rather than solved here.
+`ComplianceHarness` is a genuine, separate piece of work, not a drop-in addition to this round;
+tracked in Follow-ups below rather than solved here (no GitHub issue exists yet as of this writing —
+"filed as a follow-up" in an earlier draft of this section overclaimed; issues are drafted,
+dedupe-checked, and filed only with an explicit go, per this repo's issue-standard).
+
+**Sixth correction (fresh Gate 4 pass — happy-path, unhappy-path, consistency-auditor — run AFTER
+the Fifth correction's fixes landed, 2026-08-24):** an earlier pass of this governance run had
+skipped Gate 4 entirely, going straight from Gate 2/3 findings to fixing; this is the correction,
+covering the full branch. happy-path: clean, no findings beyond two NICE items already covered by
+the Fifth correction. consistency-auditor: three SHOULD-level findings (all folded into this round
+except one deferred — see below) plus confirmation the Fifth correction's ADR claim (exactly four
+degrade strings, all `"policy store"`-prefixed) was accurate, not an overclaim. unhappy-path found
+one genuinely new BLOCKING defect and several SHOULD-level residuals:
+
+- **`remediate()` had no in-flight dedup, unlike `kickoff_check`'s Check-phase guard (unhappy-path
+  UP-3, BLOCKING).** Two concurrent `POST /remediate` calls for the same policy (an operator
+  double-click, or a client retry racing a slow response — an ordinary occurrence, not a rare race,
+  hence E3 not E5 in the derivation) had no guard preventing both from reaching the blocking dispatch
+  call. Each independently calls `update_agent_status(..., "fixing")`, which increments the
+  fix-attempt retry counter — so a double-click doesn't just duplicate a dispatch, it burns the
+  retry budget twice as fast and can force an agent to `error` after fewer genuine attempts than the
+  cap intends, on a fix instruction that may not be idempotent (e.g. a software install re-run).
+  Derives HIGH (I2, state/counter corruption; no raise, no cap) — blocks.
+
+  Fixed with a reservation, not a copy of `kickoff_check`'s dedupe shape: `kickoff_check`'s own
+  pattern (scan-under-lock → blocking dispatch unlocked → push-under-lock) leaves the *entire*
+  blocking-dispatch window open, which is exactly the long window that makes this hazard real — a
+  mirrored dedupe would have shipped the fix and left most of the race open. Instead, `remediate()`
+  now reserves the policy_id in a new `remediating_` set (guarded by the existing `mu_`) BEFORE the
+  blocking dispatch call, checked atomically alongside the existing `in_flight_` FixWait scan; an RAII
+  guard (`ReservationGuard`) erases the reservation on every exit path. The reservation only needs to
+  cover this call's own window — once a successful call's FixWait entry lands in `in_flight_`, that
+  entry itself is what a later concurrent call's scan sees, so the reservation and the `in_flight_`
+  scan compose rather than duplicate. New error case `"remediation already in flight for this
+  policy"` classified as 409 in the route (a business rejection, not a degrade). Residual, honestly
+  scoped: the reservation is per-process — a cross-replica double-remediate (two REST calls landing
+  on different replicas) remains possible, tracked below with `kickoff_check`'s equivalent
+  cross-replica gap, not fixed here.
+
+  This fix also made a `RemediateResult` header comment provably false: `update_agent_status`'s
+  UPSERT being "naturally idempotent against a racing manual remediate() on another replica" is true
+  for the STATUS VALUE but was never true for the retry-attempt COUNTER — amended in
+  `policy_evaluator.hpp`'s class-level doc comment.
+
+- **Folded into this round** (cheap, in files already being touched): `RemediateResult` gained an
+  explicit `bool degraded` field, set at each of `remediate()`'s four degrade return points — the
+  route's `starts_with("policy store")` prefix match (consistency-auditor SHOULD-2: an unshared,
+  untested string contract distinct from `kPolicyDbErrorPrefix`, and a future reword of any of the
+  four strings would have silently broken it with nothing to catch the break) is retired in favor of
+  reading the typed field directly. `dispatch_due()`'s per-policy `kickoff_check` degrade (UP-2) now
+  also increments `yuzu_server_policy_eval_errors_total{phase="dispatch"}`, symmetric with the
+  `phase="claim"` counter the Fifth correction added — previously warn-log-only, same silent-skip
+  consequence class the Fifth correction explicitly hardened for the claim path. The `evaluate_now()`
+  claim-before-dispatch comment's "matches the original" claim (UP-1) is corrected: true for WHO
+  consumes the interval slot, false for BLAST RADIUS — the old in-memory `last_eval_` was
+  per-replica, so a failed dispatch cost one replica's view of the interval; the new durable stamp is
+  fleet-wide, so the identical failure now costs every replica the interval, not just one (self-heals
+  after one interval; not fixed, tracked below). `docs/user-manual/rest-api.md`'s six mutator routes
+  (create_fragment/create_policy/enable/disable/invalidate/invalidate-all) had their error responses
+  documented for the first time (consistency-auditor SHOULD-3 — a doc gap on behavior THIS round
+  changed, not a pre-existing one, and so not deferrable the way the others below are).
+
+- **Deferred, recorded in Follow-ups, not fixed this round:** `delete_fragment`/`delete_policy`
+  collapsing not-found/conflict/degrade into a bare `bool` → HTTP 200 `{"deleted": false}` in all
+  three cases (consistency-auditor SHOULD-1 — same defect class, needs the same `std::expected`
+  widening the six mutators just got, but is a new signature change, not a fold-in); UP-1's fleet-wide
+  blast-radius change (self-healing, one interval, no metric — same shape as the claim-failure gap
+  the Fifth correction did instrument, arguably deserves the same treatment as a future fast-follow);
+  UP-4 through UP-11 (a TOCTOU window in `kickoff_check`'s own dedupe scan, advisory-lock release
+  timing under an ungraceful replica death, config-error/no-targets 409 ambiguity in
+  `dispatch_instruction`, no `Retry-After` hint on any new 503, `record_dispatch`'s unconditional
+  restamp on a retried no-op call, no stranded-Check sweep matching the stranded-Fix sweep, and
+  rolling-deploy crash-loop UX on a persistent boot refusal) — all SHOULD/NICE-derived, none blocking,
+  all genuinely new observations worth a future look rather than scope creep on an already-large
+  round.
 
 ### Construction — fail-closed (this store lacked it even on SQLite)
 
@@ -648,3 +721,27 @@ relying on declaration order to prove it).
   the file's pre-existing convention) never call the canonical `error_json_a4()` helper
   (`rest_a4_envelope.hpp`) — missing `correlation_id` and nullable `retry_after_ms` (`/governance`,
   architect, 2026-08-24). File-wide, not specific to this migration's lines.
+- `delete_fragment`/`delete_policy` (`policy_store.cpp`) collapse not-found, a genuine referenced-by
+  conflict, and a real DB/lease degrade into a single bare `bool` — all three read as HTTP 200
+  `{"deleted": false}` on the corresponding routes (`/governance`, consistency-auditor SHOULD-1,
+  2026-08-24). Same defect class the six mutator routes were fixed for in the Fifth correction; needs
+  the same `std::expected<bool, std::string>` widening (not-found vs `kPolicyDbErrorPrefix` degrade vs
+  `kConflictPrefix` for the referenced-fragment case) as a separate signature change.
+- `evaluate_now()`'s durable claim-before-dispatch stamp costs the WHOLE FLEET one interval on a
+  `kickoff_check` degrade, where the pre-migration in-memory `last_eval_` only cost one replica
+  (`/governance`, unhappy-path UP-1, 2026-08-24) — a real blast-radius change from the migration, not
+  a bug, self-healing after one interval, currently unmetriced (unlike the sibling `claim`/`dispatch`
+  phase counters the Fifth/Sixth corrections added). A `phase="manual"` counter on this path would be
+  the same one-line shape as those two if this becomes worth instrumenting.
+- Several more SHOULD/NICE-derived observations from the same unhappy-path pass, none blocking:
+  a TOCTOU window in `kickoff_check`'s own Check-phase dedupe scan (the mu_-released window around
+  the blocking dispatch call — the same shape UP-3 closed for remediate(), not yet closed here);
+  advisory-lock release timing under an ungraceful winning-replica death (stalls dispatch fleet-wide
+  for roughly the pool's keepalive+TCP-timeout window, no counter on the "lock not acquired" skip
+  path); `dispatch_instruction`'s `""` return conflating "no targets" with "unknown instruction id" /
+  "dispatch_fn not wired", both landing on the same misleading 409 as the legitimate no-op case; no
+  `Retry-After`/backoff hint on any of the new 503s; `record_dispatch`'s UPSERT has no conditional
+  `WHERE`, so a retry loop against a slow Check keeps sliding the durable stamp forward; no stranded-
+  Check sweep exists to match the stranded-Fix sweep `claim_due_policies` already has; a rolling
+  multi-replica deploy has no way to distinguish "wait for operator" from "keep restarting" on a
+  persistent boot refusal beyond the new runbook.

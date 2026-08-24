@@ -3031,7 +3031,7 @@ Create a new policy fragment from YAML.
 
 **Response (409):** Returned when a fragment with the same `name` already exists. Body is `{"error": "policy fragment named '<name>' already exists"}`. Audit event recorded as `policy_fragment.create / denied / duplicate_name`. Choose a different name (existing fragments are immutable on rename).
 
-**Response (503):** Policy store not yet initialized.
+**Response (503):** Policy store not yet initialized, or a genuine internal store failure on the write (safe to retry — distinct from the 400/409 rejections above, and the internal error string is never included in the body).
 
 ---
 
@@ -3115,6 +3115,10 @@ Create a new policy from YAML.
 }
 ```
 
+**Response (400):** YAML missing required fields, unknown `fragment_id`, invalid scope expression. Body is `{"error": "<reason>"}`.
+
+**Response (503):** A genuine internal store failure on the write — safe to retry, and the internal error string is never included in the body.
+
 ---
 
 #### `GET /api/policies/{id}`
@@ -3183,6 +3187,10 @@ Enable a previously disabled policy.
 }
 ```
 
+**Response (400):** `policy not found`. **Response (503):** a genuine internal
+store failure on the write — safe to retry, internal error string never
+included in the body.
+
 ---
 
 #### `POST /api/policies/{id}/disable`
@@ -3198,6 +3206,10 @@ Disable a policy, pausing compliance checks.
   "status": "disabled"
 }
 ```
+
+**Response (400):** `policy not found`. **Response (503):** a genuine internal
+store failure on the write — safe to retry, internal error string never
+included in the body.
 
 ---
 
@@ -3216,6 +3228,9 @@ Invalidate agent-side compliance cache for a specific policy. Resets all agent s
 }
 ```
 
+**Response (503):** a genuine internal store failure on the write — safe to
+retry, internal error string never included in the body.
+
 ---
 
 #### `POST /api/policies/invalidate-all`
@@ -3232,6 +3247,9 @@ Invalidate compliance cache for all policies across all agents.
   "total_invalidated": 210
 }
 ```
+
+**Response (503):** a genuine internal store failure on the write — safe to
+retry, internal error string never included in the body.
 
 ---
 
