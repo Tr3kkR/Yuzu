@@ -165,12 +165,14 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                                        CallerFn caller_fn,
                                        ResolveFn resolve_fn,
                                        yuzu::MetricsRegistry* metrics,
-                                       InstructionStore* instruction_store) {
+                                       InstructionStore* instruction_store,
+                                       ResponseScopeFn response_scope_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                     response_store, mgmt_group_store, registry, tag_store, event_bus,
                     std::move(agents_json_fn), std::move(dispatch_fn), std::move(caller_fn),
-                    std::move(resolve_fn), metrics, instruction_store);
+                    std::move(resolve_fn), metrics, instruction_store,
+                    std::move(response_scope_fn));
 }
 
 void DashboardRoutes::register_routes(HttpRouteSink& sink,
@@ -184,7 +186,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                        CallerFn caller_fn,
                                        ResolveFn resolve_fn,
                                        yuzu::MetricsRegistry* metrics,
-                                       InstructionStore* instruction_store) {
+                                       InstructionStore* instruction_store,
+                                       ResponseScopeFn response_scope_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     audit_fn_ = std::move(audit_fn);
@@ -199,6 +202,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     resolve_fn_ = std::move(resolve_fn);
     metrics_ = metrics;
     instruction_store_ = instruction_store;
+    response_scope_fn_ = std::move(response_scope_fn);
 
     // Phase 15.A — issue #547 metric registrations. The design doc
     // (docs/tar-dashboard.md §7) defines the catalog; PR-A implements the
@@ -235,6 +239,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     sink.Get("/fragments/results",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn_(req, res, "Response", "Read")) return;
+                // #1712: resolve the session so render_results can apply the
+                // per-agent response_scope_fn_ filter — a corrupt/load-failed
+                // rbac.db must yield zero rows here, not the whole fleet
+                // (mirrors PR #1711's fix for the sibling REST/MCP readers).
+                auto session = auth_fn_(req, res);
+                if (!session) return;
 
                 auto command_id = req.get_param_value("command_id");
                 auto plugin = req.get_param_value("plugin");
@@ -339,7 +349,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 auto html = render_results(command_id, plugin, sort_col, sort_dir,
                                            page, per_page, filters, text_query,
                                            definition_id, template_id,
-                                           visible_columns);
+                                           visible_columns, session->username, &req);
                 res.set_content(html, "text/html; charset=utf-8");
             });
 
@@ -1659,7 +1669,9 @@ std::string DashboardRoutes::render_results(
     const std::string& text_query,
     const std::string& definition_id,
     const std::string& template_id,
-    const std::vector<std::string>& visible_columns) {
+    const std::vector<std::string>& visible_columns,
+    const std::string& username,
+    const httplib::Request* req) {
 
     if (!response_store_) {
         return "<tbody id=\"results-tbody\"><tr><td class=\"empty-state\">"
@@ -1728,6 +1740,42 @@ std::string DashboardRoutes::render_results(
         auto count_opt = response_store_->facet_agent_count(command_id, filters);
         store_degraded = store_degraded || !count_opt.has_value();
         total_agent_count = count_opt.value_or(0);
+    }
+
+    // #1712: per-agent management-group scope filter, mirroring PR #1711's
+    // fix for the sibling REST/MCP response readers. `perm_fn_` above only
+    // gates the flat `Response:Read` permission — it has no per-agent
+    // ownership check, so without this an operator whose grant is
+    // management-group-confined would still see every agent's rows here (the
+    // fan-out is admitted, never filtered). Gated on `response_scope_fn_`
+    // being wired at all (FAIL-OPEN-WHEN-UNWIRED, matching mcp_server.hpp's
+    // ResponseScopeFn contract) — when wired to `response_agent_in_scope`
+    // (server.cpp), a corrupt/load-failed rbac.db denies EVERY agent, so this
+    // yields zero rows rather than the whole fleet. Memoized per distinct
+    // agent_id so a wide fan-out doesn't re-run the RBAC check per row.
+    if (response_scope_fn_) {
+        std::unordered_map<std::string, bool> memo;
+        std::vector<StoredResponse> visible;
+        visible.reserve(responses.size());
+        std::size_t dropped = 0;
+        for (auto& resp : responses) {
+            auto [it, inserted] = memo.try_emplace(resp.agent_id, false);
+            if (inserted)
+                it->second = response_scope_fn_(username, resp.agent_id);
+            if (it->second)
+                visible.push_back(std::move(resp));
+            else if (inserted) // count each DISTINCT dropped agent once
+                ++dropped;
+        }
+        responses.swap(visible);
+        // CC7.2 evidence: a scope-drop is a security-relevant filtering
+        // event (parity with the REST/MCP response readers' audit rows,
+        // #1634 compliance review). `req` is null only from the
+        // test-only friend-access seam, which never wires
+        // response_scope_fn_ — so this never fires there.
+        if (dropped > 0 && req && audit_fn_)
+            audit_fn_(*req, "response.read", "denied", "Execution", command_id,
+                      "scope_dropped=" + std::to_string(dropped) + " surface=fragments_results");
     }
 
     // Phase 2: parse output lines, apply per-line filters and text search

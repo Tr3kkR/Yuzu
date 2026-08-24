@@ -159,6 +159,14 @@ struct ExecHarness {
     WorkflowRoutes::CallerFn caller_fn{[](const httplib::Request&) -> yuzu::server::DispatchCaller {
         return yuzu::server::DispatchCaller{.exec_visible = yuzu::server::authz::VisibleSet{}};
     }};
+    /// #1712: per-agent response-scope predicate override, reassignable
+    /// AFTER construction (mirrors the perm_grant/caller_fn override idiom
+    /// above) — the this-capturing indirection wired into wf_deps below
+    /// always calls THIS member, so a test can flip it post-construction.
+    /// Defaults to admit-everyone so every pre-existing "executions detail"
+    /// test keeps seeing the full response set unfiltered.
+    WorkflowRoutes::ResponseScopeFn response_scope_predicate{
+        [](const std::string&, const std::string&) { return true; }};
     WorkflowRoutes routes;
 
     /// Per-process monotonic counter for execution IDs. Replaces the prior
@@ -292,6 +300,12 @@ struct ExecHarness {
             };
         }
         wf_deps.response_store = responses.get();
+        // #1712: this-capturing indirection so response_scope_predicate can
+        // be reassigned after construction (same idiom as caller_fn above).
+        wf_deps.response_scope_fn =
+            [this](const std::string& username, const std::string& agent_id) -> bool {
+            return response_scope_predicate(username, agent_id);
+        };
         // CDX-FV-03: nullptr unless opted in, so /api/workflows/* keeps its 503
         // path for every pre-existing test.
         wf_deps.workflow_engine = workflows.get();
@@ -939,6 +953,82 @@ TEST_CASE("executions detail PR2: PR-2 rows are NOT diluted by legacy fallback",
     CHECK(res->status == 200);
     CHECK(res->body.find("tagged-row") != std::string::npos);
     CHECK(res->body.find("legacy-leak") == std::string::npos);
+}
+
+// ── #1712: per-agent response-scope filter on the executions drawer ───────
+//
+// dashboard_routes.cpp:1712 fixed the sibling /fragments/results reader;
+// these pin the SAME fail-closed contract on the executions-drawer response
+// reader — a corrupt/load-failed rbac.db (simulated here via a deny-all
+// response_scope_predicate, exactly what response_agent_in_scope returns for
+// every agent when rbac_enforcement_in_effect is true and the store can't be
+// read) must yield ZERO response rows, never the whole fleet's output.
+
+TEST_CASE("executions detail #1712: a deny-all response scope (corrupt-rbac "
+          "simulation) yields zero response rows, not the agent's output",
+          "[pg][workflow][executions][detail][1712]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-scope-deny", "ScopeDeny");
+    auto eid = h.make_exec("def-scope-deny", "completed", 1, 1, 0,
+                           /*dispatched_at=*/1735689600);
+    h.agent_status(eid, "agent-secret", "success", 0, "", 1735689601);
+    h.store_response("cmd-scope-deny", "agent-secret", "sensitive-output",
+                     /*execution_id=*/eid, 1735689601);
+
+    // Simulate a corrupt/load-failed rbac.db: response_agent_in_scope denies
+    // every agent when rbac_enforcement_in_effect is true and the store
+    // can't answer check_scoped_permission.
+    h.response_scope_predicate = [](const std::string&, const std::string&) { return false; };
+
+    auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // The response is dropped entirely — never rendered, not even behind a
+    // "denied" marker that would still leak its existence/content.
+    CHECK(res->body.find("sensitive-output") == std::string::npos);
+    CHECK(res->body.find("No responses recorded.") != std::string::npos);
+}
+
+TEST_CASE("executions detail #1712: out-of-scope agent's response is dropped "
+          "while an in-scope agent's response is kept, with a denied audit row",
+          "[pg][workflow][executions][detail][1712]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-scope-mix", "ScopeMix");
+    auto eid = h.make_exec("def-scope-mix", "completed", 2, 2, 0,
+                           /*dispatched_at=*/1735689600);
+    h.agent_status(eid, "agent-in-scope", "success", 0, "", 1735689601);
+    h.agent_status(eid, "agent-out-of-scope", "success", 0, "", 1735689602);
+    h.store_response("cmd-scope-mix", "agent-in-scope", "visible-output",
+                     /*execution_id=*/eid, 1735689601);
+    h.store_response("cmd-scope-mix", "agent-out-of-scope", "hidden-output",
+                     /*execution_id=*/eid, 1735689602);
+
+    // Only "agent-in-scope" is in the caller's management group.
+    h.response_scope_predicate = [](const std::string&, const std::string& agent_id) {
+        return agent_id == "agent-in-scope";
+    };
+
+    auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("visible-output") != std::string::npos);
+    CHECK(res->body.find("hidden-output") == std::string::npos);
+
+    // CC7.2 evidence: the drop is audited (parity with the REST/MCP response
+    // readers' scope_dropped audit rows, #1634 compliance review).
+    bool found_denied_audit = false;
+    for (const auto& call : h.audit_calls) {
+        if (call.action == "response.read" && call.result == "denied" &&
+            call.target_id == eid && call.detail.find("surface=executions_drawer") !=
+                                          std::string::npos) {
+            found_denied_audit = true;
+        }
+    }
+    CHECK(found_denied_audit);
 }
 
 // ── Gate-7 hardening regression net for PR 2 ──────────────────────────────

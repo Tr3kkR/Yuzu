@@ -66,6 +66,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     auto* policy_store = deps.policy_store;
     auto* approval_manager = deps.approval_manager;
     auto* response_store = deps.response_store;
+    auto response_scope_fn = std::move(deps.response_scope_fn);
     auto* execution_event_bus = deps.execution_event_bus;
     auto* metrics = deps.metrics;
     auto cmd_dispatch = std::move(deps.command_dispatch_fn);
@@ -261,7 +262,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get(
         R"(/fragments/executions/([A-Za-z0-9_-]{1,128})/detail)",
         [auth_fn, perm_fn, audit_fn, execution_tracker, instruction_store,
-         response_store](const httplib::Request& req, httplib::Response& res) {
+         response_store, response_scope_fn](const httplib::Request& req, httplib::Response& res) {
             auto session = auth_fn(req, res);
             if (!session)
                 return;
@@ -585,6 +586,45 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     }
                 }
                 std::vector<StoredResponse> filtered = std::move(responses);
+
+                // #1712: per-agent management-group scope filter, mirroring
+                // PR #1711's fix for the sibling REST/MCP response readers.
+                // `perm_fn` above only gates the flat `Execution:Read`
+                // permission — it has no per-agent ownership check on the
+                // response rows this drawer renders, so without this an
+                // operator whose grant is management-group-confined would
+                // still see every agent's output/error text here. Gated on
+                // `response_scope_fn` being wired at all
+                // (FAIL-OPEN-WHEN-UNWIRED, matching mcp_server.hpp's
+                // ResponseScopeFn contract) — when wired to
+                // `response_agent_in_scope` (server.cpp), a corrupt/
+                // load-failed rbac.db denies EVERY agent, so this yields
+                // zero rows rather than the whole fleet. Memoized per
+                // distinct agent_id so a wide fan-out doesn't re-run the
+                // RBAC check per row.
+                if (response_scope_fn) {
+                    std::unordered_map<std::string, bool> memo;
+                    std::vector<StoredResponse> visible;
+                    visible.reserve(filtered.size());
+                    std::size_t dropped = 0;
+                    for (auto& r : filtered) {
+                        auto [it, inserted] = memo.try_emplace(r.agent_id, false);
+                        if (inserted)
+                            it->second = response_scope_fn(session->username, r.agent_id);
+                        if (it->second)
+                            visible.push_back(std::move(r));
+                        else if (inserted) // count each DISTINCT dropped agent once
+                            ++dropped;
+                    }
+                    filtered.swap(visible);
+                    // CC7.2 evidence: a scope-drop is a security-relevant
+                    // filtering event (parity with the REST/MCP response
+                    // readers' audit rows, #1634 compliance review).
+                    if (dropped > 0)
+                        audit_fn(req, "response.read", "denied", "Execution", exec.id,
+                                "scope_dropped=" + std::to_string(dropped) +
+                                    " surface=executions_drawer");
+                }
 
                 html += std::format("<details class=\"per-agent-responses\">"
                                     "<summary>Show responses ({})</summary>",

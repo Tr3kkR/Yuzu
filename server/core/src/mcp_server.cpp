@@ -365,7 +365,10 @@ static const ToolDef kTools[] = {
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}}},"required":["agents"]})j"},
 
-    {"get_agent_details", "Get detailed info for a single agent including tags and inventory.",
+    {"get_agent_details",
+     "Get detailed info for a single agent including tags and inventory. #1700: an agent_id "
+     "outside the caller's management-group scope renders identically to 'Agent not found' "
+     "(never a distinct error), so existence itself is not disclosed.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"description":"Agent ID"}},"required":["agent_id"]})",
      R"j({"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"tags":{"type":"array","items":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"source":{"type":"string"}},"required":["key","value","source"]}}},"required":["agent_id","hostname","os","arch","agent_version"]})j"},
 
@@ -4760,6 +4763,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (agent_id.empty()) {
                     res.set_content(error_response(id, kInvalidParams, "agent_id is required"),
                                     "application/json");
+                    return;
+                }
+                // #1700: management-group scope gate (mirrors #1653's S2 fix
+                // for summarize_working_set kind=agent). Without this, an
+                // operator scoped to one management group could confirm the
+                // existence of, and recover the hostname/os of, an agent in
+                // another group — hostname/os often encode role and site. An
+                // out-of-scope agent_id is rendered IDENTICALLY to not-found
+                // so existence itself does not leak. Unwired scope fn →
+                // legacy-open, matching query_responses/summarize_working_set.
+                const bool in_scope =
+                    !response_scope_fn || response_scope_fn(session->username, agent_id);
+                if (!in_scope) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "Agent not found: " + agent_id),
+                        "application/json");
                     return;
                 }
                 // Find agent in registry

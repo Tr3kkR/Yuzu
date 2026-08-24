@@ -79,6 +79,23 @@ public:
     using CallerFn =
         std::function<yuzu::server::DispatchCaller(const httplib::Request&)>;
 
+    /// Per-agent Response-scope predicate (#1712 / #1634 class) for the
+    /// executions-drawer response reader. Returns true iff `username` may see
+    /// `agent_id`'s rows. Wired in server.cpp to the SAME
+    /// `response_agent_in_scope` helper the REST/MCP response readers use, so
+    /// this surface shares ONE fail-closed implementation rather than a
+    /// drifted copy — a corrupt/load-failed rbac.db makes
+    /// `response_agent_in_scope` deny every agent, which is what turns a
+    /// corrupt store into zero rows here instead of the whole fleet (mirrors
+    /// PR #1711's fix for the sibling REST/MCP response readers).
+    ///
+    /// FAIL-OPEN-WHEN-UNWIRED, deliberately, matching `mcp_server.hpp`'s
+    /// `ResponseScopeFn` contract: the default-constructed `{}` means an
+    /// unset predicate applies NO filter (legacy behaviour, e.g. test
+    /// harnesses that don't wire RBAC at all).
+    using ResponseScopeFn =
+        std::function<bool(const std::string& username, const std::string& agent_id)>;
+
     /// PR 2.5 — deps-struct refactor (#670).
     ///
     /// `register_routes` had grown to 16 arguments across two overloads.
@@ -114,6 +131,10 @@ public:
         CallerFn caller_fn;
         ApprovalManager* approval_manager{nullptr};
         ResponseStore* response_store{nullptr};
+        /// #1712: per-agent scope filter for the executions-drawer response
+        /// reader (`/fragments/executions/{id}/detail`). Default-constructed
+        /// `{}` = unwired = no filter (test harnesses that don't wire RBAC).
+        ResponseScopeFn response_scope_fn;
         /// PR 3 — per-execution SSE event bus for `/sse/executions/{id}`.
         /// When non-null, `ExecutionTracker` publishers (update_agent_status,
         /// refresh_counts, mark_cancelled) emit transitions onto this bus

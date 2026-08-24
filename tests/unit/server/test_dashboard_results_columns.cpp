@@ -62,11 +62,19 @@ struct DashboardResultsColumnsTestAccess {
         routes.instruction_store_ = is;
         routes.response_store_ = rs;
     }
+    // #1712: test-only access to the private per-agent scope predicate.
+    // Unset (default) means render_results applies NO filter, matching
+    // every pre-existing test in this file.
+    void set_response_scope_fn(DashboardRoutes::ResponseScopeFn fn) {
+        routes.response_scope_fn_ = std::move(fn);
+    }
     std::string render(const std::string& command_id, const std::string& plugin,
-                       const std::string& definition_id = {}) {
+                       const std::string& definition_id = {},
+                       const std::string& username = {}) {
         return routes.render_results(command_id, plugin, /*sort_col=*/"agent",
                                      /*sort_dir=*/"asc", /*page=*/1, /*per_page=*/50,
-                                     /*filters=*/{}, /*text_query=*/"", definition_id);
+                                     /*filters=*/{}, /*text_query=*/"", definition_id,
+                                     /*template_id=*/{}, /*visible_columns=*/{}, username);
     }
     std::string render_filter_bar(const std::string& command_id, const std::string& plugin) {
         return routes.render_filter_bar(command_id, plugin);
@@ -247,6 +255,81 @@ TEST_CASE("render_filter_bar: a degraded facet read disables the dropdown "
     CHECK(contains(html, "disabled"));
     CHECK(contains(html, "(unavailable)"));
     CHECK(contains(html, "response store degraded"));
+}
+
+// ── #1712: per-agent response-scope filter on /fragments/results ──────────
+//
+// Mirrors PR #1711's fix for the sibling REST/MCP response readers: a
+// corrupt/load-failed rbac.db must yield ZERO response rows here, never the
+// whole fleet's output. A deny-all response_scope_fn_ simulates exactly what
+// response_agent_in_scope (server.cpp) returns for every agent when
+// rbac_enforcement_in_effect is true and the store can't answer
+// check_scoped_permission.
+
+TEST_CASE("render_results #1712: a deny-all response scope (corrupt-rbac "
+          "simulation) yields zero rows, not the agent's output",
+          "[pg][server][dashboard][render_results][1712]") {
+    InstructionStore is{":memory:"};
+    REQUIRE(is.is_open());
+
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    const std::string command_id = "cmd-scope-deny";
+    StoredResponse r;
+    r.instruction_id = command_id;
+    r.agent_id = "agent-secret";
+    r.received_at_ms = 1000;
+    r.status = 0;
+    r.output = "sensitive-output";
+    rs.store(r);
+
+    DashboardResultsColumnsTestAccess acc;
+    acc.set_stores(&is, &rs);
+    acc.set_response_scope_fn([](const std::string&, const std::string&) { return false; });
+    const std::string html = acc.render(command_id, "registry", /*definition_id=*/{},
+                                        /*username=*/"confined-operator");
+
+    CHECK_FALSE(contains(html, "sensitive-output"));
+    CHECK_FALSE(contains(html, "agent-secret"));
+}
+
+TEST_CASE("render_results #1712: out-of-scope agent's row is dropped while an "
+          "in-scope agent's row is kept",
+          "[pg][server][dashboard][render_results][1712]") {
+    InstructionStore is{":memory:"};
+    REQUIRE(is.is_open());
+
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    const std::string command_id = "cmd-scope-mix";
+    StoredResponse in_scope;
+    in_scope.instruction_id = command_id;
+    in_scope.agent_id = "agent-in-scope";
+    in_scope.received_at_ms = 1000;
+    in_scope.status = 0;
+    in_scope.output = "visible-output";
+    rs.store(in_scope);
+    StoredResponse out_of_scope;
+    out_of_scope.instruction_id = command_id;
+    out_of_scope.agent_id = "agent-out-of-scope";
+    out_of_scope.received_at_ms = 1001;
+    out_of_scope.status = 0;
+    out_of_scope.output = "hidden-output";
+    rs.store(out_of_scope);
+
+    DashboardResultsColumnsTestAccess acc;
+    acc.set_stores(&is, &rs);
+    acc.set_response_scope_fn([](const std::string&, const std::string& agent_id) {
+        return agent_id == "agent-in-scope";
+    });
+    const std::string html = acc.render(command_id, "registry", /*definition_id=*/{},
+                                        /*username=*/"confined-operator");
+
+    CHECK(contains(html, "visible-output"));
+    CHECK_FALSE(contains(html, "hidden-output"));
+    CHECK_FALSE(contains(html, "agent-out-of-scope"));
 }
 
 } // namespace yuzu::server

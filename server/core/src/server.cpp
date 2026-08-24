@@ -18009,7 +18009,15 @@ private:
                 }
                 return {"", ""};
             },
-            &metrics_, instruction_store_.get());
+            &metrics_, instruction_store_.get(),
+            // #1712: per-agent Response-scope predicate for the
+            // /fragments/results reader. Routes through the SAME
+            // response_agent_in_scope helper as the REST/MCP response
+            // readers (#1634) so a corrupt/load-failed rbac.db fails closed
+            // here too, instead of disclosing the whole fleet.
+            [this](const std::string& username, const std::string& agent_id) -> bool {
+                return response_agent_in_scope(username, agent_id);
+            });
 
         // WorkflowRoutes — /fragments/executions, /fragments/schedules, /api/workflows/*,
         //                   /api/workflow-executions/*, /api/product-packs/*, /api/scope/estimate
@@ -18071,6 +18079,14 @@ private:
         };
         wf_deps.approval_manager = approval_manager_.get();
         wf_deps.response_store = response_store_.get();
+        // #1712: per-agent Response-scope predicate for the executions-drawer
+        // reader. Routes through the SAME response_agent_in_scope helper as
+        // the REST/MCP response readers and the DashboardRoutes wiring above
+        // (#1634) so a corrupt/load-failed rbac.db fails closed here too.
+        wf_deps.response_scope_fn =
+            [this](const std::string& username, const std::string& agent_id) -> bool {
+            return response_agent_in_scope(username, agent_id);
+        };
         // PR 3 — SSE event bus for live execution updates. Server owns
         // the bus; ExecutionTracker publishes onto it; SSE handler
         // subscribes per-connection.

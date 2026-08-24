@@ -5053,6 +5053,55 @@ TEST_CASE("MCP Agentic demo: summarize_working_set agent kind enforces group sco
     CHECK(out_res->body.find("windows") == std::string::npos); // os must NOT leak
 }
 
+TEST_CASE("MCP Integration: get_agent_details enforces management-group scope (#1700)",
+          "[mcp][integration][scope][1700]") {
+    McpTestServer ts;
+    // Operator scoped to agent-001 only; agent-002 (db-01 / windows) is out of scope.
+    // Mirrors the summarize_working_set kind=agent G-S2 fix (#1653) this
+    // handler had been left out of.
+    ts.response_scope_fn_for_test = [](const std::string&, const std::string& agent_id) -> bool {
+        return agent_id == "agent-001";
+    };
+    ts.start("readonly");
+
+    // In-scope agent: found, full details disclosed as before.
+    auto in_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":700,"params":{"name":"get_agent_details","arguments":{"agent_id":"agent-001"}}})");
+    REQUIRE(in_res);
+    CHECK(in_res->status == 200);
+    auto in_body = nlohmann::json::parse(in_res->body);
+    REQUIRE(in_body.contains("result"));
+    auto in_text =
+        nlohmann::json::parse(in_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(in_text["agent_id"] == "agent-001");
+    CHECK(in_text["hostname"] == "web-01");
+
+    // Out-of-scope agent: rendered IDENTICALLY to a genuinely unknown agent_id
+    // — same error code, same "Agent not found: <id>" message shape — so
+    // existence itself is not disclosed; hostname/os must not leak anywhere
+    // in the response body either.
+    auto out_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":701,"params":{"name":"get_agent_details","arguments":{"agent_id":"agent-002"}}})");
+    REQUIRE(out_res);
+    CHECK(out_res->status == 200);
+    auto out_body = nlohmann::json::parse(out_res->body);
+    REQUIRE(out_body.contains("error"));
+    CHECK(out_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(out_body["error"]["message"].get<std::string>().find("Agent not found: agent-002") !=
+          std::string::npos);
+    CHECK(out_res->body.find("db-01") == std::string::npos);   // hostname must NOT leak
+    CHECK(out_res->body.find("windows") == std::string::npos); // os must NOT leak
+
+    // Sanity: a genuinely unknown agent_id (not merely out-of-scope) produces
+    // the SAME error shape — proving out-of-scope isn't distinguishable from
+    // not-found by a client inspecting the response.
+    auto unknown_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":702,"params":{"name":"get_agent_details","arguments":{"agent_id":"no-such-agent"}}})");
+    REQUIRE(unknown_res);
+    auto unknown_body = nlohmann::json::parse(unknown_res->body);
+    CHECK(unknown_body["error"]["code"] == out_body["error"]["code"]);
+}
+
 TEST_CASE("MCP Agentic demo: summarize_working_set execution kind requires Execution:Read (G-S2)",
           "[mcp][integration][agentic-demo][scope][review-1653]") {
     auto db_path = yuzu::test::unique_temp_path("test-mcp-exec-scope-");

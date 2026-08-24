@@ -77,6 +77,23 @@ public:
     using ResolveFn = std::function<std::pair<std::string, std::string>(
         const std::string& instruction_text)>;
 
+    /// Per-agent Response-scope predicate (#1712 / #1634 class). Returns true
+    /// iff `username` may see `agent_id`'s rows. Wired in server.cpp to the
+    /// SAME `response_agent_in_scope` helper the REST/MCP response readers
+    /// use (`ServerImpl::response_agent_in_scope`), so this surface shares
+    /// ONE fail-closed implementation rather than a drifted copy — a
+    /// corrupt/load-failed rbac.db makes `response_agent_in_scope` deny every
+    /// agent, which is what turns a corrupt store into zero rows here instead
+    /// of the whole fleet (mirrors PR #1711's fix for the sibling REST/MCP
+    /// response readers).
+    ///
+    /// FAIL-OPEN-WHEN-UNWIRED, deliberately, matching `mcp_server.hpp`'s
+    /// `ResponseScopeFn` contract: the default `= {}` means an unset
+    /// predicate applies NO filter (legacy behaviour, e.g. test harnesses
+    /// that don't wire RBAC at all).
+    using ResponseScopeFn =
+        std::function<bool(const std::string& username, const std::string& agent_id)>;
+
     void register_routes(httplib::Server& svr,
                          AuthFn auth_fn,
                          PermFn perm_fn,
@@ -91,7 +108,8 @@ public:
                          CallerFn caller_fn,
                          ResolveFn resolve_fn,
                          yuzu::MetricsRegistry* metrics = nullptr,
-                         InstructionStore* instruction_store = nullptr);
+                         InstructionStore* instruction_store = nullptr,
+                         ResponseScopeFn response_scope_fn = {});
 
     /// HttpRouteSink overload — identical registration against the polymorphic
     /// seam so the fragment handlers (notably the destructive TAR
@@ -112,7 +130,8 @@ public:
                          CallerFn caller_fn,
                          ResolveFn resolve_fn,
                          yuzu::MetricsRegistry* metrics = nullptr,
-                         InstructionStore* instruction_store = nullptr);
+                         InstructionStore* instruction_store = nullptr,
+                         ResponseScopeFn response_scope_fn = {});
 
     /// Operator-declared external origins for the CSRF same-site gate (#2537),
     /// already normalised by `normalise_trusted_origins` at boot. Set BEFORE
@@ -132,6 +151,7 @@ private:
     AuthFn auth_fn_;
     PermFn perm_fn_;
     AuditFn audit_fn_;
+    ResponseScopeFn response_scope_fn_;
     ResponseStore* response_store_{nullptr};
     ManagementGroupStore* mgmt_group_store_{nullptr};
     detail::AgentRegistry* registry_{nullptr};
@@ -168,6 +188,13 @@ private:
     /// the listed plugin column names are rendered (the "Agent" pseudo-
     /// column is always shown). @p template_id is propagated through pager
     /// / sort URLs so that switching pages doesn't drop the chosen template.
+    /// #1712: @p username + @p req are used ONLY to apply the per-agent
+    /// `response_scope_fn_` filter (and audit a drop, when @p req is
+    /// non-null) — a corrupt/load-failed rbac.db must yield zero rows here,
+    /// never the whole fleet. Both default so the existing test-only
+    /// friend-access seam (DashboardResultsColumnsTestAccess) keeps working
+    /// unchanged: `response_scope_fn_` is unset there, so the filter never
+    /// activates regardless of @p username.
     std::string render_results(const std::string& command_id, const std::string& plugin,
                                const std::string& sort_col, const std::string& sort_dir,
                                int page, int per_page,
@@ -175,7 +202,9 @@ private:
                                const std::string& text_query,
                                const std::string& definition_id = {},
                                const std::string& template_id = {},
-                               const std::vector<std::string>& visible_columns = {});
+                               const std::vector<std::string>& visible_columns = {},
+                               const std::string& username = {},
+                               const httplib::Request* req = nullptr);
 
     /// Render filter controls for a plugin schema. When @p definition_id is
     /// non-empty it's emitted as a hidden form input so subsequent
