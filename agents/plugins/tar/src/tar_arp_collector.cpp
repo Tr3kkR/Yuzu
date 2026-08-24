@@ -169,38 +169,34 @@ std::vector<ArpEntry> enumerate_arp() {
     }
 
     const auto parsed = yuzu::shared::parse_rt_flags_llinfo(std::span{fetch.blob});
+    // classify_arp_collection + should_warn_ratelimited are pure and unit-
+    // tested directly against fixture facts (tests/unit/test_tar_arp.cpp);
+    // only the std::atomic latches below are impure.
+    const auto status = classify_arp_collection(fetch.ok, parsed.truncated, parsed.records.size());
 
     // Rate-limit the partial-table warn, same pattern as the Windows leg's
     // cap warn below: once when it begins, suppressed until a subsequent
     // read comes back whole.
     static std::atomic<bool> s_arp_parse_truncated_warned{false};
-    if (parsed.truncated) {
-        if (!s_arp_parse_truncated_warned.exchange(true))
-            spdlog::warn("TAR arp: NET_RT_FLAGS read returned a partial table (repeats "
-                         "suppressed until it clears)");
-    } else {
-        s_arp_parse_truncated_warned.store(false);
-    }
+    const bool was_parse_truncated_warned =
+        s_arp_parse_truncated_warned.exchange(status.parse_truncated);
+    if (should_warn_ratelimited(status.parse_truncated, was_parse_truncated_warned))
+        spdlog::warn("TAR arp: NET_RT_FLAGS read returned a partial table (repeats "
+                     "suppressed until it clears)");
 
     out.reserve(parsed.records.size());
-    bool cap_hit = false;
     for (const auto& rec : parsed.records) {
-        if (out.size() >= kArpEntryCap) {
-            cap_hit = true;
+        if (out.size() >= kArpEntryCap)
             break;
-        }
         out.push_back(arp_entry_from_route_record(rec));
     }
 
     static std::atomic<bool> s_arp_cap_warned{false};
-    if (cap_hit) {
-        if (!s_arp_cap_warned.exchange(true))
-            spdlog::warn("TAR arp: entry cap {} reached — truncating (repeats suppressed until it "
-                         "clears)",
-                         kArpEntryCap);
-    } else {
-        s_arp_cap_warned.store(false);
-    }
+    const bool was_cap_warned = s_arp_cap_warned.exchange(status.capped);
+    if (should_warn_ratelimited(status.capped, was_cap_warned))
+        spdlog::warn("TAR arp: entry cap {} reached — truncating (repeats suppressed until it "
+                     "clears)",
+                     kArpEntryCap);
 
     // The partial table (if any) is still returned — an ARP table is a SET,
     // and the neighbours that DID parse are individually true; the operator

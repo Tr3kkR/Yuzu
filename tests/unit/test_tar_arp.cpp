@@ -13,6 +13,11 @@
  *     (tests/unit/test_route_sysctl_arp.cpp); this only covers the thin
  *     {ip, mac} -> ArpEntry mapping layer this package adds on top, fed
  *     constructed records.
+ *   - classify_arp_collection() / should_warn_ratelimited(): the
+ *     failed-fetch, kernel-truncated-read, and over-cap warn decisions the
+ *     macOS leg of enumerate_arp() makes, extracted to pure functions so
+ *     they're directly assertable against fixture facts instead of only
+ *     reachable through a live sysctl call.
  */
 
 #include "tar_arp_parsers.hpp"
@@ -128,6 +133,91 @@ TEST_CASE("parse_proc_net_arp: an under-cap table is not reported as truncated",
     const auto parsed = parse_proc_net_arp(kRealProcNetArp, /*cap=*/10);
     CHECK_FALSE(parsed.truncated);
     CHECK(parsed.entries.size() == 3);
+}
+
+// ── classify_arp_collection / should_warn_ratelimited ───────────────────────
+//
+// The macOS leg of enumerate_arp() (tar_arp_collector.cpp) makes three warn
+// decisions from a fetch/parse result -- failed fetch, a kernel-truncated
+// read, and an entry count over kArpEntryCap -- previously embedded directly
+// in that impure function and untested. These fixture-fed cases exercise
+// the extracted pure classify_arp_collection()/should_warn_ratelimited()
+// functions directly; no sysctl call, process spawn, or sleep involved.
+
+TEST_CASE("classify_arp_collection: a failed fetch reports fetch_failed and nothing else",
+          "[tar][arp][classify]") {
+    // parse_truncated/record_count are irrelevant once the fetch itself
+    // failed -- pass values that would otherwise trip truncated/capped to
+    // prove fetch_failed short-circuits them.
+    const auto status = classify_arp_collection(/*fetch_ok=*/false, /*parse_truncated=*/true,
+                                                  /*record_count=*/9999, /*cap=*/10);
+    CHECK(status.fetch_failed);
+    CHECK_FALSE(status.parse_truncated);
+    CHECK_FALSE(status.capped);
+}
+
+TEST_CASE("classify_arp_collection: a successful, whole, under-cap read is clean",
+          "[tar][arp][classify]") {
+    const auto status = classify_arp_collection(/*fetch_ok=*/true, /*parse_truncated=*/false,
+                                                  /*record_count=*/5, /*cap=*/10);
+    CHECK_FALSE(status.fetch_failed);
+    CHECK_FALSE(status.parse_truncated);
+    CHECK_FALSE(status.capped);
+}
+
+TEST_CASE("classify_arp_collection: a kernel-truncated read is reported independent of the cap",
+          "[tar][arp][classify]") {
+    const auto status = classify_arp_collection(/*fetch_ok=*/true, /*parse_truncated=*/true,
+                                                  /*record_count=*/5, /*cap=*/10);
+    CHECK_FALSE(status.fetch_failed);
+    CHECK(status.parse_truncated);
+    CHECK_FALSE(status.capped); // 5 records, cap 10 -- under cap even though truncated
+}
+
+TEST_CASE("classify_arp_collection: a record count over the cap is capped",
+          "[tar][arp][classify]") {
+    const auto status = classify_arp_collection(/*fetch_ok=*/true, /*parse_truncated=*/false,
+                                                  /*record_count=*/11, /*cap=*/10);
+    CHECK_FALSE(status.fetch_failed);
+    CHECK_FALSE(status.parse_truncated);
+    CHECK(status.capped);
+}
+
+TEST_CASE("classify_arp_collection: a record count exactly at the cap is NOT capped",
+          "[tar][arp][classify]") {
+    // No entry was actually omitted at an exact match -- "capped" means a
+    // valid entry was omitted, not merely that the count reached the cap.
+    const auto status = classify_arp_collection(/*fetch_ok=*/true, /*parse_truncated=*/false,
+                                                  /*record_count=*/10, /*cap=*/10);
+    CHECK_FALSE(status.capped);
+}
+
+TEST_CASE("should_warn_ratelimited: warns only on the transition into true",
+          "[tar][arp][classify]") {
+    CHECK(should_warn_ratelimited(/*condition=*/true, /*previously_latched=*/false));
+    CHECK_FALSE(should_warn_ratelimited(/*condition=*/true, /*previously_latched=*/true));
+}
+
+TEST_CASE("should_warn_ratelimited: never warns while the condition is false",
+          "[tar][arp][classify]") {
+    CHECK_FALSE(should_warn_ratelimited(/*condition=*/false, /*previously_latched=*/false));
+    CHECK_FALSE(should_warn_ratelimited(/*condition=*/false, /*previously_latched=*/true));
+}
+
+TEST_CASE("should_warn_ratelimited: the latch clears and can warn again on the next occurrence",
+          "[tar][arp][classify]") {
+    // Simulates the collector's own exchange() sequence across three calls:
+    // condition begins true (warn), clears (no warn, latch resets), then
+    // returns true again -- the latch clearing must let it warn again
+    // rather than staying suppressed forever.
+    bool latched = false;
+    CHECK(should_warn_ratelimited(true, latched));
+    latched = true; // collector's exchange(true) after the warn above
+
+    CHECK_FALSE(should_warn_ratelimited(false, latched));
+    latched = false; // collector's exchange(false) once the condition clears
+
+    CHECK(should_warn_ratelimited(true, latched));
 }
 
 #ifdef __APPLE__

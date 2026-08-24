@@ -128,6 +128,42 @@ inline ProcNetArpParse parse_proc_net_arp(const std::string& text,
     return out;
 }
 
+/// Pure classification of an `arp` collection outcome from a fetch/parse
+/// result. Fetch failure, a kernel-truncated read, and an entry count over
+/// the cap are three independent facts the (impure) collector must each
+/// turn into a rate-limited warn decision -- extracted here so each state
+/// is directly unit-testable (tests/unit/test_tar_arp.cpp) without invoking
+/// a real sysctl/procfs read. Currently consumed by the macOS leg of
+/// enumerate_arp() (tar_arp_collector.cpp); fetch_failed is always false
+/// coming from the Linux leg, which has no separate fetch stage.
+struct ArpCollectionStatus {
+    bool fetch_failed{false};
+    bool parse_truncated{false};
+    bool capped{false};
+};
+
+inline ArpCollectionStatus classify_arp_collection(bool fetch_ok, bool parse_truncated,
+                                                     std::size_t record_count,
+                                                     std::size_t cap = kArpEntryCap) {
+    if (!fetch_ok)
+        return ArpCollectionStatus{.fetch_failed = true};
+    return ArpCollectionStatus{
+        .parse_truncated = parse_truncated,
+        .capped = record_count > cap,
+    };
+}
+
+/// Pure decision behind every once-when-it-begins/reset-when-it-clears
+/// rate-limited warn in this collector (the macOS parse-truncated + cap
+/// warns above, and the same pattern in the Linux/Windows legs): warn only
+/// on the transition into `condition` being true, not on every call while
+/// it stays true, and stop warning again immediately once it clears --
+/// callers derive `previously_latched` via
+/// `atomic<bool>::exchange(condition)`, keeping the latch update atomic.
+inline bool should_warn_ratelimited(bool condition, bool previously_latched) {
+    return condition && !previously_latched;
+}
+
 #ifdef __APPLE__
 
 /// Map one decoded route_sysctl_arp.hpp record onto the TAR ArpEntry shape.
