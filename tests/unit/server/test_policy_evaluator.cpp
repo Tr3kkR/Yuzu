@@ -21,6 +21,7 @@
 #include "instruction_store.hpp"
 #include "management_group_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "test_mgmt_group_pg_helper.hpp"
 #include "policy_evaluator.hpp"
 #include "policy_store.hpp"
@@ -29,6 +30,7 @@
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
 
 #include <map>
 #include <stdexcept>
@@ -38,7 +40,9 @@
 #include <vector>
 
 using namespace yuzu::server;
+using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
+using yuzu::server::pg::PgResult;
 
 namespace {
 
@@ -205,6 +209,33 @@ TEST_CASE("policy evaluator: compliant + non_compliant verdicts (multi-agent fan
 
     CHECK(h.status_of(pid, "agentA") == "compliant");
     CHECK(h.status_of(pid, "agentB") == "non_compliant");
+}
+
+TEST_CASE("policy evaluator: evaluate_now does not dispatch when record_dispatch fails "
+          "(adversarial review, round 2)",
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    auto pid = h.author("result.hostname != ''");
+
+    // Drop the durable claim table out from under the live store — a
+    // reproducible stand-in for a transient connection loss / botched
+    // migration. record_dispatch() (called first inside evaluate_now())
+    // must now fail, and evaluate_now() must NOT proceed to dispatch: a
+    // dispatch that runs without a durable stamp is exactly the "next
+    // automatic tick sees no row and re-claims immediately" bug this
+    // store's dispatch-claim design exists to prevent.
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult r{PQexec(conn.get(), "DROP TABLE policy_store.policy_dispatch_state CASCADE")};
+        REQUIRE(r.ok());
+    }
+
+    PolicyEvaluator ev(h.deps());
+    CHECK(ev.evaluate_now(pid).empty());
+    CHECK(h.dispatch_calls == 0);
 }
 
 TEST_CASE("policy evaluator: non-responder -> unknown, plugin failure -> error",

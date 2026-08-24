@@ -842,6 +842,43 @@ description: missing fragment field
 }
 
 // ============================================================================
+// Degrade behaviour — detail-query failures (adversarial review, round 2)
+// ============================================================================
+
+TEST_CASE("PolicyStore: get_policy/query_policies degrade on a detail-table failure, "
+          "never a partial policy",
+          "[policy_store][pg][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto yaml = make_policy_yaml(frag.value(), "Detail-Degrade Policy");
+    auto pol = store.create_policy(yaml);
+    REQUIRE(pol.has_value());
+
+    // Sanity: the policy has real details before the table is dropped.
+    auto before = store.get_policy(pol.value());
+    REQUIRE(before.has_value());
+    REQUIRE(before->has_value());
+    REQUIRE((*before)->triggers.size() == 2);
+
+    // OWN clone: drops the triggers table out from under the live store —
+    // a reproducible stand-in for a transient connection loss / botched
+    // migration (same mechanism test_tag_store.cpp uses).
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult r{PQexec(conn.get(), "DROP TABLE policy_store.policy_triggers CASCADE")};
+        REQUIRE(r.ok());
+    }
+
+    CHECK_FALSE(store.get_policy(pol.value()).has_value());
+    CHECK_FALSE(store.query_policies().has_value());
+}
+
+// ============================================================================
 // Compliance tracking
 // ============================================================================
 
