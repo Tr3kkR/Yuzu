@@ -786,18 +786,46 @@ TEST_CASE("ProductPackStore::install: a partial compensation increments the comp
               .value() == 1);
 }
 
-// ── Ambiguous-commit-ack safety (Gate 5 CHAOS-1, #3481) ──────────────────────
+// ── Ambiguous-commit-ack safety (Gate 5 CHAOS-1/CHAOS-1b, #3481) ─────────────
 //
 // A real network fault landing between Postgres processing COMMIT and the client reading
-// PGRES_COMMAND_OK is a genuine hazard that cannot be reproduced deterministically without a
-// connection-level fault-injecting proxy this test suite doesn't have. What IS directly
-// testable, and what these three cases prove instead: the check_pack_row_exists decision seam
-// itself — the exact mechanism install()'s final-persist failure path now consults before
-// deciding whether compensating is safe. Recorded as `likely`, not `verified`, in governance
-// terms: verified against this seam, reasoned (not fault-injection-proven) for the full
-// ambiguous-commit integration.
+// PGRES_COMMAND_OK — or a middlebox/pooler severing the client's connection at a moment
+// uncorrelated with the backend's own commit progress (CHAOS-1b) — is a genuine hazard that
+// cannot be reproduced deterministically without a connection-level fault-injecting proxy this
+// test suite doesn't have. What IS directly testable, and what these three cases prove instead:
+// the check_transaction_outcome decision seam itself — the exact mechanism install()'s
+// final-persist failure path now consults before deciding whether compensating is safe. Unlike
+// the row-visibility check it replaced, all three of THIS mechanism's real outcomes (committed,
+// aborted, still in progress) are directly, deterministically producible with two connections —
+// no fault injection needed for the seam itself, only for the full ambiguous-commit integration
+// (recorded as `likely`, not `verified`, in governance terms).
 
-TEST_CASE("ProductPackStore::check_pack_row_exists: kExists for a row that's actually there",
+TEST_CASE("ProductPackStore::check_transaction_outcome: kUnknown while the transaction is still "
+          "in progress (never guessed as kAborted)",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto held_lease = pool.acquire();
+    REQUIRE(held_lease);
+    REQUIRE(pg::exec_params(held_lease.get(), "BEGIN", std::vector<std::string>{}).status() ==
+           PGRES_COMMAND_OK);
+    pg::PgResult xid_res = pg::exec_params(held_lease.get(), "SELECT pg_current_xact_id()::text",
+                                           std::vector<std::string>{});
+    REQUIRE(xid_res.status() == PGRES_TUPLES_OK);
+    auto xact_id = std::string(PQgetvalue(xid_res.get(), 0, 0));
+
+    // The transaction is still open on held_lease — queried from a SEPARATE connection while it
+    // stays that way.
+    CHECK(ProductPackStore::check_transaction_outcome(pool, xact_id) ==
+         yuzu::server::TransactionOutcome::kUnknown);
+
+    pg::exec_params(held_lease.get(), "ROLLBACK", std::vector<std::string>{});
+}
+
+TEST_CASE("ProductPackStore::check_transaction_outcome: kCommitted after a real COMMIT",
           "[product_pack_store][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -806,31 +834,45 @@ TEST_CASE("ProductPackStore::check_pack_row_exists: kExists for a row that's act
 
     auto lease = pool.acquire();
     REQUIRE(lease);
-    pg::PgResult ins = pg::exec_params(
-        lease.get(),
-        "INSERT INTO product_pack_store.product_packs (id, name, yaml_source) "
-        "VALUES ($1, 'seam-test', 'seam-test-yaml')",
-        std::vector<std::string>{"seam-test-pack-id"});
-    REQUIRE(ins.status() == PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(lease.get(), "BEGIN", std::vector<std::string>{}).status() ==
+           PGRES_COMMAND_OK);
+    pg::PgResult xid_res = pg::exec_params(lease.get(), "SELECT pg_current_xact_id()::text",
+                                           std::vector<std::string>{});
+    REQUIRE(xid_res.status() == PGRES_TUPLES_OK);
+    auto xact_id = std::string(PQgetvalue(xid_res.get(), 0, 0));
+    REQUIRE(pg::exec_params(lease.get(), "COMMIT", std::vector<std::string>{}).status() ==
+           PGRES_COMMAND_OK);
     lease.reset();
 
-    CHECK(ProductPackStore::check_pack_row_exists(pool, "seam-test-pack-id") ==
-         yuzu::server::PackExistenceCheck::kExists);
+    CHECK(ProductPackStore::check_transaction_outcome(pool, xact_id) ==
+         yuzu::server::TransactionOutcome::kCommitted);
 }
 
-TEST_CASE("ProductPackStore::check_pack_row_exists: kAbsent for an id that was never installed",
+TEST_CASE("ProductPackStore::check_transaction_outcome: kAborted after a real ROLLBACK",
           "[product_pack_store][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ProductPackStore store{pool};
     REQUIRE(store.is_open());
 
-    CHECK(ProductPackStore::check_pack_row_exists(pool, "definitely-never-installed") ==
-         yuzu::server::PackExistenceCheck::kAbsent);
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    REQUIRE(pg::exec_params(lease.get(), "BEGIN", std::vector<std::string>{}).status() ==
+           PGRES_COMMAND_OK);
+    pg::PgResult xid_res = pg::exec_params(lease.get(), "SELECT pg_current_xact_id()::text",
+                                           std::vector<std::string>{});
+    REQUIRE(xid_res.status() == PGRES_TUPLES_OK);
+    auto xact_id = std::string(PQgetvalue(xid_res.get(), 0, 0));
+    REQUIRE(pg::exec_params(lease.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+           PGRES_COMMAND_OK);
+    lease.reset();
+
+    CHECK(ProductPackStore::check_transaction_outcome(pool, xact_id) ==
+         yuzu::server::TransactionOutcome::kAborted);
 }
 
-TEST_CASE("ProductPackStore::check_pack_row_exists: kUnavailable when the pool can't be reached, "
-          "never guessed as kAbsent",
+TEST_CASE("ProductPackStore::check_transaction_outcome: kUnknown when the pool can't be "
+          "reached, never guessed as kAborted",
           "[product_pack_store][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 1}};
@@ -839,8 +881,62 @@ TEST_CASE("ProductPackStore::check_pack_row_exists: kUnavailable when the pool c
 
     auto unrelated_lease = pool.acquire();
     REQUIRE(unrelated_lease);
-    CHECK(ProductPackStore::check_pack_row_exists(pool, "irrelevant-id") ==
-         yuzu::server::PackExistenceCheck::kUnavailable);
+    CHECK(ProductPackStore::check_transaction_outcome(pool, "1") ==
+         yuzu::server::TransactionOutcome::kUnknown);
+}
+
+// Gate 5 CHAOS-1b regression net: the install()-level integration, driven WITHOUT network fault
+// injection by forcing a genuine, deterministic transaction failure while the write lease is
+// held — a competing autocommit INSERT (on its OWN connection, simulating a concurrent racer)
+// takes the SAME idempotency_key before this install's own persist INSERT runs, so the persist
+// hits the partial unique index's violation with the lease still held. This exercises the REAL
+// kAborted arm through install() end-to-end (not just the check_transaction_outcome seam above),
+// and doubles as a live regression net for the CHAOS-3 race-loser scenario documented in
+// product_pack_store.hpp (the loser gets a retryable db_error, not the differing-body 400).
+TEST_CASE("ProductPackStore::install: a genuine persist failure (unique-violation, lease held) "
+          "resolves kAborted via pg_xact_status and compensates through install() end to end",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    const std::string kRacingKey = "chaos-1b-racing-key";
+    std::vector<std::pair<std::string, std::string>> compensated;
+    auto compensate_fn = [&compensated](const std::string& kind,
+                                        const std::string& item_id) -> bool {
+        compensated.emplace_back(kind, item_id);
+        return true;
+    };
+    // install_fn plays the role of a concurrent racer: before this attempt's OWN persist INSERT
+    // runs, a SEPARATE autocommit connection claims kRacingKey first — by the time this
+    // attempt's persist transaction executes, the partial unique index already has a row for
+    // that key, so the INSERT fails on a genuine, real constraint violation (not a fault).
+    auto install_fn = [&pool, &kRacingKey](
+                          const std::string&,
+                          const std::string&) -> std::expected<std::string, std::string> {
+        auto racer_lease = pool.acquire();
+        if (!racer_lease)
+            return std::unexpected("could not acquire racer lease");
+        pg::PgResult ins = pg::exec_params(
+            racer_lease.get(),
+            "INSERT INTO product_pack_store.product_packs (id, name, yaml_source, "
+            "idempotency_key) VALUES ('chaos-1b-racer-pack', 'racer', 'racer-yaml', $1)",
+            std::vector<std::string>{kRacingKey});
+        if (ins.status() != PGRES_COMMAND_OK)
+            return std::unexpected("racer insert failed");
+        return std::string{"item-id"};
+    };
+
+    auto result = store.install(kUnsignedPackYaml, install_fn, compensate_fn, kRacingKey);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().starts_with(yuzu::server::kProductPackDbErrorPrefix));
+    // The compensate_and_fail path ran (not the kUnknown-skip path) — proving
+    // check_transaction_outcome resolved kAborted for this attempt's own (genuinely rolled
+    // back) transaction, not the racer's (committed) one.
+    REQUIRE(compensated.size() == 1);
+    CHECK(compensated[0].first == "InstructionDefinition");
 }
 
 // Gate 5 CHAOS-1 regression net at the install() level: a write-lease ACQUIRE failure (the

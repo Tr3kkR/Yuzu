@@ -4,7 +4,13 @@
   failing, or the duplicate-item-id validation check — now best-effort compensates (undoes) every
   already-installed item, in reverse install order, via the same per-kind delete dispatch
   `DELETE /api/product-packs/{id}` already used (now shared through one helper so the two paths
-  can't drift). **Known gap, not closed by this change:** compensation is best-effort — a sibling
+  can't drift). The final-persist failure path specifically distinguishes a genuinely-aborted
+  transaction (safe to compensate) from one whose outcome merely couldn't be confirmed after the
+  connection failed — a lost COMMIT acknowledgment after Postgres actually committed, or a
+  connection severed at a point uncorrelated with the backend's own commit progress — by asking
+  Postgres itself (`pg_xact_status()`) rather than inferring the outcome from a side effect;
+  compensating on anything but a confirmed abort would actively delete real, already-persisted
+  content. **Known gap, not closed by this change:** compensation is best-effort — a sibling
   store's own delete can itself fail (e.g. a referential-integrity refusal outside the bundle's
   own dependency chain); a residual orphan from that is logged at `spdlog::error` and counted in
   the new `yuzu_server_product_pack_install_compensation_total{result}` metric (pre-seeded,

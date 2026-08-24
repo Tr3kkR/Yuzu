@@ -170,12 +170,18 @@ struct ProductPackQuery {
     int limit{100};
 };
 
-/// Outcome of a post-failure existence re-check on `product_packs` (gov Gate 5 CHAOS-1,
-/// #3481) — see `ProductPackStore::check_pack_row_exists`'s doc comment.
-enum class PackExistenceCheck {
-    kExists,     ///< The row is there — a prior "failed" persist actually committed.
-    kAbsent,     ///< The row is genuinely not there — safe to compensate.
-    kUnavailable // Could not verify either way — the ONLY safe read is "do not compensate".
+/// Server-authoritative outcome of a post-failure transaction-status re-check (gov Gate 5
+/// CHAOS-1/CHAOS-1b, #3481) — see `ProductPackStore::check_transaction_outcome`'s doc comment.
+/// Deliberately NOT based on row visibility: a row's absence from a fresh read cannot
+/// distinguish "aborted" from "not yet committed" (the client-observed connection failure that
+/// triggers this check is not ordered relative to the backend's own commit progress — a
+/// middlebox/pooler can sever the client's connection at any point independent of whether the
+/// backend has finished, or even started, applying the commit), so `pg_xact_status()` — the
+/// question of that xact's true fate, answered by Postgres itself — is the mechanism instead.
+enum class TransactionOutcome {
+    kCommitted, ///< The backend confirms the transaction committed — the ack was merely lost.
+    kAborted,   ///< The backend confirms the transaction genuinely aborted — safe to compensate.
+    kUnknown    // Could not determine either way — the ONLY safe read is "do not compensate".
 };
 
 // ── Callbacks for delegating item install/uninstall to existing stores ────────
@@ -342,19 +348,28 @@ public:
     // Minimal YAML value extraction — public so install callbacks can use it
     static std::string extract_yaml_value(const std::string& yaml, const std::string& key);
 
-    /// Gov Gate 5 CHAOS-1 (#3481, verified: a fault landing between Postgres processing COMMIT
-    /// and the client reading `PGRES_COMMAND_OK` — a lost ack, not a rollback — is
-    /// indistinguishable from a genuine failure at the `with_txn_on`/`with_txn_for` call site).
-    /// Before `install()`'s compensating rollback runs on a final-persist failure, it uses this
-    /// to tell "the transaction never landed" (safe to compensate — the pre-#3481 behavior) from
-    /// "it actually committed and only the ack was lost" (compensating would ACTIVELY DELETE
-    /// real, already-persisted content — worse than the orphan #3481 exists to close). Public
-    /// (not file-local) specifically so this exact decision seam is unit-testable without
-    /// connection-level fault injection: pre-insert a row with a known id on a live store, call
-    /// this directly, and assert `kExists` — the seam a live network-partition repro would also
-    /// exercise, without needing a fault-injecting proxy this test suite doesn't have.
-    /// `kUnavailable` on ANY doubt (lease unavailable, query error) — never guess `kAbsent`.
-    static PackExistenceCheck check_pack_row_exists(pg::PgPool& pool, const std::string& pack_id);
+    /// Gov Gate 5 CHAOS-1/CHAOS-1b (#3481, verified): a fault landing between Postgres
+    /// processing COMMIT and the client reading `PGRES_COMMAND_OK` is indistinguishable, at the
+    /// `with_txn_on` call site, from a genuine transaction failure — the client-observed
+    /// connection failure is not ordered relative to the backend's own commit progress, so
+    /// "check whether the row exists now" (an earlier version of this method) is ALSO not
+    /// reliable: absence could mean genuinely aborted, or could mean the backend simply hasn't
+    /// finished applying an already-in-flight commit yet. `pg_xact_status()` asks Postgres
+    /// itself the true fate of that specific transaction id instead of inferring it from a
+    /// side effect — it is documented for exactly this ("commit status of transactions whose
+    /// outcome is in doubt due to a lost connection"). Before `install()`'s compensating
+    /// rollback runs on a final-persist failure, it uses this to tell "the transaction genuinely
+    /// aborted" (safe to compensate — the pre-#3481 behavior) from "it actually committed and
+    /// only the ack was lost" (compensating would ACTIVELY DELETE real, already-persisted
+    /// content — worse than the orphan #3481 exists to close) from "still in progress, or
+    /// unknown" (`kUnknown` — the ONLY safe read when doubt remains; never guess `kAborted`).
+    /// Public (not file-local) specifically so this exact decision seam is unit-testable
+    /// deterministically (no fault injection needed): open a transaction on one connection,
+    /// query its status from a second while still open (`kInProgress`... i.e. `kUnknown`), then
+    /// after `COMMIT` (`kCommitted`) and after `ROLLBACK` (`kAborted`) on a fresh transaction —
+    /// all three real server-confirmed outcomes are directly producible.
+    static TransactionOutcome check_transaction_outcome(pg::PgPool& pool,
+                                                        const std::string& xact_id);
 
     /// Verify an Ed25519 signature over content.
     /// Uses OpenSSL EVP_DigestVerify on every platform (see the .cpp file header for the

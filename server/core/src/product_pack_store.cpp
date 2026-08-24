@@ -467,17 +467,23 @@ std::string ProductPackStore::extract_yaml_value(const std::string& yaml, const 
     return {};
 }
 
-PackExistenceCheck ProductPackStore::check_pack_row_exists(pg::PgPool& pool,
-                                                            const std::string& pack_id) {
+TransactionOutcome ProductPackStore::check_transaction_outcome(pg::PgPool& pool,
+                                                                const std::string& xact_id) {
     auto lease = pool.try_acquire_for(kReadTimeout);
     if (!lease)
-        return PackExistenceCheck::kUnavailable;
-    pg::PgResult res = pg::exec_params(
-        lease.get(), "SELECT 1 FROM product_pack_store.product_packs WHERE id = $1",
-        std::vector<std::string>{pack_id});
-    if (res.status() != PGRES_TUPLES_OK)
-        return PackExistenceCheck::kUnavailable;
-    return PQntuples(res.get()) > 0 ? PackExistenceCheck::kExists : PackExistenceCheck::kAbsent;
+        return TransactionOutcome::kUnknown;
+    pg::PgResult res = pg::exec_params(lease.get(), "SELECT pg_xact_status($1::xid8)",
+                                       std::vector<std::string>{xact_id});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
+        return TransactionOutcome::kUnknown;
+    if (PQgetisnull(res.get(), 0, 0))
+        return TransactionOutcome::kUnknown; // xid too old for the commit log — genuinely unknown
+    auto status = text_col(res.get(), 0, 0);
+    if (status == "committed")
+        return TransactionOutcome::kCommitted;
+    if (status == "aborted")
+        return TransactionOutcome::kAborted;
+    return TransactionOutcome::kUnknown; // "in progress" — still unresolved, or an unrecognized value
 }
 
 std::vector<std::string> ProductPackStore::split_yaml_documents(const std::string& bundle) {
@@ -1338,21 +1344,35 @@ std::expected<std::string, std::string> ProductPackStore::install(
     // Now persist the pack row + its successfully-installed item rows in ONE transaction
     // (parent-before-child for the product_pack_items -> product_packs FK).
     //
-    // Gov Gate 5 CHAOS-1 (#3481, verified): acquire the write lease OURSELVES first, via
-    // try_acquire_for + with_txn_on, rather than the one-call with_txn_for — this is what lets
-    // the failure branch below tell apart "the lease was never acquired, the transaction never
-    // started" (nothing ambiguous, safe to compensate exactly as before) from "the lease was
-    // held and the transaction itself reported failure" (ambiguous: could be a genuine
-    // rollback, OR a lost COMMIT-response network fault after Postgres actually committed —
-    // with_txn_for's single bool return cannot distinguish these, and compensating on the
-    // latter would ACTIVELY DELETE real, already-persisted sibling-store content, which is
-    // worse than the orphan #3481 exists to close). The existing pool-starvation compensation
-    // tests pin the pool's only connection BEFORE calling install() — that failure mode is
-    // caught here as a with_txn_lease acquire failure and compensates exactly as before; those
-    // tests are unaffected.
+    // Gov Gate 5 CHAOS-1/CHAOS-1b (#3481, verified): acquire the write lease OURSELVES first,
+    // via try_acquire_for + with_txn_on, rather than the one-call with_txn_for — this is what
+    // lets the failure branch below tell apart "the lease was never acquired, the transaction
+    // never started" (nothing ambiguous, safe to compensate exactly as before) from "the lease
+    // was held and the transaction itself reported failure" (ambiguous — the client-observed
+    // failure is not ordered relative to the backend's own commit progress, so it could be a
+    // genuine rollback, a still-in-flight commit, OR a lost COMMIT-response ack after Postgres
+    // already committed — with_txn_for's single bool return cannot distinguish any of these,
+    // and compensating on anything but a genuine rollback would ACTIVELY DELETE real,
+    // already-persisted sibling-store content). The existing pool-starvation compensation tests
+    // pin the pool's only connection BEFORE calling install() — that failure mode is caught here
+    // as a with_txn_lease acquire failure and compensates exactly as before; those tests are
+    // unaffected.
+    std::string current_xact_id; // captured inside the txn body; empty = no write could have landed
     auto with_txn_lease = pool_.try_acquire_for(kWriteTimeout);
     bool write_lease_acquired = static_cast<bool>(with_txn_lease);
     bool ok = pool_.with_txn_on(std::move(with_txn_lease), [&](PGconn* conn) -> bool {
+        // Captured FIRST, before any write: if THIS statement fails, nothing in this
+        // transaction could have been written yet, so current_xact_id stays empty and the
+        // failure path below treats it as unambiguous without needing a server-side outcome
+        // check at all. If it succeeds, the id lets that path ask Postgres the transaction's
+        // true fate (committed/aborted/still-unresolved) rather than inferring it from a
+        // row-visibility side effect, which CHAOS-1b showed is not a reliable proxy.
+        pg::PgResult xid_res = pg::exec_params(conn, "SELECT pg_current_xact_id()::text",
+                                               std::vector<std::string>{});
+        if (xid_res.status() != PGRES_TUPLES_OK || PQntuples(xid_res.get()) == 0)
+            return false;
+        current_xact_id = text_col(xid_res.get(), 0, 0);
+
         // idempotency_key binds via the std::optional<std::string> overload — NOT the plain
         // std::string overload, which would bind an empty key as "" rather than SQL NULL and
         // break the partial unique index's NULL-exemption for every keyless install after the
@@ -1388,30 +1408,33 @@ std::expected<std::string, std::string> ProductPackStore::install(
         return true;
     });
     if (!ok) {
-        if (write_lease_acquired) {
-            // The lease was held and the transaction body itself reported failure — this is
-            // the ambiguous case (genuine rollback, OR a lost COMMIT-response ack after
-            // Postgres actually committed). Re-verify on a FRESH connection before deciding.
-            switch (check_pack_row_exists(pool_, pack_id)) {
-            case PackExistenceCheck::kExists:
+        if (write_lease_acquired && !current_xact_id.empty()) {
+            // The lease was held and this transaction's own id was captured before it failed —
+            // this is the ambiguous case. Ask Postgres itself for that xact's true fate rather
+            // than inferring it from row visibility (CHAOS-1b: absence alone can't distinguish
+            // "aborted" from "not yet committed").
+            switch (check_transaction_outcome(pool_, current_xact_id)) {
+            case TransactionOutcome::kCommitted:
                 // The commit landed; only the ack was lost. Do NOT compensate — that would
                 // delete real, already-persisted sibling-store content. Report success.
                 spdlog::error(
                     "ProductPackStore: install for pack '{}' ({}) reported a transaction "
-                    "failure but the pack row EXISTS on re-check — an ambiguous "
+                    "failure but Postgres confirms xact {} actually COMMITTED — an ambiguous "
                     "COMMIT-acknowledgment loss, not a real failure. Treating as success; no "
                     "compensation run.",
-                    sanitize_for_log(pack_name), pack_id);
+                    sanitize_for_log(pack_name), pack_id, current_xact_id);
                 return pack_id;
-            case PackExistenceCheck::kUnavailable:
-                // Cannot verify either way. The only safe read is "do not compensate" — never
-                // risk deleting content that might actually be there.
+            case TransactionOutcome::kUnknown:
+                // Still in progress, too old for the commit log, or the check itself couldn't
+                // run. The only safe read is "do not compensate" — never risk deleting content
+                // that might actually be there.
                 spdlog::error(
-                    "ProductPackStore: install for pack '{}' failed to persist AND the "
-                    "post-failure existence re-check itself failed — cannot confirm whether "
-                    "the pack actually committed. Skipping compensation as unsafe; this pack "
-                    "id may be a residual orphan requiring manual/operator verification.",
-                    sanitize_for_log(pack_name));
+                    "ProductPackStore: install for pack '{}' failed to persist AND xact {}'s "
+                    "outcome could not be confirmed (still in progress, or the status check "
+                    "itself failed) — cannot rule out an eventual commit. Skipping compensation "
+                    "as unsafe; this pack id may be a residual orphan requiring manual/operator "
+                    "verification.",
+                    sanitize_for_log(pack_name), current_xact_id);
                 if (metrics_)
                     metrics_
                         ->counter("yuzu_server_product_pack_install_compensation_total",
@@ -1419,8 +1442,8 @@ std::expected<std::string, std::string> ProductPackStore::install(
                         .increment();
                 return std::unexpected(std::string(kProductPackDbErrorPrefix) +
                                        "failed to persist pack '" + pack_name + "'");
-            case PackExistenceCheck::kAbsent:
-                break; // Genuinely never committed — fall through to compensate as before.
+            case TransactionOutcome::kAborted:
+                break; // Genuinely rolled back — fall through to compensate as before.
             }
         }
         return compensate_and_fail(
