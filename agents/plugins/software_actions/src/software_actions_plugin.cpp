@@ -136,6 +136,15 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
         yuzu::agent::SubprocessOptions{.deadline = kSlowToolDeadline});
     bool status_forwarded = yuzu::agent::forward_runner_failure(ctx, res);
     auto parsed = yuzu::software_actions::parse_winget_upgrade(res.output);
+    if (parsed.header_unrecognized && !status_forwarded) {
+        // The table was found but its header did not yield the five expected
+        // column origins, so every row below is reported name-only. Say so —
+        // an operator must be able to tell "these packages are upgradable and
+        // here are the versions" from "these packages are upgradable and the
+        // version columns could not be read".
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "software_actions:winget_header_unrecognized");
+    }
     if (parsed.rows.empty()) {
         ctx.write_output(parsed.separator_found ? "upgradable|none|System is up to date|-"
                                                 : "upgradable|none|-|-");
@@ -228,13 +237,20 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
 int do_installed_count(yuzu::CommandContext& ctx) {
 #ifdef _WIN32
     auto count = registry_uninstall_subkey_count();
-    if (count < 0) {
+    auto line = yuzu::software_actions::installed_count_line(count);
+    if (!line) {
+        // Registry read failed: report the degrade through the ABI4 status
+        // seam and write NO `count|` line at all. Emitting `count|0` here
+        // would be a fabricated zero — a consumer reading the output lines
+        // would see "this host has zero installed programs", which is the
+        // false-clean shape the antivirus plugin's `exclusion_count|0`
+        // invariant (tests/unit/test_antivirus_local_dispatcher.cpp) exists
+        // to forbid: a count line must never coexist with a degraded status.
         ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               "software_actions:registry_query_failed");
-        ctx.write_output("count|0");
         return 1;
     }
-    ctx.write_output(std::format("count|{}", count));
+    ctx.write_output(*line);
     return 0;
 
 #elif defined(__linux__)

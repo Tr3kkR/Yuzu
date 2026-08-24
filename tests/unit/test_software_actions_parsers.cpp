@@ -11,9 +11,11 @@
  * Fixture provenance, stated honestly:
  *   - the `softwareupdate -l` fixture is a REAL capture from this macOS host
  *     (2026-08-24, `/usr/sbin/softwareupdate -l`, rc=0, empty stderr).
- *   - the winget/apt/yum/dpkg-query fixtures are RECONSTRUCTED from each
- *     tool's documented output format — no Windows or Linux host was
- *     available in this sandbox to capture them live.
+ *   - the 23-row winget fixture in the "REAL capture" case below is a REAL
+ *     capture from a live Windows host (`winget upgrade
+ *     --accept-source-agreements`), including its two trailer lines.
+ *   - the remaining winget/apt/yum/dpkg-query fixtures are RECONSTRUCTED from
+ *     each tool's documented output format.
  */
 
 #include "software_actions_parsers.hpp"
@@ -85,6 +87,133 @@ TEST_CASE("winget upgrade: footer 'N upgrades available' line is skipped, not pa
     auto parsed = parse_winget_upgrade(out);
     REQUIRE(parsed.rows.size() == 1);
     CHECK(parsed.rows[0].name == "Git");
+}
+
+// ── Windows: winget upgrade, REAL capture (the column-mis-mapping regression)
+
+/// Verbatim `winget upgrade --accept-source-agreements` output from a live
+/// Windows host, trailer lines included. Five of these 23 rows are the
+/// pathological shape that broke the old split-on-2+-spaces parser: their
+/// Name or Id fills its column completely, leaving a SINGLE space before the
+/// next column, so a whitespace split yielded 3 or 4 fields instead of 5.
+/// Reading `parts[3]` as the available version then returned the *Source*
+/// column — a literal "winget" reported as a version number.
+constexpr std::string_view kRealWingetCapture =
+    "Name                                             Id                                     Version          Available        Source\n"
+    "--------------------------------------------------------------------------------------------------------------------------------\n"
+    "CMake                                            Kitware.CMake                          4.3.3            4.4.2            winget\n"
+    "Docker Desktop                                   Docker.DockerDesktop                   4.84.0           4.87.0           winget\n"
+    "Erlang OTP 28.5.0.1 (16.4.0.1)                   Erlang.ErlangOTP                       28.5.0.1         29.0.5           winget\n"
+    "Git                                              Git.Git                                2.54.0           2.55.0.3         winget\n"
+    "GitHub CLI                                       GitHub.cli                             2.89.0           2.97.0           winget\n"
+    "Google Chrome                                    Google.Chrome                          149.0.7827.201   151.0.7922.170   winget\n"
+    "Microsoft 365 Apps for enterprise - en-us        Microsoft.Office                       16.0.19822.20114 16.0.20228.20124 winget\n"
+    "Microsoft GameInput                              Microsoft.GameInput                    3.3.221.0        3.4.218          winget\n"
+    "Microsoft Visual Studio Code (User)              Microsoft.VisualStudioCode             1.128.1          1.132.0          winget\n"
+    "Microsoft Windows Desktop Runtime - 6.0.20 (x86) Microsoft.DotNet.DesktopRuntime.6      6.0.20           6.0.36           winget\n"
+    "Microsoft Windows Desktop Runtime - 8.0.28 (x86) Microsoft.DotNet.DesktopRuntime.8      8.0.28           8.0.30           winget\n"
+    "Node.js (LTS)                                    OpenJS.NodeJS.LTS                      24.16.0          24.19.0          winget\n"
+    "NordVPN                                          NordSecurity.NordVPN                   7.60.1.0         8.9.1.0          winget\n"
+    "Notepad++ (64-bit x64)                           Notepad++.Notepad++                    8.9.6.4          8.9.7            winget\n"
+    "Outlook for Windows                              Microsoft.Outlook                      1.2026.602.400   1.2026.720.100   winget\n"
+    "PlayStation Accessories                          PlayStation.PlayStationAccessories     2.0.0.13         2.2.1.2          winget\n"
+    "PostgreSQL 18                                    PostgreSQL.PostgreSQL.18               18.2-1           18.6-1           winget\n"
+    "Python Launcher                                  Python.Launcher                        3.12.10          3.13.5           winget\n"
+    "Signal 8.18.0                                    OpenWhisperSystems.Signal              8.18.0           8.24.0           winget\n"
+    "Visual Studio Build Tools 2022                   Microsoft.VisualStudio.2022.BuildTools < 17.14.35       17.14.39         winget\n"
+    "Windows 11 Installation Assistant                Microsoft.WindowsInstallationAssistant 1.4.19041.5003   1.4.19041.6448   winget\n"
+    "Windows PC Health Check                          Microsoft.WindowsPCHealthCheck         3.6.2204.08001   4.0.2410.23001   winget\n"
+    "Windows Subsystem for Linux                      Microsoft.WSL                          2.6.3.0          2.7.12           winget\n"
+    "23 upgrades available.\n"
+    "1 package(s) have version numbers that cannot be determined. Use --include-unknown to see all results.\n";
+
+TEST_CASE("winget upgrade: REAL capture — all 23 rows parse, no column is ever mis-mapped",
+          "[software_actions]") {
+    auto parsed = parse_winget_upgrade(kRealWingetCapture);
+    CHECK(parsed.separator_found);
+    CHECK_FALSE(parsed.header_unrecognized);
+    // Exactly the 23 data rows — neither trailer line becomes a phantom row.
+    REQUIRE(parsed.rows.size() == 23);
+
+    // THE regression: "winget" is the Source column. It must never appear as
+    // a version on any row.
+    for (const auto& row : parsed.rows) {
+        CHECK(row.available_version != "winget");
+        CHECK(row.current_version != "winget");
+        CHECK_FALSE(row.name.empty());
+    }
+}
+
+TEST_CASE("winget upgrade: REAL capture — the five rows that defeated the whitespace split",
+          "[software_actions]") {
+    auto parsed = parse_winget_upgrade(kRealWingetCapture);
+    REQUIRE(parsed.rows.size() == 23);
+
+    auto row_named = [&](std::string_view name) {
+        for (const auto& r : parsed.rows) {
+            if (r.name == name)
+                return r;
+        }
+        FAIL("row not found: " << name);
+        return parsed.rows.front();
+    };
+
+    // Id fills its column, leaving one space before Version. The old parser
+    // produced 4 fields and reported available_version == "winget".
+    auto dotnet6 = row_named("Microsoft Windows Desktop Runtime - 6.0.20 (x86)");
+    CHECK(dotnet6.current_version == "6.0.20");
+    CHECK(dotnet6.available_version == "6.0.36");
+
+    auto dotnet8 = row_named("Microsoft Windows Desktop Runtime - 8.0.28 (x86)");
+    CHECK(dotnet8.current_version == "8.0.28");
+    CHECK(dotnet8.available_version == "8.0.30");
+
+    auto assistant = row_named("Windows 11 Installation Assistant");
+    CHECK(assistant.current_version == "1.4.19041.5003");
+    CHECK(assistant.available_version == "1.4.19041.6448");
+
+    // Name AND Version both full-width: the old parser produced 3 fields and
+    // collapsed this row to name-only.
+    auto office = row_named("Microsoft 365 Apps for enterprise - en-us");
+    CHECK(office.current_version == "16.0.19822.20114");
+    CHECK(office.available_version == "16.0.20228.20124");
+
+    // winget's unknown-version marker contains a SPACE, so no space-delimited
+    // split can recover it — only positional slicing can.
+    auto buildtools = row_named("Visual Studio Build Tools 2022");
+    CHECK(buildtools.current_version == "< 17.14.35");
+    CHECK(buildtools.available_version == "17.14.39");
+}
+
+TEST_CASE("winget upgrade: an unreadable header degrades to name-only, never a borrowed column",
+          "[software_actions]") {
+    // No recognisable header above the separator: the parser cannot know
+    // where the columns start, so it reports names and "-" versions rather
+    // than guessing.
+    constexpr std::string_view out =
+        "-----------------------------------------------------------------------------\n"
+        "Git                Git.Git                   2.40.0       2.42.0       winget\n";
+    auto parsed = parse_winget_upgrade(out);
+    CHECK(parsed.separator_found);
+    CHECK(parsed.header_unrecognized);
+    REQUIRE(parsed.rows.size() == 1);
+    CHECK(parsed.rows[0].name == "Git");
+    CHECK(parsed.rows[0].current_version == "-");
+    CHECK(parsed.rows[0].available_version == "-");
+}
+
+// ── installed_count emit decision ──────────────────────────────────────────
+
+TEST_CASE("installed_count: a negative sentinel emits NO count line, never a fabricated zero",
+          "[software_actions]") {
+    // Windows' registry_uninstall_subkey_count() returns -1 when the registry
+    // read fails. `count|0` there would assert "zero installed programs".
+    CHECK_FALSE(installed_count_line(-1).has_value());
+
+    REQUIRE(installed_count_line(0).has_value());
+    CHECK(*installed_count_line(0) == "count|0"); // a genuine, measured zero
+    REQUIRE(installed_count_line(214).has_value());
+    CHECK(*installed_count_line(214) == "count|214");
 }
 
 // ── Linux: apt list --upgradable ───────────────────────────────────────────

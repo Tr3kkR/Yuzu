@@ -15,6 +15,7 @@
  */
 
 #include <cstddef>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -42,9 +43,49 @@ namespace detail {
     return lines;
 }
 
+/// Offsets at which each whitespace-separated token of `header` begins.
+/// winget renders a fixed-width table whose header names sit at the exact
+/// column origins of the data beneath them, so the token starts ARE the
+/// column boundaries. Only the positions are used, never the header text —
+/// winget localises the column names, so reading the text would break on
+/// every non-English Windows.
+[[nodiscard]] inline std::vector<std::size_t> column_origins(std::string_view header) {
+    std::vector<std::size_t> origins;
+    bool in_token = false;
+    for (std::size_t i = 0; i < header.size(); ++i) {
+        const bool is_space = header[i] == ' ' || header[i] == '\t';
+        if (!is_space && !in_token) {
+            origins.push_back(i);
+            in_token = true;
+        } else if (is_space) {
+            in_token = false;
+        }
+    }
+    return origins;
+}
+
+/// `line[begin, end)` with surrounding blanks trimmed; empty when the slice
+/// starts past the end of the line (a short row simply has empty tail columns).
+[[nodiscard]] inline std::string slice_trimmed(const std::string& line, std::size_t begin,
+                                               std::size_t end) {
+    if (begin >= line.size())
+        return {};
+    end = end < line.size() ? end : line.size();
+    const auto width = end - begin;
+    const auto first = line.find_first_not_of(" \t", begin);
+    if (first == std::string::npos || first >= begin + width)
+        return {};
+    const auto last = line.find_last_not_of(" \t", begin + width - 1);
+    return line.substr(first, last - first + 1);
+}
+
 } // namespace detail
 
 // ── Windows: winget upgrade ────────────────────────────────────────────────
+
+/// winget upgrade renders five columns: Name / Id / Version / Available /
+/// Source.
+inline constexpr std::size_t kWingetColumnCount = 5;
 
 struct WingetUpgradeRow {
     std::string name;
@@ -62,67 +103,115 @@ struct WingetUpgradeParse {
     // date" line) — the same two-shape distinction the original popen-based
     // code made via `lines.empty()` vs `!found_any`.
     bool separator_found = false;
+    // True when the header line above the separator did NOT yield exactly
+    // kWingetColumnCount column origins, so positional slicing was not
+    // possible and rows were emitted name-only (`name|-|-`). Never means a
+    // version was guessed: a version is either read from its own column or
+    // reported as "-". The caller surfaces this as a CONSTRAINED/partial
+    // result so an operator can tell "no upgrades" from "could not read the
+    // version columns".
+    bool header_unrecognized = false;
 };
 
-/// Parse `winget upgrade --accept-source-agreements` output. winget uses
-/// fixed-width columns (Name / Id / Version / Available / Source); columns
-/// are split on runs of 2+ spaces, single spaces inside a column value are
-/// preserved. Footer lines ("N upgrades available") are skipped by their own
-/// "upgrade"+"available" substring pair, matching the pre-migration parser.
+/// Parse `winget upgrade --accept-source-agreements` output.
+///
+/// winget renders a FIXED-WIDTH table (Name / Id / Version / Available /
+/// Source), so columns are sliced by the byte offsets of the header's tokens
+/// rather than guessed from runs of 2+ spaces. The old split-on-2+-spaces
+/// heuristic silently mis-mapped every row whose content filled a column to
+/// its full width and so was followed by a SINGLE space: those rows yielded
+/// four fields instead of five, and reading `parts[3]` as the available
+/// version handed back the *Source* column, emitting a literal
+/// `available_version == "winget"`. Against a real 23-row capture from a
+/// live Windows host, 4 rows reported "winget" as the available version and
+/// a 5th collapsed to name-only — fabricated data of the same class as the
+/// Wave-3 BitLocker/firewall false-state bugs. Positional slicing parses all
+/// 23 of those rows exactly, including `Version == "< 17.14.35"` (a value
+/// containing a space, which no space-delimited split can recover).
+///
+/// Only header token POSITIONS are used, never the header text: winget
+/// localises the column names, so matching on "Name"/"Version" would break
+/// on every non-English Windows.
+///
+/// Honesty contract: a line that does not map cleanly onto the header's
+/// columns NEVER contributes a value borrowed from a neighbouring column. It
+/// is either skipped (trailer lines such as "23 upgrades available." and the
+/// "N package(s) have version numbers that cannot be determined" footer,
+/// neither of which aligns to the Id column) or, when the header itself is
+/// unreadable, emitted name-only as `name|-|-` with header_unrecognized set.
 [[nodiscard]] inline WingetUpgradeParse parse_winget_upgrade(std::string_view output) {
     WingetUpgradeParse result;
-    bool in_data = false;
-    for (const auto& line : detail::split_nonblank_lines(output)) {
-        if (!in_data) {
-            // Look for the separator line (all dashes/spaces).
-            bool is_sep = !line.empty();
-            for (char ch : line) {
-                if (ch != '-' && ch != ' ') {
-                    is_sep = false;
-                    break;
-                }
+    const auto lines = detail::split_nonblank_lines(output);
+
+    std::size_t separator_index = lines.size();
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        bool is_sep = !lines[i].empty();
+        for (char ch : lines[i]) {
+            if (ch != '-' && ch != ' ') {
+                is_sep = false;
+                break;
             }
-            if (is_sep && line.size() > 10) {
-                in_data = true;
-                result.separator_found = true;
-            }
-            continue;
         }
-        // Skip footer lines (e.g. "N upgrades available").
-        if (line.find("upgrade") != std::string::npos &&
-            line.find("available") != std::string::npos) {
+        if (is_sep && lines[i].size() > 10) {
+            separator_index = i;
+            result.separator_found = true;
+            break;
+        }
+    }
+    if (!result.separator_found)
+        return result;
+
+    std::vector<std::size_t> origins;
+    if (separator_index > 0)
+        origins = detail::column_origins(lines[separator_index - 1]);
+    const bool positional = origins.size() == kWingetColumnCount;
+    result.header_unrecognized = !positional;
+
+    for (std::size_t i = separator_index + 1; i < lines.size(); ++i) {
+        const auto& line = lines[i];
+
+        if (!positional) {
+            // Header unreadable — emit the Name column only. The Name column
+            // always begins at offset 0, so the text before the first run of
+            // 2+ spaces is genuinely the name; the version columns are
+            // reported as "-" rather than guessed.
+            if (line.find("upgrade") != std::string::npos &&
+                line.find("available") != std::string::npos)
+                continue;
+            const auto gap = line.find("  ");
+            auto name = detail::slice_trimmed(line, 0, gap == std::string::npos ? line.size() : gap);
+            if (!name.empty())
+                result.rows.push_back({std::move(name), "-", "-"});
             continue;
         }
 
-        // Typical format: "Name            Id              Version  Available"
-        // Split on multiple spaces.
-        std::vector<std::string> parts;
-        std::string current;
-        int spaces = 0;
-        for (char ch : line) {
-            if (ch == ' ') {
-                spaces++;
-                if (spaces >= 2 && !current.empty()) {
-                    parts.push_back(current);
-                    current.clear();
-                    spaces = 0;
-                }
-            } else {
-                if (spaces > 0 && spaces < 2) {
-                    current += std::string(static_cast<std::size_t>(spaces), ' ');
-                }
-                spaces = 0;
-                current += ch;
+        // A data row must respect every column boundary: the character
+        // immediately before each column origin is a space (or the row ends
+        // before that column). Trailer prose overflows its columns and fails
+        // this check, so it can never become a phantom row.
+        bool aligned = true;
+        for (std::size_t c = 1; c < origins.size(); ++c) {
+            const std::size_t origin = origins[c];
+            if (origin < line.size() && line[origin - 1] != ' ') {
+                aligned = false;
+                break;
             }
         }
-        if (!current.empty())
-            parts.push_back(current);
+        if (!aligned)
+            continue;
 
-        if (parts.size() >= 4) {
-            result.rows.push_back({parts[0], parts[2], parts[3]});
-        } else if (parts.size() >= 2) {
-            result.rows.push_back({parts[0], "-", "-"});
-        }
+        auto name = detail::slice_trimmed(line, origins[0], origins[1]);
+        const auto id = detail::slice_trimmed(line, origins[1], origins[2]);
+        auto current = detail::slice_trimmed(line, origins[2], origins[3]);
+        auto available = detail::slice_trimmed(line, origins[3], origins[4]);
+        // Id and Version are always populated on a genuine winget row; a
+        // short trailer line ("23 upgrades available.") aligns trivially but
+        // leaves them empty, which is what distinguishes it from data.
+        if (name.empty() || id.empty() || current.empty())
+            continue;
+        if (available.empty())
+            available = "-";
+        result.rows.push_back({std::move(name), std::move(current), std::move(available)});
     }
     return result;
 }
@@ -257,6 +346,25 @@ struct YumUpgradeRow {
 /// Generic "one record per non-empty line" count (`rpm -qa`, `pkgutil --pkgs`).
 [[nodiscard]] inline std::size_t count_nonempty_lines(std::string_view output) {
     return detail::split_nonblank_lines(output).size();
+}
+
+// ── installed_count emit decision (pure seam) ──────────────────────────────
+
+/// The `count|N` line for a subkey/record count, or std::nullopt when the
+/// count is unavailable (a negative sentinel — Windows'
+/// registry_uninstall_subkey_count() returns -1 when the registry read
+/// fails).
+///
+/// Pure so the FAILURE path is unit-testable on every host: the Windows
+/// registry read it guards essentially never fails on a real machine, so
+/// the honest-degrade branch would otherwise ship unexercised. A degraded
+/// read must emit NO count line — `count|0` would assert "zero programs are
+/// installed", the same false-clean shape the antivirus plugin's
+/// `exclusion_count|0` invariant forbids.
+[[nodiscard]] inline std::optional<std::string> installed_count_line(int count) {
+    if (count < 0)
+        return std::nullopt;
+    return "count|" + std::to_string(count);
 }
 
 } // namespace yuzu::software_actions
