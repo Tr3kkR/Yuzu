@@ -1010,8 +1010,11 @@ static const ToolDef kTools[] = {
      "that closes the loop, gated behind its own Security:Write check rather than being inferred "
      "from a successful rotate call. Requires the successor token_id the rotate call returned — "
      "the confirm is pinned to that exact rotation and a stale or mismatched id is rejected with "
-     "no state change, so a blind retry can never confirm a later rotation. Replaying a confirm "
-     "after this rotation already resolved (a network-dropped success, a double-submit) returns a "
+     "no state change, so a blind retry can never confirm a later rotation. Also requires the raw "
+     "successor secret (#3015 proof of possession, SOC 2 CC6.3) — this call revokes the "
+     "predecessor on success, so it must not proceed on token_id alone; a wrong secret is refused "
+     "with a distinct error, checked only after every other admission gate has already passed. "
+     "Replaying a confirm after this rotation already resolved (a network-dropped success, a double-submit) returns a "
      "TERMINAL already-confirmed/already-resolved error (not a retryable one) - do not retry; "
      "re-rotate if a fresh rotation is needed. If confirm instead reports 'rotation confirmation "
      "unavailable' (the initiator binding is lost or in dispute), do NOT call "
@@ -1037,8 +1040,15 @@ static const ToolDef kTools[] = {
      // rejected by confirm_rotation's own lookup; the pattern now bounds the
      // exact shape so that rejection happens before a ticket is ever touched.
      R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"},)j"
-     R"j("token_id":{"type":"string","pattern":"^[0-9a-f]{24}$","maxLength":24,"description":"Successor token_id returned by rotate_engine_credential (24 lowercase hex) - pins the exact rotation being confirmed"})j"
-     R"j(},"required":["principal_id","token_id"]})j",
+     R"j("token_id":{"type":"string","pattern":"^[0-9a-f]{24}$","maxLength":24,"description":"Successor token_id returned by rotate_engine_credential (24 lowercase hex) - pins the exact rotation being confirmed"},)j"
+     // #3015 proof of possession: the raw successor secret rotate_engine_credential
+     // returned. A wrong secret is rejected with a distinct "rotation secret
+     // mismatch" outcome (kPermissionDenied) — reachable only after every
+     // other admission check (ownership, pair-state, the token_id pin, the
+     // initiator binding) already passed, so this is never an oracle over
+     // WHICH of those checks failed. Never logged/persisted server-side.
+     R"j("secret":{"type":"string","minLength":1,"maxLength":512,"description":"The raw successor secret returned by rotate_engine_credential - proof that the caller actually received the new credential before this call revokes the predecessor"})j"
+     R"j(},"required":["principal_id","token_id","secret"]})j",
      R"j({"type":"object","properties":{"confirmed":{"type":"boolean"},"principal_id":{"type":"string"}},"required":["confirmed","principal_id"]})j"},
 
     {"rotate_api_token",
@@ -1074,8 +1084,11 @@ static const ToolDef kTools[] = {
      "rather than being inferred from a successful rotate call. token_id here is the SUCCESSOR "
      "token_id the rotate call returned — the confirm is pinned to that exact rotation and a "
      "stale or mismatched id is rejected with no state change, so a blind retry can never "
-     "confirm a later rotation. Replaying a confirm after this rotation already resolved (a "
-     "network-dropped success, a double-submit) returns a TERMINAL already-confirmed/already-"
+     "confirm a later rotation. Also requires the raw successor secret (#3015 proof of "
+     "possession, SOC 2 CC6.3) — this call revokes the predecessor on success, so it must not "
+     "proceed on token_id alone; a wrong secret is refused with a distinct error, checked only "
+     "after every other admission gate has already passed. Replaying a confirm after this "
+     "rotation already resolved (a network-dropped success, a double-submit) returns a TERMINAL already-confirmed/already-"
      "resolved error (not a retryable one) — do not retry; rotate again if a fresh rotation is "
      "needed. If confirm instead reports 'rotation confirmation unavailable' (the initiator "
      "binding is lost or in dispute), revoke the SPECIFIC untrusted credential via "
@@ -1084,8 +1097,11 @@ static const ToolDef kTools[] = {
      "applies. Self-service ONLY, same owner-vs-nonexistent posture as rotate_api_token. Mirrors "
      "POST /api/v1/tokens/{id}/confirm. Destructive — requires ApiToken:Rotate.",
      R"j({"type":"object","properties":{)j"
-     R"j("token_id":{"type":"string","minLength":1,"maxLength":64,"description":"Successor token_id returned by rotate_api_token (pins the exact rotation being confirmed) — must be owned by the calling principal"})j"
-     R"j(},"required":["token_id"]})j",
+     R"j("token_id":{"type":"string","minLength":1,"maxLength":64,"description":"Successor token_id returned by rotate_api_token (pins the exact rotation being confirmed) — must be owned by the calling principal"},)j"
+     // #3015 proof of possession — same contract as confirm_engine_rotation's
+     // own "secret" field (see that schema's comment).
+     R"j("secret":{"type":"string","minLength":1,"maxLength":512,"description":"The raw successor secret returned by rotate_api_token - proof that the caller actually received the new credential before this call revokes the predecessor"})j"
+     R"j(},"required":["token_id","secret"]})j",
      R"j({"type":"object","properties":{"confirmed":{"type":"boolean"},"token_id":{"type":"string"}},"required":["confirmed","token_id"]})j"},
 
     {"transfer_engine_principal_owner",
@@ -2534,6 +2550,11 @@ int mcp_error_for_store_msg(const std::string& msg) {
         return kInvalidParams;
     case yuzu::server::detail::EngineStoreErrorClass::Transient:
         return kInternalError;
+    case yuzu::server::detail::EngineStoreErrorClass::SecretMismatch:
+        // #3015: reachable only after every other admission gate passed —
+        // the closest existing JSON-RPC vocabulary entry for "you don't get
+        // to do this", the same code the RBAC/tier denial sites use.
+        return kPermissionDenied;
     }
     return kInternalError; // unreachable — all enum cases return above
 }
@@ -11614,8 +11635,18 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // #3015 proof-of-possession — never echoed into mcp_audit/
+                // a4_error strings (secret hygiene).
+                const auto presented_secret = param_str(args, "secret");
+                if (presented_secret.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "secret is required",
+                                             "pass the raw successor secret returned by "
+                                             "rotate_engine_credential"),
+                                    "application/json");
+                    return;
+                }
                 auto confirmed = engine_credential_store_->confirm_rotation(
-                    principal_id, confirm_token_id, session->username);
+                    principal_id, confirm_token_id, presented_secret, session->username);
                 if (!confirmed) {
                     // Increment BEFORE the audit emission so an audit-store
                     // failure cannot suppress the operational counter (#2404).
@@ -11933,6 +11964,16 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // #3015 proof-of-possession — never echoed into mcp_audit/
+                // audit_fn/a4_error strings (secret hygiene).
+                const auto presented_secret = param_str(args, "secret");
+                if (presented_secret.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "secret is required",
+                                             "pass the raw successor secret returned by "
+                                             "rotate_api_token"),
+                                    "application/json");
+                    return;
+                }
 
                 // Owner-vs-nonexistent belt, same self-service-only posture
                 // as rotate above — no admin bypass, identical body for both
@@ -11965,7 +12006,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // re-check of the authority-inheritance guard (governance
                 // Gate 7).
                 auto confirmed = engine_credential_store_->confirm_token_rotation(
-                    token_id, session->username, session->mcp_tier, session->token_scope_service);
+                    token_id, presented_secret, session->username, session->mcp_tier,
+                    session->token_scope_service);
                 if (!confirmed) {
                     // Increment BEFORE the audit emission so an audit-store
                     // failure cannot suppress the operational counter.
