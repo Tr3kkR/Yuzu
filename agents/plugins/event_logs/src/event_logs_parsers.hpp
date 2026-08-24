@@ -24,8 +24,6 @@
 // forge extra fields/rows. That hardening is a deliberate, disclosed
 // behaviour change of this migration.
 
-#include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field
-
 #include <algorithm>
 #include <cctype>
 #include <charconv>
@@ -34,6 +32,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field, yuzu::util::icontains
 
 namespace yuzu::event_logs_parsers {
 
@@ -73,24 +73,12 @@ inline std::string truncate_field(std::string_view value,
 
 // ASCII case-insensitive substring test (needle empty -> true). The
 // PowerShell `-like '*f*'` filter this replaces was case-insensitive, so the
-// native filter stays case-insensitive too.
-inline bool contains_ci(std::string_view haystack, std::string_view needle) {
-    if (needle.empty())
-        return true;
-    if (needle.size() > haystack.size())
-        return false;
-    auto lower = [](char c) {
-        return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    };
-    for (std::size_t i = 0; i + needle.size() <= haystack.size(); ++i) {
-        std::size_t j = 0;
-        while (j < needle.size() && lower(haystack[i + j]) == lower(needle[j]))
-            ++j;
-        if (j == needle.size())
-            return true;
-    }
-    return false;
-}
+// native filter stays case-insensitive too. This is the SHARED
+// yuzu::util::icontains (sdk/include/yuzu/string_utils.hpp) rather than a
+// fourth hand-rolled copy — same semantics on all three edge cases (empty
+// needle -> true, needle longer than haystack -> false, ASCII tolower
+// comparison).
+using yuzu::util::icontains;
 
 // Empty display fields render as "-" so a missing provider/timestamp cannot
 // silently collapse two pipe delimiters together.
@@ -357,7 +345,7 @@ inline std::string win_level_display(int level) {
 // provider name is matched too so an operator's "query filter=AppName"
 // keeps finding that provider's events. Disclosed in the changelog.
 inline bool win_event_matches(const WinEvent& ev, std::string_view filter) {
-    return contains_ci(ev.message, filter) || contains_ci(ev.provider, filter);
+    return icontains(ev.message, filter) || icontains(ev.provider, filter);
 }
 
 // error|timestamp|event_id|source|message  (the plugin's documented shape)
@@ -450,7 +438,7 @@ inline JournalRow parse_short_iso_line(std::string_view line) {
 // semantics over the already-allowlist-sanitized filter parameter; disclosed
 // in the changelog).
 inline bool journal_message_matches(std::string_view message, std::string_view filter) {
-    return contains_ci(message, filter);
+    return icontains(message, filter);
 }
 
 } // namespace yuzu::event_logs_parsers

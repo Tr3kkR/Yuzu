@@ -176,6 +176,7 @@ EvtQueryOutcome query_win_events(const wchar_t* channel, const wchar_t* xpath, s
     }
 
     std::size_t taken = 0;
+    std::size_t render_failures = 0;
     while (taken < cap) {
         EVT_HANDLE raw[64]{};
         DWORD got = 0;
@@ -199,8 +200,10 @@ EvtQueryOutcome query_win_events(const wchar_t* channel, const wchar_t* xpath, s
             if (taken >= cap)
                 continue; // keep closing remaining handles in this batch
             const std::string xml = render_event_xml(ev.h);
-            if (xml.empty())
+            if (xml.empty()) {
+                ++render_failures;
                 continue;
+            }
             for (auto& parsed : parsers::parse_win_events(xml)) {
                 out.push_back(std::move(parsed));
                 if (++taken >= cap)
@@ -208,6 +211,16 @@ EvtQueryOutcome query_win_events(const wchar_t* channel, const wchar_t* xpath, s
             }
         }
     }
+
+    // EvtQuery and EvtNext both succeeded, but every event they handed back
+    // failed to render. Returning kOk here would emit the honest-empty
+    // sentinel — "queried fine, nothing there" — for what is actually a total
+    // acquisition failure, reintroducing the failure-reads-as-empty-log mode
+    // on the Windows leg. A PARTIAL render failure still reports kOk: those
+    // events are genuinely lost, but the rows that did render are real, which
+    // matches the users-plugin precedent this leg follows.
+    if (out.empty() && render_failures > 0)
+        return EvtQueryOutcome::kOtherError;
     return EvtQueryOutcome::kOk;
 }
 
@@ -317,8 +330,36 @@ int run_journalctl_fallback(yuzu::CommandContext& ctx, std::vector<std::string> 
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               unavailable_provenance);
     }
+
+    // A journalctl that LAUNCHED and then exited nonzero (no journal files on
+    // the host, an ACL denial for a process outside the `systemd-journal`
+    // group, an unsupported argument on an old build) must never be folded
+    // into the clean "none found" sentinel — a failure reading as an empty log
+    // is precisely the mode this migration exists to remove, and the honest
+    // typed status is the whole point of the rung-1 contract.
+    //
+    // Guarded on `exited` deliberately: `stop_after_max_lines` is set above, so
+    // on a busy host the runner KILLS the child after the cap, leaving
+    // termination_reason == line_limit and exit_code at the -1 kill sentinel
+    // (SubprocessResult's documented contract — never fabricated to 0). That is
+    // a clean bounded stop, not a failure; testing `exit_code != 0` alone would
+    // report every busy host as unavailable — the exact defect fixed on the
+    // macOS classifier in this same PR.
+    std::string failure_sentinel;
+    std::string_view sentinel_message = empty_message;
+    if (result.termination_reason == yuzu::agent::TerminationReason::exited &&
+        result.exit_code != 0) {
+        spdlog::warn("event_logs: journalctl fallback exited {} — reporting unavailable",
+                     result.exit_code);
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              unavailable_provenance);
+        failure_sentinel =
+            std::format("journalctl exited {} (event data unavailable)", result.exit_code);
+        sentinel_message = failure_sentinel;
+    }
+
     if (result.lines.empty()) {
-        ctx.write_output(std::format("{}|none|-|{}", prefix, empty_message));
+        ctx.write_output(std::format("{}|none|-|{}", prefix, sentinel_message));
         return 0;
     }
     for (const auto& line : result.lines) {

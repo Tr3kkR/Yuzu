@@ -127,6 +127,12 @@ TEST_CASE("event_logs plugin: errors executes the real acquisition leg, every ro
     std::vector<YuzuParam> params{{"log", "System"}, {"hours", "1"}};
     auto result = dispatcher.run(plugin->descriptor, "errors", params);
     CHECK(result.rc == 0);
+    // A leg that silently emitted NOTHING would satisfy rc==0 and vacuously
+    // satisfy the prefix check below (every_nonempty_line_has_prefix is true
+    // for empty input). The plugin's contract is that it always emits either
+    // real rows or the honest-empty sentinel row, so bare silence is a real
+    // regression and must fail here rather than read as a pass.
+    CHECK_FALSE(result.captured.empty());
     // A reverted/broken leg (wrong tool, wrong argv, or a shell hop that
     // silently no-ops) either fails this call or produces a row that never
     // matches "error|" -- this only passes if a real acquisition leg
@@ -156,7 +162,28 @@ TEST_CASE("event_logs plugin: query executes the real acquisition leg, every row
     std::vector<YuzuParam> params{{"log", "System"}, {"filter", "a"}, {"count", "5"}};
     auto result = dispatcher.run(plugin->descriptor, "query", params);
     CHECK(result.rc == 0);
+    CHECK_FALSE(result.captured.empty()); // bare silence is a regression, not a pass
     CHECK(every_nonempty_line_has_prefix(result.captured, "event|"));
+}
+
+TEST_CASE("event_logs plugin: descriptor advertises the migrated version and ABI4 declarations",
+          "[event_logs][posix_actions]") {
+    // The runtime advertisement is what the server's capability matrix and the
+    // os-capability-matrix generated block are derived from, so it can drift
+    // away from the implemented migration with every other test still green.
+    // Pin the parts this PR changed: the 1.0.0 -> 1.1.0 bump, ABI4 (required
+    // for per-action capability declarations to exist at all), and the two
+    // migrated actions each carrying a declaration.
+    auto plugin = load_event_logs_plugin();
+    REQUIRE(plugin.has_value());
+    const auto* d = plugin->descriptor;
+
+    REQUIRE(d->version != nullptr);
+    CHECK(std::string_view{d->version} == "1.1.0");
+    CHECK(std::string_view{d->name} == "event_logs");
+    CHECK(d->abi_version == 4);
+    REQUIRE(d->action_descriptors != nullptr);
+    CHECK(d->action_descriptor_count == 2); // errors + query, both migrated
 }
 
 TEST_CASE("event_logs plugin: an unknown action fails with the standard unknown-action message",

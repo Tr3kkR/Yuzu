@@ -108,27 +108,27 @@ TEST_CASE("clamp_int_param: exact bounds pass through unchanged", "[event_logs][
 }
 
 // ---------------------------------------------------------------------------
-// contains_ci
+// icontains (shared yuzu::util helper, re-exported by the parsers header)
 // ---------------------------------------------------------------------------
 
-TEST_CASE("contains_ci: case-insensitive substring match", "[event_logs][parsers]") {
-    CHECK(contains_ci("Hello World", "world"));
-    CHECK(contains_ci("Hello World", "WORLD"));
-    CHECK(contains_ci("Hello World", "Hello"));
+TEST_CASE("icontains: case-insensitive substring match", "[event_logs][parsers]") {
+    CHECK(icontains("Hello World", "world"));
+    CHECK(icontains("Hello World", "WORLD"));
+    CHECK(icontains("Hello World", "Hello"));
 }
 
-TEST_CASE("contains_ci: empty needle always matches", "[event_logs][parsers]") {
-    CHECK(contains_ci("anything", ""));
-    CHECK(contains_ci("", ""));
+TEST_CASE("icontains: empty needle always matches", "[event_logs][parsers]") {
+    CHECK(icontains("anything", ""));
+    CHECK(icontains("", ""));
 }
 
-TEST_CASE("contains_ci: needle longer than haystack never matches", "[event_logs][parsers]") {
-    CHECK_FALSE(contains_ci("ab", "abc"));
-    CHECK_FALSE(contains_ci("", "x"));
+TEST_CASE("icontains: needle longer than haystack never matches", "[event_logs][parsers]") {
+    CHECK_FALSE(icontains("ab", "abc"));
+    CHECK_FALSE(icontains("", "x"));
 }
 
-TEST_CASE("contains_ci: a genuine miss returns false", "[event_logs][parsers]") {
-    CHECK_FALSE(contains_ci("Hello World", "xyz"));
+TEST_CASE("icontains: a genuine miss returns false", "[event_logs][parsers]") {
+    CHECK_FALSE(icontains("Hello World", "xyz"));
 }
 
 // ---------------------------------------------------------------------------

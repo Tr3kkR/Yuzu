@@ -26,8 +26,6 @@
 // drive it against a real journal for verification, and the row FORMATTING
 // stays in the pure event_logs_parsers.hpp.
 
-#include <systemd/sd-journal.h>
-
 #include <chrono>
 #include <cstdint>
 #include <ctime>
@@ -36,7 +34,9 @@
 #include <utility>
 #include <vector>
 
-#include "event_logs_parsers.hpp" // contains_ci (filter matching)
+#include <systemd/sd-journal.h>
+
+#include "event_logs_parsers.hpp" // journal_message_matches (filter matching)
 
 namespace yuzu::event_logs_journal {
 
@@ -213,7 +213,10 @@ inline ReadResult read_matches(std::string_view filter, std::size_t count, std::
         std::uint64_t usec = 0;
         if (::sd_journal_get_realtime_usec(j.get(), &usec) < 0)
             continue;
-        const std::string message = field_value(j.get(), "MESSAGE");
+        // Non-const so the move below is a real move, and read ONCE here —
+        // read_current_entry would otherwise fetch MESSAGE a second time only
+        // for it to be overwritten.
+        std::string message = field_value(j.get(), "MESSAGE");
         if (!yuzu::event_logs_parsers::journal_message_matches(message, filter))
             continue;
         Entry e = detail::read_current_entry(j.get(), usec);

@@ -129,6 +129,12 @@ TEST_CASE("event_logs plugin (Windows): errors executes the real bounded wevtapi
     // actually ran, whether it found events, found none (honest-empty
     // sentinel), or hit a typed failure (permission_denied on a
     // non-elevated runner is legal and still row-prefixed).
+    //
+    // The non-empty check is load-bearing: every_nonempty_line_has_prefix is
+    // vacuously true for empty input, so without it a leg that emitted
+    // NOTHING would pass both assertions. The plugin always emits real rows,
+    // the honest-empty sentinel, or a typed failure row -- never silence.
+    CHECK_FALSE(result.captured.empty());
     CHECK(every_nonempty_line_has_prefix(result.captured, "error|"));
 }
 
@@ -143,6 +149,7 @@ TEST_CASE("event_logs plugin (Windows): query executes the real bounded wevtapi 
         {"log", "Application"}, {"filter", "Windows"}, {"count", "10"}};
     auto result = dispatcher.run(plugin->descriptor, "query", params);
     CHECK(result.rc == 0);
+    CHECK_FALSE(result.captured.empty()); // bare silence is a regression, not a pass
     CHECK(every_nonempty_line_has_prefix(result.captured, "event|"));
 }
 
