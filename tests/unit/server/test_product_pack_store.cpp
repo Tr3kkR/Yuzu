@@ -2124,3 +2124,60 @@ name: rest-item-bad-kind
     CHECK(result == "success");
     CHECK(detail.find("2/3") != std::string::npos);
 }
+
+// Gate 8 finding (#3479/#3481, security-guardian): errors[] can reflect attacker-controlled
+// YAML field values (e.g. an invalid `mode:` quoted verbatim into the error string) — unlike
+// `id` (server-generated hex, always valid UTF-8). The default strict nlohmann::json dump()
+// throws on invalid UTF-8, which would 500 AFTER the partial install (and its audit row)
+// already committed. Proves the fix (error_handler_t::replace) instead of just asserting it.
+TEST_CASE("REST: POST /api/product-packs survives invalid UTF-8 reflected into a per-item error "
+          "string instead of 500ing after the partial install already committed",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    yuzu::test::TempDbFile inst_db{std::string_view{"yuzu_test_partial-utf8-instr-"}};
+    InstructionStore instruction_store{inst_db.path};
+    REQUIRE(instruction_store.is_open());
+
+    ProductPackRestHarness h{&store, &instruction_store};
+
+    // The invalid byte sequence (\xFF\xFE, never valid UTF-8) is embedded directly in the
+    // bundle text — this store's YAML extraction is a plain substring scan, not a UTF-8-aware
+    // parser, so it passes the raw bytes through into `mode:`'s value verbatim, which
+    // install_fn then quotes into its "invalid approval mode: <value>" error string.
+    const std::string kBadUtf8Bundle =
+        "apiVersion: yuzu.io/v1alpha1\n"
+        "kind: ProductPack\n"
+        "name: test-rest-bad-utf8\n"
+        "version: 1.0.0\n"
+        "description: One item succeeds, one fails with invalid UTF-8 in the reflected value\n"
+        "---\n"
+        "apiVersion: yuzu.io/v1alpha1\n"
+        "kind: InstructionDefinition\n"
+        "name: rest-item-ok\n"
+        "plugin: system\n"
+        "action: noop\n"
+        "---\n"
+        "apiVersion: yuzu.io/v1alpha1\n"
+        "kind: InstructionDefinition\n"
+        "name: rest-item-bad-utf8\n"
+        "plugin: system\n"
+        "action: noop\n"
+        "mode: bad-\xFF\xFE-mode\n";
+
+    auto res = h.sink.dispatch("POST", "/api/product-packs", kBadUtf8Bundle, "text/plain");
+    REQUIRE(res);
+    // Must NOT be a 500 (the pre-fix failure mode) — the partial install already committed by
+    // the time the response is built, so the response itself must survive serializing it.
+    CHECK(res->status == 201);
+    // The body must be well-formed JSON (nlohmann::json::parse throws on malformed input,
+    // failing this REQUIRE, if the response were ever empty/truncated by a mid-dump() throw).
+    nlohmann::json body;
+    REQUIRE_NOTHROW(body = nlohmann::json::parse(res->body));
+    REQUIRE(body.contains("errors"));
+    REQUIRE(body["errors"].size() == 1);
+}

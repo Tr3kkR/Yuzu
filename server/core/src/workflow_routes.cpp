@@ -2104,7 +2104,16 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Product pack installed","level":"success"}})");
         res.status = 201;
-        res.set_content(response_body.dump(), "application/json");
+        // Gate 8 review (security-guardian, #3479/#3481): unlike `id` (server-generated hex,
+        // always valid UTF-8), `errors[]` entries can reflect attacker-controlled YAML field
+        // values (e.g. an invalid `mode:` value quoted verbatim into the error string) — the
+        // default strict dump() throws on invalid UTF-8, which would 500 AFTER the partial
+        // install (and its audit row) already committed. error_handler_t::replace (established
+        // convention — see analytics_event_store.cpp/bundle_service.cpp/preflight_eval.cpp)
+        // substitutes U+FFFD instead.
+        res.set_content(
+            response_body.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
+            "application/json");
     });
 
     // GET /api/product-packs/:id -- get product pack detail
