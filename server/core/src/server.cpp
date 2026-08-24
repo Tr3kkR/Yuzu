@@ -16761,8 +16761,10 @@ private:
                 if (stop_requested_.load(std::memory_order_acquire))
                     break;
                 if (policy_evaluator_) {
-                    // tick() touches JSON parsing, the CEL evaluator and SQLite —
-                    // any of which can throw on a malformed policy/result. An
+                    // tick() touches JSON parsing and the CEL evaluator (Postgres
+                    // reads/writes go through PolicyStore's std::expected/bool
+                    // contracts, not exceptions) — any of the former can throw on
+                    // a malformed policy/result. An
                     // exception escaping a std::thread entry calls std::terminate,
                     // so a single bad policy must not take the process (or silently
                     // kill compliance evaluation). Catch, log, and keep ticking.
