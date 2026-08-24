@@ -3732,12 +3732,15 @@ List all configured webhooks.
       "id": 1,
       "url": "https://example.com/hooks/yuzu",
       "event_types": ["agent.registered", "command.completed"],
+      "has_secret": true,
       "enabled": true,
       "created_at": 1710849600
     }
   ]
 }
 ```
+
+`has_secret` reports whether a signing secret is configured — the secret itself is never returned by this or any other endpoint, encrypted or otherwise.
 
 #### `POST /api/webhooks`
 
@@ -3772,6 +3775,14 @@ Create a new webhook subscription.
 `agent.registered` fires on *every* gRPC reconnect, not only first enrollment — a server restart, a network blip, or a gateway bounce that strands and reconnects a fleet produces one delivery per reconnecting agent, not one per genuinely new device. A target wired to a low-tolerance channel (e.g. a Slack alert intended for "new device joined the fleet") should filter or debounce on the receiving end if reconnect noise matters; the dashboard's own "Agent Enrolled" notification does not have this problem (it fires once, on first enrollment only).
 
 If a `secret` is provided, each delivery includes an `X-Yuzu-Signature` header containing the HMAC-SHA256 hex digest of the request body.
+
+**Security — secret storage and the legacy-file retention window.** A configured signing secret
+is envelope-encrypted at rest (AES-256-GCM, ADR-0010) — a stolen database backup alone cannot
+recover it. There is no rotation endpoint today: to change a secret, delete the webhook and
+recreate it. Deployments that upgraded from a release before the Postgres cutover retain the
+pre-cutover SQLite `webhooks.db` file for one release as a rollback net (ADR-0009); that file
+still holds signing secrets in **plaintext**. If your backup posture for that one-release window
+is unknown, rotate (delete-and-recreate) every webhook's secret once the window has closed.
 
 #### `DELETE /api/webhooks/{id}`
 

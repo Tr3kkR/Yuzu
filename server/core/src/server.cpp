@@ -5228,12 +5228,74 @@ public:
                 }
             }
         }
-        // Webhook store
-        {
-            auto webhook_db = cfg_.db_dir() / "webhooks.db";
-            webhook_store_ = std::make_unique<WebhookStore>(webhook_db);
-            webhook_store_->set_metrics(&metrics_);
-            agent_service_.set_webhook_store(webhook_store_.get());
+        // WebhookStore (ADR-0057, Wave 3) — Postgres-backed, construction
+        // fail-closed (ADR-0012 §1). First store past AuthDB to carry a
+        // real SecretCodec migration (`webhooks.secret`, the webhook HMAC
+        // signing secret) — the ADR-0057 template for OffloadTargetStore/
+        // RuntimeConfigStore. Construction order mirrors AuthDB's block
+        // above EXACTLY (docs/postgres-store-playbook.md step 3,
+        // "Instance model" — one codec per secret-bearing store, reusing
+        // auth_key_provider_ rather than minting a second KeyProvider over
+        // the same install-wide KEK): SecretCodec (ctor only) -> WebhookStore
+        // (this ctor registers `secret` as the secret column) ->
+        // SecretCodec::init() -> migrate_from_sqlite (MANDATORY backfill,
+        // ADR-0009 — webhook configs+secrets are unconditionally mandatory,
+        // and ADR-0057 also treats the delivery log as mandatory: it is
+        // not TTL'd, so ResponseStore's "ages out" skip-justification does
+        // not hold, and one transaction already covers both tables at this
+        // scale). auth_key_provider_ is guaranteed non-null whenever this
+        // guard is reached — same reasoning as the plugin_config_store_
+        // block above.
+        if (pg_pool_ && !startup_failed_) {
+            webhook_secret_codec_ = std::make_unique<pg::SecretCodec>(*auth_key_provider_);
+            webhook_store_ = std::make_unique<WebhookStore>(*pg_pool_, *webhook_secret_codec_);
+            if (!webhook_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: webhook store migration/open failed "
+                              "(database reachable but the webhook_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                auto lease = pg_pool_->acquire();
+                if (!lease) {
+                    spdlog::error("[PG] Refusing to start: could not acquire a connection to run "
+                                  "SecretCodec::init() for webhook_store ({})",
+                                  pg_pool_->last_error());
+                    startup_failed_ = true;
+                } else {
+                    auto init_res = webhook_secret_codec_->init(lease.get());
+                    lease.reset();
+                    if (!init_res) {
+                        spdlog::error(
+                            "[PG] Refusing to start: webhook_store SecretCodec::init() failed — "
+                            "{}: {}",
+                            pg::SecretCodec::to_string(init_res.error().kind),
+                            init_res.error().message);
+                        startup_failed_ = true;
+                    } else {
+                        auto webhook_db = cfg_.db_dir() / "webhooks.db";
+                        if (!webhook_store_->migrate_from_sqlite(webhook_db)) {
+                            spdlog::error(
+                                "[PG] Refusing to start: webhook legacy-SQLite backfill failed "
+                                "(see prior log lines) — webhook_store is authoritative and must "
+                                "not serve partially-migrated secret-bearing data. Operator "
+                                "remediation: repair {} or move it aside to skip the backfill "
+                                "(existing webhooks/signing secrets in it will NOT carry over)",
+                                webhook_db.string());
+                            startup_failed_ = true;
+                        } else {
+                            spdlog::info("WebhookStore initialized (schema webhook_store; legacy "
+                                         "backfill source {})",
+                                         webhook_db.string());
+                            webhook_store_->set_metrics(&metrics_);
+                            // #3261/#3294 lesson 10: wire the consumer only
+                            // inside the full-success branch — a top-of-ctor
+                            // wiring block that ran before this store
+                            // existed silently never fired.
+                            agent_service_.set_webhook_store(webhook_store_.get());
+                        }
+                    }
+                }
+            }
         }
         {
             auto offload_db = cfg_.db_dir() / "offload_targets.db";
@@ -6510,8 +6572,12 @@ public:
                 // count, so this is a `set()` of a monotonic total, not an
                 // increment, and a scrape that races a failure simply reports
                 // it on the next one.
-                if (auth_secret_codec_) {
-                    for (const auto& [key, count] : auth_secret_codec_->decrypt_failure_counts()) {
+                // Iterates every KEK-enrolled codec (kek_enrolled_codecs()) —
+                // was auth_secret_codec_-only, which silently missed
+                // plugin_config_secret_codec_'s decrypt failures; webhook_
+                // secret_codec_ joins the same enrolled set (ADR-0057).
+                for (auto* codec : kek_enrolled_codecs()) {
+                    for (const auto& [key, count] : codec->decrypt_failure_counts()) {
                         const auto& [store, cls] = key;
                         metrics_
                             .gauge("yuzu_server_secret_decrypt_failures_total",
@@ -7553,7 +7619,7 @@ public:
         // plugin_config_secret_codec_, which borrows the SAME
         // auth_key_provider_ auth_secret_codec_ above borrows — so both
         // stores/codecs must be gone before auth_key_provider_.reset()
-        // below (docs/postgres-store-playbook.md:112 destruct-before-pool,
+        // (docs/postgres-store-playbook.md:112 destruct-before-pool,
         // applied transitively to the shared key provider too). No audit
         // hook to clear: PluginConfigStore's SecretCodec is never wired to
         // audit_store_ (its own audit trail runs through
@@ -7565,7 +7631,13 @@ public:
         // the pool. Every HTTP handler holding the raw pointer is quiesced
         // by the drains above.
         upload_grant_store_.reset();
-        auth_key_provider_.reset();
+        // auth_key_provider_.reset() does NOT happen here (ADR-0057). It
+        // used to, but webhook_secret_codec_/webhook_store_ ALSO borrow it
+        // transitively, and webhook_store_ does not reset until AFTER the
+        // up-to-60s delivery-pool quiesce() below — an in-flight delivery
+        // decrypts (touches the KeyProvider) right up until it drains. See
+        // the auth_key_provider_.reset() call further down, right after
+        // that drain, for the actual reset point and its own comment.
         // AuditStore (ADR-0040) borrows pg_pool_ via its retention thread — that
         // thread is joined at stop_cleanup() above; drop the store before the
         // pool so no late lease touches a destroyed pool. Unwire the borrowed
@@ -7802,6 +7874,21 @@ public:
         agent_service_.set_offload_target_store(nullptr);
         webhook_store_.reset();
         offload_target_store_.reset();
+        // ADR-0057: webhook_secret_codec_ borrows auth_key_provider_ — same
+        // contract as auth_secret_codec_/plugin_config_secret_codec_ above
+        // (clear the audit hook before the codec dies, then drop it) —
+        // except this pair sits HERE, after the delivery-pool quiesce()
+        // just above, not up with the other codecs: an in-flight delivery
+        // decrypts (touches webhook_secret_codec_, transitively
+        // auth_key_provider_) right up until quiesce() proves it drained,
+        // so resetting either any earlier would UAF a still-draining
+        // delivery. auth_key_provider_.reset() ALSO moved here from its
+        // former position up with the other codecs, for the identical
+        // reason — see that block's comment.
+        if (webhook_secret_codec_)
+            webhook_secret_codec_->set_audit_hook({});
+        webhook_secret_codec_.reset();
+        auth_key_provider_.reset();
         // TagStore (ADR-0050) borrows pg_pool_ — unwire the borrowed raw
         // pointer from agent_service_ (the Register sync_agent_tags ingest —
         // Register-only, heartbeats do not sync tags; governance perf-F8),
@@ -19441,6 +19528,13 @@ private:
             out.push_back(auth_secret_codec_.get());
         if (plugin_config_secret_codec_)
             out.push_back(plugin_config_secret_codec_.get());
+        // WebhookStore's SecretCodec (ADR-0057) — reuses auth_key_provider_
+        // (same "one KeyProvider instance backing multiple independent
+        // SecretCodec instances" shape as plugin_config_secret_codec_
+        // above), enrolled so its secret never stays pinned to whatever KEK
+        // version was active when it was written once rotation runs.
+        if (webhook_secret_codec_)
+            out.push_back(webhook_secret_codec_.get());
         return out;
     }
 
@@ -19512,6 +19606,16 @@ private:
 
     // Notification & Webhook stores
     std::unique_ptr<NotificationStore> notification_store_;
+    // WebhookStore's own SecretCodec (ADR-0057/ADR-0010) — declared BEFORE
+    // webhook_store_ (borrows it by reference) so normal ~ServerImpl
+    // (reverse declaration order) tears the store down first. stop()
+    // additionally moves auth_key_provider_.reset() to AFTER this store's
+    // drain+reset (see that block's comment) — declaration order alone is
+    // NOT sufficient there, because webhook_store_ only resets after the
+    // up-to-60s delivery-pool quiesce(), well past auth_key_provider_'s old
+    // reset point, and an in-flight delivery decrypts (touches the
+    // KeyProvider transitively) right up until it drains.
+    std::unique_ptr<pg::SecretCodec> webhook_secret_codec_;
     std::unique_ptr<WebhookStore> webhook_store_;
     std::unique_ptr<OffloadTargetStore> offload_target_store_;
 

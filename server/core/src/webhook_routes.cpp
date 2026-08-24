@@ -19,15 +19,28 @@ void WebhookRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn
                         "application/json");
                     return;
                 }
+                // list() is type-distinguishable (ADR-0036/postgres-store-
+                // playbook policy) — nullopt is a degraded read, never
+                // silently rendered as "no webhooks configured" (ADR-0057).
                 auto webhooks = webhook_store->list();
+                if (!webhooks) {
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"webhook store degraded"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
                 nlohmann::json arr = nlohmann::json::array();
-                for (const auto& w : webhooks) {
+                for (const auto& w : *webhooks) {
                     arr.push_back({{"id", w.id},
                                    {"url", w.url},
                                    {"event_types", w.event_types},
+                                   {"has_secret", w.has_secret},
                                    {"enabled", w.enabled},
                                    {"created_at", w.created_at}});
-                    // Intentionally omit secret from list response
+                    // Intentionally omit the secret (encrypted or otherwise)
+                    // from every list response — has_secret is the
+                    // non-sensitive signal.
                 }
                 res.set_content(nlohmann::json({{"webhooks", arr}}).dump(),
                                 "application/json");
@@ -68,7 +81,26 @@ void WebhookRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn
                  auto secret = body.value("secret", "");
                  auto enabled = body.value("enabled", true);
 
-                 auto id = webhook_store->create_webhook(url, event_types, secret, enabled);
+                 auto result = webhook_store->create_webhook(url, event_types, secret, enabled);
+                 if (!result) {
+                     // #3097 classification: caller error (bad URL) is 400,
+                     // never conflated with a store/DB degradation (503).
+                     if (result.error() == WebhookWriteError::invalid_url) {
+                         audit_fn(req, "webhook.create", "failure", "webhook", "", "invalid_url");
+                         res.status = 400;
+                         res.set_content(
+                             R"({"error":{"code":400,"message":"url must be http:// or https://"},"meta":{"api_version":"v1"}})",
+                             "application/json");
+                     } else {
+                         audit_fn(req, "webhook.create", "failure", "webhook", "", "db_error");
+                         res.status = 503;
+                         res.set_content(
+                             R"({"error":{"code":503,"message":"webhook store unavailable"},"meta":{"api_version":"v1"}})",
+                             "application/json");
+                     }
+                     return;
+                 }
+                 const auto id = *result;
                  audit_fn(req, "webhook.create", "success", "webhook",
                           std::to_string(id), "");
                  if (emit_event_fn)
@@ -93,7 +125,20 @@ void WebhookRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn
                        return;
                    }
                    auto id = std::stoll(req.matches[1].str());
-                   if (webhook_store->delete_webhook(id)) {
+                   auto result = webhook_store->delete_webhook(id);
+                   if (!result) {
+                       // #3097 classification: a query failure against an
+                       // open store is 503, distinct from the plain
+                       // not-found case below (never conflated).
+                       audit_fn(req, "webhook.delete", "failure", "webhook", std::to_string(id),
+                                "db_error");
+                       res.status = 503;
+                       res.set_content(
+                           R"({"error":{"code":503,"message":"webhook store unavailable"},"meta":{"api_version":"v1"}})",
+                           "application/json");
+                       return;
+                   }
+                   if (*result) {
                        audit_fn(req, "webhook.delete", "success", "webhook",
                                 std::to_string(id), "");
                        res.set_content(R"({"status":"deleted"})", "application/json");
