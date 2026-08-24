@@ -185,9 +185,18 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
     auto res = yuzu::agent::run_bounded_subprocess(
         {tool, "upgrade", "--accept-source-agreements"},
         yuzu::agent::SubprocessOptions{.deadline = kSlowToolDeadline});
-    bool status_forwarded = yuzu::agent::forward_runner_failure(ctx, res);
+    // A runner-level outcome or a truncated capture disqualifies the whole
+    // table: parsing a half-captured table would report a SHORTER upgrade list
+    // as though it were complete. The exit code is not part of this test --
+    // winget returns a documented nonzero for several benign states -- so a
+    // nonzero exit only matters when nothing parsed (below), where it is the
+    // difference between "up to date" and "the query failed".
+    if (!capture_usable(res, /*exit_ok=*/true)) {
+        degrade(ctx, res, "software_actions:winget_failed");
+        return 1;
+    }
     auto parsed = yuzu::software_actions::parse_winget_upgrade(res.output);
-    if (parsed.unmapped_lines > 0 && !status_forwarded && !parsed.header_unrecognized) {
+    if (parsed.unmapped_lines > 0 && !parsed.header_unrecognized) {
         // Some post-separator line looked like data but did not fit the
         // header's columns, so it was dropped rather than emitted with values
         // borrowed from a neighbouring column. A vanished package must not be
@@ -195,7 +204,7 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               "software_actions:winget_rows_unmapped");
     }
-    if (parsed.header_unrecognized && !status_forwarded) {
+    if (parsed.header_unrecognized) {
         // The table was found but its header did not yield the five expected
         // column origins, so every row below is reported name-only. Say so —
         // an operator must be able to tell "these packages are upgradable and
@@ -205,15 +214,31 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
                               "software_actions:winget_header_unrecognized");
     }
     if (parsed.rows.empty()) {
-        ctx.write_output(parsed.separator_found ? "upgradable|none|System is up to date|-"
-                                                : "upgradable|none|-|-");
-    } else {
-        for (const auto& r : parsed.rows) {
-            ctx.write_output(
-                std::format("upgradable|{}|{}|{}", r.name, r.current_version, r.available_version));
+        if (res.exit_code != 0) {
+            // Nothing parsed AND a failing exit: no basis to claim this host is
+            // up to date.
+            degrade(ctx, res, "software_actions:winget_failed");
+            return 1;
         }
+        if (!parsed.separator_found) {
+            // winget exited cleanly but produced no recognisable table at all,
+            // so nothing about this host's upgrades was established. The
+            // non-committal "-" line is kept for output-shape compatibility;
+            // the status is what tells an operator it is not an "up to date".
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
+                                  YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "software_actions:winget_no_table");
+            ctx.write_output("upgradable|none|-|-");
+            return 1;
+        }
+        ctx.write_output("upgradable|none|System is up to date|-");
+        return 0;
     }
-    return status_forwarded ? 1 : 0;
+    for (const auto& r : parsed.rows) {
+        ctx.write_output(
+            std::format("upgradable|{}|{}|{}", r.name, r.current_version, r.available_version));
+    }
+    return 0;
 
 #elif defined(__linux__)
     bool found = false;
