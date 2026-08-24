@@ -1860,9 +1860,13 @@ mandatory and fails closed rather than degrading silently — same posture class
   release during the one-release rollback window, that binary reads `product-packs.db`
   directly and does not know Postgres or the tombstone table exist — an uninstalled
   pack's catalog listing can reappear for the duration of the rollback. The pack's
-  actual content is not restored (it was permanently deleted from its own separate
-  store by `uninstall()`), so this is a stale listing, not reinstated content, and it
-  self-corrects on the next roll-forward.
+  actual content is not restored — it was already deleted from its own separate stores
+  by `uninstall()` (a `PolicyFragment` still referenced by another policy is the one
+  documented exception, logged and non-fatal to the pack's own uninstall) — so this is a
+  stale listing, not reinstated content: a lookup that follows one of that listing's item
+  ids elsewhere (fetching or executing an instruction by id, for example) will 404
+  against content that's already gone, which is expected during the window, not a new
+  fault. It self-corrects on the next roll-forward.
 
 **Operator-visible behaviour changes.**
 
@@ -1883,8 +1887,10 @@ mandatory and fails closed rather than degrading silently — same posture class
   caller (logged server-side instead; see `docs/user-manual/rest-api.md`'s Product
   Packs section).
 - Installing a bundle whose documents assign the same item id twice now fails the whole
-  install with a database error instead of silently discarding the duplicate item (a
-  pre-migration bug, not a preserved behavior).
+  install as a **400 validation error** instead of silently discarding the duplicate
+  item (a pre-migration bug, not a preserved behavior) — detected before any Postgres
+  interaction, so unlike a genuine database error this is **not retryable**: the same
+  bundle always fails the same way.
 - No change to the `#802`/W7.4 signed-pack enforcement default, the Ed25519 signature
   verification path, or the `--allow-unsigned-packs` / `YUZU_ALLOW_UNSIGNED_PACKS`
   operator escape hatch.

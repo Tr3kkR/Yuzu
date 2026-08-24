@@ -158,10 +158,14 @@ above did not originally address what stops a redeployed or newly-joined replica
 `migrate_from_sqlite` re-checks its content-fingerprint marker on *every* boot, not just the
 fleet's first migration, so this is reachable on an ordinary rolling redeploy, not only a
 contrived scenario. Closed via a `deleted_pack_ids(pack_id, deleted_at)` tombstone table:
-`uninstall()` stamps a row into it in the same transaction as its deletes; every
-`migrate_from_sqlite` pass checks it before treating an unmatched legacy pack id as fresh
-content, skipping both the pack row and its item rows together (avoids a `product_pack_items ->
-product_packs` FK violation against a never-inserted parent). Both writers coordinate through a
+`uninstall()` stamps a row into it in the same transaction as its deletes; the first time a
+given legacy file's exact content is seen (its whole-file fingerprint has no prior marker),
+`migrate_from_sqlite` checks the tombstone before treating an unmatched legacy pack id as
+fresh content, skipping both the pack row and its item rows together (avoids a
+`product_pack_items -> product_packs` FK violation against a never-inserted parent) — a
+later pass against byte-identical content is a safe no-op fingerprint-skip, not a repeat
+tombstone check, because that content was already fully reconciled in the transaction that
+stamped its marker. Both writers coordinate through a
 `pg_advisory_xact_lock` (`kErasureCoordLockSql`, mirroring `RbacStore`'s
 `kRevokeCoordLockSql`/CHAOS-1 fix for the identical check-then-insert race shape) taken as the
 first statement in each transaction — without it, a concurrent `uninstall()` committing between

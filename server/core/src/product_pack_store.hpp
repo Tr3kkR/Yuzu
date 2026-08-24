@@ -162,15 +162,17 @@ public:
     /// boot whose legacy file content-fingerprint hasn't been seen before, not just the fleet's
     /// first migration — see the fingerprint-marker check below.
     ///
-    /// SCOPE, per Gate 8 review of F035 (docs-writer/architect/cpp-expert, all BLOCKING — self-
-    /// authored "now SATISFIED" ledger claim correctly rejected, pending adjudication): this
-    /// closes the cross-replica/redeployed-replica hazard only. ADR-0009's Decision section
-    /// separately requires a wired erasure path to "delete the same subject/device from the
-    /// rollback copy" — i.e. the retained legacy SQLite file itself — so that an operator who
-    /// rolls the server binary BACK to the pre-migration release (which reads this file directly
-    /// and has no knowledge Postgres or `deleted_pack_ids` exist) cannot see an uninstalled pack
-    /// reappear. This method does not implement that half of the clause; the legacy file is
-    /// never mutated. Tracked pending adjudication — see the F035 ledger rows.
+    /// SCOPE (Gate 8 review of F035; resolved by ADR-0009's `ProductPackStore`/ADR-0054 update
+    /// note, adjudicated by an independent reviewer + the change owner): this closes the
+    /// cross-replica/redeployed-replica hazard only. ADR-0009's Decision section separately
+    /// requires a wired erasure path to "delete the same subject/device from the rollback
+    /// copy" — i.e. the retained legacy SQLite file itself — so that an operator who rolls the
+    /// server binary BACK to the pre-migration release (which reads this file directly and has
+    /// no knowledge Postgres or `deleted_pack_ids` exist) cannot see an uninstalled pack's
+    /// catalog listing reappear for the duration of that rollback window. This method does not
+    /// implement that half of the clause; the legacy file is never mutated. Accepted as a
+    /// deliberate, store-scoped residual — see ADR-0009's update note for the full reasoning
+    /// and its explicit non-precedent scoping.
     [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
     /// When true, packs WITHOUT a `signature` field are rejected at install time. Packs with a
