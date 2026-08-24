@@ -1924,7 +1924,7 @@ TEST_CASE("MCP rotate_api_token: a committed mint whose successor read-back fail
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
     CHECK(body["error"]["message"].get<std::string>().find("could not be read back") !=
           std::string::npos);
-    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == 2000); // A5: genuinely retryable
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == mcp::kMcpStoreFaultShortRetryMs); // A5: genuinely retryable
 
     // THE ASSERTION THIS TEST EXISTS FOR: "partial", never "failure" — the
     // domain-specific row AND the generic MCP gate-level row both reflect
@@ -3114,7 +3114,7 @@ TEST_CASE("MCP Integration: discover_plugins wired vs unwired", "[mcp][integrati
     p->set_version("1.0");
     p->set_description("Process enumeration");
     p->add_capabilities("list");
-    registry.register_agent(info);
+    (void)registry.register_agent(info);
 
     McpTestServer ts;
     ts.agent_registry_for_test = &registry;
@@ -3184,6 +3184,17 @@ TEST_CASE("MCP: #2986 tools carry real typed outputSchema, not the kObjectOutput
          {"classification", "rationale", "recommended_next_tools"}},
         {"get_incident_playbook", {"scenario", "expected_first_tool", "steps", "safety"}},
         {"summarize_working_set", {"narrative", "resource_links", "recommended_next_tools"}},
+        // #3344: also closes these three tools' typed-ness gap — they were
+        // absent from this map even though they already used real per-field
+        // outputSchemas, so nothing was regression-guarding them.
+        {"get_execution_status",
+         {"id", "definition_id", "status", "scope_expression", "dispatched_by", "dispatched_at",
+          "agents_targeted", "agents_responded", "agents_success", "agents_failure",
+          "progress_pct", "retry_after_ms"}},
+        {"query_responses",
+         {"responses", "audit_persisted", "result_truncated_by_cap", "retry_after_ms"}},
+        {"get_bundle_result",
+         {"complete", "received", "succeeded", "expected", "steps", "retry_after_ms"}},
     };
 
     std::set<std::string> seen;
@@ -4231,8 +4242,28 @@ TEST_CASE("MCP compare_app_perf_versions: cohort-paired before/after (evidential
 // perm_fn - same gap here,
 // same fix (deny_fleet_wide_service_scoped, reused verbs). ────────────────
 
-TEST_CASE("MCP get_dex_group_app_perf: denies a service-scoped token, denial audited",
-          "[pg][mcp][integration][dex][app_perf][security]") {
+// #3290 Phase 2 bucket 1a retired this tool's interim deny_fleet_wide_
+// service_scoped() call as provably dead — perm_fn (production:
+// require_permission) already denies any service-scoped token outright for
+// (GuaranteedState, Read) before the tool-specific branch is ever reached
+// (kServiceScopeGlobalSafe is compile-time-empty). This test's OWN fake
+// perm_fn defaults to "always allow" (McpTestServer's documented default,
+// unlike production), so proving the tool still denies a service-scoped
+// token now needs an explicit perm_override_for_test simulating what
+// require_permission's real flip-deny does for this securable/operation —
+// the same pattern other MCP tool-gating tests in this file already use.
+// This test proves the TOOL honors a perm_fn denial — it does not itself
+// prove require_permission's real flip-deny fires for a genuine
+// service-scoped session (composition, not re-derivation): that is proven
+// generically, securable-agnostic (a pure empty-allow-list membership
+// check, no per-securable special-casing), by "AuthRoutes::require_permission
+// — service-scoped token: ITServiceOwner ceiling holds but the default-deny
+// allow-list still denies (the flip)", test_auth_routes.cpp:794 — including
+// the audit trail (`auth.permission_required`) this test does not
+// re-prove per-tool (quality-engineer, governance run 2026-08-21).
+TEST_CASE("MCP get_dex_group_app_perf: still denies a service-scoped token "
+          "via perm_fn (interim tool-specific deny retired, #3290 bucket 1a)",
+          "[mcp][integration][dex][app_perf][security]") {
     McpTestServer ts;
     ts.app_perf_providers_for_test.group =
         [](std::string_view, std::string_view,
@@ -4240,22 +4271,35 @@ TEST_CASE("MCP get_dex_group_app_perf: denies a service-scoped token, denial aud
         return std::vector<yuzu::server::AppPerfFleetRow>{};
     };
     ts.mock_token_scope_service = "printers";
+    ts.perm_override_for_test = [](const std::string& sec, const std::string& op) -> bool {
+        return !(sec == "GuaranteedState" && op == "Read");
+    };
     ts.start("readonly");
 
     auto res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":94,"params":{"name":"get_dex_group_app_perf","arguments":{"group_id":"g1","app":"chrome.exe"}}})");
     REQUIRE(res);
+    CHECK(res->status == 403); // denied at the GuaranteedState:Read gate
+    // NOT the JSON-RPC kPermissionDenied error-code shape other tool-specific
+    // denial tests in this file assert on — this test's denial comes from the
+    // fake perm_fn (McpTestServer harness, ~line 1018), so the tool-specific
+    // branch that would construct that envelope is never reached (matching
+    // production's own perm_fn gate ordering). The harness's fake perm_fn
+    // returns a simplified {"error":"forbidden"} literal that does NOT match
+    // production's real shape (require_permission's actual denials always go
+    // through detail::a4_denial, where `error` is an object carrying
+    // code/message/correlation_id/etc — never a bare string, per
+    // rest_api_v1.cpp's error_json_a4). This test proves the tool respects a
+    // perm_fn denial and returns an error body at all; it does not and cannot
+    // prove the real production wire shape — that's proven generically by
+    // test_auth_routes.cpp:794 (governance run 2026-08-21, quality-engineer:
+    // an earlier draft of this comment incorrectly claimed the fixture
+    // "mimics" the real body).
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
-    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
 
-    bool saw_denied = false;
-    for (const auto& a : ts.audit_log) {
-        if (a == "dex.perf.group.view|denied")
-            saw_denied = true;
+    for (const auto& a : ts.audit_log)
         CHECK(a != "dex.perf.group.view|success");
-    }
-    CHECK(saw_denied);
 }
 
 TEST_CASE("MCP compare_app_perf_versions: denies a service-scoped token, denied under "
@@ -4675,7 +4719,7 @@ TEST_CASE("MCP Integration: resources/list returns the expected resources", "[mc
     REQUIRE(result.contains("resources"));
     auto& resources = result["resources"];
     REQUIRE(resources.is_array());
-    CHECK(resources.size() == 9); // existing resources + agentic context resources
+    CHECK(resources.size() == 11); // existing 9 + 2g PR4 specs-as-resources
 
     // The Guardian schema discovery resource is advertised on the MCP plane.
     std::set<std::string> uris;
@@ -4687,6 +4731,8 @@ TEST_CASE("MCP Integration: resources/list returns the expected resources", "[mc
     CHECK(uris.count("yuzu://operating-model") == 1);
     CHECK(uris.count("yuzu://demo/playbooks") == 1);
     CHECK(uris.count("yuzu://golden-prompts/enterprise-it-v1") == 1);
+    CHECK(uris.count("yuzu://openapi") == 1);
+    CHECK(uris.count("yuzu://scope-dsl") == 1);
 
     // Each resource should have uri, name, description, mimeType
     for (const auto& r : resources) {
@@ -4695,6 +4741,100 @@ TEST_CASE("MCP Integration: resources/list returns the expected resources", "[mc
         CHECK(r.contains("description"));
         CHECK(r.contains("mimeType"));
     }
+}
+
+// ── 2g PR4: specs-as-resources (yuzu://openapi, yuzu://scope-dsl) ──────────
+//
+// Both resources share the SAME builder as their REST /discover/* and MCP
+// discover_* tool twins (A2 shared-builder principle) and are tier-gated
+// (unlike the 9 legacy resources above, which predate the annotation/tier
+// sweep and are perm_fn-only — #2713 tracks closing that gap for them).
+
+TEST_CASE("MCP 2g PR4: yuzu://openapi matches openapi_spec_json()",
+          "[mcp][2g][integration]") {
+    McpTestServer ts;
+    ts.start("readonly"); // Infrastructure:Read is allowed on every MCP tier
+
+    const auto expected = nlohmann::json::parse(yuzu::server::openapi_spec_json());
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":30,"params":{"uri":"yuzu://openapi"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& contents = body["result"]["contents"];
+    REQUIRE(contents.is_array());
+    REQUIRE(contents.size() == 1);
+    CHECK(contents[0]["uri"] == "yuzu://openapi");
+    CHECK(contents[0]["mimeType"] == "application/json");
+    auto got = nlohmann::json::parse(contents[0]["text"].get<std::string>());
+    CHECK(got == expected);
+}
+
+TEST_CASE("MCP 2g PR4: yuzu://scope-dsl matches scope_kinds_catalog()",
+          "[mcp][2g][integration]") {
+    McpTestServer ts;
+    ts.start("readonly");
+
+    const auto expected = nlohmann::json::parse(yuzu::server::scope_kinds_catalog().json);
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":31,"params":{"uri":"yuzu://scope-dsl"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& contents = body["result"]["contents"];
+    REQUIRE(contents.is_array());
+    REQUIRE(contents.size() == 1);
+    CHECK(contents[0]["uri"] == "yuzu://scope-dsl");
+    CHECK(contents[0]["mimeType"] == "application/json");
+    auto got = nlohmann::json::parse(contents[0]["text"].get<std::string>());
+    CHECK(got == expected);
+}
+
+TEST_CASE("MCP 2g PR4: yuzu://openapi and yuzu://scope-dsl deny without Infrastructure:Read",
+          "[mcp][2g][integration]") {
+    McpTestServer ts;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& operation) {
+        return !(securable == "Infrastructure" && operation == "Read");
+    };
+    ts.start("readonly");
+
+    auto res_openapi = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":32,"params":{"uri":"yuzu://openapi"}})");
+    REQUIRE(res_openapi);
+    CHECK(res_openapi->status != 200); // perm_fn denial sets its own error status
+
+    auto res_scope_dsl = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":33,"params":{"uri":"yuzu://scope-dsl"}})");
+    REQUIRE(res_scope_dsl);
+    CHECK(res_scope_dsl->status != 200);
+}
+
+TEST_CASE("MCP 2g PR4: yuzu://openapi and yuzu://scope-dsl deny at an unrecognized MCP tier",
+          "[mcp][2g][integration]") {
+    // tier_allows() returns false for any tier string it doesn't recognize
+    // (mcp_policy.hpp's final `return false;`) — this is the first tier-gated
+    // resource, so this test pins the branch against a future regression to
+    // the legacy perm_fn-only resources/read pattern.
+    McpTestServer ts;
+    ts.start("bogus-unrecognized-tier");
+
+    auto res_openapi = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":34,"params":{"uri":"yuzu://openapi"}})");
+    REQUIRE(res_openapi);
+    auto body = nlohmann::json::parse(res_openapi->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+
+    auto res_scope_dsl = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":35,"params":{"uri":"yuzu://scope-dsl"}})");
+    REQUIRE(res_scope_dsl);
+    auto body2 = nlohmann::json::parse(res_scope_dsl->body);
+    REQUIRE(body2.contains("error"));
+    CHECK(body2["error"]["code"] == yuzu::server::mcp::kTierDenied);
 }
 
 // ── 11. Unknown method — verify kMethodNotFound ─────────────────────────────
@@ -4958,6 +5098,76 @@ TEST_CASE("MCP Agentic demo: summarize_working_set execution kind requires Execu
         R"({"jsonrpc":"2.0","method":"tools/call","id":302,"params":{"name":"summarize_working_set","arguments":{"kind":"execution","id":"exec-xyz"}}})");
     REQUIRE(res);
     CHECK(res->status == 403); // denied at the Execution:Read gate, before tracker read
+}
+
+// #3344: get_execution_status had zero prior unit coverage.
+TEST_CASE("MCP get_execution_status: #3344 retry_after_ms present only while non-terminal",
+          "[mcp][integration][execution]") {
+    auto db_path = yuzu::test::unique_temp_path("test-mcp-exec-status-poll-");
+    std::filesystem::remove(db_path);
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(db_path.string().c_str(), &db) == SQLITE_OK);
+    struct Guard {
+        sqlite3* h;
+        std::filesystem::path p;
+        ~Guard() {
+            if (h)
+                sqlite3_close(h);
+            std::error_code ec;
+            std::filesystem::remove(p, ec);
+            std::filesystem::remove(p.string() + "-wal", ec);
+            std::filesystem::remove(p.string() + "-shm", ec);
+        }
+    } guard{db, db_path};
+    yuzu::server::ExecutionTracker tracker(db);
+    tracker.create_tables();
+
+    yuzu::server::Execution exec;
+    exec.definition_id = "def-poll-status";
+    exec.scope_expression = "ostype = 'windows'";
+    exec.dispatched_by = "operator";
+    exec.status = "running";
+    auto created = tracker.create_execution(exec);
+    REQUIRE(created.has_value());
+    const std::string exec_id = *created;
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.metrics_for_test = &reg;
+    ts.start("operator");
+
+    auto running = ts.call(
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":720,)"
+                    R"("params":{"name":"get_execution_status","arguments":{"execution_id":")") +
+        exec_id + R"("}}})");
+    REQUIRE(running);
+    auto running_sc = nlohmann::json::parse(running->body)["result"]["structuredContent"];
+    CHECK(running_sc["status"] == "running");
+    REQUIRE(running_sc.contains("retry_after_ms"));
+    CHECK(running_sc["retry_after_ms"] == mcp::kMcpResultPollRetryMs);
+    CHECK(reg.counter("yuzu_mcp_poll_total",
+                      {{"tool", "get_execution_status"}, {"result", "not_ready"}})
+              .value() == 1.0);
+
+    tracker.mark_cancelled(exec_id, "operator");
+    auto terminal = ts.call(
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":721,)"
+                    R"("params":{"name":"get_execution_status","arguments":{"execution_id":")") +
+        exec_id + R"("}}})");
+    REQUIRE(terminal);
+    auto terminal_sc = nlohmann::json::parse(terminal->body)["result"]["structuredContent"];
+    CHECK(terminal_sc["status"] == "cancelled");
+    CHECK_FALSE(terminal_sc.contains("retry_after_ms"));
+    CHECK(reg.counter("yuzu_mcp_poll_total",
+                      {{"tool", "get_execution_status"}, {"result", "ready"}})
+              .value() == 1.0);
+
+    auto missing = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":722,"params":{"name":"get_execution_status","arguments":{"execution_id":"exec-does-not-exist"}}})");
+    REQUIRE(missing);
+    auto missing_body = nlohmann::json::parse(missing->body);
+    CHECK(missing_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
 }
 
 TEST_CASE("MCP Agentic demo: ceo_demo prompt is live-only and ignores injected args (ADR-0016)",
@@ -6064,7 +6274,13 @@ TEST_CASE("MCP Integration: execute_instruction zero agents reached",
     REQUIRE(content.size() >= 1);
 
     auto text_str = content[0]["text"].get<std::string>();
-    CHECK(text_str.find("No agents reachable") != std::string::npos);
+    // #881: the message no longer ASSERTS unreachability, because a target can
+    // also be withheld by the containment gate — a permanent policy denial an
+    // agentic caller must not retry. Pin the two halves that carry that
+    // meaning rather than a prefix, so a future reword cannot quietly drop
+    // either one back to the old single-cause claim.
+    CHECK(text_str.find("No agents reached") != std::string::npos);
+    CHECK(text_str.find("quarantine containment gate") != std::string::npos);
 
     // #2712: structuredContent mirrors content[0].text for the zero-agents
     // oneOf branch - status is the stable discriminator, agents_reached is
@@ -6328,6 +6544,8 @@ TEST_CASE("MCP Integration: execute_instruction supervised tier mints approval t
     REQUIRE(body["error"].contains("data"));
     CHECK(body["error"]["data"].contains("approval_id"));
     CHECK(body["error"]["data"]["status_url"].get<std::string>().rfind("/api/v1/approvals/", 0) == 0);
+    // #3344: honest, non-null poll hint — approval is retryable on human timescales.
+    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpApprovalPollRetryMs);
     // A ticket was minted, NOT executed.
     CHECK_FALSE(dispatched);
     CHECK(appr.pending_count() == 1);
@@ -6651,6 +6869,108 @@ TEST_CASE("MCP query_responses: full execute_instruction -> collect-by-execution
     CHECK(rows[0]["output"] == "Windows 11");
 }
 
+TEST_CASE("MCP query_responses: #3344 retry_after_ms confirms in-flight, absent once terminal",
+          "[pg][mcp][integration][response][fanout][execute]") {
+    auto db_path = yuzu::test::unique_temp_path("test-mcp-query-poll-hint-");
+    std::filesystem::remove(db_path);
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(db_path.string().c_str(), &db) == SQLITE_OK);
+    struct Guard {
+        sqlite3* h;
+        std::filesystem::path p;
+        ~Guard() {
+            if (h)
+                sqlite3_close(h);
+            std::error_code ec;
+            std::filesystem::remove(p, ec);
+            std::filesystem::remove(p.string() + "-wal", ec);
+            std::filesystem::remove(p.string() + "-shm", ec);
+        }
+    } guard{db, db_path};
+
+    yuzu::server::ExecutionTracker tracker(db);
+    tracker.create_tables();
+    YUZU_REQUIRE_PG_DB_TPL(pgdb, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = pgdb.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.response_store_for_test = &store;
+    ts.metrics_for_test = &reg;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+        return {"cmd-poll-hint", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto disp = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":710,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(disp);
+    auto exec_id = nlohmann::json::parse(
+                       nlohmann::json::parse(disp->body)["result"]["content"][0]["text"]
+                           .get<std::string>())["execution_id"]
+                       .get<std::string>();
+    REQUIRE(!exec_id.empty());
+
+    // No response has landed yet — the tracker still reads "running". Zero
+    // rows AND a poll hint: this is the case the hint exists to disambiguate
+    // from "no rows matched" (which would carry no hint).
+    auto inflight = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":711,)"
+                                        R"("params":{"name":"query_responses","arguments":)") +
+                            R"({"execution_id":")" + exec_id + R"("}}})");
+    REQUIRE(inflight);
+    auto inflight_body = nlohmann::json::parse(inflight->body);
+    auto inflight_rows = nlohmann::json::parse(
+        inflight_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(inflight_rows.empty());
+    REQUIRE(inflight_body["result"].contains("retry_after_ms"));
+    CHECK(inflight_body["result"]["retry_after_ms"] == mcp::kMcpResultPollRetryMs);
+    REQUIRE(inflight_body["result"]["structuredContent"].contains("retry_after_ms"));
+    CHECK(inflight_body["result"]["structuredContent"]["retry_after_ms"] ==
+          mcp::kMcpResultPollRetryMs);
+    CHECK(reg.counter("yuzu_mcp_poll_total",
+                      {{"tool", "query_responses"}, {"result", "not_ready"}})
+              .value() == 1.0);
+
+    // Drive to terminal. The hint disappears even though the row count is
+    // still zero — the earlier zero-rows response was never a lie, only
+    // incomplete, and this one is now the honest final answer.
+    tracker.mark_cancelled(exec_id, "test-user");
+    auto terminal = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":712,)"
+                                        R"("params":{"name":"query_responses","arguments":)") +
+                            R"({"execution_id":")" + exec_id + R"("}}})");
+    REQUIRE(terminal);
+    auto terminal_body = nlohmann::json::parse(terminal->body);
+    CHECK_FALSE(terminal_body["result"].contains("retry_after_ms"));
+    CHECK_FALSE(terminal_body["result"]["structuredContent"].contains("retry_after_ms"));
+    CHECK(reg.counter("yuzu_mcp_poll_total",
+                      {{"tool", "query_responses"}, {"result", "ready"}})
+              .value() == 1.0);
+
+    // instruction_id-only: in-flight-ness is unknowable, so no hint either way.
+    auto instr_only = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":713,"params":{"name":"query_responses","arguments":{"instruction_id":"instr-poll-hint-unrelated"}}})");
+    REQUIRE(instr_only);
+    auto instr_only_body = nlohmann::json::parse(instr_only->body);
+    CHECK_FALSE(instr_only_body["result"].contains("retry_after_ms"));
+    // #3344 Gate 8 fold (sre): an unknowable call is neither ready nor
+    // not_ready — it was never checked, so it must not be counted as either,
+    // or the "checked and found done" fraction the counter exists to
+    // measure gets diluted by calls that could never have been not_ready.
+    // Both series stay at their pre-call values (1.0 not_ready, 1.0 ready
+    // from the two calls above).
+    CHECK(reg.counter("yuzu_mcp_poll_total",
+                      {{"tool", "query_responses"}, {"result", "ready"}})
+              .value() == 1.0);
+    CHECK(reg.counter("yuzu_mcp_poll_total",
+                      {{"tool", "query_responses"}, {"result", "not_ready"}})
+              .value() == 1.0);
+}
+
 // ── #1550 HIGH-1/HIGH-2 + review hardening ───────────────────────────────────
 
 TEST_CASE("MCP query_responses: management-group scope filters another operator's rows (#1550)",
@@ -6937,10 +7257,23 @@ TEST_CASE("MCP CA: list_issued_certs + revoke_certificate are advertised in tool
     CHECK(names.count("revoke_certificate") == 1);
 }
 
+namespace {
+// Shared with test_ca_store.cpp's "castore" key — identical setup, replay-verified by the
+// PgTestTemplate registry (docs/postgres-store-playbook.md step 7).
+yuzu::test::PgTestTemplate mcp_ca_store_tpl{
+    "castore", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        yuzu::server::CaStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("ca_store template: store failed to migrate");
+    }};
+} // namespace
+
 TEST_CASE("MCP CA: list_issued_certs returns the CA inventory (Security:Read)",
-          "[mcp][integration][pki]") {
-    yuzu::test::TempDbFile db{std::string_view{"mcp-ca-"}};
-    yuzu::server::CaStore store(db.path);
+          "[mcp][integration][pki][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
     REQUIRE(store.is_open());
     yuzu::server::IssuedCertRecord rec;
     rec.serial_hex = "AB12";
@@ -6948,7 +7281,7 @@ TEST_CASE("MCP CA: list_issued_certs returns the CA inventory (Security:Read)",
     rec.purpose = "agent";
     rec.not_after = 4102444800; // 2100
     rec.issued_at = 1700000000;
-    REQUIRE(store.record_issued(rec));
+    REQUIRE(store.record_issued(rec).has_value());
 
     McpTestServer ts;
     ts.ca_store_for_test = &store;
@@ -6971,18 +7304,19 @@ TEST_CASE("MCP CA: list_issued_certs returns the CA inventory (Security:Read)",
 }
 
 TEST_CASE("MCP CA: list_issued_certs is allowed on the readonly tier (Security:Read)",
-          "[mcp][integration][pki][security]") {
+          "[mcp][integration][pki][security][pg]") {
     // #1240 L3: the readonly tier permits ALL Read ops, so a read-only agentic
     // worker can inventory the CA. Pin this so a tier_allows regression can't
     // silently narrow (or widen) the access boundary.
-    yuzu::test::TempDbFile db{std::string_view{"mcp-ca-"}};
-    yuzu::server::CaStore store(db.path);
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
     yuzu::server::IssuedCertRecord rec;
     rec.serial_hex = "C0DE";
     rec.subject = "agent-ro";
     rec.purpose = "agent";
     rec.not_after = 4102444800;
-    REQUIRE(store.record_issued(rec));
+    REQUIRE(store.record_issued(rec).has_value());
 
     McpTestServer ts;
     ts.ca_store_for_test = &store;
@@ -7008,15 +7342,16 @@ TEST_CASE("MCP CA: list_issued_certs without a CA returns an error, not a crash"
 }
 
 TEST_CASE("MCP CA: revoke_certificate is tier-denied below supervised (Security:Delete)",
-          "[mcp][integration][pki][security]") {
-    yuzu::test::TempDbFile db{std::string_view{"mcp-ca-"}};
-    yuzu::server::CaStore store(db.path);
+          "[mcp][integration][pki][security][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
     yuzu::server::IssuedCertRecord rec;
     rec.serial_hex = "DEAD";
     rec.subject = "agent-x";
     rec.purpose = "agent";
     rec.not_after = 4102444800;
-    REQUIRE(store.record_issued(rec));
+    REQUIRE(store.record_issued(rec).has_value());
 
     McpTestServer ts;
     ts.ca_store_for_test = &store;
@@ -7033,15 +7368,16 @@ TEST_CASE("MCP CA: revoke_certificate is tier-denied below supervised (Security:
 }
 
 TEST_CASE("MCP CA: revoke_certificate supervised, no approval manager, degraded deny",
-          "[mcp][integration][pki][security]") {
-    yuzu::test::TempDbFile db{std::string_view{"mcp-ca-"}};
-    yuzu::server::CaStore store(db.path);
+          "[mcp][integration][pki][security][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
     yuzu::server::IssuedCertRecord rec;
     rec.serial_hex = "BEEF";
     rec.subject = "agent-y";
     rec.purpose = "agent";
     rec.not_after = 4102444800;
-    REQUIRE(store.record_issued(rec));
+    REQUIRE(store.record_issued(rec).has_value());
 
     McpTestServer ts;
     ts.ca_store_for_test = &store;
@@ -7059,15 +7395,16 @@ TEST_CASE("MCP CA: revoke_certificate supervised, no approval manager, degraded 
 }
 
 TEST_CASE("MCP CA: revoke_certificate supervised + approval manager mints a ticket (#289)",
-          "[mcp][integration][pki][security][approval]") {
-    yuzu::test::TempDbFile db{std::string_view{"mcp-ca-"}};
-    yuzu::server::CaStore store(db.path);
+          "[mcp][integration][pki][security][approval][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
     yuzu::server::IssuedCertRecord rec;
     rec.serial_hex = "BEEF";
     rec.subject = "agent-y";
     rec.purpose = "agent";
     rec.not_after = 4102444800;
-    REQUIRE(store.record_issued(rec));
+    REQUIRE(store.record_issued(rec).has_value());
 
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
     sqlite3* raw = nullptr;
@@ -7096,15 +7433,16 @@ TEST_CASE("MCP CA: revoke_certificate supervised + approval manager mints a tick
 
 TEST_CASE("MCP CA: revoke_certificate full approval-ticket round-trip reaches revoked:true "
           "(#2712)",
-          "[mcp][integration][pki][security][approval]") {
-    yuzu::test::TempDbFile db{std::string_view{"yuzu_test_mcp_ca_"}};
-    yuzu::server::CaStore store(db.path);
+          "[mcp][integration][pki][security][approval][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
     yuzu::server::IssuedCertRecord rec;
     rec.serial_hex = "CAFE";
     rec.subject = "agent-z";
     rec.purpose = "agent";
     rec.not_after = 4102444800;
-    REQUIRE(store.record_issued(rec));
+    REQUIRE(store.record_issued(rec).has_value());
 
     yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_"}};
     // RAII, not a trailing sqlite3_close: every REQUIRE below throws, and a
@@ -7154,6 +7492,72 @@ TEST_CASE("MCP CA: revoke_certificate full approval-ticket round-trip reaches re
     CHECK(body2["result"]["structuredContent"] == payload);
 }
 
+// Gate 4 consistency-auditor SHOULD (2026-08-21): the StoreError (genuine ca_store
+// DB failure, not "serial not found") branch discarded audit_fn's return value —
+// unlike its "denied"/"success" siblings, an agentic caller had no way to learn a
+// dropped audit row accompanied the 503. Exercises BOTH halves together: the
+// ca_store degrade forces the StoreError branch, and audit_succeeds_=false forces
+// the audit_fn call inside it to fail, so a passing test proves the fix threads
+// audit_fn's result through this exact branch.
+TEST_CASE("MCP CA: revoke_certificate StoreError (genuine DB failure) surfaces "
+          "audit_persisted:false on a dropped audit row (Gate 4 fix, 2026-08-21)",
+          "[mcp][integration][pki][security][approval][audit][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    yuzu::server::IssuedCertRecord rec;
+    rec.serial_hex = "FEED";
+    rec.subject = "agent-storeerr";
+    rec.purpose = "agent";
+    rec.not_after = 4102444800;
+    REQUIRE(store.record_issued(rec).has_value());
+
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_storeerr_"}};
+    yuzu::test::SqliteHandleOwner<sqlite3> raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw.db) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.db);
+    appr.create_tables();
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.audit_succeeds_ = false; // the ca.cert.revoked|failure row cannot persist
+    ts.start("supervised");
+
+    // Mint + approve the ticket while the store is still healthy — schema
+    // validation and the approval flow are not what this test exercises.
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":8,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"FEED","reason":"key_compromise"}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    // Degrade the store out from under the live handler, same idiom as the
+    // tag_store StoreError suite: a QUERY failure once is_open() is still true.
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{PQexec(conn.get(), "DROP TABLE ca_store.ca_issued CASCADE")};
+        REQUIRE(r.ok());
+    }
+
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"FEED","reason":"key_compromise","approval_id":")" +
+        approval_id + R"("}}})";
+    auto res = ts.call(recall);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    REQUIRE(body["error"].contains("data"));
+    // The fix: this branch now threads audit_fn's (forced-false) return value
+    // through, exactly like the denied/success siblings already did.
+    REQUIRE(body["error"]["data"].contains("audit_persisted"));
+    CHECK(body["error"]["data"]["audit_persisted"] == false);
+}
+
 // #2444 item 3: yuzu_mcp_approval_burned_total{tool,reason}. revoke_certificate
 // is a deliberate pick — its "serial not found" business rejection (CaStore::
 // revoke returning false) is emitted ONLY via the domain-verb audit_fn call
@@ -7163,9 +7567,10 @@ TEST_CASE("MCP CA: revoke_certificate full approval-ticket round-trip reaches re
 // hooking mcp_audit (which this exact branch bypasses).
 TEST_CASE("MCP 2444: yuzu_mcp_approval_burned_total fires on a post-consume handler reject, "
           "not on schema-invalid or success",
-          "[mcp][2g][approval][metrics]") {
-    yuzu::test::TempDbFile db{std::string_view{"yuzu_test_mcp_ca_burn_"}};
-    yuzu::server::CaStore store(db.path); // deliberately empty — no cert recorded
+          "[mcp][2g][approval][metrics][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool}; // deliberately empty — no cert recorded
     yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_burn_"}};
     yuzu::test::SqliteHandleOwner<sqlite3> raw;
     REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw.db) == SQLITE_OK);
@@ -8514,6 +8919,72 @@ TEST_CASE("MCP get_bundle_result collates the responses in request order", "[pg]
     // output is wrapped UNCHANGED (error_handler_t::replace preserved), never
     // reserialized, so this must be an exact match, not just field-equivalent.
     CHECK(bundle_structured(get) == p);
+}
+
+TEST_CASE("MCP get_bundle_result: #3344 retry_after_ms present only while complete=false",
+          "[pg][mcp][bundle]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.metrics_for_test = &reg;
+    ts.start_with_dispatch(fake_bundle_dispatch());
+
+    auto disp = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":830,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-1","steps":[{"plugin":"os_info","action":"uptime"},{"plugin":"os_info","action":"os_name"}]}}})");
+    auto bundle_id = bundle_payload(disp)["bundle_id"].get<std::string>();
+
+    // Only ONE of the two steps has responded — the bundle is incomplete.
+    yuzu::server::StoredResponse r;
+    r.execution_id = bundle_id;
+    r.instruction_id = "cmd-os_info-uptime";
+    r.agent_id = "agent-1";
+    r.status = 1;
+    r.output = "up 3d";
+    r.timestamp = 100;
+    store.store(r);
+
+    auto incomplete = ts.call(
+        std::string(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":831,"params":{"name":"get_bundle_result","arguments":{"bundle_id":")") +
+        bundle_id + R"("}}})");
+    auto ip = bundle_payload(incomplete);
+    CHECK(ip["complete"] == false);
+    REQUIRE(ip.contains("retry_after_ms"));
+    CHECK(ip["retry_after_ms"] == mcp::kMcpResultPollRetryMs);
+    // The splice must land identically in content[0].text AND structuredContent
+    // — the #2712 invariant this splice was written to preserve, not just the
+    // pre-existing fields.
+    CHECK(bundle_structured(incomplete) == ip);
+    CHECK(reg.counter("yuzu_mcp_poll_total",
+                      {{"tool", "get_bundle_result"}, {"result", "not_ready"}})
+              .value() == 1.0);
+
+    // The second step responds — now complete, and the hint disappears.
+    yuzu::server::StoredResponse r2;
+    r2.execution_id = bundle_id;
+    r2.instruction_id = "cmd-os_info-os_name";
+    r2.agent_id = "agent-1";
+    r2.status = 1;
+    r2.output = "os_name|Win";
+    r2.timestamp = 101;
+    store.store(r2);
+
+    auto complete = ts.call(
+        std::string(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":832,"params":{"name":"get_bundle_result","arguments":{"bundle_id":")") +
+        bundle_id + R"("}}})");
+    auto cp = bundle_payload(complete);
+    CHECK(cp["complete"] == true);
+    CHECK_FALSE(cp.contains("retry_after_ms"));
+    CHECK(bundle_structured(complete) == cp);
+    CHECK(reg.counter("yuzu_mcp_poll_total",
+                      {{"tool", "get_bundle_result"}, {"result", "ready"}})
+              .value() == 1.0);
 }
 
 TEST_CASE("MCP get_bundle_result enforces ownership (IDOR)", "[pg][mcp][bundle]") {
@@ -10004,7 +10475,7 @@ TEST_CASE("MCP approval recall: a store fault at the lookup rung is a retryable 
     CHECK(fbody["error"]["code"] == yuzu::server::mcp::kInternalError);
     CHECK(fbody["error"]["message"] == "approval store temporarily unavailable");
     REQUIRE(fbody["error"]["data"].contains("retry_after_ms"));
-    CHECK(fbody["error"]["data"]["retry_after_ms"] == 5000);
+    CHECK(fbody["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
 
     CHECK(reg.counter("yuzu_mcp_approval_refused_total", {{"tool", "delete_tag"}}).value() == 1.0);
     // #2786: a lookup-rung fault means the origin check two rungs down never
@@ -10254,7 +10725,7 @@ TEST_CASE("MCP approval recall: a store fault at the CONSUME rung is caught too,
     // silently, and the audit token (no " (lookup)" suffix, unlike rung 1's)
     // is the one thing that actually distinguishes the two rungs.
     REQUIRE(fbody["error"]["data"].contains("retry_after_ms"));
-    CHECK(fbody["error"]["data"]["retry_after_ms"] == 5000);
+    CHECK(fbody["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
     CHECK(reg.counter("yuzu_mcp_approval_refused_total", {{"tool", "delete_tag"}}).value() == 1.0);
     // Negative control: this fault hit only the CAS, AFTER the binding check
     // already passed (the MCP mint declares ApprovalOrigin::kMcp, and this
@@ -10364,7 +10835,7 @@ TEST_CASE("MCP approval recall: a store fault AT the origin check masks a foreig
     CHECK(fbody["error"]["code"] == yuzu::server::mcp::kInternalError);
     CHECK(fbody["error"]["message"] == "approval store temporarily unavailable");
     REQUIRE(fbody["error"]["data"].contains("retry_after_ms"));
-    CHECK(fbody["error"]["data"]["retry_after_ms"] == 5000);
+    CHECK(fbody["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
     CHECK(reg.counter("yuzu_mcp_approval_refused_total", {{"tool", "delete_tag"}}).value() == 1.0);
     CHECK(reg.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", "delete_tag"}})
               .value() == 1.0);
@@ -10482,11 +10953,16 @@ TEST_CASE("MCP approval mint dedups identical pending requests",
 
     const char* call =
         R"({"jsonrpc":"2.0","method":"tools/call","id":240,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role"}}})";
-    auto id1 = nlohmann::json::parse(ts.call(call)->body)["error"]["data"]["approval_id"]
-                   .get<std::string>();
-    auto id2 = nlohmann::json::parse(ts.call(call)->body)["error"]["data"]["approval_id"]
-                   .get<std::string>();
+    auto body1 = nlohmann::json::parse(ts.call(call)->body);
+    auto body2 = nlohmann::json::parse(ts.call(call)->body);
+    auto id1 = body1["error"]["data"]["approval_id"].get<std::string>();
+    auto id2 = body2["error"]["data"]["approval_id"].get<std::string>();
     CHECK(id1 == id2);              // same ticket handed back
+    // #3344: the poll hint is stable across dedup re-calls too — a caller
+    // polling faster than this floor wastes round trips, never mints a
+    // second ticket.
+    CHECK(body1["error"]["data"]["retry_after_ms"] == mcp::kMcpApprovalPollRetryMs);
+    CHECK(body2["error"]["data"]["retry_after_ms"] == mcp::kMcpApprovalPollRetryMs);
     CHECK(appr.pending_count() == 1); // exactly one row, not two
     sqlite3_close(raw);
 }
@@ -11909,16 +12385,24 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
     sqlite3_close(raw);
 }
 
-TEST_CASE("MCP quarantine_device records-only (agents_reached=0) is still a SUCCESS, "
-          "never a failure - pins the schema's minimum:0, not minimum:1",
+TEST_CASE("MCP quarantine_device records-only (agents_reached=0) returns a RETRYABLE "
+          "ERROR, never a success envelope - #3127 pins the schema's minimum:1",
           "[mcp][integration][quarantine][approval][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
-    // #2712: an offline/unreachable device still gets recorded (the isolation
-    // dispatch just never lands) - this is NOT a failure path, and the schema
-    // must accept agents_reached==0 as a valid success value. A naive copy of
-    // execute_instruction's normal-branch minimum:1 onto this tool would be
-    // exactly the wrong constraint here (Fable's review of the #2712 batch 3
-    // plan flagged this as the natural mistake to avoid).
+    // #3127: this test USED to pin the opposite judgement - "records-only is
+    // still a SUCCESS, the schema's minimum:0 not minimum:1" - on the theory
+    // that a naive copy of execute_instruction's minimum:1 would be the wrong
+    // constraint here (Fable's review of the #2712 batch 3 plan flagged that
+    // as the natural mistake to avoid). #3127 inverted that judgement: a
+    // record that is active but whose isolation dispatch was never confirmed
+    // accepted is NOT the same terminal state as genuinely isolated, and a
+    // success envelope for it is the exact phantom-isolated result this issue
+    // is about. The record still persists — an offline/unreachable device is
+    // legitimately recorded, and persisting it is what lets a retry
+    // re-dispatch the stored intent later (see the already_active retry-
+    // contract test below) — but the response no longer claims success over
+    // it; it returns a retryable error instead, and the caller retries the
+    // same call to re-drive dispatch.
     yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
     yuzu::server::QuarantineStore quar(qpool);
     REQUIRE(quar.is_open());
@@ -11965,18 +12449,71 @@ TEST_CASE("MCP quarantine_device records-only (agents_reached=0) is still a SUCC
     auto res2 = ts.call(recall);
     REQUIRE(res2);
     auto body2 = nlohmann::json::parse(res2->body);
-    REQUIRE(body2.contains("result")); // SUCCESS, not an error - recording still worked
-    auto payload2 = write_tool_payload(res2);
-    CHECK(payload2["agents_reached"] == 0);
-    CHECK(payload2["command_id"].get<std::string>().empty());
-    // The record still persisted despite no live dispatch.
+    // #3127: the write succeeded (a new record) but the isolation dispatch
+    // was never confirmed accepted - a RETRYABLE ERROR, never a success
+    // envelope.
+    REQUIRE(body2.contains("error"));
+    CHECK_FALSE(body2.contains("result"));
+    CHECK(body2["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body2["error"]["data"]["retry_after_ms"] == 5000);
+    // The record still persisted despite no confirmed dispatch - that's the
+    // whole point: it survives so a later retry can re-dispatch it (see the
+    // already_active retry-contract test below), the response just refuses
+    // to claim isolation over it.
     auto rec = quar.get_status("agent-offline");
     REQUIRE(rec.has_value()); // read succeeded
     REQUIRE(rec->has_value()); // and found an active record
     CHECK((*rec)->status == "active");
-    // #2712: structuredContent mirrors content[0].text exactly, including the
-    // agents_reached:0 value the schema must accept (minimum:0).
-    CHECK(write_tool_structured(res2) == payload2);
+    // #3127: the audit row is a FAILURE, not a success - the requested
+    // operation was isolation and isolation was not achieved. record_persisted=1
+    // keeps the row honest in the OPPOSITE direction too: an auditor greps it
+    // and can see the record survived (Item C).
+    CHECK(ts.audit_log.back() == "mcp.quarantine_device|failure");
+    REQUIRE_FALSE(ts.audit_details.empty());
+    CHECK(ts.audit_details.back().find("agent_id=agent-offline") != std::string::npos);
+    CHECK(ts.audit_details.back().find("agents_reached=0") != std::string::npos);
+    CHECK(ts.audit_details.back().find("record_persisted=1") != std::string::npos);
+
+    // ── The retry hint must not describe a STABLE state as a transient one ──
+    //
+    // A SECOND recall against the same still-unreachable device. The record
+    // now exists, so this takes the already_active re-dispatch path — and
+    // reaches zero agents again, because the device is offline rather than
+    // momentarily busy. An autonomous caller honouring the 5s hint above would
+    // perform a store write, a store read, a dispatch attempt and an audit
+    // write every five seconds for as long as the device stays down, and
+    // nothing changes until the agent reconnects.
+    //
+    // So the hint backs off, and the message says the thing that actually
+    // resolves the caller's uncertainty: the record is durable and the #881
+    // server-side gate is ALREADY denying every other command to this device,
+    // so containment at the control plane is in force — only the endpoint's
+    // own firewall is still unapplied.
+    auto mint2 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":244,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-offline","reason":"malware"}}})");
+    REQUIRE(mint2);
+    std::string approval_id2 =
+        nlohmann::json::parse(mint2->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id2, "reviewer-bob", ""));
+    std::string recall2 =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":245,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-offline","reason":"malware","approval_id":")" +
+        approval_id2 + R"("}}})";
+    auto res3 = ts.call(recall2);
+    REQUIRE(res3);
+    auto body3 = nlohmann::json::parse(res3->body);
+    REQUIRE(body3.contains("error"));
+    CHECK(body3["error"]["code"] == yuzu::server::mcp::kInternalError);
+    // The discriminator: a FIRST failure keeps 5000 (asserted above, on the
+    // same device, in the same test — so this pair cannot both drift), a
+    // repeat against an already-recorded device backs off.
+    CHECK(body3["error"]["data"]["retry_after_ms"] == 60000);
+    CHECK(body3["error"]["message"].get<std::string>().find(
+              "already denying dispatch to this device") != std::string::npos);
+    // And it must say what does NOT happen. An earlier wording promised the
+    // endpoint firewall would apply on reconnect; nothing does that, and a SOC
+    // analyst who believes it closes the ticket on an uncontained device.
+    CHECK(body3["error"]["message"].get<std::string>().find(
+              "nothing re-applies it automatically on reconnect") != std::string::npos);
 }
 
 TEST_CASE("MCP write tools are advertised in tools/list", "[mcp][integration][tag]") {
@@ -12105,7 +12642,17 @@ TEST_CASE("MCP quarantine_device enforces the per-device scope gate",
         }
         return true;
     };
-    ts.start();
+    // #3127: agents_reached=0 is no longer a success shape - wire a dispatch
+    // stub so the in-scope arm below still reaches a result envelope; this
+    // test is about the scope gate, not the dispatch outcome.
+    auto dispatch = [](const std::string&, const std::string&,
+                       const std::vector<std::string>&, const std::string&,
+                       const std::unordered_map<std::string, std::string>&,
+                       const std::string&,
+                       const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+        return {"cmd-scope", 1};
+    };
+    ts.start_with_dispatch(dispatch);
 
     // Out-of-scope device → denied, no record, no isolation.
     auto denied = ts.call(
@@ -12121,7 +12668,7 @@ TEST_CASE("MCP quarantine_device enforces the per-device scope gate",
     CHECK(calls[0].op == "Execute");
     CHECK(calls[0].agent_id == "agent-outside");
 
-    // In-scope device → recorded (no dispatch_fn wired → record-only).
+    // In-scope device → recorded and dispatched.
     auto ok = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":265,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-inside","reason":"sus"}}})");
     auto payload = write_tool_payload(ok);
@@ -12181,22 +12728,58 @@ TEST_CASE("MCP quarantine_device classifies store failure vs business error "
     ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
                                     const std::string&, const std::string&,
                                     const std::string&) -> bool { return true; };
-    ts.start(); // default tier: no approval gate, single-call round-trip
+    // #3127: the already-quarantined retry section below needs dispatch
+    // wired (agents_reached==1) to reach a result envelope; harmless to the
+    // store-failure section, which returns before dispatch is ever attempted.
+    // `dispatch_calls` is what MAKES that second clause an assertion rather
+    // than a comment — a store failure means the record never persisted, so a
+    // dispatch on that path would isolate a device with nothing durable behind
+    // it and no way for a retry to find the record it should re-drive.
+    int dispatch_calls = 0;
+    auto dispatch = [&](const std::string& plugin, const std::string& action,
+                        const std::vector<std::string>& agent_ids, const std::string&,
+                        const std::unordered_map<std::string, std::string>& params,
+                        const std::string&,
+                        const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+        ++dispatch_calls;
+        ts.last_dispatch_plugin = plugin;
+        ts.last_dispatch_action = action;
+        ts.last_dispatch_agent_ids = agent_ids;
+        ts.last_dispatch_params = params;
+        return {"cmd-retry", 1};
+    };
+    ts.start_with_dispatch(dispatch); // default tier: no approval gate, single-call round-trip
 
-    SECTION("business error: agent already quarantined -> kInvalidParams, no retry") {
-        REQUIRE(quar.quarantine_device("agent-dup", "seed", "pre-seeded", "").has_value());
+    SECTION("retry on an already-quarantined device re-dispatches the STORED intent (#3127)") {
+        // #3127: DELIBERATE divergence from the REST twin — POST
+        // /api/v1/quarantine is record-only and never dispatches, so there is
+        // no dispatch behaviour to keep in parity with (matching the comment
+        // on the handler's already_active branch in mcp_server.cpp).
+        REQUIRE(
+            quar.quarantine_device("agent-dup", "seed", "pre-seeded", "10.0.0.9").has_value());
         auto res = ts.call(
-            R"({"jsonrpc":"2.0","method":"tools/call","id":267,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-dup","reason":"dup"}}})");
+            R"({"jsonrpc":"2.0","method":"tools/call","id":267,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-dup","reason":"dup","whitelist":"10.0.0.42"}}})");
         REQUIRE(res);
         auto body = nlohmann::json::parse(res->body);
-        REQUIRE(body.contains("error"));
-        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
-        CHECK(body["error"]["message"] == "device is already quarantined");
-        // Non-retryable business error: no retry_after_ms hint.
-        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        REQUIRE(body.contains("result")); // re-dispatch succeeded, NOT a terminal error
+        CHECK_FALSE(body.contains("error"));
+        auto payload = write_tool_payload(res);
+        CHECK(payload["record_pre_existing"] == true);
+        CHECK(payload["dispatch_confirmed"] == true);
+        // The STORED whitelist ("10.0.0.9") reached dispatch, never the retry
+        // call's own unpersisted one ("10.0.0.42") - dispatching the
+        // request's value would silently rewrite the device's firewall
+        // allow-list with no store update and no audit trail.
+        CHECK(ts.last_dispatch_params.at("whitelist_ips") == "10.0.0.9");
+        CHECK(payload["quarantine_record"]["whitelist"] == "10.0.0.9");
+        CHECK(payload["whitelist_request_ignored"] == true);
         REQUIRE_FALSE(ts.audit_details.empty());
-        CHECK(ts.audit_details.back().find("agent_id=agent-dup, device is already quarantined") !=
-              std::string::npos);
+        CHECK(ts.audit_details.back().find("record_pre_existing=1") != std::string::npos);
+        CHECK(ts.audit_details.back().find("whitelist_ignored=1") != std::string::npos);
+        // The positive twin of the store-failure section's assertion: this
+        // path DOES dispatch, exactly once. Both sections share one counter so
+        // neither can pass by the dispatch stub simply never being wired.
+        CHECK(dispatch_calls == 1);
     }
 
     SECTION("store failure: schema dropped -> kInternalError, retryable") {
@@ -12215,11 +12798,18 @@ TEST_CASE("MCP quarantine_device classifies store failure vs business error "
         CHECK(body["error"]["message"].get<std::string>().starts_with(
             yuzu::server::kQuarantineDbErrorPrefix));
         // Retryable store failure: A5 requires an honest retry_after_ms.
-        CHECK(body["error"]["data"]["retry_after_ms"] == 5000);
+        CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
         REQUIRE_FALSE(ts.audit_details.empty());
         CHECK(ts.audit_details.back().find("agent_id=agent-degraded, ") != std::string::npos);
         CHECK(ts.audit_details.back().find(yuzu::server::kQuarantineDbErrorPrefix) !=
               std::string::npos);
+        // The half the error envelope alone cannot show: nothing was
+        // dispatched. `should_dispatch_isolation(store_error)` is false in the
+        // decision core, and this is the production path proving the handler
+        // honours it — an isolation dispatched against a write that never
+        // landed leaves a contained device with no record to release it by.
+        CHECK(dispatch_calls == 0);
+        CHECK(ts.last_dispatch_plugin.empty());
     }
 }
 

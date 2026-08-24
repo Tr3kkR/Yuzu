@@ -2049,9 +2049,9 @@ TEST_CASE("AgentRegistry::sweep_revoked cancels only the revoked, cert-bearing s
     EventBus bus;
     AgentRegistry registry{bus, metrics};
 
-    registry.register_agent(make_agent_info("agent-good"));
-    registry.register_agent(make_agent_info("agent-bad"));
-    registry.register_agent(make_agent_info("agent-nocert"));
+    (void)registry.register_agent(make_agent_info("agent-good"));
+    (void)registry.register_agent(make_agent_info("agent-bad"));
+    (void)registry.register_agent(make_agent_info("agent-nocert"));
 
     // Two contexts stand in for live Subscribe streams; TryCancel on a context
     // with no underlying call is a safe no-op (grpc_call_cancel_with_status
@@ -2086,7 +2086,7 @@ TEST_CASE("AgentRegistry::sweep_revoked is a no-op for a null predicate or no re
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    registry.register_agent(make_agent_info("agent-1"));
+    (void)registry.register_agent(make_agent_info("agent-1"));
     grpc::ServerContext ctx;
     registry.set_stream("agent-1", nullptr, &ctx, "PEM-1");
 
@@ -2099,7 +2099,7 @@ TEST_CASE("AgentRegistry::sweep_revoked skips a session whose stream has been cl
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    registry.register_agent(make_agent_info("agent-1"));
+    (void)registry.register_agent(make_agent_info("agent-1"));
     grpc::ServerContext ctx;
     registry.set_stream("agent-1", nullptr, &ctx, "PEM-1");
     registry.clear_stream("agent-1"); // disconnect → context + pem cleared
@@ -2124,7 +2124,7 @@ TEST_CASE("AgentRegistry::sweep_revoked does NOT cancel a stream whose cert chan
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    registry.register_agent(make_agent_info("agent-1"));
+    (void)registry.register_agent(make_agent_info("agent-1"));
     grpc::ServerContext ctx_old, ctx_new;
     registry.set_stream("agent-1", nullptr, &ctx_old, "PEM-OLD");
 

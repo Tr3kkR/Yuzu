@@ -159,6 +159,7 @@
 #include "fleet_topology_store.hpp"
 #include "heartbeat_ingestion.hpp"
 #include "fleet_topology_types.hpp"
+#include "mcp_retry.hpp"  // kMcpPollTotalMetric (#3344) — direct, not transitive
 #include "mcp_server.hpp"
 #include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
 #include "stream_budget.hpp" // shared held-open-SSE admission budget (2f PR 2, Decision 15(h))
@@ -230,6 +231,7 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <spdlog/spdlog.h>
 
 #include <atomic>
+#include <semaphore>
 #include <cctype>
 #include <charconv>
 #include <chrono>
@@ -462,6 +464,22 @@ public:
                           "gauge");
         metrics_.describe("yuzu_agents_registered_total", "Total number of agent registrations",
                           "counter");
+        // #3401: a re-registration was refused, either because the W1.5/#823 device-token
+        // revoke-by-device sweep itself failed (fail-closed, ADR-0012 §1) or because a
+        // concurrent registration for the same agent_id already won (see register_agent's
+        // phase-2 supersede check) — either way the agent retries on its normal reconnect
+        // backoff. Pre-seed both reason values so absent()-style alerting works from a healthy
+        // boot (kNvdCountedReasons precedent above). Dormant today for the revoke-failure reason
+        // (device_token_store_ is never wired live); the supersede reason is live regardless.
+        metrics_.describe("yuzu_agents_registration_refused_total",
+                          "Agent registration refused because a required pre-install step "
+                          "failed, or because a concurrent registration for the same agent_id "
+                          "already won. Labelled reason.",
+                          "counter");
+        for (const char* reason :
+             {"device_token_revoke_failed", "superseded_by_concurrent_registration"}) {
+            metrics_.counter("yuzu_agents_registration_refused_total", {{"reason", reason}});
+        }
         metrics_.describe("yuzu_commands_dispatched_total",
                           "Total number of commands dispatched to agents", "counter");
         metrics_.describe("yuzu_commands_completed_total",
@@ -713,6 +731,21 @@ public:
                           "mcp_server.cpp for the exact scope. Does not interact with the "
                           "kMcpSubmitterPendingCap 25-slot cap: a ticket leaves the pending "
                           "bucket at admin-approval time, before it can ever reach this class",
+                          "counter");
+        // #3344: poll-rate signal for the three success-shaped result-poll
+        // tools, so the named retry_after_ms floors (mcp_retry.hpp) can be
+        // data-tuned instead of ossifying as guessed constants. not_ready:
+        // the response carried a retry_after_ms hint (execution non-terminal,
+        // bundle incomplete, or query_responses rows still in flight); ready:
+        // served terminal/complete without one. Excludes pre-verdict denials
+        // (tier/permission/invalid-params/not-found) — those are already
+        // visible via the denial counters and A4 envelopes above. Both labels
+        // are closed sets (3 tools x 2 results), pre-seeded below.
+        metrics_.describe(mcp::kMcpPollTotalMetric,
+                          "MCP result-poll tool calls by verdict (get_execution_status, "
+                          "query_responses, get_bundle_result). not_ready: the success payload "
+                          "carried a retry_after_ms poll hint; ready: served terminal/complete "
+                          "without one. Excludes pre-verdict denials.",
                           "counter");
         // Progress bridge core (2f PR 3a). Same closed-set posture: every reject/
         // degrade reason is a static literal inside the bridge, never derived
@@ -1044,6 +1077,15 @@ public:
             metrics_.counter("yuzu_mcp_approval_burned_total",
                              {{"tool", tool}, {"reason", "handler_reject"}});
         }
+        // #3344: yuzu_mcp_poll_total — the closed set is exactly the three
+        // success-shaped result-poll tools x the two verdicts, so every
+        // combination is pre-seeded here for absent() to stay meaningful.
+        for (const auto tool :
+             {"get_execution_status", "query_responses", "get_bundle_result"}) {
+            for (const auto result : {"ready", "not_ready"}) {
+                metrics_.counter(mcp::kMcpPollTotalMetric, {{"tool", tool}, {"result", result}});
+            }
+        }
         // yuzu_mcp_approval_precondition_denied_total's reachable label set is
         // NARROWER than the two above: kPrecondition can only fire for a tool
         // that actually has a ConsumePrecondition wired, which today is just
@@ -1129,6 +1171,58 @@ public:
         metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                          {{"route", "dispatch_closure"},
                           {"reason", std::string(yuzu::server::kReasonClosureNoTarget)}});
+        // #881: the quarantine dispatch gate emits `reason=quarantined` from
+        // three routes — `dispatch_closure` (the shared closure serving MCP/
+        // workflows/schedules/REST v1), `command` (`/api/command`) and
+        // `legacy` (`forward_legacy_command`) — never as a cross-product with
+        // the targeting-shape reasons above, because a quarantine denial is a
+        // containment decision, not a targeting-shape violation. Seeded here,
+        // same discipline as every other pair on this series: an unseeded
+        // series reads as "quarantine has never blocked anything" when the
+        // truth may be "the gate never ran".
+        for (const char* route : {"dispatch_closure", "command", "legacy"})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", route},
+                              {"reason", std::string(yuzu::server::kReasonQuarantined)}});
+
+        // The containment gate's own outcome series, seeded across its whole
+        // closed label set for the same reason. Without this, `absent()` on
+        // `outcome="fail_closed"` cannot tell "the gate has never had to fail
+        // closed" from "the gate never ran at all" — and the second is the
+        // condition an operator most needs an alert to catch. Driven from
+        // `kQuarantineGateOutcomes` so a new label cannot be added at an emit
+        // site without appearing here too.
+        for (const auto outcome : yuzu::server::kQuarantineGateOutcomes)
+            metrics_.counter("yuzu_server_quarantine_gate_total",
+                             {{"outcome", std::string(outcome)}});
+
+        // The quarantine read-degrade family was never pre-seeded, unlike its
+        // mgmt-group and discovery siblings above, so every reason read as
+        // absent on a healthy server and `absent()` could not be used on any of
+        // them. Seeded here now that #881 adds a FOURTH reason — the
+        // read-concurrency cap — whose whole purpose is to be alertable before
+        // it ever fires. The three store-side values are emitted by
+        // quarantine_store.cpp; `read_concurrency_cap` is emitted by
+        // make_containment_gate and has no store involvement at all, which is
+        // exactly why it needs its own value rather than being folded into one
+        // of theirs.
+        for (const auto reason :
+             {"store_not_open", "pool_acquire_timeout", "query_error", "read_concurrency_cap"})
+            metrics_.counter("yuzu_server_quarantine_read_degrade_total", {{"reason", reason}});
+
+        // #3402: the internal pushes that deliberately BYPASS that gate, seeded
+        // across the full capability x result product. Every combination is
+        // reachable — each of the three pushes can fail at the registry seam —
+        // so unlike the per-route targeting seed above, the product is honest
+        // here rather than publishing series no code path can produce.
+        // `undelivered` at zero is the point: it is the value an operator needs
+        // to be able to alert on, and an absent series cannot be alerted on.
+        for (const auto push : yuzu::server::kSystemReservedPushes)
+            for (const auto result : yuzu::server::kSystemReservedPushResults)
+                metrics_.counter(
+                    "yuzu_server_system_reserved_push_total",
+                    {{"capability", std::string(yuzu::server::system_reserved_push_label(push))},
+                     {"result", std::string(result)}});
         // ── Dispatch chokepoint + gateway wire-capability denials ─────────
         //
         // These three series answer "did the gate run and refuse?" — a question
@@ -1983,6 +2077,20 @@ public:
                           "Engine-principal liveness re-checks answered StoreUnreachable from the "
                           "failure backoff without taking a connection lease",
                           "counter");
+        metrics_.describe("yuzu_server_engine_revalidate_generation_capacity_fallback_total",
+                          "#2454/#3385: the per-principal poisoning-guard map was full (even "
+                          "after a TTL sweep) and a NEW principal's invalidate fell back to the "
+                          "coarse global epoch. NOT a narrowly-scoped degradation: while "
+                          "tripped, the epoch bump defeats EVERY principal's concurrent "
+                          "cache-write, not just the triggering one - reproducing the "
+                          "fleet-wide cache disablement #2454 exists to fix, bounded to start "
+                          "past the 1024-distinct-principals-per-63s ceiling. Since #3385 this "
+                          "is self-clearing: entries age out on a TTL, so the fallback stops "
+                          "once churn drops back under the ceiling - no restart required. Not "
+                          "expected under ordinary load; a climbing value means the guard is "
+                          "running at reduced precision - see "
+                          "docs/ops-runbooks/engine-principal-store-recovery.md.",
+                          "counter");
         metrics_.describe("yuzu_server_audit_events_total",
                           "Audit events written, bucketed by result", "counter");
         // gov PR-E OBS-2: a from_result_set: scope ref resolved to an
@@ -2159,7 +2267,7 @@ public:
                           "#1118). Labelled event=security (SIEM-routing tag)",
                           "counter");
         // PKI PR3: an agent-initiated RPC rejected because the presented client
-        // leaf's serial is on the internal CA's revocation list (ca.db). A revoked
+        // leaf's serial is on the internal CA's revocation list (ca_store). A revoked
         // agent that keeps calling is a decommissioned/compromised-credential
         // signal. Labelled by rpc (subscribe|heartbeat|download_update) so an
         // operator can see a revoked agent trying every surface, not just the
@@ -2176,14 +2284,37 @@ public:
                           "enrollment (PKI PR3). Labelled purpose (agent)",
                           "counter");
         // PKI PR4 (gov sre/unhappy SHOULD): the CRL could not be (re)built/signed —
-        // the public CRL is stale relative to ca.db. Alert on >0 since a revocation,
+        // the public CRL is stale relative to ca_store. Alert on >0 since a revocation,
         // since server-side enforcement is live but external consumers are not
         // seeing the revocation. The audit row (ca.crl.published failure) is the
         // forensic pair; this counter is the real-time alert source.
+        // ADR-0053 UP-1 (gov sre F1, Gate 6, 2026-08-21): describe() alone populates a
+        // description entry but MetricsRegistry::serialize() only emits # TYPE/# HELP for
+        // a name already present in the counters_ map — without a matching .counter() call
+        // this series is entirely ABSENT from /metrics (not present-at-0) until its first
+        // failure ever fires, which makes an absent()-based alert useless (can't distinguish
+        // "healthy" from "never registered"). All three CA-family failure counters below are
+        // pre-seeded at 0 for this reason (the sibling two had the same gap, found while
+        // writing this family's alert rules).
         metrics_.describe("yuzu_server_ca_crl_publish_failures_total",
                           "Internal-CA CRL (re)publish failures (key load / build / record). A "
                           "non-zero value since a revocation means the public CRL is stale (PKI PR4)",
                           "counter");
+        (void)metrics_.counter("yuzu_server_ca_crl_publish_failures_total");
+        metrics_.describe("yuzu_server_ca_reissue_blocked_total",
+                          "Agent CSR re-issuance refused because a revoked, non-expired cert "
+                          "already exists for that identity (sign_agent_csr's revocation-bypass "
+                          "guard). A sustained non-zero rate may indicate a revoked agent "
+                          "repeatedly attempting to re-provision.",
+                          "counter");
+        metrics_.counter("yuzu_server_ca_reissue_blocked_total", {{"reason", "revoked_identity"}});
+        metrics_.describe("yuzu_server_ca_revocation_sweep_read_failures_total",
+                          "Revocation-sweep tick's list_revoked_serials() read failed — that "
+                          "tick's sweep was skipped entirely rather than treating every live "
+                          "agent as revoked (ADR-0053 UP-1). A sustained non-zero rate means "
+                          "already-revoked agents' live streams may not be torn down promptly",
+                          "counter");
+        (void)metrics_.counter("yuzu_server_ca_revocation_sweep_read_failures_total");
         // #1128: a peer-IP mismatch that was TOLERATED (not rejected) because a
         // NAT-aware accommodation applied. Paired with _peer_mismatch_total
         // (rejects): a spike here without a matching reject spike is benign
@@ -3785,7 +3916,12 @@ public:
                 std::unordered_set<std::string> dispatched;
                 dispatched.reserve(agent_ids.size());
                 for (const auto& aid : agent_ids) {
-                    if (registry_.send_to(aid, *classified))
+                    // #881: system_reserved internal push (tar.fleet_snapshot),
+                    // not operator instruction dispatch — deliberately NOT
+                    // quarantine-gated (see dispatch_confined_arms.hpp).
+                    if (send_system_reserved(
+                            aid, *classified,
+                            yuzu::server::SystemReservedPush::tar_fleet_snapshot))
                         dispatched.insert(aid);
                 }
                 forward_gateway_pending();
@@ -3980,9 +4116,32 @@ public:
                     }
                 }
             }
-            // Internal-CA store (ca.db) — cert inventory + CRL versions. The CA
-            // root key itself is a 0600 file via default_certs, never in this DB.
-            ca_store_ = std::make_unique<CaStore>(cfg_.db_dir() / "ca.db");
+            // Internal-CA store — PostgreSQL (ADR-0053, schema ca_store): cert inventory + CRL
+            // versions. The CA root key itself is a 0600 file via default_certs, never in this
+            // DB. Born-on-PG like the other migrated stores: fail-closed on open, then a
+            // MANDATORY backfill of the legacy ca.db (issued-cert + CRL history is compliance
+            // evidence, ADR-0053 — refuse boot rather than serve a knowingly-incomplete trail).
+            if (pg_pool_ && !startup_failed_) {
+                ca_store_ = std::make_unique<CaStore>(*pg_pool_);
+                if (!ca_store_->is_open()) {
+                    spdlog::error("[PG] Refusing to start: ca store migration/open failed "
+                                  "(database reachable but the ca_store schema could not be "
+                                  "created/opened)");
+                    startup_failed_ = true;
+                } else {
+                    auto ca_db = cfg_.db_dir() / "ca.db";
+                    if (!ca_store_->migrate_from_sqlite(ca_db)) {
+                        spdlog::error("[PG] Refusing to start: ca store backfill from legacy {} "
+                                      "failed (ADR-0009 mandatory-backfill fail-closed; see prior "
+                                      "log lines). The issued-cert/CRL evidence chain must be "
+                                      "complete before serving; the next boot retries. Operator "
+                                      "remediation: repair the file, or quarantine it aside if it "
+                                      "is unrecoverable.",
+                                      ca_db.string());
+                        startup_failed_ = true;
+                    }
+                }
+            }
             // PR 10 hardening — wire AuditStore into FleetTopologyStore
             // so push success (first-per-agent) and rejections emit
             // AuditEvents (F-1 / CC6.1 / CC7.3 evidence chain). Must
@@ -4294,14 +4453,46 @@ public:
                         }
                         return;
                     }
-                    // Per-agent filtering as the fan-out (M4): only rules that target
-                    // this agent's OS and name it in scope. Cache scope membership
-                    // across rules sharing a scope_expr within this one reconcile.
                     // Baseline gate (docs/guardian-baseline-model.md): the rule source
                     // is the union of member Guards of *deployed* Baselines, so an
                     // enabled-but-undeployed Guard is never reconciled onto an agent.
+                    // ADR-0055 catastrophic-read set: a degraded read MUST abort this
+                    // reconcile, never fan out an empty deployed-set it cannot
+                    // distinguish from "nothing deployed" — mirrors the list_rules
+                    // degrade handling immediately above.
+                    auto deployed_result = deployed_member_rule_ids();
+                    if (!deployed_result) {
+                        metrics_
+                            .counter("yuzu_server_guardian_reconciles_total",
+                                     {{"result", "degraded"}})
+                            .increment();
+                        spdlog::warn("Guardian heartbeat reconcile: deployed_member_rule_ids "
+                                     "degraded ({}) — aborting re-push for agent_id={}",
+                                     deployed_result.error(), agent_id);
+                        if (audit_store_ && audit_store_->is_open()) {
+                            AuditEvent ev;
+                            ev.timestamp =
+                                std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+                            ev.principal = "system";
+                            ev.action = "guaranteed_state.reconcile";
+                            ev.target_type = "GuaranteedState";
+                            ev.target_id = agent_id;
+                            ev.detail = "heartbeat reconcile ABORTED — baseline store degraded (" +
+                                        deployed_result.error() +
+                                        "); agent rules did not converge (generation " +
+                                        std::to_string(agent_gen) + ")";
+                            ev.result = "degraded";
+                            (void)audit_store_->log(ev);
+                        }
+                        return;
+                    }
+                    // Per-agent filtering as the fan-out (M4): only rules that target
+                    // this agent's OS and name it in scope. Cache scope membership
+                    // across rules sharing a scope_expr within this one reconcile.
                     const auto rules =
-                        guardian::filter_deployed_members(*rules_result, deployed_member_rule_ids());
+                        guardian::filter_deployed_members(*rules_result, *deployed_result);
                     std::unordered_map<std::string, bool> scope_member;
                     auto push = guardian::build_agent_push(
                         rules, sess->os,
@@ -4344,7 +4535,13 @@ public:
                     auto classified = build_classified_command(
                         yuzu::server::DispatchCaller{.system = true}, "__guard__", "push_rules",
                         command_id, /*parameters=*/{}, push.SerializeAsString());
-                    if (classified && registry_.send_to(agent_id, *classified)) {
+                    // #881: system_reserved internal push (__guard__.push_rules),
+                    // not operator instruction dispatch — deliberately NOT
+                    // quarantine-gated (see dispatch_confined_arms.hpp).
+                    if (classified &&
+                        send_system_reserved(
+                            agent_id, *classified,
+                            yuzu::server::SystemReservedPush::guardian_push_rules)) {
                         forward_gateway_pending();
                         metrics_
                             .counter("yuzu_server_guardian_reconciles_total",
@@ -5109,11 +5306,39 @@ public:
         // Guardian Baselines — the deployable collection of Guards (M:N members +
         // included/excluded management-group assignment). Control-plane only; the
         // agent never hears the word "Baseline". See docs/guardian-baseline-model.md.
-        {
-            auto bl_db = cfg_.db_dir() / "guardian-baselines.db";
-            baseline_store_ = std::make_unique<BaselineStore>(bl_db);
-            if (baseline_store_ && baseline_store_->is_open())
-                spdlog::info("BaselineStore initialized at {}", bl_db.string());
+        // Migrated Postgres store (ADR-0006/0055, schema `baseline_store`) —
+        // construction fail-CLOSED per ADR-0012 §1 (same template as
+        // GuaranteedStateStore above, its closest Guardian-domain sibling): a
+        // reachable database whose schema can't migrate/open is a fatal startup
+        // error, never a serve-degraded state. `migrate_from_sqlite` runs the
+        // one-time, idempotent legacy-`guardian-baselines.db` backfill (ADR-0009)
+        // — every table here is AUTHORITATIVE operator-authored enforcement
+        // config, so a backfill failure is ALSO fatal (never serve on top of a
+        // partially-migrated Baseline set).
+        if (pg_pool_ && !startup_failed_) {
+            baseline_store_ = std::make_unique<BaselineStore>(*pg_pool_);
+            if (!baseline_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: baseline store migration/open failed "
+                              "(database reachable but the baseline_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                auto bl_db = cfg_.db_dir() / "guardian-baselines.db";
+                if (!baseline_store_->migrate_from_sqlite(bl_db)) {
+                    spdlog::error(
+                        "[PG] Refusing to start: Guardian Baseline legacy-SQLite backfill failed "
+                        "(see prior log lines) — Baselines are authoritative enforcement config "
+                        "and must not serve partially-migrated data. Operator remediation: "
+                        "repair {} or move it aside to skip the backfill (Baselines in it will "
+                        "NOT carry over)",
+                        bl_db.string());
+                    startup_failed_ = true;
+                } else {
+                    spdlog::info("BaselineStore initialized (schema baseline_store; legacy "
+                                 "backfill source {})",
+                                 bl_db.string());
+                }
+            }
         }
 
         // Phase 7: Runtime Configuration + Custom Properties
@@ -5166,26 +5391,78 @@ public:
             }
         }
 
-        // Phase 7: Product Pack Store
-        {
-            auto pack_db = cfg_.db_dir() / "product-packs.db";
-            product_pack_store_ = std::make_unique<ProductPackStore>(pack_db);
-            if (product_pack_store_ && product_pack_store_->is_open()) {
-                spdlog::info("ProductPackStore initialized at {}", pack_db.string());
-                // #802 / W7.4: enforce signed-pack-by-default. Default
-                // ProductPackStore ctor sets require_signed_packs_=true; we
-                // invert only when the operator opts in via the flag, and
-                // make the relaxed posture loud in operator logs + audit
-                // (audit emission deferred to post-audit_store_-construction
-                // block below to mirror the viz_disable pattern).
-                product_pack_store_->set_require_signed_packs(!cfg_.allow_unsigned_packs);
-                if (cfg_.allow_unsigned_packs) {
-                    spdlog::warn("[SECURITY] product pack signature enforcement DISABLED "
-                                 "by configuration (--allow-unsigned-packs / "
-                                 "YUZU_ALLOW_UNSIGNED_PACKS). Unsigned packs will be "
-                                 "accepted at install — this exposes the fleet to "
-                                 "arbitrary instruction/plugin execution. Sign packs and "
-                                 "remove the flag as soon as feasible.");
+        // Phase 7: Product Pack Store — Migrated Postgres store (ADR-0006/0009/0054, schema
+        // `product_pack_store`). Construction fail-CLOSED per ADR-0012 §1 (same template as
+        // CustomPropertiesStore/NotificationStore above): a reachable database whose schema
+        // can't migrate/open is a fatal startup error, never a serve-degraded pack catalog.
+        // `migrate_from_sqlite` runs the one-time, idempotent legacy-`product-packs.db` backfill
+        // (ADR-0009) — AUTHORITATIVE operator-installed content means a backfill failure is ALSO
+        // fatal (never serve on top of partially-migrated packs).
+        if (pg_pool_ && !startup_failed_) {
+            product_pack_store_ = std::make_unique<ProductPackStore>(*pg_pool_);
+            if (!product_pack_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: product pack store migration/open failed "
+                              "(database reachable but the product_pack_store schema could not "
+                              "be created/opened)");
+                startup_failed_ = true;
+            } else {
+                spdlog::info("ProductPackStore initialized (schema product_pack_store)");
+                // #3261/#3294 class: set_metrics BEFORE migrate_from_sqlite, so the
+                // backfill-result counter is live on the one pass that matters — a
+                // registry wired only after the (one-shot, idempotent) backfill call
+                // would leave that specific pass permanently uncounted.
+                product_pack_store_->set_metrics(&metrics_);
+                // Pre-seed both bounded-label families to 0 (governance arch-F2, per
+                // docs/observability-conventions.md, TagStore precedent above) so
+                // absent()-based alerting stays meaningful before the first
+                // degrade/backfill event — load-bearing here specifically because a
+                // backfill failure sets startup_failed_ (refused boot never serves
+                // /metrics at all), so an alert on THIS store's backfill result must
+                // be able to fire on the ABSENCE of a success/fresh sample, which
+                // requires the label set to already exist.
+                metrics_.describe("yuzu_server_product_pack_read_degrade_total",
+                                  "ProductPackStore reads that degraded instead of answering, by "
+                                  "reason",
+                                  "counter");
+                for (auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"}) {
+                    metrics_.counter("yuzu_server_product_pack_read_degrade_total",
+                                     {{"reason", reason}});
+                }
+                metrics_.describe("yuzu_server_product_pack_backfill_total",
+                                  "One-time legacy product-packs.db backfill outcome (ADR-0054)",
+                                  "counter");
+                for (auto result : {"fresh", "success", "failed"}) {
+                    metrics_.counter("yuzu_server_product_pack_backfill_total",
+                                     {{"result", result}});
+                }
+                auto pack_db = cfg_.db_dir() / "product-packs.db";
+                if (!product_pack_store_->migrate_from_sqlite(pack_db)) {
+                    spdlog::error(
+                        "[PG] Refusing to start: product-pack legacy-SQLite backfill failed "
+                        "(see prior log lines) — product_pack_store is the AUTHORITATIVE pack "
+                        "catalog and must not serve partially-migrated data. Operator "
+                        "remediation: repair {} or move it aside to skip the backfill (packs "
+                        "in it will NOT carry over)",
+                        pack_db.string());
+                    startup_failed_ = true;
+                } else {
+                    // #802 / W7.4: enforce signed-pack-by-default. Default ProductPackStore
+                    // ctor sets require_signed_packs_=true; we invert only when the operator
+                    // opts in via the flag, and make the relaxed posture loud in operator logs
+                    // + audit (audit emission deferred to post-audit_store_-construction block
+                    // below to mirror the viz_disable pattern). #3261/#3294 class: this call
+                    // MUST stay inside the same fail-closed guard as construction — a
+                    // null-guarded call sitting outside it is the silent-skip-wiring bug class
+                    // that shipped three dead integrations.
+                    product_pack_store_->set_require_signed_packs(!cfg_.allow_unsigned_packs);
+                    if (cfg_.allow_unsigned_packs) {
+                        spdlog::warn("[SECURITY] product pack signature enforcement DISABLED "
+                                     "by configuration (--allow-unsigned-packs / "
+                                     "YUZU_ALLOW_UNSIGNED_PACKS). Unsigned packs will be "
+                                     "accepted at install — this exposes the fleet to "
+                                     "arbitrary instruction/plugin execution. Sign packs and "
+                                     "remove the flag as soon as feasible.");
+                    }
                 }
             }
         }
@@ -5629,7 +5906,7 @@ public:
         const std::filesystem::path dir =
             cfg_.ca_dir.empty() ? auth::default_cert_dir() : cfg_.ca_dir;
         if (!ca_store_ || !ca_store_->is_open())
-            spdlog::warn("default_certs: ca.db is not open — cert-inventory recording will fail and "
+            spdlog::warn("default_certs: ca_store is not open — cert-inventory recording will fail and "
                          "generation will refuse (surfacing the DB-open failure)");
         if (!ensure_default_certs(dir, detect_hostname(), ca_store_.get(), default_cert_set_,
                                   cfg_.cert_sans, cfg_.cert_group)) {
@@ -5658,7 +5935,7 @@ public:
             // INVARIANT: using_default_agent_certs ⟹ using_default_certs (it is set
             // inside this `if (https_needs/agent_needs)` block, only after
             // using_default_certs is set above). The /healthz ca-store check keys on
-            // the broader using_default_certs (ca.db is needed whenever ANY default
+            // the broader using_default_certs (ca_store is needed whenever ANY default
             // surface is active); the listener relaxation keys on the agent-specific
             // flag. Keep them in sync if a future mixed-mode is introduced.
             cfg_.using_default_agent_certs = true;
@@ -5780,74 +6057,101 @@ public:
         agent_service_.set_require_client_identity(cfg_.tls_enabled && !cfg_.tls_ca_cert.empty());
         // Only an install with our OWN issuing CA (built-in defaults today,
         // subordinate in PR6) signs agent CSRs. When the operator brought their
-        // own certs there is no root in ca.db → no signer, and agents must carry
+        // own certs there is no root in ca_store → no signer, and agents must carry
         // operator-minted client certs (the pre-PKI contract). The revocation
         // checker is wired whenever a CA root exists so a revoked leaf is refused
         // even on an operator-supplied-cert install that still uses our CA.
-        if (ca_store_ && ca_store_->is_open() && ca_store_->has_root()) {
-            // LIFETIME: these [this]-capturing lambdas are invoked from gRPC worker
-            // threads and dereference ca_store_/agent_ca_cert_pem_/csr_issue_*. That
-            // is safe only because stop() (run from ~ServerImpl) calls
-            // agent_server_->Shutdown(deadline) — draining/cancelling all in-flight
-            // RPCs — BEFORE any member is destroyed, even though ca_store_ is
-            // declared after agent_service_/agent_server_ (destructs first). Same
-            // shutdown-before-destruct contract as execution_tracker_. agent_ca_cert_pem_
-            // is written ONCE here, before BuildAndStart accepts traffic (publish-
-            // before-start), so the worker-thread reads are race-free; do not re-wire
-            // the CA at runtime without adding synchronisation.
-            // Cache the issuing-CA cert PEM so is_yuzu_issued() can signature-verify
-            // a presented client leaf against OUR CA specifically (Hermes CRITICAL-1
-            // / LOW-5 — a foreign cert in a multi-CA trust bundle must not be
-            // mistaken for a Yuzu agent identity or a revoked Yuzu serial).
-            if (auto r = ca_store_->get_root())
-                agent_ca_cert_pem_ = r->cert_pem;
-            // ONE guarded signer, shared by the direct (AgentServiceImpl) and
-            // gateway-proxied (GatewayUpstreamServiceImpl::ProxyRegister, PR5d)
-            // Register paths — so an agent enrolling through the gateway receives a
-            // per-agent client cert too, with the SAME CA / rate-limit / ca_issued
-            // recording / CSR-size cap (one chokepoint, cannot drift). The
-            // try/catch enforces sign_agent_csr's documented "nullopt on any
-            // failure" contract even if it throws (e.g. bad_alloc) — an uncaught
-            // exception out of a sync gRPC handler on the exposed one-way-TLS agent
-            // edge would otherwise terminate the server (Hermes pass-2 MEDIUM).
-            std::function<std::optional<std::pair<std::string, std::string>>(
-                const std::string&, const std::string&, CertIssuanceSource)>
-                cert_signer = [this](const std::string& csr_pem, const std::string& agent_id,
-                                     CertIssuanceSource src)
-                -> std::optional<std::pair<std::string, std::string>> {
-                try {
-                    return sign_agent_csr(csr_pem, agent_id, src);
-                } catch (const std::exception& e) {
-                    spdlog::error("PKI: agent CSR signing threw ({}) for {} — non-fatal", e.what(),
-                                  agent_id);
-                    return std::nullopt;
-                } catch (...) {
-                    spdlog::error("PKI: agent CSR signing threw (unknown) for {} — non-fatal",
-                                  agent_id);
-                    return std::nullopt;
-                }
-            };
-            agent_service_.set_agent_cert_signer(cert_signer);
-            if (gateway_service_)
-                gateway_service_->set_agent_cert_signer(cert_signer);
-            agent_service_.set_revocation_checker(
-                [this](const std::string& peer_cert_pem) { return is_peer_cert_revoked(peer_cert_pem); });
-            // Recognizer: lets the Register re-auth gate treat ONLY Yuzu-issued
-            // certs as agent identities (foreign certs fall through to bootstrap).
-            agent_service_.set_peer_cert_recognizer(
-                [this](const std::string& peer_cert_pem) { return is_yuzu_issued(peer_cert_pem); });
-            spdlog::info("PKI: per-agent mTLS issuance active (CA {})",
-                         default_cert_set_.ca_fingerprint_sha256.empty()
-                             ? std::string("operator-supplied")
-                             : default_cert_set_.ca_fingerprint_sha256);
-            // Hermes M1: pre-publish the CRL at startup so the PUBLIC GET
-            // /api/v1/ca/crl serves a cached, already-signed CRL and never loads
-            // the CA key for an anonymous caller (the public handler is
-            // serve-or-503, it does NOT build). Best-effort: a failure just means
-            // /ca/crl returns 503 until the next revoke republishes.
-            if (!publish_crl())
-                spdlog::warn("PKI: initial CRL publish failed; GET /api/v1/ca/crl will 503 until "
-                             "the next revocation republishes");
+        if (ca_store_ && ca_store_->is_open()) {
+            // ADR-0036/ADR-0053 (adversarial-review HIGH, 2026-08-20): get_root()
+            // directly, NOT has_root() — this one-shot decision wires (or skips) the
+            // revocation checker/signer/recognizer for the rest of the process's
+            // life, with no retry. has_root() folds a genuine Postgres lease/query
+            // failure into "no root", so a transient blip here used to skip wiring
+            // SILENTLY — the server would keep serving with revoked Yuzu-issued
+            // agent certs unchecked until the next restart, exactly the fail-open
+            // ADR-0053 documents has_root() as unsafe for outside the CRL-freshness
+            // tick and /readyz. Fail the boot instead on a genuine error: run()'s
+            // existing startup_failed_ recheck after start_web_server() (same shape
+            // as the SCIM boot-failure case above) tears down the already-
+            // BuildAndStart'd gRPC listeners before any RPC is served.
+            auto root_or_err = ca_store_->get_root();
+            if (!root_or_err) {
+                spdlog::error("PKI: get_root() failed while wiring per-agent mTLS at boot ({}) — "
+                              "refusing to start rather than serve with revocation enforcement "
+                              "unwired",
+                              root_or_err.error());
+                startup_failed_ = true;
+                // Bare return, not fall-through: nothing has called BuildAndStart yet at this
+                // point in run() (same precedent as the TLS-credential failures a few dozen
+                // lines below) — no listener is up to tear down, so there is nothing stop()
+                // would additionally need to do here that ~ServerImpl won't already do.
+                return;
+            } else if (root_or_err->has_value()) {
+                // LIFETIME: these [this]-capturing lambdas are invoked from gRPC worker
+                // threads and dereference ca_store_/agent_ca_cert_pem_/csr_issue_*. That
+                // is safe only because stop() (run from ~ServerImpl) calls
+                // agent_server_->Shutdown(deadline) — draining/cancelling all in-flight
+                // RPCs — BEFORE any member is destroyed, even though ca_store_ is
+                // declared after agent_service_/agent_server_ (destructs first). Same
+                // shutdown-before-destruct contract as execution_tracker_. agent_ca_cert_pem_
+                // is written ONCE here, before BuildAndStart accepts traffic (publish-
+                // before-start), so the worker-thread reads are race-free; do not re-wire
+                // the CA at runtime without adding synchronisation.
+                // Cache the issuing-CA cert PEM so is_yuzu_issued() can signature-verify
+                // a presented client leaf against OUR CA specifically (Hermes CRITICAL-1
+                // / LOW-5 — a foreign cert in a multi-CA trust bundle must not be
+                // mistaken for a Yuzu agent identity or a revoked Yuzu serial).
+                agent_ca_cert_pem_ = (*root_or_err)->cert_pem;
+                // ONE guarded signer, shared by the direct (AgentServiceImpl) and
+                // gateway-proxied (GatewayUpstreamServiceImpl::ProxyRegister, PR5d)
+                // Register paths — so an agent enrolling through the gateway receives a
+                // per-agent client cert too, with the SAME CA / rate-limit / ca_issued
+                // recording / CSR-size cap (one chokepoint, cannot drift). The
+                // try/catch enforces sign_agent_csr's documented "nullopt on any
+                // failure" contract even if it throws (e.g. bad_alloc) — an uncaught
+                // exception out of a sync gRPC handler on the exposed one-way-TLS agent
+                // edge would otherwise terminate the server (Hermes pass-2 MEDIUM).
+                std::function<std::optional<std::pair<std::string, std::string>>(
+                    const std::string&, const std::string&, CertIssuanceSource)>
+                    cert_signer = [this](const std::string& csr_pem, const std::string& agent_id,
+                                         CertIssuanceSource src)
+                    -> std::optional<std::pair<std::string, std::string>> {
+                    try {
+                        return sign_agent_csr(csr_pem, agent_id, src);
+                    } catch (const std::exception& e) {
+                        spdlog::error("PKI: agent CSR signing threw ({}) for {} — non-fatal", e.what(),
+                                      agent_id);
+                        return std::nullopt;
+                    } catch (...) {
+                        spdlog::error("PKI: agent CSR signing threw (unknown) for {} — non-fatal",
+                                      agent_id);
+                        return std::nullopt;
+                    }
+                };
+                agent_service_.set_agent_cert_signer(cert_signer);
+                if (gateway_service_)
+                    gateway_service_->set_agent_cert_signer(cert_signer);
+                agent_service_.set_revocation_checker(
+                    [this](const std::string& peer_cert_pem) { return is_peer_cert_revoked(peer_cert_pem); });
+                // Recognizer: lets the Register re-auth gate treat ONLY Yuzu-issued
+                // certs as agent identities (foreign certs fall through to bootstrap).
+                agent_service_.set_peer_cert_recognizer(
+                    [this](const std::string& peer_cert_pem) { return is_yuzu_issued(peer_cert_pem); });
+                spdlog::info("PKI: per-agent mTLS issuance active (CA {})",
+                             default_cert_set_.ca_fingerprint_sha256.empty()
+                                 ? std::string("operator-supplied")
+                                 : default_cert_set_.ca_fingerprint_sha256);
+                // Hermes M1: pre-publish the CRL at startup so the PUBLIC GET
+                // /api/v1/ca/crl serves a cached, already-signed CRL and never loads
+                // the CA key for an anonymous caller (the public handler is
+                // serve-or-503, it does NOT build). Best-effort: a failure just means
+                // /ca/crl returns 503 until the next revoke republishes.
+                if (!publish_crl())
+                    spdlog::warn("PKI: initial CRL publish failed; GET /api/v1/ca/crl will 503 until "
+                                 "the next revocation republishes");
+            }
+            // else: nullopt — genuinely no root (operator brought their own certs) —
+            // no signer/recognizer/revocation-checker wiring, same as before.
         }
 
         grpc::EnableDefaultHealthCheckService(true);
@@ -6031,6 +6335,102 @@ public:
         if (cfg_.cert_reload_enabled && cfg_.tls_enabled) {
             spdlog::warn("gRPC TLS certificate hot-reload is not yet supported; "
                          "gRPC listeners will use the certificates loaded at startup");
+        }
+
+        // #881: keep the containment snapshot WARM.
+        //
+        // The bounded-staleness budget (`kQuarantineSnapshotMaxAge`, 60s) is
+        // meant to absorb a transient store blip so a pool-acquire timeout does
+        // not convert into a fleet-wide dispatch refusal. It could not do that,
+        // because the snapshot's only writer was `make_containment_gate` — i.e.
+        // a DISPATCH. So the snapshot's age was "time since the last dispatch",
+        // not "time since the last successful read", and on a server with no
+        // sustained operator traffic (the PolicyEvaluator's default interval is
+        // 3600s) every dispatch arrived with a snapshot already past the
+        // budget. One timed-out read then went straight to fail-closed, the
+        // operator's command was refused against every target, and a critical
+        // alert fired — while the runbook told them a 60-second cushion had
+        // absorbed it. The mechanism was sound; nothing kept it fed.
+        //
+        // This does NOT change what a dispatch does: every non-exempt dispatch
+        // still performs its own fresh read and uses this snapshot only as the
+        // fallback. Serving the snapshot directly would put a whole refresh
+        // interval of lag between a quarantine write and its enforcement, which
+        // is the bypass window the fresh-read-per-dispatch design exists to
+        // close. This only keeps the fallback recent enough to be worth having.
+        //
+        // Cadence is a third of the budget, so two consecutive refresh failures
+        // still leave a usable snapshot — and it narrows the other edge of the
+        // same window: a device quarantined while reads are degrading is absent
+        // from a snapshot taken before the write, so the shorter the snapshot's
+        // maximum age, the shorter that bypass.
+        if (quarantine_store_) {
+            quarantine_snapshot_refresh_thread_ = std::thread([this]() {
+                using namespace std::chrono_literals;
+                spdlog::info("Quarantine containment snapshot refresher started (interval=20s, "
+                             "staleness budget={}s)",
+                             yuzu::server::kQuarantineSnapshotMaxAge.count());
+                while (!stop_requested_.load(std::memory_order_acquire)) {
+                    for (int i = 0; i < 4 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                        std::this_thread::sleep_for(5s);
+                    if (stop_requested_.load(std::memory_order_acquire))
+                        break;
+                    // Per-tick try/catch: an exception escaping a std::thread
+                    // entry is std::terminate — the whole process, from a
+                    // best-effort cache refresh. This body allocates (the id
+                    // set, and list_quarantined's own vector), so `bad_alloc`
+                    // alone makes it reachable. Five other background loops in
+                    // this file already carry this shape; the two that did not
+                    // were this one and health_recompute_thread_.
+                    try {
+                    if (!quarantine_store_ || !quarantine_store_->is_open())
+                        continue;
+                    // Take a slot like any other containment read. Without
+                    // this the refresher is the ONE read the bound does not
+                    // bound — a stalled backend pins five pool connections,
+                    // not four, and the member's own doc comment is off by
+                    // one. It waits like a dispatch does; if it cannot get in,
+                    // it simply skips this tick, which costs nothing (the next
+                    // is 20s away and the snapshot is still inside its 60s
+                    // budget).
+                    if (!containment_read_slots_.try_acquire_for(std::chrono::seconds{2}))
+                        continue;
+                    ContainmentReadSlot release_slot{containment_read_slots_};
+                    // Stamped BEFORE the read for the same reason
+                    // make_containment_gate stamps before its own: the budget
+                    // bounds the age of the DATA, and a read that blocked for
+                    // seconds on a contended pool would otherwise be recorded
+                    // as fresher than it is.
+                    const auto read_started_at = std::chrono::steady_clock::now();
+                    auto rows = quarantine_store_->list_quarantined();
+                    if (!rows)
+                        continue; // a failed refresh leaves the previous snapshot to age out
+                    std::unordered_set<std::string> ids;
+                    ids.reserve(rows->size());
+                    for (const auto& r : *rows)
+                        ids.insert(r.agent_id);
+                    {
+                        std::lock_guard<std::mutex> lk(quarantine_snapshot_mtx_);
+                        // Never move the stamp BACKWARDS. A refresh that raced a
+                        // dispatch's own fresh read could otherwise replace a
+                        // newer snapshot with an older one and age the fallback
+                        // out early.
+                        if (quarantine_snapshot_.valid && quarantine_snapshot_.at > read_started_at)
+                            continue;
+                        quarantine_snapshot_ =
+                            yuzu::server::QuarantineSnapshot{std::move(ids), read_started_at, true};
+                    }
+                    } catch (const std::exception& e) {
+                        // Log and keep ticking. A failed refresh leaves the
+                        // previous snapshot to age out, which is the same
+                        // outcome as a failed read and is already handled.
+                        spdlog::warn("quarantine snapshot refresher tick failed: {}", e.what());
+                    } catch (...) {
+                        spdlog::warn("quarantine snapshot refresher tick failed: unknown exception");
+                    }
+                }
+                spdlog::info("Quarantine containment snapshot refresher stopped");
+            });
         }
 
         // Spawn fleet health recomputation thread (aggregates agent heartbeat data)
@@ -6314,27 +6714,65 @@ public:
                         }
                     }
                 }
+                // UP-1 (Gate 4 unhappy-path, 2026-08-21): build the revoked set ONCE per
+                // tick from a typed serials-only read and ABORT the sweep on a degraded
+                // read, rather than calling the per-request is_peer_cert_revoked() (which
+                // fails CLOSED = revoked, by design, for the mTLS-accept gate) once per
+                // live agent. Reusing the per-request gate here made a transient PG outage
+                // indistinguishable from "every enrolled agent was just revoked": every
+                // Subscribe stream got torn down AND a session.cert_revoked|denied audit
+                // row written for each — a false compliance record, not just an
+                // availability blip, since nothing was actually revoked.
+                //
+                // Gate 8 fix (unhappy-path, 2026-08-21): reads list_revoked_serials(), NOT
+                // list_revoked() — the full-row query (cert_pem blobs, ORDER BY, no cap,
+                // nothing ever prunes ca_issued) is measurably heavier than the point-lookup
+                // is_revoked() the per-request gate uses, so sharing it here opened a
+                // narrower but real corridor: a load/lock-contention pattern specific to the
+                // heavier query could fail THIS read while is_revoked() kept succeeding —
+                // new connections still correctly gated, but the ONLY mechanism that tears
+                // down an already-live stream silently doing nothing, indefinitely, with no
+                // "DB is down" to point to. list_revoked_serials() hits the same
+                // idx_ca_issued_status partial index at point-lookup-equivalent cost, closing
+                // that asymmetry. Same abort-never-empty contract either way (mirrored by the
+                // CRL publish caller below, which still needs the full rows).
                 if (ca_store_ && ca_store_->is_open()) {
-                    const auto swept = registry_.sweep_revoked(
-                        [this](const std::string& pem) { return is_peer_cert_revoked(pem); });
-                    if (!swept.empty()) {
-                        spdlog::warn("Revocation sweep cancelled {} Subscribe stream(s)",
-                                     swept.size());
-                        // HIGH-1 (#1239 Hermes): a revocation-driven access termination
-                        // is a durable SOC 2 CC6.3/CC7.2 event, not just a metric/log.
-                        // The sweep is low-frequency (fires only on actual revocations),
-                        // so a WAL row per cancelled stream is not a flood risk.
-                        if (audit_store_ && audit_store_->is_open()) {
-                            for (const auto& aid : swept) {
-                                (void)audit_store_->log(
-                                    {.timestamp = std::time(nullptr),
-                                     .principal = "agent:" + aid,
-                                     .principal_role = "agent",
-                                     .action = "session.cert_revoked",
-                                     .target_type = "Session",
-                                     .target_id = aid,
-                                     .detail = "reason=revoked_client_cert source=stream_sweep",
-                                     .result = "denied"});
+                    auto revoked_or_err = ca_store_->list_revoked_serials();
+                    if (!revoked_or_err) {
+                        spdlog::error("PKI: revocation sweep skipped this tick — "
+                                      "list_revoked_serials() failed ({}); live Subscribe "
+                                      "streams left untouched rather than treated as "
+                                      "mass-revoked",
+                                      revoked_or_err.error());
+                        metrics_.counter("yuzu_server_ca_revocation_sweep_read_failures_total")
+                            .increment();
+                    } else {
+                        std::unordered_set<std::string> revoked_serials(revoked_or_err->begin(),
+                                                                        revoked_or_err->end());
+                        const auto swept = registry_.sweep_revoked(
+                            [this, &revoked_serials](const std::string& pem) {
+                                return is_peer_cert_revoked_in(pem, revoked_serials);
+                            });
+                        if (!swept.empty()) {
+                            spdlog::warn("Revocation sweep cancelled {} Subscribe stream(s)",
+                                         swept.size());
+                            // HIGH-1 (#1239 Hermes): a revocation-driven access termination
+                            // is a durable SOC 2 CC6.3/CC7.2 event, not just a metric/log.
+                            // The sweep is low-frequency (fires only on actual revocations),
+                            // so a WAL row per cancelled stream is not a flood risk.
+                            if (audit_store_ && audit_store_->is_open()) {
+                                for (const auto& aid : swept) {
+                                    (void)audit_store_->log(
+                                        {.timestamp = std::time(nullptr),
+                                         .principal = "agent:" + aid,
+                                         .principal_role = "agent",
+                                         .action = "session.cert_revoked",
+                                         .target_type = "Session",
+                                         .target_id = aid,
+                                         .detail =
+                                             "reason=revoked_client_cert source=stream_sweep",
+                                         .result = "denied"});
+                                }
                             }
                         }
                     }
@@ -6386,6 +6824,11 @@ public:
                     metrics_.gauge("yuzu_server_engine_revalidate_backoff_suppressed_total")
                         .set(static_cast<double>(
                             engine_principal_store_->revalidate_backoff_suppressed()));
+                    // #2454: the per-principal poisoning-guard map's capacity-exhaustion
+                    // fallback rate.
+                    metrics_.gauge("yuzu_server_engine_revalidate_generation_capacity_fallback_total")
+                        .set(static_cast<double>(
+                            engine_principal_store_->revoke_generation_capacity_fallback()));
                 }
                 // Publish FleetTopologyStore internals so the 256 MiB store-
                 // level oversize cap and single-flight refill timeouts are
@@ -7207,6 +7650,12 @@ public:
             auth_db_->request_stop();
         }
 
+        // Join the containment snapshot refresher BEFORE the stores it reads
+        // (#881). It touches quarantine_store_ and quarantine_snapshot_ only.
+        if (quarantine_snapshot_refresh_thread_.joinable()) {
+            quarantine_snapshot_refresh_thread_.join();
+        }
+
         // Join the fleet health recomputation thread
         if (health_recompute_thread_.joinable()) {
             health_recompute_thread_.join();
@@ -7393,10 +7842,17 @@ public:
         // from Register/Subscribe/Heartbeat/CheckForUpdate/DownloadUpdate. The
         // drain above guarantees no handler is mid-invocation; null them for the
         // same belt-and-braces reason as the tracker so a stray late call cannot
-        // touch released CA state.
+        // touch released CA state. gateway_service_ is wired with the SAME
+        // cert_signer lambda at boot (server.cpp's PKI wiring block) — null its
+        // copy too, matching the blast-radius-detector/dex-alert-router parity
+        // above (governance Gate 3 cpp-safety, 2026-08-21). gateway_service_
+        // registers on the same agent_server_ builder, so the drain already
+        // covers it; this closes the belt-and-braces gap, not a proven UAF.
         agent_service_.set_agent_cert_signer(nullptr);
         agent_service_.set_revocation_checker(nullptr);
         agent_service_.set_peer_cert_recognizer(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_agent_cert_signer(nullptr);
 
         // 2f PR 3a: the bridge borrows the bus (unsubscribe on teardown) and the
         // session registry - shut it down and release it BEFORE the tracker/bus
@@ -7916,12 +8372,23 @@ public:
         // margin. What .lock() alone does NOT protect is the pg::PgPool&
         // that object still borrows: AnalyticsEventStore::stop_drain(),
         // called well above, sets an internal shutting_down_ latch as its
-        // first statement, and emit()/query_recent()/pending_count()/
-        // start_drain() all check it before ever touching pool_ — a
-        // latch, not a rundown guard, so it refuses NEW entrants from the
-        // moment stop_drain() runs, not a caller already past the check.
-        // That residual is bounded by the multi-second span between
-        // stop_drain() (above) and pg_pool_.reset() (below) — several
+        // first statement, and emit()/start_drain() check it before ever
+        // touching pool_ — a latch, not a rundown guard, so it refuses NEW
+        // entrants from the moment stop_drain() runs, not a caller already
+        // past the check. query_recent()/pending_count() are deliberately
+        // NOT gated on it (fjarvis review, PR #3350, 2026-08-20 — an
+        // earlier version of this fix gated them too, which broke this
+        // store's own drain tests): their sole production callers are
+        // web_server_->Get(...) HTTP handlers, and web_thread_'s join
+        // below (with its own bounded wait/_Exit escalation) completes
+        // strictly before pg_pool_.reset() runs — every httplib worker,
+        // including any in-flight analytics handler, is already joined by
+        // the time that non-timeout path continues. That's a join
+        // ordering, not a timing margin.
+        // emit()'s residual (it IS still latch-gated, and the latch is a
+        // check-then-use gate, not a rundown guard) is bounded by the
+        // multi-second span between stop_drain() (above) and
+        // pg_pool_.reset() (below) — several
         // joins/quiesce waits sit in between — which makes it small in
         // practice, not zero by construction (cpp-expert review, PR
         // #3350, 2026-08-20). The detached thread itself outliving this
@@ -7945,6 +8412,12 @@ public:
         // concurrent access — analytics_store_.reset() below is what
         // expires it, atomically, for every locker regardless of thread.
         analytics_store_.reset();
+        // CaStore (ADR-0053) borrows pg_pool_ — its PKI callbacks (signer/revocation
+        // checker/recognizer) are already nulled above; drop the store explicitly
+        // before the pool rather than relying on declaration-order destruction alone
+        // (adversarial-review MEDIUM, 2026-08-20 — matches the sibling stores' own
+        // explicit-reset discipline in this function).
+        ca_store_.reset();
         pg_pool_.reset();
 
         // ONLY on full completion — a path above that escalates via std::_Exit(1)
@@ -8161,9 +8634,15 @@ private:
         const char* const via = to_audit_via(src);
         if (!ca_store_ || !ca_store_->is_open())
             return std::nullopt;
-        auto root = ca_store_->get_root();
+        auto root_or_err = ca_store_->get_root();
+        if (!root_or_err) {
+            spdlog::error("PKI: agent CSR signing aborted — ca_store read failed: {}",
+                          root_or_err.error());
+            return std::nullopt;
+        }
+        auto& root = *root_or_err;
         if (!root) {
-            spdlog::warn("PKI: agent CSR signing requested but ca.db has no root");
+            spdlog::warn("PKI: agent CSR signing requested but ca_store has no root");
             return std::nullopt;
         }
         // PR5d / Hermes LOW: bound the attacker-supplied CSR before any parse or
@@ -8200,8 +8679,17 @@ private:
         // (fine at realistic revocation counts; a subject-indexed query is the
         // follow-up if it ever grows).
         {
+            auto revoked_or_err = ca_store_->list_revoked();
+            if (!revoked_or_err) {
+                // ADR-0036: a silently-empty read here would silently BYPASS the HIGH-2
+                // revocation-bypass guard below — fail closed (refuse to issue) rather than
+                // treat "couldn't read the revoked set" as "nothing is revoked".
+                spdlog::error("PKI: agent CSR signing aborted — list_revoked failed: {}",
+                              revoked_or_err.error());
+                return std::nullopt;
+            }
             const auto now_epoch = static_cast<int64_t>(std::time(nullptr));
-            for (const auto& rev : ca_store_->list_revoked()) {
+            for (const auto& rev : *revoked_or_err) {
                 if (rev.subject == agent_id && rev.not_after > now_epoch) {
                     spdlog::warn("PKI: refusing to re-issue for agent {} — a revoked, "
                                  "non-expired cert (serial {}) exists; an operator must clear "
@@ -8229,10 +8717,10 @@ private:
         }
         // Hermes MEDIUM-4: per-agent issuance rate-limit. A holder of a valid
         // enrollment credential could otherwise spam Register-with-CSR, each call
-        // burning an ECDSA sign + a ca.db row. A legitimate agent issues once per
+        // burning an ECDSA sign + a ca_store row. A legitimate agent issues once per
         // provisioning (it then re-Registers WITHOUT a CSR) and again only at the
         // ~8-month renewal, so this floor never affects the happy path; it also
-        // bounds the ca.db rows a bounded agent retry (Hermes HIGH-2) can create.
+        // bounds the ca_store rows a bounded agent retry (Hermes HIGH-2) can create.
         {
             // gov UP-1: CHECK only here; the timestamp is recorded AFTER a
             // successful issuance (below), so a transient server-side failure
@@ -8288,7 +8776,7 @@ private:
         lp.usage = pki::LeafUsage{.client_auth = true};
         // Install-scoped URI SAN (defence in depth + forensic identity). The CA
         // fingerprint (colon-stripped → a valid URI authority) is the per-install
-        // id; fall back to the ca.db root fingerprint on an operator-supplied set.
+        // id; fall back to the ca_store root fingerprint on an operator-supplied set.
         std::string install = default_cert_set_.ca_fingerprint_sha256.empty()
                                   ? root->fingerprint_sha256
                                   : default_cert_set_.ca_fingerprint_sha256;
@@ -8302,7 +8790,7 @@ private:
             return std::nullopt;
         }
 
-        // Record the issued leaf so it can be revoked / inventoried (ca.db).
+        // Record the issued leaf so it can be revoked / inventoried (ca_store).
         IssuedCertRecord rec;
         rec.serial_hex = issued->serial_hex;
         rec.subject = agent_id;
@@ -8321,10 +8809,11 @@ private:
         if (auto kid = pki::issuer_key_id(root->cert_pem))
             rec.issuer_key_id = *kid;
         rec.issuer_fingerprint = root->fingerprint_sha256;
-        if (!ca_store_->record_issued(rec)) {
+        if (auto rec_result = ca_store_->record_issued(rec); !rec_result) {
             // Fail closed: an unrecorded cert can't be revoked, so don't hand it
             // out — the agent stays on the bootstrap posture and retries.
-            spdlog::error("PKI: failed to record issued agent cert for {} — not issuing", agent_id);
+            spdlog::error("PKI: failed to record issued agent cert for {} — not issuing: {}",
+                          agent_id, rec_result.error());
             return std::nullopt;
         }
 
@@ -8369,9 +8858,15 @@ private:
     std::optional<std::string> export_ca_csr() {
         if (!ca_store_ || !ca_store_->is_open())
             return std::nullopt;
-        auto root = ca_store_->get_root();
+        auto root_or_err = ca_store_->get_root();
+        if (!root_or_err) {
+            spdlog::error("PKI: CA CSR export aborted — ca_store read failed: {}",
+                          root_or_err.error());
+            return std::nullopt;
+        }
+        auto& root = *root_or_err;
         if (!root) {
-            spdlog::warn("PKI: CA CSR export requested but ca.db has no root");
+            spdlog::warn("PKI: CA CSR export requested but ca_store has no root");
             return std::nullopt;
         }
         const std::filesystem::path dir =
@@ -8413,7 +8908,13 @@ private:
                                                      const std::string& parent_chain_pem) {
         if (!ca_store_ || !ca_store_->is_open())
             return CaRoutes::ImportOutcome::StoreError;
-        auto root = ca_store_->get_root();
+        auto root_or_err = ca_store_->get_root();
+        if (!root_or_err) {
+            spdlog::error("PKI: subordinate import aborted — ca_store read failed: {}",
+                          root_or_err.error());
+            return CaRoutes::ImportOutcome::StoreError;
+        }
+        auto& root = *root_or_err;
         if (!root)
             return CaRoutes::ImportOutcome::NoRoot;
 
@@ -8475,8 +8976,9 @@ private:
         updated.not_after = std::chrono::duration_cast<std::chrono::seconds>(
                                 details->not_after.time_since_epoch())
                                 .count();
-        if (!ca_store_->set_root(updated)) {
-            spdlog::error("PKI: subordinate import validated but set_root failed");
+        if (auto set_result = ca_store_->set_root(updated); !set_result) {
+            spdlog::error("PKI: subordinate import validated but set_root failed: {}",
+                          set_result.error());
             return CaRoutes::ImportOutcome::StoreError;
         }
         spdlog::warn("PKI: issuing identity switched to SUBORDINATE — intermediate {} now chains "
@@ -8486,38 +8988,62 @@ private:
         return CaRoutes::ImportOutcome::Ok;
     }
 
-    /// True iff the presented client leaf is one of OURS and its serial is revoked
-    /// in ca.db. Issuer-scoped (is_yuzu_issued) so a foreign cert whose serial
-    /// happens to collide with a revoked Yuzu serial is not falsely rejected
-    /// (Hermes LOW-5). Reads only the CA store (its own mutex) — safe off the
-    /// agent-plane lock.
-    bool is_peer_cert_revoked(const std::string& peer_cert_pem) {
-        if (!ca_store_ || !ca_store_->is_open() || !is_yuzu_issued(peer_cert_pem))
-            return false;
-        // gov/sre: the serial is IMMUTABLE for a given leaf PEM, so cache the
-        // PEM→serial parse (mirrors yuzu_issued_cache_) — the per-heartbeat
-        // revocation gate would otherwise pay an X509 PEM parse on every call,
-        // fleet-wide. CRITICAL: the is_revoked() lookup below stays LIVE — caching
-        // the revocation *result* would let a revoked agent keep talking until the
-        // cache expired (a security bug). Only the parse is memoised.
-        std::string serial;
+    /// Issuer-scoped (is_yuzu_issued) PEM→serial resolution, shared by the live
+    /// per-request revocation gate and the tick-scoped sweep below. Empty return
+    /// means "not one of ours" (foreign cert or unparseable) — callers must NOT
+    /// treat that as revoked, only as "this gate has no opinion".
+    ///
+    /// gov/sre: the serial is IMMUTABLE for a given leaf PEM, so cache the
+    /// PEM→serial parse (mirrors yuzu_issued_cache_) — the per-heartbeat
+    /// revocation gate would otherwise pay an X509 PEM parse on every call,
+    /// fleet-wide. CRITICAL: only the parse is memoised — the revocation
+    /// lookup itself must stay live at the caller (caching it would let a
+    /// revoked agent keep talking until the cache expired).
+    std::string resolve_yuzu_peer_serial(const std::string& peer_cert_pem) {
+        if (!is_yuzu_issued(peer_cert_pem))
+            return {};
         {
             std::lock_guard<std::mutex> lk(peer_serial_cache_mu_);
             if (auto it = peer_serial_cache_.find(peer_cert_pem);
                 it != peer_serial_cache_.end())
-                serial = it->second;
+                return it->second;
         }
-        if (serial.empty()) {
-            auto details = pki::parse_certificate(peer_cert_pem);
-            if (!details || details->serial_hex.empty())
-                return false; // unparseable → not our cert; the identity gate handles it
-            serial = details->serial_hex;
-            std::lock_guard<std::mutex> lk(peer_serial_cache_mu_);
-            if (peer_serial_cache_.size() > 16384)
-                peer_serial_cache_.clear(); // crude bound; certs are stable → low churn
-            peer_serial_cache_[peer_cert_pem] = serial;
-        }
-        return ca_store_->is_revoked(serial);
+        auto details = pki::parse_certificate(peer_cert_pem);
+        if (!details || details->serial_hex.empty())
+            return {}; // unparseable → not our cert; the identity gate handles it
+        const std::string& serial = details->serial_hex;
+        std::lock_guard<std::mutex> lk(peer_serial_cache_mu_);
+        if (peer_serial_cache_.size() > 16384)
+            peer_serial_cache_.clear(); // crude bound; certs are stable → low churn
+        peer_serial_cache_[peer_cert_pem] = serial;
+        return serial;
+    }
+
+    /// True iff the presented client leaf is one of OURS and its serial is revoked
+    /// in ca_store. Issuer-scoped (is_yuzu_issued) so a foreign cert whose serial
+    /// happens to collide with a revoked Yuzu serial is not falsely rejected
+    /// (Hermes LOW-5). Reads only the CA store (its own mutex) — safe off the
+    /// agent-plane lock. Per-request gate: deliberately fails CLOSED (see
+    /// CaStore::is_revoked) on a degraded read — the documented exception to
+    /// UP-1's abort-on-degraded rule below, since a single mTLS accept refusing
+    /// to admit is bounded, unlike a fleet-wide sweep tick.
+    bool is_peer_cert_revoked(const std::string& peer_cert_pem) {
+        if (!ca_store_ || !ca_store_->is_open())
+            return false;
+        const std::string serial = resolve_yuzu_peer_serial(peer_cert_pem);
+        return !serial.empty() && ca_store_->is_revoked(serial);
+    }
+
+    /// Set-membership variant for the revocation sweep tick (UP-1, Gate 4
+    /// unhappy-path, 2026-08-21): checks against a revoked-serial set read ONCE
+    /// per tick via the typed list_revoked_serials(), instead of calling the
+    /// fail-closed is_peer_cert_revoked() once per live agent — see the
+    /// sweep-tick comment in run() for why. Never touches ca_store_ directly, so
+    /// it has no degraded-read behavior of its own to get wrong.
+    bool is_peer_cert_revoked_in(const std::string& peer_cert_pem,
+                                  const std::unordered_set<std::string>& revoked_serials) {
+        const std::string serial = resolve_yuzu_peer_serial(peer_cert_pem);
+        return !serial.empty() && revoked_serials.contains(serial);
     }
 
     /// PKI PR4: build + record a new CRL version over the current revoked set,
@@ -8531,7 +9057,13 @@ private:
         std::lock_guard<std::mutex> publish_lock(crl_publish_mu_);
         if (!ca_store_ || !ca_store_->is_open())
             return std::nullopt;
-        auto root = ca_store_->get_root();
+        auto root_or_err = ca_store_->get_root();
+        if (!root_or_err) {
+            spdlog::error("PKI: CRL publish aborted — ca_store read failed: {}",
+                          root_or_err.error());
+            return std::nullopt;
+        }
+        auto& root = *root_or_err;
         if (!root)
             return std::nullopt;
         const std::filesystem::path dir =
@@ -8545,15 +9077,34 @@ private:
         }
         detail::ScopedKeyZero ca_key_zero{*ca_key};
 
+        auto revoked_or_err = ca_store_->list_revoked();
+        if (!revoked_or_err) {
+            // ADR-0036/ADR-0053: never build a CRL over a possibly-incomplete revoked set — a
+            // degraded read here would publish a CRL that silently un-revokes every real
+            // revocation in every cache that trusts it. Abort the whole publish instead.
+            spdlog::error("PKI: CRL publish aborted — list_revoked failed: {}",
+                          revoked_or_err.error());
+            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
+            return std::nullopt;
+        }
         std::vector<pki::CrlRevocation> revoked;
-        for (const auto& r : ca_store_->list_revoked()) {
+        for (const auto& r : *revoked_or_err) {
             revoked.push_back(
                 {r.serial_hex,
                  std::chrono::system_clock::time_point{std::chrono::seconds{r.revoked_at}}});
         }
         const auto now = std::chrono::system_clock::now();
         const pki::Validity validity{now, now + std::chrono::hours(24 * 7)}; // 7-day nextUpdate
-        const std::uint64_t number = ca_store_->next_crl_number();
+        auto number_or_err = ca_store_->next_crl_number();
+        if (!number_or_err) {
+            // ADR-0053: never substitute a default number on error — see next_crl_number()'s
+            // doc comment for why the pre-migration "silently return 1" default is unsafe here.
+            spdlog::error("PKI: CRL publish aborted — next_crl_number failed: {}",
+                          number_or_err.error());
+            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
+            return std::nullopt;
+        }
+        const std::uint64_t number = *number_or_err;
         auto der = pki::build_crl(root->cert_pem, *ca_key, revoked, validity, number);
         if (!der) {
             spdlog::error("PKI: build_crl failed");
@@ -9048,6 +9599,36 @@ private:
     /// `std::unexpected` explicitly. Every denial is counted (one family,
     /// `reason` label) and logged; no path returns a permissive default
     /// (ADR-0033 §2).
+    /// #881 / #3402 — the ONE door for a server-internal push that reaches an
+    /// agent WITHOUT passing the containment gate.
+    ///
+    /// Four call sites bypass the gate deliberately (see
+    /// `SystemReservedPush` in dispatch_confined_arms.hpp for why each is
+    /// correct). Before this wrapper the bypass was enforced by a comment
+    /// above a raw `registry_.send_to`, which is not enforcement: a fifth site
+    /// added later would inherit it silently, and there was nothing to grep
+    /// for. Taking an ENUM rather than a string means a new internal push
+    /// cannot compile without adding an enumerator next to the rule it is an
+    /// exemption from.
+    ///
+    /// It also makes the bypass COUNTABLE. `undelivered` is the value that
+    /// matters: a Guardian rule push that never landed leaves a device
+    /// unenforced, and until now that fell on the floor at three of the four
+    /// sites (only the reconcile path metered anything, and only its success).
+    /// `sent` means the registry accepted the frame — for a gateway-attached
+    /// agent `send_to` only QUEUES it, so this is acceptance, never delivery.
+    [[nodiscard]] bool send_system_reserved(const std::string& agent_id,
+                                            const detail::ClassifiedCommand& cmd,
+                                            yuzu::server::SystemReservedPush push) {
+        const bool ok = registry_.send_to(agent_id, cmd);
+        metrics_
+            .counter("yuzu_server_system_reserved_push_total",
+                     {{"capability", std::string(yuzu::server::system_reserved_push_label(push))},
+                      {"result", ok ? "sent" : "undelivered"}})
+            .increment();
+        return ok;
+    }
+
     std::expected<detail::ClassifiedCommand, detail::DispatchDenial> build_classified_command(
         const yuzu::server::DispatchCaller& caller, const std::string& plugin,
         const std::string& action, const std::string& command_id,
@@ -9175,6 +9756,149 @@ private:
             }};
     }
 
+    /// #881: the ONE place a `ContainmentGate` is built. Called once per
+    /// dispatch — never per agent — at every one of the six production
+    /// dispatch sites (`dispatch_confined` below, the four `/api/command`
+    /// arms, `forward_legacy_command`).
+    ///
+    /// The quarantine plugin's OWN control channel is exempted WITHOUT
+    /// touching `quarantine_store_` at all: `is_quarantine_control_plugin`
+    /// is pure, so a Postgres outage that fails every other dispatch closed
+    /// cannot also block the one action (release) that would end it.
+    /// Keyed on the `(plugin, ACTION)` pair against a closed four-action set,
+    /// NOT on the plugin name — a fifth action added later arrives gated
+    /// rather than inheriting the bypass. See that predicate's own doc
+    /// comment for why all four of today's actions are on the list and why
+    /// `unquarantine` alone is not enough.
+    ///
+    /// Otherwise, `quarantine_store_->list_quarantined()` runs EXACTLY ONCE
+    /// and the result — success or the collapsed-to-nullopt failure —
+    /// crosses into `evaluate_quarantine_degradation`
+    /// (dispatch_confined_arms.hpp), the pure #881 policy that decides
+    /// fresh/stale/fail-closed and refreshes `quarantine_snapshot_` on a
+    /// successful read. `store_permanently_unavailable` is computed here
+    /// (null or `!is_open()`) rather than inside that pure function because
+    /// it is the one input that is genuinely `ServerImpl`-shaped — a
+    /// permanent condition the server already refuses to start on
+    /// (server.cpp, quarantine store construction), never something a fake
+    /// reader in a test needs to fabricate via `list_quarantined()` itself.
+    yuzu::server::ContainmentGate make_containment_gate(const std::string& plugin,
+                                                       const std::string& action) {
+        // The exemption DECISION lives in `compose_containment_gate` (testable,
+        // CDX-P1-06); this local only decides whether to spend a store READ.
+        // Deliberately not an early return: an early return here is exactly
+        // what the mutation test disabled to switch containment off for every
+        // plugin with the suite still green. Skipping the read keeps the
+        // property the spec asks for — the release path must survive a store
+        // outage, so it must not depend on a query — without giving this
+        // function a second, untested copy of the enforcement decision.
+        const bool exempt = yuzu::server::is_quarantine_control_plugin(plugin, action);
+        const bool store_unavailable = !quarantine_store_ || !quarantine_store_->is_open();
+        // #881: sampled BEFORE the store read, not after — the 60s budget in
+        // `evaluate_quarantine_degradation` is meant to bound the age of the
+        // DATA, and stamping `now` only after a read that may itself have
+        // blocked for seconds on a contended pool would understate that.
+        const auto read_started_at = std::chrono::steady_clock::now();
+        std::optional<std::unordered_set<std::string>> fresh_read;
+
+        // CONCURRENCY BOUND on the containment read — and a WAIT, not a skip.
+        //
+        // `list_quarantined()` is a synchronous libpq round trip with no
+        // client-side deadline that actually binds. `statement_timeout` is
+        // server-side and a FROZEN backend cannot enforce it; `tcp_user_timeout`
+        // only covers unacknowledged data, and a paused container still ACKs.
+        // Measured against the pool's exact conninfo with the backend paused
+        // for 100s: the query returned successfully after 101.009s, with
+        // neither bound firing.
+        //
+        // Before #881 no dispatch touched this store. Now every non-exempt one
+        // does, so without a bound a stalled backend pins one pool connection
+        // per dispatching worker — and that pool is the SAME one auth, RBAC,
+        // audit and every other store draw from. A dispatch stall would become
+        // server-wide pool exhaustion.
+        //
+        // WHY THIS WAITS RATHER THAN SKIPPING, which is the whole subtlety.
+        // The first version of this bound was non-blocking: miss a slot, fall
+        // through to the `nullopt` path. That is wrong, and wrong in the
+        // direction this gate exists to prevent. The `nullopt` path serves the
+        // last-known-good snapshot, which is a reasonable answer when the store
+        // COULD NOT answer — and a bypass when nobody asked it. Against a
+        // HEALTHY store, a dispatch that skipped its read would be decided from
+        // a snapshot up to 60s old, so a device quarantined in the meantime
+        // would be dispatched to. With the HTTP pool sized in the hundreds and
+        // this bound at four, missing a slot is the steady state under ordinary
+        // agentic load, not an edge case: it would have under-enforced
+        // routinely.
+        //
+        // A bounded wait has neither problem. Against a healthy store the read
+        // is milliseconds, so four slots sustain far more dispatch than the
+        // fleet generates and the wait is unobservable. The bound only bites
+        // when reads are SLOW — exactly the stall it exists for — and a
+        // genuine timeout then means the store is not answering, which is a
+        // fail-CLOSED condition, not a stale-snapshot one.
+        //
+        // The slot wait is DELIBERATELY SHORTER than the store's own read
+        // timeout (`QuarantineStore::kReadTimeout`, 2000ms) so the two bounds
+        // COMPOSE rather than stack. Waiting the full store timeout for a slot
+        // and then paying it again inside the read puts worst-case dispatch
+        // latency at 4s plus the query, all on an httplib worker from the pool
+        // `StreamBudget` is sized against. At 500ms a healthy store — where
+        // this read is milliseconds — never notices, and a stalled one is
+        // rejected quickly rather than parking a worker.
+        //
+        // Not configurable: a blast-radius bound, not a tuning knob. The bound
+        // itself is `kMaxConcurrentContainmentReads`, a class-scope constant.
+        static constexpr auto kContainmentReadSlotWait = std::chrono::milliseconds{500};
+        bool read_slot_timed_out = false;
+        if (!exempt && !store_unavailable) {
+            if (containment_read_slots_.try_acquire_for(kContainmentReadSlotWait)) {
+                ContainmentReadSlot release_slot{containment_read_slots_};
+                if (auto rows = quarantine_store_->list_quarantined()) {
+                    std::unordered_set<std::string> ids;
+                    ids.reserve(rows->size());
+                    for (const auto& r : *rows)
+                        ids.insert(r.agent_id);
+                    fresh_read = std::move(ids);
+                }
+            } else {
+                // Countable and DISTINCT: "the read was never attempted because
+                // reads are saturated" is a different operator problem from
+                // "the read failed", and it resolves to fail-closed rather than
+                // to the snapshot.
+                read_slot_timed_out = true;
+                metrics_
+                    .counter("yuzu_server_quarantine_read_degrade_total",
+                             {{"reason", "read_concurrency_cap"}})
+                    .increment();
+            }
+        }
+
+        // The exemption, the degradation policy and the monotonic snapshot
+        // advance all live in `compose_containment_gate` so they are reachable
+        // from a test (CDX-P1-06): this method previously held the plugin
+        // exemption inline, where making it unconditional disabled containment
+        // for every plugin with the whole dispatch suite still green. What
+        // stays here is only what is genuinely ServerImpl-shaped — the store
+        // read above, this lock, and the metric below.
+        // Constructed inside the lock rather than default-constructed and then
+        // assigned: ContainmentGate has no default state, so there is nothing to
+        // hold a gate in before the decision is made.
+        const yuzu::server::QuarantineDegradationResult decision = [&] {
+            std::lock_guard<std::mutex> lk(quarantine_snapshot_mtx_);
+            return yuzu::server::compose_containment_gate(
+                plugin, action, store_unavailable || read_slot_timed_out, fresh_read,
+                quarantine_snapshot_, read_started_at);
+        }();
+        // Outside the snapshot lock: the metrics registry has its own
+        // internal locking (yuzu::Counter) and does not need to serialise
+        // through `quarantine_snapshot_mtx_` as well.
+        metrics_
+            .counter("yuzu_server_quarantine_gate_total",
+                     {{"outcome", std::string(decision.outcome)}})
+            .increment();
+        return decision.gate;
+    }
+
     /// The SINGLE confined dispatch seam — the one place the target "arm"
     /// (Group / Scope / Ids / Broadcast / None) is resolved and a
     /// `CommandRequest` is handed to `registry_`. Shared by the shared
@@ -9284,6 +10008,13 @@ private:
                          plugin, norm_action, kBroadcastScope);
         }
 
+        // #881: the ONE store read for this whole dispatch (never per-agent —
+        // a fleet broadcast must not become N queries). Exempts the
+        // quarantine plugin's own control channel without touching the store
+        // at all, so release keeps working through a Postgres outage that
+        // would otherwise fail every OTHER dispatch closed.
+        const auto containment_gate = make_containment_gate(plugin, norm_action);
+
         // K-1/QE-2: the ladder resolution + per-arm visible-set intersection
         // (A-3) is the ONE call every caller makes — no per-arm branch is
         // hand-rolled here. The resolvers-and-sink WIRING itself (previously
@@ -9292,7 +10023,7 @@ private:
         // a real AgentRegistry independent of ServerImpl. A parse failure has
         // no `res` to answer on this path (matching pre-existing behaviour):
         // reach nobody, no audit.
-        const auto [ignored_command_id, sent] = yuzu::server::wire_and_dispatch_confined(
+        auto outcome = yuzu::server::wire_and_dispatch_confined(
             registry_, mgmt_group_store_.get(), result_set_store_.get(), tag_store_.get(),
             custom_properties_store_.get(), execution_tracker_.get(),
             [this](const std::string& principal, const std::string& role,
@@ -9306,13 +10037,30 @@ private:
                 audit_scope_evaluation_aborted(principal, role, cmd_id, reason);
             },
             command_id, execution_id, caller.principal_role, agent_ids, scope_expr,
-            caller.exec_visible, broadcast_on_none, *classified);
-        (void)ignored_command_id; // always == command_id, minted above
+            caller.exec_visible, broadcast_on_none, containment_gate, *classified);
+
+        // #881: this seam serves the MAJORITY of dispatch (MCP, workflows,
+        // schedules, REST v1) — without this, quarantine enforcement here
+        // would be silent. Fail-closed denies every connected agent, so it
+        // gets ONE aggregate row (see that function's own comment); a
+        // specific-quarantine denial gets one row per id up to a cap, then a
+        // single summary row — "bounded by the active-quarantine set" is not a
+        // bound during a mass-containment incident, which is precisely when
+        // this fires (see audit_quarantine_dispatch_denied_batch).
+        if (containment_gate.fail_closed) {
+            audit_quarantine_dispatch_fail_closed("dispatch_closure", caller.principal,
+                                                  caller.principal_role, command_id,
+                                                  outcome.denied_quarantined_count);
+        } else {
+            audit_quarantine_dispatch_denied_batch("dispatch_closure", caller.principal,
+                                                   caller.principal_role, command_id,
+                                                   std::move(outcome.denied_quarantined));
+        }
 
         forward_gateway_pending();
-        if (sent > 0)
+        if (outcome.sent > 0)
             metrics_.counter("yuzu_commands_dispatched_total").increment();
-        return {command_id, sent};
+        return {command_id, outcome.sent};
     }
 
     /// #1634: the SINGLE per-agent Response-scope predicate — every Response:Read
@@ -9501,7 +10249,12 @@ private:
         // (capdecls::core_dispatch_capabilities.hpp).
         auto classified = build_classified_command(yuzu::server::DispatchCaller{.system = true},
                                                     "asset_tags", "sync", command_id, parameters);
-        if (classified && registry_.send_to(agent_id, *classified)) {
+        // #881: system_reserved internal push (asset_tags.sync), not operator
+        // instruction dispatch — deliberately NOT quarantine-gated (see
+        // dispatch_confined_arms.hpp).
+        if (classified && send_system_reserved(
+                              agent_id, *classified,
+                              yuzu::server::SystemReservedPush::asset_tags_sync)) {
             spdlog::debug("Pushed asset tag sync to agent {}", agent_id);
             forward_gateway_pending();
         }
@@ -9603,6 +10356,213 @@ private:
         if (!audit_store_->log(ev))
             spdlog::error("audit write failed: scope.evaluation_aborted (command={} reason={})",
                           command_id, reason);
+    }
+
+    // #881: one audit row + counter increment per agent a quarantine gate
+    // specifically withheld, copying audit_scope_resolution_failed's exact
+    // mechanism above so a quarantine denial is visible through the SAME
+    // forensic chain every other dispatch refusal uses. `route` IS threaded
+    // per call site (unlike the None-arm "no target" counter above, whose
+    // `dispatch_closure` label is correct because that arm genuinely only
+    // fires inside the closure) — `route` on this series means "which surface
+    // dispatched", and collapsing it to one literal would let a `/api/command`
+    // or `forward_legacy_command` denial page on `dispatch_closure`'s
+    // published meaning ("a caller forgot to name a target — a code defect"),
+    // which a quarantine denial is not. Callers: `dispatch_confined` passes
+    // "dispatch_closure", the four `/api/command` arms pass "command",
+    // `forward_legacy_command` passes "legacy".
+    //
+    // Reserved for the NON-fail-closed case (a specific, bounded
+    // `gate.quarantined` set) — a fail-closed denial reaches every connected
+    // agent and goes through `audit_quarantine_dispatch_fail_closed` instead,
+    // which emits ONE row rather than fanning out N synchronous audit-store
+    // writes against the same pool whose degradation produced fail-closed.
+    void audit_quarantine_dispatch_denied(std::string_view route, const std::string& principal,
+                                          const std::string& principal_role,
+                                          const std::string& command_id,
+                                          const std::string& agent_id) {
+        metrics_
+            .counter("yuzu_server_dispatch_target_rejected_total",
+                     {{"route", std::string(route)},
+                      {"reason", std::string(yuzu::server::kReasonQuarantined)}})
+            .increment();
+        spdlog::warn("dispatch denied: command={} agent={} principal={} reason=quarantined",
+                     command_id, agent_id, principal.empty() ? "unknown" : principal);
+        if (!audit_store_)
+            return;
+        AuditEvent ev{};
+        ev.timestamp = std::time(nullptr);
+        ev.principal = principal.empty() ? "unknown" : principal;
+        ev.principal_role = principal_role;
+        ev.action = "quarantine.dispatch_denied";
+        // "Security", not "agent": the sibling quarantine.enable/disable rows
+        // (rest_api_v1.cpp) use the Security securable as target_type with the
+        // agent id as target_id, and target_type's documented vocabulary is
+        // PascalCase. A lowercase "agent" answered neither
+        // ?target_type=Security nor ?target_type=Agent, so an auditor
+        // collecting CC7.2 evidence for "were commands issued to contained
+        // devices" would have found none while the rows sat under a value no
+        // doc names.
+        ev.target_type = "Security";
+        ev.target_id = agent_id;
+        ev.detail = std::string("QUARANTINE_DISPATCH_DENIED command=") + command_id +
+                    " agent=" + agent_id + " reason=active_quarantine";
+        ev.result = "denied";
+        if (!audit_store_->log(ev))
+            spdlog::error("audit write failed: quarantine.dispatch_denied (command={} agent={})",
+                          command_id, agent_id);
+    }
+
+    /// Per-device denial rows, BOUNDED.
+    ///
+    /// The fail-closed case is already collapsed to one row (below) because it
+    /// denies the whole connected fleet. The specific-quarantine case was not,
+    /// and its bound — "the size of the active-quarantine set" — is exactly the
+    /// quantity that is large during the incident this feature exists for. A
+    /// ransomware response contains 1'000 hosts; a per-minute scheduled
+    /// broadcast then drives 1'000 blocking `pool_.try_acquire_for` INSERTs per
+    /// tick, on the dispatch thread, through the same PgPool serving dispatch.
+    /// That converts correct enforcement into an availability problem on a
+    /// path shared with a security operation, which is the class the
+    /// fail-closed collapse was written to avoid in the first place.
+    ///
+    /// So: per-device rows up to a cap — the normal case, a handful of
+    /// contained devices, keeps its full per-device evidence — then ONE
+    /// summary row naming how many were elided. The COUNTER is unaffected and
+    /// stays exact either way, so the metric never loses precision to the
+    /// audit bound, and the elision is declared in the row rather than silent.
+    static constexpr std::size_t kMaxPerDeviceQuarantineAuditRows = 25;
+
+    void audit_quarantine_dispatch_denied_batch(std::string_view route,
+                                                const std::string& principal,
+                                                const std::string& principal_role,
+                                                const std::string& command_id,
+                                                std::vector<std::string> ordered) {
+        // WHICH rows get elided must not be the caller's choice.
+        //
+        // The Ids arm's target list is the caller's own `agent_ids` array and
+        // `filter_to_scope` preserves its order, so capping the list as given
+        // let a caller decide whose denial got a device-named row: name 25
+        // other contained devices first and the 26th — theirs — is elided,
+        // taking its `spdlog::warn` with it. "Was a command issued to contained
+        // device D" is exactly the question the target_type fix was made to
+        // answer, and it would have been unanswerable for a caller-chosen D.
+        //
+        // Sorting makes the selection deterministic and independent of request
+        // order. It does not by itself make the set unreachable — a caller who
+        // knows the sort can still push a chosen id past the cap — which is why
+        // the elided IDENTITIES are logged below rather than dropped. The audit
+        // store is what the cap protects; the log is not, and it is where the
+        // forensic answer lives when a row was elided.
+        // Taken BY VALUE and sorted in place: the callers own their vectors and
+        // do not read them afterwards, so a `std::move` at the call site makes
+        // this free rather than a fleet-scale copy on the dispatch thread —
+        // which is the allocation shape the fail-closed path was just changed
+        // to avoid. Note the call sites are declared non-const for that reason:
+        // `std::move` on a `const` object yields `const T&&`, which cannot bind
+        // to the move constructor and silently selects the COPY — two of the
+        // three sites did exactly that until this was measured.
+        std::sort(ordered.begin(), ordered.end());
+        const std::size_t emit = std::min(ordered.size(), kMaxPerDeviceQuarantineAuditRows);
+        for (std::size_t i = 0; i < emit; ++i)
+            audit_quarantine_dispatch_denied(route, principal, principal_role, command_id,
+                                             ordered[i]);
+        if (ordered.size() <= kMaxPerDeviceQuarantineAuditRows)
+            return;
+
+        const std::size_t elided = ordered.size() - emit;
+
+        // The identities the audit row cannot carry, in bounded chunks so one
+        // line never grows with the fleet. Cheap: this is the log, not N
+        // blocking INSERTs through the pool that serves dispatch.
+        constexpr std::size_t kElidedPerLogLine = 50;
+        for (std::size_t i = emit; i < ordered.size(); i += kElidedPerLogLine) {
+            std::string chunk;
+            const std::size_t upto = std::min(i + kElidedPerLogLine, ordered.size());
+            for (std::size_t j = i; j < upto; ++j) {
+                if (!chunk.empty())
+                    chunk += ',';
+                chunk += ordered[j];
+            }
+            spdlog::warn("dispatch denied (audit-elided): command={} principal={} "
+                         "reason=quarantined agents={}",
+                         command_id, principal.empty() ? "unknown" : principal, chunk);
+        }
+        // The counter already moved by the true count inside the loop above for
+        // the emitted rows; move it by the remainder here so the metric total
+        // equals the denial total regardless of the audit cap.
+        metrics_
+            .counter("yuzu_server_dispatch_target_rejected_total",
+                     {{"route", std::string(route)},
+                      {"reason", std::string(yuzu::server::kReasonQuarantined)}})
+            .increment(static_cast<double>(elided));
+        if (!audit_store_)
+            return;
+        AuditEvent ev{};
+        ev.timestamp = std::time(nullptr);
+        ev.principal = principal.empty() ? "unknown" : principal;
+        ev.principal_role = principal_role;
+        ev.action = "quarantine.dispatch_denied";
+        ev.target_type = "Security";
+        ev.target_id = "*";
+        ev.detail = "QUARANTINE_DISPATCH_DENIED command=" + command_id +
+                    " reason=active_quarantine agents_elided=" + std::to_string(elided) +
+                    " agents_total=" + std::to_string(ordered.size()) +
+                    " (per-device rows capped at " +
+                    std::to_string(kMaxPerDeviceQuarantineAuditRows) +
+                    ", selected in sorted id order; the counter carries the exact total and the "
+                    "elided ids are in the server log at WARN, keyed on this command id)";
+        ev.result = "denied";
+        if (!audit_store_->log(ev))
+            spdlog::error("audit write failed: quarantine.dispatch_denied (command={} elided={})",
+                          command_id, elided);
+    }
+
+    // #881: a fail-closed dispatch denies EVERY connected agent, so emitting
+    // one audit row per id (as `audit_quarantine_dispatch_denied` does for a
+    // specific-quarantine denial) would drive N synchronous `AuditStore::log`
+    // INSERTs — each a blocking `pool_.try_acquire_for` — through the SAME
+    // `PgPool` whose degradation is why this dispatch fail-closed in the
+    // first place. On a large fleet with a saturated pool that turns one
+    // bounded read failure into an unbounded write storm on the dispatch/HTTP
+    // thread, which is exactly the outage the bounded-staleness snapshot
+    // exists to prevent. A fail-closed denial is ONE policy decision about
+    // the whole dispatch — it gets ONE audit row; the rejection counter still
+    // moves by the true denial count so the metric stays exact.
+    void audit_quarantine_dispatch_fail_closed(std::string_view route,
+                                                const std::string& principal,
+                                                const std::string& principal_role,
+                                                const std::string& command_id,
+                                                std::size_t denied_count) {
+        if (denied_count == 0)
+            return;
+        // One `Counter::increment(v)` call, not a loop — the counter itself
+        // adds `v` under its own lock, so this is the exact-metric guarantee
+        // without N lock acquisitions.
+        metrics_
+            .counter("yuzu_server_dispatch_target_rejected_total",
+                     {{"route", std::string(route)},
+                      {"reason", std::string(yuzu::server::kReasonQuarantined)}})
+            .increment(static_cast<double>(denied_count));
+        spdlog::warn("dispatch denied: command={} principal={} reason=quarantined "
+                     "fail_closed=true agents={}",
+                     command_id, principal.empty() ? "unknown" : principal, denied_count);
+        if (!audit_store_)
+            return;
+        AuditEvent ev{};
+        ev.timestamp = std::time(nullptr);
+        ev.principal = principal.empty() ? "unknown" : principal;
+        ev.principal_role = principal_role;
+        ev.action = "quarantine.dispatch_denied";
+        ev.target_type = "Security"; // see the per-device emitter above
+        ev.target_id = "*";
+        ev.detail = "QUARANTINE_DISPATCH_DENIED command=" + command_id +
+                    " reason=degraded_fail_closed agents=" + std::to_string(denied_count);
+        ev.result = "denied";
+        if (!audit_store_->log(ev))
+            spdlog::error("audit write failed: quarantine.dispatch_denied (command={} "
+                          "fail_closed, agents={})",
+                          command_id, denied_count);
     }
 
     // Apply stored runtime config overrides on startup
@@ -10912,11 +11872,11 @@ private:
             // as offload_target above; webhook_store was missing from this
             // probe even though its sibling was already covered.
             bool webhook_ok = webhook_store_ && webhook_store_->is_open();
-            // #1238 B-3: ca.db is load-bearing whenever default certs are active
+            // #1238 B-3: ca_store is load-bearing whenever default certs are active
             // (issuance / revocation / CRL). It was wired into /readyz but missing
-            // here, so /healthz could report "healthy" with a dead ca.db. Mirrors
+            // here, so /healthz could report "healthy" with a dead ca_store. Mirrors
             // the /readyz conjunction; trivially true when not on default certs
-            // (the operator brought their own, so ca.db isn't required).
+            // (the operator brought their own, so ca_store isn't required).
             bool ca_ok = !cfg_.using_default_certs || (ca_store_ && ca_store_->is_open());
             // Born-on-Postgres stores (ADR-0012). They were wired into /readyz but
             // not here, so /healthz could report "healthy" with a degraded store —
@@ -11271,7 +12231,7 @@ private:
                 // authoritative store on this ladder (all of which are wired in
                 // here) as belt-and-braces against a runtime is_open() flip.
                 {"deployment_store", deployment_store_ && deployment_store_->is_open()},
-                // PKI PR2: ca.db is load-bearing only when the install is on
+                // PKI PR2: ca_store is load-bearing only when the install is on
                 // built-in default certs (PR3+ make it load-bearing for mTLS
                 // issuance/revocation). When the operator brought their own certs
                 // it is not on the request path, so report ok.
@@ -12721,7 +13681,25 @@ private:
 
             agent_service_.record_send_time(command_id);
 
+            // #881: the ONE store read for this whole request (never per
+            // arm, never per agent) — computed once here, AFTER every early
+            // return above (no-agent 503, classification 403/400), so a
+            // request that will be refused for an unrelated reason does not
+            // also cost a Postgres round trip. Still shared by all four arm
+            // branches below.
+            const auto containment_gate = make_containment_gate(plugin, action);
+
             int sent = 0;
+            // #881: filled by whichever arm branch below actually ran, then
+            // audited once — BEFORE the sent==0 -> 503 branch further down —
+            // so a deliberate policy denial correlates with the transport
+            // error it is knowingly reported as.
+            std::vector<std::string> denied_quarantined;
+            // Separate from the vector: under fail-closed the ids are
+            // deliberately not collected (a fleet-sized allocation on the
+            // dispatch thread, per refused dispatch), so .size() is not the
+            // denial count. See ArmDispatchResult.
+            std::size_t denied_quarantined_count = 0;
             // `__all__` is the PUBLISHED ground scope kind (/discover/scope-kinds,
             // the MCP execute_instruction schema, docs/scope-walking-design.md), and
             // it is handled here as "no scope expression" so the ordering matches the
@@ -12738,10 +13716,10 @@ private:
             // but the DECISION OF WHO IS REACHED is the shared one, so the two
             // can no longer drift.
             const auto confined_sink = make_confined_dispatch_sink(*classified);
-            const auto dispatch_broadcast = [&]() -> int {
+            const auto dispatch_broadcast = [&]() -> yuzu::server::ArmDispatchResult {
                 return yuzu::server::dispatch_confined_arms(
                     yuzu::server::DispatchArm::Broadcast, {}, exec_visible,
-                    /*broadcast_on_none=*/true, confined_sink);
+                    /*broadcast_on_none=*/true, containment_gate, confined_sink);
             };
 
             if (arm == yuzu::server::DispatchArm::Group) {
@@ -12755,9 +13733,12 @@ private:
                         members.push_back(m.agent_id);
                 yuzu::server::ConfinedDispatchTargets t;
                 t.group_members = &members;
-                sent = yuzu::server::dispatch_confined_arms(arm, t, exec_visible,
-                                                            /*broadcast_on_none=*/true,
-                                                            confined_sink);
+                const auto result = yuzu::server::dispatch_confined_arms(
+                    arm, t, exec_visible, /*broadcast_on_none=*/true, containment_gate,
+                    confined_sink);
+                sent = result.sent;
+                denied_quarantined = result.denied_quarantined;
+                denied_quarantined_count = result.denied_quarantined_count;
             } else if (arm == yuzu::server::DispatchArm::Scope) {
                 // Scope expression dispatch.
                 // Owner principal for from_result_set: resolution (review B1).
@@ -12810,8 +13791,12 @@ private:
                     // dispatch.
                     yuzu::server::ConfinedDispatchTargets t;
                     t.scope_matched = &*ladder.matched;
-                    sent = yuzu::server::dispatch_confined_arms(
-                        arm, t, exec_visible, /*broadcast_on_none=*/true, confined_sink);
+                    const auto result = yuzu::server::dispatch_confined_arms(
+                        arm, t, exec_visible, /*broadcast_on_none=*/true, containment_gate,
+                        confined_sink);
+                    sent = result.sent;
+                    denied_quarantined = result.denied_quarantined;
+                    denied_quarantined_count = result.denied_quarantined_count;
                 }
                 // else: the ladder already audited the abort (db_degraded /
                 // owner_check_failed / principal_unresolved) — sent stays 0.
@@ -12825,15 +13810,21 @@ private:
                 // non-empty list narrowed by visibility, a different thing).
                 yuzu::server::ConfinedDispatchTargets t;
                 t.agent_ids = &agent_ids;
-                sent = yuzu::server::dispatch_confined_arms(arm, t, exec_visible,
-                                                            /*broadcast_on_none=*/true,
-                                                            confined_sink);
+                const auto result = yuzu::server::dispatch_confined_arms(
+                    arm, t, exec_visible, /*broadcast_on_none=*/true, containment_gate,
+                    confined_sink);
+                sent = result.sent;
+                denied_quarantined = result.denied_quarantined;
+                denied_quarantined_count = result.denied_quarantined_count;
             } else if (arm == yuzu::server::DispatchArm::Broadcast) {
                 // Explicitly asked for the fleet by its published name — #1788
                 // still narrows delivery to the operator's visible set; the
                 // NAME `__all__` is preserved (never rejected, never reread as
                 // "no target"), only the SEND SET composes with visibility.
-                sent = dispatch_broadcast();
+                const auto result = dispatch_broadcast();
+                sent = result.sent;
+                denied_quarantined = result.denied_quarantined;
+                denied_quarantined_count = result.denied_quarantined_count;
             } else {
                 // Broadcast ONLY when the caller named no target at all (#2500).
                 // A target that was SUPPLIED but resolved to nothing must never
@@ -12893,17 +13884,53 @@ private:
                 // #1788: an omitted target means "the whole fleet" (#2500) —
                 // still narrowed to the operator's visible set, same as the
                 // named Broadcast arm above.
-                sent = dispatch_broadcast();
+                const auto result = dispatch_broadcast();
+                sent = result.sent;
+                denied_quarantined = result.denied_quarantined;
+                denied_quarantined_count = result.denied_quarantined_count;
+            }
+
+            // #881: emitted BEFORE the sent==0 -> 503 branch below, so a
+            // deliberate quarantine denial is correlated with the transport
+            // error it is knowingly reported as. Fail-closed denies every
+            // connected agent, so it gets ONE aggregate row rather than N.
+            if (containment_gate.fail_closed) {
+                audit_quarantine_dispatch_fail_closed("command", caller.principal,
+                                                      caller.principal_role, command_id,
+                                                      denied_quarantined_count);
+            } else {
+                audit_quarantine_dispatch_denied_batch("command", caller.principal,
+                                                       caller.principal_role, command_id,
+                                                       std::move(denied_quarantined));
             }
 
             // Forward commands queued for gateway agents
             forward_gateway_pending();
 
             if (sent == 0) {
+                // #881: say WHICH kind of nothing. All three of these answered
+                // "failed to send command to any agent", which reads as an
+                // agent-connectivity outage — so a fail-closed containment
+                // gate, which denies EVERY agent on EVERY dispatch fleet-wide,
+                // sent an operator diagnosing a transport problem while the
+                // real cause (the quarantine store is unreadable) appeared
+                // only in an audit row and a metric. ADR-0033 §2 names that
+                // shape — a silent deny-all reported as an empty fleet —
+                // as a gate violation.
                 res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"failed to send command to any agent"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                if (containment_gate.fail_closed) {
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"containment state is unreadable — dispatch is failing closed and reaching no agent; check the quarantine store","reason":"containment_unreadable","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                } else if (denied_quarantined_count > 0) {
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"every target is quarantined — dispatch was withheld, not attempted","reason":"quarantined","retry_after_ms":null},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                } else {
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"failed to send command to any agent"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                }
                 return;
             }
 
@@ -12918,13 +13945,27 @@ private:
                         {"action", action},
                         {"command_id", command_id},
                         {"scope", scope_expr}});
-            res.set_header("HX-Trigger", "{\"showToast\":{\"message\":\"Command sent to " +
-                                             std::to_string(sent) +
-                                             " agent(s)\",\"level\":\"success\"}}");
+            res.set_header(
+                "HX-Trigger",
+                "{\"showToast\":{\"message\":\"Command sent to " + std::to_string(sent) +
+                    " agent(s)" +
+                    (denied_quarantined_count == 0
+                         ? std::string{}
+                         : "; " + std::to_string(denied_quarantined_count) +
+                               " withheld (quarantined)") +
+                    "\",\"level\":\"success\"}}");
+            // #881: a PARTIAL dispatch must say so. Without this an operator
+            // targeting a 100-device group with 3 contained devices reads
+            // "Command sent to 97 agent(s)" and has no signal that 3 were
+            // deliberately withheld — the count alone is indistinguishable
+            // from three devices being offline. Always present (0 on a clean
+            // dispatch) rather than conditionally added, so a client can read
+            // the field unconditionally.
             res.set_content(
                 nlohmann::json({{"status", "sent"},
                                 {"command_id", command_id},
                                 {"agents_reached", sent},
+                                {"withheld_quarantined", denied_quarantined_count},
                                 {"thead_html", agent_service_.thead_for_plugin(plugin)}})
                     .dump(),
                 "application/json");
@@ -14809,14 +15850,18 @@ private:
                                                   httplib::Response& res) {
             if (!require_permission(req, res, "Schedule", "Read"))
                 return;
-            // guardian-confinement-2298 hardening sweep: ITServiceOwner grants
-            // full CRUD on Schedule, and query_schedules has no owner/service
-            // filter at all — a bare Schedule:Read gate lets a service-scoped
-            // token enumerate every schedule from every other service. No
-            // single schedule to confine per-target, so this is a blanket
-            // deny, same shape as the fleet-wide dashboard fragment twin.
-            if (deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.list", ""))
-                return;
+            // guardian-confinement-2298 hardening sweep originally added an
+            // explicit deny_service_scoped_schedule() call here (ITServiceOwner
+            // grants full CRUD on Schedule, and query_schedules has no owner/
+            // service filter at all — a bare Schedule:Read gate would let a
+            // service-scoped token enumerate every schedule from every other
+            // service). guardian-confinement-2298 PR 3 ("the flip") made it
+            // provably dead: require_permission above already denies any
+            // service-scoped token outright for (Schedule, Read)
+            // (kServiceScopeGlobalSafe is compile-time-empty), so a
+            // service-scoped session can never reach this point at all.
+            // Retired #3290 Phase 2 bucket 1a — see
+            // docs/security-reviews/service-scope-phase2-migrations-2026-08.md.
             if (!schedule_engine_) {
                 res.status = 503;
                 res.set_content(
@@ -14867,13 +15912,14 @@ private:
             }
 
             auto id = req.matches[1].str();
-            // Interim deny (schedule_routes.hpp): delete_schedule is
-            // username-owner-scoped below, and a service-scoped token shares
-            // its creating principal's username (ApiToken::principal_id) —
-            // without this it could delete a fleet-wide schedule its own
-            // principal created interactively.
-            if (deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.delete", id))
-                return;
+            // An interim deny_service_scoped_schedule() call used to sit here
+            // (delete_schedule is username-owner-scoped below, and a
+            // service-scoped token shares its creating principal's username —
+            // without a deny it could delete a fleet-wide schedule its own
+            // principal created interactively). guardian-confinement-2298 PR 3
+            // ("the flip") made it provably dead: require_permission above
+            // already denies any service-scoped token outright for
+            // (Schedule, Delete). Retired #3290 Phase 2 bucket 1a.
             // M-01 (#1806): owner-scoped delete — a Schedule:Delete grant
             // deletes only schedules the caller created, not the whole
             // fleet's. auth_routes_->resolve_session, not require_permission's
@@ -14917,15 +15963,19 @@ private:
             // runaway schedule even without Execution:Execute.
             if (enabled && !require_permission(req, res, "Execution", "Execute"))
                 return;
-            // Interim deny (schedule_routes.hpp), enable(true) only — a
-            // re-enabled schedule arms unattended fleet-wide dispatch through
-            // ScheduleRunner, the same concern as create. Disabling stays
-            // reachable: it only ever stops a schedule, never arms one, so a
-            // service-scoped token keeps its kill-switch (H-01's own
-            // rationale for gating disable on Schedule:Write alone).
-            if (enabled && deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.enable",
-                                                        id))
-                return;
+            // An interim deny_service_scoped_schedule() call used to sit here,
+            // enable(true) only — deliberately built to leave disable
+            // reachable for a service-scoped token as its kill switch (H-01).
+            // guardian-confinement-2298 PR 3 ("the flip") made the deny itself
+            // provably dead (require_permission above already denies any
+            // service-scoped token outright for (Schedule, Write), enabled or
+            // not) — retired here, #3290 Phase 2 bucket 1a. NOTE: the flip's
+            // unconditional Schedule:Write gate ALSO means the documented
+            // kill-switch guarantee (disable stays reachable) does not
+            // currently hold for a service-scoped token, since it never gets
+            // past `require_permission` above regardless of `enabled`'s
+            // value — a real, pre-existing, NOT-yet-fixed gap this retirement
+            // discovered but does not resolve; see #3378.
 
             // M-01 (#1806): owner-scoped enable/disable, same as delete above.
             auto session = auth_routes_->resolve_session(req);
@@ -16331,10 +17381,10 @@ private:
         // perf tags (validated through the SAME dex_perf_rules the Prometheus
         // gauges use), AgentRegistry sessions (OS + agent-reported tags) and the
         // TagStore (operator tags, ONE bulk query per render — not N point
-        // lookups). Cohort precedence mirrors evaluate_scope: agent scopable_tags
-        // first, then the tag store. Shared by the /dex Performance fragments,
-        // the /api/v1/dex/perf/* REST surface and the MCP perf tools so all
-        // three can never disagree.
+        // lookups). Cohort precedence mirrors evaluate_scope: the tag store
+        // first, then agent scopable_tags (#3295 — both are store-first now).
+        // Shared by the /dex Performance fragments, the /api/v1/dex/perf/*
+        // REST surface and the MCP perf tools so all three can never disagree.
         auto dex_perf_uncached = [this](const std::string& cohort_key) -> DexPerfSnapshot {
             DexPerfSnapshot snap;
             snap.cohort_key = cohort_key;
@@ -16390,16 +17440,16 @@ private:
                         detail::parse_perf_disk_lat_ms(get(detail::kPerfTagDiskLatMs));
                 }
                 if (!cohort_key.empty()) {
-                    // STORE-FIRST precedence — deliberately the OPPOSITE of
-                    // evaluate_scope's agent-first order: a benchmark cohort is
-                    // an operator-declared comparison population, so a rogue
-                    // agent must not self-assign into "executive-laptops" and
-                    // drag its p90 (G4 UP-5). The store already carries honest
-                    // agents' tags via sync_agent_tags, so store-first loses
-                    // nothing; the in-memory fallback only covers a tag not yet
-                    // synced, and it is value-validated (G2 sec-L2: scopable_tags
-                    // are unvalidated at session ingest) so oversized/garbage
-                    // bytes never become a cohort label.
+                    // STORE-FIRST precedence — the SAME order evaluate_scope's
+                    // tag: resolver uses since #3295 (previously the opposite):
+                    // a benchmark cohort is an operator-declared comparison
+                    // population, so a rogue agent must not self-assign into
+                    // "executive-laptops" and drag its p90 (G4 UP-5). The store
+                    // already carries honest agents' tags via sync_agent_tags,
+                    // so store-first loses nothing; the in-memory fallback only
+                    // covers a tag not yet synced. scopable_tags is validated
+                    // and 'service'-filtered at session ingest (register_agent,
+                    // #3295); this re-validates on top as defense-in-depth.
                     if (auto cv = cohort_values.find(id); cv != cohort_values.end()) {
                         d.cohort = cv->second;
                     } else if (auto it = s->scopable_tags.find(cohort_key);
@@ -18441,8 +19491,19 @@ private:
                 // Baseline gate: push only Guards that are members of a *deployed*
                 // Baseline (docs/guardian-baseline-model.md). With nothing deployed
                 // the set is empty and a full_sync converges agents to zero guards.
+                // ADR-0055 catastrophic-read set: a degraded read MUST abort the
+                // push, never fan out an empty deployed-set indistinguishable from
+                // "nothing deployed" — same -2 sentinel as the list_rules degrade
+                // just above, so the REST caller maps it to 503.
+                auto deployed_result = deployed_member_rule_ids();
+                if (!deployed_result) {
+                    spdlog::warn("Guardian push: deployed_member_rule_ids degraded ({}) — "
+                                 "aborting push (scope={})",
+                                 deployed_result.error(), scope);
+                    return -2;
+                }
                 const auto rules =
-                    guardian::filter_deployed_members(*rules_result, deployed_member_rule_ids());
+                    guardian::filter_deployed_members(*rules_result, *deployed_result);
 
                 // Resolve the agent set this push is ADDRESSED to. H1 scopes a single
                 // toggle to the affected rule's scope_expr (was the whole fleet); an
@@ -18516,7 +19577,13 @@ private:
                     auto classified = build_classified_command(
                         yuzu::server::DispatchCaller{.system = true}, "__guard__", "push_rules",
                         push_command_id, /*parameters=*/{}, push.SerializeAsString());
-                    if (classified && registry_.send_to(aid, *classified)) {
+                    // #881: system_reserved internal push (__guard__.push_rules),
+                    // not operator instruction dispatch — deliberately NOT
+                    // quarantine-gated (see dispatch_confined_arms.hpp).
+                    if (classified &&
+                        send_system_reserved(
+                            aid, *classified,
+                            yuzu::server::SystemReservedPush::guardian_push_rules)) {
                         ++sent;
                         metrics_
                             .counter("yuzu_server_guardian_pushes_dispatched_total",
@@ -19031,15 +20098,52 @@ private:
             [&](const std::string& aid) { return registry_.send_to(aid, *classified); },
             [&] { return registry_.send_to_all(*classified); },
             [&] { return registry_.all_ids(); }};
-        int sent = yuzu::server::dispatch_confined_arms(
+        // #881: one of the two production sites that hits the unfiltered
+        // `send_to_all_unfiltered` fast path in practice — a default install
+        // with RBAC disabled (or a legacy-admin superuser) resolves
+        // `exec_visible` to `nullopt` here, and the Broadcast arm below is
+        // called directly, exactly the case #881's spec calls out. Without
+        // the gate, that unfiltered path bypasses containment with no per-id
+        // check at all.
+        const auto containment_gate = make_containment_gate(plugin, action);
+        auto result = yuzu::server::dispatch_confined_arms(
             yuzu::server::DispatchArm::Broadcast, {}, exec_visible,
-            /*broadcast_on_none=*/false, sink);
+            /*broadcast_on_none=*/false, containment_gate, sink);
+        int sent = result.sent;
+
+        // #881: emitted BEFORE the sent==0 -> 503 branch below, so a
+        // deliberate quarantine denial is correlated with the transport
+        // error it is knowingly reported as. Fail-closed denies every
+        // connected agent, so it gets ONE aggregate row rather than N.
+        if (containment_gate.fail_closed) {
+            audit_quarantine_dispatch_fail_closed("legacy", caller.principal,
+                                                  caller.principal_role, command_id,
+                                                  result.denied_quarantined_count);
+        } else {
+            audit_quarantine_dispatch_denied_batch("legacy", caller.principal,
+                                                   caller.principal_role, command_id,
+                                                   std::move(result.denied_quarantined));
+        }
 
         if (sent == 0) {
+            // Same three-way split as /api/command above — see the comment
+            // there. A fail-closed gate is a fleet-wide condition, not a
+            // per-agent transport failure, and reporting it as one sends the
+            // operator to the wrong subsystem.
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"failed to send command"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            if (containment_gate.fail_closed) {
+                res.set_content(
+                    R"({"error":{"code":503,"message":"containment state is unreadable — dispatch is failing closed and reaching no agent; check the quarantine store","reason":"containment_unreadable","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            } else if (result.denied_quarantined_count > 0) {
+                res.set_content(
+                    R"({"error":{"code":503,"message":"every target is quarantined — dispatch was withheld, not attempted","reason":"quarantined","retry_after_ms":null},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            } else {
+                res.set_content(
+                    R"({"error":{"code":503,"message":"failed to send command"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            }
             return;
         }
         res.set_content("{\"status\":\"sent\"}", "application/json");
@@ -19326,6 +20430,14 @@ private:
     /// `quarantine_store_.reset()` in stop(), alongside
     /// api_token_store_/engine_principal_store_/result_set_store_'s.
     std::unique_ptr<QuarantineStore> quarantine_store_;
+    /// #881: the last-known-good containment read, guarded by ITS OWN mutex
+    /// (never `quarantine_store_`'s pool lock) and refreshed on every
+    /// successful `list_quarantined()` inside `make_containment_gate`. Read
+    /// with `kQuarantineSnapshotMaxAge` bounded staleness on a `nullopt`
+    /// read — see `evaluate_quarantine_degradation` (dispatch_confined_arms.hpp)
+    /// for the policy this snapshot serves.
+    yuzu::server::QuarantineSnapshot quarantine_snapshot_;
+    std::mutex quarantine_snapshot_mtx_;
     /// Migrated Postgres store (ADR-0006/ADR-0036, schema `result_set_store`).
     /// Borrows pg_pool_ (declared earlier, destructs later) — declared here so
     /// it destructs after the ingest/HTTP paths that hold its raw pointer and
@@ -19448,12 +20560,16 @@ private:
     // fan-out and the heartbeat reconcile filter their rule source through this via
     // guardian::filter_deployed_members. Empty when nothing is deployed — a
     // full_sync push then converges agents to zero guards (correct by model).
-    // Delegates to BaselineStore (one shared lock; the store owns the snapshot
+    // Delegates to BaselineStore (one pool lease; the store owns the snapshot
     // format) so an edit to a deployed Baseline's members does not change what the
     // fleet enforces until a Push-gated re-deploy rewrites the snapshot.
-    std::unordered_set<std::string> deployed_member_rule_ids() const {
+    // CATASTROPHIC-READ SET (CLAUDE.md Guardian invariant, ADR-0055): typed
+    // `std::expected` — a degraded read is `std::unexpected`, NEVER a silent
+    // empty set. Every caller MUST abort (503 / no-op push) on `!result`,
+    // mirroring how `list_rules()`'s degrade is handled just above.
+    std::expected<std::unordered_set<std::string>, std::string> deployed_member_rule_ids() const {
         if (!baseline_store_)
-            return {};
+            return std::unexpected("baseline store not wired");
         return baseline_store_->deployed_member_rule_ids();
     }
 
@@ -19657,6 +20773,33 @@ private:
 
     // Fleet health aggregation
     detail::AgentHealthStore health_store_;
+    /// #881: the containment-read concurrency bound, spelled ONCE. It appears
+    /// in the member's type, at both acquire sites and in the guard, and three
+    /// literal 4s would drift the moment one of them was tuned.
+    static constexpr int kMaxConcurrentContainmentReads = 4;
+    /// Releases a containment-read slot on scope exit. Shared by the dispatch
+    /// path and the snapshot refresher — it was declared separately in each,
+    /// which is one definition too many for four lines.
+    struct ContainmentReadSlot {
+        explicit ContainmentReadSlot(
+            std::counting_semaphore<kMaxConcurrentContainmentReads>& s) noexcept
+            : sem(s) {}
+        ~ContainmentReadSlot() { sem.release(); }
+        ContainmentReadSlot(const ContainmentReadSlot&) = delete;
+        ContainmentReadSlot& operator=(const ContainmentReadSlot&) = delete;
+
+    private:
+        std::counting_semaphore<kMaxConcurrentContainmentReads>& sem;
+    };
+
+    /// #881: how many dispatches may be inside `list_quarantined()` at once.
+    /// Bounds the pool connections a stalled backend can pin. A caller that
+    /// cannot acquire within its budget fails CLOSED — never falls back to the
+    /// stale snapshot, which against a healthy store would under-enforce. See
+    /// the reasoning at the acquire site in `make_containment_gate`.
+    std::counting_semaphore<kMaxConcurrentContainmentReads> containment_read_slots_{
+        kMaxConcurrentContainmentReads};
+    std::thread quarantine_snapshot_refresh_thread_; // #881; joined before stores
     std::thread health_recompute_thread_;
     std::thread policy_eval_thread_;
     std::thread app_perf_rollup_thread_;

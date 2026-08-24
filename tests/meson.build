@@ -86,6 +86,13 @@ elif host_machine.system() == 'windows'
   # its own copy, same shape as tar_test_deps' Windows block below.
   agent_test_native_deps += cxx.find_library('ws2_32')
   agent_test_native_deps += cxx.find_library('iphlpapi')
+  # test_wmi_bounded.cpp / test_wmi_local_dispatcher.cpp include the
+  # header-only agents/shared/wmi_bounded.hpp directly into this exe (same
+  # shape as tar_test_deps' Windows block) — bounded WMI needs WbemLocator
+  # (wbemuuid) + COM init/BSTR (ole32/oleaut32).
+  agent_test_native_deps += cxx.find_library('wbemuuid')
+  agent_test_native_deps += cxx.find_library('ole32')
+  agent_test_native_deps += cxx.find_library('oleaut32')
 endif
 
 # ── Test fixture: FROZEN ABI3-layout plugin (PLAN-03 — real backward-compat) ──
@@ -253,6 +260,7 @@ agent_test_exe = executable(
     'unit/test_device_ci_sync.cpp',
     'unit/test_sync_source_app_perf.cpp',
     'unit/test_win_str_utils.cpp',
+    'unit/test_wmi_bounded.cpp',        # shared bounded WMI helper (roadmap C-8 extraction); header-only, no separate .cpp to list
     'unit/test_installed_apps_registry_utf8.cpp',
     'unit/test_service_binpath.cpp',
     'unit/test_installed_apps_inventory.cpp',
@@ -275,9 +283,15 @@ agent_test_exe = executable(
     'unit/test_event_logs_macos.cpp',         # BR-08: pure `log show` SubprocessResult classifier
     'unit/test_users_macos_last.cpp',         # qe-M1: pure `last -y` timestamp/weekday parsers
     'unit/test_user_profile_model.cpp',       # PR1.7: pure ProfileList/HKU model (runs on every host)
+    'unit/test_value_enumeration.cpp',        # Wave 3 gate-2 remediation: pure registry-enumeration
+                                                # completeness decision (runs on every host)
     'unit/test_registry_local_dispatcher.cpp', # PR1.7 remediation fix #3: real registry.dll driven
                                                 # end to end via LocalDispatcher (Windows-only; a no-op
                                                 # TU elsewhere via the file's own #ifdef _WIN32 guard)
+    'unit/test_wmi_local_dispatcher.cpp',      # gate-1 remediation: real wmi.dll's query/get_instance
+                                                # actions driven end to end via LocalDispatcher, same
+                                                # pattern as test_registry_local_dispatcher.cpp above
+                                                # (Windows-only; a no-op TU elsewhere)
     'unit/test_content_dist_upload_parsers.cpp', # PR1.6b: pure upload-protocol planner/classifier (no I/O)
     'unit/test_runner_status.cpp',             # Wave 2 WP-0: pure runner-outcome -> ABI4 result-seam table
     'unit/test_host_arg.cpp',                 # Wave 2 WP-0: shared leading-'-' host-arg gate (Decision 6)
@@ -290,6 +304,12 @@ agent_test_exe = executable(
     'unit/test_certificates_x509.cpp',        # Wave 2 WP-B: pure libcrypto PEM/DER field extraction
     'unit/test_quarantine_parsers.cpp',       # Wave 2 WP-F: pure netsh/iptables/pfctl output parsers
     'unit/test_quarantine_argv.cpp',          # Wave 2 WP-F remediation: pure mutating-argv construction (FN-03)
+    'unit/test_quarantine_serialization.cpp', # Wave 2 P4: MutationGate bounded-wait serialization (#3286)
+    'unit/test_server_address_parsers.cpp',   # #3429 round 4: pure host:port / IP-literal helpers for
+                                                # server_address_resolver.cpp's boot-time DNS resolution
+    'unit/test_server_address_resolver.cpp',  # #3429 round 4 fix: resolve_bounded's deadline wrapper,
+                                                # resolver injected (no network) -- proves the caller
+                                                # returns at the deadline, not after the resolver finishes
     'unit/test_network_actions_parsers.cpp',  # Wave 2 WP-D: pure resolver-flush-flag selection
     'unit/test_wol_check_plan.cpp',           # Wave 2 WP-E: pure check-mechanism decision logic
     'unit/test_services_parsers.cpp',         # Wave 2 WP-G: pure systemctl/launchctl output parsers
@@ -310,6 +330,19 @@ agent_test_exe = executable(
                                                 # hardware.dylib/device_identity.dylib driven end to end
                                                 # via LocalDispatcher (macOS-only; a no-op TU elsewhere
                                                 # via the file's own #if defined(__APPLE__) guard)
+    'unit/test_windows_updates_parsers.cpp',  # Wave 3: pure installed/missing parse+format helpers
+    'unit/test_windows_updates_posix_actions.cpp', # Wave 3 PR33d remediation: real windows_updates.dylib/.so driven (Linux/macOS)
+    'unit/test_windows_updates_win_actions.cpp',   # Wave 3 PR33d remediation: real windows_updates.dll driven (Windows WMI)
+    'unit/test_sccm_parsers.cpp',             # Wave 3 PR33d: pure SCM-status mirror + real authority-key/IDispatch decision logic
+    'unit/test_sccm_win_actions.cpp',         # Wave 3 PR33d remediation: real sccm.dll driven (Windows SCM/COM)
+    'unit/test_bitlocker_windows_wmi.cpp',    # Wave 3: pure WMI-row -> BitLocker output-row mapping
+    'unit/test_bitlocker_linux_parsers.cpp',  # Wave 3: pure dm-crypt uuid / LUKS state parser
+    'unit/test_antivirus_local_dispatcher.cpp', # Wave 3 gate remediation: real antivirus.dll driven
+                                                # end to end via LocalDispatcher (Windows-only; a no-op
+                                                # TU elsewhere via the file's own #ifdef _WIN32 guard)
+    'unit/test_bitlocker_local_dispatcher.cpp', # Wave 3 gate remediation: real bitlocker.dll driven
+                                                # end to end via LocalDispatcher (Windows-only; a no-op
+                                                # TU elsewhere via the file's own #ifdef _WIN32 guard)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -325,7 +358,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/hardware/src'),  # hardware_disks_macos.hpp (pure parser, PR1.8)
     include_directories('../agents/plugins/services/src'),      # services_macos_launchd.hpp (P8 test)
     include_directories('../agents/plugins/msi_packages/src'),  # msi_packages_macos.hpp (P8 test)
-    include_directories('../agents/plugins/bitlocker/src'),     # bitlocker_macos_apfs.hpp (P8 test)
+    include_directories('../agents/plugins/bitlocker/src'),     # bitlocker_macos_apfs.hpp (P8 test); Wave 3: bitlocker_windows_wmi.hpp, bitlocker_linux_parsers.hpp
     include_directories('../agents/plugins/filesystem/src'),    # filesystem_macos_sig.hpp (#2273/1.14)
     include_directories('../agents/plugins/event_logs/src'),    # event_logs_macos.hpp (BR-08)
     include_directories('../agents/plugins/certificates/src'),  # certificates_macos_parsers.hpp (Gate-7 FIX A: pure helpers shared with the plugin)
@@ -337,6 +370,8 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/discovery/src'),      # discovery_parsers.hpp (Wave 2 WP-C pure parser)
     include_directories('../agents/plugins/os_info/src'),        # os_info_macos.hpp (Wave 3 PR3.1 pure plist parser)
     include_directories('../agents/plugins/device_identity/src'), # device_identity_macos.hpp (Wave 3 PR3.2 pure parser)
+    include_directories('../agents/plugins/windows_updates/src'), # windows_updates_parsers.hpp (Wave 3 pure parser)
+    include_directories('../agents/plugins/sccm/src'),           # sccm_parsers.hpp (Wave 3 PR33d pure parser)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
@@ -364,10 +399,14 @@ agent_test_exe = executable(
   # hardware_plugin_lib / device_identity_plugin_lib (agents/plugins/{hardware,device_identity}/meson.build):
   # test_hardware_device_identity_posix_actions.cpp loads both real plugins by
   # path for the identical reason (Wave 3 PR3.2 gate-1 remediation).
+  # windows_updates_plugin_lib / sccm_plugin_lib: same reasoning for
+  # test_windows_updates_{posix,win}_actions.cpp / test_sccm_win_actions.cpp
+  # (Wave 3 PR33d code-review remediation).
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin,
                 users_plugin_lib, os_info_plugin_lib, processes_plugin_lib,
                 network_diag_plugin_lib, ioc_plugin_lib,
-                hardware_plugin_lib, device_identity_plugin_lib],
+                hardware_plugin_lib, device_identity_plugin_lib,
+                windows_updates_plugin_lib, sccm_plugin_lib],
 )
 # Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
 # threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it
@@ -653,6 +692,8 @@ if build_server
       'unit/server/test_rest_access_review.cpp',
       'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
+      'unit/server/test_quarantine_dispatch_decision.cpp', # #3127: pure write/response classification — no Postgres, no MCP transport, no agent
+      'unit/server/test_quarantine_dispatch_gate.cpp',     # #881: containment gate at the dispatch chokepoint — pure arm/degradation logic, no store
       'unit/server/test_result_set_store.cpp',
       'unit/server/test_result_set_matcher.cpp',
       'unit/server/test_rest_result_sets_async.cpp',
@@ -945,8 +986,8 @@ if build_server
   #     (2026-08-17, see scripts/ci/flake-retry.py's _cmd_for_case_retry);
   #   - no entry name may be a substring of another (flake-retry maps
   #     meson-junit names by longest substring match) — 'shard A'/'shard B'/
-  #     'shard C'/'shard D'/'shard E'/'shard F'/'shard G' and 'server unit tests' are
-  #     pairwise non-substring.
+  #     'shard C'/'shard D'/'shard E'/'shard F'/'shard G'/'shard H' and 'server
+  #     unit tests' are pairwise non-substring.
   # If a quiet leg pushes a shard past the #2093 80%-of-budget warning, the first
   # move is the concurrency gate / per-op cost (Defender TEMP exclusion, RAM disk),
   # then split or rebalance — raising the number is the last resort, not the first.
@@ -1028,11 +1069,103 @@ if build_server
   # store) — same confined-to-one-file precedent as every other tag in that
   # list, re-verified against this merge's actual case counts via --list-tests
   # on the built binary, not assumed from either side's pre-merge numbers.
-  # Partition preserved: N([pg]) == N(A) + N(B) + N(D) + N(E) + N(C). (shard B
-  # split into B+D on 2026-08-16, shard C split further into C+E on 2026-08-17
-  # — see the blocks below.)
+  # Partition preserved: N([pg]) == N(A) + N(B) + N(D) + N(E) + N(F) + N(G) +
+  # N(C) + N(H) (adversarial-review COD-P1-001/K5: an earlier version of this
+  # comment omitted F and G, which don't appear until further below in this
+  # file — the omission was prose-only, the filters and the verified sum at
+  # line ~1062 were always correct). (shard B split into B+D on 2026-08-16,
+  # shard C split further into C+E on 2026-08-17, shard A split into A+H on
+  # 2026-08-22 — see the blocks below.)
+  #
+  # SPLIT INTO A+H on 2026-08-22 (#2185-adjacent — same "reddening dev,
+  # unclassifiable TIMEOUT, no failing case on enumeration re-run" signature
+  # #3322 diagnosed for shard E on 2026-08-19): shard A reached 600.12/600s
+  # TIMEOUT on Linux gcc-15/clang-21 across a whole day's worth of dev pushes
+  # (confirmed via CI history: 549-580s on quiet runs, TIMEOUT under any
+  # added load, unrelated to any single PR — a #2093-style creep from many
+  # small additions, same as every prior split on this file). Per the
+  # standing house rule ("if it warns, split shard C itself" — the C->C+E
+  # precedent) and the "measure, don't just count" rule this file's own
+  # history rejected an unmeasured split for once already: the boundary was
+  # DESIGNED via an exhaustive tag-partition check (every candidate tag
+  # cross-referenced against every OTHER file using it, so no case straddling
+  # two shards, no case left in neither) and then VERIFIED on the built
+  # binary both ways — exact partition (`--list-tests`: A 251 + H 313 = 564,
+  # matching the pre-split undifferentiated shard A exactly; at the time of
+  # the split, the full 8-shard sum A+B+D+E+F+G+C+H = 2270 matched the
+  # binary's total [pg] case count — since risen to 2290 as later governance
+  # rounds restored migration-only tests found to be sole regression coverage
+  # for named catastrophic properties; re-verify the sum against --list-tests
+  # rather than trusting either number as current) and real wall-time
+  # against live Postgres, local :5433, quiet box:
+  # A 89.6s (251 cases, 4296 assertions), H 102.4s (313 cases, 27707
+  # assertions) — both ~15-17% of the 600s budget even before accounting for
+  # CI's ~2x contention multiplier. H's per-case rate (0.327s) is slightly
+  # CHEAPER than A's (0.357s) despite carrying more cases, consistent with
+  # the "store-CRUD cases cost more than route-handler cases" premise below.
+  #
+  # shard H carves out four DOMAINS that were only in shard A because they
+  # happen to carry the broad [routes]/[token] category tags shard A claimed
+  # unconditionally BEFORE this split (shard A's pre-split clause had no
+  # exclusions — everything HERE already only reached A because no OTHER
+  # shard's clause tolerated routes/store/token; docs-writer, governance Gate
+  # 2 2026-08-22 — the parenthetical previously read present-tense against
+  # code that, three lines below, now plainly does carry exclusions):
+  # SCIM routes (test_scim_routes.cpp, 101 cases),
+  # DEX routes (test_dex_routes.cpp + one case in test_dex_perf_model.cpp:916
+  # that also carries [pg][routes][dex], 37 — adversarial-review COD-P2-005/K4
+  # caught the initial 36-only count; the partition was never affected, only
+  # this prose), the whole MFA route surface (test_auth_routes_mfa.cpp +
+  # test_settings_routes_mfa.cpp via the shared [mfa] tag, 34+14=48), and
+  # token rotation (test_api_token_store.cpp's [rotation]-tagged subset +
+  # test_rest_api_tokens_rotation.cpp + test_engine_principal_lifecycle.cpp +
+  # test_mcp_server.cpp's [token][rotation] cases, 95+25+2+5=127) —
+  # 101+37+48+127=313, matching H's verified --list-tests count exactly. Each
+  # carve-out tag was checked
+  # against every OTHER file using it to confirm the exclusion added to A
+  # below can't orphan a same-tag case that belongs in a DIFFERENT shard
+  # (e.g. [mfa] alone would be unsafe — test_mfa_step_up.cpp/test_mfa_qr.cpp/
+  # test_mfa_store.cpp/test_totp.cpp also carry it but never with [routes],
+  # so they were never in A and are untouched either way; [rotation] alone
+  # would be unsafe too — test_rotation_sweep_naming.cpp/
+  # test_rotation_warn_dedup.cpp carry it with no [pg] tag at all, never
+  # shard candidates). H's own clauses require the SAME co-tag ([routes] or
+  # [token]) shard A's own clause already required, so nothing changes
+  # about which cases were ever reachable from A — only which of two A-side
+  # shards now claims them. 313 cases, 55% of the pre-split 564 — the larger
+  # half on a case-count basis but NOT the larger half on time (see the
+  # measured numbers above: H's per-case rate is the cheaper of the two, so
+  # 313 cases lands at 102.4s vs A's 251 at 89.6s — close to balanced by
+  # wall-time despite the count skew). All of H's cases are [pg]-tagged
+  # store/route behaviour tests with no non-DSN survivor — confirmed on the
+  # built binary (no-DSN run: exit 4 without the flag, exit 0 with it) —
+  # needs --allow-running-no-tests like shard D.
   test('server pg unit tests shard A', server_test_exe,
-       args: ['[pg][routes],[pg][store],[pg][token]'],
+       args: ['[pg][routes]~[scim]~[dex]~[mfa],[pg][store],[pg][token]~[rotation]'],
+       suite: 'server', timeout: 600)
+  # H's four clauses each add `~[store]` (fable review, structural hardening):
+  # A's own `[pg][store]` clause carries NO exclusions, so any [pg][store]
+  # case is unconditionally claimed by A regardless of what else it carries —
+  # excluding `[store]` from H therefore can never orphan a case, only ever
+  # remove a case H would otherwise have double-run with A. This closes the
+  # largest of the two theoretical (currently empty, but not structurally
+  # impossible) overlap classes a future case could fall into; the smaller
+  # one is NOT closable this way without risking an orphan (Catch2's flat tag
+  # algebra can't express "unless it's also elsewhere in H"), so it stays a
+  # documented residual, not a bug. The actual hazard shapes (verified by
+  # working the filter algebra, gov Gate 2 docs-writer — an earlier draft of
+  # this comment named the wrong pairing, one that in fact matches ONLY H,
+  # never A, since A's [routes] clause excludes every domain tag and A's
+  # [token] clause excludes rotation): a bare [routes][token][rotation] case
+  # with NO domain tag (matches A via its undomained-routes clause AND H via
+  # its rotation clause), or a [routes]+{scim|dex|mfa}+[token] case with NO
+  # [rotation] (matches A via its non-rotation-token clause AND H via that
+  # domain's routes clause). Verify with --list-tests that no case matches
+  # more than one of H's four clauses before adding a new routes+token-domain
+  # tag to any surviving store file.
+  test('server pg unit tests shard H', server_test_exe,
+       args: ['[pg][routes][scim]~[store],[pg][routes][dex]~[store],[pg][routes][mfa]~[store],[pg][token][rotation]~[store]',
+              '--allow-running-no-tests'],
        suite: 'server', timeout: 600)
   # shard B SPLIT into B+D on 2026-08-16 (#2092/#2093): the store-tag half had
   # reached 600/600s (100%) and flaked. BALANCED BY TIME, NOT COUNT — case count
