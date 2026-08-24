@@ -14,8 +14,6 @@
 
 #include <spdlog/spdlog.h>
 
-#include <array>
-#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -28,6 +26,12 @@
 #endif
 #include <windows.h>
 #include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
+#else
+#include "tar_service_parsers.hpp" // yuzu::tar::{parse_systemctl_list_units,parse_launchctl_list}
+
+#include <chrono>
+
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess / probe_tool_path (ADR-3002 rung 2)
 #endif
 
 namespace yuzu::tar {
@@ -133,109 +137,63 @@ std::vector<ServiceInfo> enumerate_services() {
 #elif defined(__linux__)
 
 std::vector<ServiceInfo> enumerate_services() {
-    std::vector<ServiceInfo> services;
-    FILE* pipe = popen(
-        "timeout 10 systemctl list-units --type=service --all --no-pager --no-legend 2>/dev/null", "r");
-    if (!pipe) {
-        spdlog::error("TAR: failed to run systemctl for service enumeration (popen returned null)");
-        return services;
+    // Probed over the two absolute paths systemctl actually lives at across
+    // distros (mirrors the services plugin's own probe --
+    // services_plugin.cpp's enumerate_services_linux precedent). Degrades
+    // to empty with the existing spdlog::error when neither is present --
+    // preserves today's degrade contract (previously a null pipe-open).
+    auto systemctl_path = yuzu::agent::probe_tool_path({"/usr/bin/systemctl", "/bin/systemctl"});
+    if (systemctl_path.empty()) {
+        spdlog::error("TAR: failed to run systemctl for service enumeration (systemctl not found)");
+        return {};
     }
 
-    std::array<char, 1024> buf{};
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        std::string line{buf.data()};
-        while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
-            line.pop_back();
-        if (line.empty())
-            continue;
-
-        // Trim leading whitespace and bullet
-        auto start = line.find_first_not_of(" *");
-        if (start == std::string::npos)
-            continue;
-        line = line.substr(start);
-
-        ServiceInfo si;
-        size_t pos = 0;
-        auto next_token = [&]() -> std::string {
-            auto s = line.find_first_not_of(' ', pos);
-            if (s == std::string::npos)
-                return {};
-            auto e = line.find(' ', s);
-            if (e == std::string::npos)
-                e = line.size();
-            pos = e;
-            return line.substr(s, e - s);
-        };
-
-        si.name = next_token();     // UNIT
-        next_token();               // LOAD
-        next_token();               // ACTIVE
-        si.status = next_token();   // SUB
-        // Remainder is description
-        auto desc_start = line.find_first_not_of(' ', pos);
-        if (desc_start != std::string::npos)
-            si.display_name = line.substr(desc_start);
-
-        si.startup_type = "unknown";
-        services.push_back(std::move(si));
+    // Bounded, fork-lock-covered, shell-free argv exec (ADR-3002 rung 2): no
+    // `/bin/sh -c` hop and no `timeout 10` prefix -- the runner's own
+    // deadline subsumes that exactly, and stderr -> /dev/null is the
+    // runner's default (merge_stderr=false, subprocess_runner.hpp:98),
+    // matching the old `2>/dev/null` shell suffix. Parsing is pure
+    // (tar_service_parsers.hpp), unit-testable independent of the runner.
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {systemctl_path, "list-units", "--type=service", "--all", "--no-pager", "--no-legend"},
+        yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{10}});
+    if (!res.tool_ran) {
+        spdlog::error("TAR: failed to run systemctl for service enumeration (spawn failed)");
+        return {};
     }
-    pclose(pipe);
-    return services;
+
+    return parse_systemctl_list_units(res.lines);
 }
 
 // -- macOS implementation -----------------------------------------------------
 #elif defined(__APPLE__)
 
 std::vector<ServiceInfo> enumerate_services() {
-    std::vector<ServiceInfo> services;
-    FILE* pipe = popen("launchctl list 2>/dev/null", "r");
-    if (!pipe) {
-        spdlog::error("TAR: failed to run launchctl for service enumeration (popen returned null)");
-        return services;
+    // launchctl lives at exactly one absolute path on macOS (no /usr/bin
+    // alternative, unlike systemctl's cross-distro split) -- probe_tool_path
+    // still verifies it exists+is executable before trusting it into
+    // argv[0], same as every other runner-migrated call site, and degrades
+    // to empty with the existing spdlog::error when absent (previously a
+    // null pipe-open).
+    auto launchctl_path = yuzu::agent::probe_tool_path({"/bin/launchctl"});
+    if (launchctl_path.empty()) {
+        spdlog::error("TAR: failed to run launchctl for service enumeration (launchctl not found)");
+        return {};
     }
 
-    std::array<char, 1024> buf{};
-    // Skip header line
-    if (fgets(buf.data(), static_cast<int>(buf.size()), pipe) == nullptr) {
-        pclose(pipe);
-        return services;
+    // Bounded, fork-lock-covered, shell-free argv exec (ADR-3002 rung 2):
+    // stderr -> /dev/null is the runner's default (merge_stderr=false,
+    // subprocess_runner.hpp:98), matching the old `2>/dev/null` shell
+    // suffix. Parsing (including the header-row skip) is pure
+    // (tar_service_parsers.hpp), unit-testable independent of the runner.
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {launchctl_path, "list"}, yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{10}});
+    if (!res.tool_ran) {
+        spdlog::error("TAR: failed to run launchctl for service enumeration (spawn failed)");
+        return {};
     }
 
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        std::string line{buf.data()};
-        while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
-            line.pop_back();
-        if (line.empty())
-            continue;
-
-        // Format: PID\tStatus\tLabel
-        ServiceInfo si;
-        size_t pos = 0;
-        auto next_field = [&]() -> std::string {
-            auto tab = line.find('\t', pos);
-            std::string field;
-            if (tab == std::string::npos) {
-                field = line.substr(pos);
-                pos = line.size();
-            } else {
-                field = line.substr(pos, tab - pos);
-                pos = tab + 1;
-            }
-            return field;
-        };
-
-        auto pid_str = next_field();
-        next_field(); // status code
-        si.name = next_field();
-
-        si.status = (pid_str != "-" && !pid_str.empty()) ? "running" : "stopped";
-        // macOS launchctl list does not provide startup type; 'unknown' is correct
-        si.startup_type = "unknown";
-        services.push_back(std::move(si));
-    }
-    pclose(pipe);
-    return services;
+    return parse_launchctl_list(res.lines);
 }
 
 #else
