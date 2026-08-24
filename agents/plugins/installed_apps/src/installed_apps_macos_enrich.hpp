@@ -127,12 +127,28 @@ inline EnrichResult enrich_app(const std::string& app_path) {
     }
     yuzu::agent::ScopedCFRef<CFDictionaryRef> info(raw_info);
 
-    // SecCodeCopySigningInformation only succeeded for a code object whose
-    // seal Security.framework accepted at this call -- an ad-hoc or
-    // self-signed binary still reports "signed" here (integrity-only, not a
-    // trust verdict -- same honesty caveat filesystem_macos_sig.hpp documents
-    // for codesign's exit code 0).
-    out.signature_status = "signed";
+    // CALL SUCCESS IS NOT A SIGNATURE. Measured on macOS 26 (2026-08-24):
+    // SecStaticCodeCreateWithPath AND SecCodeCopySigningInformation BOTH
+    // return errSecSuccess for a bundle `codesign -dv` calls "code object is
+    // not signed at all" -- the dictionary simply comes back without signing
+    // keys, and errSecCSUnsigned is never surfaced on this path. Reporting
+    // "signed" on call success therefore labelled EVERY enriched app signed,
+    // including genuinely unsigned ones -- a false positive on a
+    // security-posture field (installed_apps_inventory.hpp's own wording).
+    //
+    // kSecCodeInfoIdentifier presence is the discriminator, verified against
+    // three ground-truth cases on this host:
+    //   unsigned  -> identifier ABSENT,  0 certs  => "unsigned"
+    //   ad-hoc    -> identifier PRESENT, 0 certs  => "signed" (no publisher)
+    //   Apple     -> identifier PRESENT, 3 certs  => "signed" + leaf CN
+    // Ad-hoc/self-signed still reads "signed": integrity-at-creation only,
+    // never a Gatekeeper/notarization trust verdict (the caveat this header's
+    // top comment and filesystem_macos_sig.hpp both already state).
+    const bool has_identifier =
+        CFDictionaryGetValue(info.get(), kSecCodeInfoIdentifier) != nullptr;
+    out.signature_status = has_identifier ? "signed" : "unsigned";
+    if (!has_identifier)
+        return out; // unsigned code has no leaf cert to read a publisher from
 
     if (auto* certs = static_cast<CFArrayRef>(
             CFDictionaryGetValue(info.get(), kSecCodeInfoCertificates));
