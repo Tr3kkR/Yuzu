@@ -236,10 +236,20 @@ resolve_executable(std::string_view cmd, std::string_view cwd,
 /// characters are stripped, no escape processing beyond that) — the exact
 /// rule script_exec's "args" param has always followed (unchanged from the
 /// plugin-local helper this replaces). Pure and allocation-only.
+///
+/// BR3-002 (whole-branch review round 3): a token is tracked as STARTED
+/// independently of whether `current` has accumulated any bytes, so an
+/// explicitly quoted empty argument (`''`/`""`) survives as an empty argv
+/// element — matching what the deleted pre-migration Windows path produced
+/// (it appended the raw command line to CreateProcess verbatim, so the
+/// child's own CRT argv parser preserved a quoted empty field). The prior
+/// `!current.empty()` gate here collapsed `'' sentinel` to `{"sentinel"}`,
+/// silently dropping argv[0] and shifting every later positional argument.
 [[nodiscard]] inline std::vector<std::string> split_args(std::string_view s) {
     std::vector<std::string> result;
     std::string current;
     bool in_quote = false;
+    bool token_started = false;
     char quote_char = 0;
 
     for (char ch : s) {
@@ -251,17 +261,20 @@ resolve_executable(std::string_view cmd, std::string_view cwd,
             }
         } else if (ch == '"' || ch == '\'') {
             in_quote = true;
+            token_started = true;
             quote_char = ch;
         } else if (ch == ' ' || ch == '\t') {
-            if (!current.empty()) {
+            if (token_started) {
                 result.push_back(std::move(current));
                 current.clear();
+                token_started = false;
             }
         } else {
             current += ch;
+            token_started = true;
         }
     }
-    if (!current.empty())
+    if (token_started)
         result.push_back(std::move(current));
     return result;
 }

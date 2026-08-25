@@ -247,3 +247,20 @@ TEST_CASE("assemble_argv: powershell mode carries the (already-encoded) script a
     CHECK(argv[3] == "-EncodedCommand");
     CHECK(argv[4] == "QQBCAEMA"); // one element -- the Base64 blob is opaque to argv splitting
 }
+
+TEST_CASE("split_args: preserves explicitly quoted empty arguments (BR3-002)",
+          "[script_exec][parsers]") {
+    // Regression: the pre-migration Windows path never called split_args
+    // for exec mode at all -- it appended the raw command line to
+    // CreateProcessA verbatim, so the child's own CRT argv parser
+    // preserved a quoted empty field. Post-migration, split_args runs on
+    // every platform for exec mode, so its own `!current.empty()` gate
+    // (already present, and already lossy, in the pre-migration POSIX-only
+    // copy of this function) silently dropped an explicitly quoted empty
+    // argument on Windows for the first time.
+    auto args = split_args(R"("" sentinel '')");
+    REQUIRE(args.size() == 3);
+    CHECK(args[0].empty());
+    CHECK(args[1] == "sentinel");
+    CHECK(args[2].empty());
+}
