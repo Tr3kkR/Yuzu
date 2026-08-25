@@ -480,6 +480,30 @@ jobs:
       YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
     strategy:
       fail-fast: false
+      # max-parallel: 3, not 4 — Big Tam has exactly 4 yuzu-bigtam-linux runner
+      # agents on one box. A `dev`/`main` push runs the full 2x2 matrix below
+      # and would otherwise claim all 4 simultaneously, starving a
+      # concurrently-queued PR's single Linux leg at the RUNNER-ACQUISITION
+      # level — below with-test-slot.sh, which only gates contention *inside*
+      # a job that already has a runner (docs/ci-architecture.md "Cross-job";
+      # a PR job was directly observed waiting 35 minutes for a free runner
+      # during exactly this window). Capping at 3 leaves at least one Big Tam
+      # runner unclaimed BY THIS MATRIX. No-op on `pull_request` events: the
+      # exclude below already trims that matrix to a single gcc-15/debug leg,
+      # so max-parallel never binds there. Trade-off: a `dev` push's 4th leg
+      # waits for a slot to free (two waves instead of one) — acceptable,
+      # since push-triggered runs aren't PR-fast-path latency sensitive.
+      # NOT a guarantee the freed runner reaches the intended PR job: this
+      # matrix isn't the only claimant on the pool. `proto-compat` below
+      # targets the bare `[self-hosted, Linux, X64]` label, which every
+      # Big Tam Linux runner also carries, and runs on the same push trigger
+      # this cap targets — it can claim the freed runner itself (its own
+      # `timeout-minutes: 5` means it self-frees quickly, but it is a real
+      # same-push competitor, not just the already-named nightly-overlap
+      # case). A stacked nightly run, another concurrent PR/push, or a
+      # manual `workflow_dispatch` can do the same. Mitigation, not a
+      # guarantee. Tracked: #3443.
+      max-parallel: 3
       matrix:
         compiler: [gcc-15, clang-21]
         build_type: [debug, release]
@@ -874,6 +898,17 @@ jobs:
         # population shrinking. Both mitigations are combined on purpose: the
         # split cuts each shard's real cost roughly in half, the timeout bump
         # absorbs whatever 2-wide pairing overlap remains on top of that.
+        #
+        # Same day: EXTENDED to the remaining six shards (A/B/D/F/H/C, all
+        # now 700s too) after merging #3582 required a dev sync, and dev's
+        # own CI (run 32833097478) TIMEOUT'd shard E at the OLD 600.51s and
+        # landed G at 585-590/600s (97-98%) on all four Linux legs — live
+        # confirmation the 600s ceiling was tight fleet-wide, not just on the
+        # two shards #3582 split. See tests/meson.build's shard-E/I/G/J
+        # comment block and docs/ci-architecture.md's worst-case job-budget
+        # arithmetic (re-derived for all-ten-at-700s: makespan is now a
+        # deterministic 3500s at --num-processes 2, no pairing variance,
+        # margin against the 90-min job ceiling under 2 minutes worst-case).
         #
         # Telemetry note: each invocation overwrites meson's single
         # testlog.junit.xml, so only the LAST one's per-suite ci_test_suites

@@ -1163,7 +1163,7 @@ if build_server
   # needs --allow-running-no-tests like shard D.
   test('server pg unit tests shard A', server_test_exe,
        args: ['[pg][routes]~[scim]~[dex]~[mfa],[pg][store],[pg][token]~[rotation]'],
-       suite: 'server', timeout: 600)
+       suite: 'server', timeout: 700)
   # H's four clauses each add `~[store]` (fable review, structural hardening):
   # A's own `[pg][store]` clause carries NO exclusions, so any [pg][store]
   # case is unconditionally claimed by A regardless of what else it carries —
@@ -1187,7 +1187,7 @@ if build_server
   test('server pg unit tests shard H', server_test_exe,
        args: ['[pg][routes][scim]~[store],[pg][routes][dex]~[store],[pg][routes][mfa]~[store],[pg][token][rotation]~[store]',
               '--allow-running-no-tests'],
-       suite: 'server', timeout: 600)
+       suite: 'server', timeout: 700)
   # shard B SPLIT into B+D on 2026-08-16 (#2092/#2093): the store-tag half had
   # reached 600/600s (100%) and flaked. BALANCED BY TIME, NOT COUNT — case count
   # is not proportional to wall-time (shard C carries ~1082 cases comfortably;
@@ -1222,7 +1222,7 @@ if build_server
   # list per the same instruction (both or neither).
   test('server pg unit tests shard B', server_test_exe,
        args: ['[pg][rbac_store]~[routes]~[store]~[token]'],
-       suite: 'server', timeout: 600)
+       suite: 'server', timeout: 700)
   # --allow-running-no-tests: shard D's tags are ALL DSN-gated store
   # behaviour tests, so on a DSN-less platform (macOS, ADR-0035) every case
   # SKIPs and Catch2 exits 4 on an all-skipped run — reddening the leg (#2092,
@@ -1239,7 +1239,7 @@ if build_server
   test('server pg unit tests shard D', server_test_exe,
        args: ['[pg][audit_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token],[pg][software_deployment]~[routes]~[store]~[token]',
               '--allow-running-no-tests'],
-       suite: 'server', timeout: 600)
+       suite: 'server', timeout: 700)
   # 2026-08-17 (PR #3174 CI, run 32004956605): shard C STILL TIMEOUT-ed at
   # 600.07/600s on the real contended Big Tam pool after the [software_deployment]
   # move above — the local-measurement projection (sre's own Gate 6 finding on
@@ -1346,27 +1346,30 @@ if build_server
   # 55.6s / J 35.8s — each roughly half its parent's own last-measured local
   # baseline, consistent with the case-count split ratio.
   #
-  # The 600->700s timeout bump (E/I/G/J only — A/B/C/D/F/H stay at 600) is a
-  # DELIBERATE, TEMPORARY exception to this file's own "split, don't raise
-  # the timeout" house rule (the C->C+E and A->A+H precedents above never
-  # raised it). Justification, corrected after Gate 2 governance review
-  # (2026-08-25) caught the original wording overclaiming a settled
-  # near-term timeline: `docs/postgres-migration-ladder.md` explicitly
-  # disclaims one ("mutable state that drains over time, not a contract"),
-  # and completing that ladder is architecturally more likely to GROW this
-  # population than shrink it — every store that migrates onto Postgres
-  # adds its own [pg]-tagged CRUD/behaviour cases (exactly what shards
-  # E/I/G/J already carry), while only each store's narrow, already-thin
-  # migrate_from_sqlite backfill suite becomes prunable. So this margin is
-  # NOT bought against an expected population shrink — it is a plain safety
-  # cushion on top of what the split alone already earns (every new shard's
-  # scaled-from-real-diagnostic-numbers estimate lands well under 700s even
-  # 2-wide paired, per the measurements above). Revisit on a fixed cadence,
-  # not on an assumed completion date — tighten back to 600, or drop, once a
-  # shard is comfortably under budget. Tracked at issue #3443 (the existing
-  # linked home for the pg-shard-reliability lineage) — a prose-only "revisit
-  # later" with no dated/metric trigger has this file's own track record of
-  # being forgotten until the next stale-pin incident forces it.
+  # The 600->700s timeout bump originally shipped E/I/G/J-only (PR #3582,
+  # 2026-08-25) as a DELIBERATE, TEMPORARY exception to this file's own
+  # "split, don't raise the timeout" house rule (the C->C+E and A->A+H
+  # precedents above never raised it). EXTENDED to all remaining shards
+  # (A/B/D/F/H/C) the same day, after dev's own CI (run 32833097478, merge of
+  # PR #3466 — no PR-specific pg-shard changes) TIMEOUT'd shard E at 600.51s
+  # AND landed shard G at 585-590/600s (97-98%) on all four Linux legs — live
+  # confirmation that the 600s ceiling was already tight fleet-wide, not just
+  # on the two shards #3582 happened to split. Justification, corrected after
+  # Gate 2 governance review (2026-08-25) caught the original wording
+  # overclaiming a settled near-term timeline: `docs/postgres-migration-ladder.md`
+  # explicitly disclaims one ("mutable state that drains over time, not a
+  # contract"), and completing that ladder is architecturally more likely to
+  # GROW this population than shrink it — every store that migrates onto
+  # Postgres adds its own [pg]-tagged CRUD/behaviour cases, while only each
+  # store's narrow, already-thin migrate_from_sqlite backfill suite becomes
+  # prunable. So this margin is NOT bought against an expected population
+  # shrink — it is a plain safety cushion on top of whatever headroom each
+  # shard's own split already earns. Revisit on a fixed cadence, not on an
+  # assumed completion date — tighten back to 600, or drop, per shard, once
+  # that shard is comfortably under budget. Tracked at issue #3443 (the
+  # existing linked home for the pg-shard-reliability lineage) — a prose-only
+  # "revisit later" with no dated/metric trigger has this file's own track
+  # record of being forgotten until the next stale-pin incident forces it.
   test('server pg unit tests shard E', server_test_exe,
        args: ['[pg][scim]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][guaranteed_state]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][oidc]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][software_inventory]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]'],
        suite: 'server', timeout: 700)
@@ -1387,10 +1390,10 @@ if build_server
        suite: 'server', timeout: 700)
   test('server pg unit tests shard F', server_test_exe,
        args: ['[pg][dex]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment],[pg][mcp]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]'],
-       suite: 'server', timeout: 600)
+       suite: 'server', timeout: 700)
   test('server pg unit tests shard C', server_test_exe,
        args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]'],
-       suite: 'server', timeout: 600)
+       suite: 'server', timeout: 700)
 
   # 2026-08-20 (ADR-0056, PolicyStore, batch-6): PolicyStore moved off SQLite
   # onto Postgres, and test_policy_store.cpp / test_policy_evaluator.cpp went

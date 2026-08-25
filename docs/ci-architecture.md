@@ -425,7 +425,10 @@ the 90-minute job budget to REDUCE (not guarantee-away) the chance a starved
 job hits the ambiguous job-level timeout kill instead of the script's own
 attributable error — the 90-minute budget also covers checkout/build time
 before Test starts, so a slow build can still leave less than 30 minutes of
-headroom when the wait begins.
+headroom when the wait begins. This fix gates contention only *inside* a
+job that already holds a runner — it does not address a job that cannot
+start at all because no runner is free; see "Cross-job — runner
+acquisition, a fourth layer" later in this section for that gap.
 
 `nightly.yml`'s Linux ASan/TSan/coverage legs and `sanitizer-tests.yml`'s
 ASan/TSan legs (the `/test --full` pre-push gate) invoke `meson test` directly
@@ -500,55 +503,70 @@ count-balanced, ~half each; I defers to E and J defers to G the same way G
 already deferred to E, to avoid double-counting a case that carries a tag
 from both sides of a split — a first attempt without that deferral double-
 counted 12 and 47 cases respectively, caught by `--list-tests` before
-trusting it), and the four split shards' (E/I/G/J only — A/B/C/D/F/H are
-unchanged) `timeout:` moved from 600 to 700. The timeout bump is a
-**deliberate, temporary** exception to this file's own "split, don't raise"
-house rule (`tests/meson.build`'s shard-history comment) — corrected after
-Gate 2 governance review (2026-08-25) caught an earlier draft's justification
-overclaiming a settled near-term timeline. `docs/postgres-migration-ladder.md`
-explicitly disclaims one ("mutable state that drains over time, not a
-contract"), and completing that ladder is architecturally more likely to GROW
-the `[pg]` population than shrink it: each store that migrates onto Postgres
-adds its own `[pg]`-tagged CRUD/behaviour cases (exactly what shards E/I/G/J
-already carry), while only each store's narrow, already-thin
-`migrate_from_sqlite` backfill suite becomes prunable. The margin bought here
-is a plain safety cushion on top of what the split alone already earns (every
-new shard's real-diagnostic-scaled estimate lands well under 700s even 2-wide
-paired). Revisit on a fixed cadence, not an assumed completion date — tighten
-back to 600, or drop, once a shard is comfortably under budget: TWO reasons to
-revisit, not just budget hygiene — the worst-case job-budget arithmetic below,
-and the #2093 duration watchdog's 80%-of-timeout warning threshold moving with
-it (480s->560s on exactly the four shards with the most recent drift history,
-diluting the watchdog's lead time on them specifically). This "revisit later"
-commitment is tracked at issue #3443 (adversarial review, 2026-08-25 — a
-prose-only commitment with no dated/metric-based trigger has this file's own
-track record of being forgotten until the next stale-pin incident forces it;
-#3443 is the existing linked home for the pg-shard-reliability lineage, not a
-fresh one-off). Full measurements,
+trusting it), and the four split shards' `timeout:` moved from 600 to 700.
+The timeout bump is a **deliberate, temporary** exception to this file's own
+"split, don't raise" house rule (`tests/meson.build`'s shard-history comment)
+— corrected after Gate 2 governance review (2026-08-25) caught an earlier
+draft's justification overclaiming a settled near-term timeline.
+`docs/postgres-migration-ladder.md` explicitly disclaims one ("mutable state
+that drains over time, not a contract"), and completing that ladder is
+architecturally more likely to GROW the `[pg]` population than shrink it:
+each store that migrates onto Postgres adds its own `[pg]`-tagged
+CRUD/behaviour cases (exactly what shards E/I/G/J already carry), while only
+each store's narrow, already-thin `migrate_from_sqlite` backfill suite
+becomes prunable. The margin bought here is a plain safety cushion on top of
+what the split alone already earns (every new shard's real-diagnostic-scaled
+estimate lands well under 700s even 2-wide paired).
+
+**Extended to all ten shards, same day.** Merging PR #3582 required syncing
+this branch to `dev`, and dev's own CI (run 32833097478, merging PR #3466 —
+no PR-specific pg-shard changes) TIMEOUT'd shard E at 600.51s AND landed
+shard G at 585-590/600s (97-98%) on all four Linux legs — live confirmation,
+not a projection, that the 600s ceiling was already tight fleet-wide, not
+just on the two shards #3582 happened to split. `tests/meson.build`'s
+remaining six shards (A/B/D/F/H/C) moved from `timeout: 600` to `timeout:
+700` the same way. Revisit on a fixed cadence, not an assumed completion date
+— tighten back to 600, or drop, **per shard**, once that shard is comfortably
+under budget: TWO reasons to revisit, not just budget hygiene — the
+worst-case job-budget arithmetic below, and the #2093 duration watchdog's
+80%-of-timeout warning threshold moving with it (480s->560s, now on all ten
+shards, diluting the watchdog's lead time fleet-wide rather than on four).
+This "revisit later" commitment is tracked at issue #3443 (adversarial
+review, 2026-08-25 — a prose-only commitment with no dated/metric-based
+trigger has this file's own track record of being forgotten until the next
+stale-pin incident forces it; #3443 is the existing linked home for the
+pg-shard-reliability lineage, not a fresh one-off). Full measurements,
 partition verification, and per-shard local wall time: `tests/meson.build`'s
 own comment at the shard E/I/G/J block.
 
 **Worst-case job-budget arithmetic (Gate 6 SRE, 2026-08-25; corrected by
-adversarial review, same day — the first version of this paragraph had an
-arithmetic error, caught independently by both Kimi and Codex and verified
-against a real pairing before trusting it), recorded so a future reviewer
-doesn't have to re-derive it.** Degenerate case — every pg shard hitting its
-OWN timeout simultaneously — sums to 6*600s + 4*700s = 6400 test-seconds; at
-`--num-processes 2` (5 pairs) the BEST achievable makespan is 3200s (pair
-same-sized shards together: 2 pairs of 700+700, 3 pairs of 600+600), and the
-WORST achievable is 3400s (pair every 700s shard with a 600s shard — 4 pairs
-at max=700 plus one remaining 600+600 pair — no valid pairing of these ten
-shards produces anything higher). Add the up-to-30-min cross-job slot wait
-(`YUZU_TEST_SLOT_TIMEOUT_MIN`) and the worst case alone reaches ~87 min
-against the 90-min job ceiling, before checkout/build time. This is the
-theoretical ceiling, not the expected case (it requires the box already so
-unhealthy that a job-level kill is arguably the correct outcome, not a
-failure of this design) — the realistic case, using the real measured/scaled
-numbers this
-split was based on, is comfortably inside budget and materially IMPROVED by
-the split versus the pre-split 8-shard layout. Both directions — a tighter
-theoretical ceiling, a healthier realistic case — are true at once and both
-worth knowing.
+adversarial review, same day; re-derived 2026-08-25 after the timeout bump
+extended to all ten shards), recorded so a future reviewer doesn't have to
+re-derive it.** With all ten pg shards now sharing one `timeout: 700`, the
+degenerate case — every shard hitting its own timeout simultaneously — sums
+to 10*700s = 7000 test-seconds, and at `--num-processes 2` (5 pairs) BEST and
+WORST achievable makespan are now the SAME number: 3500s. Uniform per-shard
+budgets remove the pairing-order variable the earlier (six-at-600/four-at-700)
+version of this paragraph had to reason about — there is no longer a
+lighter/heavier shard to pair favourably or unfavourably. Add the up-to-30-min
+cross-job slot wait (`YUZU_TEST_SLOT_TIMEOUT_MIN`) and this ceiling alone
+reaches ~88.3 min against the 90-min job ceiling, before checkout/build time
+— a TIGHTER margin than the pre-extension worst case (~87 min), by
+construction: six shards moved from a 600s cap to a 700s one and nothing
+moved the other way, so the worst-case ceiling can only have gone up. This
+number is the test-phase-plus-slot-wait sub-budget only — it does NOT
+supersede the "Cross-job" paragraph above's own caveat that the 90-minute
+ceiling also covers checkout/build time, so the REAL total-job margin is
+smaller than ~1.7 min whenever a build isn't instant. Quoting "<2 minutes"
+on its own without that qualifier overstates how much slack actually
+remains. This
+is the theoretical ceiling, not the expected case (it requires the box
+already so unhealthy that a job-level kill is arguably the correct outcome,
+not a failure of this design) — the realistic case, using the real
+measured/scaled numbers the original E/I/G/J split was based on, is
+comfortably inside budget. The margin against the 90-min ceiling is real but
+thin (under 2 minutes) and is the load-bearing reason this bump stays
+temporary and per-shard-revisitable rather than a permanent 700s floor.
 
 **Drift risk, not yet automated:** the 3-way split hardcodes the 10 pg shard
 names and the 3 non-pg server test names directly in `ci.yml`. A new/renamed
@@ -558,6 +576,32 @@ meson.build`, and was nearly missed entirely while writing this split) needs a
 matching update on both sides or silently stops running in CI. See the
 cross-reference comment at the shard-naming-invariant block in
 `tests/meson.build`.
+
+**Cross-job — runner acquisition, a fourth layer (2026-08-25, same day as the
+split/timeout extension above):** the "Cross-job (fixed second, #3443 AC4)"
+fix earlier in this section (`with-test-slot.sh`) gates contention only
+*inside* a job that already holds a runner — it does nothing for a job that
+cannot START because no runner is free. That is a structurally lower-level
+gap than any of the three fixes above address, and the 35-minute-wait
+incident that paragraph cites is actually an instance of THIS gap, not one
+`with-test-slot.sh` closes: a `dev`/`main` push's own 4-way Linux matrix
+could claim all 4 Big Tam runners simultaneously, leaving nothing reserving
+a runner for a concurrently-queued PR job. Fix: `ci.yml`'s Linux job's
+`strategy.max-parallel: 3` caps how many legs of that SAME matrix run
+concurrently, leaving at least one Big Tam runner unclaimed by it — a no-op
+on `pull_request` events (already a single-leg matrix via the existing
+`exclude`). This is a mitigation, not a guarantee: the freed runner is not
+reserved for any specific job. `proto-compat` (this same workflow) targets
+the bare `[self-hosted, Linux, X64]` label every Big Tam Linux runner also
+carries and runs on the same push trigger — it can claim the freed runner
+itself before a queued PR job does (its own `timeout-minutes: 5` means it
+self-frees quickly, but it is a real same-push competitor, not just the
+already-named nightly-overlap case). A stacked nightly run, another
+concurrent PR/push, or a manual `workflow_dispatch` can do the same — none
+of these are fixable from this diff's scope; a genuine guarantee needs
+runner-pool partitioning (dedicating a runner label to PR-fast-path jobs),
+which needs direct access to the Big Tam box and is tracked as a follow-up
+on #3443, not done here.
 
 ### Persistent runner-local test history
 
