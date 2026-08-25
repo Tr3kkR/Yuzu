@@ -83,6 +83,15 @@ struct LaunchSpec {
     // shell ever consumes it.
     std::string windows_command_line;
 
+    // A2-002: pure passthrough of LaunchOptions::inherit_parent_env -- see
+    // that field's comment. `env` above is ALWAYS computed the ordinary way
+    // regardless of this flag (this header does no OS I/O to honour it);
+    // only the Windows OS shell in subprocess_runner.cpp branches on it, by
+    // substituting a live-read parent environment (with extra_env layered on
+    // top via the same merge_launch_env() below) for `env` at the point it
+    // actually builds the Win32 environment block. Default false.
+    bool inherit_parent_env = false;
+
     // A1/Windows: which handles the shell must mark inheritable and name in
     // PROC_THREAD_ATTRIBUTE_HANDLE_LIST -- expressed as roles rather than
     // live HANDLEs (which don't exist yet at spec-build time), so a test can
@@ -133,6 +142,19 @@ struct LaunchOptions {
     // default. Merged onto the A5 allow-list by build_launch_spec() via
     // merge_launch_env() below.
     std::vector<EnvVar> extra_env;
+
+    // A2-002 (Alex plan-gate ruling, script_exec's Windows-parity escalation):
+    // mirror of SubprocessOptions::inherit_parent_env (subprocess_runner.hpp)
+    // -- see that field's doc comment for the full contract. Pure PASSTHROUGH
+    // only: this header never reads the live process environment (it is a
+    // pure, allocation-only core -- see the file header), so build_launch_spec()
+    // below copies this flag onto LaunchSpec unchanged and otherwise computes
+    // `env` exactly as it always has (default_launch_env() + extra_env). The
+    // impure OS shell in subprocess_runner.cpp is what actually branches on
+    // spec.inherit_parent_env -- and only in its Windows backend; the POSIX
+    // backend never reads it at all. Default false, matching
+    // SubprocessOptions'.
+    bool inherit_parent_env = false;
 };
 
 /** The bare outcome a Spawner reports for a LaunchSpec. Deliberately minimal
@@ -493,6 +515,7 @@ inline LaunchSpec build_launch_spec(const std::vector<std::string>& argv, const 
     spec.umask_value = 0077;
     spec.rlimits = opts.rlimits;
     spec.exec_verify = opts.exec_verify;
+    spec.inherit_parent_env = opts.inherit_parent_env; // pure passthrough -- see field comment
 
     // The per-OS allow-list lives in the pure, host-testable
     // default_launch_env(); extra_env (already validated above -- nothing

@@ -176,6 +176,71 @@ struct SubprocessOptions {
     // specific rejection reason.
     std::vector<std::pair<std::string, std::string>> extra_env;
 
+    // A2-002 (Alex plan-gate ruling, script_exec Windows-parity escalation):
+    // a SECOND, narrower and Windows-ONLY widening of A5's clear-slate env
+    // policy, additive to (never a replacement for) extra_env above. Default
+    // false, so every existing caller's launch is bit-for-bit unchanged --
+    // this is covered by test_subprocess_launch_spec.cpp's default-value
+    // assertion and by test_subprocess_runner.cpp's "extra_env-only, flag
+    // unset" launch-spec test.
+    //
+    // WHY THIS EXISTS: script_exec's Windows leg (deleted CreateProcessA
+    // call, pre-runner-migration) passed a null lpEnvironment, so its
+    // children inherited the FULL parent environment unfiltered -- unlike
+    // the POSIX leg, which always kept an explicit seven-name safe_vars
+    // allow-list (PATH/HOME/USER/LANG/LC_ALL/TERM/TZ). Alex ruled AGAINST
+    // narrowing that pre-existing Windows behaviour to match POSIX's seven
+    // names when this runner replaced script_exec's private spawn paths.
+    // extra_env alone cannot express "forward everything the parent has" --
+    // it is an explicit, individually-validated, additive allow-list, by
+    // design (ADR-3002 A5) -- so this flag is the one narrowly-scoped
+    // exception PLAN-04/A2-002 authorizes: it exists ONLY to reproduce
+    // script_exec's pre-existing Windows behaviour, not as a general-purpose
+    // "give me the parent's environment" facility for any other caller.
+    //
+    // (a) INTERACTION WITH extra_env: when true, extra_env entries are still
+    // applied ON TOP of the inherited parent-environment block, using the
+    // SAME replace-in-place-never-duplicate semantics merge_launch_env()
+    // always uses (subprocess_launch_spec.hpp) -- extra_env is the base
+    // that's swapped from the A5 default to the live parent snapshot, not a
+    // rule that stops applying. A caller combining both (as script_exec
+    // does, forwarding its own seven-name allow-list on top of the full
+    // inherited block) gets: full parent env, with any of those seven names
+    // set to exactly the value extra_env specified, even if that differs
+    // from what the live parent process itself currently holds.
+    //
+    // (b) SECURITY: this deliberately bypasses ADR-3002 A5's clear-slate
+    // policy for ONE platform -- gated tightly: opt-in, default-off,
+    // Windows-only (see below), and every extra_env entry is STILL run
+    // through the existing denylist/malformed-entry checks
+    // (is_denied_env_name/is_malformed_env_entry) exactly as when this flag
+    // is false -- LD_*/DYLD_*/IFS/BASH_ENV/ENV/GCONV_PATH/NLSPATH/LOCPATH
+    // remain refused (the whole launch fails closed) regardless of this
+    // flag's value; it only changes what UNNAMED variables the child also
+    // receives, never what extra_env itself is allowed to name. This exists
+    // to preserve pre-existing script_exec behaviour that PREDATES the
+    // runner -- it is not, and must never become, a general-purpose "inherit
+    // everything" facility for a caller with no equivalent legacy
+    // requirement.
+    //
+    // (c) POSIX: intentionally IGNORED -- read (mirrored onto
+    // LaunchOptions::inherit_parent_env, subprocess_launch_spec.hpp) but
+    // never acted on by the POSIX backend in subprocess_runner.cpp, which
+    // always builds envp from spec.env (the ordinary A5-allow-list-plus-
+    // extra_env computation) regardless of this flag. Two independent
+    // reasons, not just "not implemented yet": (1) POSIX already has no gap
+    // to fill -- script_exec's deleted POSIX fork/execvpe path ALREADY used
+    // an explicit safe_vars allow-list, so extra_env alone (no widening
+    // needed) already reproduces it exactly, which is what this same PR's
+    // script_exec plugin change does; (2) Alex's ruling was scoped to
+    // preserving the WINDOWS leg's pre-existing behaviour specifically --
+    // extending a blanket "inherit everything" primitive to POSIX as well
+    // would be a materially different, unauthorized widening of A5 on the
+    // platform that never had this gap. A future caller with a genuine
+    // POSIX equivalent need would require its own explicit plan-gate
+    // ruling, not a silent extension of this flag's meaning.
+    bool inherit_parent_env = false;
+
     // B3: optional per-invocation resource caps, OFF (nullopt) by default --
     // RLIMIT_AS in particular breaks mmap-heavy tools like `log show`, so
     // these are opt-in per call site, never a blanket default.

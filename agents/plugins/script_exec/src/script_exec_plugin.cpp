@@ -18,17 +18,74 @@
  *   stdout|line_content
  *   exit_code|N
  *   status|ok/error/timeout
+ *
+ * All three modes route through yuzu::agent::run_bounded_subprocess
+ * (agents/core/src/subprocess_runner.cpp, ADR-3002) instead of this
+ * plugin's own private per-OS spawn paths (the old Win32 process-creation
+ * call on Windows; a raw POSIX spawn-and-exec pair on Linux/macOS) — the
+ * runner already provides no-shell argv exec, a bounded output capture, a
+ * deadline, and process-wide child-launch serialization internally, so this
+ * plugin no longer links against the shared launch-serialization lock
+ * header at all. script_exec_parsers.hpp's resolve_executable()/
+ * assemble_argv() are the pure decision layer around that call.
+ *
+ * ENVIRONMENT (PLAN-04, resolved — option (b), extend the runner):
+ * SubprocessOptions::extra_env (a0-runner-env-allowlist) lets this plugin
+ * preserve its pre-migration environment behaviour EXACTLY: the same seven
+ * names the deleted POSIX spawn path's safe_vars list kept (PATH, HOME,
+ * USER, LANG, LC_ALL, TERM, TZ) are read from THIS process's own
+ * environment at call time (parent_env_allowlist(), below — the impure
+ * shell, never the pure header) and passed through opts.extra_env on every
+ * mode. A name unset in the parent is simply not forwarded — EXCEPT for
+ * PATH and LC_ALL, the two names the runner's own default_launch_env()
+ * bakes into every launch regardless of extra_env (subprocess_launch_spec.hpp);
+ * extra_env can only REPLACE a base entry it names, so leaving those two
+ * unforwarded when the parent has them unset would let the runner's fixed
+ * default (PATH=/usr/bin:/bin:/usr/sbin:/sbin, LC_ALL=C) silently reappear.
+ * parent_env_allowlist() forwards an explicit empty-value override for
+ * those two names in that case instead, to neutralize the runner default
+ * (see its own comment for why an empty value is the closest available
+ * equivalent to unset here).
+ *
+ * One platform note, UPDATED by Alex at the A2-002 escalation (superseding
+ * the paragraph this replaces): the deleted Windows spawn path passed a
+ * null environment block to CreateProcessA, so its children inherited the
+ * FULL parent environment unfiltered — narrower than the POSIX safe_vars
+ * list, not equal to it. Alex ruled AGAINST narrowing that pre-existing
+ * Windows behaviour to match POSIX's seven names (an earlier draft of this
+ * migration did exactly that, and it was flagged and reversed). Windows
+ * instead uses the new, narrowly-scoped
+ * SubprocessOptions::inherit_parent_env (subprocess_runner.hpp — read that
+ * field's doc comment for the full contract, including its three explicit
+ * design points: extra_env interaction, security gating, and why it is a
+ * no-op on POSIX), set true only on this plugin's Windows leg below. The
+ * net effect: Windows children continue to receive the SAME full parent
+ * environment they always did pre-migration, with this plugin's seven-name
+ * allow-list still layered on top via extra_env exactly as on POSIX — so
+ * there is NO operator-visible environment change on either platform.
+ *
+ * Because the child's PATH is once again the parent's real PATH (via
+ * extra_env, not the runner's fixed four-directory default), do_exec's
+ * bare-name resolution reads that SAME captured PATH value (parent_env_allowlist()
+ * is called ONCE per action and its result reused for both resolution and
+ * the launch, rather than two independent getenv() reads) and probes it via
+ * resolve_executable — never the runner's own default allow-list PATH.
  */
 
 #include <yuzu/plugin.hpp>
 
-#include <array>
+#include "script_exec_parsers.hpp"
+
+#include <yuzu/agent/subprocess_runner.hpp>
+
 #include <chrono>
-#include <cstdio>
-#include <cstring>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
 #include <format>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -41,21 +98,23 @@
 #include <windows.h>
 #include <wincrypt.h>
 #pragma comment(lib, "Crypt32.lib")
-#else
-#include <yuzu/agent/fork_lock.hpp> // BR-001: process-wide fork/CLOEXEC serialization
-
-#include <csignal>
-#include <fcntl.h>
-#include <sys/wait.h>
-#include <unistd.h>
-#ifdef __APPLE__
-#include <crt_externs.h> // _NSGetEnviron
-#endif
 #endif
 
 namespace {
 
 constexpr size_t kMaxOutputBytes = 16 * 1024 * 1024; // 16 MiB hard output cap
+
+// The cwd resolve_executable's relative-path branch joins against. Matches
+// the runner's OWN default working_dir exactly (SubprocessOptions::working_dir
+// is left unset by every call below, so this is genuinely what the child
+// runs with) — "/" on POSIX; on Windows, subprocess_runner.cpp maps the "/"
+// sentinel it also defaults to onto "C:\Windows\System32" for the actual
+// spawn call, so that is the literal used here rather than "/".
+#ifdef _WIN32
+constexpr const char* kRunnerDefaultCwd = "C:\\Windows\\System32";
+#else
+constexpr const char* kRunnerDefaultCwd = "/";
+#endif
 
 // ── helper: parse timeout ──────────────────────────────────────────────────
 
@@ -76,322 +135,156 @@ int parse_timeout(yuzu::Params& params) {
     return val;
 }
 
-// ── Stream output from a file descriptor/handle with timeout ────────────
+// ── helper: parent environment allow-list (see file header) ────────────────
 
+// PATH and LC_ALL are the two names run_bounded_subprocess's own
+// default_launch_env() bakes into EVERY launch regardless of extra_env
+// (POSIX: PATH=/usr/bin:/bin:/usr/sbin:/sbin, LC_ALL=C --
+// subprocess_launch_spec.hpp). merge_launch_env() only REPLACES a base
+// entry that extra_env names; an unset name is left alone. So simply
+// omitting PATH/LC_ALL when the parent leaves them unset (this plugin's
+// "unset stays unset" rule for the other five names) would let the
+// runner's own default silently reappear in the child -- exactly the
+// operator-visible change this allow-list exists to prevent. LC_ALL unset
+// with only LANG set is the common real-world case this guards.
+//
+// An explicit empty-value override neutralizes the runner's default: for
+// LC_ALL, POSIX/glibc's locale-resolution algorithm treats "unset" and ""
+// identically (setlocale(3): an empty LC_ALL falls through to
+// LC_<category>/LANG exactly as an absent one does). For PATH the
+// empty-vs-unset distinction is a much narrower edge (a bare-name PATH
+// search treats "" as "search cwd only" rather than falling back to an
+// OS-default search path) -- but a parent process with NO PATH at all is
+// already vanishingly rare, and an explicit empty override is still closer
+// to "unset" than silently reintroducing the runner's fixed
+// /usr/bin:/bin:/usr/sbin:/sbin default would be.
+constexpr const char* kRunnerDefaultedNames[] = {"PATH", "LC_ALL"};
+
+bool is_runner_defaulted(std::string_view name) {
+    for (const char* defaulted : kRunnerDefaultedNames) {
+        if (name == defaulted)
+            return true;
+    }
+    return false;
+}
+
+std::vector<std::pair<std::string, std::string>> parent_env_allowlist() {
+    static constexpr const char* kNames[] = {"PATH", "HOME", "USER", "LANG",
+                                             "LC_ALL", "TERM", "TZ"};
+    std::vector<std::pair<std::string, std::string>> out;
+    for (const char* name : kNames) {
+        if (const char* val = std::getenv(name))
+            out.emplace_back(name, val);
+        else if (is_runner_defaulted(name))
+            out.emplace_back(name, std::string{});
+    }
+    return out;
+}
+
+// ── helper: real "would the runner be able to exec this" probe ─────────────
+
+// Reuses the runner's own probe semantics (yuzu::agent::probe_tool_path,
+// subprocess_runner.hpp) instead of a plugin-local existence check: POSIX =
+// regular file + access(X_OK); Windows = GetBinaryTypeW, a real
+// UTF-8-correct executable-image check -- not "exists and isn't a
+// directory," which would accept a non-PE file that the runner could never
+// actually spawn. probe_tool_path requires an ABSOLUTE candidate (mirrors
+// the runner's own argv[0] contract), which every candidate resolve_executable
+// probes here already is.
+bool is_executable_probe(const std::string& path) {
+    return !yuzu::agent::probe_tool_path({path}).empty();
+}
+
+// ── helper: run argv through the shared runner, emit the wire lines ────────
+
+int run_via_runner(yuzu::CommandContext& ctx, const std::vector<std::string>& argv,
+                   int timeout_secs,
+                   std::vector<std::pair<std::string, std::string>> extra_env) {
+    yuzu::agent::SubprocessOptions opts;
+    opts.deadline = std::chrono::seconds(timeout_secs);
+    // Both deleted spawn paths merged the child's stderr into the SAME
+    // stream as stdout (POSIX: dup2'd pipe_fd[1] onto both STDOUT_FILENO and
+    // STDERR_FILENO; Windows: si.hStdError = stdout_write) — preserve that.
+    opts.merge_stderr = true;
+    // ADR-3002's caller-configurable ceiling — the stored-blob bound that
+    // matches the caller-side on_line byte counter below.
+    opts.output_cap_bytes = kMaxOutputBytes;
+    // Caller-captured (see do_exec/do_bash/do_powershell) rather than read
+    // here via a fresh parent_env_allowlist() call: do_exec's PATH-based
+    // resolution and the env the child actually receives must observe the
+    // SAME snapshot of the parent's environment, not two independent
+    // getenv() reads that a concurrent environment mutation could split.
+    opts.extra_env = std::move(extra_env);
 #ifdef _WIN32
-
-int stream_from_handle(yuzu::CommandContext& ctx, HANDLE read_handle, HANDLE proc_handle,
-                       int timeout_secs) {
-    auto start = std::chrono::steady_clock::now();
-    bool timed_out = false;
-
-    std::string line_buf;
-    std::array<char, 512> buf{};
-
-    while (true) {
-        auto elapsed = std::chrono::steady_clock::now() - start;
-        if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() >= timeout_secs) {
-            timed_out = true;
-            TerminateProcess(proc_handle, 1);
-            break;
-        }
-
-        DWORD avail = 0;
-        if (!PeekNamedPipe(read_handle, nullptr, 0, nullptr, &avail, nullptr) || avail == 0) {
-            // Check if process is still alive
-            if (WaitForSingleObject(proc_handle, 10) != WAIT_TIMEOUT)
-                break;
-            continue;
-        }
-
-        DWORD bytes_read = 0;
-        if (!ReadFile(read_handle, buf.data(), static_cast<DWORD>(buf.size() - 1), &bytes_read,
-                      nullptr) ||
-            bytes_read == 0) {
-            break;
-        }
-
-        for (DWORD i = 0; i < bytes_read; ++i) {
-            if (buf[i] == '\n') {
-                while (!line_buf.empty() && line_buf.back() == '\r')
-                    line_buf.pop_back();
-                ctx.write_output(std::format("stdout|{}", line_buf));
-                line_buf.clear();
-            } else {
-                line_buf += buf[i];
-            }
-        }
-    }
-
-    // Flush remaining
-    if (!line_buf.empty()) {
-        while (!line_buf.empty() && (line_buf.back() == '\r' || line_buf.back() == '\n'))
-            line_buf.pop_back();
-        if (!line_buf.empty())
-            ctx.write_output(std::format("stdout|{}", line_buf));
-    }
-
-    DWORD exit_code = 0;
-    GetExitCodeProcess(proc_handle, &exit_code);
-
-    ctx.write_output(std::format("exit_code|{}", static_cast<int>(exit_code)));
-    if (timed_out) {
-        ctx.write_output("status|timeout");
-        return 1;
-    }
-    ctx.write_output(exit_code == 0 ? "status|ok" : "status|error");
-    return exit_code == 0 ? 0 : 1;
-}
-
-int run_process_win(yuzu::CommandContext& ctx, const std::string& cmd_line, int timeout_secs) {
-    SECURITY_ATTRIBUTES sa{};
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = TRUE;
-    sa.lpSecurityDescriptor = nullptr;
-
-    HANDLE stdout_read = nullptr;
-    HANDLE stdout_write = nullptr;
-    if (!CreatePipe(&stdout_read, &stdout_write, &sa, 0)) {
-        ctx.write_output("status|error");
-        ctx.write_output("exit_code|-1");
-        return 1;
-    }
-    SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
-
-    STARTUPINFOA si{};
-    si.cb = sizeof(si);
-    si.hStdOutput = stdout_write;
-    si.hStdError = stdout_write;
-    si.dwFlags |= STARTF_USESTDHANDLES;
-
-    PROCESS_INFORMATION pi{};
-
-    // CreateProcessA needs a mutable buffer
-    std::vector<char> cmd_buf(cmd_line.begin(), cmd_line.end());
-    cmd_buf.push_back('\0');
-
-    if (!CreateProcessA(nullptr, cmd_buf.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr,
-                        nullptr, &si, &pi)) {
-        CloseHandle(stdout_read);
-        CloseHandle(stdout_write);
-        ctx.write_output("status|error");
-        ctx.write_output("exit_code|-1");
-        return 1;
-    }
-
-    CloseHandle(stdout_write); // Close write end in parent
-
-    int result = stream_from_handle(ctx, stdout_read, pi.hProcess, timeout_secs);
-
-    CloseHandle(stdout_read);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    return result;
-}
-
-#else // POSIX
-
-int run_process_posix(yuzu::CommandContext& ctx, const std::vector<std::string>& argv,
-                      int timeout_secs) {
-    // BR-001: hold the process-wide fork lock across [pipe()..fork()] --
-    // macOS/BSD has no pipe2(), so an unrelated thread's fork() landing in
-    // this window could inherit these still-inheritable fds. Released in
-    // the PARENT right after fork() returns; the child inherits it locked
-    // and never touches it (see fork_lock.hpp's contract).
-    std::unique_lock<std::mutex> fork_pipe_lock(yuzu::agent::global_fork_lock());
-
-    int pipe_fd[2];
-    if (pipe(pipe_fd) != 0) {
-        ctx.write_output("status|error");
-        ctx.write_output("exit_code|-1");
-        return 1;
-    }
-
-    // Fail closed: fork_lock.hpp's release precondition requires CLOEXEC
-    // (F_SETFD, distinct from the O_NONBLOCK F_SETFL below) on both pipe
-    // ends before the lock is released, so a concurrent locked launcher
-    // forking in the unlock->close window can never inherit a live,
-    // non-CLOEXEC write end. A failed fcntl here is treated the same as a
-    // failed pipe() above rather than silently forking with a leaky fd.
-    if (fcntl(pipe_fd[0], F_SETFD, FD_CLOEXEC) == -1 ||
-        fcntl(pipe_fd[1], F_SETFD, FD_CLOEXEC) == -1) {
-        close(pipe_fd[0]);
-        close(pipe_fd[1]);
-        ctx.write_output("status|error");
-        ctx.write_output("exit_code|-1");
-        return 1;
-    }
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(pipe_fd[0]);
-        close(pipe_fd[1]);
-        ctx.write_output("status|error");
-        ctx.write_output("exit_code|-1");
-        return 1;
-    }
-
-    if (pid == 0) {
-        // Child — new session so we can kill the entire process group on timeout
-        setsid();
-
-        close(pipe_fd[0]);
-        dup2(pipe_fd[1], STDOUT_FILENO);
-        dup2(pipe_fd[1], STDERR_FILENO);
-        close(pipe_fd[1]);
-
-        // Sanitize environment: keep only safe variables
-        const char* safe_vars[] = {"PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "TZ"};
-        std::vector<std::string> env_storage;
-        std::vector<const char*> env_ptrs;
-        for (const char* name : safe_vars) {
-            const char* val = getenv(name);
-            if (val) {
-                env_storage.push_back(std::string(name) + "=" + val);
-                env_ptrs.push_back(env_storage.back().c_str());
-            }
-        }
-        env_ptrs.push_back(nullptr);
-
-        // Build argv for execvpe
-        std::vector<const char*> c_argv;
-        for (const auto& arg : argv) {
-            c_argv.push_back(arg.c_str());
-        }
-        c_argv.push_back(nullptr);
-
-#ifdef __linux__
-        execvpe(c_argv[0], const_cast<char* const*>(c_argv.data()),
-                const_cast<char* const*>(env_ptrs.data()));
-#elif defined(__APPLE__)
-        // macOS: no execvpe; set environment then exec
-        *_NSGetEnviron() = const_cast<char**>(env_ptrs.data());
-        execvp(c_argv[0], const_cast<char* const*>(c_argv.data()));
+    // A2-002 (Alex plan-gate ruling): reproduce the deleted CreateProcessA
+    // call's null-lpEnvironment behaviour -- Windows children continue to
+    // receive the FULL parent environment, with opts.extra_env (the
+    // seven-name allow-list above) still applying on top of it. See
+    // SubprocessOptions::inherit_parent_env's doc comment for the full
+    // contract; this is scoped to script_exec's Windows leg specifically
+    // (the one caller with a pre-existing full-inheritance behaviour to
+    // preserve), never a general default.
+    opts.inherit_parent_env = true;
 #endif
-        _exit(127); // exec failed
-    }
 
-    // Parent: fork() has returned and this is not the child branch --
-    // release the fork lock now (see fork_lock.hpp's contract).
-    fork_pipe_lock.unlock();
-
-    // Parent
-    close(pipe_fd[1]);
-
-    // Set read end to non-blocking
-    int flags = fcntl(pipe_fd[0], F_GETFL, 0);
-    fcntl(pipe_fd[0], F_SETFL, flags | O_NONBLOCK);
-
-    auto start = std::chrono::steady_clock::now();
-    bool timed_out = false;
-    bool output_truncated = false;
-    size_t total_output = 0;
-    std::string line_buf;
-    std::array<char, 512> buf{};
-
-    while (true) {
-        auto elapsed = std::chrono::steady_clock::now() - start;
-        if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() >= timeout_secs) {
-            timed_out = true;
-            kill(-pid, SIGKILL); // Kill entire process group
-            break;
+    // on_line delivers every line regardless of any runner-side cap
+    // (subprocess_runner.hpp), INCLUDING a fully blank completed line
+    // (A2-002 escalation, A2-006: the runner's store_line() now invokes
+    // on_line before its blank-line early return, matching both deleted
+    // spawn paths' behaviour of emitting a "stdout|" record for an empty
+    // line -- only the STORED SubprocessResult::lines/byte-cap accounting
+    // still excludes it), so the 16 MiB bound here is entirely caller-side:
+    // once exceeded, emit the existing truncation sentinel exactly once and
+    // suppress every further line while the runner drains the rest of the
+    // child's output.
+    bool truncated = false;
+    std::size_t total_bytes = 0;
+    opts.on_line = [&ctx, &truncated, &total_bytes](const std::string& line) {
+        if (truncated)
+            return;
+        // Counts only the line's own content bytes, not an assumed
+        // trailing newline: on_line's contract does not tell the caller
+        // whether the delivered line actually ended with a delimiter (the
+        // final line at EOF may not have), so adding a blanket "+1" could
+        // overcount an unterminated final line and trip the sentinel one
+        // line early. Undercounting the interior newlines by 1 byte each
+        // is immaterial at a 16 MiB cap.
+        total_bytes += line.size();
+        if (total_bytes > kMaxOutputBytes) {
+            truncated = true;
+            ctx.write_output("stdout|[output truncated — exceeded 16 MiB limit]");
+            return;
         }
+        ctx.write_output(std::format("stdout|{}", line));
+    };
 
-        if (output_truncated) {
-            // Drain remaining output without storing
-            auto n = read(pipe_fd[0], buf.data(), buf.size());
-            if (n <= 0) break;
-            continue;
-        }
+    auto run = yuzu::agent::run_bounded_subprocess(argv, opts);
 
-        auto n = read(pipe_fd[0], buf.data(), buf.size());
-        if (n > 0) {
-            total_output += static_cast<size_t>(n);
-            if (total_output > kMaxOutputBytes) {
-                output_truncated = true;
-                ctx.write_output("stdout|[output truncated — exceeded 16 MiB limit]");
-                continue;
-            }
-            for (ssize_t i = 0; i < n; ++i) {
-                if (buf[i] == '\n') {
-                    while (!line_buf.empty() && line_buf.back() == '\r')
-                        line_buf.pop_back();
-                    ctx.write_output(std::format("stdout|{}", line_buf));
-                    line_buf.clear();
-                } else {
-                    line_buf += buf[i];
-                }
-            }
-        } else if (n == 0) {
-            break; // EOF
-        } else {
-            // EAGAIN — no data yet, brief sleep
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                struct timespec ts = {0, 10'000'000}; // 10ms
-                nanosleep(&ts, nullptr);
-                continue;
-            }
-            break; // Real error
-        }
+    std::string status;
+    int exit_code = run.exit_code;
+    switch (run.termination_reason) {
+    case yuzu::agent::TerminationReason::deadline:
+    case yuzu::agent::TerminationReason::cancelled:
+        // cancelled has no old-code precedent (the deleted fork/exec paths
+        // had no cancellation concept at all) but is the same *shape* of
+        // outcome as a deadline on this plugin's wire protocol — the runner
+        // killed the child before it exited on its own — so it gets the
+        // same status token rather than a fabricated third case.
+        status = "timeout";
+        break;
+    case yuzu::agent::TerminationReason::spawn_error:
+        status = "error";
+        exit_code = -1;
+        break;
+    default: // exited, signaled, line_limit (line_limit is unreachable here:
+             // this plugin never sets max_lines/stop_after_max_lines)
+        status = (exit_code == 0) ? "ok" : "error";
+        break;
     }
-
-    close(pipe_fd[0]);
-
-    // Flush remaining
-    if (!line_buf.empty()) {
-        while (!line_buf.empty() && (line_buf.back() == '\r' || line_buf.back() == '\n'))
-            line_buf.pop_back();
-        if (!line_buf.empty())
-            ctx.write_output(std::format("stdout|{}", line_buf));
-    }
-
-    int status = 0;
-    waitpid(pid, &status, 0);
-    int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 
     ctx.write_output(std::format("exit_code|{}", exit_code));
-    if (timed_out) {
-        ctx.write_output("status|timeout");
-        return 1;
-    }
-    ctx.write_output(exit_code == 0 ? "status|ok" : "status|error");
-    return exit_code == 0 ? 0 : 1;
-}
-
-#endif
-
-// ── Split a string into arguments (simple whitespace split) ────────────
-
-std::vector<std::string> split_args(std::string_view s) {
-    std::vector<std::string> result;
-    std::string current;
-    bool in_quote = false;
-    char quote_char = 0;
-
-    for (size_t i = 0; i < s.size(); ++i) {
-        char ch = s[i];
-        if (in_quote) {
-            if (ch == quote_char) {
-                in_quote = false;
-            } else {
-                current += ch;
-            }
-        } else if (ch == '"' || ch == '\'') {
-            in_quote = true;
-            quote_char = ch;
-        } else if (ch == ' ' || ch == '\t') {
-            if (!current.empty()) {
-                result.push_back(std::move(current));
-                current.clear();
-            }
-        } else {
-            current += ch;
-        }
-    }
-    if (!current.empty()) {
-        result.push_back(std::move(current));
-    }
-    return result;
+    ctx.write_output(std::format("status|{}", status));
+    return status == "ok" ? 0 : 1;
 }
 
 // ── exec action ────────────────────────────────────────────────────────────
@@ -407,23 +300,39 @@ int do_exec(yuzu::CommandContext& ctx, yuzu::Params params) {
     int timeout = parse_timeout(params);
 
 #ifdef _WIN32
-    // On Windows, build a command line string for CreateProcess
-    // The program path and args are kept separate — no shell interpretation
-    std::string cmd_line = command;
-    if (!args_str.empty()) {
-        cmd_line += " " + args_str;
-    }
-    return run_process_win(ctx, cmd_line, timeout);
+    constexpr bool kWindowsRules = true;
 #else
-    // On POSIX, use execvp with an argv array — no shell interpretation
-    std::vector<std::string> argv;
-    argv.push_back(command);
-    if (!args_str.empty()) {
-        auto extra = split_args(args_str);
-        argv.insert(argv.end(), extra.begin(), extra.end());
-    }
-    return run_process_posix(ctx, argv, timeout);
+    constexpr bool kWindowsRules = false;
 #endif
+
+    // Captured ONCE and reused for both PATH-search resolution and the
+    // child's env below -- two independent getenv("PATH") reads could
+    // observe different values across a concurrent environment mutation,
+    // resolving the binary through one PATH but launching the child with
+    // another.
+    auto env_allowlist = parent_env_allowlist();
+    std::string_view path_value;
+    for (const auto& [name, value] : env_allowlist) {
+        if (name == "PATH") {
+            path_value = value;
+            break;
+        }
+    }
+    auto path_entries = yuzu::script_exec::split_path_entries(path_value, kWindowsRules);
+
+    auto resolved = yuzu::script_exec::resolve_executable(
+        command, kRunnerDefaultCwd, path_entries, is_executable_probe, kWindowsRules);
+    if (!resolved) {
+        // Matches the deleted paths' own early-setup-failure shape: status
+        // before exit_code, unlike the post-runner-return order below.
+        ctx.write_output("status|error");
+        ctx.write_output("exit_code|-1");
+        return 1;
+    }
+
+    auto argv = yuzu::script_exec::assemble_argv(yuzu::script_exec::ExecMode::exec, *resolved,
+                                                 args_str, "");
+    return run_via_runner(ctx, argv, timeout, std::move(env_allowlist));
 }
 
 // ── powershell action ──────────────────────────────────────────────────────
@@ -460,10 +369,9 @@ int do_powershell(yuzu::CommandContext& ctx, yuzu::Params params) {
                          CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, b64.data(), &b64_len);
     b64.resize(b64_len);
 
-    auto cmd_line =
-        std::format("powershell.exe -NoProfile -NonInteractive -EncodedCommand {}", b64);
-
-    return run_process_win(ctx, cmd_line, timeout);
+    auto argv =
+        yuzu::script_exec::assemble_argv(yuzu::script_exec::ExecMode::powershell, "", "", b64);
+    return run_via_runner(ctx, argv, timeout, parent_env_allowlist());
 #endif
 }
 
@@ -483,37 +391,39 @@ int do_bash(yuzu::CommandContext& ctx, yuzu::Params params) {
 
     int timeout = parse_timeout(params);
 
-    // Pass script as a single argument to bash -c via execvp (no shell expansion)
-    std::vector<std::string> argv = {"/bin/bash", "-c", script};
-    return run_process_posix(ctx, argv, timeout);
+    // Pass script as a single argv element to bash -c (no shell expansion
+    // by this outer spawn — bash itself is the interpreter, ADR-3002
+    // Decision 5).
+    auto argv = yuzu::script_exec::assemble_argv(yuzu::script_exec::ExecMode::bash, "", "", script);
+    return run_via_runner(ctx, argv, timeout, parent_env_allowlist());
 #endif
 }
 
 // ── ABI4 capability declarations (#2204) ────────────────────────────────────
 //
-// exec: CreateProcess (Windows) / fork+execvp (POSIX) with a pre-split argv
-// -- no shell interpretation of any kind (the code's own comments say so
-// explicitly) -- rung 2 on every OS.
+// exec: clean pre-split argv through yuzu::agent::run_bounded_subprocess --
+// no shell interpretation of any kind -- rung 2 on every OS.
 // powershell: spawns powershell.exe directly (no /bin/sh wrapper), but
 // PowerShell is itself a scripting interpreter executing the caller's
 // script text -- an interpreter payload, rung 3, same principle as
 // interaction's osascript leg. Windows-only; the code returns an explicit
 // "Windows-only" error elsewhere.
-// bash: execvp({"/bin/bash", "-c", script}) -- bash is the interpreter
-// executing the caller's script text -- rung 3. Linux/macOS only; the code
-// returns an explicit "not available on Windows" error there.
+// bash: {"/bin/bash", "-c", script} through the same runner -- bash is the
+// interpreter executing the caller's script text -- rung 3. Linux/macOS
+// only; the code returns an explicit "not available on Windows" error there.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {"exec",
-     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 2, "fork_execvp", nullptr},
-     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 2, "fork_execvp", nullptr},
-     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 2, "create_process", nullptr}},
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 2, "subprocess_runner:direct_argv", nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 2, "subprocess_runner:direct_argv", nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 2, "subprocess_runner:direct_argv", nullptr}},
     {"powershell",
      /* linux   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
      /* macos   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
-     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 3, "powershell_encodedcommand", nullptr}},
+     /* windows = */
+     {YUZU_SUPPORT_SUPPORTED, 3, "subprocess_runner:powershell_encodedcommand", nullptr}},
     {"bash",
-     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "bash_c", nullptr},
-     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 3, "bash_c", nullptr},
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "subprocess_runner:bash_c", nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 3, "subprocess_runner:bash_c", nullptr},
      /* windows = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr}},
 };
 
