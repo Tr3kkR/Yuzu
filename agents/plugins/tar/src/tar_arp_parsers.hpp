@@ -41,6 +41,19 @@ namespace yuzu::tar {
 struct ProcNetArpParse {
     std::vector<ArpEntry> entries;
     bool truncated{false};
+    // BR4-005 (round 4): true when at least one non-blank, non-header row
+    // failed to tokenize into all 6 columns or carried an unparseable Flags
+    // value. A malformed row is a MISSING binding relative to a genuinely
+    // complete table -- diffing the surviving subset against the last
+    // COMPLETE snapshot would record that omission as a false `removed`
+    // event (and a false compensating `appeared` once the row parses
+    // cleanly next tick). The parser still decodes every row around the
+    // malformed one (kept in `entries`, for diagnostics -- e.g. logging the
+    // raw incomplete-capture reason) rather than aborting outright; it is
+    // the CALLER (enumerate_arp(), tar_arp_collector.cpp) that turns this
+    // flag into an IncompleteCaptureError throw, mirroring how `truncated`
+    // is only acted on there too.
+    bool malformed{false};
 };
 
 namespace detail {
@@ -75,11 +88,17 @@ inline std::string arp_entry_type_for_flags(unsigned long flags) {
 ///
 /// The header line is always skipped (first non-blank line, unconditionally
 /// — /proc/net/arp always emits one). A row that doesn't tokenize into all
-/// 6 columns, or whose Flags column isn't parseable as a number, is skipped
-/// rather than thrown — same defensive tolerance as the Windows leg's
-/// ip_address.empty() skip. Incomplete rows (Flags 0x0, HW address
-/// 00:00:00:00:00:00) are KEPT — parity with the Windows leg reporting
-/// NlnsIncomplete/Unreachable rows rather than dropping them. Stops at `cap`
+/// 6 columns, or whose Flags column isn't parseable as a number, is DROPPED
+/// from `entries` (the surrounding valid rows still decode — same
+/// defensive tolerance as the Windows leg's ip_address.empty() skip) but
+/// sets `out.malformed = true` (BR4-005, round 4) rather than passing
+/// silently: a malformed row is a missing binding relative to a genuinely
+/// complete table, and the CALLER (enumerate_arp(), tar_arp_collector.cpp)
+/// throws IncompleteCaptureError on that flag rather than diffing the
+/// surviving subset as though it were complete. Incomplete rows (Flags
+/// 0x0, HW address 00:00:00:00:00:00) are KEPT and NOT malformed — parity
+/// with the Windows leg reporting NlnsIncomplete/Unreachable rows rather
+/// than dropping them. Stops at `cap`
 /// entries and sets `truncated`, exactly like the Windows leg's own
 /// kArpEntryCap enforcement.
 inline ProcNetArpParse parse_proc_net_arp(const std::string& text,
@@ -101,17 +120,25 @@ inline ProcNetArpParse parse_proc_net_arp(const std::string& text,
 
         std::istringstream cols(line);
         std::string ip, hw_type, flags_str, mac, mask, device;
-        if (!(cols >> ip >> hw_type >> flags_str >> mac >> mask >> device))
-            continue; // short/malformed row — tolerate, skip
+        if (!(cols >> ip >> hw_type >> flags_str >> mac >> mask >> device)) {
+            out.malformed = true; // BR4-005: short row — a missing binding, not tolerated silently
+            continue;
+        }
 
-        if (flags_str.front() == '-')
-            continue; // negative token — strtoul would silently wrap it unsigned, skip instead
+        if (flags_str.front() == '-') {
+            // negative token — strtoul would silently wrap it unsigned, skip instead
+            out.malformed = true; // BR4-005
+            continue;
+        }
 
         char* endp = nullptr;
         errno = 0;
         const unsigned long flags = std::strtoul(flags_str.c_str(), &endp, 0);
-        if (endp == flags_str.c_str() || *endp != '\0' || errno == ERANGE)
-            continue; // not a fully-consumed, in-range number — malformed, skip
+        if (endp == flags_str.c_str() || *endp != '\0' || errno == ERANGE) {
+            // not a fully-consumed, in-range number — malformed, skip
+            out.malformed = true; // BR4-005
+            continue;
+        }
 
         // Checked BEFORE constructing/pushing the candidate row (round 3,
         // B3-004/B3-005): would_exceed_cap is the same shared decision the

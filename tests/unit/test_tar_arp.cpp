@@ -63,6 +63,7 @@ TEST_CASE("parse_proc_net_arp decodes the real captured /proc/net/arp text",
           "[tar][arp][parse]") {
     const auto parsed = parse_proc_net_arp(kRealProcNetArp);
     CHECK_FALSE(parsed.truncated);
+    CHECK_FALSE(parsed.malformed); // BR4-005: a clean real capture is not malformed
     REQUIRE(parsed.entries.size() == 3);
 
     // Header row consumed, not emitted as a (malformed) entry.
@@ -86,8 +87,17 @@ TEST_CASE("parse_proc_net_arp decodes the real captured /proc/net/arp text",
     CHECK(parsed.entries[2].entry_type == "static");
 }
 
-TEST_CASE("parse_proc_net_arp tolerates malformed lines without dropping the rows around them",
+TEST_CASE("parse_proc_net_arp flags malformed lines but keeps the valid rows around them for "
+          "diagnostics -- BR4-005 (round 4)",
           "[tar][arp][parse]") {
+    // BR4-005: a malformed row used to be silently skipped with no signal
+    // that the table might be missing a real binding -- indistinguishable
+    // from a genuinely smaller, complete table once diffed. The parser
+    // still decodes every valid row around the junk (so a caller can log
+    // what it saw), but now also sets `malformed`; it is the CALLER
+    // (enumerate_arp(), tar_arp_collector.cpp) that turns that flag into an
+    // IncompleteCaptureError throw rather than diffing/persisting the
+    // subset as complete.
     const std::string text = kRealProcNetArp +
                               "too few columns\n"                                    // < 6 tokens
                               "\n"                                                    // blank line
@@ -96,12 +106,24 @@ TEST_CASE("parse_proc_net_arp tolerates malformed lines without dropping the row
 
     const auto parsed = parse_proc_net_arp(text);
     CHECK_FALSE(parsed.truncated);
-    // 3 real rows + the one trailing valid row; the 3 malformed/blank lines
-    // are skipped, not thrown, and don't stop the walk.
+    CHECK(parsed.malformed);
+    // 3 real rows + the one trailing valid row; the 2 malformed lines are
+    // dropped from `entries` (blank lines are not malformed at all — the
+    // parser's own header/blank-skip runs before the malformed checks) but
+    // don't stop the walk — the valid rows around them still decode.
     REQUIRE(parsed.entries.size() == 4);
     CHECK(parsed.entries[3].ip_address == "172.17.0.100");
     CHECK(parsed.entries[3].mac_address == "aa:bb:cc:dd:ee:ff");
     CHECK(parsed.entries[3].entry_type == "dynamic");
+}
+
+TEST_CASE("parse_proc_net_arp: a blank line alone does not set malformed -- BR4-005 (round 4)",
+          "[tar][arp][parse]") {
+    // Blank lines are ordinary formatting, not a missing binding — must not
+    // trip the same incomplete-capture signal a real malformed row does.
+    const auto parsed = parse_proc_net_arp(kRealProcNetArp + "\n\n");
+    CHECK_FALSE(parsed.malformed);
+    REQUIRE(parsed.entries.size() == 3);
 }
 
 TEST_CASE("parse_proc_net_arp caps at kArpEntryCap and sets truncated, using the named constant",

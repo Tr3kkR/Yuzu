@@ -286,6 +286,18 @@ std::vector<ArpEntry> enumerate_arp() {
 
     auto parsed = parse_proc_net_arp(buf.str(), kArpEntryCap);
 
+    // BR4-005 (round 4): a malformed row is a missing binding relative to a
+    // genuinely complete table -- diffing the surviving subset (parsed.entries
+    // still holds every row around it, kept for this log line's diagnostics)
+    // against the last COMPLETE snapshot would fabricate a false `removed`
+    // event for it. Same collect-or-retain contract as the cap-truncation
+    // throw just below.
+    if (parsed.malformed) {
+        spdlog::warn("TAR arp: malformed row in /proc/net/arp -- skipping diff, retaining "
+                     "previous baseline");
+        throw yuzu::tar::IncompleteCaptureError("TAR: malformed row in /proc/net/arp");
+    }
+
     // Rate-limit the cap-truncation warn (UP-7), exactly mirroring the
     // Windows leg's s_arp_cap_warned pattern above: once when it begins,
     // reset once a subsequent read comes back under the cap.
