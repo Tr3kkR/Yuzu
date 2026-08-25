@@ -5580,6 +5580,13 @@ public:
         // reads feed auth/OIDC behaviour, so serving degraded here is a
         // fail-open, not a benign default.
         //
+        // NO backfill (ADR-0009's 2026-08-25 fresh-start-by-default
+        // amendment, ADR-0060): no production fleet has ever run a
+        // pre-Postgres Yuzu build, so there is no real legacy
+        // runtime-config.db to protect. The legacy file is never read; a
+        // one-time loud boot log records the deliberate reset (mirrors
+        // ResponseStore/ADR-0039).
+        //
         // Own SecretCodec instance (ADR-0010 per-store model, mirrors
         // plugin_config_store_'s construction sequence exactly, see that
         // block above): construct the codec first (ctor only), THEN
@@ -5619,18 +5626,12 @@ public:
                         startup_failed_ = true;
                     } else {
                         runtime_config_store_->set_metrics(&metrics_);
-                        auto rtcfg_db = cfg_.db_dir() / "runtime-config.db";
-                        if (!runtime_config_store_->migrate_from_sqlite(rtcfg_db)) {
-                            spdlog::error(
-                                "[PG] Refusing to start: runtime config legacy-SQLite backfill "
-                                "failed (see prior log lines) — runtime_config_store is "
-                                "AUTHORITATIVE operator-set config and must not serve "
-                                "partially-migrated data. Operator remediation: repair {} or move "
-                                "it aside to skip the backfill (overrides in it will NOT carry "
-                                "over)",
-                                rtcfg_db.string());
-                            startup_failed_ = true;
-                        } else if (!apply_runtime_config_overrides()) {
+                        spdlog::warn(
+                            "[PG] runtime config reset on Postgres cutover — the legacy "
+                            "runtime-config.db is not migrated (ADR-0009 fresh-start-by-default "
+                            "amendment, ADR-0060 skippable backfill class); operators reapply any "
+                            "Settings overrides (including OIDC configuration) once after upgrade");
+                        if (!apply_runtime_config_overrides()) {
                             spdlog::error(
                                 "[PG] Refusing to start: could not apply stored runtime config "
                                 "overrides at boot (see prior log lines) — a config read failure "

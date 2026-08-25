@@ -59,30 +59,22 @@
 /// own schema migration, and the caller runs `SecretCodec::init()` on a
 /// pinned lease right after construction returns (register-before-init).
 ///
-/// **Backfill (ADR-0009): mandatory, one-time, idempotent, fail-closed.**
-/// Operator-set runtime config is irreducible intent. `migrate_from_sqlite()`
-/// follows the `TagStore`/`RbacStore` post-#2703 reference shape (content
-/// fingerprint stamped with the completion marker in the SAME transaction
-/// via a monotonic-promotion upsert; holder-side verification on later
-/// boots) with ONE addition: secret-key rows never plain-copy (ADR-0009 /
-/// ADR-0040 "transform, never copy a secret column during backfill") — a
-/// non-empty legacy `oidc_client_secret` is ENCRYPTED during the copy,
-/// landing in `runtime_config_secrets`, never in the plaintext table. Row
-/// conflicts are DIRECTION-AWARE for non-secret keys (`TagStore`'s
-/// updated_at comparison: a Postgres row strictly ahead, or identical, is a
-/// benign no-op; a legacy row strictly ahead, or a tied `updated_at` with
-/// differing content, fails the backfill closed). Secret keys use a
-/// SIMPLER rule per the kickoff review: an envelope blob does not
-/// byte-compare against legacy plaintext, so ANY existing Postgres content
-/// for a secret key (`runtime_config_secrets` row present, OR a non-empty
-/// `runtime_config` row) wins unconditionally — the legacy value is
-/// skipped as a benign no-op, never compared or overwritten.
+/// **Backfill: SKIPPED unconditionally (ADR-0009's 2026-08-25
+/// fresh-start-by-default amendment).** No `migrate_from_sqlite()` — the
+/// legacy `runtime-config.db` is never read. No production fleet has ever
+/// run a pre-Postgres Yuzu build, so there is no real operator-set legacy
+/// config anywhere to protect; the original per-store-ADR "mandatory
+/// backfill for config/reference stores" default assumed a live fleet that
+/// has never existed. On cutover the server logs a one-time loud boot line
+/// (`server.cpp`'s construction site) noting the reset, mirroring
+/// `ResponseStore`/ADR-0039's reference shape for the skippable class —
+/// operators reapply Settings overrides (including `oidc_client_secret`)
+/// once after upgrading past this release.
 
 #include "config_secret_keys.hpp"
 
 #include <cstdint>
 #include <expected>
-#include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
@@ -128,14 +120,11 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
-    /// Wire a metrics registry for the backfill-result counter
-    /// (`yuzu_server_runtime_config_backfill_total{result}`) and the read
-    /// accessors' degrade counter (`yuzu_server_runtime_config_read_degrade_total{reason}`,
-    /// matching ProductPackStore/CustomPropertiesStore's #1675 convention).
-    /// Set ONCE during single-threaded startup — BEFORE `migrate_from_sqlite()`
-    /// (#3261/#3294 wiring-order class), so the backfill counter is live on
-    /// the one pass that matters. A null registry (the default, e.g. in unit
-    /// tests) disables emission.
+    /// Wire a metrics registry for the read accessors' degrade counter
+    /// (`yuzu_server_runtime_config_read_degrade_total{reason}`, matching
+    /// ProductPackStore/CustomPropertiesStore's #1675 convention). Set ONCE
+    /// during single-threaded startup. A null registry (the default, e.g.
+    /// in unit tests) disables emission.
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
 
     /// THE THREE PLAIN READ ACCESSORS REDACT; plaintext requires a
@@ -206,9 +195,8 @@ public:
     /// becomes-secret-later transform: a non-empty value is encrypted and
     /// written to `runtime_config_secrets`, and any stale plaintext row for
     /// the same key in `runtime_config` (left over from before the key was
-    /// classified secret, or from a legacy SQLite backfill row not yet
-    /// re-written) is deleted in the SAME transaction. An empty value does
-    /// the reverse: any `runtime_config_secrets` row is deleted, and
+    /// classified secret) is deleted in the SAME transaction. An empty value
+    /// does the reverse: any `runtime_config_secrets` row is deleted, and
     /// `runtime_config` gets `value=''` (so `updated_by`/`updated_at`
     /// survive an explicit clear).
     ///
@@ -228,15 +216,6 @@ public:
     /// transitional becomes-secret-later state can have a stale row in
     /// each. Returns true if either delete removed a row.
     bool remove(const std::string& key);
-
-    /// Legacy-SQLite backfill (ADR-0009). Call once at server startup,
-    /// before serving, after construction has proven the Postgres schema is
-    /// open. Idempotent (content-fingerprinted, `TagStore`'s reference
-    /// shape). Fails CLOSED on any error. Returns true (no-op) when
-    /// `legacy_db_path` does not exist or holds no `runtime_config` table
-    /// (fresh install). See the file header for the secret-key transform
-    /// and direction-aware conflict rules.
-    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
     /// Check if a key is in the allow-list of safe runtime-configurable keys.
     static bool is_allowed_key(const std::string& key);

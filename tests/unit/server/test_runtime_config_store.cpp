@@ -1,15 +1,16 @@
 // RuntimeConfigStore tests (ADR-0060) — general store behaviour. Redaction
 // specifically is covered in test_runtime_config_secret_redaction.cpp; this
 // file covers CRUD, updated_by/updated_at semantics, the SecretCodec
-// envelope round-trip, the plaintext-legacy -> envelope backfill transform,
+// envelope round-trip, the becomes-secret-later transitional-row transform,
 // the empty-secret rule at the storage layer, and degrade-distinguishable
 // reads (ADR-0036) — there was no general store test file before this PR.
+// No backfill coverage: ADR-0009's fresh-start-by-default amendment means
+// this store never reads a legacy SQLite file.
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
 #include <cstdlib>
-#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -20,12 +21,10 @@
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
 #include "runtime_config_store.hpp"
-#include "sqlite_raii.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <libpq-fe.h>
-#include <sqlite3.h>
 
 using yuzu::server::FileKeyProvider;
 using yuzu::server::RuntimeConfigEntry;
@@ -106,58 +105,12 @@ TEST_CASE("RuntimeConfigStore opens on a fresh Postgres and migrates once",
     CHECK(store2.is_open());
 }
 
-// ── Backfill (ADR-0009) — each case constructs its OWN store against its
-//    OWN per-test database (YUZU_REQUIRE_PG_DB), since these exercise
-//    fresh/empty-database behaviour a shared template's clone can't. ───────
+// ── Store-behaviour tests: pre-migrated template (§7) ───────────────────────
+//
+// No backfill section: ADR-0009's 2026-08-25 fresh-start-by-default amendment
+// means this store never reads a legacy SQLite file (see the header doc).
 
 namespace {
-
-struct TempSqliteFile {
-    std::filesystem::path path;
-    explicit TempSqliteFile(const std::string& prefix)
-        : path(yuzu::test::unique_temp_path(prefix)) {}
-    ~TempSqliteFile() {
-        std::error_code ec;
-        std::filesystem::remove(path, ec);
-        const std::string stem = path.filename().string() + ".migrated-";
-        std::error_code dir_ec;
-        for (const auto& entry : std::filesystem::directory_iterator(path.parent_path(), dir_ec)) {
-            if (entry.path().filename().string().starts_with(stem))
-                std::filesystem::remove(entry.path(), ec);
-        }
-    }
-    TempSqliteFile(const TempSqliteFile&) = delete;
-    TempSqliteFile& operator=(const TempSqliteFile&) = delete;
-};
-
-struct LegacyRow {
-    std::string key, value, updated_by;
-    std::int64_t updated_at;
-};
-
-void write_legacy_runtime_config_db(const std::filesystem::path& path,
-                                    const std::vector<LegacyRow>& rows) {
-    yuzu::server::SqliteDb raw;
-    REQUIRE(sqlite3_open(path.string().c_str(), raw.addr()) == SQLITE_OK);
-    yuzu::server::SqliteErrMsg err;
-    REQUIRE(sqlite3_exec(raw.get(),
-                         "CREATE TABLE IF NOT EXISTS runtime_config (key TEXT PRIMARY KEY, value "
-                         "TEXT NOT NULL, updated_by TEXT NOT NULL DEFAULT '', updated_at INTEGER "
-                         "NOT NULL);",
-                         nullptr, nullptr, err.addr()) == SQLITE_OK);
-    for (const auto& r : rows) {
-        yuzu::server::SqliteStmt stmt;
-        REQUIRE(sqlite3_prepare_v2(raw.get(),
-                                   "INSERT INTO runtime_config (key, value, updated_by, "
-                                   "updated_at) VALUES (?, ?, ?, ?)",
-                                   -1, stmt.addr(), nullptr) == SQLITE_OK);
-        sqlite3_bind_text(stmt.get(), 1, r.key.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt.get(), 2, r.value.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt.get(), 3, r.updated_by.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt.get(), 4, r.updated_at);
-        REQUIRE(sqlite3_step(stmt.get()) == SQLITE_DONE);
-    }
-}
 
 /// Fully-wired store for a test case: fresh keys dir, fresh codec, fresh
 /// pool, `codec.init()` run in the correct order. Callers keep this alive
@@ -188,93 +141,6 @@ std::size_t count_rows(const std::string& dsn, const char* table) {
 }
 
 } // namespace
-
-TEST_CASE("RuntimeConfigStore: backfill with no legacy file marks complete (fresh install)",
-          "[pg][runtime_config][backfill]") {
-    YUZU_REQUIRE_PG_DB(db);
-    Wired w{db.dsn()};
-    TempSqliteFile legacy("yuzu_test_rtcfg_nofile_");
-    CHECK(w.store.migrate_from_sqlite(legacy.path));
-    // Idempotent re-run.
-    CHECK(w.store.migrate_from_sqlite(legacy.path));
-}
-
-TEST_CASE("RuntimeConfigStore: backfill copies non-secret keys and encrypts a legacy secret",
-          "[pg][runtime_config][backfill]") {
-    YUZU_REQUIRE_PG_DB(db);
-    Wired w{db.dsn()};
-    TempSqliteFile legacy("yuzu_test_rtcfg_backfill_");
-    write_legacy_runtime_config_db(
-        legacy.path, {{"log_level", "debug", "admin", 1700000000},
-                      {"oidc_client_secret", "legacy-plaintext-secret", "admin", 1700000001}});
-    REQUIRE(w.store.migrate_from_sqlite(legacy.path));
-
-    // Non-secret key copied as-is.
-    CHECK(w.store.get_value("log_level") == "debug");
-
-    // Secret key: the real value decrypts correctly, and no plaintext ever
-    // landed in the plain table.
-    CHECK(w.store.get_value_with_secrets("oidc_client_secret") == "legacy-plaintext-secret");
-    CHECK(count_rows(db.dsn(), "runtime_config_store.runtime_config_secrets") == 1);
-    // Legacy file moved aside on success (ADR-0009 rollback window).
-    CHECK_FALSE(std::filesystem::exists(legacy.path));
-}
-
-TEST_CASE("RuntimeConfigStore: backfill keeps Postgres's existing secret over legacy plaintext",
-          "[pg][runtime_config][backfill]") {
-    // Envelopes don't byte-compare against legacy plaintext (kickoff review):
-    // ANY existing Postgres content for a secret key wins unconditionally.
-    YUZU_REQUIRE_PG_DB(db);
-    Wired w{db.dsn()};
-    REQUIRE(w.store.set("oidc_client_secret", "already-set-in-pg", "operator").has_value());
-
-    TempSqliteFile legacy("yuzu_test_rtcfg_secretwins_");
-    write_legacy_runtime_config_db(legacy.path,
-                                   {{"oidc_client_secret", "legacy-value-should-be-ignored",
-                                     "admin", 1700000000}});
-    REQUIRE(w.store.migrate_from_sqlite(legacy.path));
-    CHECK(w.store.get_value_with_secrets("oidc_client_secret") == "already-set-in-pg");
-}
-
-TEST_CASE("RuntimeConfigStore: backfill fails closed when a legacy non-secret row is strictly "
-          "ahead of Postgres",
-          "[pg][runtime_config][backfill]") {
-    YUZU_REQUIRE_PG_DB(db);
-    Wired w{db.dsn()};
-    REQUIRE(w.store.set("log_level", "info", "operator").has_value());
-    auto stored = w.store.get("log_level");
-    REQUIRE(stored.has_value());
-    REQUIRE(stored->has_value());
-    const auto pg_updated_at = (*stored)->updated_at;
-
-    TempSqliteFile legacy("yuzu_test_rtcfg_ahead_");
-    write_legacy_runtime_config_db(legacy.path,
-                                   {{"log_level", "trace", "admin", pg_updated_at + 1000}});
-    CHECK_FALSE(w.store.migrate_from_sqlite(legacy.path));
-    // The refused backfill must not have clobbered Postgres's value.
-    CHECK(w.store.get_value("log_level") == "info");
-    // ...and the legacy file must NOT have been consumed on a failed backfill.
-    CHECK(std::filesystem::exists(legacy.path));
-}
-
-TEST_CASE("RuntimeConfigStore: backfill of an empty legacy secret leaves no ciphertext row",
-          "[pg][runtime_config][backfill]") {
-    YUZU_REQUIRE_PG_DB(db);
-    Wired w{db.dsn()};
-    TempSqliteFile legacy("yuzu_test_rtcfg_emptysecret_");
-    write_legacy_runtime_config_db(legacy.path, {{"oidc_client_secret", "", "admin", 1700000000}});
-    REQUIRE(w.store.migrate_from_sqlite(legacy.path));
-
-    CHECK(w.store.get_value_with_secrets("oidc_client_secret").empty());
-    CHECK(count_rows(db.dsn(), "runtime_config_store.runtime_config_secrets") == 0);
-    // The empty value still materializes as a row (attribution survives).
-    auto e = w.store.get_with_secrets("oidc_client_secret");
-    REQUIRE(e.has_value());
-    REQUIRE(e->has_value());
-    CHECK((*e)->updated_by == "admin");
-}
-
-// ── Store-behaviour tests: pre-migrated template (§7) ───────────────────────
 
 namespace {
 
@@ -434,7 +300,7 @@ TEST_CASE("RuntimeConfigStore: a stale legacy-plaintext row for a secret key is 
     // Simulates the becomes-secret-later transitional state: a plaintext row
     // sitting in runtime_config for a key that IS classified secret today,
     // with no runtime_config_secrets row yet (as if it were written by an
-    // older release, or a not-yet-re-encrypted backfill row).
+    // older release, before the key was classified secret).
     YUZU_REQUIRE_PG_DB_TPL(db, rtcfg_store_tpl);
     Wired w{db.dsn()};
 

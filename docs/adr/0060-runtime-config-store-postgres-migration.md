@@ -5,8 +5,9 @@ owner: platform (Postgres substrate migration program)
 deciders: parallel wave batch-8 migration worker — the LAST un-started store on
   `docs/postgres-migration-ladder.md`
 scope: server — `RuntimeConfigStore` (persistent runtime configuration overrides), its cutover
-  from SQLite to PostgreSQL, its ADR-0009 backfill, and the ADR-0010 secrets seam for
-  `oidc_client_secret` — the store's own per-KEY (not per-column) secrecy model
+  from SQLite to PostgreSQL (ADR-0009's fresh-start-by-default class — no backfill), and the
+  ADR-0010 secrets seam for `oidc_client_secret` — the store's own per-KEY (not per-column)
+  secrecy model
 builds-on: ADR-0006 (Postgres substrate), ADR-0007 (single-backend, no SQLite fallback),
   ADR-0008 (substrate architecture), ADR-0009 (per-store first-boot backfill cutover),
   ADR-0010 (secrets-at-rest envelope encryption), ADR-0012 (server Postgres store contract),
@@ -35,8 +36,8 @@ header comment.
 This is the LAST un-started store on `docs/postgres-migration-ladder.md`'s Wave 3 (secret-gated)
 table — every other server store either has already migrated to Postgres or is in flight
 (`WebhookStore`/ADR-0057, `InstructionStore`/ADR-0058, `OffloadTargetStore`/ADR-0059, all pending
-review at the time of this ADR). When this merges, every server store is on the Postgres
-substrate (NvdDatabase excluded by a recorded owner override, M1a).
+review at the time of this ADR, and not part of this change). Once all four land, every server
+store is on the Postgres substrate (NvdDatabase excluded by a recorded owner override, M1a).
 
 **The headline problem this ADR resolves is per-KEY, not per-column, secrecy.** Unlike
 `WebhookStore`/`OffloadTargetStore` (one secret column per row) or `AuthDB` (one secret column,
@@ -66,11 +67,6 @@ CREATE TABLE runtime_config_secrets (
     sealed_value BYTEA NOT NULL,
     updated_by   TEXT NOT NULL DEFAULT '',
     updated_at   BIGINT NOT NULL
-);
-
-CREATE TABLE runtime_config_meta (
-    key    TEXT PRIMARY KEY,
-    value  TEXT NOT NULL
 );
 ```
 
@@ -112,8 +108,8 @@ never silently lost, just not yet encrypted. `set()` is the ONLY path that mater
 transform: writing a non-empty value for a secret key encrypts it into
 `runtime_config_secrets` AND deletes any stale `runtime_config` row for the same key in the SAME
 transaction, so the plaintext echo does not persist past the next write. "Next write envelopes
-it" is the accepted answer, matching this ADR's own backfill precedent (below) rather than a
-retroactive re-encryption pass, which no other store on the ladder implements either.
+it" is the accepted answer rather than a retroactive re-encryption pass, which no other store on
+the ladder implements either.
 
 ### Posture: authoritative / fail-closed (ADR-0012 §1)
 
@@ -142,39 +138,32 @@ from the `--allow-unsigned-packs` CLI flag at boot (`server.cpp`), never from th
 future caller wires either into a genuine grant/enforce/skip decision, it must switch to
 `get()`/`get_with_secrets()`.
 
-### Backfill (ADR-0009): mandatory, fingerprinted, transform-not-copy for secrets
+### Backfill: SKIPPED unconditionally (ADR-0009's 2026-08-25 fresh-start-by-default amendment)
 
-`migrate_from_sqlite()` follows `TagStore`'s reference shape (content fingerprint + completion
-marker stamped together via a monotonic-promotion upsert on `runtime_config_meta`; holder-side
-fingerprint verification on a later boot that still holds its own legacy file) — `key` is
-IDENTITY, `value`/`updated_by`/`updated_at` are LIFECYCLE, same as `TagStore`'s
-`(agent_id, key)`/`value` split.
+ADR-0009's original text defaults config/reference stores to MANDATORY backfill, and an earlier
+draft of this ADR built exactly that: a `TagStore`-shaped `migrate_from_sqlite()` (content
+fingerprint + completion marker on a `runtime_config_meta` table, direction-aware conflict rules
+for non-secret keys, transform-not-copy encryption for `oidc_client_secret`, move-aside-on-success
+for the legacy file). ADR-0009 was amended (2026-08-25) to fresh-start-by-default: **no
+production fleet has ever run a pre-Postgres Yuzu build**, so the "protect a live fleet's data"
+premise the mandatory default assumed has never actually applied to any store on this ladder,
+`RuntimeConfigStore` included. Building and testing a fingerprinted, direction-aware,
+secret-transforming backfill path — the single most complex piece of this migration — protected
+against a scenario that has never existed.
 
-**Non-secret keys** use `TagStore`'s direction-aware conflict rule unchanged: identical ->
-benign no-op; Postgres strictly ahead on `updated_at` -> benign no-op (warned); legacy strictly
-ahead, or a tied `updated_at` with differing content -> fail closed (never silently discard the
-operator's later write).
+**This store now follows `ResponseStore`/ADR-0039's skippable-class reference shape, not
+`TagStore`'s mandatory one**: no `migrate_from_sqlite()`, no `runtime_config_meta` completion-marker
+table, no read of the legacy `runtime-config.db` at all. On cutover, `server.cpp`'s construction
+site logs a one-time warning ("runtime config reset on Postgres cutover") after a successful
+schema open, and the boot override pass (`apply_runtime_config_overrides()`) proceeds against
+whatever `runtime_config_store` already holds (empty, on a first Postgres boot). Operators reapply
+any Settings overrides — including `oidc_client_secret` — once after upgrading past this release;
+see `docs/user-manual/upgrading.md`.
 
-**Secret keys use a SIMPLER, different rule** — envelopes don't byte-compare against legacy
-plaintext, so direction-aware comparison is not meaningful. ANY existing Postgres content for a
-secret key (a `runtime_config_secrets` row, OR a non-empty `runtime_config` row — the
-becomes-secret-later fallback shape) wins UNCONDITIONALLY; the legacy value is skipped as a
-benign no-op, never compared, never used to overwrite. A non-empty legacy secret with no existing
-Postgres content is ENCRYPTED during the copy (ADR-0009/0040 "transform, never copy a secret
-column during backfill") — plaintext never lands in `runtime_config` for a key
-`is_secret_config_key` classifies as secret. An empty legacy secret backfills into the plain
-table (`value=''`), matching the empty-secret rule above.
-
-**Legacy-file disposition: move-aside-after-verified-complete** (`TagStore`'s shape, the newest
-precedent on the ladder) — a successful backfill moves the legacy `runtime-config.db` to
-`<path>.migrated-<timestamp>` rather than leaving it in place untouched (`ProductPackStore`'s
-choice). Reasoning: this store's legacy file is small, config-only, and holds no cross-replica
-erasure-consistency hazard (`ProductPackStore`'s uninstall-tombstone problem does not apply —
-nothing here is ever "deleted then potentially resurrected by a stale replica's legacy file"; a
-`remove()`'d key simply has no row, and a stale legacy file backfilling it again would only ever
-lose the direction-aware compare in the operator's favor or (for a secret) be unconditionally
-ignored). Move-aside keeps the rollback window (ADR-0009: retained one release) without adding
-tombstone machinery this store has no correctness need for.
+This is a DEVIATION from ADR-0009's stated "mandatory for config/reference stores" default,
+recorded here rather than silently taken: `RuntimeConfigStore` IS a config/reference store by that
+ADR's own classification, and the deviation rests entirely on the fresh-start amendment, not on
+any property specific to this store.
 
 ### `/readyz` / `/healthz`
 
@@ -191,8 +180,8 @@ that one `FileKeyProvider`, after `auth_secret_codec_` and `plugin_config_secret
 Construction sequence in `server.cpp` mirrors `PluginConfigStore`'s exactly: construct the codec
 (ctor only) -> construct `RuntimeConfigStore` (registers `runtime_config_secrets.sealed_value`
 immediately after its own schema migration) -> `SecretCodec::init()` on a pinned lease -> the
-ADR-0009 backfill -> the boot override pass. Any failure at any step is a fatal startup error
-(`startup_failed_ = true`), never a serve-degraded config plane.
+one-time fresh-start boot log -> the boot override pass. Any failure at any step is a fatal
+startup error (`startup_failed_ = true`), never a serve-degraded config plane.
 
 ## Considered and rejected
 
@@ -214,17 +203,22 @@ ADR-0009 backfill -> the boot override pass. Any failure at any step is a fatal 
   its callers expect and which would need its own transaction/failure-handling story for a
   scenario that (today) can never actually occur — `kSecretKeys` has exactly one entry and it
   has always been secret.
-- **Never mutating the legacy SQLite file (`ProductPackStore`'s choice).** Rejected — this store
-  has no erasure-consistency hazard that never-mutate exists to close, and `TagStore`'s
-  move-aside-on-success is the newer, simpler default absent a specific reason to deviate.
+- **A mandatory, fingerprinted `migrate_from_sqlite()`** (`TagStore`'s shape: content fingerprint +
+  completion marker, direction-aware conflict rules for non-secret keys, transform-not-copy
+  encryption for `oidc_client_secret`, move-aside-on-success for the legacy file) — an earlier
+  draft of this ADR built exactly this, per ADR-0009's original "mandatory for config/reference
+  stores" default. Rejected once ADR-0009 was amended (2026-08-25, fresh-start-by-default): no
+  production fleet has ever run a pre-Postgres Yuzu build, so there is no real legacy
+  `runtime-config.db` anywhere to protect, and the single most complex piece of this migration
+  would have existed solely to guard against a scenario that has never occurred. See the "Backfill"
+  section above.
 - **Adding a `scripts/test/test-upgrade-stack.sh` survival assertion for a runtime-config value
   (e.g. a `log_level` override + `oidc_client_secret` `is_set`) across the previous-release →
-  HEAD image swap.** Checked for precedent first: `git log` on that script shows only the
-  flagship `feat/pg-migrate-inventory-store` work added per-store assertions there — none of
-  `TagStore`/`PolicyStore`/`PluginConfigStore`/`ProductPackStore` (all migrated, all with their
-  own SQLite→Postgres backfill) added their own. Not an established per-migrated-store pattern to
-  match, so none added here either; `migrate_from_sqlite()`'s fingerprint-based idempotency is
-  exercised directly by `test_runtime_config_store.cpp`'s backfill test cases instead.
+  HEAD image swap.** Moot once backfill was dropped — there is nothing to survive the cutover by
+  design. (Checked for precedent before backfill was dropped: `git log` on that script showed only
+  the flagship `feat/pg-migrate-inventory-store` work added per-store assertions there — none of
+  `TagStore`/`PolicyStore`/`PluginConfigStore`/`ProductPackStore` added their own either, so this
+  was never an established per-migrated-store pattern to match.)
 
 ## Consequences
 
@@ -244,11 +238,15 @@ ADR-0009 backfill -> the boot override pass. Any failure at any step is a fatal 
 - `apply_runtime_config_overrides()` (boot) now returns `bool`; a read failure is a fatal startup
   error (`startup_failed_ = true`) rather than a silently-skipped override pass.
 - No REST/API-visible change to `GET /api/config`'s success-path JSON shape, `PUT
-  /api/config/:key`'s 200 response, or any Settings UI behavior — the migration is
-  storage-layer-only from an operator's perspective.
-- `test_runtime_config_store.cpp` is new (no general store test file existed pre-migration);
-  `test_runtime_config_secret_redaction.cpp` keeps every pre-migration assertion's INTENT, adapted
-  to the widened `std::expected` API and `PgTestTemplate` construction.
+  /api/config/:key`'s 200 response, or any Settings UI behavior beyond the one-time reset — the
+  migration is otherwise storage-layer-only from an operator's perspective.
+- **Every operator-set runtime config override is reset on upgrade to this release** — the one
+  operator-visible consequence of the fresh-start decision. `docs/user-manual/upgrading.md`
+  documents the one-time boot warning and the "reapply your overrides" instruction.
+- `test_runtime_config_store.cpp` is new (no general store test file existed pre-migration) and
+  has no backfill coverage by design; `test_runtime_config_secret_redaction.cpp` keeps every
+  pre-migration assertion's INTENT, adapted to the widened `std::expected` API and
+  `PgTestTemplate` construction.
 - `get_all_with_secrets()`/`get_with_secrets()` gain a `yuzu_server_runtime_config_read_degrade_total{reason}`
   counter (`store_not_open`/`pool_acquire_timeout`/`query_error`/`crypto_error`), matching
   `ProductPackStore`/`CustomPropertiesStore`'s #1675 observability convention.
