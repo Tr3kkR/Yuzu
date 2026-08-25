@@ -599,8 +599,14 @@ condition clears.
 > **`arp_enabled` / `dns_enabled` are new this release (ADR-0015) and also ship
 > off by default.** Expect both to read `false` in `tar.status` on upgrade; the
 > new `$ARP_*` / `$DNS_*` warehouse tables are created automatically and stay
-> empty until you opt in (Windows-only collectors today; Linux/macOS planned).
-> No data collection changes on upgrade from ARP/DNS. **GUI note:** after enabling a source
+> empty until you opt in. **ARP now collects on Windows, Linux, and macOS as of
+> this release** (previously Windows-only) — if you already set
+> `arp_enabled=true` fleet-wide (e.g. while only Windows agents could collect),
+> upgrading Linux/macOS agents starts them collecting neighbour IP/MAC/interface
+> records at the next `fast_interval` tick, with no separate notice. Set
+> `arp_enabled=false` before upgrading any endpoint where that new collection
+> is not yet approved, then re-enable once it is. DNS remains Windows-only, so
+> there is no DNS collection change on upgrade. **GUI note:** after enabling a source
 > (Capture-sources frame or `configure`), the first rows appear at the next
 > `fast_interval` tick (default 60 s) — an empty panel immediately after enabling
 > is expected, not a fault.
