@@ -203,6 +203,38 @@ int run_via_runner(yuzu::CommandContext& ctx, const std::vector<std::string>& ar
                    std::vector<std::pair<std::string, std::string>> extra_env) {
     yuzu::agent::SubprocessOptions opts;
     opts.deadline = std::chrono::seconds(timeout_secs);
+    // BR-002 (whole-branch review): this action is MUTATING (an operator-
+    // named program or an operator-authored bash/PowerShell script -- either
+    // can hold real state: a partially-written file, an in-flight package
+    // operation invoked from within the script, etc.). ADR-3002's
+    // "termination semantics for mutating tools" requires a mutating site to
+    // carry a nonzero soft-terminate grace, not just a generous deadline:
+    // on a deadline/cancel trigger the runner sends SIGTERM (Windows:
+    // CTRL_BREAK) to the process group first and waits this long for a
+    // voluntary exit before escalating to the unmodified hard kill, instead
+    // of an immediate SIGKILL with zero chance to unwind.
+    //
+    // 10s, chosen deliberately: this plugin's own deadline (parse_timeout,
+    // above) is ALREADY caller-configurable and generous (1-3600s, clamp
+    // unchanged from the deleted pre-migration spawn paths -- see that
+    // function's own history), so there is no deadline regression here to
+    // fix, only the missing grace. Pre-migration behaviour on BOTH
+    // platforms was an immediate hard kill with NO grace at all (POSIX:
+    // `kill(-pid, SIGKILL)` straight to the process group; Windows: no
+    // kill call existed on timeout at all -- WaitForSingleObject just
+    // stopped waiting). Adding a bounded 10s unwind window is therefore a
+    // strict improvement over pre-migration behaviour, not a parity
+    // requirement -- kept short because, unlike content_dist's staged
+    // installers (content_dist_exec_parsers.hpp), an arbitrary operator
+    // script has no known "generous" unwind time to size against, and a
+    // short bounded grace is cheap insurance against an immediate SIGKILL
+    // without materially extending the worst-case admin-triggered runtime.
+    // xplat-A2 note (subprocess_runner.hpp): on Windows this delivers via
+    // GenerateConsoleCtrlEvent, which reliably fails for the console-less
+    // agent SERVICE and escalates straight to the hard kill -- the grace is
+    // effectively POSIX-only for this deployment shape, same caveat as
+    // every other mutating site that sets it.
+    opts.soft_terminate_grace = std::chrono::seconds(10);
     // Both deleted spawn paths merged the child's stderr into the SAME
     // stream as stdout (POSIX: dup2'd pipe_fd[1] onto both STDOUT_FILENO and
     // STDERR_FILENO; Windows: si.hStdError = stdout_write) — preserve that.
