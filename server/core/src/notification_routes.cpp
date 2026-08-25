@@ -62,11 +62,20 @@ void NotificationRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, P
                          R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
                          "application/json");
                      return;
-                 }
-                 auto id = std::stoll(req.matches[1].str());
-                 notification_store->mark_read(id);
-                 res.set_content(R"({"status":"ok"})", "application/json");
-             });
+                  }
+                  int64_t id;
+                  try {
+                      id = std::stoll(req.matches[1].str());
+                  } catch (const std::out_of_range&) {
+                      res.status = 404;
+                      res.set_content(
+                          R"({"error":{"code":404,"message":"notification not found"},"meta":{"api_version":"v1"}})",
+                          "application/json");
+                      return;
+                  }
+                  notification_store->mark_read(id);
+                  res.set_content(R"({"status":"ok"})", "application/json");
+              });
 
     // POST /api/notifications/:id/dismiss — dismiss notification
     svr.Post(R"(/api/notifications/(\d+)/dismiss)",
@@ -81,7 +90,16 @@ void NotificationRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, P
                          "application/json");
                      return;
                  }
-                 auto id = std::stoll(req.matches[1].str());
+                 int64_t id;
+                 try {
+                     id = std::stoll(req.matches[1].str());
+                 } catch (const std::out_of_range&) {
+                     res.status = 404;
+                     res.set_content(
+                         R"({"error":{"code":404,"message":"notification not found"},"meta":{"api_version":"v1"}})",
+                         "application/json");
+                     return;
+                 }
                  notification_store->dismiss(id);
                  audit_fn(req, "notification.dismiss", "success", "notification",
                           std::to_string(id), "");

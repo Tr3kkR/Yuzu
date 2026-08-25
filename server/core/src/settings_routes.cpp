@@ -4179,7 +4179,16 @@ void SettingsRoutes::register_routes(
               [this](const httplib::Request& req, httplib::Response& res) {
                   if (!admin_fn_(req, res))
                       return;
-                  auto idx = static_cast<size_t>(std::stoul(req.matches[1].str()));
+                  size_t idx;
+                  try {
+                      idx = static_cast<size_t>(std::stoul(req.matches[1].str()));
+                  } catch (const std::out_of_range&) {
+                      res.status = 404;
+                      res.set_content(
+                          R"({"error":{"code":404,"message":"auto-approve rule not found"},"meta":{"api_version":"v1"}})",
+                          "application/json");
+                      return;
+                  }
                   auto rules = auto_approve_->list_rules();
                   if (idx < rules.size()) {
                       auto_approve_->set_enabled(idx, !rules[idx].enabled);
@@ -4191,7 +4200,16 @@ void SettingsRoutes::register_routes(
                 [this](const httplib::Request& req, httplib::Response& res) {
                     if (!admin_fn_(req, res))
                         return;
-                    auto idx = static_cast<size_t>(std::stoul(req.matches[1].str()));
+                    size_t idx;
+                    try {
+                        idx = static_cast<size_t>(std::stoul(req.matches[1].str()));
+                    } catch (const std::out_of_range&) {
+                        res.status = 404;
+                        res.set_content(
+                            R"({"error":{"code":404,"message":"auto-approve rule not found"},"meta":{"api_version":"v1"}})",
+                            "application/json");
+                        return;
+                    }
                     auto_approve_->remove_rule(idx);
                     spdlog::info("Auto-approve rule {} removed", idx);
                     res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");

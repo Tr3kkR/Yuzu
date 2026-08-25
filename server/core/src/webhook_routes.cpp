@@ -92,7 +92,16 @@ void WebhookRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn
                            "application/json");
                        return;
                    }
-                   auto id = std::stoll(req.matches[1].str());
+                   int64_t id;
+                   try {
+                       id = std::stoll(req.matches[1].str());
+                   } catch (const std::out_of_range&) {
+                       res.status = 404;
+                       res.set_content(
+                           R"({"error":{"code":404,"message":"webhook not found"},"meta":{"api_version":"v1"}})",
+                           "application/json");
+                       return;
+                   }
                    if (webhook_store->delete_webhook(id)) {
                        audit_fn(req, "webhook.delete", "success", "webhook",
                                 std::to_string(id), "");
@@ -117,7 +126,16 @@ void WebhookRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn
                         "application/json");
                     return;
                 }
-                auto webhook_id = std::stoll(req.matches[1].str());
+                int64_t webhook_id;
+                try {
+                    webhook_id = std::stoll(req.matches[1].str());
+                } catch (const std::out_of_range&) {
+                    res.status = 404;
+                    res.set_content(
+                        R"({"error":{"code":404,"message":"webhook not found"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
                 int limit = 50;
                 auto limit_str = req.get_param_value("limit");
                 if (!limit_str.empty()) {
