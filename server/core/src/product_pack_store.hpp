@@ -57,6 +57,8 @@
 /// storage hygiene only; it does not re-verify the Ed25519 signature over the sanitized bytes —
 /// `verify_signature` runs once, before sanitization, over the exact bytes that were signed.
 
+#include "store_errors.hpp"
+
 #include <atomic>
 #include <cstdint>
 #include <expected>
@@ -79,9 +81,11 @@ namespace yuzu::server {
 /// Machine-checkable prefix on every `ProductPackStore` `unexpected()` that represents a genuine
 /// DB/lease failure rather than caller-input validation, a signature/policy rejection, or a
 /// not-found error (mirrors `LicenseStore::kLicenseDbErrorPrefix` / `AccessReviewStore`'s
-/// `"not_found: "` idiom). Callers classify: `"not_found:"` prefix -> 404, this prefix -> 503,
-/// else -> 400 (see `workflow_routes.cpp`'s `product_pack_error_status`).
-inline constexpr const char* kProductPackDbErrorPrefix = "db_error: ";
+/// `"not_found: "` idiom, and `InstructionStore::kInstructionStoreDbErrorPrefix` — both alias
+/// the single shared `kDbErrorPrefix`, `store_errors.hpp`). Callers classify: `"not_found:"`
+/// prefix -> 404, this prefix -> 503, else -> 400 (see `workflow_routes.cpp`'s
+/// `product_pack_error_status`).
+inline constexpr std::string_view kProductPackDbErrorPrefix = kDbErrorPrefix;
 
 // ── Data types ───────────────────────────────────────────────────────────────
 

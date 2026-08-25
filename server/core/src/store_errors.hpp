@@ -35,4 +35,15 @@ inline bool is_conflict_error(std::string_view msg) {
     return msg.rfind(kConflictPrefix, 0) == 0;
 }
 
+// Shared error-message prefix that migrated-store methods use to signal a genuine DB/lease
+// failure, distinct from not-found/validation (ADR-0036 typed-read policy; governance Gate 3
+// architect finding). Each store previously defined its own independent
+// `"db_error: "` literal (`kInstructionStoreDbErrorPrefix`, `kProductPackDbErrorPrefix`) —
+// coupled only by string-equality convention, not by type, so a future store adopting a
+// differently-spelled prefix would silently fall into a caller's "tolerated" branch instead
+// of its "genuine failure, abort" branch (the exact class of bug found in
+// `ProductPackStore::uninstall`'s `ItemUninstallFn` classification). New migrated stores
+// should reference `kDbErrorPrefix` directly rather than minting their own literal.
+inline constexpr std::string_view kDbErrorPrefix = "db_error: ";
+
 } // namespace yuzu::server

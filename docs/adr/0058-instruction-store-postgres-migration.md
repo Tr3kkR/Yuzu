@@ -287,11 +287,11 @@ rows also mutate post-insert), scaled down since `InstructionDefinition` has no 
 security-sensitive field like `revoked` needing a direction-aware rule:
 
 - **IDENTITY** (write-once — no runtime method mutates these after INSERT): `id` (the `ON
-  CONFLICT` target itself), `created_by`, `created_at`. A mismatch on either fails the backfill
-  closed, naming both sides — the only plausible cause is a corrupted/hand-edited legacy file or
-  two genuinely different definitions sharing an id, either of which deserves a halt, not a
-  silent pick.
-- **LIFECYCLE** (everything else — `name`/`version`/`type`/`plugin`/`action`/`description`/
+  CONFLICT` target itself) and `created_by` only. A mismatch fails the backfill closed, naming
+  both sides — the only plausible cause is a corrupted/hand-edited legacy file or two genuinely
+  different definitions sharing an id, either of which deserves a halt, not a silent pick.
+- **LIFECYCLE** (everything else, including `created_at` — see below —
+  `name`/`version`/`type`/`plugin`/`action`/`description`/
   `enabled`/`instruction_set_id`/`gather_ttl_seconds`/`response_ttl_days`/`updated_at`/
   `yaml_source`/`parameter_schema`/`result_schema`/`approval_mode`/`concurrency_mode`/`platforms`/
   `min_agent_version`/`required_plugins`/`readable_payload`/`visualization_spec`/
@@ -304,9 +304,39 @@ security-sensitive field like `revoked` needing a direction-aware rule:
   established for the reseed loop ("operator edit is never clobbered"), extended to the backfill
   path for the identical reason.
 
-`instruction_sets` has **no analogous mutation path at all** (`update_set` does not exist) —
-`ProductPackStore`'s simpler rule applies unchanged: any conflict is resolved by full-row-equality
-or fail-closed, since every column is write-once by construction, not by omission.
+**`created_at` was originally classified as IDENTITY (write-once); this was wrong, and was
+corrected during Gate 4 governance review before merge.** The legacy `instruction_definitions`
+table has no column distinguishing a bundled (build-time-embedded) row from an operator-authored
+one — both pass through the same `insert_definition_row`, and a bundled row's `created_at` is
+stamped `now()` the first time *this specific replica* seeds it into its own pre-migration
+`instructions.db`, not authored content. Two independently-provisioned replicas' legacy files
+therefore legitimately hold *different* `created_at` for the exact same bundled id — the same
+"replica B's legacy snapshot legitimately diverges" reasoning already used above to justify
+excluding LIFECYCLE columns from the conflict check applies to `created_at` too, and was not
+originally applied to it. With `created_at` in IDENTITY, backfill bricked the boot of every
+replica after the first to backfill any given bundled id — not a corner case, since every replica
+independently seeds all ~232 bundled definitions / 10 bundled sets during normal operation.
+`created_by` remains safe as IDENTITY: bundled content never specifies one (verified against
+`content/definitions/*.yaml` and `embed_content.py` — neither emits the field), so it resolves
+deterministically via the parser's fallback (`""` for definitions, `"system"` for sets) across
+every replica and every release vintage; a real corrupted/hand-edited file or a genuine id
+collision would still typically differ on `created_by` too. Pinned by the two-replica-divergence
+regression tests in `test_instruction_store.cpp` (`[instruction_store][pg][backfill]`).
+
+`instruction_sets` has **no analogous mutation path at all** (`update_set` does not exist), which
+was originally read as "every column is write-once by construction, so any conflict must be
+full-row-equality-or-fail-closed, per `ProductPackStore`'s simpler rule." That reasoning is also
+wrong for the same reason as `created_at` above: a bundled set's `name`/`description` can
+legitimately differ across two replicas' legacy files whose *release vintage* diverged (pinned
+test 4's "changed bundled content across releases" finding applies to sets exactly as it does to
+definitions), and `created_at` is replica-local seed time either way. `instruction_sets` therefore
+uses the SAME IDENTITY/LIFECYCLE split as definitions: `id`/`created_by` are IDENTITY,
+everything else (`name`/`description`/`created_at`) is LIFECYCLE — Postgres's existing row always
+wins on conflict, never compared. `ProductPackStore`'s full-row-equality rule remains correct for
+`ProductPackStore` itself: it has no build-time-embedded/bundled-pack concept at all (verified —
+no `kBundledPacks`/seed-insert path exists), so every row it backfills is genuinely
+operator-authored and write-once end to end; the rule does not generalize to a store that also
+seeds build-time content through the same table.
 
 **All-vintage column handling.** A legacy file may predate any of the ~9 compat-`ALTER`-only
 columns (`yaml_source`/`parameter_schema`/`result_schema`/`approval_mode`/`concurrency_mode`/
@@ -404,10 +434,12 @@ ADR-recorded behaviour change this migration makes, not a silent test rewrite to
   `rest_api_v1.cpp`/`workflow_routes.cpp` must classify it.
 - `query_definitions`/`get_definition`/`list_sets`/`export_definition_json` callers across
   `dashboard_routes.cpp`, `discover_routes.cpp`, `mcp_server.cpp`, `policy_evaluator.cpp`,
-  `rest_api_v1.cpp`, `schedule_runner.cpp`, `workflow_routes.cpp`, `legacy_shim.cpp` now handle a
+  `rest_api_v1.cpp`, `schedule_runner.cpp`, `workflow_routes.cpp` now handle a
   `std::expected` and must 503 on a genuine DB error rather than silently treating it as "no
   definitions" — the exact fail-open ADR-0036 exists to close, and the one this migration's
   kickoff called out by name for `execute_instruction`'s definition resolution.
+  (`legacy_shim.cpp` only calls `create_definition`, already `std::expected` pre-migration — not
+  an affected caller; corrected here after Gate 3 review flagged the original overclaim.)
 - **Breaking, deliberate**: resurrection-on-delete of a bundled definition/set is REMOVED.
   Post-migration, an operator-deleted bundled id stays deleted across every future boot and
   release upgrade, on every replica, indefinitely — recorded in a changelog fragment as an
@@ -415,7 +447,14 @@ ADR-recorded behaviour change this migration makes, not a silent test rewrite to
 - The untouched-but-stale bundled-content refresh gap (finding 4) is NOT solved by this
   migration — an existing bundled row, touched or not, never picks up newer bundled content
   short of an operator deleting and losing the row (which the tombstone above no longer even
-  allows to come back automatically). Flagged as a follow-up issue, not solved here.
+  allows to come back automatically). Tracked in #2555 (pre-existing issue covering the same
+  underlying problem), not solved here.
+- **Multi-replica backfill correctness (fixed pre-merge, Gate 4 governance finding):** the
+  backfill's original conflict-comparison over-scoped IDENTITY to include `created_at`
+  (definitions) and the full row (sets), both of which legitimately diverge across independently
+  -provisioned replicas for bundled content — see "Backfill" above. This bricked the boot of
+  every replica after the first to backfill a given bundled id, unconditionally, on any real
+  multi-replica fleet. Fixed before merge; no release ever shipped the broken version.
 - No change to the #1073/W7.4 signed-import enforcement semantics, the Ed25519 verify path, or
   the `--allow-unsigned-definitions` operator flag — all pure/storage-independent, ported
   unchanged.

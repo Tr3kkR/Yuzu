@@ -64,6 +64,8 @@
 /// own connection-level concurrency replace it, matching every other migrated store on the
 /// ladder.
 
+#include "store_errors.hpp"
+
 #include <atomic>
 #include <cstdint>
 #include <expected>
@@ -84,9 +86,10 @@ namespace yuzu::server {
 
 /// Machine-checkable prefix on every `InstructionStore` `unexpected()` that represents a
 /// genuine DB/lease failure rather than caller-input validation, a signature/policy rejection,
-/// or a not-found error (mirrors `ProductPackStore::kProductPackDbErrorPrefix`). Callers
-/// classify: `"not_found:"` prefix -> 404, this prefix -> 503, else -> 400.
-inline constexpr const char* kInstructionStoreDbErrorPrefix = "db_error: ";
+/// or a not-found error (mirrors `ProductPackStore::kProductPackDbErrorPrefix` — both alias
+/// the single shared `kDbErrorPrefix`, `store_errors.hpp`). Callers classify: `"not_found:"`
+/// prefix -> 404, this prefix -> 503, else -> 400.
+inline constexpr std::string_view kInstructionStoreDbErrorPrefix = kDbErrorPrefix;
 
 struct InstructionDefinition {
     std::string id;

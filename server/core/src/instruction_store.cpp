@@ -266,6 +266,16 @@ void note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason) {
             .increment();
 }
 
+// Write-side counterpart (gov Gate 3 sre finding): pre-migration write paths had no
+// store-layer failure signal at all — a genuine DB error on create/update/delete surfaced
+// only as an unlabelled 503 at whichever REST route happened to call it, with no aggregate
+// InstructionStore-specific trace for an on-call engineer to key an alert on.
+void note_write_degrade(yuzu::MetricsRegistry* metrics, const char* reason) {
+    if (metrics)
+        metrics->counter("yuzu_server_instruction_write_degrade_total", {{"reason", reason}})
+            .increment();
+}
+
 // ── Legacy row shapes (backfill only) ───────────────────────────────────────
 
 struct LegacyDefinitionRow {
@@ -587,8 +597,10 @@ InstructionStore::validate_and_prepare(InstructionDefinition& def) const {
 
 std::expected<std::string, std::string>
 InstructionStore::insert_definition_row(const InstructionDefinition& def, bool is_seed) {
-    if (!open_)
+    if (!open_) {
+        note_write_degrade(metrics_, "insert_definition_row");
         return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) + "store not open");
+    }
 
     const auto now = now_epoch();
     const std::string created_at = std::to_string(def.created_at > 0 ? def.created_at : now);
@@ -643,13 +655,17 @@ InstructionStore::insert_definition_row(const InstructionDefinition& def, bool i
 
     if (!is_seed) {
         auto lease = pool_.try_acquire_for(kWriteTimeout);
-        if (!lease)
+        if (!lease) {
+            note_write_degrade(metrics_, "insert_definition_row");
             return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) +
                                    "pool acquire timeout");
+        }
         pg::PgResult res = pg::exec_params(lease.get(), insert_sql, binds);
-        if (res.status() != PGRES_TUPLES_OK)
+        if (res.status() != PGRES_TUPLES_OK) {
+            note_write_degrade(metrics_, "insert_definition_row");
             return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) +
                                    PQerrorMessage(lease.get()));
+        }
         if (PQntuples(res.get()) == 0)
             return std::unexpected(conflict_msg);
         return def.id;
@@ -686,8 +702,10 @@ InstructionStore::insert_definition_row(const InstructionDefinition& def, bool i
         tombstoned = PQntuples(res.get()) == 0; // reuse the flag: "did not land" either way
         return true;
     });
-    if (!ok)
+    if (!ok) {
+        note_write_degrade(metrics_, "insert_definition_row");
         return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) + failure);
+    }
     if (tombstoned)
         return std::unexpected(conflict_msg);
     return def.id;
@@ -707,8 +725,10 @@ InstructionStore::create_definition(const InstructionDefinition& def) {
 // ---------------------------------------------------------------------------
 
 std::expected<void, std::string> InstructionStore::update_definition(const InstructionDefinition& def) {
-    if (!open_)
+    if (!open_) {
+        note_write_degrade(metrics_, "update_definition");
         return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) + "store not open");
+    }
     if (def.id.empty())
         return std::unexpected("id is required for update");
 
@@ -759,21 +779,27 @@ std::expected<void, std::string> InstructionStore::update_definition(const Instr
                                    def.id};
 
     auto lease = pool_.try_acquire_for(kWriteTimeout);
-    if (!lease)
+    if (!lease) {
+        note_write_degrade(metrics_, "update_definition");
         return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) +
                                "pool acquire timeout");
+    }
     pg::PgResult res = pg::exec_params(lease.get(), sql, binds);
-    if (res.status() != PGRES_TUPLES_OK)
+    if (res.status() != PGRES_TUPLES_OK) {
+        note_write_degrade(metrics_, "update_definition");
         return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) +
                                PQerrorMessage(lease.get()));
+    }
     if (PQntuples(res.get()) == 0)
         return std::unexpected("not_found: definition not found: " + def.id);
     return {};
 }
 
 std::expected<void, std::string> InstructionStore::delete_definition(const std::string& id) {
-    if (!open_)
+    if (!open_) {
+        note_write_degrade(metrics_, "delete_definition");
         return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) + "store not open");
+    }
 
     std::string failure;
     bool deleted = false;
@@ -808,8 +834,10 @@ std::expected<void, std::string> InstructionStore::delete_definition(const std::
         }
         return true;
     });
-    if (!ok)
+    if (!ok) {
+        note_write_degrade(metrics_, "delete_definition");
         return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) + failure);
+    }
     if (!deleted)
         return std::unexpected("not_found: instruction definition not found: " + id);
     return {};
@@ -1134,8 +1162,10 @@ std::expected<std::vector<InstructionSet>, std::string> InstructionStore::list_s
 
 std::expected<std::string, std::string> InstructionStore::insert_set_row(const InstructionSet& s,
                                                                          bool is_seed) {
-    if (!open_)
+    if (!open_) {
+        note_write_degrade(metrics_, "insert_set_row");
         return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) + "store not open");
+    }
     const std::string id = s.id.empty() ? generate_id() : s.id;
     const std::string created_at = std::to_string(s.created_at > 0 ? s.created_at : now_epoch());
     const char* insert_sql =
@@ -1148,13 +1178,17 @@ std::expected<std::string, std::string> InstructionStore::insert_set_row(const I
 
     if (!is_seed) {
         auto lease = pool_.try_acquire_for(kWriteTimeout);
-        if (!lease)
+        if (!lease) {
+            note_write_degrade(metrics_, "insert_set_row");
             return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) +
                                    "pool acquire timeout");
+        }
         pg::PgResult res = pg::exec_params(lease.get(), insert_sql, binds);
-        if (res.status() != PGRES_TUPLES_OK)
+        if (res.status() != PGRES_TUPLES_OK) {
+            note_write_degrade(metrics_, "insert_set_row");
             return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) +
                                    PQerrorMessage(lease.get()));
+        }
         if (PQntuples(res.get()) == 0)
             return std::unexpected(conflict_msg);
         return id;
@@ -1208,8 +1242,10 @@ std::expected<std::string, std::string> InstructionStore::create_set_seed(const 
 }
 
 std::expected<void, std::string> InstructionStore::delete_set(const std::string& id) {
-    if (!open_)
+    if (!open_) {
+        note_write_degrade(metrics_, "delete_set");
         return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) + "store not open");
+    }
 
     std::string failure;
     bool deleted = false;
@@ -1617,12 +1653,19 @@ bool InstructionStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
                 continue; // inserted cleanly
 
             // Conflict: id already present (another replica's own backfill/seed already landed
-            // it). IDENTITY (id/created_by/created_at, write-once) must match or this is a
-            // genuine corruption/collision, not a benign replay — LIFECYCLE columns are NOT
-            // compared: Postgres's already-live value always wins on those (ADR-0058), the same
-            // rule the reseed loop enforces for an operator's edit.
+            // it). IDENTITY is `id`/`created_by` only, write-once — a mismatch on `created_by`
+            // is a genuine corruption/collision, not a benign replay. `created_at` is
+            // deliberately NOT compared: for BUNDLED content (which has no discriminator column
+            // separating it from operator content in the legacy schema — it goes through this
+            // same table), `created_at` is stamped at first-seed time on each replica
+            // independently, not authored content, so two replicas' legacy files legitimately
+            // diverge on it for the exact same row. Comparing it here bricked every replica's
+            // boot after the first one to backfill any given bundled id (found by unhappy-path
+            // Gate 4 review; see the two-replica regression tests above). LIFECYCLE columns
+            // (including created_at) are NOT compared: Postgres's already-live value always wins
+            // on those (ADR-0058), the same rule the reseed loop enforces for an operator's edit.
             pg::PgResult existing = pg::exec_params(
-                conn, "SELECT created_by, created_at FROM instruction_store.instruction_definitions "
+                conn, "SELECT created_by FROM instruction_store.instruction_definitions "
                      "WHERE id=$1",
                 std::vector<std::string>{d.id});
             if (existing.status() != PGRES_TUPLES_OK || PQntuples(existing.get()) == 0) {
@@ -1634,12 +1677,10 @@ bool InstructionStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
                 return false;
             }
             const std::string existing_created_by = text_col(existing.get(), 0, 0);
-            const std::int64_t existing_created_at = to_i64(PQgetvalue(existing.get(), 0, 1));
-            if (existing_created_by != sanitize_pg_text(d.created_by) ||
-                existing_created_at != d.created_at) {
+            if (existing_created_by != sanitize_pg_text(d.created_by)) {
                 failure_detail = std::format(
                     "legacy definition id='{}': IDENTITY mismatch against existing row "
-                    "(created_by/created_at differ) — refusing to guess which is correct",
+                    "(created_by differs) — refusing to guess which is correct",
                     d.id);
                 spdlog::error("InstructionStore::migrate_from_sqlite: {}", failure_detail);
                 return false;
@@ -1684,14 +1725,19 @@ bool InstructionStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
             if (PQntuples(res.get()) > 0)
                 continue;
 
-            // instruction_sets has no mutation path at all (no update_set exists) — every
-            // column is write-once by construction, so a conflict is only benign if identical
-            // (mirrors ProductPackStore's simpler no-LIFECYCLE rule).
+            // instruction_sets has no mutation path at all (no update_set exists), but that does
+            // NOT make every column write-once IDENTITY for backfill purposes: bundled
+            // (build-time-embedded) sets have no discriminator separating them from
+            // operator-authored ones in the legacy schema, so a bundled set's name/description
+            // can legitimately differ across two replicas' legacy files whose content vintage
+            // diverged (the same class pinned for definitions above), and created_at is
+            // replica-local first-seed time, never authored content. Comparing the full row
+            // bricked every replica's boot after the first to backfill a given bundled set id.
+            // IDENTITY is `id`/`created_by` only — Postgres's already-live row always wins on
+            // name/description/created_at, matching definitions' LIFECYCLE rule.
             pg::PgResult existing = pg::exec_params(
                 conn,
-                std::string(std::string("SELECT ") + kSetCols +
-                           " FROM instruction_store.instruction_sets WHERE id=$1")
-                    .c_str(),
+                "SELECT created_by FROM instruction_store.instruction_sets WHERE id=$1",
                 std::vector<std::string>{s.id});
             if (existing.status() != PGRES_TUPLES_OK || PQntuples(existing.get()) == 0) {
                 failure_detail = std::format(
@@ -1701,19 +1747,16 @@ bool InstructionStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
                 spdlog::error("InstructionStore::migrate_from_sqlite: {}", failure_detail);
                 return false;
             }
-            const InstructionSet stored = read_set_row(existing.get(), 0);
-            const bool identical = stored.name == sanitize_pg_text(s.name) &&
-                                   stored.description == sanitize_pg_text(s.description) &&
-                                   stored.created_by == sanitize_pg_text(s.created_by) &&
-                                   stored.created_at == s.created_at;
-            if (!identical) {
+            const std::string existing_created_by = text_col(existing.get(), 0, 0);
+            if (existing_created_by != sanitize_pg_text(s.created_by)) {
                 failure_detail = std::format(
-                    "legacy set id='{}': conflicts with a differently-valued existing row "
-                    "(every column is write-once for instruction_sets)",
+                    "legacy set id='{}': IDENTITY mismatch against existing row (created_by "
+                    "differs) — refusing to guess which is correct",
                     s.id);
                 spdlog::error("InstructionStore::migrate_from_sqlite: {}", failure_detail);
                 return false;
             }
+            // IDENTITY matches — benign, Postgres's existing (possibly since-edited) row wins.
         }
         pg::PgResult marker = pg::exec_params(
             conn,

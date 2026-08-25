@@ -16,6 +16,7 @@
  */
 
 #include "instruction_store.hpp"
+#include "sqlite_raii.hpp"
 #include "store_errors.hpp"
 
 #include "pg/pg_pool.hpp"
@@ -24,6 +25,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <sqlite3.h>
+
+#include <algorithm>
 #include <string>
 
 using namespace yuzu::server;
@@ -68,6 +72,28 @@ yuzu::test::PgTestTemplate instruction_store_tpl{
         if (!store.is_open())
             throw std::runtime_error("instruction_store template: store failed to migrate");
     }};
+
+void legacy_exec(sqlite3* db, const char* sql) {
+    char* err = nullptr;
+    int rc = sqlite3_exec(db, sql, nullptr, nullptr, &err);
+    INFO((err ? err : "no error"));
+    REQUIRE(rc == SQLITE_OK);
+    if (err)
+        sqlite3_free(err);
+}
+
+const char* kLegacyDefsSchema =
+    "CREATE TABLE instruction_definitions ("
+    " id TEXT PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL,"
+    " type TEXT NOT NULL, plugin TEXT NOT NULL, action TEXT NOT NULL,"
+    " description TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1,"
+    " instruction_set_id TEXT NOT NULL DEFAULT '', gather_ttl_seconds INTEGER NOT NULL DEFAULT 0,"
+    " response_ttl_days INTEGER NOT NULL DEFAULT 0, created_by TEXT NOT NULL DEFAULT '',"
+    " created_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0);";
+const char* kLegacySetsSchema =
+    "CREATE TABLE instruction_sets ("
+    " id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',"
+    " created_by TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL DEFAULT 0);";
 } // namespace
 
 // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -1303,4 +1329,139 @@ TEST_CASE("InstructionStore: plain create_set (operator path) is unaffected by a
     auto recreated = store.create_set(reclaimed);
     REQUIRE(recreated.has_value());
     CHECK(*recreated == s.id);
+}
+
+// ── Backfill (ADR-0009/0058) — multi-replica bundled-content divergence ─────
+//
+// Bundled (build-time-embedded) definitions/sets carry NO created_at in their source YAML —
+// insert_definition_row/create_set_seed stamp it as "now" at whatever wall-clock moment THIS
+// replica first seeds it into ITS OWN legacy instructions.db, pre-migration. Two independently
+// -provisioned replicas' legacy files therefore legitimately hold DIFFERENT created_at (and, for
+// sets, potentially different name/description across release vintages — pinned test 4 above)
+// for the SAME bundled id. Treating created_at (or, for sets, the full row) as write-once IDENTITY
+// during backfill made every replica after the first brick its boot on this entirely benign
+// divergence. This is a regression pin for that fix — verified red against the pre-fix code.
+
+TEST_CASE("InstructionStore::migrate_from_sqlite: two independently-provisioned replicas' legacy "
+          "files with a shared bundled id and DIVERGENT created_at is a benign no-op, not a "
+          "fail-closed error",
+          "[instruction_store][pg][backfill]") {
+    yuzu::test::TempDbFile legacy_a{std::string_view{"instr-legacy-conflict-a-"}};
+    {
+        SqliteDb db;
+        REQUIRE(sqlite3_open_v2(legacy_a.path.string().c_str(), db.addr(),
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+        legacy_exec(db.get(), kLegacyDefsSchema);
+        legacy_exec(db.get(), kLegacySetsSchema);
+        // A bundled definition as replica A's own legacy file recorded it: no created_by
+        // (matches real bundled content, which never specifies one), created_at = replica A's
+        // own historical first-seed time.
+        legacy_exec(db.get(),
+                    "INSERT INTO instruction_definitions (id, name, version, type, plugin, "
+                    "action, description, enabled, instruction_set_id, gather_ttl_seconds, "
+                    "response_ttl_days, created_by, created_at, updated_at) VALUES "
+                    "('bundled.shared.id', 'Shared Bundled Def', '1.0', 'question', 'sysinfo', "
+                    "'query', 'desc', 1, '', 0, 0, '', 1700000000, 1700000000);");
+    }
+    yuzu::test::TempDbFile legacy_b{std::string_view{"instr-legacy-conflict-b-"}};
+    {
+        SqliteDb db;
+        REQUIRE(sqlite3_open_v2(legacy_b.path.string().c_str(), db.addr(),
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+        legacy_exec(db.get(), kLegacyDefsSchema);
+        legacy_exec(db.get(), kLegacySetsSchema);
+        // Same id, same created_by (""), but a DIFFERENT created_at — replica B independently
+        // seeded this same bundled definition at its own, later, first-boot time.
+        legacy_exec(db.get(),
+                    "INSERT INTO instruction_definitions (id, name, version, type, plugin, "
+                    "action, description, enabled, instruction_set_id, gather_ttl_seconds, "
+                    "response_ttl_days, created_by, created_at, updated_at) VALUES "
+                    "('bundled.shared.id', 'Shared Bundled Def', '1.0', 'question', 'sysinfo', "
+                    "'query', 'desc', 1, '', 0, 0, '', 1800000000, 1800000000);");
+        // An unrelated row so this file's fingerprint differs from legacy_a's (otherwise
+        // whole-file fingerprint dedup would skip legacy_b before ever reaching the per-row
+        // conflict path this test targets).
+        legacy_exec(db.get(),
+                    "INSERT INTO instruction_definitions (id, name, version, type, plugin, "
+                    "action, description, enabled, instruction_set_id, gather_ttl_seconds, "
+                    "response_ttl_days, created_by, created_at, updated_at) VALUES "
+                    "('b.only.def', 'B-Only Def', '1.0', 'question', 'sysinfo', 'query', 'desc', "
+                    "1, '', 0, 0, '', 1800000000, 1800000000);");
+    }
+
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.migrate_from_sqlite(legacy_a.path));
+    // Replica B's own backfill against its own, independently-diverged legacy file must NOT
+    // brick its boot.
+    REQUIRE(store.migrate_from_sqlite(legacy_b.path));
+
+    // Postgres's already-committed row (from replica A, the first writer) wins — replica B's
+    // backfill neither overwrites it nor fails.
+    auto shared = store.get_definition("bundled.shared.id");
+    REQUIRE(shared.has_value());
+    REQUIRE(shared->has_value());
+    CHECK((*shared)->created_at == 1700000000);
+
+    auto b_only = store.get_definition("b.only.def");
+    REQUIRE(b_only.has_value());
+    REQUIRE(b_only->has_value());
+}
+
+TEST_CASE("InstructionStore::migrate_from_sqlite: two replicas' legacy files with a shared "
+          "bundled set id and a DIFFERENT description (release-vintage content change) is a "
+          "benign no-op, not a fail-closed error",
+          "[instruction_store][pg][backfill]") {
+    yuzu::test::TempDbFile legacy_a{std::string_view{"instr-legacy-set-conflict-a-"}};
+    {
+        SqliteDb db;
+        REQUIRE(sqlite3_open_v2(legacy_a.path.string().c_str(), db.addr(),
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+        legacy_exec(db.get(), kLegacyDefsSchema);
+        legacy_exec(db.get(), kLegacySetsSchema);
+        legacy_exec(db.get(),
+                    "INSERT INTO instruction_sets (id, name, description, created_by, "
+                    "created_at) VALUES ('bundled.shared.set', 'Shared Set', 'v1 description', "
+                    "'system', 1700000000);");
+    }
+    yuzu::test::TempDbFile legacy_b{std::string_view{"instr-legacy-set-conflict-b-"}};
+    {
+        SqliteDb db;
+        REQUIRE(sqlite3_open_v2(legacy_b.path.string().c_str(), db.addr(),
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+        legacy_exec(db.get(), kLegacyDefsSchema);
+        legacy_exec(db.get(), kLegacySetsSchema);
+        // Same id, same created_by ("system", the bundled-set default), but the description
+        // (and created_at) differ — replica B seeded this set under a later release vintage
+        // whose shipped content had a different description (the same class pinned test 4
+        // established for definitions).
+        legacy_exec(db.get(),
+                    "INSERT INTO instruction_sets (id, name, description, created_by, "
+                    "created_at) VALUES ('bundled.shared.set', 'Shared Set', 'v2 description', "
+                    "'system', 1800000000);");
+        legacy_exec(db.get(),
+                    "INSERT INTO instruction_sets (id, name, description, created_by, "
+                    "created_at) VALUES ('b.only.set', 'B-Only Set', 'desc', 'system', "
+                    "1800000000);");
+    }
+
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.migrate_from_sqlite(legacy_a.path));
+    REQUIRE(store.migrate_from_sqlite(legacy_b.path));
+
+    auto shared = store.list_sets();
+    REQUIRE(shared.has_value());
+    auto it = std::find_if(shared->begin(), shared->end(),
+                           [](const InstructionSet& s) { return s.id == "bundled.shared.set"; });
+    REQUIRE(it != shared->end());
+    // Postgres's already-committed row (replica A's) wins.
+    CHECK(it->description == "v1 description");
+    CHECK(it->created_at == 1700000000);
 }
