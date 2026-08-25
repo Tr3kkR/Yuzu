@@ -63,14 +63,20 @@ constexpr const char* kSourcelessFingerprint = "sourceless";
 constexpr const char* kSeedCoordLockSql =
     "SELECT pg_advisory_xact_lock(2037545589, hashtext('instruction_store:seed_coordination'))";
 
-// The code-default `created_by` a bundled (build-time-embedded) row gets when its JSON
-// envelope omits the field — confirmed no content/definitions/*.yaml or bundled-set envelope
-// specifies one, so this is deterministic across every replica and release vintage. Used by
-// migrate_from_sqlite's backfill conflict check to decide whether cross-replica content
-// divergence for a shared id is benign bundle-vintage drift (sentinel) or a real
-// two-independently-authored-rows collision (any other created_by) — see the comment there.
-constexpr const char* kBundledDefinitionCreator = ""; // instruction_store.cpp:1021 default
-constexpr const char* kBundledSetCreator = "system";  // server.cpp kBundledSets default
+// The `created_by` every bundled (build-time-embedded) row gets. `embed_content.py`'s
+// `def_envelope()`/`set_envelope()` BOTH unconditionally set `"created_by": "system"` on every
+// generated envelope (verified: `grep created_by server/core/scripts/embed_content.py`, and
+// every entry in the built `bundled_content.cpp` carries it) — so the parser's own `""` fallback
+// (`def.created_by = parsed.value("created_by", "")`, this file, `import_definition_json_impl`)
+// never actually fires for bundled content; an earlier version of this constant assumed it did
+// and used `""` for definitions, which made the sentinel-match branch below dead code and
+// reintroduced the exact boot-brick this whole mechanism exists to prevent (Gate 8 re-review,
+// caught before merge). Used by migrate_from_sqlite's backfill conflict check to decide whether
+// cross-replica content divergence for a shared id is benign bundle-vintage drift (sentinel) or
+// a real two-independently-authored-rows collision (any other created_by) — see the comment
+// there. Deterministic across every replica and release vintage either way.
+constexpr const char* kBundledDefinitionCreator = "system";
+constexpr const char* kBundledSetCreator = "system";
 
 int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -1674,10 +1680,10 @@ bool InstructionStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
             //
             // `created_by` alone is NOT sufficient IDENTITY for the row's CONTENT, though —
             // that split is what this check gets wrong if applied uniformly:
-            //  - BUNDLED content (created_by == kBundledDefinitionCreator, the code-default
-            //    sentinel every kBundledDefinitions envelope gets when it omits `created_by` —
-            //    confirmed no content/definitions/*.yaml specifies one) has no discriminator
-            //    column separating it from operator content in the legacy schema, and its
+            //  - BUNDLED content (created_by == kBundledDefinitionCreator, "system" — every
+            //    kBundledDefinitions envelope sets this explicitly, see the constant's own
+            //    comment) has no discriminator column separating it from operator content in
+            //    the legacy schema, and its
             //    yaml_source legitimately DIVERGES across releases/replicas whose bundle
             //    vintage differs even though it is the "same" logical row. Failing closed on
             //    that divergence bricked every replica's boot after the first one to backfill
@@ -1716,7 +1722,15 @@ bool InstructionStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
                 spdlog::error("InstructionStore::migrate_from_sqlite: {}", failure_detail);
                 return false;
             }
-            const std::string existing_yaml_source = text_col(existing.get(), 0, 1);
+            // Both sides sanitized before comparing, even though insert_definition_row/
+            // update_definition store yaml_source RAW (Ed25519 signature bytes, never
+            // sanitized) — an already-persisted value should already equal its own sanitized
+            // form (sanitize_pg_text is confirmed idempotent; only rejects what Postgres's own
+            // UTF8 validation would already have rejected at insert time), but comparing
+            // raw-vs-sanitized here would be the same asymmetry that caused a false content
+            // mismatch in ProductPackStore (test_product_pack_store.cpp:698, Gate 8 re-review).
+            const std::string existing_yaml_source =
+                sanitize_pg_text(text_col(existing.get(), 0, 1));
             const std::string sanitized_yaml_source = sanitize_pg_text(d.yaml_source);
             if (existing_yaml_source != sanitized_yaml_source) {
                 if (sanitized_created_by == kBundledDefinitionCreator) {

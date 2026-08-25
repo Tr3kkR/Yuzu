@@ -316,12 +316,26 @@ excluding LIFECYCLE columns from the conflict check applies to `created_at` too,
 originally applied to it. With `created_at` in IDENTITY, backfill bricked the boot of every
 replica after the first to backfill any given bundled id — not a corner case, since every replica
 independently seeds all ~232 bundled definitions / 10 bundled sets during normal operation.
-`created_by` remains safe as IDENTITY: bundled content never specifies one (verified against
-`content/definitions/*.yaml` and `embed_content.py` — neither emits the field), so it resolves
-deterministically via the parser's fallback (`""` for definitions, `"system"` for sets) across
-every replica and every release vintage; a real corrupted/hand-edited file or a genuine id
-collision would still typically differ on `created_by` too. Pinned by the two-replica-divergence
-regression tests in `test_instruction_store.cpp` (`[instruction_store][backfill][pg]`).
+`created_by` remains safe as IDENTITY: bundled content always gets the same value —
+`embed_content.py`'s `def_envelope()`/`set_envelope()` both unconditionally set
+`"created_by": "system"` on every generated envelope (verified: every entry in the built
+`bundled_content.cpp` carries it) — so it resolves deterministically to `"system"` across every
+replica and every release vintage; a real corrupted/hand-edited file or a genuine id collision
+would still typically differ on `created_by` too. Pinned by the two-replica-divergence regression
+tests in `test_instruction_store.cpp` (`[instruction_store][backfill][pg]`).
+
+**Correction (Gate 8 re-review, second pass):** an earlier revision of this paragraph, and the
+`kBundledDefinitionCreator` constant below, claimed the definitions sentinel was `""` — reasoning
+that `embed_content.py` "never emits the `created_by` field" and the parser's own `""` fallback
+would apply. That premise was wrong: `def_envelope()` DOES emit the field, always set to
+`"system"`, so the `""` fallback never fires for real bundled content and the sentinel-match
+branch below was dead code for definitions — reintroducing the exact boot-brick this section
+exists to prevent. Fixed before merge; caught by an independent re-verify of the fix commit, not
+by the tests (the existing definitions regression test happens not to exercise `yaml_source`
+divergence at all, only `created_at`, which the LIFECYCLE rule already ignored either way — a new
+test exercising `yaml_source` divergence under the `"system"` sentinel was added alongside this
+correction, mirroring the sets test that already covered the equivalent case and would have
+caught this).
 
 **`created_by`-only IDENTITY (the paragraph above) was itself over-corrected; fixed during Gate 8
 re-review, before merge.** Narrowing IDENTITY to `id`/`created_by` fixed the bundled-content brick
@@ -332,8 +346,8 @@ pre-Postgres replicas, or hand-synced YAML that drifted) whose content genuinely
 which — the exact silent-loss failure mode this store's backfill design otherwise refuses to
 produce. The corrected rule is conditional on `created_by`, not a blanket comparison:
 
-- `created_by` equal to the code-default bundled sentinel (`""` for definitions —
-  `kBundledDefinitionCreator`; `"system"` for sets — `kBundledSetCreator`, `instruction_store.cpp`):
+- `created_by` equal to the code-default bundled sentinel (`"system"` for both definitions —
+  `kBundledDefinitionCreator` — and sets — `kBundledSetCreator`, `instruction_store.cpp`):
   content divergence (`yaml_source` for definitions; `name`/`description` for sets) stays benign —
   bundle-vintage drift, Postgres's existing row wins — but is now logged at WARN naming the id, so
   the discard is visible instead of silent.
@@ -346,13 +360,26 @@ produce. The corrected rule is conditional on `created_by`, not a blanket compar
   closed on that alone. The corrected rule compares content, not import time, so a clean hand-sync
   is benign on both sides of this split.
 
-Known residual, not fixed here: `create_definition`'s REST route sets `created_by` from
-`AuthRoutes::resolve_session`, which is `nullopt` for an unauthenticated request (a route reachable
-under RBAC-off, the documented default deployment mode); an operator row created that way collides
-with the definitions sentinel (`""`) and is treated leniently (WARN, not fail-closed) on divergence,
-same as bundled content. This is the same class of residual as "no retroactive tombstone
-reconstruction" below — narrower than the general case, stated so this ADR does not overclaim.
-Pinned by the additional two-replica regression tests in `test_instruction_store.cpp`
+Known residual, not fixed here: **an earlier revision of this paragraph named the wrong trigger**
+(`create_definition`'s REST route under RBAC-off/unauthenticated create) — traced during Gate 8
+re-review and found not reachable: `require_permission`/`resolve_session`'s RBAC-off fallback
+still requires a valid session, and every session-synthesis path sets a non-empty username, so
+`def.created_by = session->username` never lands on `""` via that route. The actually-reachable
+residual is different and needs no RBAC-off at all: `POST /api/instructions/import` calls
+`import_definition_json` directly on the request body with **no session-based `created_by`
+override** (unlike the create route), so any caller holding the ordinary
+`InstructionDefinition:Write` permission — the normal way to import definitions — can set
+`created_by` to `"system"` just by supplying it (or omitting it, since the parser's own fallback
+is `""`, not `"system"` — only the code-generated envelope path forces `"system"`) in the import
+body, and have that row treated leniently (WARN, not fail-closed) on any future content
+divergence, same as real bundled content. This field being caller-controlled is pre-existing
+behaviour, unchanged by this migration; what changes here is that it gains security significance
+(sentinel-spoofing to bypass the fail-closed content-divergence check). Whether
+`/api/instructions/import`'s untrusted path should reject or override a caller-supplied
+`created_by` is tracked as a separate follow-up, not resolved by this ADR. This is the same class
+of residual as "no retroactive tombstone reconstruction" below — narrower than the general case,
+stated so this ADR does not overclaim. Pinned by the additional two-replica regression tests in
+`test_instruction_store.cpp`
 (non-sentinel `created_by`, both the drifted-content-fails-closed and
 identical-content-stays-benign cases, for both definitions and sets).
 

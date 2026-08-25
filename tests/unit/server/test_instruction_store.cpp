@@ -1353,15 +1353,18 @@ TEST_CASE("InstructionStore::migrate_from_sqlite: two independently-provisioned 
                                 SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
         legacy_exec(db.get(), kLegacyDefsSchema);
         legacy_exec(db.get(), kLegacySetsSchema);
-        // A bundled definition as replica A's own legacy file recorded it: no created_by
-        // (matches real bundled content, which never specifies one), created_at = replica A's
-        // own historical first-seed time.
+        // A bundled definition as replica A's own legacy file recorded it: created_by='system'
+        // (matches real bundled content — embed_content.py's def_envelope() sets this
+        // unconditionally on every generated envelope; NOT an omitted/empty field, corrected
+        // during Gate 8 re-review after an earlier revision of this test used '' and so never
+        // actually exercised the sentinel-match branch), created_at = replica A's own
+        // historical first-seed time.
         legacy_exec(db.get(),
                     "INSERT INTO instruction_definitions (id, name, version, type, plugin, "
                     "action, description, enabled, instruction_set_id, gather_ttl_seconds, "
                     "response_ttl_days, created_by, created_at, updated_at) VALUES "
                     "('bundled.shared.id', 'Shared Bundled Def', '1.0', 'question', 'sysinfo', "
-                    "'query', 'desc', 1, '', 0, 0, '', 1700000000, 1700000000);");
+                    "'query', 'desc', 1, '', 0, 0, 'system', 1700000000, 1700000000);");
     }
     yuzu::test::TempDbFile legacy_b{std::string_view{"instr-legacy-conflict-b-"}};
     {
@@ -1370,14 +1373,14 @@ TEST_CASE("InstructionStore::migrate_from_sqlite: two independently-provisioned 
                                 SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
         legacy_exec(db.get(), kLegacyDefsSchema);
         legacy_exec(db.get(), kLegacySetsSchema);
-        // Same id, same created_by (""), but a DIFFERENT created_at — replica B independently
-        // seeded this same bundled definition at its own, later, first-boot time.
+        // Same id, same created_by ('system'), but a DIFFERENT created_at — replica B
+        // independently seeded this same bundled definition at its own, later, first-boot time.
         legacy_exec(db.get(),
                     "INSERT INTO instruction_definitions (id, name, version, type, plugin, "
                     "action, description, enabled, instruction_set_id, gather_ttl_seconds, "
                     "response_ttl_days, created_by, created_at, updated_at) VALUES "
                     "('bundled.shared.id', 'Shared Bundled Def', '1.0', 'question', 'sysinfo', "
-                    "'query', 'desc', 1, '', 0, 0, '', 1800000000, 1800000000);");
+                    "'query', 'desc', 1, '', 0, 0, 'system', 1800000000, 1800000000);");
         // An unrelated row so this file's fingerprint differs from legacy_a's (otherwise
         // whole-file fingerprint dedup would skip legacy_b before ever reaching the per-row
         // conflict path this test targets).
@@ -1386,7 +1389,7 @@ TEST_CASE("InstructionStore::migrate_from_sqlite: two independently-provisioned 
                     "action, description, enabled, instruction_set_id, gather_ttl_seconds, "
                     "response_ttl_days, created_by, created_at, updated_at) VALUES "
                     "('b.only.def', 'B-Only Def', '1.0', 'question', 'sysinfo', 'query', 'desc', "
-                    "1, '', 0, 0, '', 1800000000, 1800000000);");
+                    "1, '', 0, 0, 'system', 1800000000, 1800000000);");
     }
 
     YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
@@ -1409,6 +1412,71 @@ TEST_CASE("InstructionStore::migrate_from_sqlite: two independently-provisioned 
     auto b_only = store.get_definition("b.only.def");
     REQUIRE(b_only.has_value());
     REQUIRE(b_only->has_value());
+}
+
+TEST_CASE("InstructionStore::migrate_from_sqlite: two replicas' legacy files with a shared "
+          "bundled definition id and DIVERGENT yaml_source (release-vintage content change) is "
+          "a benign no-op, not a fail-closed error",
+          "[instruction_store][backfill][pg]") {
+    // Regression for the Gate 8 re-verify finding: kBundledDefinitionCreator was previously
+    // (wrongly) "" — this test uses 'system', the REAL bundled-content created_by, with
+    // divergent yaml_source, so it actually exercises the sentinel-match branch. The definitions
+    // test above only diverges on created_at (LIFECYCLE, never compared either way), so it would
+    // have passed even with the wrong sentinel constant; this test mirrors the sets test below,
+    // which already covered the equivalent case for sets and would have caught the bug there.
+    yuzu::test::TempDbFile legacy_a{std::string_view{"instr-legacy-yaml-conflict-a-"}};
+    {
+        SqliteDb db;
+        REQUIRE(sqlite3_open_v2(legacy_a.path.string().c_str(), db.addr(),
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+        legacy_exec(db.get(), kLegacyDefsSchema);
+        legacy_exec(db.get(), kLegacySetsSchema);
+        legacy_exec(db.get(), "ALTER TABLE instruction_definitions ADD COLUMN yaml_source TEXT "
+                              "NOT NULL DEFAULT '';");
+        legacy_exec(db.get(),
+                    "INSERT INTO instruction_definitions (id, name, version, type, plugin, "
+                    "action, description, enabled, instruction_set_id, gather_ttl_seconds, "
+                    "response_ttl_days, created_by, created_at, updated_at, yaml_source) VALUES "
+                    "('bundled.yaml.shared.id', 'Shared Bundled Def', '1.0', 'question', "
+                    "'sysinfo', 'query', 'desc', 1, '', 0, 0, 'system', 1700000000, 1700000000, "
+                    "'scope: {}\nversion: 1');");
+    }
+    yuzu::test::TempDbFile legacy_b{std::string_view{"instr-legacy-yaml-conflict-b-"}};
+    {
+        SqliteDb db;
+        REQUIRE(sqlite3_open_v2(legacy_b.path.string().c_str(), db.addr(),
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+        legacy_exec(db.get(), kLegacyDefsSchema);
+        legacy_exec(db.get(), kLegacySetsSchema);
+        legacy_exec(db.get(), "ALTER TABLE instruction_definitions ADD COLUMN yaml_source TEXT "
+                              "NOT NULL DEFAULT '';");
+        // Same id, same created_by ('system', the REAL bundled-content default), but a
+        // DIFFERENT yaml_source — replica B seeded this bundled definition under a later
+        // release vintage whose shipped content differed.
+        legacy_exec(db.get(),
+                    "INSERT INTO instruction_definitions (id, name, version, type, plugin, "
+                    "action, description, enabled, instruction_set_id, gather_ttl_seconds, "
+                    "response_ttl_days, created_by, created_at, updated_at, yaml_source) VALUES "
+                    "('bundled.yaml.shared.id', 'Shared Bundled Def', '1.0', 'question', "
+                    "'sysinfo', 'query', 'desc', 1, '', 0, 0, 'system', 1800000000, 1800000000, "
+                    "'scope: {}\nversion: 2');");
+    }
+
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.migrate_from_sqlite(legacy_a.path));
+    // Replica B's own backfill against its own, independently-diverged legacy file must NOT
+    // brick its boot — this is the exact bug the wrong "" sentinel reintroduced.
+    REQUIRE(store.migrate_from_sqlite(legacy_b.path));
+
+    auto shared = store.get_definition("bundled.yaml.shared.id");
+    REQUIRE(shared.has_value());
+    REQUIRE(shared->has_value());
+    // Postgres's already-committed row (replica A's) wins.
+    CHECK((*shared)->yaml_source == "scope: {}\nversion: 1");
 }
 
 TEST_CASE("InstructionStore::migrate_from_sqlite: two replicas' legacy files with a shared "
