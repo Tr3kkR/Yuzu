@@ -2702,7 +2702,7 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `bundle.<plugin>.<action>` | One step of a live-query bundle, emitted per step at dispatch — the device-access lens. `target_type=Agent`, `target_id=<agent_id>`. `result=dispatched` (reached the agent) or `result=no_agents` (reached zero agents → `dispatch_failed` on collate). A bundle of N steps emits N of these, so it is exactly as auditable as N separate executions (works-council parity). Emitted on **both** the REST and MCP surfaces (the per-step verb is transport-agnostic; the MCP tool-call envelope additionally audits as `mcp.execute_bundle`). |
 | `bundle.collate` | Live-query bundle collated via `GET /api/v1/bundles/{id}`. `target_type=Execution`, `target_id=<correlation id>`. `result=success` (detail `complete=0\|1`), `result=denied` (`not found or not owned` — the 404 covers both an unknown id and a non-owner, so the audit row is where the real reason is recorded), or `result=failure` (`response store degraded` — a 503, distinct from `denied`: the bundle WAS found and owned, the read just could not be served; retryable, `retry_after_ms:5000`). |
 | `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_name` (409, fragment with the same `name` already exists). |
-| `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result=success`. Detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row. |
+| `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result=success`. Detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row; the `503` InstructionStore-unavailable case (ADR-0058) DOES audit, `result=denied` detail `store_unavailable`. |
 | `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`}. Success detail `execution_id=<id> agents=<n>`; denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents). |
 | `quarantine.enable` | Device quarantined |
 | `quarantine.disable` | Device released from quarantine |
@@ -3278,9 +3278,12 @@ verdicts appear a few seconds later.
 
 **Response (404):** policy not found. **Response (409):** the policy's fragment
 has no `check` instruction, or the policy matches no agents. **Response (503):**
-policy evaluation not available.
+either the policy-evaluation subsystem isn't wired up, or (ADR-0058) the InstructionStore
+itself hit a genuine database/lease failure resolving the check instruction — distinct from
+the 409 "no check instruction" case, and worth a client retry.
 
-**Audit:** `policy.evaluate`.
+**Audit:** `policy.evaluate` — including on the InstructionStore-unavailable 503 above
+(`result=denied`, detail `store_unavailable`).
 
 ---
 
@@ -3318,7 +3321,8 @@ is remediated.
 
 **Response (404):** policy not found. **Response (409):** the fragment defines no
 `fix` instruction, or there are no non-compliant agents to remediate.
-**Response (503):** policy evaluation not available.
+**Response (503):** either the policy-evaluation subsystem isn't wired up, or (ADR-0058) the
+InstructionStore itself hit a genuine database/lease failure resolving the fix instruction.
 
 **Audit:** `policy.remediate` (`result` ∈ {`success`, `denied`}).
 
@@ -6538,15 +6542,33 @@ exists in the store. Body is
 Audit event recorded as `instruction.create / denied / duplicate_id`. To
 update the existing definition use `PUT /api/instructions/{id}`.
 
-**Response (503):** Instruction store not yet initialized.
+**Response (503):** Instruction store not yet initialized, or a genuine database/lease failure
+(ADR-0058) — distinct from the validation/conflict cases above, and worth a client retry.
 
 #### `PUT /api/instructions/{id}`
 
 Update an existing instruction definition.
 
+**Permission:** `InstructionDefinition:Write`
+
+**Response (400):** Validation error (same shape as `POST` above).
+
+**Response (503):** A genuine database/lease failure (ADR-0058).
+
 #### `DELETE /api/instructions/{id}`
 
 Delete an instruction definition.
+
+**Permission:** `InstructionDefinition:Delete`
+
+**Response (200):** `{"deleted": true}`.
+
+**Response (404):** Unknown id. **Breaking change (ADR-0058):** prior to this store's
+PostgreSQL migration, a missing id returned `200 {"deleted": false}`; it now returns 404. Any
+automation keying off the old `deleted: false` shape must be updated to handle 404 instead.
+
+**Response (503):** A genuine database/lease failure (ADR-0058) — distinct from 404, and worth
+a client retry.
 
 #### `GET /api/instructions/{id}/export`
 
@@ -6578,6 +6600,9 @@ Import an InstructionDefinition (JSON envelope). Requires `InstructionDefinition
 A failed signature ALWAYS rejects, even when enforcement is off — `--allow-unsigned-definitions` only widens the unsigned-path policy, it does not skip crypto on present signatures.
 
 **Audit:** every import attempt emits `instruction.import` with `result=success` on success, `result=denied` on rejection. The `target_id` is the definition's `id` on success; empty on rejection.
+
+**Response (503):** A genuine database/lease failure (ADR-0058) — audited the same as every
+other rejection above, distinct from a signature/validation/conflict `400`/`409`.
 
 #### `POST /api/instructions/yaml`
 
@@ -6676,9 +6701,27 @@ List all instruction sets.
 
 Create a new instruction set (a named collection of definitions).
 
+**Permission:** `InstructionSet:Write`
+
+**Response (200):** `{"id": "<id>"}` for the newly-created set.
+
+**Response (400):** Validation error.
+
+**Response (503):** A genuine database/lease failure (ADR-0058).
+
 #### `DELETE /api/instruction-sets/{id}`
 
-Delete an instruction set.
+Delete an instruction set. Definitions that referenced the deleted set have their
+`instruction_set_id` cleared, not deleted.
+
+**Permission:** `InstructionSet:Delete`
+
+**Response (200):** `{"deleted": true}`.
+
+**Response (404):** Unknown id. **Breaking change (ADR-0058):** prior to this store's
+PostgreSQL migration, a missing id returned `200 {"deleted": false}`; it now returns 404.
+
+**Response (503):** A genuine database/lease failure (ADR-0058).
 
 ---
 
