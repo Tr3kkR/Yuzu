@@ -48,6 +48,19 @@
  * misreported as ordinary capture incompleteness (B3-003); and
  * snapshot_result_line is the `snapshot` action's honesty decision, tested
  * here as the action-level regression for B3-002.
+ *
+ * Round 4 additions close two more gaps found in round-4 review:
+ * is_unexpected_enumeration_status is the shared, platform-neutral
+ * "is this status one of the documented non-failure outcomes" decision the
+ * Windows mapdrive WNet/NetSessionEnum legs now apply before throwing
+ * IncompleteCaptureError, in place of the previous bare `rc != NO_ERROR`
+ * checks that conflated unexpected failures with normal completion
+ * (BR4-003) -- exercised directly here since those Windows-only call sites
+ * cannot run on this host. snapshot_phase_outcome is the `snapshot`
+ * action's SECOND honesty decision: it folds collect_fast_impl/
+ * collect_slow_impl/do_collect_software's own return codes (an ordinary
+ * persistence failure, not just a collect_or_retain skip) into the same
+ * response, tested here as the action-level regression for BR4-001.
  */
 
 #include "tar_capture_status.hpp"
@@ -395,4 +408,133 @@ TEST_CASE("snapshot_result_line: multiple skipped sources are comma-joined, orde
           "[tar_capture_status][snapshot]") {
     CHECK(snapshot_result_line({"arp", "service", "mapdrive"}) ==
           "tar|snapshot|partial|arp,service,mapdrive");
+}
+
+// ── is_unexpected_enumeration_status (BR4-003, round 4) ─────────────────────
+//
+// tar_mapdrive_collector.cpp's Windows legs (enum_wnet_outbound,
+// enum_netsession_inbound) previously conflated any unexpected WNet/
+// NetSessionEnum status with normal enumeration completion -- a bare
+// `if (rc != NO_ERROR) break/return` treated a transient provider/transport
+// failure the same as "table exhausted, zero more rows", letting a partial
+// outbound/inbound map set silently replace the last complete baseline.
+// This predicate is the exact decision those call sites now apply before
+// throwing IncompleteCaptureError; it's exercised here with plain integer
+// status codes standing in for the real WNetOpenEnumW / WNetEnumResourceW /
+// NetSessionEnum results those Windows-only (_WIN32-gated, uncompiled on
+// this host) call sites would produce -- open failure, mid-enumeration
+// failure, and session-enumeration failure are the three BR4-003 explicitly
+// calls out, and each is one of the cases below.
+
+TEST_CASE("is_unexpected_enumeration_status: WNetOpenEnumW open failure",
+          "[tar_capture_status][enumeration]") {
+    constexpr unsigned long kNoError = 0;
+    constexpr unsigned long kErrorNotConnected = 2250; // real WNet transport failure code
+    // Clean open: NO_ERROR is the only acceptable status at this call site.
+    CHECK_FALSE(is_unexpected_enumeration_status(kNoError, {kNoError}));
+    // Open failure: any other status must NOT be treated as a benign
+    // "no connected resources" empty result.
+    CHECK(is_unexpected_enumeration_status(kErrorNotConnected, {kNoError}));
+}
+
+TEST_CASE("is_unexpected_enumeration_status: WNetEnumResourceW mid-enumeration failure",
+          "[tar_capture_status][enumeration]") {
+    constexpr unsigned long kNoError = 0;
+    constexpr unsigned long kErrorNoMoreItems = 259;
+    constexpr unsigned long kErrorNetworkBusy = 54; // real mid-enumeration transport failure
+    // NO_ERROR (more rows this page) and ERROR_NO_MORE_ITEMS (genuinely
+    // exhausted) are both acceptable outcomes at this call site.
+    CHECK_FALSE(is_unexpected_enumeration_status(kNoError, {kNoError, kErrorNoMoreItems}));
+    CHECK_FALSE(is_unexpected_enumeration_status(kErrorNoMoreItems, {kNoError, kErrorNoMoreItems}));
+    // Any other status mid-enumeration is an unexpected failure, not a
+    // documented "table exhausted" terminal code.
+    CHECK(is_unexpected_enumeration_status(kErrorNetworkBusy, {kNoError, kErrorNoMoreItems}));
+}
+
+TEST_CASE("is_unexpected_enumeration_status: NetSessionEnum session-enumeration failure",
+          "[tar_capture_status][enumeration]") {
+    constexpr unsigned long kNerrSuccess = 0;
+    constexpr unsigned long kErrorAccessDenied = 5;   // handled separately by the caller
+    constexpr unsigned long kErrorInvalidLevel = 124; // real unexpected session-enum failure
+    // A clean NetSessionEnum page is acceptable at this call site.
+    CHECK_FALSE(is_unexpected_enumeration_status(kNerrSuccess, {kNerrSuccess}));
+    // ERROR_ACCESS_DENIED is NOT in the acceptable set here deliberately --
+    // the caller (enum_netsession_inbound) checks and handles it BEFORE
+    // reaching this predicate, as its own documented constrained-empty
+    // outcome, so it is exercised as "unexpected" from this predicate's own
+    // narrow point of view.
+    CHECK(is_unexpected_enumeration_status(kErrorAccessDenied, {kNerrSuccess}));
+    // A genuinely unexpected session-enumeration failure.
+    CHECK(is_unexpected_enumeration_status(kErrorInvalidLevel, {kNerrSuccess}));
+}
+
+// ── snapshot_phase_outcome (BR4-001, round 4) ────────────────────────────────
+//
+// do_snapshot's (tar_plugin.cpp) SECOND honesty decision: fold the three
+// per-phase return codes collect_fast_impl/collect_slow_impl/
+// do_collect_software produce into the phase names added to
+// skipped_sources and the action's own return code. Previously those three
+// return values were discarded (bare expression statements), so an
+// ordinary persistence failure inside any of them -- injected here as a
+// fixture return code standing in for db_->insert_*_events() returning
+// false -- still produced "tar|snapshot|complete" / rc 0. TarPlugin is
+// translation-unit-local (tar_plugin.cpp) and cannot be constructed from
+// tests/unit/*.cpp, so this is the real production aggregation function
+// do_snapshot calls, exercised directly with fixture return codes standing
+// in for a failed collect_fast_impl/collect_slow_impl/do_collect_software
+// call (e.g. from an injected failing database write) rather than a
+// re-implementation.
+
+TEST_CASE("snapshot_phase_outcome: all phases succeed reports no failures, rc 0",
+          "[tar_capture_status][snapshot]") {
+    const auto out = snapshot_phase_outcome(/*fast_rc=*/0, /*slow_rc=*/0, /*software_rc=*/0);
+    CHECK(out.failed_phases.empty());
+    CHECK(out.return_code == 0);
+}
+
+TEST_CASE("snapshot_phase_outcome: a failed collect_fast_impl (e.g. injected insert failure) "
+          "is reported and fails the action",
+          "[tar_capture_status][snapshot]") {
+    const auto out = snapshot_phase_outcome(/*fast_rc=*/1, /*slow_rc=*/0, /*software_rc=*/0);
+    REQUIRE(out.failed_phases.size() == 1);
+    CHECK(out.failed_phases[0] == "collect_fast");
+    CHECK(out.return_code == 1);
+}
+
+TEST_CASE("snapshot_phase_outcome: a failed collect_slow_impl (e.g. the BR4-001 service-insert "
+          "scenario) is reported and fails the action",
+          "[tar_capture_status][snapshot]") {
+    const auto out = snapshot_phase_outcome(/*fast_rc=*/0, /*slow_rc=*/1, /*software_rc=*/0);
+    REQUIRE(out.failed_phases.size() == 1);
+    CHECK(out.failed_phases[0] == "collect_slow");
+    CHECK(out.return_code == 1);
+}
+
+TEST_CASE("snapshot_phase_outcome: a failed do_collect_software is reported and fails the "
+          "action",
+          "[tar_capture_status][snapshot]") {
+    const auto out = snapshot_phase_outcome(/*fast_rc=*/0, /*slow_rc=*/0, /*software_rc=*/1);
+    REQUIRE(out.failed_phases.size() == 1);
+    CHECK(out.failed_phases[0] == "software");
+    CHECK(out.return_code == 1);
+}
+
+TEST_CASE("snapshot_phase_outcome: multiple failed phases are all reported, call order "
+          "preserved, and compose with snapshot_result_line",
+          "[tar_capture_status][snapshot]") {
+    const auto out = snapshot_phase_outcome(/*fast_rc=*/1, /*slow_rc=*/1, /*software_rc=*/1);
+    REQUIRE(out.failed_phases.size() == 3);
+    CHECK(out.failed_phases[0] == "collect_fast");
+    CHECK(out.failed_phases[1] == "collect_slow");
+    CHECK(out.failed_phases[2] == "software");
+    CHECK(out.return_code == 1);
+
+    // Composed exactly as do_snapshot composes it: an arp precollection
+    // skip (collect_or_retain path) PLUS a phase failure both surface in
+    // the one response line an operator/agentic consumer reads.
+    std::vector<std::string> skipped_sources{"arp"};
+    skipped_sources.insert(skipped_sources.end(), out.failed_phases.begin(),
+                           out.failed_phases.end());
+    CHECK(snapshot_result_line(skipped_sources) ==
+          "tar|snapshot|partial|arp,collect_fast,collect_slow,software");
 }

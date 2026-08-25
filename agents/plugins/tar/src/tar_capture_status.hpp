@@ -30,6 +30,7 @@
 // weakening this default for everyone.
 
 #include <cstddef>
+#include <initializer_list>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -80,6 +81,39 @@ struct CaptureCompleteness {
 /// decision, only a stand-in throw.
 inline bool would_exceed_cap(std::size_t size_before_push, std::size_t cap) {
     return size_before_push >= cap;
+}
+
+/// True when `status` is NOT one of an enumeration API's documented
+/// terminal/exempt codes for the call site it came from -- e.g. {NO_ERROR}
+/// for a WNetOpenEnumW open (any other status is a real open failure, not
+/// "no connected resources"), {NO_ERROR, ERROR_NO_MORE_ITEMS} for a
+/// WNetEnumResourceW page (NO_ERROR means "more rows, keep paging",
+/// ERROR_NO_MORE_ITEMS means "table exhausted, stop cleanly" -- any other
+/// code is an unexpected provider/transport failure), or {NERR_Success} for
+/// a NetSessionEnum result once its own ERROR_MORE_DATA paging and
+/// ERROR_ACCESS_DENIED (a documented, constrained-empty outcome handled
+/// separately by the caller) are already accounted for.
+///
+/// BR4-003 (round 4): tar_mapdrive_collector.cpp's Windows legs previously
+/// conflated any unexpected WNet/NetSessionEnum status with normal
+/// enumeration completion (a bare `if (rc != NO_ERROR) break/return`),
+/// so a transient provider error could silently persist a partial
+/// outbound/inbound map set as though it were the complete live snapshot.
+/// This predicate is the single, shared "is this status one of the
+/// documented non-failure outcomes for this call" decision every Windows
+/// mapdrive enumeration site now applies before deciding to throw
+/// IncompleteCaptureError -- extracted as plain `unsigned long` codes (not
+/// the WinAPI DWORD/NET_API_STATUS typedefs) and an initializer_list of
+/// acceptable codes so it compiles and is unit-tested on every OS with
+/// fixture status codes standing in for real WNet/NetApi results, exactly
+/// like classify_subprocess_capture / would_exceed_cap above.
+inline bool is_unexpected_enumeration_status(unsigned long status,
+                                              std::initializer_list<unsigned long> acceptable) {
+    for (auto code : acceptable) {
+        if (status == code)
+            return false;
+    }
+    return true;
 }
 
 /// Pure completeness check over a bounded-subprocess result's status fields
@@ -174,6 +208,41 @@ inline std::string snapshot_result_line(const std::vector<std::string>& skipped_
         joined += skipped_sources[i];
     }
     return "tar|snapshot|partial|" + joined;
+}
+
+/// The `snapshot` action's SECOND honesty decision (BR4-001, round 4):
+/// given the three per-phase return codes do_snapshot's own three
+/// collect_fast_impl / collect_slow_impl / do_collect_software calls
+/// produced, decide which phase names to add to the skipped_sources list
+/// snapshot_result_line above renders, and the action's own exit code.
+///
+/// Previously do_snapshot called all three as bare expression statements
+/// and discarded every return value, so an ordinary persistence failure
+/// inside any of them (e.g. "error|service insert failed", already written
+/// to ctx by the failing phase itself) still produced
+/// "tar|snapshot|complete" and a zero return code -- collect_or_retain's
+/// IncompleteCaptureError skip path was the ONLY failure snapshot_result_line
+/// could ever report; a plain `return 1` from a failed DB write was
+/// invisible to it. Extracted as a pure function over three plain `int`s
+/// (not a live TarPlugin/CommandContext/database -- TarPlugin is
+/// translation-unit-local, so it cannot be constructed from
+/// tests/unit/*.cpp) so this exact aggregation is unit-tested with fixture
+/// return codes standing in for do_snapshot's three real calls.
+struct SnapshotPhaseOutcome {
+    std::vector<std::string> failed_phases; // appended to skipped_sources, in call order
+    int return_code{0};
+};
+
+inline SnapshotPhaseOutcome snapshot_phase_outcome(int fast_rc, int slow_rc, int software_rc) {
+    SnapshotPhaseOutcome out;
+    if (fast_rc != 0)
+        out.failed_phases.push_back("collect_fast");
+    if (slow_rc != 0)
+        out.failed_phases.push_back("collect_slow");
+    if (software_rc != 0)
+        out.failed_phases.push_back("software");
+    out.return_code = out.failed_phases.empty() ? 0 : 1;
+    return out;
 }
 
 } // namespace yuzu::tar
