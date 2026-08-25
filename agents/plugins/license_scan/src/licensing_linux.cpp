@@ -25,10 +25,6 @@
 
 #ifdef __linux__
 
-#include "licensing_parsers.hpp"
-#include "licensing_probes.hpp"
-#include "licensing_record.hpp"
-
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess / probe_tool_path (ADR-3002 rung 2)
 
 #include <chrono>
@@ -36,6 +32,10 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "licensing_parsers.hpp"
+#include "licensing_probes.hpp"
+#include "licensing_record.hpp"
 
 namespace yuzu::license_scan {
 

@@ -91,7 +91,7 @@ struct HKeyCloser {
 //
 // Returns -1 on any registry failure so the caller can report an honest
 // degrade rather than a fabricated zero.
-int registry_uninstall_subkey_count() {
+[[nodiscard]] int registry_uninstall_subkey_count() {
     HKEY hkey{};
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
                        L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall", 0, KEY_READ,
@@ -124,7 +124,7 @@ int registry_uninstall_subkey_count() {
 // is the authority on what it can actually spawn, and CreateProcess DOES follow
 // an APPEXECLINK. A genuinely absent winget then surfaces as the runner's own
 // spawn_error -> UNAVAILABLE, which is distinguishable from a winget that ran.
-std::string winget_candidate_path() {
+[[nodiscard]] std::string winget_candidate_path() {
     wchar_t buf[MAX_PATH]{};
     const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH);
     if (n == 0 || n >= MAX_PATH)
