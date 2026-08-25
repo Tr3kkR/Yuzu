@@ -3962,7 +3962,7 @@ A target is identified by a unique `name` so a definition can reference it via `
 
 `agent.registered` fires on *every* gRPC reconnect, not only first enrollment — same caveat as the Webhooks section above, and the same event-type table, since both sinks fire off the identical set of events. A target wired to a low-tolerance channel should filter or debounce on the receiving end if reconnect noise matters.
 
-All five endpoints require the `Infrastructure` securable type — `Read` for `GET`, `Write` for `POST`/`DELETE`. The `auth_credential` is **never** returned in any response (redacted from `list()` and from `get()`); only the auth_type and shape leak. Audit events: `offload_target.create` (success or denied) and `offload_target.delete`.
+All five endpoints require the `Infrastructure` securable type — `Read` for `GET`, `Write` for `POST`/`DELETE`. The `auth_credential` is **never** returned in any response (redacted from `list()` and from `get()`, not even as the encrypted-at-rest blob) — a `has_credential` boolean instead reports whether one is configured. Audit events: `offload_target.create` (success or denied) and `offload_target.delete`.
 
 #### `GET /api/v1/offload-targets`
 
@@ -3978,6 +3978,7 @@ List all configured offload targets.
       "name": "siem-primary",
       "url": "https://siem.example.com/ingest",
       "auth_type": "bearer",
+      "has_credential": true,
       "event_types": "execution.completed",
       "batch_size": 50,
       "enabled": true,
@@ -3989,7 +3990,7 @@ List all configured offload targets.
 
 #### `GET /api/v1/offload-targets/{id}`
 
-Fetch a single target by numeric id. `auth_credential` is redacted. 404 when no such id exists.
+Fetch a single target by numeric id. `auth_credential` is redacted (`has_credential` reports whether one is configured). 404 when no such id exists, 503 on a degraded read.
 
 #### `POST /api/v1/offload-targets`
 

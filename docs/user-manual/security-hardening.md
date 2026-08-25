@@ -330,6 +330,11 @@ Four classes that used to appear on that list no longer belong on it:
   dropped the SQLite-era `sessions` table outright rather than migrating it, so
   there is no session-token column to encrypt — or to leak in a dump. A restart
   is itself a fleet-wide session revocation.
+- **Offload-target credentials** (`offload_target_store.offload_targets.auth_credential`)
+  are `SecretCodec`-encrypted as of 2026-08-25 (ADR-0059). Same backup-pairing
+  requirement as MFA TOTP secrets above: a Postgres dump alone cannot recover a
+  configured target's credential without the matching keys directory — the
+  target survives, but its credential must be re-entered.
 
 ## Plugin Allowlist
 

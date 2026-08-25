@@ -1853,6 +1853,25 @@ public:
                                  "yuzu_server_offload_delivery_dropped_total"}) {
             metrics_.counter(name);
         }
+        // ADR-0059 (OffloadTargetStore Postgres migration) — three new
+        // counters this migration adds, same pre-seed rule as the six above.
+        metrics_.describe("yuzu_server_offload_delivery_credential_unavailable_total",
+                          "Offload-target deliveries skipped because the target's credential "
+                          "failed to decrypt (ADR-0010 fail-closed - never fired unsigned)",
+                          "counter");
+        metrics_.counter("yuzu_server_offload_delivery_credential_unavailable_total");
+        metrics_.describe("yuzu_server_offload_fire_event_degraded_total",
+                          "fire_event's enabled-target scan degraded (lease timeout or query "
+                          "failure) and skipped this tick's dispatch entirely",
+                          "counter");
+        metrics_.counter("yuzu_server_offload_fire_event_degraded_total");
+        metrics_.describe("yuzu_server_offload_backfill_total",
+                          "OffloadTargetStore legacy-SQLite backfill outcome at boot, by result",
+                          "counter");
+        // Bounded label set ({"ok","failed"}) — both pre-seeded, same rule
+        // as the six no-label counters above.
+        metrics_.counter("yuzu_server_offload_backfill_total", {{"result", "ok"}});
+        metrics_.counter("yuzu_server_offload_backfill_total", {{"result", "failed"}});
         // ADR-0010 §Decision 3. Carried in the gauge family because the
         // authoritative cumulative count lives in SecretCodec and is exported
         // pull-model at scrape time, but it IS a monotonic counter — declared
@@ -5942,11 +5961,61 @@ public:
                 }
             }
         }
-        {
-            auto offload_db = cfg_.db_dir() / "offload_targets.db";
-            offload_target_store_ = std::make_unique<OffloadTargetStore>(offload_db);
-            offload_target_store_->set_metrics(&metrics_);
-            agent_service_.set_offload_target_store(offload_target_store_.get());
+        // OffloadTargetStore — Postgres substrate migration (ADR-0059, Wave 3
+        // secret-gated store, mirrors WebhookStore/ADR-0057's conventions).
+        // Deliberate posture upgrade from the prior unconditional SQLite
+        // construction (no startup_failed_ gate) to the same fail-CLOSED
+        // posture as every other born-on-PG store (ADR-0012 §1): these are
+        // operator-authored target configs + credentials, not best-effort
+        // telemetry. Construction order mirrors the PluginConfigStore block
+        // above exactly: FileKeyProvider (shared, already constructed by the
+        // AuthDB block) → SecretCodec (constructed only) → OffloadTargetStore
+        // (migrates the schema AND registers auth_credential as a secret
+        // column) → SecretCodec::init() (runs AFTER the store so the column
+        // it validates already exists) → migrate_from_sqlite (legacy
+        // offload_targets.db backfill — transforms the plaintext credential
+        // through the just-initialized codec, per ADR-0010).
+        if (pg_pool_ && !startup_failed_) {
+            offload_secret_codec_ = std::make_unique<pg::SecretCodec>(*auth_key_provider_);
+            offload_target_store_ =
+                std::make_unique<OffloadTargetStore>(*pg_pool_, *offload_secret_codec_);
+            if (!offload_target_store_->is_open()) {
+                spdlog::error(
+                    "[PG] Refusing to start: offload target store migration/open failed");
+                startup_failed_ = true;
+            } else {
+                auto lease = pg_pool_->acquire();
+                if (!lease) {
+                    spdlog::error(
+                        "[PG] Refusing to start: could not acquire a connection to run "
+                        "SecretCodec::init() for offload_target_store ({})",
+                        pg_pool_->last_error());
+                    startup_failed_ = true;
+                } else {
+                    auto init_res = offload_secret_codec_->init(lease.get());
+                    lease.reset();
+                    if (!init_res) {
+                        spdlog::error(
+                            "[PG] Refusing to start: offload_target_store SecretCodec::init() "
+                            "failed — {}: {}",
+                            pg::SecretCodec::to_string(init_res.error().kind),
+                            init_res.error().message);
+                        startup_failed_ = true;
+                    } else {
+                        offload_target_store_->set_metrics(&metrics_);
+                        auto offload_db = cfg_.db_dir() / "offload_targets.db";
+                        if (!offload_target_store_->migrate_from_sqlite(offload_db)) {
+                            spdlog::error(
+                                "[PG] Refusing to start: offload target legacy-SQLite backfill "
+                                "failed ({})",
+                                offload_db.string());
+                            startup_failed_ = true;
+                        } else {
+                            agent_service_.set_offload_target_store(offload_target_store_.get());
+                        }
+                    }
+                }
+            }
         }
 
         // Phase 7: Inventory Store (Issue 7.17) — generic per-source blob store,
@@ -7375,18 +7444,22 @@ public:
                         .set(static_cast<double>(baseline_store_->baseline_count()));
                 }
                 // ADR-0010 §Decision 3 — `yuzu_server_secret_decrypt_failures_total`
-                // {store, failure_class}. The codec accumulates these
-                // internally; before the 2026-07-25 review (HIGH #4) nothing
-                // read them, so the metric existed only as a comment in
-                // secret_codec.hpp. Exported pull-model at scrape time (#1909
-                // pattern) — the codec keeps the authoritative cumulative
-                // count, so this is a `set()` of a monotonic total, not an
-                // increment, and a scrape that races a failure simply reports
-                // it on the next one.
-                // Iterates every KEK-enrolled codec (kek_enrolled_codecs()) —
-                // was auth_secret_codec_-only, which silently missed
-                // plugin_config_secret_codec_'s decrypt failures; webhook_
-                // secret_codec_ joins the same enrolled set (ADR-0057).
+                // {store, failure_class}. Each codec accumulates its own
+                // counts internally; before the 2026-07-25 review (HIGH #4)
+                // nothing read them, so the metric existed only as a comment
+                // in secret_codec.hpp. Exported pull-model at scrape time
+                // (#1909 pattern) — each codec keeps its own authoritative
+                // cumulative count, so this is a `set()` of a monotonic
+                // total, not an increment, and a scrape that races a
+                // failure simply reports it on the next one. Fanned out
+                // across EVERY kek_enrolled_codecs() instance — was
+                // auth_secret_codec_-only, which silently missed
+                // plugin_config_secret_codec_'s decrypt failures;
+                // webhook_secret_codec_ (ADR-0057) and offload_secret_codec_
+                // (ADR-0059) both join the same enrolled set — the `store`
+                // label already disambiguates which secret-bearing store
+                // each entry belongs to, so merging counts from multiple
+                // codec instances into one metric family is safe.
                 for (auto* codec : kek_enrolled_codecs()) {
                     for (const auto& [key, count] : codec->decrypt_failure_counts()) {
                         const auto& [store, cls] = key;
@@ -8475,9 +8548,9 @@ public:
         // plugin_config_secret_codec_, which borrows the SAME
         // auth_key_provider_ auth_secret_codec_ above borrows — so both
         // stores/codecs must be gone before auth_key_provider_.reset()
-        // (docs/postgres-store-playbook.md:112 destruct-before-pool,
-        // applied transitively to the shared key provider too). No audit
-        // hook to clear: PluginConfigStore's SecretCodec is never wired to
+        // (docs/postgres-store-playbook.md:112 destruct-before-pool, applied
+        // transitively to the shared key provider too). No audit hook to
+        // clear: PluginConfigStore's SecretCodec is never wired to
         // audit_store_ (its own audit trail runs through
         // plugin_config_routes.cpp's rest_audit.hpp calls, not the codec's
         // ADR-0010 audit hook).
@@ -8487,13 +8560,18 @@ public:
         // the pool. Every HTTP handler holding the raw pointer is quiesced
         // by the drains above.
         upload_grant_store_.reset();
-        // auth_key_provider_.reset() does NOT happen here (ADR-0057). It
-        // used to, but webhook_secret_codec_/webhook_store_ ALSO borrow it
-        // transitively, and webhook_store_ does not reset until AFTER the
-        // up-to-60s delivery-pool quiesce() below — an in-flight delivery
-        // decrypts (touches the KeyProvider) right up until it drains. See
-        // the auth_key_provider_.reset() call further down, right after
-        // that drain, for the actual reset point and its own comment.
+        // auth_key_provider_.reset() does NOT happen here — see the call
+        // site right after webhook_store_/offload_target_store_.reset()
+        // below. Unlike auth_db_/plugin_config_store_ above (no async
+        // worker touching their codec past their own .reset()),
+        // WebhookStore (ADR-0057) and OffloadTargetStore (ADR-0059) both
+        // dispatch deliveries onto a bounded worker pool that can still be
+        // decrypting through webhook_secret_codec_/offload_secret_codec_ —
+        // which borrow THIS SAME auth_key_provider_ — right up until each
+        // store's own quiesce() (a few hundred lines below, after the gRPC
+        // drain) proves it drained. Resetting the shared provider here,
+        // before those quiesce() calls run, would be a UAF against a live
+        // delivery's KeyProvider::unwrap_dek call.
         // AuditStore (ADR-0040) borrows pg_pool_ via its retention thread — that
         // thread is joined at stop_cleanup() above. Unwire the borrowed pointer
         // from every OTHER writer HERE (belt-and-braces, matching the sibling
@@ -8731,43 +8809,44 @@ public:
         agent_service_.set_offload_target_store(nullptr);
         webhook_store_.reset();
         offload_target_store_.reset();
-        // ADR-0057: webhook_secret_codec_ borrows auth_key_provider_ — same
-        // contract as auth_secret_codec_/plugin_config_secret_codec_ above
-        // (clear the audit hook before the codec dies, then drop it) —
-        // except this pair sits HERE, after the delivery-pool quiesce()
-        // just above, not up with the other codecs: an in-flight delivery
-        // decrypts (touches webhook_secret_codec_, transitively
-        // auth_key_provider_) right up until quiesce() proves it drained,
-        // so resetting either any earlier would UAF a still-draining
-        // delivery. auth_key_provider_.reset() ALSO moved here from its
-        // former position up with the other codecs, for the identical
-        // reason — see that block's comment.
+        // ADR-0057/ADR-0059: webhook_secret_codec_ and offload_secret_codec_
+        // both borrow auth_key_provider_ — same contract as
+        // auth_secret_codec_/plugin_config_secret_codec_ above (clear the
+        // audit hook before the codec dies, then drop it) — except this
+        // pair sits HERE, after both stores' delivery-pool quiesce() just
+        // above, not up with the other codecs: an in-flight delivery
+        // decrypts (touches its codec, transitively auth_key_provider_)
+        // right up until quiesce() proves it drained, so resetting either
+        // any earlier would UAF a still-draining delivery.
+        // auth_key_provider_.reset() ALSO moved here from its former
+        // position up with the other codecs, for the identical reason —
+        // see that block's comment.
         //
         // audit_store_.reset() ALSO moved here (gov Gate 8 cpp-safety,
         // hardening round) — for a THIRD, distinct reason from the two
-        // above, not merely "matches the pattern": webhook_secret_codec_'s
-        // audit hook (registered near its construction site) is a LIVE
-        // CALLBACK into audit_store_ for as long as a delivery can still
-        // decrypt through it, i.e. right up until webhook_store_->quiesce()
-        // above proves it drained. The earlier position (up with
-        // set_audit_store(nullptr) et al., before this drain) let
-        // audit_store_ die while that callback was still reachable; the
-        // hook's own `if (!audit_store_ || !audit_store_->is_open())
-        // return;` guard made this memory-safe, never a UAF, but it SILENTLY
-        // DROPPED every decrypt-failure audit event fired during that
-        // window — exactly the ADR-0010 §Decision-3 evidence ("emit an
-        // audit event + metric" on every decrypt failure) this codec exists
-        // to guarantee. This is NOT symmetric with auth_secret_codec_'s own
-        // hook-clear position (still correctly up near set_audit_store,
-        // unmoved): auth_db_'s reaper thread — the only thing that could
-        // still call auth_secret_codec_->decrypt() — is already joined by
-        // ~AuthDB before auth_db_.reset() runs a few lines above that
-        // block, so auth_secret_codec_'s caller is provably dead before its
-        // hook is cleared; webhook_secret_codec_'s caller (a StoreWorkerPool
-        // delivery thread) is deliberately kept alive past that point by
-        // this exact quiesce(), so its hook — and the audit_store_ it
-        // reads — must stay live until the quiesce proves the caller is
-        // gone too.
+        // above, not merely "matches the pattern": each codec's audit hook
+        // (registered near its construction site) is a LIVE CALLBACK into
+        // audit_store_ for as long as a delivery can still decrypt through
+        // it, i.e. right up until that store's own quiesce() above proves
+        // it drained. The earlier position (up with set_audit_store(nullptr)
+        // et al., before this drain) let audit_store_ die while that
+        // callback was still reachable; the hook's own
+        // `if (!audit_store_ || !audit_store_->is_open()) return;` guard
+        // made this memory-safe, never a UAF, but it SILENTLY DROPPED every
+        // decrypt-failure audit event fired during that window — exactly
+        // the ADR-0010 §Decision-3 evidence ("emit an audit event + metric"
+        // on every decrypt failure) this codec exists to guarantee. This is
+        // NOT symmetric with auth_secret_codec_'s own hook-clear position
+        // (still correctly up near set_audit_store, unmoved): auth_db_'s
+        // reaper thread — the only thing that could still call
+        // auth_secret_codec_->decrypt() — is already joined by ~AuthDB
+        // before auth_db_.reset() runs a few lines above that block, so
+        // auth_secret_codec_'s caller is provably dead before its hook is
+        // cleared; webhook_secret_codec_'s and offload_secret_codec_'s
+        // callers (each a StoreWorkerPool delivery thread) are deliberately
+        // kept alive past that point by their own quiesce(), so their
+        // hooks — and the audit_store_ they read — must stay live until
+        // that quiesce proves the caller is gone too.
         if (webhook_secret_codec_)
             webhook_secret_codec_->set_audit_hook({});
         webhook_secret_codec_.reset();
@@ -8784,6 +8863,9 @@ public:
         // below), so moving these two lines earlier is safe.
         runtime_config_store_.reset();
         runtime_config_secret_codec_.reset();
+        if (offload_secret_codec_)
+            offload_secret_codec_->set_audit_hook({});
+        offload_secret_codec_.reset();
         auth_key_provider_.reset();
         audit_store_.reset();
         // TagStore (ADR-0050) borrows pg_pool_ — unwire the borrowed raw
@@ -21376,11 +21458,12 @@ private:
             out.push_back(auth_secret_codec_.get());
         if (plugin_config_secret_codec_)
             out.push_back(plugin_config_secret_codec_.get());
-        // WebhookStore's SecretCodec (ADR-0057) — reuses auth_key_provider_
-        // (same "one KeyProvider instance backing multiple independent
-        // SecretCodec instances" shape as plugin_config_secret_codec_
-        // above), enrolled so its secret never stays pinned to whatever KEK
-        // version was active when it was written once rotation runs.
+        // WebhookStore's SecretCodec (ADR-0057) and OffloadTargetStore's
+        // (ADR-0059) — both reuse auth_key_provider_ (same "one KeyProvider
+        // instance backing multiple independent SecretCodec instances"
+        // shape as plugin_config_secret_codec_ above), enrolled so their
+        // secrets never stay pinned to whatever KEK version was active when
+        // they were written once rotation runs.
         if (webhook_secret_codec_)
             out.push_back(webhook_secret_codec_.get());
         // RuntimeConfigStore's SecretCodec (ADR-0060) — same shape, same
@@ -21391,6 +21474,8 @@ private:
         // undecryptable once the old KEK version is later retired.
         if (runtime_config_secret_codec_)
             out.push_back(runtime_config_secret_codec_.get());
+        if (offload_secret_codec_)
+            out.push_back(offload_secret_codec_.get());
         return out;
     }
 
@@ -21481,6 +21566,16 @@ private:
     // KeyProvider transitively) right up until it drains.
     std::unique_ptr<pg::SecretCodec> webhook_secret_codec_;
     std::unique_ptr<WebhookStore> webhook_store_;
+    // OffloadTargetStore's own SecretCodec (ADR-0010 per-store instance
+    // model), backed by the SHARED auth_key_provider_ FileKeyProvider (one
+    // KEK per database is install-wide custody — see the PluginConfigStore
+    // block's identical reasoning above). Declared BEFORE
+    // offload_target_store_ so reverse-declaration-order destruction tears
+    // the store down first (a still-draining delivery decrypts through this
+    // codec right up until OffloadTargetStore::quiesce() proves it drained —
+    // see stop()'s teardown-ordering comment, which moves
+    // auth_key_provider_.reset() to after that quiesce for the same reason).
+    std::unique_ptr<pg::SecretCodec> offload_secret_codec_;
     std::unique_ptr<OffloadTargetStore> offload_target_store_;
 
     // Phase 7: Inventory Store (Issue 7.17)
