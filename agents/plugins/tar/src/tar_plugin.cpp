@@ -2605,6 +2605,21 @@ private:
         // left its baseline stale, which is exactly what happened before
         // this round: the collect_*_impl return values were ignored and the
         // action wrote "tar|snapshot|complete" unconditionally.
+        //
+        // round 4 (BR4-001): that fix covered only the collect_or_retain /
+        // IncompleteCaptureError skip path (arp/service/mapdrive). An
+        // ordinary persistence failure inside collect_fast_impl,
+        // collect_slow_impl, or do_collect_software (each already writes
+        // its own "error|... insert failed" line and returns 1) was still
+        // invisible here -- the three calls below were bare expression
+        // statements with their return values discarded, so the action
+        // still finished "tar|snapshot|complete" / rc 0 despite a failed
+        // write. fast_rc/slow_rc/software_rc capture those return codes;
+        // snapshot_phase_outcome (tar_capture_status.hpp) is the pure
+        // function deciding which phase names to add here and the action's
+        // own exit code, unit-tested directly since TarPlugin is
+        // translation-unit-local and cannot be exercised from
+        // tests/unit/*.cpp.
         std::vector<std::string> skipped_sources;
         // arp: same optional-through-collect_or_retain precollection as
         // do_collect_fast, and for the identical reason (BR-001, round 2) --
@@ -2634,20 +2649,29 @@ private:
             dns_pre.clear();
             netqual_pre.clear();
         }
+        int fast_rc = 0;
+        int slow_rc = 0;
         {
             std::lock_guard lock(collect_mu_);
-            collect_fast_impl(ctx, arp_on ? &arp_pre : nullptr, dns_on ? &dns_pre : nullptr,
-                              netqual_on ? &netqual_pre : nullptr, &skipped_sources);
-            collect_slow_impl(ctx, &skipped_sources);
+            fast_rc = collect_fast_impl(ctx, arp_on ? &arp_pre : nullptr,
+                                        dns_on ? &dns_pre : nullptr,
+                                        netqual_on ? &netqual_pre : nullptr, &skipped_sources);
+            slow_rc = collect_slow_impl(ctx, &skipped_sources);
         }
         // Software lives on its own dedicated software_collect_mu_ (NOT collect_mu_),
         // so collect it as a SEPARATE step after the collect_mu_ scope closes —
         // preserving the collect_mu_ ≺ software_collect_mu_ lock order. It self-gates
         // on source_enabled("software"), so a disabled source is a no-op. The manual
         // promises `snapshot` collects all enabled capture sources (#1620).
-        do_collect_software(ctx);
+        const int software_rc = do_collect_software(ctx);
+        // BR4-001 (round 4): fold each phase's own return code into the
+        // honesty response -- see the comment above skipped_sources.
+        const auto phase_outcome =
+            yuzu::tar::snapshot_phase_outcome(fast_rc, slow_rc, software_rc);
+        skipped_sources.insert(skipped_sources.end(), phase_outcome.failed_phases.begin(),
+                               phase_outcome.failed_phases.end());
         ctx.write_output(yuzu::tar::snapshot_result_line(skipped_sources));
-        return 0;
+        return phase_outcome.return_code;
     }
 
     // ── fleet_snapshot action (single JSON document for fleet-topology viz) ──
