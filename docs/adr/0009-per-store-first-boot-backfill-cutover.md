@@ -73,13 +73,17 @@ data).
   **Update (`ResponseStore`/#2691, 2026-08-08):** "behind a flag" above overstated the
   mechanism for the first store to actually exercise the skippable class. No flag was
   built, and none is needed: `ResponseStore` skips backfill **unconditionally** — on
-  cutover the legacy `responses.db` is never read, and a one-time loud boot log records
-  "response history reset on Postgres cutover." There is no compliance or config-durability
-  requirement to preserve response rows across the cut (unlike the config/reference and
-  audit classes above), so a conditional flag would add a knob nobody has a reason to turn
-  off. `ResponseStore` is the reference case for this class: a future purely-TTL'd,
-  purely-ephemeral store should also skip unconditionally, not gate the skip behind a flag,
-  unless a specific store has a reason this one doesn't.
+  cutover the legacy `responses.db` is never read. (Correction, 2026-08-25: an earlier
+  version of this paragraph claimed "a one-time loud boot log records 'response history
+  reset on Postgres cutover'" — no such log exists; `ResponseStore` logs only its generic
+  `"ResponseStore initialized (schema {}, retention={}d)"` line, with nothing distinguishing
+  a fresh start from any other boot. See the fresh-start-by-default Update below for the new
+  detect-and-warn requirement this gap motivates for stores holding real operator data.)
+  There is no compliance or config-durability requirement to preserve response rows across
+  the cut (unlike the config/reference and audit classes above), so a conditional flag would
+  add a knob nobody has a reason to turn off. `ResponseStore` is the reference case for this
+  class: a future purely-TTL'd, purely-ephemeral store should also skip unconditionally, not
+  gate the skip behind a flag, unless a specific store has a reason this one doesn't.
 
   **Update (`ProductPackStore`/ADR-0054, 2026-08-23):** the "must... delete the same
   subject/device from the rollback copy" sentence above literally names mutating the
@@ -131,3 +135,54 @@ data).
   (the clause's original target) rather than operator-authored catalog metadata over
   separately-erased content. That store will likely need the literal per-file mechanism
   this update declines for `ProductPackStore`.
+
+  **Update (fresh-start-by-default, 2026-08-25 — operator directive):** the "Backfill is
+  mandatory for config/reference stores" bullet above assumed a real fleet with real
+  legacy data to protect. That has never been true — no production fleet has ever run a
+  pre-Postgres build of any Yuzu store — so for every migration still to come (as of this
+  writing: `InstructionStore`, `OffloadTargetStore`, `RuntimeConfigStore`), the default
+  flips: **skip `migrate_from_sqlite()` entirely, unconditionally, the same way
+  `ResponseStore` already does** (Update above), rather than build a backfill and plan to
+  remove it later. This is not a narrowing of what backfill protects — the mandate's
+  entire premise (preserving real operator config / real SOC 2 audit history across a real
+  upgrade) is empty while there is nothing real to preserve.
+
+  (`WebhookStore`/PR #3563 merged with a full `migrate_from_sqlite()` already built the
+  same day this amendment landed, ahead of it reaching that PR — too late for the "don't
+  build it" guidance to apply retroactively. Its backfill stays for now, same as every
+  other already-migrated store's.)
+
+  (`InstructionStore`/PR #3602 is a DIFFERENT situation from `WebhookStore`'s, not the same
+  one — it is still OPEN, unmerged, as of this amendment landing, with a full mandatory
+  backfill already built under the pre-amendment text. Unlike `WebhookStore`, nothing here
+  is retroactive: #3602 should drop that backfill before merging, not keep it — this default
+  now governs it directly, the same as any other not-yet-merged `InstructionStore` work. Its
+  reviewer had already separately requested changes for unrelated bugs in the backfill's
+  conflict-resolution logic; removing the backfill entirely resolves those findings along
+  with bringing the PR into line with this default.)
+
+  **This default is conditional on the fact, not permanent policy.** It holds only while
+  "no production fleet" stays true. If a real external deployment (a design partner, a
+  pilot customer, a dogfooded production instance) exists or is committed to before a
+  given store migrates, that store's own per-store ADR must re-derive whether backfill is
+  needed for IT specifically — do not cite this update as blanket cover once the premise
+  changes. `AuditStore` (already migrated, ADR-0040, backfill built and shipped) is the
+  one store where this would matter most if the premise ever flips retroactively: audit
+  evidence cannot be regenerated the way config or cache state can, so its already-built
+  backfill is deliberately not a candidate for retroactive removal. A future store whose
+  data is similarly irreplaceable (not just operator-authored-and-reconstructible) should
+  weigh that before defaulting to skip.
+
+  **Existing stores already migrated WITH a backfill are unaffected by this update** —
+  removing an already-built `migrate_from_sqlite()` is a separate decision, tracked
+  per-store, not mandated by this ADR.
+
+  **This supersedes two specific sentences above for a skip-by-default store, and no others:**
+  the Decision bullet requiring "each per-store migration's upgrade-test must assert that
+  config/reference/audit data survives the previous-release-SQLite → new-release-Postgres
+  transition" does not apply — there is no transition to assert for a store with nothing
+  copied across; and the Consequences bullet stating "each per-store migration carries a
+  `migrate_from_sqlite()` implementation and an upgrade-test assertion" is no longer a blanket
+  requirement for a migration that lands under this default. Every other Decision/Consequences
+  bullet (the legacy-file rollback-window retention, the fail-closed construction posture, the
+  secret-transform-never-copy rule for the documented-exception case) is untouched.
