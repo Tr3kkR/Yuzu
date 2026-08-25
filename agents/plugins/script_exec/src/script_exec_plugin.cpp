@@ -50,8 +50,11 @@
  * One platform note, UPDATED by Alex at the A2-002 escalation (superseding
  * the paragraph this replaces): the deleted Windows spawn path passed a
  * null environment block to CreateProcessA, so its children inherited the
- * FULL parent environment unfiltered — narrower than the POSIX safe_vars
- * list, not equal to it. Alex ruled AGAINST narrowing that pre-existing
+ * FULL parent environment unfiltered — BROADER than the POSIX safe_vars
+ * list (dozens of ambient variables vs. seven curated names), not equal to
+ * it. BR3-004 (whole-branch review round 3): an earlier version of this
+ * comment said "narrower," backwards from the actual comparison. Alex ruled
+ * AGAINST narrowing that pre-existing
  * Windows behaviour to match POSIX's seven names (an earlier draft of this
  * migration did exactly that, and it was flagged and reversed). Windows
  * instead uses the new, narrowly-scoped
@@ -108,9 +111,16 @@ constexpr size_t kMaxOutputBytes = 16 * 1024 * 1024; // 16 MiB hard output cap
 // The cwd resolve_executable's relative-path branch joins against. Matches
 // the runner's OWN default working_dir exactly (SubprocessOptions::working_dir
 // is left unset by every call below, so this is genuinely what the child
-// runs with) — "/" on POSIX; on Windows, subprocess_runner.cpp maps the "/"
-// sentinel it also defaults to onto "C:\Windows\System32" for the actual
-// spawn call, so that is the literal used here rather than "/".
+// runs with) — "/" on POSIX; on Windows, subprocess_runner.cpp resolves its
+// own "/" sentinel via yuzu::agent::windows_system_directory()
+// (GetSystemDirectoryW, cached process-lifetime), so this function performs
+// the IDENTICAL resolution rather than trusting the hard-coded literal
+// "C:\Windows\System32" this used to be (BR3-001, whole-branch review round
+// 3) — an install with Windows on a non-C: volume would otherwise anchor a
+// relative command/PATH entry against an untrusted, attacker-populatable
+// directory tree. Returns an EMPTY string on Windows if resolution fails;
+// do_exec below fails the action closed in that case rather than falling
+// back to the old literal.
 //
 // BR-009 (whole-branch review): this is a DELIBERATE, operator-visible
 // compatibility break from the deleted execvp()/CreateProcessA() paths, not
@@ -127,9 +137,13 @@ constexpr size_t kMaxOutputBytes = 16 * 1024 * 1024; // 16 MiB hard output cap
 // Recorded here rather than silently inherited: see changelog.d's
 // script_exec fragment for the operator-facing note.
 #ifdef _WIN32
-constexpr const char* kRunnerDefaultCwd = "C:\\Windows\\System32";
+std::string runner_default_cwd() {
+    return yuzu::agent::windows_system_directory();
+}
 #else
-constexpr const char* kRunnerDefaultCwd = "/";
+std::string runner_default_cwd() {
+    return "/";
+}
 #endif
 
 // ── helper: parse timeout ──────────────────────────────────────────────────
@@ -386,8 +400,20 @@ int do_exec(yuzu::CommandContext& ctx, yuzu::Params params) {
     }
     auto path_entries = yuzu::script_exec::split_path_entries(path_value, kWindowsRules);
 
+    // BR3-001: on Windows this is a real GetSystemDirectoryW resolution
+    // (cached in the runner), not a compile-time literal -- fail the
+    // action closed if it comes back empty rather than silently anchoring
+    // against a relative/empty cwd. Always non-empty on POSIX.
+    auto default_cwd = runner_default_cwd();
+    if (default_cwd.empty()) {
+        ctx.write_output("error|failed to resolve Windows system directory");
+        ctx.write_output("status|error");
+        ctx.write_output("exit_code|-1");
+        return 1;
+    }
+
     auto resolved = yuzu::script_exec::resolve_executable(
-        command, kRunnerDefaultCwd, path_entries, is_executable_probe, kWindowsRules);
+        command, default_cwd, path_entries, is_executable_probe, kWindowsRules);
     if (!resolved) {
         // Matches the deleted paths' own early-setup-failure shape: status
         // before exit_code, unlike the post-runner-return order below.
@@ -417,6 +443,24 @@ int do_powershell(yuzu::CommandContext& ctx, yuzu::Params params) {
 
     int timeout = parse_timeout(params);
 
+    // BR3-001 (whole-branch review round 3): resolved via
+    // yuzu::agent::windows_system_directory() (GetSystemDirectoryW,
+    // cached), not the compile-time literal this used to be -- an install
+    // with Windows on a non-C: volume would otherwise trust an untrusted,
+    // attacker-populatable "C:\Windows\System32" tree as the PowerShell
+    // launch root. Fail the action closed on resolution failure -- never
+    // fall back to a bare "powershell.exe" that would reintroduce a PATH
+    // search (the exact issue this migration's absolute-path launch
+    // already improved on pre-migration bare CreateProcessA(powershell.exe)).
+    const std::string& sys_dir = yuzu::agent::windows_system_directory();
+    if (sys_dir.empty()) {
+        ctx.write_output("error|failed to resolve Windows system directory");
+        ctx.write_output("status|error");
+        ctx.write_output("exit_code|-1");
+        return 1;
+    }
+    const std::string powershell_path = sys_dir + "\\WindowsPowerShell\\v1.0\\powershell.exe";
+
     // Use -EncodedCommand with Base64-encoded UTF-16LE to avoid all escaping issues.
     // This prevents any shell metacharacter injection.
     std::vector<uint8_t> utf16le;
@@ -435,8 +479,8 @@ int do_powershell(yuzu::CommandContext& ctx, yuzu::Params params) {
                          CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, b64.data(), &b64_len);
     b64.resize(b64_len);
 
-    auto argv =
-        yuzu::script_exec::assemble_argv(yuzu::script_exec::ExecMode::powershell, "", "", b64);
+    auto argv = yuzu::script_exec::assemble_argv(yuzu::script_exec::ExecMode::powershell,
+                                                 powershell_path, "", b64);
     return run_via_runner(ctx, argv, timeout, parent_env_allowlist());
 #endif
 }
