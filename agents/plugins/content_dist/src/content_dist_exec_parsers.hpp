@@ -53,12 +53,57 @@ namespace yuzu::content_dist::exec {
 [[nodiscard]] inline yuzu::agent::SubprocessOptions build_execution_options(bool is_linux) {
     yuzu::agent::SubprocessOptions opts;
 
-    // 30s: preserves the deleted Windows path's
-    // WaitForSingleObject(pi.hProcess, 30000) timeout exactly. The deleted
-    // POSIX path never bounded its own read/waitpid loop at all -- this is
-    // a deliberate tightening to match the Windows leg's existing external
-    // contract rather than a second, wider, platform-specific bound.
-    opts.deadline = std::chrono::seconds(30);
+    // BR-002 (whole-branch review correction -- supersedes an earlier
+    // version of this comment, and of this migration's spec, that is WRONG
+    // and must not be re-derived from): a flat 30s deadline is NOT a
+    // preservation of the deleted paths' pre-migration behaviour on either
+    // platform. The deleted Windows path called
+    // WaitForSingleObject(pi.hProcess, 30000) but never acted on a timeout
+    // -- it simply stopped waiting and read back whatever GetExitCodeProcess
+    // returned (STILL_ACTIVE if the child was still running), leaving the
+    // child running, undisturbed, in the background; no kill was ever sent.
+    // The deleted POSIX path's waitpid() had no bound at all. So on BOTH
+    // platforms, pre-migration, execute_staged actually let a staged
+    // installer run to completion, however long that took. A 30s deadline
+    // with soft_terminate_grace at its zero default (the runner's
+    // immediate-hard-SIGKILL behaviour, subprocess_runner.hpp) is a NEW,
+    // strictly worse regression this migration would otherwise introduce:
+    // a real installer legitimately running past 30s -- entirely plausible
+    // for content_dist's actual use case, staged package/tooling installers
+    // -- gets SIGKILLed mid-transaction, which the pre-migration code never
+    // did on either OS.
+    //
+    // execute_staged is MUTATING (it runs a staged installer that can hold
+    // real state -- mid-write files, an in-flight package-manager
+    // transaction) and takes no caller-supplied timeout parameter (unlike
+    // script_exec's operator-set `timeout`), so this function must pick one
+    // fixed, generous value that stands in for "no bound" without actually
+    // being unbounded -- ADR-3002's entire migration rationale is that an
+    // agent-spawned child must never be able to hang the runner forever.
+    // 30 MINUTES: comfortably longer than any legitimate installer this
+    // plugin stages in practice (script_exec's own operator-configurable
+    // ceiling for arbitrary admin scripts tops out at 3600s/1hr -- this is
+    // half that, deliberately more conservative since execute_staged runs
+    // unattended, without an operator able to raise it per-call), while
+    // still closing the genuine "run forever" hang risk the pre-migration
+    // code left wide open. If a real deployment needs longer, that is a
+    // new, explicit, reviewed exception -- not a silent unbounded default.
+    opts.deadline = std::chrono::minutes(30);
+
+    // ADR-3002 "termination semantics for mutating tools": a mutating site
+    // must carry a nonzero soft-terminate grace, not just a bounded
+    // deadline -- on a deadline trigger the runner sends SIGTERM to the
+    // process group first (Windows: CTRL_BREAK, xplat-A2-unsupported for
+    // this service-hosted agent, subprocess_runner.hpp) and waits this long
+    // for a voluntary exit before escalating to the same unmodified hard
+    // kill. 30s: a staged installer is the site most likely of the two
+    // mutating runner call sites in this branch to be mid-write/
+    // mid-transaction at the deadline (script_exec's grace, by contrast,
+    // covers an arbitrary operator script with no known transactional
+    // shape) -- long enough to let a well-behaved installer catch SIGTERM
+    // and roll back or flush, short enough that a genuinely hung installer
+    // still resolves promptly.
+    opts.soft_terminate_grace = std::chrono::seconds(30);
 
     // Both deleted paths merged stderr into the SAME captured stream as
     // stdout: the Windows launcher pointed its error handle at the same

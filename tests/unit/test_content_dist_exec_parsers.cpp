@@ -27,10 +27,19 @@ using yuzu::agent::TerminationReason;
 
 // ── build_execution_options ──────────────────────────────────────────────
 
-TEST_CASE("build_execution_options sets the fixed deadline/merge/output-cap trio",
+TEST_CASE("build_execution_options sets the fixed deadline/grace/merge/output-cap quad",
          "[agent][content_dist][exec]") {
     auto opts = build_execution_options(/*is_linux=*/false);
-    CHECK(opts.deadline == std::chrono::seconds(30));
+    // BR-002 (whole-branch review): 30 MINUTES, not 30 seconds -- the
+    // deleted pre-migration paths ran a staged installer to completion
+    // unbounded on both platforms (see build_execution_options' own
+    // rationale comment); 30 minutes is the deliberately generous bound
+    // that replaces "no bound" without reintroducing it.
+    CHECK(opts.deadline == std::chrono::minutes(30));
+    // Mutating-site grace (ADR-3002): a deadline/cancel kill sends SIGTERM
+    // first and waits this long for a voluntary exit before the hard kill,
+    // instead of an immediate SIGKILL mid-transaction.
+    CHECK(opts.soft_terminate_grace == std::chrono::seconds(30));
     CHECK(opts.merge_stderr);
     CHECK(opts.output_cap_bytes == 16u * 1024 * 1024);
 }
