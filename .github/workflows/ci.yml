@@ -874,9 +874,11 @@ jobs:
         # not better. Reverted without a real run confirming it helps; this
         # repo's own house rule (tests/meson.build's shard-history comment):
         # "raising the number is the last resort, not the first." The cross-job
-        # slot count in with-test-slot.sh below stays at 2, unchanged — a
-        # different axis (#3443 AC4, box-wide job saturation); raising it would
-        # reopen that problem.
+        # slot count in with-test-slot.sh below was ALSO held at 2 at the time
+        # this paragraph was written, for the same reason (box-wide job
+        # saturation, #3443 AC4) — SUPERSEDED 2026-08-25, see the "Cross-job
+        # slot count: 2 -> 3" paragraph below. --num-processes here is
+        # UNCHANGED (still 2) — only the box-wide slot count moved.
         #
         # 2026-08-25: the solo diagnostic above (E=353.32s, G=317.04s) is what
         # finally disproved the "isolate the pool and it'll fit" premise this
@@ -929,6 +931,65 @@ jobs:
         # measured ~1-2 min combined, no Postgres/heavy-CPU contention), but a
         # real narrowing of what #3443 AC4's gate covers, not just an
         # implementation detail.
+        #
+        # Cross-job slot count: 2 -> 3 (2026-08-25, same day as max-parallel:3
+        # landed). max-parallel:3 (this job's `strategy:` block, above) and
+        # this slot gate are DIFFERENT axes, not substitutes for each other:
+        # max-parallel governs RUNNER ACQUISITION for one push's own matrix;
+        # this gate governs box-wide HEAVY TEST-PHASE concurrency across ALL
+        # jobs (any push, any PR, nightly, manual dispatch) once a job already
+        # has a runner and has finished building. Raising max-parallel:3
+        # doesn't make the OLD "stays at 2" reasoning wrong on its own terms —
+        # it just no longer needs the slot gate to ALSO be the sole box-wide
+        # throttle, which is what "reopen that problem" assumed.
+        #
+        # Trigger: two real runs the same day hit the 2-slot ceiling hard —
+        # PR #3600's own Linux job waited the full 30-min
+        # YUZU_TEST_SLOT_TIMEOUT_MIN and gave up (`no 'yuzu-bigtam-heavy' slot
+        # free after 30 min (2 slots busy)`; recovered via a manual rerun once
+        # the contending jobs finished); PR #3530's Linux job waited 17m16s
+        # (`acquired 'yuzu-bigtam-heavy' slot 1/2 after 1036s`) before running
+        # clean. Both times the 2 slots were held by OTHER concurrent jobs'
+        # own long pg-shard test phases, not by anything abnormal.
+        #
+        # Why 3 is safe to try, not just convenient: each of the 4 Big Tam
+        # runner agents idempotently (re)uses its OWN persistent
+        # `yuzu-ci-postgres-<n>` container — 3 concurrent heavy phases don't
+        # contend for one shared Postgres instance, unlike the WITHIN-job
+        # `--num-processes` cap above (which exists because ONE job's own pg
+        # shards fan out onto that SAME job's ONE container). A same-day
+        # diagnostic (tests/meson.build's shard-history comment) measured a
+        # shard's wall time within ~3% whether the box was quiet or under 3
+        # OTHER PRs' full CI runs — Big Tam's per-op cost doesn't degrade
+        # sharply under moderate added load. That said, per-runner Postgres
+        # isolation removes DB lock/connection contention but NOT shared
+        # physical resources (page cache, DRAM bandwidth, kernel/container
+        # overhead) — necessary evidence, not sufficient proof by itself. The
+        # cap stays below 4 (not raised to match runner count) specifically to
+        # keep SOME protection against a full-box heavy-phase pileup.
+        #
+        # NOT starvation-proof: this script has no FIFO or PR-aware admission
+        # (scripts/ci/with-test-slot.sh polls every 5s, first-come-first-
+        # served) — if 3 dev-push legs hold all 3 slots, a 4th job (a PR's or
+        # otherwise) still waits the full 30 minutes, same as before. Raising
+        # the count reduces how OFTEN that happens, it doesn't eliminate it.
+        #
+        # --num-processes stays at 2, deliberately NOT bundled with this
+        # change: 2 slots x 2 shards/job = 4 concurrent pg shards today; 3
+        # slots x 2 = 6; 3 slots x 3 would jump to 9 with no diagnostic
+        # support at that load and no way to attribute a regression to either
+        # knob. Ship and measure one axis at a time.
+        #
+        # Acceptance/rollback signal: the #2093 duration watchdog's 560s
+        # (80% of the 700s per-shard ceiling) warning is an EXPECTED, accepted
+        # verification signal on early 3-slot runs, not a reason to revert on
+        # its own (worst shard measured 522.73s at 2-wide -> 700s failure
+        # needs roughly a 34% slowdown, comfortably avoided). REPEATED
+        # warnings on the SAME shard specifically under confirmed 3-slot
+        # occupancy is the real signal that this operating point consumed too
+        # much margin — the response then is rebalancing/splitting that
+        # shard or reverting to slots=2, never another timeout increase.
+        # Tracked: #3443.
         env:
           YUZU_TEST_SLOT_DIR: /tmp/yuzu-bigtam-test-slots
           YUZU_TEST_SLOT_NAME: yuzu-bigtam-heavy
@@ -936,7 +997,7 @@ jobs:
         run: |
           python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --suite agent --suite docs --suite proto --suite tar --suite gateway
           python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs "server unit tests shard A" "server unit tests shard B" "mcp bridge teardown allocation budget"
-          bash scripts/ci/with-test-slot.sh 2 -- \
+          bash scripts/ci/with-test-slot.sh 3 -- \
             python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 "server pg unit tests shard A" "server pg unit tests shard H" "server pg unit tests shard B" "server pg unit tests shard D" "server pg unit tests shard E" "server pg unit tests shard I" "server pg unit tests shard G" "server pg unit tests shard J" "server pg unit tests shard F" "server pg unit tests shard C"
 
       # Break-glass MFA-reset CLI contract (#1226) — exit codes + JSON output of
