@@ -1115,10 +1115,18 @@ private:
     // collect_or_retain contract) is preserved as nullopt through this layer
     // instead of collapsing to an empty vector indistinguishable from a
     // genuinely empty ARP table (BR-001, round 2) -- do_collect_fast sets it.
+    // skipped_sources: when non-null, the name of every enabled
+    // collect_or_retain-backed source this call skipped (arp) is appended --
+    // do_snapshot (round 3, B3-002) aggregates these across both
+    // collect_fast_impl and collect_slow_impl to decide whether the forced
+    // `snapshot` action can honestly report "complete". Null for the regular
+    // collect_fast trigger tick (do_collect_fast), which already logs the
+    // same skip via spdlog and has no separate completeness response to give.
     int collect_fast_impl(yuzu::CommandContext& ctx,
                           std::optional<std::vector<yuzu::tar::ArpEntry>>* arp_pre = nullptr,
                           std::vector<yuzu::tar::DnsEntry>* dns_pre = nullptr,
-                          std::vector<yuzu::tar::TcpQualitySample>* netqual_pre = nullptr) {
+                          std::vector<yuzu::tar::TcpQualitySample>* netqual_pre = nullptr,
+                          std::vector<std::string>* skipped_sources = nullptr) {
         auto ts = now_epoch_seconds();
         auto snap_id = next_snapshot_id();
         auto redaction = load_redaction_patterns(*db_);
@@ -1531,9 +1539,12 @@ private:
                 auto res = yuzu::tar::collect_or_retain(
                     [] { return yuzu::tar::enumerate_arp(); });
                 current = std::move(res.current);
-                if (!current)
+                if (!current) {
                     spdlog::warn("TAR: arp snapshot incomplete ({}) -- retaining baseline",
                                  res.skip_reason);
+                    if (skipped_sources)
+                        skipped_sources->push_back("arp");
+                }
             }
             if (current) {
                 auto previous = json_to_arp(db_->get_state("arp"));
@@ -1863,7 +1874,12 @@ private:
 
     // ── collect_slow: services + users ────────────────────────────────────────
     // Unlocked implementation -- caller must hold collect_mu_
-    int collect_slow_impl(yuzu::CommandContext& ctx) {
+    // skipped_sources: see collect_fast_impl's parameter doc above -- service
+    // and mapdrive are BOTH collected entirely inside this function (no
+    // outer precollection stage like arp/dns/netqual has), so this is the
+    // only place their collect_or_retain skip can be recorded for do_snapshot.
+    int collect_slow_impl(yuzu::CommandContext& ctx,
+                          std::vector<std::string>* skipped_sources = nullptr) {
         auto ts = now_epoch_seconds();
         auto snap_id = next_snapshot_id();
         int total_events = 0;
@@ -1882,9 +1898,12 @@ private:
             // mapdrive historical backfill (init(), enumerate_mapdrive_history).
             auto res = yuzu::tar::collect_or_retain([] { return yuzu::tar::enumerate_services(); });
             auto current = std::move(res.current);
-            if (!current)
+            if (!current) {
                 spdlog::warn("TAR: service snapshot incomplete ({}) -- retaining baseline",
                              res.skip_reason);
+                if (skipped_sources)
+                    skipped_sources->push_back("service");
+            }
             if (current) {
                 const std::string svc_key{yuzu::tar::diff_state_key("service")}; // #538
                 auto prev_json = db_->get_state(svc_key);
@@ -1990,9 +2009,12 @@ private:
             // against the last COMPLETE one.
             auto res = yuzu::tar::collect_or_retain([] { return yuzu::tar::enumerate_mapdrive(); });
             auto current = std::move(res.current);
-            if (!current)
+            if (!current) {
                 spdlog::warn("TAR: mapdrive snapshot incomplete ({}) -- retaining baseline",
                              res.skip_reason);
+                if (skipped_sources)
+                    skipped_sources->push_back("mapdrive");
+            }
             if (current) {
                 const std::string md_key{yuzu::tar::diff_state_key("mapdrive")}; // #538
                 auto previous = json_to_mapdrive(db_->get_state(md_key));
@@ -2565,6 +2587,19 @@ private:
         const bool arp_on = source_enabled(*db_, "arp");
         const bool dns_on = source_enabled(*db_, "dns");
         const bool netqual_on = db_->get_config("netqual_enabled", "false") == "true";
+        // round 3 (B3-002): names of every enabled source classified
+        // incomplete this pass (arp/service/mapdrive) -- accumulated across
+        // the arp precollection below AND collect_slow_impl's service/
+        // mapdrive legs (collect_fast_impl's arp leg never adds to this: arp
+        // is always precollected here, so its own internal else-branch is
+        // unreachable for this caller). snapshot_result_line
+        // (tar_capture_status.hpp) turns this into the action's honest
+        // response -- the whole point being that a forced `snapshot` must
+        // never report "complete" while it silently skipped a source and
+        // left its baseline stale, which is exactly what happened before
+        // this round: the collect_*_impl return values were ignored and the
+        // action wrote "tar|snapshot|complete" unconditionally.
+        std::vector<std::string> skipped_sources;
         // arp: same optional-through-collect_or_retain precollection as
         // do_collect_fast, and for the identical reason (BR-001, round 2) --
         // see that function's comment.
@@ -2572,9 +2607,11 @@ private:
         if (arp_on) {
             auto res = yuzu::tar::collect_or_retain([] { return yuzu::tar::enumerate_arp(); });
             arp_pre = std::move(res.current);
-            if (!arp_pre)
+            if (!arp_pre) {
                 spdlog::warn("TAR: arp snapshot incomplete ({}) -- retaining baseline",
                              res.skip_reason);
+                skipped_sources.push_back("arp");
+            }
         }
         std::vector<yuzu::tar::DnsEntry> dns_pre;
         std::vector<yuzu::tar::TcpQualitySample> netqual_pre;
@@ -2594,8 +2631,8 @@ private:
         {
             std::lock_guard lock(collect_mu_);
             collect_fast_impl(ctx, arp_on ? &arp_pre : nullptr, dns_on ? &dns_pre : nullptr,
-                              netqual_on ? &netqual_pre : nullptr);
-            collect_slow_impl(ctx);
+                              netqual_on ? &netqual_pre : nullptr, &skipped_sources);
+            collect_slow_impl(ctx, &skipped_sources);
         }
         // Software lives on its own dedicated software_collect_mu_ (NOT collect_mu_),
         // so collect it as a SEPARATE step after the collect_mu_ scope closes —
@@ -2603,7 +2640,7 @@ private:
         // on source_enabled("software"), so a disabled source is a no-op. The manual
         // promises `snapshot` collects all enabled capture sources (#1620).
         do_collect_software(ctx);
-        ctx.write_output("tar|snapshot|complete");
+        ctx.write_output(yuzu::tar::snapshot_result_line(skipped_sources));
         return 0;
     }
 
