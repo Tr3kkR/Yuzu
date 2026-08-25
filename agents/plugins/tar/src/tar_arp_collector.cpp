@@ -10,9 +10,20 @@
 // parse_proc_net_arp(). macOS: reuses agents/shared/route_sysctl_arp.hpp's
 // NET_RT_FLAGS/RTF_LLINFO sysctl fetch + parse (the same native mechanism
 // discovery's scan_subnet already uses), mapped onto ArpEntry by this
-// header's arp_entry_from_route_record(). Both non-Windows legs are
-// log-and-degrade on failure/truncation, matching the Windows leg's own
-// warn-and-return-empty / rate-limited cap-warn contract.
+// header's arp_entry_from_route_record().
+//
+// Completeness contract (mirrors tar_service_collector.cpp /
+// tar_mapdrive_collector.cpp's subprocess-capture contract, tar_capture_status.hpp):
+// all three platform legs THROW std::runtime_error rather than returning a
+// plain (possibly partial) vector when the read failed, the kernel/parser
+// reported a truncated read, or the kArpEntryCap was reached before the
+// whole table was consumed. A capped-or-partial vector is otherwise
+// indistinguishable from a genuinely smaller neighbour table once it
+// reaches the diff in tar_plugin.cpp -- diffing it against the last
+// COMPLETE snapshot would fabricate durable false removed/appeared events.
+// Every failure/truncation path still warns first (rate-limited where it
+// repeats), so the operator sees the reason; the throw is what stops the
+// partial result from being diffed and persisted as the new baseline.
 
 #include "tar_arp_parsers.hpp"
 #include "tar_collectors.hpp"
@@ -21,6 +32,7 @@
 
 #include <atomic> // rate-limited truncation warn
 #include <format>
+#include <stdexcept> // std::runtime_error -- incomplete-capture throw contract, see below
 #include <string>
 #include <utility> // std::move
 #include <vector>
@@ -114,9 +126,10 @@ std::vector<ArpEntry> enumerate_arp() {
     PMIB_IPNET_TABLE2 table = nullptr;
     DWORD rc = GetIpNetTable2(AF_UNSPEC, &table);
     if (rc != NO_ERROR || table == nullptr) {
-        if (rc != NO_ERROR)
-            spdlog::warn("TAR arp: GetIpNetTable2 failed (rc={})", rc);
-        return out;
+        spdlog::warn("TAR arp: GetIpNetTable2 failed (rc={}) -- skipping diff, retaining previous "
+                     "baseline",
+                     rc);
+        throw std::runtime_error(std::format("TAR: GetIpNetTable2 failed (rc={})", rc));
     }
 
     out.reserve(table->NumEntries);
@@ -138,7 +151,7 @@ std::vector<ArpEntry> enumerate_arp() {
         }
     }
 
-    FreeMibTable(table);
+    FreeMibTable(table); // freed before any throw below -- no leak on the incomplete path
     // Rate-limit the truncation warn (UP-7): once when it begins, suppressed until
     // the table drops back under the cap.
     static std::atomic<bool> s_arp_cap_warned{false};
@@ -147,25 +160,30 @@ std::vector<ArpEntry> enumerate_arp() {
             spdlog::warn("TAR arp: entry cap {} reached — truncating (repeats suppressed until it "
                          "clears)",
                          kArpEntryCap);
-    } else {
-        s_arp_cap_warned.store(false);
+        // A capped table omits real neighbours -- indistinguishable from a
+        // genuinely smaller one once diffed. Skip this tick's diff/state
+        // advance entirely rather than diff/persist the truncated result
+        // (BR-001/round 2): same contract as the failed-fetch path above.
+        spdlog::warn("TAR arp: snapshot incomplete (entry cap reached) -- skipping diff, "
+                     "retaining previous baseline");
+        throw std::runtime_error(std::format("TAR: arp entry cap {} reached", kArpEntryCap));
     }
+    s_arp_cap_warned.store(false);
     return out;
 }
 
 #elif defined(__APPLE__) // macOS: reuse agents/shared/route_sysctl_arp.hpp
 
 std::vector<ArpEntry> enumerate_arp() {
-    std::vector<ArpEntry> out;
-
     const auto fetch = yuzu::shared::fetch_rt_flags_llinfo();
     if (!fetch.ok) {
         // ok=false is a FAILED sysctl read, not an empty table — same
         // distinction the Windows leg's GetIpNetTable2 failure warn above
-        // preserves; collapsing it to {} silently would report the failure
-        // as a quiet, empty ARP table.
-        spdlog::warn("TAR arp: NET_RT_FLAGS sysctl failed");
-        return out;
+        // preserves; throwing (rather than returning {}) is what stops this
+        // failure from being diffed/persisted as a quiet, empty ARP table.
+        spdlog::warn("TAR arp: NET_RT_FLAGS sysctl failed -- skipping diff, retaining previous "
+                     "baseline");
+        throw std::runtime_error("TAR: NET_RT_FLAGS sysctl failed");
     }
 
     const auto parsed = yuzu::shared::parse_rt_flags_llinfo(std::span{fetch.blob});
@@ -184,13 +202,6 @@ std::vector<ArpEntry> enumerate_arp() {
         spdlog::warn("TAR arp: NET_RT_FLAGS read returned a partial table (repeats "
                      "suppressed until it clears)");
 
-    out.reserve(parsed.records.size());
-    for (const auto& rec : parsed.records) {
-        if (out.size() >= kArpEntryCap)
-            break;
-        out.push_back(arp_entry_from_route_record(rec));
-    }
-
     static std::atomic<bool> s_arp_cap_warned{false};
     const bool was_cap_warned = s_arp_cap_warned.exchange(status.capped);
     if (should_warn_ratelimited(status.capped, was_cap_warned))
@@ -198,10 +209,26 @@ std::vector<ArpEntry> enumerate_arp() {
                      "clears)",
                      kArpEntryCap);
 
-    // The partial table (if any) is still returned — an ARP table is a SET,
-    // and the neighbours that DID parse are individually true; the operator
-    // learns about the gap via the warn above, not via a silently smaller
-    // "complete-looking" result.
+    // BR-001 (round 2): a kernel-truncated read OR an over-cap snapshot both
+    // omit real neighbours -- either is indistinguishable from a genuinely
+    // smaller table once diffed against the last COMPLETE baseline, and
+    // would fabricate durable false removed/appeared events. Skip this
+    // tick's diff/state advance entirely (the warns above already told the
+    // operator why) rather than returning "the partial table is still
+    // individually true" as before.
+    if (status.parse_truncated || status.capped) {
+        spdlog::warn("TAR arp: snapshot incomplete ({}) -- skipping diff, retaining previous "
+                     "baseline",
+                     status.parse_truncated ? "kernel-truncated read" : "entry cap reached");
+        throw std::runtime_error(status.parse_truncated
+                                      ? "TAR: NET_RT_FLAGS read returned a partial table"
+                                      : std::format("TAR: arp entry cap {} reached", kArpEntryCap));
+    }
+
+    std::vector<ArpEntry> out;
+    out.reserve(parsed.records.size());
+    for (const auto& rec : parsed.records)
+        out.push_back(arp_entry_from_route_record(rec));
     return out;
 }
 
@@ -211,10 +238,12 @@ std::vector<ArpEntry> enumerate_arp() {
     std::ifstream f("/proc/net/arp");
     if (!f) {
         // Parity with the Windows leg's GetIpNetTable2 failure warn above:
-        // a read failure is reported, not silently returned as {} looking
-        // like a genuinely empty table.
-        spdlog::warn("TAR arp: failed to read /proc/net/arp");
-        return {};
+        // a read failure is reported, and throwing (not returning {}) is
+        // what stops it from being diffed/persisted as a genuinely empty
+        // table.
+        spdlog::warn(
+            "TAR arp: failed to read /proc/net/arp -- skipping diff, retaining previous baseline");
+        throw std::runtime_error("TAR: failed to open /proc/net/arp");
     }
     std::ostringstream buf;
     buf << f.rdbuf();
@@ -223,8 +252,9 @@ std::vector<ArpEntry> enumerate_arp() {
         // discovery_plugin.cpp): a mid-stream read failure is a distinct
         // outcome from a genuinely empty table and must not feed a partial
         // snapshot into the diff as authoritative.
-        spdlog::warn("TAR arp: read error mid-stream on /proc/net/arp");
-        return {};
+        spdlog::warn("TAR arp: read error mid-stream on /proc/net/arp -- skipping diff, retaining "
+                     "previous baseline");
+        throw std::runtime_error("TAR: read error mid-stream on /proc/net/arp");
     }
 
     auto parsed = parse_proc_net_arp(buf.str(), kArpEntryCap);
@@ -238,9 +268,15 @@ std::vector<ArpEntry> enumerate_arp() {
             spdlog::warn("TAR arp: entry cap {} reached — truncating (repeats suppressed until it "
                          "clears)",
                          kArpEntryCap);
-    } else {
-        s_arp_cap_warned.store(false);
+        // BR-001 (round 2): a capped table omits real neighbours -- diffing
+        // it against the last COMPLETE snapshot would fabricate durable
+        // false removed/appeared events. Skip this tick's diff/state
+        // advance entirely instead of returning the truncated result.
+        spdlog::warn("TAR arp: snapshot incomplete (entry cap reached) -- skipping diff, "
+                     "retaining previous baseline");
+        throw std::runtime_error(std::format("TAR: arp entry cap {} reached", kArpEntryCap));
     }
+    s_arp_cap_warned.store(false);
 
     return std::move(parsed.entries);
 }

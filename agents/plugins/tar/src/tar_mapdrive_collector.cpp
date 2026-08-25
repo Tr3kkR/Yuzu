@@ -37,6 +37,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib> // std::strtol — timestamp/event-field parsing (no scanf family)
+#include <format>
 #include <fstream>
 #include <optional>
 #include <sstream>
@@ -1137,32 +1138,63 @@ namespace {
 // remote filesystem, matching this collector's degrade-not-block contract
 // for every other leg (WNet/NetSessionEnum/smbstatus/journalctl all avoid
 // blocking calls too).
-std::vector<MacMountRec> read_getfsstat() {
+//
+// getfsstat(2)'s documented contract is: returns -1 and sets errno on
+// failure, else the number of matches (0 is a legitimate, if practically
+// unreachable, "no mounts" result). `ok=false` is the ONLY signal for the
+// former; collapsing both cases to "return {}" (as this used to) makes a
+// transient getfsstat failure indistinguishable from a genuinely empty
+// mount table once it reaches enumerate_mapdrive() (BR-002, round 2).
+struct GetfsstatOutcome {
+    std::vector<MacMountRec> mounts;
+    bool ok{true};
+};
+
+GetfsstatOutcome read_getfsstat() {
     int n = getfsstat(nullptr, 0, MNT_NOWAIT);
-    if (n <= 0)
-        return {};
+    if (n < 0)
+        return GetfsstatOutcome{.mounts = {}, .ok = false};
+    if (n == 0)
+        return GetfsstatOutcome{}; // genuinely no mounts -- ok, empty
     std::vector<struct statfs> buf(static_cast<std::size_t>(n));
     int filled =
         getfsstat(buf.data(), static_cast<int>(buf.size() * sizeof(struct statfs)), MNT_NOWAIT);
-    if (filled <= 0)
-        return {};
+    if (filled < 0)
+        return GetfsstatOutcome{.mounts = {}, .ok = false};
+    if (filled == 0)
+        return GetfsstatOutcome{}; // mounts vanished between the two calls -- treat as
+                                    // genuinely empty this tick, not an error
     if (static_cast<std::size_t>(filled) < buf.size())
         buf.resize(static_cast<std::size_t>(filled));
-    std::vector<MacMountRec> out;
-    out.reserve(buf.size());
+    GetfsstatOutcome out;
+    out.mounts.reserve(buf.size());
     for (const auto& fs : buf)
-        out.push_back(MacMountRec{fs.f_fstypename, fs.f_mntfromname, fs.f_mntonname});
+        out.mounts.push_back(MacMountRec{fs.f_fstypename, fs.f_mntfromname, fs.f_mntonname});
     return out;
 }
 
 } // namespace
 
 std::vector<MapDriveEntry> enumerate_mapdrive() {
+    auto fetch = read_getfsstat();
+    if (!fetch.ok) {
+        // A getfsstat(2) failure (errno, e.g. EIO on a hung/unreachable
+        // remote filesystem) is not a genuinely empty mount table -- same
+        // distinction the Linux/Windows subprocess legs' `tool_ran`/timeout/
+        // truncation checks preserve via classify_subprocess_capture. Throw
+        // rather than diff/persist an empty vector as though every mapping
+        // had been removed (BR-002, round 2): same contract as
+        // enumerate_services()/the Linux+Windows enumerate_mapdrive() legs.
+        spdlog::warn(
+            "TAR mapdrive: getfsstat failed -- skipping diff, retaining previous baseline");
+        throw std::runtime_error("TAR: getfsstat failed");
+    }
+
     // remote_host_of is injected so the pure classifier
     // (tar_mapdrive_macos_parsers.hpp) stays free of any dependency on this
     // translation unit's anonymous-namespace helpers — the same function a
     // unit test can substitute a fixture-equivalent implementation for.
-    auto out = classify_macos_mounts(read_getfsstat(), remote_host_of);
+    auto out = classify_macos_mounts(fetch.mounts, remote_host_of);
     // Cap-and-warn parity with the Linux leg (same pattern, same message);
     // the truncation decision itself is apply_entry_cap (pure, unit-tested).
     if (apply_entry_cap(out, kMapDriveEntryCap)) {
@@ -1170,6 +1202,12 @@ std::vector<MapDriveEntry> enumerate_mapdrive() {
         if (!warned.exchange(true))
             spdlog::warn("TAR mapdrive: live cap {} reached — truncating (repeats suppressed)",
                          kMapDriveEntryCap);
+        // An over-cap snapshot omits real mounts -- the same "indistinguishable
+        // from a genuinely smaller table" problem the failed-fetch path above
+        // guards against. Skip this tick's diff/state advance too (BR-002).
+        spdlog::warn("TAR mapdrive: snapshot incomplete (entry cap reached) -- skipping diff, "
+                     "retaining previous baseline");
+        throw std::runtime_error(std::format("TAR: mapdrive entry cap {} reached", kMapDriveEntryCap));
     }
     return out;
 }
