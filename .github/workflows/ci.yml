@@ -480,6 +480,21 @@ jobs:
       YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
     strategy:
       fail-fast: false
+      # max-parallel: 3, not 4 — Big Tam has exactly 4 yuzu-bigtam-linux runner
+      # agents on one box. A `dev`/`main` push runs the full 2x2 matrix below
+      # and would otherwise claim all 4 simultaneously, starving a
+      # concurrently-queued PR's single Linux leg at the RUNNER-ACQUISITION
+      # level — below with-test-slot.sh, which only gates contention *inside*
+      # a job that already has a runner (docs/ci-architecture.md "Cross-job";
+      # a PR job was directly observed waiting 35 minutes for a free runner
+      # during exactly this window). Capping at 3 structurally leaves one
+      # runner free. No-op on `pull_request` events: the exclude below already
+      # trims that matrix to a single gcc-15/debug leg, so max-parallel never
+      # binds there. Trade-off: a `dev` push's 4th leg waits for a slot to free
+      # (two waves instead of one) — acceptable, since push-triggered runs
+      # aren't PR-fast-path latency sensitive. Mitigation, not a guarantee: a
+      # nightly run stacked on top can still fill the pool. Tracked: #3443.
+      max-parallel: 3
       matrix:
         compiler: [gcc-15, clang-21]
         build_type: [debug, release]
