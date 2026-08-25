@@ -122,10 +122,12 @@ form-body-size caveat on how large an assertion can realistically reach `/saml/a
 
 `InstructionStore` (InstructionDefinitions and InstructionSets — the operator- and
 build-time-shipped instruction/question catalog) moves from per-replica SQLite to the shared
-PostgreSQL substrate (ADR-0006/0007), like every other migrated store. On first startup after
-upgrade, each replica backfills its own local `instructions.db` into Postgres once
-(idempotent, safely re-runnable if interrupted); the SQLite file is not deleted and is never
-read again afterward.
+PostgreSQL substrate (ADR-0006/0007), like every other migrated store. **No legacy-SQLite
+backfill** (ADR-0009's fresh-start-by-default class, following `ResponseStore`'s precedent): no
+production fleet has ever run a pre-Postgres build of any Yuzu store, so the pre-migration
+`instructions.db` is never read. On upgrade, the bundled catalog reseeds fresh on first boot the
+same way it always does, and any operator-authored content must be re-created via the normal
+API (`POST /api/instructions`, `POST /api/instruction-sets`) — there is no automatic carry-over.
 
 **Breaking, deliberate: an operator-deleted bundled definition/set no longer reappears.**
 Since 0.12.x (see that row above), deleting a build-time-shipped definition and rebooting made
@@ -151,32 +153,8 @@ other refresh mechanism; tracked in [#2555](https://github.com/Tr3kkR/Yuzu/issue
 reference. Any automation that specifically parsed the old `200 {"deleted": false}` shape or
 treated every non-2xx response as a validation error should be updated.
 
-No operator action is required to upgrade; the backfill and the reseed loop both run
-automatically at boot. See `docs/adr/0058-instruction-store-postgres-migration.md` for the full
-design record.
-
-**Expect a burst of `bundle-vintage drift` WARN lines on a rolling multi-replica upgrade —
-this is benign.** Each replica's backfill compares its own legacy `instructions.db` against
-whichever replica already backfilled first; a bundled definition/set whose content vintage
-differs across replicas (normal during a staged upgrade) logs one
-`InstructionStore::migrate_from_sqlite:` WARN per row and discards the legacy side — up to one
-per bundled catalog entry on a lagging replica. Treat
-`yuzu_server_instruction_backfill_total{result}` as the pass/fail signal, not WARN volume.
-
-**If the backfill refuses to start** (`spdlog::error` line beginning `[PG] Refusing to start:
-instruction legacy-SQLite backfill failed`), this means a genuine, unresolvable conflict — two
-replicas' legacy files disagree on **operator-authored** (non-bundled) content sharing an id,
-which the backfill deliberately will not guess between. The preceding `InstructionStore::
-migrate_from_sqlite:` log line names the specific id and which check failed (`created_by`
-IDENTITY mismatch vs. content divergence) — start there. Because the whole backfill runs in one
-transaction, every restart retries the same file and hits the same failure again until it's
-resolved. Recovery: move `instructions.db` aside on the affected replica (the server boots
-clean; that replica's legacy content will NOT carry over) and re-create only the specific lost
-definition/set via `POST /api/instructions`/`import`, or reconcile the two replicas' legacy
-files by hand before retrying. There is currently no per-row skip option — only "resolve the
-row" or "discard the whole file". See
-[`../ops-runbooks/instruction-store-backfill-recovery.md`](../ops-runbooks/instruction-store-backfill-recovery.md)
-for the full per-log-line reference.
+No operator action is required to upgrade; the reseed loop runs automatically at boot. See
+`docs/adr/0058-instruction-store-postgres-migration.md` for the full design record.
 
 ## Behaviour change: token-rotation confirm now requires proof of possession (#3015)
 

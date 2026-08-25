@@ -1,6 +1,7 @@
 - **`InstructionStore` migrated from SQLite to PostgreSQL** (schema `instruction_store`,
-  ADR-0058), with a mandatory first-boot backfill of the legacy `instructions.db`, tracked per
-  distinct legacy-file content (SHA-256 fingerprint across both tables). `create_definition`/
+  ADR-0058). No legacy-SQLite backfill (ADR-0009's fresh-start-by-default class): the
+  pre-migration `instructions.db` is never read; the bundled catalog reseeds fresh on first
+  boot and operator-authored content must be re-created via the normal API. `create_definition`/
   `update_definition`/`create_set`/`import_definition_json`/`import_definition_json_trusted`/
   `query_definitions`/`get_definition`/`list_sets`/`delete_definition`/`delete_set`/
   `export_definition_json` are all typed `std::expected`, so a genuine database or lease

@@ -6,8 +6,9 @@ deciders: parallel Wave 2 batch-7 migration worker, following the ladder assignm
   `docs/postgres-migration-ladder.md` (Wave 2); seed-vs-live design independently reviewed by
   Codex (`gpt-5.6-sol`, opine-only consult) before being locked in by Dave
 scope: server — `InstructionStore` (`InstructionDefinition`/`InstructionSet` content catalog),
-  its cutover from SQLite to PostgreSQL, its ADR-0009 backfill, and the boot-time bundled-content
-  reseed loop's multi-replica seed-vs-live design
+  its cutover from SQLite to PostgreSQL (fresh-start-by-default, ADR-0009's skippable class — no
+  legacy-SQLite backfill), and the boot-time bundled-content reseed loop's multi-replica
+  seed-vs-live design
 builds-on: ADR-0006 (Postgres substrate), ADR-0007 (single-backend, no SQLite fallback),
   ADR-0008 (substrate architecture), ADR-0009 (per-store first-boot backfill cutover, whose
   Context paragraph already names this store's class: "build-time-seeded — instructions,
@@ -22,8 +23,8 @@ related: docs/postgres-migration-ladder.md (Wave 2 -> Done); docs/adr/0054-produ
   lines 286-329 (the named "hard DELETE + unconditional reseed resurrects it" anti-pattern)
 ---
 
-# 0058 — `InstructionStore` Postgres migration (authoritative, with backfill; first every-boot
-reseed loop on the ladder)
+# 0058 — `InstructionStore` Postgres migration (authoritative, fresh-start-by-default, no
+legacy-SQLite backfill; first every-boot reseed loop on the ladder)
 
 ## Context
 
@@ -51,9 +52,7 @@ unconditional every-boot reseed loop (`server.cpp:4703-4859` walks build-time-em
 each entry on **every** boot) **and** rows that mutate after insert (`update_definition` — no
 analogous `update_set` exists). That combination is what this ADR's Decision section works
 through: a straight port of the reseed loop's current SQLite behaviour, taken literally, contains
-a defect (documented and pinned below); the backfill can't reuse `ProductPackStore`'s
-full-row-equality-or-fail-closed rule wholesale because most of an `InstructionDefinition`'s
-columns are legitimately mutable.
+a defect (documented and pinned below).
 
 ### Pinned current-SQLite behaviour (the contract to preserve, or deliberately diverge from)
 
@@ -139,8 +138,6 @@ CREATE TABLE instruction_sets (
   description TEXT NOT NULL DEFAULT '',
   created_by  TEXT NOT NULL DEFAULT '',
   created_at  BIGINT NOT NULL DEFAULT 0);
--- ADR-0009 backfill idempotency (content-fingerprinted, not a fleet-wide flag).
-CREATE TABLE sqlite_backfill_source (fingerprint TEXT PRIMARY KEY, completed_at BIGINT NOT NULL);
 -- ADR-0009 erasure consistency / reseed suppression (the headline decision — see below).
 CREATE TABLE deleted_seed_content (
   kind       TEXT NOT NULL,  -- 'definition' | 'set'
@@ -212,9 +209,9 @@ explicitly out of scope — see Consequences).
 id)` is `RbacStore`'s `revoked_seed_defaults` shape extended with a `kind` discriminator (the same
 technique `revoked_seed_defaults` itself uses via its `securable_type` column) rather than two
 separate tables — one lock, one table, both content kinds. Consulted **only** by the trusted-reseed
-insert path and the backfill's tombstone check; never by any read path, any normal
-`create_definition`/`create_set` call, or any authorization/targeting decision — the playbook's
-general rule ("don't represent 'suppress the next reseed' as a fact your read path can see").
+insert path; never by any read path, any normal `create_definition`/`create_set` call, or any
+authorization/targeting decision — the playbook's general rule ("don't represent 'suppress the
+next reseed' as a fact your read path can see").
 
 **Discriminator, reusing an existing signal.** `import_definition_json_impl`'s existing
 `check_signature` parameter already identifies "boot-time trusted content" exactly:
@@ -268,190 +265,26 @@ anti-pattern). A tombstoned id and an already-existing id both resolve to the sa
 loop classification (`is_conflict_error` -> "skip, already accounted for") needs no change; it
 cannot distinguish "already there" from "deliberately suppressed," and does not need to.
 
-### Backfill (ADR-0009)
+### Backfill — none (ADR-0009's fresh-start-by-default class)
 
-Mandatory — instruction definitions/sets are irreducible operator intent (explicitly named by
-ADR-0009's own Context paragraph as this store's class). Content-fingerprinted (SHA-256 over both
-tables' canonicalized, sorted, length-prefixed rows — `ProductPackStore`'s two-section shape,
-`sqlite_backfill_source`), not a single fleet-wide completion flag.
+Per ADR-0009's fresh-start-by-default amendment: this store does **not** implement
+`migrate_from_sqlite()` and never reads the legacy `instructions.db`. No production fleet has
+ever run a pre-Postgres build of any Yuzu store, so there is no real legacy data to protect —
+the original "mandatory backfill" default assumed a real fleet that has never existed. Follows
+`ResponseStore`'s (#2691) unconditional-skip precedent: no flag, no conditional path, just a
+one-time boot log line (`"InstructionStore initialized (schema instruction_store) — fresh
+start, no legacy backfill"`) noting the fresh start on cutover.
 
-**Conflict handling does NOT copy `ProductPackStore`'s full-row-equality-or-fail-closed rule for
-definitions.** That rule is only correct when every column is write-once; `InstructionDefinition`
-rows are not (`update_definition` mutates everything except `id`/`created_by`/`created_at`), and
-each replica boots from its **own** `instructions.db` — a normal multi-replica cutover has
-replica B's legacy snapshot legitimately diverge from a row replica A already backfilled and an
-operator then edited live on Postgres. Fail-closed-on-any-mismatch would brick replica B's boot on
-an ordinary condition, not corruption — this is exactly kickoff lesson 1's "IDENTITY vs LIFECYCLE
-per column," and `DeviceTokenStore`'s ADR-0052 backfill is the applicable precedent (a store whose
-rows also mutate post-insert), scaled down since `InstructionDefinition` has no monotonic
-security-sensitive field like `revoked` needing a direction-aware rule:
-
-- **IDENTITY** (write-once — no runtime method mutates these after INSERT): `id` (the `ON
-  CONFLICT` target itself) and `created_by` only. A mismatch fails the backfill closed, naming
-  both sides — the only plausible cause is a corrupted/hand-edited legacy file or two genuinely
-  different definitions sharing an id, either of which deserves a halt, not a silent pick.
-- **LIFECYCLE** (everything else, including `created_at` — see below —
-  `name`/`version`/`type`/`plugin`/`action`/`description`/
-  `enabled`/`instruction_set_id`/`gather_ttl_seconds`/`response_ttl_days`/`updated_at`/
-  `yaml_source`/`parameter_schema`/`result_schema`/`approval_mode`/`concurrency_mode`/`platforms`/
-  `min_agent_version`/`required_plugins`/`readable_payload`/`visualization_spec`/
-  `response_templates_spec`): on a conflict with matching IDENTITY, Postgres's existing value
-  **always wins silently**, regardless of which side is numerically newer or which fields differ
-  — the backfill never `UPDATE`s an existing row. No direction-aware special case is needed
-  (unlike `DeviceTokenStore`'s `revoked`): nothing in this column set is a security control whose
-  legacy-side truth must override a stale live value, so "PG already has a live value, keep it" is
-  correct unconditionally. This is the SAME rule the pinned seed-vs-live test 2 already
-  established for the reseed loop ("operator edit is never clobbered"), extended to the backfill
-  path for the identical reason.
-
-**`created_at` was originally classified as IDENTITY (write-once); this was wrong, and was
-corrected during Gate 4 governance review before merge.** The legacy `instruction_definitions`
-table has no column distinguishing a bundled (build-time-embedded) row from an operator-authored
-one — both pass through the same `insert_definition_row`, and a bundled row's `created_at` is
-stamped `now()` the first time *this specific replica* seeds it into its own pre-migration
-`instructions.db`, not authored content. Two independently-provisioned replicas' legacy files
-therefore legitimately hold *different* `created_at` for the exact same bundled id — the same
-"replica B's legacy snapshot legitimately diverges" reasoning already used above to justify
-excluding LIFECYCLE columns from the conflict check applies to `created_at` too, and was not
-originally applied to it. With `created_at` in IDENTITY, backfill bricked the boot of every
-replica after the first to backfill any given bundled id — not a corner case, since every replica
-independently seeds all ~232 bundled definitions / 10 bundled sets during normal operation.
-`created_by` remains safe as IDENTITY: bundled content always gets the same value —
-`embed_content.py`'s `def_envelope()`/`set_envelope()` both unconditionally set
-`"created_by": "system"` on every generated envelope (verified: every entry in the built
-`bundled_content.cpp` carries it) — so it resolves deterministically to `"system"` across every
-replica and every release vintage; a real corrupted/hand-edited file or a genuine id collision
-would still typically differ on `created_by` too. Pinned by the two-replica-divergence regression
-tests in `test_instruction_store.cpp` (`[instruction_store][backfill][pg]`).
-
-**Correction (Gate 8 re-review, second pass):** an earlier revision of this paragraph, and the
-`kBundledDefinitionCreator` constant below, claimed the definitions sentinel was `""` — reasoning
-that `embed_content.py` "never emits the `created_by` field" and the parser's own `""` fallback
-would apply. That premise was wrong: `def_envelope()` DOES emit the field, always set to
-`"system"`, so the `""` fallback never fires for real bundled content and the sentinel-match
-branch below was dead code for definitions — reintroducing the exact boot-brick this section
-exists to prevent. Fixed before merge; caught by an independent re-verify of the fix commit, not
-by the tests (the existing definitions regression test happens not to exercise `yaml_source`
-divergence at all, only `created_at`, which the LIFECYCLE rule already ignored either way — a new
-test exercising `yaml_source` divergence under the `"system"` sentinel was added alongside this
-correction, mirroring the sets test that already covered the equivalent case and would have
-caught this).
-
-**`created_by`-only IDENTITY (the paragraph above) was itself over-corrected; fixed during Gate 8
-re-review, before merge.** Narrowing IDENTITY to `id`/`created_by` fixed the bundled-content brick
-above, but removed protection against a DIFFERENT scenario the original full-row check caught: two
-**operator-authored** rows sharing an id AND a `created_by` (e.g. a shared login used across
-pre-Postgres replicas, or hand-synced YAML that drifted) whose content genuinely differs. Under the
-`created_by`-only rule, that silently discards one replica's real content with no log line naming
-which — the exact silent-loss failure mode this store's backfill design otherwise refuses to
-produce. The corrected rule is conditional on `created_by`, not a blanket comparison:
-
-- `created_by` equal to the code-default bundled sentinel (`"system"` for both definitions —
-  `kBundledDefinitionCreator` — and sets — `kBundledSetCreator`, `instruction_store.cpp`):
-  content divergence (`yaml_source` for definitions; `name`/`description` for sets) stays benign —
-  bundle-vintage drift, Postgres's existing row wins — but is now logged at WARN naming the id, so
-  the discard is visible instead of silent.
-- Any other `created_by`: content divergence fails the backfill closed, naming both the id and the
-  shared `created_by`, exactly like the pre-narrowing full-row check did — but WITHOUT reintroducing
-  the `created_at` comparison that caused the original bundled-content brick, since `created_at`
-  stays LIFECYCLE-only regardless of `created_by`. This also fixes a latent false-brick the
-  ORIGINAL (pre-Gate-4) full-row design carried for operator content: two replicas hand-synced from
-  the *same* file, imported at different times, differ only on `created_at` and would have failed
-  closed on that alone. The corrected rule compares content, not import time, so a clean hand-sync
-  is benign on both sides of this split.
-
-Known residual, not fixed here: **an earlier revision of this paragraph named the wrong trigger**
-(`create_definition`'s REST route under RBAC-off/unauthenticated create) — traced during Gate 8
-re-review and found not reachable: `require_permission`/`resolve_session`'s RBAC-off fallback
-still requires a valid session, and every session-synthesis path sets a non-empty username, so
-`def.created_by = session->username` never lands on `""` via that route. The actually-reachable
-residual is different and needs no RBAC-off at all: `POST /api/instructions/import` calls
-`import_definition_json` directly on the request body with **no session-based `created_by`
-override** (unlike the create route), so any caller holding the ordinary
-`InstructionDefinition:Write` permission — the normal way to import definitions — can set
-`created_by` to `"system"` just by supplying it (or omitting it, since the parser's own fallback
-is `""`, not `"system"` — only the code-generated envelope path forces `"system"`) in the import
-body, and have that row treated leniently (WARN, not fail-closed) on any future content
-divergence, same as real bundled content. This field being caller-controlled is pre-existing
-behaviour, unchanged by this migration; what changes here is that it gains security significance
-(sentinel-spoofing to bypass the fail-closed content-divergence check). Whether
-`/api/instructions/import`'s untrusted path should reject or override a caller-supplied
-`created_by` is tracked as a separate follow-up, not resolved by this ADR. This is the same class
-of residual as "no retroactive tombstone reconstruction" below — narrower than the general case,
-stated so this ADR does not overclaim. Pinned by the additional two-replica regression tests in
-`test_instruction_store.cpp`
-(non-sentinel `created_by`, both the drifted-content-fails-closed and
-identical-content-stays-benign cases, for both definitions and sets).
-
-`instruction_sets` has **no analogous mutation path at all** (`update_set` does not exist), which
-was originally read as "every column is write-once by construction, so any conflict must be
-full-row-equality-or-fail-closed, per `ProductPackStore`'s simpler rule." That reasoning is also
-wrong for the same reason as `created_at` above: a bundled set's `name`/`description` can
-legitimately differ across two replicas' legacy files whose *release vintage* diverged (pinned
-test 4's "changed bundled content across releases" finding applies to sets exactly as it does to
-definitions), and `created_at` is replica-local seed time either way. `instruction_sets` therefore
-uses the SAME IDENTITY/LIFECYCLE split as definitions, including the `created_by`-conditional
-content check corrected above: `id`/`created_by` are IDENTITY (write-once, fail-closed on
-mismatch); `created_at` is LIFECYCLE (never compared, Postgres's existing value always wins);
-`name`/`description` are content — benign-with-WARN divergence for the `"system"` bundled
-sentinel, fail-closed divergence for any other `created_by`. `ProductPackStore`'s full-row-equality
-rule remains correct for
-`ProductPackStore` itself: it has no build-time-embedded/bundled-pack concept at all (verified —
-no `kBundledPacks`/seed-insert path exists), so every row it backfills is genuinely
-operator-authored and write-once end to end; the rule does not generalize to a store that also
-seeds build-time content through the same table.
-
-**All-vintage column handling.** A legacy file may predate any of the ~9 compat-`ALTER`-only
-columns (`yaml_source`/`parameter_schema`/`result_schema`/`approval_mode`/`concurrency_mode`/
-`platforms`/`min_agent_version`/`required_plugins`/`readable_payload`) or the v2/v3
-`MigrationRunner` columns (`visualization_spec`/`response_templates_spec`) — probed via
-`pragma_table_info` before each is selected, generalizing `ProductPackStore`'s single
-pre-7.13-`verified`-column probe to all eleven; a missing column defaults to the same value the
-pre-migration `ALTER ... DEFAULT` clause / v2/v3 migration would have produced (`''`/`'{}'`/
-`'auto'`/`'per-device'`/`'[]'` per column, matching the Decision → Schema block above exactly),
-so an old and a fully-migrated vintage of otherwise-identical data fingerprint identically.
-
-**Reseed-suppression tombstone consulted during backfill too**, not just the reseed loop — closes
-the same resurrection hazard `ProductPackStore`'s `migrate_from_sqlite` closes for
-`deleted_pack_ids`: a redeployed/stale-image replica's own untouched legacy file must not
-resurrect a definition or set this store has already reported erased into Postgres. Under the
-same `kSeedCoordLockSql` as the reseed path's writers, every legacy row's id is checked against
-`deleted_seed_content` before being treated as fresh content; a tombstoned definition and every
-item that would otherwise reference it are skipped together (there is no FK to violate here,
-unlike `ProductPackStore`'s parent/child case, but the skip is still applied uniformly so a
-tombstoned definition's `instruction_set_id` never gets backfilled as if it were live).
-
-**Boot ordering — backfill runs strictly BEFORE the seed loop.** Trace the alternative
-(seed-first) on an empty-Postgres cutover: the seed loop inserts pristine bundled content for id
-X, THEN backfill reads the legacy file's operator-edited copy of X and finds a LIFECYCLE conflict
-against the row the seed loop *just* inserted — under the LIFECYCLE rule above, Postgres's
-(pristine, un-edited) value silently wins, discarding the operator's edit. That is exactly what
-the pinned seed-vs-live test 2 exists to prevent; backfill-first (the shipped ordering) makes the
-operator's edited row land first, so the seed loop's later conflict-skip preserves it correctly.
-`server.cpp`'s construction sequence is: construct `InstructionStore` (PG) -> `migrate_from_sqlite`
-(reads the legacy `instructions.db`, still in place) -> THEN the `kBundledDefinitions`/
-`kBundledSets` reseed loop. This ordering is load-bearing, not incidental — a future refactor that
-reorders it silently reintroduces the discard.
-
-**The physical `instructions.db` file is not retired by this migration** — `InstructionDbPool`
-(a separate SQLite pool onto the SAME file, backing the still-unmigrated `ExecutionTracker`/
-`ApprovalManager`/`ScheduleEngine`) keeps reading and writing it after this migration lands; only
-the `instruction_definitions`/`instruction_sets` tables within it become dead weight, never
-written to again post-cutover. `server.cpp` still constructs `instr_db_pool_` after a successful
-`InstructionStore` open+backfill, structurally unchanged from the pre-migration nesting — under
-the AUTHORITATIVE/fail-hard posture above, an `InstructionStore` open or backfill failure already
-sets `startup_failed_` and refuses the whole boot (ADR-0007: the server requires Postgres
-unconditionally, no serving happens on any failure path), so `instr_db_pool_`'s construction
-being nested under `instruction_store_`'s success path has no behavioral consequence to decouple
-— there is no scenario where PG fails but the server still serves `instr_db_pool_`'s consumers.
-
-**No retroactive tombstone reconstruction.** `deleted_seed_content` is a new Postgres-only table
-with no SQLite-side history — a definition deleted under the pre-migration SQLite binary, before
-this migration ever shipped, is not distinguishable from "never seeded" by anything this store's
-state retains, and cannot be. Only deletes issued after a given replica's cutover to this version
-get suppression protection. This is stated here so the ADR does not overclaim what the fix covers
-— the same class of residual ADR-0009's `ProductPackStore` update note (2026-08-23) already
-accepted as store-scoped, not a general precedent.
+This is a scope change from an earlier revision of this ADR, which specified a mandatory,
+extensively-designed backfill (three correction rounds, each fixing a real conflict-detection
+bug the previous round introduced — see the governance ledger,
+`governance.d/instructionstore-adr0058-gov.4uLptn.jsonl`, for the full history). That design is
+retired in full along with this section: the `migrate_from_sqlite()` method, its legacy-table
+readers and fingerprint helpers, its dedicated `[backfill]`-tagged regression tests, and the
+`sqlite_backfill_source` marker table are all removed. The `deleted_seed_content` tombstone
+mechanism documented above is UNAFFECTED — it protects against a different, unrelated hazard
+(the every-boot bundled-content reseed loop resurrecting an operator's deletion), not against
+losing pre-migration SQLite content.
 
 ### Testing
 
@@ -512,18 +345,16 @@ ADR-recorded behaviour change this migration makes, not a silent test rewrite to
   short of an operator deleting and losing the row (which the tombstone above no longer even
   allows to come back automatically). Tracked in #2555 (pre-existing issue covering the same
   underlying problem), not solved here.
-- **Multi-replica backfill correctness (fixed pre-merge, Gate 4 governance finding, further
-  corrected at Gate 8):** the backfill's original conflict-comparison over-scoped IDENTITY to
-  include `created_at` (definitions) and the full row (sets), both of which legitimately diverge
-  across independently-provisioned replicas for bundled content — see "Backfill" above. This
-  bricked the boot of every replica after the first to backfill a given bundled id,
-  unconditionally, on any real multi-replica fleet. The first fix (`created_by`-only IDENTITY) was
-  itself over-corrected — it removed protection against two operator-authored rows sharing an id
-  and `created_by` with genuinely different content — and was narrowed further to a
-  `created_by`-conditional content check (sentinel = lenient+WARN, non-sentinel = fail-closed) at
-  Gate 8 re-review. Both rounds fixed before merge; no release ever shipped either broken version.
-- **A later fix round (fixing the Gate 4 backfill finding above) touched code outside the
-  Backfill section and is recorded here rather than there:**
+- **Historical: multi-replica backfill correctness (now moot — the backfill mechanism this
+  fixed is retired, see "Backfill" above).** An earlier revision of this store's design had a
+  mandatory legacy-SQLite backfill that went through two rounds of real conflict-detection bugs
+  (an original over-scoped IDENTITY comparison bricking every replica's boot on ordinary
+  bundled-content vintage drift; the fix for that over-correcting in the opposite direction,
+  losing protection against genuinely-different operator content sharing an id). Both fixed
+  before merge; no release ever shipped either broken version. Full history:
+  `governance.d/instructionstore-adr0058-gov.4uLptn.jsonl`.
+- **A later fix round touched code outside the (now-retired) Backfill section and is recorded
+  here rather than there:**
   - `schedule_runner.cpp`'s `fire()` no longer calls `advance_schedule` on an InstructionStore
     DB-error branch — a transient failure now retries the occurrence next tick instead of
     permanently losing it (independently found by both `security-guardian` and `sre` at Gate 3).
