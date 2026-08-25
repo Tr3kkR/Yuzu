@@ -787,6 +787,33 @@ TEST_CASE("InstructionStore: delete nonexistent set returns not_found",
     CHECK(deleted.error().starts_with("not_found:"));
 }
 
+TEST_CASE("InstructionStore: delete nonexistent set must not mutate definitions that happen to "
+          "reference that id (not_found must be a pure no-op)",
+          "[instruction_store][sets][pg]") {
+    // Regression pin for a data-integrity bug: delete_set used to unlink
+    // instruction_set_id on referencing definitions BEFORE checking whether the
+    // set actually existed, so a not-found delete (typo, stale id, or a
+    // deliberate probe) could still silently commit the unlink.
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto def = make_question("Get Hostname");
+    def.instruction_set_id = "typo-set-id-that-was-never-created";
+    auto def_result = store.create_definition(def);
+    REQUIRE(def_result.has_value());
+
+    auto deleted = store.delete_set("typo-set-id-that-was-never-created");
+    REQUIRE_FALSE(deleted.has_value());
+    CHECK(deleted.error().starts_with("not_found:"));
+
+    auto fetched = store.get_definition(*def_result);
+    REQUIRE(fetched.has_value());
+    REQUIRE(fetched->has_value());
+    CHECK((*fetched)->instruction_set_id == "typo-set-id-that-was-never-created");
+}
+
 // ── Extended Fields ────────────────────────────────────────────────────────
 
 TEST_CASE("InstructionStore: extended fields round-trip", "[instruction_store][extended][pg]") {

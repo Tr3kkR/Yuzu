@@ -165,7 +165,7 @@ TEST_CASE("ProductPackStore reports !is_open on an unreachable pool, and every m
     CHECK(get_res.error().starts_with(yuzu::server::kProductPackDbErrorPrefix));
 
     auto uninstall_res = store.uninstall(
-        "x", [](const std::string&, const std::string&) { return true; });
+        "x", [](const std::string&, const std::string&) -> std::expected<void, std::string> { return {}; });
     CHECK_FALSE(uninstall_res.has_value());
     CHECK(uninstall_res.error().starts_with(yuzu::server::kProductPackDbErrorPrefix));
 
@@ -454,7 +454,7 @@ TEST_CASE("ProductPackStore: list/get/uninstall round-trip", "[product_pack_stor
 
     SECTION("uninstall on an unknown id returns not_found") {
         auto r = store.uninstall("does-not-exist",
-                                 [](const std::string&, const std::string&) { return true; });
+                                 [](const std::string&, const std::string&) -> std::expected<void, std::string> { return {}; });
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error().starts_with("not_found:"));
     }
@@ -462,9 +462,10 @@ TEST_CASE("ProductPackStore: list/get/uninstall round-trip", "[product_pack_stor
     SECTION("uninstall removes the pack and invokes uninstall_fn per item") {
         int uninstall_calls = 0;
         auto r = store.uninstall(pack_id, [&uninstall_calls](const std::string&,
-                                                              const std::string&) {
+                                                              const std::string&)
+                                             -> std::expected<void, std::string> {
             ++uninstall_calls;
-            return true;
+            return {};
         });
         REQUIRE(r.has_value());
         CHECK(uninstall_calls == 1);
@@ -472,6 +473,27 @@ TEST_CASE("ProductPackStore: list/get/uninstall round-trip", "[product_pack_stor
         auto got = store.get(pack_id);
         REQUIRE(got.has_value());
         CHECK_FALSE(got->has_value());
+    }
+
+    SECTION("uninstall aborts (never deletes the pack row) when an item's origin store reports "
+            "a genuine DB error") {
+        // Regression pin: an origin-store DB error used to be tolerated the same as a
+        // not-found item (the callback collapsed to bool), so a pack could be reported
+        // "uninstalled" while a contained item was actually never removed because its store
+        // was down. A db_error-prefixed failure must abort the whole uninstall instead.
+        auto r = store.uninstall(
+            pack_id, [](const std::string&, const std::string&) -> std::expected<void, std::string> {
+                return std::unexpected(std::string(yuzu::server::kProductPackDbErrorPrefix) +
+                                       "simulated origin-store outage");
+            });
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().starts_with(yuzu::server::kProductPackDbErrorPrefix));
+
+        // The pack must still exist — uninstall() never reached the delete+tombstone txn.
+        auto got = store.get(pack_id);
+        REQUIRE(got.has_value());
+        REQUIRE(got->has_value());
+        CHECK((*got)->id == pack_id);
     }
 }
 
@@ -826,7 +848,7 @@ TEST_CASE("ProductPackStore::migrate_from_sqlite: an uninstalled pack is never r
     const std::string ghost_id = *installed;
 
     auto uninstalled = store.uninstall(
-        ghost_id, [](const std::string&, const std::string&) { return true; });
+        ghost_id, [](const std::string&, const std::string&) -> std::expected<void, std::string> { return {}; });
     REQUIRE(uninstalled.has_value());
     REQUIRE_FALSE(store.get(ghost_id)->has_value());
 
