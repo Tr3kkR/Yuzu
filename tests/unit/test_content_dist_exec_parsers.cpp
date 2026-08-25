@@ -29,7 +29,7 @@ using yuzu::agent::TerminationReason;
 
 TEST_CASE("build_execution_options sets the fixed deadline/grace/merge/output-cap quad",
          "[agent][content_dist][exec]") {
-    auto opts = build_execution_options(/*is_linux=*/false);
+    auto opts = build_execution_options(/*is_linux=*/false, /*is_windows=*/false);
     // BR-002 (whole-branch review): 30 MINUTES, not 30 seconds -- the
     // deleted pre-migration paths ran a staged installer to completion
     // unbounded on both platforms (see build_execution_options' own
@@ -46,10 +46,10 @@ TEST_CASE("build_execution_options sets the fixed deadline/grace/merge/output-ca
 
 TEST_CASE("build_execution_options enables exec_verify only when is_linux is true",
          "[agent][content_dist][exec]") {
-    auto linux_opts = build_execution_options(true);
+    auto linux_opts = build_execution_options(true, false);
     CHECK(linux_opts.exec_verify.enabled);
 
-    auto non_linux_opts = build_execution_options(false);
+    auto non_linux_opts = build_execution_options(false, false);
     CHECK_FALSE(non_linux_opts.exec_verify.enabled);
 }
 
@@ -58,13 +58,13 @@ TEST_CASE("build_execution_options leaves require_root_owned false on every plat
     // Deliberate: the staging dir is agent-owned 0700, not root -- see the
     // header's own rationale comment. require_root_owned=true would
     // spawn_error every staged file on a rootless agent.
-    CHECK_FALSE(build_execution_options(true).exec_verify.require_root_owned);
-    CHECK_FALSE(build_execution_options(false).exec_verify.require_root_owned);
+    CHECK_FALSE(build_execution_options(true, false).exec_verify.require_root_owned);
+    CHECK_FALSE(build_execution_options(false, false).exec_verify.require_root_owned);
 }
 
 TEST_CASE("build_execution_options never sets expected_size -- that is the caller's job",
          "[agent][content_dist][exec]") {
-    auto opts = build_execution_options(true);
+    auto opts = build_execution_options(true, false);
     CHECK_FALSE(opts.exec_verify.expected_size.has_value());
 }
 
@@ -315,4 +315,29 @@ TEST_CASE("is_shebang_payload: ELF magic is false", "[agent][content_dist][exec]
 
 TEST_CASE("is_shebang_payload: empty input is false", "[agent][content_dist][exec]") {
     CHECK_FALSE(is_shebang_payload(""));
+}
+
+// ── inherit_parent_env (Windows legacy-environment preservation) ─────────
+// The deleted Windows launcher passed lpEnvironment=nullptr to CreateProcessW,
+// so a staged installer inherited the agent's full parent environment. These
+// pin that the migrated options builder preserves it on Windows and does NOT
+// set it anywhere else -- the flag is a no-op on POSIX and must never become a
+// general default.
+TEST_CASE("build_execution_options preserves the Windows parent environment only on Windows",
+          "[agent][content_dist][exec]") {
+    CHECK(build_execution_options(/*is_linux=*/false, /*is_windows=*/true).inherit_parent_env);
+    CHECK_FALSE(build_execution_options(/*is_linux=*/false, /*is_windows=*/false).inherit_parent_env);
+    CHECK_FALSE(build_execution_options(/*is_linux=*/true, /*is_windows=*/false).inherit_parent_env);
+}
+
+TEST_CASE("build_execution_options keeps exec_verify and inherit_parent_env independent",
+          "[agent][content_dist][exec]") {
+    // Linux gets the fd-exec verification and never the Windows env flag;
+    // Windows gets the env flag and never fd-exec (it fails closed there).
+    auto lin = build_execution_options(/*is_linux=*/true, /*is_windows=*/false);
+    auto win = build_execution_options(/*is_linux=*/false, /*is_windows=*/true);
+    CHECK(lin.exec_verify.enabled);
+    CHECK_FALSE(lin.inherit_parent_env);
+    CHECK_FALSE(win.exec_verify.enabled);
+    CHECK(win.inherit_parent_env);
 }

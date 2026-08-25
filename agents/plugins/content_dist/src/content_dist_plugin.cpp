@@ -619,6 +619,11 @@ private:
 #else
         constexpr bool kIsLinux = false;
 #endif
+#ifdef _WIN32
+        constexpr bool kIsWindows = true;
+#else
+        constexpr bool kIsWindows = false;
+#endif
 
         if constexpr (kIsLinux) {
             // CDX-002: reject a shebang-interpreted script before it ever
@@ -708,7 +713,7 @@ private:
         for (auto& a : split_args(args))
             argv.push_back(std::move(a));
 
-        auto opts = yuzu::content_dist::exec::build_execution_options(kIsLinux);
+        auto opts = yuzu::content_dist::exec::build_execution_options(kIsLinux, kIsWindows);
         // B6 exec_verify.expected_size: the staged file's hash-verified
         // size, sourced here (the caller) because build_execution_options
         // is a pure function that never touches the filesystem. A failure
