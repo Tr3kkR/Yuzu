@@ -96,16 +96,17 @@ namespace yuzu::content_dist::exec {
 /// invocation with. `is_linux` gates exec_verify (Linux-only fd-exec
 /// TOCTOU closure); pass both `is_linux`/`is_windows` `true` only on an
 /// actual matching build (`#ifdef __linux__`/`#ifdef _WIN32` at the call
-/// site), never based on a runtime guess. `is_windows` no longer varies the
-/// result as of BR-001 (inherit_parent_env is now unconditional -- see that
-/// field's own comment below) but stays a parameter for call-site symmetry
-/// with content_dist_plugin.cpp's existing kIsLinux/kIsWindows pair, and in
-/// case a future Windows-specific tuning needs it again. The caller still
-/// MUST set `.exec_verify.expected_size` on the returned options afterward,
-/// once the staged file's hash-verified size is known: this function never
-/// touches the filesystem, so it cannot know that size itself.
+/// site), never based on a runtime guess. `is_windows` did not vary the
+/// result between BR-001 (inherit_parent_env made unconditional -- see that
+/// field's own comment below) and BR4-007 (whole-branch review round 4,
+/// below): it now also gates `no_window`, restoring the deleted Windows
+/// launcher's CREATE_NO_WINDOW behaviour for this Windows-only-relevant
+/// flag. The caller still MUST set `.exec_verify.expected_size` on the
+/// returned options afterward, once the staged file's hash-verified size is
+/// known: this function never touches the filesystem, so it cannot know
+/// that size itself.
 [[nodiscard]] inline yuzu::agent::SubprocessOptions build_execution_options(bool is_linux,
-                                                                              [[maybe_unused]] bool is_windows) {
+                                                                              bool is_windows) {
     yuzu::agent::SubprocessOptions opts;
 
     // BR-002 (whole-branch review correction -- supersedes an earlier
@@ -237,6 +238,14 @@ namespace yuzu::content_dist::exec {
     // rewrite) plus this fd-exec's own TOCTOU closure, plus the runner's
     // retained not-group/other-writable check.
     opts.exec_verify.require_root_owned = false;
+
+    // BR4-007 (whole-branch review round 4): the deleted Windows launcher
+    // passed CREATE_NO_WINDOW to CreateProcessA; migrating onto this
+    // runner's shared Windows backend (whose create_flags never set that
+    // bit for a caller with no pre-existing behaviour to preserve) silently
+    // dropped it. Windows-only significance -- see
+    // SubprocessOptions::no_window's doc comment.
+    opts.no_window = is_windows;
 
     return opts;
 }
