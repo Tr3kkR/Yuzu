@@ -76,6 +76,7 @@
 
 #include "script_exec_parsers.hpp"
 
+#include <yuzu/agent/runner_status.hpp>     // yuzu::agent::forward_runner_failure (ABI4 result-status seam, ADR-3002)
 #include <yuzu/agent/subprocess_runner.hpp>
 
 #include <chrono>
@@ -259,6 +260,18 @@ int run_via_runner(yuzu::CommandContext& ctx, const std::vector<std::string>& ar
     };
 
     auto run = yuzu::agent::run_bounded_subprocess(argv, opts);
+    // BR-001: forward a runner-level failure (deadline/cancelled/signaled/
+    // spawn_error) through the ABI4 CC-07 result-status seam BEFORE the
+    // switch below flattens termination_reason into this plugin's own
+    // status|/exit_code| wire text. Without this call the terminal
+    // CommandResponse carries only PLUGIN_RESULT_UNDECLARED, and an
+    // MCP/Reflex consumer can no longer distinguish "ran and failed"
+    // (retry) from "killed at deadline" (escalate) from "spawn error"
+    // (never retry) -- exactly ADR-3002's "Honest termination reporting"
+    // requirement, and the same one-line pattern every other migrated
+    // mutating plugin uses (services_plugin.cpp, network_actions_plugin.cpp,
+    // interaction_plugin.cpp).
+    yuzu::agent::forward_runner_failure(ctx, run);
 
     std::string status;
     int exit_code = run.exit_code;

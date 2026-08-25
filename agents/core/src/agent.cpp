@@ -388,7 +388,10 @@ YUZU_EXPORT YuzuResultStatus derive_effective_result_status(YuzuResultStatus rep
 // coupling.
 int dispatch_with_capture(const YuzuPluginDescriptor* descriptor, const char* action,
                           const YuzuParam* params, std::size_t param_count,
-                          std::string* capture_out, bool* truncated_out, std::size_t capture_cap) {
+                          std::string* capture_out, bool* truncated_out, std::size_t capture_cap,
+                          YuzuResultStatus* result_status_out,
+                          YuzuResultCompleteness* result_completeness_out,
+                          std::string* result_provenance_out) {
     CommandContextImpl ctx_impl{};
     ctx_impl.command_id = "__local_dispatch__";
     ctx_impl.start_time = std::chrono::steady_clock::now();
@@ -408,6 +411,17 @@ int dispatch_with_capture(const YuzuPluginDescriptor* descriptor, const char* ac
     ctx_impl.flush_output(); // no-op in capture mode
     if (truncated_out)
         *truncated_out = ctx_impl.capture_truncated;
+    // BR-001: read back whatever the plugin reported via
+    // yuzu_ctx_set_result_status() on THIS SAME ctx_impl -- lets a caller
+    // (LocalDispatcher::run) prove a migrated plugin's forward_runner_failure
+    // call actually reached the ABI4 CC-07 result-status seam, not just that
+    // the call site exists in source.
+    if (result_status_out)
+        *result_status_out = ctx_impl.result_status;
+    if (result_completeness_out)
+        *result_completeness_out = ctx_impl.result_completeness;
+    if (result_provenance_out)
+        *result_provenance_out = ctx_impl.result_provenance;
     return rc;
 }
 

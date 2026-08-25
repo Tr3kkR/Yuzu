@@ -21,6 +21,7 @@
 #include "content_dist_exec_parsers.hpp"
 #include "content_dist_upload_parsers.hpp"
 
+#include <yuzu/agent/runner_status.hpp>     // yuzu::agent::forward_runner_failure (ABI4 result-status seam, ADR-3002)
 #include <yuzu/agent/subprocess_runner.hpp>
 
 #include <algorithm>
@@ -743,6 +744,14 @@ private:
         // that would duplicate (and diverge from) the runner's own B6
         // logic; the fix belongs in the runner, not this caller.
         auto run = yuzu::agent::run_bounded_subprocess(argv, opts);
+        // BR-001: forward a runner-level failure through the ABI4 CC-07
+        // result-status seam BEFORE map_execution_result below flattens
+        // termination_reason into this action's own status|/exit_code|
+        // wire text -- same one-line pattern every other migrated mutating
+        // plugin uses (services_plugin.cpp, network_actions_plugin.cpp,
+        // interaction_plugin.cpp), and required end-to-end by ADR-3002's
+        // "Honest termination reporting" precondition for a mutating site.
+        yuzu::agent::forward_runner_failure(ctx, run);
         auto wire = yuzu::content_dist::exec::map_execution_result(run);
 
         ctx.write_output(std::format("status|{}", wire.status));
