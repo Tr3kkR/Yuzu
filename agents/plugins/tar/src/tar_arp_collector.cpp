@@ -14,8 +14,8 @@
 //
 // Completeness contract (mirrors tar_service_collector.cpp /
 // tar_mapdrive_collector.cpp's subprocess-capture contract, tar_capture_status.hpp):
-// all three platform legs THROW std::runtime_error rather than returning a
-// plain (possibly partial) vector when the read failed, the kernel/parser
+// all three platform legs THROW yuzu::tar::IncompleteCaptureError rather than
+// returning a plain (possibly partial) vector when the read failed, the kernel/parser
 // reported a truncated read, or the kArpEntryCap was reached before the
 // whole table was consumed. A capped-or-partial vector is otherwise
 // indistinguishable from a genuinely smaller neighbour table once it
@@ -26,13 +26,14 @@
 // partial result from being diffed and persisted as the new baseline.
 
 #include "tar_arp_parsers.hpp"
+#include "tar_capture_status.hpp" // yuzu::tar::IncompleteCaptureError, would_exceed_cap
 #include "tar_collectors.hpp"
 
 #include <spdlog/spdlog.h>
 
 #include <atomic> // rate-limited truncation warn
 #include <format>
-#include <stdexcept> // std::runtime_error -- incomplete-capture throw contract, see below
+#include <stdexcept> // yuzu::tar::IncompleteCaptureError derives from std::runtime_error
 #include <string>
 #include <utility> // std::move
 #include <vector>
@@ -118,6 +119,25 @@ std::string iface_alias(const NET_LUID& luid, NET_IFINDEX idx) {
     return std::format("if{}", static_cast<unsigned long>(idx));
 }
 
+// RAII owner for the MIB_IPNET_TABLE2 allocation (round 3, B3-003): the loop
+// below performs string/vector allocations (iface_alias's from_wide/format,
+// sockaddr_inet_to_string, mac_to_string, out.push_back) between a successful
+// GetIpNetTable2 and the table free -- a throwing allocation there used to
+// skip the manual FreeMibTable(table) call entirely, leaking the table.
+// Same shape as this repo's other Win32 RAII guards (network_config_plugin.cpp's
+// own MibTableGuard, processes_plugin.cpp's HandleGuard, tar_mapdrive_collector.cpp's
+// WNetEnumGuard/NetApiBufGuard).
+struct MibTableGuard {
+    PMIB_IPNET_TABLE2 t{nullptr};
+    explicit MibTableGuard(PMIB_IPNET_TABLE2 tbl) noexcept : t(tbl) {}
+    ~MibTableGuard() {
+        if (t)
+            FreeMibTable(t);
+    }
+    MibTableGuard(const MibTableGuard&) = delete;
+    MibTableGuard& operator=(const MibTableGuard&) = delete;
+};
+
 } // namespace
 
 std::vector<ArpEntry> enumerate_arp() {
@@ -129,8 +149,9 @@ std::vector<ArpEntry> enumerate_arp() {
         spdlog::warn("TAR arp: GetIpNetTable2 failed (rc={}) -- skipping diff, retaining previous "
                      "baseline",
                      rc);
-        throw std::runtime_error(std::format("TAR: GetIpNetTable2 failed (rc={})", rc));
+        throw yuzu::tar::IncompleteCaptureError(std::format("TAR: GetIpNetTable2 failed (rc={})", rc));
     }
+    MibTableGuard table_guard{table}; // frees on every exit -- normal, cap throw, or a bad_alloc
 
     out.reserve(table->NumEntries);
     bool truncated = false;
@@ -143,15 +164,20 @@ std::vector<ArpEntry> enumerate_arp() {
         e.entry_type = entry_type_for_state(row.State);
         if (e.ip_address.empty())
             continue; // address failed to format — skip defensively
-        out.push_back(std::move(e));
 
-        if (out.size() >= kArpEntryCap) {
+        // Test capacity BEFORE appending (round 3, B3-004): the prior
+        // check-AFTER-push shape appended the cap-th row, saw size == cap,
+        // and declared the table truncated even when that row was the
+        // table's LAST entry -- discarding an exact-cap-but-complete
+        // snapshot forever. would_exceed_cap (tar_capture_status.hpp) is the
+        // single shared decision every capped collector loop now applies.
+        if (yuzu::tar::would_exceed_cap(out.size(), kArpEntryCap)) {
             truncated = true;
             break;
         }
+        out.push_back(std::move(e));
     }
 
-    FreeMibTable(table); // freed before any throw below -- no leak on the incomplete path
     // Rate-limit the truncation warn (UP-7): once when it begins, suppressed until
     // the table drops back under the cap.
     static std::atomic<bool> s_arp_cap_warned{false};
@@ -166,7 +192,8 @@ std::vector<ArpEntry> enumerate_arp() {
         // (BR-001/round 2): same contract as the failed-fetch path above.
         spdlog::warn("TAR arp: snapshot incomplete (entry cap reached) -- skipping diff, "
                      "retaining previous baseline");
-        throw std::runtime_error(std::format("TAR: arp entry cap {} reached", kArpEntryCap));
+        throw yuzu::tar::IncompleteCaptureError(
+            std::format("TAR: arp entry cap {} reached", kArpEntryCap));
     }
     s_arp_cap_warned.store(false);
     return out;
@@ -183,7 +210,7 @@ std::vector<ArpEntry> enumerate_arp() {
         // failure from being diffed/persisted as a quiet, empty ARP table.
         spdlog::warn("TAR arp: NET_RT_FLAGS sysctl failed -- skipping diff, retaining previous "
                      "baseline");
-        throw std::runtime_error("TAR: NET_RT_FLAGS sysctl failed");
+        throw yuzu::tar::IncompleteCaptureError("TAR: NET_RT_FLAGS sysctl failed");
     }
 
     const auto parsed = yuzu::shared::parse_rt_flags_llinfo(std::span{fetch.blob});
@@ -220,9 +247,9 @@ std::vector<ArpEntry> enumerate_arp() {
         spdlog::warn("TAR arp: snapshot incomplete ({}) -- skipping diff, retaining previous "
                      "baseline",
                      status.parse_truncated ? "kernel-truncated read" : "entry cap reached");
-        throw std::runtime_error(status.parse_truncated
-                                      ? "TAR: NET_RT_FLAGS read returned a partial table"
-                                      : std::format("TAR: arp entry cap {} reached", kArpEntryCap));
+        throw yuzu::tar::IncompleteCaptureError(
+            status.parse_truncated ? "TAR: NET_RT_FLAGS read returned a partial table"
+                                    : std::format("TAR: arp entry cap {} reached", kArpEntryCap));
     }
 
     std::vector<ArpEntry> out;
@@ -243,7 +270,7 @@ std::vector<ArpEntry> enumerate_arp() {
         // table.
         spdlog::warn(
             "TAR arp: failed to read /proc/net/arp -- skipping diff, retaining previous baseline");
-        throw std::runtime_error("TAR: failed to open /proc/net/arp");
+        throw yuzu::tar::IncompleteCaptureError("TAR: failed to open /proc/net/arp");
     }
     std::ostringstream buf;
     buf << f.rdbuf();
@@ -254,7 +281,7 @@ std::vector<ArpEntry> enumerate_arp() {
         // snapshot into the diff as authoritative.
         spdlog::warn("TAR arp: read error mid-stream on /proc/net/arp -- skipping diff, retaining "
                      "previous baseline");
-        throw std::runtime_error("TAR: read error mid-stream on /proc/net/arp");
+        throw yuzu::tar::IncompleteCaptureError("TAR: read error mid-stream on /proc/net/arp");
     }
 
     auto parsed = parse_proc_net_arp(buf.str(), kArpEntryCap);
@@ -274,7 +301,7 @@ std::vector<ArpEntry> enumerate_arp() {
         // advance entirely instead of returning the truncated result.
         spdlog::warn("TAR arp: snapshot incomplete (entry cap reached) -- skipping diff, "
                      "retaining previous baseline");
-        throw std::runtime_error(std::format("TAR: arp entry cap {} reached", kArpEntryCap));
+        throw yuzu::tar::IncompleteCaptureError(std::format("TAR: arp entry cap {} reached", kArpEntryCap));
     }
     s_arp_cap_warned.store(false);
 

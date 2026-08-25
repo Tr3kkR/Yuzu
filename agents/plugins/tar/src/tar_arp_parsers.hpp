@@ -17,6 +17,7 @@
  */
 #pragma once
 
+#include "tar_capture_status.hpp" // yuzu::tar::would_exceed_cap
 #include "tar_collectors.hpp" // ArpEntry, kArpEntryCap
 
 #ifdef __APPLE__
@@ -112,7 +113,11 @@ inline ProcNetArpParse parse_proc_net_arp(const std::string& text,
         if (endp == flags_str.c_str() || *endp != '\0' || errno == ERANGE)
             continue; // not a fully-consumed, in-range number — malformed, skip
 
-        if (out.entries.size() >= cap) {
+        // Checked BEFORE constructing/pushing the candidate row (round 3,
+        // B3-004/B3-005): would_exceed_cap is the same shared decision the
+        // Windows ARP/mapdrive loops now call, so an exact-cap table is
+        // never misclassified as truncated here either.
+        if (would_exceed_cap(out.entries.size(), cap)) {
             out.truncated = true;
             break;
         }
