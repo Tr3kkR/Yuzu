@@ -2528,7 +2528,7 @@ Remove a template. Returns 400 when `template_id` is `__default__`.
 | 500 | Persist failure |
 | 503 | Service unavailable |
 
-**Audit events emitted:** `response_template.create`, `response_template.update`, `response_template.delete` — target type `InstructionDefinition`, target id = definition id, detail = template id (success) or `reason=<r>` (audit-path failure). 4xx branches emit `result=denied`; 500 persist failures emit `result=failure`. See `audit-log.md` for the full reason vocabulary.
+**Audit events emitted:** `response_template.create`, `response_template.update`, `response_template.delete` — target type `InstructionDefinition`, target id = definition id, detail = template id (success) or `reason=<r>` (audit-path failure). 4xx branches emit `result=denied`; 500 persist failures emit `result=failure`; the 503 store-unavailable branch emits `result=error` (an infra degrade is not an operator denial — ADR-0058). See `audit-log.md` for the full reason vocabulary.
 
 ---
 
@@ -2695,7 +2695,10 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `auth.lockout.cleared` | Account-lockout counter reset. `result` ∈ {`ok`, `error`}, `target_type=User`. `detail=admin_unlock` for `POST /api/v1/users/{name}/unlock`, or `reset_on_successful_login` when the user's next successful login clears a non-zero counter. |
 | `execution.live_subscribe` | Server-Sent Events subscribe to `/sse/executions/{id}`. `result=success`. Emitted on every successful subscribe (no per-session-per-execution dedup currently — see #700). The forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`. |
 | `api.v1.events.subscribe` | Agentic-first SSE subscribe to `/api/v1/events?execution_id=<id>` (sprint W5.1). `result=success`. Detail format: `correlation_id=req-<hex-ms>-<hex-seq>` so SIEM rules can join the audit row to the response's `X-Correlation-Id` header. Deliberately separated from `execution.live_subscribe` so the SIEM can distinguish browser-tier vs agentic-worker consumers. Same no-dedup policy (#700). Post-auth denial branches (404 unknown execution / 410 terminal / 503 unavailable) do not audit but write a `spdlog::warn` row carrying the cid and the authenticated principal so an operator can reconstruct what happened without the client surfacing the cid. |
-| `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). |
+| `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). `error` detail `db_error` on a genuine InstructionStore DB/lease failure (503, ADR-0058) — distinct from `denied`, since an infra degrade is not an operator denial. |
+| `instruction.update` | Instruction definition updated via `PUT /api/instructions/{id}`. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). A plain 400 validation error is not audited (matches `instruction.create`'s equivalent branch). |
+| `instruction.delete` | Instruction definition deleted via `DELETE /api/instructions/{id}`. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). |
+| `instruction_set.delete` | Instruction set deleted via `DELETE /api/instruction-sets/{id}`. `result` ∈ {`denied`, `error`}. Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). Success is not audited (`create_set`/`delete_set` predate any audit coverage on this pair — tracked separately, #3598 — the 404/503 denial branches above are new with ADR-0058 and audited from the start rather than shipped asymmetrically). |
 | `instruction.scope_resolution_failed` | Emitted at dispatch when a `from_result_set:` reference in the scope cannot be resolved (set absent, TTL-expired, or not owned by the dispatching principal). `result=failure`. Detail format: `INSTRUCTION_SCOPE_RESOLUTION_FAILED command=<command_id> ref=<id-or-alias> reason=...`. Fires on all scoped dispatch paths (generic REST, tracked, MCP) and increments the `yuzu_scope_resolution_failed_total` metric; as of governance M1 (2026-07-29) the **entire dispatch is aborted** — no devices are targeted, including from other scope atoms — recorded by a paired `scope.evaluation_aborted` row with `reason=owner_check_failed`. |
 | `scope.evaluation_aborted` | Emitted when a scoped dispatch is aborted fail-closed before any device is targeted. `result=failure`. Reasons: `db_degraded` (a `from_result_set:<id>` alias/owner/membership read against the result-set store could not answer — ADR-0036 — **or** a `props.<key>` bulk preload against the custom-properties store could not answer — ADR-0045; both abort the same way and share this reason value), `owner_check_failed` (a referenced set is absent, expired, or not owned — paired with per-ref `instruction.scope_resolution_failed` rows), `principal_unresolved` (a tracked/MCP dispatch could not recover the dispatching operator). Fires on all three scoped dispatch paths, plus the no-principal tracked-closure guard (principal_unresolved only). |
 | `bundle.dispatch` | Live-query bundle dispatched via `POST /api/v1/bundles` (ADR-0011). `target_type=Execution`. `result=success` (`target_id=<bundle-… correlation id>`, detail `agent=<id> steps=<n>`) or `result=failure` (dispatch threw — `target_id` empty, detail `agent=<id> error=<…>`). |
@@ -6536,11 +6539,19 @@ Returns a catalog of all available plugins and their supported actions, as repor
 
 #### `GET /api/instructions`
 
-List all instruction definitions stored in the server.
+List instruction definitions stored in the server. Query params: `name`, `plugin`, `type`,
+`set_id`, `enabled_only`, `limit`.
+
+**Response (503):** InstructionStore not yet initialized, or a genuine database/lease failure
+(ADR-0058) — the list is never silently rendered empty on a degraded store.
 
 #### `GET /api/instructions/{id}`
 
 Get a single instruction definition by ID.
+
+**Response (404):** Unknown id.
+
+**Response (503):** A genuine database/lease failure (ADR-0058), distinct from 404.
 
 #### `POST /api/instructions`
 
@@ -6580,6 +6591,7 @@ update the existing definition use `PUT /api/instructions/{id}`.
 
 **Response (503):** Instruction store not yet initialized, or a genuine database/lease failure
 (ADR-0058) — distinct from the validation/conflict cases above, and worth a client retry.
+Audit event recorded as `instruction.create / error / db_error`.
 
 #### `PUT /api/instructions/{id}`
 
@@ -6593,7 +6605,7 @@ Update an existing instruction definition.
 Audit event recorded as `instruction.update / denied / not_found`.
 
 **Response (503):** A genuine database/lease failure (ADR-0058) — distinct from 404, and worth
-a client retry.
+a client retry. Audit event recorded as `instruction.update / error / db_error`.
 
 #### `DELETE /api/instructions/{id}`
 
@@ -6606,13 +6618,21 @@ Delete an instruction definition.
 **Response (404):** Unknown id. **Breaking change (ADR-0058):** prior to this store's
 PostgreSQL migration, a missing id returned `200 {"deleted": false}`; it now returns 404. Any
 automation keying off the old `deleted: false` shape must be updated to handle 404 instead.
+Audit event recorded as `instruction.delete / denied / not_found`.
 
 **Response (503):** A genuine database/lease failure (ADR-0058) — distinct from 404, and worth
-a client retry.
+a client retry. Audit event recorded as `instruction.delete / error / db_error`.
 
 #### `GET /api/instructions/{id}/export`
 
 Export an instruction definition in a portable format.
+
+**Response (200) on an unknown id:** `{}` (an empty JSON object, not an error) — pre-existing
+behavior, unchanged by ADR-0058; unlike every other route on this store, an unknown id here is
+NOT distinguishable from a 503/404 by status code. Callers must check for an empty body.
+
+**Response (503):** A genuine InstructionStore database/lease failure (ADR-0058) reading the
+definition, distinct from the empty-body not-found case above, and worth a client retry.
 
 #### `POST /api/instructions/import`
 
@@ -6737,6 +6757,9 @@ Returned when the definition's `approval_mode` is `role-gated` or `always` and t
 
 List all instruction sets.
 
+**Response (503):** InstructionStore not yet initialized, or a genuine database/lease failure
+(ADR-0058) — the list is never silently rendered empty on a degraded store.
+
 #### `POST /api/instruction-sets`
 
 Create a new instruction set (a named collection of definitions).
@@ -6762,6 +6785,10 @@ Delete an instruction set. Definitions that referenced the deleted set have thei
 PostgreSQL migration, a missing id returned `200 {"deleted": false}`; it now returns 404.
 
 **Response (503):** A genuine database/lease failure (ADR-0058).
+
+**Audit:** `instruction_set.delete` on the 404 (`result=denied` detail `not_found`) and 503
+(`result=error` detail `db_error`) branches; the 200 success path is not audited (see the audit
+table entry above).
 
 ---
 

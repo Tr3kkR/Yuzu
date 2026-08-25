@@ -68,10 +68,10 @@ query-owner seam (ADR-0012 §3) when scoring lands.
 Security/authz and operator-authored state. Authoritative; a silent empty read is a fail-open
 hole — `security-guardian` gates each.
 
-| Store | Schema | Provisional posture | Notes |
-|---|---|---|---|
-| `PolicyStore` | `policy_store` | authoritative | compliance evaluation. |
-| `InstructionStore` | `instruction_store` | authoritative | build-time-seeded + operator additions. |
+**All migrated.** `PolicyStore` (ADR-0056) and `InstructionStore` (ADR-0058) were this wave's
+last two entries — both are removed from this pending table per convention (every other
+completed store is removed once done, not left duplicated alongside its `## Done` row); see
+the `## Done` table above for their full entries.
 
 ## Wave 3 — secret-gated (need the ADR-0010 secrets seam wired)
 
