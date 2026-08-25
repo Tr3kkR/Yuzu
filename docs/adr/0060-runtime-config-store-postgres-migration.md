@@ -217,6 +217,14 @@ ADR-0009 backfill -> the boot override pass. Any failure at any step is a fatal 
 - **Never mutating the legacy SQLite file (`ProductPackStore`'s choice).** Rejected — this store
   has no erasure-consistency hazard that never-mutate exists to close, and `TagStore`'s
   move-aside-on-success is the newer, simpler default absent a specific reason to deviate.
+- **Adding a `scripts/test/test-upgrade-stack.sh` survival assertion for a runtime-config value
+  (e.g. a `log_level` override + `oidc_client_secret` `is_set`) across the previous-release →
+  HEAD image swap.** Checked for precedent first: `git log` on that script shows only the
+  flagship `feat/pg-migrate-inventory-store` work added per-store assertions there — none of
+  `TagStore`/`PolicyStore`/`PluginConfigStore`/`ProductPackStore` (all migrated, all with their
+  own SQLite→Postgres backfill) added their own. Not an established per-migrated-store pattern to
+  match, so none added here either; `migrate_from_sqlite()`'s fingerprint-based idempotency is
+  exercised directly by `test_runtime_config_store.cpp`'s backfill test cases instead.
 
 ## Consequences
 
@@ -241,3 +249,10 @@ ADR-0009 backfill -> the boot override pass. Any failure at any step is a fatal 
 - `test_runtime_config_store.cpp` is new (no general store test file existed pre-migration);
   `test_runtime_config_secret_redaction.cpp` keeps every pre-migration assertion's INTENT, adapted
   to the widened `std::expected` API and `PgTestTemplate` construction.
+- `get_all_with_secrets()`/`get_with_secrets()` gain a `yuzu_server_runtime_config_read_degrade_total{reason}`
+  counter (`store_not_open`/`pool_acquire_timeout`/`query_error`/`crypto_error`), matching
+  `ProductPackStore`/`CustomPropertiesStore`'s #1675 observability convention.
+- `get_all_with_secrets()` runs its plain-table and secrets-table SELECTs as two statements on one
+  lease, not one transaction: a concurrent `set()` moving a key between tables can make that key
+  transiently absent from one merged read. Recorded, not fixed — an admin config read racing an
+  admin config write, not a security boundary (see the method's header doc).

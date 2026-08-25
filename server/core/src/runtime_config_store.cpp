@@ -18,7 +18,9 @@
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <map>
 #include <span>
@@ -186,6 +188,35 @@ RuntimeConfigEntry plain_row(PGresult* r, int i) {
     return e;
 }
 
+// ── Read-degrade observability (#1675 convention, mirrors ProductPackStore) ──
+constexpr const char* kReasonStoreNotOpen = "store_not_open";
+constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
+constexpr const char* kReasonQueryError = "query_error";
+constexpr const char* kReasonCryptoError = "crypto_error";
+constexpr std::uint64_t kReadDegradeLogSample = 100;
+constexpr std::int64_t kDegradeEpisodeGapSecs = 60;
+
+struct DegradeSampler {
+    std::atomic<std::uint64_t> count{0};
+    std::atomic<std::int64_t> last_ts{0};
+};
+
+bool note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason, DegradeSampler& s) {
+    if (metrics)
+        metrics->counter("yuzu_server_runtime_config_read_degrade_total", {{"reason", reason}})
+            .increment();
+    const std::int64_t now = now_secs();
+    const std::int64_t prev = s.last_ts.exchange(now, std::memory_order_relaxed);
+    const std::uint64_t n = s.count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool new_episode = prev == 0 || (now - prev) > kDegradeEpisodeGapSecs;
+    return new_episode || (n % kReadDegradeLogSample) == 0;
+}
+
+// One sampler per distinct read call site (a shared sampler would let a hot get_all_with_secrets()
+// degrade mask a cold get_with_secrets() one from ever logging).
+DegradeSampler g_get_all_sampler;
+DegradeSampler g_get_sampler;
+
 } // namespace
 
 // ── Constructor ───────────────────────────────────────────────────────────
@@ -248,13 +279,19 @@ decrypt_sealed_value(pg::SecretCodec& codec, const std::string& key, const char*
 
 std::expected<std::vector<RuntimeConfigEntry>, std::string>
 RuntimeConfigStore::get_all_with_secrets() const {
-    if (!open_)
+    if (!open_) {
+        if (note_read_degrade(metrics_, kReasonStoreNotOpen, g_get_all_sampler))
+            spdlog::warn("RuntimeConfigStore: get_all_with_secrets degraded - store not open");
         return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) + "store not open");
+    }
 
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
-    if (!lease)
+    if (!lease) {
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, g_get_all_sampler))
+            spdlog::warn("RuntimeConfigStore: get_all_with_secrets degraded - pool acquire timeout");
         return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) +
                                "no database connection in time");
+    }
 
     std::map<std::string, RuntimeConfigEntry> merged;
 
@@ -263,8 +300,11 @@ RuntimeConfigStore::get_all_with_secrets() const {
         "SELECT key, value, updated_by, updated_at FROM runtime_config_store.runtime_config "
         "ORDER BY key",
         std::vector<std::string>{});
-    if (plain.status() != PGRES_TUPLES_OK)
+    if (plain.status() != PGRES_TUPLES_OK) {
+        if (note_read_degrade(metrics_, kReasonQueryError, g_get_all_sampler))
+            spdlog::warn("RuntimeConfigStore: get_all_with_secrets degraded - plain query error");
         return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) + "database read failed");
+    }
     for (int i = 0; i < PQntuples(plain.get()); ++i) {
         auto e = plain_row(plain.get(), i);
         const std::string k = e.key;
@@ -276,13 +316,19 @@ RuntimeConfigStore::get_all_with_secrets() const {
         "SELECT key, encode(sealed_value, 'hex'), updated_by, updated_at "
         "FROM runtime_config_store.runtime_config_secrets ORDER BY key",
         std::vector<std::string>{});
-    if (secrets.status() != PGRES_TUPLES_OK)
+    if (secrets.status() != PGRES_TUPLES_OK) {
+        if (note_read_degrade(metrics_, kReasonQueryError, g_get_all_sampler))
+            spdlog::warn("RuntimeConfigStore: get_all_with_secrets degraded - secrets query error");
         return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) + "database read failed");
+    }
     for (int i = 0; i < PQntuples(secrets.get()); ++i) {
         const std::string key = col_str(secrets.get(), i, 0);
         auto real = decrypt_sealed_value(secret_codec_, key, col(secrets.get(), i, 1));
-        if (!real.has_value())
+        if (!real.has_value()) {
+            if (note_read_degrade(metrics_, kReasonCryptoError, g_get_all_sampler))
+                spdlog::warn("RuntimeConfigStore: get_all_with_secrets degraded - decrypt failed");
             return std::unexpected(real.error());
+        }
         RuntimeConfigEntry e;
         e.key = key;
         e.value = *real;
@@ -316,25 +362,37 @@ std::expected<std::vector<RuntimeConfigEntry>, std::string> RuntimeConfigStore::
 
 std::expected<std::optional<RuntimeConfigEntry>, std::string>
 RuntimeConfigStore::get_with_secrets(const std::string& key) const {
-    if (!open_)
+    if (!open_) {
+        if (note_read_degrade(metrics_, kReasonStoreNotOpen, g_get_sampler))
+            spdlog::warn("RuntimeConfigStore: get_with_secrets degraded - store not open");
         return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) + "store not open");
+    }
 
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
-    if (!lease)
+    if (!lease) {
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, g_get_sampler))
+            spdlog::warn("RuntimeConfigStore: get_with_secrets degraded - pool acquire timeout");
         return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) +
                                "no database connection in time");
+    }
 
     pg::PgResult secret = pg::exec_params(
         lease.get(),
         "SELECT encode(sealed_value, 'hex'), updated_by, updated_at "
         "FROM runtime_config_store.runtime_config_secrets WHERE key = $1",
         std::vector<std::string>{key});
-    if (secret.status() != PGRES_TUPLES_OK)
+    if (secret.status() != PGRES_TUPLES_OK) {
+        if (note_read_degrade(metrics_, kReasonQueryError, g_get_sampler))
+            spdlog::warn("RuntimeConfigStore: get_with_secrets degraded - secret query error");
         return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) + "database read failed");
+    }
     if (PQntuples(secret.get()) > 0) {
         auto real = decrypt_sealed_value(secret_codec_, key, col(secret.get(), 0, 0));
-        if (!real.has_value())
+        if (!real.has_value()) {
+            if (note_read_degrade(metrics_, kReasonCryptoError, g_get_sampler))
+                spdlog::warn("RuntimeConfigStore: get_with_secrets degraded - decrypt failed");
             return std::unexpected(real.error());
+        }
         RuntimeConfigEntry e;
         e.key = key;
         e.value = *real;
@@ -348,8 +406,11 @@ RuntimeConfigStore::get_with_secrets(const std::string& key) const {
         "SELECT key, value, updated_by, updated_at FROM runtime_config_store.runtime_config "
         "WHERE key = $1",
         std::vector<std::string>{key});
-    if (plain.status() != PGRES_TUPLES_OK)
+    if (plain.status() != PGRES_TUPLES_OK) {
+        if (note_read_degrade(metrics_, kReasonQueryError, g_get_sampler))
+            spdlog::warn("RuntimeConfigStore: get_with_secrets degraded - plain query error");
         return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) + "database read failed");
+    }
     if (PQntuples(plain.get()) == 0)
         return std::optional<RuntimeConfigEntry>(std::nullopt);
     return std::optional<RuntimeConfigEntry>(plain_row(plain.get(), 0));

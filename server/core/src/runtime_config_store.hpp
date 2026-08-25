@@ -129,8 +129,10 @@ public:
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
     /// Wire a metrics registry for the backfill-result counter
-    /// (`yuzu_server_runtime_config_backfill_total{result}`). Set ONCE
-    /// during single-threaded startup — BEFORE `migrate_from_sqlite()`
+    /// (`yuzu_server_runtime_config_backfill_total{result}`) and the read
+    /// accessors' degrade counter (`yuzu_server_runtime_config_read_degrade_total{reason}`,
+    /// matching ProductPackStore/CustomPropertiesStore's #1675 convention).
+    /// Set ONCE during single-threaded startup — BEFORE `migrate_from_sqlite()`
     /// (#3261/#3294 wiring-order class), so the backfill counter is live on
     /// the one pass that matters. A null registry (the default, e.g. in unit
     /// tests) disables emission.
@@ -160,6 +162,15 @@ public:
     /// startup override pass, which must apply the real secret. Anything
     /// that EMITS -- a log, an API response, an audit detail, a dashboard
     /// fragment -- must not use this.
+    ///
+    /// Runs the plain-table and secrets-table SELECTs as two separate
+    /// statements on one lease, not one transaction: a concurrent `set()`
+    /// moving a key between tables (the becomes-secret / empty-secret
+    /// transitions) can make that key transiently ABSENT from this merge if
+    /// it lands between the two reads (already deleted from one table, not
+    /// yet visible in the other's post-commit read). Accepted -- an admin
+    /// config read racing an admin config write, not a security boundary --
+    /// matching `ProductPackStore`'s recorded-not-fixed uninstall race.
     [[nodiscard]] std::expected<std::vector<RuntimeConfigEntry>, std::string>
     get_all_with_secrets() const;
 
