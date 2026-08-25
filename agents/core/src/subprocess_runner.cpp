@@ -131,6 +131,7 @@
                   // supplies towupper, NOT toupper, and this branch is compiled
                   // only by MSVC, which no reviewer on a POSIX host can check.
 #include <cwctype>
+#include <memory> // std::unique_ptr -- BR-004 GetEnvironmentStringsW RAII owner below
 #endif
 
 namespace yuzu::agent {
@@ -1565,25 +1566,59 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     std::vector<EnvVar> sorted_env;
     if (spec.inherit_parent_env) {
         std::vector<EnvVar> parent_env;
-        if (LPWCH env_strings = GetEnvironmentStringsW(); env_strings != nullptr) {
-            for (const wchar_t* p = env_strings; *p != L'\0';) {
-                std::wstring entry(p);
-                p += entry.size() + 1;
-                // Skip Windows' per-drive "=C:=C:\..." pseudo-variables: a
-                // leading '=' means this isn't a real, settable environment
-                // variable name (CreateProcessW seeds every child's block
-                // with these; they are not part of "the parent's
-                // environment" in the sense this flag exists to forward).
-                if (entry.empty() || entry.front() == L'=')
-                    continue;
-                auto eq = entry.find(L'=');
-                if (eq == std::wstring::npos)
-                    continue; // malformed entry with no '=' at all -- skip, don't guess
-                parent_env.push_back({yuzu::win::from_wide(entry.substr(0, eq).c_str()),
-                                      yuzu::win::from_wide(entry.substr(eq + 1).c_str())});
+        // BR-004 (whole-branch review): GetEnvironmentStringsW() returns an
+        // OWNED block that used to be released only by a later, lexically
+        // paired FreeEnvironmentStringsW() call below -- lexical pairing is
+        // not ownership proof, because std::wstring construction/append and
+        // parent_env.push_back() between acquisition and that call are NOT
+        // noexcept. An exception thrown from any of them (allocation
+        // failure snapshotting a large service environment block, most
+        // plausibly) would skip the free entirely and leak the block; the
+        // agent's plugin exception firewall catches the exception, so the
+        // process survives to leak it again on the next inherit_parent_env
+        // call. Wrap the pointer in a scope-owning RAII guard immediately
+        // on acquisition instead, so every exit path -- normal fall-through
+        // OR an exception unwinding through this scope -- releases it
+        // exactly once via the destructor, never a manual call.
+        struct EnvironmentStringsDeleter {
+            void operator()(wchar_t* value) const noexcept {
+                if (value)
+                    FreeEnvironmentStringsW(value);
             }
-            FreeEnvironmentStringsW(env_strings);
+        };
+        std::unique_ptr<wchar_t, EnvironmentStringsDeleter> env_strings{
+            GetEnvironmentStringsW()};
+        // BR-008 (whole-branch review): a null return here used to fall
+        // through silently, launching the child with an EMPTY parent-env
+        // base plus only opts.extra_env's few named overrides -- the
+        // OPPOSITE of inherit_parent_env's contract (full parent-env
+        // inheritance), with no error signalled anywhere. Fail the spawn
+        // instead: a caller that opted into full inheritance and can't get
+        // it should see spawn_error, not a child silently missing the
+        // credentials/proxy/tool configuration the parent's real
+        // environment would have carried.
+        if (!env_strings) {
+            result.termination_reason = TerminationReason::spawn_error;
+            return result;
         }
+        for (const wchar_t* p = env_strings.get(); *p != L'\0';) {
+            std::wstring entry(p);
+            p += entry.size() + 1;
+            // Skip Windows' per-drive "=C:=C:\..." pseudo-variables: a
+            // leading '=' means this isn't a real, settable environment
+            // variable name (CreateProcessW seeds every child's block
+            // with these; they are not part of "the parent's
+            // environment" in the sense this flag exists to forward).
+            if (entry.empty() || entry.front() == L'=')
+                continue;
+            auto eq = entry.find(L'=');
+            if (eq == std::wstring::npos)
+                continue; // malformed entry with no '=' at all -- skip, don't guess
+            parent_env.push_back({yuzu::win::from_wide(entry.substr(0, eq).c_str()),
+                                  yuzu::win::from_wide(entry.substr(eq + 1).c_str())});
+        }
+        // env_strings releases here (scope exit), on every path including
+        // an exception from the loop body above.
         sorted_env = merge_launch_env(parent_env, launch_opts.extra_env, /*windows=*/true).env;
     } else {
         sorted_env.assign(spec.env.begin(), spec.env.end());
