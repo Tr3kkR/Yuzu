@@ -2105,11 +2105,21 @@ fleet-wide compliance-check dispatch across replicas.
 
 **No legacy-SQLite migration path.** No production fleet ever ran a pre-Postgres build
 of this store, so there was no real `policies.db` data to carry over — the one-time
-backfill mechanism this section originally described was retired the same day it
-merged. A reachable database whose schema can't migrate or open is a fatal startup
-error (fail-closed, matching the ladder's "authoritative" posture for this store), same
-as every other born-on-Postgres store — there is no separate legacy-file recovery
-procedure to know about.
+backfill mechanism this section originally described was retired shortly after this
+store's Postgres migration merged, under ADR-0009's fresh-start-by-default amendment.
+
+These are two SEPARATE failure/detection behaviors, not one — do not conflate them:
+
+- A reachable Postgres database whose schema can't migrate or open **is** a fatal
+  startup error (fail-closed, matching the ladder's "authoritative" posture for this
+  store), same as every other born-on-Postgres store.
+- A legacy `policies.db` file with real content **does NOT** fail startup and is never
+  read — the server logs `A legacy policies.db (<path>) has <N> policy row(s) but
+  PolicyStore no longer backfills it...` at WARN and boots fresh-started anyway. If you
+  see this warning and the environment genuinely has real compliance-policy data to
+  keep, there is no automated recovery path: re-author the equivalent fragments and
+  policies against the new Postgres-backed store via `POST /api/policy-fragments` and
+  `POST /api/policies` before relying on it.
 
 **Operator-visible behaviour changes (fail-closed reads/writes).**
 
