@@ -237,9 +237,9 @@ implementation is.
 | content_dist | stage | linux | supported | 1 | httplib_tls | - |
 | content_dist | stage | macos | supported | 1 | httplib_tls | - |
 | content_dist | stage | windows | constrained | 1 | httplib_tls | requires OpenSSL to be found at build time; HTTPS unavailable if absent |
-| content_dist | execute_staged | linux | supported | 2 | fork_execvp | - |
-| content_dist | execute_staged | macos | supported | 2 | fork_execvp | - |
-| content_dist | execute_staged | windows | supported | 2 | createprocessw | - |
+| content_dist | execute_staged | linux | supported | 2 | subprocess_runner:staged_payload | - |
+| content_dist | execute_staged | macos | supported | 2 | subprocess_runner:staged_payload | - |
+| content_dist | execute_staged | windows | supported | 2 | subprocess_runner:staged_payload | - |
 | content_dist | list_staged | linux | supported | 1 | std_filesystem | - |
 | content_dist | list_staged | macos | supported | 1 | std_filesystem | - |
 | content_dist | list_staged | windows | supported | 1 | std_filesystem | - |
@@ -540,14 +540,14 @@ implementation is.
 | sccm | site | linux | unsupported | - | - | - |
 | sccm | site | macos | unsupported | - | - | - |
 | sccm | site | windows | supported | 1 | registry+com_dispatch | - |
-| script_exec | exec | linux | supported | 2 | fork_execvp | - |
-| script_exec | exec | macos | supported | 2 | fork_execvp | - |
-| script_exec | exec | windows | supported | 2 | create_process | - |
+| script_exec | exec | linux | supported | 2 | subprocess_runner:direct_argv | - |
+| script_exec | exec | macos | supported | 2 | subprocess_runner:direct_argv | - |
+| script_exec | exec | windows | supported | 2 | subprocess_runner:direct_argv | - |
 | script_exec | powershell | linux | unsupported | - | - | - |
 | script_exec | powershell | macos | unsupported | - | - | - |
-| script_exec | powershell | windows | supported | 3 | powershell_encodedcommand | - |
-| script_exec | bash | linux | supported | 3 | bash_c | - |
-| script_exec | bash | macos | supported | 3 | bash_c | - |
+| script_exec | powershell | windows | supported | 3 | subprocess_runner:powershell_encodedcommand | - |
+| script_exec | bash | linux | supported | 3 | subprocess_runner:bash_c | - |
+| script_exec | bash | macos | supported | 3 | subprocess_runner:bash_c | - |
 | script_exec | bash | windows | unsupported | - | - | - |
 | services | list | linux | supported | 2 | runner argv 'systemctl list-units' | - |
 | services | list | macos | supported | 2 | runner argv 'launchctl list' | - |
