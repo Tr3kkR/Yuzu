@@ -458,4 +458,23 @@ YUZU_EXPORT bool subprocess_cancel_requested();
  */
 YUZU_EXPORT std::string probe_tool_path(const std::vector<std::string>& candidates);
 
+#ifdef _WIN32
+/**
+ * Whole-branch review round 3 (BR3-001): the Windows system directory,
+ * resolved via GetSystemDirectoryW and cached for the process's lifetime --
+ * same rationale, and the same pattern, as quarantine_plugin.cpp's
+ * netsh_path(). Both this runner's own Windows default working_dir (A6,
+ * below) and any caller that needs an absolute path to a well-known
+ * System32 tool (e.g. script_exec's PowerShell launch) must resolve
+ * through here rather than trusting a hard-coded "C:\Windows\System32"
+ * literal, which is wrong on any install where Windows lives on a non-C:
+ * volume -- an attacker-writable "C:\Windows\System32" tree on such a host
+ * would otherwise be treated as trusted.
+ *
+ * Returns an EMPTY string if GetSystemDirectoryW fails. Callers MUST fail
+ * closed on that (refuse the spawn), never fall back to a guessed literal.
+ */
+YUZU_EXPORT const std::string& windows_system_directory();
+#endif
+
 } // namespace yuzu::agent

@@ -1565,6 +1565,25 @@ std::wstring utf8_to_wide(const std::string& s) {
 
 } // namespace
 
+const std::string& windows_system_directory() {
+    // BR3-001 (whole-branch review round 3): resolved once, cached for the
+    // process's lifetime -- the system directory cannot change while this
+    // process is running, and this is called on every Windows spawn whose
+    // working_dir defaults ("/" sentinel, mapped below) plus every
+    // Windows-plugin caller (e.g. script_exec's PowerShell path) that needs
+    // a trusted absolute System32 path. Same pattern as
+    // quarantine_plugin.cpp's netsh_path(): an honest empty return on
+    // failure, never a guessed fallback -- callers fail closed on it.
+    static const std::string dir = [] {
+        wchar_t buf[MAX_PATH]{};
+        UINT n = GetSystemDirectoryW(buf, MAX_PATH);
+        if (n == 0 || n >= MAX_PATH)
+            return std::string{};
+        return yuzu::win::from_wide(buf);
+    }();
+    return dir;
+}
+
 SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
                                          const SubprocessOptions& opts) {
     SubprocessResult result;
@@ -1773,9 +1792,25 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     env_block += L'\0'; // double-NUL terminator
     std::vector<wchar_t> env_buf(env_block.begin(), env_block.end());
 
-    // A6: safe, non-writable working directory.
-    const std::wstring cwd =
-        spec.working_dir == "/" ? std::wstring(L"C:\\Windows\\System32") : utf8_to_wide(spec.working_dir);
+    // A6: safe, non-writable working directory. BR3-001 (whole-branch
+    // review round 3): resolved via windows_system_directory()
+    // (GetSystemDirectoryW) rather than trusted as a hard-coded
+    // "C:\Windows\System32" literal -- an install with Windows on a
+    // non-C: volume would otherwise default every migrated action into an
+    // untrusted, attacker-populatable directory tree. Fails the spawn
+    // (never falls back to the old literal) if resolution fails, matching
+    // the null-GetEnvironmentStringsW handling above.
+    std::wstring cwd;
+    if (spec.working_dir == "/") {
+        const std::string& sys_dir = windows_system_directory();
+        if (sys_dir.empty()) {
+            result.termination_reason = TerminationReason::spawn_error;
+            return result;
+        }
+        cwd = utf8_to_wide(sys_dir);
+    } else {
+        cwd = utf8_to_wide(spec.working_dir);
+    }
 
     // Output pipe: only the WRITE end must ever be inheritable, and only it is
     // named in the handle allow-list below (A1) -- the read end must never be.

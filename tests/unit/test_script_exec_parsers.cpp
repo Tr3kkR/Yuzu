@@ -231,9 +231,17 @@ TEST_CASE("assemble_argv: bash mode carries the script as ONE argv element (Deci
 TEST_CASE("assemble_argv: powershell mode carries the (already-encoded) script as ONE argv "
           "element (Decision-5)",
           "[script_exec][parsers]") {
-    auto argv = assemble_argv(ExecMode::powershell, "", "", "QQBCAEMA");
+    // BR3-001 (whole-branch review round 3): the PowerShell path is no
+    // longer a compile-time constant this header owns -- the caller
+    // (script_exec_plugin.cpp's do_powershell) resolves it via
+    // yuzu::agent::windows_system_directory() and passes the result in as
+    // resolved_cmd, so this pure test plugs in an arbitrary fixture value
+    // rather than asserting on a hard-coded path.
+    auto argv = assemble_argv(ExecMode::powershell,
+                              "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+                              "", "QQBCAEMA");
     REQUIRE(argv.size() == 5);
-    CHECK(argv[0] == yuzu::script_exec::kPowerShellPath);
+    CHECK(argv[0] == "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
     CHECK(argv[1] == "-NoProfile");
     CHECK(argv[2] == "-NonInteractive");
     CHECK(argv[3] == "-EncodedCommand");

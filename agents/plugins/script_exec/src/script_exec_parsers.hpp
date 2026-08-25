@@ -40,12 +40,6 @@ enum class ExecMode { exec, bash, powershell };
 /// resolve_executable is exercised with no OS calls at all.
 using IsExecutableFn = std::function<bool(const std::string&)>;
 
-/// The absolute System32 PowerShell path assemble_argv's powershell mode
-/// uses — the same well-known 5.1 location interaction_plugin.cpp's
-/// kPowerShellPath already probes (ADR-3002 "tool path probing" precedent).
-inline constexpr const char* kPowerShellPath =
-    "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
-
 namespace detail {
 
 inline bool is_path_like(std::string_view cmd, bool windows_rules) {
@@ -138,11 +132,14 @@ inline std::string join_cwd(std::string_view cwd, std::string_view rel, bool win
 /// BR-009 (whole-branch review): the RESOLUTION ALGORITHM below matches
 /// execvp()/CreateProcessA()'s pre-migration rules exactly, but the `cwd`
 /// value the CALLER passes in does NOT — script_exec_plugin.cpp passes a
-/// fixed safe sentinel (kRunnerDefaultCwd: "/" on POSIX, Windows'
-/// System32 on Windows), never the agent daemon's actual real working
-/// directory the deleted paths implicitly used. This is a deliberate,
-/// documented compatibility break (ADR-3002 A6), not an exact behavioural
-/// preservation — see kRunnerDefaultCwd's own comment at the call site.
+/// fixed safe sentinel (runner_default_cwd(): "/" on POSIX, the resolved
+/// Windows system directory on Windows — see BR3-001, whole-branch review
+/// round 3, for why that is a runtime GetSystemDirectoryW resolution
+/// rather than a hard-coded literal), never the agent daemon's actual real
+/// working directory the deleted paths implicitly used. This is a
+/// deliberate, documented compatibility break (ADR-3002 A6), not an exact
+/// behavioural preservation — see runner_default_cwd()'s own comment at
+/// the call site.
 ///
 ///  - a PATH-LIKE cmd (contains '/', or under windows_rules contains '\\'
 ///    or has a drive-letter prefix) that is already ABSOLUTE passes through
@@ -278,11 +275,18 @@ resolve_executable(std::string_view cmd, std::string_view cwd,
 ///  - bash: {"/bin/bash", "-c", script} — `script` as ONE argv element
 ///    (ADR-3002 Decision 5, rung 3: bash, not this outer spawn, interprets
 ///    it); `resolved_cmd`/`args` are ignored.
-///  - powershell: {kPowerShellPath, "-NoProfile", "-NonInteractive",
-///    "-EncodedCommand", script} — `script` here is ALREADY the Base64
-///    UTF-16LE payload (encoding needs CryptBinaryToStringA, an OS call, so
-///    it happens in the plugin shell before this pure function is ever
-///    called); `resolved_cmd`/`args` are ignored.
+///  - powershell: {resolved_cmd, "-NoProfile", "-NonInteractive",
+///    "-EncodedCommand", script} — BR3-001 (whole-branch review round 3):
+///    `resolved_cmd` here is the caller-RESOLVED absolute PowerShell path,
+///    no longer a compile-time constant — the plugin shell
+///    (script_exec_plugin.cpp's do_powershell) resolves it via
+///    yuzu::agent::windows_system_directory() (GetSystemDirectoryW,
+///    cached) and fails the action closed before ever calling this
+///    function if resolution fails, rather than falling back to a bare
+///    "powershell.exe" that would reintroduce a PATH search. `script` here
+///    is ALREADY the Base64 UTF-16LE payload (encoding needs
+///    CryptBinaryToStringA, an OS call, so it happens in the plugin shell
+///    before this pure function is ever called); `args` is ignored.
 [[nodiscard]] inline std::vector<std::string> assemble_argv(ExecMode mode,
                                                              const std::string& resolved_cmd,
                                                              std::string_view args,
@@ -297,7 +301,7 @@ resolve_executable(std::string_view cmd, std::string_view cwd,
     case ExecMode::bash:
         return {"/bin/bash", "-c", script};
     case ExecMode::powershell:
-        return {kPowerShellPath, "-NoProfile", "-NonInteractive", "-EncodedCommand", script};
+        return {resolved_cmd, "-NoProfile", "-NonInteractive", "-EncodedCommand", script};
     }
     return {};
 }
