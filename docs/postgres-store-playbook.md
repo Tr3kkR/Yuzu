@@ -155,9 +155,19 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
 
 ## Extra steps when migrating an existing SQLite store
 
-- **Backfill** (ADR-0009): a one-time, idempotent `migrate_from_sqlite()` that runs at startup,
-  before serving, and **fails closed** on any error. Mandatory for config/reference and `audit`
-  (SOC 2); skippable behind a flag only for purely TTL'd ephemeral stores (`response`).
+- **Backfill — fresh-start-by-default (ADR-0009, amended 2026-08-25): do NOT build
+  `migrate_from_sqlite()` for a new migration unless you have a specific, documented reason to.**
+  No production fleet has ever run a pre-Postgres build of any Yuzu store, so the original
+  "mandatory for config/reference and audit" default assumed real legacy data that has never
+  existed — skip the legacy-file backfill entirely, the same unconditional way `ResponseStore`
+  already does (no flag, no legacy-file read, a one-time loud boot log noting the fresh start).
+  This default holds only while "no production fleet" stays true — if a real external deployment
+  exists or is committed to before your store migrates, re-derive whether backfill is actually
+  needed for THIS store in its own per-store ADR; don't cite this bullet as blanket cover once
+  the premise has changed. (Historical note: the original mandatory-backfill mechanism this
+  bullet used to describe — a one-time, idempotent `migrate_from_sqlite()` running at startup,
+  before serving, failing closed on any error — is still what every already-migrated store
+  built, and stays in place for those stores. See ADR-0009's amendment for the full rationale.)
 - **Secret columns transform, never copy** (ADR-0010): a backfill that touches secret material
   encrypts/hashes on the way in — a plain column copy of a secret is forbidden.
 - **Rollback window**: retain the legacy `<name>.db` for exactly one release, then remove it.

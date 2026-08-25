@@ -12,6 +12,15 @@ provisional** — each is finalized in that store's per-store ADR after reading 
 
 Schema name = `snake_case(FullClassName)` incl. the `Store` suffix (ADR-0008 Update).
 
+> **For the 4 remaining stores (`InstructionStore`, `WebhookStore`, `OffloadTargetStore`,
+> `RuntimeConfigStore`): do NOT build `migrate_from_sqlite()`.** ADR-0009's 2026-08-25
+> fresh-start-by-default amendment applies to all four — no production fleet has ever run a
+> pre-Postgres build of any Yuzu store, so there is no real legacy data to protect. Skip the
+> legacy-file backfill entirely (same as `ResponseStore`'s existing precedent), including its
+> test suite, its fixture helper, and its ops-runbook. See each store's own row below for the
+> specific pointer, and ADR-0009's amendment for the full rationale + the one carve-out
+> (`AuditStore`, already migrated, keeps its backfill).
+
 ## Done
 
 | Store | Schema | Notes |
@@ -69,18 +78,22 @@ hole — `security-guardian` gates each.
 
 | Store | Schema | Provisional posture | Notes |
 |---|---|---|---|
-| `InstructionStore` | `instruction_store` | authoritative | build-time-seeded + operator additions. |
+| `InstructionStore` | `instruction_store` | authoritative | build-time-seeded + operator additions. **Do NOT build `migrate_from_sqlite()` for this store** — ADR-0009's 2026-08-25 fresh-start-by-default amendment: no production fleet has ever run a pre-Postgres build, so there is no real legacy `instructions.db` operator-added content to protect. This is separate from, and does not affect, the build-time seed mechanism (re-seeding from embedded YAML content via `embed_content.py`/`bundled_content.cpp`) — that stays exactly as it is; only the legacy-SQLite-file backfill path is being skipped. |
 
 ## Wave 3 — secret-gated (need the ADR-0010 secrets seam wired)
 
-Migrate last because they require `SecretCodec` (or a verify-only-hash schema) in place. Backfill
-**transforms** (encrypt/hash), never copies (ADR-0010).
+Migrate last because they require `SecretCodec` (or a verify-only-hash schema) in place.
+**No `migrate_from_sqlite()` for any of these three** — ADR-0009's 2026-08-25 fresh-start-by-default
+amendment supersedes the older "backfill transforms (encrypt/hash), never copies" sentence this
+section used to carry: no production fleet has ever run a pre-Postgres build, so there is no real
+legacy secret material to transform-and-carry-over. Skip the legacy-file backfill entirely, same as
+`ResponseStore` already does; wire `SecretCodec` for the store's live write/read path only.
 
 | Store | Schema | Secret handling | Notes |
 |---|---|---|---|
-| `WebhookStore` | `webhook_store` | `SecretCodec` | shared secrets. |
-| `OffloadTargetStore` | `offload_target_store` | `SecretCodec` | target credentials. |
-| `RuntimeConfigStore` | `runtime_config_store` | `SecretCodec` | secret-valued config keys. |
+| `WebhookStore` | `webhook_store` | `SecretCodec` | shared secrets. **Do NOT build `migrate_from_sqlite()`** — see Wave 3 note above. |
+| `OffloadTargetStore` | `offload_target_store` | `SecretCodec` | target credentials. **Do NOT build `migrate_from_sqlite()`** — see Wave 3 note above. |
+| `RuntimeConfigStore` | `runtime_config_store` | `SecretCodec` | secret-valued config keys. **Do NOT build `migrate_from_sqlite()`** — see Wave 3 note above. |
 
 ## Notes
 
