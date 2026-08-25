@@ -131,3 +131,35 @@ data).
   (the clause's original target) rather than operator-authored catalog metadata over
   separately-erased content. That store will likely need the literal per-file mechanism
   this update declines for `ProductPackStore`.
+
+  **Update (fresh-start-by-default, 2026-08-25 — operator directive):** the "Backfill is
+  mandatory for config/reference stores" bullet above assumed a real fleet with real
+  legacy data to protect. That has never been true — no production fleet has ever run a
+  pre-Postgres build of any Yuzu store — so for every migration still to come (as of this
+  writing: `InstructionStore`, `WebhookStore`, `OffloadTargetStore`, `RuntimeConfigStore`),
+  the default flips: **skip `migrate_from_sqlite()` entirely, unconditionally, the same
+  way `ResponseStore` already does** (Update above), rather than build a backfill and plan
+  to remove it later. This is not a narrowing of what backfill protects — the mandate's
+  entire premise (preserving real operator config / real SOC 2 audit history across a real
+  upgrade) is empty while there is nothing real to preserve. Retired for the same reason,
+  same day: `PolicyStore`'s already-shipped backfill (ADR-0056, commit `f46cefe8e`) — see
+  `docs/postgres-migration-ladder.md`'s `PolicyStore` row.
+
+  **This default is conditional on the fact, not permanent policy.** It holds only while
+  "no production fleet" stays true. If a real external deployment (a design partner, a
+  pilot customer, a dogfooded production instance) exists or is committed to before a
+  given store migrates, that store's own per-store ADR must re-derive whether backfill is
+  needed for IT specifically — do not cite this update as blanket cover once the premise
+  changes. `AuditStore` (already migrated, ADR-0040, backfill built and shipped) is the
+  one store where this would matter most if the premise ever flips retroactively: audit
+  evidence cannot be regenerated the way config or cache state can, so its already-built
+  backfill is deliberately NOT being retired alongside `PolicyStore`'s — see the ladder's
+  `AuditStore` row. A future store whose data is similarly irreplaceable (not just
+  operator-authored-and-reconstructible) should weigh that before defaulting to skip.
+
+  **Existing stores already migrated WITH a backfill are unaffected by this update** —
+  removing their already-built `migrate_from_sqlite()` is a separate decision (tracked as
+  ongoing cleanup, not mandated by this ADR), and per `docs/postgres-store-playbook.md`'s
+  authoring contract, an in-place schema-DDL edit is safe only for a store whose schema
+  version was never shipped (`PolicyStore`'s case); every other store's removal needs a
+  proper version-bumped migration, not a copy of that shortcut.
