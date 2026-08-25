@@ -99,6 +99,10 @@
 #include <sys/stat.h> // umask, fstat, S_ISREG/S_IWGRP/S_IWOTH (A6, B6)
 #include <sys/wait.h>
 #if defined(__APPLE__)
+#include <crt_externs.h> // _NSGetEnviron() -- BR-001 POSIX inherit_parent_env below: a
+                         // dylib (this TU builds into yuzu_agent_core_lib, a
+                         // shared_library) cannot rely on a directly-linked
+                         // `environ` symbol the way a main executable can.
 #include <sys/sysctl.h> // sysctlbyname(kern.maxfilesperproc) — per-process fd ceiling
 #endif
 #if defined(__linux__)
@@ -127,10 +131,11 @@
 
 #include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (CDX-R4-05, #1681)
 
-#include <cctype> // std::toupper in the env-sort comparator below -- <cwctype>
-                  // supplies towupper, NOT toupper, and this branch is compiled
-                  // only by MSVC, which no reviewer on a POSIX host can check.
-#include <cwctype>
+// BR-003 (whole-branch review round 2): the env-sort comparator below used
+// to hand-roll ASCII-only case folding via std::toupper/<cctype> here; it
+// now calls Win32's own CompareStringOrdinal (windows.h, already included
+// above) for a real locale-independent Unicode ordinal comparison, so
+// neither <cctype> nor <cwctype> is needed in this branch any more.
 #include <memory> // std::unique_ptr -- BR-004 GetEnvironmentStringsW RAII owner below
 #endif
 
@@ -572,6 +577,33 @@ void wait_for_activity(int read_fd, int err_read_fd, int pidfd, long nanos) {
     sleep_briefly(nanos);
 }
 
+// BR-001 (whole-branch review round 2): this process' own live environment,
+// as a char** NUL-terminated block -- the read side of POSIX
+// inherit_parent_env below. Deliberately NOT a bare `extern char** environ;`
+// used directly at the call site: this TU builds into yuzu_agent_core_lib
+// (a shared_library, agents/core/meson.build), and on Apple platforms the
+// `environ` symbol is reliably available only to a directly-linked main
+// executable -- a dylib must go through _NSGetEnviron() instead
+// (crt_externs.h, included above under __APPLE__) or risk an unresolved
+// symbol / wrong-image environ at link or load time. glibc/other POSIX
+// exposes `environ` to any translation unit that declares it extern, no
+// such indirection needed.
+#if !defined(__APPLE__)
+// POSIX guarantees this variable exists but NOT that any header declares
+// it without a feature-test macro (glibc only exposes it via <unistd.h>
+// under _GNU_SOURCE; musl/other libcs vary) -- declare it explicitly rather
+// than depend on an include-order accident.
+extern char** environ;
+#endif
+
+char** current_environ() {
+#if defined(__APPLE__)
+    return *_NSGetEnviron();
+#else
+    return environ;
+#endif
+}
+
 } // namespace
 
 SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
@@ -610,11 +642,11 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     launch_opts.extra_env.reserve(opts.extra_env.size());
     for (const auto& [key, value] : opts.extra_env)
         launch_opts.extra_env.push_back({key, value});
-    // A2-002: passed through for the pure LaunchSpec passthrough/testability,
-    // but never acted on below -- this (POSIX) backend always builds envp
-    // from spec.env, exactly as when the flag is false. See
-    // SubprocessOptions::inherit_parent_env's doc comment, point (c), for why
-    // this is an intentional no-op here rather than an oversight.
+    // BR-001 (whole-branch review round 2): passed through for the pure
+    // LaunchSpec passthrough/testability, AND now actually acted on below --
+    // see the envp-construction block further down and
+    // SubprocessOptions::inherit_parent_env's doc comment, point (c), for
+    // the full contract this (POSIX) backend now honours.
     launch_opts.inherit_parent_env = opts.inherit_parent_env;
 
     LaunchSpec spec = build_launch_spec(argv, launch_opts);
@@ -635,14 +667,58 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         c_argv.push_back(const_cast<char*>(arg.c_str()));
     c_argv.push_back(nullptr);
 
-    // A5: explicit clear-and-allow-list envp, built here from spec.env (which
-    // build_launch_spec assembled from nothing -- LD_*/DYLD_*/IFS/BASH_ENV/
-    // GCONV_PATH are stripped by construction, never copied from this
-    // process' own environment).
+    // A5 (ordinary case): explicit clear-and-allow-list envp, built here
+    // from spec.env (which build_launch_spec assembled from nothing --
+    // LD_*/DYLD_*/IFS/BASH_ENV/GCONV_PATH are stripped by construction,
+    // never copied from this process' own environment).
+    //
+    // BR-001 (whole-branch review round 2, Alex ruling): when
+    // inherit_parent_env is set, this backend now mirrors the Windows
+    // backend's existing inherit_parent_env branch (see that code for the
+    // twin structure) -- swap the BASE for this envp from the A5 allow-list
+    // to a live read of THIS process' own real environment (POSIX
+    // `environ`, via current_environ() above), with the ADR-3002 A5
+    // injection class stripped via filter_inherited_env()
+    // (subprocess_launch_spec.hpp) and extra_env layered on top via the
+    // SAME merge_launch_env() replace-never-duplicate semantics used below
+    // for the ordinary case. extra_env was already validated (denylist/
+    // malformed-entry checks) by build_launch_spec() above UNCONDITIONALLY,
+    // so nothing here can smuggle a denied name through just because this
+    // flag is set -- that fail-closed behaviour is UNCHANGED.
+    //
+    // filter_inherited_env's strip, by contrast, is SILENT: an inherited
+    // parent-environment variable that matches the injection class is
+    // simply withheld from the child, never a reason to refuse the whole
+    // launch -- see that function's own comment for why an inherited
+    // variable's failure mode must differ from extra_env's. Log what was
+    // stripped so the behaviour stays observable rather than silent at the
+    // OPERATOR level, even though it is silent at the API level.
     std::vector<std::string> envp_strings;
-    envp_strings.reserve(spec.env.size());
-    for (const auto& e : spec.env)
-        envp_strings.push_back(e.key + "=" + e.value);
+    if (spec.inherit_parent_env) {
+        std::vector<EnvVar> parent_env;
+        for (char** e = current_environ(); e && *e != nullptr; ++e) {
+            std::string_view entry(*e);
+            auto eq = entry.find('=');
+            if (eq == std::string_view::npos)
+                continue; // malformed entry with no '=' at all -- skip, don't guess
+            parent_env.push_back({std::string(entry.substr(0, eq)), std::string(entry.substr(eq + 1))});
+        }
+        EnvInheritResult filtered = filter_inherited_env(parent_env, /*windows=*/false);
+        for (const auto& name : filtered.stripped) {
+            spdlog::debug("run_bounded_subprocess: withholding inherited env var '{}' from the "
+                         "child (ADR-3002 A5 injection class, inherit_parent_env)",
+                         name);
+        }
+        std::vector<EnvVar> merged =
+            merge_launch_env(filtered.env, launch_opts.extra_env, /*windows=*/false).env;
+        envp_strings.reserve(merged.size());
+        for (const auto& e : merged)
+            envp_strings.push_back(e.key + "=" + e.value);
+    } else {
+        envp_strings.reserve(spec.env.size());
+        for (const auto& e : spec.env)
+            envp_strings.push_back(e.key + "=" + e.value);
+    }
     std::vector<char*> c_envp;
     c_envp.reserve(envp_strings.size() + 1);
     for (auto& s : envp_strings)
@@ -1050,13 +1126,23 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         // accumulator below), independent of the output_cap budget this same
         // cap is supposed to enforce on result.output. Both caps now apply
         // together whenever max_lines is armed.
-        const bool line_room =
-            stored_line_bytes < output_cap && (opts.max_lines == 0 || result.lines.size() < opts.max_lines);
+        // BR-008 (whole-branch review round 2): comparing stored_line_bytes
+        // against output_cap with a strict `<` only proved SOME budget
+        // remained, not that THIS line's bytes fit within it -- a single
+        // stored line can be up to output_cap bytes long (line_buf's own
+        // accumulator caps it there), so a one-byte remainder could still
+        // admit a whole second cap-sized line, letting result.lines grow to
+        // nearly 2x the documented output_cap budget. Require the line's
+        // OWN source-byte count (+1 for the terminating newline, same
+        // accounting as below) to fit in the REMAINING budget instead.
+        const std::size_t source_bytes = line.size() + 1;
+        const bool line_room = source_bytes <= output_cap - stored_line_bytes &&
+                               (opts.max_lines == 0 || result.lines.size() < opts.max_lines);
         if (line_room) {
             // +1 for the terminating newline: count the SOURCE bytes the line
             // consumed, matching output_cap's blob accounting so result.lines
             // stays bounded by the same cap as result.output (BR-001).
-            stored_line_bytes += line.size() + 1;
+            stored_line_bytes += source_bytes;
             result.lines.push_back(std::move(line));
             if (opts.stop_after_max_lines && opts.max_lines != 0 &&
                 result.lines.size() >= opts.max_lines)
@@ -1564,6 +1650,20 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     // GetEnvironmentStringsW() is real OS I/O that subprocess_launch_spec.hpp
     // (a pure header) must never perform itself.
     std::vector<EnvVar> sorted_env;
+    // BR-002 (whole-branch review round 2): the `=X:` per-drive current-
+    // directory pseudo-entries below (e.g. "=C:=C:\Users\foo") are excluded
+    // from `parent_env`/`sorted_env` (they are not real, settable
+    // environment variable NAMES -- see the loop comment) but are still
+    // part of process-environment inheritance semantics per the CreateProcess
+    // contract: they carry each drive's current directory, and Windows
+    // itself always emits them at the FRONT of GetEnvironmentStringsW()'s
+    // block, ahead of the alphabetically sorted real variables. Dropping
+    // them (the previous behaviour) meant a caller relying on `D:relative`
+    // path resolution after this migration silently lost that state.
+    // Collected as raw wide entries (never round-tripped through
+    // EnvVar/UTF-8 -- they are not KEY=VALUE pairs in the ordinary sense)
+    // and serialized verbatim ahead of `sorted_env` below.
+    std::vector<std::wstring> drive_pseudo_vars;
     if (spec.inherit_parent_env) {
         std::vector<EnvVar> parent_env;
         // BR-004 (whole-branch review): GetEnvironmentStringsW() returns an
@@ -1604,13 +1704,19 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         for (const wchar_t* p = env_strings.get(); *p != L'\0';) {
             std::wstring entry(p);
             p += entry.size() + 1;
-            // Skip Windows' per-drive "=C:=C:\..." pseudo-variables: a
-            // leading '=' means this isn't a real, settable environment
-            // variable name (CreateProcessW seeds every child's block
-            // with these; they are not part of "the parent's
-            // environment" in the sense this flag exists to forward).
-            if (entry.empty() || entry.front() == L'=')
+            // BR-002: Windows' per-drive "=C:=C:\..." pseudo-variables are
+            // not a real, settable environment variable NAME (a leading '='
+            // means merge_launch_env/EnvVar's ordinary KEY=VALUE model does
+            // not apply), so they never go through parent_env/merge_launch_env
+            // -- but they ARE still part of what CreateProcessW's contract
+            // means by "the parent's environment", so preserve them verbatim
+            // for later, rather than discarding them entirely as the
+            // previous version of this loop did.
+            if (entry.empty() || entry.front() == L'=') {
+                if (!entry.empty())
+                    drive_pseudo_vars.push_back(std::move(entry));
                 continue;
+            }
             auto eq = entry.find(L'=');
             if (eq == std::wstring::npos)
                 continue; // malformed entry with no '=' at all -- skip, don't guess
@@ -1630,15 +1736,36 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     // but not-necessarily-sorted order, so sort a copy by upper-cased key here
     // before serializing. The keys are unique (allow-list / merge dedup), so
     // a stable name sort is total.
+    // BR-003 (whole-branch review round 2): CreateProcess's own contract
+    // (MSDN) requires the block "sorted alphabetically... case-insensitively,
+    // as in Unicode order" -- a locale-independent ORDINAL comparison. The
+    // previous comparator upper-cased individual UTF-8 BYTES
+    // (std::toupper, which is also C-locale-dependent -- see
+    // to_upper_ascii's own comment in subprocess_launch_spec.hpp for why a
+    // security-adjacent comparison must never depend on process locale
+    // state), which is correct only for ASCII names and produces an
+    // unspecified, non-ordinal order for any non-ASCII byte -- reachable
+    // only via a genuinely non-ASCII INHERITED parent-environment variable
+    // name (extra_env's own is_malformed_env_entry check already rejects a
+    // non-ASCII name fail-closed, so this gap cannot come from there).
+    // CompareStringOrdinal is the actual Win32 primitive CreateProcessW's
+    // own contract is defined against -- use it directly on the wide form
+    // rather than re-deriving ordinal comparison by hand.
     std::sort(sorted_env.begin(), sorted_env.end(), [](const EnvVar& a, const EnvVar& b) {
-        auto up = [](std::string s) {
-            for (char& c : s)
-                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-            return s;
-        };
-        return up(a.key) < up(b.key);
+        const std::wstring wa = utf8_to_wide(a.key);
+        const std::wstring wb = utf8_to_wide(b.key);
+        return CompareStringOrdinal(wa.c_str(), -1, wb.c_str(), -1, TRUE) == CSTR_LESS_THAN;
     });
     std::wstring env_block;
+    // BR-002: the `=X:` drive-current-directory pseudo-entries go FIRST,
+    // matching the order Windows itself always uses in
+    // GetEnvironmentStringsW()'s own block -- empty on the ordinary A5 case
+    // (drive_pseudo_vars is only ever populated inside the inherit_parent_env
+    // branch above), so this is a strict no-op there.
+    for (const auto& raw : drive_pseudo_vars) {
+        env_block += raw;
+        env_block += L'\0';
+    }
     for (const auto& e : sorted_env) {
         env_block += utf8_to_wide(e.key + "=" + e.value);
         env_block += L'\0';
@@ -1870,13 +1997,23 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         // for the full reasoning (an armed max_lines used to skip the
         // stored_line_bytes check entirely, letting result.lines grow up to
         // max_lines * output_cap).
-        const bool line_room =
-            stored_line_bytes < output_cap && (opts.max_lines == 0 || result.lines.size() < opts.max_lines);
+        // BR-008 (whole-branch review round 2): comparing stored_line_bytes
+        // against output_cap with a strict `<` only proved SOME budget
+        // remained, not that THIS line's bytes fit within it -- a single
+        // stored line can be up to output_cap bytes long (line_buf's own
+        // accumulator caps it there), so a one-byte remainder could still
+        // admit a whole second cap-sized line, letting result.lines grow to
+        // nearly 2x the documented output_cap budget. Require the line's
+        // OWN source-byte count (+1 for the terminating newline, same
+        // accounting as below) to fit in the REMAINING budget instead.
+        const std::size_t source_bytes = line.size() + 1;
+        const bool line_room = source_bytes <= output_cap - stored_line_bytes &&
+                               (opts.max_lines == 0 || result.lines.size() < opts.max_lines);
         if (line_room) {
             // +1 for the terminating newline: count the SOURCE bytes the line
             // consumed, matching output_cap's blob accounting so result.lines
             // stays bounded by the same cap as result.output (BR-001).
-            stored_line_bytes += line.size() + 1;
+            stored_line_bytes += source_bytes;
             result.lines.push_back(std::move(line));
             if (opts.stop_after_max_lines && opts.max_lines != 0 &&
                 result.lines.size() >= opts.max_lines)

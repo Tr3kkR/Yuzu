@@ -226,22 +226,46 @@ struct SubprocessOptions {
     // everything" facility for a caller with no equivalent legacy
     // requirement.
     //
-    // (c) POSIX: intentionally IGNORED -- read (mirrored onto
-    // LaunchOptions::inherit_parent_env, subprocess_launch_spec.hpp) but
-    // never acted on by the POSIX backend in subprocess_runner.cpp, which
-    // always builds envp from spec.env (the ordinary A5-allow-list-plus-
-    // extra_env computation) regardless of this flag. Two independent
-    // reasons, not just "not implemented yet": (1) POSIX already has no gap
-    // to fill -- script_exec's deleted POSIX fork/execvpe path ALREADY used
-    // an explicit safe_vars allow-list, so extra_env alone (no widening
-    // needed) already reproduces it exactly, which is what this same PR's
-    // script_exec plugin change does; (2) Alex's ruling was scoped to
-    // preserving the WINDOWS leg's pre-existing behaviour specifically --
-    // extending a blanket "inherit everything" primitive to POSIX as well
-    // would be a materially different, unauthorized widening of A5 on the
-    // platform that never had this gap. A future caller with a genuine
-    // POSIX equivalent need would require its own explicit plan-gate
-    // ruling, not a silent extension of this flag's meaning.
+    // (c) POSIX: HONOURED, as of BR-001 (whole-branch review round 2, Alex
+    // ruling) -- this point previously said POSIX intentionally ignored the
+    // flag; that was true only until content_dist's migration exposed a
+    // real gap the reasoning below explains.
+    //
+    // content_dist's deleted POSIX launcher called execvp() WITHOUT ever
+    // replacing `environ`, so a staged installer inherited this agent's
+    // FULL live environment (HTTPS_PROXY, a licence variable, HOME,
+    // whatever the deployment set) -- unlike script_exec's deleted POSIX
+    // path, which already used an explicit seven-name safe_vars allow-list
+    // (extra_env alone reproduces THAT one exactly, no widening needed,
+    // which is why script_exec's POSIX leg still never sets this flag --
+    // see script_exec_plugin.cpp). The migrated runner's A5 clear-slate
+    // silently narrowed content_dist's staged installers to
+    // PATH/LC_ALL(/TZ) only: an undisclosed regression, not a deliberate
+    // hardening decision, and Alex ruled it must be fixed by extending this
+    // flag to POSIX rather than inventing a second mechanism.
+    //
+    // The POSIX backend in subprocess_runner.cpp now branches on this flag
+    // exactly as the Windows backend already did: reads its own live
+    // environment (POSIX `environ`), strips the ADR-3002 A5 injection class
+    // (LD_*/DYLD_*/IFS/BASH_ENV/ENV/GCONV_PATH/NLSPATH/LOCPATH) via
+    // subprocess_launch_spec.hpp's filter_inherited_env() -- SILENTLY
+    // (dropped, not fatal; see that function's own comment for why an
+    // inherited variable's failure mode must differ from extra_env's
+    // fail-closed one) -- then layers extra_env on top with the SAME
+    // replace-never-duplicate merge_launch_env() semantics point (a)
+    // above already describes for Windows. extra_env's own denylist/
+    // malformed-entry checks are UNCHANGED: a denied or malformed extra_env
+    // entry still fails the whole launch closed, on POSIX exactly as on
+    // Windows, regardless of this flag.
+    //
+    // content_dist now sets this flag on EVERY platform (its pre-migration
+    // behaviour was full inheritance everywhere, POSIX included -- there
+    // was never a Windows-only asymmetry in what it actually did, only in
+    // what this runner initially reproduced). script_exec's POSIX leg is
+    // UNCHANGED and must stay that way: it already has its own curated
+    // seven-name allow-list with no gap to fill, and widening it to full
+    // inheritance would be an unrelated, undiscussed behaviour change this
+    // flag's contract does not authorize for that caller.
     bool inherit_parent_env = false;
 
     // B3: optional per-invocation resource caps, OFF (nullopt) by default --

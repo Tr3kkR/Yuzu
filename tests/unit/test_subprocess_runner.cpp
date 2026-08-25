@@ -37,6 +37,7 @@
 #include <barrier>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib> // ::setenv/::unsetenv (BR-001 POSIX inherit_parent_env tests below)
 #include <cstring> // std::strerror (B6 spawn_errno diagnostic)
 #include <filesystem>
 #include <memory>
@@ -904,6 +905,22 @@ TEST_CASE("run_bounded_subprocess: a blank line contributes nothing to the store
     CHECK(r.lines[0] == "hi");
 }
 
+TEST_CASE("run_bounded_subprocess: result.lines never overshoots output_cap_bytes even when a "
+          "one-byte remainder would previously have admitted a whole second line (BR-008)",
+          "[subprocess][streaming][output_cap]") {
+    // output_cap_bytes = 5: "ab" consumes 3 stored bytes (2 + 1 accounting
+    // byte), leaving a budget of 2. "cd" needs 3 -- it must NOT fit. Before
+    // this fix, the gate only checked `stored_line_bytes < output_cap`
+    // (3 < 5, true) without ever checking whether THIS line's own bytes fit
+    // the remainder, so "cd" was admitted anyway and stored_line_bytes grew
+    // to 6 -- past the documented cap.
+    SubprocessResult r = run_bounded_subprocess({"/bin/sh", "-c", "printf 'ab\\ncd\\n'"},
+                                                 SubprocessOptions{.deadline = 5000ms, .output_cap_bytes = 5});
+    CHECK(r.tool_ran);
+    REQUIRE(r.lines.size() == 1); // "cd" correctly rejected, not overshot in
+    CHECK(r.lines[0] == "ab");
+}
+
 TEST_CASE("run_bounded_subprocess: A6 chdir's the child into working_dir",
           "[subprocess][working_dir]") {
     std::filesystem::path dir = yuzu::test::unique_temp_path("yuzu_test_cwd_");
@@ -954,6 +971,69 @@ TEST_CASE("run_bounded_subprocess: A5 env is a clear-and-allow-list, not the dae
         CHECK(line.substr(0, 9) != "BASH_ENV=");
         CHECK(line.substr(0, 11) != "GCONV_PATH=");
     }
+}
+
+// ── BR-001 (whole-branch review round 2): POSIX inherit_parent_env ─────────
+// content_dist's deleted POSIX launcher inherited the agent's full parent
+// environment via execvp() (no environ replacement); the migrated runner's
+// A5 clear-slate silently narrowed that. These are the real-child twin of
+// test_subprocess_launch_spec.cpp's pure filter_inherited_env/
+// merge_launch_env fixtures -- proving the actual POSIX fork/exec path (not
+// just the pure decision core) observes the contract.
+
+TEST_CASE("run_bounded_subprocess: POSIX inherit_parent_env defaults to false, leaving an "
+          "existing caller's child environment exactly as before (BR-001, no-regression guard)",
+          "[subprocess][env][inherit_parent_env]") {
+    ::setenv("YUZU_TEST_INHERIT_ENV_MARKER", "parent_value", 1);
+    SubprocessResult r = run_bounded_subprocess({"/usr/bin/env"}, SubprocessOptions{.deadline = 5000ms});
+    ::unsetenv("YUZU_TEST_INHERIT_ENV_MARKER");
+
+    CHECK(r.tool_ran);
+    CHECK_FALSE(contains_line(r.lines, "YUZU_TEST_INHERIT_ENV_MARKER=parent_value"));
+}
+
+TEST_CASE("run_bounded_subprocess: POSIX inherit_parent_env=true forwards the real parent "
+          "environment, minus the ADR-3002 A5 injection class (BR-001)",
+          "[subprocess][env][inherit_parent_env]") {
+    ::setenv("YUZU_TEST_INHERIT_ENV_MARKER", "parent_value", 1);
+    // Injection-class names -- must be withheld from the child even though
+    // they ARE genuinely present in the real parent environment being
+    // inherited (silent strip, not a launch failure -- see
+    // filter_inherited_env's own contract comment).
+    ::setenv("LD_PRELOAD", "/evil.so", 1);
+    ::setenv("IFS", "$'\\n'", 1);
+    SubprocessResult r = run_bounded_subprocess(
+        {"/usr/bin/env"}, SubprocessOptions{.deadline = 5000ms, .inherit_parent_env = true});
+    ::unsetenv("YUZU_TEST_INHERIT_ENV_MARKER");
+    ::unsetenv("LD_PRELOAD");
+    ::unsetenv("IFS");
+
+    CHECK(r.tool_ran);
+    // The real parent value survives via full-environment inheritance --
+    // this name is never in the runner's own A5 allow-list at all.
+    CHECK(contains_line(r.lines, "YUZU_TEST_INHERIT_ENV_MARKER=parent_value"));
+    for (const auto& line : r.lines) {
+        CHECK(line.substr(0, 3) != "LD_");
+        CHECK(line.substr(0, 5) != "DYLD_");
+        CHECK(line.substr(0, 4) != "IFS=");
+    }
+}
+
+TEST_CASE("run_bounded_subprocess: POSIX inherit_parent_env=true still applies extra_env on top, "
+          "replace-never-duplicate (BR-001, design point (a))",
+          "[subprocess][env][inherit_parent_env]") {
+    ::setenv("YUZU_TEST_INHERIT_ENV_MARKER", "parent_value", 1);
+    SubprocessResult r = run_bounded_subprocess(
+        {"/usr/bin/env"},
+        SubprocessOptions{.deadline = 5000ms,
+                           .extra_env = {{"YUZU_TEST_INHERIT_ENV_MARKER", "override"}},
+                           .inherit_parent_env = true});
+    ::unsetenv("YUZU_TEST_INHERIT_ENV_MARKER");
+
+    CHECK(r.tool_ran);
+    // extra_env REPLACES the inherited value in place -- one entry, not two.
+    CHECK(contains_line(r.lines, "YUZU_TEST_INHERIT_ENV_MARKER=override"));
+    CHECK_FALSE(contains_line(r.lines, "YUZU_TEST_INHERIT_ENV_MARKER=parent_value"));
 }
 
 TEST_CASE("run_bounded_subprocess: B3 an opt-in RLIMIT_CPU cap is applied to the child, off by default "
