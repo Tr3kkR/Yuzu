@@ -7,18 +7,21 @@
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
 #include "secure_buffer.hpp"
+#include "sqlite_raii.hpp"
 #include "utf8_sanitize.hpp"
 
 #include <yuzu/metrics.hpp>
 
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
+#include <sqlite3.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <map>
 #include <span>
 
@@ -584,6 +587,58 @@ bool RuntimeConfigStore::remove(const std::string& key) {
         return true;
     });
     return ok && removed;
+}
+
+void RuntimeConfigStore::warn_if_legacy_data_present(
+    const std::filesystem::path& legacy_db_path) {
+    std::error_code ec;
+    if (!std::filesystem::exists(legacy_db_path, ec) || ec)
+        return; // genuine fresh install -- the unremarkable, silent case
+
+    SqliteDb db;
+    if (sqlite3_open_v2(legacy_db_path.string().c_str(), db.addr(), SQLITE_OPEN_READONLY,
+                        nullptr) != SQLITE_OK) {
+        spdlog::warn("RuntimeConfigStore: legacy {} exists but could not be opened ({}) -- "
+                    "verify manually whether it holds operator overrides that need reapplying",
+                    legacy_db_path.string(), sqlite3_errmsg(db.get()));
+        return;
+    }
+
+    // sqlite3_open_v2 is lazy -- it succeeds even against a file that is not a valid SQLite
+    // database at all; the format is only checked on first real access. Check sqlite_master
+    // FIRST, distinctly from the row-count query below, so "this file cannot be read as a
+    // SQLite database" (warn -- exactly the corruption case detection exists to catch) is
+    // never conflated with "this file IS a SQLite database, just not one holding our table"
+    // (silent -- an unfamiliar schema is not this store's data to report on).
+    SqliteStmt table_check;
+    if (sqlite3_prepare_v2(db.get(),
+                           "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runtime_config'",
+                           -1, table_check.addr(), nullptr) != SQLITE_OK) {
+        spdlog::warn("RuntimeConfigStore: legacy {} exists but could not be read as a SQLite "
+                    "database ({}) -- verify manually whether it holds operator overrides "
+                    "that need reapplying",
+                    legacy_db_path.string(), sqlite3_errmsg(db.get()));
+        return;
+    }
+    const int table_rc = sqlite3_step(table_check.get());
+    if (table_rc != SQLITE_ROW)
+        return; // no runtime_config table -- nothing this store ever wrote, silent
+
+    SqliteStmt stmt;
+    if (sqlite3_prepare_v2(db.get(), "SELECT COUNT(*) FROM runtime_config", -1, stmt.addr(),
+                           nullptr) != SQLITE_OK || sqlite3_step(stmt.get()) != SQLITE_ROW) {
+        spdlog::warn("RuntimeConfigStore: legacy {} exists but its row count could not be read "
+                    "-- verify manually whether it holds operator overrides that need "
+                    "reapplying",
+                    legacy_db_path.string());
+        return;
+    }
+    const auto count = static_cast<std::size_t>(sqlite3_column_int64(stmt.get(), 0));
+    if (count > 0)
+        spdlog::warn("RuntimeConfigStore: legacy {} holds {} override(s) that will NOT be "
+                    "carried over (ADR-0009 fresh-start-by-default) -- reapply them via "
+                    "Settings after this boot",
+                    legacy_db_path.string(), count);
 }
 
 } // namespace yuzu::server

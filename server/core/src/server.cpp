@@ -5582,10 +5582,13 @@ public:
         //
         // NO backfill (ADR-0009's 2026-08-25 fresh-start-by-default
         // amendment, ADR-0060): no production fleet has ever run a
-        // pre-Postgres Yuzu build, so there is no real legacy
-        // runtime-config.db to protect. The legacy file is never read; a
-        // one-time loud boot log records the deliberate reset (mirrors
-        // ResponseStore/ADR-0039).
+        // pre-Postgres Yuzu build, so the legacy runtime-config.db is never
+        // COPIED. Unlike ResponseStore (purely TTL'd telemetry), this store
+        // holds real operator config, so the playbook's detect-and-warn
+        // obligation applies: warn_if_legacy_data_present() opens the
+        // legacy file read-only to check for real rows and warns loudly
+        // (with a count) only when it finds them -- silence is the
+        // unremarkable case (fresh install, or an already-cutover boot).
         //
         // Own SecretCodec instance (ADR-0010 per-store model, mirrors
         // plugin_config_store_'s construction sequence exactly, see that
@@ -5626,11 +5629,11 @@ public:
                         startup_failed_ = true;
                     } else {
                         runtime_config_store_->set_metrics(&metrics_);
-                        spdlog::warn(
-                            "[PG] runtime config reset on Postgres cutover — the legacy "
-                            "runtime-config.db is not migrated (ADR-0009 fresh-start-by-default "
-                            "amendment, ADR-0060 skippable backfill class); operators reapply any "
-                            "Settings overrides (including OIDC configuration) once after upgrade");
+                        // Detect-and-warn (docs/postgres-store-playbook.md's Backfill bullet):
+                        // silent unless the legacy file actually holds real overrides this
+                        // cutover will not carry over -- see the store's own doc comment.
+                        RuntimeConfigStore::warn_if_legacy_data_present(cfg_.db_dir() /
+                                                                        "runtime-config.db");
                         if (!apply_runtime_config_overrides()) {
                             spdlog::error(
                                 "[PG] Refusing to start: could not apply stored runtime config "

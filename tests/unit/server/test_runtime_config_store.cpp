@@ -2,15 +2,19 @@
 // specifically is covered in test_runtime_config_secret_redaction.cpp; this
 // file covers CRUD, updated_by/updated_at semantics, the SecretCodec
 // envelope round-trip, the becomes-secret-later transitional-row transform,
-// the empty-secret rule at the storage layer, and degrade-distinguishable
-// reads (ADR-0036) — there was no general store test file before this PR.
-// No backfill coverage: ADR-0009's fresh-start-by-default amendment means
-// this store never reads a legacy SQLite file.
+// the empty-secret rule at the storage layer, degrade-distinguishable reads
+// (ADR-0036), and the detect-and-warn obligation
+// (docs/postgres-store-playbook.md's Backfill bullet) — there was no
+// general store test file before this PR. No backfill coverage:
+// ADR-0009's fresh-start-by-default amendment means this store never
+// copies a legacy SQLite file.
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -21,10 +25,13 @@
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
 #include "runtime_config_store.hpp"
+#include "sqlite_raii.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <libpq-fe.h>
+#include <sqlite3.h>
 
 using yuzu::server::FileKeyProvider;
 using yuzu::server::RuntimeConfigEntry;
@@ -75,6 +82,99 @@ TEST_CASE("a store that failed to open reports every read/write as unexpected, n
     CHECK(store.get_value_with_secrets("oidc_client_secret").empty());
 
     CHECK_FALSE(store.remove("log_level"));
+}
+
+// ── Detect-and-warn (docs/postgres-store-playbook.md's Backfill bullet) — pure
+//    SQLite + filesystem, NO Postgres required ─────────────────────────────
+
+TEST_CASE("warn_if_legacy_data_present is silent when the legacy file does not exist",
+          "[runtime_config][detect-and-warn]") {
+    auto path = yuzu::test::unique_temp_path("yuzu_test_rtcfg_nofile_");
+    REQUIRE_FALSE(std::filesystem::exists(path));
+
+    yuzu::test::LogCapture cap;
+    RuntimeConfigStore::warn_if_legacy_data_present(path);
+    cap.stop();
+    CHECK(cap.text().find("legacy") == std::string::npos);
+}
+
+TEST_CASE("warn_if_legacy_data_present is silent when the legacy table is empty",
+          "[runtime_config][detect-and-warn]") {
+    yuzu::test::TempDbFile legacy{"yuzu_test_rtcfg_empty_"};
+    {
+        yuzu::server::SqliteDb raw;
+        REQUIRE(sqlite3_open(legacy.path.string().c_str(), raw.addr()) == SQLITE_OK);
+        yuzu::server::SqliteErrMsg err;
+        REQUIRE(sqlite3_exec(raw.get(),
+                             "CREATE TABLE runtime_config (key TEXT PRIMARY KEY, value TEXT "
+                             "NOT NULL, updated_by TEXT NOT NULL DEFAULT '', updated_at "
+                             "INTEGER NOT NULL);",
+                             nullptr, nullptr, err.addr()) == SQLITE_OK);
+    }
+
+    yuzu::test::LogCapture cap;
+    RuntimeConfigStore::warn_if_legacy_data_present(legacy.path);
+    cap.stop();
+    CHECK(cap.text().find("legacy") == std::string::npos);
+}
+
+TEST_CASE("warn_if_legacy_data_present is silent when the file has no runtime_config table",
+          "[runtime_config][detect-and-warn]") {
+    yuzu::test::TempDbFile legacy{"yuzu_test_rtcfg_notable_"};
+    {
+        yuzu::server::SqliteDb raw;
+        REQUIRE(sqlite3_open(legacy.path.string().c_str(), raw.addr()) == SQLITE_OK);
+        yuzu::server::SqliteErrMsg err;
+        REQUIRE(sqlite3_exec(raw.get(), "CREATE TABLE unrelated (x INTEGER);", nullptr, nullptr,
+                             err.addr()) == SQLITE_OK);
+    }
+
+    yuzu::test::LogCapture cap;
+    RuntimeConfigStore::warn_if_legacy_data_present(legacy.path);
+    cap.stop();
+    CHECK(cap.text().find("legacy") == std::string::npos);
+}
+
+TEST_CASE("warn_if_legacy_data_present warns with a row count when real overrides exist",
+          "[runtime_config][detect-and-warn]") {
+    yuzu::test::TempDbFile legacy{"yuzu_test_rtcfg_realdata_"};
+    {
+        yuzu::server::SqliteDb raw;
+        REQUIRE(sqlite3_open(legacy.path.string().c_str(), raw.addr()) == SQLITE_OK);
+        yuzu::server::SqliteErrMsg err;
+        REQUIRE(sqlite3_exec(raw.get(),
+                             "CREATE TABLE runtime_config (key TEXT PRIMARY KEY, value TEXT "
+                             "NOT NULL, updated_by TEXT NOT NULL DEFAULT '', updated_at "
+                             "INTEGER NOT NULL); "
+                             "INSERT INTO runtime_config VALUES "
+                             "('log_level','debug','admin',1700000000),"
+                             "('oidc_client_secret','s3cr3t','admin',1700000001);",
+                             nullptr, nullptr, err.addr()) == SQLITE_OK);
+    }
+
+    yuzu::test::LogCapture cap;
+    RuntimeConfigStore::warn_if_legacy_data_present(legacy.path);
+    cap.stop();
+    const std::string text = cap.text();
+    CHECK(text.find("2") != std::string::npos);
+    CHECK(text.find(legacy.path.string()) != std::string::npos);
+    // The secret's plaintext value must never appear in the warning.
+    CHECK(text.find("s3cr3t") == std::string::npos);
+}
+
+TEST_CASE("warn_if_legacy_data_present warns defensively when the legacy file is corrupt",
+          "[runtime_config][detect-and-warn]") {
+    yuzu::test::TempDbFile legacy{"yuzu_test_rtcfg_corrupt_"};
+    {
+        std::ofstream f(legacy.path, std::ios::binary);
+        REQUIRE(f.is_open());
+        f << "this is not a valid sqlite database file";
+    }
+
+    yuzu::test::LogCapture cap;
+    RuntimeConfigStore::warn_if_legacy_data_present(legacy.path);
+    cap.stop();
+    CHECK(cap.text().find("legacy") != std::string::npos);
 }
 
 // ── Migration / fresh-database (plain YUZU_REQUIRE_PG_DB, per the playbook's

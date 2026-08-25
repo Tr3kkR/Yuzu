@@ -2212,17 +2212,22 @@ policies and fleet compliance percentage.
 `RuntimeConfigStore` — the Settings-configurable overrides behind `GET`/`PUT
 /api/config/:key` (retention windows, `log_level`, DEX alert-routing knobs, and the
 `oidc_*` OIDC parameters) — moves from the SQLite `runtime-config.db` file to the
-server's PostgreSQL substrate in this release, schema `runtime_config_store`. This is
-the last store started on the Postgres migration ladder. `WebhookStore` has since merged;
-`InstructionStore` and `OffloadTargetStore` remain not yet started as of this note.
+server's PostgreSQL substrate in this release, schema `runtime_config_store`. This was
+the last store on the Postgres migration ladder to START migration work. `WebhookStore`
+has since merged; `InstructionStore` has an open PR (#3602) in flight; `OffloadTargetStore`
+remains not yet started as of this note.
 
-- **Your stored overrides do NOT carry over.** Per ADR-0009's fresh-start-by-default
-  amendment, the legacy `runtime-config.db` is never read on this cutover — no
-  production fleet has ever run a pre-Postgres Yuzu build, so there was no real
-  operator-set config to protect. The server logs a one-time warning on first boot
-  after upgrading ("runtime config reset on Postgres cutover") and starts with every
-  key at its CLI/env default. **Reapply any Settings overrides — including your OIDC
-  configuration — once after upgrading past this release.**
+- **Your stored overrides do NOT carry over on this cutover.** Per ADR-0009's
+  fresh-start-by-default amendment, the legacy `runtime-config.db` is never copied — no
+  production fleet has ever run a pre-Postgres Yuzu build, so the mandate to preserve
+  real operator config across the cutover has nothing real to preserve for this
+  migration. If your `runtime-config.db` DID hold real overrides, the server checks for
+  this at boot and logs a warning naming the exact count found (e.g. "legacy
+  runtime-config.db holds 2 override(s) that will NOT be carried over") — silence at
+  boot means either a genuinely fresh install or that this cutover already happened on
+  a previous boot. Starts with every key at its CLI/env default either way.
+  **Reapply any Settings overrides — including your OIDC configuration — once after
+  upgrading past this release.**
 - **`oidc_client_secret` is now encrypted at rest** (SecretCodec envelope, AES-256-GCM)
   instead of plaintext, from the point you reapply it onward.
 - **The legacy `runtime-config.db` is left in place, untouched, and may still contain your

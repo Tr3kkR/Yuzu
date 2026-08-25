@@ -61,20 +61,30 @@
 ///
 /// **Backfill: SKIPPED unconditionally (ADR-0009's 2026-08-25
 /// fresh-start-by-default amendment).** No `migrate_from_sqlite()` — the
-/// legacy `runtime-config.db` is never read. No production fleet has ever
-/// run a pre-Postgres Yuzu build, so there is no real operator-set legacy
-/// config anywhere to protect; the original per-store-ADR "mandatory
-/// backfill for config/reference stores" default assumed a live fleet that
-/// has never existed. On cutover the server logs a one-time loud boot line
-/// (`server.cpp`'s construction site) noting the reset, mirroring
-/// `ResponseStore`/ADR-0039's reference shape for the skippable class —
-/// operators reapply Settings overrides (including `oidc_client_secret`)
-/// once after upgrading past this release.
+/// legacy `runtime-config.db` is never COPIED. No production fleet has
+/// ever run a pre-Postgres Yuzu build, so the original per-store-ADR
+/// "mandatory backfill for config/reference stores" default assumed a
+/// live fleet that has never existed. On cutover the server logs a boot
+/// warning (`server.cpp`'s construction site) noting the reset, mirroring
+/// `ResponseStore`/ADR-0039's reference shape for the skippable class.
+///
+/// **Detect-and-warn, per `docs/postgres-store-playbook.md`'s Backfill
+/// bullet.** Unlike `ResponseStore` (purely TTL'd telemetry — a silent
+/// reset is genuinely benign), this store holds real operator-authored
+/// config, so a silent reset would be a fail-open if the "no production
+/// fleet" premise ever turns out to be locally wrong. `detect_legacy_data()`
+/// opens the legacy file READ-ONLY (never migrates, never mutates, never
+/// moves it aside) purely to check whether it exists and holds any rows;
+/// the caller logs a loud, count-bearing warning only when it does —
+/// silence is the expected, unremarkable case (a genuinely fresh install
+/// or an already-cutover boot), not something to warn about on every
+/// start.
 
 #include "config_secret_keys.hpp"
 
 #include <cstdint>
 #include <expected>
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
@@ -216,6 +226,22 @@ public:
     /// transitional becomes-secret-later state can have a stale row in
     /// each. Returns true if either delete removed a row.
     bool remove(const std::string& key);
+
+    /// Detect-and-warn obligation (`docs/postgres-store-playbook.md`'s Backfill
+    /// bullet, ADR-0009 fresh-start-by-default): does the legacy
+    /// `runtime-config.db` at `legacy_db_path` hold real operator overrides
+    /// this cutover will NOT carry over? Read-only — never migrates, mutates,
+    /// or moves the file; logs the finding itself (the caller has nothing to
+    /// branch on). Three outcomes, each logged distinctly: the file does not
+    /// exist (silent — a genuine fresh install, the unremarkable case, not
+    /// worth a line on every boot); the file exists but cannot be opened or
+    /// queried (`spdlog::warn` — corrupt/permission-denied is exactly the
+    /// case detection cannot silently wave through, since a real override
+    /// could be trapped behind it); the file opens and its `runtime_config`
+    /// table has zero rows (silent — genuinely nothing to lose); the table
+    /// has N > 0 rows (`spdlog::warn` with the count — the case this
+    /// obligation exists for).
+    static void warn_if_legacy_data_present(const std::filesystem::path& legacy_db_path);
 
     /// Check if a key is in the allow-list of safe runtime-configurable keys.
     static bool is_allowed_key(const std::string& key);
