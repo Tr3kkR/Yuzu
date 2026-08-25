@@ -248,8 +248,18 @@ std::expected<std::string, std::string>
 PolicyEvaluator::dispatch_instruction(const std::string& instruction_id,
                                       const std::unordered_map<std::string, std::string>& parameters,
                                       const std::vector<std::string>& targets) {
-    if (targets.empty() || !d_.instruction_store || !d_.dispatch_fn)
+    if (targets.empty() || !d_.dispatch_fn)
         return "";
+    // db_error, not a legitimate no-op (gov Gate 3 architect finding): a null
+    // instruction_store is a genuine unavailability, not "no targets"/"unknown
+    // instruction" — collapsing it into the same "" those return would silently
+    // skip dispatch instead of surfacing degraded. Currently unreachable (this
+    // Deps struct is only ever constructed with a live instruction_store — same
+    // boot-latch shape as workflow_routes.cpp's uninstall_fn), kept correct as
+    // defense-in-depth against that invariant changing.
+    if (!d_.instruction_store)
+        return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) +
+                               "instruction store unavailable");
     // ADR-0058: get_definition now returns std::expected<optional<...>, string>.
     // A genuine DB error must surface as `unexpected` — never collapse into the
     // same "" a not-found id legitimately returns (that fail-open is exactly

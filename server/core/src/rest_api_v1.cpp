@@ -5316,7 +5316,9 @@ void RestApiV1::register_routes(
                   if (!def_result) {
                       res.status = 503;
                       res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
-                      audit_fn(req, "response_template.create", "denied", "InstructionDefinition",
+                      // "error", not "denied" (gov Gate 6 compliance-officer finding): an
+                      // infra degrade is not an operator denial.
+                      audit_fn(req, "response_template.create", "error", "InstructionDefinition",
                                def_id, "reason=store_unavailable");
                       return;
                   }
@@ -5413,7 +5415,9 @@ void RestApiV1::register_routes(
                  if (!def_result) {
                      res.status = 503;
                      res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
-                     audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
+                     // "error", not "denied" (gov Gate 6 compliance-officer finding): an
+                     // infra degrade is not an operator denial.
+                     audit_fn(req, "response_template.update", "error", "InstructionDefinition",
                               def_id, "reason=store_unavailable");
                      return;
                  }
@@ -5511,7 +5515,9 @@ void RestApiV1::register_routes(
             if (!def_result) {
                 res.status = 503;
                 res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
-                audit_fn(req, "response_template.delete", "denied", "InstructionDefinition", def_id,
+                // "error", not "denied" (gov Gate 6 compliance-officer finding): an infra
+                // degrade is not an operator denial.
+                audit_fn(req, "response_template.delete", "error", "InstructionDefinition", def_id,
                          "reason=store_unavailable");
                 return;
             }

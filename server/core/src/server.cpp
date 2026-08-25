@@ -4818,6 +4818,19 @@ public:
                     metrics_.counter("yuzu_server_instruction_read_degrade_total",
                                      {{"reason", reason}});
                 }
+                // gov Gate 3 sre finding: was never registered/pre-seeded, unlike its
+                // read-degrade sibling two statements above — absent from /metrics until the
+                // first write failure ever occurs, breaking observability-conventions.md's
+                // pre-seed-to-0 rule for bounded-label counters.
+                metrics_.describe("yuzu_server_instruction_write_degrade_total",
+                                  "InstructionStore writes that degraded instead of succeeding, "
+                                  "by call site",
+                                  "counter");
+                for (auto reason : {"insert_definition_row", "update_definition",
+                                    "delete_definition", "insert_set_row", "delete_set"}) {
+                    metrics_.counter("yuzu_server_instruction_write_degrade_total",
+                                     {{"reason", reason}});
+                }
                 metrics_.describe("yuzu_server_instruction_backfill_total",
                                   "One-time legacy instructions.db backfill outcome (ADR-0058)",
                                   "counter");
@@ -15330,7 +15343,10 @@ private:
                     if (result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0) {
                         // R2: checked, not discarded — a create denial is a security-relevant
                         // evidence-chain audit (see audit_log's [[nodiscard]] comment).
-                        const bool audit_ok = audit_log(req, "instruction.create", "denied",
+                        // "error", not "denied" (gov Gate 6 compliance-officer finding): an
+                        // infra degrade is not an operator denial — matches policy.evaluate's
+                        // own error-vs-denied convention (rest-api.md's classification rule).
+                        const bool audit_ok = audit_log(req, "instruction.create", "error",
                                                         "InstructionDefinition", def.id,
                                                         "db_error");
                         if (!audit_ok)
@@ -15513,7 +15529,9 @@ private:
                     // evidence-chain audit (see audit_log's [[nodiscard]] comment).
                     bool audit_ok = true;
                     if (db_error)
-                        audit_ok = audit_log(req, "instruction.update", "denied",
+                        // "error", not "denied" (gov Gate 6 compliance-officer finding): an
+                        // infra degrade is not an operator denial.
+                        audit_ok = audit_log(req, "instruction.update", "error",
                                              "InstructionDefinition", id, "db_error");
                     else if (not_found)
                         audit_ok = audit_log(req, "instruction.update", "denied",
@@ -15561,7 +15579,9 @@ private:
             // R2: checked, not discarded — a delete denial is a security-relevant
             // evidence-chain audit (see audit_log's [[nodiscard]] comment).
             if (!del_result && del_result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0) {
-                if (!audit_log(req, "instruction.delete", "denied", "InstructionDefinition", id,
+                // "error", not "denied" (gov Gate 6 compliance-officer finding): an infra
+                // degrade is not an operator denial.
+                if (!audit_log(req, "instruction.delete", "error", "InstructionDefinition", id,
                                "db_error"))
                     res.set_header("Sec-Audit-Failed", "true");
                 res.status = 503;
@@ -15632,7 +15652,9 @@ private:
                 // conflict/validation split below. R4: audited the same as every other
                 // rejection branch below (gov Gate 6 compliance-officer finding).
                 if (result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0) {
-                    const bool audit_ok = audit_log(req, "instruction.import", "denied",
+                    // "error", not "denied" (gov Gate 6 compliance-officer finding, second
+                    // round): an infra degrade is not an operator denial.
+                    const bool audit_ok = audit_log(req, "instruction.import", "error",
                                                     "InstructionDefinition", "", "db_error");
                     if (!audit_ok)
                         res.set_header("Sec-Audit-Failed", "true");
@@ -15790,7 +15812,16 @@ private:
             // genuine DB error 503s distinctly; "not_found: " -> 404 (mirrors
             // ProductPackStore::uninstall's identical REST contract change).
             auto del_result = instruction_store_->delete_set(id);
+            // R2 / gov Gate 4 consistency-auditor finding: these 404/503 denial branches are
+            // new in this migration (pre-migration delete_set was an undifferentiated
+            // 200 {"deleted": bool} with no distinguishable denial to audit) — unlike
+            // create_set (still undifferentiated 400/503 today, tracked separately, see the
+            // instruction-sets audit-gap issue), these are new-in-this-diff and must not ship
+            // unaudited from birth.
             if (!del_result && del_result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0) {
+                if (!audit_log(req, "instruction_set.delete", "error", "InstructionSet", id,
+                               "db_error"))
+                    res.set_header("Sec-Audit-Failed", "true");
                 res.status = 503;
                 res.set_content(
                     R"({"error":{"code":503,"message":"instruction store delete failed"},"meta":{"api_version":"v1"}})",
@@ -15798,6 +15829,9 @@ private:
                 return;
             }
             if (!del_result) {
+                if (!audit_log(req, "instruction_set.delete", "denied", "InstructionSet", id,
+                               "not_found"))
+                    res.set_header("Sec-Audit-Failed", "true");
                 res.status = 404;
                 res.set_content(
                     R"({"error":{"code":404,"message":"instruction set not found"},"meta":{"api_version":"v1"}})",
