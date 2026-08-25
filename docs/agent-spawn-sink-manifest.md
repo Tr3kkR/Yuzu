@@ -311,8 +311,10 @@ sites above).
 private CreateProcessA and fork+execvpe/execvp spawn paths — including the
 plugin-local process-wide launch-lock usage the runner now owns internally
 — onto `yuzu::agent::run_bounded_subprocess`; all three actions transcribed
-above. Environment behaviour preserved exactly on POSIX and tightened —
-documented, not silent — on Windows: see the ENVIRONMENT comment block at
+above. Environment behaviour preserved exactly on both platforms — full
+parent-environment inheritance on Windows, the curated seven-name allow-list
+on POSIX, neither one narrowed or widened by this migration — and now
+documented rather than left implicit: see the ENVIRONMENT comment block at
 `script_exec_plugin.cpp`'s top).
 
 **Direct exec via private helpers:** filesystem (filesystem is fully migrated
