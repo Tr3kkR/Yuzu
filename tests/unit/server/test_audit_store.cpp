@@ -5,13 +5,18 @@
  * random-sample, degrade-distinguishable reads, and the retention clock guard
  * (#2360) ported to a single-sweeper advisory lease with durable dedup.
  *
- * No legacy-SQLite backfill test coverage: the dedicated [backfill] TEST_CASE
- * suite (2026-08-25) was removed as part of a fresh-start-by-default policy
- * change (ADR-0009 amendment) — no production fleet has ever run a
- * pre-Postgres build. AuditStore's migrate_from_sqlite() production method
- * itself is UNCHANGED and still present (its removal is a separate, later
- * step) — it is still called by the metrics-wiring test below (which tests
- * metrics pre-seeding, not backfill behavior, so it was kept).
+ * Most of the dedicated [backfill] TEST_CASE suite (2026-08-25) was removed
+ * as part of a fresh-start-by-default policy change (ADR-0009 amendment) —
+ * no production fleet has ever run a pre-Postgres build. AuditStore's
+ * migrate_from_sqlite() production method itself is UNCHANGED and still
+ * present — unlike every other already-migrated store, ADR-0009's amendment
+ * explicitly does NOT treat AuditStore as a removal candidate (audit
+ * evidence cannot be regenerated the way config/cache state can), so its
+ * backfill stays live and boot-invoked indefinitely, not just "for now."
+ * It is called by the metrics-wiring test below (metrics pre-seeding, not
+ * backfill correctness) and by one reinstated regression test (#2854, the
+ * liveness-gauge same-instance reseed ordering bug) that governance flagged
+ * as still guarding a real bug on a still-live path.
  *
  * PG-gated: skips when YUZU_TEST_POSTGRES_DSN is unset, fails when it is set but
  * broken. Store-behaviour tests use a pre-migrated template clone; the metrics
@@ -25,6 +30,7 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "sqlite_raii.hpp"
 
 #include <yuzu/metrics.hpp>
 
@@ -33,6 +39,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
+#include <sqlite3.h>
 
 #include <cstdint>
 #include <filesystem>
@@ -153,6 +160,67 @@ void anchor_guard(AuditStore& store, std::int64_t last_pass_now) {
 
 std::int64_t row_count(const std::string& dsn) {
     return std::stoll(query_scalar(dsn, "SELECT COUNT(*) FROM audit_store.audit_events"));
+}
+
+// ── Legacy SQLite audit.db builder — reinstated for the #2854 regression test
+// below only (governance flagged its removal: AuditStore's backfill is the
+// one program-wide case that stays live, so this ordering bug's regression
+// coverage should not have been swept with the other 18 stores' tests).
+// Writes the production v3 SQLite schema (all three legacy migrations
+// collapsed) and `count` rows, so migrate_from_sqlite has a realistic source.
+void build_legacy_audit_db(const std::filesystem::path& path, int count,
+                           bool with_principal_class = true, bool with_meta = true) {
+    // TempDir computes a unique path but does NOT create the directory.
+    std::filesystem::create_directories(path.parent_path());
+    SqliteDb db;
+    REQUIRE(sqlite3_open(path.string().c_str(), db.addr()) == SQLITE_OK);
+    const char* schema =
+        "CREATE TABLE audit_events ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, principal TEXT NOT NULL,"
+        " principal_role TEXT NOT NULL, action TEXT NOT NULL, target_type TEXT, target_id TEXT,"
+        " detail TEXT, source_ip TEXT, user_agent TEXT, session_id TEXT, result TEXT NOT NULL,"
+        " ttl_expires_at INTEGER DEFAULT 0);";
+    REQUIRE(sqlite3_exec(db.get(), schema, nullptr, nullptr, nullptr) == SQLITE_OK);
+    if (with_principal_class)
+        REQUIRE(sqlite3_exec(db.get(),
+                             "ALTER TABLE audit_events ADD COLUMN principal_class TEXT NOT NULL "
+                             "DEFAULT '';",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+    if (with_meta)
+        REQUIRE(sqlite3_exec(db.get(),
+                             "CREATE TABLE audit_retention_meta (key TEXT PRIMARY KEY, value "
+                             "INTEGER NOT NULL);",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+    REQUIRE(sqlite3_exec(db.get(), "BEGIN", nullptr, nullptr, nullptr) == SQLITE_OK);
+    SqliteStmt stmt;
+    const char* ins =
+        with_principal_class
+            ? "INSERT INTO audit_events (timestamp, principal, principal_role, action, detail, "
+              "result, ttl_expires_at, principal_class) VALUES (?,?,?,?,?,?,?,?)"
+            : "INSERT INTO audit_events (timestamp, principal, principal_role, action, detail, "
+              "result, ttl_expires_at) VALUES (?,?,?,?,?,?,?)";
+    REQUIRE(sqlite3_prepare_v2(db.get(), ins, -1, stmt.addr(), nullptr) == SQLITE_OK);
+    for (int i = 0; i < count; ++i) {
+        sqlite3_reset(stmt.get());
+        sqlite3_bind_int64(stmt.get(), 1, 1000 + i);
+        sqlite3_bind_text(stmt.get(), 2, "admin", -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 3, "admin", -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 4, "auth.login", -1, SQLITE_STATIC);
+        const std::string detail = "legacy-" + std::to_string(i);
+        sqlite3_bind_text(stmt.get(), 5, detail.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 6, "success", -1, SQLITE_STATIC);
+        sqlite3_bind_int64(stmt.get(), 7, 0);
+        if (with_principal_class)
+            sqlite3_bind_text(stmt.get(), 8, "human", -1, SQLITE_STATIC);
+        REQUIRE(sqlite3_step(stmt.get()) == SQLITE_DONE);
+    }
+    stmt.reset();
+    if (with_meta)
+        REQUIRE(sqlite3_exec(db.get(),
+                             "INSERT INTO audit_retention_meta (key, value) VALUES "
+                             "('last_pass_now', 1699000000);",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+    REQUIRE(sqlite3_exec(db.get(), "COMMIT", nullptr, nullptr, nullptr) == SQLITE_OK);
 }
 
 } // namespace
@@ -533,6 +601,33 @@ TEST_CASE("AuditStore: wiring metrics pre-seeds both closed label sets",
     CHECK(after.find("yuzu_server_audit_backfill_total{result=\"completed\"} 0") !=
           std::string::npos);
     CHECK(after.find("yuzu_server_audit_backfill_total{result=\"fresh\"} 0") != std::string::npos);
+}
+
+TEST_CASE("AuditStore #2854: the liveness gauge is seeded from a legacy anchor without a "
+          "restart",
+          "[pg][audit_store][backfill]") {
+    // The ORDERING bug #2854 fixes: a seed placed only in the constructor reads
+    // before this backfill has a chance to run, so on the FIRST Postgres boot —
+    // the exact upgrade the feature exists for — the gauge would stay at 0
+    // forever. `migrate_from_sqlite`'s success chokepoint (`backfill_ok`) must
+    // re-seed after copying the legacy anchor, on the SAME store instance,
+    // with no restart in between.
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::test::TempDir dir{std::string_view{"yuzu_test_audit_seed_"}};
+    auto legacy = dir.path / "audit.db";
+    build_legacy_audit_db(legacy, /*count=*/5); // seeds legacy last_pass_now=1699000000
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    // Pre-backfill: no durable anchor on this (fresh) Postgres database yet —
+    // the constructor's own seed correctly finds nothing.
+    CHECK(store.last_pass_unixtime() == 0);
+
+    REQUIRE(store.migrate_from_sqlite(legacy));
+    // Post-backfill, same instance: the copied legacy anchor is now visible
+    // without a process restart.
+    CHECK(store.last_pass_unixtime() == 1699000000);
 }
 
 // Gate 3 cpp-expert, who measured both halves on PG 18: `result` and
