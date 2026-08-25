@@ -248,9 +248,17 @@ std::vector<UserSession> enumerate_users();
 void enumerate_machine_software(std::vector<SoftwareInfo>& out);
 
 /**
- * Enumerate the host ARP / neighbour table (ADR-0015). Windows: GetIpNetTable2
- * (AF_UNSPEC). Hard-capped at kArpEntryCap entries (a `spdlog::warn` is logged on
- * truncation). Returns `{}` off Windows until the Linux/macOS follow-ups land.
+ * Enumerate the host ARP / neighbour table (ADR-0015). Implemented on Windows
+ * (GetIpNetTable2/AF_UNSPEC), Linux (/proc/net/arp), and macOS (the shared
+ * NET_RT_FLAGS/RTF_LLINFO sysctl fetch) -- see os-capability-matrix.md for the
+ * platform-specific field constraints (e.g. macOS's entry_type is always
+ * "unknown" and iface is always empty). Hard-capped at kArpEntryCap entries.
+ * Completeness contract: THROWS std::runtime_error rather than returning a
+ * partial vector when the platform read failed, the kernel/parser reported a
+ * truncated read, or the cap was reached before the whole table was consumed
+ * (tar_capture_status.hpp) -- callers MUST NOT diff or persist a caught
+ * exception's snapshot as though it were a genuinely smaller/empty table; see
+ * collect_or_retain() and its call sites in tar_plugin.cpp.
  */
 std::vector<ArpEntry> enumerate_arp();
 
@@ -266,8 +274,18 @@ std::vector<DnsEntry> enumerate_dns();
  * the live snapshot-diff. Windows: outbound via WNetOpenEnumW/WNetEnumResourceW
  * (+ WNetGetUserW), inbound via NetSessionEnum (degrades to empty without
  * admin/Server-Operator). Linux: outbound via /proc/mounts network fstypes,
- * inbound via `smbstatus` (empty if Samba absent). Returns `{}` on macOS
- * (kPlanned). Hard-capped at kMapDriveEntryCap (warn on truncation).
+ * inbound via `smbstatus` (empty if Samba absent). macOS: outbound only, via
+ * getfsstat(2) (no inbound/historical visibility for an unprivileged agent).
+ * Hard-capped at kMapDriveEntryCap.
+ * Completeness contract: THROWS std::runtime_error rather than returning a
+ * partial vector when the underlying capture didn't genuinely complete -- a
+ * subprocess capture that didn't run to completion (Linux `smbstatus`,
+ * Windows `wevtutil`/`journalctl`; tar_capture_status.hpp's
+ * classify_subprocess_capture), or on macOS a getfsstat(2) failure or an
+ * over-cap snapshot (tar_mapdrive_collector.cpp). Callers MUST NOT diff or
+ * persist a caught exception's snapshot as though it were a genuinely
+ * smaller/empty mount table; see collect_or_retain() and its call sites in
+ * tar_plugin.cpp.
  */
 std::vector<MapDriveEntry> enumerate_mapdrive();
 
