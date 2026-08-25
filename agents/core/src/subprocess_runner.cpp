@@ -1631,6 +1631,10 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     // the env-block construction below and SubprocessOptions::
     // inherit_parent_env's doc comment for the full contract.
     launch_opts.inherit_parent_env = opts.inherit_parent_env;
+    // BR4-007: THIS backend is the one that actually honours no_window --
+    // see the create_flags computation below and SubprocessOptions::
+    // no_window's doc comment for the full contract.
+    launch_opts.no_window = opts.no_window;
 
     LaunchSpec spec = build_launch_spec(argv, launch_opts);
     if (spec.error != LaunchSpecError::none)
@@ -1915,8 +1919,15 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     // CREATE_NEW_PROCESS_GROUP gives the group a CTRL_BREAK target for
     // soft_terminate_grace -- the Windows twin of POSIX's process-group
     // SIGTERM.
+    // BR4-007 (whole-branch review round 4): CREATE_NO_WINDOW, opt-in via
+    // spec.no_window (SubprocessOptions::no_window's doc comment has the
+    // full contract) -- suppresses a visible console window for a migrated
+    // caller whose deleted private Windows launcher used to set this flag
+    // itself. Does not otherwise change CREATE_NEW_PROCESS_GROUP's
+    // CTRL_BREAK target.
     const DWORD create_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED |
-                                CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_PROCESS_GROUP;
+                                CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_PROCESS_GROUP |
+                                (spec.no_window ? CREATE_NO_WINDOW : 0);
 
     std::vector<wchar_t> cmdline_buf(cmdline.begin(), cmdline.end());
     cmdline_buf.push_back(L'\0'); // CreateProcessW requires a MUTABLE lpCommandLine buffer

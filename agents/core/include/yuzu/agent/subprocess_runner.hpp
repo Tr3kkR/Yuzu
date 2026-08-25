@@ -180,8 +180,17 @@ struct SubprocessOptions {
     std::vector<std::pair<std::string, std::string>> extra_env;
 
     // A2-002 (Alex plan-gate ruling, script_exec Windows-parity escalation):
-    // a SECOND, narrower and Windows-ONLY widening of A5's clear-slate env
-    // policy, additive to (never a replacement for) extra_env above. Default
+    // a SECOND, narrower widening of A5's clear-slate env policy, additive
+    // to (never a replacement for) extra_env above. BR4-006 (whole-branch
+    // review round 4): this point previously called the widening
+    // "Windows-ONLY" -- true when this flag was introduced, but point (c)
+    // below records that content_dist's migration exposed a real POSIX gap
+    // and Alex extended the SAME flag to the POSIX backend rather than
+    // inventing a second mechanism; the flag itself is cross-platform as of
+    // that ruling, even though script_exec (the caller this paragraph is
+    // about) only ever sets it on its own Windows leg -- see (c) and
+    // script_exec_plugin.cpp's file-header comment for why that ONE
+    // caller's POSIX leg has no gap to fill. Default
     // false, so every existing caller's launch is bit-for-bit unchanged --
     // this is covered by test_subprocess_launch_spec.cpp's default-value
     // assertion and by test_subprocess_runner.cpp's "extra_env-only, flag
@@ -213,9 +222,10 @@ struct SubprocessOptions {
     // from what the live parent process itself currently holds.
     //
     // (b) SECURITY: this deliberately bypasses ADR-3002 A5's clear-slate
-    // policy for ONE platform -- gated tightly: opt-in, default-off,
-    // Windows-only (see below), and every extra_env entry is STILL run
-    // through the existing denylist/malformed-entry checks
+    // policy -- gated tightly: opt-in, default-off, cross-platform but
+    // per-caller (see (c) below for the POSIX backend's own gating), and
+    // every extra_env entry is STILL run through the existing
+    // denylist/malformed-entry checks
     // (is_denied_env_name/is_malformed_env_entry) exactly as when this flag
     // is false -- LD_*/DYLD_*/IFS/BASH_ENV/ENV/GCONV_PATH/NLSPATH/LOCPATH
     // remain refused (the whole launch fails closed) regardless of this
@@ -267,6 +277,28 @@ struct SubprocessOptions {
     // inheritance would be an unrelated, undiscussed behaviour change this
     // flag's contract does not authorize for that caller.
     bool inherit_parent_env = false;
+
+    // BR4-007 (whole-branch review round 4): Windows-only, no POSIX
+    // equivalent (there is no console concept to suppress there, so this
+    // field is simply ignored on the POSIX backend). Both script_exec's and
+    // content_dist's deleted private Windows launchers passed
+    // CREATE_NO_WINDOW to CreateProcessA -- migrating them onto this
+    // runner's shared Windows backend (whose own create_flags never set
+    // that bit, for callers with no equivalent pre-migration behaviour to
+    // preserve) silently dropped it, so an interactively-run agent
+    // launching either action could flash a console window a pre-migration
+    // caller never saw. Default false so every existing caller's launch is
+    // bit-for-bit unchanged -- opt in per call site, exactly the
+    // inherit_parent_env precedent above. Session-0 SERVICE deployments are
+    // unaffected either way (no console to flash); this exists for the
+    // interactive/diagnostic run case. Does not disable
+    // CREATE_NEW_PROCESS_GROUP or this call's soft_terminate_grace
+    // CTRL_BREAK delivery -- CREATE_NO_WINDOW only suppresses the new
+    // console WINDOW's visibility, it does not remove the process group or
+    // its console, and xplat-A2's existing caveat (GenerateConsoleCtrlEvent
+    // is already unreliable for a console-less agent SERVICE) is unchanged
+    // by this flag either way.
+    bool no_window = false;
 
     // B3: optional per-invocation resource caps, OFF (nullopt) by default --
     // RLIMIT_AS in particular breaks mmap-heavy tools like `log show`, so
