@@ -159,6 +159,7 @@
 #include "fleet_topology_store.hpp"
 #include "heartbeat_ingestion.hpp"
 #include "fleet_topology_types.hpp"
+#include "mcp_retry.hpp"  // kMcpPollTotalMetric (#3344) — direct, not transitive
 #include "mcp_server.hpp"
 #include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
 #include "stream_budget.hpp" // shared held-open-SSE admission budget (2f PR 2, Decision 15(h))
@@ -463,6 +464,22 @@ public:
                           "gauge");
         metrics_.describe("yuzu_agents_registered_total", "Total number of agent registrations",
                           "counter");
+        // #3401: a re-registration was refused, either because the W1.5/#823 device-token
+        // revoke-by-device sweep itself failed (fail-closed, ADR-0012 §1) or because a
+        // concurrent registration for the same agent_id already won (see register_agent's
+        // phase-2 supersede check) — either way the agent retries on its normal reconnect
+        // backoff. Pre-seed both reason values so absent()-style alerting works from a healthy
+        // boot (kNvdCountedReasons precedent above). Dormant today for the revoke-failure reason
+        // (device_token_store_ is never wired live); the supersede reason is live regardless.
+        metrics_.describe("yuzu_agents_registration_refused_total",
+                          "Agent registration refused because a required pre-install step "
+                          "failed, or because a concurrent registration for the same agent_id "
+                          "already won. Labelled reason.",
+                          "counter");
+        for (const char* reason :
+             {"device_token_revoke_failed", "superseded_by_concurrent_registration"}) {
+            metrics_.counter("yuzu_agents_registration_refused_total", {{"reason", reason}});
+        }
         metrics_.describe("yuzu_commands_dispatched_total",
                           "Total number of commands dispatched to agents", "counter");
         metrics_.describe("yuzu_commands_completed_total",
@@ -714,6 +731,21 @@ public:
                           "mcp_server.cpp for the exact scope. Does not interact with the "
                           "kMcpSubmitterPendingCap 25-slot cap: a ticket leaves the pending "
                           "bucket at admin-approval time, before it can ever reach this class",
+                          "counter");
+        // #3344: poll-rate signal for the three success-shaped result-poll
+        // tools, so the named retry_after_ms floors (mcp_retry.hpp) can be
+        // data-tuned instead of ossifying as guessed constants. not_ready:
+        // the response carried a retry_after_ms hint (execution non-terminal,
+        // bundle incomplete, or query_responses rows still in flight); ready:
+        // served terminal/complete without one. Excludes pre-verdict denials
+        // (tier/permission/invalid-params/not-found) — those are already
+        // visible via the denial counters and A4 envelopes above. Both labels
+        // are closed sets (3 tools x 2 results), pre-seeded below.
+        metrics_.describe(mcp::kMcpPollTotalMetric,
+                          "MCP result-poll tool calls by verdict (get_execution_status, "
+                          "query_responses, get_bundle_result). not_ready: the success payload "
+                          "carried a retry_after_ms poll hint; ready: served terminal/complete "
+                          "without one. Excludes pre-verdict denials.",
                           "counter");
         // Progress bridge core (2f PR 3a). Same closed-set posture: every reject/
         // degrade reason is a static literal inside the bridge, never derived
@@ -1044,6 +1076,15 @@ public:
             // pattern instead of introducing an unseeded one.
             metrics_.counter("yuzu_mcp_approval_burned_total",
                              {{"tool", tool}, {"reason", "handler_reject"}});
+        }
+        // #3344: yuzu_mcp_poll_total — the closed set is exactly the three
+        // success-shaped result-poll tools x the two verdicts, so every
+        // combination is pre-seeded here for absent() to stay meaningful.
+        for (const auto tool :
+             {"get_execution_status", "query_responses", "get_bundle_result"}) {
+            for (const auto result : {"ready", "not_ready"}) {
+                metrics_.counter(mcp::kMcpPollTotalMetric, {{"tool", tool}, {"result", result}});
+            }
         }
         // yuzu_mcp_approval_precondition_denied_total's reachable label set is
         // NARROWER than the two above: kPrecondition can only fire for a tool
@@ -2875,11 +2916,13 @@ public:
         // forensics. One describe site only (#2446 last-write-wins on dup).
         metrics_.describe("yuzu_engine_principal_confirm_total",
                           "Engine-credential rotation confirm outcomes by surface (rest|mcp) and "
-                          "result (success|conflict|client_error|transient); store-reaching calls "
-                          "only, pre-store denials excluded (#2404)",
+                          "result (success|conflict|client_error|transient|secret_mismatch); "
+                          "store-reaching calls only, pre-store denials excluded (#2404; "
+                          "secret_mismatch added #3015 proof-of-possession)",
                           "counter");
         for (auto surface : {"rest", "mcp"}) {
-            for (auto result : {"success", "conflict", "client_error", "transient"}) {
+            for (auto result :
+                {"success", "conflict", "client_error", "transient", "secret_mismatch"}) {
                 metrics_.counter("yuzu_engine_principal_confirm_total",
                                  {{"surface", surface}, {"result", result}});
             }
@@ -2924,12 +2967,14 @@ public:
         // diverge into a shadow series.
         metrics_.describe(kApiTokenConfirmTotalMetric,
                           "Human API-token rotation confirm outcomes by surface (rest|mcp) and "
-                          "result (success|conflict|client_error|transient); store-reaching calls "
-                          "only, pre-store denials excluded - the human-owned twin of "
-                          "yuzu_engine_principal_confirm_total",
+                          "result (success|conflict|client_error|transient|secret_mismatch); "
+                          "store-reaching calls only, pre-store denials excluded - the "
+                          "human-owned twin of yuzu_engine_principal_confirm_total "
+                          "(secret_mismatch added #3015 proof-of-possession)",
                           "counter");
         for (auto surface : {"rest", "mcp"}) {
-            for (auto result : {"success", "conflict", "client_error", "transient"}) {
+            for (auto result :
+                {"success", "conflict", "client_error", "transient", "secret_mismatch"}) {
                 metrics_.counter(kApiTokenConfirmTotalMetric,
                                  {{"surface", surface}, {"result", result}});
             }
@@ -4412,14 +4457,46 @@ public:
                         }
                         return;
                     }
-                    // Per-agent filtering as the fan-out (M4): only rules that target
-                    // this agent's OS and name it in scope. Cache scope membership
-                    // across rules sharing a scope_expr within this one reconcile.
                     // Baseline gate (docs/guardian-baseline-model.md): the rule source
                     // is the union of member Guards of *deployed* Baselines, so an
                     // enabled-but-undeployed Guard is never reconciled onto an agent.
+                    // ADR-0055 catastrophic-read set: a degraded read MUST abort this
+                    // reconcile, never fan out an empty deployed-set it cannot
+                    // distinguish from "nothing deployed" — mirrors the list_rules
+                    // degrade handling immediately above.
+                    auto deployed_result = deployed_member_rule_ids();
+                    if (!deployed_result) {
+                        metrics_
+                            .counter("yuzu_server_guardian_reconciles_total",
+                                     {{"result", "degraded"}})
+                            .increment();
+                        spdlog::warn("Guardian heartbeat reconcile: deployed_member_rule_ids "
+                                     "degraded ({}) — aborting re-push for agent_id={}",
+                                     deployed_result.error(), agent_id);
+                        if (audit_store_ && audit_store_->is_open()) {
+                            AuditEvent ev;
+                            ev.timestamp =
+                                std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+                            ev.principal = "system";
+                            ev.action = "guaranteed_state.reconcile";
+                            ev.target_type = "GuaranteedState";
+                            ev.target_id = agent_id;
+                            ev.detail = "heartbeat reconcile ABORTED — baseline store degraded (" +
+                                        deployed_result.error() +
+                                        "); agent rules did not converge (generation " +
+                                        std::to_string(agent_gen) + ")";
+                            ev.result = "degraded";
+                            (void)audit_store_->log(ev);
+                        }
+                        return;
+                    }
+                    // Per-agent filtering as the fan-out (M4): only rules that target
+                    // this agent's OS and name it in scope. Cache scope membership
+                    // across rules sharing a scope_expr within this one reconcile.
                     const auto rules =
-                        guardian::filter_deployed_members(*rules_result, deployed_member_rule_ids());
+                        guardian::filter_deployed_members(*rules_result, *deployed_result);
                     std::unordered_map<std::string, bool> scope_member;
                     auto push = guardian::build_agent_push(
                         rules, sess->os,
@@ -5233,11 +5310,39 @@ public:
         // Guardian Baselines — the deployable collection of Guards (M:N members +
         // included/excluded management-group assignment). Control-plane only; the
         // agent never hears the word "Baseline". See docs/guardian-baseline-model.md.
-        {
-            auto bl_db = cfg_.db_dir() / "guardian-baselines.db";
-            baseline_store_ = std::make_unique<BaselineStore>(bl_db);
-            if (baseline_store_ && baseline_store_->is_open())
-                spdlog::info("BaselineStore initialized at {}", bl_db.string());
+        // Migrated Postgres store (ADR-0006/0055, schema `baseline_store`) —
+        // construction fail-CLOSED per ADR-0012 §1 (same template as
+        // GuaranteedStateStore above, its closest Guardian-domain sibling): a
+        // reachable database whose schema can't migrate/open is a fatal startup
+        // error, never a serve-degraded state. `migrate_from_sqlite` runs the
+        // one-time, idempotent legacy-`guardian-baselines.db` backfill (ADR-0009)
+        // — every table here is AUTHORITATIVE operator-authored enforcement
+        // config, so a backfill failure is ALSO fatal (never serve on top of a
+        // partially-migrated Baseline set).
+        if (pg_pool_ && !startup_failed_) {
+            baseline_store_ = std::make_unique<BaselineStore>(*pg_pool_);
+            if (!baseline_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: baseline store migration/open failed "
+                              "(database reachable but the baseline_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                auto bl_db = cfg_.db_dir() / "guardian-baselines.db";
+                if (!baseline_store_->migrate_from_sqlite(bl_db)) {
+                    spdlog::error(
+                        "[PG] Refusing to start: Guardian Baseline legacy-SQLite backfill failed "
+                        "(see prior log lines) — Baselines are authoritative enforcement config "
+                        "and must not serve partially-migrated data. Operator remediation: "
+                        "repair {} or move it aside to skip the backfill (Baselines in it will "
+                        "NOT carry over)",
+                        bl_db.string());
+                    startup_failed_ = true;
+                } else {
+                    spdlog::info("BaselineStore initialized (schema baseline_store; legacy "
+                                 "backfill source {})",
+                                 bl_db.string());
+                }
+            }
         }
 
         // Phase 7: Runtime Configuration + Custom Properties
@@ -19326,8 +19431,19 @@ private:
                 // Baseline gate: push only Guards that are members of a *deployed*
                 // Baseline (docs/guardian-baseline-model.md). With nothing deployed
                 // the set is empty and a full_sync converges agents to zero guards.
+                // ADR-0055 catastrophic-read set: a degraded read MUST abort the
+                // push, never fan out an empty deployed-set indistinguishable from
+                // "nothing deployed" — same -2 sentinel as the list_rules degrade
+                // just above, so the REST caller maps it to 503.
+                auto deployed_result = deployed_member_rule_ids();
+                if (!deployed_result) {
+                    spdlog::warn("Guardian push: deployed_member_rule_ids degraded ({}) — "
+                                 "aborting push (scope={})",
+                                 deployed_result.error(), scope);
+                    return -2;
+                }
                 const auto rules =
-                    guardian::filter_deployed_members(*rules_result, deployed_member_rule_ids());
+                    guardian::filter_deployed_members(*rules_result, *deployed_result);
 
                 // Resolve the agent set this push is ADDRESSED to. H1 scopes a single
                 // toggle to the affected rule's scope_expr (was the whole fleet); an
@@ -20384,12 +20500,16 @@ private:
     // fan-out and the heartbeat reconcile filter their rule source through this via
     // guardian::filter_deployed_members. Empty when nothing is deployed — a
     // full_sync push then converges agents to zero guards (correct by model).
-    // Delegates to BaselineStore (one shared lock; the store owns the snapshot
+    // Delegates to BaselineStore (one pool lease; the store owns the snapshot
     // format) so an edit to a deployed Baseline's members does not change what the
     // fleet enforces until a Push-gated re-deploy rewrites the snapshot.
-    std::unordered_set<std::string> deployed_member_rule_ids() const {
+    // CATASTROPHIC-READ SET (CLAUDE.md Guardian invariant, ADR-0055): typed
+    // `std::expected` — a degraded read is `std::unexpected`, NEVER a silent
+    // empty set. Every caller MUST abort (503 / no-op push) on `!result`,
+    // mirroring how `list_rules()`'s degrade is handled just above.
+    std::expected<std::unordered_set<std::string>, std::string> deployed_member_rule_ids() const {
         if (!baseline_store_)
-            return {};
+            return std::unexpected("baseline store not wired");
         return baseline_store_->deployed_member_rule_ids();
     }
 

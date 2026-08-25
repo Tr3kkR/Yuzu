@@ -12,6 +12,7 @@
 #include <yuzu/secure_zero.hpp>
 
 #include <libpq-fe.h>
+#include <openssl/crypto.h> // CRYPTO_memcmp — constant-time PoP secret compare (#3015)
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -467,6 +468,50 @@ TokenLookup read_token_by_id_on_conn(PGconn* conn, const std::string& token_id) 
     if (result.ok && PQntuples(res.get()) > 0)
         result.token = read_token(res.get(), 0);
     return result;
+}
+
+// #3015 proof-of-possession: fresh single-column read of the REAL
+// `token_hash` for one token_id, on the caller-supplied `conn` — inside the
+// confirm functions' own already-advisory-locked transaction, never a
+// pre-lock snapshot. Every OTHER reader in this file (including
+// `read_token_by_id_on_conn`/`read_active_for_principal_on_conn` above) masks
+// `token_hash` behind a literal `''` — see `kTokenColsTail`'s own comment —
+// so PoP verification needs this dedicated authoritative read rather than
+// reusing either list projection. `nullopt` on a query failure or a
+// zero-row match (the row vanished — should not happen under the lock the
+// callers already hold, but fails closed rather than assuming a match).
+std::optional<std::string> read_token_hash_by_id_on_conn(PGconn* conn, const std::string& token_id) {
+    pg::PgResult res = pg::exec_params(
+        conn, "SELECT token_hash FROM api_token_store.api_tokens WHERE token_id = $1",
+        std::vector<std::string>{token_id});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
+        return std::nullopt;
+    return std::string(PQgetvalue(res.get(), 0, 0));
+}
+
+// #3015 proof-of-possession: constant-time comparison of two SHA-256 hex
+// digests. Mirrors `saml_provider.cpp`'s own `constant_time_hex_equal` —
+// duplicated (same rationale `upload_grant_parsers.hpp::constant_time_equals`
+// records for its own duplicate of `AuthManager::constant_time_compare`)
+// rather than exporting a symbol from an unrelated auth surface, and the
+// `<openssl/crypto.h>` include here is unconditional (mirrors
+// `scim_store.cpp`'s own cross-platform CRYPTO_memcmp use, NOT
+// saml_provider.cpp's Windows-stubbed one) since OpenSSL is a hard
+// dependency on every platform including Windows regardless of this file's
+// own Windows-vs-OpenSSL branch in `sha256_hex` above. Length is compared
+// first (not secret — both operands are always fixed-length 64-char hex
+// digests here), then CRYPTO_memcmp compares the equal-length byte ranges
+// without early-exit-on-mismatch, so branch timing does not leak how many
+// leading bytes matched.
+bool constant_time_hex_equal(const std::string& a, const std::string& b) {
+    if (a.size() != b.size())
+        return false;
+    if (a.empty())
+        return true; // both empty. Unreachable here (operands are always fixed
+                     // 64-char SHA-256 hex); do NOT reuse this helper with
+                     // attacker-controllable empty operands without revisiting
+                     // this shortcut (#3015 UP-8).
+    return CRYPTO_memcmp(a.data(), b.data(), a.size()) == 0;
 }
 
 // Runs `fn` unconditionally in its destructor — covers EVERY exit from the
@@ -1571,6 +1616,7 @@ ApiTokenStore::rotate_engine_credential(const std::string& principal_id, int64_t
 
 std::expected<void, std::string>
 ApiTokenStore::confirm_rotation(const std::string& principal_id, const std::string& token_id,
+                                const std::string& presented_secret,
                                 const std::string& requesting_user) {
     if (!open_)
         return std::unexpected("database not open");
@@ -1578,6 +1624,8 @@ ApiTokenStore::confirm_rotation(const std::string& principal_id, const std::stri
         return std::unexpected("principal_id required");
     if (token_id.empty())
         return std::unexpected("token_id required");
+    if (presented_secret.empty())
+        return std::unexpected("secret required");
     if (requesting_user.empty())
         return std::unexpected("requesting_user required");
 
@@ -1722,6 +1770,26 @@ ApiTokenStore::confirm_rotation(const std::string& principal_id, const std::stri
         }
         if (*initiator != requesting_user) {
             error_msg = "rotation in progress by a different operator";
+            return false;
+        }
+
+        // #3015 PROOF OF POSSESSION — checked LAST, strictly after ownership/
+        // principal-kind, pair-state, the token_id pin, and the initiator
+        // binding above have all passed (see the .hpp doc comment for the
+        // full rationale and the cross-admin-oracle reasoning this ordering
+        // closes). Reads the AUTHORITATIVE successor row's real token_hash —
+        // never the masked `''` `read_active_for_principal_on_conn`
+        // populated `successor` from above — fresh, inside this same locked
+        // transaction.
+        std::optional<std::string> successor_hash =
+            read_token_hash_by_id_on_conn(conn, successor->token_id);
+        if (!successor_hash) {
+            error_msg = "failed to verify rotation secret";
+            return false;
+        }
+        if (!constant_time_hex_equal(sha256_hex(presented_secret), *successor_hash)) {
+            error_msg = "rotation secret mismatch — the presented secret does not verify "
+                        "against the pending successor";
             return false;
         }
 
@@ -2178,6 +2246,7 @@ ApiTokenStore::rotate_token(const std::string& predecessor_token_id, int64_t ove
 
 std::expected<void, std::string>
 ApiTokenStore::confirm_token_rotation(const std::string& successor_token_id,
+                                      const std::string& presented_secret,
                                       const std::string& requesting_user,
                                       const std::string& caller_mcp_tier,
                                       const std::string& caller_scope_service) {
@@ -2185,6 +2254,8 @@ ApiTokenStore::confirm_token_rotation(const std::string& successor_token_id,
         return std::unexpected("database not open");
     if (successor_token_id.empty())
         return std::unexpected("token_id required");
+    if (presented_secret.empty())
+        return std::unexpected("secret required");
     if (requesting_user.empty())
         return std::unexpected("requesting_user required");
 
@@ -2376,6 +2447,25 @@ ApiTokenStore::confirm_token_rotation(const std::string& successor_token_id,
         }
         if (*initiator != requesting_user) {
             error_msg = "rotation in progress by a different operator";
+            return false;
+        }
+
+        // #3015 PROOF OF POSSESSION — same ordering/oracle-freedom rationale
+        // as confirm_rotation above: checked LAST, strictly after ownership,
+        // pair-state, the token_id pin, tier/scope, and the initiator
+        // binding have all passed. Reads the AUTHORITATIVE successor row's
+        // real token_hash — never the masked `''` `principal_active`
+        // populated `successor` from above — fresh, inside this same locked
+        // transaction.
+        std::optional<std::string> successor_hash =
+            read_token_hash_by_id_on_conn(conn, successor->token_id);
+        if (!successor_hash) {
+            error_msg = "failed to verify rotation secret";
+            return false;
+        }
+        if (!constant_time_hex_equal(sha256_hex(presented_secret), *successor_hash)) {
+            error_msg = "rotation secret mismatch — the presented secret does not verify "
+                        "against the pending successor";
             return false;
         }
 
@@ -3181,35 +3271,83 @@ ApiTokenStore::revoke_for_principal(const std::string& principal_id) {
     // `revoke_token`.
     revoke_generation_.fetch_add(1, std::memory_order_release);
 
-    auto lease = pool_.try_acquire_for(kWriteTimeout);
-    if (!lease)
+    std::vector<std::string> hashes;
+    std::vector<std::string> rotation_groups;
+    std::string error_msg;
+
+    // #2961 residual A: wrapped in the SAME per-principal advisory lock
+    // (hashtext(principal_id)) rotate_engine_credential/rotate_token/
+    // confirm_rotation/confirm_token_rotation all take — this deactivation
+    // necessarily includes both sides of any in-flight rotation pair, so it
+    // follows the same per-principal serialization discipline every other
+    // rotation-touching write in this store already does. ONE statement
+    // yields the count (PQntuples), every hash to invalidate, and every
+    // rotation_group to scrub (RETURNING) — no separate pre-SELECT snapshot
+    // needed; the UPDATE's own WHERE clause is the authoritative "what
+    // changed" answer (#1033).
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult lock_res =
+            pg::exec_params(conn, "SELECT pg_advisory_xact_lock(hashtext($1))",
+                            std::vector<std::string>{principal_id});
+        if (lock_res.status() != PGRES_TUPLES_OK) {
+            error_msg = "failed to acquire rotation lock";
+            return false;
+        }
+        pg::PgResult res = pg::exec_params(
+            conn,
+            "UPDATE api_token_store.api_tokens SET revoked = TRUE "
+            "WHERE principal_id = $1 AND revoked = FALSE "
+            "RETURNING token_hash, rotation_group",
+            std::vector<std::string>{principal_id});
+        if (res.status() != PGRES_TUPLES_OK) {
+            error_msg =
+                std::string("revoke_for_principal did not persist: ") + PQerrorMessage(conn);
+            return false;
+        }
+        const int rows = PQntuples(res.get());
+        hashes.reserve(static_cast<std::size_t>(rows));
+        for (int i = 0; i < rows; ++i) {
+            hashes.emplace_back(PQgetvalue(res.get(), i, 0));
+            std::string group = PQgetvalue(res.get(), i, 1);
+            if (!group.empty())
+                rotation_groups.push_back(std::move(group));
+        }
+        return true;
+    });
+
+    if (!ok)
         // authoritative: never report a count (even 0) when we could not reach
         // the DB — that is indistinguishable from "the principal had no tokens"
         // and would let "Sign out everywhere" lie during an outage.
-        return std::unexpected("database unavailable — try again");
+        return std::unexpected(error_msg.empty() ? "revoke_for_principal did not persist"
+                                                  : error_msg);
 
-    // ONE statement yields both the count (PQntuples) and every hash to
-    // invalidate (RETURNING token_hash) — no separate pre-SELECT snapshot
-    // needed; the UPDATE's own WHERE clause is the authoritative "what
-    // changed" answer (#1033).
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "UPDATE api_token_store.api_tokens SET revoked = TRUE "
-        "WHERE principal_id = $1 AND revoked = FALSE RETURNING token_hash",
-        std::vector<std::string>{principal_id});
-    if (res.status() != PGRES_TUPLES_OK)
-        return std::unexpected(std::string("revoke_for_principal did not persist: ") +
-                               PQerrorMessage(lease.get()));
-
-    const int rows = PQntuples(res.get());
     // Second generation bump after the UPDATE commits, before invalidating —
     // see revoke_token for the full rationale (closes the post-first-bump /
     // pre-commit READ COMMITTED cache-poisoning window).
-    if (rows > 0)
+    if (!hashes.empty())
         revoke_generation_.fetch_add(1, std::memory_order_release);
-    for (int i = 0; i < rows; ++i)
-        invalidate_cache(PQgetvalue(res.get(), i, 0));
-    return static_cast<std::size_t>(rows);
+    for (const auto& hash : hashes)
+        invalidate_cache(hash);
+
+    // #2961 residual A: scrub every affected rotation_group's RAM-only grace
+    // cache entry (keyed by rotation_group, NOT principal — mapped via the
+    // RETURNING rows above) so "sign out everywhere"/deactivate cannot leave
+    // an already-cached raw successor secret from a recent rotate
+    // re-servable via a grace-window replay after every credential for this
+    // principal was just revoked. `evict_rotation_raw` scrubs
+    // (`yuzu::secure_zero`) the raw value before erasing — never a bare
+    // erase. See this function's own .hpp doc comment for what this does
+    // NOT close (a genuinely concurrent in-flight mint's own post-commit
+    // cache write — bounded by `successor_rotation_still_pending` instead,
+    // #2961 residual B, out of scope here).
+    std::sort(rotation_groups.begin(), rotation_groups.end());
+    rotation_groups.erase(std::unique(rotation_groups.begin(), rotation_groups.end()),
+                          rotation_groups.end());
+    for (const auto& group : rotation_groups)
+        evict_rotation_raw(group);
+
+    return hashes.size();
 }
 
 std::expected<bool, std::string> ApiTokenStore::delete_token(const std::string& token_id) {

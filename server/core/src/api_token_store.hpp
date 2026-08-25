@@ -447,9 +447,36 @@ public:
     /// pending it confirms it (once); after cutover — or once a later
     /// rotation is in flight — the stale id mismatches and nothing is
     /// written.
+    ///
+    /// #3015 PROOF OF POSSESSION: `presented_secret` is the raw successor
+    /// secret the caller claims to hold (the value `rotate_engine_credential`
+    /// returned). Confirm — unlike rotate itself — REVOKES the predecessor
+    /// immediately, so requiring only the non-secret `token_id` + session
+    /// identity let any caller who could name the successor's id (never
+    /// secret) force an immediate cutover without ever having received the
+    /// new credential. Verified via
+    /// `constant_time_hex_equal(sha256_hex(presented_secret), successor.token_hash)`
+    /// against the AUTHORITATIVE successor row read fresh inside this call's
+    /// own advisory-locked transaction (never a list/lookup projection —
+    /// every OTHER reader in this file masks `token_hash` behind a literal
+    /// `''`, see `kTokenColsTail`'s own comment). The raw secret is never
+    /// persisted or logged — used only to compute this one hash comparison.
+    ///
+    /// ORDERING IS LOAD-BEARING (governance/architect review): PoP is
+    /// checked LAST, strictly after every other admission check — ownership/
+    /// principal-kind, pair-state, the `token_id` pin above, and the
+    /// initiator binding below — all pass. On this arm the caller is a
+    /// third-party admin, not the rotation's own initiator, so checking PoP
+    /// any earlier would let a non-initiator admin distinguish "wrong
+    /// secret" from "valid secret, not your rotation" — a cross-admin
+    /// oracle over who initiated a rotation. Every earlier failure folds
+    /// into the SAME non-disclosing wording it already used; only a caller
+    /// who has already cleared every other gate can reach the PoP check, and
+    /// only THAT caller gets the distinguishable "rotation secret mismatch"
+    /// outcome on a wrong secret.
     [[nodiscard]] std::expected<void, std::string>
     confirm_rotation(const std::string& principal_id, const std::string& token_id,
-                     const std::string& requesting_user);
+                     const std::string& presented_secret, const std::string& requesting_user);
 
     // ── Human arm: token-keyed overlap-pair rotation (P2 #11, SOC 2 CC6.3) ──
     //
@@ -580,8 +607,24 @@ public:
     /// it, never a live path today. REQUIRED, not defaulted, for the same
     /// reason as `rotate_token`'s own pair (governance Gate 8 fix) — see
     /// that doc comment.
+    ///
+    /// #3015 PROOF OF POSSESSION — same contract as `confirm_rotation`'s own
+    /// `presented_secret` parameter (see that doc comment for the full
+    /// rationale and the ordering-is-load-bearing note): verified via
+    /// `constant_time_hex_equal(sha256_hex(presented_secret), successor.token_hash)`
+    /// against the authoritative successor row, checked LAST — after
+    /// ownership, pair-state, the `token_id` pin, tier/scope, and the
+    /// initiator binding all pass — so a caller who fails any earlier gate
+    /// gets the SAME non-disclosing outcome regardless of what secret they
+    /// present. This arm is self-service only (the caller IS the rotation's
+    /// own initiator by construction), so the cross-admin oracle
+    /// `confirm_rotation` guards against does not apply here the same way —
+    /// the ordering is kept identical anyway, for the same reason every
+    /// other invariant in this pair of functions is kept identical: one
+    /// contract, two arms, never a silent divergence.
     [[nodiscard]] std::expected<void, std::string>
     confirm_token_rotation(const std::string& successor_token_id,
+                           const std::string& presented_secret,
                            const std::string& requesting_user,
                            const std::string& caller_mcp_tier,
                            const std::string& caller_scope_service);
@@ -942,6 +985,27 @@ public:
     /// revokes everywhere (cookie sessions + API tokens), not just browser
     /// cookies — a stolen-laptop incident otherwise leaves the on-laptop API
     /// token fully functional while the operator UX silently lies.
+    ///
+    /// #2961 residual A: the DB write runs inside the SAME per-principal
+    /// advisory lock (`pg_advisory_xact_lock(hashtext(principal_id))`)
+    /// `rotate_engine_credential`/`rotate_token`/`confirm_rotation`/
+    /// `confirm_token_rotation` all take, so this deactivation can't
+    /// interleave mid-flight with a concurrent rotate/confirm for the same
+    /// principal. It also collects every `rotation_group` the revoked rows
+    /// belonged to (the cache is keyed by rotation_group, not principal, so
+    /// this maps principal -> groups first) and, after commit, calls
+    /// `evict_rotation_raw` on each — scrubbing (`yuzu::secure_zero`, never
+    /// a bare erase) any raw successor secret still resident in the
+    /// RAM-only grace cache. Without this, "sign out everywhere" left an
+    /// already-cached raw secret from a recent rotate re-servable via a
+    /// grace-window replay for up to `kRotationGraceSecs` AFTER every
+    /// credential for the principal was just revoked. This does NOT close
+    /// every conceivable interleaving with `store_rotation_raw`'s own
+    /// post-commit, outside-the-lock cache write (see that function's own
+    /// doc comment and `successor_rotation_still_pending` — a genuinely
+    /// concurrent in-flight mint racing this call is bounded by that
+    /// existing guard, not by this one) — reworking that RAM re-serve
+    /// design further is explicitly out of scope here (#2961 residual B).
     ///   * value — the number of tokens marked revoked (0 = the principal had
     ///             none; the DB write still succeeded).
     ///   * `unexpected(msg)` — the write did NOT persist; the caller MUST

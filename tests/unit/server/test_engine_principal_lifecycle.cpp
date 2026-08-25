@@ -396,8 +396,9 @@ struct RestEngineHarness {
             "/api/v1/engine-principals/" + principal_id + "/credentials/confirm", "{}");
     }
 
-    auto confirm(const std::string& principal_id, const std::string& token_id) {
-        nlohmann::json body{{"token_id", token_id}};
+    auto confirm(const std::string& principal_id, const std::string& token_id,
+                 const std::string& secret) {
+        nlohmann::json body{{"token_id", token_id}, {"secret", secret}};
         return sink.Post(
             "/api/v1/engine-principals/" + principal_id + "/credentials/confirm", body.dump());
     }
@@ -990,8 +991,11 @@ TEST_CASE("Engine-principal REST: POST .../credentials/confirm dispatched throug
     REQUIRE_FALSE(successor_token_id.empty());
 
     // Same operator ("alice") who initiated the rotation confirms it,
-    // pinning the exact rotation with the successor id from the response.
-    auto res = h.confirm(principal_id, successor_token_id);
+    // pinning the exact rotation with the successor id AND proving possession
+    // of the successor secret from the response (#3015).
+    const auto successor_secret =
+        nlohmann::json::parse(rot->body)["data"]["token"].get<std::string>();
+    auto res = h.confirm(principal_id, successor_token_id, successor_secret);
     REQUIRE(res);
     CHECK(res->status == 200);
     auto body = nlohmann::json::parse(res->body);
@@ -1037,8 +1041,11 @@ TEST_CASE("Engine-principal REST: confirm replayed after success is a terminal 4
             .value();
     };
 
-    // First confirm succeeds (the real cutover).
-    auto first = h.confirm(principal_id, successor_token_id);
+    // First confirm succeeds (the real cutover) — proving possession of the
+    // successor secret from the rotate response (#3015).
+    const auto successor_secret =
+        nlohmann::json::parse(rot->body)["data"]["token"].get<std::string>();
+    auto first = h.confirm(principal_id, successor_token_id, successor_secret);
     REQUIRE(first);
     REQUIRE(first->status == 200);
     CHECK(confirm_metric("success") == 1.0);
@@ -1046,7 +1053,7 @@ TEST_CASE("Engine-principal REST: confirm replayed after success is a terminal 4
     // The replay (network-dropped 200 / double-submit): SAME args. Terminal
     // 409, NOT 503 — an agentic client honouring idempotentHint must stop, not
     // loop. The A4 envelope carries a correlation_id and the terminal message.
-    auto replay = h.confirm(principal_id, successor_token_id);
+    auto replay = h.confirm(principal_id, successor_token_id, successor_secret);
     REQUIRE(replay);
     CHECK(replay->status == 409);
     CHECK(replay->body.find("rotation already confirmed") != std::string::npos);
@@ -1091,7 +1098,11 @@ TEST_CASE("Engine-principal REST: confirm with a mismatched or missing token_id 
     CHECK(successor_token_id == structural_successor_id);
 
     // Mismatched id → 409 Conflict + failure audit; both credentials intact.
-    auto mismatch = h.confirm(principal_id, "feedfacefeedfacefeedface");
+    // A valid secret is presented so the pin check (which fires BEFORE the
+    // #3015 PoP check) is what rejects it — proving order, not just outcome.
+    const auto successor_secret =
+        nlohmann::json::parse(rot->body)["data"]["token"].get<std::string>();
+    auto mismatch = h.confirm(principal_id, "feedfacefeedfacefeedface", successor_secret);
     REQUIRE(mismatch);
     CHECK(mismatch->status == 409);
     CHECK(h.token_store->list_active_for_principal(principal_id).size() == 2);
@@ -1122,12 +1133,71 @@ TEST_CASE("Engine-principal REST: confirm with a mismatched or missing token_id 
     REQUIRE(wrong_type);
     CHECK(wrong_type->status == 400);
 
-    // The rotation is untouched by all of the above — the correct id still
-    // confirms it.
+    // The rotation is untouched by all of the above — the correct id + secret
+    // still confirms it.
     CHECK(h.token_store->list_active_for_principal(principal_id).size() == 2);
-    auto res = h.confirm(principal_id, successor_token_id);
+    auto res = h.confirm(principal_id, successor_token_id, successor_secret);
     REQUIRE(res);
     CHECK(res->status == 200);
+}
+
+TEST_CASE("Engine-principal REST: confirm requires proof-of-possession of the "
+          "successor secret; wrong-secret is 403 and is NOT an oracle (#3015)",
+          "[pg][rest][engine_principal][confirm]") {
+    RestEngineHarness h;
+    auto [principal_id, raw1] = h.create_and_mint("confirm-pop");
+    (void)raw1;
+    h.session_user = "alice";
+
+    auto rot = h.rotate(principal_id);
+    REQUIRE(rot);
+    REQUIRE(rot->status == 200);
+    const auto rot_json = nlohmann::json::parse(rot->body);
+    const auto successor_token_id = rot_json["data"]["token_id"].get<std::string>();
+    const auto successor_secret = rot_json["data"]["token"].get<std::string>();
+    REQUIRE_FALSE(successor_token_id.empty());
+    REQUIRE_FALSE(successor_secret.empty());
+
+    // Wrong secret (correct id, correct initiator) → 403 SecretMismatch; the
+    // rotation is untouched. This outcome is reachable ONLY by a caller who has
+    // already cleared every authz gate, because PoP is verified LAST.
+    auto wrong = h.confirm(principal_id, successor_token_id, "not-the-real-secret");
+    REQUIRE(wrong);
+    CHECK(wrong->status == 403);
+    CHECK(h.token_store->list_active_for_principal(principal_id).size() == 2);
+
+    // Empty secret → 400 input validation, before any authz gate.
+    auto empty_secret = h.confirm(principal_id, successor_token_id, "");
+    REQUIRE(empty_secret);
+    CHECK(empty_secret->status == 400);
+    CHECK(h.token_store->list_active_for_principal(principal_id).size() == 2);
+
+    // Oracle-freedom (the architect's engine-arm concern): a DIFFERENT operator
+    // ("bob") presenting the CORRECT secret must be rejected by the initiator
+    // gate that fires BEFORE PoP — so bob can never distinguish "valid secret"
+    // from "wrong secret" (never 200, never the 403 wrong-secret code), and the
+    // rotation stays intact.
+    h.session_user = "bob";
+    auto other = h.confirm(principal_id, successor_token_id, successor_secret);
+    REQUIRE(other);
+    CHECK(other->status == 409); // "rotation in progress by a different operator"
+                                 // → Conflict, deterministically — the initiator
+                                 // gate fires BEFORE PoP, so it is never 200 and
+                                 // never the 403 wrong-secret code.
+    // Oracle-freedom proof: bob presenting a WRONG secret must land on the SAME
+    // outcome as bob presenting the correct one — if they differed, the code
+    // itself would be an oracle over secret validity to a non-initiator.
+    auto other_wrong = h.confirm(principal_id, successor_token_id, "not-the-real-secret");
+    REQUIRE(other_wrong);
+    CHECK(other_wrong->status == other->status);
+    CHECK(h.token_store->list_active_for_principal(principal_id).size() == 2);
+
+    // The real initiator with the real secret still confirms.
+    h.session_user = "alice";
+    auto ok = h.confirm(principal_id, successor_token_id, successor_secret);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(h.token_store->list_active_for_principal(principal_id).size() == 1);
 }
 
 TEST_CASE("Engine-principal REST: transfer-owner 200 success path (previously "

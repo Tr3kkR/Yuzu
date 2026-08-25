@@ -241,6 +241,11 @@ const char* to_string(McpStreamClose reason) {
 // close_remediation above is TU-local but name-visible here.
 std::string make_stream_closed_frame(McpStreamClose reason, std::string_view correlation_id,
                                      std::string_view extra_params_json) {
+    // #3344: retry_after_ms stays null here — `close_remediation(reason)`
+    // already carries per-reason reconnect guidance (e.g. re-initialize vs.
+    // wait out a cap), and the admission paths that actually gate a
+    // reconnect (kMcpStreamCapRetryAfterMs / kMcpHandoverRetryAfterMs) carry
+    // their own honest hints on the 429 the client hits when it reconnects.
     std::string body =
         "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/yuzu.stream_closed\",\"params\":{\"reason\":";
     body += detail::json_quoted(to_string(reason));

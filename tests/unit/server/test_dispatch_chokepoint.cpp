@@ -139,7 +139,7 @@ TEST_CASE("ClassifiedCommand: only the test-only door can mint one outside Serve
     agent_pb::AgentInfo info;
     info.set_agent_id("dev-door");
     info.set_hostname("host.local");
-    registry.register_agent(info);
+    (void)registry.register_agent(info);
 
     // No live stream and no gateway_node → send_to fails closed (false), not
     // because of anything THIS test is proving — just documenting that a
@@ -631,7 +631,7 @@ TEST_CASE("AgentRegistry::send_to: the defensive tag check rejects an empty/malf
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    registry.register_agent(make_agent_info("dev-A"));
+    (void)registry.register_agent(make_agent_info("dev-A"));
 
     agent_pb::CommandRequest cmd;
     cmd.set_command_id("bad-tag-cmd");
@@ -655,8 +655,8 @@ TEST_CASE("AgentRegistry::send_to_all: the defensive tag check is evaluated once
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    registry.register_agent(make_agent_info("dev-A"));
-    registry.register_agent(make_agent_info("dev-B"));
+    (void)registry.register_agent(make_agent_info("dev-A"));
+    (void)registry.register_agent(make_agent_info("dev-B"));
 
     agent_pb::CommandRequest cmd;
     cmd.set_command_id("bad-tag-broadcast");
@@ -674,7 +674,7 @@ TEST_CASE("AgentRegistry::send_to: a routed envelope to a gateway session that n
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    registry.register_agent(make_agent_info("dev-gw"));
+    (void)registry.register_agent(make_agent_info("dev-gw"));
     // Node set, capabilities deliberately EMPTY — this gateway has not
     // proven it forwards dispatch_tag untouched.
     registry.set_gateway_route("dev-gw", "gw-node-1", {});
@@ -695,7 +695,7 @@ TEST_CASE("AgentRegistry::send_to: a routed envelope succeeds once the gateway h
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    registry.register_agent(make_agent_info("dev-gw"));
+    (void)registry.register_agent(make_agent_info("dev-gw"));
     registry.set_gateway_route("dev-gw", "gw-node-1",
                                {std::string(kGatewayWireCapabilityDispatchTagV1)});
 
@@ -714,10 +714,10 @@ TEST_CASE("AgentRegistry::send_to_all: an individual gateway recipient missing t
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    registry.register_agent(make_agent_info("dev-ok"));
+    (void)registry.register_agent(make_agent_info("dev-ok"));
     registry.set_gateway_route("dev-ok", "gw-node-1",
                                {std::string(kGatewayWireCapabilityDispatchTagV1)});
-    registry.register_agent(make_agent_info("dev-missing"));
+    (void)registry.register_agent(make_agent_info("dev-missing"));
     // dev-missing's gateway never advertised the capability.
     registry.set_gateway_route("dev-missing", "gw-node-2", {});
 
@@ -745,7 +745,7 @@ TEST_CASE("AgentRegistry: gateway wire capabilities are recorded and queryable",
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    registry.register_agent(make_agent_info("dev-A"));
+    (void)registry.register_agent(make_agent_info("dev-A"));
 
     // Node value is irrelevant here — gateway_has_wire_capability never
     // reads it — so a fixed placeholder is used throughout this test.
@@ -763,7 +763,7 @@ TEST_CASE("AgentRegistry: a reconnect REPLACES advertised wire capabilities, nev
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    registry.register_agent(make_agent_info("dev-A"));
+    (void)registry.register_agent(make_agent_info("dev-A"));
 
     registry.set_gateway_route("dev-A", "irrelevant-node", {"cap_a", "cap_b"});
     REQUIRE(registry.gateway_has_wire_capability("dev-A", "cap_a"));
@@ -783,7 +783,7 @@ TEST_CASE("AgentRegistry: clear_stream_if_session clears advertised wire capabil
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    registry.register_agent(make_agent_info("dev-A"));
+    (void)registry.register_agent(make_agent_info("dev-A"));
     registry.map_session("sess-1", "dev-A");
     registry.set_gateway_route("dev-A", "irrelevant-node",
                                {std::string(kGatewayWireCapabilityDispatchTagV1)});
@@ -803,7 +803,7 @@ TEST_CASE("AgentRegistry: clear_gateway_wire_capabilities drops the advertised s
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    registry.register_agent(make_agent_info("dev-A"));
+    (void)registry.register_agent(make_agent_info("dev-A"));
     registry.set_gateway_route("dev-A", "irrelevant-node", {"cap_a"});
     REQUIRE(registry.gateway_has_wire_capability("dev-A", "cap_a"));
 
