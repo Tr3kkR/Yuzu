@@ -31,7 +31,9 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm> // std::min (BR4-006 reserve cap)
 #include <atomic> // rate-limited truncation warn
+#include <cstddef> // std::size_t
 #include <format>
 #include <stdexcept> // yuzu::tar::IncompleteCaptureError derives from std::runtime_error
 #include <string>
@@ -153,7 +155,13 @@ std::vector<ArpEntry> enumerate_arp() {
     }
     MibTableGuard table_guard{table}; // frees on every exit -- normal, cap throw, or a bad_alloc
 
-    out.reserve(table->NumEntries);
+    // BR4-006 (round 4): reserve only up to kArpEntryCap -- out will never
+    // retain more than that regardless of how large the kernel's reported
+    // NumEntries is (the would_exceed_cap loop below stops there), so
+    // reserving the full kernel count needlessly risks a large allocation
+    // (potential bad_alloc under memory pressure) for a bound the cap
+    // already exists to enforce.
+    out.reserve(std::min<std::size_t>(table->NumEntries, kArpEntryCap));
     bool truncated = false;
     for (ULONG i = 0; i < table->NumEntries; ++i) {
         const MIB_IPNET_ROW2& row = table->Table[i];
