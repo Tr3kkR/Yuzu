@@ -551,6 +551,12 @@ reaches ~88.3 min against the 90-min job ceiling, before checkout/build time
 — a TIGHTER margin than the pre-extension worst case (~87 min), by
 construction: six shards moved from a 600s cap to a 700s one and nothing
 moved the other way, so the worst-case ceiling can only have gone up. This
+number is the test-phase-plus-slot-wait sub-budget only — it does NOT
+supersede the "Cross-job" paragraph above's own caveat that the 90-minute
+ceiling also covers checkout/build time, so the REAL total-job margin is
+smaller than ~1.7 min whenever a build isn't instant. Quoting "<2 minutes"
+on its own (as this round's commit message and doc both do) without that
+qualifier overstates how much slack actually remains. This
 is the theoretical ceiling, not the expected case (it requires the box
 already so unhealthy that a job-level kill is arguably the correct outcome,
 not a failure of this design) — the realistic case, using the real
@@ -567,6 +573,32 @@ meson.build`, and was nearly missed entirely while writing this split) needs a
 matching update on both sides or silently stops running in CI. See the
 cross-reference comment at the shard-naming-invariant block in
 `tests/meson.build`.
+
+**Cross-job — runner acquisition, a fourth layer (2026-08-25, same day as the
+split/timeout extension above):** the "Cross-job (fixed second, #3443 AC4)"
+fix earlier in this section (`with-test-slot.sh`) gates contention only
+*inside* a job that already holds a runner — it does nothing for a job that
+cannot START because no runner is free. That is a structurally lower-level
+gap than any of the three fixes above address, and the 35-minute-wait
+incident that paragraph cites is actually an instance of THIS gap, not one
+`with-test-slot.sh` closes: a `dev`/`main` push's own 4-way Linux matrix
+could claim all 4 Big Tam runners simultaneously, leaving nothing reserving
+a runner for a concurrently-queued PR job. Fix: `ci.yml`'s Linux job's
+`strategy.max-parallel: 3` caps how many legs of that SAME matrix run
+concurrently, leaving at least one Big Tam runner unclaimed by it — a no-op
+on `pull_request` events (already a single-leg matrix via the existing
+`exclude`). This is a mitigation, not a guarantee: the freed runner is not
+reserved for any specific job. `proto-compat` (this same workflow) targets
+the bare `[self-hosted, Linux, X64]` label every Big Tam Linux runner also
+carries and runs on the same push trigger — it can claim the freed runner
+itself before a queued PR job does (its own `timeout-minutes: 5` means it
+self-frees quickly, but it is a real same-push competitor, not just the
+already-named nightly-overlap case). A stacked nightly run, another
+concurrent PR/push, or a manual `workflow_dispatch` can do the same — none
+of these are fixable from this diff's scope; a genuine guarantee needs
+runner-pool partitioning (dedicating a runner label to PR-fast-path jobs),
+which needs direct access to the Big Tam box and is tracked as a follow-up
+on #3443, not done here.
 
 ### Persistent runner-local test history
 

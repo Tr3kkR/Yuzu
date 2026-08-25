@@ -487,13 +487,22 @@ jobs:
       # level — below with-test-slot.sh, which only gates contention *inside*
       # a job that already has a runner (docs/ci-architecture.md "Cross-job";
       # a PR job was directly observed waiting 35 minutes for a free runner
-      # during exactly this window). Capping at 3 structurally leaves one
-      # runner free. No-op on `pull_request` events: the exclude below already
-      # trims that matrix to a single gcc-15/debug leg, so max-parallel never
-      # binds there. Trade-off: a `dev` push's 4th leg waits for a slot to free
-      # (two waves instead of one) — acceptable, since push-triggered runs
-      # aren't PR-fast-path latency sensitive. Mitigation, not a guarantee: a
-      # nightly run stacked on top can still fill the pool. Tracked: #3443.
+      # during exactly this window). Capping at 3 leaves at least one Big Tam
+      # runner unclaimed BY THIS MATRIX. No-op on `pull_request` events: the
+      # exclude below already trims that matrix to a single gcc-15/debug leg,
+      # so max-parallel never binds there. Trade-off: a `dev` push's 4th leg
+      # waits for a slot to free (two waves instead of one) — acceptable,
+      # since push-triggered runs aren't PR-fast-path latency sensitive.
+      # NOT a guarantee the freed runner reaches the intended PR job: this
+      # matrix isn't the only claimant on the pool. `proto-compat` below
+      # targets the bare `[self-hosted, Linux, X64]` label, which every
+      # Big Tam Linux runner also carries, and runs on the same push trigger
+      # this cap targets — it can claim the freed runner itself (its own
+      # `timeout-minutes: 5` means it self-frees quickly, but it is a real
+      # same-push competitor, not just the already-named nightly-overlap
+      # case). A stacked nightly run, another concurrent PR/push, or a
+      # manual `workflow_dispatch` can do the same. Mitigation, not a
+      # guarantee. Tracked: #3443.
       max-parallel: 3
       matrix:
         compiler: [gcc-15, clang-21]
