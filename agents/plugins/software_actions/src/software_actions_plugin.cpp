@@ -215,6 +215,19 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               "software_actions:winget_header_unrecognized");
     }
+    if (res.exit_code != 0 && !parsed.rows.empty()) {
+        // winget exited nonzero but the table still parsed rows -- e.g. one
+        // configured source (`msstore`) is unreachable while winget still
+        // prints what it could reach from the others, and still exits
+        // nonzero for the source it couldn't reach. capture_usable()
+        // deliberately does not gate on the exit code at all (a documented
+        // nonzero covers several benign states), so nothing else catches
+        // this: without this check the caller derives "ok" from an
+        // undeclared status, and a short upgrade list is indistinguishable
+        // from a complete one.
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "software_actions:winget_partial_exit");
+    }
     if (parsed.rows.empty()) {
         if (res.exit_code != 0) {
             // Nothing parsed AND a failing exit: no basis to claim this host is
@@ -332,10 +345,6 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
     // software_actions/list_upgradable_macos#1 (docs/agent-spawn-sink-manifest.md)
     auto res = yuzu::agent::run_bounded_subprocess(
         {tool, "-l"}, yuzu::agent::SubprocessOptions{.deadline = kSlowToolDeadline});
-    // The exit code is deliberately NOT part of the usability test here:
-    // `softwareupdate -l` has varied its exit status across macOS releases, so
-    // inventing a failure from it would be its own dishonesty. Runner-level
-    // outcomes and truncation still disqualify the capture.
     // The exit-code check sits ABOVE the parse deliberately. Below it, a
     // failing run whose diagnostic text happened to parse as an entry would be
     // emitted as a package name -- `upgradable|<diagnostic>|-|-` at rc 0.
