@@ -275,14 +275,20 @@ int run_via_runner(yuzu::CommandContext& ctx, const std::vector<std::string>& ar
     opts.on_line = [&ctx, &truncated, &total_bytes](const std::string& line) {
         if (truncated)
             return;
-        // Counts only the line's own content bytes, not an assumed
-        // trailing newline: on_line's contract does not tell the caller
-        // whether the delivered line actually ended with a delimiter (the
-        // final line at EOF may not have), so adding a blanket "+1" could
-        // overcount an unterminated final line and trip the sentinel one
-        // line early. Undercounting the interior newlines by 1 byte each
-        // is immaterial at a 16 MiB cap.
-        total_bytes += line.size();
+        // BR-03 (whole-branch review, supersedes the reasoning this comment
+        // used to carry): counting ONLY line.size() means a completed line
+        // with NO content -- a blank line -- adds zero bytes to the budget.
+        // A newline-only producer (e.g. `yes ''`, or any command that spams
+        // blank lines under a long timeout) then never trips the cap at
+        // all: total_bytes stays at 0 while an unbounded number of
+        // "stdout|" RUNNING records get written to ctx/gRPC/server storage,
+        // defeating the very cap this counter exists to enforce -- an
+        // availability/response-volume issue, not just an off-by-one.
+        // Counting `line.size() + 1` (one delimiter byte per completed
+        // line) closes that gap; the previously-cited risk -- overcounting
+        // an unterminated final line by one byte -- is immaterial next to
+        // letting the cap be bypassed entirely.
+        total_bytes += line.size() + 1;
         if (total_bytes > kMaxOutputBytes) {
             truncated = true;
             ctx.write_output("stdout|[output truncated — exceeded 16 MiB limit]");
