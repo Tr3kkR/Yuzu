@@ -280,15 +280,19 @@ so `absent()`/`rate()` alerting is meaningful on a healthy server.
 |---|---|---|
 | `yuzu_preflight_tick_errors_total` | counter | Exceptions caught by the background `PreflightRunner`'s per-tick try/catch (60 s cadence). A rising rate means pre-flight runs are not being re-dispatched/settled — check the server log. |
 
-## Webhook / offload delivery metrics (#3261)
+## Webhook / offload delivery metrics (#3261, extended ADR-0057)
 
-`WebhookStore` and `OffloadTargetStore` (see [REST API §Webhooks / §Offload Targets](rest-api.md)) dispatch deliveries through a bounded worker pool; these counters cover delivery outcomes and pool backpressure. All six are pre-seeded to `0` at boot, so `absent()`-based alerting stays meaningful on a fresh server before the first delivery ever fires.
+`WebhookStore` and `OffloadTargetStore` (see [REST API §Webhooks / §Offload Targets](rest-api.md)) dispatch deliveries through a bounded worker pool; these counters cover delivery outcomes and pool backpressure. Every no-label counter below is pre-seeded to `0` at boot, so `absent()`-based alerting stays meaningful on a fresh server before the first delivery ever fires; `yuzu_server_webhook_backfill_total` is pre-seeded per `result` label value for the same reason.
 
 | Metric | Type | Meaning |
 |---|---|---|
 | `yuzu_server_webhook_delivery_success_total` | counter | Webhook deliveries that completed with a 2xx response. |
 | `yuzu_server_webhook_delivery_failed_total` | counter | Webhook deliveries that failed (connection error, non-2xx, exception). |
 | `yuzu_server_webhook_delivery_dropped_total` | counter | Webhook deliveries dropped because the delivery worker pool's bounded queue was full, or the store was quiescing (shutdown in progress). A rising rate under normal operation indicates a persistently slow/unreachable endpoint saturating the pool — check `GET /api/webhooks/{id}/deliveries` for the failing target. |
+| `yuzu_server_webhook_delivery_secret_unavailable_total` | counter | Webhook deliveries skipped because the signing secret could not be decrypted (tamper, KEK loss, or a malformed blob) — never fired unsigned or with an empty secret. A sustained rate indicates a KEK-availability incident; cross-reference `yuzu_server_secret_decrypt_failures_total{store="webhook_store"}` for the specific failure class. |
+| `yuzu_server_webhook_fire_event_degraded_total` | counter | `fire_event` ticks that skipped their enabled-webhook scan because the Postgres pool did not yield a connection within its bounded (300ms) acquire, or the enabled-webhook query failed after a connection was acquired — either way, that tick's events are not delivered to any webhook. |
+| `yuzu_server_webhook_delivery_log_failed_total` | counter | Delivery-log `INSERT`s (`webhook_deliveries`) that failed against an open store — the delivery itself still ran; only its record did not persist. |
+| `yuzu_server_webhook_backfill_total{result}` | counter | One-time legacy `webhooks.db` → `webhook_store` Postgres backfill outcome on every boot, `result` ∈ `{success, failed}` (`success` covers a fresh install, an already-migrated skip, and a completed migration alike). ADR-0057. |
 | `yuzu_server_offload_delivery_success_total` | counter | Offload-target deliveries that completed with a 2xx response. |
 | `yuzu_server_offload_delivery_failed_total` | counter | Offload-target deliveries that failed (connection error, non-2xx, exception, or a tampered non-http(s) URL). |
 | `yuzu_server_offload_delivery_dropped_total` | counter | Offload-target deliveries dropped because the delivery worker pool's bounded queue was full, or the store was quiescing. |
