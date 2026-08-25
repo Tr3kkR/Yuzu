@@ -7552,15 +7552,37 @@ public:
         // auto-reconnect churn for the whole 30s window — it only happens
         // once the socket is genuinely about to stop accepting anyway.
         //
-        // NOT wired into the MCP GET/streamed-POST surfaces: McpStreamPump's
-        // teardown is driven by session_alive_/session-registry
-        // revalidation, a materially different mechanism (see
-        // StreamBudget::closing()'s doc comment) — an open MCP stream still
-        // relies on the bounded web-thread join below as its backstop.
-        // Tracked as a named follow-up (#2371 comment, 2026-08-11), not
-        // silently left uncovered.
+        // The MCP GET/streamed-POST surfaces are NOT on StreamBudget::closing()
+        // (see its doc comment) — a different mechanism closes them, below.
         if (stream_budget_)
             stream_budget_->begin_closing();
+
+        // #3042: close-signal every live MCP session BEFORE web_server_->stop().
+        // httplib's own chunked-write loop already re-checks its shutdown flag
+        // between provider calls, so a healthy MCP stream would drain within
+        // about one tick (~3s) even without this — but that path is a bare
+        // connection drop, no close frame, no reason. mcp_sessions_->shutdown()
+        // stickily refuses new mints and closes every live session's stream
+        // state (McpStreamState::close(), same mechanism a DELETE or idle-GC
+        // uses) — a GET pump has that state as its own sink, so it wakes its
+        // wait predicate immediately; a streamed-POST pump's sink is a separate
+        // SseSinkState this close() never touches, so it instead notices on its
+        // own next tick via session_alive_(). Either way the pump exits with a
+        // clean `session_terminated` close frame instead of riding out to a
+        // silent drop. What this does NOT fix: a stream whose pump is blocked
+        // *inside* a single write (a blackholed or drip-feeding peer, bounded
+        // by the write timeout, not the tick) never sees the flip until that
+        // write resolves — that residual case is still the bounded web-thread
+        // join + `_Exit` escalation below.
+        if (mcp_sessions_) {
+            // `n` is every registry entry drained, not just ones with an attached sink
+            // (close() no-ops on an entry with none) — say "removed", not "live", so this
+            // line can't overstate how many clients were actually connected.
+            const std::size_t n = mcp_sessions_->shutdown();
+            if (n > 0) {
+                spdlog::info("MCP sessions: removed {} session(s) for shutdown", n);
+            }
+        }
 
         // Stop cert reloader before web server (it holds a pointer to
         // web_server_) — moved up alongside web_server_->stop() for the
@@ -7686,8 +7708,9 @@ public:
         // web_server_->listen() returns (already closed above) and this
         // waits on that signal instead of a bare join(). On the fast path —
         // the common case once the close-signal above has drained every
-        // /events / /api/v1/events / dashboard-drawer stream — this returns
-        // within one keep-alive tick, well under the bound.
+        // /events / /api/v1/events / dashboard-drawer stream, and #3042's
+        // mcp_sessions_->shutdown() has woken every live MCP pump — this
+        // returns within one keep-alive tick, well under the bound.
         //
         // Escalation is a deliberate std::_Exit, NOT the nvd_sync
         // leak-and-continue precedent a few lines above: nvd_sync's leak
@@ -7700,11 +7723,11 @@ public:
         // farm, not a leak. `_Exit` skips the remaining teardown below
         // (including offload_target_store_->flush_all(), the RESTART-1 fix)
         // exactly the same way a supervisor SIGKILL would — strictly no
-        // worse, and it only fires when the close-signal above did NOT
-        // reach every stream: an open MCP GET/streamed-POST connection (the
-        // one surface item 2 does not close-signal — see
-        // StreamBudget::closing()'s doc comment) or a genuinely wedged
-        // handler.
+        // worse, and by #3042 it should now fire only for a handler stuck
+        // *inside* a single write (a blackholed or drip-feeding peer, bounded
+        // by the write timeout rather than the tick — the close-signals above
+        // wake a WAITING pump, not one already mid-write) or a genuinely
+        // wedged handler unrelated to any stream.
         if (web_thread_.joinable()) {
             // #3007 governance (sre, unhappy-path UP-7/UP-8): stop() now runs off the
             // signal handler, so this wait is silent-by-design up to 15s with no
