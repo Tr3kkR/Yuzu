@@ -2000,11 +2000,17 @@ private:
         // retries the same deltas next tick. The one-time historical backfill is
         // separate (init, mapdrive_backfill_done) and does not touch this baseline.
         if (source_enabled(*db_, "mapdrive")) {
-            // enumerate_mapdrive() throws when its underlying capture didn't
-            // genuinely complete -- a subprocess capture (smbstatus on Linux,
-            // wevtutil/journalctl) or, on macOS, a getfsstat(2) failure/over-cap
-            // snapshot (tar_mapdrive_collector.cpp, BR-002 round 2) -- same
-            // contract as enumerate_services() above. Skip the whole tick's
+            // enumerate_mapdrive() throws when its underlying LIVE capture
+            // didn't genuinely complete -- WNet/NetSessionEnum on Windows,
+            // /proc/mounts/smbstatus on Linux, or on macOS a getfsstat(2)
+            // failure/over-cap snapshot (tar_mapdrive_collector.cpp, BR-002
+            // round 2) -- same contract as enumerate_services() above.
+            // (wevtutil/journalctl are used only by the SEPARATE one-time
+            // enumerate_mapdrive_history() backfill, not this live path --
+            // BR4-007, round 4: an earlier version of this comment named
+            // them here and could mislead a reader auditing live
+            // completeness into thinking the live WNet/procfs legs were
+            // history-tool-guarded too.) Skip the whole tick's
             // diff/state-advance on a throw rather than diff a partial snapshot
             // against the last COMPLETE one.
             auto res = yuzu::tar::collect_or_retain([] { return yuzu::tar::enumerate_mapdrive(); });
