@@ -233,9 +233,23 @@ resolve_executable(std::string_view cmd, std::string_view cwd,
 }
 
 /// Split `args` on whitespace, honoring '"'/'\'' quoted spans (the quote
-/// characters are stripped, no escape processing beyond that) — the exact
-/// rule script_exec's "args" param has always followed (unchanged from the
-/// plugin-local helper this replaces). Pure and allocation-only.
+/// characters are stripped, no escape processing beyond that) — the rule
+/// script_exec's "args" param has always followed on POSIX (unchanged from
+/// the plugin-local helper this replaces). Pure and allocation-only.
+///
+/// BR4-002 (whole-branch review round 4): POSIX ONLY as of this fix. This
+/// function was previously applied on Windows too, but its "either quote
+/// character opens a span, quote bytes are stripped, no escaping" rule is a
+/// POSIX shell convention that the pre-migration Windows path never followed
+/// -- that path built a raw command line and handed it to CreateProcessA
+/// verbatim, so the CHILD's own CRT argv parser (Colascione rules: double
+/// quotes only, backslash-escaping, no meaning for a single quote at all)
+/// was always what actually split "args" on Windows. Using this parser there
+/// silently changed the argument grammar for any Windows command line
+/// relying on CRT quoting/escaping (a literal `'two words'` single-quoted
+/// span, or a backslash-escaped embedded double quote) -- see
+/// split_args_windows() below for the CRT-compatible replacement,
+/// dispatched by assemble_argv()'s `windows_rules` parameter.
 ///
 /// BR3-002 (whole-branch review round 3): a token is tracked as STARTED
 /// independently of whether `current` has accumulated any bytes, so an
@@ -279,15 +293,91 @@ resolve_executable(std::string_view cmd, std::string_view cwd,
     return result;
 }
 
+/// Windows CRT-compatible split of `args` — the exact reverse of
+/// quote_windows_arg()'s Colascione encoding (subprocess_launch_spec.hpp),
+/// i.e. the same rules the Microsoft C runtime's own startup argv parser
+/// (and every well-behaved native Windows program that follows its
+/// convention) applies to a command line:
+///
+///  1. Arguments are delimited by space/tab, UNLESS inside a double-quoted
+///     span.
+///  2. A double quote has NO effect on backslashes that precede it beyond
+///     rule 3 below — backslashes not immediately before a quote are always
+///     literal.
+///  3. N backslashes immediately followed by a double quote: N/2 literal
+///     backslashes are emitted; if N is EVEN, the quote toggles quoting
+///     (and is itself consumed, not emitted); if N is ODD, the quote is
+///     consumed and emitted as one literal `"` (no toggle).
+///  4. A SINGLE QUOTE has no special meaning at all — unlike split_args()
+///     above, it is ordinary token content, exactly like CommandLineToArgvW
+///     and the MSVC CRT startup parser (BR4-002, whole-branch review round
+///     4): a caller-supplied `'two words'` is TWO Windows argv elements
+///     (`'two`, `words'`), never one.
+///
+/// Deliberately does NOT implement CommandLineToArgvW's separate `""`
+/// inside-a-quoted-span-means-one-literal-quote convention — quote_windows_arg()
+/// never emits that form (it always escapes an embedded quote via backslash
+/// doubling, rule 3), so this decoder only needs to invert what this
+/// codebase's own encoder produces; an operator-authored `args` string that
+/// happens to use the `""`-inside-quotes idiom instead reads it as an
+/// (immediate) unquote/requote pair, which is still well-defined, just not
+/// the doubled-literal-quote reading some Windows shells apply. Pure and
+/// allocation-only, like split_args() above.
+[[nodiscard]] inline std::vector<std::string> split_args_windows(std::string_view s) {
+    std::vector<std::string> result;
+    const std::size_t n = s.size();
+    std::size_t i = 0;
+
+    auto is_ws = [](char c) { return c == ' ' || c == '\t'; };
+
+    while (true) {
+        while (i < n && is_ws(s[i]))
+            ++i;
+        if (i >= n)
+            break;
+
+        std::string arg;
+        bool in_quote = false;
+        while (i < n && (in_quote || !is_ws(s[i]))) {
+            std::size_t backslashes = 0;
+            while (i < n && s[i] == '\\') {
+                ++backslashes;
+                ++i;
+            }
+            if (i < n && s[i] == '"') {
+                arg.append(backslashes / 2, '\\');
+                if (backslashes % 2 == 1) {
+                    arg += '"'; // odd run: escaped literal quote, no toggle
+                } else {
+                    in_quote = !in_quote; // even run: the quote is a delimiter
+                }
+                ++i;
+            } else {
+                arg.append(backslashes, '\\');
+                if (i < n) {
+                    arg += s[i];
+                    ++i;
+                }
+            }
+        }
+        result.push_back(std::move(arg));
+    }
+    return result;
+}
+
 /// Assemble the final argv run_bounded_subprocess receives, for each of
 /// script_exec's three modes:
 ///
-///  - exec: {resolved_cmd, ...split_args(args)} — `resolved_cmd` is already
+///  - exec: {resolved_cmd, ...split(args)} — `resolved_cmd` is already
 ///    an absolute path (see resolve_executable above); `args` is the raw,
-///    unsplit "args" param; `script` is ignored.
+///    unsplit "args" param, split by split_args_windows() when
+///    `windows_rules` is true and split_args() otherwise (BR4-002, whole-
+///    branch review round 4: the two regimes are genuinely different
+///    grammars — see each function's own comment — never the same call
+///    gated only by an `#ifdef`); `script` is ignored.
 ///  - bash: {"/bin/bash", "-c", script} — `script` as ONE argv element
 ///    (ADR-3002 Decision 5, rung 3: bash, not this outer spawn, interprets
-///    it); `resolved_cmd`/`args` are ignored.
+///    it); `resolved_cmd`/`args`/`windows_rules` are ignored.
 ///  - powershell: {resolved_cmd, "-NoProfile", "-NonInteractive",
 ///    "-EncodedCommand", script} — BR3-001 (whole-branch review round 3):
 ///    `resolved_cmd` here is the caller-RESOLVED absolute PowerShell path,
@@ -299,15 +389,18 @@ resolve_executable(std::string_view cmd, std::string_view cwd,
 ///    "powershell.exe" that would reintroduce a PATH search. `script` here
 ///    is ALREADY the Base64 UTF-16LE payload (encoding needs
 ///    CryptBinaryToStringA, an OS call, so it happens in the plugin shell
-///    before this pure function is ever called); `args` is ignored.
+///    before this pure function is ever called); `args`/`windows_rules` are
+///    ignored.
 [[nodiscard]] inline std::vector<std::string> assemble_argv(ExecMode mode,
                                                              const std::string& resolved_cmd,
                                                              std::string_view args,
-                                                             const std::string& script) {
+                                                             const std::string& script,
+                                                             bool windows_rules) {
     switch (mode) {
     case ExecMode::exec: {
         std::vector<std::string> argv{resolved_cmd};
-        for (auto& a : split_args(args))
+        auto split = windows_rules ? split_args_windows(args) : split_args(args);
+        for (auto& a : split)
             argv.push_back(std::move(a));
         return argv;
     }

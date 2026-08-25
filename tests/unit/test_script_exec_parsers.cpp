@@ -11,6 +11,8 @@
 
 #include "script_exec_parsers.hpp"
 
+#include <yuzu/agent/subprocess_launch_spec.hpp> // yuzu::agent::quote_windows_arg (BR4-002 round-trip test)
+
 #include <set>
 #include <string>
 #include <vector>
@@ -19,6 +21,7 @@ using yuzu::script_exec::assemble_argv;
 using yuzu::script_exec::ExecMode;
 using yuzu::script_exec::resolve_executable;
 using yuzu::script_exec::split_args;
+using yuzu::script_exec::split_args_windows;
 using yuzu::script_exec::split_path_entries;
 
 namespace {
@@ -203,9 +206,10 @@ TEST_CASE("split_args: splits on whitespace and strips quote characters",
     CHECK(args[3] == "plain");
 }
 
-TEST_CASE("assemble_argv: exec mode is {resolved_cmd, ...split_args(args)}",
+TEST_CASE("assemble_argv: exec mode is {resolved_cmd, ...split_args(args)} on POSIX",
           "[script_exec][parsers]") {
-    auto argv = assemble_argv(ExecMode::exec, "/usr/bin/echo", "hello world", "");
+    auto argv = assemble_argv(ExecMode::exec, "/usr/bin/echo", "hello world", "",
+                              /*windows_rules=*/false);
     REQUIRE(argv.size() == 3);
     CHECK(argv[0] == "/usr/bin/echo");
     CHECK(argv[1] == "hello");
@@ -214,14 +218,34 @@ TEST_CASE("assemble_argv: exec mode is {resolved_cmd, ...split_args(args)}",
 
 TEST_CASE("assemble_argv: exec mode with no args produces a single-element argv",
           "[script_exec][parsers]") {
-    auto argv = assemble_argv(ExecMode::exec, "/usr/bin/whoami", "", "");
+    auto argv = assemble_argv(ExecMode::exec, "/usr/bin/whoami", "", "", /*windows_rules=*/false);
     REQUIRE(argv.size() == 1);
     CHECK(argv[0] == "/usr/bin/whoami");
 }
 
+TEST_CASE("assemble_argv: exec mode dispatches to split_args_windows under windows_rules "
+          "(BR4-002)",
+          "[script_exec][parsers]") {
+    // The single-quote span below round-trips differently under each
+    // regime (see split_args/split_args_windows' own comments) -- proof
+    // assemble_argv actually threads windows_rules through to the right
+    // splitter rather than always using one or the other.
+    auto posix_argv = assemble_argv(ExecMode::exec, "C:\\tool.exe", "'two words'", "",
+                                     /*windows_rules=*/false);
+    REQUIRE(posix_argv.size() == 2);
+    CHECK(posix_argv[1] == "two words");
+
+    auto win_argv = assemble_argv(ExecMode::exec, "C:\\tool.exe", "'two words'", "",
+                                  /*windows_rules=*/true);
+    REQUIRE(win_argv.size() == 3);
+    CHECK(win_argv[1] == "'two");
+    CHECK(win_argv[2] == "words'");
+}
+
 TEST_CASE("assemble_argv: bash mode carries the script as ONE argv element (Decision-5)",
           "[script_exec][parsers]") {
-    auto argv = assemble_argv(ExecMode::bash, "", "", "echo hi; echo bye");
+    auto argv = assemble_argv(ExecMode::bash, "", "", "echo hi; echo bye",
+                              /*windows_rules=*/false);
     REQUIRE(argv.size() == 3);
     CHECK(argv[0] == "/bin/bash");
     CHECK(argv[1] == "-c");
@@ -239,7 +263,7 @@ TEST_CASE("assemble_argv: powershell mode carries the (already-encoded) script a
     // rather than asserting on a hard-coded path.
     auto argv = assemble_argv(ExecMode::powershell,
                               "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
-                              "", "QQBCAEMA");
+                              "", "QQBCAEMA", /*windows_rules=*/true);
     REQUIRE(argv.size() == 5);
     CHECK(argv[0] == "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
     CHECK(argv[1] == "-NoProfile");
@@ -250,17 +274,88 @@ TEST_CASE("assemble_argv: powershell mode carries the (already-encoded) script a
 
 TEST_CASE("split_args: preserves explicitly quoted empty arguments (BR3-002)",
           "[script_exec][parsers]") {
-    // Regression: the pre-migration Windows path never called split_args
-    // for exec mode at all -- it appended the raw command line to
-    // CreateProcessA verbatim, so the child's own CRT argv parser
-    // preserved a quoted empty field. Post-migration, split_args runs on
-    // every platform for exec mode, so its own `!current.empty()` gate
-    // (already present, and already lossy, in the pre-migration POSIX-only
-    // copy of this function) silently dropped an explicitly quoted empty
-    // argument on Windows for the first time.
+    // Regression: the pre-migration Windows path never called this function
+    // at all -- it appended the raw command line to CreateProcessA
+    // verbatim, so the child's own CRT argv parser preserved a quoted empty
+    // field. This function's own `!current.empty()` gate (already present,
+    // and already lossy, in the pre-migration POSIX-only copy) silently
+    // dropped an explicitly quoted empty argument. BR4-002 (whole-branch
+    // review round 4) moved Windows off this parser entirely (see
+    // split_args_windows below) -- this test now covers POSIX only, which
+    // is this function's sole caller as of that fix.
     auto args = split_args(R"("" sentinel '')");
     REQUIRE(args.size() == 3);
     CHECK(args[0].empty());
     CHECK(args[1] == "sentinel");
     CHECK(args[2].empty());
+}
+
+// ── split_args_windows (BR4-002, whole-branch review round 4) ──────────────
+
+TEST_CASE("split_args_windows: a single-quoted span is NOT one argument -- single quotes are "
+          "ordinary content",
+          "[script_exec][parsers][windows]") {
+    auto args = split_args_windows(R"('two words')");
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "'two");
+    CHECK(args[1] == "words'");
+}
+
+TEST_CASE("split_args_windows: a double-quoted span with spaces is ONE argument, quotes "
+          "stripped",
+          "[script_exec][parsers][windows]") {
+    auto args = split_args_windows(R"("a b" c)");
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "a b");
+    CHECK(args[1] == "c");
+}
+
+TEST_CASE("split_args_windows: an odd backslash run before a quote escapes it to a literal '\"' "
+          "with no toggle",
+          "[script_exec][parsers][windows]") {
+    // a\"b -- one backslash (odd) before the quote: halved to zero literal
+    // backslashes, the quote itself survives as a literal '"', quoting
+    // never toggles on (so the trailing 'b' is NOT inside a quoted span).
+    auto args = split_args_windows(R"(a\"b)");
+    REQUIRE(args.size() == 1);
+    CHECK(args[0] == "a\"b");
+}
+
+TEST_CASE("split_args_windows: an even backslash run before a quote halves and toggles quoting",
+          "[script_exec][parsers][windows]") {
+    // a\\"b c" -- two backslashes (even) before the quote: halved to one
+    // literal backslash, the quote toggles quoting on, so the space before
+    // 'c' stays inside the token.
+    auto args = split_args_windows(R"(a\\"b c")");
+    REQUIRE(args.size() == 1);
+    CHECK(args[0] == "a\\b c");
+}
+
+TEST_CASE("split_args_windows: a trailing backslash run with no following quote is literal",
+          "[script_exec][parsers][windows]") {
+    auto args = split_args_windows(R"(C:\path\)");
+    REQUIRE(args.size() == 1);
+    CHECK(args[0] == "C:\\path\\");
+}
+
+TEST_CASE("split_args_windows: an explicitly quoted empty argument survives (BR3-002 parity)",
+          "[script_exec][parsers][windows]") {
+    auto args = split_args_windows(R"("" sentinel)");
+    REQUIRE(args.size() == 2);
+    CHECK(args[0].empty());
+    CHECK(args[1] == "sentinel");
+}
+
+TEST_CASE("split_args_windows: empty input yields no arguments", "[script_exec][parsers][windows]") {
+    CHECK(split_args_windows("").empty());
+}
+
+TEST_CASE("split_args_windows: round-trips quote_windows_arg's own encoding for an arg "
+          "containing a space, a quote, and a trailing backslash",
+          "[script_exec][parsers][windows]") {
+    const std::string original = R"(has space, a "quote, and trail\)";
+    const std::string encoded = yuzu::agent::quote_windows_arg(original);
+    auto args = split_args_windows(encoded);
+    REQUIRE(args.size() == 1);
+    CHECK(args[0] == original);
 }

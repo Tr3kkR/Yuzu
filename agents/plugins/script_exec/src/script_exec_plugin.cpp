@@ -59,13 +59,20 @@
  * migration did exactly that, and it was flagged and reversed). Windows
  * instead uses the new, narrowly-scoped
  * SubprocessOptions::inherit_parent_env (subprocess_runner.hpp — read that
- * field's doc comment for the full contract, including its three explicit
- * design points: extra_env interaction, security gating, and why it is a
- * no-op on POSIX), set true only on this plugin's Windows leg below. The
- * net effect: Windows children continue to receive the SAME full parent
- * environment they always did pre-migration, with this plugin's seven-name
- * allow-list still layered on top via extra_env exactly as on POSIX — so
- * there is NO operator-visible environment change on either platform.
+ * field's doc comment for the full contract, including its explicit design
+ * points: extra_env interaction and security gating), set true only on
+ * this plugin's Windows leg below. BR4-006 (whole-branch review round 4):
+ * the field is honoured on POSIX too (subprocess_runner.hpp's own comment
+ * point (c)) — this plugin's POSIX leg simply never NEEDS to set it, because
+ * its seven-name safe_vars allow-list (extra_env, below) already
+ * reproduces its pre-migration POSIX behaviour exactly with no widening
+ * required; an earlier version of this paragraph called that a POSIX
+ * "no-op," true only before content_dist's migration exposed the real
+ * POSIX gap the field's own comment now documents. The net effect:
+ * Windows children continue to receive the SAME full parent environment
+ * they always did pre-migration, with this plugin's seven-name allow-list
+ * still layered on top via extra_env exactly as on POSIX — so there is
+ * NO operator-visible environment change on either platform.
  *
  * Because the child's PATH is once again the parent's real PATH (via
  * extra_env, not the runner's fixed four-directory default), do_exec's
@@ -81,12 +88,15 @@
 
 #include <yuzu/agent/runner_status.hpp>     // yuzu::agent::forward_runner_failure (ABI4 result-status seam, ADR-3002)
 #include <yuzu/agent/subprocess_runner.hpp>
+#include <yuzu/agent/updater.hpp> // yuzu::agent::current_executable_path (BR4-003, trusted app dir)
 
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <format>
+#include <iterator>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -102,6 +112,8 @@
 #include <windows.h>
 #include <wincrypt.h>
 #pragma comment(lib, "Crypt32.lib")
+
+#include <win_str.hpp> // yuzu::win::from_wide (agents/shared, #1681; BR4-004)
 #endif
 
 namespace {
@@ -198,15 +210,68 @@ bool is_runner_defaulted(std::string_view name) {
     return false;
 }
 
+// BR4-004 (whole-branch review round 4): std::getenv() is the NARROW CRT
+// environment on Windows -- a separate, narrower-encoded copy the CRT
+// startup code builds from the process' real (wide) environment block
+// using the ACTIVE CODE PAGE, not UTF-8. A value containing a character
+// outside that code page round-trips lossily (or not at all) through
+// std::getenv() even though the real, wide environment block the runner
+// itself reads via GetEnvironmentStringsW() (subprocess_runner.cpp,
+// A2-002's inherit_parent_env branch) carries it correctly. Reading via
+// GetEnvironmentVariableW() and converting the result ONCE with
+// yuzu::win::from_wide() (agents/shared/win_str.hpp, CP_UTF8) gets this
+// allow-list's seven captured values from the SAME encoding source the
+// runner's own snapshot uses, so a name/value that resolve_executable
+// probes here and the value the runner ultimately launches the child with
+// are never two different byte sequences for the same character.
+#ifdef _WIN32
+std::optional<std::string> get_env_value(const char* name) {
+    // Every kNames entry below is a compile-time ASCII literal, so a plain
+    // widen (no yuzu::win::to_wide dependency needed) is exact.
+    std::wstring wname(name, name + std::char_traits<char>::length(name));
+
+    wchar_t stack_buf[256];
+    DWORD len = GetEnvironmentVariableW(wname.c_str(), stack_buf,
+                                        static_cast<DWORD>(std::size(stack_buf)));
+    if (len == 0) {
+        // ERROR_ENVVAR_NOT_FOUND (unset) and every other failure both read
+        // as "not present" here -- this allow-list already treats an unset
+        // name as absent-not-fatal (see parent_env_allowlist()'s call
+        // site), so there is no separate error case for a caller to react
+        // to.
+        return std::nullopt;
+    }
+    if (len < std::size(stack_buf))
+        return yuzu::win::from_wide(stack_buf, static_cast<int>(len));
+
+    // Value longer than the stack buffer: len is the required size
+    // INCLUDING the terminating NUL on this branch (GetEnvironmentVariableW's
+    // contract), so a len-sized buffer holds it exactly.
+    std::wstring buf(len, L'\0');
+    DWORD len2 = GetEnvironmentVariableW(wname.c_str(), buf.data(), len);
+    if (len2 == 0 || len2 >= len)
+        return std::nullopt; // shrank or failed between the two calls -- treat as absent
+    buf.resize(len2);
+    return yuzu::win::from_wide(buf.c_str(), static_cast<int>(len2));
+}
+#endif
+
 std::vector<std::pair<std::string, std::string>> parent_env_allowlist() {
     static constexpr const char* kNames[] = {"PATH", "HOME", "USER", "LANG",
                                              "LC_ALL", "TERM", "TZ"};
     std::vector<std::pair<std::string, std::string>> out;
     for (const char* name : kNames) {
+#ifdef _WIN32
+        if (auto val = get_env_value(name))
+            out.emplace_back(name, std::move(*val));
+        else if (is_runner_defaulted(name))
+            out.emplace_back(name, std::string{});
+#else
         if (const char* val = std::getenv(name))
             out.emplace_back(name, val);
         else if (is_runner_defaulted(name))
             out.emplace_back(name, std::string{});
+#endif
     }
     return out;
 }
@@ -287,6 +352,12 @@ int run_via_runner(yuzu::CommandContext& ctx, const std::vector<std::string>& ar
     // (the one caller with a pre-existing full-inheritance behaviour to
     // preserve), never a general default.
     opts.inherit_parent_env = true;
+    // BR4-007 (whole-branch review round 4): the deleted CreateProcessA
+    // call also passed CREATE_NO_WINDOW -- restore it so an interactively
+    // run agent invoking exec/powershell doesn't flash a console window a
+    // pre-migration caller never saw. See SubprocessOptions::no_window's
+    // doc comment for the full contract.
+    opts.no_window = true;
 #endif
 
     // on_line delivers every line regardless of any runner-side cap
@@ -412,8 +483,44 @@ int do_exec(yuzu::CommandContext& ctx, yuzu::Params params) {
         return 1;
     }
 
-    auto resolved = yuzu::script_exec::resolve_executable(
-        command, default_cwd, path_entries, is_executable_probe, kWindowsRules);
+#ifdef _WIN32
+    // BR4-003 (whole-branch review round 4): a bare Windows `command` used
+    // to search ONLY the captured PATH, narrower than the deleted
+    // CreateProcessA(lpApplicationName=nullptr) call's search contract,
+    // which additionally checked (in order) the calling application's own
+    // directory and the system directory before ever consulting PATH --
+    // breaking a helper installed beside the agent binary, or one that
+    // relied on the system-directory stage, with no PATH entry added for
+    // it. Explicitly reconstructs those two earlier stages -- trusted
+    // application directory, then the SAME runtime-resolved system
+    // directory `default_cwd` above already is on Windows (no second
+    // GetSystemDirectoryW call) -- ahead of the captured PATH, while still
+    // deliberately EXCLUDING the daemon's own current working directory
+    // (ADR-3002 A6, BR-009: a potentially attacker-influenced value that
+    // was never part of this hardening's intent to restore). Windows'
+    // remaining CreateProcess search stage (the 16-bit Windows directory)
+    // has no accessible resolution API and is 16-bit-application-only, so
+    // it is not reconstructed -- there is no in-tree caller for which it
+    // could ever matter. `current_executable_path()` (updater.hpp) is a
+    // best-effort addition: if it fails to resolve, the app-directory
+    // stage is simply omitted rather than failing the whole action closed
+    // -- unlike default_cwd's own resolution above, a missing app
+    // directory only means fewer places are searched, never a wrong or
+    // untrusted one.
+    std::vector<std::string> windows_search_dirs;
+    if (auto app_dir = yuzu::agent::current_executable_path().parent_path().string();
+        !app_dir.empty())
+        windows_search_dirs.push_back(std::move(app_dir));
+    windows_search_dirs.push_back(default_cwd); // == windows_system_directory() here
+    windows_search_dirs.insert(windows_search_dirs.end(), path_entries.begin(),
+                               path_entries.end());
+    const std::vector<std::string>& search_dirs = windows_search_dirs;
+#else
+    const std::vector<std::string>& search_dirs = path_entries;
+#endif
+
+    auto resolved = yuzu::script_exec::resolve_executable(command, default_cwd, search_dirs,
+                                                           is_executable_probe, kWindowsRules);
     if (!resolved) {
         // Matches the deleted paths' own early-setup-failure shape: status
         // before exit_code, unlike the post-runner-return order below.
@@ -422,8 +529,11 @@ int do_exec(yuzu::CommandContext& ctx, yuzu::Params params) {
         return 1;
     }
 
+    // BR4-002 (whole-branch review round 4): `windows_rules` selects the
+    // CRT-compatible split on Windows (split_args_windows) instead of the
+    // POSIX-quoting split (split_args) -- see assemble_argv's own comment.
     auto argv = yuzu::script_exec::assemble_argv(yuzu::script_exec::ExecMode::exec, *resolved,
-                                                 args_str, "");
+                                                 args_str, "", kWindowsRules);
     return run_via_runner(ctx, argv, timeout, std::move(env_allowlist));
 }
 
@@ -480,7 +590,7 @@ int do_powershell(yuzu::CommandContext& ctx, yuzu::Params params) {
     b64.resize(b64_len);
 
     auto argv = yuzu::script_exec::assemble_argv(yuzu::script_exec::ExecMode::powershell,
-                                                 powershell_path, "", b64);
+                                                 powershell_path, "", b64, /*windows_rules=*/true);
     return run_via_runner(ctx, argv, timeout, parent_env_allowlist());
 #endif
 }
@@ -504,7 +614,8 @@ int do_bash(yuzu::CommandContext& ctx, yuzu::Params params) {
     // Pass script as a single argv element to bash -c (no shell expansion
     // by this outer spawn — bash itself is the interpreter, ADR-3002
     // Decision 5).
-    auto argv = yuzu::script_exec::assemble_argv(yuzu::script_exec::ExecMode::bash, "", "", script);
+    auto argv = yuzu::script_exec::assemble_argv(yuzu::script_exec::ExecMode::bash, "", "", script,
+                                                 /*windows_rules=*/false);
     return run_via_runner(ctx, argv, timeout, parent_env_allowlist());
 #endif
 }
