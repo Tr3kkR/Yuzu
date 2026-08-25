@@ -467,9 +467,10 @@ spend margin on" — reverted to 2 without a real run confirming it helped: at
 running concurrently for a long stretch, plausibly worse than today's 2-wide
 pairing. `tests/meson.build`'s own shard-history comment states the house
 rule this broke: "raising the number is the last resort, not the first." The
-cross-job slot count in `with-test-slot.sh` stays at 2, unchanged — a
-different axis (box-wide job saturation, #3443 AC4); raising it would reopen
-that problem.
+cross-job slot count in `with-test-slot.sh` was ALSO held at 2 at the time
+this paragraph was written, for the same reason (box-wide job saturation,
+#3443 AC4) — SUPERSEDED 2026-08-25, see "Cross-job slot count: 2 -> 3"
+below. `--num-processes` here is unaffected, still 2.
 
 **Two more disclosed tradeoffs from the split, neither affecting job pass/fail
 (each invocation gates on its own exit code via `bash -e`):** each invocation
@@ -602,6 +603,72 @@ of these are fixable from this diff's scope; a genuine guarantee needs
 runner-pool partitioning (dedicating a runner label to PR-fast-path jobs),
 which needs direct access to the Big Tam box and is tracked as a follow-up
 on #3443, not done here.
+
+**Cross-job slot count: 2 -> 3 (2026-08-25, same day as the max-parallel
+fix above).** `max-parallel: 3` and the `with-test-slot.sh` slot gate are
+different axes, not substitutes: max-parallel governs runner acquisition
+for one push's own matrix; the slot gate governs box-wide heavy
+test-phase concurrency across ALL jobs (any push, any PR, nightly, manual
+dispatch) once a job already has a runner and has finished building.
+Trigger: PR #3600's own Linux job waited the full 30-minute
+`YUZU_TEST_SLOT_TIMEOUT_MIN` and gave up (`no 'yuzu-bigtam-heavy' slot free
+after 30 min (2 slots busy)`, recovered via a manual rerun once the
+contending jobs finished); PR #3530's Linux job waited 17m16s
+(`acquired 'yuzu-bigtam-heavy' slot 1/2 after 1036s`) before running clean.
+Both times the 2 slots were held by other jobs' own long pg-shard test
+phases — ordinary concurrent CI activity, not an anomaly.
+
+Why 3 is a reasonable experiment, not just a convenient number: each of the
+4 Big Tam runner agents idempotently (re)uses its OWN persistent
+`yuzu-ci-postgres-<n>` container, so 3 concurrent heavy phases don't
+contend for one shared Postgres instance — unlike the WITHIN-job
+`--num-processes` cap (which exists because one job's own pg shards fan
+out onto that SAME job's one container). A same-day diagnostic (the
+`tests/meson.build` shard-history comment) measured a shard's wall time
+within ~3% whether the box was quiet or under 3 other PRs' full CI runs.
+CAVEAT: that diagnostic was measured while the slot gate held at 2 — it
+describes a load shape that never exceeded 2 SIMULTANEOUS heavy pg
+phases, lighter than the 3-slot regime this change ships. It supports
+trying 3; it is not proof the same low sensitivity holds at 3-wide.
+Post-ship telemetry is the real confirmation, not this number alone.
+Separate Postgres containers also remove DB-lock/connection contention
+but not shared physical resources (page cache, DRAM bandwidth,
+kernel/container overhead) — the cap stays below 4 specifically to keep
+some protection against a full-box heavy-phase pileup. `--num-processes`
+stays at 2, deliberately NOT bundled with this change: 2 slots x 2
+shards/job = 4 concurrent pg shards today, 3 slots x 2 = 6, but 3 slots x
+3 would jump to 9 with no diagnostic support at that load and no way to
+attribute a regression to either knob — ship and measure one axis at a
+time.
+
+Not starvation-proof: `with-test-slot.sh` has no FIFO or PR-aware
+admission — a freed slot goes to whichever waiter's 5s poll tick happens
+to fire next, not to whichever waiter arrived first. If 3 dev-push legs
+hold all 3 slots, a 4th job still waits the full 30 minutes, same as
+before. Raising the count reduces how often that happens; it does not
+eliminate it. Also unenforced: `nightly.yml`'s and `sanitizer-tests.yml`'s
+Linux legs share this same box but invoke `meson test` directly,
+bypassing this gate entirely (pre-existing gap, #3443) — an ungated heavy
+job on the box's 4th runner can erode the margin above further, on top of
+whatever the 3-slot regime itself costs.
+
+Acceptance/rollback signal: the #2093 duration watchdog's 560s warning
+(80% of the 700s per-shard ceiling) is an expected, accepted verification
+signal on early 3-slot runs, not by itself a reason to revert (worst
+shard measured 522.73s at 2-wide — PR #3530's Linux gcc-15 debug leg, run
+32861777346/job 97847463421, 2026-08-25 — vs. the 700s ceiling needs
+roughly a 34% slowdown before an actual failure). Two rollback triggers,
+not one: repeated warnings on the SAME shard under confirmed 3-slot
+occupancy, or warnings scattered across MULTIPLE DIFFERENT shards in the
+same or overlapping runs (the box-wide-contention signature a
+single-shard trigger would miss) — either is the signal this operating
+point consumed too much margin. "Confirmed 3-slot occupancy" today means
+manually correlating each job's own "acquired slot N/3" log line against
+overlapping runs' timestamps — there is no automated cross-job
+correlation yet; building that is a real #3443 follow-up, not assumed
+done here. Response to either trigger is rebalancing/splitting the
+affected shard(s) or reverting to slots=2, never another timeout
+increase. Tracked: #3443.
 
 ### Persistent runner-local test history
 
