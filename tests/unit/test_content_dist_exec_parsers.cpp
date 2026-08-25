@@ -145,8 +145,14 @@ TEST_CASE("map_execution_result: deadline reports status|error, exit_code|-1, an
     CHECK(wire.output == "partial output before kill\n[terminated: deadline exceeded]");
 }
 
-TEST_CASE("map_execution_result: cancelled maps the same way as deadline",
+TEST_CASE("map_execution_result: cancelled reports its own distinct annotation, not "
+         "\"deadline exceeded\" (BR-006)",
          "[agent][content_dist][exec]") {
+    // Pre-fix, this branch collapsed cancelled into the literal text
+    // "deadline exceeded" -- a consumer reading the output text (as
+    // opposed to the BR-001 typed result-status seam) would pick the wrong
+    // retry/escalation reason for an agent-shutdown cancel vs a real
+    // timeout.
     SubprocessResult r;
     r.tool_ran = true;
     r.termination_reason = TerminationReason::cancelled;
@@ -157,7 +163,28 @@ TEST_CASE("map_execution_result: cancelled maps the same way as deadline",
     auto wire = map_execution_result(r);
     CHECK(wire.status == "error");
     CHECK(wire.exit_code == -1);
-    CHECK(wire.output == "\n[terminated: deadline exceeded]");
+    CHECK(wire.output == "\n[terminated: cancelled]");
+}
+
+TEST_CASE("map_execution_result: a cancelled run that was ALSO truncated at the byte cap "
+         "reports both facts, not just one (BR-006)",
+         "[agent][content_dist][exec]") {
+    // Pre-fix, this branch returned before ever checking output_truncated,
+    // so a run that was both cut short at 16 MiB AND then cancelled/killed
+    // lost the truncation fact entirely -- a consumer could parse the
+    // partial output as complete.
+    SubprocessResult r;
+    r.tool_ran = true;
+    r.termination_reason = TerminationReason::deadline;
+    r.exit_code = -1;
+    r.timed_out = true;
+    r.output_truncated = true;
+    r.output = "partial output before kill";
+
+    auto wire = map_execution_result(r);
+    CHECK(wire.status == "error");
+    CHECK(wire.output == "partial output before kill\n[output truncated at 16 MiB]"
+                         "\n[terminated: deadline exceeded]");
 }
 
 TEST_CASE("map_execution_result: a pre-armed cancel that fires before exec is confirmed "
@@ -180,7 +207,7 @@ TEST_CASE("map_execution_result: a pre-armed cancel that fires before exec is co
     auto wire = map_execution_result(r);
     CHECK(wire.status == "error");
     CHECK(wire.exit_code == -1);
-    CHECK(wire.output == "\n[terminated: deadline exceeded]");
+    CHECK(wire.output == "\n[terminated: cancelled]");
 }
 
 TEST_CASE("map_execution_result: a pre-armed deadline kill with tool_ran==false maps the "

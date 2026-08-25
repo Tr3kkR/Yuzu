@@ -179,7 +179,21 @@ map_execution_result(const yuzu::agent::SubprocessResult& result) {
     // discarding it.
     if (result.termination_reason == yuzu::agent::TerminationReason::deadline ||
         result.termination_reason == yuzu::agent::TerminationReason::cancelled) {
-        std::string output = result.output + "\n[terminated: deadline exceeded]";
+        // BR-006 (whole-branch review): this branch used to collapse BOTH
+        // reasons into the literal text "deadline exceeded" and return
+        // before ever checking output_truncated -- so a cancel (e.g. agent
+        // shutdown mid-install) read as a false "it timed out", and a run
+        // that was BOTH truncated at the 16 MiB cap AND then killed lost
+        // the truncation fact entirely, letting a consumer parse partial
+        // output as complete. Append truncation independently of
+        // termination (same as the ordinary exited/signaled path below),
+        // then annotate the actual reason, not an assumed one.
+        std::string output = result.output;
+        if (result.output_truncated)
+            output += "\n[output truncated at 16 MiB]";
+        output += result.termination_reason == yuzu::agent::TerminationReason::deadline
+                      ? "\n[terminated: deadline exceeded]"
+                      : "\n[terminated: cancelled]";
         return ExecutionWireResult{"error", -1, std::move(output)};
     }
 
