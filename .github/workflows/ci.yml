@@ -961,18 +961,31 @@ jobs:
         # diagnostic (tests/meson.build's shard-history comment) measured a
         # shard's wall time within ~3% whether the box was quiet or under 3
         # OTHER PRs' full CI runs — Big Tam's per-op cost doesn't degrade
-        # sharply under moderate added load. That said, per-runner Postgres
-        # isolation removes DB lock/connection contention but NOT shared
-        # physical resources (page cache, DRAM bandwidth, kernel/container
-        # overhead) — necessary evidence, not sufficient proof by itself. The
-        # cap stays below 4 (not raised to match runner count) specifically to
-        # keep SOME protection against a full-box heavy-phase pileup.
+        # sharply under moderate added load. CAVEAT (Gate 4 unhappy-path,
+        # governance): that ~3% figure was measured while the slot gate held
+        # at 2 — it describes a lighter load shape (never more than 2
+        # SIMULTANEOUS heavy pg phases) than the 3-slot regime this change
+        # ships. It supports TRYING 3, it is not proof the same low
+        # sensitivity holds at 3-wide; treat post-ship telemetry as the real
+        # confirmation, not this number alone. Per-runner Postgres isolation
+        # also removes DB lock/connection contention but NOT shared physical
+        # resources (page cache, DRAM bandwidth, kernel/container overhead) —
+        # necessary evidence, not sufficient proof by itself. The cap stays
+        # below 4 (not raised to match runner count) specifically to keep
+        # SOME protection against a full-box heavy-phase pileup.
         #
         # NOT starvation-proof: this script has no FIFO or PR-aware admission
-        # (scripts/ci/with-test-slot.sh polls every 5s, first-come-first-
-        # served) — if 3 dev-push legs hold all 3 slots, a 4th job (a PR's or
-        # otherwise) still waits the full 30 minutes, same as before. Raising
-        # the count reduces how OFTEN that happens, it doesn't eliminate it.
+        # — a freed slot goes to whichever waiter's 5s poll tick (see
+        # scripts/ci/with-test-slot.sh) happens to fire next, not to
+        # whichever waiter arrived first. If 3 dev-push legs hold all 3
+        # slots, a 4th job (a PR's or otherwise) still waits the full 30
+        # minutes, same as before. Raising the count reduces how OFTEN that
+        # happens, it doesn't eliminate it. Also unenforced: nightly.yml's
+        # and sanitizer-tests.yml's Linux legs share this same box but invoke
+        # meson test directly, bypassing this gate entirely (pre-existing gap,
+        # #3443) — an ungated heavy job on the box's 4th runner can erode the
+        # margin above further, on top of whatever the 3-slot regime itself
+        # costs.
         #
         # --num-processes stays at 2, deliberately NOT bundled with this
         # change: 2 slots x 2 shards/job = 4 concurrent pg shards today; 3
@@ -983,13 +996,21 @@ jobs:
         # Acceptance/rollback signal: the #2093 duration watchdog's 560s
         # (80% of the 700s per-shard ceiling) warning is an EXPECTED, accepted
         # verification signal on early 3-slot runs, not a reason to revert on
-        # its own (worst shard measured 522.73s at 2-wide -> 700s failure
-        # needs roughly a 34% slowdown, comfortably avoided). REPEATED
-        # warnings on the SAME shard specifically under confirmed 3-slot
-        # occupancy is the real signal that this operating point consumed too
-        # much margin — the response then is rebalancing/splitting that
-        # shard or reverting to slots=2, never another timeout increase.
-        # Tracked: #3443.
+        # its own (worst shard measured 522.73s at 2-wide — PR #3530's Linux
+        # gcc-15 debug leg, run 32861777346/job 97847463421, 2026-08-25 —
+        # vs. the 700s ceiling needs roughly a 34% slowdown to actually fail,
+        # comfortably avoided). Two rollback triggers, not one: REPEATED
+        # warnings on the SAME shard under confirmed 3-slot occupancy, OR
+        # warnings scattered across MULTIPLE DIFFERENT shards in the same or
+        # overlapping runs (the box-wide-contention signature a single-shard
+        # trigger would miss) — either is the signal this operating point
+        # consumed too much margin. "Confirmed 3-slot occupancy" today means
+        # manual correlation of each job's own "acquired slot N/3" log line
+        # against overlapping runs' timestamps — there is no automated
+        # cross-job correlation yet; building that is a real #3443 follow-up,
+        # not assumed done here. Response to either trigger is
+        # rebalancing/splitting the affected shard(s) or reverting to
+        # slots=2, never another timeout increase. Tracked: #3443.
         env:
           YUZU_TEST_SLOT_DIR: /tmp/yuzu-bigtam-test-slots
           YUZU_TEST_SLOT_NAME: yuzu-bigtam-heavy

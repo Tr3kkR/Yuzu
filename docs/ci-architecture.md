@@ -467,9 +467,10 @@ spend margin on" — reverted to 2 without a real run confirming it helped: at
 running concurrently for a long stretch, plausibly worse than today's 2-wide
 pairing. `tests/meson.build`'s own shard-history comment states the house
 rule this broke: "raising the number is the last resort, not the first." The
-cross-job slot count in `with-test-slot.sh` stays at 2, unchanged — a
-different axis (box-wide job saturation, #3443 AC4); raising it would reopen
-that problem.
+cross-job slot count in `with-test-slot.sh` was ALSO held at 2 at the time
+this paragraph was written, for the same reason (box-wide job saturation,
+#3443 AC4) — SUPERSEDED 2026-08-25, see "Cross-job slot count: 2 -> 3"
+below. `--num-processes` here is unaffected, still 2.
 
 **Two more disclosed tradeoffs from the split, neither affecting job pass/fail
 (each invocation gates on its own exit code via `bash -e`):** each invocation
@@ -625,29 +626,49 @@ contend for one shared Postgres instance — unlike the WITHIN-job
 out onto that SAME job's one container). A same-day diagnostic (the
 `tests/meson.build` shard-history comment) measured a shard's wall time
 within ~3% whether the box was quiet or under 3 other PRs' full CI runs.
-That argument is necessary but not sufficient by itself: separate
-containers remove DB-lock/connection contention but not shared physical
-resources (page cache, DRAM bandwidth, kernel/container overhead) — the
-cap stays below 4 specifically to keep some protection against a
-full-box heavy-phase pileup. `--num-processes` stays at 2, deliberately
-NOT bundled with this change: 2 slots x 2 shards/job = 4 concurrent pg
-shards today, 3 slots x 2 = 6, but 3 slots x 3 would jump to 9 with no
-diagnostic support at that load and no way to attribute a regression to
-either knob — ship and measure one axis at a time.
+CAVEAT: that diagnostic was measured while the slot gate held at 2 — it
+describes a load shape that never exceeded 2 SIMULTANEOUS heavy pg
+phases, lighter than the 3-slot regime this change ships. It supports
+trying 3; it is not proof the same low sensitivity holds at 3-wide.
+Post-ship telemetry is the real confirmation, not this number alone.
+Separate Postgres containers also remove DB-lock/connection contention
+but not shared physical resources (page cache, DRAM bandwidth,
+kernel/container overhead) — the cap stays below 4 specifically to keep
+some protection against a full-box heavy-phase pileup. `--num-processes`
+stays at 2, deliberately NOT bundled with this change: 2 slots x 2
+shards/job = 4 concurrent pg shards today, 3 slots x 2 = 6, but 3 slots x
+3 would jump to 9 with no diagnostic support at that load and no way to
+attribute a regression to either knob — ship and measure one axis at a
+time.
 
 Not starvation-proof: `with-test-slot.sh` has no FIFO or PR-aware
-admission (polls every 5s, first-come-first-served) — if 3 dev-push legs
+admission — a freed slot goes to whichever waiter's 5s poll tick happens
+to fire next, not to whichever waiter arrived first. If 3 dev-push legs
 hold all 3 slots, a 4th job still waits the full 30 minutes, same as
 before. Raising the count reduces how often that happens; it does not
-eliminate it. Acceptance/rollback signal: the #2093 duration watchdog's
-560s warning (80% of the 700s per-shard ceiling) is an expected,
-accepted verification signal on early 3-slot runs, not by itself a
-reason to revert (worst shard measured 522.73s at 2-wide; a ~34%
-slowdown is needed before an actual 700s failure). Repeated warnings on
-the SAME shard specifically under confirmed 3-slot occupancy is the real
-signal this operating point consumed too much margin — the response is
-then rebalancing/splitting that shard or reverting to slots=2, never
-another timeout increase. Tracked: #3443.
+eliminate it. Also unenforced: `nightly.yml`'s and `sanitizer-tests.yml`'s
+Linux legs share this same box but invoke `meson test` directly,
+bypassing this gate entirely (pre-existing gap, #3443) — an ungated heavy
+job on the box's 4th runner can erode the margin above further, on top of
+whatever the 3-slot regime itself costs.
+
+Acceptance/rollback signal: the #2093 duration watchdog's 560s warning
+(80% of the 700s per-shard ceiling) is an expected, accepted verification
+signal on early 3-slot runs, not by itself a reason to revert (worst
+shard measured 522.73s at 2-wide — PR #3530's Linux gcc-15 debug leg, run
+32861777346/job 97847463421, 2026-08-25 — vs. the 700s ceiling needs
+roughly a 34% slowdown before an actual failure). Two rollback triggers,
+not one: repeated warnings on the SAME shard under confirmed 3-slot
+occupancy, or warnings scattered across MULTIPLE DIFFERENT shards in the
+same or overlapping runs (the box-wide-contention signature a
+single-shard trigger would miss) — either is the signal this operating
+point consumed too much margin. "Confirmed 3-slot occupancy" today means
+manually correlating each job's own "acquired slot N/3" log line against
+overlapping runs' timestamps — there is no automated cross-job
+correlation yet; building that is a real #3443 follow-up, not assumed
+done here. Response to either trigger is rebalancing/splitting the
+affected shard(s) or reverting to slots=2, never another timeout
+increase. Tracked: #3443.
 
 ### Persistent runner-local test history
 
