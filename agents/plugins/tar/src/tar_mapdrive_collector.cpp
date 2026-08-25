@@ -229,6 +229,7 @@ bool is_network_fstype(const std::string& fs) {
 //   scheme://[user@]host/path  (afp://, https:// (WebDAV), smb://, ...)
 //   //user@server/share  (credentialed UNC — macOS getfsstat can surface
 //   embedded usernames in f_mntfromname for smbfs mounts)
+//   user@[2001:db8::1]:/path  2001:db8::1:/path  (IPv6 NFS hosts, BR-003)
 std::string remote_host_of(const std::string& path) {
     std::string p = path;
     // Both the URI-authority and UNC forms below may embed "user@" ahead of
@@ -253,12 +254,30 @@ std::string remote_host_of(const std::string& path) {
         return strip_userinfo(
             p.substr(start, end == std::string::npos ? std::string::npos : end - start));
     }
-    // user@host:/path — strip the user@ prefix first
+    // user@host:/path — the NFS host/export separator is specifically
+    // ":/" (a colon immediately followed by a slash), not the first bare
+    // colon: an IPv6 host (bracketed "[2001:db8::1]:/export" or unbracketed
+    // "2001:db8::1:/export") embeds colons of its own, and the first-colon
+    // split used before this fix (BR-003) truncated either shape at the
+    // host's very first hextet. rfind, not find: NFS export paths only ever
+    // start with a single leading '/', so the LAST ":/" in the string is
+    // always the host/export boundary, never a colon inside the path.
     auto at = p.find('@');
-    auto colon = p.find(':');
-    if (colon != std::string::npos && (at == std::string::npos || at < colon)) {
+    auto separator = p.rfind(":/");
+    if (separator == std::string::npos) {
+        // No "<colon><slash>" boundary at all -- fall back to the first
+        // bare colon (the pre-BR-003 behavior), covering a colon-separated
+        // host whose export path doesn't start with '/' (e.g.
+        // "server:export"); an IPv4/hostname host has at most one colon, so
+        // this fallback never mis-splits one of those.
+        separator = p.find(':');
+    }
+    if (separator != std::string::npos && (at == std::string::npos || at < separator)) {
         std::size_t start = (at != std::string::npos) ? at + 1 : 0;
-        return p.substr(start, colon - start);
+        std::string host = p.substr(start, separator - start);
+        if (host.size() >= 2 && host.front() == '[' && host.back() == ']')
+            host = host.substr(1, host.size() - 2);
+        return host;
     }
     return {};
 }

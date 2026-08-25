@@ -506,6 +506,23 @@ TEST_CASE("mapdrive parse_fstab: scheme:// and credentialed-UNC hosts resolve to
     CHECK(out[1].entry.remote_host == "fileserver"); // username stripped, not "alice@fileserver"
 }
 
+// BR-003: an IPv6 NFS host embeds colons of its own, so the first-bare-colon
+// split previously used truncated it at the host's first hextet (`2001` for
+// "2001:db8::1:/export", `[2001` for the bracketed form). remote_host_of now
+// splits on the LAST ":/" (the export path's leading slash), which an IPv6
+// address's own colons never contain.
+TEST_CASE("mapdrive parse_proc_mounts: IPv6 NFS hosts resolve in full, bracketed and not",
+          "[tar][mapdrive][parse]") {
+    const std::string text = "2001:db8::1:/export /mnt/v6a nfs4 rw 0 0\n"
+                             "[2001:db8::1]:/export /mnt/v6b nfs4 rw 0 0\n"
+                             "alice@2001:db8::1:/export /mnt/v6c nfs4 rw 0 0\n";
+    auto out = parse_proc_mounts(text);
+    REQUIRE(out.size() == 3);
+    CHECK(out[0].remote_host == "2001:db8::1");
+    CHECK(out[1].remote_host == "2001:db8::1"); // brackets stripped
+    CHECK(out[2].remote_host == "2001:db8::1"); // username stripped, full host kept
+}
+
 // ── apply_entry_cap (kMapDriveEntryCap parity with the Linux leg) ─────────────
 
 TEST_CASE("mapdrive apply_entry_cap: truncates at kMapDriveEntryCap, reports truncation",
