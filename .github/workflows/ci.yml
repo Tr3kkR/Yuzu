@@ -890,6 +890,17 @@ jobs:
         # split cuts each shard's real cost roughly in half, the timeout bump
         # absorbs whatever 2-wide pairing overlap remains on top of that.
         #
+        # Same day: EXTENDED to the remaining six shards (A/B/D/F/H/C, all
+        # now 700s too) after merging #3582 required a dev sync, and dev's
+        # own CI (run 32833097478) TIMEOUT'd shard E at the OLD 600.51s and
+        # landed G at 585-590/600s (97-98%) on all four Linux legs — live
+        # confirmation the 600s ceiling was tight fleet-wide, not just on the
+        # two shards #3582 split. See tests/meson.build's shard-E/I/G/J
+        # comment block and docs/ci-architecture.md's worst-case job-budget
+        # arithmetic (re-derived for all-ten-at-700s: makespan is now a
+        # deterministic 3500s at --num-processes 2, no pairing variance,
+        # margin against the 90-min job ceiling under 2 minutes worst-case).
+        #
         # Telemetry note: each invocation overwrites meson's single
         # testlog.junit.xml, so only the LAST one's per-suite ci_test_suites
         # rows survive the "Finish persistent CI telemetry" step's unmodified
