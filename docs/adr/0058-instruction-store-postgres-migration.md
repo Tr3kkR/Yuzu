@@ -548,6 +548,21 @@ ADR-recorded behaviour change this migration makes, not a silent test rewrite to
     concurrent claim's restore could in theory clobber a different claim. Replaced with a
     monotonic per-policy `generation` counter (`EvalClaim` in `policy_evaluator.hpp`), captured
     locally at claim time and compared instead of the timestamp.
+- **Superseded post-merge, not by this ADR:** the `EvalClaim` generation-counter fix immediately
+  above no longer exists. Merging `origin/dev` (PolicyStore's own PG migration, ADR-0056) pulled
+  in a durable, fleet-wide `PolicyStore::claim_due_policies` dispatch claim that replaces the
+  entire in-memory `last_eval_` throttle map this fix was patching — the ABA hazard is
+  structurally absent from a durable atomic claim the way it never can be from a local timestamp
+  comparison, so there was nothing to re-apply the fix onto. `dispatch_instruction`/
+  `kickoff_check`'s `DispatchOutcome`/`DispatchResult` enum (this ADR's own addition, propagating
+  a genuine InstructionStore DB error distinctly from a not-found id) was similarly retired in
+  favor of ADR-0056's `std::expected`-based idiom already used throughout that file — the
+  InstructionStore DB/lease-failure distinction itself is preserved (grafted onto
+  `dispatch_instruction`'s new `std::expected<std::string, std::string>` return, propagated
+  through `kickoff_check`/`evaluate_now`/`remediate` the same way those functions propagate their
+  own other degrade paths), just no longer via a bespoke enum. See ADR-0056 for the durable-claim
+  design and `governance.d/instructionstore-adr0058-gov.4uLptn.jsonl`'s superseding rows for the
+  merge-time re-verify.
 - No change to the #1073/W7.4 signed-import enforcement semantics, the Ed25519 verify path, or
   the `--allow-unsigned-definitions` operator flag — all pure/storage-independent, ported
   unchanged.

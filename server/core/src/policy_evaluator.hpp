@@ -10,24 +10,48 @@
 /// 0%. This component closes that gap.
 ///
 /// Model (two-phase, async): a background thread `tick()`s on a cadence.
-///   * dispatch_due(): find enabled policies whose interval has elapsed,
-///     resolve scope -> agents, dispatch the fragment's check_instruction with
-///     a generated execution_id, and record an in-flight check.
+///   * dispatch_due(): claims due policies via `PolicyStore::claim_due_policies`
+///     (ADR-0056 — a durable, fleet-wide single-sweeper claim; see that store's
+///     header for why due-ness can no longer live in this class's own
+///     memory), resolves scope -> agents, dispatches the fragment's
+///     check_instruction with a generated execution_id, and records an
+///     in-flight check.
 ///   * collect_ready(): for in-flight checks past a grace window (or once all
 ///     targets have responded), read each agent's result via
 ///     ResponseStore::query_by_execution, evaluate the CEL against the parsed
 ///     result fields, and write compliant / non_compliant / unknown / error
-///     via PolicyStore::update_agent_status (one row per agent).
+///     via PolicyStore::update_agent_status (one row per agent). Stays
+///     per-replica and in-memory: only the replica that dispatched a check
+///     ever holds its in-flight entry, so there is nothing to coordinate here
+///     — `update_agent_status`'s UPSERT is naturally idempotent against a
+///     racing manual evaluate_now()/remediate() call on another replica FOR
+///     THE STATUS VALUE (each write converges to a consistent final row).
+///     This does NOT extend to remediate()'s retry-attempt counter (governance
+///     UP-3, 2026-08-24): two concurrent remediate() calls for the same
+///     policy — same-process, guarded by `remediating_`; cross-replica,
+///     still open — each independently increment it, which is a real double
+///     count, not an idempotent no-op.
 ///
 /// Remediation is MANUAL and opt-in (operator-gated) and only available when
 /// the fragment defines a fix_instruction: `remediate()` marks targets
 /// `fixing`, dispatches the fix, then (on a later tick) dispatches the
 /// post-check / check instruction and writes the true post-fix verdict. There
-/// is no automatic non_compliant -> fix loop.
+/// is no automatic non_compliant -> fix loop. A concurrent `remediate()` call
+/// for the same policy while one is already dispatching is rejected (error,
+/// same-process only via `remediating_`/`ReservationGuard` below — a
+/// cross-replica race is still possible, see the Multi-replica note above).
+///
+/// Multi-replica note (ADR-0056): a stranded `fixing` row (the dispatching
+/// replica died mid-FixWait) is swept back to `unknown` by
+/// `claim_due_policies`'s per-tick staleness check, not by this class's
+/// constructor — the old unconditional every-restart reset would stomp
+/// another replica's still-live remediation under N replicas.
 
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -64,17 +88,6 @@ public:
         const std::unordered_map<std::string, std::string>& parameters,
         const std::string& execution_id)>;
 
-    /// ADR-0058: a dispatch attempt either succeeds, is a genuine skip (unknown
-    /// instruction id / no targets — same as pre-migration), or fails because
-    /// InstructionStore itself is unavailable (a genuine DB/lease error) — the
-    /// latter must never collapse into the former; REST callers 503 on it.
-    enum class DispatchOutcome { kDispatched, kSkipped, kStoreUnavailable };
-
-    struct DispatchResult {
-        DispatchOutcome outcome{DispatchOutcome::kSkipped};
-        std::string execution_id; // set only when outcome == kDispatched
-    };
-
     /// Epoch-seconds clock. Injectable for deterministic tests.
     using NowFn = std::function<int64_t()>;
 
@@ -91,6 +104,14 @@ public:
         NowFn now_fn;                          // defaults to system clock if unset
         int64_t default_interval_seconds{3600}; // when a policy has no interval trigger
         int64_t grace_seconds{15};             // wait before scoring non-responders
+        // ADR-0056: how long a 'fixing' status may sit before
+        // claim_due_policies' staleness sweep resets it to 'unknown' (the
+        // dispatching replica died/restarted mid-remediation and no one will
+        // ever collect its FixWait). Long enough that a genuinely slow fix
+        // instruction (e.g. a content_dist software install, which can run
+        // minutes) is not false-positive reset mid-flight; short enough that
+        // a truly stranded fix does not sit invisible indefinitely.
+        int64_t fixing_stale_seconds{1800};
     };
 
     explicit PolicyEvaluator(Deps deps);
@@ -99,16 +120,30 @@ public:
     /// policies. Safe to call from a single background thread.
     void tick();
 
-    /// Force an immediate check of one policy, ignoring its interval. outcome is
-    /// kSkipped when the policy is missing / has no check instruction / matches
-    /// no agents; kStoreUnavailable when InstructionStore itself errored (caller
-    /// must 503, not 409); kDispatched with execution_id set on success.
-    DispatchResult evaluate_now(const std::string& policy_id);
+    /// Force an immediate check of one policy, ignoring its interval. Returns
+    /// the dispatch execution_id, or "" if the policy is missing / has no check
+    /// instruction / matches no agents / already has one in flight — a
+    /// legitimate no-op, never an error. `unexpected` means an internal store
+    /// failure (degraded policy read, the durable-dispatch-claim stamp failed,
+    /// or — ADR-0058 — InstructionStore itself errored resolving the check
+    /// instruction) — the caller must surface this as degraded (503), not as
+    /// "no targets" (409).
+    [[nodiscard]] std::expected<std::string, std::string>
+    evaluate_now(const std::string& policy_id);
 
     struct RemediateResult {
         bool ok{false};
-        bool store_unavailable{false}; // set when !ok because InstructionStore errored (503, not 4xx)
         std::string error;        // set when !ok
+        // Governance (2026-08-24): set explicitly by remediate() at each
+        // degrade return point — the caller must not infer this from a
+        // string prefix on `error`. A previous route-layer version keyed off
+        // `error.starts_with("policy store")`, an unshared, untested string
+        // contract a future reword of any degrade message would silently
+        // break (consistency-auditor SHOULD-2). Covers a genuine PolicyStore
+        // degrade AND — ADR-0058 — InstructionStore erroring resolving the
+        // fix instruction; both are the same "internal store failure, not a
+        // business rejection" shape to every caller.
+        bool degraded{false};
         std::string execution_id; // fix-dispatch execution id when ok
         int agents{0};            // agents the fix was dispatched to
     };
@@ -137,24 +172,17 @@ private:
         std::string verify_parameters_json;
     };
 
-    // The throttle timestamp (`last_eval`) doubles as the CAS "claim token" dispatch_due()/
-    // evaluate_now() use to detect whether their own claim is still in place before a
-    // store-unavailable restore. A bare `int64_t` timestamp is ABA-able: two claims within the
-    // same wall-clock second are indistinguishable, so a concurrent claim's restore could
-    // silently clobber a different claim that happens to share the same second (gov Gate 8
-    // unhappy-path/security-guardian/cpp-safety, independently converged). `generation` is a
-    // monotonic per-policy counter bumped on every claim and captured locally at claim time;
-    // the restore is CAS-guarded on `generation`, not on the timestamp, so it can never match a
-    // different claim regardless of wall-clock resolution.
-    struct EvalClaim {
-        int64_t last_eval{0};
-        uint64_t generation{0};
-    };
-
     Deps d_;
-    std::mutex mu_;                                   // guards in_flight_ + last_eval_
+    std::mutex mu_;                                   // guards in_flight_, remediating_
     std::vector<InFlight> in_flight_;
-    std::unordered_map<std::string, EvalClaim> last_eval_;
+    // Governance UP-3 (2026-08-24): reserved policy_ids between remediate()'s
+    // dedupe check and the FixWait entry landing in in_flight_ — the window
+    // kickoff_check doesn't have (it dispatches, THEN registers, all under a
+    // single caller). remediate() burns the attempt-counter retry budget on
+    // its own dispatch, so a second concurrent call in that window is a
+    // stronger hazard than kickoff_check's equivalent gap, not just a
+    // duplicate-check nuisance. See remediate()'s RAII guard.
+    std::set<std::string> remediating_;
 
     void dispatch_due();
     void collect_ready();
@@ -165,22 +193,24 @@ private:
     std::vector<std::string> resolve_targets(const Policy& p) const;
 
     // Resolve targets, dispatch the fragment's check_instruction, record a
-    // Check in-flight. kSkipped on failure / when a Check for this policy is
-    // already in flight (dedupe) / no fragment; kStoreUnavailable propagated from
-    // dispatch_instruction. Lock discipline: this acquires mu_ only briefly
-    // (dedupe scan, in-flight push) and NEVER holds it across the dispatch call —
-    // dispatch_fn does blocking gRPC + gateway forwarding, so it must run
-    // lock-free. Caller must NOT hold mu_.
-    DispatchResult kickoff_check(const Policy& p);
+    // Check in-flight. Returns the execution_id, or "" on failure / when a Check
+    // for this policy is already in flight (dedupe). Lock discipline: this
+    // acquires mu_ only briefly (dedupe scan, in-flight push) and NEVER holds it
+    // across the dispatch call — dispatch_fn does blocking gRPC + gateway
+    // forwarding, so it must run lock-free. Caller must NOT hold mu_.
+    std::expected<std::string, std::string> kickoff_check(const Policy& p);
 
-    // Dispatch `instruction_id` to `targets`. kStoreUnavailable when
-    // InstructionStore::get_definition itself errors (ADR-0058: must not
-    // collapse into the same skip as unknown-id); kSkipped for a genuine
-    // unknown definition / empty targets; kDispatched with execution_id set on
-    // success. Must be called WITHOUT mu_ held (invokes the blocking dispatch_fn).
-    DispatchResult dispatch_instruction(const std::string& instruction_id,
-                                        const std::unordered_map<std::string, std::string>& parameters,
-                                        const std::vector<std::string>& targets);
+    // Dispatch `instruction_id` to `targets`; returns a fresh execution_id, or
+    // "" on a legitimate no-op (unknown definition / empty targets — same as
+    // pre-migration). `unexpected` when InstructionStore::get_definition itself
+    // errors (ADR-0058: a genuine DB/lease failure must never collapse into the
+    // same "" a not-found id returns — every caller propagates this the same
+    // way it propagates its own other degrade paths). Must be called WITHOUT
+    // mu_ held (invokes the blocking dispatch_fn).
+    std::expected<std::string, std::string>
+    dispatch_instruction(const std::string& instruction_id,
+                         const std::unordered_map<std::string, std::string>& parameters,
+                         const std::vector<std::string>& targets);
 
     int64_t now() const;
     static std::string gen_execution_id();
