@@ -3450,7 +3450,15 @@ McpServer::HandlerFn McpServer::build_handler(
             if (uri == "yuzu://compliance/fleet" && policy_store) {
                 if (!perm_fn(req, res, "Policy", "Read"))
                     return;
-                auto fc = policy_store->get_fleet_compliance();
+                // ADR-0056: degrade-distinguishable read — surface an error,
+                // never a false 0%/empty fleet-compliance resource.
+                auto fc_res = policy_store->get_fleet_compliance();
+                if (!fc_res) {
+                    res.set_content(error_response(id, kInternalError, "Policy store degraded"),
+                                    "application/json");
+                    return;
+                }
+                const auto& fc = *fc_res;
                 auto content = JObj()
                                    .add("total_checks", fc.total_checks)
                                    .add("compliant", fc.compliant)
@@ -5933,9 +5941,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 PolicyQuery pq;
-                auto policies = policy_store->query_policies(pq);
+                auto policies_res = policy_store->query_policies(pq);
+                if (!policies_res) {
+                    mcp_audit("failure", "store degraded; list_policies");
+                    res.set_content(
+                        a4_error(kInternalError, "Policy store degraded — query failed", {},
+                                 /*retry_after_ms=*/5000),
+                        "application/json");
+                    return;
+                }
                 JArr arr;
-                for (const auto& p : policies) {
+                for (const auto& p : *policies_res) {
                     arr.add(JObj()
                                 .add("id", p.id)
                                 .add("name", p.name)
@@ -5969,7 +5985,16 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto policy_id = param_str(args, "policy_id");
-                auto cs = policy_store->get_compliance_summary(policy_id);
+                auto cs_res = policy_store->get_compliance_summary(policy_id);
+                if (!cs_res) {
+                    mcp_audit("failure", "store degraded; " + policy_id);
+                    res.set_content(
+                        a4_error(kInternalError, "Policy store degraded — query failed", {},
+                                 /*retry_after_ms=*/5000),
+                        "application/json");
+                    return;
+                }
+                const auto& cs = *cs_res;
                 auto obj = JObj()
                                .add("policy_id", cs.policy_id)
                                .add("compliant", cs.compliant)
@@ -5999,7 +6024,16 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto fc = policy_store->get_fleet_compliance();
+                auto fc_res = policy_store->get_fleet_compliance();
+                if (!fc_res) {
+                    mcp_audit("failure", "store degraded; get_fleet_compliance");
+                    res.set_content(
+                        a4_error(kInternalError, "Policy store degraded — query failed", {},
+                                 /*retry_after_ms=*/5000),
+                        "application/json");
+                    return;
+                }
+                const auto& fc = *fc_res;
                 auto obj = JObj()
                                .add("total_checks", fc.total_checks)
                                .add("compliant", fc.compliant)
@@ -9445,14 +9479,22 @@ McpServer::HandlerFn McpServer::build_handler(
                     .add("offline_note", "MCP posture v1 sees currently registered agents; durable "
                                          "offline counts are a follow-up source.");
                 JObj policy_obj;
-                if (policy_store) {
-                    const auto fc = policy_store->get_fleet_compliance();
+                std::expected<FleetCompliance, PolicyReadError> fc_res =
+                    std::unexpected(PolicyReadError::kDegraded);
+                if (policy_store)
+                    fc_res = policy_store->get_fleet_compliance();
+                if (fc_res) {
+                    const auto& fc = *fc_res;
                     policy_obj.add("total_checks", fc.total_checks)
                         .add("compliant", fc.compliant)
                         .add("non_compliant", fc.non_compliant)
                         .add("unknown", fc.unknown)
                         .add("compliance_pct", fc.compliance_pct);
                 } else {
+                    // No store wired, or ADR-0056 degrade — either way this is a
+                    // best-effort aggregate view, so fold both into the same
+                    // "available: false" shape rather than failing the whole
+                    // multi-source response over one degraded source.
                     policy_obj.add("available", false);
                 }
 
