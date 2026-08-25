@@ -531,6 +531,110 @@ TEST_CASE("WebhookStore[pg]: backfill restricts WAL/SHM sidecars to 0600, not ju
         CHECK((perms & std::filesystem::perms::mask) == owner_only);
     }
 }
+
+TEST_CASE("WebhookStore[pg]: a sidecar that fails to move is still 0600 at its original path, "
+         "and doesn't block the main file from moving",
+         "[webhook_store][pg]") {
+    // gov Gate 5 chaos analysis CH-1 (PR #3563 fix round): force the `-wal`
+    // rename to fail by pre-occupying its target path with a non-empty
+    // directory (POSIX rename() onto a non-empty directory fails
+    // ENOTEMPTY/EISDIR). Proves two independent claims: (1) the read-time
+    // 0600 force in migrate_from_sqlite_impl protects a sidecar regardless
+    // of whether move_legacy_aside later manages to relocate it; (2) one
+    // sidecar's rename failure doesn't prevent the main file (or the OTHER
+    // sidecar) from moving and being chmod'd normally.
+    //
+    // `aside`'s suffix comes from `now_epoch()` (1s-resolution wall clock)
+    // read INSIDE move_legacy_aside, which this test can't observe
+    // directly — pre-occupy a small window of candidate seconds around
+    // "now" so a slow test runner can't miss the real timestamp.
+    WebhookStorePg store;
+    auto legacy_path = yuzu::test::unique_temp_path("yuzu_test_webhook_legacy_wal_fail") += ".db";
+    {
+        LegacyWebhookDb legacy(legacy_path);
+        legacy.insert({.id = 1,
+                      .url = "https://example.com/hook",
+                      .event_types = "*",
+                      .secret = "s",
+                      .enabled = true,
+                      .created_at = 1700000000});
+    }
+    for (const char* suffix : {"-wal", "-shm"}) {
+        auto side = legacy_path;
+        side += suffix;
+        std::ofstream(side) << "dummy-sidecar-content";
+    }
+
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    std::vector<std::filesystem::path> decoy_dirs;
+    // gov Gate 8 (PR #3563 fix round): a generous window — creating a few
+    // dozen empty decoy directories is essentially free, and widening it
+    // costs nothing but removes a real (if unlikely) flake source on a
+    // heavily contended runner where several seconds could elapse between
+    // this read and move_legacy_aside's own now_epoch() call.
+    for (auto t = now - 2; t <= now + 60; ++t) {
+        auto decoy = legacy_path;
+        decoy += ".migrated-" + std::to_string(t) + "-wal";
+        std::error_code mk_ec;
+        if (std::filesystem::create_directory(decoy, mk_ec) && !mk_ec) {
+            std::ofstream(decoy / "occupied") << "blocks the rename target";
+            decoy_dirs.push_back(decoy);
+        }
+    }
+    REQUIRE_FALSE(decoy_dirs.empty());
+
+    REQUIRE(store->migrate_from_sqlite(legacy_path)); // non-fatal: still succeeds
+
+    // The original `-wal` file must still exist at its ORIGINAL path (the
+    // rename never succeeded) and must be 0600 from the read-time force —
+    // independent of the later move that failed for it.
+    auto orphan_wal = legacy_path;
+    orphan_wal += "-wal";
+    REQUIRE(std::filesystem::exists(orphan_wal));
+    {
+        std::error_code st_ec;
+        const auto perms = std::filesystem::status(orphan_wal, st_ec).permissions();
+        REQUIRE_FALSE(st_ec);
+        CHECK((perms & std::filesystem::perms::mask) ==
+             (std::filesystem::perms::owner_read | std::filesystem::perms::owner_write));
+    }
+
+    // The main file and the (unobstructed) -shm sidecar must still have
+    // moved and been chmod'd normally — one sidecar's failure doesn't take
+    // the rest down with it.
+    std::filesystem::path moved_main, moved_shm;
+    for (const auto& entry :
+        std::filesystem::directory_iterator(legacy_path.parent_path())) {
+        const auto s = entry.path().string();
+        if (!s.starts_with(legacy_path.string() + ".migrated-") || s.ends_with("-wal"))
+            continue;
+        if (s.ends_with("-shm"))
+            moved_shm = entry.path();
+        else
+            moved_main = entry.path();
+    }
+    REQUIRE_FALSE(moved_main.empty());
+    REQUIRE_FALSE(moved_shm.empty());
+    const auto owner_only2 =
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write;
+    for (const auto& p : {moved_main, moved_shm}) {
+        std::error_code st_ec;
+        const auto perms = std::filesystem::status(p, st_ec).permissions();
+        REQUIRE_FALSE(st_ec);
+        CHECK((perms & std::filesystem::perms::mask) == owner_only2);
+    }
+
+    // A second boot against the (now-nonexistent) original main path must
+    // not disturb the orphaned sidecar's permissions — it's never
+    // rediscovered once the main file is gone.
+    REQUIRE(store->migrate_from_sqlite(legacy_path));
+    std::error_code st_ec2;
+    const auto perms2 = std::filesystem::status(orphan_wal, st_ec2).permissions();
+    REQUIRE_FALSE(st_ec2);
+    CHECK((perms2 & std::filesystem::perms::mask) == owner_only2);
+}
 #endif
 
 TEST_CASE("WebhookStore[pg]: backfill is idempotent — a second run against the moved-aside-free "
@@ -569,10 +673,24 @@ TEST_CASE("WebhookStore[pg]: backfill with no legacy file is a clean no-op",
 
 TEST_CASE("WebhookStore[pg]: backfill refuses (fail-closed) on an orphaned delivery row",
          "[webhook_store][pg]") {
+    // gov Gate 3/4 (PR #3563 fix round): also seed a secret-bearing webhook
+    // row so this fail-closed early-return path exercises
+    // `LegacySecretWiper`'s destructor over real, non-empty legacy secret
+    // data — not just an empty `legacy_hooks`. The wiper's own correctness
+    // isn't independently observable from outside the process (zeroized
+    // memory can't be asserted on without UB), so this only proves the
+    // early-return itself still behaves correctly with a populated
+    // `legacy_hooks`; it doesn't add a new assertion of its own.
     WebhookStorePg store;
     auto legacy_path = yuzu::test::unique_temp_path("yuzu_test_webhook_legacy_orphan") += ".db";
     {
         LegacyWebhookDb legacy(legacy_path);
+        legacy.insert({.id = 1,
+                      .url = "https://example.com/hook",
+                      .event_types = "*",
+                      .secret = "orphan-test-plaintext-secret",
+                      .enabled = true,
+                      .created_at = 1700000000});
         // A delivery referencing a webhook_id that was never inserted — the
         // legacy AND migrated schema both enforce this via FK CASCADE, so
         // this shape is corruption, not a real upgrade artifact.
@@ -588,4 +706,9 @@ TEST_CASE("WebhookStore[pg]: backfill refuses (fail-closed) on an orphaned deliv
     // Refusing must leave the legacy file untouched (never moved aside on
     // a failed backfill — ADR-0009).
     CHECK(std::filesystem::exists(legacy_path));
+    // The secret-bearing row must NOT have been written on a refused
+    // backfill (fail-closed also means "never a partial write").
+    auto hooks = store->list();
+    REQUIRE(hooks.has_value());
+    CHECK(hooks->empty());
 }

@@ -290,9 +290,12 @@ std::string canonicalize_legacy(const std::vector<LegacyWebhook>& hooks,
 // already been established by the time this runs. Carries the WAL/SHM
 // sidecars across with the main file (ADR-0040/AuditStore precedent): a
 // clean shutdown checkpoints them away, but after an unclean stop the
-// committed tail lives in `-wal`, and the retained copy — which still
-// holds the pre-cutover PLAINTEXT signing secret(s), ADR-0009/0010 forbid
-// scrubbing it — is unopenable standalone without it.
+// committed tail lives in `-wal` — so the sidecars hold the SAME
+// pre-cutover PLAINTEXT signing secret(s) the main file does (ADR-0009/0010
+// forbid scrubbing any of it), not just retention/openability data, and get
+// the identical confidentiality treatment (0600, POSIX) as the main file
+// below. The retained copy is also unopenable standalone without its
+// sidecars, which is the OTHER reason they're carried across.
 void move_legacy_aside(const std::filesystem::path& legacy_db_path) {
     std::error_code mv_ec;
     auto aside = legacy_db_path;
@@ -305,6 +308,14 @@ void move_legacy_aside(const std::filesystem::path& legacy_db_path) {
         return;
     }
     std::vector<std::filesystem::path> side_asides;
+    // Tracks whether every DISCOVERED sidecar was actually moved — folded
+    // into `perm_ok` below so a sidecar that never made it across (and so
+    // was never chmod'd here either) can't leave the summary log falsely
+    // claiming complete 0600 coverage (gov external-review finding, PR
+    // #3563). A sidecar left at its original path still got the read-time
+    // 0600 force in `migrate_from_sqlite_impl`, independent of this flag —
+    // this only affects what THIS function's log line is allowed to claim.
+    bool all_sidecars_moved = true;
     for (const char* suffix : {"-wal", "-shm"}) {
         auto side = legacy_db_path;
         side += suffix;
@@ -315,6 +326,7 @@ void move_legacy_aside(const std::filesystem::path& legacy_db_path) {
         side_aside += suffix;
         std::filesystem::rename(side, side_aside, side_ec);
         if (side_ec) {
+            all_sidecars_moved = false;
             spdlog::warn("WebhookStore::migrate_from_sqlite: moved the legacy webhook db but not "
                          "its {} sidecar ({}); the retained copy at {} may not open standalone "
                          "until the sidecar is moved beside it",
@@ -334,31 +346,23 @@ void move_legacy_aside(const std::filesystem::path& legacy_db_path) {
     // earlier version of this code chmod'd only the main file and logged an
     // unconditional "(0600, ...)" claim without checking whether the call
     // actually succeeded (gov external-review finding, PR #3563).
-    bool perm_ok = true;
-    std::error_code perm_ec;
-    std::filesystem::permissions(aside,
-                                 std::filesystem::perms::owner_read |
-                                     std::filesystem::perms::owner_write,
-                                 std::filesystem::perm_options::replace, perm_ec);
-    if (perm_ec) {
-        perm_ok = false;
-        spdlog::warn("WebhookStore::migrate_from_sqlite: could not set 0600 on moved legacy db "
-                     "{}: {}",
-                     aside.string(), perm_ec.message());
-    }
-    for (const auto& side_aside : side_asides) {
-        std::error_code side_perm_ec;
-        std::filesystem::permissions(side_aside,
+    bool perm_ok = all_sidecars_moved;
+    auto chmod_0600 = [&perm_ok](const std::filesystem::path& p, std::string_view kind) {
+        std::error_code chmod_ec;
+        std::filesystem::permissions(p,
                                      std::filesystem::perms::owner_read |
                                          std::filesystem::perms::owner_write,
-                                     std::filesystem::perm_options::replace, side_perm_ec);
-        if (side_perm_ec) {
+                                     std::filesystem::perm_options::replace, chmod_ec);
+        if (chmod_ec) {
             perm_ok = false;
             spdlog::warn("WebhookStore::migrate_from_sqlite: could not set 0600 on moved legacy "
-                         "sidecar {}: {}",
-                         side_aside.string(), side_perm_ec.message());
+                         "{} {}: {}",
+                         kind, p.string(), chmod_ec.message());
         }
-    }
+    };
+    chmod_0600(aside, "db");
+    for (const auto& side_aside : side_asides)
+        chmod_0600(side_aside, "sidecar");
     if (perm_ok) {
         spdlog::info("WebhookStore::migrate_from_sqlite: moved legacy webhook db to {} (0600, "
                      "retained one release per ADR-0009 — still holds the pre-cutover PLAINTEXT "
@@ -739,8 +743,17 @@ void WebhookStore::deliver_single(const WebhookDeliveryTarget& wh, const std::st
         // Scoped to this block only: the SecureBuffer is wiped by its own
         // destructor the instant `secret` goes out of scope, before the URL
         // is even parsed — well before any socket is opened.
-        SecureBuffer secret = std::move(*dec);
+        const SecureBuffer secret = std::move(*dec);
         auto view = std::string_view(reinterpret_cast<const char*>(secret.data()), secret.size());
+        // hmac_sha256/bytes_to_hex sit outside the try/catch below on
+        // purpose, same as the decrypt call just above — both are C-API
+        // calls (OpenSSL HMAC()/BCrypt) that cannot themselves throw; the
+        // only theoretical throw source in this block is bad_alloc from
+        // string construction, a class of failure this file already
+        // accepts uncaught here (gov Gate 3 cpp-safety/architect,
+        // PR #3563: StoreWorkerPool::worker_loop's own try/catch is the
+        // accepted backstop for that essentially-unreachable case, not a
+        // silent gap).
         signature = hmac_sha256(view, payload_json);
     }
 
@@ -915,7 +928,16 @@ bool WebhookStore::migrate_from_sqlite_impl(const std::filesystem::path& legacy_
     // its log line, which was simply false on Windows. No compensating
     // Windows ACL exists for this path today (unlike key_provider.cpp's
     // WinOwnerOnlyDacl for the KEK file) — tracked as a follow-up, not
-    // fixed here.
+    // fixed here: issue #3593.
+    //
+    // Also force any pre-existing -wal/-shm sidecar here, at read time — an
+    // unclean prior shutdown leaves the pre-checkpoint plaintext secret
+    // pages in the WAL, not the main file, so a sidecar is exactly as
+    // sensitive as the main file it belongs to. This is independent of
+    // move_legacy_aside's own end-of-migration chmod: forcing it HERE means
+    // a sidecar whose later RENAME fails (so it's never touched by
+    // move_legacy_aside at all) still isn't left at an inherited
+    // group/world-readable mode (gov external-review finding, PR #3563).
     if (legacy_exists) {
         std::filesystem::permissions(legacy_db_path,
                                      std::filesystem::perms::owner_read |
@@ -924,6 +946,23 @@ bool WebhookStore::migrate_from_sqlite_impl(const std::filesystem::path& legacy_
         if (ec)
             spdlog::warn("WebhookStore::migrate_from_sqlite: could not set 0600 on legacy {}: {}",
                          legacy_db_path.string(), ec.message());
+        for (const char* suffix : {"-wal", "-shm"}) {
+            auto side = legacy_db_path;
+            side += suffix;
+            std::error_code side_exists_ec;
+            if (!std::filesystem::exists(side, side_exists_ec) || side_exists_ec)
+                continue;
+            std::error_code side_ec;
+            std::filesystem::permissions(side,
+                                         std::filesystem::perms::owner_read |
+                                             std::filesystem::perms::owner_write,
+                                         std::filesystem::perm_options::replace, side_ec);
+            if (side_ec)
+                spdlog::warn(
+                    "WebhookStore::migrate_from_sqlite: could not set 0600 on legacy sidecar "
+                    "{}: {}",
+                    side.string(), side_ec.message());
+        }
     }
 #endif
 
@@ -943,7 +982,14 @@ bool WebhookStore::migrate_from_sqlite_impl(const std::filesystem::path& legacy_
     // external-review finding, PR #3563).
     struct LegacySecretWiper {
         std::vector<LegacyWebhook>& hooks;
-        ~LegacySecretWiper() {
+        // Idempotent — safe to call explicitly on the common all-succeed
+        // path (right after the encrypt loop consumes `h.secret`, so the
+        // wipe happens as early as it did before this RAII refactor) AND
+        // let the destructor below re-run it unconditionally as the
+        // fail-closed backstop for every other exit path; a row already
+        // wiped by the explicit call is a no-op the second time
+        // (`h.secret.empty()` short-circuits it).
+        void wipe_now() {
             for (auto& h : hooks) {
                 if (!h.secret.empty()) {
                     OPENSSL_cleanse(h.secret.data(), h.secret.size());
@@ -951,6 +997,7 @@ bool WebhookStore::migrate_from_sqlite_impl(const std::filesystem::path& legacy_
                 }
             }
         }
+        ~LegacySecretWiper() { wipe_now(); }
     } wipe_legacy_secrets{legacy_hooks};
 
     if (!legacy_exists) {
@@ -1189,11 +1236,18 @@ bool WebhookStore::migrate_from_sqlite_impl(const std::filesystem::path& legacy_
         encrypted_secrets[i] = std::move(*enc);
     }
 
-    // `wipe_legacy_secrets` (declared above, at the top of this function)
-    // wipes every legacy plaintext secret when this function returns —
-    // every read below must key off `encrypted_secrets[i]` (populated iff
-    // the secret was non-empty), never `h.secret`, which the has_secret
-    // derivation just inside the transaction below now does.
+    // Explicit wipe here, on the common all-succeed path — as early as the
+    // pre-RAII code wiped it, right after `h.secret` is done being read.
+    // `wipe_legacy_secrets`'s destructor (declared above, at the top of
+    // this function) re-runs the same wipe unconditionally at function
+    // exit as the fail-closed backstop for every OTHER path (an encrypt
+    // failure returns false mid-loop above, or any of the earlier
+    // fail-closed returns before this point) — this call is a no-op for
+    // rows the destructor will find already empty. Every read below must
+    // key off `encrypted_secrets[i]` (populated iff the secret was
+    // non-empty), never `h.secret`, which the has_secret derivation just
+    // inside the transaction below now does.
+    wipe_legacy_secrets.wipe_now();
 
     std::string failure_detail;
     // ONE transaction: fail closed on any error, nothing partially

@@ -223,18 +223,28 @@ class).
 - **Legacy file disposition (ADR-0010 §Consequences (a)–(d) — first store to actually implement
   this; `AuthDB` was fresh-start/no-backfill, so this is the program's first secret-bearing
   legacy-retention window in practice):**
-  - (a) **0600 forced, POSIX only** — on the legacy file before it is opened for reading, and
-    re-applied to the moved-aside copy (defence-in-depth; `auth.cpp`'s belt-and-suspenders
-    idiom for credential-bearing files). `std::filesystem::permissions` with owner-only POSIX
-    bits is a silent no-op on Windows (no ACL is touched, the call reports success) — gov
-    Gate 3 cross-platform caught an earlier revision of this ADR and the shipped code both
-    claiming "0600" unconditionally, which was false there. Both are now `#ifndef _WIN32`-
-    guarded and the Windows-side log line does not claim a restriction that did not happen. No
-    compensating Windows ACL exists for this path today (unlike `key_provider.hpp`'s
-    `WinOwnerOnlyDacl` for the KEK file itself) — tracked as a follow-up, not fixed here.
+  - (a) **0600 forced, POSIX only** — on the legacy file **and any pre-existing `-wal`/`-shm`
+    sidecars**, before the legacy file is opened for reading, and re-applied to every moved-aside
+    artifact (main file and sidecars alike) once the backfill completes (defence-in-depth;
+    `auth.cpp`'s belt-and-suspenders idiom for credential-bearing files). The WAL can carry the
+    same pre-checkpoint plaintext secret pages the main file's own force protects, so it gets the
+    identical restriction at BOTH points in the file's lifecycle — a sidecar whose move-time
+    rename fails (so it's never touched by the move-aside step) still isn't left unprotected,
+    because the read-time force already covered it independently. The move-aside step's own
+    success claim is honest about this: it only logs "(0600, ...)" when every chmod it attempted
+    AND every sidecar rename actually succeeded — a partial failure (e.g. one sidecar's rename or
+    chmod fails while the main file succeeds) logs a degraded variant naming the earlier warning
+    instead. `std::filesystem::permissions` with owner-only POSIX bits is a silent no-op on
+    Windows (no ACL is touched, the call reports success) — gov Gate 3 cross-platform caught an
+    earlier revision of this ADR and the shipped code both claiming "0600" unconditionally, which
+    was false there. Both are now `#ifndef _WIN32`-guarded and the Windows-side log line does not
+    claim a restriction that did not happen. No compensating Windows ACL exists for this path
+    today (unlike `key_provider.hpp`'s `WinOwnerOnlyDacl` for the KEK file itself) — tracked as a
+    follow-up, not fixed here: issue #3593.
   - Moved aside (never deleted) on a verified backfill, WAL/SHM sidecars carried across
     (`AuditStore`/ADR-0040 precedent — an unclean shutdown's committed tail lives in `-wal`, and
-    the retained copy is unopenable standalone without it).
+    the retained copy is unopenable standalone without it, **and both files carry the same
+    secret-confidentiality requirement as the main file, per (a) above**).
   - (b) **Operator purge flag**: not built in this PR — tracked as a follow-up issue
     (`docs/postgres-migration-ladder.md` row + a filed issue), consistent with ADR-0010's own
     framing ("an operator purge flag allows early deletion" — a capability, not a mandate on
