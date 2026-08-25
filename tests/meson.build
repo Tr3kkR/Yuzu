@@ -1363,7 +1363,10 @@ if build_server
   # scaled-from-real-diagnostic-numbers estimate lands well under 700s even
   # 2-wide paired, per the measurements above). Revisit on a fixed cadence,
   # not on an assumed completion date — tighten back to 600, or drop, once a
-  # shard is comfortably under budget.
+  # shard is comfortably under budget. Tracked at issue #3443 (the existing
+  # linked home for the pg-shard-reliability lineage) — a prose-only "revisit
+  # later" with no dated/metric trigger has this file's own track record of
+  # being forgotten until the next stale-pin incident forces it.
   test('server pg unit tests shard E', server_test_exe,
        args: ['[pg][scim]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][guaranteed_state]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][oidc]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][software_inventory]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]'],
        suite: 'server', timeout: 700)
