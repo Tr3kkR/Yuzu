@@ -636,8 +636,16 @@ std::string system32_path(const char* exe) {
 void enum_wnet_outbound(std::vector<MapDriveEntry>& out) {
     HANDLE hEnum = nullptr;
     DWORD rc = WNetOpenEnumW(RESOURCE_CONNECTED, RESOURCETYPE_DISK, 0, nullptr, &hEnum);
-    if (rc != NO_ERROR)
-        return; // no connected network resources (or provider unavailable)
+    // BR4-003 (round 4): a WNetOpenEnumW failure was previously conflated
+    // with "no connected network resources" and swallowed to an empty `out`
+    // -- WNetOpenEnumW's own contract has no such benign-empty failure mode
+    // (an empty result comes back as a valid handle whose first
+    // WNetEnumResourceW call then returns ERROR_NO_MORE_ITEMS, handled
+    // below); any open failure is a real provider/transport error that must
+    // not be silently persisted as "this host has zero outbound mappings".
+    if (yuzu::tar::is_unexpected_enumeration_status(rc, {NO_ERROR}))
+        throw yuzu::tar::IncompleteCaptureError(
+            std::format("TAR: WNetOpenEnumW failed (rc={})", rc));
     WNetEnumGuard eg{hEnum}; // closes on every exit (cap throw / normal)
 
     std::vector<char> buffer(16384);
@@ -651,8 +659,18 @@ void enum_wnet_outbound(std::vector<MapDriveEntry>& out) {
             buffer.resize(size);
             continue;
         }
+        // BR4-003 (round 4): ONLY ERROR_NO_MORE_ITEMS is the documented
+        // "table exhausted" terminal status -- the prior `if (rc != NO_ERROR)
+        // break` conflated every other unexpected status (provider dropped,
+        // transport error, etc.) with normal completion, so a partial
+        // outbound set could still replace the last complete baseline. Any
+        // status outside {NO_ERROR (more rows this page), ERROR_NO_MORE_ITEMS
+        // (exhausted)} throws instead of silently stopping the loop.
+        if (yuzu::tar::is_unexpected_enumeration_status(rc, {NO_ERROR, ERROR_NO_MORE_ITEMS}))
+            throw yuzu::tar::IncompleteCaptureError(
+                std::format("TAR: WNetEnumResourceW failed (rc={})", rc));
         if (rc != NO_ERROR)
-            break; // ERROR_NO_MORE_ITEMS or a failure — done
+            break; // ERROR_NO_MORE_ITEMS — done, genuinely exhausted
         auto* res = reinterpret_cast<NETRESOURCEW*>(buffer.data());
         for (DWORD i = 0; i < count; ++i) {
             // Test capacity BEFORE building/pushing the candidate row (round
@@ -766,12 +784,24 @@ void enum_netsession_inbound(std::vector<MapDriveEntry>& out) {
         s = enum_sessions_level<SESSION_INFO_10>(
             10, &SESSION_INFO_10::sesi10_cname, &SESSION_INFO_10::sesi10_username, out);
 
-    // Access denied at both levels (not local-admin / Server-Operator) — degrade
-    // to empty, warned once.
+    // Access denied at both levels (not local-admin / Server-Operator) —
+    // documented, constrained-empty outcome: degrade to empty, warned once.
     static std::atomic<bool> s_denied_warned{false};
-    if (s == ERROR_ACCESS_DENIED && !s_denied_warned.exchange(true))
-        spdlog::warn("TAR mapdrive: NetSessionEnum access denied — inbound sessions require "
-                     "local-admin / Server-Operator; skipping (repeats suppressed)");
+    if (s == ERROR_ACCESS_DENIED) {
+        if (!s_denied_warned.exchange(true))
+            spdlog::warn("TAR mapdrive: NetSessionEnum access denied — inbound sessions require "
+                         "local-admin / Server-Operator; skipping (repeats suppressed)");
+        return;
+    }
+    // BR4-003 (round 4): every OTHER unexpected NetSessionEnum status was
+    // previously silently accepted -- `out` (whatever collect_sessions
+    // gathered before the failure, possibly empty) was returned as though
+    // it were the complete inbound session list. Any final status besides
+    // NERR_Success (clean) or ERROR_ACCESS_DENIED (handled above) is a real
+    // provider/transport failure and must not be persisted as complete.
+    if (yuzu::tar::is_unexpected_enumeration_status(s, {NERR_Success}))
+        throw yuzu::tar::IncompleteCaptureError(
+            std::format("TAR: NetSessionEnum failed (rc={})", s));
 }
 
 // --- registry helpers for outbound history ---
