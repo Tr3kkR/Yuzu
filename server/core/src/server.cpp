@@ -5572,13 +5572,75 @@ public:
             }
         }
 
-        // Phase 7: Runtime Configuration + Custom Properties
-        {
-            auto rtcfg_db = cfg_.db_dir() / "runtime-config.db";
-            runtime_config_store_ = std::make_unique<RuntimeConfigStore>(rtcfg_db);
-            if (runtime_config_store_ && runtime_config_store_->is_open()) {
-                // Apply stored overrides on startup
-                apply_runtime_config_overrides();
+        // Phase 7: Runtime Configuration — Migrated Postgres store (ADR-0006/
+        // 0009/0060, schema `runtime_config_store`). Same fail-CLOSED
+        // construction posture as every other born-on-PG store (ADR-0012
+        // §1): a reachable database whose schema can't migrate/open is a
+        // fatal startup error, never a serve-degraded config plane — config
+        // reads feed auth/OIDC behaviour, so serving degraded here is a
+        // fail-open, not a benign default.
+        //
+        // Own SecretCodec instance (ADR-0010 per-store model, mirrors
+        // plugin_config_store_'s construction sequence exactly, see that
+        // block above): construct the codec first (ctor only), THEN
+        // RuntimeConfigStore's own constructor registers its ONE secret
+        // column (runtime_config_store.runtime_config_secrets.sealed_value)
+        // immediately after its schema migration, THEN SecretCodec::init()
+        // runs on a pinned lease. Reuses auth_key_provider_ (constructed
+        // above; guaranteed non-null whenever this guard is reached) rather
+        // than minting a third FileKeyProvider — the KEK material is
+        // install-wide (ADR-0010 §2), so one KeyProvider instance backing
+        // three independent SecretCodec instances is the correct shape.
+        if (pg_pool_ && !startup_failed_) {
+            runtime_config_secret_codec_ = std::make_unique<pg::SecretCodec>(*auth_key_provider_);
+            runtime_config_store_ =
+                std::make_unique<RuntimeConfigStore>(*pg_pool_, *runtime_config_secret_codec_);
+            if (!runtime_config_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: runtime config store migration/open failed "
+                              "(database reachable but the runtime_config_store schema could not "
+                              "be created/opened)");
+                startup_failed_ = true;
+            } else {
+                auto lease = pg_pool_->acquire();
+                if (!lease) {
+                    spdlog::error("[PG] Refusing to start: could not acquire a connection to run "
+                                  "SecretCodec::init() for runtime_config_store ({})",
+                                  pg_pool_->last_error());
+                    startup_failed_ = true;
+                } else {
+                    auto init_res = runtime_config_secret_codec_->init(lease.get());
+                    lease.reset();
+                    if (!init_res) {
+                        spdlog::error(
+                            "[PG] Refusing to start: runtime_config_store SecretCodec::init() "
+                            "failed — {}: {}",
+                            pg::SecretCodec::to_string(init_res.error().kind),
+                            init_res.error().message);
+                        startup_failed_ = true;
+                    } else {
+                        runtime_config_store_->set_metrics(&metrics_);
+                        auto rtcfg_db = cfg_.db_dir() / "runtime-config.db";
+                        if (!runtime_config_store_->migrate_from_sqlite(rtcfg_db)) {
+                            spdlog::error(
+                                "[PG] Refusing to start: runtime config legacy-SQLite backfill "
+                                "failed (see prior log lines) — runtime_config_store is "
+                                "AUTHORITATIVE operator-set config and must not serve "
+                                "partially-migrated data. Operator remediation: repair {} or move "
+                                "it aside to skip the backfill (overrides in it will NOT carry "
+                                "over)",
+                                rtcfg_db.string());
+                            startup_failed_ = true;
+                        } else if (!apply_runtime_config_overrides()) {
+                            spdlog::error(
+                                "[PG] Refusing to start: could not apply stored runtime config "
+                                "overrides at boot (see prior log lines) — a config read failure "
+                                "here would otherwise silently boot with defaults instead of the "
+                                "operator's stored overrides, including a possible OIDC client "
+                                "secret");
+                            startup_failed_ = true;
+                        }
+                    }
+                }
             }
         }
         // Migrated Postgres store (ADR-0006/ADR-0045, schema
@@ -10896,13 +10958,23 @@ private:
                           command_id, denied_count);
     }
 
-    // Apply stored runtime config overrides on startup
-    void apply_runtime_config_overrides() {
+    // Apply stored runtime config overrides on startup. Returns false on a
+    // genuine read failure (ADR-0036) — the caller treats that as a fatal
+    // boot error (startup_failed_), never as "nothing configured": a
+    // transient read blip here would otherwise silently boot with defaults
+    // instead of the operator's stored overrides, including a possible OIDC
+    // client secret (kickoff decision #1 / CH-2).
+    [[nodiscard]] bool apply_runtime_config_overrides() {
         if (!runtime_config_store_ || !runtime_config_store_->is_open())
-            return;
+            return true; // nothing to apply; not itself a failure
         // The ONE caller entitled to plaintext: it must apply the real secret.
-        auto entries = runtime_config_store_->get_all_with_secrets();
-        for (const auto& e : entries) {
+        auto entries_result = runtime_config_store_->get_all_with_secrets();
+        if (!entries_result.has_value()) {
+            spdlog::error("apply_runtime_config_overrides: read failed: {}",
+                          entries_result.error());
+            return false;
+        }
+        for (const auto& e : *entries_result) {
             // Never log a credential. This line wrote the OIDC client secret verbatim
             // into yuzu-server.log on every boot once it had been set via Settings.
             spdlog::info("Applying runtime config override: {} = {}", e.key,
@@ -10949,6 +11021,7 @@ private:
         // F1 DEX alerting config — both consumers accept live updates, so the
         // same call applies at boot and from the settings POST handlers.
         apply_dex_alert_config();
+        return true;
     }
 
     /// F1: push the persisted DEX alerting config into the alert router and
@@ -12813,7 +12886,17 @@ private:
                     "application/json");
                 return;
             }
-            nlohmann::json overrides = build_overrides_json(runtime_config_store_->get_all());
+            auto overrides_result = runtime_config_store_->get_all();
+            if (!overrides_result.has_value()) {
+                spdlog::error("GET /api/config: read failed: {}", overrides_result.error());
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"runtime configuration store unavailable"},)"
+                    R"("meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            nlohmann::json overrides = build_overrides_json(*overrides_result);
 
             nlohmann::json allowed = nlohmann::json::array();
             for (const auto& k : RuntimeConfigStore::allowed_keys())
@@ -12891,9 +12974,23 @@ private:
 
             auto result = runtime_config_store_->set(key, value, session->username);
             if (!result) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
-                                "application/json");
+                // A genuine DB/crypto failure (kRuntimeConfigDbErrorPrefix) is a
+                // 503 with a generic message -- never echo the internal detail
+                // to the caller; caller-input validation (unknown key, bad
+                // value shape, the redaction-placeholder guard) is a 400 with
+                // the store's own message, which is written for an operator.
+                if (result.error().starts_with(kRuntimeConfigDbErrorPrefix)) {
+                    spdlog::error("PUT /api/config/{}: write failed: {}", key, result.error());
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"runtime config store unavailable"},)"
+                        R"("meta":{"api_version":"v1"}})",
+                        "application/json");
+                } else {
+                    res.status = 400;
+                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
+                                    "application/json");
+                }
                 return;
             }
 
@@ -21254,6 +21351,14 @@ private:
     std::atomic<bool> viz_disabled_{false};
 
     // Phase 7: Runtime config, custom properties, health monitoring, workflows, product packs
+    //
+    // ADR-0060: runtime_config_store_ borrows runtime_config_secret_codec_ by
+    // reference (ADR-0010 per-store codec model, same shape as
+    // plugin_config_store_ / plugin_config_secret_codec_ above), so it must
+    // destruct BEFORE the codec it borrows — true here because it is
+    // declared AFTER the codec. Both borrow pg_pool_ by reference too, and
+    // both destruct before it (declared above every member here).
+    std::unique_ptr<pg::SecretCodec> runtime_config_secret_codec_;
     std::unique_ptr<RuntimeConfigStore> runtime_config_store_;
     std::unique_ptr<CustomPropertiesStore> custom_properties_store_;
     std::unique_ptr<WorkflowEngine> workflow_engine_;

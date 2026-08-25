@@ -2207,6 +2207,35 @@ These are two SEPARATE failure/detection behaviors, not one — do not conflate 
 **Verify:** after the server reports ready, `GET /api/compliance` returns the expected
 policies and fleet compliance percentage.
 
+## Runtime configuration migrates to Postgres — OIDC client secret now encrypted at rest (mandatory backfill, RuntimeConfigStore, ADR-0060)
+
+`RuntimeConfigStore` — the Settings-configurable overrides behind `GET`/`PUT
+/api/config/:key` (retention windows, `log_level`, DEX alert-routing knobs, and the
+`oidc_*` OIDC parameters) — moves from the SQLite `runtime-config.db` file to the
+server's PostgreSQL substrate in this release, schema `runtime_config_store`. This is
+the last store on the Postgres migration ladder — every server store now runs on
+Postgres.
+
+- **`oidc_client_secret` is now encrypted at rest** (SecretCodec envelope, AES-256-GCM)
+  instead of plaintext. A non-empty legacy secret is encrypted during the backfill;
+  it is never written to Postgres in plaintext. Every other config key backfills
+  unchanged.
+- **Fail-closed boot, retried each start.** A backfill that cannot complete — an
+  unreadable/corrupt `runtime-config.db`, a Postgres write error, a fingerprint
+  mismatch, or a legacy row demonstrably ahead of an already-migrated Postgres row —
+  refuses the boot and retries on the next start, matching this ladder's standard
+  authoritative posture. A successful backfill moves the legacy file aside to
+  `runtime-config.db.migrated-<timestamp>` (retained for one release, per the usual
+  rollback window).
+- **`GET`/`PUT /api/config/:key` now return an honest 503** on a genuine database
+  error, rather than a response indistinguishable from "nothing configured" (`GET`)
+  or a `400` validation failure (`PUT`). No change to either route's success-path
+  response shape.
+- No Settings UI or dashboard-visible change. See
+  [`security-hardening.md`](security-hardening.md) for the pre-existing OIDC secret
+  redaction behaviour (unchanged by this migration) and `docs/adr/0060-runtime-config-store-postgres-migration.md`
+  for the full design.
+
 ## ⚠️ Behaviour change: quarantine is now enforced at instruction dispatch (#881, #3127)
 
 Quarantine previously isolated a device's network without stopping the control plane from
