@@ -31,9 +31,14 @@ early exit, and exception unwind) releases exactly the listed resource.
   to leak it again on the next `inherit_parent_env` call. Fixed by wrapping
   the pointer in the RAII owner above at the point of acquisition.
 - **All paths covered:** normal loop completion ✓ · null return from
-  `GetEnvironmentStringsW` (guarded by `if (env_strings)`, BR-008 tracks the
-  separate "should this fail the spawn instead" question, not addressed
-  here) ✓ · exception unwinding through the parse loop ✓
+  `GetEnvironmentStringsW` (BR3-005, whole-branch review round 3: BR-008
+  is FIXED, not merely tracked-separately as an earlier version of this
+  line said — a null return now fails the spawn closed,
+  `result.termination_reason = TerminationReason::spawn_error`, before the
+  parse loop or the RAII owner above is ever reached, so there is nothing
+  for that owner to release on this path; the `unique_ptr` remains safely
+  null-constructed and its destructor is a no-op) ✓ · exception unwinding
+  through the parse loop ✓
 - **Platform note:** this code path is Windows-only (`#else // _WIN32` block,
   `agents/core/src/subprocess_runner.cpp`); verified by compile only on this
   host (macOS) — no Windows runtime evidence was collected for this fix.
