@@ -20,6 +20,7 @@
  *   -> compute diff -> insert events -> save current state
  */
 
+#include "tar_capture_status.hpp" // yuzu::tar::collect_or_retain
 #include "tar_collectors.hpp"
 #include "tar_netqual_nstat.hpp"
 #include "tar_proc_etw.hpp"
@@ -1109,8 +1110,13 @@ private:
     // arp_pre/dns_pre: optionally pre-enumerated snapshots collected by the caller
     // BEFORE collect_mu_ was taken (the arp/dns collectors are syscall-heavy — see
     // do_collect_fast). When null, the leg enumerates inline (legacy/no-op path).
+    // arp_pre is an optional<vector> (not a bare vector) so a precollection
+    // failure (enumerate_arp() threw -- incomplete capture, tar_capture_status.hpp's
+    // collect_or_retain contract) is preserved as nullopt through this layer
+    // instead of collapsing to an empty vector indistinguishable from a
+    // genuinely empty ARP table (BR-001, round 2) -- do_collect_fast sets it.
     int collect_fast_impl(yuzu::CommandContext& ctx,
-                          std::vector<yuzu::tar::ArpEntry>* arp_pre = nullptr,
+                          std::optional<std::vector<yuzu::tar::ArpEntry>>* arp_pre = nullptr,
                           std::vector<yuzu::tar::DnsEntry>* dns_pre = nullptr,
                           std::vector<yuzu::tar::TcpQualitySample>* netqual_pre = nullptr) {
         auto ts = now_epoch_seconds();
@@ -1505,20 +1511,44 @@ private:
         // failure — the always-on legs above already committed, so a failure here
         // must not misreport a healthy tick; the diff baseline is advanced ONLY on
         // success so a failed insert retries the same deltas next tick.
+        //
+        // enumerate_arp() throws when the platform capture didn't genuinely
+        // complete (sysctl/procfs/GetIpNetTable2 read failure, a kernel-
+        // truncated parse, or the kArpEntryCap reached before the whole table
+        // was consumed -- tar_arp_collector.cpp / tar_capture_status.hpp). A
+        // partial ARP table must never be diffed against the last COMPLETE
+        // snapshot (it would manufacture false appeared/removed forensic
+        // events) or replace it as the new baseline -- same
+        // collect-or-retain contract as the service/mapdrive legs below.
+        // arp_pre, when supplied, carries the OUTCOME of a precollection
+        // attempt (nullopt if that threw -- do_collect_fast), not just the
+        // entries.
         if (source_enabled(*db_, "arp")) {
-            auto current = arp_pre ? std::move(*arp_pre) : yuzu::tar::enumerate_arp();
-            auto previous = json_to_arp(db_->get_state("arp"));
-            auto typed = yuzu::tar::compute_arp_events(previous, current, ts, snap_id);
-            bool ok = true;
-            if (!typed.empty()) {
-                ok = db_->insert_arp_events(typed);
-                if (ok)
-                    total_events += static_cast<int>(typed.size());
-                else
-                    spdlog::error("TAR: arp insert failed this tick (state not advanced)");
+            std::optional<std::vector<yuzu::tar::ArpEntry>> current;
+            if (arp_pre) {
+                current = std::move(*arp_pre);
+            } else {
+                auto res = yuzu::tar::collect_or_retain(
+                    [] { return yuzu::tar::enumerate_arp(); });
+                current = std::move(res.current);
+                if (!current)
+                    spdlog::warn("TAR: arp snapshot incomplete ({}) -- retaining baseline",
+                                 res.skip_reason);
             }
-            if (ok)
-                db_->set_state("arp", arp_to_json(current).dump());
+            if (current) {
+                auto previous = json_to_arp(db_->get_state("arp"));
+                auto typed = yuzu::tar::compute_arp_events(previous, *current, ts, snap_id);
+                bool ok = true;
+                if (!typed.empty()) {
+                    ok = db_->insert_arp_events(typed);
+                    if (ok)
+                        total_events += static_cast<int>(typed.size());
+                    else
+                        spdlog::error("TAR: arp insert failed this tick (state not advanced)");
+                }
+                if (ok)
+                    db_->set_state("arp", arp_to_json(*current).dump());
+            }
         }
 
         // DNS-cache diff (ADR-0015). Opt-in (usage-class PII — visited domains).
@@ -1645,22 +1675,35 @@ private:
         // Windows ESTATS pass is a per-connection enable+read syscall sweep, so
         // it pre-collects lock-free with arp/dns.
         const bool netqual_on = db_->get_config("netqual_enabled", "false") == "true";
-        std::vector<yuzu::tar::ArpEntry> arp_pre;
+        // arp: precollected through collect_or_retain into an OPTIONAL (not a
+        // bare vector) so enumerate_arp()'s incomplete-capture throw (read
+        // failure / kernel-truncated parse / entry-cap reached --
+        // tar_arp_collector.cpp) is preserved as nullopt through this layer,
+        // rather than collapsing to an empty vector collect_fast_impl could
+        // not tell apart from a genuinely empty ARP table (BR-001, round 2).
+        // Isolated in its own try (via collect_or_retain) so an ARP failure
+        // does not also discard the independent dns/netqual precollection
+        // below.
+        std::optional<std::vector<yuzu::tar::ArpEntry>> arp_pre;
+        if (arp_on) {
+            auto res = yuzu::tar::collect_or_retain([] { return yuzu::tar::enumerate_arp(); });
+            arp_pre = std::move(res.current);
+            if (!arp_pre)
+                spdlog::warn("TAR: arp snapshot incomplete ({}) -- retaining baseline",
+                             res.skip_reason);
+        }
         std::vector<yuzu::tar::DnsEntry> dns_pre;
         std::vector<yuzu::tar::TcpQualitySample> netqual_pre;
         // Belt-and-suspenders (SRE): the dns collector calls an undocumented dnsapi
         // export over an opaque heap list; isolate any throw so a bad list degrades
         // this tick to empty rather than crossing the plugin ABI boundary.
         try {
-            if (arp_on)
-                arp_pre = yuzu::tar::enumerate_arp();
             if (dns_on)
                 dns_pre = yuzu::tar::enumerate_dns();
             if (netqual_on)
                 netqual_pre = yuzu::tar::collect_tcp_quality();
         } catch (...) {
-            spdlog::error("TAR: arp/dns/netqual enumeration threw; skipping this tick");
-            arp_pre.clear();
+            spdlog::error("TAR: dns/netqual enumeration threw; skipping this tick");
             dns_pre.clear();
             netqual_pre.clear();
         }
@@ -1837,13 +1880,11 @@ private:
             // diff and state-advance entirely and retry next tick, exactly the
             // same "leave state untouched, retry" contract already used for the
             // mapdrive historical backfill (init(), enumerate_mapdrive_history).
-            std::optional<std::vector<yuzu::tar::ServiceInfo>> current;
-            try {
-                current = yuzu::tar::enumerate_services();
-            } catch (const std::exception& e) {
+            auto res = yuzu::tar::collect_or_retain([] { return yuzu::tar::enumerate_services(); });
+            auto current = std::move(res.current);
+            if (!current)
                 spdlog::warn("TAR: service snapshot incomplete ({}) -- retaining baseline",
-                             e.what());
-            }
+                             res.skip_reason);
             if (current) {
                 const std::string svc_key{yuzu::tar::diff_state_key("service")}; // #538
                 auto prev_json = db_->get_state(svc_key);
@@ -1940,18 +1981,18 @@ private:
         // retries the same deltas next tick. The one-time historical backfill is
         // separate (init, mapdrive_backfill_done) and does not touch this baseline.
         if (source_enabled(*db_, "mapdrive")) {
-            // enumerate_mapdrive() throws when its underlying subprocess capture
-            // (smbstatus on Linux) didn't genuinely complete -- same contract as
-            // enumerate_services() above. Skip the whole tick's diff/state-advance
-            // on a throw rather than diff a partial snapshot against the last
-            // COMPLETE one.
-            std::optional<std::vector<yuzu::tar::MapDriveEntry>> current;
-            try {
-                current = yuzu::tar::enumerate_mapdrive();
-            } catch (const std::exception& e) {
+            // enumerate_mapdrive() throws when its underlying capture didn't
+            // genuinely complete -- a subprocess capture (smbstatus on Linux,
+            // wevtutil/journalctl) or, on macOS, a getfsstat(2) failure/over-cap
+            // snapshot (tar_mapdrive_collector.cpp, BR-002 round 2) -- same
+            // contract as enumerate_services() above. Skip the whole tick's
+            // diff/state-advance on a throw rather than diff a partial snapshot
+            // against the last COMPLETE one.
+            auto res = yuzu::tar::collect_or_retain([] { return yuzu::tar::enumerate_mapdrive(); });
+            auto current = std::move(res.current);
+            if (!current)
                 spdlog::warn("TAR: mapdrive snapshot incomplete ({}) -- retaining baseline",
-                             e.what());
-            }
+                             res.skip_reason);
             if (current) {
                 const std::string md_key{yuzu::tar::diff_state_key("mapdrive")}; // #538
                 auto previous = json_to_mapdrive(db_->get_state(md_key));
@@ -2524,22 +2565,29 @@ private:
         const bool arp_on = source_enabled(*db_, "arp");
         const bool dns_on = source_enabled(*db_, "dns");
         const bool netqual_on = db_->get_config("netqual_enabled", "false") == "true";
-        std::vector<yuzu::tar::ArpEntry> arp_pre;
+        // arp: same optional-through-collect_or_retain precollection as
+        // do_collect_fast, and for the identical reason (BR-001, round 2) --
+        // see that function's comment.
+        std::optional<std::vector<yuzu::tar::ArpEntry>> arp_pre;
+        if (arp_on) {
+            auto res = yuzu::tar::collect_or_retain([] { return yuzu::tar::enumerate_arp(); });
+            arp_pre = std::move(res.current);
+            if (!arp_pre)
+                spdlog::warn("TAR: arp snapshot incomplete ({}) -- retaining baseline",
+                             res.skip_reason);
+        }
         std::vector<yuzu::tar::DnsEntry> dns_pre;
         std::vector<yuzu::tar::TcpQualitySample> netqual_pre;
         // Belt-and-suspenders (SRE): the dns collector calls an undocumented dnsapi
         // export over an opaque heap list; isolate any throw so a bad list degrades
         // this tick to empty rather than crossing the plugin ABI boundary.
         try {
-            if (arp_on)
-                arp_pre = yuzu::tar::enumerate_arp();
             if (dns_on)
                 dns_pre = yuzu::tar::enumerate_dns();
             if (netqual_on)
                 netqual_pre = yuzu::tar::collect_tcp_quality();
         } catch (...) {
-            spdlog::error("TAR: arp/dns/netqual enumeration threw; skipping this tick");
-            arp_pre.clear();
+            spdlog::error("TAR: dns/netqual enumeration threw; skipping this tick");
             dns_pre.clear();
             netqual_pre.clear();
         }

@@ -29,7 +29,10 @@
 // must pass zero_exit_required=false at its own call site rather than
 // weakening this default for everyone.
 
+#include <optional>
 #include <string>
+#include <type_traits>
+#include <utility>
 
 namespace yuzu::tar {
 
@@ -61,6 +64,43 @@ inline CaptureCompleteness classify_subprocess_capture(bool tool_ran, bool timed
         return CaptureCompleteness{.complete = false,
                                    .reason = "exit code " + std::to_string(exit_code)};
     return CaptureCompleteness{.complete = true, .reason = {}};
+}
+
+/// Outcome of an incomplete-capture-aware snapshot collection: either the
+/// collector ran to completion (`current` holds the snapshot) or it threw
+/// (an incomplete/failed/truncated/capped capture, however the specific
+/// collector detected that -- subprocess status via
+/// classify_subprocess_capture above, or a platform syscall's own error
+/// contract for the native ARP/mapdrive legs), in which case `current` is
+/// empty and `skip_reason` carries the thrown what() for logging.
+template <typename T>
+struct CollectOrRetain {
+    std::optional<T> current;
+    std::string skip_reason;
+};
+
+/// The single collect-or-retain seam every TAR snapshot-diff source applies
+/// (service, mapdrive, arp): call `collect`, and on a thrown
+/// std::exception -- the shared signal a collector uses to report "this
+/// capture did not complete" -- return an empty result instead of
+/// propagating, so the caller's existing "skip this tick's diff and state
+/// advance, retain the previous baseline" branch (`if (current) { ... }` at
+/// every tar_plugin.cpp call site) is the ONLY place that decision is made.
+/// A free function taking the collector as a parameter (rather than each
+/// call site's own inline try/catch) means a test can inject a fixture
+/// collector that throws/returns on demand and assert the exact
+/// skip/retain/recover behaviour without a live syscall or subprocess
+/// (tests/unit/test_tar_capture_status.cpp).
+template <typename CollectFn>
+auto collect_or_retain(CollectFn&& collect) {
+    using T = std::invoke_result_t<CollectFn>;
+    CollectOrRetain<T> result;
+    try {
+        result.current = std::forward<CollectFn>(collect)();
+    } catch (const std::exception& e) {
+        result.skip_reason = e.what();
+    }
+    return result;
 }
 
 } // namespace yuzu::tar
