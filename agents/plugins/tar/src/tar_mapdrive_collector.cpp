@@ -25,7 +25,7 @@
 // redact_cmdline (cmdline-only; it would mangle UNC paths) — opt-in + audit is
 // the protection, exactly as dns_live does for visited domains.
 
-#include "tar_capture_status.hpp" // classify_subprocess_capture
+#include "tar_capture_status.hpp" // classify_subprocess_capture, IncompleteCaptureError, would_exceed_cap
 #include "tar_collectors.hpp"
 
 #include <yuzu/agent/subprocess_runner.hpp> // run_bounded_subprocess (rung 2 argv sites)
@@ -638,7 +638,7 @@ void enum_wnet_outbound(std::vector<MapDriveEntry>& out) {
     DWORD rc = WNetOpenEnumW(RESOURCE_CONNECTED, RESOURCETYPE_DISK, 0, nullptr, &hEnum);
     if (rc != NO_ERROR)
         return; // no connected network resources (or provider unavailable)
-    WNetEnumGuard eg{hEnum}; // closes on every exit (cap return / throw / normal)
+    WNetEnumGuard eg{hEnum}; // closes on every exit (cap throw / normal)
 
     std::vector<char> buffer(16384);
     for (;;) {
@@ -655,6 +655,20 @@ void enum_wnet_outbound(std::vector<MapDriveEntry>& out) {
             break; // ERROR_NO_MORE_ITEMS or a failure — done
         auto* res = reinterpret_cast<NETRESOURCEW*>(buffer.data());
         for (DWORD i = 0; i < count; ++i) {
+            // Test capacity BEFORE building/pushing the candidate row (round
+            // 3, B3-001/B3-004): the prior check-AFTER-push shape (a)
+            // misclassified an exact-cap table as truncated, and (b) merely
+            // `return`ed the partial `out` to the caller instead of
+            // signalling incompleteness -- enumerate_mapdrive() then diffed
+            // and persisted it as though it were the complete combined
+            // outbound+inbound snapshot. Throwing here is what makes B3-001's
+            // "combined snapshot known to fit" requirement hold: NEITHER
+            // direction's rows are usable once either direction's cap trips.
+            if (yuzu::tar::would_exceed_cap(out.size(), kMapDriveEntryCap)) {
+                static std::atomic<bool> warned{false};
+                warn_capped(warned, "live", kMapDriveEntryCap);
+                throw yuzu::tar::IncompleteCaptureError("TAR: mapdrive live entry cap reached");
+            }
             MapDriveEntry e;
             e.direction = "outbound";
             if (res[i].lpLocalName)
@@ -670,11 +684,6 @@ void enum_wnet_outbound(std::vector<MapDriveEntry>& out) {
             if (key && WNetGetUserW(key, ubuf, &ulen) == NO_ERROR)
                 e.username = yuzu::win::from_wide(ubuf);
             out.push_back(std::move(e));
-            if (out.size() >= kMapDriveEntryCap) {
-                static std::atomic<bool> warned{false};
-                warn_capped(warned, "live", kMapDriveEntryCap);
-                return; // eg unwinds WNetCloseEnum
-            }
         }
     }
 }
@@ -693,27 +702,34 @@ void collect_sessions(INFO* buf, DWORD n, std::vector<MapDriveEntry>& out,
         e.provider = "SMB";
         if (e.remote_host.empty() && e.username.empty())
             continue;
+        // Check-before-push (round 3, B3-001/B3-004), same reasoning as
+        // enum_wnet_outbound above: throws rather than silently returning a
+        // partial `out` the caller would otherwise diff/persist as complete.
+        if (yuzu::tar::would_exceed_cap(out.size(), kMapDriveEntryCap))
+            throw yuzu::tar::IncompleteCaptureError("TAR: mapdrive live entry cap reached");
         out.push_back(std::move(e));
-        if (out.size() >= kMapDriveEntryCap)
-            return;
     }
 }
 
 // Drain one NetSessionEnum level, paging on ERROR_MORE_DATA via the resume
 // handle (MAX_PREFERRED_LENGTH usually returns everything in one call, but the
 // API may still page — a single call silently drops sessions past page one on a
-// busy file server). Stops at kMapDriveEntryCap with a truncation warn (§8
-// cap-with-warn); each page's buffer is freed by NetApiBufGuard even on a throw.
-// Returns the final NET_API_STATUS so the caller can branch on access-denied.
+// busy file server). collect_sessions() now throws internally the moment the
+// combined cap would be exceeded (round 3), so this loop no longer needs its
+// own post-collect cap check; each page's buffer is freed by NetApiBufGuard
+// even on that throw. Returns the final NET_API_STATUS so the caller can
+// branch on access-denied.
 template <typename INFO>
 NET_API_STATUS enum_sessions_level(DWORD level, LPWSTR INFO::*cname, LPWSTR INFO::*uname,
                                    std::vector<MapDriveEntry>& out) {
     DWORD resume = 0; // NetSessionEnum resume_handle is LPDWORD (DWORD), not DWORD_PTR
     NET_API_STATUS s;
-    // Hard progress backstop: the cap check below only trips once `out` grows, so a
-    // (pathological) provider returning ERROR_MORE_DATA without advancing `resume`
-    // and yielding only skipped rows could otherwise spin. Real result sets need
-    // far fewer than this many pages; exceeding it means no forward progress.
+    // Hard progress backstop: a (pathological) provider returning
+    // ERROR_MORE_DATA without advancing `resume` and yielding only skipped
+    // rows could otherwise spin forever (collect_sessions's cap throw only
+    // trips once `out` actually grows, which a no-progress page never does).
+    // Real result sets need far fewer than this many pages; exceeding it
+    // means no forward progress.
     constexpr unsigned kMaxPages = 4096;
     unsigned pages = 0;
     do {
@@ -723,17 +739,18 @@ NET_API_STATUS enum_sessions_level(DWORD level, LPWSTR INFO::*cname, LPWSTR INFO
                            MAX_PREFERRED_LENGTH, &read, &total, &resume);
         NetApiBufGuard g{buf};
         if (s == NERR_Success || s == ERROR_MORE_DATA)
-            collect_sessions<INFO>(buf, read, out, cname, uname); // caps internally
-        if (out.size() >= kMapDriveEntryCap) {
-            static std::atomic<bool> warned{false};
-            warn_capped(warned, "inbound", kMapDriveEntryCap);
-            return s;
-        }
+            collect_sessions<INFO>(buf, read, out, cname, uname); // throws on cap (round 3)
         if (s == ERROR_MORE_DATA && (read == 0 || ++pages >= kMaxPages)) {
+            // round 3 (B3-001): a stalled pager silently returned a partial
+            // inbound list before -- that partial `out` would then be
+            // combined with outbound and diffed/persisted as though it were
+            // the complete snapshot. Throw instead, same contract as every
+            // other incomplete-capture path in this file.
             spdlog::warn("TAR mapdrive: NetSessionEnum paging made no progress — stopping "
                          "(read={}, pages={})",
                          read, pages);
-            break; // no forward progress — bail rather than spin
+            throw yuzu::tar::IncompleteCaptureError(
+                "TAR: NetSessionEnum paging made no progress");
         }
     } while (s == ERROR_MORE_DATA);
     return s;
@@ -976,9 +993,17 @@ void enum_registry_outbound_history(std::vector<MapDriveHistoryRow>& out) {
 
 std::vector<MapDriveEntry> enumerate_mapdrive() {
     std::vector<MapDriveEntry> out;
+    // round 3 (B3-001): the mapdrive snapshot is a COMBINED outbound+inbound
+    // result, so inbound is ALWAYS collected too, never skipped because
+    // outbound alone already used up (or came close to) the cap. Both
+    // enum_wnet_outbound and enum_netsession_inbound now throw internally
+    // the moment the shared `out` vector would exceed kMapDriveEntryCap
+    // (would_exceed_cap, checked before every push), so this function
+    // either returns the complete combined snapshot or never returns at all
+    // for this tick -- there is no path back to the caller with a partial
+    // `out`.
     enum_wnet_outbound(out);
-    if (out.size() < kMapDriveEntryCap)
-        enum_netsession_inbound(out);
+    enum_netsession_inbound(out);
     return out;
 }
 
@@ -1023,7 +1048,7 @@ std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
         spdlog::error("TAR: mapdrive historical backfill incomplete (wevtutil {}) -- backfill "
                       "left undone, retried on restart",
                       status.reason);
-        throw std::runtime_error("TAR: wevtutil capture incomplete: " + status.reason);
+        throw yuzu::tar::IncompleteCaptureError("TAR: wevtutil capture incomplete: " + status.reason);
     }
     auto inbound = parse_win_security_logons(run.output);
     rows.insert(rows.end(), inbound.begin(), inbound.end());
@@ -1062,17 +1087,28 @@ std::vector<MapDriveEntry> enumerate_mapdrive() {
             spdlog::error("TAR: mapdrive snapshot incomplete (smbstatus {}) -- skipping diff, "
                           "retaining previous baseline",
                           status.reason);
-            throw std::runtime_error("TAR: smbstatus capture incomplete: " + status.reason);
+            throw yuzu::tar::IncompleteCaptureError("TAR: smbstatus capture incomplete: " + status.reason);
         }
         inbound = parse_smbstatus(run.output);
     }
     out.insert(out.end(), inbound.begin(), inbound.end());
+    // round 3 (B3-001): this is the COMBINED outbound(/proc/mounts)+inbound
+    // (smbstatus) snapshot, checked only after both directions are known --
+    // silently resizing here (the pre-fix behaviour) discarded real mounts
+    // from the combined result without telling the caller, which then
+    // diffed/persisted the truncated vector as though it were complete.
+    // Throw instead, same contract as every other capped/failed leg in this
+    // file: the caller (collect_or_retain) skips this tick's diff/state
+    // advance and retains the previous baseline.
     if (out.size() > kMapDriveEntryCap) {
         static std::atomic<bool> warned{false};
         if (!warned.exchange(true))
             spdlog::warn("TAR mapdrive: live cap {} reached — truncating (repeats suppressed)",
                          kMapDriveEntryCap);
-        out.resize(kMapDriveEntryCap);
+        spdlog::warn("TAR mapdrive: snapshot incomplete (entry cap reached) -- skipping diff, "
+                     "retaining previous baseline");
+        throw yuzu::tar::IncompleteCaptureError(
+            std::format("TAR: mapdrive entry cap {} reached", kMapDriveEntryCap));
     }
     return out;
 }
@@ -1112,7 +1148,7 @@ std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
                 spdlog::error("TAR: mapdrive historical backfill incomplete (journalctl {}) -- "
                               "backfill left undone, retried on restart",
                               status.reason);
-                throw std::runtime_error("TAR: journalctl capture incomplete: " + status.reason);
+                throw yuzu::tar::IncompleteCaptureError("TAR: journalctl capture incomplete: " + status.reason);
             }
             logs = run.output;
         }
@@ -1187,7 +1223,7 @@ std::vector<MapDriveEntry> enumerate_mapdrive() {
         // enumerate_services()/the Linux+Windows enumerate_mapdrive() legs.
         spdlog::warn(
             "TAR mapdrive: getfsstat failed -- skipping diff, retaining previous baseline");
-        throw std::runtime_error("TAR: getfsstat failed");
+        throw yuzu::tar::IncompleteCaptureError("TAR: getfsstat failed");
     }
 
     // remote_host_of is injected so the pure classifier
@@ -1207,7 +1243,7 @@ std::vector<MapDriveEntry> enumerate_mapdrive() {
         // guards against. Skip this tick's diff/state advance too (BR-002).
         spdlog::warn("TAR mapdrive: snapshot incomplete (entry cap reached) -- skipping diff, "
                      "retaining previous baseline");
-        throw std::runtime_error(std::format("TAR: mapdrive entry cap {} reached", kMapDriveEntryCap));
+        throw yuzu::tar::IncompleteCaptureError(std::format("TAR: mapdrive entry cap {} reached", kMapDriveEntryCap));
     }
     return out;
 }
