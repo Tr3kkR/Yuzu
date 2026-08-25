@@ -1499,8 +1499,9 @@ private:
         }
 
         // ARP diff (ADR-0015). Opt-in: default_enabled=false in the registry, so
-        // source_enabled returns false until an operator turns it on. Windows-only
-        // collector today (enumerate_arp returns {} elsewhere). Non-fatal on insert
+        // source_enabled returns false until an operator turns it on. Implemented
+        // on Windows, Linux, and macOS -- see the registry (tar_schema_registry.cpp)
+        // for the platform-specific field constraints. Non-fatal on insert
         // failure — the always-on legs above already committed, so a failure here
         // must not misreport a healthy tick; the diff baseline is advanced ONLY on
         // success so a failed insert retries the same deltas next tick.
@@ -1826,22 +1827,40 @@ private:
 
         // Service diff (C6: check insert return)
         if (source_enabled(*db_, "service")) {
-            const std::string svc_key{yuzu::tar::diff_state_key("service")}; // #538
-            auto current = yuzu::tar::enumerate_services();
-            auto prev_json = db_->get_state(svc_key);
-            auto previous = json_to_services(prev_json);
-
-            auto typed = yuzu::tar::compute_service_events(previous, current, ts, snap_id);
-            if (!typed.empty()) {
-                if (!db_->insert_service_events(typed)) {
-                    spdlog::error("TAR: failed to insert service events, skipping state save");
-                    ctx.write_output("error|service insert failed");
-                    return 1;
-                }
-                total_events += static_cast<int>(typed.size());
+            // enumerate_services() throws when the underlying capture (systemctl/
+            // launchctl via run_bounded_subprocess) didn't genuinely complete --
+            // spawn failure, deadline, output-cap truncation, or non-zero exit
+            // (tar_service_collector.cpp, tar_capture_status.hpp). A partial
+            // service list must never be diffed against the last COMPLETE
+            // snapshot (it would manufacture false stopped/started events) or
+            // replace it as the new baseline -- so on a throw, skip this tick's
+            // diff and state-advance entirely and retry next tick, exactly the
+            // same "leave state untouched, retry" contract already used for the
+            // mapdrive historical backfill (init(), enumerate_mapdrive_history).
+            std::optional<std::vector<yuzu::tar::ServiceInfo>> current;
+            try {
+                current = yuzu::tar::enumerate_services();
+            } catch (const std::exception& e) {
+                spdlog::warn("TAR: service snapshot incomplete ({}) -- retaining baseline",
+                             e.what());
             }
+            if (current) {
+                const std::string svc_key{yuzu::tar::diff_state_key("service")}; // #538
+                auto prev_json = db_->get_state(svc_key);
+                auto previous = json_to_services(prev_json);
 
-            db_->set_state(svc_key, services_to_json(current).dump());
+                auto typed = yuzu::tar::compute_service_events(previous, *current, ts, snap_id);
+                if (!typed.empty()) {
+                    if (!db_->insert_service_events(typed)) {
+                        spdlog::error("TAR: failed to insert service events, skipping state save");
+                        ctx.write_output("error|service insert failed");
+                        return 1;
+                    }
+                    total_events += static_cast<int>(typed.size());
+                }
+
+                db_->set_state(svc_key, services_to_json(*current).dump());
+            }
         }
 
         // User diff
@@ -1921,20 +1940,33 @@ private:
         // retries the same deltas next tick. The one-time historical backfill is
         // separate (init, mapdrive_backfill_done) and does not touch this baseline.
         if (source_enabled(*db_, "mapdrive")) {
-            const std::string md_key{yuzu::tar::diff_state_key("mapdrive")}; // #538
-            auto current = yuzu::tar::enumerate_mapdrive();
-            auto previous = json_to_mapdrive(db_->get_state(md_key));
-            auto typed = yuzu::tar::compute_mapdrive_events(previous, current, ts, snap_id);
-            bool ok = true;
-            if (!typed.empty()) {
-                ok = db_->insert_mapdrive_events(typed);
-                if (ok)
-                    total_events += static_cast<int>(typed.size());
-                else
-                    spdlog::error("TAR: mapdrive insert failed this tick (state not advanced)");
+            // enumerate_mapdrive() throws when its underlying subprocess capture
+            // (smbstatus on Linux) didn't genuinely complete -- same contract as
+            // enumerate_services() above. Skip the whole tick's diff/state-advance
+            // on a throw rather than diff a partial snapshot against the last
+            // COMPLETE one.
+            std::optional<std::vector<yuzu::tar::MapDriveEntry>> current;
+            try {
+                current = yuzu::tar::enumerate_mapdrive();
+            } catch (const std::exception& e) {
+                spdlog::warn("TAR: mapdrive snapshot incomplete ({}) -- retaining baseline",
+                             e.what());
             }
-            if (ok)
-                db_->set_state(md_key, mapdrive_to_json(current).dump());
+            if (current) {
+                const std::string md_key{yuzu::tar::diff_state_key("mapdrive")}; // #538
+                auto previous = json_to_mapdrive(db_->get_state(md_key));
+                auto typed = yuzu::tar::compute_mapdrive_events(previous, *current, ts, snap_id);
+                bool ok = true;
+                if (!typed.empty()) {
+                    ok = db_->insert_mapdrive_events(typed);
+                    if (ok)
+                        total_events += static_cast<int>(typed.size());
+                    else
+                        spdlog::error("TAR: mapdrive insert failed this tick (state not advanced)");
+                }
+                if (ok)
+                    db_->set_state(md_key, mapdrive_to_json(*current).dump());
+            }
         }
 
         // Legacy purge removed — retention is now handled by run_retention() in rollup action

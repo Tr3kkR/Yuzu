@@ -28,9 +28,11 @@
 #include <windows.h>
 #include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #else
+#include "tar_capture_status.hpp" // yuzu::tar::classify_subprocess_capture
 #include "tar_service_parsers.hpp" // yuzu::tar::{parse_systemctl_list_units,parse_launchctl_list}
 
 #include <chrono>
+#include <stdexcept>
 
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess / probe_tool_path (ADR-3002 rung 2)
 #endif
@@ -145,8 +147,9 @@ std::vector<ServiceInfo> enumerate_services() {
     // preserves today's degrade contract (previously a null pipe-open).
     auto systemctl_path = yuzu::agent::probe_tool_path({"/usr/bin/systemctl", "/bin/systemctl"});
     if (systemctl_path.empty()) {
-        spdlog::error("TAR: failed to run systemctl for service enumeration (systemctl not found)");
-        return {};
+        spdlog::error("TAR: service snapshot incomplete (systemctl not found) -- skipping diff, "
+                      "retaining previous baseline");
+        throw std::runtime_error("TAR: systemctl not found");
     }
 
     // Bounded, fork-lock-covered, shell-free argv exec (ADR-3002 rung 2): no
@@ -158,9 +161,19 @@ std::vector<ServiceInfo> enumerate_services() {
     auto res = yuzu::agent::run_bounded_subprocess(
         {systemctl_path, "list-units", "--type=service", "--all", "--no-pager", "--no-legend"},
         yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{10}});
-    if (!res.tool_ran) {
-        spdlog::error("TAR: failed to run systemctl for service enumeration (spawn failed)");
-        return {};
+    // zero_exit_required=true verified live (Docker jrei/systemd-ubuntu:22.04,
+    // amd64 emulation): `systemctl list-units --type=service --all --no-legend
+    // --no-pager` exits 0 both on a healthy system AND with a failed unit
+    // present (`systemctl is-system-running` reporting "degraded") -- listing
+    // is a query, not a health check, so a real stopped/failed service is
+    // reported via its row's own status column, never via a non-zero exit.
+    auto status = yuzu::tar::classify_subprocess_capture(res.tool_ran, res.timed_out,
+                                                          res.output_truncated, res.exit_code);
+    if (!status.complete) {
+        spdlog::error("TAR: service snapshot incomplete (systemctl {}) -- skipping diff, "
+                      "retaining previous baseline",
+                      status.reason);
+        throw std::runtime_error("TAR: systemctl capture incomplete: " + status.reason);
     }
 
     return parse_systemctl_list_units(res.lines);
@@ -178,8 +191,9 @@ std::vector<ServiceInfo> enumerate_services() {
     // null pipe-open).
     auto launchctl_path = yuzu::agent::probe_tool_path({"/bin/launchctl"});
     if (launchctl_path.empty()) {
-        spdlog::error("TAR: failed to run launchctl for service enumeration (launchctl not found)");
-        return {};
+        spdlog::error("TAR: service snapshot incomplete (launchctl not found) -- skipping diff, "
+                      "retaining previous baseline");
+        throw std::runtime_error("TAR: launchctl not found");
     }
 
     // Bounded, fork-lock-covered, shell-free argv exec (ADR-3002 rung 2):
@@ -189,9 +203,15 @@ std::vector<ServiceInfo> enumerate_services() {
     // (tar_service_parsers.hpp), unit-testable independent of the runner.
     auto res = yuzu::agent::run_bounded_subprocess(
         {launchctl_path, "list"}, yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{10}});
-    if (!res.tool_ran) {
-        spdlog::error("TAR: failed to run launchctl for service enumeration (spawn failed)");
-        return {};
+    // zero_exit_required=true verified live on this host: `launchctl list`
+    // exits 0 (511 jobs listed, including third-party agents/daemons).
+    auto status = yuzu::tar::classify_subprocess_capture(res.tool_ran, res.timed_out,
+                                                          res.output_truncated, res.exit_code);
+    if (!status.complete) {
+        spdlog::error("TAR: service snapshot incomplete (launchctl {}) -- skipping diff, "
+                      "retaining previous baseline",
+                      status.reason);
+        throw std::runtime_error("TAR: launchctl capture incomplete: " + status.reason);
     }
 
     return parse_launchctl_list(res.lines);

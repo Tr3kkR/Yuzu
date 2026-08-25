@@ -25,6 +25,7 @@
 // redact_cmdline (cmdline-only; it would mangle UNC paths) — opt-in + audit is
 // the protection, exactly as dns_live does for visited domains.
 
+#include "tar_capture_status.hpp" // classify_subprocess_capture
 #include "tar_collectors.hpp"
 
 #include <yuzu/agent/subprocess_runner.hpp> // run_bounded_subprocess (rung 2 argv sites)
@@ -39,6 +40,7 @@
 #include <fstream>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -1005,6 +1007,23 @@ std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
     auto run = yuzu::agent::run_bounded_subprocess(
         argv, yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(15),
                                              .output_cap_bytes = 8u * 1024 * 1024});
+    // zero_exit_required=true is ASSUMED from documented wevtutil behaviour
+    // (`wevtutil qe` exits 0 on a successful query including zero matching
+    // events, non-zero on a channel/query error), NOT independently verified
+    // on a live Windows host in this session. A partial capture here must
+    // not be recorded as "no historical inbound mappings" -- throwing
+    // propagates to init()'s existing enumerate_mapdrive_history() try/catch
+    // (tar_plugin.cpp), which leaves mapdrive_backfill_done unset so the next
+    // restart retries the whole one-time backfill rather than permanently
+    // losing the inbound leg.
+    auto status = yuzu::tar::classify_subprocess_capture(run.tool_ran, run.timed_out,
+                                                          run.output_truncated, run.exit_code);
+    if (!status.complete) {
+        spdlog::error("TAR: mapdrive historical backfill incomplete (wevtutil {}) -- backfill "
+                      "left undone, retried on restart",
+                      status.reason);
+        throw std::runtime_error("TAR: wevtutil capture incomplete: " + status.reason);
+    }
     auto inbound = parse_win_security_logons(run.output);
     rows.insert(rows.end(), inbound.begin(), inbound.end());
     return dedup_history(std::move(rows));
@@ -1030,6 +1049,20 @@ std::vector<MapDriveEntry> enumerate_mapdrive() {
             std::vector<std::string>{tool, "-b"},
             yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(10),
                                            .output_cap_bytes = 8u * 1024 * 1024});
+        // zero_exit_required=true verified live (Docker dperson/samba, Alpine
+        // Samba 4.13.7): `smbstatus -b` exits 0 both with an active session
+        // listed and with none connected -- an incomplete run here must not
+        // be diffed (this feeds the LIVE mapdrive snapshot, not history), so
+        // throw and let the caller skip the whole tick's diff/baseline
+        // advance rather than record a partial inbound session list.
+        auto status = yuzu::tar::classify_subprocess_capture(
+            run.tool_ran, run.timed_out, run.output_truncated, run.exit_code);
+        if (!status.complete) {
+            spdlog::error("TAR: mapdrive snapshot incomplete (smbstatus {}) -- skipping diff, "
+                          "retaining previous baseline",
+                          status.reason);
+            throw std::runtime_error("TAR: smbstatus capture incomplete: " + status.reason);
+        }
         inbound = parse_smbstatus(run.output);
     }
     out.insert(out.end(), inbound.begin(), inbound.end());
@@ -1061,6 +1094,25 @@ std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
                                          "-n", "5000"},
                 yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(15),
                                                .output_cap_bytes = 8u * 1024 * 1024});
+            // zero_exit_required=true verified live (Docker jrei/systemd-ubuntu:22.04,
+            // amd64 emulation, real journald): `journalctl -u <unit> --no-pager
+            // -o short-iso -n 5000` exits 0 for a non-existent unit and for a
+            // unit with zero matching entries alike ("-- No entries --" on
+            // stdout, exit 0) -- it only returns non-zero on a genuine error
+            // (bad options, journal corruption, permission denial). This is the
+            // sole inbound-history source when log.smbd is absent, so an
+            // incomplete run here must not silently become "no inbound
+            // history" -- throwing propagates to init()'s existing
+            // enumerate_mapdrive_history() try/catch (tar_plugin.cpp), which
+            // leaves mapdrive_backfill_done unset so the next restart retries.
+            auto status = yuzu::tar::classify_subprocess_capture(
+                run.tool_ran, run.timed_out, run.output_truncated, run.exit_code);
+            if (!status.complete) {
+                spdlog::error("TAR: mapdrive historical backfill incomplete (journalctl {}) -- "
+                              "backfill left undone, retried on restart",
+                              status.reason);
+                throw std::runtime_error("TAR: journalctl capture incomplete: " + status.reason);
+            }
             logs = run.output;
         }
     }
