@@ -2213,9 +2213,8 @@ policies and fleet compliance percentage.
 /api/config/:key` (retention windows, `log_level`, DEX alert-routing knobs, and the
 `oidc_*` OIDC parameters) — moves from the SQLite `runtime-config.db` file to the
 server's PostgreSQL substrate in this release, schema `runtime_config_store`. This is
-the last store started on the Postgres migration ladder; `WebhookStore`,
-`InstructionStore`, and `OffloadTargetStore` are in flight in parallel and not yet
-merged as of this note.
+the last store started on the Postgres migration ladder. `WebhookStore` has since merged;
+`InstructionStore` and `OffloadTargetStore` remain not yet started as of this note.
 
 - **Your stored overrides do NOT carry over.** Per ADR-0009's fresh-start-by-default
   amendment, the legacy `runtime-config.db` is never read on this cutover — no

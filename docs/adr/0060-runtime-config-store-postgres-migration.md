@@ -15,7 +15,10 @@ builds-on: ADR-0006 (Postgres substrate), ADR-0007 (single-backend, no SQLite fa
 related: docs/postgres-migration-ladder.md (Wave 3 -> Done, last row); ADR-3005
   (`PluginConfigStore`, the precedent for a shared config namespace where only SOME
   entries are secret); AuthDB `mfa_totp_secret` (the precedent for a secret column most
-  rows never populate)
+  rows never populate); ADR-0057 (`WebhookStore`, the nullable-column-plus-flag shape
+  considered and rejected for this store's different problem — see Considered and
+  rejected); ADR-0039 (`ResponseStore`, the skippable-backfill reference shape this
+  migration follows)
 ---
 
 # 0060 — `RuntimeConfigStore` Postgres migration (per-key secrecy, last store on the ladder)
@@ -36,8 +39,10 @@ header comment.
 This is the LAST un-started store on `docs/postgres-migration-ladder.md`'s Wave 3 (secret-gated)
 table — every other server store either has already migrated to Postgres or is in flight
 (`WebhookStore`/ADR-0057, `InstructionStore`/ADR-0058, `OffloadTargetStore`/ADR-0059, all pending
-review at the time of this ADR, and not part of this change). Once all four land, every server
-store is on the Postgres substrate (NvdDatabase excluded by a recorded owner override, M1a).
+review at the time of this ADR was drafted, and not part of this change; `WebhookStore`/ADR-0057
+has since merged, `InstructionStore`/ADR-0058 and `OffloadTargetStore`/ADR-0059 remain not yet
+started). Once all four land, every server store is on the Postgres substrate (NvdDatabase
+excluded by a recorded owner override, M1a).
 
 **The headline problem this ADR resolves is per-KEY, not per-column, secrecy.** Unlike
 `WebhookStore`/`OffloadTargetStore` (one secret column per row) or `AuthDB` (one secret column,
@@ -203,6 +208,14 @@ startup error (`startup_failed_ = true`), never a serve-degraded config plane.
   branching at every read/write call site that a table split gets for free via presence, AND it
   would have been a NOVEL discrimination scheme on the ladder rather than reusing an
   already-reviewed, already-merged one.
+- **`WebhookStore`'s (ADR-0057, merged after this ADR was drafted) `has_secret BOOLEAN` +
+  nullable `secret BYTEA` + `CHECK` constraint shape** — structurally the same family as the
+  nullable-column sketch above, confirmed once ADR-0057 actually merged. It is the RIGHT choice
+  for webhook's problem (every row is the SAME kind of thing — a webhook — with one secret column
+  that is legitimately null for an unsigned webhook) but does not fit this store's problem: a bare
+  `IS NOT NULL`/flag check cannot distinguish "this key's plaintext config value" from "that key's
+  ciphertext" when MANY DIFFERENT keys share one `value` column, which is exactly why
+  `PluginConfigStore`'s table split remains the correct precedent here, not `WebhookStore`'s.
 - **Widening `get_value()`/`get_value_with_secrets()` to `std::expected`.** Rejected as
   disproportionate — no live call site feeds a security decision (verified above), and widening
   would touch ~15 call sites across `server.cpp`/`settings_routes.cpp` and two test files for no
