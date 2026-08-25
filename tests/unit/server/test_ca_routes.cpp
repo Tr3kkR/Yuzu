@@ -12,6 +12,7 @@
 
 #include "ca_routes.hpp"
 #include "ca_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
@@ -31,16 +32,35 @@ using json = nlohmann::json;
 
 namespace {
 
+// Shared with test_ca_store.cpp's "castore" key — identical setup, replay-verified by the
+// PgTestTemplate registry (docs/postgres-store-playbook.md step 7).
+yuzu::test::PgTestTemplate ca_routes_store_tpl{
+    "castore", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        CaStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("ca_store template: store failed to migrate");
+    }};
+
 struct AuditRow {
     std::string action, result, target_type, target_id, detail;
 };
 
 // Wires CaRoutes against an in-process sink with a real CaStore + fakes for
 // perm/audit/CRL. `perm_allow` toggles the permission gate; audit rows are
-// captured; `crl_calls` counts publish_crl_fn invocations.
+// captured; `crl_calls` counts publish_crl_fn invocations. Owns its own PgPool
+// (fixture-owned std::optional<PgPool> per the playbook's high-volume-file pattern) so every
+// TEST_CASE's `Harness h;` gets an independent, freshly-cloned `ca_store` schema.
 struct Harness {
-    yuzu::test::TempDbFile db{std::string_view{"ca-routes-"}};
-    std::unique_ptr<CaStore> store{std::make_unique<CaStore>(db.path)};
+    // Declared FIRST (constructed first, destroyed LAST): the cloned database must outlive
+    // pool_holder/store, which hold live connections to it. A constructor-LOCAL PostgresTestDb
+    // would be destroyed at the end of the constructor body — its destructor drops the database
+    // WITH (FORCE), which terminates every connection still open on it, including pool_holder's
+    // — silently breaking the store immediately after construction (#observed: every request
+    // returned 503 as if the store had never opened).
+    std::optional<yuzu::test::PostgresTestDb> db_holder;
+    std::optional<pg::PgPool> pool_holder;
+    std::unique_ptr<CaStore> store;
     test::TestRouteSink sink;
     std::vector<AuditRow> audits;
     bool perm_allow{true};
@@ -59,6 +79,20 @@ struct Harness {
     std::string last_import_intermediate;
     std::string last_import_chain;
     int import_calls{0};
+
+    Harness() {
+        // Hand-expanded YUZU_REQUIRE_PG_DB_TPL (that macro declares its own function-local
+        // `var`, which cannot become a class member — see db_holder's doc comment above for
+        // why this must persist past construction).
+        if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+            SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+        }
+        db_holder.emplace(ca_routes_store_tpl);
+        INFO("[Harness] fixture status (blank == database came up OK): " << db_holder->error());
+        REQUIRE(db_holder->available());
+        pool_holder.emplace(pg::PgPool::Options{.conninfo = db_holder->dsn(), .size = 4});
+        store = std::make_unique<CaStore>(*pool_holder);
+    }
 
     void wire(bool null_store = false) {
         CaRoutes routes;
@@ -128,7 +162,7 @@ IssuedCertRecord sample_issued(const std::string& serial) {
 
 } // namespace
 
-TEST_CASE("ca_routes: GET /ca/root serves PEM, 404 with no root", "[ca_routes][pki]") {
+TEST_CASE("ca_routes: GET /ca/root serves PEM, 404 with no root", "[ca_routes][pki][pg]") {
     Harness h;
     h.wire();
     auto r404 = h.sink.Get("/api/v1/ca/root");
@@ -143,7 +177,7 @@ TEST_CASE("ca_routes: GET /ca/root serves PEM, 404 with no root", "[ca_routes][p
     REQUIRE(ok->get_header_value("Content-Type") == "application/x-pem-file");
 }
 
-TEST_CASE("ca_routes: GET /ca/root is public (no perm gate)", "[ca_routes][pki][security]") {
+TEST_CASE("ca_routes: GET /ca/root is public (no perm gate)", "[ca_routes][pki][security][pg]") {
     Harness h;
     REQUIRE(h.store->set_root(sample_root()));
     h.perm_allow = false; // would block a gated route
@@ -153,7 +187,7 @@ TEST_CASE("ca_routes: GET /ca/root is public (no perm gate)", "[ca_routes][pki][
     REQUIRE(ok->status == 200); // root is public — perm_fn is never consulted
 }
 
-TEST_CASE("ca_routes: GET /ca/issued requires Security:Read", "[ca_routes][pki][security]") {
+TEST_CASE("ca_routes: GET /ca/issued requires Security:Read", "[ca_routes][pki][security][pg]") {
     Harness h;
     REQUIRE(h.store->set_root(sample_root()));
     REQUIRE(h.store->record_issued(sample_issued("DEAD")));
@@ -180,7 +214,7 @@ TEST_CASE("ca_routes: GET /ca/issued requires Security:Read", "[ca_routes][pki][
     REQUIRE(denied->status == 403);
 }
 
-TEST_CASE("ca_routes: POST /ca/revoke flow", "[ca_routes][pki][security]") {
+TEST_CASE("ca_routes: POST /ca/revoke flow", "[ca_routes][pki][security][pg]") {
     Harness h;
     REQUIRE(h.store->set_root(sample_root()));
     REQUIRE(h.store->record_issued(sample_issued("DEAD")));
@@ -237,7 +271,7 @@ TEST_CASE("ca_routes: POST /ca/revoke flow", "[ca_routes][pki][security]") {
 }
 
 TEST_CASE("ca_routes: GET /ca/crl serves latest-or-503, never builds on the public path",
-          "[ca_routes][pki][security]") {
+          "[ca_routes][pki][security][pg]") {
     Harness h;
     REQUIRE(h.store->set_root(sample_root()));
     h.wire();
@@ -265,7 +299,7 @@ TEST_CASE("ca_routes: GET /ca/crl serves latest-or-503, never builds on the publ
     REQUIRE(served->body.size() == 3);
 }
 
-TEST_CASE("ca_routes: /ca/root sets download + cache headers", "[ca_routes][pki]") {
+TEST_CASE("ca_routes: /ca/root sets download + cache headers", "[ca_routes][pki][pg]") {
     Harness h;
     REQUIRE(h.store->set_root(sample_root()));
     h.wire();
@@ -276,7 +310,7 @@ TEST_CASE("ca_routes: /ca/root sets download + cache headers", "[ca_routes][pki]
     REQUIRE(ok->get_header_value("Cache-Control").find("max-age") != std::string::npos);
 }
 
-TEST_CASE("ca_routes: revoke validates serial + bounds the body", "[ca_routes][pki][security]") {
+TEST_CASE("ca_routes: revoke validates serial + bounds the body", "[ca_routes][pki][security][pg]") {
     Harness h;
     REQUIRE(h.store->set_root(sample_root()));
     REQUIRE(h.store->record_issued(sample_issued("DEAD")));
@@ -313,7 +347,7 @@ TEST_CASE("ca_routes: revoke validates serial + bounds the body", "[ca_routes][p
     REQUIRE(h.store->is_revoked("DEAD"));
 }
 
-TEST_CASE("ca_routes: revoke succeeds but CRL republish fails is audited", "[ca_routes][pki]") {
+TEST_CASE("ca_routes: revoke succeeds but CRL republish fails is audited", "[ca_routes][pki][pg]") {
     Harness h;
     REQUIRE(h.store->set_root(sample_root()));
     REQUIRE(h.store->record_issued(sample_issued("DEAD")));
@@ -340,7 +374,7 @@ TEST_CASE("ca_routes: revoke succeeds but CRL republish fails is audited", "[ca_
 }
 
 TEST_CASE("ca_routes: a dropped audit row on a successful revoke sets Sec-Audit-Failed (#1240 M2)",
-          "[ca_routes][pki][security]") {
+          "[ca_routes][pki][security][pg]") {
     // The AuditFn is bool-returning; a privileged revoke whose audit row fails to
     // persist must signal the evidence-chain gap to the operator (Sec-Audit-Failed)
     // while the revoke itself still stands. Without a test, a regression in the
@@ -359,7 +393,7 @@ TEST_CASE("ca_routes: a dropped audit row on a successful revoke sets Sec-Audit-
     REQUIRE(ok->get_header_value("Sec-Audit-Failed") == "true"); // gap surfaced
 }
 
-TEST_CASE("ca_routes: /ca/issued pagination params are accepted + clamped", "[ca_routes][pki]") {
+TEST_CASE("ca_routes: /ca/issued pagination params are accepted + clamped", "[ca_routes][pki][pg]") {
     Harness h;
     REQUIRE(h.store->set_root(sample_root()));
     REQUIRE(h.store->record_issued(sample_issued("AA01")));
@@ -374,7 +408,7 @@ TEST_CASE("ca_routes: /ca/issued pagination params are accepted + clamped", "[ca
 }
 
 TEST_CASE("ca_routes: dashboard fragment renders, gated, and HTML-escapes (PR4b)",
-          "[ca_routes][pki][security]") {
+          "[ca_routes][pki][security][pg]") {
     Harness h;
     REQUIRE(h.store->set_root(sample_root()));
     // A cert whose subject carries an XSS payload — must be escaped in the table.
@@ -405,7 +439,7 @@ TEST_CASE("ca_routes: dashboard fragment renders, gated, and HTML-escapes (PR4b)
 }
 
 TEST_CASE("ca_routes: dashboard revoke wrapper revokes + re-renders (PR4b)",
-          "[ca_routes][pki][security]") {
+          "[ca_routes][pki][security][pg]") {
     Harness h;
     REQUIRE(h.store->set_root(sample_root()));
     REQUIRE(h.store->record_issued(sample_issued("DEAD")));
@@ -442,7 +476,7 @@ TEST_CASE("ca_routes: dashboard revoke wrapper revokes + re-renders (PR4b)",
 }
 
 TEST_CASE("ca_routes: /ca/issued reports has_more + next_offset across pages",
-          "[ca_routes][pki]") {
+          "[ca_routes][pki][pg]") {
     Harness h;
     REQUIRE(h.store->set_root(sample_root()));
     // Three distinct issued certs; page through them two at a time.
@@ -482,7 +516,7 @@ TEST_CASE("ca_routes: /ca/issued reports has_more + next_offset across pages",
     REQUIRE(je["meta"]["has_more"] == false);
 }
 
-TEST_CASE("ca_routes: 503 when CA store unavailable", "[ca_routes][pki]") {
+TEST_CASE("ca_routes: 503 when CA store unavailable", "[ca_routes][pki][pg]") {
     Harness h;
     h.wire(/*null_store=*/true);
     for (const char* path : {"/api/v1/ca/root", "/api/v1/ca/crl", "/api/v1/ca/issued",
@@ -503,7 +537,7 @@ TEST_CASE("ca_routes: 503 when CA store unavailable", "[ca_routes][pki]") {
 // ── PR6 subordinate-CA REST ─────────────────────────────────────────────────
 
 TEST_CASE("ca_routes: GET /ca/root-csr exports a CSR, gated Security:Read, audited",
-          "[ca_routes][pki][subordinate][security]") {
+          "[ca_routes][pki][subordinate][security][pg]") {
     Harness h;
     REQUIRE(h.store->set_root(sample_root()));
     h.wire();
@@ -535,7 +569,7 @@ TEST_CASE("ca_routes: GET /ca/root-csr exports a CSR, gated Security:Read, audit
 }
 
 TEST_CASE("ca_routes: POST /ca/import-chain validates body + maps outcomes + audits",
-          "[ca_routes][pki][subordinate][security]") {
+          "[ca_routes][pki][subordinate][security][pg]") {
     Harness h;
     REQUIRE(h.store->set_root(sample_root()));
     h.wire();
@@ -613,7 +647,7 @@ TEST_CASE("ca_routes: POST /ca/import-chain validates body + maps outcomes + aud
 }
 
 TEST_CASE("ca_routes: dashboard fragment shows trust mode + subordinate controls (PR6)",
-          "[ca_routes][pki][subordinate]") {
+          "[ca_routes][pki][subordinate][pg]") {
     Harness h;
     REQUIRE(h.store->set_root(sample_root())); // builtin
     h.wire();
@@ -627,7 +661,7 @@ TEST_CASE("ca_routes: dashboard fragment shows trust mode + subordinate controls
 }
 
 TEST_CASE("ca_routes: dashboard import wrapper enforces CSRF + Security:Write (PR6)",
-          "[ca_routes][pki][subordinate][security]") {
+          "[ca_routes][pki][subordinate][security][pg]") {
     Harness h;
     REQUIRE(h.store->set_root(sample_root()));
     h.wire();
@@ -690,7 +724,7 @@ TEST_CASE("ca_routes: dashboard import wrapper enforces CSRF + Security:Write (P
 // ── PR4b dashboard panel (#1241) ────────────────────────────────────────────
 
 TEST_CASE("ca_routes: dashboard revoke refuses a cross-origin POST (H-1 CSRF)",
-          "[ca_routes][pki][security]") {
+          "[ca_routes][pki][security][pg]") {
     // H-1: the dashboard revoke is cookie-authed; SameSite=Lax does not block a
     // top-level cross-site form POST, so a forged revoke (= fleet-lockout DoS)
     // must be refused by the Origin/Referer gate + audited csrf.denied, and the
@@ -717,7 +751,7 @@ TEST_CASE("ca_routes: dashboard revoke refuses a cross-origin POST (H-1 CSRF)",
 }
 
 TEST_CASE("ca_routes: dashboard revoke with NO Origin/Referer is refused (destructive endpoint)",
-          "[ca_routes][pki][security]") {
+          "[ca_routes][pki][security][pg]") {
     // Hermes PR4b M: a browser HTMX POST always carries Origin (or Referer), so a
     // request with NEITHER on this DESTRUCTIVE cookie endpoint is treated as
     // cross-site — closing the both-empty gap a header-stripping proxy could ride.
@@ -734,7 +768,7 @@ TEST_CASE("ca_routes: dashboard revoke with NO Origin/Referer is refused (destru
 }
 
 TEST_CASE("ca_routes: dashboard revoke proceeds for a same-origin POST + re-renders the panel",
-          "[ca_routes][pki][security]") {
+          "[ca_routes][pki][security][pg]") {
     Harness h;
     REQUIRE(h.store->set_root(sample_root()));
     REQUIRE(h.store->record_issued(sample_issued("DEAD")));
@@ -755,12 +789,13 @@ TEST_CASE("ca_routes: dashboard revoke proceeds for a same-origin POST + re-rend
     REQUIRE(h.last_perm_op == "Delete");
     // The reason was recorded (UP-7).
     auto rec = h.store->get_issued("DEAD");
-    REQUIRE(rec);
-    REQUIRE(rec->revocation_reason == "decommissioned");
+    REQUIRE(rec.has_value());
+    REQUIRE(rec->has_value());
+    REQUIRE((*rec)->revocation_reason == "decommissioned");
 }
 
 TEST_CASE("ca_routes: dashboard fragment renders empty-CA + no-root states without crashing",
-          "[ca_routes][pki]") {
+          "[ca_routes][pki][pg]") {
     {
         Harness h; // no root set
         h.wire();

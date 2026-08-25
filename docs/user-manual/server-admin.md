@@ -157,12 +157,12 @@ The server stores its configuration in files located in the **same directory as 
 | `enrollment-tokens.cfg` | Legacy enrollment-token file (Tier 2). New deployments persist tokens inside `auth.db`; this file remains writable for backwards-compatibility on upgrades from pre-AuthDB releases. |
 | `pending-agents.cfg` | Queue of agents awaiting manual approval (Tier 1 enrollment). Contains agent ID, hostname, IP, and registration timestamp. |
 
-> **Backup recommendation:** Back up `auth.db` (use `sqlite3 auth.db ".backup ..."`, NEVER `cp` against a live WAL DB), `yuzu-server.cfg`, the rest of the `--data-dir` SQLite stores (including **`ca.db`** — the internal-CA inventory + CRL history), and **the entire CA/cert directory `--ca-dir`** (`default-ca.key` especially — the per-install CA private key) on the same schedule. Use the SQLite online-backup API for every `.db` file, not `cp`. **Losing `default-ca.key` forces a full fleet re-enrollment** (every agent's cert chains to that root, and the server refuses to silently re-root — see below). Losing `auth.db` AND `yuzu-server.cfg` requires re-running `--first-run-setup` to create a new admin. Losing `auth.db` alone is recoverable — see `docs/ops-runbooks/auth-db-recovery.md`. As server stores migrate to PostgreSQL (ADR-0006), a complete backup also covers the Postgres database — see [PostgreSQL Substrate](#postgresql-substrate) for the `pg_dump`/`pg_restore` procedure and the ADR-0010 restore-pairing invariant.
+> **Backup recommendation:** Back up `auth.db` (use `sqlite3 auth.db ".backup ..."`, NEVER `cp` against a live WAL DB), `yuzu-server.cfg`, the rest of the `--data-dir` SQLite stores, and **the entire CA/cert directory `--ca-dir`** (`default-ca.key` especially — the per-install CA private key) on the same schedule. Use the SQLite online-backup API for every `.db` file, not `cp`. **Losing `default-ca.key` forces a full fleet re-enrollment** (every agent's cert chains to that root, and the server refuses to silently re-root — see below). Losing `auth.db` AND `yuzu-server.cfg` requires re-running `--first-run-setup` to create a new admin. Losing `auth.db` alone is recoverable — see `docs/ops-runbooks/auth-db-recovery.md`. As server stores migrate to PostgreSQL (ADR-0006), a complete backup also covers the Postgres database — see [PostgreSQL Substrate](#postgresql-substrate) for the `pg_dump`/`pg_restore` procedure and the ADR-0010 restore-pairing invariant. **The internal-CA inventory + CRL history (`ca_store` schema, ADR-0053) is one of the migrated Postgres stores** — back it up with `pg_dump`/`pg_restore`, not as a separate local file.
 
 > **Built-in default certificates — convenience, not production.** With no `--cert`/`--key`/`--https-cert` supplied (and without `--no-default-certs`), the server generates a per-install ECDSA CA + server leaves on first boot so a fresh install is encrypted with zero config. Operational caveats:
 > - **10-year, no auto-renewal.** The server leaves do not auto-renew; the `yuzu_server_cert_expiry_timestamp_seconds{cert="default-ca"}` gauge + the `YuzuCertificateExpiringSoon`/`…Critical` alerts (`docs/prometheus/yuzu-alerts.yml`) warn ahead of expiry. **Replace defaults before production rollout** with operator-provided certs (`--cert`/`--key`, `--https-cert`/`--https-key`) or, to rotate the built-in set, clear `--ca-dir` (after backing it up) and restart.
 > - **SAN limitation.** Default leaf SANs cover `localhost`, `127.0.0.1`, `::1`, and the boot-time hostname only. Reaching the dashboard/agent listener by a LAN IP or a different FQDN needs operator-provided certs (or DNS that resolves to a covered name). A host rename invalidates the SAN — rotate the certs after renaming.
-> - **No silent re-root.** If `ca.db` already holds a CA root but the on-disk certs in `--ca-dir` are missing/corrupt (e.g. a wiped cert dir on a persistent data volume), the server **refuses to start** rather than mint a new CA that would orphan every enrolled agent. Restore `default-*.{pem,key}` from backup (matching the `ca.db` root), or remove `ca.db` too for a deliberate clean re-root.
+> - **No silent re-root.** If `ca_store` (the internal-CA Postgres store, ADR-0053) already holds a CA root but the on-disk certs in `--ca-dir` are missing/corrupt (e.g. a wiped cert dir on a persistent data volume, or ordinary later damage to an established install — a bad partial restore, a lost leaf file), the server **refuses to start** rather than mint a new CA that would orphan every enrolled agent — **unless this exact instance can prove it minted the still-incomplete root** (its local CA key file still resolves and cryptographically pairs with the stored root), in which case it resumes automatically and re-mints its own default leaves under the same root (ADR-0053). When that self-heal condition does not hold, restore `default-*.{pem,key}` from backup (matching the `ca_store` root), or perform a deliberate clean re-root by clearing `ca_store.ca_root`/`ca_issued`/`ca_crl_versions` directly against Postgres — see `docs/pki-architecture.md` "Operator runbook" for the full procedure.
 
 > **File permissions (Unix):** `auth.db` is created with mode `0600` (owner read/write only); `yuzu-server.cfg`, `enrollment-tokens.cfg`, and `pending-agents.cfg` are also `0600` after every write. No manual `chmod` is required.
 
@@ -746,6 +746,18 @@ Three operator-visible consequences:
   (the shipped systemd unit and every shipped compose file use **210 s**); 30 s
   — which suited GET alone — is the figure to move away from. Under-sizing
   SIGKILLs mid-drain and silently drops in-flight streams on deploy.
+  **Update (#3042):** the ~156 s figure above bounds a single streamed-POST
+  *call* during ordinary (non-shutdown) operation — it is not how long
+  `ServerImpl::stop()` itself waits on one. Since #3042, graceful shutdown
+  close-signals every live MCP session up front, so a streamed POST held open
+  across an ordinary `stop()` ends within about one pump tick (~3 s), not the
+  120 s cap; the underlying execution is unaffected and stays fetchable by
+  `execution_id`. What still bounds shutdown is a stream stuck mid-write to a
+  blackholed or drip-feeding peer (the 30 s write timeout) — see
+  `docs/mcp-server.md`'s Shutdown section for the current mechanism. The 210 s
+  `TimeoutStopSec` recommendation above remains a safe, comfortably
+  conservative choice; it is no longer the tight bound its original
+  derivation implied.
 - **Per-principal ceiling.** `--mcp-max-streams-per-principal` governs the GET
   channel. The streamed-POST allowance is a fixed 4 concurrent calls per
   principal — numerically the same as, but counted and enforced separately
@@ -1020,6 +1032,19 @@ two live instances briefly, or an unauthorised second server pointed at the
 same DSN. If you run single-replica, treat any sustained non-zero
 `yuzu_rotation_sweep_lock_skipped_total` as a fault to investigate, not
 background noise; see `docs/ops-runbooks/rotation-sweep-clock-guard.md`.
+
+### vNEXT — API-token rotation confirm now requires proof of possession (#3015) (breaking)
+
+**What changed.** `confirm` on a rotation — REST `POST /api/v1/tokens/{id}/confirm` and `POST /api/v1/engine-principals/{id}/credentials/confirm`, plus the MCP twins `confirm_api_token_rotation`/`confirm_engine_rotation` — previously admitted on caller identity plus the successor's `token_id` alone. A caller who recovered an unknown successor's `token_id` out-of-band (a support ticket, a log line) could confirm — and thereby revoke the predecessor for — a rotation whose secret they never received. All four confirm surfaces now additionally require the raw successor secret in the request body/args, verified with a constant-time hash comparison against the successor's stored hash, checked LAST — strictly after ownership, pair-state, the `token_id` pin, tier, scope, and the initiator binding have all already passed — before the predecessor is touched.
+
+**Who this affects.** Any caller confirming with only `token_id`: REST now returns `400` instead of succeeding; MCP returns `kInvalidParams`. A caller confirming with a *wrong* secret gets REST `403` / MCP `kPermissionDenied`. Correctly-installing automation is unaffected — the secret required here is the same raw value the `rotate` response already returns exactly once (REST `data.token`), so automation that installs the successor from that response and passes it straight to `confirm` sees no behavior change.
+
+**If you lose the rotate response before confirming,** you can no longer confirm — the secret cannot be manufactured from the `token_id` alone. Two recovery paths:
+
+1. **Wait for the automatic overlap-window sweep.** Proof of possession gates the immediate, explicit `confirm` call only — the 60-second background sweep is unaffected by this change and still auto-revokes the predecessor on its own schedule with no secret required, provided the successor secret was actually installed and presented (used) at least once.
+2. **Revoke the unknown successor and start a new rotation** (`DELETE /api/v1/tokens/{token_id}` or the engine-principal twin) — keeps the predecessor working immediately, at the cost of restarting the rotation.
+
+Full detail: [`authentication.md`](authentication.md#rotating-a-token) "Rotating a Token", [`engine-principals.md`](engine-principals.md) "Rotate the credential", and [`mcp.md`](mcp.md) rows 61/71.
 
 ### vNEXT — Guardian status routes gain real data, new denial/failure modes (#2298 item 6d) (breaking)
 
@@ -1444,6 +1469,10 @@ systemctl start yuzu-server
 **New audit actions.** `response_template.create`, `response_template.update`, `response_template.delete` — see `audit-log.md` for the failure-reason vocabulary. SIEM rules already filtering on `success`/`denied` will pick these up unchanged.
 
 **Authoring caveats.** The dashboard YAML editor's lightweight line-scanner does not extract `spec.responseTemplates` into the indexed column; author through `POST /api/v1/definitions/import` (JSON envelope) or the REST template endpoints. Imported templates with the reserved `id: __default__` are silently dropped during normalisation.
+
+### vNEXT — `initialize` can answer `503` during a graceful shutdown (#3042)
+
+With MCP streaming on, `initialize` now returns `HTTP 503` / JSON-RPC `-32015` ("Server is shutting down") for a narrow, transient window (seconds, not the deploy's whole grace period) if it lands after `ServerImpl::stop()` has begun draining live sessions. **Affected:** any MCP client integration — the reference clients and most SDKs already treat a non-2xx `initialize` as a transient failure and retry/reconnect; a client that specifically asserted "initialize never 503s" needs updating. No `retry_after_ms` is given (this process has no visibility into when a replacement instance will be reachable); reconnect and re-`initialize` once it is. A session that was already live when shutdown began instead receives a clean `notifications/yuzu.stream_closed` close frame (`reason: session_terminated`) rather than a bare connection drop — see [MCP — Troubleshooting](mcp.md#-32015-server-is-shutting-down-http-503) for the full symptom/cause/fix.
 
 ---
 
@@ -2069,6 +2098,8 @@ The server's storage substrate is **PostgreSQL** (ADR-0006/0007; the agent stays
 **Connection-pool sizing.** The server opens up to `--postgres-pool-size` / `YUZU_POSTGRES_POOL_SIZE` connections (default **16**). Each heartbeat persists last-seen with one short-lived lease (≈33/s at 1 000 agents on a 30 s heartbeat — well within 16), and `/viz/fleet` draws one. Raise the size for large fleets (rule of thumb: +1 per ~1 000 agents beyond 5 000, plus headroom per additional Postgres-backed store as they migrate) or for a slow managed-PG link. Tune against the `yuzu_pg_pool_{in_use,open,size}` gauges, the `yuzu_pg_acquire_wait_seconds` histogram (the leading saturation signal), and the `yuzu_pg_{connect_failed,acquire_timeout,unhealthy_discard}_total` counters (`unhealthy_discard` counts pooled connections dropped on a failed health probe); the bundled alert rules (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`, `YuzuPgConnectFailing` in `docs/prometheus/yuzu-alerts.yml`) fire before `/readyz` is affected. The heartbeat upsert is best-effort with a 250 ms acquire deadline, so a saturated pool degrades the stale-host display, never the live fleet.
 
 Held-open SSE streams also lease this pool: each re-validates its credential every ~3 s tick. Those reads are cached (60 s for API tokens, 15 s for the engine-principal liveness check), so steady-state cost is proportional to *distinct credentials* rather than to stream count — but the refreshes still land here alongside ordinary traffic, and a stream capacity far above the pool size is the shape that turns a brief pool blip into a correlated stall. The server warns at startup when effective SSE stream capacity exceeds 16x `--postgres-pool-size`. Treat that as a prompt to watch `yuzu_pg_acquire_wait_seconds` and `yuzu_pg_pool_in_use`, not as an instruction to enlarge the pool reflexively — adding connections against an already-struggling database makes matters worse, and lowering the stream capacity is often the better lever.
+
+**Bootstrap-time floor (default-cert generation, ADR-0053).** First-boot (or self-heal) default-cert generation takes the `yuzu:default_certs_bootstrap` Postgres advisory lock for the duration of its critical section, holding one pool lease for that whole window while the CA-store writes it performs inside the lock each draw their own nested per-call lease from the SAME pool — an N-way race at this one boot-time code path needs roughly N+1 simultaneous connections. At the allowed minimum `--postgres-pool-size=1` this is not merely "can self-contend under a race" — it fails **every** boot that needs to generate certs, deterministically, zero racers required, since the outer lease alone exhausts a pool of size 1. It fails closed and loudly (a nested-acquire timeout surfaces as an ordinary `record_issued` failure → refuse to start), never a hang or silent corruption, but a pool sized at the bare minimum for steady-state heartbeat/SSE traffic above can still be too small for this one-time bootstrap path — size for at least 2 even on the smallest deployments.
 
 **`endpoint_state` is reconstructible.** The `endpoint_state` schema (last-known offline-host display) is pure cache — the server repopulates it from heartbeats within one cycle (~30 s). A targeted restore may safely omit it; only the secret-bearing schemas and live operational data need the paired key-directory restore above.
 

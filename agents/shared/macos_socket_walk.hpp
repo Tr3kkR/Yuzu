@@ -8,15 +8,15 @@
  * remote_port) — so network_diag and ioc can migrate off their `lsof`
  * shell-outs onto rung 1 (ADR-3002) without a third hand-rolled copy.
  *
- * netstat_plugin.cpp and sockwho_plugin.cpp deliberately keep their own
- * inline copies for now — migrating them onto this header is a separate
- * follow-up PR, not folded into this one. tar_network_collector.cpp's third
- * copy of this walk is likewise deliberately out of scope here (follow-up
- * issue).
+ * netstat_plugin.cpp and tar_network_collector.cpp's macOS enumerators now
+ * both consume this header directly (#3403 dedupe, PR3.1-b) — the former
+ * inline copies are gone, so this is the single macOS socket-walk
+ * implementation in the tree. sockwho_plugin.cpp's own copy was retired
+ * along with the plugin (folded into netstat's `attribution` action).
  *
- * resolve_proc_name_path() is sourced from sockwho_plugin.cpp's macOS
- * proc_name/proc_pidpath pair (same ignore-return-value convention as the
- * source: a zero-initialized buffer that libproc left untouched reads as
+ * resolve_proc_name_path() is sourced from the retired sockwho_plugin.cpp's
+ * macOS proc_name/proc_pidpath pair (same ignore-return-value convention as
+ * the source: a zero-initialized buffer that libproc left untouched reads as
  * "unresolved", not as an error to propagate).
  */
 #pragma once

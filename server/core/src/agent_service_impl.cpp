@@ -471,7 +471,17 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
 enrolled:
     // -- Agent is enrolled -- proceed with registration --------------------------
 
-    registry_.register_agent(info);
+    // #3401 Gap 2: register_agent fails closed if the W1.5/#823 device-token revoke sweep
+    // itself errors — refuse the registration rather than install a session the sweep could
+    // not clear stale tokens for. UNAVAILABLE (not accepted=false / reject_reason, which the
+    // agent treats as a PERMANENT rejection, agent.cpp:1649-1657) so the agent retries with its
+    // normal reconnect backoff. The PG failure detail stays server-side (spdlog only).
+    if (auto reg_result = registry_.register_agent(info); !reg_result) {
+        spdlog::error("Register: register_agent failed for '{}': {}", info.agent_id(),
+                      reg_result.error());
+        return grpc::Status(grpc::StatusCode::UNAVAILABLE,
+                            "registration temporarily unavailable");
+    }
     // Auto-add to root management group
     if (mgmt_group_store_ && mgmt_group_store_->is_open())
         mgmt_group_store_->add_member(ManagementGroupStore::kRootGroupId, info.agent_id());
@@ -818,7 +828,7 @@ grpc::Status AgentServiceImpl::Subscribe(
     // PR3: revoked-cert gate. The presented client leaf IS the agent's mTLS
     // identity (issued bound to agent_id at enrollment). If its serial is on the
     // CRL the whole data plane is closed to it — reject before any registry work.
-    // Independent of pending_mu_: reads only the gRPC auth context + ca.db, so it
+    // Independent of pending_mu_: reads only the gRPC auth context + ca_store, so it
     // runs BEFORE the plane lock is taken (no cross-store query under the lock,
     // gov #1117). No-op when no cert is presented or no checker is wired.
     if (revocation_checker_) {

@@ -37,6 +37,17 @@ enum class EngineStoreErrorClass {
     ClientValidation, //!< Bad input / bad state — REST 400, MCP kInvalidParams.
     Conflict,         //!< Rotation-state conflict, don't blindly retry — REST 409, MCP kInvalidParams.
     Transient,        //!< Store/infra failure, retryable — REST 503, MCP kInternalError.
+    // #3015 proof-of-possession: the caller cleared every other admission
+    // gate (ownership, pair-state, the token_id pin, tier/scope, the
+    // initiator binding) but presented a secret that does not hash-match the
+    // pending successor's stored hash. MUST stay a distinct outcome — never
+    // folded into ClientValidation/Conflict — because it is reachable ONLY
+    // after every other gate passed (confirm_rotation/confirm_token_rotation
+    // check it strictly last); collapsing it into an existing class would
+    // erase the one signal that makes the ordering an oracle-freedom
+    // guarantee rather than just documentation. REST 403, MCP
+    // kPermissionDenied.
+    SecretMismatch,
 };
 
 [[nodiscard]] inline EngineStoreErrorClass classify_engine_store_error(const std::string& msg) {
@@ -59,6 +70,19 @@ enum class EngineStoreErrorClass {
     //     that same failure mode in the opposite direction).
     if (has("no in-flight rotation to confirm"))
         return EngineStoreErrorClass::Transient;
+
+    // 1c. #3015 proof-of-possession mismatch — reachable ONLY after every
+    //     earlier admission gate in confirm_rotation/confirm_token_rotation
+    //     already passed (ownership, pair-state, the token_id pin, tier/
+    //     scope, the initiator binding — see those functions' own doc
+    //     comments for why PoP is checked strictly last). MUST classify to
+    //     its own distinct SecretMismatch outcome, never Conflict or
+    //     ClientValidation — folding it into either erases the signal that
+    //     makes the ordering an oracle-freedom guarantee. Placed before
+    //     step 2 (no substring overlap with anything below, order-
+    //     independent, but grouped with the other confirm-outcome entries).
+    if (has("rotation secret mismatch"))
+        return EngineStoreErrorClass::SecretMismatch;
 
     // 2. Conflict strings that ALSO contain a broad transient substring —
     //    must win before the broad "unavailable" check below.
@@ -175,6 +199,7 @@ enum class EngineStoreErrorClass {
         "non-engine active credential",
         "principal_id required",
         "token_id required",
+        "secret required",
         "requesting_user required",
         "overlap window below 24h floor",
         "overlap window exceeds the maximum",
@@ -211,9 +236,9 @@ enum class EngineStoreErrorClass {
 /// Metric `result`-label for a store error class, shared by the REST and MCP
 /// confirm handlers so `yuzu_engine_principal_confirm_total{result=...}` reads
 /// identically on both surfaces (#2404). `success` is stamped by the caller on
-/// the ok path; this maps only the failure classes. The four labels
-/// (success|conflict|client_error|transient) are the closed set pre-seeded in
-/// server.cpp — keep the two in sync.
+/// the ok path; this maps only the failure classes. The five labels
+/// (success|conflict|client_error|transient|secret_mismatch) are the closed set
+/// pre-seeded in server.cpp — keep the two in sync.
 [[nodiscard]] inline const char* confirm_result_label(EngineStoreErrorClass cls) {
     switch (cls) {
     case EngineStoreErrorClass::ClientValidation:
@@ -222,6 +247,8 @@ enum class EngineStoreErrorClass {
         return "conflict";
     case EngineStoreErrorClass::Transient:
         return "transient";
+    case EngineStoreErrorClass::SecretMismatch:
+        return "secret_mismatch";
     }
     return "transient"; // unreachable — all enum cases return above
 }

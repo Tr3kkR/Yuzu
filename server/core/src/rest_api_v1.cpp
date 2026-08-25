@@ -291,6 +291,10 @@ static int engine_store_error_status(const std::string& err) {
         return 409;
     case yuzu::server::detail::EngineStoreErrorClass::Transient:
         return 503;
+    case yuzu::server::detail::EngineStoreErrorClass::SecretMismatch:
+        // #3015: reachable only after the caller cleared every other
+        // admission gate — 403, distinct from the 400/409/503 above.
+        return 403;
     }
     return 503; // unreachable — all enum cases return above
 }
@@ -817,7 +821,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Overlap-pair rotation of an engine principal's credential (design §7)", "tags": ["Security"], "description": "Mints a successor credential alongside the still-valid predecessor for the overlap window. A retry within the grace window by the SAME operator re-serves the identical raw secret (idempotent); step-up is re-validated on every call, including a re-serve.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token is the raw successor secret (Cache-Control: no-store)"}, "400": {"description": "overlap_secs outside the 24h-10y bounds, or more than 2 active credentials in an unrecognized shape"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, or no active credential to rotate (ambiguous with a transient store read failure — retry, or mint if genuinely absent)"}}}
     },
     "/engine-principals/{id}/credentials/confirm": {
-      "post": {"summary": "Confirm receipt of a rotated credential's successor secret (design §7 maker-checker)", "tags": ["Security"], "description": "The required token_id pins the confirm to the exact pending rotation — pass the successor token_id the rotate response returned; a stale or mismatched id is rejected with no state change.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["token_id"], "properties": {"token_id": {"type": "string", "maxLength": 64, "description": "Successor token_id returned by the rotate call (24 lowercase hex) — pins the exact rotation being confirmed"}}}}}}, "responses": {"200": {"description": "Confirmed; predecessor credential revoked"}, "400": {"description": "token_id missing, empty, or not a string; more than two active credentials; or a non-engine active credential"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "Replay or resolved-rotation conflict (do not blindly retry): token_id does not match the pending successor; the rotation was already confirmed or otherwise resolved by cutover/sweep/revoke; the sole active credential has unresolved rotation metadata; the grace window elapsed; or the rotation was initiated by a different operator"}, "503": {"description": "Retryable: store unavailable, advisory-lock contention, a confirm/revoke/clear persistence failure, or no in-flight rotation to confirm - the last covers zero active credentials (ambiguous with a transient read failure) and an unrecognized two-credential pair; rotate first if genuinely absent"}}}
+      "post": {"summary": "Confirm receipt of a rotated credential's successor secret (design §7 maker-checker)", "tags": ["Security"], "description": "Pass the successor token_id the rotate response returned (pins the confirm to that exact rotation; a stale or mismatched id is rejected with no state change) AND the raw successor secret (proof of possession, #3015). Confirm revokes the predecessor only after the presented secret verifies against the stored hash.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["token_id", "secret"], "properties": {"token_id": {"type": "string", "pattern": "^[0-9a-f]{24}$", "minLength": 24, "maxLength": 24, "description": "Successor token_id returned by the rotate call (24 lowercase hex) — pins the exact rotation being confirmed"}, "secret": {"type": "string", "minLength": 1, "maxLength": 512, "description": "The raw successor secret the rotate call returned — proof of possession (#3015), verified constant-time against the stored hash; checked only after every other admission gate. Missing/empty is 400; wrong is 403"}}}}}}, "responses": {"200": {"description": "Confirmed; predecessor credential revoked"}, "400": {"description": "token_id or secret missing, empty, or not a string; more than two active credentials; or a non-engine active credential"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write, or the presented secret does not verify against the pending successor (#3015)"}, "409": {"description": "Replay or resolved-rotation conflict (do not blindly retry): token_id does not match the pending successor; the rotation was already confirmed or otherwise resolved by cutover/sweep/revoke; the sole active credential has unresolved rotation metadata; the grace window elapsed; or the rotation was initiated by a different operator"}, "503": {"description": "Retryable: store unavailable, advisory-lock contention, a confirm/revoke/clear persistence failure, or no in-flight rotation to confirm - the last covers zero active credentials (ambiguous with a transient read failure) and an unrecognized two-credential pair; rotate first if genuinely absent"}}}
     },
     "/engine-principals/{id}/transfer-owner": {
       "post": {"summary": "Admin-forced ownership reassignment of an engine principal", "tags": ["Security"], "description": "Never depends on the outgoing owner's cooperation (design §3.1).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["new_owner"], "properties": {"new_owner": {"type": "string", "description": "Must reference an existing user"}}}}}}, "responses": {"200": {"description": "Transferred; {transferred:true}"}, "400": {"description": "Bad JSON, or new_owner missing/does not reference an existing user"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No engine principal with that id"}, "409": {"description": "Engine principal is not active"}, "503": {"description": "Store unavailable"}}}
@@ -841,7 +845,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6.3)", "tags": ["API Tokens"], "description": "Mints a successor token alongside the still-valid predecessor for the overlap window; requires ApiToken:Rotate and step-up on EVERY call (including an idempotent re-serve within the grace window). Self-service only — the caller must own the token; no admin override. The successor always inherits the predecessor's expires_at verbatim (rotation is lifetime-neutral).", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "The token_id of the token being rotated (the predecessor)"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token/token_id/expires_at describe the successor (found structurally, scoped to THIS predecessor's token_id); overlap_expires_at describes the PREDECESSOR (echoed for convenience — the epoch it is auto-revoked). token is the raw successor secret (Cache-Control: no-store)"}, "400": {"description": "overlap_secs present but not an integer, overlap_secs outside the 24h-10y bounds, or more than 2 active credentials in an unrecognized shape"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires ApiToken:Rotate"}, "404": {"description": "No such token, or the caller does not own it (identical body — not an enumeration oracle)"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, no active credential to rotate (ambiguous with a transient store read failure — retry, or mint a new token if genuinely absent), or the rotation succeeded but the successor could not be read back for the response (fails closed rather than return an uncorrelatable secret)"}}}
     },
     "/tokens/{token_id}/confirm": {
-      "post": {"summary": "Confirm receipt of a rotated API token's successor secret (P2 #11 maker-checker)", "tags": ["API Tokens"], "description": "token_id in the path is the SUCCESSOR token_id the rotate response returned — no request body. Requires ApiToken:Rotate and step-up. Self-service only.", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "The successor token_id returned by the rotate call"}], "responses": {"200": {"description": "Confirmed; predecessor token revoked"}, "400": {"description": "Terminal client-state conditions the store classifies ClientValidation: the caller's (mcp_tier, scope_service) does not equal the predecessor's, more than two active credentials share the rotation_group, or the token is not a human-owned credential"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires ApiToken:Rotate"}, "404": {"description": "No such token, or the caller does not own it (identical body — not an enumeration oracle)"}, "409": {"description": "Replay or resolved-rotation conflict (do not blindly retry)"}, "503": {"description": "Retryable: store unavailable, advisory-lock contention, or the deliberately-ambiguous no-in-flight-rotation read (a swallowed query failure and a genuinely empty active set are indistinguishable, so it stays retryable). A MALFORMED pair found after a positive two-row read is terminal 409, not this (#2943)."}}}
+      "post": {"summary": "Confirm receipt of a rotated API token's successor secret (P2 #11 maker-checker)", "tags": ["API Tokens"], "description": "token_id in the path is the SUCCESSOR token_id the rotate response returned. The request body MUST carry the raw successor secret (proof of possession, #3015), verified against the stored hash before the predecessor is revoked. Requires ApiToken:Rotate and step-up. Self-service only.", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "The successor token_id returned by the rotate call"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["secret"], "properties": {"secret": {"type": "string", "minLength": 1, "maxLength": 512, "description": "The raw successor secret the rotate call returned — proof of possession (#3015), verified constant-time against the stored hash; checked only after ownership/step-up. Missing/empty is 400; wrong is 403"}}}}}}, "responses": {"200": {"description": "Confirmed; predecessor token revoked"}, "400": {"description": "Missing or empty secret (#3015); or terminal client-state conditions the store classifies ClientValidation: the caller's (mcp_tier, scope_service) does not equal the predecessor's, more than two active credentials share the rotation_group, or the token is not a human-owned credential"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires ApiToken:Rotate, or the presented secret does not verify (#3015)"}, "404": {"description": "No such token, or the caller does not own it (identical body — not an enumeration oracle)"}, "409": {"description": "Replay or resolved-rotation conflict (do not blindly retry)"}, "503": {"description": "Retryable: store unavailable, advisory-lock contention, or the deliberately-ambiguous no-in-flight-rotation read (a swallowed query failure and a genuinely empty active set are indistinguishable, so it stays retryable). A MALFORMED pair found after a positive two-row read is terminal 409, not this (#2943)."}}}
     },
     "/ca/root": {
       "get": {"summary": "Internal CA root certificate (PEM, public)", "tags": ["Security"], "responses": {"200": {"description": "PEM CA certificate", "content": {"application/x-pem-file": {}}}, "404": {"description": "No CA root"}}}
@@ -1925,10 +1929,20 @@ void RestApiV1::register_routes(
                 // METRIC is a known small imprecision, and the path is only
                 // reachable at all if scoped_perm_fn and the derived set
                 // disagree about this device, which is itself a bug.
+                // #881: this can also mean the device is QUARANTINED — a
+                // permanent policy denial, not a transient reachability
+                // problem — or that the containment gate is failing closed
+                // fleet-wide. The dispatch closure returns only a sent count,
+                // so this route cannot yet tell them apart (#3424). Naming all
+                // three beats asserting the one that is most often wrong
+                // during an incident.
                 res.status = 404;
                 bump("agent_not_connected");
                 res.set_content(
-                    detail::error_json_a4(404, "device offline or not reachable", cid, 5000, ""),
+                    detail::error_json_a4(404,
+                                          "device offline, quarantined, or withheld because "
+                                          "containment state could not be read",
+                                          cid, 5000, ""),
                     "application/json");
                 return;
             }
@@ -3225,8 +3239,10 @@ void RestApiV1::register_routes(
     // confirmation that a rotation's successor secret has been received (P2
     // #11 / SOC 2 CC6.3). {id} is the SUCCESSOR token_id the rotate response
     // returned — ApiTokenStore::confirm_token_rotation resolves the
-    // principal and rotation group from that row, so no request body is
-    // needed at all.
+    // principal and rotation group from that row. #3015: the request body
+    // now MUST carry the raw successor secret ("secret") — proof of
+    // possession that the caller actually received the new credential
+    // before this call immediately revokes the predecessor.
     sink.Post(
         R"(/api/v1/tokens/([^/]+)/confirm)",
         [perm_fn, auth_fn, audit_fn, step_up_fn, token_store, metrics_registry](
@@ -3267,6 +3283,31 @@ void RestApiV1::register_routes(
 
             auto token_id = req.matches[1].str();
 
+            // #3015 proof-of-possession: the caller must supply the raw
+            // successor secret rotate returned, in the request body's
+            // "secret" field. Parsed AFTER the perm/auth/deny/step-up belt
+            // above so body validation can never become an unauthenticated
+            // oracle (same discipline the engine credentials/confirm route
+            // below already uses). Missing/empty is a pure 400 validation
+            // error — distinct from every auth/state outcome below, and
+            // NEVER echoed into an audit/error string (secret hygiene).
+            const auto body = nlohmann::json::parse(req.body, nullptr, false);
+            std::string presented_secret;
+            if (!body.is_discarded() && body.is_object() && body.contains("secret") &&
+                body["secret"].is_string())
+                presented_secret = body["secret"].get<std::string>();
+            if (presented_secret.empty()) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "secret required",
+                                                 {.remediation = "pass the raw successor secret "
+                                                                 "rotate returned in the request "
+                                                                 "body's \"secret\" field"}),
+                                "application/json");
+                (void)audit_fn(req, "api_token.confirm", "failure", "ApiToken", token_id,
+                               "secret required");
+                return;
+            }
+
             // Owner-vs-nonexistent 404 belt, same self-service-only posture
             // as rotate above — no admin bypass, identical body for both
             // missing-id and not-owner. NOT a store-reaching confirm call
@@ -3296,7 +3337,8 @@ void RestApiV1::register_routes(
             // reason as the rotate route above — defence-in-depth re-check
             // of the authority-inheritance guard (governance Gate 7).
             auto confirmed = token_store->confirm_token_rotation(
-                token_id, session->username, session->mcp_tier, session->token_scope_service);
+                token_id, presented_secret, session->username, session->mcp_tier,
+                session->token_scope_service);
             if (!confirmed) {
                 // Increment BEFORE the audit emission so an audit-store
                 // failure cannot suppress the operational counter (#2404).
@@ -3898,8 +3940,26 @@ void RestApiV1::register_routes(
                                "EnginePrincipal", principal_id, "token_id required");
                 return;
             }
-            auto confirmed =
-                token_store->confirm_rotation(principal_id, confirm_token_id, session->username);
+            // #3015 proof-of-possession: the caller must ALSO present the
+            // raw successor secret rotate returned — never echoed into an
+            // audit/error string (secret hygiene).
+            std::string presented_secret;
+            if (!body.is_discarded() && body.is_object() && body.contains("secret") &&
+                body["secret"].is_string())
+                presented_secret = body["secret"].get<std::string>();
+            if (presented_secret.empty()) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "secret required",
+                                                 {.remediation = "pass the raw successor secret "
+                                                                 "rotate returned in the request "
+                                                                 "body's \"secret\" field"}),
+                                "application/json");
+                (void)audit_fn(req, "engine_principal.credential.confirm", "failure",
+                               "EnginePrincipal", principal_id, "secret required");
+                return;
+            }
+            auto confirmed = token_store->confirm_rotation(principal_id, confirm_token_id,
+                                                            presented_secret, session->username);
             if (!confirmed) {
                 // Increment BEFORE the audit emission so an audit-store failure
                 // cannot suppress the operational counter (#2404).
@@ -7318,8 +7378,19 @@ void RestApiV1::register_routes(
                 // That indistinguishability is deliberate — a distinct "refused
                 // by confinement" status would disclose the existence of
                 // devices the caller is not allowed to see.
+                // #881 adds two more ways to reach zero that are NOT about
+                // device visibility: every target quarantined, and the gate
+                // failing closed because containment state is unreadable.
+                // Neither discloses anything about devices the caller cannot
+                // see — a fail-closed gate is a server condition, and
+                // quarantine state is already readable at GET
+                // /api/v1/quarantine — so naming them does not weaken the
+                // confinement rationale above.
                 execution_tracker->mark_cancelled(exec_id, owner);
-                rs_err(res, 503, "RESULT_SET_NO_AGENTS: no agents reached in the target scope");
+                rs_err(res, 503,
+                       "RESULT_SET_NO_AGENTS: no agents reached in the target scope — targets may "
+                       "be unreachable, quarantined, or withheld because containment state could "
+                       "not be read");
                 return;
             }
             execution_tracker->set_agents_targeted(exec_id, sent);
@@ -8139,7 +8210,13 @@ void RestApiV1::register_routes(
                 // migrated store can also fail on a Postgres blip. Classify before assuming
                 // "entropy exhausted": mislabeling a DB fault as csprng_unavailable would both
                 // misinform SIEM and increment the wrong Prometheus counter.
-                if (result.error().starts_with(yuzu::server::kDeviceTokenDbErrorPrefix)) {
+                //
+                // #3351: "internal_error: " (hash_token's checked-EVP failure path) joins this
+                // same non-CSPRNG arm — a hashing fault is exactly as much "not entropy
+                // exhaustion" as a DB fault is, and must not increment
+                // yuzu_secure_random_failure_total either.
+                if (result.error().starts_with(yuzu::server::kDeviceTokenDbErrorPrefix) ||
+                    result.error().starts_with("internal_error: ")) {
                     bool audit_emitted = false;
                     try {
                         audit_emitted = audit_fn(req, "device_token.create", "failure",
@@ -8164,6 +8241,44 @@ void RestApiV1::register_routes(
                         .add("audit_emitted", audit_emitted)
                         .raw("meta", R"({"api_version":"v1"})");
                     res.set_content(envelope.str(), "application/json");
+                    return;
+                }
+                // gov Gate 4 (consistency-auditor, C-1): a store-level input-validation failure
+                // (`invalid_input_length:` or the pre-existing empty-principal_id guard) is a
+                // client error, not a service fault or CSPRNG exhaustion — the prior two-way
+                // classifier fell through to the CSPRNG arm below by elimination, which would
+                // have reported 503 + a misleading "CSPRNG unavailable" message/audit-reason and
+                // incremented yuzu_secure_random_failure_total for what is actually a 400.
+                // Unreachable via REST today (name/device_id/definition_id are pre-clamped at
+                // 256 chars above; principal_id is session->username, bounded by AuthDB's 64-char
+                // limit) — defence-in-depth for a future non-REST caller the store's own doc
+                // comment anticipates (e.g. an MCP twin).
+                //
+                // gov Gate 8 (consistency-auditor): uses the canonical detail::a4_error envelope
+                // (correlation_id, matches this endpoint's OWN pre-clamp 400s just above) rather
+                // than the hand-rolled shape the sibling 503 arms below use — two different 400s
+                // from the same endpoint should look the same. Sec-Audit-Failed header only (no
+                // audit_emitted body field), matching the same convention already used where an
+                // audited failure returns an A4-enveloped body elsewhere in this file (e.g.
+                // dex.device.view's audit fail-closed branch).
+                if (result.error().starts_with("invalid_input_length:") ||
+                    result.error() == "principal_id cannot be empty") {
+                    bool audit_emitted = false;
+                    try {
+                        audit_emitted = audit_fn(req, "device_token.create", "failure",
+                                                 "DeviceToken", device_id,
+                                                 "invalid_input: " + result.error());
+                    } catch (const std::exception& ex) {
+                        spdlog::error("device_token.create audit emission threw: {}", ex.what());
+                        audit_emitted = false;
+                    } catch (...) {
+                        spdlog::error("device_token.create audit emission threw unknown");
+                        audit_emitted = false;
+                    }
+                    if (!audit_emitted)
+                        res.set_header("Sec-Audit-Failed", "true");
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, result.error()), "application/json");
                     return;
                 }
                 // sre-1: Prometheus signal for CSPRNG failure (see
@@ -11521,7 +11636,21 @@ void RestApiV1::register_routes(
             }
 
             const bool deployed = (baseline->lifecycle == kBaselineDeployed);
-            const auto guard_ids = baseline_store->deployed_member_rule_ids(baseline->baseline_id);
+            // ADR-0055 catastrophic-read set: a degraded deployed_member_rule_ids
+            // read must 503, never render an empty guard_ids that would flow
+            // through rule_names_for/the compliance tally below as a false-clean
+            // "0 guards, fully compliant" report for this baseline.
+            auto guard_ids_result = baseline_store->deployed_member_rule_ids(baseline->baseline_id);
+            if (!guard_ids_result) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "baseline store degraded", cid),
+                                "application/json");
+                spdlog::warn("guardian.device.view baseline store degraded (503) cid={} "
+                             "agent_id={}",
+                             cid, agent_id);
+                return;
+            }
+            const auto& guard_ids = *guard_ids_result;
 
             // rule_id -> Guard name, resolved ONLY for this baseline's deployed
             // members (name-only read; never materializes the rule body blobs).

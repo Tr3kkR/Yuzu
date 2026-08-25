@@ -65,6 +65,8 @@ Plugins for querying operating system details, hardware inventory, device identi
 | `disks` | Physical disk model, size, interface type, and health status. |
 | `drivers` | Installed device drivers: name, version, date, provider, and device class. Uses `Win32_PnPSignedDriver` on Windows (the query takes several seconds — the `device.hardware.drivers` definition gathers it with a daily TTL); loaded kernel modules via `/proc/modules` on Linux (module name only — version/date not available). Not supported on macOS. |
 
+**Sentinel rows.** Any field the underlying probe cannot read (WMI/DMI/`sysctl` call failed, or ran on an unsupported platform) is emitted as the literal string `unknown` rather than being omitted — this applies to `manufacturer`, `model`, `bios`, `processors`, `memory`, and `disks`. `drivers` additionally emits a `__truncated__` sentinel in the driver-name field on Windows when the WMI enumeration hit its row cap (`agents/shared/wmi_bounded.hpp`, 512 rows) — the reached count rides in the row-index column, and `__truncated__` cannot collide with a real `DeviceName`, so a consumer can distinguish "no more drivers" from "the list was cut short."
+
 ### device_identity
 
 | | |
@@ -225,22 +227,12 @@ Plugins for network configuration, active connections, diagnostics, and administ
 | | |
 |---|---|
 | **Platforms** | W L M |
-| **Description** | Active network connections (similar to the `netstat` command-line tool). |
+| **Description** | Active network connections (similar to the `netstat` command-line tool), and socket-to-process attribution. |
 
 | Action | Description |
 |---|---|
 | `netstat_list` | List all TCP and UDP connections with local/remote address, port, state, and owning PID. |
-
-### sockwho
-
-| | |
-|---|---|
-| **Platforms** | W L M |
-| **Description** | Maps open sockets to the processes that own them. |
-
-| Action | Description |
-|---|---|
-| `sockwho_list` | For each listening or established socket, returns the owning process name and PID alongside connection details. |
+| `attribution` | Same enumeration, plus the owning process's name and executable path for each socket. Folds the retired `sockwho` plugin's functionality into netstat (#3403). On macOS, a socket shared across a fork (multiple processes holding the same fd) is deduplicated to one owner row, matching `netstat_list` — unlike the retired `sockwho`, which emitted one row per (pid, fd). |
 
 ### network_diag
 
@@ -358,7 +350,7 @@ Plugins for software inventory, Windows-specific package management, update stat
 
 | Action | Description |
 |---|---|
-| `installed` | List installed updates/hotfixes with KB number, date, and type. |
+| `installed` | List installed updates/hotfixes with KB number, date, and type. On Windows, sourced from a bounded WMI `Win32_QuickFixEngineering` query, capped at 512 rows with **no sort order** — WQL has no `ORDER BY` for a data-class query, so this no longer matches the retired PowerShell path's 50-most-recent-by-install-date behavior. |
 | `missing` | List updates that are available but not yet installed. |
 | `pending_reboot` | Detect whether the endpoint requires a reboot after updates. Checks Windows registry keys, Linux reboot-required file and kernel version, macOS softwareupdate restart flag. |
 
@@ -416,7 +408,7 @@ Plugins for antivirus, firewall, disk encryption, event logs, vulnerability scan
 | Action | Description |
 |---|---|
 | `state` | Whether the firewall is enabled, per profile (domain, private, public on Windows). On macOS, reports the Application Firewall global state (`backend\|appfirewall` + `state\|…`, plus `mode\|block_all` when block-all is set) and a secondary `pf\|<state>` row for the pf packet filter. `state\|unknown` means the check output was unreadable or unrecognised — never assumed safe; `pf\|unknown` is expected on agents not running as root (reading `/dev/pf` needs root) and is not a fault. |
-| `rules` | List firewall rules with direction, action, port, and protocol. |
+| `rules` | List firewall rules with direction, action, port, and protocol. On Linux, the nftables backend (probed before ufw/iptables) reports only base-chain hook/policy and per-rule table/chain/handle — no per-rule action/port/protocol (expression-level decoding is out of scope); the ufw/iptables fallback rows do carry action. |
 
 ### bitlocker
 
@@ -531,14 +523,14 @@ Supported indicator types for the `check` action:
 | | |
 |---|---|
 | **Platforms** | W L M |
-| **Description** | Network quarantine for compromised or suspicious devices. Uses `netsh` on Windows, `iptables`/`nftables` on Linux, and `pfctl` on macOS. |
+| **Description** | Network quarantine for compromised or suspicious devices. Uses `netsh` on Windows, `iptables` **and `ip6tables`** on Linux, and `pfctl` on macOS. There is no `nftables` path — an earlier version of this line claimed one. On a dual-stack Linux host both families are contained, so a whitelist must name the management server's IPv6 address as well as its IPv4 one or the device can be stranded on its next reconnect; see [Security Hardening](security-hardening.md#whitelisting-on-a-dual-stack-host-read-this-before-quarantining-one). |
 
 | Action | Description |
 |---|---|
 | `quarantine` | Isolate the device by blocking all network traffic except the Yuzu server connection. |
-| `unquarantine` | Remove quarantine rules and restore normal network access. |
+| `unquarantine` | Remove quarantine rules and restore normal network access. Reports `release_uncertain` rather than `released` when the teardown could not be confirmed. |
 | `status` | Check whether quarantine is currently active. |
-| `whitelist` | Add an IP or CIDR range to the quarantine exception list. |
+| `whitelist` | Add an IP or CIDR range to the quarantine exception list — the repair path for a contained device whose whitelist is wrong. **On macOS this action is itself a quarantine-time operation**: it rebuilds and reloads the whole pf ruleset, which includes the `block all` default-deny, and enables pf — so dispatching it at a device that is not already quarantined will isolate it. Check `status` first if unsure. |
 
 ---
 

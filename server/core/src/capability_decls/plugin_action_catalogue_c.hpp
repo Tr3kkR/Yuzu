@@ -7,10 +7,12 @@
 #include "../command_capability.hpp"
 
 /// @file plugin_action_catalogue_c.hpp
-/// PR1.9 data C: the command-capability catalogue fragment for the 14
+/// PR1.9 data C: the command-capability catalogue fragment for the 13
 /// network/security agent plugins (PR1.10 group C) — network_config,
-/// netprobe, netstat, sockwho, network_diag, network_actions, discovery,
+/// netprobe, netstat, network_diag, network_actions, discovery,
 /// wifi, wol, http_client, certificates, firewall, quarantine, rdp_control.
+/// (sockwho retired into netstat's `attribution` action, #3403 -- was its
+/// own plugin group member here, now a second netstat row below.)
 /// One row per action, grouped by plugin below (each group cites the
 /// `.cpp` its `actions()` table came from). Every other plugin's rows live
 /// in a separate fragment header owned by a different package — see
@@ -130,6 +132,9 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
     },
 
     // ── netstat (agents/plugins/netstat/src/netstat_plugin.cpp) ──
+    // `attribution` folds the retired sockwho plugin's socket-to-process
+    // mapping into netstat (#3403) -- same read-only/Infrastructure shape
+    // sockwho's own row carried.
     {
         .plugin = "netstat",
         .action = "netstat_list",
@@ -139,11 +144,9 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
     },
-
-    // ── sockwho (agents/plugins/sockwho/src/sockwho_plugin.cpp) ──
     {
-        .plugin = "sockwho",
-        .action = "sockwho_list",
+        .plugin = "netstat",
+        .action = "attribution",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
         .securable = "Infrastructure",

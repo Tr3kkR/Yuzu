@@ -136,9 +136,32 @@ struct DispatchResolvers {
 /// dispatched; `scope_parse_error` is set only when the Scope arm's resolved
 /// expression failed to parse — the one distinction a caller with an HTTP
 /// response to shape might still act on differently than reaching nobody.
+///
+/// #881: `denied_quarantined` carries every reachable id the quarantine gate
+/// withheld OUT of this function, so the caller can audit it — without this
+/// field the majority of dispatch (MCP, workflows, schedules, REST v1, all
+/// of which route through `wire_and_dispatch_confined`) would enforce
+/// quarantine but audit nothing. `command_id` rides along for the same
+/// reason: once the return type stopped being a bare `std::pair<std::string,
+/// int>`, the caller needed a way to correlate `denied_quarantined` entries
+/// with the dispatch that produced them without re-deriving it.
+///
+/// `command_id` is populated ONLY by `wire_and_dispatch_confined` (it takes
+/// the id as a parameter and assigns it on return); `resolve_and_dispatch_confined`
+/// has no command id to give it and leaves the field default-constructed
+/// (empty). A caller of `resolve_and_dispatch_confined` directly — today only
+/// this file's own tests — must not read `command_id` off its result.
 struct ConfinedDispatchOutcome {
     int sent = 0;
     std::optional<std::string> scope_parse_error;
+    /// The ids withheld, for audit rows that name a device. **Empty on a
+    /// fail-closed denial** — the ids are deliberately not collected there.
+    std::vector<std::string> denied_quarantined;
+    /// How many were withheld, always. Report counts from THIS, never from
+    /// `denied_quarantined.size()`, which differs under fail-closed. See
+    /// `ArmDispatchResult` for why the two are separate.
+    std::size_t denied_quarantined_count = 0;
+    std::string command_id;
 };
 
 /// The "middle link": classify the arm, resolve ITS targets via the injected
@@ -147,7 +170,7 @@ struct ConfinedDispatchOutcome {
 /// feeds it is exercised by the same tests that bind the intersection itself.
 inline ConfinedDispatchOutcome resolve_and_dispatch_confined(
     const std::vector<std::string>& agent_ids, const std::string& scope_expr,
-    const authz::VisibleSet& exec_visible, bool broadcast_on_none,
+    const authz::VisibleSet& exec_visible, bool broadcast_on_none, const ContainmentGate& gate,
     const DispatchResolvers& resolvers, const ConfinedDispatchSink& sink) {
     ConfinedDispatchOutcome outcome;
     const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
@@ -158,7 +181,10 @@ inline ConfinedDispatchOutcome resolve_and_dispatch_confined(
             members = resolvers.group_members_fn(scope_expr.substr(6));
         ConfinedDispatchTargets t;
         t.group_members = &members;
-        outcome.sent = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, sink);
+        const auto r = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink);
+        outcome.sent = r.sent;
+        outcome.denied_quarantined = r.denied_quarantined;
+        outcome.denied_quarantined_count = r.denied_quarantined_count;
         return outcome;
     }
 
@@ -171,14 +197,20 @@ inline ConfinedDispatchOutcome resolve_and_dispatch_confined(
             return outcome; // ABORTED — the ladder already audited it
         ConfinedDispatchTargets t;
         t.scope_matched = &*ladder.matched;
-        outcome.sent = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, sink);
+        const auto r = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink);
+        outcome.sent = r.sent;
+        outcome.denied_quarantined = r.denied_quarantined;
+        outcome.denied_quarantined_count = r.denied_quarantined_count;
         return outcome;
     }
 
     ConfinedDispatchTargets t;
     if (arm == DispatchArm::Ids)
         t.agent_ids = &agent_ids;
-    outcome.sent = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, sink);
+    const auto r = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink);
+    outcome.sent = r.sent;
+    outcome.denied_quarantined = r.denied_quarantined;
+    outcome.denied_quarantined_count = r.denied_quarantined_count;
     return outcome;
 }
 
@@ -199,7 +231,7 @@ inline ConfinedDispatchOutcome resolve_and_dispatch_confined(
 /// a real `AgentRegistry` + real/null stores, independent of `ServerImpl`.
 /// `ServerImpl::dispatch_confined` becomes a thin wrapper over this function;
 /// its own body, behaviour, and every caller are unchanged.
-inline std::pair<std::string, int> wire_and_dispatch_confined(
+inline ConfinedDispatchOutcome wire_and_dispatch_confined(
     yuzu::server::detail::AgentRegistry& registry, ManagementGroupStore* mgmt_group_store,
     ResultSetStore* result_set_store, const TagStore* tag_store,
     const CustomPropertiesStore* custom_properties_store, ExecutionTracker* execution_tracker,
@@ -212,7 +244,8 @@ inline std::pair<std::string, int> wire_and_dispatch_confined(
     const std::string& command_id, const std::string& execution_id,
     const std::string& principal_role, const std::vector<std::string>& agent_ids,
     const std::string& scope_expr, const yuzu::server::authz::VisibleSet& exec_visible,
-    bool broadcast_on_none, const yuzu::server::detail::ClassifiedCommand& cmd) {
+    bool broadcast_on_none, const ContainmentGate& gate,
+    const yuzu::server::detail::ClassifiedCommand& cmd) {
     DispatchResolvers resolvers;
     resolvers.group_members_fn = [mgmt_group_store](const std::string& group_id) {
         std::vector<std::string> members;
@@ -256,9 +289,10 @@ inline std::pair<std::string, int> wire_and_dispatch_confined(
         [&registry, &cmd] { return registry.send_to_all(cmd); },
         [&registry] { return registry.all_ids(); }};
 
-    const auto outcome = resolve_and_dispatch_confined(agent_ids, scope_expr, exec_visible,
-                                                        broadcast_on_none, resolvers, sink);
-    return {command_id, outcome.sent};
+    auto outcome = resolve_and_dispatch_confined(agent_ids, scope_expr, exec_visible,
+                                                  broadcast_on_none, gate, resolvers, sink);
+    outcome.command_id = command_id;
+    return outcome;
 }
 
 } // namespace yuzu::server
