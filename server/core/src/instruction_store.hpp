@@ -21,14 +21,21 @@
 /// statement. Mutate-and-return uses `RETURNING` where a caller needs to distinguish "inserted"
 /// from "conflicted" — never a bare `PGRES_COMMAND_OK` on `ON CONFLICT DO NOTHING`.
 ///
+/// **No legacy-SQLite backfill (ADR-0009's fresh-start-by-default class).** Unlike most stores
+/// on the Postgres migration ladder, this store does NOT read the pre-migration
+/// `instructions.db` on cutover — no production fleet has ever run a pre-Postgres build of any
+/// Yuzu store, so there is no real legacy data to protect. Follows `ResponseStore`'s
+/// unconditional-skip precedent: no flag, no `migrate_from_sqlite`, just a one-time boot log
+/// line noting the fresh start.
+///
 /// **Seed-vs-live semantics (ADR-0058, the headline decision).** The boot-time reseed loop
 /// (`server.cpp`'s every-boot walk of `kBundledDefinitions`/`kBundledSets`) stays
 /// conflict-skip-on-id-existence, content-blind, exactly as pre-migration — an operator's edit
 /// to a bundled definition is never clobbered by a later reseed. Deletion, however, is now an
 /// INTENTIONAL SUPPRESSION rather than a plain DELETE: `deleted_seed_content(kind, id)` records
-/// every deleted definition/set id, consulted ONLY by the seed-aware insert paths below and by
-/// `migrate_from_sqlite`'s backfill — never by any read path, any normal `create_definition`/
-/// `create_set` call, or any authorization/targeting decision. This is a DELIBERATE BEHAVIOUR
+/// every deleted definition/set id, consulted ONLY by the seed-aware insert paths below — never
+/// by any read path, any normal `create_definition`/`create_set` call, or any
+/// authorization/targeting decision. This is a DELIBERATE BEHAVIOUR
 /// CHANGE from the pre-migration SQLite store, which resurrected an operator-deleted bundled
 /// definition on the very next boot (pinned and then inverted — see
 /// `tests/unit/server/test_instruction_store.cpp` tag `[instruction_store][seed]`). See
@@ -69,7 +76,6 @@
 #include <atomic>
 #include <cstdint>
 #include <expected>
-#include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
@@ -162,37 +168,12 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
-    /// Wire a metrics registry for the backfill-result counter
-    /// (`yuzu_server_instruction_backfill_total{result}`) and the read-degrade counters
-    /// (`yuzu_server_instruction_read_degrade_total{reason}`), matching
-    /// `ProductPackStore`/`CustomPropertiesStore`'s #1675 convention. Set ONCE during
-    /// single-threaded startup, BEFORE `migrate_from_sqlite()`. A null registry (the default,
-    /// e.g. in unit tests) disables emission.
+    /// Wire a metrics registry for the read-degrade counters
+    /// (`yuzu_server_instruction_read_degrade_total{reason}`) and their write-side counterpart,
+    /// matching `ProductPackStore`/`CustomPropertiesStore`'s #1675 convention. Set ONCE during
+    /// single-threaded startup. A null registry (the default, e.g. in unit tests) disables
+    /// emission.
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
-
-    /// Legacy-SQLite backfill (ADR-0009/0058). Call once at server startup, before serving,
-    /// after construction has proven the Postgres schema is open, and BEFORE the boot-time
-    /// bundled-content reseed loop runs (load-bearing ordering — see the ADR's "Boot ordering"
-    /// section: seeding before backfill can let pristine bundled content silently shadow an
-    /// operator's legacy-side edit). Idempotent PER DISTINCT LEGACY-FILE CONTENT (a SHA-256
-    /// fingerprint over both tables' rows, or a sourceless sentinel). Conflict handling
-    /// partitions `instruction_definitions` columns into IDENTITY (`id`/`created_by`/
-    /// `created_at` — write-once) and LIFECYCLE (everything else, mutable via
-    /// `update_definition`): an IDENTITY mismatch fails the backfill closed; a LIFECYCLE
-    /// mismatch is a benign no-op — Postgres's existing value always wins, matching the reseed
-    /// loop's own "operator edit is never clobbered" rule. `instruction_sets` has no mutation
-    /// path at all (no `update_set` exists) — any conflict there is full-row-equality-or-
-    /// fail-closed, mirroring `ProductPackStore`. Every legacy row is also checked against
-    /// `deleted_seed_content` before being treated as fresh content, so a redeployed/stale-image
-    /// replica's own untouched legacy file cannot resurrect a definition or set this store has
-    /// already reported erased. Transparently handles a legacy file predating any of the
-    /// compat-`ALTER`/v2/v3 columns (defaults match the pre-migration `ALTER ... DEFAULT`
-    /// clauses exactly). Returns true (no-op) when `legacy_db_path` does not exist or holds
-    /// neither table (fresh install). Opens the legacy file READ-ONLY and never deletes/moves
-    /// it — the file remains live for `InstructionDbPool`'s still-SQLite siblings
-    /// (`ExecutionTracker`/`ApprovalManager`/`ScheduleEngine`); only the two tables this store
-    /// owns become dead weight, retained indefinitely, harmlessly.
-    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
     /// When true, `import_definition_json` rejects payloads that lack a
     /// `signature` field. Payloads WITH a signature are always verified

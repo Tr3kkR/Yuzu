@@ -4781,8 +4781,9 @@ public:
         // ADR-0012 §1 (ProductPackStore template): a reachable database whose schema can't
         // migrate/open is a fatal startup error, never a serve-degraded instruction catalog —
         // execute_instruction resolves definitions here, so a silent-empty read would break
-        // dispatch. `migrate_from_sqlite` runs the one-time, idempotent legacy-`instructions.db`
-        // backfill (ADR-0009) — AUTHORITATIVE content means a backfill failure is ALSO fatal.
+        // dispatch. No legacy-SQLite backfill (ADR-0009's fresh-start-by-default class,
+        // ResponseStore precedent): no production fleet has ever run a pre-Postgres build of
+        // any Yuzu store, so there is no legacy `instructions.db` content to protect.
         if (pg_pool_ && !startup_failed_) {
             instruction_store_ = std::make_unique<InstructionStore>(*pg_pool_);
             if (!instruction_store_->is_open()) {
@@ -4791,7 +4792,8 @@ public:
                               "be created/opened)");
                 startup_failed_ = true;
             } else {
-                spdlog::info("InstructionStore initialized (schema instruction_store)");
+                spdlog::info("InstructionStore initialized (schema instruction_store) — fresh "
+                             "start, no legacy backfill");
                 // #1073 / W7.4 sibling-gap: InstructionStore ctor sets
                 // require_signed_definitions_=true. Wire the operator opt-out
                 // immediately after construction, before any import path can
@@ -4805,10 +4807,6 @@ public:
                                  "YUZU_ALLOW_UNSIGNED_DEFINITIONS) — unsigned "
                                  "instruction imports will be accepted");
                 }
-                // #3261/#3294 class: set_metrics BEFORE migrate_from_sqlite, so the
-                // backfill-result counter is live on the one pass that matters — a registry
-                // wired only after the (one-shot, idempotent) backfill call would leave that
-                // specific pass permanently uncounted.
                 instruction_store_->set_metrics(&metrics_);
                 metrics_.describe("yuzu_server_instruction_read_degrade_total",
                                   "InstructionStore reads that degraded instead of answering, "
@@ -4818,10 +4816,6 @@ public:
                     metrics_.counter("yuzu_server_instruction_read_degrade_total",
                                      {{"reason", reason}});
                 }
-                // gov Gate 3 sre finding: was never registered/pre-seeded, unlike its
-                // read-degrade sibling two statements above — absent from /metrics until the
-                // first write failure ever occurs, breaking observability-conventions.md's
-                // pre-seed-to-0 rule for bounded-label counters.
                 metrics_.describe("yuzu_server_instruction_write_degrade_total",
                                   "InstructionStore writes that degraded instead of succeeding, "
                                   "by call site",
@@ -4830,28 +4824,6 @@ public:
                                     "delete_definition", "insert_set_row", "delete_set"}) {
                     metrics_.counter("yuzu_server_instruction_write_degrade_total",
                                      {{"reason", reason}});
-                }
-                metrics_.describe("yuzu_server_instruction_backfill_total",
-                                  "One-time legacy instructions.db backfill outcome (ADR-0058)",
-                                  "counter");
-                for (auto result : {"fresh", "success", "failed"}) {
-                    metrics_.counter("yuzu_server_instruction_backfill_total",
-                                     {{"result", result}});
-                }
-
-                // ADR-0058 boot ordering — backfill MUST run before the bundled-content reseed
-                // loop below: a seed-first ordering would let pristine bundled content silently
-                // shadow an operator's legacy-side edit (see the ADR's "Boot ordering" section).
-                auto instr_db = cfg_.db_dir() / "instructions.db";
-                if (!instruction_store_->migrate_from_sqlite(instr_db)) {
-                    spdlog::error(
-                        "[PG] Refusing to start: instruction legacy-SQLite backfill failed (see "
-                        "prior log lines) — instruction_store is the AUTHORITATIVE "
-                        "definition/set catalog and must not serve partially-migrated data. "
-                        "Operator remediation: repair {} or move it aside to skip the backfill "
-                        "(content in it will NOT carry over)",
-                        instr_db.string());
-                    startup_failed_ = true;
                 }
             }
         }
@@ -4896,9 +4868,8 @@ public:
         // script converts each YAML doc to a JSON envelope; we walk the arrays and upsert.
         // Conflicts on already-existing ids are expected on second-and-later startups and
         // silently skipped — content is the source of truth at boot, not override of in-place
-        // operator edits. Requires the Postgres instruction_store to be open and runs AFTER
-        // migrate_from_sqlite above (load-bearing ordering, see that call site's comment); the
-        // `!startup_failed_` guard skips this on a backfill failure that is about to refuse
+        // operator edits. Requires the Postgres instruction_store to be open; the
+        // `!startup_failed_` guard skips this on a construction failure that is about to refuse
         // boot anyway.
         //
         // Conflict detection uses is_conflict_error() against the
