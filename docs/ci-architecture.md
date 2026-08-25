@@ -481,7 +481,38 @@ overlap unrestrained. Judged low-risk (cheap suites measured ~1-2 min combined,
 no Postgres/heavy-CPU contention), but a real narrowing of what #3443 AC4's
 gate covers.
 
-**Drift risk, not yet automated:** the 3-way split hardcodes the 8 pg shard
+**Split again + timeout bump (2026-08-25, PR #3582).** The isolation fix above
+removed cross-job and within-pool contention as variables, but E and G still
+TIMEOUT'd — proof arrived via a direct solo diagnostic on Big Tam itself
+(`--num-processes 1`, no other job on the box): A=227.86s H=214.19s B=90.35s
+D=227.48s **E=353.32s** **G=317.04s** F=262.81s C=359.42s. E and G were each
+already past half of the then-600s ceiling completely alone — 2-wide pairing
+was never going to have real headroom, regardless of which other shard it
+paired with. Both shards' own local-uncontended baselines had also roughly
+doubled since their last (2026-08-19) split measurement (E: 180.45s ->
+353.32s), only partly explained by case-count growth (E: 329->405 cases,
++23%; G: 278->351, +26%) — the rest is Big Tam's own per-op cost for this
+fsync-heavy DDL workload drifting up over the same window, not further
+diagnosed.
+
+Fix: `tests/meson.build` split shard E into E+I and shard G into G+J (case-
+count-balanced, ~half each; I defers to E and J defers to G the same way G
+already deferred to E, to avoid double-counting a case that carries a tag
+from both sides of a split — a first attempt without that deferral double-
+counted 12 and 47 cases respectively, caught by `--list-tests` before
+trusting it), and every pg shard's `timeout:` moved from 600 to 700 across
+the board. The timeout bump is a **deliberate, temporary** exception to this
+file's own "split, don't raise" house rule (`tests/meson.build`'s shard-
+history comment) — justified specifically because the `[pg]` population is
+expected to shrink within days as the SQLite->Postgres migration program
+completes and migration-only regression tests become prunable
+(`docs/postgres-migration-ladder.md`), directly cutting the fsync-heavy
+CREATE/DROP DATABASE case count these shards carry. Revisit (tighten back to
+600, or drop entirely if a shard is comfortably under budget) once that prune
+lands. Full measurements, partition verification, and per-shard local wall
+time: `tests/meson.build`'s own comment at the shard E/I/G/J block.
+
+**Drift risk, not yet automated:** the 3-way split hardcodes the 10 pg shard
 names and the 3 non-pg server test names directly in `ci.yml`. A new/renamed
 server test() entry or a new top-level `suite:` (`tests/meson.build` or the
 root `meson.build` — the `gateway` suite lives there, not in `tests/
