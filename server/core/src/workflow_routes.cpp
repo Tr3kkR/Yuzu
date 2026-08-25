@@ -2159,20 +2159,33 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         auto id = req.matches[1].str();
 
-        // Uninstall callback: delegate to the appropriate store
-        auto uninstall_fn = [instruction_store, policy_store, workflow_engine](
-                                const std::string& kind, const std::string& item_id) -> bool {
+        // Uninstall callback: delegate to the appropriate store. InstructionDefinition passes
+        // through InstructionStore's real db_error/not_found split (ADR-0058) so a genuine DB
+        // failure aborts the whole pack uninstall instead of being silently tolerated as a
+        // removed item (product_pack_store.cpp's uninstall() checks the prefix). PolicyFragment/
+        // Policy/Workflow's origin stores are still bool-only — `false` there maps to a tolerated
+        // not_found, matching pre-ADR-0058 behaviour for those kinds.
+        auto uninstall_fn = [instruction_store, policy_store,
+                             workflow_engine](const std::string& kind, const std::string& item_id)
+            -> std::expected<void, std::string> {
             if (kind == "InstructionDefinition") {
-                // ADR-0058: delete_definition now returns std::expected<void, std::string>.
-                return instruction_store && instruction_store->delete_definition(item_id).has_value();
+                if (!instruction_store)
+                    return std::unexpected("not_found: instruction store unavailable");
+                return instruction_store->delete_definition(item_id);
             } else if (kind == "PolicyFragment") {
-                return policy_store && policy_store->delete_fragment(item_id);
+                if (policy_store && policy_store->delete_fragment(item_id))
+                    return {};
+                return std::unexpected("not_found: policy fragment '" + item_id + "'");
             } else if (kind == "Policy") {
-                return policy_store && policy_store->delete_policy(item_id);
+                if (policy_store && policy_store->delete_policy(item_id))
+                    return {};
+                return std::unexpected("not_found: policy '" + item_id + "'");
             } else if (kind == "Workflow") {
-                return workflow_engine && workflow_engine->delete_workflow(item_id);
+                if (workflow_engine && workflow_engine->delete_workflow(item_id))
+                    return {};
+                return std::unexpected("not_found: workflow '" + item_id + "'");
             }
-            return false;
+            return std::unexpected("not_found: unsupported item kind '" + kind + "'");
         };
 
         auto result = product_pack_store->uninstall(id, uninstall_fn);

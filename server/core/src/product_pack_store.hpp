@@ -117,8 +117,13 @@ struct ProductPackQuery {
 using ItemInstallFn = std::function<std::expected<std::string, std::string>(
     const std::string& kind, const std::string& yaml_source)>;
 
-/// Called for each item during uninstall to remove it from its origin store.
-using ItemUninstallFn = std::function<bool(const std::string& kind, const std::string& item_id)>;
+/// Called for each item during uninstall to remove it from its origin store. `{}` on success;
+/// `unexpected("db_error: ...")` on a genuine store failure — `uninstall()` aborts the whole
+/// operation on this (never deletes the pack row while a contained item may still be live);
+/// any other `unexpected(...)` (not-found, unsupported kind) is tolerated and logged, matching
+/// pre-ADR-0058 behaviour for kinds whose origin store doesn't yet distinguish the two.
+using ItemUninstallFn = std::function<std::expected<void, std::string>(const std::string& kind,
+                                                                        const std::string& item_id)>;
 
 // ── ProductPackStore ────────────────────────────────────────────────────────
 

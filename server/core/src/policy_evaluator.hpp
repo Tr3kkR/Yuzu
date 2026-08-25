@@ -64,6 +64,17 @@ public:
         const std::unordered_map<std::string, std::string>& parameters,
         const std::string& execution_id)>;
 
+    /// ADR-0058: a dispatch attempt either succeeds, is a genuine skip (unknown
+    /// instruction id / no targets — same as pre-migration), or fails because
+    /// InstructionStore itself is unavailable (a genuine DB/lease error) — the
+    /// latter must never collapse into the former; REST callers 503 on it.
+    enum class DispatchOutcome { kDispatched, kSkipped, kStoreUnavailable };
+
+    struct DispatchResult {
+        DispatchOutcome outcome{DispatchOutcome::kSkipped};
+        std::string execution_id; // set only when outcome == kDispatched
+    };
+
     /// Epoch-seconds clock. Injectable for deterministic tests.
     using NowFn = std::function<int64_t()>;
 
@@ -88,13 +99,15 @@ public:
     /// policies. Safe to call from a single background thread.
     void tick();
 
-    /// Force an immediate check of one policy, ignoring its interval. Returns
-    /// the dispatch execution_id, or "" if the policy is missing / has no check
-    /// instruction / matches no agents.
-    std::string evaluate_now(const std::string& policy_id);
+    /// Force an immediate check of one policy, ignoring its interval. outcome is
+    /// kSkipped when the policy is missing / has no check instruction / matches
+    /// no agents; kStoreUnavailable when InstructionStore itself errored (caller
+    /// must 503, not 409); kDispatched with execution_id set on success.
+    DispatchResult evaluate_now(const std::string& policy_id);
 
     struct RemediateResult {
         bool ok{false};
+        bool store_unavailable{false}; // set when !ok because InstructionStore errored (503, not 4xx)
         std::string error;        // set when !ok
         std::string execution_id; // fix-dispatch execution id when ok
         int agents{0};            // agents the fix was dispatched to
@@ -138,19 +151,22 @@ private:
     std::vector<std::string> resolve_targets(const Policy& p) const;
 
     // Resolve targets, dispatch the fragment's check_instruction, record a
-    // Check in-flight. Returns the execution_id, or "" on failure / when a Check
-    // for this policy is already in flight (dedupe). Lock discipline: this
-    // acquires mu_ only briefly (dedupe scan, in-flight push) and NEVER holds it
-    // across the dispatch call — dispatch_fn does blocking gRPC + gateway
-    // forwarding, so it must run lock-free. Caller must NOT hold mu_.
-    std::string kickoff_check(const Policy& p);
+    // Check in-flight. kSkipped on failure / when a Check for this policy is
+    // already in flight (dedupe) / no fragment; kStoreUnavailable propagated from
+    // dispatch_instruction. Lock discipline: this acquires mu_ only briefly
+    // (dedupe scan, in-flight push) and NEVER holds it across the dispatch call —
+    // dispatch_fn does blocking gRPC + gateway forwarding, so it must run
+    // lock-free. Caller must NOT hold mu_.
+    DispatchResult kickoff_check(const Policy& p);
 
-    // Dispatch `instruction_id` to `targets`; returns a fresh execution_id, or
-    // "" on failure (unknown definition / empty targets). Must be called WITHOUT
-    // mu_ held (invokes the blocking dispatch_fn).
-    std::string dispatch_instruction(const std::string& instruction_id,
-                                     const std::unordered_map<std::string, std::string>& parameters,
-                                     const std::vector<std::string>& targets);
+    // Dispatch `instruction_id` to `targets`. kStoreUnavailable when
+    // InstructionStore::get_definition itself errors (ADR-0058: must not
+    // collapse into the same skip as unknown-id); kSkipped for a genuine
+    // unknown definition / empty targets; kDispatched with execution_id set on
+    // success. Must be called WITHOUT mu_ held (invokes the blocking dispatch_fn).
+    DispatchResult dispatch_instruction(const std::string& instruction_id,
+                                        const std::unordered_map<std::string, std::string>& parameters,
+                                        const std::vector<std::string>& targets);
 
     int64_t now() const;
     static std::string gen_execution_id();

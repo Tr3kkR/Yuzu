@@ -15258,6 +15258,16 @@ private:
 
                 auto result = instruction_store_->create_definition(def);
                 if (!result) {
+                    // ADR-0058: a genuine DB/lease failure 503s — never falls through to
+                    // the conflict/validation split below (see delete routes for the
+                    // same check).
+                    if (result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0) {
+                        res.status = 503;
+                        res.set_content(
+                            R"({"error":{"code":503,"message":"instruction store unavailable"},"meta":{"api_version":"v1"}})",
+                            "application/json");
+                        return;
+                    }
                     // #402: store-level kConflictPrefix maps to HTTP 409. The
                     // prefix is an internal store↔route contract — strip it
                     // before placing the message in the operator-facing JSON
@@ -15417,8 +15427,13 @@ private:
 
                 auto result = instruction_store_->update_definition(def);
                 if (!result) {
-                    res.status = 400;
-                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
+                    // ADR-0058: a genuine DB/lease failure 503s, never falls through to 400.
+                    bool db_error = result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0;
+                    res.status = db_error ? 503 : 400;
+                    res.set_content(nlohmann::json({{"error", db_error
+                                                                   ? "instruction store unavailable"
+                                                                   : result.error()}})
+                                        .dump(),
                                     "application/json");
                     return;
                 }
@@ -15448,8 +15463,9 @@ private:
 
             auto id = req.matches[1].str();
             // ADR-0058: delete_definition now returns std::expected<void, std::string> —
-            // a genuine DB error 503s distinctly; "not found" keeps the pre-migration
-            // {"deleted": false} shape (this route never distinguished the two before).
+            // a genuine DB error 503s distinctly; "not_found: " -> 404 (mirrors
+            // ProductPackStore::uninstall's identical REST contract change,
+            // workflow_routes.cpp product_pack_error_status).
             auto del_result = instruction_store_->delete_definition(id);
             if (!del_result && del_result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0) {
                 res.status = 503;
@@ -15458,15 +15474,19 @@ private:
                     "application/json");
                 return;
             }
-            bool deleted = del_result.has_value();
-            if (deleted) {
-                (void)audit_log(req, "instruction.delete", "success", "InstructionDefinition", id);
-                emit_event("instruction.deleted", req, {}, {{"instruction_id", id}});
-                res.set_header(
-                    "HX-Trigger",
-                    R"({"showToast":{"message":"Instruction definition deleted","level":"success"}})");
+            if (!del_result) {
+                res.status = 404;
+                res.set_content(
+                    R"({"error":{"code":404,"message":"instruction definition not found"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
             }
-            res.set_content(nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
+            (void)audit_log(req, "instruction.delete", "success", "InstructionDefinition", id);
+            emit_event("instruction.deleted", req, {}, {{"instruction_id", id}});
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Instruction definition deleted","level":"success"}})");
+            res.set_content(nlohmann::json({{"deleted", true}}).dump(), "application/json");
         });
 
         web_server_->Get(R"(/api/instructions/([^/]+)/export)", [this](const httplib::Request& req,
@@ -15509,6 +15529,15 @@ private:
 
             auto result = instruction_store_->import_definition_json(req.body);
             if (!result) {
+                // ADR-0058: a genuine DB/lease failure 503s — never falls through to the
+                // conflict/validation split below.
+                if (result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0) {
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"instruction store unavailable"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
                 // iter-H2: /import shares the create_definition_impl path,
                 // so it inherits the kConflictPrefix → 409 mapping that the
                 // POST handler does. Without this mapping the import path
@@ -15625,8 +15654,12 @@ private:
             s.description = desc;
             auto result = instruction_store_->create_set(s);
             if (!result) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
+                // ADR-0058: a genuine DB/lease failure 503s, never falls through to 400.
+                bool db_error = result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0;
+                res.status = db_error ? 503 : 400;
+                res.set_content(nlohmann::json({{"error", db_error ? "instruction store unavailable"
+                                                                    : result.error()}})
+                                    .dump(),
                                 "application/json");
                 return;
             }
@@ -15647,8 +15680,8 @@ private:
 
             auto id = req.matches[1].str();
             // ADR-0058: delete_set now returns std::expected<void, std::string> — a
-            // genuine DB error 503s distinctly; "not found" keeps the pre-migration
-            // {"deleted": false} shape (this route never distinguished the two before).
+            // genuine DB error 503s distinctly; "not_found: " -> 404 (mirrors
+            // ProductPackStore::uninstall's identical REST contract change).
             auto del_result = instruction_store_->delete_set(id);
             if (!del_result && del_result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0) {
                 res.status = 503;
@@ -15657,8 +15690,14 @@ private:
                     "application/json");
                 return;
             }
-            bool deleted = del_result.has_value();
-            res.set_content(nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
+            if (!del_result) {
+                res.status = 404;
+                res.set_content(
+                    R"({"error":{"code":404,"message":"instruction set not found"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            res.set_content(nlohmann::json({{"deleted", true}}).dump(), "application/json");
         });
 
         // -- Execution API ----------------------------------------------------

@@ -799,8 +799,15 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
                 res.set_content(R"({"error":{"code":404,"message":"policy not found"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
-            auto exec_id = policy_evaluator_->evaluate_now(id);
-            if (exec_id.empty()) {
+            auto dispatch = policy_evaluator_->evaluate_now(id);
+            if (dispatch.outcome == yuzu::server::PolicyEvaluator::DispatchOutcome::kStoreUnavailable) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"instruction store unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            if (dispatch.outcome != yuzu::server::PolicyEvaluator::DispatchOutcome::kDispatched) {
                 res.status = 409;
                 res.set_content(
                     nlohmann::json({{"error",
@@ -812,6 +819,7 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
                     "application/json");
                 return;
             }
+            const auto& exec_id = dispatch.execution_id;
             audit_fn_(req, "policy.evaluate", "success", "policy", id, "execution_id=" + exec_id);
             emit_event_fn_("policy.evaluated", req, {},
                            {{"policy_id", id}, {"execution_id", exec_id}});
@@ -907,7 +915,9 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             auto result = policy_evaluator_->remediate(id, agent_ids);
             if (!result.ok) {
                 int code = 400;
-                if (result.error.find("not found") != std::string::npos)
+                if (result.store_unavailable)
+                    code = 503;
+                else if (result.error.find("not found") != std::string::npos)
                     code = 404;
                 else if (result.error.find("remediation pathway") != std::string::npos ||
                          result.error.find("no non_compliant") != std::string::npos ||

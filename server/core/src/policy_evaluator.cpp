@@ -21,6 +21,7 @@
 #include <algorithm>
 
 #include <chrono>
+#include <format>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -269,35 +270,41 @@ std::vector<std::string> PolicyEvaluator::resolve_targets(const Policy& p) const
     return out;
 }
 
-std::string
+PolicyEvaluator::DispatchResult
 PolicyEvaluator::dispatch_instruction(const std::string& instruction_id,
                                       const std::unordered_map<std::string, std::string>& parameters,
                                       const std::vector<std::string>& targets) {
     if (targets.empty() || !d_.instruction_store || !d_.dispatch_fn)
-        return "";
-    // ADR-0058: get_definition now returns std::expected<optional<...>, string> — a
-    // genuine DB error and a not-found id both mean "cannot dispatch this check/fix",
-    // matching the pre-migration behaviour of treating both as the same skip.
+        return {DispatchOutcome::kSkipped, ""};
+    // ADR-0058: get_definition now returns std::expected<optional<...>, string>.
+    // A genuine DB error must surface as kStoreUnavailable — never collapse into
+    // the same skip as a not-found id (that fail-open is exactly what ADR-0036
+    // exists to close on an authorization/dispatch-adjacent read).
     auto def_result = d_.instruction_store->get_definition(instruction_id);
-    if (!def_result || !*def_result) {
+    if (!def_result) {
+        spdlog::warn("policy_evaluator: instruction store unavailable resolving '{}': {}",
+                     instruction_id, def_result.error());
+        return {DispatchOutcome::kStoreUnavailable, ""};
+    }
+    if (!*def_result) {
         spdlog::warn("policy_evaluator: unknown check/fix instruction '{}'", instruction_id);
-        return "";
+        return {DispatchOutcome::kSkipped, ""};
     }
     const auto& def = **def_result;
     auto execid = gen_execution_id();
     d_.dispatch_fn(def.plugin, def.action, targets, /*scope_expr=*/"", parameters, execid);
-    return execid;
+    return {DispatchOutcome::kDispatched, execid};
 }
 
-std::string PolicyEvaluator::kickoff_check(const Policy& p) {
+PolicyEvaluator::DispatchResult PolicyEvaluator::kickoff_check(const Policy& p) {
     if (!d_.policy_store)
-        return "";
+        return {DispatchOutcome::kSkipped, ""};
     auto frag = d_.policy_store->get_fragment(p.fragment_id);
     if (!frag || frag->check_instruction.empty())
-        return "";
+        return {DispatchOutcome::kSkipped, ""};
     auto targets = resolve_targets(p);
     if (targets.empty())
-        return "";
+        return {DispatchOutcome::kSkipped, ""};
 
     // Dedupe (gov UP-5 / UP-13): if a Check for this policy is already in flight,
     // do not dispatch another — otherwise rapid /evaluate calls or a tick landing
@@ -307,20 +314,20 @@ std::string PolicyEvaluator::kickoff_check(const Policy& p) {
         std::lock_guard<std::mutex> lk(mu_);
         for (const auto& f : in_flight_)
             if (f.phase == Phase::Check && f.policy_id == p.id)
-                return "";
+                return {DispatchOutcome::kSkipped, ""};
     }
 
     auto params = build_params(frag->check_parameters, p.inputs);
     // dispatch_instruction invokes the blocking dispatch_fn — call it WITHOUT mu_.
-    auto execid = dispatch_instruction(frag->check_instruction, params, targets);
-    if (execid.empty())
-        return "";
+    auto result = dispatch_instruction(frag->check_instruction, params, targets);
+    if (result.outcome != DispatchOutcome::kDispatched)
+        return result;
 
     {
         std::lock_guard<std::mutex> lk(mu_);
         in_flight_.push_back(InFlight{.phase = Phase::Check,
                                       .policy_id = p.id,
-                                      .execution_id = execid,
+                                      .execution_id = result.execution_id,
                                       .instruction_id = frag->check_instruction,
                                       .compliance_expr = frag->check_compliance,
                                       .targets = std::move(targets),
@@ -329,7 +336,7 @@ std::string PolicyEvaluator::kickoff_check(const Policy& p) {
                                       .verify_compliance = "",
                                       .verify_parameters_json = ""});
     }
-    return execid;
+    return result;
 }
 
 void PolicyEvaluator::dispatch_due() {
@@ -346,24 +353,36 @@ void PolicyEvaluator::dispatch_due() {
         // every tick — a self-inflicted dispatch amplifier.
         int64_t interval = std::max<int64_t>(interval_for(p, d_.default_interval_seconds), 60);
         // Claim the due slot under a short lock, then dispatch lock-free.
+        int64_t prior_last = 0;
         {
             std::lock_guard<std::mutex> lk(mu_);
             auto it = last_eval_.find(p.id);
-            int64_t last = (it != last_eval_.end()) ? it->second : 0;
-            if (t - last < interval)
+            prior_last = (it != last_eval_.end()) ? it->second : 0;
+            if (t - prior_last < interval)
                 continue;
             last_eval_[p.id] = t; // claim before dispatch (throttle)
         }
-        kickoff_check(p); // does its own brief locking; dispatch runs without mu_
+        auto result = kickoff_check(p); // does its own brief locking; dispatch runs without mu_
+        if (result.outcome == DispatchOutcome::kStoreUnavailable) {
+            // A store-unavailable attempt is not a completed evaluation — restore the
+            // prior throttle state so the next tick retries immediately instead of
+            // waiting out the full interval on a transient InstructionStore failure.
+            std::lock_guard<std::mutex> lk(mu_);
+            last_eval_[p.id] = prior_last;
+            if (d_.metrics)
+                d_.metrics
+                    ->counter("yuzu_server_policy_eval_errors_total", {{"phase", "check"}})
+                    .increment();
+        }
     }
 }
 
-std::string PolicyEvaluator::evaluate_now(const std::string& policy_id) {
+PolicyEvaluator::DispatchResult PolicyEvaluator::evaluate_now(const std::string& policy_id) {
     if (!d_.policy_store)
-        return "";
+        return {DispatchOutcome::kSkipped, ""};
     auto p = d_.policy_store->get_policy(policy_id);
     if (!p)
-        return "";
+        return {DispatchOutcome::kSkipped, ""};
     {
         std::lock_guard<std::mutex> lk(mu_);
         last_eval_[policy_id] = now();
@@ -429,11 +448,17 @@ PolicyEvaluator::remediate(const std::string& policy_id,
     // burn an attempt against the retry cap even when the dispatch fails (unknown
     // instruction / all targets offline), eventually locking the agent to 'error'
     // with no fix ever sent. dispatch_instruction must run without mu_ held.
-    auto execid = dispatch_instruction(frag->fix_instruction, fix_params, targets);
-    if (execid.empty()) {
+    auto dispatch_result = dispatch_instruction(frag->fix_instruction, fix_params, targets);
+    if (dispatch_result.outcome == DispatchOutcome::kStoreUnavailable) {
+        out.store_unavailable = true;
+        out.error = "instruction store unavailable";
+        return out;
+    }
+    if (dispatch_result.outcome != DispatchOutcome::kDispatched) {
         out.error = "fix dispatch failed (unknown instruction or no agents)";
         return out;
     }
+    const auto& execid = dispatch_result.execution_id;
 
     // Now mark fixing (increments the attempt counter; >3 auto-transitions to error).
     for (const auto& tgt : targets)
@@ -522,12 +547,12 @@ void PolicyEvaluator::collect_ready() {
             }
             if (!verify_targets.empty()) {
                 auto vparams = params_from_json_obj(f.verify_parameters_json);
-                auto execid = dispatch_instruction(f.verify_instruction, vparams, verify_targets);
-                if (!execid.empty()) {
+                auto result = dispatch_instruction(f.verify_instruction, vparams, verify_targets);
+                if (result.outcome == DispatchOutcome::kDispatched) {
                     std::lock_guard<std::mutex> lk(mu_);
                     in_flight_.push_back(InFlight{.phase = Phase::Check,
                                                   .policy_id = f.policy_id,
-                                                  .execution_id = execid,
+                                                  .execution_id = result.execution_id,
                                                   .instruction_id = f.verify_instruction,
                                                   .compliance_expr = f.verify_compliance,
                                                   .targets = verify_targets,
@@ -536,10 +561,16 @@ void PolicyEvaluator::collect_ready() {
                                                   .verify_compliance = "",
                                                   .verify_parameters_json = ""});
                 } else if (d_.policy_store) {
+                    // A store-unavailable verify dispatch is a transient infra failure, not
+                    // a genuine post-fix verification failure — the result JSON records which
+                    // it was rather than collapsing both into the same "dispatch_failed".
+                    const char* result_tag = result.outcome == DispatchOutcome::kStoreUnavailable
+                                                  ? "store_unavailable"
+                                                  : "dispatch_failed";
                     for (const auto& tgt : verify_targets) {
                         (void)d_.policy_store->update_agent_status(
                             f.policy_id, tgt, "error",
-                            R"({"phase":"verify","result":"dispatch_failed"})");
+                            std::format(R"({{"phase":"verify","result":"{}"}})", result_tag));
                         if (d_.metrics)
                             d_.metrics
                                 ->counter("yuzu_server_policy_eval_errors_total",
