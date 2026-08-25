@@ -10,10 +10,12 @@
  *   macOS   -- launchctl list
  */
 
+#include "tar_capture_status.hpp" // yuzu::tar::{classify_subprocess_capture,IncompleteCaptureError}
 #include "tar_collectors.hpp"
 
 #include <spdlog/spdlog.h>
 
+#include <stdexcept>
 #include <string>
 #include <utility> // std::move
 #include <vector>
@@ -28,11 +30,9 @@
 #include <windows.h>
 #include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #else
-#include "tar_capture_status.hpp" // yuzu::tar::classify_subprocess_capture
 #include "tar_service_parsers.hpp" // yuzu::tar::{parse_systemctl_list_units,parse_launchctl_list}
 
 #include <chrono>
-#include <stdexcept>
 
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess / probe_tool_path (ADR-3002 rung 2)
 #endif
@@ -72,14 +72,47 @@ const char* startup_type_str(DWORD start_type) {
     }
 }
 
+// RAII owner for a SC_HANDLE (round 3, B3-003): both the SCM handle and each
+// per-service handle are held across allocations that can throw
+// (std::vector<BYTE> buffer(bytes_needed)/config_buf(config_bytes), the
+// from_wide string conversions, services.push_back) -- a throwing
+// allocation between a successful Open*/CloseServiceHandle used to skip the
+// close entirely, leaking the handle. Same shape as this repo's other Win32
+// RAII guards (processes_plugin.cpp's HandleGuard, tar_arp_collector.cpp's
+// MibTableGuard, tar_mapdrive_collector.cpp's WNetEnumGuard/NetApiBufGuard).
+struct ScHandleGuard {
+    SC_HANDLE h{nullptr};
+    explicit ScHandleGuard(SC_HANDLE hh) noexcept : h(hh) {}
+    ~ScHandleGuard() {
+        if (h)
+            CloseServiceHandle(h);
+    }
+    ScHandleGuard(const ScHandleGuard&) = delete;
+    ScHandleGuard& operator=(const ScHandleGuard&) = delete;
+};
+
 } // namespace
 
 std::vector<ServiceInfo> enumerate_services() {
     std::vector<ServiceInfo> services;
 
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ENUMERATE_SERVICE);
-    if (!scm)
-        return services;
+    if (!scm) {
+        // round 3 (same shape as the Linux/macOS subprocess legs below): a
+        // failed SCM open is not "zero services", it is an acquisition
+        // failure -- returning an empty vector here used to be diffed
+        // against the last COMPLETE service baseline as though every
+        // service had stopped/been removed. Throw so collect_or_retain
+        // (tar_capture_status.hpp) skips this tick's diff/state-advance
+        // instead, retaining the previous baseline.
+        auto rc = GetLastError();
+        spdlog::error("TAR: service snapshot incomplete (OpenSCManagerW failed, rc={}) -- "
+                      "skipping diff, retaining previous baseline",
+                      rc);
+        throw yuzu::tar::IncompleteCaptureError(
+            "TAR: OpenSCManagerW failed: rc=" + std::to_string(rc));
+    }
+    ScHandleGuard scm_guard{scm};
 
     DWORD bytes_needed = 0;
     DWORD service_count = 0;
@@ -97,8 +130,15 @@ std::vector<ServiceInfo> enumerate_services() {
                                SERVICE_STATE_ALL, buffer.data(),
                                static_cast<DWORD>(buffer.size()), &bytes_needed,
                                &service_count, &resume_handle, nullptr)) {
-        CloseServiceHandle(scm);
-        return services;
+        // Same acquisition-failure shape as the OpenSCManagerW throw above:
+        // a partial/failed enumeration must not be diffed as a genuinely
+        // empty service list.
+        auto rc = GetLastError();
+        spdlog::error("TAR: service snapshot incomplete (EnumServicesStatusExW failed, rc={}) -- "
+                      "skipping diff, retaining previous baseline",
+                      rc);
+        throw yuzu::tar::IncompleteCaptureError(
+            "TAR: EnumServicesStatusExW failed: rc=" + std::to_string(rc));
     }
 
     auto* entries = reinterpret_cast<ENUM_SERVICE_STATUS_PROCESSW*>(buffer.data());
@@ -108,15 +148,19 @@ std::vector<ServiceInfo> enumerate_services() {
         si.display_name = from_wide(entries[i].lpDisplayName);
         si.status = service_state_str(entries[i].ServiceStatusProcess.dwCurrentState);
 
-        // Query startup type
-        SC_HANDLE svc = OpenServiceW(scm, entries[i].lpServiceName, SERVICE_QUERY_CONFIG);
-        if (svc) {
+        // Query startup type. A per-service query failure degrades only
+        // this one row's startup_type field to "unknown" -- the service's
+        // name/status are still real and the overall snapshot is still
+        // complete, so this is NOT an incomplete-capture condition (unlike
+        // the SCM-wide failures above).
+        ScHandleGuard svc_guard{OpenServiceW(scm, entries[i].lpServiceName, SERVICE_QUERY_CONFIG)};
+        if (svc_guard.h) {
             DWORD config_bytes = 0;
-            BOOL ok = QueryServiceConfigW(svc, nullptr, 0, &config_bytes);
+            BOOL ok = QueryServiceConfigW(svc_guard.h, nullptr, 0, &config_bytes);
             if (!ok && GetLastError() == ERROR_INSUFFICIENT_BUFFER && config_bytes > 0) {
                 std::vector<BYTE> config_buf(config_bytes);
                 auto* config = reinterpret_cast<QUERY_SERVICE_CONFIGW*>(config_buf.data());
-                if (QueryServiceConfigW(svc, config, config_bytes, &config_bytes)) {
+                if (QueryServiceConfigW(svc_guard.h, config, config_bytes, &config_bytes)) {
                     si.startup_type = startup_type_str(config->dwStartType);
                 } else {
                     si.startup_type = "unknown";
@@ -124,7 +168,6 @@ std::vector<ServiceInfo> enumerate_services() {
             } else {
                 si.startup_type = "unknown";
             }
-            CloseServiceHandle(svc);
         } else {
             si.startup_type = "unknown";
         }
@@ -132,7 +175,6 @@ std::vector<ServiceInfo> enumerate_services() {
         services.push_back(std::move(si));
     }
 
-    CloseServiceHandle(scm);
     return services;
 }
 
@@ -149,7 +191,7 @@ std::vector<ServiceInfo> enumerate_services() {
     if (systemctl_path.empty()) {
         spdlog::error("TAR: service snapshot incomplete (systemctl not found) -- skipping diff, "
                       "retaining previous baseline");
-        throw std::runtime_error("TAR: systemctl not found");
+        throw yuzu::tar::IncompleteCaptureError("TAR: systemctl not found");
     }
 
     // Bounded, fork-lock-covered, shell-free argv exec (ADR-3002 rung 2): no
@@ -173,7 +215,7 @@ std::vector<ServiceInfo> enumerate_services() {
         spdlog::error("TAR: service snapshot incomplete (systemctl {}) -- skipping diff, "
                       "retaining previous baseline",
                       status.reason);
-        throw std::runtime_error("TAR: systemctl capture incomplete: " + status.reason);
+        throw yuzu::tar::IncompleteCaptureError("TAR: systemctl capture incomplete: " + status.reason);
     }
 
     return parse_systemctl_list_units(res.lines);
@@ -193,7 +235,7 @@ std::vector<ServiceInfo> enumerate_services() {
     if (launchctl_path.empty()) {
         spdlog::error("TAR: service snapshot incomplete (launchctl not found) -- skipping diff, "
                       "retaining previous baseline");
-        throw std::runtime_error("TAR: launchctl not found");
+        throw yuzu::tar::IncompleteCaptureError("TAR: launchctl not found");
     }
 
     // Bounded, fork-lock-covered, shell-free argv exec (ADR-3002 rung 2):
@@ -211,7 +253,7 @@ std::vector<ServiceInfo> enumerate_services() {
         spdlog::error("TAR: service snapshot incomplete (launchctl {}) -- skipping diff, "
                       "retaining previous baseline",
                       status.reason);
-        throw std::runtime_error("TAR: launchctl capture incomplete: " + status.reason);
+        throw yuzu::tar::IncompleteCaptureError("TAR: launchctl capture incomplete: " + status.reason);
     }
 
     return parse_launchctl_list(res.lines);
