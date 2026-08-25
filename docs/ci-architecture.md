@@ -515,9 +515,28 @@ already carry), while only each store's narrow, already-thin
 is a plain safety cushion on top of what the split alone already earns (every
 new shard's real-diagnostic-scaled estimate lands well under 700s even 2-wide
 paired). Revisit on a fixed cadence, not an assumed completion date — tighten
-back to 600, or drop, once a shard is comfortably under budget. Full
-measurements, partition verification, and per-shard local wall time:
-`tests/meson.build`'s own comment at the shard E/I/G/J block.
+back to 600, or drop, once a shard is comfortably under budget: TWO reasons to
+revisit, not just budget hygiene — the worst-case job-budget arithmetic below,
+and the #2093 duration watchdog's 80%-of-timeout warning threshold moving with
+it (480s->560s on exactly the four shards with the most recent drift history,
+diluting the watchdog's lead time on them specifically). Full measurements,
+partition verification, and per-shard local wall time: `tests/meson.build`'s
+own comment at the shard E/I/G/J block.
+
+**Worst-case job-budget arithmetic (Gate 6 SRE, 2026-08-25), recorded so a
+future reviewer doesn't have to re-derive it.** Degenerate case — every pg
+shard hitting its OWN timeout simultaneously — sums to 6*600s + 4*700s =
+6400 test-seconds; at `--num-processes 2` that floors to 3550s (~59.2 min)
+even under ideal pairing. Add the up-to-30-min cross-job slot wait
+(`YUZU_TEST_SLOT_TIMEOUT_MIN`) and this alone reaches ~89 min against the
+90-min job ceiling, before checkout/build time. This is the theoretical
+ceiling, not the expected case (it requires the box already so unhealthy
+that a job-level kill is arguably the correct outcome, not a failure of this
+design) — the realistic case, using the real measured/scaled numbers this
+split was based on, is comfortably inside budget and materially IMPROVED by
+the split versus the pre-split 8-shard layout. Both directions — a tighter
+theoretical ceiling, a healthier realistic case — are true at once and both
+worth knowing.
 
 **Drift risk, not yet automated:** the 3-way split hardcodes the 10 pg shard
 names and the 3 non-pg server test names directly in `ci.yml`. A new/renamed
