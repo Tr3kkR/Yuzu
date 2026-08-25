@@ -132,20 +132,28 @@ inline std::string join_cwd(std::string_view cwd, std::string_view rel, bool win
 }
 
 /// Resolve `cmd` (script_exec's "command" param, or an exec-mode argv[0]) to
-/// an absolute path the runner can exec, following the SAME rules
-/// execvp()/CreateProcessA() applied before this migration — pure and
-/// OS-call-free so both the POSIX and Windows regimes are testable on any
-/// host via `windows_rules`:
+/// an absolute path the runner can exec — pure and OS-call-free so both the
+/// POSIX and Windows regimes are testable on any host via `windows_rules`.
+///
+/// BR-009 (whole-branch review): the RESOLUTION ALGORITHM below matches
+/// execvp()/CreateProcessA()'s pre-migration rules exactly, but the `cwd`
+/// value the CALLER passes in does NOT — script_exec_plugin.cpp passes a
+/// fixed safe sentinel (kRunnerDefaultCwd: "/" on POSIX, Windows'
+/// System32 on Windows), never the agent daemon's actual real working
+/// directory the deleted paths implicitly used. This is a deliberate,
+/// documented compatibility break (ADR-3002 A6), not an exact behavioural
+/// preservation — see kRunnerDefaultCwd's own comment at the call site.
 ///
 ///  - a PATH-LIKE cmd (contains '/', or under windows_rules contains '\\'
 ///    or has a drive-letter prefix) that is already ABSOLUTE passes through
 ///    unchanged;
 ///  - a PATH-LIKE cmd that is RELATIVE (./tool, .\tool.exe) resolves
 ///    against `cwd` (a plain string parameter, never read from the OS here)
-///    to an absolute path — the same relative-launch semantics
-///    execvp()/CreateProcessA() gave a "./tool"-style argv[0] under the
-///    process's real cwd, now made explicit since the runner's argv[0]
-///    contract requires an already-absolute path; a Windows DRIVE-RELATIVE
+///    to an absolute path — the same JOIN RULE execvp()/CreateProcessA()
+///    applied to a "./tool"-style argv[0] under the process's real cwd, now
+///    made explicit since the runner's argv[0] contract requires an
+///    already-absolute path, but joined against the caller-supplied `cwd`
+///    above, not necessarily the daemon's own; a Windows DRIVE-RELATIVE
 ///    cmd ("C:foo", no backslash/slash after the colon) is the one
 ///    exception — it resolves against `cwd` only when `cwd` names the SAME
 ///    drive (the "C:" prefix is stripped before joining, since Windows
