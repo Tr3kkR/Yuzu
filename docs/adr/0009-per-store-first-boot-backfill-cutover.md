@@ -73,13 +73,17 @@ data).
   **Update (`ResponseStore`/#2691, 2026-08-08):** "behind a flag" above overstated the
   mechanism for the first store to actually exercise the skippable class. No flag was
   built, and none is needed: `ResponseStore` skips backfill **unconditionally** — on
-  cutover the legacy `responses.db` is never read, and a one-time loud boot log records
-  "response history reset on Postgres cutover." There is no compliance or config-durability
-  requirement to preserve response rows across the cut (unlike the config/reference and
-  audit classes above), so a conditional flag would add a knob nobody has a reason to turn
-  off. `ResponseStore` is the reference case for this class: a future purely-TTL'd,
-  purely-ephemeral store should also skip unconditionally, not gate the skip behind a flag,
-  unless a specific store has a reason this one doesn't.
+  cutover the legacy `responses.db` is never read. (Correction, 2026-08-25: an earlier
+  version of this paragraph claimed "a one-time loud boot log records 'response history
+  reset on Postgres cutover'" — no such log exists; `ResponseStore` logs only its generic
+  `"ResponseStore initialized (schema {}, retention={}d)"` line, with nothing distinguishing
+  a fresh start from any other boot. See the fresh-start-by-default Update below for the new
+  detect-and-warn requirement this gap motivates for stores holding real operator data.)
+  There is no compliance or config-durability requirement to preserve response rows across
+  the cut (unlike the config/reference and audit classes above), so a conditional flag would
+  add a knob nobody has a reason to turn off. `ResponseStore` is the reference case for this
+  class: a future purely-TTL'd, purely-ephemeral store should also skip unconditionally, not
+  gate the skip behind a flag, unless a specific store has a reason this one doesn't.
 
   **Update (`ProductPackStore`/ADR-0054, 2026-08-23):** the "must... delete the same
   subject/device from the rollback copy" sentence above literally names mutating the
@@ -147,6 +151,15 @@ data).
   same day this amendment landed, ahead of it reaching that PR — too late for the "don't
   build it" guidance to apply retroactively. Its backfill stays for now, same as every
   other already-migrated store's.)
+
+  (`InstructionStore`/PR #3602 is a DIFFERENT situation from `WebhookStore`'s, not the same
+  one — it is still OPEN, unmerged, as of this amendment landing, with a full mandatory
+  backfill already built under the pre-amendment text. Unlike `WebhookStore`, nothing here
+  is retroactive: #3602 should drop that backfill before merging, not keep it — this default
+  now governs it directly, the same as any other not-yet-merged `InstructionStore` work. Its
+  reviewer had already separately requested changes for unrelated bugs in the backfill's
+  conflict-resolution logic; removing the backfill entirely resolves those findings along
+  with bringing the PR into line with this default.)
 
   **This default is conditional on the fact, not permanent policy.** It holds only while
   "no production fleet" stays true. If a real external deployment (a design partner, a

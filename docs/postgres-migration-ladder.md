@@ -85,7 +85,7 @@ hole — `security-guardian` gates each.
 
 | Store | Schema | Provisional posture | Notes |
 |---|---|---|---|
-| `InstructionStore` | `instruction_store` | authoritative | build-time-seeded + operator additions. **Do NOT build `migrate_from_sqlite()` for this store** — ADR-0009's 2026-08-25 fresh-start-by-default amendment: no production fleet has ever run a pre-Postgres build, so there is no real legacy `instructions.db` operator-added content to protect. This is separate from, and does not affect, the build-time seed mechanism (re-seeding from embedded YAML content via `embed_content.py`/`bundled_content.cpp`) — that stays exactly as it is; only the legacy-SQLite-file backfill path is being skipped. |
+| `InstructionStore` | `instruction_store` | authoritative | build-time-seeded + operator additions. **Do NOT build `migrate_from_sqlite()` for this store** — ADR-0009's 2026-08-25 fresh-start-by-default amendment: no production fleet has ever run a pre-Postgres build, so there is no real legacy `instructions.db` operator-added content to protect. This is separate from, and does not affect, the build-time seed mechanism (re-seeding from embedded YAML content via `embed_content.py`/`bundled_content.cpp`) — that stays exactly as it is; only the legacy-SQLite-file backfill path is being skipped. **PR #3602 (open, unmerged as of this amendment) already built a full mandatory backfill under the pre-amendment text — see ADR-0009's amendment for why that PR should drop it before merging rather than being grandfathered like `WebhookStore`.** |
 
 ## Wave 3 — secret-gated (need the ADR-0010 secrets seam wired)
 
