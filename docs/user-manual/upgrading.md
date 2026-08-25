@@ -775,6 +775,56 @@ it was never in `ca.db` and stays a local file behind `KeyProvider` (`--ca-dir`)
   until Postgres notices the dead session) and `pg_terminate_backend` it — see
   `docs/pki-architecture.md`'s operator runbook.
 
+## ⚠️ Behaviour change: webhook store moves to Postgres (ADR-0057)
+
+`WebhookStore` (operator-registered outbound webhooks and their delivery log —
+everything behind `GET`/`POST`/`DELETE /api/webhooks` and
+`GET /api/webhooks/{id}/deliveries`) moves from the SQLite `webhooks.db` file
+to the server's PostgreSQL substrate in this release (schema `webhook_store`).
+The webhook HMAC signing secret is now envelope-encrypted at rest
+(`SecretCodec`, AES-256-GCM, ADR-0010) instead of a plaintext column.
+
+- **Mandatory, automatic backfill on first boot, both tables.** The legacy
+  `webhooks.db` (if present) is read once at startup; every webhook's signing
+  secret is re-encrypted (never copied in plaintext), and every delivery
+  record carries over too (the delivery log has no expiry, so — unlike
+  `ResponseStore` below — it is not treated as skippable). A failed backfill
+  refuses to start the server (see remediation below).
+- **New fail-closed-at-boot behaviour.** A Postgres/`SecretCodec` error at any
+  point in this store's boot sequence (schema migration, KEK verification, or
+  the backfill itself) now refuses to start the server, rather than starting
+  with webhooks silently unwired.
+- **If the backfill fails:** the boot log names the exact remediation — repair
+  `webhooks.db`, or move it aside to skip the backfill. Skipping means any
+  webhooks/signing secrets it held do **not** carry over; recreate them via
+  `POST /api/webhooks` after the server starts.
+- **Legacy file retention.** On a verified successful backfill, `webhooks.db`
+  is renamed to `webhooks.db.migrated-<unix-epoch>` alongside its `-wal`/`-shm`
+  sidecars — never deleted — and access is restricted to the owner where the
+  platform supports it. It still holds every pre-cutover signing secret in
+  **plaintext** for the one-release rollback window (ADR-0009); see
+  [`rest-api.md`](rest-api.md#post-apiwebhooks) for the rotation guidance if
+  your backup posture for that window is unknown.
+- **`POST`/`DELETE /api/webhooks` now distinguish a caller error from a store
+  failure**: `POST` returns `400` for an invalid URL scheme (previously an
+  ambiguous non-error response), and `GET`/`POST`/`DELETE /api/webhooks`
+  (list/create/delete) return `503` on a genuine database error instead of a
+  silently-empty or silently-failed result. `GET /api/webhooks/{id}/deliveries`'s
+  degrade-vs-error handling specifically is unchanged by this migration — a
+  degraded read there still renders an empty delivery list rather than a
+  `503`, the same as before the cutover.
+- **`GET /api/webhooks/{id}/deliveries`'s `?limit=` handling changed.**
+  `limit=0` (or any non-positive value) previously meant "return zero rows";
+  it now falls back to the default of 50, the same as an omitted `limit`. A
+  value above 10000 was previously passed through unbounded; it is now
+  silently capped at 10000. If your integration relies on `limit=0` meaning
+  "give me nothing," or on retrieving more than 10000 rows in one call,
+  update it.
+- Every other webhook behavior — event-type matching, HMAC-SHA256 signature
+  format (`X-Yuzu-Signature: sha256=<hex>`), unsigned delivery when no secret
+  is configured — is unchanged. Detail:
+  `docs/adr/0057-webhook-store-postgres-migration.md`.
+
 ## ⚠️ Behaviour change: response history resets on Postgres cutover (ADR-0039)
 
 `ResponseStore` (agentic command/instruction results — the executions drawer

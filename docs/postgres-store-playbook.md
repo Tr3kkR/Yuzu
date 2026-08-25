@@ -53,6 +53,25 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
    reach for it without a specific reason; the per-store model is the one this ADR/playbook
    actually prescribes and the one `AuthDB` demonstrates. See ADR-0010's "Instance model" note
    for the full rationale.
+
+   **Two lessons from `WebhookStore` (ADR-0057, `SecretCodec`'s second production consumer,
+   the template for `OffloadTargetStore`/`RuntimeConfigStore`), generalized here since the
+   next author of one of those two stores should not have to re-derive them from a sibling
+   ADR:**
+   - **A backfill idempotency fingerprint over a secret-bearing legacy table must hash only a
+     has-secret bit, never the plaintext or a hash of it.** A stored hash of the secret would be
+     a SQL-insider brute-force oracle against every legacy signing secret; ADR-0057's fingerprint
+     deliberately excludes the secret bytes entirely from what gets hashed for fingerprint-set
+     idempotency, while the per-row IDENTITY/LIFECYCLE conflict rule (unaffected by this) still
+     protects the row itself.
+   - **A secret-bearing store's `KeyProvider`/`SecretCodec` reset in `stop()` must run only
+     AFTER that store's own delivery/worker-pool drain completes** — not at the shared top of
+     the teardown block alongside every other store's reset. `WebhookStore`'s first fix-round
+     attempt got this wrong (the codec reset ran before the delivery-pool drain, silently
+     dropping in-flight decrypt-failure audit events during shutdown); the corrected ordering is
+     `server.cpp`'s webhook teardown block. Copy that block's *shape*, not necessarily its
+     literal position — a store with no worker-pool/background-delivery surface may not need
+     this reordering at all.
 4. **Authoritative reads must be type-distinguishable (2026-07-25 program policy, ADR-0036).**
    On an **authoritative** store, every read whose result can feed a grant/target/enforce/skip
    decision MUST make a runtime DB error TYPE-DISTINGUISHABLE from "no rows" at the call site —

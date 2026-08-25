@@ -3851,12 +3851,15 @@ List all configured webhooks.
       "id": 1,
       "url": "https://example.com/hooks/yuzu",
       "event_types": ["agent.registered", "command.completed"],
+      "has_secret": true,
       "enabled": true,
       "created_at": 1710849600
     }
   ]
 }
 ```
+
+`has_secret` reports whether a signing secret is configured — the secret itself is never returned by this or any other endpoint, encrypted or otherwise.
 
 #### `POST /api/webhooks`
 
@@ -3874,7 +3877,7 @@ Create a new webhook subscription.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `url` | string | Yes | HTTPS endpoint to receive POST notifications |
+| `url` | string | Yes | Endpoint to receive POST notifications (`http://` or `https://`; see the cleartext-HTTP warning below) |
 | `event_types` | array | Yes | Events to subscribe to (see the table below) |
 | `secret` | string | No | HMAC-SHA256 secret for payload signing |
 
@@ -3892,13 +3895,36 @@ Create a new webhook subscription.
 
 If a `secret` is provided, each delivery includes an `X-Yuzu-Signature` header containing the HMAC-SHA256 hex digest of the request body.
 
+**Security — secret storage and the legacy-file retention window.** A configured signing secret
+is envelope-encrypted at rest (AES-256-GCM, ADR-0010) — a stolen database backup alone cannot
+recover it. There is no rotation endpoint today: to change a secret, delete the webhook and
+recreate it. Deployments that upgraded from a release before the Postgres cutover retain the
+pre-cutover SQLite `webhooks.db` file for one release as a rollback net (ADR-0009); that file
+still holds signing secrets in **plaintext**. If your backup posture for that one-release window
+is unknown, rotate (delete-and-recreate) every webhook's secret once the window has closed.
+
+**Cleartext HTTP warning.** When `url` is `http://` (not `https://`), the delivered event
+payload is transmitted in cleartext. Production deployments should use `https://` only. The
+store accepts `http://` for development convenience — same posture as Offload Targets below.
+
+**Errors.** `400` for an empty/missing `url`, invalid JSON, or a URL that isn't `http://`/`https://`.
+`503` for a store/database degradation. Every error response is audited (`webhook.create`,
+result `failure`, a distinct detail string per cause).
+
 #### `DELETE /api/webhooks/{id}`
 
-Delete a webhook by numeric ID.
+Delete a webhook by numeric ID. `200` on success, `404` if no webhook has that id, `503` on a
+store/database error. Every outcome (including `404`) is audited as `webhook.delete`; a
+successful delete's audit detail carries the webhook's URL (captured just before deletion), so
+the record of where a webhook pointed survives its removal.
 
 #### `GET /api/webhooks/{id}/deliveries`
 
-List recent delivery attempts for a webhook. Includes HTTP status code, response time, and any error message for failed deliveries.
+List recent delivery attempts for a webhook, newest first. Includes HTTP status code, response
+time, and any error message for failed deliveries. `?limit=` defaults to 50 (any non-positive
+value also falls back to 50) and is capped at 10000; no `offset`/pagination parameter exists. A
+degraded read renders an empty list rather than a `503` — delivery history is audit convenience,
+not a decision surface.
 
 **Usage guide:**
 
