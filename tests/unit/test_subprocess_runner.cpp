@@ -1310,11 +1310,18 @@ namespace {
 
 // argv[0] MUST be absolute -- run_bounded_subprocess never PATH-searches
 // (subprocess_runner.hpp) -- and neither of these carries a banned
-// .bat/.cmd/.com extension. These are the same canonical system paths the
-// runner's own Windows backend already assumes for the child's working
-// directory ("C:\\Windows\\System32", subprocess_runner.cpp) and its A5
-// environment allow-list (SystemRoot/windir = "C:\\Windows",
-// subprocess_launch_spec.hpp default_launch_env).
+// .bat/.cmd/.com extension. These are resolved at RUNTIME via
+// windows_system_directory() (GetSystemDirectoryW, cached) rather than the
+// hard-coded "C:\\Windows\\System32" literal this used to be (BR4-005,
+// whole-branch review round 4): a hard-coded literal makes this whole suite
+// fail before ever exercising anything -- including BR3-001's runtime
+// system-directory fix itself -- on the relocated-system (non-`C:`)
+// configuration this branch's own security fix (subprocess_runner.cpp's
+// `windows_system_directory()` call, changelog.d's
+// 5.1-windows-system-directory-resolution fragment) exists to protect. On a
+// standard `C:` install the resolved value is byte-identical to the old
+// literal, so this is a strict improvement with no behaviour change on the
+// common case.
 //
 // Every argv token below is passed as its OWN element, so the Colascione
 // quoter never has to quote anything: the child sees a bare
@@ -1323,13 +1330,13 @@ namespace {
 // AutoRun hook, so a machine-local `Command Processor\AutoRun` value on a CI
 // image can neither inject output into the captured stream nor change the
 // child's exit code -- these assertions describe the runner, not the host.
-constexpr const char* kCmdExe = "C:\\Windows\\System32\\cmd.exe";
+const std::string kCmdExe = windows_system_directory() + "\\cmd.exe";
 
 // `ping -n 30 127.0.0.1` is the portable Windows sleep: ~29s of one-second
 // intervals, far longer than any deadline asserted below, with no PowerShell
 // and no real network dependency (loopback ICMP is serviced locally, and even
 // a blocked ICMP path only makes it take LONGER, never shorter).
-constexpr const char* kPingExe = "C:\\Windows\\System32\\ping.exe";
+const std::string kPingExe = windows_system_directory() + "\\ping.exe";
 
 } // namespace
 
@@ -1501,9 +1508,12 @@ TEST_CASE("run_bounded_subprocess (Windows) inherit_parent_env=true forwards the
 // then refuse (or worse, be unable) to exec.
 TEST_CASE("probe_tool_path (Windows) honours the executable half of its contract",
           "[subprocess][probe][windows]") {
-    // A real PE binary is returned; a directory is not executable.
+    // A real PE binary is returned; a directory is not executable. (BR4-005:
+    // the system directory itself, runtime-resolved like kCmdExe above,
+    // rather than a hard-coded "C:\\Windows" literal -- any real directory
+    // proves the same "not executable" contract.)
     CHECK(probe_tool_path({kCmdExe}) == kCmdExe);
-    CHECK(probe_tool_path({"C:\\Windows"}).empty());
+    CHECK(probe_tool_path({windows_system_directory()}).empty());
 
     yuzu::test::TempDir dir("yuzu_test_probe_");
     std::filesystem::create_directories(dir.path);

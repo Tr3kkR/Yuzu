@@ -34,6 +34,7 @@
 #ifdef _WIN32
 
 #include <yuzu/agent/plugin_loader.hpp>
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::windows_system_directory (BR4-005)
 #include <yuzu/plugin.h>
 
 #include "local_dispatcher.hpp"
@@ -108,8 +109,16 @@ TEST_CASE("script_exec plugin (Windows): exec streams real cmd.exe output throug
     // the rest of the reassembled command line as one command, so this
     // proves the runner's argv->command-line reconstruction round-trips
     // correctly for a real Windows child.
-    std::vector<YuzuParam> params{{"command", "C:\\Windows\\System32\\cmd.exe"},
-                                  {"args", "/c echo happy-path-win"}};
+    //
+    // BR4-005 (whole-branch review round 4): runtime-resolved via
+    // yuzu::agent::windows_system_directory() rather than a hard-coded
+    // "C:\\Windows\\System32" literal -- the hard-coded form fails this
+    // whole test (fs::copy_file/CreateProcessW can't find the literal)
+    // before ever exercising anything on the relocated-system (non-`C:`)
+    // configuration BR3-001's runtime resolution fix exists to protect,
+    // silently hiding exactly the class of regression that fix closes.
+    const std::string cmd_exe = yuzu::agent::windows_system_directory() + "\\cmd.exe";
+    std::vector<YuzuParam> params{{"command", cmd_exe.c_str()}, {"args", "/c echo happy-path-win"}};
     auto result = dispatcher.run(plugin->descriptor, "exec", params);
 
     CHECK(result.rc == 0);

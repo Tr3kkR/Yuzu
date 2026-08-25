@@ -32,6 +32,8 @@
 #include "content_dist_exec_seam.hpp"
 #include "test_helpers.hpp"
 
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::windows_system_directory (BR4-005)
+
 #include <algorithm>
 #include <filesystem>
 #include <string>
@@ -49,6 +51,16 @@ bool contains_line(const std::vector<std::string>& lines, std::string_view needl
                        [&](const std::string& l) { return l.find(needle) != std::string::npos; });
 }
 
+// BR4-005 (whole-branch review round 4): runtime-resolved via
+// yuzu::agent::windows_system_directory() rather than a hard-coded
+// "C:\\Windows\\System32\\cmd.exe" literal -- the hard-coded form fails
+// every TEST_CASE below (fs::copy_file can't find the source) before ever
+// exercising anything on the relocated-system (non-`C:`) configuration
+// BR3-001's runtime resolution fix exists to protect.
+std::string real_cmd_exe() {
+    return yuzu::agent::windows_system_directory() + "\\cmd.exe";
+}
+
 } // namespace
 
 TEST_CASE("execute_verified_payload (Windows) runs a REAL staged native executable through the "
@@ -63,7 +75,7 @@ TEST_CASE("execute_verified_payload (Windows) runs a REAL staged native executab
     // than a fixture stand-in.
     fs::path payload = dir.path / "staged-cmd.exe";
     std::error_code copy_ec;
-    fs::copy_file("C:\\Windows\\System32\\cmd.exe", payload, fs::copy_options::overwrite_existing,
+    fs::copy_file(real_cmd_exe(), payload, fs::copy_options::overwrite_existing,
                   copy_ec);
     REQUIRE_FALSE(copy_ec);
 
@@ -107,7 +119,7 @@ TEST_CASE("execute_verified_payload (Windows) rejects args containing shell meta
     fs::create_directories(dir.path);
     fs::path payload = dir.path / "staged-cmd.exe";
     std::error_code copy_ec;
-    fs::copy_file("C:\\Windows\\System32\\cmd.exe", payload, fs::copy_options::overwrite_existing,
+    fs::copy_file(real_cmd_exe(), payload, fs::copy_options::overwrite_existing,
                   copy_ec);
     REQUIRE_FALSE(copy_ec);
 
