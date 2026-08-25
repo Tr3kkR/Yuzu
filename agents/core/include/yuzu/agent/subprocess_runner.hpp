@@ -166,8 +166,11 @@ struct SubprocessOptions {
     //
     // FAILS CLOSED: if any entry's name is denylisted (the LD_*/DYLD_*
     // prefixes, or the exact names IFS/BASH_ENV/ENV/GCONV_PATH/NLSPATH/
-    // LOCPATH) or malformed (empty name, a name containing '=' or a NUL, or
-    // a value containing a NUL), the ENTIRE launch is refused
+    // LOCPATH) or malformed (empty name, a name containing '=' or a NUL, a
+    // value containing a NUL, OR a name containing any non-ASCII byte --
+    // BR-010 whole-branch review: is_malformed_env_entry rejects this on
+    // EVERY platform, POSIX included, not just Windows), the ENTIRE launch
+    // is refused
     // (termination_reason == spawn_error, tool_ran == false, no OS call
     // attempted) rather than proceeding with that one entry silently
     // dropped -- a silently-ignored LD_PRELOAD request would hide a caller
