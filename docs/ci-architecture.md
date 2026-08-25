@@ -425,7 +425,10 @@ the 90-minute job budget to REDUCE (not guarantee-away) the chance a starved
 job hits the ambiguous job-level timeout kill instead of the script's own
 attributable error — the 90-minute budget also covers checkout/build time
 before Test starts, so a slow build can still leave less than 30 minutes of
-headroom when the wait begins.
+headroom when the wait begins. This fix gates contention only *inside* a
+job that already holds a runner — it does not address a job that cannot
+start at all because no runner is free; see "Cross-job — runner
+acquisition, a fourth layer" later in this section for that gap.
 
 `nightly.yml`'s Linux ASan/TSan/coverage legs and `sanitizer-tests.yml`'s
 ASan/TSan legs (the `/test --full` pre-push gate) invoke `meson test` directly
@@ -555,8 +558,8 @@ number is the test-phase-plus-slot-wait sub-budget only — it does NOT
 supersede the "Cross-job" paragraph above's own caveat that the 90-minute
 ceiling also covers checkout/build time, so the REAL total-job margin is
 smaller than ~1.7 min whenever a build isn't instant. Quoting "<2 minutes"
-on its own (as this round's commit message and doc both do) without that
-qualifier overstates how much slack actually remains. This
+on its own without that qualifier overstates how much slack actually
+remains. This
 is the theoretical ceiling, not the expected case (it requires the box
 already so unhealthy that a job-level kill is arguably the correct outcome,
 not a failure of this design) — the realistic case, using the real
