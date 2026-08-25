@@ -517,6 +517,30 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  auto session = auth_fn_(req, res);
                  if (!session) return;
 
+                 // CSRF same-site gate (parity with the TAR re-enable/purge
+                 // fragments; defense-in-depth on top of SameSite=Lax, which
+                 // does not stop a same-site sibling origin). This route
+                 // materialises management-group membership and had no such
+                 // gate — pre-existing gap, closed here.
+                 {
+                     const std::string origin = req.get_header_value("Origin");
+                     const std::string referer = req.get_header_value("Referer");
+                     const bool same_site =
+                         !(origin.empty() && referer.empty()) &&
+                         origin_is_same_site(req.get_header_value("Host"), origin, referer,
+                                             csrf_trusted_origins_);
+                     if (!same_site) {
+                         audit_fn_(req, "group.create_from_results", "denied",
+                                   "ManagementGroup", "", "csrf_cross_origin");
+                         res.status = 403;
+                         res.set_header("HX-Retarget", "#group-form-slot");
+                         res.set_content(
+                             "<span class=\"feedback-error\">Cross-origin request refused.</span>",
+                             "text/html; charset=utf-8");
+                         return;
+                     }
+                 }
+
                  auto group_name = extract_form_value(req.body, "group_name");
                  auto command_id = extract_form_value(req.body, "command_id");
                  auto plugin = extract_form_value(req.body, "plugin");

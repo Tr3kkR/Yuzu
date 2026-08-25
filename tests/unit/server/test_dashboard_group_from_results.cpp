@@ -398,3 +398,38 @@ TEST_CASE("group-from-results: an unfiltered (nullopt) scope materialises "
 
     CHECK(h.audits_for("response.read", "denied") == 0);
 }
+
+// ── (6) CSRF same-site gate — branch-review BR-001 ─────────────────────────
+// This route materialises management-group membership and, before this fix,
+// had no origin check at all (a pre-existing gap, unrelated to the scope
+// confinement above, closed in the same round it was found). Mirrors
+// test_dashboard_tar_fragments.cpp's coverage of the identical gate on the
+// TAR re-enable/purge fragments.
+
+TEST_CASE("group-from-results: CSRF same-site gate rejects cross-origin and "
+          "header-less POSTs, never creates a group, before any scope logic",
+          "[pg][server][dashboard][group_from_results][csrf]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A", "agent-B"});
+
+    SECTION("cross-origin Origin") {
+        auto res = h.post(GroupFromResultsHarness::form_body("csrf-group"),
+                          {{"Host", kHost}, {"Origin", "https://evil.example"}});
+        CHECK(res->status == 403);
+        CHECK(h.audit_detail("group.create_from_results", "denied") == "csrf_cross_origin");
+        CHECK_FALSE(h.mg.find_group_by_name("csrf-group").has_value());
+    }
+
+    SECTION("neither Origin nor Referer — stricter than origin_is_same_site's default") {
+        auto res = h.post(GroupFromResultsHarness::form_body("csrf-group"), {{"Host", kHost}});
+        CHECK(res->status == 403);
+        CHECK(h.audit_detail("group.create_from_results", "denied") == "csrf_cross_origin");
+        CHECK_FALSE(h.mg.find_group_by_name("csrf-group").has_value());
+    }
+
+    SECTION("same-site Origin is accepted (the default headers every other case in this file uses)") {
+        auto res = h.post(GroupFromResultsHarness::form_body("csrf-group"));
+        CHECK(res->status == 200);
+        CHECK(h.mg.find_group_by_name("csrf-group").has_value());
+    }
+}
