@@ -17,6 +17,7 @@
 
 #include <functional>
 #include <string>
+#include <utility> // std::move
 #include <vector>
 
 #include "tar_collectors.hpp"
