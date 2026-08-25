@@ -323,12 +323,19 @@ agent_test_exe = executable(
                                                 # end to end via LocalDispatcher (POSIX-only; a no-op
                                                 # TU on Windows via the file's own #ifndef _WIN32 guard)
     'unit/test_script_exec_actions.cpp',       # Wave 5 PR5.1: script_exec exec/bash dispatch via LocalDispatcher (POSIX-only TU guard)
+    'unit/test_script_exec_win_actions.cpp',   # Wave 5 PR5.1 round-3 remediation (BR3-003): script_exec
+                                                # exec/powershell dispatch via LocalDispatcher, real
+                                                # script_exec.dll (Windows-only TU guard; proves BR3-001's
+                                                # windows_system_directory() PowerShell resolution end to end)
     'unit/test_script_exec_parsers.cpp',       # Wave 5 PR5.1: pure argv-assembly / PATH-resolution helpers (no I/O)
     'unit/test_content_dist_actions.cpp',      # Wave 5 PR5.1: content_dist dispatch gates via LocalDispatcher (POSIX-only TU guard)
     'unit/test_content_dist_exec_parsers.cpp', # Wave 5 PR5.1: pure SubprocessResult -> wire mapping + options builder (no I/O)
     'unit/test_content_dist_exec_seam.cpp',    # Wave 5 PR5.1 round-2 remediation (BR-006): real staged-file
                                                 # execute_verified_payload() end to end (real chmod, real
                                                 # runner spawn, no KV/g_ctx wall; POSIX-only TU guard)
+    'unit/test_content_dist_exec_seam_win.cpp', # Wave 5 PR5.1 round-3 remediation (BR3-003): Windows twin of
+                                                # the above -- real staged/copied executable payload, real
+                                                # runner spawn (Windows-only TU guard)
     'unit/test_certificates_x509.cpp',        # Wave 2 WP-B: pure libcrypto PEM/DER field extraction
     'unit/test_quarantine_parsers.cpp',       # Wave 2 WP-F: pure netsh/iptables/pfctl output parsers
     'unit/test_quarantine_argv.cpp',          # Wave 2 WP-F remediation: pure mutating-argv construction (FN-03)
