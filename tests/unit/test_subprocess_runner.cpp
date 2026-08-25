@@ -864,6 +864,46 @@ TEST_CASE("run_bounded_subprocess: on_line delivers every produced line, uncappe
     CHECK(streamed[4] == "e");
 }
 
+TEST_CASE("run_bounded_subprocess: store_line delivers a blank completed line to on_line, matching "
+          "both deleted script_exec spawn paths' wire behaviour (A2-006)",
+          "[subprocess][streaming]") {
+    std::vector<std::string> streamed;
+    SubprocessResult r = run_bounded_subprocess(
+        {"/bin/sh", "-c", "printf 'row1\\n\\nrow2\\n'"},
+        SubprocessOptions{.deadline = 5000ms,
+                           .on_line = [&](const std::string& line) { streamed.push_back(line); }});
+    CHECK_FALSE(r.timed_out);
+    // The callback sees the blank line too -- three deliveries (row1, "",
+    // row2), not two. Before this fix, store_line's early `if (line.empty())
+    // return;` sat BEFORE the on_line call, so the middle blank line never
+    // reached the callback at all.
+    REQUIRE(streamed.size() == 3);
+    CHECK(streamed[0] == "row1");
+    CHECK(streamed[1].empty());
+    CHECK(streamed[2] == "row2");
+    // The stored collect-at-end snapshot still excludes the blank line --
+    // ONLY callback delivery changed; result.lines' contract is untouched.
+    REQUIRE(r.lines.size() == 2);
+    CHECK(r.lines[0] == "row1");
+    CHECK(r.lines[1] == "row2");
+}
+
+TEST_CASE("run_bounded_subprocess: a blank line contributes nothing to the stored-line byte budget "
+          "(A2-006)",
+          "[subprocess][streaming][output_cap]") {
+    // Four blank lines ahead of "hi": if a blank line consumed even one byte
+    // of the stored_line_bytes budget (as it would if store_line's early
+    // return ran before, rather than after, its budget bookkeeping), a
+    // 5-byte cap would be exhausted before "hi" is ever stored. Since blank
+    // lines are excluded from that accounting entirely, the full budget
+    // remains available for "hi" (2 bytes + 1 accounting byte).
+    SubprocessResult r = run_bounded_subprocess({"/bin/sh", "-c", "printf '\\n\\n\\n\\nhi\\n'"},
+                                                 SubprocessOptions{.deadline = 5000ms, .output_cap_bytes = 5});
+    CHECK(r.tool_ran);
+    REQUIRE(r.lines.size() == 1);
+    CHECK(r.lines[0] == "hi");
+}
+
 TEST_CASE("run_bounded_subprocess: A6 chdir's the child into working_dir",
           "[subprocess][working_dir]") {
     std::filesystem::path dir = yuzu::test::unique_temp_path("yuzu_test_cwd_");
@@ -1176,6 +1216,7 @@ TEST_CASE("the Spawner interface is independently injectable/testable without sp
 #include <yuzu/agent/subprocess_runner.hpp>
 
 #include <chrono>
+#include <cstdlib> // _putenv_s (A2-002 inherit_parent_env tests below)
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -1305,6 +1346,72 @@ TEST_CASE("run_bounded_subprocess (Windows) honours a pre-armed per-invocation C
     CHECK(result.timed_out);
     CHECK(result.termination_reason == TerminationReason::cancelled);
     CHECK(elapsed < 15s);
+}
+
+TEST_CASE("run_bounded_subprocess (Windows) store_line delivers a blank completed line to on_line "
+          "(A2-006)",
+          "[subprocess][windows][streaming]") {
+    std::vector<std::string> streamed;
+    SubprocessResult result = run_bounded_subprocess(
+        {kCmdExe, "/d", "/c", "echo row1 & echo. & echo row2"},
+        SubprocessOptions{.deadline = 10000ms,
+                           .on_line = [&](const std::string& line) { streamed.push_back(line); }});
+
+    CHECK_FALSE(result.timed_out);
+    CHECK(result.tool_ran);
+    // "echo." emits a bare CRLF -- a completed BLANK line -- between the two
+    // named lines; the callback must see all three, not two. Before this fix,
+    // store_line's early `if (line.empty()) return;` sat BEFORE the on_line
+    // call, so this middle line never reached the callback at all.
+    REQUIRE(streamed.size() == 3);
+    CHECK(streamed[0] == "row1");
+    CHECK(streamed[1].empty());
+    CHECK(streamed[2] == "row2");
+    // The stored collect-at-end snapshot still excludes the blank line --
+    // ONLY callback delivery changed.
+    REQUIRE(result.lines.size() == 2);
+    CHECK(result.lines[0] == "row1");
+    CHECK(result.lines[1] == "row2");
+}
+
+TEST_CASE("run_bounded_subprocess (Windows) inherit_parent_env defaults to false, leaving an "
+          "existing caller's child environment exactly as before (A2-002)",
+          "[subprocess][windows][env]") {
+    (void)_putenv_s("YUZU_TEST_INHERIT_ENV_MARKER", "parent_value");
+    SubprocessResult result = run_bounded_subprocess(
+        {kCmdExe, "/d", "/c", "echo %YUZU_TEST_INHERIT_ENV_MARKER%"},
+        SubprocessOptions{.deadline = 10000ms}); // inherit_parent_env left at its default
+    (void)_putenv_s("YUZU_TEST_INHERIT_ENV_MARKER", ""); // best-effort cleanup
+
+    CHECK(result.tool_ran);
+    REQUIRE(result.lines.size() == 1);
+    // cmd.exe echoes an unexpanded "%VAR%" literal when the name is unset in
+    // ITS OWN environment -- proving the A5 allow-list child never saw this
+    // process' marker, exactly as every existing caller already gets today.
+    CHECK(result.lines[0] == "%YUZU_TEST_INHERIT_ENV_MARKER%");
+}
+
+TEST_CASE("run_bounded_subprocess (Windows) inherit_parent_env=true forwards the full parent "
+          "environment, with extra_env still applied on top (A2-002, design point (a))",
+          "[subprocess][windows][env]") {
+    (void)_putenv_s("YUZU_TEST_INHERIT_ENV_MARKER", "parent_value");
+    SubprocessResult result = run_bounded_subprocess(
+        {kCmdExe, "/d", "/c",
+         "echo %YUZU_TEST_INHERIT_ENV_MARKER% & echo %YUZU_TEST_OVERRIDE_MARKER%"},
+        SubprocessOptions{.deadline = 10000ms,
+                           .extra_env = {{"YUZU_TEST_OVERRIDE_MARKER", "extra_value"}},
+                           .inherit_parent_env = true});
+    (void)_putenv_s("YUZU_TEST_INHERIT_ENV_MARKER", ""); // best-effort cleanup
+
+    CHECK(result.tool_ran);
+    REQUIRE(result.lines.size() == 2);
+    // The real parent value survives via full-environment inheritance -- this
+    // name was never in extra_env at all.
+    CHECK(result.lines[0] == "parent_value");
+    // extra_env is still applied ON TOP of the inherited block: this name was
+    // never set in the real parent environment, so its only possible source
+    // is extra_env's replace-never-duplicate merge over the inherited base.
+    CHECK(result.lines[1] == "extra_value");
 }
 
 // K2/CDX-P2-003: the Windows "is executable" half of probe_tool_path's

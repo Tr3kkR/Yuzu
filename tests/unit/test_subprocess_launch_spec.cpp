@@ -365,3 +365,105 @@ TEST_CASE("merge_launch_env rejects non-ASCII env names fail-closed rather than 
     // is on names (matching semantics/comparison), not values.
     CHECK(merge_launch_env(base, {{"FOO", "\xc3\xa5var"}}, /*windows=*/false).rejected.empty());
 }
+
+// --- SubprocessOptions::inherit_parent_env / LaunchOptions::inherit_parent_env
+// (Alex plan-gate ruling, A2-002 escalation: a second, Windows-only, opt-in
+// widening of A5, additive to extra_env -- see subprocess_runner.hpp's field
+// comment for the full contract). This header is PURE, so it can only test
+// the passthrough shape and the merge algorithm the impure Windows OS shell
+// (subprocess_runner.cpp) calls with a live-read parent environment --
+// actually reading GetEnvironmentStringsW() and observing a real child's
+// environment is exercised in test_subprocess_runner.cpp's Windows block. ---
+
+TEST_CASE("LaunchOptions::inherit_parent_env defaults to false and build_launch_spec passes it "
+          "through unchanged (A2-002)",
+          "[subprocess][launch_spec][inherit_parent_env]") {
+    using namespace yuzu::agent;
+
+    CHECK_FALSE(LaunchOptions{}.inherit_parent_env);
+
+    LaunchSpec default_spec = build_launch_spec({"/bin/echo"}, LaunchOptions{});
+    REQUIRE(default_spec.error == LaunchSpecError::none);
+    CHECK_FALSE(default_spec.inherit_parent_env);
+
+    LaunchOptions opts_true;
+    opts_true.inherit_parent_env = true;
+    LaunchSpec true_spec = build_launch_spec({"/bin/echo"}, opts_true);
+    REQUIRE(true_spec.error == LaunchSpecError::none);
+    CHECK(true_spec.inherit_parent_env);
+}
+
+TEST_CASE("inherit_parent_env does not change what THIS pure header computes for spec.env -- only "
+          "the impure Windows OS shell branches on it (A2-002)",
+          "[subprocess][launch_spec][inherit_parent_env]") {
+    using namespace yuzu::agent;
+    // build_launch_spec is a pure, allocation-only core with no OS env I/O
+    // (see the file header) -- it cannot itself read a "real parent
+    // environment" to honour this flag, and must not silently change its own
+    // A5-allow-list-plus-extra_env computation just because the flag is set.
+    // Only subprocess_runner.cpp's Windows backend, AFTER calling this
+    // function, substitutes a live parent-environment read for spec.env when
+    // inherit_parent_env is true (see that file's comment at the call site).
+    LaunchOptions opts_false;
+    opts_false.tz = std::string("UTC");
+    LaunchOptions opts_true = opts_false;
+    opts_true.inherit_parent_env = true;
+
+    LaunchSpec spec_false = build_launch_spec({"/bin/echo"}, opts_false);
+    LaunchSpec spec_true = build_launch_spec({"/bin/echo"}, opts_true);
+    REQUIRE(spec_false.error == LaunchSpecError::none);
+    REQUIRE(spec_true.error == LaunchSpecError::none);
+    CHECK(spec_false.env == spec_true.env);
+    CHECK_FALSE(spec_false.inherit_parent_env);
+    CHECK(spec_true.inherit_parent_env);
+}
+
+TEST_CASE("merge_launch_env layers extra_env on top of a live parent-environment base with the SAME "
+          "replace-never-duplicate semantics as the ordinary A5 case (A2-002, design point (a))",
+          "[subprocess][launch_spec][inherit_parent_env]") {
+    using namespace yuzu::agent;
+    // Stands in for a GetEnvironmentStringsW() read the impure Windows OS
+    // shell performs at runtime when inherit_parent_env is true -- this is
+    // the EXACT algorithm subprocess_runner.cpp's Windows backend calls
+    // (merge_launch_env(parent_env, launch_opts.extra_env, /*windows=*/true))
+    // once it has that live snapshot, so pinning it here proves the contract
+    // without any OS I/O.
+    std::vector<EnvVar> parent_env = {
+        {"SystemRoot", "C:\\Windows"}, {"HTTPS_PROXY", "http://proxy:8080"}, {"USERNAME", "svc"}};
+
+    // A name NOT in extra_env survives untouched from the parent snapshot.
+    EnvMergeResult merged_passthrough = merge_launch_env(parent_env, {}, /*windows=*/true);
+    CHECK(merged_passthrough.rejected.empty());
+    CHECK(merged_passthrough.env == parent_env);
+
+    // extra_env REPLACES a same-named parent entry in place (case-insensitive
+    // on the Windows target) rather than appending a second, ambiguous entry.
+    EnvMergeResult merged_replace =
+        merge_launch_env(parent_env, {{"UserName", "override"}}, /*windows=*/true);
+    CHECK(merged_replace.rejected.empty());
+    REQUIRE(merged_replace.env.size() == 3); // still 3 -- replaced, not appended
+    auto find = [](const std::vector<EnvVar>& env, const std::string& k) -> const EnvVar* {
+        for (const auto& e : env)
+            if (e.key == k)
+                return &e;
+        return nullptr;
+    };
+    REQUIRE(find(merged_replace.env, "USERNAME"));
+    CHECK(find(merged_replace.env, "USERNAME")->value == "override");
+
+    // extra_env can also ADD a name the parent never had at all.
+    EnvMergeResult merged_add =
+        merge_launch_env(parent_env, {{"YUZU_SITE", "site-1"}}, /*windows=*/true);
+    CHECK(merged_add.rejected.empty());
+    REQUIRE(merged_add.env.size() == 4);
+    REQUIRE(find(merged_add.env, "YUZU_SITE"));
+    CHECK(find(merged_add.env, "YUZU_SITE")->value == "site-1");
+
+    // The denylist STILL applies over a parent-environment base -- this flag
+    // widens what UNNAMED variables reach the child, never what extra_env
+    // itself is allowed to name (design point (b): security stays gated).
+    EnvMergeResult merged_denied =
+        merge_launch_env(parent_env, {{"LD_PRELOAD", "/evil.so"}}, /*windows=*/true);
+    CHECK(merged_denied.rejected == std::vector<std::string>{"LD_PRELOAD"});
+    CHECK(merged_denied.env == parent_env); // refused entry never applied
+}

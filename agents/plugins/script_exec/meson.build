@@ -1,4 +1,4 @@
-shared_library(
+script_exec_plugin_lib = shared_library(
   'script_exec',
   files('src/script_exec_plugin.cpp'),
   name_prefix: '',

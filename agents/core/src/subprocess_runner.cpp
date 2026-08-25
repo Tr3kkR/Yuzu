@@ -609,6 +609,12 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     launch_opts.extra_env.reserve(opts.extra_env.size());
     for (const auto& [key, value] : opts.extra_env)
         launch_opts.extra_env.push_back({key, value});
+    // A2-002: passed through for the pure LaunchSpec passthrough/testability,
+    // but never acted on below -- this (POSIX) backend always builds envp
+    // from spec.env, exactly as when the flag is false. See
+    // SubprocessOptions::inherit_parent_env's doc comment, point (c), for why
+    // this is an intentional no-op here rather than an oversight.
+    launch_opts.inherit_parent_env = opts.inherit_parent_env;
 
     LaunchSpec spec = build_launch_spec(argv, launch_opts);
     if (spec.error != LaunchSpecError::none)
@@ -1018,14 +1024,20 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     auto store_line = [&](std::string line) {
         if (!line.empty() && line.back() == '\r')
             line.pop_back();
-        if (line.empty())
-            return;
         // ADR-3002 streaming primitive: every completed line reaches the
         // caller's callback (if any) UNCAPPED -- neither max_lines nor the
         // output_cap blob budget gates it (CDX-P2-005: the caller's live
-        // stream must not silently stop when stored capture saturates).
+        // stream must not silently stop when stored capture saturates), AND
+        // a blank completed line is delivered too (A2-006: "every completed
+        // line" means every one -- a script's blank stdout lines produced a
+        // wire record under both spawn paths this runner replaced, and the
+        // doc comment above has always promised it uncapped, not
+        // uncapped-except-empty). Only STORAGE below excludes blank lines --
+        // callback delivery must happen before that early return, not after.
         if (opts.on_line)
             opts.on_line(line);
+        if (line.empty())
+            return;
         // result.lines (the collect-at-end snapshot) STAYS bounded: by
         // max_lines when armed, else by the output_cap byte budget -- so an
         // unlimited-max_lines run past the blob cap can't grow it without end.
@@ -1509,6 +1521,10 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     launch_opts.extra_env.reserve(opts.extra_env.size());
     for (const auto& [key, value] : opts.extra_env)
         launch_opts.extra_env.push_back({key, value});
+    // A2-002: THIS backend is the one that actually honours the flag -- see
+    // the env-block construction below and SubprocessOptions::
+    // inherit_parent_env's doc comment for the full contract.
+    launch_opts.inherit_parent_env = opts.inherit_parent_env;
 
     LaunchSpec spec = build_launch_spec(argv, launch_opts);
     if (spec.error != LaunchSpecError::none)
@@ -1530,16 +1546,55 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     const std::wstring app = utf8_to_wide(spec.argv.front());
     std::wstring cmdline = utf8_to_wide(spec.windows_command_line);
 
-    // A5: explicit lpEnvironment built from the SAME allow-list
-    // build_launch_spec assembled -- never NULL/never inherited.
+    // A5 (ordinary case): explicit lpEnvironment built from the SAME
+    // allow-list build_launch_spec assembled -- never NULL/never inherited.
+    //
+    // A2-002 (opt-in exception, script_exec's Windows-parity ruling): when
+    // inherit_parent_env is set, swap the BASE for this merge from the A5
+    // allow-list to a live read of this process' own real environment block
+    // -- reproducing the deleted CreateProcessA call's null-lpEnvironment
+    // behaviour (full parent-environment inheritance) -- and layer extra_env
+    // on top of THAT base via the exact same merge_launch_env()
+    // replace-never-duplicate semantics used below for the ordinary case.
+    // extra_env was already validated (denylist/malformed-entry checks) by
+    // build_launch_spec() above UNCONDITIONALLY, so nothing here can smuggle
+    // a denied name through just because this flag is set. This whole block
+    // is the impure boundary layer this flag's contract requires: reading
+    // GetEnvironmentStringsW() is real OS I/O that subprocess_launch_spec.hpp
+    // (a pure header) must never perform itself.
+    std::vector<EnvVar> sorted_env;
+    if (spec.inherit_parent_env) {
+        std::vector<EnvVar> parent_env;
+        if (LPWCH env_strings = GetEnvironmentStringsW(); env_strings != nullptr) {
+            for (const wchar_t* p = env_strings; *p != L'\0';) {
+                std::wstring entry(p);
+                p += entry.size() + 1;
+                // Skip Windows' per-drive "=C:=C:\..." pseudo-variables: a
+                // leading '=' means this isn't a real, settable environment
+                // variable name (CreateProcessW seeds every child's block
+                // with these; they are not part of "the parent's
+                // environment" in the sense this flag exists to forward).
+                if (entry.empty() || entry.front() == L'=')
+                    continue;
+                auto eq = entry.find(L'=');
+                if (eq == std::wstring::npos)
+                    continue; // malformed entry with no '=' at all -- skip, don't guess
+                parent_env.push_back({yuzu::win::from_wide(entry.substr(0, eq).c_str()),
+                                      yuzu::win::from_wide(entry.substr(eq + 1).c_str())});
+            }
+            FreeEnvironmentStringsW(env_strings);
+        }
+        sorted_env = merge_launch_env(parent_env, launch_opts.extra_env, /*windows=*/true).env;
+    } else {
+        sorted_env.assign(spec.env.begin(), spec.env.end());
+    }
     //
     // K-10/L-d: a CreateProcess environment block MUST be sorted (MSDN:
     // "the block must be sorted alphabetically by name, case-insensitively, as
-    // in Unicode order"). build_launch_spec emits the allow-list in a fixed but
-    // not-necessarily-sorted order, so sort a copy by upper-cased key here
-    // before serializing. The keys are unique (allow-list), so a stable name
-    // sort is total.
-    std::vector<EnvVar> sorted_env(spec.env.begin(), spec.env.end());
+    // in Unicode order"). Both branches above emit their result in a fixed
+    // but not-necessarily-sorted order, so sort a copy by upper-cased key here
+    // before serializing. The keys are unique (allow-list / merge dedup), so
+    // a stable name sort is total.
     std::sort(sorted_env.begin(), sorted_env.end(), [](const EnvVar& a, const EnvVar& b) {
         auto up = [](std::string s) {
             for (char& c : s)
@@ -1765,12 +1820,15 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     auto store_line = [&](std::string line) {
         if (!line.empty() && line.back() == '\r')
             line.pop_back();
-        if (line.empty())
-            return;
         // Uncapped streaming primitive (CDX-P2-005): every completed line
-        // reaches the callback regardless of max_lines or the blob cap.
+        // reaches the callback regardless of max_lines or the blob cap, AND
+        // a blank completed line is delivered too (A2-006 -- see the POSIX
+        // loop's store_line for the full reasoning; this is the same fix,
+        // mirrored). Only STORAGE below excludes blank lines.
         if (opts.on_line)
             opts.on_line(line);
+        if (line.empty())
+            return;
         // result.lines stays bounded: by max_lines when armed, else by the
         // output_cap byte budget. sec-7: the byte budget applies REGARDLESS
         // of whether max_lines is armed -- see the POSIX loop's store_line
