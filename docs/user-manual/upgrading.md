@@ -2113,13 +2113,17 @@ These are two SEPARATE failure/detection behaviors, not one — do not conflate 
 - A reachable Postgres database whose schema can't migrate or open **is** a fatal
   startup error (fail-closed, matching the ladder's "authoritative" posture for this
   store), same as every other born-on-Postgres store.
-- A legacy `policies.db` file with real content **does NOT** fail startup and is never
-  read — the server logs `A legacy policies.db (<path>) has <N> policy row(s) but
-  PolicyStore no longer backfills it...` at WARN and boots fresh-started anyway. If you
-  see this warning and the environment genuinely has real compliance-policy data to
-  keep, there is no automated recovery path: re-author the equivalent fragments and
-  policies against the new Postgres-backed store via `POST /api/policy-fragments` and
-  `POST /api/policies` before relying on it.
+- A legacy `policies.db` file with real content **does NOT** fail startup and its
+  content is **never imported** — the server opens it read-only, purely to count rows
+  for a diagnostic warning, then boots fresh-started regardless of what it finds. If
+  either the `policies` or `policy_fragments` table has rows, it logs `A legacy
+  policies.db (<path>) has <N> policy row(s) and <N> fragment row(s) but PolicyStore no
+  longer backfills it...` at WARN; if the file exists but its row counts can't be read
+  (corrupt, unreadable, or a locked file), it logs a similar countless warning instead.
+  Either way, boot proceeds unaffected. If you see either warning and the environment
+  genuinely has real compliance-policy data to keep, there is no automated recovery
+  path: re-author the equivalent fragments and policies against the new Postgres-backed
+  store via `POST /api/policy-fragments` and `POST /api/policies` before relying on it.
 
 **Operator-visible behaviour changes (fail-closed reads/writes).**
 

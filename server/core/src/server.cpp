@@ -95,6 +95,7 @@
 #include "nvd_db.hpp"
 #include "policy_store.hpp"
 #include "sqlite_raii.hpp" // read-only legacy-file row count, PolicyStore boot detect-and-warn
+#include <sqlite3.h> // direct include per house IWYU convention (baseline_store.cpp, ca_store.cpp, etc.), not relied on transitively via sqlite_raii.hpp
 #include "guaranteed_state_store.hpp"
 #include "baseline_store.hpp"
 #include "guardian_push_builder.hpp"
@@ -336,8 +337,22 @@ bool is_custom_properties_db_error(const std::string& err) {
 // diagnostic-only: any failure (missing table, corrupt file, wrong schema
 // version) returns nullopt and the caller falls back to a countless warning
 // rather than treating this as fatal — it must never affect boot outcome.
+// `table` MUST be a compile-time literal, never request/config-derived —
+// there is no bind placeholder for a table name (gov Gate 8 security-guardian).
+// Known accepted limitation (gov Gate 8 security-guardian, LOW): if the
+// legacy file was left mid-lifecycle in WAL mode with an unchecked-out
+// -wal/-shm pair, SQLite's reader can create a -shm index sidecar even
+// under SQLITE_OPEN_READONLY (the main file's bytes are never written —
+// READONLY guarantees that — only a transient sibling file can appear).
+// Avoiding this needs SQLITE_OPEN_URI + `immutable=1`, which requires
+// correctly percent-encoding `path` for the file: URI form; not done here
+// to avoid introducing a path-escaping bug for a narrow, low-severity gap
+// on a diagnostic-only path — revisit if this pattern gets a second caller.
 std::optional<std::int64_t> legacy_sqlite_row_count(const std::filesystem::path& path,
                                                      const char* table) {
+    std::error_code reg_ec;
+    if (!std::filesystem::is_regular_file(path, reg_ec) || reg_ec)
+        return std::nullopt; // refuse a FIFO/symlink/device node — never block on open()
     yuzu::server::SqliteDb db;
     if (sqlite3_open_v2(path.string().c_str(), db.addr(), SQLITE_OPEN_READONLY, nullptr) !=
         SQLITE_OK)
@@ -5247,28 +5262,36 @@ public:
                 // A schema-only file (created but never written to — any dev/UAT box
                 // that booted the pre-Postgres build once, even with zero real
                 // policies) must not trip this warning: count rows, don't just check
-                // existence, per postgres-store-playbook.md's own requirement.
-                auto count = legacy_sqlite_row_count(legacy_policy_db, "policies");
-                if (count.value_or(0) > 0) {
+                // existence, per postgres-store-playbook.md's own requirement. Check
+                // BOTH `policies` and `policy_fragments` — the dependency runs
+                // policies.fragment_id -> policy_fragments(id), not the reverse, so
+                // an operator could have authored real fragments with zero policies
+                // created from them yet; counting `policies` alone would silently
+                // call that "nothing lost" (gov Gate 8 architect finding).
+                auto policy_count = legacy_sqlite_row_count(legacy_policy_db, "policies");
+                auto fragment_count = legacy_sqlite_row_count(legacy_policy_db, "policy_fragments");
+                if (policy_count.value_or(0) > 0 || fragment_count.value_or(0) > 0) {
                     spdlog::warn(
-                        "[PG] A legacy policies.db ({}) has {} policy row(s) but PolicyStore no "
-                        "longer backfills it (retired 2026-08-25 — no production fleet has ever "
-                        "run a pre-Postgres build). This content will NOT be carried over. To "
-                        "reconcile manually, re-author the equivalent fragments/policies via "
-                        "POST /api/policy-fragments and POST /api/policies before relying on "
-                        "this Postgres instance.",
-                        legacy_policy_db.string(), *count);
-                } else if (!count.has_value()) {
-                    // Couldn't read a row count (corrupt file, unreadable, unexpected
+                        "[PG] A legacy policies.db ({}) has {} policy row(s) and {} fragment "
+                        "row(s) but PolicyStore no longer backfills it (retired 2026-08-25 — no "
+                        "production fleet has ever run a pre-Postgres build). This content will "
+                        "NOT be carried over. To reconcile manually, re-author the equivalent "
+                        "fragments/policies via POST /api/policy-fragments and POST /api/policies "
+                        "before relying on this Postgres instance.",
+                        legacy_policy_db.string(), policy_count.value_or(0),
+                        fragment_count.value_or(0));
+                } else if (!policy_count.has_value() && !fragment_count.has_value()) {
+                    // Couldn't read either count (corrupt file, unreadable, unexpected
                     // schema) — still worth a heads-up, but don't claim a real count.
-                    spdlog::warn("[PG] A legacy policies.db ({}) exists but its row count "
+                    spdlog::warn("[PG] A legacy policies.db ({}) exists but its row counts "
                                  "couldn't be read (corrupt or unreadable) — PolicyStore no "
                                  "longer backfills it regardless; if this environment has real "
                                  "compliance-policy data, inspect the file manually before "
                                  "relying on this Postgres instance.",
                                  legacy_policy_db.string());
                 }
-                // count == 0: schema-only file, nothing lost — no warning.
+                // Both tables read successfully and both are empty: schema-only
+                // file, nothing lost — no warning.
             }
             policy_store_ = std::make_unique<PolicyStore>(*pg_pool_);
             if (!policy_store_->is_open()) {
