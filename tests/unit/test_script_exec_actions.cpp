@@ -24,12 +24,16 @@
 #include <yuzu/plugin.h>
 
 #include "local_dispatcher.hpp"
+#include "test_helpers.hpp"
 
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <string>
 #include <vector>
+
+#include <sys/stat.h>
 
 namespace fs = std::filesystem;
 
@@ -190,6 +194,55 @@ TEST_CASE("script_exec plugin: a blank stdout line still streams its own stdout|
     CHECK(result.captured.find("stdout|a\nstdout|\nstdout|b") != std::string::npos);
     CHECK(result.captured.find("exit_code|0") != std::string::npos);
     CHECK(result.captured.find("status|ok") != std::string::npos);
+}
+
+TEST_CASE("script_exec plugin: a runner-level spawn_error reaches the ABI4 result-status seam "
+          "(BR-001: forward_runner_failure must not be flattened away)",
+          "[script_exec][actions]") {
+    auto plugin = load_script_exec_plugin();
+    // Hard failure, not WARN-and-skip: the plugin build is guaranteed
+    // ordered ahead of this test (tests/meson.build link_depends), so its
+    // absence is a real regression this test exists to catch, not a
+    // benign "plugin not built this configuration" case (BR-005).
+    REQUIRE(plugin.has_value());
+
+    // A regular, executable, absolute file that resolve_executable's own
+    // is_executable_probe (regular file + access(X_OK)) happily accepts --
+    // so do_exec reaches run_bounded_subprocess -- but whose shebang names
+    // an interpreter that cannot possibly exist. execve() itself then
+    // fails (ENOENT resolving the interpreter), which the runner reports
+    // as termination_reason::spawn_error / tool_ran=false, never as an
+    // ordinary nonzero exit. Deterministic and immediate: no timing/sleep
+    // dependency, matching this suite's no-wall-clock discipline.
+    yuzu::test::TempDir dir("yuzu_test_script_exec_spawn_error_");
+    // TempDir only reserves a unique path -- it does not create the
+    // directory itself (test_helpers.hpp), so create it before writing
+    // into it.
+    REQUIRE(fs::create_directories(dir.path));
+    auto script_path = dir.path / "bad-shebang.sh";
+    {
+        std::ofstream f(script_path);
+        f << "#!/yuzu-test-definitely-nonexistent-interpreter-xyz\necho hi\n";
+    }
+    REQUIRE(::chmod(script_path.c_str(), 0700) == 0);
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    // YuzuParam holds raw const char*, not std::string -- keep the backing
+    // string alive across the dispatcher.run() call below rather than
+    // binding a temporary's .c_str() into the params vector.
+    const std::string script_path_str = script_path.string();
+    std::vector<YuzuParam> params{{"command", script_path_str.c_str()}};
+    auto result = dispatcher.run(plugin->descriptor, "exec", params);
+
+    CHECK(result.rc != 0);
+    CHECK(result.captured.find("status|error") != std::string::npos);
+    // The actual assertion this test exists for: forward_runner_failure's
+    // ctx.set_result_status() call reached the SAME CommandContextImpl the
+    // wire lines above came from -- not just that do_exec/run_via_runner
+    // called it, which a grep could already confirm.
+    CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(result.result_provenance == "subprocess_runner:spawn_error");
 }
 
 #endif // !_WIN32
