@@ -21,6 +21,8 @@
 
 #include "pg/pg_pool.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -1346,7 +1348,7 @@ TEST_CASE("InstructionStore::migrate_from_sqlite: two independently-provisioned 
           "files with a shared bundled id and DIVERGENT created_at is a benign no-op, not a "
           "fail-closed error",
           "[instruction_store][backfill][pg]") {
-    yuzu::test::TempDbFile legacy_a{std::string_view{"instr-legacy-conflict-a-"}};
+    yuzu::test::TempDbFile legacy_a{std::string_view{"yuzu_test_instr_legacy_conflict_a_"}};
     {
         SqliteDb db;
         REQUIRE(sqlite3_open_v2(legacy_a.path.string().c_str(), db.addr(),
@@ -1366,7 +1368,7 @@ TEST_CASE("InstructionStore::migrate_from_sqlite: two independently-provisioned 
                     "('bundled.shared.id', 'Shared Bundled Def', '1.0', 'question', 'sysinfo', "
                     "'query', 'desc', 1, '', 0, 0, 'system', 1700000000, 1700000000);");
     }
-    yuzu::test::TempDbFile legacy_b{std::string_view{"instr-legacy-conflict-b-"}};
+    yuzu::test::TempDbFile legacy_b{std::string_view{"yuzu_test_instr_legacy_conflict_b_"}};
     {
         SqliteDb db;
         REQUIRE(sqlite3_open_v2(legacy_b.path.string().c_str(), db.addr(),
@@ -1424,7 +1426,7 @@ TEST_CASE("InstructionStore::migrate_from_sqlite: two replicas' legacy files wit
     // test above only diverges on created_at (LIFECYCLE, never compared either way), so it would
     // have passed even with the wrong sentinel constant; this test mirrors the sets test below,
     // which already covered the equivalent case for sets and would have caught the bug there.
-    yuzu::test::TempDbFile legacy_a{std::string_view{"instr-legacy-yaml-conflict-a-"}};
+    yuzu::test::TempDbFile legacy_a{std::string_view{"yuzu_test_instr_legacy_yaml_conflict_a_"}};
     {
         SqliteDb db;
         REQUIRE(sqlite3_open_v2(legacy_a.path.string().c_str(), db.addr(),
@@ -1441,7 +1443,7 @@ TEST_CASE("InstructionStore::migrate_from_sqlite: two replicas' legacy files wit
                     "'sysinfo', 'query', 'desc', 1, '', 0, 0, 'system', 1700000000, 1700000000, "
                     "'scope: {}\nversion: 1');");
     }
-    yuzu::test::TempDbFile legacy_b{std::string_view{"instr-legacy-yaml-conflict-b-"}};
+    yuzu::test::TempDbFile legacy_b{std::string_view{"yuzu_test_instr_legacy_yaml_conflict_b_"}};
     {
         SqliteDb db;
         REQUIRE(sqlite3_open_v2(legacy_b.path.string().c_str(), db.addr(),
@@ -1483,7 +1485,7 @@ TEST_CASE("InstructionStore::migrate_from_sqlite: two replicas' legacy files wit
           "bundled set id and a DIFFERENT description (release-vintage content change) is a "
           "benign no-op, not a fail-closed error",
           "[instruction_store][backfill][pg]") {
-    yuzu::test::TempDbFile legacy_a{std::string_view{"instr-legacy-set-conflict-a-"}};
+    yuzu::test::TempDbFile legacy_a{std::string_view{"yuzu_test_instr_legacy_set_conflict_a_"}};
     {
         SqliteDb db;
         REQUIRE(sqlite3_open_v2(legacy_a.path.string().c_str(), db.addr(),
@@ -1495,7 +1497,7 @@ TEST_CASE("InstructionStore::migrate_from_sqlite: two replicas' legacy files wit
                     "created_at) VALUES ('bundled.shared.set', 'Shared Set', 'v1 description', "
                     "'system', 1700000000);");
     }
-    yuzu::test::TempDbFile legacy_b{std::string_view{"instr-legacy-set-conflict-b-"}};
+    yuzu::test::TempDbFile legacy_b{std::string_view{"yuzu_test_instr_legacy_set_conflict_b_"}};
     {
         SqliteDb db;
         REQUIRE(sqlite3_open_v2(legacy_b.path.string().c_str(), db.addr(),
@@ -1538,7 +1540,7 @@ TEST_CASE("InstructionStore::migrate_from_sqlite: two replicas' legacy files sha
           "OPERATOR-authored (non-sentinel created_by) definition id with DRIFTED yaml_source "
           "fails closed — this is NOT bundle-vintage drift",
           "[instruction_store][backfill][pg]") {
-    yuzu::test::TempDbFile legacy_a{std::string_view{"instr-legacy-op-conflict-a-"}};
+    yuzu::test::TempDbFile legacy_a{std::string_view{"yuzu_test_instr_legacy_op_conflict_a_"}};
     {
         SqliteDb db;
         REQUIRE(sqlite3_open_v2(legacy_a.path.string().c_str(), db.addr(),
@@ -1557,7 +1559,7 @@ TEST_CASE("InstructionStore::migrate_from_sqlite: two replicas' legacy files sha
                     "'query', 'desc', 1, '', 0, 0, 'admin', 1700000000, 1700000000, "
                     "'scope: {}\nversion: 1');");
     }
-    yuzu::test::TempDbFile legacy_b{std::string_view{"instr-legacy-op-conflict-b-"}};
+    yuzu::test::TempDbFile legacy_b{std::string_view{"yuzu_test_instr_legacy_op_conflict_b_"}};
     {
         SqliteDb db;
         REQUIRE(sqlite3_open_v2(legacy_b.path.string().c_str(), db.addr(),
@@ -1594,7 +1596,7 @@ TEST_CASE("InstructionStore::migrate_from_sqlite: two replicas' legacy files sha
           "OPERATOR-authored definition id with IDENTICAL yaml_source but divergent created_at "
           "is a benign no-op",
           "[instruction_store][backfill][pg]") {
-    yuzu::test::TempDbFile legacy_a{std::string_view{"instr-legacy-op-clean-a-"}};
+    yuzu::test::TempDbFile legacy_a{std::string_view{"yuzu_test_instr_legacy_op_clean_a_"}};
     {
         SqliteDb db;
         REQUIRE(sqlite3_open_v2(legacy_a.path.string().c_str(), db.addr(),
@@ -1611,7 +1613,7 @@ TEST_CASE("InstructionStore::migrate_from_sqlite: two replicas' legacy files sha
                     "'query', 'desc', 1, '', 0, 0, 'admin', 1700000000, 1700000000, "
                     "'scope: {}\nversion: 1');");
     }
-    yuzu::test::TempDbFile legacy_b{std::string_view{"instr-legacy-op-clean-b-"}};
+    yuzu::test::TempDbFile legacy_b{std::string_view{"yuzu_test_instr_legacy_op_clean_b_"}};
     {
         SqliteDb db;
         REQUIRE(sqlite3_open_v2(legacy_b.path.string().c_str(), db.addr(),
@@ -1658,7 +1660,7 @@ TEST_CASE("InstructionStore::migrate_from_sqlite: two replicas' legacy files sha
           "OPERATOR-authored (non-sentinel created_by) set id with DRIFTED description fails "
           "closed",
           "[instruction_store][backfill][pg]") {
-    yuzu::test::TempDbFile legacy_a{std::string_view{"instr-legacy-op-set-conflict-a-"}};
+    yuzu::test::TempDbFile legacy_a{std::string_view{"yuzu_test_instr_legacy_op_set_conflict_a_"}};
     {
         SqliteDb db;
         REQUIRE(sqlite3_open_v2(legacy_a.path.string().c_str(), db.addr(),
@@ -1670,7 +1672,7 @@ TEST_CASE("InstructionStore::migrate_from_sqlite: two replicas' legacy files sha
                     "created_at) VALUES ('operator.shared.set', 'Shared Set', 'v1 description', "
                     "'alice', 1700000000);");
     }
-    yuzu::test::TempDbFile legacy_b{std::string_view{"instr-legacy-op-set-conflict-b-"}};
+    yuzu::test::TempDbFile legacy_b{std::string_view{"yuzu_test_instr_legacy_op_set_conflict_b_"}};
     {
         SqliteDb db;
         REQUIRE(sqlite3_open_v2(legacy_b.path.string().c_str(), db.addr(),
@@ -1692,4 +1694,211 @@ TEST_CASE("InstructionStore::migrate_from_sqlite: two replicas' legacy files sha
 
     REQUIRE(store.migrate_from_sqlite(legacy_a.path));
     CHECK_FALSE(store.migrate_from_sqlite(legacy_b.path));
+}
+
+TEST_CASE("InstructionStore: read and write degrade counters increment on a store that failed "
+          "to open (gov Gate 3 quality-engineer finding)",
+          "[instruction_store][pg]") {
+    // A garbage conninfo leaves the pool invalid and the store's own construction-time
+    // lease acquire fails, so open_ stays false — every read/write call takes the
+    // store_not_open branch, the one deterministic way to hit note_read_degrade/
+    // note_write_degrade without simulating a real pool timeout or query failure.
+    PgPool broken_pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 1}};
+    REQUIRE_FALSE(broken_pool.valid());
+    InstructionStore store{broken_pool};
+    REQUIRE_FALSE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics); // wired after construction — construction's own failed
+                                 // lease attempt must not touch the counter.
+
+    auto read_result = store.query_definitions(InstructionQuery{});
+    CHECK_FALSE(read_result.has_value());
+    CHECK(metrics.counter("yuzu_server_instruction_read_degrade_total",
+                          {{"reason", "store_not_open"}})
+              .value() == 1.0);
+
+    InstructionDefinition d = make_question("degrade-counter-test");
+    auto write_result = store.create_definition(d);
+    CHECK_FALSE(write_result.has_value());
+    CHECK(metrics.counter("yuzu_server_instruction_write_degrade_total",
+                          {{"reason", "insert_definition_row"}})
+              .value() == 1.0);
+}
+
+TEST_CASE("InstructionStore::migrate_from_sqlite: a tombstoned definition is NOT resurrected "
+          "by a legacy file backfill (gov Gate 3 quality-engineer finding)",
+          "[instruction_store][backfill][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    InstructionDefinition d = make_question("tombstone-vs-backfill-def");
+    d.id = "tombstone.vs.backfill.def";
+    auto created = store.create_definition(d);
+    REQUIRE(created.has_value());
+    REQUIRE(store.delete_definition(d.id).has_value());
+    REQUIRE_FALSE(store.get_definition(d.id).value().has_value());
+
+    yuzu::test::TempDbFile legacy{std::string_view{"yuzu_test_instr_tombstone_backfill_"}};
+    {
+        SqliteDb legacy_db;
+        REQUIRE(sqlite3_open_v2(legacy.path.string().c_str(), legacy_db.addr(),
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) ==
+                SQLITE_OK);
+        legacy_exec(legacy_db.get(), kLegacyDefsSchema);
+        legacy_exec(legacy_db.get(), kLegacySetsSchema);
+        // Same id as the tombstoned row above, as a stale legacy file (from a replica that
+        // never saw the delete) would still hold it.
+        legacy_exec(legacy_db.get(),
+                    "INSERT INTO instruction_definitions (id, name, version, type, plugin, "
+                    "action, description, enabled, instruction_set_id, gather_ttl_seconds, "
+                    "response_ttl_days, created_by, created_at, updated_at) VALUES "
+                    "('tombstone.vs.backfill.def', 'Tombstone Vs Backfill Def', '1.0', "
+                    "'question', 'system_info', 'query', 'desc', 1, '', 0, 0, '', 1700000000, "
+                    "1700000000);");
+    }
+
+    // Backfill must succeed (the tombstone check skips the row, not a conflict) and the
+    // definition must stay absent — a stale legacy file must never resurrect a deliberate
+    // delete.
+    REQUIRE(store.migrate_from_sqlite(legacy.path));
+    CHECK_FALSE(store.get_definition(d.id).value().has_value());
+}
+
+TEST_CASE("InstructionStore::migrate_from_sqlite: a tombstoned set is NOT resurrected by a "
+          "legacy file backfill (gov Gate 3 quality-engineer finding)",
+          "[instruction_store][backfill][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    InstructionSet s;
+    s.id = "tombstone.vs.backfill.set";
+    s.name = "Tombstone Vs Backfill Set";
+    s.description = "desc";
+    auto created = store.create_set(s);
+    REQUIRE(created.has_value());
+    REQUIRE(store.delete_set(s.id).has_value());
+
+    yuzu::test::TempDbFile legacy{std::string_view{"yuzu_test_instr_tombstone_backfill_set_"}};
+    {
+        SqliteDb legacy_db;
+        REQUIRE(sqlite3_open_v2(legacy.path.string().c_str(), legacy_db.addr(),
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) ==
+                SQLITE_OK);
+        legacy_exec(legacy_db.get(), kLegacyDefsSchema);
+        legacy_exec(legacy_db.get(), kLegacySetsSchema);
+        legacy_exec(legacy_db.get(),
+                    "INSERT INTO instruction_sets (id, name, description, created_by, "
+                    "created_at) VALUES ('tombstone.vs.backfill.set', 'Tombstone Vs Backfill "
+                    "Set', 'desc', '', 1700000000);");
+    }
+
+    REQUIRE(store.migrate_from_sqlite(legacy.path));
+    auto sets = store.list_sets();
+    REQUIRE(sets.has_value());
+    CHECK(std::find_if(sets->begin(), sets->end(), [&](const InstructionSet& x) {
+              return x.id == s.id;
+          }) == sets->end());
+}
+
+TEST_CASE("InstructionStore::migrate_from_sqlite: a clean single-file backfill round-trips "
+          "every column, not just the base v1 shape (gov Gate 3 quality-engineer finding)",
+          "[instruction_store][backfill][pg]") {
+    yuzu::test::TempDbFile legacy{std::string_view{"yuzu_test_instr_full_column_backfill_"}};
+    {
+        SqliteDb legacy_db;
+        REQUIRE(sqlite3_open_v2(legacy.path.string().c_str(), legacy_db.addr(),
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) ==
+                SQLITE_OK);
+        legacy_exec(legacy_db.get(), kLegacyDefsSchema);
+        legacy_exec(legacy_db.get(), kLegacySetsSchema);
+        // Every one of the ~9 compat-ALTER-only + v2/v3 MigrationRunner columns
+        // (col_or_default's full list), so this test actually exercises the extended-field
+        // read path instead of just the base v1 columns every other backfill test uses.
+        legacy_exec(legacy_db.get(),
+                    "ALTER TABLE instruction_definitions ADD COLUMN yaml_source TEXT NOT NULL "
+                    "DEFAULT '';");
+        legacy_exec(legacy_db.get(),
+                    "ALTER TABLE instruction_definitions ADD COLUMN parameter_schema TEXT NOT "
+                    "NULL DEFAULT '{}';");
+        legacy_exec(legacy_db.get(),
+                    "ALTER TABLE instruction_definitions ADD COLUMN result_schema TEXT NOT NULL "
+                    "DEFAULT '{}';");
+        legacy_exec(legacy_db.get(),
+                    "ALTER TABLE instruction_definitions ADD COLUMN approval_mode TEXT NOT NULL "
+                    "DEFAULT 'auto';");
+        legacy_exec(legacy_db.get(),
+                    "ALTER TABLE instruction_definitions ADD COLUMN concurrency_mode TEXT NOT "
+                    "NULL DEFAULT 'per-device';");
+        legacy_exec(legacy_db.get(),
+                    "ALTER TABLE instruction_definitions ADD COLUMN platforms TEXT NOT NULL "
+                    "DEFAULT '';");
+        legacy_exec(legacy_db.get(),
+                    "ALTER TABLE instruction_definitions ADD COLUMN min_agent_version TEXT NOT "
+                    "NULL DEFAULT '';");
+        legacy_exec(legacy_db.get(),
+                    "ALTER TABLE instruction_definitions ADD COLUMN required_plugins TEXT NOT "
+                    "NULL DEFAULT '';");
+        legacy_exec(legacy_db.get(),
+                    "ALTER TABLE instruction_definitions ADD COLUMN readable_payload TEXT NOT "
+                    "NULL DEFAULT '';");
+        legacy_exec(legacy_db.get(),
+                    "ALTER TABLE instruction_definitions ADD COLUMN visualization_spec TEXT NOT "
+                    "NULL DEFAULT '{}';");
+        legacy_exec(legacy_db.get(),
+                    "ALTER TABLE instruction_definitions ADD COLUMN response_templates_spec "
+                    "TEXT NOT NULL DEFAULT '[]';");
+        legacy_exec(
+            legacy_db.get(),
+            "INSERT INTO instruction_definitions (id, name, version, type, plugin, action, "
+            "description, enabled, instruction_set_id, gather_ttl_seconds, response_ttl_days, "
+            "created_by, created_at, updated_at, yaml_source, parameter_schema, result_schema, "
+            "approval_mode, concurrency_mode, platforms, min_agent_version, required_plugins, "
+            "readable_payload, visualization_spec, response_templates_spec) VALUES "
+            "('full.column.def', 'Full Column Def', '2.5', 'action', 'sysinfo', 'gather', "
+            "'full column round-trip', 1, 'set-1', 120, 30, 'alice', 1700000000, 1700000001, "
+            "'scope: {}\nversion: full', '{\"type\":\"object\"}', '{\"columns\":[]}', "
+            "'role-gated', 'per-definition', 'windows,linux', '1.2.3', 'plugin_a,plugin_b', "
+            "'Inspect ${x}', '{\"chart\":\"bar\"}', '[{\"id\":\"t1\"}]');");
+    }
+
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.migrate_from_sqlite(legacy.path));
+
+    auto fetched = store.get_definition("full.column.def");
+    REQUIRE(fetched.has_value());
+    REQUIRE(fetched->has_value());
+    const auto& def = **fetched;
+    CHECK(def.name == "Full Column Def");
+    CHECK(def.version == "2.5");
+    CHECK(def.type == "action");
+    CHECK(def.plugin == "sysinfo");
+    CHECK(def.action == "gather");
+    CHECK(def.description == "full column round-trip");
+    CHECK(def.enabled == true);
+    CHECK(def.instruction_set_id == "set-1");
+    CHECK(def.gather_ttl_seconds == 120);
+    CHECK(def.response_ttl_days == 30);
+    CHECK(def.created_by == "alice");
+    CHECK(def.created_at == 1700000000);
+    CHECK(def.updated_at == 1700000001);
+    CHECK(def.yaml_source == "scope: {}\nversion: full");
+    CHECK(def.parameter_schema == R"({"type":"object"})");
+    CHECK(def.result_schema == R"({"columns":[]})");
+    CHECK(def.approval_mode == "role-gated");
+    CHECK(def.concurrency_mode == "per-definition");
+    CHECK(def.platforms == "windows,linux");
+    CHECK(def.min_agent_version == "1.2.3");
+    CHECK(def.required_plugins == "plugin_a,plugin_b");
+    CHECK(def.readable_payload == "Inspect ${x}");
+    CHECK(def.visualization_spec == R"({"chart":"bar"})");
+    CHECK(def.response_templates_spec == R"([{"id":"t1"}])");
 }
