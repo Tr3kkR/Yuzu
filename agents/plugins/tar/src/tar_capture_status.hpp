@@ -129,7 +129,16 @@ inline CaptureCompleteness classify_subprocess_capture(bool tool_ran, bool timed
     if (!tool_ran)
         return CaptureCompleteness{.complete = false, .reason = "spawn failed"};
     if (timed_out)
-        return CaptureCompleteness{.complete = false, .reason = "deadline exceeded"};
+        // BR-007: `timed_out` is set for BOTH a genuine wall-clock deadline
+        // AND an explicit cancel request (SubprocessResult::timed_out's own
+        // documented contract, subprocess_runner.hpp) -- this header stays
+        // free of any agents/core dependency (see the header comment above)
+        // so it cannot take a TerminationReason to disambiguate. "deadline
+        // exceeded" alone previously misreported a deliberate shutdown
+        // cancellation as a timeout, sending an operator to tune timeouts
+        // for a run that was never slow. Honest combined wording until the
+        // enum dependency is accepted.
+        return CaptureCompleteness{.complete = false, .reason = "deadline/cancelled"};
     if (output_truncated)
         return CaptureCompleteness{.complete = false, .reason = "output capped"};
     if (zero_exit_required && exit_code != 0)

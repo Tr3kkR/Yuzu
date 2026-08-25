@@ -98,7 +98,7 @@ TEST_CASE("classify_subprocess_capture: a deadline kill is incomplete even if th
     auto status = classify_subprocess_capture(/*tool_ran=*/true, /*timed_out=*/true,
                                               /*output_truncated=*/false, /*exit_code=*/-1);
     CHECK_FALSE(status.complete);
-    CHECK(status.reason == "deadline exceeded");
+    CHECK(status.reason == "deadline/cancelled");
 }
 
 TEST_CASE("classify_subprocess_capture: output-cap truncation is incomplete even on a clean exit",
@@ -145,7 +145,7 @@ TEST_CASE("classify_subprocess_capture: timed_out takes priority over a reported
     auto status = classify_subprocess_capture(/*tool_ran=*/true, /*timed_out=*/true,
                                               /*output_truncated=*/false, /*exit_code=*/0);
     CHECK_FALSE(status.complete);
-    CHECK(status.reason == "deadline exceeded");
+    CHECK(status.reason == "deadline/cancelled");
 }
 
 // ── collect_or_retain ────────────────────────────────────────────────────────
