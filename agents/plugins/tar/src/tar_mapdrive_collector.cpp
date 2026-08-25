@@ -313,6 +313,31 @@ std::string word_after(const std::string& line, const std::string& marker) {
     return ss.str();
 }
 
+// Like read_file, but for a file whose content is REQUIRED for a genuinely
+// complete capture -- /proc/mounts (Linux live outbound) below -- rather
+// than best-effort history (/etc/fstab, the Samba log tail, both still on
+// read_file above). BR4-004 (round 4): read_file's silent {} on open
+// failure, and its never checking rdbuf() extraction for a mid-stream
+// error, is the right degrade for OPTIONAL history sources but was also
+// feeding /proc/mounts -- a transient procfs read failure (a restricted
+// container/namespace, a race during teardown) then came back
+// indistinguishable from "this host genuinely has zero outbound network
+// mounts", and enumerate_mapdrive() diffed/persisted that empty result as
+// complete, fabricating a false `removed` event for every previously known
+// outbound mount. Throws IncompleteCaptureError instead, same contract as
+// every other required-read leg in this file (smbstatus/wevtutil above)
+// and the adjacent ARP procfs leg (tar_arp_collector.cpp) this mirrors.
+[[maybe_unused]] std::string read_required_file(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f)
+        throw yuzu::tar::IncompleteCaptureError("TAR: failed to open " + path);
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    if (f.bad())
+        throw yuzu::tar::IncompleteCaptureError("TAR: read error mid-stream on " + path);
+    return ss.str();
+}
+
 // Read at most the LAST max_bytes of a file. Samba's log.smbd on a busy file
 // server can be hundreds of MB (or unbounded with `max log size = 0`); slurping
 // it whole on the init-critical backfill path is a memory/latency hazard. The
@@ -1089,7 +1114,7 @@ std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
 #elif defined(__linux__)
 
 std::vector<MapDriveEntry> enumerate_mapdrive() {
-    std::vector<MapDriveEntry> out = parse_proc_mounts(read_file("/proc/mounts"));
+    std::vector<MapDriveEntry> out = parse_proc_mounts(read_required_file("/proc/mounts"));
     // Inbound: current Samba sessions. Empty if Samba isn't installed / no perms
     // (unmodified degrade-to-empty contract — `timeout 10` becomes the
     // runner's own deadline, `2>/dev/null` becomes its default stderr discard).
