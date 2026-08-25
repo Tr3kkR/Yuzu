@@ -77,8 +77,10 @@ data).
   version of this paragraph claimed "a one-time loud boot log records 'response history
   reset on Postgres cutover'" — no such log exists; `ResponseStore` logs only its generic
   `"ResponseStore initialized (schema {}, retention={}d)"` line, with nothing distinguishing
-  a fresh start from any other boot. See the fresh-start-by-default Update below for the new
-  detect-and-warn requirement this gap motivates for stores holding real operator data.)
+  a fresh start from any other boot. See `docs/postgres-store-playbook.md`'s Backfill bullet
+  for the detect-and-warn requirement this gap motivates for a future skip-by-default store
+  holding real operator data — that requirement lives in the playbook's authoring guidance,
+  not restated in full here.)
   There is no compliance or config-durability requirement to preserve response rows across
   the cut (unlike the config/reference and audit classes above), so a conditional flag would
   add a knob nobody has a reason to turn off. `ResponseStore` is the reference case for this

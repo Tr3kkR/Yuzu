@@ -5210,8 +5210,24 @@ public:
         // (same template as ResultSetStore above): a reachable database whose
         // schema can't migrate/open is a fatal startup error. No legacy-SQLite
         // backfill (retired: no production fleet ever ran the pre-Postgres
-        // build, so there was never real data to carry over).
+        // build, so there was never real data to carry over) — but per
+        // postgres-store-playbook.md's detect-and-warn requirement for a
+        // skip-by-default store that holds real operator-authored data,
+        // still check whether a legacy file exists and warn loudly rather
+        // than silently proceeding fresh-started if the "no production
+        // fleet" premise ever turns out to be locally wrong.
         if (pg_pool_ && !startup_failed_) {
+            std::error_code legacy_ec;
+            auto legacy_policy_db = cfg_.db_dir() / "policies.db";
+            if (std::filesystem::exists(legacy_policy_db, legacy_ec) && !legacy_ec &&
+                std::filesystem::file_size(legacy_policy_db, legacy_ec) > 0 && !legacy_ec) {
+                spdlog::warn("[PG] A legacy policies.db ({}) exists but PolicyStore no longer "
+                             "backfills it (retired 2026-08-25 — no production fleet has ever "
+                             "run a pre-Postgres build). Its content will NOT be carried over; "
+                             "if this environment has real compliance-policy data, reconcile it "
+                             "manually before relying on this Postgres instance.",
+                             legacy_policy_db.string());
+            }
             policy_store_ = std::make_unique<PolicyStore>(*pg_pool_);
             if (!policy_store_->is_open()) {
                 spdlog::error("[PG] Refusing to start: policy store migration/open failed "
