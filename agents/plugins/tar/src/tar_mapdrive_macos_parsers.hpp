@@ -91,4 +91,89 @@ inline bool apply_entry_cap(std::vector<MapDriveEntry>& entries, std::size_t cap
     return true;
 }
 
+/// Outcome of run_getfsstat_with_retry -- `ok=false` means "not a genuinely
+/// empty/smaller mount table", the same distinction classify_subprocess_
+/// capture's tool_ran/timed_out/output_truncated preserves for the
+/// subprocess legs: the caller must throw IncompleteCaptureError, never
+/// diff/persist `mounts` as though it were complete.
+struct GetfsstatFetchOutcome {
+    std::vector<MacMountRec> mounts;
+    bool ok{true};
+};
+
+/**
+ * Bounded size-then-fill retry loop over an injectable getfsstat(2)
+ * count/fill pair (BR-002/BR-006).
+ *
+ * getfsstat(2)'s documented contract is that a bounded call fills the
+ * buffer "up to the size specified by bufsize" -- it has no resume handle
+ * and no way to report "there were more than fit". So if a mount appears
+ * between the size-only count call and the fill call, the fill can end up
+ * exactly consuming the buffer for either of two indistinguishable reasons:
+ * the count was exact, or the table grew and got truncated. Padding the
+ * allocation by one spare slot (`capacity = n + 1`) turns that ambiguity
+ * into a detectable signal: a fill that reaches `capacity` can only mean
+ * growth-with-truncation (an exact match would leave the spare slot
+ * unfilled), so it is treated as churn and retried with a fresh count/size
+ * rather than accepted as a complete snapshot -- bounded at `max_attempts`
+ * before giving up (`ok=false`) so the caller retains the previous baseline
+ * instead of persisting a partial table as though every un-refetched mount
+ * had vanished.
+ *
+ * `cap` bounds the raw kernel-reported count BEFORE any allocation
+ * (BR-006): an `n >= cap` short-circuits to `ok=false` rather than
+ * allocate/copy/translate a raw table sized by an unbounded kernel-reported
+ * count on a host with an abnormally large mount table -- the collector's
+ * own post-filter kMapDriveEntryCap check (apply_entry_cap, above) still
+ * applies to the classified/filtered result on the ordinary path, but ties
+ * the resource bound only to a table that already fit in the raw copy.
+ *
+ * `count_fn`/`fill_fn` are injected (same seam as classify_macos_mounts'
+ * `resolve_host` parameter above) so this exact retry algorithm is
+ * unit-testable against synthetic count/fill sequences -- exactly-full,
+ * grew-then-stabilized, and give-up-after-max-attempts -- without a live
+ * macOS mount table or a stand-in reimplementation of the logic under test.
+ * `count_fn` returns getfsstat(nullptr, 0, ...)'s count, or a negative
+ * value on an errno failure. `fill_fn` is handed the padded capacity for
+ * the next attempt and must either return a negative value on failure, or
+ * populate `out_mounts` with exactly the filled records and return that
+ * count (which run_getfsstat_with_retry compares against `capacity` to
+ * detect the exactly-full case -- `fill_fn` itself does not decide that).
+ */
+inline GetfsstatFetchOutcome run_getfsstat_with_retry(
+    const std::function<int()>& count_fn,
+    const std::function<int(std::size_t capacity, std::vector<MacMountRec>& out_mounts)>& fill_fn,
+    std::size_t cap, int max_attempts = 4) {
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
+        const int n = count_fn();
+        if (n < 0)
+            return GetfsstatFetchOutcome{.mounts = {}, .ok = false};
+        if (n == 0)
+            return GetfsstatFetchOutcome{}; // genuinely no mounts -- ok, empty
+
+        if (static_cast<std::size_t>(n) >= cap) {
+            // The raw kernel-reported count already meets/exceeds the entry
+            // cap -- don't allocate/copy/translate an unbounded raw table;
+            // the caller's IncompleteCaptureError path retains the previous
+            // baseline exactly as an over-cap classified result would.
+            return GetfsstatFetchOutcome{.mounts = {}, .ok = false};
+        }
+
+        const std::size_t capacity = static_cast<std::size_t>(n) + 1; // headroom slot
+        std::vector<MacMountRec> mounts;
+        const int filled = fill_fn(capacity, mounts);
+        if (filled < 0)
+            return GetfsstatFetchOutcome{.mounts = {}, .ok = false};
+        if (filled == 0)
+            return GetfsstatFetchOutcome{}; // vanished between calls -- genuinely empty this tick
+        if (static_cast<std::size_t>(filled) == capacity)
+            continue; // exactly filled the padded buffer -- churn, retry
+        return GetfsstatFetchOutcome{.mounts = std::move(mounts), .ok = true};
+    }
+    // Unstable across every retry -- give up rather than loop forever
+    // against a pathologically churning mount table; the caller throws
+    // IncompleteCaptureError and retains the previous baseline.
+    return GetfsstatFetchOutcome{.mounts = {}, .ok = false};
+}
+
 } // namespace yuzu::tar

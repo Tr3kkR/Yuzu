@@ -6,8 +6,9 @@
 //     parse_win_security_logons / parse_samba_logs), exercised from captured
 //     sample output — these compile and run on every OS;
 //   * the PURE macOS mount classifier (classify_macos_mounts /
-//     apply_entry_cap, tar_mapdrive_macos_parsers.hpp), exercised from
-//     getfsstat(2) records — also compiles and runs on every OS; and
+//     apply_entry_cap / run_getfsstat_with_retry, tar_mapdrive_macos_parsers.hpp),
+//     exercised from getfsstat(2) records and injected count/fill sequences
+//     — also compiles and runs on every OS; and
 //   * an insert round-trip through TarDatabase for both origin='historical'
 //     (incl. ts=0) and origin='live' rows.
 // The diff (compute_mapdrive_events) is covered in test_tar_diff.cpp.
@@ -551,6 +552,139 @@ TEST_CASE("mapdrive apply_entry_cap: truncates at kMapDriveEntryCap, reports tru
     // The kept rows are the first kMapDriveEntryCap, in order.
     CHECK(over_cap.front().remote_host == "host0");
     CHECK(over_cap.back().remote_host == "host" + std::to_string(kMapDriveEntryCap - 1));
+}
+
+// ── run_getfsstat_with_retry (BR-002/BR-006: exactly-full-vs-truncated) ───────
+//
+// getfsstat(2) is a native syscall (rung 1) with no test-double process to
+// spawn, so the count_fn/fill_fn injection points let these tests drive the
+// REAL retry/give-up/cap algorithm (the same function
+// tar_mapdrive_collector.cpp's read_getfsstat wires the real getfsstat(2)
+// calls into) against synthetic sequences, rather than reimplementing the
+// logic under test.
+
+TEST_CASE("run_getfsstat_with_retry: ordinary fill under capacity succeeds on the first attempt",
+          "[tar][mapdrive][macos][getfsstat]") {
+    int count_calls = 0;
+    int fill_calls = 0;
+    auto out = run_getfsstat_with_retry(
+        [&]() {
+            ++count_calls;
+            return 2; // two mounts, no churn
+        },
+        [&](std::size_t capacity, std::vector<MacMountRec>& mounts) {
+            ++fill_calls;
+            REQUIRE(capacity == 3); // n + 1 headroom slot
+            mounts = {MacMountRec{"nfs", "host:/a", "/mnt/a"}, MacMountRec{"nfs", "host:/b", "/mnt/b"}};
+            return 2; // < capacity -- not exactly full
+        },
+        kMapDriveEntryCap);
+
+    CHECK(out.ok);
+    REQUIRE(out.mounts.size() == 2);
+    CHECK(out.mounts[0].on == "/mnt/a");
+    CHECK(count_calls == 1);
+    CHECK(fill_calls == 1);
+}
+
+TEST_CASE("run_getfsstat_with_retry: a mount growing the table between count and fill is "
+          "retried, not accepted as complete",
+          "[tar][mapdrive][macos][getfsstat]") {
+    // Attempt 1: count()=1 -> capacity=2, but a mount appears before fill()
+    // runs, so fill() exactly fills the padded buffer (2) -- indistinguishable
+    // from truncation, must be retried rather than returned as a 1-mount
+    // snapshot that silently dropped the new mount.
+    // Attempt 2: the table has stabilized at 2 -- count()=2 -> capacity=3,
+    // fill() returns 2 (< capacity), a genuine complete snapshot.
+    int attempt = 0;
+    auto out = run_getfsstat_with_retry(
+        [&]() { return attempt == 0 ? 1 : 2; },
+        [&](std::size_t capacity, std::vector<MacMountRec>& mounts) {
+            ++attempt;
+            if (attempt == 1) {
+                REQUIRE(capacity == 2);
+                mounts = {MacMountRec{"nfs", "host:/a", "/mnt/a"},
+                          MacMountRec{"nfs", "host:/b", "/mnt/b"}};
+                return 2; // == capacity -- exactly full, churn signal
+            }
+            REQUIRE(capacity == 3);
+            mounts = {MacMountRec{"nfs", "host:/a", "/mnt/a"}, MacMountRec{"nfs", "host:/b", "/mnt/b"}};
+            return 2; // < capacity -- stabilized, complete
+        },
+        kMapDriveEntryCap);
+
+    CHECK(out.ok);
+    REQUIRE(out.mounts.size() == 2);
+    CHECK(attempt == 2); // retried exactly once
+}
+
+TEST_CASE("run_getfsstat_with_retry: a mount table that never stabilizes gives up rather than "
+          "loop forever, retaining the previous baseline",
+          "[tar][mapdrive][macos][getfsstat]") {
+    // Every attempt's fill() exactly fills the padded buffer -- a
+    // pathologically churning table. After max_attempts the helper must give
+    // up (ok=false) so the caller throws IncompleteCaptureError, not loop
+    // forever or accept a partial table as complete.
+    int attempts = 0;
+    auto out = run_getfsstat_with_retry(
+        [&]() { return 1; },
+        [&](std::size_t capacity, std::vector<MacMountRec>& mounts) {
+            ++attempts;
+            mounts = {MacMountRec{"nfs", "host:/a", "/mnt/a"}};
+            return static_cast<int>(capacity); // always exactly full
+        },
+        kMapDriveEntryCap, /*max_attempts=*/4);
+
+    CHECK_FALSE(out.ok);
+    CHECK(out.mounts.empty());
+    CHECK(attempts == 4); // bounded, not unbounded
+}
+
+TEST_CASE("run_getfsstat_with_retry: a raw count at/over the cap is rejected before any "
+          "allocation (BR-006)",
+          "[tar][mapdrive][macos][getfsstat]") {
+    bool fill_called = false;
+    auto out = run_getfsstat_with_retry(
+        [&]() { return 5; }, // n >= cap
+        [&](std::size_t, std::vector<MacMountRec>&) {
+            fill_called = true;
+            return 0;
+        },
+        /*cap=*/5);
+
+    CHECK_FALSE(out.ok);
+    CHECK(out.mounts.empty());
+    CHECK_FALSE(fill_called); // never allocates/fills an over-cap raw table
+}
+
+TEST_CASE("run_getfsstat_with_retry: count()/fill() errno failures and the vanished/empty "
+          "cases are reported honestly",
+          "[tar][mapdrive][macos][getfsstat]") {
+    // count() failure (e.g. EIO) -- not a genuinely empty table.
+    auto count_fail = run_getfsstat_with_retry(
+        [] { return -1; }, [](std::size_t, std::vector<MacMountRec>&) { return 0; },
+        kMapDriveEntryCap);
+    CHECK_FALSE(count_fail.ok);
+
+    // Genuinely empty mount table (n == 0) -- ok, no fill() call needed.
+    auto genuinely_empty = run_getfsstat_with_retry(
+        [] { return 0; },
+        [](std::size_t, std::vector<MacMountRec>&) -> int { FAIL("fill_fn should not run"); return -1; },
+        kMapDriveEntryCap);
+    CHECK(genuinely_empty.ok);
+    CHECK(genuinely_empty.mounts.empty());
+
+    // fill() failure (e.g. EIO) after a successful count().
+    auto fill_fail = run_getfsstat_with_retry(
+        [] { return 2; }, [](std::size_t, std::vector<MacMountRec>&) { return -1; }, kMapDriveEntryCap);
+    CHECK_FALSE(fill_fail.ok);
+
+    // Every mount vanished between count() and fill() -- genuinely empty
+    // this tick, not an error.
+    auto vanished = run_getfsstat_with_retry(
+        [] { return 2; }, [](std::size_t, std::vector<MacMountRec>&) { return 0; }, kMapDriveEntryCap);
+    CHECK(vanished.ok);
+    CHECK(vanished.mounts.empty());
 }
 
 // ── argv re-home: same blob -> same entries ────────────────────────────────

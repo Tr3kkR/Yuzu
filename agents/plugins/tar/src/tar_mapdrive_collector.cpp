@@ -1239,15 +1239,11 @@ namespace {
 
 // Size-then-fill getfsstat(2) (rung 1 — native syscall, no shell/subprocess):
 // a NULL buf with bufsize 0 returns the current mount count with no
-// allocation; a second call fills a buffer sized to that count. A mount
-// appearing between the two calls is simply not included this cycle rather
-// than reallocating in a loop — getfsstat has no resume handle, and a
-// once-per-tick miss is acceptable for a low-cardinality, slowly-changing
-// table (same posture as this file's other snapshot legs). MNT_NOWAIT reads
-// the kernel's cached mount table without blocking on a hung/unreachable
-// remote filesystem, matching this collector's degrade-not-block contract
-// for every other leg (WNet/NetSessionEnum/smbstatus/journalctl all avoid
-// blocking calls too).
+// allocation; a second call fills a buffer sized to that count. MNT_NOWAIT
+// reads the kernel's cached mount table without blocking on a hung/
+// unreachable remote filesystem, matching this collector's degrade-not-block
+// contract for every other leg (WNet/NetSessionEnum/smbstatus/journalctl
+// all avoid blocking calls too).
 //
 // getfsstat(2)'s documented contract is: returns -1 and sets errno on
 // failure, else the number of matches (0 is a legitimate, if practically
@@ -1255,32 +1251,34 @@ namespace {
 // former; collapsing both cases to "return {}" (as this used to) makes a
 // transient getfsstat failure indistinguishable from a genuinely empty
 // mount table once it reaches enumerate_mapdrive() (BR-002, round 2).
-struct GetfsstatOutcome {
-    std::vector<MacMountRec> mounts;
-    bool ok{true};
-};
-
-GetfsstatOutcome read_getfsstat() {
-    int n = getfsstat(nullptr, 0, MNT_NOWAIT);
-    if (n < 0)
-        return GetfsstatOutcome{.mounts = {}, .ok = false};
-    if (n == 0)
-        return GetfsstatOutcome{}; // genuinely no mounts -- ok, empty
-    std::vector<struct statfs> buf(static_cast<std::size_t>(n));
-    int filled =
-        getfsstat(buf.data(), static_cast<int>(buf.size() * sizeof(struct statfs)), MNT_NOWAIT);
-    if (filled < 0)
-        return GetfsstatOutcome{.mounts = {}, .ok = false};
-    if (filled == 0)
-        return GetfsstatOutcome{}; // mounts vanished between the two calls -- treat as
-                                    // genuinely empty this tick, not an error
-    if (static_cast<std::size_t>(filled) < buf.size())
-        buf.resize(static_cast<std::size_t>(filled));
-    GetfsstatOutcome out;
-    out.mounts.reserve(buf.size());
-    for (const auto& fs : buf)
-        out.mounts.push_back(MacMountRec{fs.f_fstypename, fs.f_mntfromname, fs.f_mntonname});
-    return out;
+//
+// A mount appearing between the count and fill calls is NOT simply dropped
+// (as an earlier round did) — getfsstat fills only "up to the size
+// specified by bufsize", so an exactly-full fill is indistinguishable from
+// truncation, and silently accepting it as complete can make a still-present
+// mount look removed-then-reappeared across ticks (BR-002, round 3). The
+// retry-with-headroom algorithm that resolves this is
+// run_getfsstat_with_retry (tar_mapdrive_macos_parsers.hpp) — extracted so
+// it is unit-testable against synthetic count/fill sequences; this function
+// wires in the two real getfsstat(2) calls.
+GetfsstatFetchOutcome read_getfsstat() {
+    return run_getfsstat_with_retry(
+        []() { return getfsstat(nullptr, 0, MNT_NOWAIT); },
+        [](std::size_t capacity, std::vector<MacMountRec>& out_mounts) {
+            std::vector<struct statfs> buf(capacity);
+            int filled = getfsstat(buf.data(), static_cast<int>(buf.size() * sizeof(struct statfs)),
+                                   MNT_NOWAIT);
+            if (filled < 0)
+                return filled;
+            if (static_cast<std::size_t>(filled) < buf.size())
+                buf.resize(static_cast<std::size_t>(filled));
+            out_mounts.clear();
+            out_mounts.reserve(buf.size());
+            for (const auto& fs : buf)
+                out_mounts.push_back(MacMountRec{fs.f_fstypename, fs.f_mntfromname, fs.f_mntonname});
+            return filled;
+        },
+        kMapDriveEntryCap);
 }
 
 } // namespace
