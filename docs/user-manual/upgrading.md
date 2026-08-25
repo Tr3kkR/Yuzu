@@ -2084,6 +2084,81 @@ log and `/readyz` are the channels to watch during an upgrade.
 `SELECT count(*) FROM baseline_store.baselines;` against Postgres matches
 `sqlite3 guardian-baselines.db.migrated-<epoch> "SELECT count(*) FROM baselines;"`.
 
+## Compliance policy engine migrates to Postgres (mandatory backfill, PolicyStore, ADR-0056)
+
+The `PolicyStore` — compliance policy fragments/policies behind `POST/DELETE
+/api/policy-fragments*`, `POST/DELETE /api/policies*`, `POST /api/policies/{id}/{enable,
+disable,invalidate,evaluate,remediate}`, `GET /api/compliance*`, and every dispatched
+compliance check/fix/verify — moves from the SQLite `policies.db` file to the server's
+PostgreSQL substrate in this release, schema `policy_store`, on the existing shared
+pool. Six operator-authored tables (fragments, policies, and their input/trigger/group
+associations, plus per-agent `policy_status`) plus a new operational-only seventh table,
+`policy_dispatch_state`, which coordinates fleet-wide compliance-check dispatch across
+replicas and is never backfilled.
+
+**Before you upgrade**, sanity-check the legacy `policies.db`:
+
+```bash
+sqlite3 /path/to/policies.db "SELECT count(*) FROM policies; SELECT count(*) FROM policy_status;"
+```
+
+- **What is preserved:** every policy fragment and policy definition, and per-agent
+  compliance status history (`policy_status` — `compliant`/`non_compliant`/`unknown`/
+  `error`, plus the fix-attempt counter) via a direction-aware LIFECYCLE merge rather
+  than a fresh start: the default 3600s evaluation interval would otherwise leave up to
+  an hour of false-`unknown` fleet compliance on an operator-visible dashboard after
+  every upgrade. Fragments and policies write once (no update path exists once created —
+  only enable/disable and status mutate post-creation), so the identity side of the
+  backfill is unusually clean.
+- **Fail-closed boot, retried each start.** A backfill that cannot complete — an
+  unreadable/corrupt `policies.db`, a Postgres write error, a fingerprint mismatch, or a
+  legacy `policy_status` row demonstrably ahead of an already-migrated Postgres row —
+  **refuses the boot** and retries on the next start. This store had no fail-closed
+  guard on SQLite; on Postgres, a reachable database whose schema can't migrate or open
+  is now a fatal startup error too, matching the ladder's existing "authoritative"
+  posture for this store. The boot log's `PolicyStore`/`[PG] Refusing to start` lines
+  carry the specific refusal, and `docs/ops-runbooks/policy-store-backfill-recovery.md`
+  maps each message to its recovery.
+- **"Move it aside" drops status history, not just definitions.** The documented
+  operator remediation for a stuck backfill — move `policies.db` aside to skip it — is
+  correctly described in the boot log itself: doing so drops both the policy
+  definitions AND per-agent compliance status history that only exists in the legacy
+  file. See the runbook for why, and for the "leave it in place as a backup" trap (the
+  legacy-ahead check re-runs on every boot for as long as the file exists at its
+  configured path, so a stale backup file left behind reproduces the refusal as a boot
+  crash loop on any later clock skew).
+- Tolerates a legacy `policies.db` predating the `fix_attempt_count` column
+  (defaults missing rows to 0); a probe failure reading that column now fails the
+  backfill closed rather than silently defaulting every row to 0.
+- Real FK + `ON DELETE CASCADE` added from `policy_status` to `policies` — the SQLite
+  original had none, and `delete_policy` hand-wrote a second `DELETE` whose failure was
+  silently swallowed.
+
+**Operator-visible behaviour changes (fail-closed reads/writes).**
+
+- A genuine store degrade on any of the six policy/fragment mutator routes, `/evaluate`,
+  or `/remediate` now returns **503** (`{"error":{"code":503,"message":...}}`) instead
+  of collapsing into the same `400`/`500` a validation error or business rejection gets
+  — the earlier behaviour leaked the internal error string into the response body and
+  gave callers no way to distinguish "retry" from "don't retry."
+- Compliance-check dispatch is now a durable, fleet-wide single-sweeper claim
+  (`pg_try_advisory_xact_lock`) rather than each replica's own in-memory timer — a
+  persistently-failing claim (compliance checks silently stop running fleet-wide) now
+  logs at `error` and increments `yuzu_server_policy_eval_errors_total{phase="claim"}`,
+  where it previously only warned with no counter.
+- `POST /api/policies/{id}/remediate` now rejects (409) a second call for the same
+  policy while a remediation it already started is still in flight — same-process
+  dedup only; a cross-replica race is a documented, tracked gap, not yet closed.
+- The compliance dashboard's hero no longer claims a "Last evaluated: just now"
+  freshness that the server was not actually tracking — no dashboard regression, since
+  no timestamp was ever computed; the freshness claim itself has simply been removed
+  rather than shipped false. A real evaluation-health signal is tracked as a follow-up.
+
+**Verify:** after the server reports ready, `GET /api/compliance` shows the same
+policies and fleet compliance percentage as before the upgrade, and `SELECT count(*)
+FROM policy_store.policies;` / `policy_store.policy_status` against Postgres match the
+legacy file's counts.
+
 ## ⚠️ Behaviour change: quarantine is now enforced at instruction dispatch (#881, #3127)
 
 Quarantine previously isolated a device's network without stopping the control plane from

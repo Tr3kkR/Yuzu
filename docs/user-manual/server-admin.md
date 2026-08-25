@@ -746,6 +746,18 @@ Three operator-visible consequences:
   (the shipped systemd unit and every shipped compose file use **210 s**); 30 s
   — which suited GET alone — is the figure to move away from. Under-sizing
   SIGKILLs mid-drain and silently drops in-flight streams on deploy.
+  **Update (#3042):** the ~156 s figure above bounds a single streamed-POST
+  *call* during ordinary (non-shutdown) operation — it is not how long
+  `ServerImpl::stop()` itself waits on one. Since #3042, graceful shutdown
+  close-signals every live MCP session up front, so a streamed POST held open
+  across an ordinary `stop()` ends within about one pump tick (~3 s), not the
+  120 s cap; the underlying execution is unaffected and stays fetchable by
+  `execution_id`. What still bounds shutdown is a stream stuck mid-write to a
+  blackholed or drip-feeding peer (the 30 s write timeout) — see
+  `docs/mcp-server.md`'s Shutdown section for the current mechanism. The 210 s
+  `TimeoutStopSec` recommendation above remains a safe, comfortably
+  conservative choice; it is no longer the tight bound its original
+  derivation implied.
 - **Per-principal ceiling.** `--mcp-max-streams-per-principal` governs the GET
   channel. The streamed-POST allowance is a fixed 4 concurrent calls per
   principal — numerically the same as, but counted and enforced separately
@@ -1474,6 +1486,10 @@ window, restricted to the file owner where the platform supports it (POSIX only,
 detail: `docs/adr/0057-webhook-store-postgres-migration.md` and the
 `## ⚠️ Behaviour change: webhook store moves to Postgres (ADR-0057)` section in
 `docs/user-manual/upgrading.md`.
+
+### vNEXT — `initialize` can answer `503` during a graceful shutdown (#3042)
+
+With MCP streaming on, `initialize` now returns `HTTP 503` / JSON-RPC `-32015` ("Server is shutting down") for a narrow, transient window (seconds, not the deploy's whole grace period) if it lands after `ServerImpl::stop()` has begun draining live sessions. **Affected:** any MCP client integration — the reference clients and most SDKs already treat a non-2xx `initialize` as a transient failure and retry/reconnect; a client that specifically asserted "initialize never 503s" needs updating. No `retry_after_ms` is given (this process has no visibility into when a replacement instance will be reachable); reconnect and re-`initialize` once it is. A session that was already live when shutdown began instead receives a clean `notifications/yuzu.stream_closed` close frame (`reason: session_terminated`) rather than a bare connection drop — see [MCP — Troubleshooting](mcp.md#-32015-server-is-shutting-down-http-503) for the full symptom/cause/fix.
 
 ---
 

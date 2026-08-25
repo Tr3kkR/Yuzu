@@ -5205,12 +5205,42 @@ public:
             }
         }
 
-        // Phase 5: Policy Engine
-        {
-            auto policy_db = cfg_.db_dir() / "policies.db";
-            policy_store_ = std::make_unique<PolicyStore>(policy_db);
-            if (policy_store_ && policy_store_->is_open()) {
-                spdlog::info("PolicyStore initialized at {}", policy_db.string());
+        // Phase 5: Policy Engine. Migrated Postgres store (ADR-0006/ADR-0056,
+        // schema `policy_store`) — construction fail-CLOSED per ADR-0012 §1
+        // (same template as ResultSetStore above): a reachable database whose
+        // schema can't migrate/open is a fatal startup error. This store had
+        // NO fail-closed guard on SQLite (a pre-existing gap the ladder's
+        // Wave 2 "authoritative" posture already called for — ADR-0056
+        // closes it, not a new decision). `migrate_from_sqlite` runs the
+        // one-time, idempotent legacy-`policies.db` backfill (ADR-0009);
+        // AUTHORITATIVE posture means a backfill failure is ALSO fatal.
+        if (pg_pool_ && !startup_failed_) {
+            policy_store_ = std::make_unique<PolicyStore>(*pg_pool_);
+            if (!policy_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: policy store migration/open failed "
+                              "(database reachable but the policy_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                auto policy_db = cfg_.db_dir() / "policies.db";
+                if (!policy_store_->migrate_from_sqlite(policy_db)) {
+                    // Recovery procedure for every refusal shape (divergent
+                    // legacy file, legacy-ahead status row, unreadable file):
+                    // docs/ops-runbooks/policy-store-backfill-recovery.md.
+                    spdlog::error("[PG] Refusing to start: policy legacy-SQLite backfill failed "
+                                  "(see prior log lines) — policy_store is authoritative and "
+                                  "must not serve partially-migrated compliance data. Operator "
+                                  "remediation: repair {} or move it aside to skip the backfill "
+                                  "(policy definitions AND per-agent status history in it will "
+                                  "NOT carry over — see "
+                                  "docs/ops-runbooks/policy-store-backfill-recovery.md)",
+                                  policy_db.string());
+                    startup_failed_ = true;
+                } else {
+                    spdlog::info("PolicyStore initialized (schema policy_store; legacy backfill "
+                                 "source {})",
+                                 policy_db.string());
+                }
             }
         }
 
@@ -7686,15 +7716,37 @@ public:
         // auto-reconnect churn for the whole 30s window — it only happens
         // once the socket is genuinely about to stop accepting anyway.
         //
-        // NOT wired into the MCP GET/streamed-POST surfaces: McpStreamPump's
-        // teardown is driven by session_alive_/session-registry
-        // revalidation, a materially different mechanism (see
-        // StreamBudget::closing()'s doc comment) — an open MCP stream still
-        // relies on the bounded web-thread join below as its backstop.
-        // Tracked as a named follow-up (#2371 comment, 2026-08-11), not
-        // silently left uncovered.
+        // The MCP GET/streamed-POST surfaces are NOT on StreamBudget::closing()
+        // (see its doc comment) — a different mechanism closes them, below.
         if (stream_budget_)
             stream_budget_->begin_closing();
+
+        // #3042: close-signal every live MCP session BEFORE web_server_->stop().
+        // httplib's own chunked-write loop already re-checks its shutdown flag
+        // between provider calls, so a healthy MCP stream would drain within
+        // about one tick (~3s) even without this — but that path is a bare
+        // connection drop, no close frame, no reason. mcp_sessions_->shutdown()
+        // stickily refuses new mints and closes every live session's stream
+        // state (McpStreamState::close(), same mechanism a DELETE or idle-GC
+        // uses) — a GET pump has that state as its own sink, so it wakes its
+        // wait predicate immediately; a streamed-POST pump's sink is a separate
+        // SseSinkState this close() never touches, so it instead notices on its
+        // own next tick via session_alive_(). Either way the pump exits with a
+        // clean `session_terminated` close frame instead of riding out to a
+        // silent drop. What this does NOT fix: a stream whose pump is blocked
+        // *inside* a single write (a blackholed or drip-feeding peer, bounded
+        // by the write timeout, not the tick) never sees the flip until that
+        // write resolves — that residual case is still the bounded web-thread
+        // join + `_Exit` escalation below.
+        if (mcp_sessions_) {
+            // `n` is every registry entry drained, not just ones with an attached sink
+            // (close() no-ops on an entry with none) — say "removed", not "live", so this
+            // line can't overstate how many clients were actually connected.
+            const std::size_t n = mcp_sessions_->shutdown();
+            if (n > 0) {
+                spdlog::info("MCP sessions: removed {} session(s) for shutdown", n);
+            }
+        }
 
         // Stop cert reloader before web server (it holds a pointer to
         // web_server_) — moved up alongside web_server_->stop() for the
@@ -7820,8 +7872,9 @@ public:
         // web_server_->listen() returns (already closed above) and this
         // waits on that signal instead of a bare join(). On the fast path —
         // the common case once the close-signal above has drained every
-        // /events / /api/v1/events / dashboard-drawer stream — this returns
-        // within one keep-alive tick, well under the bound.
+        // /events / /api/v1/events / dashboard-drawer stream, and #3042's
+        // mcp_sessions_->shutdown() has woken every live MCP pump — this
+        // returns within one keep-alive tick, well under the bound.
         //
         // Escalation is a deliberate std::_Exit, NOT the nvd_sync
         // leak-and-continue precedent a few lines above: nvd_sync's leak
@@ -7834,11 +7887,11 @@ public:
         // farm, not a leak. `_Exit` skips the remaining teardown below
         // (including offload_target_store_->flush_all(), the RESTART-1 fix)
         // exactly the same way a supervisor SIGKILL would — strictly no
-        // worse, and it only fires when the close-signal above did NOT
-        // reach every stream: an open MCP GET/streamed-POST connection (the
-        // one surface item 2 does not close-signal — see
-        // StreamBudget::closing()'s doc comment) or a genuinely wedged
-        // handler.
+        // worse, and by #3042 it should now fire only for a handler stuck
+        // *inside* a single write (a blackholed or drip-feeding peer, bounded
+        // by the write timeout rather than the tick — the close-signals above
+        // wake a WAITING pump, not one already mid-write) or a genuinely
+        // wedged handler unrelated to any stream.
         if (web_thread_.joinable()) {
             // #3007 governance (sre, unhappy-path UP-7/UP-8): stop() now runs off the
             // signal handler, so this wait is silent-by-design up to 15s with no
@@ -8082,6 +8135,15 @@ public:
         // which was inaccurate — the thread exists, it is simply already
         // joined by the time execution reaches this line.
         custom_properties_store_.reset();
+        // PolicyStore (ADR-0056) borrows pg_pool_ — same discipline, and the
+        // same reasoning as the comment above: PolicyEvaluator holds a raw
+        // `policy_store` pointer on its background policy_eval_thread_,
+        // already joined earlier in this same stop() before this reset runs.
+        // Unlike on SQLite (where policy_store_ owned its own standalone
+        // sqlite3* with no shared dependency, so implicit declaration-order
+        // destruction was safe), it now borrows the pool and needs the same
+        // explicit belt-and-braces reset every other migrated store gets.
+        policy_store_.reset();
         // ResultSetStore borrows pg_pool_ — drop before the pool. The maintenance
         // thread that leased it is already joined above; every HTTP/gRPC handler
         // holding the raw pointer is quiesced by the drains above.
@@ -17067,8 +17129,10 @@ private:
                 if (stop_requested_.load(std::memory_order_acquire))
                     break;
                 if (policy_evaluator_) {
-                    // tick() touches JSON parsing, the CEL evaluator and SQLite —
-                    // any of which can throw on a malformed policy/result. An
+                    // tick() touches JSON parsing and the CEL evaluator (Postgres
+                    // reads/writes go through PolicyStore's std::expected/bool
+                    // contracts, not exceptions) — any of the former can throw on
+                    // a malformed policy/result. An
                     // exception escaping a std::thread entry calls std::terminate,
                     // so a single bad policy must not take the process (or silently
                     // kill compliance evaluation). Catch, log, and keep ticking.
