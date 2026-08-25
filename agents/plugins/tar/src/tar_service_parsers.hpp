@@ -31,10 +31,21 @@
 namespace yuzu::tar {
 
 /// Parse the line-split stdout of `systemctl list-units --type=service
-/// --all --no-pager --no-legend` (SubprocessResult::lines -- blank lines
-/// already dropped and a trailing '\r' already stripped by the runner).
-/// Tolerant of a leading whitespace/bullet column (systemctl marks a failed
-/// unit with "*"); `--no-legend` means there is no header row to skip.
+/// --all --plain --no-pager --no-legend` (SubprocessResult::lines -- blank
+/// lines already dropped and a trailing '\r' already stripped by the
+/// runner). `--plain` (BR-001) makes the invoked argv never emit a marker
+/// column at all -- verified live (Docker jrei/systemd-ubuntu:22.04): a
+/// `failed`/`not-found` unit's row starts directly at the UNIT field, no
+/// leading glyph or space. Without `--plain`, systemctl marks such units
+/// with a locale-dependent marker column -- ASCII `*` under a C locale, but
+/// the UTF-8 glyph `●` (e2 97 8f) under a UTF-8 one, which this trim does
+/// NOT recognise (a real, previously-latent defect this argv change makes
+/// moot: see tar_service_collector.cpp's --plain comment). The
+/// `find_first_not_of(" *")` trim below stays as defensive tolerance for
+/// that ASCII form -- harmless on real `--plain` output (start is always 0,
+/// nothing to trim) and correct if a future caller ever invokes this parser
+/// against non-`--plain` C-locale output; `--no-legend` means there is no
+/// header row to skip either way.
 inline std::vector<ServiceInfo>
 parse_systemctl_list_units(const std::vector<std::string>& lines) {
     std::vector<ServiceInfo> services;

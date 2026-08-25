@@ -200,8 +200,26 @@ std::vector<ServiceInfo> enumerate_services() {
     // runner's default (merge_stderr=false, subprocess_runner.hpp:98),
     // matching the old `2>/dev/null` shell suffix. Parsing is pure
     // (tar_service_parsers.hpp), unit-testable independent of the runner.
+    //
+    // --plain (BR-001): without it, systemctl's list-units marks a
+    // failed/not-found unit with a UTF-8 "*" glyph column
+    // (glyph(GLYPH_BLACK_CIRCLE), U+25CF, bytes e2 97 8f) whenever it thinks
+    // stdout supports UTF-8 -- verified live (Docker
+    // jrei/systemd-ubuntu:22.04, amd64 emulation, a real `failed` unit):
+    // under a UTF-8 locale the row reads `\xe2\x97\x8f yzfail.service ...`,
+    // which the parser's ASCII `find_first_not_of(" *")` trim does not
+    // recognise, so the glyph is read as the unit name and the real row
+    // shifts/collides. This process currently only ever observed the
+    // locale-C ASCII `*` form (LC_ALL=C in the runner's inherited
+    // environment), so the defect has not fired in production -- but that
+    // correctness depended entirely on an unstated locale default, not on
+    // anything this argv asserts. --plain removes the marker column
+    // outright (verified live, same container: `yzfail.service ...` with no
+    // leading column at all under either locale), so parsing no longer
+    // depends on the runner's environment.
     auto res = yuzu::agent::run_bounded_subprocess(
-        {systemctl_path, "list-units", "--type=service", "--all", "--no-pager", "--no-legend"},
+        {systemctl_path, "list-units", "--type=service", "--all", "--plain", "--no-pager",
+         "--no-legend"},
         yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{10}});
     // zero_exit_required=true verified live (Docker jrei/systemd-ubuntu:22.04,
     // amd64 emulation): `systemctl list-units --type=service --all --no-legend

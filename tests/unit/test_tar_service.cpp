@@ -10,15 +10,29 @@
  * Fixture provenance (binding rule: fixtures must come from real captures,
  * never invented output shapes):
  *
- *   - systemctl rows below were captured 2026-08-24 by running
- *     `systemctl list-units --type=service --all --no-pager --no-legend`
- *     inside a `jrei/systemd-ubuntu:latest` Docker container (booted with
- *     `--platform linux/amd64 --privileged`, QEMU-emulated on this arm64
- *     development host, real systemd PID 1 running under cgroupfs
- *     passthrough). The container's minimal/degraded boot produced real
- *     `not-found` (bullet-marked) and `failed` (bullet-marked) rows
- *     alongside ordinary `loaded`/`inactive`/`dead` ones -- all reproduced
- *     verbatim below, column spacing included.
+ *   - the original (pre-`--plain`) systemctl rows below were captured
+ *     2026-08-24 by running `systemctl list-units --type=service --all
+ *     --no-pager --no-legend` inside a `jrei/systemd-ubuntu:latest` Docker
+ *     container (booted with `--platform linux/amd64 --privileged`,
+ *     QEMU-emulated on this arm64 development host, real systemd PID 1
+ *     running under cgroupfs passthrough). The container's minimal/degraded
+ *     boot produced real `not-found` (bullet-marked) and `failed`
+ *     (bullet-marked) rows alongside ordinary `loaded`/`inactive`/`dead`
+ *     ones -- all reproduced verbatim below, column spacing included. Kept
+ *     as a defensive-tolerance fixture (see tar_service_parsers.hpp) even
+ *     though the shipped argv no longer produces this ASCII-`*` shape.
+ *
+ *   - the `--plain` rows below were captured 2026-08-25 (BR-001 remediation)
+ *     by running `systemctl list-units --type=service --all --plain
+ *     --no-pager --no-legend` in a fresh `jrei/systemd-ubuntu:22.04`
+ *     container (`--platform linux/amd64 --privileged --cgroupns=host`,
+ *     QEMU-emulated), after installing and starting a deliberately-failing
+ *     `yzfail.service` (`ExecStart=/bin/false`) to force a real `failed`
+ *     row. This is the exact argv/output shape tar_service_collector.cpp
+ *     now invokes -- no marker column at all, confirmed byte-for-byte via
+ *     `od -c` under both a UTF-8 locale and the container's real default
+ *     (`LC_ALL=C`) -- proving the argv change makes systemctl's row shape
+ *     locale-independent rather than merely re-confirming the ASCII case.
  *
  *   - launchctl rows below were captured 2026-08-24 by running
  *     `launchctl list` directly on this macOS development host (arm64).
@@ -76,6 +90,39 @@ TEST_CASE("parse_systemctl_list_units: real systemd-ubuntu container capture",
 
     CHECK(services[4].name == "systemd-journald.service");
     CHECK(services[4].display_name == "Journal Service");
+}
+
+TEST_CASE("parse_systemctl_list_units: real --plain capture has no marker column, "
+          "including on a genuinely failed unit",
+          "[tar_service]") {
+    // Real capture (see file header, BR-001) -- this is the exact argv shape
+    // tar_service_collector.cpp now invokes. yzfail.service is a real
+    // ExecStart=/bin/false unit that systemd reports failed; under the old
+    // (non-`--plain`) argv on a UTF-8 stdout this row would have started
+    // with the `●` glyph (e2 97 8f) instead of the unit name -- `--plain`
+    // means there is no marker column to collide on at all, verified live.
+    std::vector<std::string> lines = {
+        "dbus.service                         loaded    inactive dead    D-Bus System Message Bus",
+        "display-manager.service              not-found inactive dead    display-manager.service",
+        "yzfail.service                       loaded    failed   failed  yzfail test unit",
+    };
+
+    auto services = parse_systemctl_list_units(lines);
+    REQUIRE(services.size() == 3);
+
+    CHECK(services[0].name == "dbus.service");
+    CHECK(services[0].status == "dead");
+
+    // not-found: no marker column under --plain, unlike the pre-remediation
+    // bullet-marked fixture above.
+    CHECK(services[1].name == "display-manager.service");
+    CHECK(services[1].status == "dead");
+
+    // The real failed unit -- name and status parse correctly with no glyph
+    // collision, the defect BR-001 closes.
+    CHECK(services[2].name == "yzfail.service");
+    CHECK(services[2].status == "failed");
+    CHECK(services[2].display_name == "yzfail test unit");
 }
 
 // ── parse_launchctl_list ─────────────────────────────────────────────────────
