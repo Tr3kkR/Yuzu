@@ -356,7 +356,7 @@ overlap, and a 22–25 % timeout rate on the `server ~[pg]`/`tar` suites overall
 `fork()`/VFS/page-cache and no AV minifilter keep Big Tam's (Linux) per-op cost
 lower than Wee Tam's — but a prior revision of this section claimed Big Tam
 "scales flat" and needed no gate at all, which was never actually true; see
-"Linux within-job concurrency cap" below.
+"Linux concurrency caps (within-job + cross-job)" below.
 
 `ci.yml`'s Windows **Test** step therefore wraps the run in
 [`scripts/ci/with-test-slot.sh`](../scripts/ci/with-test-slot.sh) — a crash-safe
@@ -368,14 +368,15 @@ count is the first knob to revisit (→3) once per-op cost is cut (Defender `%TE
 exclusion, RAM-disk data dirs). Full diagnosis: the `tests/meson.build`
 server-shard comment.
 
-### Linux within-job concurrency cap
+### Linux concurrency caps (within-job + cross-job)
 
 Big Tam's 4 runners are also CCD-pinned (16 logical CPUs each, "Self-hosted
 runner topology" above), and each runner agent's `Ensure Postgres (server
 tests)` step idempotently (re)uses one persistent `yuzu-ci-postgres-<n>`
-container scoped to that agent — so unlike Wee Tam, Big Tam was never
-suffering primarily from OTHER, concurrently-running jobs sharing the box. The
-bottleneck was **within one job**: `ci.yml`'s Linux `Test` step invoked
+container scoped to that agent. Two independent contention mechanisms turned
+out to be stacked here, not one — fixed in two rounds.
+
+**Within-job (fixed first):** `ci.yml`'s Linux `Test` step invoked
 `scripts/ci/flake-retry.py` with no `--num-processes` cap. meson's own default
 worker count is an uncapped, non-affinity-aware `cpu_count()` — the job's
 execution is genuinely confined to 16 logical CPUs via cgroup, but meson's own
@@ -392,29 +393,215 @@ artifact, not a shard's own baseline.
 
 Each pg shard carries `timeout: 600` as a hard per-test meson kwarg (not the
 job-level budget). Shard E hit it dead-on — 600.11–600.60 s, repeatedly —
-under this same uncapped fan-out before the 2026-08-19 E→E+G split (#3322);
-the post-split E/G pair was still measured at 86–96% of that ceiling across
-several runs, as
-recently as this week, i.e. the box was never actually scaling flat — the
-separate shard A→A+H split (#3434) addressed a different pair and only moved
-which shard sat closest to the ceiling, it didn't touch this mechanism. The
-fix: `--num-processes 2` on the Linux Test step, mirroring the already-proven
-Windows value — chosen over a larger number specifically because E/G had no
-measured headroom to spend on a guess.
+under this same uncapped fan-out before the 2026-08-19 E→E+G split (#3322).
+The fix: `--num-processes 2` on the Linux Test step, mirroring the
+already-proven Windows value — chosen over a larger number specifically
+because E/G had no measured headroom to spend on a guess.
+
+**Cross-job (fixed second, #3443 AC4):** the within-job fix alone left
+cross-job contention explicitly unmeasured at merge time, and it turned out
+NOT to be a rare edge case: the post-split E/G pair was still measured at
+86–96% of that ceiling across several runs the same week `--num-processes 2`
+shipped, and a subsequent push to `dev` timed E out again at exactly 600.01s.
+The mechanism: a single push to `dev` launches its own 4-way Linux matrix
+(gcc-15/clang-21 × debug/release) **simultaneously**, saturating all 4 Big Tam
+runners by itself — so Big Tam was never suffering primarily from OTHER
+unrelated jobs the way Wee Tam does, but its OWN push-triggered matrix is
+enough on its own. A concurrently-queued PR's Linux job was directly observed
+waiting **35 minutes** for a free runner during exactly this window. The fix:
+`ci.yml`'s Linux Test step now also wraps in `with-test-slot.sh 2`, the same
+box-wide slot gate Wee Tam already used — capping concurrent heavy test
+*phases* to 2 per box (the build phase stays 4-wide). Three Linux-specific
+settings were required, unlike Windows which uses the script's defaults for
+all of them: `YUZU_TEST_SLOT_DIR` is set explicitly to a genuinely box-wide
+path (`/tmp/yuzu-bigtam-test-slots`, following the same proven pattern as
+`/tmp/yuzu-ci-apt.lock` above) because Big Tam's `RUNNER_TOOL_CACHE` is
+per-agent, not box-wide like Wee Tam's shared `D:\ci\tool_cache` — the
+script's own default would have silently no-op'd, each runner gating against
+its own private lock dir and never actually contending with the others.
+`YUZU_TEST_SLOT_NAME` is set to keep the two platforms' slot namespaces
+distinct in logs. `YUZU_TEST_SLOT_TIMEOUT_MIN=30` is set short relative to
+the 90-minute job budget to REDUCE (not guarantee-away) the chance a starved
+job hits the ambiguous job-level timeout kill instead of the script's own
+attributable error — the 90-minute budget also covers checkout/build time
+before Test starts, so a slow build can still leave less than 30 minutes of
+headroom when the wait begins. This fix gates contention only *inside* a
+job that already holds a runner — it does not address a job that cannot
+start at all because no runner is free; see "Cross-job — runner
+acquisition, a fourth layer" later in this section for that gap.
 
 `nightly.yml`'s Linux ASan/TSan/coverage legs and `sanitizer-tests.yml`'s
 ASan/TSan legs (the `/test --full` pre-push gate) invoke `meson test` directly
-with the identical uncapped-fan-out shape and are NOT fixed by this change —
-tracked in #3443 alongside the Linux cross-job gate below.
+and carry NEITHER fix — tracked as the remaining open item on #3443. Full
+diagnosis: the `tests/meson.build` server-shard comment (shard E/G split
+history) + #3443.
 
-A Linux cross-job gate via `with-test-slot.sh` (today Windows-only) is a
-candidate fast-follow if within-job capping alone proves insufficient; it isn't
-wired in yet because its default lock directory
-(`$RUNNER_TOOL_CACHE/yuzu-test-slots`) is per-agent on Big Tam, not box-wide
-like Wee Tam's shared `D:\ci\tool_cache` — bundling it would need an explicit
-shared `YUZU_TEST_SLOT_DIR` to actually gate cross-job, or it would silently
-no-op. Full diagnosis: the `tests/meson.build` server-shard comment (shard
-E/G split history) + #3443.
+**Suite isolation (fixed third, same day):** even with the cross-job gate live
+and uncontested — a real run acquired its cross-job slot in 0s, no other job
+competing — shards E and G still TIMEOUT'd at 600.51s/600.54s (SIGKILL'd). The
+within-job `--num-processes` pool was shared by ALL ~32 registered tests, not
+just the 8 pg shards: the Linux Test step ran one `meson test` invocation with
+no `--suite`/name filter at all. Fix: split the Test step into 3
+`flake-retry.py` invocations, cheap-first (fail-fast via `bash -e`) — 21 tests
+across 5 cheap suites (`agent`/`docs`/`proto`/`tar`/`gateway`) run first, then
+the 3 non-pg server tests, both uncapped (neither touches Postgres); the 8 pg
+shards, isolated by exact name into their own `with-test-slot.sh`-gated call,
+run last with the pool dedicated entirely to them. 21+3+8 = 32, verified as an
+exact partition of the full registered test set before trusting it in CI.
+
+**Root cause, corrected.** The original theory — a cheap test stealing one of
+the 2 within-job slots — was superseded during governance re-review: back-
+computed start times from the actual failing run show shard E's real
+co-runners were shard D (~370s of overlap) then shard G (~230s), plain 2-wide
+FIFO over `tests/meson.build`'s declaration order; cheap tests hadn't even
+started by the time G timed out. The real mechanism is what this section's own
+earlier paragraphs already say — shard cost is a function of concurrent
+pg-shard count, and 8 shards at 2-wide inherently pairs some heavy ones for
+extended stretches. Isolating cheap tests from the pool is still a real, if
+smaller, improvement (it removes an incidental ~51s gap the same
+reconstruction found between shards A and H starting), but doesn't by itself
+explain or fix E/G's own margin. An earlier version of this fix also raised
+`--num-processes` to 3, reasoning the now-pg-only pool had "no competition to
+spend margin on" — reverted to 2 without a real run confirming it helped: at
+3-wide, FIFO over A,H,B,D,E,G,F,C predicts D, E, and G (three of the heaviest)
+running concurrently for a long stretch, plausibly worse than today's 2-wide
+pairing. `tests/meson.build`'s own shard-history comment states the house
+rule this broke: "raising the number is the last resort, not the first." The
+cross-job slot count in `with-test-slot.sh` stays at 2, unchanged — a
+different axis (box-wide job saturation, #3443 AC4); raising it would reopen
+that problem.
+
+**Two more disclosed tradeoffs from the split, neither affecting job pass/fail
+(each invocation gates on its own exit code via `bash -e`):** each invocation
+overwrites meson's single `testlog.junit.xml`, so only the pg-gated call's
+(last) per-suite telemetry survives the default import — and separately,
+`flake-retry.py` writes `meson-logs/flake-retry.json` unconditionally on every
+clean invocation, so a clean pg-shard pass can silently overwrite recovered-
+flake evidence the cheap-suite calls found earlier. And groups 1/2 now run
+entirely outside `with-test-slot.sh` — before this split, one gated invocation
+covered all 32 tests; up to 4 concurrent Linux jobs' cheap-suite phases can now
+overlap unrestrained. Judged low-risk (cheap suites measured ~1-2 min combined,
+no Postgres/heavy-CPU contention), but a real narrowing of what #3443 AC4's
+gate covers.
+
+**Split again + timeout bump (2026-08-25, PR #3582).** The isolation fix above
+removed cross-job and within-pool contention as variables, but E and G still
+TIMEOUT'd — proof arrived via a direct solo diagnostic on Big Tam itself
+(`--num-processes 1`, no other job on the box): A=227.86s H=214.19s B=90.35s
+D=227.48s **E=353.32s** **G=317.04s** F=262.81s C=359.42s. E and G were each
+already past half of the then-600s ceiling completely alone — 2-wide pairing
+was never going to have real headroom, regardless of which other shard it
+paired with. Both shards' own local-uncontended baselines had also roughly
+doubled since their last (2026-08-19) split measurement (E: 180.45s ->
+353.32s), only partly explained by case-count growth (E: 329->405 cases,
++23%; G: 278->351, +26%) — the rest is Big Tam's own per-op cost for this
+fsync-heavy DDL workload drifting up over the same window, not further
+diagnosed.
+
+Fix: `tests/meson.build` split shard E into E+I and shard G into G+J (case-
+count-balanced, ~half each; I defers to E and J defers to G the same way G
+already deferred to E, to avoid double-counting a case that carries a tag
+from both sides of a split — a first attempt without that deferral double-
+counted 12 and 47 cases respectively, caught by `--list-tests` before
+trusting it), and the four split shards' `timeout:` moved from 600 to 700.
+The timeout bump is a **deliberate, temporary** exception to this file's own
+"split, don't raise" house rule (`tests/meson.build`'s shard-history comment)
+— corrected after Gate 2 governance review (2026-08-25) caught an earlier
+draft's justification overclaiming a settled near-term timeline.
+`docs/postgres-migration-ladder.md` explicitly disclaims one ("mutable state
+that drains over time, not a contract"), and completing that ladder is
+architecturally more likely to GROW the `[pg]` population than shrink it:
+each store that migrates onto Postgres adds its own `[pg]`-tagged
+CRUD/behaviour cases (exactly what shards E/I/G/J already carry), while only
+each store's narrow, already-thin `migrate_from_sqlite` backfill suite
+becomes prunable. The margin bought here is a plain safety cushion on top of
+what the split alone already earns (every new shard's real-diagnostic-scaled
+estimate lands well under 700s even 2-wide paired).
+
+**Extended to all ten shards, same day.** Merging PR #3582 required syncing
+this branch to `dev`, and dev's own CI (run 32833097478, merging PR #3466 —
+no PR-specific pg-shard changes) TIMEOUT'd shard E at 600.51s AND landed
+shard G at 585-590/600s (97-98%) on all four Linux legs — live confirmation,
+not a projection, that the 600s ceiling was already tight fleet-wide, not
+just on the two shards #3582 happened to split. `tests/meson.build`'s
+remaining six shards (A/B/D/F/H/C) moved from `timeout: 600` to `timeout:
+700` the same way. Revisit on a fixed cadence, not an assumed completion date
+— tighten back to 600, or drop, **per shard**, once that shard is comfortably
+under budget: TWO reasons to revisit, not just budget hygiene — the
+worst-case job-budget arithmetic below, and the #2093 duration watchdog's
+80%-of-timeout warning threshold moving with it (480s->560s, now on all ten
+shards, diluting the watchdog's lead time fleet-wide rather than on four).
+This "revisit later" commitment is tracked at issue #3443 (adversarial
+review, 2026-08-25 — a prose-only commitment with no dated/metric-based
+trigger has this file's own track record of being forgotten until the next
+stale-pin incident forces it; #3443 is the existing linked home for the
+pg-shard-reliability lineage, not a fresh one-off). Full measurements,
+partition verification, and per-shard local wall time: `tests/meson.build`'s
+own comment at the shard E/I/G/J block.
+
+**Worst-case job-budget arithmetic (Gate 6 SRE, 2026-08-25; corrected by
+adversarial review, same day; re-derived 2026-08-25 after the timeout bump
+extended to all ten shards), recorded so a future reviewer doesn't have to
+re-derive it.** With all ten pg shards now sharing one `timeout: 700`, the
+degenerate case — every shard hitting its own timeout simultaneously — sums
+to 10*700s = 7000 test-seconds, and at `--num-processes 2` (5 pairs) BEST and
+WORST achievable makespan are now the SAME number: 3500s. Uniform per-shard
+budgets remove the pairing-order variable the earlier (six-at-600/four-at-700)
+version of this paragraph had to reason about — there is no longer a
+lighter/heavier shard to pair favourably or unfavourably. Add the up-to-30-min
+cross-job slot wait (`YUZU_TEST_SLOT_TIMEOUT_MIN`) and this ceiling alone
+reaches ~88.3 min against the 90-min job ceiling, before checkout/build time
+— a TIGHTER margin than the pre-extension worst case (~87 min), by
+construction: six shards moved from a 600s cap to a 700s one and nothing
+moved the other way, so the worst-case ceiling can only have gone up. This
+number is the test-phase-plus-slot-wait sub-budget only — it does NOT
+supersede the "Cross-job" paragraph above's own caveat that the 90-minute
+ceiling also covers checkout/build time, so the REAL total-job margin is
+smaller than ~1.7 min whenever a build isn't instant. Quoting "<2 minutes"
+on its own without that qualifier overstates how much slack actually
+remains. This
+is the theoretical ceiling, not the expected case (it requires the box
+already so unhealthy that a job-level kill is arguably the correct outcome,
+not a failure of this design) — the realistic case, using the real
+measured/scaled numbers the original E/I/G/J split was based on, is
+comfortably inside budget. The margin against the 90-min ceiling is real but
+thin (under 2 minutes) and is the load-bearing reason this bump stays
+temporary and per-shard-revisitable rather than a permanent 700s floor.
+
+**Drift risk, not yet automated:** the 3-way split hardcodes the 10 pg shard
+names and the 3 non-pg server test names directly in `ci.yml`. A new/renamed
+server test() entry or a new top-level `suite:` (`tests/meson.build` or the
+root `meson.build` — the `gateway` suite lives there, not in `tests/
+meson.build`, and was nearly missed entirely while writing this split) needs a
+matching update on both sides or silently stops running in CI. See the
+cross-reference comment at the shard-naming-invariant block in
+`tests/meson.build`.
+
+**Cross-job — runner acquisition, a fourth layer (2026-08-25, same day as the
+split/timeout extension above):** the "Cross-job (fixed second, #3443 AC4)"
+fix earlier in this section (`with-test-slot.sh`) gates contention only
+*inside* a job that already holds a runner — it does nothing for a job that
+cannot START because no runner is free. That is a structurally lower-level
+gap than any of the three fixes above address, and the 35-minute-wait
+incident that paragraph cites is actually an instance of THIS gap, not one
+`with-test-slot.sh` closes: a `dev`/`main` push's own 4-way Linux matrix
+could claim all 4 Big Tam runners simultaneously, leaving nothing reserving
+a runner for a concurrently-queued PR job. Fix: `ci.yml`'s Linux job's
+`strategy.max-parallel: 3` caps how many legs of that SAME matrix run
+concurrently, leaving at least one Big Tam runner unclaimed by it — a no-op
+on `pull_request` events (already a single-leg matrix via the existing
+`exclude`). This is a mitigation, not a guarantee: the freed runner is not
+reserved for any specific job. `proto-compat` (this same workflow) targets
+the bare `[self-hosted, Linux, X64]` label every Big Tam Linux runner also
+carries and runs on the same push trigger — it can claim the freed runner
+itself before a queued PR job does (its own `timeout-minutes: 5` means it
+self-frees quickly, but it is a real same-push competitor, not just the
+already-named nightly-overlap case). A stacked nightly run, another
+concurrent PR/push, or a manual `workflow_dispatch` can do the same — none
+of these are fixable from this diff's scope; a genuine guarantee needs
+runner-pool partitioning (dedicating a runner label to PR-fast-path jobs),
+which needs direct access to the Big Tam box and is tracked as a follow-up
+on #3443, not done here.
 
 ### Persistent runner-local test history
 
@@ -434,6 +621,15 @@ each Meson test entry's result/duration/timeout, and any listed flake recovered
 by `flake-retry`. A cancelled job normally finalizes as `cancelled`; a hard kill
 that prevents post-steps intentionally leaves an `in_progress` row, which is
 itself evidence of runner/job termination rather than a fabricated result.
+
+**Linux-specific gap, since the "Suite isolation" split above:** the finalizer
+imports one `meson-logs/testlog.junit.xml`, and Linux's Test step now runs 3
+separate `meson test` invocations against the same builddir, each overwriting
+that file. Only the last (pg-shard) invocation's per-suite `ci_test_suites`
+rows and any `flake-retry` recovery it reports survive — the two earlier, cheap
+invocations still gate the job (their own exit code), but produce no queryable
+history via `test-db-query.sh ci-suite-stats`/`ci-flakes` for this job. Windows
+and macOS are unaffected (still one invocation each).
 
 Provisioning is versioned in
 [`deploy/linux/Provision-BigTam-Runner-Telemetry.sh`](../deploy/linux/Provision-BigTam-Runner-Telemetry.sh)

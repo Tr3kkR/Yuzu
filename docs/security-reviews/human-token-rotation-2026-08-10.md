@@ -682,3 +682,85 @@ Multi-round review across the store-core, telemetry, and REST sub-branches
 principal-keyed), two ownership/architecture specialists (round 6), and an
 independent architect adjudication (round 5, confirm-error taxonomy). MCP
 tool twins are reviewed separately and remain in progress.
+
+## Addendum — 2026-08-23 (#3015, proof of possession)
+
+This review's "Rotating a Token" interim guidance (added `5edbbc06`, in
+response to UP-2 above: if the rotate response was lost, revoke the unknown
+successor rather than looking its `token_id` up and confirming it) covered a
+real gap — `confirm` took only the session identity + `token_id`, so a
+caller who recovered an unknown successor's id out-of-band could confirm a
+rotation whose secret they never received, revoking the predecessor they
+still held. That gap is now closed at the mechanism, not just the operator
+runbook: **#3015 adds proof-of-possession to both confirm arms** —
+`confirm_rotation` (engine) and `confirm_token_rotation` (human) now require
+the caller to present the raw successor secret itself, verified via a
+constant-time hash comparison against the successor's stored hash, checked
+last, strictly after every other admission check (ownership, pair-state,
+the successor `token_id` pin, and the initiator binding) has passed. A
+caller who never received the secret cannot manufacture it from a recovered
+`token_id` alone, so the interim revoke-don't-confirm guidance is no longer
+a workaround for a missing check — it is now what the mechanism itself
+enforces (`docs/user-manual/authentication.md` "Rotating a Token", updated
+in the same round as this addendum). This is a **breaking** change on both
+REST confirm routes and both MCP confirm tools: a caller confirming with
+`token_id` alone now gets `400` where it previously succeeded.
+
+Shipped alongside it: the **#2961 residual A** gap this review's UP-2
+discussion did not cover — `revoke_for_principal` ("sign out everywhere" /
+principal deactivation) previously left any RAM-only grace-cache successor
+secret from a recent rotate re-servable via a grace-window replay for up to
+the grace window's duration *after* every credential for that principal had
+just been revoked. `revoke_for_principal` now scrubs (`yuzu::secure_zero`,
+never a bare erase) every affected rotation group's cached raw secret after
+the per-principal advisory-locked revoke transaction commits (keyed by the
+rotation groups that transaction returned) — safe because no active
+predecessor remains to re-serve one, so a deactivated/signed-out principal
+cannot leave a re-servable secret behind. (Residual B — a genuinely concurrent in-flight mint's own
+post-commit cache write racing a revoke — remains bounded by the existing
+`successor_rotation_still_pending` guard and is unchanged by this round;
+see `api_token_store.hpp`'s `revoke_for_principal` doc comment.)
+
+Full detail: the #3015 commit itself, `docs/user-manual/rest-api.md`'s
+confirm-route error matrices, and `docs/user-manual/authentication.md`
+"Rotating a Token".
+
+## Governance Gate 7 follow-up — 2026-08-24
+
+Two doc-fix findings against the addendum above, both verified against the
+shipped `#3015` code before writing this down (not asserted from the design
+intent alone):
+
+- **Ordering invariant.** PoP is verified STRICTLY LAST in both confirm
+  arms — after ownership/pair-state, the `token_id` pin, tier, scope, and
+  the initiator binding, in that order (`api_token_store.hpp`'s
+  `confirm_rotation`/`confirm_token_rotation` doc comments, "ORDERING IS
+  LOAD-BEARING"). A future reorder that moved PoP ahead of the initiator
+  binding would reintroduce the cross-admin oracle this addendum's engine-arm
+  design closed (a non-initiator who also knows — or guesses — the correct
+  secret could distinguish "wrong secret" from "valid secret, not your
+  rotation"). `test_api_token_store.cpp`'s `[pop][oracle]` case already pins
+  this specific relative order (a non-initiator presenting the *correct*
+  secret must get the SAME non-disclosing "different operator" outcome as
+  one presenting a *wrong* secret) — flagged here so a later change to
+  either confirm arm's check order re-verifies against that test explicitly,
+  since a reorder of PoP relative to the *other*, earlier checks (ownership,
+  pair-state, tier, scope) is a distinct hazard the oracle test does not by
+  itself cover.
+- **Deliberate REST/MCP audit asymmetry.** The missing-secret early-out
+  (`400` REST / `kInvalidParams` MCP) IS audited on the REST confirm routes
+  (`audit_fn(..., "failure", ..., "secret required")` in `rest_api_v1.cpp`)
+  but is NOT audited on the MCP confirm tools — verified in
+  `mcp_server.cpp`: both `confirm_engine_rotation` and
+  `confirm_api_token_rotation` return on a missing/empty `secret` before any
+  `mcp_audit`/`audit_fn` call. This is not new drift — it matches the
+  pre-existing, in-code-documented MCP convention that input-validation
+  early-outs (a missing `principal_id`/`token_id`, same functions) are
+  likewise unaudited on that transport ("family scope contract" — the
+  `#2404` confirm-outcome-counter comment immediately above
+  `confirm_engine_rotation`'s body states it applies "NOT on the tier / perm
+  / input-validation early-outs"). The security-relevant outcome — a
+  *wrong* secret, `403`/`kPermissionDenied` — IS audited on both
+  transports. Recorded so a later auditor reading only the MCP side does
+  not mistake the missing-secret gap for an omission specific to #3015.
+

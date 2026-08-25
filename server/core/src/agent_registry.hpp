@@ -414,7 +414,28 @@ class AgentRegistry {
 public:
     explicit AgentRegistry(EventBus& bus, yuzu::MetricsRegistry& metrics);
 
-    void register_agent(const pb::AgentInfo& info);
+    /// Register (or re-register) an agent. On re-registration, first revokes any device tokens
+    /// bound to this agent_id (W1.5 / #823, corrected by #3401 — see `revoke_by_device`) BEFORE
+    /// installing the new session, so a briefly-impersonated agent (mTLS-disabled flow, #779)
+    /// cannot keep replaying a token issued to the legitimate agent. First-time registrations
+    /// (no prior entry) skip the revoke, preserving the operator workflow of pre-issuing a token
+    /// for an agent_id that has not registered yet.
+    ///
+    /// Fails closed (ADR-0012 §1): if a wired device-token store reports a genuine revoke
+    /// failure, the registration is REFUSED — `unexpected(msg)` — and nothing changes (no
+    /// session installed, no management-group membership, no topology invalidation). A caller
+    /// MUST NOT install a session after a refusal. The revoke runs OFF the registry mutex (see
+    /// the .cpp for the two-phase structure, precedent `sweep_revoked`) — only the map
+    /// read/write is held under `mu_`, not the blocking Postgres round-trip.
+    ///
+    /// Also refused, same way, if superseded: because the revoke runs off-lock, a second
+    /// `register_agent` call for the same `agent_id` can install its session while this call's
+    /// revoke is still in flight. Phase 2 re-checks the map entry against the pointer this call
+    /// observed in phase 1 — a mismatch means a newer registration already won, and THIS call
+    /// yields rather than overwriting a live session with a stale one (its own revoke already
+    /// committed, so nothing is lost by not installing). This restores the ordering the old
+    /// single-locked implementation gave for free; it does not add a NEW guarantee beyond that.
+    [[nodiscard]] std::expected<void, std::string> register_agent(const pb::AgentInfo& info);
 
     void set_stream(const std::string& agent_id,
                     grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream,
@@ -542,9 +563,9 @@ public:
     void expire_trusted_gateway_for_test(std::chrono::seconds offset);
 
     /// W1.5 / #823: install the device-token store so `register_agent`
-    /// revokes any device tokens issued under a previous incarnation of
-    /// the same agent_id whenever a re-registration is detected. Optional
-    /// — if never called, register_agent behaves as before and stale
+    /// revokes any device tokens bound to a previous incarnation of the
+    /// same agent_id whenever a re-registration is detected. Optional —
+    /// if never called, register_agent behaves as before and stale
     /// tokens survive re-registration. Wiring lives behind a setter rather
     /// than the constructor to avoid disturbing the existing AgentRegistry
     /// construction sites, and because production `server.cpp` does not
@@ -555,8 +576,27 @@ public:
     /// Thread contract: holds the registry mutex so a concurrent
     /// `register_agent` cannot observe a partially-installed pointer.
     /// In practice the only caller is the startup wiring path, but the
-    /// lock costs nothing and removes a footgun.
+    /// lock costs nothing and removes a footgun. `register_agent` itself
+    /// only reads this pointer under `mu_` — the revoke call it makes
+    /// through it runs OFF the lock (#3401; see the .cpp).
     void set_device_token_store(DeviceTokenStore* store);
+
+    /// Test hook: fires once, synchronously, in the calling thread between `register_agent`'s
+    /// phase 1 (revoke) and phase 2 (install) — the exact window in which a concurrent
+    /// registration for the same `agent_id` can complete and install its own session. Setting
+    /// this to a callback that itself calls `register_agent` again deterministically exercises
+    /// the supersede-detection path without real threads or timing (mirrors the
+    /// `inject_*_fault_for_test` seams in `mcp_stream.hpp`). Cleared after firing — a callback
+    /// that re-arms it will recurse. Production code MUST NOT call this — no caller in
+    /// `server/core/src/**` references it.
+    ///
+    /// Single-threaded test use only: the member this sets is read/moved/cleared inside
+    /// `register_agent` with no synchronization of its own (guarded neither by `mu_` nor a
+    /// dedicated lock — deliberately, since the whole point of this hook is a same-thread,
+    /// synchronous interleave rather than a real race). Setting it from one thread while another
+    /// thread's `register_agent` call may read or fire it is a data race; every test using this
+    /// hook must do so single-threaded (set, call the one `register_agent` that fires it, done).
+    void set_register_agent_interleave_hook_for_test(std::function<void()> hook);
 
     // PLAN item 3 (provenance not syntax): only a `ClassifiedCommand` — mintable
     // ONLY by `ServerImpl::build_classified_command` (or the test-only door) —
@@ -718,7 +758,20 @@ private:
     /// W1.5 / #823: optional device-token store used by `register_agent`
     /// to revoke stale tokens on re-registration. Guarded by `mu_` (set
     /// via `set_device_token_store`, read inside `register_agent`).
+    ///
+    /// Non-owning. `AgentRegistry` never constructs, destroys, or extends the lifetime of the
+    /// pointee — the owner (test-scoped `DeviceTokenStore` instances only, today; the server's
+    /// long-lived one once a wiring PR lands) MUST outlive this registry, or call
+    /// `set_device_token_store(nullptr)` before its own destruction. There is NO production
+    /// caller of `set_device_token_store` today (`server.cpp` never invokes it; the pointer stays
+    /// `nullptr` in production, matching this store's own dormancy record). Once a wiring PR adds
+    /// one, it MUST be one-time startup wiring, before any `register_agent` call can race it — a
+    /// re-call mid-lifetime would need the same care `set_stream`/`clear_stream` already take
+    /// around a session's raw pointers.
     DeviceTokenStore* device_token_store_{nullptr};
+
+    /// Test-only, see `set_register_agent_interleave_hook_for_test`.
+    std::function<void()> register_agent_interleave_hook_for_test_;
 };
 
 // -- Scope kind discovery catalog ---------------------------------------------

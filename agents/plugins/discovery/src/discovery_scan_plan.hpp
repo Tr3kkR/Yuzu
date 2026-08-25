@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <yuzu/plugin.h> // YuzuResultStatus / YuzuResultCompleteness (ABI4)
@@ -225,16 +226,81 @@ inline int degrade_severity(YuzuResultStatus status) {
 }
 
 /**
+ * Secondary tie-break for a same-severity worst_of() merge, consulted ONLY
+ * when degrade_severity() ties — every other pair keeps the original
+ * "earliest-accumulated report wins" rule unchanged (governance-deferred
+ * #3253, extended to the DNS pair in the same governance round).
+ *
+ * The shared principle behind both named pairs: **a scan-level timeout
+ * dominates a data-completeness degrade.** `scan:timeout` says "the back
+ * half of the scan didn't run at all", which is strictly more actionable
+ * than "the part that did run returned less data than it might have" —
+ * and it is the reason an operator needs in order to know the result is
+ * not merely thinner but truncated in scope. Plain accumulation order
+ * loses it in both cases, because on the path each pair was filed for the
+ * data-completeness condition is observed FIRST. (One ordering runs the
+ * other way — the probe loop's own timeout is accumulated before the DNS
+ * degrade — but those two cannot co-occur: if the probe loop consumed the
+ * budget, the hostname loop's deadline check breaks it on its first
+ * iteration, so no lookup ever runs to degrade. It is also harmless
+ * regardless, since only `scan:timeout` is ever a preferred candidate and
+ * it therefore survives as `current` either way.)
+ *
+ *   - `arp:table_truncated` (Step 1, the ARP read) accumulates before any
+ *     `scan:timeout` — the gap #3253 filed.
+ *   - `dns:hostname_lookup_degraded` accumulates before the hostname
+ *     loop's own `scan:timeout` a few lines later in do_scan_subnet —
+ *     the identical defect shape in the same function, closed here rather
+ *     than left as new debt behind #3253's fix.
+ *
+ * Note on which deadline actually fires: the probe loop's own timeout is
+ * near-unreachable in practice (its budget ceiling is well under
+ * kScanTimeoutSeconds), so the `scan:timeout` that reaches worst_of is
+ * almost always the HOSTNAME loop's. That is also why the DNS pair matters
+ * more than it looks — see the reachability note in the tests.
+ *
+ * Known, deliberately NOT closed here: `icmp:transmit_blocked` and
+ * `icmp:ping_group_range` can also tie with a later `scan:timeout` and
+ * still lose it under earliest-wins. Whether an ICMP-blocked sweep is a
+ * "data-completeness" degrade in this principle's sense is a genuine
+ * judgment call rather than an oversight, so it is tracked as a follow-up
+ * rather than widened silently in the same round.
+ *
+ * Both are checked as EXPLICIT NAMED PAIRS rather than by ranking the
+ * data-completeness reasons below every other reason. A scalar rank would
+ * silently demote `arp:table_truncated` against `icmp:ping_group_range`
+ * and `dns:hostname_lookup_degraded` — both real CONSTRAINED-severity
+ * reasons that can tie with it in the very same scan_subnet call — which
+ * neither #3253 nor this extension asked for. Keep extending it one named
+ * pair at a time, with the pair's own regression test, rather than
+ * inventing a general actionability ordering nobody has asked for yet.
+ */
+inline bool degrade_tie_prefers_candidate(std::string_view current_reason,
+                                          std::string_view candidate_reason) {
+    if (candidate_reason != "scan:timeout")
+        return false;
+    return current_reason == "arp:table_truncated" ||
+           current_reason == "dns:hostname_lookup_degraded";
+}
+
+/**
  * Keep `current` if it is at least as severe as `candidate`; otherwise adopt
- * `candidate`. A tie keeps `current` — the earliest-reported reason — so two
- * equally severe conditions still surface the more upstream cause.
+ * `candidate`. A same-severity tie is broken by
+ * degrade_tie_prefers_candidate() (#3253); every other tie keeps `current`
+ * — the earliest-reported reason — exactly as before.
  */
 inline MaybeDegrade worst_of(MaybeDegrade current, const MaybeDegrade& candidate) {
     if (!candidate.has_report)
         return current;
     if (!current.has_report)
         return candidate;
-    if (degrade_severity(candidate.report.status) > degrade_severity(current.report.status))
+
+    const int current_sev = degrade_severity(current.report.status);
+    const int candidate_sev = degrade_severity(candidate.report.status);
+    if (candidate_sev != current_sev)
+        return candidate_sev > current_sev ? candidate : current;
+
+    if (degrade_tie_prefers_candidate(current.report.reason, candidate.report.reason))
         return candidate;
     return current;
 }

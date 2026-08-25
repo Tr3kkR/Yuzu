@@ -118,6 +118,24 @@ login** (mirrors OIDC's `group_count_exceeded` behaviour) — see "SAML Fine-Gra
 RBAC" in `authentication.md` for the full detail, including the practical httplib
 form-body-size caveat on how large an assertion can realistically reach `/saml/acs`.
 
+## Behaviour change: token-rotation confirm now requires proof of possession (#3015)
+
+`confirm` on a rotation — REST `POST /api/v1/tokens/{id}/confirm` and `POST /api/v1/engine-principals/{id}/credentials/confirm`, plus the MCP twins `confirm_api_token_rotation`/`confirm_engine_rotation` — previously admitted on caller identity plus the successor's `token_id` alone. A caller who recovered an unknown successor's `token_id` out-of-band (a support ticket, a log line) could confirm — and thereby revoke the predecessor for — a rotation whose secret they never actually received. All four confirm surfaces now additionally require the raw successor secret itself in the request body/args, verified with a constant-time hash comparison against the successor's stored hash, checked LAST — strictly after ownership, pair-state, the `token_id` pin, tier, scope, and the initiator binding have all already passed — before the predecessor is touched.
+
+**Who this affects:** any caller (human or automation) confirming a rotation with only the `token_id`, and any caller confirming with the wrong secret.
+
+- **REST:** a confirm body carrying no `secret` field (or an empty one) now gets `400` instead of succeeding; a wrong `secret` gets `403`.
+- **MCP:** `confirm_api_token_rotation`/`confirm_engine_rotation` called without a `secret` arg now get `kInvalidParams`; a wrong one gets `kPermissionDenied`.
+
+Correctly-implemented automation already holds the secret — it's the same raw value the `rotate` response returns exactly once (REST `data.token`) — so a caller that installs the successor from that response and passes it straight through to `confirm` sees no change in behavior.
+
+**What to do if you lose the rotate response before confirming:** you can no longer confirm — there's no way to manufacture the secret from the `token_id` alone. Two recovery paths, and neither is new — this change makes the mechanism enforce guidance already documented in [`authentication.md`](authentication.md#rotating-a-token) "Rotating a Token" (don't look the successor up and confirm blind):
+
+1. **Wait for the automatic overlap-window sweep.** Proof of possession gates this immediate, explicit `confirm` call only — the 60-second background sweep is unaffected by this change and still auto-revokes the predecessor on its own schedule with no secret required, provided the successor secret was actually installed and presented (used) at least once.
+2. **Revoke the unknown successor and start a new rotation.** This keeps the predecessor working immediately, at the cost of restarting the rotation.
+
+See [`authentication.md`](authentication.md#rotating-a-token) and [`engine-principals.md`](engine-principals.md) for the full detail, and [`rest-api.md`](rest-api.md) for the exact REST error bodies.
+
 ## Behaviour change: MCP approval-store permanent failures now say don't retry (#2786)
 
 An MCP approval-ticket recall that hits a store fault has always returned `-32603` with a `retry_after_ms` hint. Previously that hint was `5000` (retry after 5 seconds) for every store fault except a never-opened store, including one that was open but failing in a way no amount of retrying clears — SQLite corruption, not-a-database, a read-only filesystem, or a full disk. Those four cases now correctly get `retry_after_ms: null` (the same "escalate to an operator" response a never-opened store gets) instead of the transient retry hint.
@@ -1807,6 +1825,59 @@ the device page) shows the same tags as before the upgrade, and
 outcome (alert `YuzuTagStoreBackfillNotCompleted` keys on the ABSENCE of a
 success/fresh sample — a refused boot never serves `/metrics` at all).
 
+## ⚠️ Behaviour change: quarantine containment now covers IPv6, and reports honestly (#3282, #3283, #3284, #3285, #3286, #3260)
+
+Six issues close against the `quarantine` agent plugin across Windows, Linux and macOS. Every
+one is the same class: an outcome reported as success when it was partial, failed, or unknown.
+**Read §1 before quarantining a dual-stack Linux host — it needs operator action.**
+
+The server-side dispatch enforcement (#881) and the MCP tool's honesty fixes (#3127) ship
+separately and have their own upgrade note.
+
+### 1. Linux containment now covers IPv6 (#3282)
+
+The Linux leg installed its `yuzu-quarantine` chain in `iptables` only. On a dual-stack or
+IPv6-capable host the device stayed fully reachable over IPv6 while reporting a clean
+`status|quarantined` — containment that was not containing. The plugin now mirrors the chain into
+`ip6tables`, and a failure on either family is reported (`status|quarantined_partial`), never
+counted as applied.
+
+**Action required for dual-stack fleets.** Whitelist entries are routed to the chain matching
+their own family, so a **v4-only whitelist now leaves IPv6 contained**. There is no blanket
+"keep existing connections alive" rule on either family — only a whitelisted address survives,
+in any connection state. The agent automatically whitelists its own configured server address
+(an IP literal directly, a hostname resolved to its address(es) **once, at agent startup** —
+never at quarantine time, and using the endpoint's own resolver), so most fleets need no manual
+action here. Prefer an IP-literal `--server` config for endpoints where containment integrity
+matters most, since that removes DNS from the equation entirely. If your agents reach the
+server over IPv6 through a path DNS resolution of the configured address wouldn't reproduce
+(split-horizon DNS, a manually pinned route), or if the server's address changes after an agent
+was last started, **add the server's address to the whitelist explicitly**. See
+[Security Hardening](security-hardening.md#whitelisting-on-a-dual-stack-host-read-this-before-quarantining-one).
+
+### 2. Reporting is more conservative again (#3283, #3285, #3286, #3260)
+
+As with the Wave-2 argv migration before it, **nothing got more broken — the reporting got more
+honest**, so expect these to fire more often after upgrading:
+
+- **macOS**: a blocking pf ruleset that is loaded while pf itself is **disabled** now reads
+  `state|degraded` (traffic is not actually blocked); a pf status read that returns nothing
+  recognisable reads `state|uncertain` (#3283).
+- **`quarantine.status` exits non-zero** on `degraded` and `uncertain`, and sets the ABI result
+  status to `UNAVAILABLE`/`PARTIAL`. A consumer that only inspects the return code can no longer
+  read an unenforced or unreadable host as a clean status (#3285).
+- **Windows**: containment now sets the profile default policy rather than relying on rule
+  precedence alone, and the pre-quarantine profile policy is captured **write-once** — a
+  re-quarantine no longer overwrites the genuine capture with the quarantine's own
+  block/block policy, which previously made release replay it and strand the host while
+  reporting `status|released` (#3284).
+- **Concurrent mutations are serialised** — two overlapping `quarantine`/`unquarantine`/
+  `whitelist` actions on one host can no longer interleave firewall mutations (#3286).
+
+### No migration, no schema change
+
+Rollback is data-safe. A mixed fleet is safe: an older agent simply keeps the older, less
+honest plugin reporting until it is upgraded.
 ## Product packs migrate to Postgres (mandatory backfill, ProductPackStore, ADR-0054)
 
 The `ProductPackStore` — operator-installed product packs behind `POST/GET/DELETE
@@ -1907,6 +1978,144 @@ shape (`YuzuProductPackBackfillNotCompleted`) keys on the ABSENCE of any
 `success`/`fresh` sample across a 15-minute window, not on any single value — a
 refused boot never serves `/metrics` at all, so no server in the window reporting
 either outcome is itself the signal of a fail-closed boot-refusal loop.
+
+## Guardian Baselines migrate to Postgres (mandatory backfill, BaselineStore, ADR-0055)
+
+`BaselineStore` — Guardian's deployable Baseline unit (`/guardian` → Baselines,
+`GET /api/v1/guaranteed-state/device-compliance`) — moves from the SQLite
+`guardian-baselines.db` file to the server's PostgreSQL substrate in this release,
+schema `baseline_store`, on the existing shared pool. A **Baseline** is the only
+deployable unit in Guardian: what a deploy enforces across the fleet is read from
+each Baseline's `deployed_snapshot`, never its live member set — so, like every
+other store feeding an enforcement decision, the backfill is mandatory and fails
+closed rather than degrading silently.
+
+- **What is preserved:** every Baseline (`baselines`), its member Guards
+  (`baseline_rules`), and its assignment of included/excluded management groups
+  (`baseline_groups`) — read inside one deferred SQLite transaction so the parent
+  and its children fingerprint against the same instant. A Baseline already live
+  in Postgres (a second replica booting against shared state, or a re-run after a
+  partial pass) keeps its own current members/assignment untouched by the legacy
+  backfill — only a freshly-inserted parent's children are copied.
+- **Fail-closed boot, retried each start.** A backfill that cannot complete —
+  an unreadable/corrupt legacy file, a SHA-256 fingerprint failure, a Postgres
+  write error, an invalid legacy `lifecycle`/assignment `disposition` value, a
+  name collision against a different already-live baseline_id, or a row-direction
+  conflict (below) — **refuses the boot** and retries on the next start. The boot
+  log's `BaselineStore: migrate_from_sqlite:` lines carry the specific refusal,
+  naming the offending Baseline id.
+- **Fingerprint-verified whole-file marker, with per-row direction-aware
+  conflicts.** A completed backfill is recorded once per distinct SHA-256
+  fingerprint over the legacy file's full canonicalized content (the
+  `DiscoveryStore`/`ProductPackStore` shape — a later-booting replica still
+  holding its own legacy file re-verifies against the recorded fingerprint before
+  trusting an already-set completion marker). Independently, if Postgres already
+  holds a row for a legacy Baseline's id, that ROW is compared on `updated_at`
+  (the `TagStore` shape): Postgres strictly ahead, or identical content, is a
+  benign skip; the legacy side strictly ahead (or tied with differing content)
+  **refuses the boot** — the legacy file demonstrably holds a later write that
+  silently keeping Postgres's value would discard. Treat this refusal as a
+  data-integrity incident, not an availability one: the log names the exact
+  Baseline id and both `updated_at` values; decide which side is authoritative
+  before restarting.
+- **Legacy file moved aside after a verified backfill**
+  (`guardian-baselines.db.migrated-<epoch>`), same one-release rollback window as
+  the sibling stores.
+- **Fresh installs are unaffected** — no legacy file, nothing to migrate.
+
+**Operator-visible behaviour changes (fail-closed reads).** A degraded read on
+the enforcement-feeding path (`deployed_member_rule_ids()` — the source for the
+push fan-out, the heartbeat reconcile, and the per-device compliance view) now
+returns a distinguishable failure that the caller resolves to an explicit
+abort/503, never a silent empty/"fully compliant" enforced set. `GET
+/api/v1/guaranteed-state/device-compliance` returns **503** rather than a
+misleadingly-empty or false-compliant result when the underlying read degrades;
+Guardian deploy/delete dashboard actions show a degraded-modal rather than
+reporting success. There is no dedicated backfill-outcome metric for this store
+(matching its own precedent stores, `GuaranteedStateStore`/`DeviceTokenStore`,
+which also rely on the boot log + `/readyz` rather than a Prometheus counter for
+a boot-fatal event) — a refused boot never serves `/metrics` at all, so the boot
+log and `/readyz` are the channels to watch during an upgrade.
+
+**Verify:** after the server reports ready, `/guardian` shows the same Baselines
+(and each one's members/assignment) as before the upgrade, and
+`SELECT count(*) FROM baseline_store.baselines;` against Postgres matches
+`sqlite3 guardian-baselines.db.migrated-<epoch> "SELECT count(*) FROM baselines;"`.
+
+## Compliance policy engine migrates to Postgres (mandatory backfill, PolicyStore, ADR-0056)
+
+The `PolicyStore` — compliance policy fragments/policies behind `POST/DELETE
+/api/policy-fragments*`, `POST/DELETE /api/policies*`, `POST /api/policies/{id}/{enable,
+disable,invalidate,evaluate,remediate}`, `GET /api/compliance*`, and every dispatched
+compliance check/fix/verify — moves from the SQLite `policies.db` file to the server's
+PostgreSQL substrate in this release, schema `policy_store`, on the existing shared
+pool. Six operator-authored tables (fragments, policies, and their input/trigger/group
+associations, plus per-agent `policy_status`) plus a new operational-only seventh table,
+`policy_dispatch_state`, which coordinates fleet-wide compliance-check dispatch across
+replicas and is never backfilled.
+
+**Before you upgrade**, sanity-check the legacy `policies.db`:
+
+```bash
+sqlite3 /path/to/policies.db "SELECT count(*) FROM policies; SELECT count(*) FROM policy_status;"
+```
+
+- **What is preserved:** every policy fragment and policy definition, and per-agent
+  compliance status history (`policy_status` — `compliant`/`non_compliant`/`unknown`/
+  `error`, plus the fix-attempt counter) via a direction-aware LIFECYCLE merge rather
+  than a fresh start: the default 3600s evaluation interval would otherwise leave up to
+  an hour of false-`unknown` fleet compliance on an operator-visible dashboard after
+  every upgrade. Fragments and policies write once (no update path exists once created —
+  only enable/disable and status mutate post-creation), so the identity side of the
+  backfill is unusually clean.
+- **Fail-closed boot, retried each start.** A backfill that cannot complete — an
+  unreadable/corrupt `policies.db`, a Postgres write error, a fingerprint mismatch, or a
+  legacy `policy_status` row demonstrably ahead of an already-migrated Postgres row —
+  **refuses the boot** and retries on the next start. This store had no fail-closed
+  guard on SQLite; on Postgres, a reachable database whose schema can't migrate or open
+  is now a fatal startup error too, matching the ladder's existing "authoritative"
+  posture for this store. The boot log's `PolicyStore`/`[PG] Refusing to start` lines
+  carry the specific refusal, and `docs/ops-runbooks/policy-store-backfill-recovery.md`
+  maps each message to its recovery.
+- **"Move it aside" drops status history, not just definitions.** The documented
+  operator remediation for a stuck backfill — move `policies.db` aside to skip it — is
+  correctly described in the boot log itself: doing so drops both the policy
+  definitions AND per-agent compliance status history that only exists in the legacy
+  file. See the runbook for why, and for the "leave it in place as a backup" trap (the
+  legacy-ahead check re-runs on every boot for as long as the file exists at its
+  configured path, so a stale backup file left behind reproduces the refusal as a boot
+  crash loop on any later clock skew).
+- Tolerates a legacy `policies.db` predating the `fix_attempt_count` column
+  (defaults missing rows to 0); a probe failure reading that column now fails the
+  backfill closed rather than silently defaulting every row to 0.
+- Real FK + `ON DELETE CASCADE` added from `policy_status` to `policies` — the SQLite
+  original had none, and `delete_policy` hand-wrote a second `DELETE` whose failure was
+  silently swallowed.
+
+**Operator-visible behaviour changes (fail-closed reads/writes).**
+
+- A genuine store degrade on any of the six policy/fragment mutator routes, `/evaluate`,
+  or `/remediate` now returns **503** (`{"error":{"code":503,"message":...}}`) instead
+  of collapsing into the same `400`/`500` a validation error or business rejection gets
+  — the earlier behaviour leaked the internal error string into the response body and
+  gave callers no way to distinguish "retry" from "don't retry."
+- Compliance-check dispatch is now a durable, fleet-wide single-sweeper claim
+  (`pg_try_advisory_xact_lock`) rather than each replica's own in-memory timer — a
+  persistently-failing claim (compliance checks silently stop running fleet-wide) now
+  logs at `error` and increments `yuzu_server_policy_eval_errors_total{phase="claim"}`,
+  where it previously only warned with no counter.
+- `POST /api/policies/{id}/remediate` now rejects (409) a second call for the same
+  policy while a remediation it already started is still in flight — same-process
+  dedup only; a cross-replica race is a documented, tracked gap, not yet closed.
+- The compliance dashboard's hero no longer claims a "Last evaluated: just now"
+  freshness that the server was not actually tracking — no dashboard regression, since
+  no timestamp was ever computed; the freshness claim itself has simply been removed
+  rather than shipped false. A real evaluation-health signal is tracked as a follow-up.
+
+**Verify:** after the server reports ready, `GET /api/compliance` shows the same
+policies and fleet compliance percentage as before the upgrade, and `SELECT count(*)
+FROM policy_store.policies;` / `policy_store.policy_status` against Postgres match the
+legacy file's counts.
 
 ## ⚠️ Behaviour change: quarantine is now enforced at instruction dispatch (#881, #3127)
 

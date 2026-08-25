@@ -903,9 +903,19 @@ Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6
 
 #### `POST /api/v1/tokens/{token_id}/confirm`
 
-Explicit maker-checker confirmation that a rotation's successor secret has been received and installed. `{token_id}` in the path is the **successor's** id — the value the `rotate` response above returned — so, unlike the engine-principal confirm route, **no request body is needed at all**: the id in the URL pins the exact rotation being confirmed. On success, the predecessor token is revoked and the successor becomes the sole active token in the rotation group.
+Explicit maker-checker confirmation that a rotation's successor secret has been received and installed. `{token_id}` in the path is the **successor's** id — the value the `rotate` response above returned. On success, the predecessor token is revoked and the successor becomes the sole active token in the rotation group.
 
 **Permission:** `ApiToken:Rotate` (same distinct-operation rationale as `rotate` above)
+
+**Proof of possession (#3015, SOC 2 CC6.3) — BREAKING:** unlike before, a request body is now required — `{"secret": "<raw successor secret>"}`, the raw successor secret `rotate` returned. Confirm revokes the predecessor immediately, so it must never proceed on `token_id` alone — a caller who merely learned or guessed the (non-secret) successor `token_id` could otherwise force an immediate cutover without ever having received the new credential. A caller that previously confirmed with only the `{token_id}` path parameter now gets `400`. The check is performed immediately after auth/step-up, **before** the ownership/existence lookup below, so a missing secret is `400` even against an unowned or nonexistent token_id — it is never an enumeration oracle either way, since neither response discloses whether the token exists.
+
+**Request body (required):**
+
+```json
+{ "secret": "yzt_..." }
+```
+
+`secret` is verified last, strictly after the ownership check and every store-side admission check (pair-state, the successor pin, the authority-inheritance guard) have passed — via a constant-time hash comparison against the successor's stored hash, read fresh inside the same advisory-locked transaction as the rest of this call. It is never persisted, logged, or echoed into an audit/error string.
 
 **Ownership constraint:** the same self-service-only posture as `rotate` above — no admin bypass, `404 token not found` for both a nonexistent successor id and one owned by someone else, and the same `action=api_token.confirm`/`result=denied`/`detail=owner=<real owner>` audit row on a denied attempt.
 
@@ -919,6 +929,8 @@ Explicit maker-checker confirmation that a rotation's successor secret has been 
 ```
 
 **Errors:** the same state matrix as the engine-principal `credentials/confirm` route above (replay-after-success is a terminal `409`, an ambiguous empty/malformed-pair read is a retryable `503`, unresolved rotation metadata on the sole survivor is a terminal `409`), substituting `token is not a human-owned credential` / `principal has a non-human active credential` for the engine-kind equivalents. `401`/`403` follow the same step-up and permission rules as `rotate`. The same authority-inheritance `400` — `no such token to confirm` also applies here, as defence-in-depth only (see the `rotate` error matrix row above; the successor's tier/scope are fixed at mint time and cannot legitimately diverge from what the caller who initiated the rotation already held, so this path is not reachable today outside a future bypass of `rotate`'s own guard).
+
+`secret` missing, empty, or not a string is `400` — `secret required` (checked before the `404` ownership belt, see above). A wrong secret is `403` — `rotation secret mismatch — the presented secret does not verify against the pending successor` — distinct from every other outcome, reachable only after every other admission check has already passed. If the authoritative successor row cannot be re-read to verify the secret (should not happen under the lock already held), that's a fail-closed `503` — `failed to verify rotation secret`, folded into the general store-failure `503` row above.
 
 ---
 
@@ -1123,13 +1135,17 @@ Explicit maker-checker confirmation that a rotation's successor secret has been 
 
 **Permission:** `Security:Write`
 
+**Proof of possession (#3015, SOC 2 CC6.3) — BREAKING:** the request body now also requires `secret`, the raw successor secret `rotate` returned. Confirm revokes the predecessor immediately, so it must never proceed on `token_id` alone — a caller who merely learned or guessed the (non-secret) successor `token_id` could otherwise force an immediate cutover without ever having received the new credential. A caller that previously confirmed with only `token_id` now gets `400`. The presented secret is verified last, strictly after every other admission check (ownership, pair-state, the `token_id` pin, and the initiator binding below) has passed — so a wrong secret from a caller who fails an earlier check gets that check's own non-disclosing error, never a secret-specific one; only a caller who has already cleared every other gate can reach the mismatch outcome.
+
 **Request body:**
 
 ```json
-{ "token_id": "a1b2c3d4e5f60718293a4b5c" }
+{ "token_id": "a1b2c3d4e5f60718293a4b5c", "secret": "eng_..." }
 ```
 
 `token_id` (required) is the successor's token id **returned by the `rotate` response above** — it pins this confirm to that exact rotation. A stale or mismatched id (for example a blind retry of an old confirm after a *second* rotation has started) is rejected with `409` and **no state change**, so a replayed confirm can never resolve a later rotation early. The success audit row records the confirmed id (`token_id=<id>`).
+
+`secret` (required) is the raw successor secret from the `rotate` response — never persisted, logged, or echoed into an audit/error string. Missing, empty, or non-string is `400` — `secret required`. Verified via a constant-time hash comparison against the successor's stored hash, read fresh inside the same advisory-locked transaction as the rest of this call; a wrong secret is `403` — `rotation secret mismatch — the presented secret does not verify against the pending successor` — distinct from every other outcome below, since it is reachable only after every other gate has already passed.
 
 Replaying a confirm **after its own success** (a network-dropped `200`, a double-submit) is a terminal `409` conflict, not a retryable `503`: once the rotation has resolved the successor is the sole active credential, and the confirm returns an explicit `already confirmed` / `already resolved` answer with no state change. Treat it as done and stop retrying (rotate again only if you genuinely need a fresh rotation). See the error table below for the full state matrix.
 
@@ -1149,6 +1165,7 @@ Like `credentials/rotate` above, this route never looks up `{id}` via a `get()` 
 | Condition | Response |
 |---|---|
 | `token_id` missing from the body, empty, not a string, or the body is malformed/non-object JSON | `400` — `token_id required` |
+| `secret` missing from the body, empty, or not a string (#3015) | `400` — `secret required` — checked immediately after the `token_id` presence check, before the store is ever reached |
 | The supplied `token_id` is not the pending rotation's successor (stale id from an earlier rotation, or the predecessor's id passed by mistake) | `409` — `token_id does not match the pending rotation successor; pass the token_id returned by rotate`. No state change. |
 | Confirm attempted by a **different** operator than the one who initiated the rotation | `409` — `rotation in progress by a different operator` |
 | The initiating operator cannot be resolved from either source — the in-memory grace-cache entry is gone (different replica, or this replica restarted) **and** the durable `rotation_initiator` column on the successor row is empty (the pair started rotating before the durable-binding migration shipped) — or the two sources are both present but disagree | `409` — `rotation confirmation unavailable — fall back to revoke`. A plain same-replica restart mid-overlap no longer triggers this: the successor row's own `rotation_initiator`, stamped durably at mint time, resolves the identity check when the in-memory grace cache is gone. |
@@ -1158,6 +1175,8 @@ Like `credentials/rotate` above, this route never looks up `{id}` via a `get()` 
 | **More than two** active credentials for this principal (one minted outside the rotation path) | `400` — `more than two active credentials for this principal - resolve manually before confirming` |
 | No active credentials, or exactly two that aren't a recognized rotation pair | `503` — **not** `400`. Ambiguity-avoidance: an empty read can't be distinguished from a silently-failed read, and a malformed pair is kept conservative, so these stay retryable rather than a definitive client error. |
 | A non-engine-kind active credential is present for this principal (defensive check) | `400` — `principal has a non-engine active credential` |
+| **The presented `secret` does not hash-match the pending successor's stored secret (#3015 proof of possession)** — reached only after ownership/pair-state/the `token_id` pin/the initiator binding above have all passed | `403` — `rotation secret mismatch — the presented secret does not verify against the pending successor` |
+| The authoritative successor row could not be re-read to verify the secret (should not happen under the lock already held; fails closed rather than assume a match) | `503` — `failed to verify rotation secret` |
 | Advisory-lock acquire failure, or the confirm/predecessor-revoke/successor-clear write did not persist | `503` — retryable store failure |
 | MFA step-up not satisfied | `401` |
 | Missing `Security:Write`, or the caller's own session is engine-classed | `403` |
@@ -2684,7 +2703,7 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `bundle.collate` | Live-query bundle collated via `GET /api/v1/bundles/{id}`. `target_type=Execution`, `target_id=<correlation id>`. `result=success` (detail `complete=0\|1`), `result=denied` (`not found or not owned` — the 404 covers both an unknown id and a non-owner, so the audit row is where the real reason is recorded), or `result=failure` (`response store degraded` — a 503, distinct from `denied`: the bundle WAS found and owned, the read just could not be served; retryable, `retry_after_ms:5000`). |
 | `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_name` (409, fragment with the same `name` already exists). |
 | `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result=success`. Detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row. |
-| `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`}. Success detail `execution_id=<id> agents=<n>`; denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents). |
+| `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`, `error`}. Success detail `execution_id=<id> agents=<n>`; denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents, a remediation for this policy is already in flight); `error` is a genuine store/evaluator degrade, distinct from `denied`. |
 | `quarantine.enable` | Device quarantined |
 | `quarantine.disable` | Device released from quarantine |
 | `ca.cert.issued` | Internal CA signed a per-agent client certificate at enrollment. `target_type=AgentCertificate`, `target_id=<serial>`, `result=success`. |
@@ -3031,7 +3050,7 @@ Create a new policy fragment from YAML.
 
 **Response (409):** Returned when a fragment with the same `name` already exists. Body is `{"error": "policy fragment named '<name>' already exists"}`. Audit event recorded as `policy_fragment.create / denied / duplicate_name`. Choose a different name (existing fragments are immutable on rename).
 
-**Response (503):** Policy store not yet initialized.
+**Response (503):** Policy store not yet initialized, or a genuine internal store failure on the write (safe to retry — distinct from the 400/409 rejections above, and the internal error string is never included in the body).
 
 ---
 
@@ -3115,6 +3134,10 @@ Create a new policy from YAML.
 }
 ```
 
+**Response (400):** YAML missing required fields, unknown `fragment_id`, invalid scope expression. Body is `{"error": "<reason>"}`.
+
+**Response (503):** A genuine internal store failure on the write — safe to retry, and the internal error string is never included in the body.
+
 ---
 
 #### `GET /api/policies/{id}`
@@ -3183,6 +3206,10 @@ Enable a previously disabled policy.
 }
 ```
 
+**Response (400):** `policy not found`. **Response (503):** a genuine internal
+store failure on the write — safe to retry, internal error string never
+included in the body.
+
 ---
 
 #### `POST /api/policies/{id}/disable`
@@ -3198,6 +3225,10 @@ Disable a policy, pausing compliance checks.
   "status": "disabled"
 }
 ```
+
+**Response (400):** `policy not found`. **Response (503):** a genuine internal
+store failure on the write — safe to retry, internal error string never
+included in the body.
 
 ---
 
@@ -3216,6 +3247,9 @@ Invalidate agent-side compliance cache for a specific policy. Resets all agent s
 }
 ```
 
+**Response (503):** a genuine internal store failure on the write — safe to
+retry, internal error string never included in the body.
+
 ---
 
 #### `POST /api/policies/invalidate-all`
@@ -3232,6 +3266,9 @@ Invalidate compliance cache for all policies across all agents.
   "total_invalidated": 210
 }
 ```
+
+**Response (503):** a genuine internal store failure on the write — safe to
+retry, internal error string never included in the body.
 
 ---
 
@@ -3258,8 +3295,12 @@ verdicts appear a few seconds later.
 ```
 
 **Response (404):** policy not found. **Response (409):** the policy's fragment
-has no `check` instruction, or the policy matches no agents. **Response (503):**
-policy evaluation not available.
+has no `check` instruction, the policy matches no agents, or a check for this
+policy is already in flight. **Response (503):** either the policy evaluator
+isn't wired ("policy evaluation not available"), or a genuine internal store
+failure occurred while reading the policy or fragment, or recording the
+dispatch claim ("policy store degraded" / "policy evaluation degraded") — a
+transient failure of this kind is safe to retry and is never reported as a 409.
 
 **Audit:** `policy.evaluate`.
 
@@ -3298,10 +3339,18 @@ is remediated.
 ```
 
 **Response (404):** policy not found. **Response (409):** the fragment defines no
-`fix` instruction, or there are no non-compliant agents to remediate.
-**Response (503):** policy evaluation not available.
+`fix` instruction, there are no non-compliant agents to remediate, or a
+remediation for this policy is already in flight (dispatched but not yet past
+its `postCheck` — same-process dedup only, see the ADR-0056 Follow-ups for the
+cross-replica gap).
+**Response (503):** either the policy evaluator isn't wired ("policy evaluation
+not available"), or a genuine internal store failure occurred while resolving
+the policy or its remediation targets ("policy store degraded" / "policy store
+unavailable") — safe to retry, and distinguished from the 400/409 business
+rejections above.
 
-**Audit:** `policy.remediate` (`result` ∈ {`success`, `denied`}).
+**Audit:** `policy.remediate` (`result` ∈ {`success`, `denied`, `error`} — `error`
+is a store degrade, never a business rejection).
 
 ---
 
@@ -3315,7 +3364,7 @@ Fleet compliance summary across all active policies.
 
 **Permission:** `Policy:Read`
 
-**Response:**
+**Response (200):**
 
 ```json
 {
@@ -3329,6 +3378,10 @@ Fleet compliance summary across all active policies.
 }
 ```
 
+**Response (503):** `policy store degraded` — a genuine internal store failure,
+distinct from a genuine 0% (no policies enabled yet reads as all-zero counts
+with `200`, never a 503).
+
 ---
 
 #### `GET /api/compliance/{policy_id}`
@@ -3337,7 +3390,7 @@ Per-policy compliance detail with per-agent statuses.
 
 **Permission:** `Policy:Read`
 
-**Response:**
+**Response (200):**
 
 ```json
 {
@@ -3360,6 +3413,9 @@ Per-policy compliance detail with per-agent statuses.
   ]
 }
 ```
+
+**Response (503):** `policy store degraded`, on either the summary or the
+per-agent-status read.
 
 ---
 
@@ -4900,6 +4956,20 @@ Management](#license-management), `docs/adr/0052-device-token-store-postgres-mig
 Context), so these routes do not register today; documented for when a future change re-wires
 them.
 
+**`principal_id` vs `device_id`.** These are two different identities. `principal_id` is the
+**issuing operator's** username — set from the authenticated session at creation time, never
+supplied in the request body. `device_id` is the **agent** the token is bound to (set from the
+request body's `device_id` field) — this is the identity a presenting agent is validated against
+when the token is used, and the identity the re-registration revoke below acts on.
+
+**Re-registration revoke (#823/#3401).** When the agent named by a token's `device_id` re-registers
+with the server, every still-valid token bound to that `device_id` is revoked before the new
+session is installed — closing the window where a briefly-impersonated agent (an mTLS-disabled
+registration) could otherwise replay a token issued to the legitimate agent. This is independent
+of who issued the token (`principal_id`). If the revoke sweep itself fails (a database fault), the
+registration is refused rather than proceeding with stale tokens left live; the agent's normal
+reconnect/retry behavior applies.
+
 #### `GET /api/v1/device-tokens`
 
 List all device tokens.
@@ -4964,7 +5034,7 @@ Create a device-scoped token. The raw token value is returned exactly once at cr
 | Malformed JSON body | `400` — `invalid JSON` |
 | `name`/`device_id`/`definition_id` exceeds 256 chars | `400` — `invalid_input_length: ...` |
 | CSPRNG entropy exhaustion | `503` + `Retry-After: 5` — `CSPRNG unavailable: ...` |
-| A genuine database write failure | `503` + `Retry-After: 5` — `service unavailable` |
+| A genuine database write or token-hashing failure | `503` + `Retry-After: 5` — `service unavailable` |
 
 #### `DELETE /api/v1/device-tokens/{id}`
 

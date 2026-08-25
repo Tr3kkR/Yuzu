@@ -179,10 +179,20 @@ void write_legacy_sqlite_db(const std::filesystem::path& path,
         REQUIRE(sqlite3_prepare_v2(db.get(), sql, -1, s.addr(), nullptr) == SQLITE_OK);
         sqlite3_bind_text(s.get(), 1, r.token_id.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(s.get(), 2, r.token_hash.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(s.get(), 3, r.name.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(s.get(), 4, r.principal_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(s.get(), 5, r.device_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(s.get(), 6, r.definition_id.c_str(), -1, SQLITE_TRANSIENT);
+        // #3351: bind name/principal_id/device_id/definition_id with their REAL byte length
+        // (not -1/NUL-terminated) so a fixture value containing an embedded NUL is actually
+        // written whole — a -1 bind on a std::string::c_str() would silently truncate at the
+        // first NUL before SQLite ever saw the rest, making a NUL-embedded regression fixture
+        // impossible to construct. token_id/token_hash stay -1: they are always exact hex with
+        // no embedded NULs by construction (hex_id/hex_hash above).
+        sqlite3_bind_text(s.get(), 3, r.name.data(), static_cast<int>(r.name.size()),
+                          SQLITE_TRANSIENT);
+        sqlite3_bind_text(s.get(), 4, r.principal_id.data(),
+                          static_cast<int>(r.principal_id.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_text(s.get(), 5, r.device_id.data(), static_cast<int>(r.device_id.size()),
+                          SQLITE_TRANSIENT);
+        sqlite3_bind_text(s.get(), 6, r.definition_id.data(),
+                          static_cast<int>(r.definition_id.size()), SQLITE_TRANSIENT);
         sqlite3_bind_int64(s.get(), 7, r.created_at);
         sqlite3_bind_int64(s.get(), 8, r.expires_at);
         sqlite3_bind_int64(s.get(), 9, r.last_used_at);
@@ -264,6 +274,10 @@ TEST_CASE(
     CHECK_FALSE(revoke_by_res.has_value());
     CHECK(revoke_by_res.error().starts_with(yuzu::server::kDeviceTokenDbErrorPrefix));
 
+    auto revoke_by_device_res = store.revoke_by_device("endpoint-99");
+    CHECK_FALSE(revoke_by_device_res.has_value());
+    CHECK(revoke_by_device_res.error().starts_with(yuzu::server::kDeviceTokenDbErrorPrefix));
+
     CHECK_FALSE(store.migrate_from_sqlite("/nonexistent/does/not/matter"));
 }
 
@@ -278,6 +292,98 @@ TEST_CASE("create_token rejects an empty principal_id", "[device_token][pg]") {
     auto r = store.create_token("n", "", "d", "", 0);
     REQUIRE_FALSE(r.has_value());
     CHECK_FALSE(r.error().starts_with(yuzu::server::kDeviceTokenDbErrorPrefix));
+}
+
+// #3351: store-level length bound, matching the REST route's own 256-char clamp (rest_api_v1.cpp)
+// on name/device_id/definition_id, and the store's only bound at all on principal_id (which the
+// route never clamps — it comes from session->username). REST itself can never reach this
+// rejection (its own clamp fires first for the three clamped fields, and usernames are bounded
+// to 64 by auth_db.cpp) — this is defence-in-depth for a future non-REST caller.
+TEST_CASE("DeviceTokenStore: create_token rejects each free-text field exceeding 256 bytes, "
+          "accepts exactly 256",
+          "[device_token][3351][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_token_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string ok256(256, 'a');
+    const std::string over257(257, 'a');
+
+    SECTION("name exceeds 256") {
+        auto res = store.create_token(over257, "admin", "device-A", "", 0);
+        REQUIRE_FALSE(res.has_value());
+        CHECK(res.error().find("invalid_input_length") != std::string::npos);
+        CHECK(res.error().find("name") != std::string::npos);
+        auto tokens = store.list_tokens();
+        REQUIRE(tokens.has_value());
+        CHECK(tokens->empty());
+    }
+    SECTION("principal_id exceeds 256") {
+        auto res = store.create_token("n", over257, "device-A", "", 0);
+        REQUIRE_FALSE(res.has_value());
+        CHECK(res.error().find("invalid_input_length") != std::string::npos);
+        CHECK(res.error().find("principal_id") != std::string::npos);
+        auto tokens = store.list_tokens();
+        REQUIRE(tokens.has_value());
+        CHECK(tokens->empty());
+    }
+    SECTION("device_id exceeds 256") {
+        auto res = store.create_token("n", "admin", over257, "", 0);
+        REQUIRE_FALSE(res.has_value());
+        CHECK(res.error().find("invalid_input_length") != std::string::npos);
+        CHECK(res.error().find("device_id") != std::string::npos);
+        auto tokens = store.list_tokens();
+        REQUIRE(tokens.has_value());
+        CHECK(tokens->empty());
+    }
+    SECTION("definition_id exceeds 256") {
+        auto res = store.create_token("n", "admin", "device-A", over257, 0);
+        REQUIRE_FALSE(res.has_value());
+        CHECK(res.error().find("invalid_input_length") != std::string::npos);
+        CHECK(res.error().find("definition_id") != std::string::npos);
+        auto tokens = store.list_tokens();
+        REQUIRE(tokens.has_value());
+        CHECK(tokens->empty());
+    }
+    SECTION("exactly 256 bytes on every field is accepted") {
+        auto res = store.create_token(ok256, ok256, ok256, ok256, 0);
+        REQUIRE(res.has_value());
+        auto tokens = store.list_tokens();
+        REQUIRE(tokens.has_value());
+        REQUIRE(tokens->size() == 1);
+        CHECK((*tokens)[0].name.size() == 256);
+        CHECK((*tokens)[0].principal_id.size() == 256);
+        CHECK((*tokens)[0].device_id.size() == 256);
+        CHECK((*tokens)[0].definition_id.size() == 256);
+    }
+}
+
+// #3351: proves the linear rewrite still defangs correctly (embedded NULs -> U+FFFD) and that the
+// length bound is measured on RAW bytes BEFORE sanitize can grow the string — 256 raw NULs (which
+// would expand to 768 bytes of U+FFFD) must be accepted, not rejected as "over 256".
+TEST_CASE("DeviceTokenStore: create_token's NUL-embedded name is stored as U+FFFD, measured "
+          "pre-sanitize against the length bound",
+          "[device_token][3351][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_token_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string nul_dense(256, '\0');
+    auto created = store.create_token(nul_dense, "admin", "device-A", "", 0);
+    REQUIRE(created.has_value());
+
+    auto tokens = store.list_tokens();
+    REQUIRE(tokens.has_value());
+    REQUIRE(tokens->size() == 1);
+    const std::string expected_scrubbed = [] {
+        std::string out;
+        for (int i = 0; i < 256; ++i)
+            out += "\xEF\xBF\xBD";
+        return out;
+    }();
+    CHECK((*tokens)[0].name == expected_scrubbed);
 }
 
 TEST_CASE("DeviceTokenStore: create and validate round-trip", "[device_token][crud][pg]") {
@@ -489,6 +595,98 @@ TEST_CASE("DeviceTokenStore: revoke_by_principal is idempotent and skips already
     auto empty = store.revoke_by_principal("");
     REQUIRE(empty.has_value());
     CHECK(*empty == 0);
+}
+
+// ── #3401 — revoke_by_device (the actual #823 sweep; discriminates from revoke_by_principal) ──
+
+TEST_CASE("DeviceTokenStore: revoke_by_device revokes every still-valid token for the device, "
+          "across different operators, and leaves other devices' tokens alone",
+          "[device_token][823][3401][crud][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_token_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Two tokens for the SAME device, minted by DIFFERENT operators — the shape a
+    // principal-keyed sweep can never revoke together, and the shape revoke_by_device must.
+    auto a1 = store.create_token("alice-tok", "alice", "endpoint-99", "", 0);
+    auto a2 = store.create_token("bob-tok", "bob", "endpoint-99", "", 0);
+    // A token for a DIFFERENT device, same operator as one of the above — must survive.
+    auto other = store.create_token("alice-other", "alice", "endpoint-7", "", 0);
+    REQUIRE(a1.has_value());
+    REQUIRE(a2.has_value());
+    REQUIRE(other.has_value());
+
+    REQUIRE(store.validate_token(*a1, "endpoint-99").has_value());
+    REQUIRE(store.validate_token(*a2, "endpoint-99").has_value());
+    REQUIRE(store.validate_token(*other, "endpoint-7").has_value());
+
+    auto revoked = store.revoke_by_device("endpoint-99");
+    REQUIRE(revoked.has_value());
+    CHECK(*revoked == 2);
+
+    auto v1 = store.validate_token(*a1, "endpoint-99");
+    REQUIRE(!v1.has_value());
+    CHECK(v1.error().error == DeviceTokenValidateError::revoked);
+    CHECK(v1.error().bound_principal_id == "alice");
+
+    auto v2 = store.validate_token(*a2, "endpoint-99");
+    REQUIRE(!v2.has_value());
+    CHECK(v2.error().error == DeviceTokenValidateError::revoked);
+    CHECK(v2.error().bound_principal_id == "bob");
+
+    // Untouched: same operator (alice) as a revoked token, but a different device.
+    auto v3 = store.validate_token(*other, "endpoint-7");
+    REQUIRE(v3.has_value());
+
+    // The pre-#3401 bug, pinned as a regression check: sweeping by principal_id (an agent_id in
+    // production) must NOT touch these rows — they were minted with principal_id="alice"/"bob",
+    // never "endpoint-99".
+    auto by_principal = store.revoke_by_principal("endpoint-99");
+    REQUIRE(by_principal.has_value());
+    CHECK(*by_principal == 0);
+}
+
+TEST_CASE("DeviceTokenStore: revoke_by_device is idempotent, skips already-revoked rows, and "
+          "empty device_id is a no-op that never sweeps unbound tokens",
+          "[device_token][823][3401][crud][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_token_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto t = store.create_token("only", "alice", "endpoint-99", "", 0);
+    REQUIRE(t.has_value());
+    // An intentionally unbound token (empty device_id) — must never be swept by an empty input.
+    auto unbound = store.create_token("unbound", "alice", "", "", 0);
+    REQUIRE(unbound.has_value());
+
+    auto first = store.revoke_by_device("endpoint-99");
+    REQUIRE(first.has_value());
+    CHECK(*first == 1);
+    auto second = store.revoke_by_device("endpoint-99");
+    REQUIRE(second.has_value());
+    CHECK(*second == 0);
+
+    auto nobody = store.revoke_by_device("no-such-device");
+    REQUIRE(nobody.has_value());
+    CHECK(*nobody == 0);
+
+    auto empty = store.revoke_by_device("");
+    REQUIRE(empty.has_value());
+    CHECK(*empty == 0);
+
+    // The unbound token must have survived every call above, including the empty-string sweep.
+    auto list = store.list_tokens();
+    REQUIRE(list.has_value());
+    bool unbound_still_present = false;
+    for (const auto& tok : *list) {
+        if (tok.name == "unbound") {
+            unbound_still_present = true;
+            CHECK_FALSE(tok.revoked);
+        }
+    }
+    CHECK(unbound_still_present);
 }
 
 // ── Validate updates last_used_at ────────────────────────────────────────────
@@ -1127,10 +1325,48 @@ TEST_CASE("migrate_from_sqlite fails closed on a legacy row with a malformed tok
         CHECK_FALSE(store.migrate_from_sqlite(path));
     }
 
-    // Neither malformed row was stamped complete or partially inserted.
+    // #3351
+    SECTION("name exceeds 256 bytes") {
+        LegacyTokenFixture row;
+        row.token_id = hex_id("oversize1");
+        row.token_hash = hex_hash("oversize1");
+        row.name = std::string(257, 'a');
+        row.principal_id = "alice";
+        row.device_id = "device-A";
+        auto path =
+            yuzu::test::unique_temp_path("yuzu_test_devtoken_oversize") / "device-tokens.db";
+        std::filesystem::create_directories(path.parent_path());
+        write_legacy_sqlite_db(path, {row});
+        CHECK_FALSE(store.migrate_from_sqlite(path));
+    }
+
+    // #3351: proves the backfill DEFANGS an embedded NUL (U+FFFD) rather than silently
+    // truncating at it — the length-aware sqlite3_column_bytes read (not std::string(const
+    // char*)) is what makes this observable at all; a C-string read would have already dropped
+    // everything after the first NUL before this row ever reached sanitize_pg_text.
+    SECTION("embedded NUL in a legacy free-text field is defanged, not truncated") {
+        LegacyTokenFixture row;
+        row.token_id = hex_id("nulrow01");
+        row.token_hash = hex_hash("nulrow01");
+        row.name = std::string("before") + '\0' + "after";
+        row.principal_id = "alice";
+        row.device_id = "device-A";
+        auto path = yuzu::test::unique_temp_path("yuzu_test_devtoken_nulrow") / "device-tokens.db";
+        std::filesystem::create_directories(path.parent_path());
+        write_legacy_sqlite_db(path, {row});
+        REQUIRE(store.migrate_from_sqlite(path));
+
+        auto tokens = store.list_tokens();
+        REQUIRE(tokens.has_value());
+        REQUIRE(tokens->size() == 1);
+        CHECK((*tokens)[0].name == "before\xEF\xBF\xBD" "after");
+    }
+
+    // Neither malformed row from the SECTIONs above was stamped complete or partially inserted.
+    // (The NUL-embedded SECTION is a SUCCESS case and asserts its own row count separately.)
     auto tokens = store.list_tokens();
     REQUIRE(tokens.has_value());
-    CHECK(tokens->empty());
+    CHECK(tokens->size() <= 1); // 0 normally; 1 if the NUL SECTION ran (its own row survives)
 }
 
 TEST_CASE("migrate_from_sqlite aborts unstamped on a mid-scan legacy read failure",

@@ -2,6 +2,17 @@
  * bounded_wait.hpp — generic bounded-wait wrapper for an uncancellable
  * blocking call (Wave 2 PR2.1c, governance Gate 4 unhappy-path finding).
  *
+ * Hoisted from agents/plugins/discovery/src/bounded_wait.hpp to agents/shared
+ * (#3429 round 4) once a second consumer needed the identical primitive:
+ * agents/core/src/server_address_resolver.cpp bounds its own getaddrinfo()
+ * call the same way discovery bounds getnameinfo() — a plain
+ * std::async(std::launch::async, ...)-obtained future's destructor blocks
+ * the calling thread until the task finishes even after wait_for() times
+ * out ([futures.async]), so it cannot serve as a caller-side deadline on its
+ * own. bounded_call()'s detached-thread-plus-condition-variable shape does
+ * not have that problem: nothing on the caller's stack ever waits on the
+ * detached thread past `timeout`.
+ *
  * Some blocking calls (getnameinfo's reverse-DNS lookup, in particular) have
  * no caller-supplied cancellation or timeout primitive. Calling one directly
  * from a task running on the agent's bounded ThreadPool risks pinning a
@@ -62,7 +73,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace yuzu::discovery {
+namespace yuzu::shared {
 
 namespace detail {
 
@@ -164,4 +175,4 @@ auto bounded_call(std::chrono::milliseconds timeout, Fn fn)
     return std::nullopt; // timed out; the detached thread finishes on its own time
 }
 
-} // namespace yuzu::discovery
+} // namespace yuzu::shared

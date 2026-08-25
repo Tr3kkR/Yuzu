@@ -174,7 +174,7 @@ enum class McpStreamClose {
     kNone,               ///< still open
     kClientGone,         ///< peer disconnected / write failed
     kSuperseded,         ///< a newer GET took the session's stream over
-    kSessionTerminated,  ///< DELETE, idle GC, or replay-window termination
+    kSessionTerminated,  ///< DELETE, idle GC, replay-window termination, or server shutdown
     kCredentialRevoked,  ///< re-validation said the credential is definitively gone
     kAuthUnavailable,    ///< re-validation was indeterminate past the grace window
     kInternalError,      ///< the pump caught an exception — OUR fault, not the client's
