@@ -136,14 +136,20 @@ data).
   mandatory for config/reference stores" bullet above assumed a real fleet with real
   legacy data to protect. That has never been true — no production fleet has ever run a
   pre-Postgres build of any Yuzu store — so for every migration still to come (as of this
-  writing: `InstructionStore`, `WebhookStore`, `OffloadTargetStore`, `RuntimeConfigStore`),
-  the default flips: **skip `migrate_from_sqlite()` entirely, unconditionally, the same
-  way `ResponseStore` already does** (Update above), rather than build a backfill and plan
-  to remove it later. This is not a narrowing of what backfill protects — the mandate's
+  writing: `InstructionStore`, `OffloadTargetStore`, `RuntimeConfigStore`), the default
+  flips: **skip `migrate_from_sqlite()` entirely, unconditionally, the same way
+  `ResponseStore` already does** (Update above), rather than build a backfill and plan to
+  remove it later. This is not a narrowing of what backfill protects — the mandate's
   entire premise (preserving real operator config / real SOC 2 audit history across a real
   upgrade) is empty while there is nothing real to preserve. Retired for the same reason,
   same day: `PolicyStore`'s already-shipped backfill (ADR-0056, commit `f46cefe8e`) — see
   `docs/postgres-migration-ladder.md`'s `PolicyStore` row.
+
+  (`WebhookStore`/PR #3563 merged with a full `migrate_from_sqlite()` already built the
+  same day this amendment landed, ahead of it reaching that PR — too late for the "don't
+  build it" guidance to apply retroactively. Its backfill TEST suite is being retired in
+  the same pass as the other already-migrated stores' backfill tests below; its production
+  `migrate_from_sqlite()` stays for now, same as the others.)
 
   **This default is conditional on the fact, not permanent policy.** It holds only while
   "no production fleet" stays true. If a real external deployment (a design partner, a

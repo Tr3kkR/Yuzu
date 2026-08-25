@@ -12,14 +12,18 @@ provisional** — each is finalized in that store's per-store ADR after reading 
 
 Schema name = `snake_case(FullClassName)` incl. the `Store` suffix (ADR-0008 Update).
 
-> **For the 4 remaining stores (`InstructionStore`, `WebhookStore`, `OffloadTargetStore`,
-> `RuntimeConfigStore`): do NOT build `migrate_from_sqlite()`.** ADR-0009's 2026-08-25
-> fresh-start-by-default amendment applies to all four — no production fleet has ever run a
-> pre-Postgres build of any Yuzu store, so there is no real legacy data to protect. Skip the
-> legacy-file backfill entirely (same as `ResponseStore`'s existing precedent), including its
-> test suite, its fixture helper, and its ops-runbook. See each store's own row below for the
-> specific pointer, and ADR-0009's amendment for the full rationale + the one carve-out
-> (`AuditStore`, already migrated, keeps its backfill).
+> **For the 3 remaining stores (`InstructionStore`, `OffloadTargetStore`, `RuntimeConfigStore`):
+> do NOT build `migrate_from_sqlite()`.** ADR-0009's 2026-08-25 fresh-start-by-default amendment
+> applies to all three — no production fleet has ever run a pre-Postgres build of any Yuzu store,
+> so there is no real legacy data to protect. Skip the legacy-file backfill entirely (same as
+> `ResponseStore`'s existing precedent), including its test suite, its fixture helper, and its
+> ops-runbook. See each store's own row below for the specific pointer, and ADR-0009's amendment
+> for the full rationale + the one carve-out (`AuditStore`, already migrated, keeps its backfill).
+> **`WebhookStore` (PR #3563) merged with a full `migrate_from_sqlite()` already built, before
+> this amendment could reach it** — too late to apply the "don't build it" guidance retroactively;
+> it instead joins the other already-migrated stores whose backfill TEST suite is being retired
+> in this same sweep (production-code removal deferred as a separate later step, same as the
+> others). See its own row below.
 
 ## Done
 
@@ -91,7 +95,7 @@ legacy secret material to transform-and-carry-over. Skip the legacy-file backfil
 
 | Store | Schema | Secret handling | Notes |
 |---|---|---|---|
-| `WebhookStore` | `webhook_store` | `SecretCodec` | shared secrets. **Do NOT build `migrate_from_sqlite()`** — see Wave 3 note above. |
+| `WebhookStore` | `webhook_store` | `SecretCodec` | shared secrets. **Migrated Postgres (PR #3563, merged 2026-08-25)** — this row is stale (still listed as pending), kept here for now rather than moved into "Done" to avoid restructuring this dense table mid-sweep. Backfill WAS built (`migrate_from_sqlite()`, ahead of ADR-0009's fresh-start amendment) — its test suite is being retired in the same pass as the other already-migrated stores' backfill tests (production code removal deferred, same as those). |
 | `OffloadTargetStore` | `offload_target_store` | `SecretCodec` | target credentials. **Do NOT build `migrate_from_sqlite()`** — see Wave 3 note above. |
 | `RuntimeConfigStore` | `runtime_config_store` | `SecretCodec` | secret-valued config keys. **Do NOT build `migrate_from_sqlite()`** — see Wave 3 note above. |
 
