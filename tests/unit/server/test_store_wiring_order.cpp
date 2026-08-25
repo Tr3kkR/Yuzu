@@ -262,8 +262,13 @@ TEST_CASE("server.cpp: response_visible_set_fn is both defined and passed to "
     // POSITIVE anchor 2: the resolver is actually PASSED to
     // register_routes, not merely defined and left unused. This is what
     // distinguishes "wired" from "defined but dropped at the call site" --
-    // the failure mode a name-presence-only check would miss entirely.
-    static const std::regex wired_re(R"(,\s*response_visible_set_fn\s*\))");
+    // the failure mode a name-presence-only check would miss entirely. The
+    // optional `std::move(...)` wrapper is tolerated -- moving the callback
+    // into the by-value `VisibleSetFn` parameter is the correct idiom (it's
+    // never used again after this call) and must not make this anchor a
+    // false negative.
+    static const std::regex wired_re(
+        R"(,\s*(?:std::move\()?response_visible_set_fn\)?\s*\))");
     CHECK(std::regex_search(text, wired_re));
 
     // Exactly two occurrences of the identifier total: one definition, one

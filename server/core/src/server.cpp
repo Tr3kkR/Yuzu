@@ -18398,7 +18398,7 @@ private:
                 }
                 return {"", ""};
             },
-            &metrics_, instruction_store_.get(), response_visible_set_fn);
+            &metrics_, instruction_store_.get(), std::move(response_visible_set_fn));
 
         // WorkflowRoutes — /fragments/executions, /fragments/schedules, /api/workflows/*,
         //                   /api/workflow-executions/*, /api/product-packs/*, /api/scope/estimate

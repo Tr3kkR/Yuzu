@@ -1,5 +1,8 @@
-- **Dashboard facet surfaces confined to the caller's management-group scope (#1712, #3489, ADR-0017).**
-  Three dashboard surfaces read the fleet-wide `response_facets` index on a flat permission gate
+- **Breaking — dashboard facet surfaces confined to the caller's management-group scope (#1712, #3489, ADR-0017).**
+  A confined operator's filter-bar dropdowns and create-group-form agent count will now show fewer
+  values than before, and `group-from-results` will silently drop out-of-scope agents from the new
+  group instead of including them — this is the fix, not a regression. Three dashboard surfaces read
+  the fleet-wide `response_facets` index on a flat permission gate
   with no per-agent confinement: `GET /fragments/results/filter-bar` populated facet dropdowns
   (values and line counts) from every agent's responses, `GET /fragments/create-group-form`
   rendered a fleet-wide matching-agent count, and `POST /api/dashboard/group-from-results`
