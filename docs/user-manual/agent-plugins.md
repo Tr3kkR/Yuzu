@@ -363,8 +363,8 @@ Plugins for software inventory, Windows-specific package management, update stat
 
 | Action | Description |
 |---|---|
-| `list_upgradable` | List packages with available upgrades (version comparison). |
-| `installed_count` | Total count of installed applications. |
+| `list_upgradable` | List packages with available upgrades (version comparison). On Windows, winget ships as a per-user App Execution Alias that can be unreachable in the agent's service context — when unresolvable, the action reports a `CONSTRAINED`/`unavailable` result rather than a fabricated "up to date". |
+| `installed_count` | Total count of installed applications. On Linux, held packages (`dpkg`'s `hi` status) count as installed alongside `ii`, matching `installed_apps`/`vuln_scan`'s presence filter. A query that fails or finds no supported package manager reports an honest degrade with no count line, rather than a fabricated `0`. |
 
 ### sccm
 
