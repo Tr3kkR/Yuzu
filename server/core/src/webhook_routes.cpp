@@ -83,6 +83,7 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                  try {
                      body = nlohmann::json::parse(req.body);
                  } catch (...) {
+                     audit_fn(req, "webhook.create", "failure", "webhook", "", "invalid_json");
                      res.status = 400;
                      res.set_content(
                          R"({"error":{"code":400,"message":"invalid JSON"},"meta":{"api_version":"v1"}})",
@@ -91,6 +92,7 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                  }
                  auto url = body.value("url", "");
                  if (url.empty()) {
+                     audit_fn(req, "webhook.create", "failure", "webhook", "", "url_required");
                      res.status = 400;
                      res.set_content(
                          R"({"error":{"code":400,"message":"url is required"},"meta":{"api_version":"v1"}})",
@@ -122,8 +124,14 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                      return;
                  }
                  const auto id = *result;
-                 audit_fn(req, "webhook.create", "success", "webhook",
-                          std::to_string(id), "");
+                 // gov Gate 2 security-guardian / Gate 4 consistency-auditor
+                 // (PR #3563 full-PR review): record the URL in the audit
+                 // detail, not just the id — a compromise-and-cleanup
+                 // attacker who creates a webhook, exfiltrates data to it,
+                 // then deletes it must not be able to erase every durable
+                 // record of WHERE the data went. Matches the sibling
+                 // hardening already applied to `offload_routes.cpp`.
+                 audit_fn(req, "webhook.create", "success", "webhook", std::to_string(id), url);
                  if (emit_event_fn)
                      emit_event_fn("webhook.created", req, {},
                                    {{"webhook_id", id}, {"url", url}});
@@ -146,6 +154,15 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                        return;
                    }
                    auto id = std::stoll(req.matches[1].str());
+                   // gov Gate 2/4/5 (PR #3563 full-PR review): snapshot the
+                   // URL BEFORE deleting — matches `offload_routes.cpp`'s
+                   // existing "compliance F-3" hardening for the identical
+                   // attack shape (compromise, exfiltrate, delete-and-erase-
+                   // evidence). Best-effort only: a degraded read here must
+                   // never block the delete itself, so a nullopt (not-found
+                   // OR a transient read failure) just means the audit
+                   // detail stays empty, not that the delete is refused.
+                   auto snapshot = webhook_store->get(id);
                    auto result = webhook_store->delete_webhook(id);
                    if (!result) {
                        // #3097 classification: a query failure against an
@@ -160,10 +177,12 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                        return;
                    }
                    if (*result) {
-                       audit_fn(req, "webhook.delete", "success", "webhook",
-                                std::to_string(id), "");
+                       audit_fn(req, "webhook.delete", "success", "webhook", std::to_string(id),
+                                snapshot ? snapshot->url : "");
                        res.set_content(R"({"status":"deleted"})", "application/json");
                    } else {
+                       audit_fn(req, "webhook.delete", "failure", "webhook", std::to_string(id),
+                                "not_found");
                        res.status = 404;
                        res.set_content(
                            R"({"error":{"code":404,"message":"webhook not found"},"meta":{"api_version":"v1"}})",

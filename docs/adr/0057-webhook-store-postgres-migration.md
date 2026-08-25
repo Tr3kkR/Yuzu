@@ -306,6 +306,27 @@ class).
 - **#3561** — `webhook_deliveries` has no retention/prune pass; unlike `ResponseStore` it was
   deliberately given a mandatory (not skippable) backfill, but no future retention policy was
   decided at migration time.
+- **#3590** — the backfill idempotency check compares sanitized-stored text against raw,
+  unsanitized freshly-read legacy bytes; on invalid-UTF-8 legacy content, two replicas racing
+  the same backfill (or the same replica across boots) can spuriously disagree.
+- **#3591** — a bundle of minor REST/test hardening gaps (`event_types` array-form input, an
+  unbounded webhook-id parse, a test-fixture prefix convention, a missing signed-delivery test).
+- **#3593** — no compensating Windows ACL for the retained legacy secret-bearing file (POSIX-only
+  0600 today, both the main file and its `-wal`/`-shm` sidecars).
+- **#3594** — `hmac_sha256`'s own failure (OpenSSL `HMAC()`/Windows BCrypt) is unchecked on both
+  platforms; could fire a garbage/empty signature instead of skipping the delivery.
+- **#3595** — the legacy-backfill read loop can trigger `std::vector` reallocation, potentially
+  leaving secret bytes in a freed, unzeroized buffer.
+- **#3613** — a deleted webhook can be silently resurrected if a stale legacy `webhooks.db`
+  snapshot (predating the delete) is replayed through the backfill path; no tombstone table
+  exists to prevent it.
+- **#3614** — a delivery racing `delete_webhook` can fire successfully but leave no durable
+  delivery-log row (FK failure, fail-soft), indistinguishable in metrics from ordinary DB
+  degradation.
 - `OffloadTargetStore`/`RuntimeConfigStore` (the remaining Wave-3 stores) should read this ADR as
   their template — in particular the fingerprint-excludes-secret-bytes decision and the
-  teardown-ordering fix, both of which generalize directly.
+  teardown-ordering fix, both of which generalize directly (see `docs/postgres-store-playbook.md`
+  for both, spelled out generically). Also worth reading before copying the backfill's
+  `LegacySecretWiper`-style wipe-after-the-fact pattern verbatim: reading legacy plaintext
+  directly into a zeroizing buffer type from the start would make that pattern unnecessary
+  (architect, gov Gate 3, PR #3563 full-PR review) — a cleaner shape for a store starting fresh.

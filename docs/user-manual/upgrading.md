@@ -809,9 +809,17 @@ The webhook HMAC signing secret is now envelope-encrypted at rest
   failure**: `POST` returns `400` for an invalid URL scheme (previously an
   ambiguous non-error response), and `GET`/`POST`/`DELETE /api/webhooks`
   (list/create/delete) return `503` on a genuine database error instead of a
-  silently-empty or silently-failed result. `GET /api/webhooks/{id}/deliveries`
-  is unchanged by this migration — a degraded read there still renders an
-  empty delivery list rather than a `503`, the same as before the cutover.
+  silently-empty or silently-failed result. `GET /api/webhooks/{id}/deliveries`'s
+  degrade-vs-error handling specifically is unchanged by this migration — a
+  degraded read there still renders an empty delivery list rather than a
+  `503`, the same as before the cutover.
+- **`GET /api/webhooks/{id}/deliveries`'s `?limit=` handling changed.**
+  `limit=0` (or any non-positive value) previously meant "return zero rows";
+  it now falls back to the default of 50, the same as an omitted `limit`. A
+  value above 10000 was previously passed through unbounded; it is now
+  silently capped at 10000. If your integration relies on `limit=0` meaning
+  "give me nothing," or on retrieving more than 10000 rows in one call,
+  update it.
 - Every other webhook behavior — event-type matching, HMAC-SHA256 signature
   format (`X-Yuzu-Signature: sha256=<hex>`), unsigned delivery when no secret
   is configured — is unchanged. Detail:

@@ -281,6 +281,52 @@ TEST_CASE("WebhookStore[pg]: delivery with no secret configured fires unsigned (
     CHECK(deliveries[0].error == "connection_failed");
 }
 
+TEST_CASE("WebhookStore[pg]: fire_event never dispatches to a disabled webhook",
+         "[webhook_store][pg]") {
+    // gov Gate 3 quality-engineer (PR #3563 full-PR review): fire_event's
+    // routing predicate (event_matches + enabled) was never exercised
+    // end-to-end by any prior round — every delivery test fired an event
+    // whose type exactly matched the sole enabled webhook. This proves the
+    // enabled=false exclusion specifically.
+    WebhookStorePg store;
+    auto disabled_id = store->create_webhook("http://127.0.0.1:1/disabled", "agent.registered",
+                                             /*secret=*/"", /*enabled=*/false);
+    REQUIRE(disabled_id.has_value());
+    auto control_id =
+        store->create_webhook("http://127.0.0.1:1/control", "agent.registered", /*secret=*/"");
+    REQUIRE(control_id.has_value());
+
+    store->fire_event("agent.registered", R"({"k":"v"})");
+    // Synchronize on the ENABLED control webhook's delivery completing —
+    // both dispatch through the same worker pool, so once the control is
+    // done the disabled one (if it had erroneously fired) would be too.
+    auto control_deliveries = wait_for_deliveries(*store, *control_id, 1);
+    REQUIRE(control_deliveries.size() == 1);
+
+    auto disabled_deliveries = store->get_deliveries(*disabled_id, 50);
+    CHECK(disabled_deliveries.empty());
+}
+
+TEST_CASE("WebhookStore[pg]: fire_event never dispatches on an event-type mismatch",
+         "[webhook_store][pg]") {
+    // Same rationale as the disabled-webhook test above — proves the
+    // event_matches() half of the routing predicate.
+    WebhookStorePg store;
+    auto mismatched_id = store->create_webhook("http://127.0.0.1:1/mismatched",
+                                               "policy.violation", /*secret=*/"");
+    REQUIRE(mismatched_id.has_value());
+    auto control_id =
+        store->create_webhook("http://127.0.0.1:1/control", "agent.registered", /*secret=*/"");
+    REQUIRE(control_id.has_value());
+
+    store->fire_event("agent.registered", R"({"k":"v"})");
+    auto control_deliveries = wait_for_deliveries(*store, *control_id, 1);
+    REQUIRE(control_deliveries.size() == 1);
+
+    auto mismatched_deliveries = store->get_deliveries(*mismatched_id, 50);
+    CHECK(mismatched_deliveries.empty());
+}
+
 TEST_CASE("WebhookStore[pg]: a tampered secret blob is skipped, never fired unsigned",
          "[webhook_store][pg][security]") {
     WebhookStorePg store;

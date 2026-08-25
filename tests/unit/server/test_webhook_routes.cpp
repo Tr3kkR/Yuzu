@@ -25,8 +25,19 @@
  *   - DELETE 404 on missing
  *   - 403 path: perm_fn denies (both read and write routes)
  *   - 503 path: null webhook store (list/create/delete/deliveries)
- *   - failure-path audit_fn detail strings are distinct per WebhookWriteError
- *     (gov Gate 4 consistency-auditor's fix)
+ *   - the invalid_url failure-path audit_fn detail is distinct from a
+ *     store/db failure's (gov Gate 4 consistency-auditor's fix) — the
+ *     store_unavailable/db_error arms of audit_detail_for() are NOT
+ *     independently exercised here (would need a pool-exhaustion/
+ *     disconnect-mid-call fixture; gov Gate 3 quality-engineer, PR #3563
+ *     full-PR review — this file previously overclaimed full coverage of
+ *     all three WebhookWriteError arms)
+ *   - webhook.create/webhook.delete audit rows carry the URL (create:
+ *     success only; delete: a best-effort pre-delete snapshot, matching
+ *     offload_routes.cpp's "compliance F-3" precedent), and every REST
+ *     failure branch (invalid JSON, missing url, invalid_url, not-found)
+ *     is now audited, not just the success/db-error paths (gov Gate 2/4/5,
+ *     PR #3563 full-PR review)
  */
 
 #include "test_webhook_store_pg_helper.hpp"
@@ -122,6 +133,11 @@ TEST_CASE("REST webhooks[pg]: create returns 200, id, and has_secret", "[rest][w
     REQUIRE(h.audit_log.size() == 1);
     CHECK(h.audit_log[0].action == "webhook.create");
     CHECK(h.audit_log[0].result == "success");
+    // gov Gate 2 security-guardian / Gate 4 consistency-auditor (PR #3563
+    // full-PR review): the audit detail must carry the URL, not just the
+    // id — a compromise-and-cleanup attacker must not be able to erase the
+    // only durable record of where data was exfiltrated to.
+    CHECK(h.audit_log[0].detail == "https://example.com/hook");
 
     auto list_res = h.sink.Get("/api/webhooks");
     REQUIRE(list_res);
@@ -161,21 +177,37 @@ TEST_CASE("REST webhooks[pg]: POST 400 on invalid URL scheme, audits invalid_url
     CHECK(h.audit_log[0].detail == "invalid_url");
 }
 
-TEST_CASE("REST webhooks[pg]: POST 400 on missing url", "[rest][webhook][pg]") {
+TEST_CASE("REST webhooks[pg]: POST 400 on missing url, and audits it",
+         "[rest][webhook][pg]") {
+    // gov Gate 5 chaos-injector CH-3 (PR #3563 full-PR review): this
+    // branch previously skipped audit_fn entirely — an asymmetry with the
+    // invalid_url branch a few lines away, which WAS audited.
     WebhookRouteHarness h;
     auto res = h.sink.Post("/api/webhooks", R"({"event_types":"*"})");
     REQUIRE(res);
     CHECK(res->status == 400);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "webhook.create");
+    CHECK(h.audit_log[0].result == "failure");
+    CHECK(h.audit_log[0].detail == "url_required");
 }
 
-TEST_CASE("REST webhooks[pg]: POST 400 on invalid JSON", "[rest][webhook][pg]") {
+TEST_CASE("REST webhooks[pg]: POST 400 on invalid JSON, and audits it",
+         "[rest][webhook][pg]") {
+    // gov Gate 5 chaos-injector CH-3 (PR #3563 full-PR review): same
+    // asymmetry as the missing-url case above.
     WebhookRouteHarness h;
     auto res = h.sink.Post("/api/webhooks", "{not-json");
     REQUIRE(res);
     CHECK(res->status == 400);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "webhook.create");
+    CHECK(h.audit_log[0].result == "failure");
+    CHECK(h.audit_log[0].detail == "invalid_json");
 }
 
-TEST_CASE("REST webhooks[pg]: DELETE removes and audits", "[rest][webhook][pg]") {
+TEST_CASE("REST webhooks[pg]: DELETE removes and audits, carrying the pre-delete URL snapshot",
+         "[rest][webhook][pg]") {
     WebhookRouteHarness h;
     auto post = h.sink.Post("/api/webhooks", R"({"url":"https://example.com/hook"})");
     REQUIRE(post);
@@ -190,20 +222,34 @@ TEST_CASE("REST webhooks[pg]: DELETE removes and audits", "[rest][webhook][pg]")
     REQUIRE(h.audit_log.size() == 1);
     CHECK(h.audit_log[0].action == "webhook.delete");
     CHECK(h.audit_log[0].result == "success");
+    // gov Gate 2/4/5 (PR #3563 full-PR review): the pre-delete
+    // WebhookStore::get(id) snapshot must land in the audit detail — a
+    // compromise-and-cleanup attacker who deletes the webhook must not
+    // erase the only durable record of where the data was going.
+    CHECK(h.audit_log[0].detail == "https://example.com/hook");
 
-    // Second delete: 404, no audit row (matches production: the 404 branch
-    // pre-dates this migration's failure-path audit additions and was not
-    // in scope to change here).
+    // Second delete: 404, and — as of this fix round — audited too (this
+    // branch previously had no audit_fn call at all, an asymmetry with the
+    // invalid_url/store-unavailable branches that WERE audited).
     auto del2 = h.sink.Delete("/api/webhooks/" + std::to_string(id));
     REQUIRE(del2);
     CHECK(del2->status == 404);
+    REQUIRE(h.audit_log.size() == 2);
+    CHECK(h.audit_log[1].action == "webhook.delete");
+    CHECK(h.audit_log[1].result == "failure");
+    CHECK(h.audit_log[1].detail == "not_found");
 }
 
-TEST_CASE("REST webhooks[pg]: DELETE 404 on missing id", "[rest][webhook][pg]") {
+TEST_CASE("REST webhooks[pg]: DELETE 404 on missing id, and audits it",
+         "[rest][webhook][pg]") {
     WebhookRouteHarness h;
     auto res = h.sink.Delete("/api/webhooks/999999");
     REQUIRE(res);
     CHECK(res->status == 404);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "webhook.delete");
+    CHECK(h.audit_log[0].result == "failure");
+    CHECK(h.audit_log[0].detail == "not_found");
 }
 
 TEST_CASE("REST webhooks[pg]: 403 when perm_fn denies (read and write)",

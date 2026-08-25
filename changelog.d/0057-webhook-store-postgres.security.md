@@ -14,4 +14,7 @@
   `webhook_deliveries` (the delivery log carries no TTL, unlike `ResponseStore`'s skippable
   class); the legacy `webhooks.db` is retained for one release, restricted to the owner where the
   platform supports it (POSIX only — see the ADR), and moved aside — never deleted or scrubbed —
-  after a verified backfill. `GET /api/webhooks` gains a `has_secret` field.
+  after a verified backfill. `GET /api/webhooks` gains a `has_secret` field. `GET
+  /api/webhooks/{id}/deliveries`'s `?limit=` handling also changed: `limit=0` (or any
+  non-positive value) now falls back to the default of 50 rows instead of returning zero, and a
+  value above 10000 is now silently capped rather than passed through unbounded.

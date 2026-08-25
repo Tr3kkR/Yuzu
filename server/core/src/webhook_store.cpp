@@ -15,15 +15,24 @@
 #include <sqlite3.h>
 #include <yuzu/metrics.hpp>
 
+// gov Gate 3 cpp-expert (PR #3563 full-PR review): unconditional, not
+// `#else`-guarded — OpenSSL is a required dependency on every platform
+// including Windows (CLAUDE.md), and this file's OPENSSL_cleanse()/
+// sha256_hex() call sites (used unconditionally, not just inside the
+// non-Windows HMAC path) previously relied on these headers reaching
+// Windows only via httplib.h's own transitive OpenSSL include chain — an
+// accidental dependency, not a contract. Matches notification_store.cpp/
+// offload_target_store.cpp's unconditional include.
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+
 #ifdef _WIN32
 // clang-format off
 #include <windows.h>
 #include <bcrypt.h>
 // clang-format on
 #pragma comment(lib, "bcrypt.lib")
-#else
-#include <openssl/evp.h>
-#include <openssl/hmac.h>
 #endif
 
 #include <chrono>
@@ -614,6 +623,35 @@ std::optional<std::vector<Webhook>> WebhookStore::list(int limit, int offset) co
         out.push_back(std::move(w));
     }
     return out;
+}
+
+std::optional<Webhook> WebhookStore::get(int64_t id) const {
+    if (!open_)
+        return std::nullopt;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::debug("WebhookStore::get: no connection in time ({})", pool_.last_error());
+        return std::nullopt;
+    }
+    // Never selects `secret` — same rule as list().
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT id, url, event_types, has_secret, enabled, created_at "
+        "FROM webhook_store.webhooks WHERE id=$1::bigint",
+        std::vector<std::string>{std::to_string(id)});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0) {
+        if (res.status() != PGRES_TUPLES_OK)
+            spdlog::debug("WebhookStore::get: query failed: {}", PQerrorMessage(lease.get()));
+        return std::nullopt;
+    }
+    Webhook w;
+    w.id = to_i64(PQgetvalue(res.get(), 0, 0));
+    w.url = text_col(res.get(), 0, 1);
+    w.event_types = text_col(res.get(), 0, 2);
+    w.has_secret = text_col(res.get(), 0, 3) == "t";
+    w.enabled = text_col(res.get(), 0, 4) == "t";
+    w.created_at = to_i64(PQgetvalue(res.get(), 0, 5));
+    return w;
 }
 
 std::expected<bool, WebhookWriteError> WebhookStore::delete_webhook(int64_t id) {

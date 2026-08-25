@@ -149,6 +149,13 @@ public:
     /// from the plain-`false` not-found case, #3097 classification).
     [[nodiscard]] std::expected<bool, WebhookWriteError> delete_webhook(int64_t id);
 
+    /// Fetch a single webhook by id (no secret material). `nullopt` covers
+    /// both "no such id" and a degraded read — this is a pre-delete-snapshot
+    /// convenience for the REST layer's audit trail (`offload_target_store`
+    /// precedent), not itself a decision surface, so it doesn't need the
+    /// finer 404-vs-503 split `delete_webhook` has.
+    [[nodiscard]] std::optional<Webhook> get(int64_t id) const;
+
     /// Recent deliveries for a webhook, newest first. Deliberately stays a
     /// plain container (empty on error) — delivery HISTORY is an audit
     /// convenience, not itself a decision surface (mirrors
