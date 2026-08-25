@@ -111,6 +111,21 @@ constexpr size_t kMaxOutputBytes = 16 * 1024 * 1024; // 16 MiB hard output cap
 // runs with) — "/" on POSIX; on Windows, subprocess_runner.cpp maps the "/"
 // sentinel it also defaults to onto "C:\Windows\System32" for the actual
 // spawn call, so that is the literal used here rather than "/".
+//
+// BR-009 (whole-branch review): this is a DELIBERATE, operator-visible
+// compatibility break from the deleted execvp()/CreateProcessA() paths, not
+// an exact preservation of their behaviour despite resolve_executable's own
+// doc comment describing "the same relative-launch semantics" -- that
+// claim is about the RESOLUTION ALGORITHM (how a relative path/bare PATH
+// entry joins against a cwd), which is unchanged; the ANCHOR VALUE is not.
+// The deleted paths resolved a relative `command`/PATH entry against the
+// agent daemon's actual real working directory; this migration resolves it
+// against this fixed safe sentinel instead (ADR-3002 A6: never the daemon's
+// own, potentially attacker-influenced, cwd). A deployment that relied on
+// `./helper`-style relative commands from a deployment-controlled agent cwd
+// will see that command fail post-migration where it previously resolved.
+// Recorded here rather than silently inherited: see changelog.d's
+// script_exec fragment for the operator-facing note.
 #ifdef _WIN32
 constexpr const char* kRunnerDefaultCwd = "C:\\Windows\\System32";
 #else
