@@ -95,6 +95,12 @@ struct LaunchSpec {
     // Default false.
     bool inherit_parent_env = false;
 
+    // BR4-007 (whole-branch review round 4): pure passthrough of
+    // SubprocessOptions::no_window (subprocess_runner.hpp -- see that
+    // field's doc comment for the full contract). Windows-only
+    // significance; the POSIX shell never reads this field. Default false.
+    bool no_window = false;
+
     // A1/Windows: which handles the shell must mark inheritable and name in
     // PROC_THREAD_ATTRIBUTE_HANDLE_LIST -- expressed as roles rather than
     // live HANDLEs (which don't exist yet at spec-build time), so a test can
@@ -161,6 +167,14 @@ struct LaunchOptions {
     // that backend layers on top). Default false, matching
     // SubprocessOptions'.
     bool inherit_parent_env = false;
+
+    // BR4-007 (whole-branch review round 4): mirror of
+    // SubprocessOptions::no_window (subprocess_runner.hpp). Pure
+    // PASSTHROUGH only, like inherit_parent_env above -- build_launch_spec()
+    // copies it onto LaunchSpec unchanged; the Windows OS shell in
+    // subprocess_runner.cpp is what actually ORs CREATE_NO_WINDOW into its
+    // create_flags when set. Default false.
+    bool no_window = false;
 };
 
 /** The bare outcome a Spawner reports for a LaunchSpec. Deliberately minimal
@@ -577,6 +591,7 @@ inline LaunchSpec build_launch_spec(const std::vector<std::string>& argv, const 
     spec.rlimits = opts.rlimits;
     spec.exec_verify = opts.exec_verify;
     spec.inherit_parent_env = opts.inherit_parent_env; // pure passthrough -- see field comment
+    spec.no_window = opts.no_window; // pure passthrough -- see field comment (BR4-007)
 
     // The per-OS allow-list lives in the pure, host-testable
     // default_launch_env(); extra_env (already validated above -- nothing
