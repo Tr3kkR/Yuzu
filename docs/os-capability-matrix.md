@@ -630,8 +630,8 @@ implementation is.
 | tar | query | linux | supported | 1 | sqlite | - |
 | tar | query | macos | supported | 1 | sqlite | - |
 | tar | query | windows | supported | 1 | sqlite | - |
-| tar | snapshot | linux | constrained | 3 | procfs+systemctl+dpkg_rpm(planned) | software inventory collection is PLANNED (dpkg/rpm not yet wired) on Linux; service enumeration shells out via popen(systemctl) |
-| tar | snapshot | macos | constrained | 3 | endpoint_security+nstat+launchctl+pkgutil(planned) | software and mapdrive collection are PLANNED on macOS; service enumeration shells out via popen(launchctl); process/tcp fall back to a poll without the Endpoint Security entitlement or nstat root privilege |
+| tar | snapshot | linux | constrained | 2 | procfs+systemctl+dpkg_rpm(planned) | software inventory collection is PLANNED (dpkg/rpm not yet wired) on Linux; service enumeration runs bounded argv (rung 2) via the shared subprocess runner |
+| tar | snapshot | macos | constrained | 2 | endpoint_security+nstat+launchctl+getfsstat+pkgutil(planned) | software collection is PLANNED on macOS; mapdrive is wired but outbound-live-only (getfsstat, no username, no inbound, no history); service enumeration runs bounded argv (rung 2) via the shared subprocess runner; process/tcp fall back to a poll without the Endpoint Security entitlement or nstat root privilege |
 | tar | snapshot | windows | supported | 1 | etw+iphlpapi+scm+wts+wnet+wevtapi+registry | - |
 | tar | export | linux | supported | 1 | sqlite | - |
 | tar | export | macos | supported | 1 | sqlite | - |
@@ -639,11 +639,11 @@ implementation is.
 | tar | configure | linux | supported | 1 | sqlite | - |
 | tar | configure | macos | supported | 1 | sqlite | - |
 | tar | configure | windows | supported | 1 | sqlite | - |
-| tar | collect_fast | linux | constrained | 1 | procfs | arp/dns opt-in sub-sources are PLANNED (no-op) on Linux; core process/network/netqual collection is native |
-| tar | collect_fast | macos | constrained | 1 | endpoint_security+nstat | process/tcp fall back to a KERN_PROC_ALL/proc_pidfdinfo poll without the Endpoint Security entitlement or nstat root privilege; arp/dns opt-in sub-sources are PLANNED (no-op) on macOS |
+| tar | collect_fast | linux | constrained | 1 | procfs | dns opt-in sub-source is PLANNED (no-op) on Linux; arp opt-in sub-source is native (procfs, /proc/net/arp); core process/network/netqual collection is native |
+| tar | collect_fast | macos | constrained | 1 | endpoint_security+nstat+route_sysctl | process/tcp fall back to a KERN_PROC_ALL/proc_pidfdinfo poll without the Endpoint Security entitlement or nstat root privilege; dns opt-in sub-source is PLANNED (no-op) on macOS; arp opt-in sub-source is native but constrained (route_sysctl, entry_type always 'unknown') |
 | tar | collect_fast | windows | supported | 1 | etw+iphlpapi | - |
-| tar | collect_slow | linux | constrained | 3 | systemctl+utmp | service enumeration shells out via popen(systemctl); startup_type reads 'unknown'; netconn opt-in source is PLANNED (no-op) on Linux |
-| tar | collect_slow | macos | constrained | 3 | launchctl+utmpx | service enumeration shells out via popen(launchctl); no startup_type; mapdrive and netconn opt-in sources are PLANNED (no-op) on macOS |
+| tar | collect_slow | linux | constrained | 2 | systemctl+utmp | service enumeration runs bounded argv (rung 2) via the shared subprocess runner; startup_type reads 'unknown'; netconn opt-in source is PLANNED (no-op) on Linux |
+| tar | collect_slow | macos | constrained | 2 | launchctl+utmpx+getfsstat | service enumeration runs bounded argv (rung 2) via the shared subprocess runner; no startup_type; mapdrive opt-in source is wired but outbound-live-only (getfsstat, no username, no inbound, no history); netconn opt-in source is PLANNED (no-op) on macOS |
 | tar | collect_slow | windows | supported | 1 | scm+wts+wnet+wevtapi | - |
 | tar | collect_perf | linux | supported | 1 | procfs | - |
 | tar | collect_perf | macos | planned | 1 | host_statistics | - |
