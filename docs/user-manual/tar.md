@@ -602,8 +602,9 @@ condition clears.
 > empty until you opt in. **ARP now collects on Windows, Linux, and macOS as of
 > this release** (previously Windows-only) — if you already set
 > `arp_enabled=true` fleet-wide (e.g. while only Windows agents could collect),
-> upgrading Linux/macOS agents starts them collecting neighbour IP/MAC/interface
-> records at the next `fast_interval` tick, with no separate notice. Set
+> upgrading Linux/macOS agents starts them collecting neighbour IP/MAC records
+> (plus interface on Linux; macOS has no interface field) at the next
+> `fast_interval` tick, with no separate notice. Set
 > `arp_enabled=false` before upgrading any endpoint where that new collection
 > is not yet approved, then re-enable once it is. DNS remains Windows-only, so
 > there is no DNS collection change on upgrade. **GUI note:** after enabling a source
