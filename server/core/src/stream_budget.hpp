@@ -342,10 +342,15 @@ public:
     /// predicate closes an idle stream within one tick, with no new
     /// cv-plumbing. NOT wired into the MCP GET/streamed-POST surfaces
     /// (`McpStreamPump`'s teardown is driven by `session_alive_`/session-
-    /// registry revalidation, a materially different mechanism) — an open
-    /// MCP stream still relies on the bounded web-thread join + escalation
-    /// in `ServerImpl::stop()` as its backstop. Tracked as a named follow-up
-    /// (#2371 comment, 2026-08-11), not silently left uncovered.
+    /// registry revalidation, a materially different mechanism) — those are
+    /// instead close-signalled via `McpSessionRegistry::shutdown()`, called
+    /// from `ServerImpl::stop()` alongside this flag (#3042): a GET pump has
+    /// its own sink in the closed session's state, so it gets a genuine wake;
+    /// a streamed-POST pump's sink is separate and untouched by that close
+    /// call, so it only notices on its own next `session_alive_()` tick. A
+    /// stream stuck mid-write (neither a wake nor a poll reaches a pump that
+    /// isn't waiting) still falls back on the bounded web-thread join +
+    /// `_Exit` escalation in `ServerImpl::stop()`.
     void begin_closing() { closing_.store(true, std::memory_order_release); }
     bool closing() const { return closing_.load(std::memory_order_acquire); }
 
