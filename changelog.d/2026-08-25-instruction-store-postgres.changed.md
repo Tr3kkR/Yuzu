@@ -1,7 +1,10 @@
 - **`InstructionStore` migrated from SQLite to PostgreSQL** (schema `instruction_store`,
   ADR-0058). No legacy-SQLite backfill (ADR-0009's fresh-start-by-default class): the
-  pre-migration `instructions.db` is never read; the bundled catalog reseeds fresh on first
-  boot and operator-authored content must be re-created via the normal API. `create_definition`/
+  pre-migration `instructions.db` is never read; the bundled catalog reseeds on every boot and
+  operator-authored content must be re-created via the normal API. A genuine database error
+  partway through the boot-time bundled-content reseed now refuses to start the server (was:
+  silently served a partial catalog) — a new `yuzu_server_instruction_bundled_content_total{result}`
+  metric plus a matching alert rule cover this. `create_definition`/
   `update_definition`/`create_set`/`import_definition_json`/`import_definition_json_trusted`/
   `query_definitions`/`get_definition`/`list_sets`/`delete_definition`/`delete_set`/
   `export_definition_json` are all typed `std::expected`, so a genuine database or lease
