@@ -331,13 +331,55 @@ TEST_CASE("mapdrive dedup_history: collapses by identity, keeps earliest non-zer
 // particular out-of-the-box macOS install mounts (a `csrutil`-sealed system
 // volume splits into more apfs rows than a stock install — /, VM, Preboot,
 // xarts, iSCPreboot, Hardware, Update, Data — plus devfs and the auto_home
-// autofs map), none of them network. No smbfs/nfs/afpfs/webdav mount was
-// reachable on that host to capture live (no network share was mounted at
-// capture time), so those rows instead cite the device-string syntax
-// mount_smbfs(8)/mount_nfs(8)/mount_afp(8) document (`//host/share`,
-// `host:/export`, `afp://host/share`) — a documented format, not a live
-// network capture; recorded here as exactly that, not represented as a
-// live capture.
+// autofs map), none of them network.
+//
+// BR-004 remediation: the network-fstype rows below are now REAL getfsstat(2)
+// captures too, taken on this same host on 2026-08-25 against locally-hosted
+// SMB/NFS/AFP servers rather than transcribed from mount(8) manual-page
+// syntax (a manual page documents accepted CLIENT input syntax, not what the
+// kernel actually returns in f_mntfromname):
+//
+//   - smbfs: `dperson/samba` (Alpine, Samba 4.13.7) in Docker, published on
+//     127.0.0.1:445, one share `public` with user `alice`; mounted via
+//     `mount_smbfs "//alice:alicepass@127.0.0.1/public" <dir>` (exit 0).
+//     getfsstat returned f_fstypename="smbfs",
+//     f_mntfromname="//alice@127.0.0.1/public" — confirms the credentialed
+//     form (username embedded ahead of the host, password never present)
+//     that remote_host_of's userinfo-stripping path (and BR-003) depend on.
+//   - nfs: `itsthenetwork/nfs-server-alpine` in Docker exporting /nfsshare
+//     with `fsid=0` (NFSv4 pseudo-root); mounted via
+//     `mount_nfs -o vers=4,tcp 127.0.0.1:/ <dir>` (exit 0). getfsstat
+//     returned f_fstypename="nfs", f_mntfromname="127.0.0.1:/" — the
+//     `host:/path` colon form remote_host_of's user@host:/path branch parses.
+//   - afpfs: `cptactionhank/netatalk` in Docker, published on 127.0.0.1:1548,
+//     one share `Share` with user `alice`; mounted via
+//     `mount_afp "afp://alice:alicepass@127.0.0.1:1548/Share" <dir>`
+//     (exit 0, with the macOS "AFP client is deprecated" warning — the
+//     protocol still works today, which is why this repo still ships an AFP
+//     leg). getfsstat returned f_fstypename="afpfs",
+//     f_mntfromname="//alice@127.0.0.1:1548/Share" — an AFP mount surfaces
+//     through getfsstat as a UNC-shaped string (not an `afp://` URI, contra
+//     the previous synthetic fixture), with the credentialed username ahead
+//     of a host:port pair.
+//
+// webdav was ATTEMPTED (bytemark/webdav and hacdias/webdav in Docker, both
+// reachable and PROPFIND-verified via curl) but never captured: macOS's
+// mount_webdav(8) requires an interactive Keychain/GUI authentication step
+// (even with -S/-i and a pre-seeded `security add-internet-password` entry)
+// that this non-interactive session cannot satisfy — every attempt hung
+// waiting on that prompt rather than failing cleanly. Per this remediation's
+// instructions, the synthetic webdav row is DELETED rather than kept
+// invented; classify_macos_mounts's "webdav" -> "WebDAV" mapping itself is
+// untouched (unreachable by any test here now) and remains to be verified
+// against a real capture in a follow-up that has an interactive macOS
+// session available.
+//
+// The "cifs" row is kept as a clearly-separate, explicitly-labeled defensive
+// case below (NOT represented as a live capture) — macOS's own SMB client
+// always reports f_fstypename="smbfs" via smbfs.kext, never "cifs" (that
+// name is the Linux kernel module's); classify_macos_mounts's "cifs" branch
+// only exists in case a third-party FUSE-based CIFS client ever reports the
+// Linux-style name, so a real macOS getfsstat capture cannot exercise it.
 
 TEST_CASE("mapdrive classify_macos_mounts: real local-fstype capture is entirely filtered",
           "[tar][mapdrive][macos][parse]") {
@@ -365,19 +407,17 @@ TEST_CASE("mapdrive classify_macos_mounts: real local-fstype capture is entirely
 TEST_CASE("mapdrive classify_macos_mounts: network fstypes populate the full MapDriveEntry "
           "contract",
           "[tar][mapdrive][macos][parse]") {
-    // Transcribed device-string shapes (see provenance note above) — no live
-    // smbfs/nfs/afpfs/webdav mount was available to capture on the test host.
-    // Row 0 embeds a username ahead of the host (`//alice@fileserver/...`),
-    // the credentialed-UNC form mount_smbfs(8) documents, to exercise the
-    // user-info-stripping path (matches remote_host_of's fix for B2-001:
-    // a credentialed UNC or URI authority must yield the bare host, not the
-    // embedded username).
+    // Real getfsstat(2) captures (see provenance note above) — smbfs/nfs/afpfs
+    // against locally-hosted Docker SMB/NFS/AFP servers on 2026-08-25. Row 0's
+    // embedded username (`//alice@127.0.0.1/public`) is exactly what a real
+    // credentialed SMB mount surfaces via f_mntfromname, exercising the
+    // user-info-stripping path (matches remote_host_of's fix for B2-001: a
+    // credentialed UNC or URI authority must yield the bare host, not the
+    // embedded username) against a genuine, not invented, value.
     std::vector<MacMountRec> mounts = {
-        {"smbfs", "//alice@fileserver/public", "/Volumes/public"},
-        {"cifs", "//nas.example.com/backup", "/Volumes/backup"},
-        {"nfs", "nfshost:/export/home", "/Volumes/home"},
-        {"afpfs", "afp://afpserver/shared", "/Volumes/shared"},
-        {"webdav", "https://dav.example.com/files", "/Volumes/files"},
+        {"smbfs", "//alice@127.0.0.1/public", "/Volumes/public"},
+        {"nfs", "127.0.0.1:/", "/Volumes/export"},
+        {"afpfs", "//alice@127.0.0.1:1548/Share", "/Volumes/shared"},
         {"apfs", "/dev/disk3s5", "/System/Volumes/Data"}, // still dropped even mixed in
     };
     // Fixture-equivalent host resolver (the collector injects the real
@@ -404,42 +444,46 @@ TEST_CASE("mapdrive classify_macos_mounts: network fstypes populate the full Map
         return {};
     };
     auto out = classify_macos_mounts(mounts, resolve_host);
-    REQUIRE(out.size() == 5); // the apfs row is dropped
+    REQUIRE(out.size() == 3); // the apfs row is dropped
 
     CHECK(out[0].direction == "outbound");
     CHECK(out[0].local_mount == "/Volumes/public");
-    CHECK(out[0].remote_path == "//alice@fileserver/public");
-    CHECK(out[0].remote_host == "fileserver"); // username stripped
+    CHECK(out[0].remote_path == "//alice@127.0.0.1/public"); // raw f_mntfromname, userinfo intact (BR-003)
+    CHECK(out[0].remote_host == "127.0.0.1"); // username stripped
     CHECK(out[0].username == ""); // unavailable via getfsstat, like the Linux leg
     CHECK(out[0].provider == "SMB");
 
     CHECK(out[1].direction == "outbound");
-    CHECK(out[1].local_mount == "/Volumes/backup");
-    CHECK(out[1].remote_path == "//nas.example.com/backup");
-    CHECK(out[1].remote_host == "nas.example.com");
+    CHECK(out[1].local_mount == "/Volumes/export");
+    CHECK(out[1].remote_path == "127.0.0.1:/");
+    CHECK(out[1].remote_host == "127.0.0.1");
     CHECK(out[1].username == "");
-    CHECK(out[1].provider == "SMB"); // cifs maps to SMB same as smbfs
+    CHECK(out[1].provider == "NFS");
 
     CHECK(out[2].direction == "outbound");
-    CHECK(out[2].local_mount == "/Volumes/home");
-    CHECK(out[2].remote_path == "nfshost:/export/home");
-    CHECK(out[2].remote_host == "nfshost");
+    CHECK(out[2].local_mount == "/Volumes/shared");
+    CHECK(out[2].remote_path == "//alice@127.0.0.1:1548/Share"); // raw f_mntfromname, userinfo intact
+    CHECK(out[2].remote_host == "127.0.0.1:1548"); // username stripped, host:port kept
     CHECK(out[2].username == "");
-    CHECK(out[2].provider == "NFS");
+    CHECK(out[2].provider == "AFP");
+}
 
-    CHECK(out[3].direction == "outbound");
-    CHECK(out[3].local_mount == "/Volumes/shared");
-    CHECK(out[3].remote_path == "afp://afpserver/shared");
-    CHECK(out[3].remote_host == "afpserver");
-    CHECK(out[3].username == "");
-    CHECK(out[3].provider == "AFP");
-
-    CHECK(out[4].direction == "outbound");
-    CHECK(out[4].local_mount == "/Volumes/files");
-    CHECK(out[4].remote_path == "https://dav.example.com/files");
-    CHECK(out[4].remote_host == "dav.example.com");
-    CHECK(out[4].username == "");
-    CHECK(out[4].provider == "WebDAV");
+TEST_CASE("mapdrive classify_macos_mounts: cifs fstype maps to SMB (defensive, not a live capture)",
+          "[tar][mapdrive][macos][parse]") {
+    // NOT a getfsstat capture — macOS's own SMB client always reports
+    // f_fstypename="smbfs" (see provenance note above); this only exercises
+    // classify_macos_mounts's defensive alias for a third-party FUSE-based
+    // CIFS client that might report the Linux-style fstype name.
+    std::vector<MacMountRec> mounts = {
+        {"cifs", "//nas.example.com/backup", "/Volumes/backup"},
+    };
+    auto resolve_host = [](const std::string& from) -> std::string {
+        auto rest = from.substr(2);
+        return rest.substr(0, rest.find('/'));
+    };
+    auto out = classify_macos_mounts(mounts, resolve_host);
+    REQUIRE(out.size() == 1);
+    CHECK(out[0].provider == "SMB"); // cifs maps to SMB same as smbfs
 }
 
 // remote_host_of itself (tar_mapdrive_collector.cpp) is anonymous-namespace
