@@ -560,7 +560,7 @@ implementation is.
 | software_actions | list_upgradable | windows | constrained | 2 | winget via bounded argv runner | winget App-Execution-Alias may be unavailable to the agent service context; reports an honest empty/unavailable result |
 | software_actions | installed_count | linux | supported | 2 | dpkg-query/rpm via bounded argv runner | - |
 | software_actions | installed_count | macos | supported | 2 | pkgutil --pkgs via bounded argv runner | - |
-| software_actions | installed_count | windows | supported | 1 | native Reg*W subkey count of the Uninstall key | - |
+| software_actions | installed_count | windows | supported | 1 | native Reg*W subkey count of the Uninstall key | default (64-bit) registry view only; 32-bit apps under WOW6432Node are not counted |
 | status | version | linux | supported | 1 | in-process (compiled version constants) | - |
 | status | version | macos | supported | 1 | in-process (compiled version constants) | - |
 | status | version | windows | supported | 1 | in-process (compiled version constants) | - |

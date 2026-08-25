@@ -537,7 +537,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
      /* macos   = */
      {YUZU_SUPPORT_SUPPORTED, 2, "pkgutil --pkgs via bounded argv runner", nullptr},
      /* windows = */
-     {YUZU_SUPPORT_SUPPORTED, 1, "native Reg*W subkey count of the Uninstall key", nullptr}},
+     {YUZU_SUPPORT_SUPPORTED, 1, "native Reg*W subkey count of the Uninstall key",
+      "reads only the default (64-bit) registry view, matching the powershell payload it "
+      "replaced; 32-bit applications registered under WOW6432Node are not counted"}},
 };
 
 } // namespace
@@ -545,7 +547,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
 class SoftwareActionsPlugin final : public yuzu::Plugin {
 public:
     std::string_view name() const noexcept override { return "software_actions"; }
-    std::string_view version() const noexcept override { return "1.0.0"; }
+    std::string_view version() const noexcept override { return "1.1.0"; }
     std::string_view description() const noexcept override {
         return "Lists upgradable packages and counts installed software";
     }
