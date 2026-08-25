@@ -921,10 +921,14 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "-u smbd fallback."},
                 {"macos",   OsSupportStatus::kSupportedConstrained, "getfsstat",
                  "Outbound live only: getfsstat(2) mount table filtered to "
-                 "network fstypes {nfs, smbfs, cifs, afpfs, webdav}; username "
-                 "unavailable (getfsstat exposes no credential). No inbound "
-                 "(no smbutil integration) and no history (getfsstat exposes "
-                 "only the current mount table, nothing historical) — "
+                 "network fstypes {nfs, smbfs, cifs, afpfs, webdav}. The dedicated "
+                 "username column is always blank (getfsstat exposes no separate "
+                 "credential field) — but unlike Linux's /proc/mounts, a "
+                 "credentialed SMB mount source (e.g. //alice@host/share) is "
+                 "surfaced VERBATIM in remote_path, so the account name is still "
+                 "observable there even though the username column is empty. No "
+                 "inbound (no smbutil integration) and no history (getfsstat "
+                 "exposes only the current mount table, nothing historical) — "
                  "honestly out of reach for an unprivileged agent."},
             },
             .granularities = {
