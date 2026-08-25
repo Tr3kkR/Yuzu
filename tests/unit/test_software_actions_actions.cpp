@@ -23,6 +23,7 @@
 #include "local_dispatcher.hpp"
 
 #include <cctype>
+#include <charconv>
 #include <cstdlib>
 #include <filesystem>
 #include <optional>
@@ -122,8 +123,18 @@ TEST_CASE("software_actions plugin: installed_count reports a real digit count v
     }
     // Any dev or CI host has dpkg/rpm/pkgutil records. Without this the case
     // is satisfied by `count|0` -- the exact fabricated zero the degrade paths
-    // were changed to stop emitting.
-    CHECK(std::stoll(rest) > 0);
+    // were changed to stop emitting. Non-default-config assumption: today's
+    // CI runners (GH-hosted, self-hosted Big Tam/Wee Tam) are full OS
+    // installs, so this holds; it would need revisiting against a genuinely
+    // minimal/containerized image with zero installed-software records.
+    // std::from_chars rather than std::stoll: it does not throw, so a
+    // non-digit capture (the isdigit loop above having already failed) still
+    // fails via a clean REQUIRE rather than an uncaught-exception diagnostic
+    // that points at the wrong line.
+    long long count = 0;
+    auto [ptr, ec] = std::from_chars(rest.data(), rest.data() + rest.size(), count);
+    REQUIRE(ec == std::errc{});
+    CHECK(count > 0);
 }
 
 #else // _WIN32
@@ -160,8 +171,17 @@ TEST_CASE("software_actions plugin: installed_count reads the Uninstall key nati
     }
     // A real Windows host always has Uninstall subkeys. A zero here would mean
     // the native read silently returned nothing -- the fabricated-zero shape
-    // this plugin's degrade path was changed to avoid.
-    CHECK(std::stoll(rest) > 0);
+    // this plugin's degrade path was changed to avoid. Non-default-config
+    // assumption: today's runners (GH-hosted windows-latest, self-hosted Wee
+    // Tam) are full OS installs, so this holds; it would need revisiting
+    // against a genuinely minimal/containerized Windows image.
+    // std::from_chars rather than std::stoll: it does not throw, so a
+    // non-digit capture (the isdigit loop above having already failed) still
+    // fails via a clean REQUIRE rather than an uncaught-exception diagnostic.
+    long long count = 0;
+    auto [ptr, ec] = std::from_chars(rest.data(), rest.data() + rest.size(), count);
+    REQUIRE(ec == std::errc{});
+    CHECK(count > 0);
 }
 
 #endif // _WIN32

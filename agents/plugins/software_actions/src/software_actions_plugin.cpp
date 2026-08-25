@@ -215,16 +215,11 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               "software_actions:winget_header_unrecognized");
     }
-    if (res.exit_code != 0 && !parsed.rows.empty()) {
-        // winget exited nonzero but the table still parsed rows -- e.g. one
-        // configured source (`msstore`) is unreachable while winget still
-        // prints what it could reach from the others, and still exits
-        // nonzero for the source it couldn't reach. capture_usable()
-        // deliberately does not gate on the exit code at all (a documented
-        // nonzero covers several benign states), so nothing else catches
-        // this: without this check the caller derives "ok" from an
-        // undeclared status, and a short upgrade list is indistinguishable
-        // from a complete one.
+    if (yuzu::software_actions::nonzero_exit_with_partial_rows(res.exit_code,
+                                                               parsed.rows.empty())) {
+        // See nonzero_exit_with_partial_rows()'s doc comment: winget exited
+        // nonzero but the table still parsed rows, so the caller must not
+        // derive "ok" from an undeclared status.
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               "software_actions:winget_partial_exit");
     }
@@ -345,15 +340,39 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
     // software_actions/list_upgradable_macos#1 (docs/agent-spawn-sink-manifest.md)
     auto res = yuzu::agent::run_bounded_subprocess(
         {tool, "-l"}, yuzu::agent::SubprocessOptions{.deadline = kSlowToolDeadline});
-    // The exit-code check sits ABOVE the parse deliberately. Below it, a
-    // failing run whose diagnostic text happened to parse as an entry would be
-    // emitted as a package name -- `upgradable|<diagnostic>|-|-` at rc 0.
-    if (!capture_usable(res, res.exit_code == 0)) {
+    // The exit code is deliberately NOT part of the capture-usability test:
+    // softwareupdate -l has been observed to exit nonzero on some macOS
+    // releases while still printing a valid, parseable table (the sibling
+    // windows_updates_plugin.cpp's do_missing() makes the identical choice
+    // for this exact tool, deliberately excluding exit_code from ITS
+    // capture-usability test, for the same reason). Gating the WHOLE capture
+    // on exit_code would discard real pending-update data whenever that
+    // happens. The misparse concern an earlier version of this function
+    // guarded against by gating here -- a failing run's diagnostic text
+    // getting emitted as a package name -- is independently closed by
+    // parse_softwareupdate_list's own shape rule below (an entry must carry
+    // the "*" marker or a Label: field; a diagnostic line can no longer be
+    // emitted as a package name), so the exit code doesn't need to gate the
+    // capture to prevent that.
+    if (!capture_usable(res, /*exit_ok=*/true)) {
         degrade(ctx, res, "software_actions:softwareupdate_failed");
         return 1;
     }
     auto labels = yuzu::software_actions::parse_softwareupdate_list(res.output);
+    if (yuzu::software_actions::nonzero_exit_with_partial_rows(res.exit_code, labels.empty())) {
+        // Nonzero exit but real labels parsed -- report the partial rather
+        // than either trusting it as fully clean or (the bug this replaces)
+        // discarding real data by failing capture_usable outright.
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "software_actions:softwareupdate_partial_exit");
+    }
     if (labels.empty()) {
+        if (res.exit_code != 0) {
+            // Nothing parsed AND a failing exit: no basis to claim this host
+            // is up to date.
+            degrade(ctx, res, "software_actions:softwareupdate_failed");
+            return 1;
+        }
         ctx.write_output("upgradable|none|System is up to date|-");
         return 0;
     }

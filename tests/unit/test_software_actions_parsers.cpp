@@ -382,6 +382,28 @@ TEST_CASE("yum check-update: exit-code decision — 0 and 100 are BOTH success, 
     CHECK_FALSE(yum_checkupdate_is_success(127));
 }
 
+// ── nonzero-exit-with-partial-rows (pure decision seam, shared by winget and
+// softwareupdate -l) ─────────────────────────────────────────────────────
+
+TEST_CASE("nonzero_exit_with_partial_rows: all four truth-table cells",
+          "[software_actions]") {
+    // THE regression this function exists to prevent, on both call sites:
+    // winget exited nonzero (e.g. one configured source like msstore is
+    // unreachable) but still printed rows from the sources it could reach,
+    // or softwareupdate -l exited nonzero on some macOS release while still
+    // printing a valid table -- either way the plugin must not emit those
+    // rows with no status set, indistinguishable from a complete result.
+    CHECK(nonzero_exit_with_partial_rows(/*exit_code=*/1, /*rows_empty=*/false));
+
+    // A clean exit is never "partial", however many rows parsed.
+    CHECK_FALSE(nonzero_exit_with_partial_rows(0, false));
+    CHECK_FALSE(nonzero_exit_with_partial_rows(0, true));
+    // A nonzero exit with NO rows parsed is the "the query failed" case,
+    // handled separately by each call site (an exit_code != 0 branch below
+    // the parse) -- not partial, since there is nothing partial to report.
+    CHECK_FALSE(nonzero_exit_with_partial_rows(1, true));
+}
+
 // ── macOS: softwareupdate -l ────────────────────────────────────────────────
 
 TEST_CASE("softwareupdate -l: one pending update — REAL capture from this host",

@@ -199,12 +199,16 @@ void run_pkg_metadata_surface(ProbeHost& host, std::vector<LicRecord>& records,
 // ── entitlement_certs (surface table Linux row 2; authoritative) ───────────
 
 // Aggregate wall-clock budget for the WHOLE per-cert loop below, not the
-// per-openssl-run deadline (20s, unnamed at each run_argv call). Each cert
-// can cost up to two 20s openssl runs (the -dateopt fallback), so an
-// unbounded loop over a directory with many certs -- 512 x 2 x 20s is
-// several hours -- could pin the instruction worker on a single
-// entitlement_certs call. Strictly better than the pre-migration unbounded
-// popen this replaced (no budget at all), but cheap enough to add here too.
+// per-openssl-run deadline (20s, unnamed at each run_argv call). This is a
+// START-GATE checked before each iteration, not a hard cap on the loop's
+// total cost: an iteration already admitted can still run up to two 20s
+// openssl runs (the -dateopt fallback) before the NEXT admission check, so
+// the loop's real worst case is this budget plus one cert's cost -- up to
+// ~100s, not 60s. Still bounds what would otherwise be unbounded: a
+// directory with many certs -- 512 x 2 x 20s is several hours -- could pin
+// the instruction worker on a single entitlement_certs call without it.
+// Strictly better than the pre-migration unbounded popen this replaced (no
+// budget at all), but cheap enough to add here too.
 constexpr std::chrono::seconds kEntitlementCertsScanBudget{60};
 
 void run_entitlement_certs_surface(ProbeHost& host, std::vector<LicRecord>& records,
@@ -280,23 +284,9 @@ void run_entitlement_certs_surface(ProbeHost& host, std::vector<LicRecord>& reco
         ++emitted;
     }
 
-    if (budget_exhausted) {
-        // The scan stopped early with certs left unexamined -- never report
-        // this as clean, whatever was or wasn't parsed before the deadline.
-        outcomes.push_back({"entitlement_certs", false, emitted, "cert_scan_budget_exhausted"});
-    } else if (emitted == 0 && any_parse_failure) {
-        // Every discovered cert failed to parse -- total failure, not partial.
-        outcomes.push_back({"entitlement_certs", false, 0, "cert_parse_failed"});
-    } else if (any_parse_failure) {
-        // At least one cert parsed AND at least one failed. Reporting this as
-        // a clean success (the prior behaviour: any_parse_failure was only
-        // checked when emitted == 0) makes the unreadable cert vanish from an
-        // authoritative compliance surface -- a lapsed or corrupt entitlement
-        // silently drops out of the record instead of surfacing as a gap.
-        outcomes.push_back({"entitlement_certs", false, emitted, "cert_parse_partial"});
-    } else {
-        outcomes.push_back({"entitlement_certs", true, emitted, {}});
-    }
+    // See entitlement_certs_outcome()'s doc comment (licensing_parsers.hpp)
+    // for the honest-degrade invariants this classification encodes.
+    outcomes.push_back(entitlement_certs_outcome(budget_exhausted, emitted, any_parse_failure));
 }
 
 } // namespace

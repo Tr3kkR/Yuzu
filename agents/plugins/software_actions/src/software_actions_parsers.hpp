@@ -11,7 +11,12 @@
  *
  * Every emit string these feed stays byte-compatible with the plugin's
  * pre-migration `upgradable|...`/`count|N` output contract — only the
- * acquisition mechanism (popen -> bounded argv runner) changed.
+ * acquisition mechanism (popen -> bounded argv runner) changed. ONE
+ * disclosed exception: Linux `installed_count` widened from the pre-
+ * migration `dpkg --list | grep '^ii'` (installed-only) to also count `hi`
+ * (installed, held) via count_dpkg_status_abbrev_installed below, matching
+ * installed_apps' convention — a genuine value-level change, called out in
+ * this branch's changelog, not a silent contract break.
  */
 
 #include <cstddef>
@@ -342,6 +347,27 @@ struct YumUpgradeRow {
     return exit_code == 0 || exit_code == 100;
 }
 
+/// Nonzero-exit-with-partial-data decision, shared by every list_upgradable
+/// leg whose tool can exit nonzero while still printing usable data: true
+/// when the tool exited nonzero but SOMETHING still parsed. Two call sites --
+///   - winget (Windows): one configured source (`msstore`) is unreachable
+///     while winget still prints what it could reach from the others, and
+///     still exits nonzero for the source it couldn't reach.
+///   - softwareupdate -l (macOS): observed to exit nonzero on some macOS
+///     releases while still printing a valid, parseable table (the sibling
+///     windows_updates_plugin.cpp's do_missing() makes the identical choice
+///     for this exact tool, deliberately excluding exit_code from ITS
+///     capture-usability test, for the same reason).
+/// In both cases `capture_usable()` deliberately does not gate on the exit
+/// code at all, so nothing else catches this: without this check, a caller
+/// derives "ok" from an undeclared status, and a short/partial result is
+/// indistinguishable from a complete one. Pure decision, tested directly
+/// here rather than only through a real subprocess (this repo's test suite
+/// deliberately never dispatches list_upgradable from a unit test).
+[[nodiscard]] constexpr bool nonzero_exit_with_partial_rows(int exit_code, bool rows_empty) {
+    return exit_code != 0 && !rows_empty;
+}
+
 /// Parse `yum check-update` / `dnf check-update` output: "package.arch
 /// new_version repo" per line, "Loaded"/"Loading"/"Last metadata" banner
 /// lines skipped.
@@ -431,10 +457,13 @@ struct YumUpgradeRow {
 // ── Linux: dpkg-query status-abbrev count ──────────────────────────────────
 
 /// Count lines from `dpkg-query -W -f='${db:Status-Abbrev}\n'` output whose
-/// 2nd character is 'i' — matches the repo's installed-and-held filter
-/// convention (installed_apps_inventory.hpp's parse_dpkg_inv_line / vuln_scan's
-/// vuln_identity.hpp): "ii" (want=install) and "hi" (want=hold) count, "rc"
-/// (removed) and "un" (unknown) do not.
+/// 2nd character is 'i' — matches installed_apps_inventory.hpp's
+/// parse_dpkg_inv_line: "ii" (want=install) and "hi" (want=hold) count, "rc"
+/// (removed) and "un" (unknown) do not. NOT vuln_scan_plugin.cpp's own dpkg
+/// query, which filters on the opposite convention (a `${Status}` ==
+/// "install ok installed" substring match, excluding held packages) — a
+/// pre-existing inconsistency between vuln_scan and its inventory sibling,
+/// not something this file follows.
 [[nodiscard]] inline std::size_t count_dpkg_status_abbrev_installed(std::string_view output) {
     std::size_t count = 0;
     for (const auto& line : detail::split_nonblank_lines(output)) {
