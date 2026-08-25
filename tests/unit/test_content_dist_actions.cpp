@@ -111,10 +111,11 @@ std::optional<LoadedPlugin> load_content_dist_plugin() {
 TEST_CASE("content_dist plugin: execute_staged rejects a missing filename parameter",
           "[agent][content_dist][posix_actions]") {
     auto plugin = load_content_dist_plugin();
-    if (!plugin) {
-        WARN("content_dist plugin library not found -- skipping LocalDispatcher round-trip test");
-        return;
-    }
+    // Hard failure, not WARN-and-skip: the plugin build is guaranteed
+    // ordered ahead of this test (tests/meson.build link_depends), so its
+    // absence is a real regression this test exists to catch, not a
+    // benign "plugin not built this configuration" case (BR-005).
+    REQUIRE(plugin.has_value());
 
     yuzu::agent::LocalDispatcher dispatcher;
     // No "filename" param at all -- exercises do_execute's first guard,
@@ -128,10 +129,11 @@ TEST_CASE("content_dist plugin: execute_staged rejects a missing filename parame
 TEST_CASE("content_dist plugin: execute_staged rejects an unsafe filename",
           "[agent][content_dist][posix_actions]") {
     auto plugin = load_content_dist_plugin();
-    if (!plugin) {
-        WARN("content_dist plugin library not found -- skipping");
-        return;
-    }
+    // Hard failure, not WARN-and-skip: the plugin build is guaranteed
+    // ordered ahead of this test (tests/meson.build link_depends), so its
+    // absence is a real regression this test exists to catch, not a
+    // benign "plugin not built this configuration" case (BR-005).
+    REQUIRE(plugin.has_value());
 
     yuzu::agent::LocalDispatcher dispatcher;
     // Path traversal attempt -- is_safe_filename() rejects it before
@@ -146,10 +148,11 @@ TEST_CASE("content_dist plugin: execute_staged reports file-not-staged for a wel
           "filename that was never staged",
           "[agent][content_dist][posix_actions]") {
     auto plugin = load_content_dist_plugin();
-    if (!plugin) {
-        WARN("content_dist plugin library not found -- skipping");
-        return;
-    }
+    // Hard failure, not WARN-and-skip: the plugin build is guaranteed
+    // ordered ahead of this test (tests/meson.build link_depends), so its
+    // absence is a real regression this test exists to catch, not a
+    // benign "plugin not built this configuration" case (BR-005).
+    REQUIRE(plugin.has_value());
 
     yuzu::agent::LocalDispatcher dispatcher;
     // A syntactically valid filename (passes is_safe_filename) that this

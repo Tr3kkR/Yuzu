@@ -94,10 +94,11 @@ std::optional<LoadedPlugin> load_script_exec_plugin() {
 TEST_CASE("script_exec plugin: exec streams real /bin/echo output through the runner",
           "[script_exec][actions]") {
     auto plugin = load_script_exec_plugin();
-    if (!plugin) {
-        WARN("script_exec plugin library not found -- skipping LocalDispatcher round-trip test");
-        return;
-    }
+    // Hard failure, not WARN-and-skip: the plugin build is guaranteed
+    // ordered ahead of this test (tests/meson.build link_depends), so its
+    // absence is a real regression this test exists to catch, not a
+    // benign "plugin not built this configuration" case (BR-005).
+    REQUIRE(plugin.has_value());
 
     yuzu::agent::LocalDispatcher dispatcher;
     std::vector<YuzuParam> params{{"command", "/bin/echo"}, {"args", "happy path"}};
@@ -124,10 +125,11 @@ TEST_CASE("script_exec plugin: exec streams real /bin/echo output through the ru
 TEST_CASE("script_exec plugin: bash runs the script as a single argv element through the runner",
           "[script_exec][actions]") {
     auto plugin = load_script_exec_plugin();
-    if (!plugin) {
-        WARN("script_exec plugin library not found -- skipping");
-        return;
-    }
+    // Hard failure, not WARN-and-skip: the plugin build is guaranteed
+    // ordered ahead of this test (tests/meson.build link_depends), so its
+    // absence is a real regression this test exists to catch, not a
+    // benign "plugin not built this configuration" case (BR-005).
+    REQUIRE(plugin.has_value());
 
     yuzu::agent::LocalDispatcher dispatcher;
     std::vector<YuzuParam> params{{"script", "echo hi"}};
@@ -148,10 +150,11 @@ TEST_CASE("script_exec plugin: exec with an unresolvable bare command reports st
           "without ever calling the runner",
           "[script_exec][actions]") {
     auto plugin = load_script_exec_plugin();
-    if (!plugin) {
-        WARN("script_exec plugin library not found -- skipping");
-        return;
-    }
+    // Hard failure, not WARN-and-skip: the plugin build is guaranteed
+    // ordered ahead of this test (tests/meson.build link_depends), so its
+    // absence is a real regression this test exists to catch, not a
+    // benign "plugin not built this configuration" case (BR-005).
+    REQUIRE(plugin.has_value());
 
     yuzu::agent::LocalDispatcher dispatcher;
     // A bare name with no separator that resolve_executable's real PATH
@@ -174,10 +177,11 @@ TEST_CASE("script_exec plugin: a blank stdout line still streams its own stdout|
           "(A2-002 escalation, A2-006)",
           "[script_exec][actions][streaming]") {
     auto plugin = load_script_exec_plugin();
-    if (!plugin) {
-        WARN("script_exec plugin library not found -- skipping");
-        return;
-    }
+    // Hard failure, not WARN-and-skip: the plugin build is guaranteed
+    // ordered ahead of this test (tests/meson.build link_depends), so its
+    // absence is a real regression this test exists to catch, not a
+    // benign "plugin not built this configuration" case (BR-005).
+    REQUIRE(plugin.has_value());
 
     yuzu::agent::LocalDispatcher dispatcher;
     // printf interprets the \n escapes; the middle one produces a completed,
