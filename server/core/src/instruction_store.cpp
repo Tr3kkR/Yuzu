@@ -1219,6 +1219,19 @@ std::expected<void, std::string> InstructionStore::delete_set(const std::string&
             failure = std::format("seed-coordination lock: {}", PQerrorMessage(conn));
             return false;
         }
+        // Check existence BEFORE unlinking anything — a not-found delete_set must be a pure
+        // no-op, never a partial mutation (a coincidental/typo'd id must not silently strip
+        // instruction_set_id off unrelated definitions on a call that reports "not found").
+        pg::PgResult del = pg::exec_params(
+            conn, "DELETE FROM instruction_store.instruction_sets WHERE id=$1 RETURNING id",
+            std::vector<std::string>{id});
+        if (del.status() != PGRES_TUPLES_OK) {
+            failure = std::format("delete: {}", PQerrorMessage(conn));
+            return false;
+        }
+        deleted = PQntuples(del.get()) > 0;
+        if (!deleted)
+            return true;
         // Unset instruction_set_id on definitions that reference this set — matches the
         // pre-migration behaviour exactly.
         pg::PgResult upd = pg::exec_params(
@@ -1230,16 +1243,6 @@ std::expected<void, std::string> InstructionStore::delete_set(const std::string&
             failure = std::format("unlink referencing definitions: {}", PQerrorMessage(conn));
             return false;
         }
-        pg::PgResult del = pg::exec_params(
-            conn, "DELETE FROM instruction_store.instruction_sets WHERE id=$1 RETURNING id",
-            std::vector<std::string>{id});
-        if (del.status() != PGRES_TUPLES_OK) {
-            failure = std::format("delete: {}", PQerrorMessage(conn));
-            return false;
-        }
-        deleted = PQntuples(del.get()) > 0;
-        if (!deleted)
-            return true;
         pg::PgResult tomb = pg::exec_params(
             conn,
             "INSERT INTO instruction_store.deleted_seed_content (kind, id, deleted_at) VALUES "
@@ -1592,17 +1595,17 @@ bool InstructionStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
                                          sanitize_pg_text(d.created_by),
                                          std::to_string(d.created_at),
                                          std::to_string(d.updated_at),
-                                         d.yaml_source,
-                                         d.parameter_schema,
-                                         d.result_schema,
-                                         d.approval_mode,
-                                         d.concurrency_mode,
+                                         sanitize_pg_text(d.yaml_source),
+                                         sanitize_pg_text(d.parameter_schema),
+                                         sanitize_pg_text(d.result_schema),
+                                         sanitize_pg_text(d.approval_mode),
+                                         sanitize_pg_text(d.concurrency_mode),
                                          sanitize_pg_text(d.platforms),
                                          sanitize_pg_text(d.min_agent_version),
                                          sanitize_pg_text(d.required_plugins),
                                          sanitize_pg_text(d.readable_payload),
-                                         d.visualization_spec,
-                                         d.response_templates_spec});
+                                         sanitize_pg_text(d.visualization_spec),
+                                         sanitize_pg_text(d.response_templates_spec)});
             if (res.status() != PGRES_TUPLES_OK) {
                 failure_detail =
                     std::format("legacy definition id='{}': {}", d.id, PQerrorMessage(conn));
