@@ -19,6 +19,7 @@
 #include <yuzu/plugin.hpp>
 
 #include "content_dist_exec_parsers.hpp"
+#include "content_dist_exec_seam.hpp"
 #include "content_dist_upload_parsers.hpp"
 
 #include <yuzu/agent/runner_status.hpp>     // yuzu::agent::forward_runner_failure (ABI4 result-status seam, ADR-3002)
@@ -353,41 +354,12 @@ int download_file(std::string_view url, const fs::path& dest, std::string& error
     return 0;
 }
 
-// ── Safe argument validation and splitting ──────────────────────────────────
-
-// Validate args contain no shell metacharacters
-bool is_safe_arg(std::string_view arg) {
-    // Allow alphanumeric, dash, underscore, dot, equals, colon, slash, backslash, space
-    // Block: ; & | ` $ ( ) { } < > ! ~ ^ " ' # * ? [ ] \n \r
-    for (char c : arg) {
-        if (c == ';' || c == '&' || c == '|' || c == '`' || c == '$' || c == '(' || c == ')' ||
-            c == '{' || c == '}' || c == '<' || c == '>' || c == '!' || c == '~' || c == '^' ||
-            c == '\'' || c == '"' || c == '#' || c == '*' || c == '?' || c == '[' || c == ']' ||
-            c == '\n' || c == '\r') {
-            return false;
-        }
-    }
-    return true;
-}
-
-// Split a string by spaces into argument vector (simple split, no shell parsing)
-std::vector<std::string> split_args(std::string_view args) {
-    std::vector<std::string> result;
-    std::string current;
-    for (char c : args) {
-        if (c == ' ' || c == '\t') {
-            if (!current.empty()) {
-                result.push_back(std::move(current));
-                current.clear();
-            }
-        } else {
-            current += c;
-        }
-    }
-    if (!current.empty())
-        result.push_back(std::move(current));
-    return result;
-}
+// BR-006 (whole-branch review round 2): is_safe_arg/split_args moved to
+// content_dist_exec_parsers.hpp (yuzu::content_dist::exec) -- pure, no-I/O
+// string functions belong in the *_parsers.hpp pure decision layer, not
+// this TU's anonymous namespace, and moving them there is what let
+// content_dist_exec_seam.hpp's execute_verified_payload() (see do_execute
+// below) call them without duplicating a second copy.
 
 // ── Safe process execution (no shell) ───────────────────────────────────────
 //
@@ -428,9 +400,26 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .action      = */ "execute_staged",
         // Spawns the staged binary directly from a pre-split argv via
         // yuzu::agent::run_bounded_subprocess — never a shell (see
-        // `do_execute`/content_dist_exec_parsers.hpp): rung 2 on every OS,
+        // `do_execute`/content_dist_exec_seam.hpp): rung 2 on every OS,
         // same token convention as filesystem_plugin.cpp's runner-based legs.
-        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 2, "subprocess_runner:staged_payload", nullptr},
+        //
+        // BR-004 (whole-branch review round 2): Linux is CONSTRAINED, not
+        // unconditionally SUPPORTED -- the CDX-002 gate in
+        // content_dist_exec_seam.hpp's execute_verified_payload() rejects
+        // every shebang-interpreted staged payload on Linux (B6 exec_verify's
+        // fd-exec primitive, execveat with O_CLOEXEC, is structurally
+        // incompatible with the kernel's binfmt_script re-open), which the
+        // deleted pre-migration POSIX launcher (a plain execvp()) never did.
+        // Declaring this leg unconditionally SUPPORTED was truthful about
+        // the migration's happy path but silently omitted a real, migration-
+        // introduced compatibility break for any staged `#!`-interpreted
+        // script; the constraint string exists so this ABI4 descriptor
+        // itself carries that disclosure, not just a code comment.
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 2, "subprocess_runner:staged_payload",
+         "shebang-interpreted (#!) staged payloads are rejected -- B6 fd-exec "
+         "(execveat O_CLOEXEC) is incompatible with the kernel's binfmt_script "
+         "re-open; native executables only"},
         /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 2, "subprocess_runner:staged_payload", nullptr},
         /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 2, "subprocess_runner:staged_payload", nullptr},
     },
@@ -625,112 +614,25 @@ private:
         constexpr bool kIsWindows = false;
 #endif
 
-        if constexpr (kIsLinux) {
-            // CDX-002: reject a shebang-interpreted script before it ever
-            // reaches the runner. B6 exec_verify's fd-exec primitive
-            // (execveat with O_CLOEXEC on the fstat-verified fd) closes
-            // that fd before the kernel's binfmt_script handler gets a
-            // chance to re-open the interpreter named on the "#!" line --
-            // a shebang script is therefore structurally incompatible with
-            // fd-exec, not just occasionally broken by it. Reporting that
-            // up front with an actionable message beats letting it fall
-            // through to an opaque spawn_error. This is best-effort
-            // operator UX, NOT a security boundary: if the file is swapped
-            // for a script AFTER this check, the runner's own fd-exec
-            // still fails it (spawn_error) exactly as before -- this check
-            // adds no new security reliance, only a clearer error earlier.
-            std::ifstream probe{path, std::ios::binary};
-            char first_bytes[2] = {};
-            probe.read(first_bytes, sizeof(first_bytes));
-            // A short/failed read (empty file, permission race, etc.) is
-            // non-fatal: skip the gate and let the runner fail honestly on
-            // its own rather than blocking execution on an unrelated I/O
-            // hiccup.
-            if (probe.gcount() == sizeof(first_bytes) &&
-                yuzu::content_dist::exec::is_shebang_payload(
-                    std::string_view{first_bytes, sizeof(first_bytes)})) {
-                ctx.write_output(
-                    "error|script payloads (shebang) are not supported for verified "
-                    "execution on Linux: the runner's fd-exec primitive is incompatible "
-                    "with shebang interpreters (execveat O_CLOEXEC closes the fd before "
-                    "binfmt_script re-opens it); stage a native executable");
-                return 1;
-            }
-        }
-
-        auto args = params.get("args");
-        // Validate args to block shell metacharacters
-        if (!args.empty() && !is_safe_arg(args)) {
-            ctx.write_output(
-                "error|args contain forbidden characters (shell metacharacters blocked)");
-            return 1;
-        }
-
-#ifndef _WIN32
-        // Make the staged file executable — the ONLY thing that turns a
-        // staged 0644 download into something the runner can exec at all.
-        // `download_file` writes via std::ofstream, which never sets an
-        // execute bit, so every staged file starts non-executable. This
-        // MUST happen before the run_bounded_subprocess call below, exactly
-        // where the plugin's old POSIX child-process launcher did it. A chmod failure
-        // is not fatal here — it is logged and execution proceeds; the
-        // exec itself then fails honestly with its own EACCES, which the
-        // runner reports through termination_reason==spawn_error/
-        // spawn_errno like any other exec failure, rather than this step
-        // silently papering over a permissions problem.
-        {
-            std::error_code chmod_ec;
-            fs::permissions(path, fs::perms::owner_exec, fs::perm_options::add, chmod_ec);
-            if (chmod_ec) {
-                ctx.write_output(std::format(
-                    "warn|failed to set execute permission on staged file: {}",
-                    chmod_ec.message()));
-            }
-        }
-#endif
-
-        std::vector<std::string> argv;
-        // staging_dir() resolves under fs::temp_directory_path() or the
-        // configured agent.data_dir -- normally absolute either way, which
-        // is what run_bounded_subprocess's argv[0] contract requires. A
-        // misconfigured relative agent.data_dir now fails safely as
-        // spawn_error (the runner runtime-rejects a relative argv[0]
-        // outright) instead of the old POSIX launcher's PATH-search
-        // fallback for a relative path -- a tightening this migration gets
-        // for free.
-#ifdef _WIN32
-        // path.string() would narrow the native wide path through the
-        // active ANSI code page, mangling any non-ASCII character in the
-        // temp/data-dir portion of the path (the filename itself is
-        // is_safe_filename-constrained, but its parent directory is not).
-        // run_bounded_subprocess's argv is UTF-8 (it widens via
-        // yuzu::win::to_wide internally, subprocess_runner.cpp) -- convert
-        // the native wide path straight to UTF-8 instead.
-        argv.push_back(yuzu::win::from_wide(path.c_str()));
-#else
-        argv.push_back(path.string());
-#endif
-        for (auto& a : split_args(args))
-            argv.push_back(std::move(a));
-
-        auto opts = yuzu::content_dist::exec::build_execution_options(kIsLinux, kIsWindows);
-        // B6 exec_verify.expected_size: the staged file's hash-verified
-        // size, sourced here (the caller) because build_execution_options
-        // is a pure function that never touches the filesystem. A failure
-        // to stat it just leaves expected_size unset -- exec_verify's other
-        // checks (regular file, ownership, not group/other-writable) still
-        // run; only the exact-size check is skipped.
-        std::error_code size_ec;
-        auto staged_size = fs::file_size(path, size_ec);
-        if (!size_ec)
-            opts.exec_verify.expected_size = static_cast<std::uint64_t>(staged_size);
-
-        // CDX-001 RESIDUAL RISK (accepted, documented -- not fixed here):
-        // the trusted SHA-256 above (#808 KV re-verification) is computed
-        // against `path`, and B6 exec_verify below independently OPENS
-        // that same path and fd-execs it. The fd-exec closes only the
+        // BR-006 (whole-branch review round 2): everything past this point
+        // -- the CDX-002 Linux shebang gate, the args safety check, the
+        // POSIX chmod, argv assembly, and the actual
+        // build_execution_options/run_bounded_subprocess/map_execution_result
+        // call sequence -- is content_dist_exec_seam.hpp's
+        // execute_verified_payload(), extracted so it is directly unit-
+        // testable against a real staged file without content_dist's KV/
+        // init machinery (g_ctx) ever entering the picture. `path` here is
+        // already hash-verified by the #808 KV re-verification above,
+        // exactly as execute_verified_payload's own contract requires.
+        //
+        // CDX-001 RESIDUAL RISK (accepted, documented -- not fixed here,
+        // and not moved into the seam header since it is about THIS
+        // hash-verification step, not the seam's own logic): the trusted
+        // SHA-256 above (#808 KV re-verification) is computed against
+        // `path`, and the seam's B6 exec_verify independently OPENS that
+        // same path and fd-execs it. The fd-exec closes only the
         // fstat-to-exec race (TOCTOU between the runner's own permission
-        // check and the exec syscall); nothing binds the digest we just
+        // check and the exec syscall); nothing binds the digest just
         // checked to the exact fd the runner ends up executing, so a
         // hash-time-to-open-time swap window remains AT THE PRIMITIVE
         // LEVEL. This is ACCEPTED, not closed, because: staging_dir()
@@ -738,32 +640,32 @@ private:
         // able to swap the staged file in that window already holds
         // agent-uid or root -- capabilities that already subsume whatever
         // the swap would gain them; and exec_verify.expected_size (set
-        // just above) further pins the exec'd fd to the hash-verified
+        // inside the seam) further pins the exec'd fd to the hash-verified
         // file's exact size, narrowing a same-size-swap window rather than
-        // leaving it fully open. Full closure requires the runner itself
-        // to accept a caller-supplied digest and verify it against its own
+        // leaving it fully open. Full closure requires the runner itself to
+        // accept a caller-supplied digest and verify it against its own
         // already-opened fd before execveat -- a frozen-contract change to
         // subprocess_runner's B6 exec_verify, deferred to a follow-up
         // runner package (reference: CDX-001). Do not attempt a plugin-
         // local open/fstat/execveat workaround here to close this gap --
         // that would duplicate (and diverge from) the runner's own B6
         // logic; the fix belongs in the runner, not this caller.
-        auto run = yuzu::agent::run_bounded_subprocess(argv, opts);
+        auto outcome = yuzu::content_dist::exec::execute_verified_payload(
+            path, params.get("args"), kIsLinux, kIsWindows);
         // BR-001: forward a runner-level failure through the ABI4 CC-07
-        // result-status seam BEFORE map_execution_result below flattens
-        // termination_reason into this action's own status|/exit_code|
-        // wire text -- same one-line pattern every other migrated mutating
-        // plugin uses (services_plugin.cpp, network_actions_plugin.cpp,
-        // interaction_plugin.cpp), and required end-to-end by ADR-3002's
-        // "Honest termination reporting" precondition for a mutating site.
-        yuzu::agent::forward_runner_failure(ctx, run);
-        auto wire = yuzu::content_dist::exec::map_execution_result(run);
-
-        ctx.write_output(std::format("status|{}", wire.status));
-        ctx.write_output(std::format("exit_code|{}", wire.exit_code));
-        if (!wire.output.empty())
-            ctx.write_output(std::format("output|{}", wire.output));
-        return wire.exit_code;
+        // result-status seam BEFORE the wire lines below -- same one-line
+        // pattern every other migrated mutating plugin uses (services_
+        // plugin.cpp, network_actions_plugin.cpp, interaction_plugin.cpp),
+        // and required end-to-end by ADR-3002's "Honest termination
+        // reporting" precondition for a mutating site. Only set on the
+        // ordinary run_bounded_subprocess path -- an early shebang/args
+        // rejection never reaches the runner, so there is nothing to
+        // forward.
+        if (outcome.run)
+            yuzu::agent::forward_runner_failure(ctx, *outcome.run);
+        for (const auto& line : outcome.lines)
+            ctx.write_output(line);
+        return outcome.rc;
     }
 
     int do_list(yuzu::CommandContext& ctx) {
