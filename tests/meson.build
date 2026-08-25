@@ -1338,7 +1338,7 @@ if build_server
   # exact), G 207 + J 144 = 351 (old G's total, exact), all four combined =
   # 756 (old E+G total, exact) — zero cases lost, zero cases duplicated.
   # E and I both still survive a DSN-less all-skip without
-  # --allow-running-no-tests (E: 6 non-DSN cases: I: 1) — G and J both need
+  # --allow-running-no-tests (E: 6 non-DSN cases; I: 1) — G and J both need
   # it, same as old G did (every one of G's original ten tags is DSN-gated;
   # subdividing a DSN-gated tag set keeps every piece DSN-gated). All four
   # ran clean against a live Postgres database with zero failures: local
@@ -1346,17 +1346,24 @@ if build_server
   # 55.6s / J 35.8s — each roughly half its parent's own last-measured local
   # baseline, consistent with the case-count split ratio.
   #
-  # The 600->700s timeout bump is a DELIBERATE, TEMPORARY exception to this
-  # file's own "split, don't raise the timeout" house rule (the C->C+E and
-  # A->A+H precedents above never raised it). Justification: the [pg] test
-  # population itself is expected to shrink within days as the SQLite->
-  # Postgres migration program completes and migration-only regression
-  # tests become prunable (docs/postgres-migration-ladder.md) — directly
-  # reducing the fsync-heavy CREATE/DROP DATABASE case count these shards
-  # carry — so the margin bought here is meant to bridge that window, not
-  # to stand in place of a further split if the timeout keeps getting hit
-  # after the prune lands. Revisit (tighten back to 600, or drop if a shard
-  # is comfortably under budget) once the migration-test prune is in.
+  # The 600->700s timeout bump (E/I/G/J only — A/B/C/D/F/H stay at 600) is a
+  # DELIBERATE, TEMPORARY exception to this file's own "split, don't raise
+  # the timeout" house rule (the C->C+E and A->A+H precedents above never
+  # raised it). Justification, corrected after Gate 2 governance review
+  # (2026-08-25) caught the original wording overclaiming a settled
+  # near-term timeline: `docs/postgres-migration-ladder.md` explicitly
+  # disclaims one ("mutable state that drains over time, not a contract"),
+  # and completing that ladder is architecturally more likely to GROW this
+  # population than shrink it — every store that migrates onto Postgres
+  # adds its own [pg]-tagged CRUD/behaviour cases (exactly what shards
+  # E/I/G/J already carry), while only each store's narrow, already-thin
+  # migrate_from_sqlite backfill suite becomes prunable. So this margin is
+  # NOT bought against an expected population shrink — it is a plain safety
+  # cushion on top of what the split alone already earns (every new shard's
+  # scaled-from-real-diagnostic-numbers estimate lands well under 700s even
+  # 2-wide paired, per the measurements above). Revisit on a fixed cadence,
+  # not on an assumed completion date — tighten back to 600, or drop, once a
+  # shard is comfortably under budget.
   test('server pg unit tests shard E', server_test_exe,
        args: ['[pg][scim]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][guaranteed_state]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][oidc]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][software_inventory]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]'],
        suite: 'server', timeout: 700)

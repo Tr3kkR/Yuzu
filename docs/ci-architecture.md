@@ -500,17 +500,24 @@ count-balanced, ~half each; I defers to E and J defers to G the same way G
 already deferred to E, to avoid double-counting a case that carries a tag
 from both sides of a split — a first attempt without that deferral double-
 counted 12 and 47 cases respectively, caught by `--list-tests` before
-trusting it), and every pg shard's `timeout:` moved from 600 to 700 across
-the board. The timeout bump is a **deliberate, temporary** exception to this
-file's own "split, don't raise" house rule (`tests/meson.build`'s shard-
-history comment) — justified specifically because the `[pg]` population is
-expected to shrink within days as the SQLite->Postgres migration program
-completes and migration-only regression tests become prunable
-(`docs/postgres-migration-ladder.md`), directly cutting the fsync-heavy
-CREATE/DROP DATABASE case count these shards carry. Revisit (tighten back to
-600, or drop entirely if a shard is comfortably under budget) once that prune
-lands. Full measurements, partition verification, and per-shard local wall
-time: `tests/meson.build`'s own comment at the shard E/I/G/J block.
+trusting it), and the four split shards' (E/I/G/J only — A/B/C/D/F/H are
+unchanged) `timeout:` moved from 600 to 700. The timeout bump is a
+**deliberate, temporary** exception to this file's own "split, don't raise"
+house rule (`tests/meson.build`'s shard-history comment) — corrected after
+Gate 2 governance review (2026-08-25) caught an earlier draft's justification
+overclaiming a settled near-term timeline. `docs/postgres-migration-ladder.md`
+explicitly disclaims one ("mutable state that drains over time, not a
+contract"), and completing that ladder is architecturally more likely to GROW
+the `[pg]` population than shrink it: each store that migrates onto Postgres
+adds its own `[pg]`-tagged CRUD/behaviour cases (exactly what shards E/I/G/J
+already carry), while only each store's narrow, already-thin
+`migrate_from_sqlite` backfill suite becomes prunable. The margin bought here
+is a plain safety cushion on top of what the split alone already earns (every
+new shard's real-diagnostic-scaled estimate lands well under 700s even 2-wide
+paired). Revisit on a fixed cadence, not an assumed completion date — tighten
+back to 600, or drop, once a shard is comfortably under budget. Full
+measurements, partition verification, and per-shard local wall time:
+`tests/meson.build`'s own comment at the shard E/I/G/J block.
 
 **Drift risk, not yet automated:** the 3-way split hardcodes the 10 pg shard
 names and the 3 non-pg server test names directly in `ci.yml`. A new/renamed

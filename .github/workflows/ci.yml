@@ -860,14 +860,20 @@ jobs:
         # each already past HALF of 600s, so 2-wide pairing was never going to
         # have real headroom regardless of which OTHER shard it paired with.
         # tests/meson.build split E->E+I and G->G+J the same day (see that
-        # file's own comment for the measurements and verification) and every
-        # pg shard's timeout moved 600->700s as a deliberate, TEMPORARY
-        # exception to the "split, don't raise" house rule — justified there by
-        # the [pg] population's expected near-term shrink once the SQLite->
-        # Postgres migration program completes and migration-only tests become
-        # prunable. Both mitigations are combined on purpose: the split cuts
-        # each shard's real cost roughly in half, the timeout bump absorbs
-        # whatever 2-wide pairing overlap remains on top of that.
+        # file's own comment for the measurements and verification) and those
+        # four shards' timeout moved 600->700s (A/B/C/D/F/H unchanged) as a
+        # deliberate, TEMPORARY exception to the "split, don't raise" house
+        # rule. Justification corrected after Gate 2 governance review
+        # (2026-08-25) caught an earlier draft overclaiming a settled
+        # near-term shrink: docs/postgres-migration-ladder.md disclaims any
+        # timeline, and completing it is architecturally more likely to GROW
+        # the [pg] population than shrink it (each migrated store adds its
+        # own [pg]-tagged CRUD cases; only the thin migrate_from_sqlite
+        # backfill suites become prunable). The bump is a plain safety
+        # cushion on what the split alone already earns, not a bet on the
+        # population shrinking. Both mitigations are combined on purpose: the
+        # split cuts each shard's real cost roughly in half, the timeout bump
+        # absorbs whatever 2-wide pairing overlap remains on top of that.
         #
         # Telemetry note: each invocation overwrites meson's single
         # testlog.junit.xml, so only the LAST one's per-suite ci_test_suites
