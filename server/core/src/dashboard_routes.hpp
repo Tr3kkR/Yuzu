@@ -173,6 +173,17 @@ private:
     std::optional<std::vector<std::string>> resolve_visible_scope(
         const std::string& username) const;
 
+    /// Same as above, but for a caller who already has the resolved session
+    /// in hand: a JIT-elevated session gets the full-fleet view (`nullopt`)
+    /// without ever calling `visible_set_fn_` — a username-only RBAC lookup
+    /// cannot see the session's in-memory elevation, so this must short-
+    /// circuit here rather than inside `visible_set_fn_`. Removes the
+    /// `is_elevated(*session) ? nullopt : resolve_visible_scope(username)`
+    /// ternary previously duplicated at each of this file's handler call
+    /// sites.
+    std::optional<std::vector<std::string>> resolve_visible_scope(
+        const auth::Session& session) const;
+
     /// Resolves the column-name list @ref render_results and @ref
     /// col_index_for_name should render/sort against: index 0 is always
     /// "Agent", followed by the InstructionDefinition's `result_schema`-

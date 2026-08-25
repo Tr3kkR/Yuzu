@@ -482,9 +482,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 // JIT-elevated: full-fleet view, not a username-derived RBAC
                 // re-check that can't see the session's live elevation (see
                 // render_filter_bar's identical comment).
-                auto agent_scope = auth::is_elevated(*session)
-                                        ? std::nullopt
-                                        : resolve_visible_scope(session->username);
+                auto agent_scope = resolve_visible_scope(*session);
 
                 // nullopt (unwired store, or filters.empty() with no store
                 // call attempted) renders the same as a genuine store
@@ -589,9 +587,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // straight into the pre-existing 422 below rather than a
                  // bespoke error. JIT-elevated: full-fleet view (see
                  // render_filter_bar's identical comment).
-                 auto agent_scope = auth::is_elevated(*session)
-                                         ? std::nullopt
-                                         : resolve_visible_scope(session->username);
+                 auto agent_scope = resolve_visible_scope(*session);
                  if (agent_scope) {
                      std::unordered_set<std::string> scope_set(agent_scope->begin(),
                                                                 agent_scope->end());
@@ -1756,6 +1752,12 @@ std::optional<std::vector<std::string>> DashboardRoutes::resolve_visible_scope(
     auto scope = visible_set_fn_(username);
     if (!scope) return std::nullopt;
     return std::vector<std::string>(scope->begin(), scope->end());
+}
+
+std::optional<std::vector<std::string>> DashboardRoutes::resolve_visible_scope(
+    const auth::Session& session) const {
+    if (auth::is_elevated(session)) return std::nullopt;
+    return resolve_visible_scope(session.username);
 }
 
 // ---------------------------------------------------------------------------

@@ -555,6 +555,80 @@ TEST_CASE("create-group-form route: dispatched through TestRouteSink, the "
     CHECK(res->get_header_value("Vary") == "Cookie");
 }
 
+// Branch-review finding (Functional CDX-FV-02, MEDIUM): only filter-bar had
+// an elevated-session test; create-group-form's identical elevation bypass
+// (dashboard_routes.cpp) was unexercised -- a deny-all visible_set_fn could
+// have silently applied to an elevated admin too, without any test noticing.
+TEST_CASE("create-group-form route: a JIT-elevated session sees the "
+          "fleet-wide matching-agent count despite a deny-all visible scope",
+          "[pg][server][dashboard][create_group_form][elevation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    const std::string command_id = "cmd-create-group-elevated";
+
+    StoredResponse r1;
+    r1.instruction_id = command_id;
+    r1.agent_id = "agent-1";
+    r1.received_at_ms = 1000;
+    r1.status = 0;
+    r1.plugin = "registry";
+    r1.output = "match";
+    rs.store(r1);
+    StoredResponse r2;
+    r2.instruction_id = command_id;
+    r2.agent_id = "agent-2";
+    r2.received_at_ms = 1000;
+    r2.status = 0;
+    r2.plugin = "registry";
+    r2.output = "match";
+    rs.store(r2);
+
+    yuzu::MetricsRegistry metrics;
+
+    // Deny-all for every username -- an elevated caller must bypass this
+    // entirely, exactly as render_filter_bar's elevation test does.
+    DashboardRoutes::VisibleSetFn visible_set_fn =
+        [](const std::string&) -> std::optional<std::set<std::string>> {
+        return std::set<std::string>{};
+    };
+    DashboardRoutes::AuthFn auth_fn =
+        [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "elevated-admin";
+        s.role = auth::Role::user;
+        s.elevated_until = std::chrono::steady_clock::now() + std::chrono::minutes(5);
+        return s;
+    };
+    DashboardRoutes::PermFn perm_fn =
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+          const std::string&) { return true; };
+    DashboardRoutes::AuditFn audit_fn =
+        [](const httplib::Request&, const std::string&, const std::string&,
+          const std::string&, const std::string&, const std::string&) {};
+
+    struct SinkHarness {
+        DashboardRoutes routes;
+        yuzu::server::test::TestRouteSink sink;
+    } h;
+
+    h.routes.register_routes(h.sink, auth_fn, perm_fn, audit_fn,
+                             &rs, /*mgmt_group_store=*/nullptr, /*registry=*/nullptr,
+                             /*tag_store=*/nullptr, /*event_bus=*/nullptr,
+                             /*agents_json_fn=*/[] { return std::string{"[]"}; },
+                             /*dispatch_fn=*/DashboardRoutes::DispatchFn{},
+                             /*caller_fn=*/DashboardRoutes::CallerFn{},
+                             /*resolve_fn=*/DashboardRoutes::ResolveFn{},
+                             &metrics, /*instruction_store=*/nullptr,
+                             visible_set_fn);
+
+    auto res = h.sink.Get("/fragments/create-group-form?command_id=" + command_id +
+                          "&plugin=registry&f_output=match");
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 200);
+    CHECK(contains(res->body, "2 agents will be added"));
+}
+
 // -- Branch-review finding BR-001: a JIT-elevated session must get the
 // -- full-fleet view, not a username-derived RBAC re-check that cannot see
 // -- the session's live (in-memory) elevation. -------------------------------

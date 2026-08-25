@@ -222,3 +222,58 @@ TEST_CASE("server.cpp: the three #3261 setters specifically are still present "
     CHECK(has("agent_service_", "webhook_store", "webhook_store_"));
     CHECK(has("agent_service_", "offload_target_store", "offload_target_store_"));
 }
+
+// #1712 branch-review finding (Functional CDX-FV-01, HIGH): the production
+// Response:Read visibility resolver `response_visible_set_fn` (defined
+// ~server.cpp:16819, wired into DashboardRoutes::register_routes as its
+// trailing argument ~server.cpp:18401) is referenced by ZERO test files --
+// every dashboard route test injects its own synthetic VisibleSetFn. Dropping
+// the production registration argument (e.g. reverting to the pre-#1712
+// call, or replacing it with `{}`) would restore fleet-wide facet/scope
+// disclosure in production while every existing #1712 test stayed green,
+// because none of them exercise this composition. Following this file's own
+// established mechanism (ServerImpl is not unit-constructible, so a source
+// scan is the only thing that can catch a dropped composition at all) rather
+// than inventing a second one.
+TEST_CASE("server.cpp: response_visible_set_fn is both defined and passed to "
+          "DashboardRoutes::register_routes (#1712)",
+          "[wiring_order][1712]") {
+    const std::string text = strip_line_comments(read_server_cpp());
+
+    // Sanity floor: server.cpp is a six-figure-character file; a
+    // suspiciously short read means YUZU_SERVER_SRC_DIR pointed somewhere
+    // empty or mangled, not that the file legitimately shrank.
+    REQUIRE(text.size() > 100000);
+
+    // POSITIVE anchor 1: the resolver is defined, and its body is the real
+    // decision ladder -- not a stub that always returns nullopt/fleet-wide.
+    // Requiring both calls it actually makes (not just its name) means a
+    // resolver silently downgraded to "return std::nullopt;" still fails
+    // this, even though `response_visible_set_fn` itself would still exist.
+    static const std::regex definition_re(R"(auto response_visible_set_fn =)");
+    CHECK(std::regex_search(text, definition_re));
+    static const std::regex global_check_re(
+        R"(check_permission\(username, "Response", "Read"\))");
+    CHECK(std::regex_search(text, global_check_re));
+    static const std::regex scoped_check_re(
+        R"(visible_agents_for_permission\(username, "Response", "Read")");
+    CHECK(std::regex_search(text, scoped_check_re));
+
+    // POSITIVE anchor 2: the resolver is actually PASSED to
+    // register_routes, not merely defined and left unused. This is what
+    // distinguishes "wired" from "defined but dropped at the call site" --
+    // the failure mode a name-presence-only check would miss entirely.
+    static const std::regex wired_re(R"(,\s*response_visible_set_fn\s*\))");
+    CHECK(std::regex_search(text, wired_re));
+
+    // Exactly two occurrences of the identifier total: one definition, one
+    // use. A THIRD occurrence would mean a second, possibly divergent, copy
+    // was introduced somewhere -- this codebase's established anti-pattern
+    // this test's own file header (and response_scope_filter.hpp elsewhere)
+    // explicitly warns against duplicating a chokepoint like this one.
+    static const std::regex occurrence_re(R"(\bresponse_visible_set_fn\b)");
+    auto count = static_cast<std::ptrdiff_t>(
+        std::distance(std::sregex_iterator(text.begin(), text.end(), occurrence_re),
+                      std::sregex_iterator()));
+    CHECK(count == 2);
+}

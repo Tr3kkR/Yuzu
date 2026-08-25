@@ -157,12 +157,30 @@ struct GroupFromResultsHarness {
     DashboardRoutes::VisibleSetFn visible_set_fn{
         [](const std::string&) -> std::optional<std::set<std::string>> { return std::nullopt; }};
 
+    /// Reassignable AFTER construction, same live-read pattern as
+    /// `visible_set_fn` above. Set true to simulate a JIT-elevated session
+    /// (CDX-FV-02): `auth_fn` below stamps `elevated_until` in the future
+    /// whenever this is true, at the moment each request is authenticated.
+    bool elevated_session{false};
+
+    /// Counts invocations of `visible_set_fn` regardless of what it
+    /// returns (CDX-FV-04) -- lets a degrade-path test prove the scope
+    /// resolver was never even CALLED, not merely that its result was
+    /// unobservable in the response.
+    int visible_set_fn_calls{0};
+
     /// @param degrade_response_store true → wire a ResponseStore pointed at
     ///        an unreachable pool (never open), so the 503-before-scope-logic
     ///        path is reachable. `mg` (the confinement substrate the group
     ///        actually gets created in) stays healthy either way — only the
     ///        response store degrades.
-    explicit GroupFromResultsHarness(bool degrade_response_store = false) {
+    /// @param csrf_trusted_origins forwarded to `set_csrf_trusted_origins`
+    ///        BEFORE `register_routes` runs below, per that setter's own
+    ///        documented contract (dashboard_routes.hpp) -- CDX-FV-05 needs
+    ///        this to actually prove the route reads a configured allowlist,
+    ///        which a post-construction call would not exercise correctly.
+    explicit GroupFromResultsHarness(bool degrade_response_store = false,
+                                     std::vector<std::string> csrf_trusted_origins = {}) {
         // ManagementGroupStorePg's own constructor already SKIPs the whole
         // TEST_CASE when YUZU_TEST_POSTGRES_DSN is unset (before this body
         // runs, per member-initialization order) — REQUIRE here is a
@@ -184,11 +202,13 @@ struct GroupFromResultsHarness {
             REQUIRE(rs_->is_open());
         }
 
-        auto auth_fn = [](const httplib::Request&,
-                          httplib::Response&) -> std::optional<auth::Session> {
+        auto auth_fn = [this](const httplib::Request&,
+                             httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
             s.username = kUser;
             s.role = auth::Role::admin;
+            if (elevated_session)
+                s.elevated_until = std::chrono::steady_clock::now() + std::chrono::minutes(5);
             return s;
         };
         auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
@@ -198,6 +218,9 @@ struct GroupFromResultsHarness {
                                const std::string& tid, const std::string& d) {
             audits.push_back({a, r, tt, tid, d});
         };
+
+        if (!csrf_trusted_origins.empty())
+            routes.set_csrf_trusted_origins(std::move(csrf_trusted_origins));
 
         routes.register_routes(
             sink, auth_fn, perm_fn, audit_fn, rs_.get(), &mg,
@@ -209,6 +232,7 @@ struct GroupFromResultsHarness {
             /*metrics=*/nullptr, /*instruction_store=*/nullptr,
             /*visible_set_fn=*/
             [this](const std::string& username) -> std::optional<std::set<std::string>> {
+                ++visible_set_fn_calls;
                 return visible_set_fn ? visible_set_fn(username) : std::nullopt;
             });
     }
@@ -245,6 +269,16 @@ struct GroupFromResultsHarness {
                 return a.detail;
         return {};
     }
+    /// Full row lookup (CDX-FV-03): action/result/detail alone don't prove
+    /// the documented SIEM taxonomy (target_type="Execution", target_id=
+    /// command_id) survived -- a regression there would pass every existing
+    /// assertion that only checks detail.
+    const AuditRow* audit_row(const std::string& action, const std::string& result) const {
+        for (const auto& a : audits)
+            if (a.action == action && a.result == result)
+                return &a;
+        return nullptr;
+    }
 };
 
 } // namespace
@@ -276,6 +310,13 @@ TEST_CASE("group-from-results: a confined visible set materialises only the "
     REQUIRE(h.audits_for("response.read", "denied") == 1);
     CHECK(h.audit_detail("response.read", "denied") ==
           "scope_dropped=1 surface=group_from_results");
+    // CDX-FV-03: the documented SIEM taxonomy (target_type="Execution",
+    // target_id=command_id) is part of the contract, not just the detail
+    // string -- a regression there would pass the two checks above alone.
+    auto row = h.audit_row("response.read", "denied");
+    REQUIRE(row != nullptr);
+    CHECK(row->target_type == "Execution");
+    CHECK(row->target_id == kCommandId);
 }
 
 // ── (2) All-dropped → the EXISTING 422, no new oracle ───────────────────────
@@ -325,6 +366,12 @@ TEST_CASE("group-from-results: a degraded response store 503s with the "
 
     CHECK(h.audits_for("response.read", "denied") == 0);
     CHECK_FALSE(h.mg.find_group_by_name("degrade-group").has_value());
+    // CDX-FV-04: prove the ordering claim in this test's own name -- the
+    // scope resolver was never even CALLED, not merely that its result
+    // never reached the response. Without this, a mutant that resolves
+    // scope BEFORE the failing response-store read (reversing the
+    // documented ordering) would still pass every assertion above.
+    CHECK(h.visible_set_fn_calls == 0);
 }
 
 // ── (4) add_member partial failure — honest partial state, no rollback ─────
@@ -399,6 +446,37 @@ TEST_CASE("group-from-results: an unfiltered (nullopt) scope materialises "
     CHECK(h.audits_for("response.read", "denied") == 0);
 }
 
+// Branch-review finding (Functional CDX-FV-02, MEDIUM): the elevation bypass
+// existed for the POST route (dashboard_routes.cpp) but had no test -- the
+// nullopt case above exercises the SAME code path a deny-all-plus-elevated
+// caller would (both resolve to "materialise everything"), so it cannot
+// distinguish "elevation genuinely bypasses the resolver" from "elevation
+// does nothing and the resolver happened to return nullopt anyway".
+TEST_CASE("group-from-results: a JIT-elevated session materialises every "
+          "matching agent despite a deny-all visible scope",
+          "[pg][server][dashboard][group_from_results][elevation]") {
+    GroupFromResultsHarness h;
+    h.elevated_session = true;
+    seed_matching_responses(h.rs(), {"agent-A", "agent-B"});
+    // Deny-all for every username -- an elevated caller must bypass this
+    // entirely, not resolve to an empty set.
+    h.visible_set_fn = [](const std::string&) -> std::optional<std::set<std::string>> {
+        return std::set<std::string>{};
+    };
+
+    auto res = h.post(GroupFromResultsHarness::form_body("elevated-group"));
+    CHECK(res->status == 200);
+    CHECK(contains(res->get_header_value("HX-Trigger"), "created with 2 agents"));
+
+    auto group = h.mg.find_group_by_name("elevated-group");
+    REQUIRE(group.has_value());
+    CHECK(member_ids_of(h.mg, group->id) == (std::set<std::string>{"agent-A", "agent-B"}));
+    CHECK(h.audits_for("response.read", "denied") == 0);
+    // Elevation must BYPASS the resolver, not merely happen to agree with
+    // its (deny-all) answer.
+    CHECK(h.visible_set_fn_calls == 0);
+}
+
 // ── (6) CSRF same-site gate — branch-review BR-001 ─────────────────────────
 // This route materialises management-group membership and, before this fix,
 // had no origin check at all (a pre-existing gap, unrelated to the scope
@@ -418,6 +496,11 @@ TEST_CASE("group-from-results: CSRF same-site gate rejects cross-origin and "
         CHECK(res->status == 403);
         CHECK(h.audit_detail("group.create_from_results", "denied") == "csrf_cross_origin");
         CHECK_FALSE(h.mg.find_group_by_name("csrf-group").has_value());
+        // CDX-FV-05: the UI contract (refusal body + HX-Retarget), not just
+        // the status code and audit row, is part of what this gate promises
+        // -- a broken feedback/retarget would pass every check above.
+        CHECK(res->body == "<span class=\"feedback-error\">Cross-origin request refused.</span>");
+        CHECK(res->get_header_value("HX-Retarget") == "#group-form-slot");
     }
 
     SECTION("neither Origin nor Referer — stricter than origin_is_same_site's default") {
@@ -432,4 +515,36 @@ TEST_CASE("group-from-results: CSRF same-site gate rejects cross-origin and "
         CHECK(res->status == 200);
         CHECK(h.mg.find_group_by_name("csrf-group").has_value());
     }
+
+    // CDX-FV-05: same-site Referer (no Origin at all) must ALSO be accepted
+    // -- a strict Origin-only check would silently break every browser
+    // request that omits Origin per the standard privacy-sensitive
+    // referrer-policy cases, none of which are CSRF.
+    SECTION("same-site Referer with no Origin is accepted") {
+        auto res = h.post(GroupFromResultsHarness::form_body("csrf-referer-group"),
+                          {{"Host", kHost},
+                           {"Referer", std::string{"https://"} + kHost + "/dashboard/results"}});
+        CHECK(res->status == 200);
+        CHECK(h.mg.find_group_by_name("csrf-referer-group").has_value());
+    }
+
+    // CDX-FV-05: a configured trusted origin (e.g. a reverse proxy on a
+    // different host) must be accepted even though it is cross-host by the
+    // bare Host comparison -- proving THIS ROUTE actually reads and passes
+    // its configured `csrf_trusted_origins_`, not just that the underlying
+    // helper supports the parameter in isolation (test_web_utils.cpp proves
+    // that; it can't prove this route wires it through).
+}
+
+TEST_CASE("group-from-results: a configured trusted origin is accepted "
+          "despite a different Host",
+          "[pg][server][dashboard][group_from_results][csrf]") {
+    GroupFromResultsHarness h{/*degrade_response_store=*/false,
+                              /*csrf_trusted_origins=*/{"https://proxy.example"}};
+    seed_matching_responses(h.rs(), {"agent-A", "agent-B"});
+
+    auto res = h.post(GroupFromResultsHarness::form_body("csrf-trusted-group"),
+                      {{"Host", kHost}, {"Origin", "https://proxy.example"}});
+    CHECK(res->status == 200);
+    CHECK(h.mg.find_group_by_name("csrf-trusted-group").has_value());
 }
