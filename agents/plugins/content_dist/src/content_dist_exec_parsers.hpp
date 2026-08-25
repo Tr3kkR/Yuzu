@@ -27,6 +27,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 namespace yuzu::content_dist::exec {
 
@@ -43,15 +44,68 @@ namespace yuzu::content_dist::exec {
     return first_bytes.size() >= 2 && first_bytes[0] == '#' && first_bytes[1] == '!';
 }
 
+/// True iff `arg` contains none of the shell metacharacters `do_execute`'s
+/// caller-supplied `args` param is refused for: `; & | \` $ ( ) { } < > ! ~
+/// ^ ' " # * ? [ ] \n \r`. `execute_staged` never invokes a shell (argv is
+/// exec'd directly via yuzu::agent::run_bounded_subprocess), so this is not
+/// closing a shell-injection hole that exists today -- it is a defence-in-
+/// depth refusal against an operator-supplied args string that LOOKS like a
+/// shell pipeline, on the theory that such a string almost certainly
+/// reflects a misunderstanding of this action's no-shell contract rather
+/// than a deliberate, safe argument. BR-006 (whole-branch review round 2):
+/// moved here from content_dist_plugin.cpp's anonymous namespace (a pure,
+/// no-I/O string predicate belongs in this header, not the impure plugin
+/// TU) so both `do_execute`'s real call site and a unit test can share the
+/// one definition.
+[[nodiscard]] inline bool is_safe_arg(std::string_view arg) {
+    for (char c : arg) {
+        if (c == ';' || c == '&' || c == '|' || c == '`' || c == '$' || c == '(' || c == ')' ||
+            c == '{' || c == '}' || c == '<' || c == '>' || c == '!' || c == '~' || c == '^' ||
+            c == '\'' || c == '"' || c == '#' || c == '*' || c == '?' || c == '[' || c == ']' ||
+            c == '\n' || c == '\r') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Splits `args` on runs of space/tab into an argv tail -- a simple
+/// whitespace split, deliberately NOT shell word-splitting (no quoting, no
+/// escaping): `execute_staged` never invokes a shell, so there is no shell
+/// grammar to replicate here. BR-006: moved here alongside is_safe_arg()
+/// above, same reasoning.
+[[nodiscard]] inline std::vector<std::string> split_args(std::string_view args) {
+    std::vector<std::string> result;
+    std::string current;
+    for (char c : args) {
+        if (c == ' ' || c == '\t') {
+            if (!current.empty()) {
+                result.push_back(std::move(current));
+                current.clear();
+            }
+        } else {
+            current += c;
+        }
+    }
+    if (!current.empty())
+        result.push_back(std::move(current));
+    return result;
+}
+
 /// The fixed SubprocessOptions `do_execute` runs every `execute_staged`
-/// invocation with. `is_linux` is the only axis that varies the result —
-/// pass `true` only on an actual Linux build (`#ifdef __linux__` at the
-/// call site), never based on a runtime guess. The caller still MUST set
-/// `.exec_verify.expected_size` on the returned options afterward, once the
-/// staged file's hash-verified size is known: this function never touches
-/// the filesystem, so it cannot know that size itself.
+/// invocation with. `is_linux` gates exec_verify (Linux-only fd-exec
+/// TOCTOU closure); pass both `is_linux`/`is_windows` `true` only on an
+/// actual matching build (`#ifdef __linux__`/`#ifdef _WIN32` at the call
+/// site), never based on a runtime guess. `is_windows` no longer varies the
+/// result as of BR-001 (inherit_parent_env is now unconditional -- see that
+/// field's own comment below) but stays a parameter for call-site symmetry
+/// with content_dist_plugin.cpp's existing kIsLinux/kIsWindows pair, and in
+/// case a future Windows-specific tuning needs it again. The caller still
+/// MUST set `.exec_verify.expected_size` on the returned options afterward,
+/// once the staged file's hash-verified size is known: this function never
+/// touches the filesystem, so it cannot know that size itself.
 [[nodiscard]] inline yuzu::agent::SubprocessOptions build_execution_options(bool is_linux,
-                                                                              bool is_windows) {
+                                                                              [[maybe_unused]] bool is_windows) {
     yuzu::agent::SubprocessOptions opts;
 
     // BR-002 (whole-branch review correction -- supersedes an earlier
@@ -126,21 +180,47 @@ namespace yuzu::content_dist::exec {
     // there; Windows verification isn't implemented and fails closed too.
     // Setting this unconditionally would make execute_staged spawn_error on
     // every single invocation on macOS and Windows.
-    // Alex ruling (whole-branch review follow-up): the deleted Windows
-    // launcher passed lpEnvironment=nullptr to CreateProcessW, so a staged
-    // installer inherited the agent's FULL parent environment. The migrated
-    // path set neither inherit_parent_env nor extra_env, which would have
-    // silently narrowed Windows children to the runner's fixed default block
-    // (SystemRoot/windir/PATH/TEMP/TMP) -- an undisclosed behaviour change to
-    // exactly the kind of vendor installer that reads machine/proxy variables.
-    // This mirrors the identical ruling already applied to script_exec's
-    // Windows leg: a convergence refactor must not silently change behaviour.
-    // POSIX is unaffected -- the deleted POSIX launcher inherited the parent
-    // environment implicitly via execvp, which is what the runner's own
-    // default-off path plus this flag's POSIX no-op preserve. Any future
-    // tightening of the environment for staged payloads is a separate,
+    // Alex ruling (whole-branch review round 1 follow-up, then round 2 --
+    // BR-001 -- superseding round 1's POSIX claim below): the deleted
+    // Windows launcher passed lpEnvironment=nullptr to CreateProcessW, so a
+    // staged installer inherited the agent's FULL parent environment. The
+    // migrated path set neither inherit_parent_env nor extra_env, which
+    // would have silently narrowed Windows children to the runner's fixed
+    // default block (SystemRoot/windir/PATH/TEMP/TMP) -- an undisclosed
+    // behaviour change to exactly the kind of vendor installer that reads
+    // machine/proxy variables. This mirrors the identical ruling already
+    // applied to script_exec's Windows leg: a convergence refactor must not
+    // silently change behaviour.
+    //
+    // BR-001 (round 2, whole-branch re-review): round 1's comment here
+    // claimed "POSIX is unaffected -- the deleted POSIX launcher inherited
+    // the parent environment implicitly via execvp, which is what the
+    // runner's own default-off path plus this flag's POSIX no-op preserve."
+    // That claim was FLATLY WRONG and must not be re-derived from: the
+    // deleted POSIX launcher DID call execvp() without ever replacing
+    // `environ`, so it DID inherit the full parent environment -- exactly
+    // like the Windows launcher, not "unaffected" by comparison to it. The
+    // runner's A5 clear-slate (PATH/LC_ALL/optional TZ only) was therefore
+    // a real, undisclosed POSIX regression too: any staged installer
+    // reading HTTPS_PROXY, HOME, a licence variable, or another deployment
+    // variable worked before this migration and silently stopped after it.
+    //
+    // The fix is the SAME primitive Windows already used, now honoured on
+    // POSIX as well (subprocess_runner.cpp's POSIX backend, BR-001) --
+    // inherit_parent_env is set on EVERY platform here, matching this
+    // action's actual pre-migration behaviour everywhere, not just on
+    // Windows. The POSIX backend additionally strips the ADR-3002 A5
+    // injection class (LD_*/DYLD_*/IFS/BASH_ENV/ENV/GCONV_PATH/NLSPATH/
+    // LOCPATH) from the inherited block before use -- silently, not a
+    // launch failure, matching subprocess_launch_spec.hpp's
+    // filter_inherited_env() contract -- which the deleted execvp() launcher
+    // never did; the strip is a narrowing relative to that exact
+    // pre-migration behaviour, deliberately: a staged installer that
+    // genuinely needed LD_PRELOAD-class inheritance was never something
+    // this migration set out to preserve. Any FURTHER tightening of the
+    // environment for staged payloads beyond that strip is a separate,
     // deliberate, disclosed change -- never a side effect of this migration.
-    opts.inherit_parent_env = is_windows;
+    opts.inherit_parent_env = true;
 
     opts.exec_verify.enabled = is_linux;
 
@@ -221,6 +301,18 @@ map_execution_result(const yuzu::agent::SubprocessResult& result) {
     // deadline/cancelled kill classification above has already been ruled
     // out.
     if (!result.tool_ran) {
+        // BR-005 (whole-branch review round 2): SubprocessResult::spawn_errno
+        // is documented (subprocess_runner.hpp) as 0 for "a non-POSIX/no-
+        // report failure path" -- the Windows runner returns spawn_error
+        // without ever assigning it. Formatting 0 through
+        // std::generic_category().message() unconditionally produced the
+        // self-contradictory "spawn failed (errno 0: Success)" on every
+        // Windows CreateProcessW/setup failure, obscuring the actual
+        // failure and misleading an operator or autonomous retry logic that
+        // parses this text. Report honestly when there is no real errno to
+        // report instead of formatting a fabricated "Success".
+        if (result.spawn_errno == 0)
+            return ExecutionWireResult{"error", -1, "spawn failed (OS error unavailable)"};
         return ExecutionWireResult{
             "error", -1,
             "spawn failed (errno " + std::to_string(result.spawn_errno) + ": " +

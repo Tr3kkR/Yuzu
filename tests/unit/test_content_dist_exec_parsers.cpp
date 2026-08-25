@@ -20,6 +20,8 @@
 
 #include <cerrno>
 #include <string>
+#include <string_view>
+#include <vector>
 
 using namespace yuzu::content_dist::exec;
 using yuzu::agent::SubprocessResult;
@@ -243,6 +245,24 @@ TEST_CASE("map_execution_result: spawn_error (tool_ran==false) reports the errno
     CHECK(wire.output.find("spawn failed (errno " + std::to_string(ENOENT) + ":") == 0);
 }
 
+TEST_CASE("map_execution_result: spawn_error with spawn_errno==0 (BR-005, e.g. a Windows "
+         "CreateProcessW/setup failure) never claims a fabricated 'Success'",
+         "[agent][content_dist][exec]") {
+    SubprocessResult r;
+    r.tool_ran = false;
+    r.termination_reason = TerminationReason::spawn_error;
+    r.exit_code = -1;
+    r.spawn_errno = 0; // documented "non-POSIX/no-report failure path" value
+
+    auto wire = map_execution_result(r);
+    CHECK(wire.status == "error");
+    CHECK(wire.exit_code == -1);
+    CHECK(wire.output == "spawn failed (OS error unavailable)");
+    // The self-contradictory text this fix removes must never appear.
+    CHECK(wire.output.find("Success") == std::string::npos);
+    CHECK(wire.output.find("errno 0") == std::string::npos);
+}
+
 TEST_CASE("map_execution_result: spawn_error from a B6 exec_verify rejection (EACCES) maps "
          "the same way as any other spawn failure",
          "[agent][content_dist][exec]") {
@@ -313,31 +333,67 @@ TEST_CASE("is_shebang_payload: ELF magic is false", "[agent][content_dist][exec]
     CHECK_FALSE(is_shebang_payload("\x7f" "ELF"));
 }
 
+// ── is_safe_arg / split_args (BR-006: moved from content_dist_plugin.cpp's
+// anonymous namespace so they are unit-testable as pure functions) ─────────
+
+TEST_CASE("is_safe_arg: ordinary argument bytes are accepted", "[agent][content_dist][exec]") {
+    CHECK(is_safe_arg("--verbose"));
+    CHECK(is_safe_arg("/opt/vendor/install.sh"));
+    CHECK(is_safe_arg("key=value"));
+    CHECK(is_safe_arg(""));
+}
+
+TEST_CASE("is_safe_arg: every documented shell metacharacter is refused",
+         "[agent][content_dist][exec]") {
+    for (char c : std::string_view{";&|`$(){}<>!~^'\"#*?[]\n\r"}) {
+        CHECK_FALSE(is_safe_arg(std::string(1, c)));
+        CHECK_FALSE(is_safe_arg("prefix" + std::string(1, c) + "suffix"));
+    }
+}
+
+TEST_CASE("split_args: splits on runs of spaces/tabs, no shell quoting", "[agent][content_dist][exec]") {
+    CHECK(split_args("") == std::vector<std::string>{});
+    CHECK(split_args("one") == std::vector<std::string>{"one"});
+    CHECK(split_args("one two") == std::vector<std::string>{"one", "two"});
+    CHECK(split_args("  one   two  ") == std::vector<std::string>{"one", "two"});
+    CHECK(split_args("one\ttwo") == std::vector<std::string>{"one", "two"});
+    // No shell word-splitting semantics -- a quoted token is NOT preserved
+    // as one argument.
+    CHECK(split_args("\"one two\"") == std::vector<std::string>{"\"one", "two\""});
+}
+
 TEST_CASE("is_shebang_payload: empty input is false", "[agent][content_dist][exec]") {
     CHECK_FALSE(is_shebang_payload(""));
 }
 
-// ── inherit_parent_env (Windows legacy-environment preservation) ─────────
-// The deleted Windows launcher passed lpEnvironment=nullptr to CreateProcessW,
-// so a staged installer inherited the agent's full parent environment. These
-// pin that the migrated options builder preserves it on Windows and does NOT
-// set it anywhere else -- the flag is a no-op on POSIX and must never become a
-// general default.
-TEST_CASE("build_execution_options preserves the Windows parent environment only on Windows",
+// ── inherit_parent_env (legacy full-environment preservation, every OS) ────
+// The deleted OS-specific launchers on BOTH platforms inherited the agent's
+// full parent environment -- Windows via lpEnvironment=nullptr to
+// CreateProcessW, POSIX via execvp() without ever replacing `environ` (BR-001,
+// whole-branch review round 2: an earlier version of this file's comment
+// claimed POSIX was unaffected, which was wrong -- see
+// build_execution_options' own rationale comment). These pin that the
+// migrated options builder preserves that on EVERY platform combination,
+// unconditionally -- inherit_parent_env is no longer an is_windows-gated
+// flag.
+TEST_CASE("build_execution_options sets inherit_parent_env unconditionally, on every platform "
+          "combination (BR-001)",
           "[agent][content_dist][exec]") {
     CHECK(build_execution_options(/*is_linux=*/false, /*is_windows=*/true).inherit_parent_env);
-    CHECK_FALSE(build_execution_options(/*is_linux=*/false, /*is_windows=*/false).inherit_parent_env);
-    CHECK_FALSE(build_execution_options(/*is_linux=*/true, /*is_windows=*/false).inherit_parent_env);
+    CHECK(build_execution_options(/*is_linux=*/false, /*is_windows=*/false).inherit_parent_env);
+    CHECK(build_execution_options(/*is_linux=*/true, /*is_windows=*/false).inherit_parent_env);
 }
 
-TEST_CASE("build_execution_options keeps exec_verify and inherit_parent_env independent",
+TEST_CASE("build_execution_options keeps exec_verify Linux-only while inherit_parent_env stays "
+          "unconditional (BR-001)",
           "[agent][content_dist][exec]") {
-    // Linux gets the fd-exec verification and never the Windows env flag;
-    // Windows gets the env flag and never fd-exec (it fails closed there).
+    // Linux gets the fd-exec verification (and, since BR-001, inherit_parent_env
+    // too -- it is no longer Windows-exclusive); non-Linux never gets fd-exec
+    // (it fails closed there) but still gets inherit_parent_env.
     auto lin = build_execution_options(/*is_linux=*/true, /*is_windows=*/false);
     auto win = build_execution_options(/*is_linux=*/false, /*is_windows=*/true);
     CHECK(lin.exec_verify.enabled);
-    CHECK_FALSE(lin.inherit_parent_env);
+    CHECK(lin.inherit_parent_env);
     CHECK_FALSE(win.exec_verify.enabled);
     CHECK(win.inherit_parent_env);
 }
