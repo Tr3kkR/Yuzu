@@ -30,12 +30,24 @@ TEST_CASE("build_launch_spec rejects the same things run_bounded_subprocess reje
     CHECK(build_launch_spec({"relative/bin"}, LaunchOptions{}).error == LaunchSpecError::relative_argv0);
     CHECK(build_launch_spec({"/bin/echo", std::string("a\0b", 3)}, LaunchOptions{}).error ==
           LaunchSpecError::embedded_nul);
+    // BR-009 (whole-branch review round 2): the .bat/.cmd/.com ban is a
+    // Windows cmd.exe/CreateProcess-quoting hazard (CVE-2024-24576) --
+    // build_launch_spec now gates it on the COMPILE target, not every
+    // platform, so a POSIX build must accept these suffixes as ordinary
+    // filename bytes (a real ELF/Mach-O tool could legitimately be named
+    // this) while a Windows build still refuses them.
+#ifdef _WIN32
     CHECK(build_launch_spec({"/path/tool.bat"}, LaunchOptions{}).error ==
           LaunchSpecError::banned_windows_extension);
     CHECK(build_launch_spec({"/path/TOOL.CMD"}, LaunchOptions{}).error ==
           LaunchSpecError::banned_windows_extension); // case-insensitive
     CHECK(build_launch_spec({"/path/tool.com"}, LaunchOptions{}).error ==
           LaunchSpecError::banned_windows_extension);
+#else
+    CHECK(build_launch_spec({"/path/tool.bat"}, LaunchOptions{}).error == LaunchSpecError::none);
+    CHECK(build_launch_spec({"/path/TOOL.CMD"}, LaunchOptions{}).error == LaunchSpecError::none);
+    CHECK(build_launch_spec({"/path/tool.com"}, LaunchOptions{}).error == LaunchSpecError::none);
+#endif
     CHECK(build_launch_spec({"C:\\tools\\thing.exe"}, LaunchOptions{}).error ==
           LaunchSpecError::none); // a valid Windows-absolute argv[0]
 }
@@ -466,4 +478,90 @@ TEST_CASE("merge_launch_env layers extra_env on top of a live parent-environment
         merge_launch_env(parent_env, {{"LD_PRELOAD", "/evil.so"}}, /*windows=*/true);
     CHECK(merged_denied.rejected == std::vector<std::string>{"LD_PRELOAD"});
     CHECK(merged_denied.env == parent_env); // refused entry never applied
+}
+
+// ── filter_inherited_env (BR-001 whole-branch review round 2) ───────────────
+//
+// Alex's binding ruling: content_dist's deleted POSIX launcher inherited the
+// agent's FULL parent environment via execvp() (no environ replacement) --
+// the migrated runner's A5 clear-slate silently narrowed that to just
+// PATH/LC_ALL(/TZ), an undisclosed regression. The fix is to honour
+// inherit_parent_env on POSIX too, but strip the ADR-3002 A5 injection class
+// first. filter_inherited_env is the pure, host-testable core of that strip
+// -- subprocess_runner.cpp's POSIX backend is the only impure caller (reads
+// `environ`, calls this, then merge_launch_env()s extra_env on top exactly
+// as the Windows backend already does).
+
+TEST_CASE("filter_inherited_env passes through an ordinary parent snapshot untouched",
+          "[subprocess][launch_spec][inherit_parent_env]") {
+    using namespace yuzu::agent;
+    std::vector<EnvVar> parent_env = {
+        {"HOME", "/home/svc"}, {"HTTPS_PROXY", "http://proxy:8080"}, {"PATH", "/usr/bin"}};
+    EnvInheritResult result = filter_inherited_env(parent_env, /*windows=*/false);
+    CHECK(result.stripped.empty());
+    CHECK(result.env == parent_env);
+}
+
+TEST_CASE("filter_inherited_env strips every LD_*/DYLD_* name and each exact denylisted name, "
+          "silently -- never fails closed",
+          "[subprocess][launch_spec][inherit_parent_env]") {
+    using namespace yuzu::agent;
+    for (const std::string& denied :
+        {std::string("LD_PRELOAD"), std::string("LD_LIBRARY_PATH"), std::string("DYLD_INSERT_LIBRARIES"),
+         std::string("DYLD_LIBRARY_PATH"), std::string("IFS"), std::string("BASH_ENV"),
+         std::string("ENV"), std::string("GCONV_PATH"), std::string("NLSPATH"), std::string("LOCPATH")}) {
+        std::vector<EnvVar> parent_env = {{"HOME", "/home/svc"}, {denied, "x"}};
+        EnvInheritResult result = filter_inherited_env(parent_env, /*windows=*/false);
+        // Dropped, not fatal: no LaunchSpecError-shaped signal here at all --
+        // just absent from .env and named in .stripped.
+        CHECK(result.stripped == std::vector<std::string>{denied});
+        REQUIRE(result.env.size() == 1);
+        CHECK(result.env[0].key == "HOME");
+    }
+}
+
+TEST_CASE("filter_inherited_env's strip follows the target's case rule, matching "
+          "merge_launch_env's own denylist case behaviour",
+          "[subprocess][launch_spec][inherit_parent_env]") {
+    using namespace yuzu::agent;
+    // POSIX real environment names are case-sensitive -- "ld_preload" is a
+    // genuinely different variable from "LD_PRELOAD" there, so the POSIX
+    // strip must be exact-case, not a case-insensitive net that widens the
+    // ban to names no real POSIX installer would ever collide with.
+    std::vector<EnvVar> posix_env = {{"ld_preload", "marker"}};
+    EnvInheritResult posix_result = filter_inherited_env(posix_env, /*windows=*/false);
+    CHECK(posix_result.stripped.empty());
+    CHECK(posix_result.env == posix_env);
+
+    // Windows environment names are case-insensitive -- the strip must catch
+    // any casing there.
+    EnvInheritResult win_result = filter_inherited_env(posix_env, /*windows=*/true);
+    CHECK(win_result.stripped == std::vector<std::string>{"ld_preload"});
+    CHECK(win_result.env.empty());
+}
+
+TEST_CASE("filter_inherited_env's accepted entries still layer correctly under merge_launch_env, "
+          "matching the POSIX backend's exact call sequence",
+          "[subprocess][launch_spec][inherit_parent_env]") {
+    using namespace yuzu::agent;
+    std::vector<EnvVar> parent_env = {
+        {"HOME", "/home/svc"}, {"LD_PRELOAD", "/evil.so"}, {"HTTPS_PROXY", "http://proxy:8080"}};
+    EnvInheritResult filtered = filter_inherited_env(parent_env, /*windows=*/false);
+    CHECK(filtered.stripped == std::vector<std::string>{"LD_PRELOAD"});
+
+    // extra_env still applies ON TOP of the filtered base, replace-never-
+    // duplicate, exactly as the Windows backend's identical sequence does.
+    EnvMergeResult merged = merge_launch_env(filtered.env, {{"HOME", "/override"}}, /*windows=*/false);
+    CHECK(merged.rejected.empty());
+    REQUIRE(merged.env.size() == 2); // LD_PRELOAD never came back
+    auto find = [](const std::vector<EnvVar>& env, const std::string& k) -> const EnvVar* {
+        for (const auto& e : env)
+            if (e.key == k)
+                return &e;
+        return nullptr;
+    };
+    REQUIRE(find(merged.env, "HOME"));
+    CHECK(find(merged.env, "HOME")->value == "/override");
+    REQUIRE(find(merged.env, "HTTPS_PROXY"));
+    CHECK_FALSE(find(merged.env, "LD_PRELOAD"));
 }

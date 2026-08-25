@@ -83,13 +83,16 @@ struct LaunchSpec {
     // shell ever consumes it.
     std::string windows_command_line;
 
-    // A2-002: pure passthrough of LaunchOptions::inherit_parent_env -- see
-    // that field's comment. `env` above is ALWAYS computed the ordinary way
-    // regardless of this flag (this header does no OS I/O to honour it);
-    // only the Windows OS shell in subprocess_runner.cpp branches on it, by
-    // substituting a live-read parent environment (with extra_env layered on
-    // top via the same merge_launch_env() below) for `env` at the point it
-    // actually builds the Win32 environment block. Default false.
+    // A2-002/BR-001 (whole-branch review round 2): pure passthrough of
+    // LaunchOptions::inherit_parent_env -- see that field's comment. `env`
+    // above is ALWAYS computed the ordinary way regardless of this flag
+    // (this header does no OS I/O to honour it); BOTH OS shells in
+    // subprocess_runner.cpp now branch on it, each substituting a live-read
+    // parent environment (with extra_env layered on top via the same
+    // merge_launch_env() below, and -- POSIX only -- the ADR-3002 A5
+    // injection class stripped via filter_inherited_env() below) for `env`
+    // at the point they actually build the child's environment block.
+    // Default false.
     bool inherit_parent_env = false;
 
     // A1/Windows: which handles the shell must mark inheritable and name in
@@ -143,16 +146,19 @@ struct LaunchOptions {
     // merge_launch_env() below.
     std::vector<EnvVar> extra_env;
 
-    // A2-002 (Alex plan-gate ruling, script_exec's Windows-parity escalation):
-    // mirror of SubprocessOptions::inherit_parent_env (subprocess_runner.hpp)
-    // -- see that field's doc comment for the full contract. Pure PASSTHROUGH
-    // only: this header never reads the live process environment (it is a
-    // pure, allocation-only core -- see the file header), so build_launch_spec()
-    // below copies this flag onto LaunchSpec unchanged and otherwise computes
-    // `env` exactly as it always has (default_launch_env() + extra_env). The
-    // impure OS shell in subprocess_runner.cpp is what actually branches on
-    // spec.inherit_parent_env -- and only in its Windows backend; the POSIX
-    // backend never reads it at all. Default false, matching
+    // A2-002/BR-001 (Alex plan-gate rulings -- script_exec's Windows-parity
+    // escalation, then content_dist's whole-branch-review round-2 POSIX
+    // extension): mirror of SubprocessOptions::inherit_parent_env
+    // (subprocess_runner.hpp) -- see that field's doc comment for the full
+    // contract. Pure PASSTHROUGH only: this header never reads the live
+    // process environment (it is a pure, allocation-only core -- see the
+    // file header), so build_launch_spec() below copies this flag onto
+    // LaunchSpec unchanged and otherwise computes `env` exactly as it always
+    // has (default_launch_env() + extra_env). The impure OS shells in
+    // subprocess_runner.cpp are what actually branch on
+    // spec.inherit_parent_env -- BOTH backends now (see
+    // filter_inherited_env() below for the POSIX-only injection-class strip
+    // that backend layers on top). Default false, matching
     // SubprocessOptions'.
     bool inherit_parent_env = false;
 };
@@ -408,6 +414,48 @@ inline EnvMergeResult merge_launch_env(const std::vector<EnvVar>& base, const st
     return result;
 }
 
+/** Outcome of filter_inherited_env(): the accepted entries, plus the names
+ *  of any that were stripped (for caller-side logging). */
+struct EnvInheritResult {
+    std::vector<EnvVar> env;
+    std::vector<std::string> stripped;
+};
+
+/// BR-001 (whole-branch review round 2, Alex ruling): filters a LIVE parent-
+/// environment snapshot (`parent_env`, e.g. read from POSIX `environ` or
+/// Windows' GetEnvironmentStringsW()) down to everything EXCEPT the
+/// ADR-3002 A5 injection class -- reusing the exact same
+/// detail::is_denied_env_name() predicate default_launch_env()'s comment
+/// and merge_launch_env()'s extra_env check already share, so there is one
+/// place, not three, that knows what that class is.
+///
+/// Deliberately NOT the same failure mode as merge_launch_env()'s handling
+/// of extra_env: a denylisted NAME here is silently DROPPED from `env` (and
+/// recorded in `stripped`) rather than treated as fatal for the whole
+/// launch. extra_env is caller-authored -- a denied name there is the
+/// caller's own mistake to fix, so failing the launch closed is the right
+/// call. An INHERITED parent-environment variable is different: it is this
+/// AGENT's own live environment, not something the caller supplied or
+/// controls, so refusing to run every `inherit_parent_env` launch on a host
+/// that happens to have `LD_PRELOAD` set in its environment would be
+/// absurd -- the correct response is to withhold exactly that one variable
+/// from the child and let the launch proceed. Silent here means "no
+/// LaunchSpecError raised BY THIS FUNCTION" -- callers are expected to
+/// still log `stripped` (see subprocess_runner.cpp's POSIX backend) so the
+/// behaviour remains observable, just not launch-refusing.
+inline EnvInheritResult filter_inherited_env(const std::vector<EnvVar>& parent_env, bool windows) {
+    EnvInheritResult result;
+    result.env.reserve(parent_env.size());
+    for (const auto& entry : parent_env) {
+        if (detail::is_denied_env_name(entry.key, windows)) {
+            result.stripped.push_back(entry.key);
+            continue;
+        }
+        result.env.push_back(entry);
+    }
+    return result;
+}
+
 /**
  * Colascione backslash-before-quote argv-element quoting: the algorithm the
  * Microsoft CRT's own command-line parser (and every parser that follows its
@@ -464,6 +512,20 @@ inline std::string quote_windows_arg(const std::string& arg) {
  */
 inline LaunchSpec build_launch_spec(const std::vector<std::string>& argv, const LaunchOptions& opts) {
     LaunchSpec spec;
+
+    // A5: clear-and-allow-list env target for this compile (CDX-P2-008:
+    // Windows must not inherit the POSIX shape) -- computed here, ahead of
+    // EVERY check below (BR-009 moved this up from just below the argv[0]
+    // extension check, which used to run unconditionally on every target),
+    // so both that check, the extra_env pre-check, and the later
+    // default_launch_env()/merge_launch_env() calls share the one
+    // definition.
+#ifdef _WIN32
+    constexpr bool kWindowsEnv = true;
+#else
+    constexpr bool kWindowsEnv = false;
+#endif
+
     if (argv.empty()) {
         spec.error = LaunchSpecError::empty_argv;
         return spec;
@@ -478,21 +540,20 @@ inline LaunchSpec build_launch_spec(const std::vector<std::string>& argv, const 
             return spec;
         }
     }
-    if (detail::is_banned_windows_extension(argv.front())) {
+    // BR-009 (whole-branch review round 2): is_banned_windows_extension's
+    // CVE-2024-24576 rationale is a Windows cmd.exe/CreateProcess quoting
+    // hazard specifically -- .bat/.cmd/.com are ordinary filename bytes on
+    // POSIX, where execve() never re-interprets an argv[0] suffix at all.
+    // Checking this unconditionally on every compile target (the previous
+    // behaviour) made a genuine POSIX ELF/Mach-O binary that happened to be
+    // named e.g. "agent.com" spawn_error on Linux/macOS for a Windows-only
+    // reason. Gate on the SAME kWindowsEnv this function's env target uses,
+    // not a runtime guess -- only a Windows-targeted build can ever hand
+    // this argv[0] to CreateProcess in the first place.
+    if (kWindowsEnv && detail::is_banned_windows_extension(argv.front())) {
         spec.error = LaunchSpecError::banned_windows_extension;
         return spec;
     }
-
-    // A5: clear-and-allow-list env target for this compile (CDX-P2-008:
-    // Windows must not inherit the POSIX shape) -- computed here, ahead of
-    // any field population below, so both the extra_env pre-check right
-    // after this and the later default_launch_env()/merge_launch_env() calls
-    // share the one definition.
-#ifdef _WIN32
-    constexpr bool kWindowsEnv = true;
-#else
-    constexpr bool kWindowsEnv = false;
-#endif
 
     // Bounded widening of A5 (Alex plan-gate ruling, PLAN-04 option b):
     // pre-validate opts.extra_env BEFORE populating anything else on spec,
