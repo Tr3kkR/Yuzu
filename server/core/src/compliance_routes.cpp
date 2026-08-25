@@ -801,6 +801,7 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             }
             auto dispatch = policy_evaluator_->evaluate_now(id);
             if (dispatch.outcome == yuzu::server::PolicyEvaluator::DispatchOutcome::kStoreUnavailable) {
+                audit_fn_(req, "policy.evaluate", "denied", "policy", id, "store_unavailable");
                 res.status = 503;
                 res.set_content(
                     R"({"error":{"code":503,"message":"instruction store unavailable"},"meta":{"api_version":"v1"}})",

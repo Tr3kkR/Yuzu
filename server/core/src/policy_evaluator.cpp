@@ -171,10 +171,19 @@ std::string verdict_for(const StoredResponse& r, const std::string& instruction_
 
     std::string schema;
     if (istore) {
-        // ADR-0058: get_definition now returns std::expected<optional<...>, string> —
-        // a DB error or a not-found id both leave schema empty, matching the
-        // pre-migration behaviour (parse_result tolerates an empty schema).
-        if (auto def_result = istore->get_definition(instruction_id); def_result && *def_result)
+        // ADR-0058: get_definition now returns std::expected<optional<...>, string>. A
+        // not-found id leaves schema empty, matching pre-migration behaviour (parse_result
+        // tolerates an empty schema) — the check already dispatched successfully against a
+        // known instruction, so a since-deleted definition is a narrow edge case, not a
+        // reason to error the verdict. A genuine DB error is NOT the same: proceeding with
+        // an empty schema on a type-blind parse could silently produce a WRONG
+        // compliant/non_compliant verdict instead of surfacing the infrastructure failure
+        // (gov Gate 3 architect finding) — persisted straight into SOC2-relevant compliance
+        // posture data via update_agent_status.
+        auto def_result = istore->get_definition(instruction_id);
+        if (!def_result)
+            return "error";
+        if (*def_result)
             schema = (*def_result)->result_schema;
     }
     InstructionResult ir = parse_result(r.output, schema);
@@ -367,8 +376,14 @@ void PolicyEvaluator::dispatch_due() {
             // A store-unavailable attempt is not a completed evaluation — restore the
             // prior throttle state so the next tick retries immediately instead of
             // waiting out the full interval on a transient InstructionStore failure.
+            // CAS-guarded (gov Gate 3 cpp-safety finding): only restore if this call's own
+            // claim (`t`) is still in place — a concurrent evaluate_now() may have claimed
+            // and successfully dispatched in between, and an unconditional overwrite would
+            // silently clobber that legitimate claim with our stale prior_last.
             std::lock_guard<std::mutex> lk(mu_);
-            last_eval_[p.id] = prior_last;
+            auto it = last_eval_.find(p.id);
+            if (it != last_eval_.end() && it->second == t)
+                it->second = prior_last;
             if (d_.metrics)
                 d_.metrics
                     ->counter("yuzu_server_policy_eval_errors_total", {{"phase", "check"}})
@@ -383,11 +398,25 @@ PolicyEvaluator::DispatchResult PolicyEvaluator::evaluate_now(const std::string&
     auto p = d_.policy_store->get_policy(policy_id);
     if (!p)
         return {DispatchOutcome::kSkipped, ""};
+    int64_t prior_last = 0;
+    int64_t t = now();
     {
         std::lock_guard<std::mutex> lk(mu_);
-        last_eval_[policy_id] = now();
+        auto it = last_eval_.find(policy_id);
+        prior_last = (it != last_eval_.end()) ? it->second : 0;
+        last_eval_[policy_id] = t;
     }
-    return kickoff_check(*p); // dispatch runs without mu_ held
+    auto result = kickoff_check(*p); // dispatch runs without mu_ held
+    if (result.outcome == DispatchOutcome::kStoreUnavailable) {
+        // Same throttle-restore-on-store-unavailable fix as dispatch_due (gov Gate 3 cpp-safety
+        // finding): a manual "Evaluate Now" that hits a transient InstructionStore failure must
+        // not burn a full background interval either. CAS-guarded against a concurrent claim.
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = last_eval_.find(policy_id);
+        if (it != last_eval_.end() && it->second == t)
+            it->second = prior_last;
+    }
+    return result;
 }
 
 PolicyEvaluator::RemediateResult

@@ -2169,8 +2169,15 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                              workflow_engine](const std::string& kind, const std::string& item_id)
             -> std::expected<void, std::string> {
             if (kind == "InstructionDefinition") {
+                // db_error, not not_found (gov Gate 3/4 finding): a null instruction_store is
+                // a genuine unavailability, not "this item doesn't exist" — using the tolerated
+                // prefix here would let ProductPackStore::uninstall delete the pack row while
+                // the (never-touched) instruction definition stays live. Currently unreachable
+                // (instruction_store_ and product_pack_store_ share one boot latch — cpp-expert
+                // Gate 3), kept correct as defense-in-depth against that invariant changing.
                 if (!instruction_store)
-                    return std::unexpected("not_found: instruction store unavailable");
+                    return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                                           "instruction store unavailable");
                 return instruction_store->delete_definition(item_id);
             } else if (kind == "PolicyFragment") {
                 if (policy_store && policy_store->delete_fragment(item_id))

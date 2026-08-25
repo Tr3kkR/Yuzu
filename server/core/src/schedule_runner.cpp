@@ -69,13 +69,17 @@ void ScheduleRunner::fire(const InstructionSchedule& s) {
         // ADR-0058: a genuine DB error (Postgres blip) — distinguished from
         // "unknown" (id doesn't exist) below so an operator doesn't mistake a
         // transient infrastructure issue for a stale/deleted schedule reference.
+        // Do NOT advance: a store-unavailable attempt is not a completed
+        // occurrence — advancing would permanently consume this schedule's due
+        // slot on a transient failure. Leaving it un-advanced means evaluate_due()
+        // returns it again next tick, matching PolicyEvaluator::dispatch_due's
+        // throttle-restore-on-store-unavailable fix (gov Gate 3 sibling finding).
         count("yuzu_schedule_fire_failures_total");
         spdlog::warn("schedule_runner: schedule '{}' (id={}) instruction store read failed for "
-                     "'{}' — occurrence skipped",
+                     "'{}' — retrying next tick",
                      s.name, s.id, s.definition_id);
         audit(s, "instruction.schedule_fired", "failure",
               "definition_store_unavailable schedule_id=" + s.id);
-        d_.schedule_engine->advance_schedule(s.id);
         return;
     }
     if (!*def_result || !(*def_result)->enabled) {

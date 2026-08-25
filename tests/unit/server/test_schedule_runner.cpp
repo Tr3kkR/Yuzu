@@ -108,10 +108,11 @@ struct Harness {
                           [](const std::string&, const std::string&, const std::string&) {
                               return true;
                           },
-                      AuditStore* audit = nullptr, yuzu::MetricsRegistry* metrics_reg = nullptr)
+                      AuditStore* audit = nullptr, yuzu::MetricsRegistry* metrics_reg = nullptr,
+                      InstructionStore* instruction_store_override = nullptr)
         : runner(ScheduleRunner::Deps{
               .schedule_engine = &engine,
-              .instruction_store = &is,
+              .instruction_store = instruction_store_override ? instruction_store_override : &is,
               .execution_tracker = &tracker,
               .approval_manager = &approvals,
               .audit_store = audit,
@@ -266,6 +267,30 @@ TEST_CASE("ScheduleRunner: unknown definition skips the occurrence but advances"
     CHECK(h.calls.empty());
     auto s = h.get(id);
     CHECK(s.next_execution_at > 1); // advanced — must not re-fire every tick
+}
+
+TEST_CASE("ScheduleRunner: InstructionStore DB error skips the occurrence WITHOUT advancing "
+          "(retries next tick)",
+          "[schedule][runner]") {
+    // Regression pin (gov Gate 3/6 sibling finding): a genuine InstructionStore DB error used
+    // to advance_schedule() unconditionally, permanently consuming that occurrence on a
+    // transient Postgres blip — the same class of bug PolicyEvaluator::dispatch_due's
+    // throttle-restore fix closed, not originally applied here.
+    yuzu::server::pg::PgPool broken_pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 1}};
+    REQUIRE_FALSE(broken_pool.valid());
+    InstructionStore broken_is{broken_pool};
+    REQUIRE_FALSE(broken_is.is_open());
+
+    Harness h(
+        [](const std::string&, const std::string&, const std::string&) { return true; }, nullptr,
+        nullptr, &broken_is);
+    auto id = h.make_due("test.def", "interval");
+
+    h.runner.tick();
+
+    CHECK(h.calls.empty());
+    // NOT advanced — still due, so the next tick retries rather than losing the occurrence.
+    CHECK(h.get(id).next_execution_at == 1);
 }
 
 TEST_CASE("ScheduleRunner: disabled definition skips the occurrence but advances",

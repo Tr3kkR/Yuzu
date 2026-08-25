@@ -15266,6 +15266,8 @@ private:
                     // the conflict/validation split below (see delete routes for the
                     // same check).
                     if (result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0) {
+                        (void)audit_log(req, "instruction.create", "denied",
+                                        "InstructionDefinition", def.id, "db_error");
                         res.status = 503;
                         res.set_content(
                             R"({"error":{"code":503,"message":"instruction store unavailable"},"meta":{"api_version":"v1"}})",
@@ -15433,6 +15435,9 @@ private:
                 if (!result) {
                     // ADR-0058: a genuine DB/lease failure 503s, never falls through to 400.
                     bool db_error = result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0;
+                    if (db_error)
+                        (void)audit_log(req, "instruction.update", "denied",
+                                        "InstructionDefinition", id, "db_error");
                     res.status = db_error ? 503 : 400;
                     res.set_content(nlohmann::json({{"error", db_error
                                                                    ? "instruction store unavailable"
@@ -15472,6 +15477,8 @@ private:
             // workflow_routes.cpp product_pack_error_status).
             auto del_result = instruction_store_->delete_definition(id);
             if (!del_result && del_result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0) {
+                (void)audit_log(req, "instruction.delete", "denied", "InstructionDefinition", id,
+                                "db_error");
                 res.status = 503;
                 res.set_content(
                     R"({"error":{"code":503,"message":"instruction store delete failed"},"meta":{"api_version":"v1"}})",
@@ -15479,6 +15486,8 @@ private:
                 return;
             }
             if (!del_result) {
+                (void)audit_log(req, "instruction.delete", "denied", "InstructionDefinition", id,
+                                "not_found");
                 res.status = 404;
                 res.set_content(
                     R"({"error":{"code":404,"message":"instruction definition not found"},"meta":{"api_version":"v1"}})",
@@ -15534,8 +15543,13 @@ private:
             auto result = instruction_store_->import_definition_json(req.body);
             if (!result) {
                 // ADR-0058: a genuine DB/lease failure 503s — never falls through to the
-                // conflict/validation split below.
+                // conflict/validation split below. R4: audited the same as every other
+                // rejection branch below (gov Gate 6 compliance-officer finding).
                 if (result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0) {
+                    const bool audit_ok = audit_log(req, "instruction.import", "denied",
+                                                    "InstructionDefinition", "", "db_error");
+                    if (!audit_ok)
+                        res.set_header("Sec-Audit-Failed", "true");
                     res.status = 503;
                     res.set_content(
                         R"({"error":{"code":503,"message":"instruction store unavailable"},"meta":{"api_version":"v1"}})",
@@ -15659,6 +15673,9 @@ private:
             auto result = instruction_store_->create_set(s);
             if (!result) {
                 // ADR-0058: a genuine DB/lease failure 503s, never falls through to 400.
+                // Not audited: this route has no audit logging at all (success or failure),
+                // pre-existing and unrelated to this migration — tracked separately, not
+                // asymmetrically half-fixed here (see the instruction-sets audit-gap issue).
                 bool db_error = result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0;
                 res.status = db_error ? 503 : 400;
                 res.set_content(nlohmann::json({{"error", db_error ? "instruction store unavailable"
@@ -16592,7 +16609,14 @@ private:
                 if (!result) {
                     spdlog::warn("instruction yaml update failed: id={} error={}",
                                  log_safe(def_id), result.error());
-                    respond("Update failed: " + result.error(), false);
+                    // A db_error-prefixed message can carry libpq internals (PQerrorMessage
+                    // fragments) — generic-ize it before it reaches the operator, matching
+                    // workflow_routes.cpp's product_pack_client_message convention (gov Gate 4
+                    // consistency finding).
+                    bool db_error = result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0;
+                    respond("Update failed: " +
+                                (db_error ? "instruction store unavailable" : result.error()),
+                            false);
                     return;
                 }
                 (void)audit_log(req, "instruction.update", "success", "InstructionDefinition",
@@ -16622,7 +16646,11 @@ private:
                                     std::string(strip_conflict_prefix(result.error())),
                                 false);
                     } else {
-                        respond("Create failed: " + result.error(), false);
+                        // See the update-branch comment above (gov Gate 4 consistency finding).
+                        bool db_error = result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0;
+                        respond("Create failed: " +
+                                    (db_error ? "instruction store unavailable" : result.error()),
+                                false);
                     }
                     return;
                 }
