@@ -4993,7 +4993,13 @@ public:
                     ++defs_errored;
                     spdlog::warn("bundled definition import failed: id={} error={}", id,
                                  r.error());
-                    audit_bundle("InstructionDefinition", id, "error", r.error());
+                    // Gate 8 re-review (security-guardian): the boot log line above already
+                    // carries the raw driver text for operators — the persisted audit row
+                    // gets the genericized form, same shape as the other 3 sites this round
+                    // fixed (r.error() can carry a genuine kDbErrorPrefix failure, not just
+                    // an is_conflict_error, since that branch is handled above).
+                    audit_bundle("InstructionDefinition", id, "error",
+                                 genericize_db_error("bundled_content reseed", r.error()));
                 }
             }
             int sets_imported = 0, sets_skipped = 0, sets_errored = 0;
@@ -5025,7 +5031,10 @@ public:
                 } else {
                     ++sets_errored;
                     spdlog::warn("bundled set import failed: id={} error={}", s.id, r.error());
-                    audit_bundle("InstructionSet", s.id, "error", r.error());
+                    // Gate 8 re-review (security-guardian): see the matching comment on the
+                    // definitions loop above.
+                    audit_bundle("InstructionSet", s.id, "error",
+                                 genericize_db_error("bundled_content reseed", r.error()));
                 }
             }
             if (defs_errored > 0 || sets_errored > 0) {

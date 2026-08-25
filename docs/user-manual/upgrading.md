@@ -156,19 +156,22 @@ treated every non-2xx response as a validation error should be updated.
 No operator action is required to upgrade; the reseed loop runs automatically at boot. See
 `docs/adr/0058-instruction-store-postgres-migration.md` for the full design record.
 
-**Caveat (rollback direction, gov Gate 2/4/6 SEC-3/UP-2/enterprise-readiness):** the above
-covers forward migration only. `instructions.db` still exists after the upgrade (it keeps
-backing the still-SQLite `ExecutionTracker`/`ApprovalManager`/`ScheduleEngine` siblings), but
-this binary never writes InstructionDefinition/InstructionSet rows to it. If you roll the
-server *binary* back to a pre-migration release, the outcome depends on your deployment's
-history and is never a silent no-op either way:
+**Caveat (rollback direction):** the above covers forward migration only. `instructions.db`
+still exists after the upgrade (it keeps backing the still-SQLite
+`ExecutionTracker`/`ApprovalManager`/`ScheduleEngine` siblings), but this binary never writes
+InstructionDefinition/InstructionSet rows to it. If you roll the server *binary* back to a
+pre-migration release, the outcome depends on your deployment's history and is never an empty
+catalog either way — the pre-migration binary's own boot sequence unconditionally
+`CREATE TABLE IF NOT EXISTS`-es the catalog tables and runs its own every-boot bundled-content
+reseed loop, the same way this store always has:
 - **A deployment that upgraded from a pre-migration install** still has its old
   `instructions.db` catalog tables, untouched by the new binary. The rolled-back binary reads
   them and serves that pre-cutover snapshot — including re-resurrecting any bundled definition
   or set an operator deliberately deleted in Postgres after cutover, since the old binary has
   no concept of the tombstone table.
 - **A deployment that was Postgres-first from its first boot** has no catalog tables in
-  `instructions.db` at all. The rolled-back binary boots against an empty catalog.
+  `instructions.db` yet. The rolled-back binary creates them fresh and reseeds that old
+  release's full bundled catalog — a stale but non-empty catalog, not an empty one.
 - **Either way, anything created or edited via the API while running the new (Postgres)
   binary is invisible during the rollback** — it lives only in Postgres, which the old binary
   never reads — and, because there is no backfill, is not recovered automatically when you
