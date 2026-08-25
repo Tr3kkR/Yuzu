@@ -103,10 +103,6 @@ std::int64_t to_i64(const char* s) {
 bool to_bool(const char* s) {
     return s != nullptr && s[0] == 't';
 }
-// Only used against legacy SQLite text columns (may be nullptr).
-const char* safe(const char* p) {
-    return p ? p : "";
-}
 
 /// Issue #587: visualization_spec is stored as a JSON array of chart
 /// objects so the engine sees one shape. This helper takes whatever the
@@ -189,6 +185,14 @@ const std::vector<pg::PgMigration>& migrations() {
          "  id         TEXT NOT NULL,"
          "  deleted_at BIGINT NOT NULL,"
          "  PRIMARY KEY (kind, id));"},
+        // Gate 4 UP-3: the original v1 briefly included a sqlite_backfill_source table
+        // (for the backfill mechanism retired in full before this store shipped, see
+        // ADR-0058's "Backfill — none" section) and had it edited out of v1 in place —
+        // PgMigrationRunner tracks by version number only, so any dev/UAT database that
+        // ran a migration during that narrow window keeps the orphan table forever.
+        // Harmless (nothing references it) but permanent schema drift; drop it
+        // idempotently for the databases that have it, no-op for the ones that don't.
+        {2, "DROP TABLE IF EXISTS sqlite_backfill_source;"},
     };
     return kMigrations;
 }
@@ -356,7 +360,11 @@ InstructionStore::query_definitions(const InstructionQuery& q) const {
         binds.push_back(val);
     };
     if (!q.name_filter.empty())
-        add_clause("name LIKE", "%" + q.name_filter + "%");
+        // Gate 4 happy-path finding 2: SQLite's LIKE is case-insensitive for ASCII by
+        // default; plain Postgres LIKE is case-sensitive. Using ILIKE here restores the
+        // pre-migration behaviour instead of silently returning zero rows for a query
+        // that differs from an existing name only by case.
+        add_clause("name ILIKE", "%" + q.name_filter + "%");
     if (!q.plugin_filter.empty())
         add_clause("plugin =", q.plugin_filter);
     if (!q.type_filter.empty())

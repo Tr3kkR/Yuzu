@@ -573,7 +573,12 @@ PolicyEvaluator::remediate(const std::string& policy_id,
     auto dispatch_result = dispatch_instruction(frag->fix_instruction, fix_params, targets);
     if (!dispatch_result) {
         out.degraded = true;
-        out.error = "instruction store unavailable: " + dispatch_result.error();
+        // Gate 3 ARCH-1: dispatch_result.error() carries raw PQerrorMessage() text on a
+        // genuine DB failure — genericized here at the source so both consumers
+        // (compliance_routes.cpp's audit row AND its POST /api/policies/:id/remediate
+        // response body, both of which echo `out.error` verbatim) get the fix for free.
+        out.error = yuzu::server::genericize_db_error("PolicyEvaluator::remediate dispatch",
+                                                       dispatch_result.error());
         return out;
     }
     if (dispatch_result->empty()) {

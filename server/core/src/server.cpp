@@ -4853,6 +4853,21 @@ public:
                     metrics_.counter("yuzu_server_instruction_write_degrade_total",
                                      {{"reason", reason}});
                 }
+                // Gate 4 UP-4: distinct from the runtime write-degrade counter above — this
+                // is the ONE-BOOT reseed-loop outcome, alertable on its own so "reseed lost
+                // N/232 items at boot" is distinguishable from an ordinary operator-write
+                // blip sharing the same reason labels.
+                metrics_.describe("yuzu_server_instruction_bundled_content_total",
+                                  "Bundled-content boot-time reseed outcome by result (clean = "
+                                  "zero import errors; errored = at least one definition/set "
+                                  "failed to import against an open store — the boot refuses "
+                                  "to serve, ADR-0058 Gate 8). Every-boot, not one-time, unlike "
+                                  "sibling *_backfill_total counters.",
+                                  "counter");
+                for (auto result : {"clean", "errored"}) {
+                    metrics_.counter("yuzu_server_instruction_bundled_content_total",
+                                     {{"result", result}});
+                }
             }
         }
 
@@ -4911,6 +4926,20 @@ public:
         // field in both the audit detail and the spdlog warning so
         // operators can triage without reading 200+ envelopes by
         // hand (Gate 6 SRE-O2).
+        //
+        // Gate 4 UP-4 (BLOCKING, HIGH-derived): a genuine DB error on any item was
+        // previously only counted (defs_errored/sets_errored) and logged at INFO — never
+        // checked against startup_failed_, unlike every OTHER store construction in this
+        // function. The server would boot and serve a silently partial catalog with no
+        // readiness signal. This loop is entirely synchronous inside the constructor —
+        // web_server_->listen() runs strictly after it returns — so there is no window
+        // where a partially-reseeded server is already accepting traffic; failing closed
+        // here means refusing to ever start serving, not interrupting an in-progress
+        // serve. A single-shot with_txn_for has no internal retry, so a transient blip on
+        // one of ~232 sequential items is a real, not hypothetical, trigger; the existing
+        // orchestrator crash-loop-backoff is the intended recovery (a failed item was
+        // never inserted, so a clean restart against a healthy Postgres re-imports it —
+        // ADR-0058's every-boot reseed already makes this self-healing).
         if (instruction_store_ && instruction_store_->is_open() && !startup_failed_) {
             auto audit_bundle = [this](std::string_view target_type, const std::string& target_id,
                                        std::string_view result, const std::string& detail) {
@@ -4999,11 +5028,27 @@ public:
                     audit_bundle("InstructionSet", s.id, "error", r.error());
                 }
             }
-            spdlog::info(
-                "bundled content: {} definitions imported / {} skipped / {} errored; "
-                "{} sets imported / {} skipped / {} errored",
-                defs_imported, defs_skipped, defs_errored, sets_imported, sets_skipped,
-                sets_errored);
+            if (defs_errored > 0 || sets_errored > 0) {
+                spdlog::error(
+                    "bundled content: {} definitions imported / {} skipped / {} errored; "
+                    "{} sets imported / {} skipped / {} errored — refusing to start "
+                    "(ADR-0058 Gate 8: a partial catalog is never served silently)",
+                    defs_imported, defs_skipped, defs_errored, sets_imported, sets_skipped,
+                    sets_errored);
+                metrics_.counter("yuzu_server_instruction_bundled_content_total",
+                                 {{"result", "errored"}})
+                    .increment();
+                startup_failed_ = true;
+            } else {
+                spdlog::info(
+                    "bundled content: {} definitions imported / {} skipped / {} errored; "
+                    "{} sets imported / {} skipped / {} errored",
+                    defs_imported, defs_skipped, defs_errored, sets_imported, sets_skipped,
+                    sets_errored);
+                metrics_.counter("yuzu_server_instruction_bundled_content_total",
+                                 {{"result", "clean"}})
+                    .increment();
+            }
         }
 
         // Initialize Phase 3: Security & RBAC stores (PostgreSQL, ADR-0041).
@@ -15934,16 +15979,31 @@ private:
             s.description = desc;
             auto result = instruction_store_->create_set(s);
             if (!result) {
-                // ADR-0058: a genuine DB/lease failure 503s, never falls through to 400.
+                // ADR-0058: a genuine DB/lease failure 503s, never falls through to
+                // the conflict/validation split below.
                 // Not audited: this route has no audit logging at all (success or failure),
                 // pre-existing and unrelated to this migration — tracked separately, not
                 // asymmetrically half-fixed here (see the instruction-sets audit-gap issue).
                 bool db_error = result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0;
-                res.status = db_error ? 503 : 400;
-                res.set_content(nlohmann::json({{"error", db_error ? "instruction store unavailable"
-                                                                    : result.error()}})
-                                    .dump(),
-                                "application/json");
+                if (db_error) {
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":"instruction store unavailable"})",
+                        "application/json");
+                    return;
+                }
+                // Gate 4 Finding A / Gate 6 enterprise-readiness: this route was the one
+                // sibling of instruction.create/update/delete that never added the
+                // is_conflict_error branch store_errors.hpp's kConflictPrefix comment says
+                // every duplicate-class error site must handle — a duplicate id fell
+                // through to plain 400 with the raw unstripped "conflict:" prefix in the
+                // body. Matches instruction.create's pattern (this route still has no audit
+                // logging at all, pre-existing gap, not fixed here).
+                bool is_conflict = is_conflict_error(result.error());
+                res.status = is_conflict ? 409 : 400;
+                auto body_msg = is_conflict ? std::string(strip_conflict_prefix(result.error()))
+                                            : result.error();
+                res.set_content(nlohmann::json({{"error", body_msg}}).dump(), "application/json");
                 return;
             }
             res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");

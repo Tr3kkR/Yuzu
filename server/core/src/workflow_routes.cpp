@@ -1440,8 +1440,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // fail the step (neither can silently widen or narrow the target set).
             auto def_result = instruction_store->get_definition(instruction_id);
             if (!def_result)
-                return std::unexpected<std::string>("instruction store unavailable: " +
-                                                     def_result.error());
+                // Gate 2 SEC-1: def_result.error() carries raw PQerrorMessage() text on a
+                // genuine DB failure — genericized before it reaches the stored step result
+                // (GET /api/workflow-executions/:id echoes this verbatim to any Workflow:Read
+                // holder).
+                return std::unexpected<std::string>(yuzu::server::genericize_db_error(
+                    "dispatch_fn instruction lookup", def_result.error()));
             if (!*def_result)
                 return std::unexpected<std::string>("unknown instruction: " + instruction_id);
             const auto& def = **def_result;
@@ -2068,7 +2072,19 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // YAML so we don't echo it into target_id (would create an
             // attacker-influenced audit key); the pack name is recoverable
             // from the request body if forensics need it.
-            audit_fn(req, "product_pack.install", "denied", "ProductPack", "", result.error());
+            //
+            // Gate 4 Finding B / Gate 6 CO-1 (third instance of SEC-1/ARCH-1's class):
+            // result.error() can carry a genuine kDbErrorPrefix failure from any
+            // install_fn arm (InstructionStore/PolicyStore/WorkflowEngine) — the response
+            // body was already genericized below via product_pack_client_message, but this
+            // audit row previously stored the raw driver text verbatim AND hardcoded
+            // "denied" even on an infrastructure failure, misclassifying an outage as an
+            // access decision (the exact vocabulary bug commit 849cf6a34 fixed at 7 other
+            // sites, missed here).
+            audit_fn(req, "product_pack.install",
+                     yuzu::server::is_generic_db_error(result.error()) ? "error" : "denied",
+                     "ProductPack", "",
+                     yuzu::server::genericize_db_error("product_pack.install", result.error()));
             res.status = product_pack_error_status(result.error());
             res.set_content(detail::a4_error(res, product_pack_client_message(
                                                        "POST /api/product-packs", result.error())),
