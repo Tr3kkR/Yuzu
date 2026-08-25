@@ -279,11 +279,14 @@ std::vector<DnsEntry> enumerate_dns();
  * Hard-capped at kMapDriveEntryCap.
  * Completeness contract: THROWS yuzu::tar::IncompleteCaptureError rather than returning a
  * partial vector when the underlying capture didn't genuinely complete -- a
- * subprocess capture that didn't run to completion (Linux `smbstatus`,
- * Windows `wevtutil`/`journalctl`; tar_capture_status.hpp's
- * classify_subprocess_capture), or on macOS a getfsstat(2) failure or an
- * over-cap snapshot (tar_mapdrive_collector.cpp). Callers MUST NOT diff or
- * persist a caught exception's snapshot as though it were a genuinely
+ * subprocess capture that didn't run to completion (this LIVE leg's own
+ * subprocess is Linux `smbstatus` only -- Windows live outbound/inbound is
+ * native WNet/NetSessionEnum, not a subprocess; `wevtutil`/`journalctl` are
+ * enumerate_mapdrive_history()'s one-time backfill subprocesses, a separate
+ * completeness contract documented below; both legs share
+ * tar_capture_status.hpp's classify_subprocess_capture), or on macOS a
+ * getfsstat(2) failure or an over-cap snapshot (tar_mapdrive_collector.cpp).
+ * Callers MUST NOT diff or persist a caught exception's snapshot as though it were a genuinely
  * smaller/empty mount table; see collect_or_retain() and its call sites in
  * tar_plugin.cpp.
  */
