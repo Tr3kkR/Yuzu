@@ -1390,6 +1390,31 @@ sum(rate(yuzu_server_product_pack_read_degrade_total[5m])) by (reason) > 0
 absent_over_time(yuzu_server_product_pack_backfill_total{result=~"success|fresh"}[15m])
 ```
 
+## Instruction store metrics (content-plane catalog, ADR-0058)
+
+The `InstructionStore` (`InstructionDefinition -> InstructionSet -> ProductPack`, schema
+`instruction_store`) is a migrated PostgreSQL store (authoritative posture). It has **no
+legacy-SQLite backfill** (ADR-0009's fresh-start-by-default class) — there is no
+`*_backfill_total` family for it, unlike most stores on this page.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_instruction_read_degrade_total{reason}` | counter | An `InstructionStore` read degraded instead of answering, and the caller FAILED CLOSED — the REST/MCP surfaces answer `503`, never a silently-empty or silently-truncated catalog. `reason` ∈ `store_not_open`, `pool_acquire_timeout`, `query_error`. Pre-seeded to 0 for all three. |
+| `yuzu_server_instruction_write_degrade_total{reason}` | counter | An `InstructionStore` write degraded instead of succeeding. `reason` ∈ `insert_definition_row`, `update_definition`, `delete_definition`, `insert_set_row`, `delete_set`. Pre-seeded to 0 for all five. Shared with the boot-time reseed loop's own inserts (`insert_definition_row`/`insert_set_row`) — a spike here during a boot window overlaps with `yuzu_server_instruction_bundled_content_total{result="errored"}` below; outside a boot window it's an ordinary operator-write failure. |
+| `yuzu_server_instruction_bundled_content_total{result}` | counter | Outcome of the **every-boot** bundled-content reseed loop (`kBundledDefinitions`/`kBundledSets`, 232 definitions / 10 sets as of this writing) — distinct from the `*_backfill_total` one-time-at-boot shape used elsewhere on this page, since this store reseeds on **every** boot, not once. `result` ∈ `clean` (zero import errors) or `errored` (at least one definition/set failed to import against an open store). Pre-seeded to 0 for both. **`errored` means the boot refused to start** (gov Gate 4 UP-4/Gate 8 fix): a genuine DB error during the reseed loop sets `startup_failed_`, so — same caveat as the `*_backfill_total{result="failed"}` families elsewhere on this page — a refused boot never serves `/metrics`, making `errored` itself effectively unscrapeable; alert on the ABSENCE of `clean` instead, the same shape `YuzuProductPackBackfillNotCompleted` uses. |
+
+**Useful PromQL queries:**
+
+```promql
+# InstructionStore reads degrading → REST/MCP catalog reads failing closed to 503.
+sum(rate(yuzu_server_instruction_read_degrade_total[5m])) by (reason) > 0
+
+# No server reporting a clean bundled-content reseed this boot → the reseed loop hit a
+# genuine DB error and the boot refused to start (absent-clean shape, not
+# result="errored" — a refused boot never serves /metrics).
+absent_over_time(yuzu_server_instruction_bundled_content_total{result="clean"}[15m])
+```
+
 ## Quarantine store metrics (Guardian device-quarantine bookkeeping, ADR-0047)
 
 The `QuarantineStore` — which agents are network-isolated, who isolated them, why, and their

@@ -12,9 +12,10 @@ provisional** — each is finalized in that store's per-store ADR after reading 
 
 Schema name = `snake_case(FullClassName)` incl. the `Store` suffix (ADR-0008 Update).
 
-> **For the 3 remaining stores (`InstructionStore`, `OffloadTargetStore`, `RuntimeConfigStore`):
+> **For the 2 remaining stores (`OffloadTargetStore`, `RuntimeConfigStore`):
 > do NOT build `migrate_from_sqlite()`.** ADR-0009's 2026-08-25 fresh-start-by-default amendment
-> applies to all three — no production fleet has ever run a pre-Postgres build of any Yuzu store,
+> applies to both — `InstructionStore` (ADR-0058) already migrated under this default and is off
+> this banner's list; no production fleet has ever run a pre-Postgres build of any Yuzu store,
 > so there is no real legacy data to protect. Skip the legacy-file copy entirely (same as
 > `ResponseStore`'s existing precedent — see the playbook's Backfill bullet for what to build
 > instead for a secret-bearing store). **This holds only while "no production fleet" stays

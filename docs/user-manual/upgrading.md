@@ -156,6 +156,24 @@ treated every non-2xx response as a validation error should be updated.
 No operator action is required to upgrade; the reseed loop runs automatically at boot. See
 `docs/adr/0058-instruction-store-postgres-migration.md` for the full design record.
 
+**Caveat (rollback direction, gov Gate 2/4/6 SEC-3/UP-2/enterprise-readiness):** the above
+covers forward migration only. `instructions.db` still exists after the upgrade (it keeps
+backing the still-SQLite `ExecutionTracker`/`ApprovalManager`/`ScheduleEngine` siblings), but
+this binary never writes InstructionDefinition/InstructionSet rows to it. If you roll the
+server *binary* back to a pre-migration release, the outcome depends on your deployment's
+history and is never a silent no-op either way:
+- **A deployment that upgraded from a pre-migration install** still has its old
+  `instructions.db` catalog tables, untouched by the new binary. The rolled-back binary reads
+  them and serves that pre-cutover snapshot — including re-resurrecting any bundled definition
+  or set an operator deliberately deleted in Postgres after cutover, since the old binary has
+  no concept of the tombstone table.
+- **A deployment that was Postgres-first from its first boot** has no catalog tables in
+  `instructions.db` at all. The rolled-back binary boots against an empty catalog.
+- **Either way, anything created or edited via the API while running the new (Postgres)
+  binary is invisible during the rollback** — it lives only in Postgres, which the old binary
+  never reads — and, because there is no backfill, is not recovered automatically when you
+  roll forward again either; content authored while rolled back must be re-entered.
+
 ## Behaviour change: token-rotation confirm now requires proof of possession (#3015)
 
 `confirm` on a rotation — REST `POST /api/v1/tokens/{id}/confirm` and `POST /api/v1/engine-principals/{id}/credentials/confirm`, plus the MCP twins `confirm_api_token_rotation`/`confirm_engine_rotation` — previously admitted on caller identity plus the successor's `token_id` alone. A caller who recovered an unknown successor's `token_id` out-of-band (a support ticket, a log line) could confirm — and thereby revoke the predecessor for — a rotation whose secret they never actually received. All four confirm surfaces now additionally require the raw successor secret itself in the request body/args, verified with a constant-time hash comparison against the successor's stored hash, checked LAST — strictly after ownership, pair-state, the `token_id` pin, tier, scope, and the initiator binding have all already passed — before the predecessor is touched.

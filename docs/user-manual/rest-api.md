@@ -6654,8 +6654,9 @@ a client retry. Audit event recorded as `instruction.delete / error / db_error`.
 Export an instruction definition in a portable format.
 
 **Response (200) on an unknown id:** `{}` (an empty JSON object, not an error) — pre-existing
-behavior, unchanged by ADR-0058; unlike every other route on this store, an unknown id here is
-NOT distinguishable from a 503/404 by status code. Callers must check for an empty body.
+behavior, unchanged by ADR-0058; unlike every other route on this store, an unknown id here
+returns `200 {}` rather than `404`. Callers must check for an empty body, not a status code,
+to detect not-found.
 
 **Response (503):** A genuine InstructionStore database/lease failure (ADR-0058) reading the
 definition, distinct from the empty-body not-found case above, and worth a client retry.
@@ -6792,9 +6793,16 @@ Create a new instruction set (a named collection of definitions).
 
 **Permission:** `InstructionSet:Write`
 
-**Response (200):** `{"id": "<id>"}` for the newly-created set.
+**Response (200):** `{"id": "<id>"}` for the newly-created set. The id is always
+server-generated (this route does not accept a caller-supplied `id`), so the `409` case below
+is not reachable via normal use of this endpoint today — documented for API-contract
+consistency with the sibling `POST /api/instructions` route, not because it fires in practice.
 
 **Response (400):** Validation error.
+
+**Response (409):** A set with that id already exists (gov Gate 4/6, fixed to match
+`POST /api/instructions`'s equivalent branch — the response no longer leaks the raw internal
+`conflict:` prefix).
 
 **Response (503):** A genuine database/lease failure (ADR-0058).
 

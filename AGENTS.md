@@ -94,7 +94,7 @@ CI history is separate from the developer-local DB: every Big Tam and Wee Tam ru
 
 The content plane: YAML-defined `InstructionDefinition` → `InstructionSet` → `ProductPack`, executed via the `CommandRequest` wire protocol; `yaml_source` is authoritative, denormalized columns are for queries. Architecture: `docs/Instruction-Engine.md`; DSL spec: `docs/yaml-dsl-spec.md`; tutorial: `docs/getting-started.md`.
 
-**Build-time gotcha:** PyYAML is a **hard build dependency** — `meson setup` fails the configure step without it. Shipped content is build-time embedded (`embed_content.py` → `bundled_content.cpp`, seeded into `instructions.db` on first boot); the runtime never reads YAML from disk — there is no `--content-dir` flag. Details + rationale: `docs/Instruction-Engine.md` "Build-time content embedding".
+**Build-time gotcha:** PyYAML is a **hard build dependency** — `meson setup` fails the configure step without it. Shipped content is build-time embedded (`embed_content.py` → `bundled_content.cpp`, reseeded into the Postgres `instruction_store` schema on every boot, ADR-0058); the runtime never reads YAML from disk — there is no `--content-dir` flag. `instructions.db` remains only for the still-SQLite `ExecutionTracker`/`ApprovalManager`/`ScheduleEngine` siblings. Details + rationale: `docs/Instruction-Engine.md` "Build-time content embedding".
 
 The **executions-history ladder** (PR 2/3 `execution_id` correlation + SSE) carries a stack of invariants every successor PR must check — see `docs/executions-history-ladder.md` (also in Routed concerns below).
 
