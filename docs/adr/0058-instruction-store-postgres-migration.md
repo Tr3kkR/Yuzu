@@ -321,7 +321,40 @@ independently seeds all ~232 bundled definitions / 10 bundled sets during normal
 deterministically via the parser's fallback (`""` for definitions, `"system"` for sets) across
 every replica and every release vintage; a real corrupted/hand-edited file or a genuine id
 collision would still typically differ on `created_by` too. Pinned by the two-replica-divergence
-regression tests in `test_instruction_store.cpp` (`[instruction_store][pg][backfill]`).
+regression tests in `test_instruction_store.cpp` (`[instruction_store][backfill][pg]`).
+
+**`created_by`-only IDENTITY (the paragraph above) was itself over-corrected; fixed during Gate 8
+re-review, before merge.** Narrowing IDENTITY to `id`/`created_by` fixed the bundled-content brick
+above, but removed protection against a DIFFERENT scenario the original full-row check caught: two
+**operator-authored** rows sharing an id AND a `created_by` (e.g. a shared login used across
+pre-Postgres replicas, or hand-synced YAML that drifted) whose content genuinely differs. Under the
+`created_by`-only rule, that silently discards one replica's real content with no log line naming
+which — the exact silent-loss failure mode this store's backfill design otherwise refuses to
+produce. The corrected rule is conditional on `created_by`, not a blanket comparison:
+
+- `created_by` equal to the code-default bundled sentinel (`""` for definitions —
+  `kBundledDefinitionCreator`; `"system"` for sets — `kBundledSetCreator`, `instruction_store.cpp`):
+  content divergence (`yaml_source` for definitions; `name`/`description` for sets) stays benign —
+  bundle-vintage drift, Postgres's existing row wins — but is now logged at WARN naming the id, so
+  the discard is visible instead of silent.
+- Any other `created_by`: content divergence fails the backfill closed, naming both the id and the
+  shared `created_by`, exactly like the pre-narrowing full-row check did — but WITHOUT reintroducing
+  the `created_at` comparison that caused the original bundled-content brick, since `created_at`
+  stays LIFECYCLE-only regardless of `created_by`. This also fixes a latent false-brick the
+  ORIGINAL (pre-Gate-4) full-row design carried for operator content: two replicas hand-synced from
+  the *same* file, imported at different times, differ only on `created_at` and would have failed
+  closed on that alone. The corrected rule compares content, not import time, so a clean hand-sync
+  is benign on both sides of this split.
+
+Known residual, not fixed here: `create_definition`'s REST route sets `created_by` from
+`AuthRoutes::resolve_session`, which is `nullopt` for an unauthenticated request (a route reachable
+under RBAC-off, the documented default deployment mode); an operator row created that way collides
+with the definitions sentinel (`""`) and is treated leniently (WARN, not fail-closed) on divergence,
+same as bundled content. This is the same class of residual as "no retroactive tombstone
+reconstruction" below — narrower than the general case, stated so this ADR does not overclaim.
+Pinned by the additional two-replica regression tests in `test_instruction_store.cpp`
+(non-sentinel `created_by`, both the drifted-content-fails-closed and
+identical-content-stays-benign cases, for both definitions and sets).
 
 `instruction_sets` has **no analogous mutation path at all** (`update_set` does not exist), which
 was originally read as "every column is write-once by construction, so any conflict must be
@@ -330,9 +363,12 @@ wrong for the same reason as `created_at` above: a bundled set's `name`/`descrip
 legitimately differ across two replicas' legacy files whose *release vintage* diverged (pinned
 test 4's "changed bundled content across releases" finding applies to sets exactly as it does to
 definitions), and `created_at` is replica-local seed time either way. `instruction_sets` therefore
-uses the SAME IDENTITY/LIFECYCLE split as definitions: `id`/`created_by` are IDENTITY,
-everything else (`name`/`description`/`created_at`) is LIFECYCLE — Postgres's existing row always
-wins on conflict, never compared. `ProductPackStore`'s full-row-equality rule remains correct for
+uses the SAME IDENTITY/LIFECYCLE split as definitions, including the `created_by`-conditional
+content check corrected above: `id`/`created_by` are IDENTITY (write-once, fail-closed on
+mismatch); `created_at` is LIFECYCLE (never compared, Postgres's existing value always wins);
+`name`/`description` are content — benign-with-WARN divergence for the `"system"` bundled
+sentinel, fail-closed divergence for any other `created_by`. `ProductPackStore`'s full-row-equality
+rule remains correct for
 `ProductPackStore` itself: it has no build-time-embedded/bundled-pack concept at all (verified —
 no `kBundledPacks`/seed-insert path exists), so every row it backfills is genuinely
 operator-authored and write-once end to end; the rule does not generalize to a store that also
@@ -449,12 +485,42 @@ ADR-recorded behaviour change this migration makes, not a silent test rewrite to
   short of an operator deleting and losing the row (which the tombstone above no longer even
   allows to come back automatically). Tracked in #2555 (pre-existing issue covering the same
   underlying problem), not solved here.
-- **Multi-replica backfill correctness (fixed pre-merge, Gate 4 governance finding):** the
-  backfill's original conflict-comparison over-scoped IDENTITY to include `created_at`
-  (definitions) and the full row (sets), both of which legitimately diverge across independently
-  -provisioned replicas for bundled content — see "Backfill" above. This bricked the boot of
-  every replica after the first to backfill a given bundled id, unconditionally, on any real
-  multi-replica fleet. Fixed before merge; no release ever shipped the broken version.
+- **Multi-replica backfill correctness (fixed pre-merge, Gate 4 governance finding, further
+  corrected at Gate 8):** the backfill's original conflict-comparison over-scoped IDENTITY to
+  include `created_at` (definitions) and the full row (sets), both of which legitimately diverge
+  across independently-provisioned replicas for bundled content — see "Backfill" above. This
+  bricked the boot of every replica after the first to backfill a given bundled id,
+  unconditionally, on any real multi-replica fleet. The first fix (`created_by`-only IDENTITY) was
+  itself over-corrected — it removed protection against two operator-authored rows sharing an id
+  and `created_by` with genuinely different content — and was narrowed further to a
+  `created_by`-conditional content check (sentinel = lenient+WARN, non-sentinel = fail-closed) at
+  Gate 8 re-review. Both rounds fixed before merge; no release ever shipped either broken version.
+- **A later fix round (fixing the Gate 4 backfill finding above) touched code outside the
+  Backfill section and is recorded here rather than there:**
+  - `schedule_runner.cpp`'s `fire()` no longer calls `advance_schedule` on an InstructionStore
+    DB-error branch — a transient failure now retries the occurrence next tick instead of
+    permanently losing it (independently found by both `security-guardian` and `sre` at Gate 3).
+  - `policy_evaluator.cpp`'s `dispatch_due`/`evaluate_now` throttle-restore-on-store-unavailable
+    is CAS-guarded (was an unconditional overwrite that could clobber a concurrent claim); a
+    second gap where `evaluate_now` had no restore logic at all is closed; `verdict_for` now
+    returns `"error"` on a genuine DB error instead of silently degrading to an empty schema.
+  - Seven new `audit_log`/`audit_fn_` calls cover previously-unaudited denial paths:
+    `instruction.create`/`.update`/`.delete` on `db_error`, `.delete` on `not_found`, and
+    `policy.evaluate` on `store_unavailable` (`compliance_routes.cpp`).
+  - `rest_api_v1.cpp`'s `persist_templates` and `workflow_routes.cpp`'s product-pack uninstall
+    `instruction_store`-unavailable branch are reclassified from a bare `"not_found: "` to the
+    `kInstructionStoreDbErrorPrefix`/`kProductPackDbErrorPrefix` convention (both now alias a
+    shared `kDbErrorPrefix` in `store_errors.hpp`), so a genuine DB error 503s instead of 404ing.
+- **This fix round's own diff was re-reviewed at Gate 8 and found two further gaps, both closed
+  before merge:**
+  - `PUT /api/instructions/{id}` fell through to a bare 400 for an unknown id (indistinguishable
+    from a validation error) instead of the 404 every sibling route in this migration uses;
+    fixed to classify `update_definition`'s `"not_found: "` prefix the same way `DELETE` does.
+  - `policy_evaluator.cpp`'s throttle-restore CAS token was the claim timestamp itself — two
+    claims on the same policy within the same wall-clock second are indistinguishable, so a
+    concurrent claim's restore could in theory clobber a different claim. Replaced with a
+    monotonic per-policy `generation` counter (`EvalClaim` in `policy_evaluator.hpp`), captured
+    locally at claim time and compared instead of the timestamp.
 - No change to the #1073/W7.4 signed-import enforcement semantics, the Ed25519 verify path, or
   the `--allow-unsigned-definitions` operator flag — all pure/storage-independent, ported
   unchanged.

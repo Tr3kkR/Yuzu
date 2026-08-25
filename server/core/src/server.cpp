@@ -15266,8 +15266,13 @@ private:
                     // the conflict/validation split below (see delete routes for the
                     // same check).
                     if (result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0) {
-                        (void)audit_log(req, "instruction.create", "denied",
-                                        "InstructionDefinition", def.id, "db_error");
+                        // R2: checked, not discarded — a create denial is a security-relevant
+                        // evidence-chain audit (see audit_log's [[nodiscard]] comment).
+                        const bool audit_ok = audit_log(req, "instruction.create", "denied",
+                                                        "InstructionDefinition", def.id,
+                                                        "db_error");
+                        if (!audit_ok)
+                            res.set_header("Sec-Audit-Failed", "true");
                         res.status = 503;
                         res.set_content(
                             R"({"error":{"code":503,"message":"instruction store unavailable"},"meta":{"api_version":"v1"}})",
@@ -15433,12 +15438,27 @@ private:
 
                 auto result = instruction_store_->update_definition(def);
                 if (!result) {
-                    // ADR-0058: a genuine DB/lease failure 503s, never falls through to 400.
+                    // ADR-0058: a genuine DB/lease failure 503s; "not_found: " -> 404 (mirrors
+                    // the DELETE route immediately below); everything else is a 400 validation
+                    // error. Previously not_found fell through to the 400 branch, indistinguishable
+                    // from a validation failure (consistency-auditor Gate 8 finding).
                     bool db_error = result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0;
+                    bool not_found = !db_error && result.error().rfind("not_found: ", 0) == 0;
+                    // Audited on db_error (existing convention) and not_found (matches the
+                    // DELETE route's audited not_found branch just below); a plain validation
+                    // 400 stays unaudited, matching create_definition's equivalent branch.
+                    // R2: checked, not discarded — an update denial is a security-relevant
+                    // evidence-chain audit (see audit_log's [[nodiscard]] comment).
+                    bool audit_ok = true;
                     if (db_error)
-                        (void)audit_log(req, "instruction.update", "denied",
-                                        "InstructionDefinition", id, "db_error");
-                    res.status = db_error ? 503 : 400;
+                        audit_ok = audit_log(req, "instruction.update", "denied",
+                                             "InstructionDefinition", id, "db_error");
+                    else if (not_found)
+                        audit_ok = audit_log(req, "instruction.update", "denied",
+                                             "InstructionDefinition", id, "not_found");
+                    if ((db_error || not_found) && !audit_ok)
+                        res.set_header("Sec-Audit-Failed", "true");
+                    res.status = db_error ? 503 : (not_found ? 404 : 400);
                     res.set_content(nlohmann::json({{"error", db_error
                                                                    ? "instruction store unavailable"
                                                                    : result.error()}})
@@ -15476,9 +15496,12 @@ private:
             // ProductPackStore::uninstall's identical REST contract change,
             // workflow_routes.cpp product_pack_error_status).
             auto del_result = instruction_store_->delete_definition(id);
+            // R2: checked, not discarded — a delete denial is a security-relevant
+            // evidence-chain audit (see audit_log's [[nodiscard]] comment).
             if (!del_result && del_result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0) {
-                (void)audit_log(req, "instruction.delete", "denied", "InstructionDefinition", id,
-                                "db_error");
+                if (!audit_log(req, "instruction.delete", "denied", "InstructionDefinition", id,
+                               "db_error"))
+                    res.set_header("Sec-Audit-Failed", "true");
                 res.status = 503;
                 res.set_content(
                     R"({"error":{"code":503,"message":"instruction store delete failed"},"meta":{"api_version":"v1"}})",
@@ -15486,8 +15509,9 @@ private:
                 return;
             }
             if (!del_result) {
-                (void)audit_log(req, "instruction.delete", "denied", "InstructionDefinition", id,
-                                "not_found");
+                if (!audit_log(req, "instruction.delete", "denied", "InstructionDefinition", id,
+                               "not_found"))
+                    res.set_header("Sec-Audit-Failed", "true");
                 res.status = 404;
                 res.set_content(
                     R"({"error":{"code":404,"message":"instruction definition not found"},"meta":{"api_version":"v1"}})",

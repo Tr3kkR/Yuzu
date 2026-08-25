@@ -1345,7 +1345,7 @@ TEST_CASE("InstructionStore: plain create_set (operator path) is unaffected by a
 TEST_CASE("InstructionStore::migrate_from_sqlite: two independently-provisioned replicas' legacy "
           "files with a shared bundled id and DIVERGENT created_at is a benign no-op, not a "
           "fail-closed error",
-          "[instruction_store][pg][backfill]") {
+          "[instruction_store][backfill][pg]") {
     yuzu::test::TempDbFile legacy_a{std::string_view{"instr-legacy-conflict-a-"}};
     {
         SqliteDb db;
@@ -1414,7 +1414,7 @@ TEST_CASE("InstructionStore::migrate_from_sqlite: two independently-provisioned 
 TEST_CASE("InstructionStore::migrate_from_sqlite: two replicas' legacy files with a shared "
           "bundled set id and a DIFFERENT description (release-vintage content change) is a "
           "benign no-op, not a fail-closed error",
-          "[instruction_store][pg][backfill]") {
+          "[instruction_store][backfill][pg]") {
     yuzu::test::TempDbFile legacy_a{std::string_view{"instr-legacy-set-conflict-a-"}};
     {
         SqliteDb db;
@@ -1464,4 +1464,164 @@ TEST_CASE("InstructionStore::migrate_from_sqlite: two replicas' legacy files wit
     // Postgres's already-committed row (replica A's) wins.
     CHECK(it->description == "v1 description");
     CHECK(it->created_at == 1700000000);
+}
+
+TEST_CASE("InstructionStore::migrate_from_sqlite: two replicas' legacy files sharing an "
+          "OPERATOR-authored (non-sentinel created_by) definition id with DRIFTED yaml_source "
+          "fails closed — this is NOT bundle-vintage drift",
+          "[instruction_store][backfill][pg]") {
+    yuzu::test::TempDbFile legacy_a{std::string_view{"instr-legacy-op-conflict-a-"}};
+    {
+        SqliteDb db;
+        REQUIRE(sqlite3_open_v2(legacy_a.path.string().c_str(), db.addr(),
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+        legacy_exec(db.get(), kLegacyDefsSchema);
+        legacy_exec(db.get(), kLegacySetsSchema);
+        legacy_exec(db.get(), "ALTER TABLE instruction_definitions ADD COLUMN yaml_source TEXT "
+                              "NOT NULL DEFAULT '';");
+        // A hand-authored definition, as replica A's legacy file recorded it: real operator
+        // created_by, real yaml_source content.
+        legacy_exec(db.get(),
+                    "INSERT INTO instruction_definitions (id, name, version, type, plugin, "
+                    "action, description, enabled, instruction_set_id, gather_ttl_seconds, "
+                    "response_ttl_days, created_by, created_at, updated_at, yaml_source) VALUES "
+                    "('operator.shared.id', 'Shared Operator Def', '1.0', 'question', 'sysinfo', "
+                    "'query', 'desc', 1, '', 0, 0, 'admin', 1700000000, 1700000000, "
+                    "'scope: {}\nversion: 1');");
+    }
+    yuzu::test::TempDbFile legacy_b{std::string_view{"instr-legacy-op-conflict-b-"}};
+    {
+        SqliteDb db;
+        REQUIRE(sqlite3_open_v2(legacy_b.path.string().c_str(), db.addr(),
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+        legacy_exec(db.get(), kLegacyDefsSchema);
+        legacy_exec(db.get(), kLegacySetsSchema);
+        legacy_exec(db.get(), "ALTER TABLE instruction_definitions ADD COLUMN yaml_source TEXT "
+                              "NOT NULL DEFAULT '';");
+        // Same id, same created_by ('admin', NOT the bundled sentinel), but a DIFFERENT
+        // yaml_source — two genuinely different authoring events sharing an id and a
+        // created_by (e.g. a shared login used on two pre-Postgres replicas), not vintage
+        // drift of the same bundled row. This must refuse to guess which is correct.
+        legacy_exec(db.get(),
+                    "INSERT INTO instruction_definitions (id, name, version, type, plugin, "
+                    "action, description, enabled, instruction_set_id, gather_ttl_seconds, "
+                    "response_ttl_days, created_by, created_at, updated_at, yaml_source) VALUES "
+                    "('operator.shared.id', 'Shared Operator Def', '1.0', 'question', 'sysinfo', "
+                    "'query', 'desc', 1, '', 0, 0, 'admin', 1800000000, 1800000000, "
+                    "'scope: {}\nversion: 2');");
+    }
+
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.migrate_from_sqlite(legacy_a.path));
+    // Replica B's backfill must fail closed rather than silently discarding either side's
+    // real, divergent operator content.
+    CHECK_FALSE(store.migrate_from_sqlite(legacy_b.path));
+}
+
+TEST_CASE("InstructionStore::migrate_from_sqlite: two replicas' legacy files sharing an "
+          "OPERATOR-authored definition id with IDENTICAL yaml_source but divergent created_at "
+          "is a benign no-op",
+          "[instruction_store][backfill][pg]") {
+    yuzu::test::TempDbFile legacy_a{std::string_view{"instr-legacy-op-clean-a-"}};
+    {
+        SqliteDb db;
+        REQUIRE(sqlite3_open_v2(legacy_a.path.string().c_str(), db.addr(),
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+        legacy_exec(db.get(), kLegacyDefsSchema);
+        legacy_exec(db.get(), kLegacySetsSchema);
+        legacy_exec(db.get(), "ALTER TABLE instruction_definitions ADD COLUMN yaml_source TEXT "
+                              "NOT NULL DEFAULT '';");
+        legacy_exec(db.get(),
+                    "INSERT INTO instruction_definitions (id, name, version, type, plugin, "
+                    "action, description, enabled, instruction_set_id, gather_ttl_seconds, "
+                    "response_ttl_days, created_by, created_at, updated_at, yaml_source) VALUES "
+                    "('operator.clean.id', 'Hand-Synced Def', '1.0', 'question', 'sysinfo', "
+                    "'query', 'desc', 1, '', 0, 0, 'admin', 1700000000, 1700000000, "
+                    "'scope: {}\nversion: 1');");
+    }
+    yuzu::test::TempDbFile legacy_b{std::string_view{"instr-legacy-op-clean-b-"}};
+    {
+        SqliteDb db;
+        REQUIRE(sqlite3_open_v2(legacy_b.path.string().c_str(), db.addr(),
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+        legacy_exec(db.get(), kLegacyDefsSchema);
+        legacy_exec(db.get(), kLegacySetsSchema);
+        legacy_exec(db.get(), "ALTER TABLE instruction_definitions ADD COLUMN yaml_source TEXT "
+                              "NOT NULL DEFAULT '';");
+        // Same id, same created_by, IDENTICAL yaml_source — this is the ordinary hand-synced
+        // (pre-Postgres multi-server) case: the same file copied to every replica, imported at
+        // different times so created_at legitimately differs. Comparing created_at here (the
+        // OLD full-row-equality design) would fail closed on this clean case; comparing
+        // content (the corrected design) must not.
+        legacy_exec(db.get(),
+                    "INSERT INTO instruction_definitions (id, name, version, type, plugin, "
+                    "action, description, enabled, instruction_set_id, gather_ttl_seconds, "
+                    "response_ttl_days, created_by, created_at, updated_at, yaml_source) VALUES "
+                    "('operator.clean.id', 'Hand-Synced Def', '1.0', 'question', 'sysinfo', "
+                    "'query', 'desc', 1, '', 0, 0, 'admin', 1800000000, 1800000000, "
+                    "'scope: {}\nversion: 1');");
+        legacy_exec(db.get(),
+                    "INSERT INTO instruction_definitions (id, name, version, type, plugin, "
+                    "action, description, enabled, instruction_set_id, gather_ttl_seconds, "
+                    "response_ttl_days, created_by, created_at, updated_at, yaml_source) VALUES "
+                    "('b.only.op.def', 'B-Only Op Def', '1.0', 'question', 'sysinfo', 'query', "
+                    "'desc', 1, '', 0, 0, 'admin', 1800000000, 1800000000, 'x');");
+    }
+
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.migrate_from_sqlite(legacy_a.path));
+    REQUIRE(store.migrate_from_sqlite(legacy_b.path));
+
+    auto shared = store.get_definition("operator.clean.id");
+    REQUIRE(shared.has_value());
+    REQUIRE(shared->has_value());
+    CHECK((*shared)->created_at == 1700000000); // replica A, the first writer, wins
+}
+
+TEST_CASE("InstructionStore::migrate_from_sqlite: two replicas' legacy files sharing an "
+          "OPERATOR-authored (non-sentinel created_by) set id with DRIFTED description fails "
+          "closed",
+          "[instruction_store][backfill][pg]") {
+    yuzu::test::TempDbFile legacy_a{std::string_view{"instr-legacy-op-set-conflict-a-"}};
+    {
+        SqliteDb db;
+        REQUIRE(sqlite3_open_v2(legacy_a.path.string().c_str(), db.addr(),
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+        legacy_exec(db.get(), kLegacyDefsSchema);
+        legacy_exec(db.get(), kLegacySetsSchema);
+        legacy_exec(db.get(),
+                    "INSERT INTO instruction_sets (id, name, description, created_by, "
+                    "created_at) VALUES ('operator.shared.set', 'Shared Set', 'v1 description', "
+                    "'alice', 1700000000);");
+    }
+    yuzu::test::TempDbFile legacy_b{std::string_view{"instr-legacy-op-set-conflict-b-"}};
+    {
+        SqliteDb db;
+        REQUIRE(sqlite3_open_v2(legacy_b.path.string().c_str(), db.addr(),
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+        legacy_exec(db.get(), kLegacyDefsSchema);
+        legacy_exec(db.get(), kLegacySetsSchema);
+        // Same id, same created_by ('alice', NOT the "system" bundled-set sentinel), different
+        // description — two genuinely different authoring events, must fail closed.
+        legacy_exec(db.get(),
+                    "INSERT INTO instruction_sets (id, name, description, created_by, "
+                    "created_at) VALUES ('operator.shared.set', 'Shared Set', 'v2 description', "
+                    "'alice', 1800000000);");
+    }
+
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.migrate_from_sqlite(legacy_a.path));
+    CHECK_FALSE(store.migrate_from_sqlite(legacy_b.path));
 }

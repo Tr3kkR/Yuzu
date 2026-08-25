@@ -137,10 +137,24 @@ private:
         std::string verify_parameters_json;
     };
 
+    // The throttle timestamp (`last_eval`) doubles as the CAS "claim token" dispatch_due()/
+    // evaluate_now() use to detect whether their own claim is still in place before a
+    // store-unavailable restore. A bare `int64_t` timestamp is ABA-able: two claims within the
+    // same wall-clock second are indistinguishable, so a concurrent claim's restore could
+    // silently clobber a different claim that happens to share the same second (gov Gate 8
+    // unhappy-path/security-guardian/cpp-safety, independently converged). `generation` is a
+    // monotonic per-policy counter bumped on every claim and captured locally at claim time;
+    // the restore is CAS-guarded on `generation`, not on the timestamp, so it can never match a
+    // different claim regardless of wall-clock resolution.
+    struct EvalClaim {
+        int64_t last_eval{0};
+        uint64_t generation{0};
+    };
+
     Deps d_;
     std::mutex mu_;                                   // guards in_flight_ + last_eval_
     std::vector<InFlight> in_flight_;
-    std::unordered_map<std::string, int64_t> last_eval_;
+    std::unordered_map<std::string, EvalClaim> last_eval_;
 
     void dispatch_due();
     void collect_ready();

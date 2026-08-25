@@ -6553,7 +6553,11 @@ Update an existing instruction definition.
 
 **Response (400):** Validation error (same shape as `POST` above).
 
-**Response (503):** A genuine database/lease failure (ADR-0058).
+**Response (404):** Unknown id. Body is `{"error": "not_found: definition not found: <id>"}`.
+Audit event recorded as `instruction.update / denied / not_found`.
+
+**Response (503):** A genuine database/lease failure (ADR-0058) — distinct from 404, and worth
+a client retry.
 
 #### `DELETE /api/instructions/{id}`
 

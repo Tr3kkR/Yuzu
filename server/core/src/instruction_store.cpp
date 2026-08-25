@@ -63,6 +63,15 @@ constexpr const char* kSourcelessFingerprint = "sourceless";
 constexpr const char* kSeedCoordLockSql =
     "SELECT pg_advisory_xact_lock(2037545589, hashtext('instruction_store:seed_coordination'))";
 
+// The code-default `created_by` a bundled (build-time-embedded) row gets when its JSON
+// envelope omits the field — confirmed no content/definitions/*.yaml or bundled-set envelope
+// specifies one, so this is deterministic across every replica and release vintage. Used by
+// migrate_from_sqlite's backfill conflict check to decide whether cross-replica content
+// divergence for a shared id is benign bundle-vintage drift (sentinel) or a real
+// two-independently-authored-rows collision (any other created_by) — see the comment there.
+constexpr const char* kBundledDefinitionCreator = ""; // instruction_store.cpp:1021 default
+constexpr const char* kBundledSetCreator = "system";  // server.cpp kBundledSets default
+
 int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
@@ -1222,8 +1231,10 @@ std::expected<std::string, std::string> InstructionStore::insert_set_row(const I
         tombstoned = PQntuples(res.get()) == 0;
         return true;
     });
-    if (!ok)
+    if (!ok) {
+        note_write_degrade(metrics_, "insert_set_row");
         return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) + failure);
+    }
     if (tombstoned)
         return std::unexpected(conflict_msg);
     return id;
@@ -1290,8 +1301,10 @@ std::expected<void, std::string> InstructionStore::delete_set(const std::string&
         }
         return true;
     });
-    if (!ok)
+    if (!ok) {
+        note_write_degrade(metrics_, "delete_set");
         return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) + failure);
+    }
     if (!deleted)
         return std::unexpected("not_found: instruction set not found: " + id);
     return {};
@@ -1653,20 +1666,37 @@ bool InstructionStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
                 continue; // inserted cleanly
 
             // Conflict: id already present (another replica's own backfill/seed already landed
-            // it). IDENTITY is `id`/`created_by` only, write-once — a mismatch on `created_by`
-            // is a genuine corruption/collision, not a benign replay. `created_at` is
-            // deliberately NOT compared: for BUNDLED content (which has no discriminator column
-            // separating it from operator content in the legacy schema — it goes through this
-            // same table), `created_at` is stamped at first-seed time on each replica
-            // independently, not authored content, so two replicas' legacy files legitimately
-            // diverge on it for the exact same row. Comparing it here bricked every replica's
-            // boot after the first one to backfill any given bundled id (found by unhappy-path
-            // Gate 4 review; see the two-replica regression tests above). LIFECYCLE columns
-            // (including created_at) are NOT compared: Postgres's already-live value always wins
-            // on those (ADR-0058), the same rule the reseed loop enforces for an operator's edit.
+            // it). `created_by` is write-once IDENTITY — a mismatch there is a genuine
+            // corruption/collision, not a benign replay, regardless of who authored the row.
+            // `created_at`/other LIFECYCLE columns are never compared: Postgres's already-live
+            // value always wins on those (ADR-0058), the same rule the reseed loop enforces for
+            // an operator's edit.
+            //
+            // `created_by` alone is NOT sufficient IDENTITY for the row's CONTENT, though —
+            // that split is what this check gets wrong if applied uniformly:
+            //  - BUNDLED content (created_by == kBundledDefinitionCreator, the code-default
+            //    sentinel every kBundledDefinitions envelope gets when it omits `created_by` —
+            //    confirmed no content/definitions/*.yaml specifies one) has no discriminator
+            //    column separating it from operator content in the legacy schema, and its
+            //    yaml_source legitimately DIVERGES across releases/replicas whose bundle
+            //    vintage differs even though it is the "same" logical row. Failing closed on
+            //    that divergence bricked every replica's boot after the first one to backfill
+            //    any given bundled id (found by unhappy-path Gate 4 review; see the two-replica
+            //    regression tests above) — so for sentinel rows content divergence stays benign
+            //    (Postgres's already-live row wins), logged at WARN so the discard is visible.
+            //  - Any OTHER `created_by` is a real operator identity, and two legacy files
+            //    agreeing on id AND created_by but disagreeing on yaml_source is NOT vintage
+            //    drift — it is two independently-authored rows that happen to share both (the
+            //    realistic case: hand-synced YAML across pre-Postgres replicas that drifted, or
+            //    the same login shared across replicas). That must fail closed like the old
+            //    full-row check did, or one replica silently discards the other's real content
+            //    and later dispatches it to the fleet as though it were authoritative
+            //    (unhappy-path Gate 8 re-review; the `created_by`-only rule below regressed this
+            //    for non-bundled rows).
             pg::PgResult existing = pg::exec_params(
-                conn, "SELECT created_by FROM instruction_store.instruction_definitions "
-                     "WHERE id=$1",
+                conn,
+                "SELECT created_by, yaml_source FROM instruction_store.instruction_definitions "
+                "WHERE id=$1",
                 std::vector<std::string>{d.id});
             if (existing.status() != PGRES_TUPLES_OK || PQntuples(existing.get()) == 0) {
                 failure_detail = std::format(
@@ -1677,13 +1707,35 @@ bool InstructionStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
                 return false;
             }
             const std::string existing_created_by = text_col(existing.get(), 0, 0);
-            if (existing_created_by != sanitize_pg_text(d.created_by)) {
+            const std::string sanitized_created_by = sanitize_pg_text(d.created_by);
+            if (existing_created_by != sanitized_created_by) {
                 failure_detail = std::format(
                     "legacy definition id='{}': IDENTITY mismatch against existing row "
                     "(created_by differs) — refusing to guess which is correct",
                     d.id);
                 spdlog::error("InstructionStore::migrate_from_sqlite: {}", failure_detail);
                 return false;
+            }
+            const std::string existing_yaml_source = text_col(existing.get(), 0, 1);
+            const std::string sanitized_yaml_source = sanitize_pg_text(d.yaml_source);
+            if (existing_yaml_source != sanitized_yaml_source) {
+                if (sanitized_created_by == kBundledDefinitionCreator) {
+                    spdlog::warn(
+                        "InstructionStore::migrate_from_sqlite: legacy definition id='{}' is "
+                        "bundled (created_by is the seed sentinel) and its yaml_source differs "
+                        "from the already-live row — treating as bundle-vintage drift, "
+                        "Postgres's existing row wins and the legacy content is discarded",
+                        d.id);
+                } else {
+                    failure_detail = std::format(
+                        "legacy definition id='{}': IDENTITY mismatch against existing row "
+                        "(created_by='{}' matches but yaml_source differs) — two "
+                        "independently-authored rows share this id, refusing to guess which "
+                        "is correct",
+                        d.id, sanitized_created_by);
+                    spdlog::error("InstructionStore::migrate_from_sqlite: {}", failure_detail);
+                    return false;
+                }
             }
             // IDENTITY matches — benign, Postgres's existing (possibly since-edited) row wins.
         }
@@ -1731,13 +1783,19 @@ bool InstructionStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
             // operator-authored ones in the legacy schema, so a bundled set's name/description
             // can legitimately differ across two replicas' legacy files whose content vintage
             // diverged (the same class pinned for definitions above), and created_at is
-            // replica-local first-seed time, never authored content. Comparing the full row
-            // bricked every replica's boot after the first to backfill a given bundled set id.
-            // IDENTITY is `id`/`created_by` only — Postgres's already-live row always wins on
-            // name/description/created_at, matching definitions' LIFECYCLE rule.
+            // replica-local first-seed time, never authored content — LIFECYCLE, never compared,
+            // Postgres's already-live value always wins. `created_by` is write-once IDENTITY.
+            //
+            // name/description are content, not IDENTITY, but ARE compared conditionally, same
+            // split as definitions above: for the bundled sentinel (created_by == "system", the
+            // kBundledSets default) divergence is benign vintage drift (WARN, existing row
+            // wins); for any other created_by, two legacy files agreeing on id+created_by but
+            // disagreeing on name/description are independently-authored rows sharing an id,
+            // and that fails closed (unhappy-path Gate 8 re-review).
             pg::PgResult existing = pg::exec_params(
                 conn,
-                "SELECT created_by FROM instruction_store.instruction_sets WHERE id=$1",
+                "SELECT created_by, name, description FROM instruction_store.instruction_sets "
+                "WHERE id=$1",
                 std::vector<std::string>{s.id});
             if (existing.status() != PGRES_TUPLES_OK || PQntuples(existing.get()) == 0) {
                 failure_detail = std::format(
@@ -1748,13 +1806,37 @@ bool InstructionStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
                 return false;
             }
             const std::string existing_created_by = text_col(existing.get(), 0, 0);
-            if (existing_created_by != sanitize_pg_text(s.created_by)) {
+            const std::string sanitized_created_by = sanitize_pg_text(s.created_by);
+            if (existing_created_by != sanitized_created_by) {
                 failure_detail = std::format(
                     "legacy set id='{}': IDENTITY mismatch against existing row (created_by "
                     "differs) — refusing to guess which is correct",
                     s.id);
                 spdlog::error("InstructionStore::migrate_from_sqlite: {}", failure_detail);
                 return false;
+            }
+            const std::string existing_name = text_col(existing.get(), 0, 1);
+            const std::string existing_description = text_col(existing.get(), 0, 2);
+            const std::string sanitized_name = sanitize_pg_text(s.name);
+            const std::string sanitized_description = sanitize_pg_text(s.description);
+            if (existing_name != sanitized_name || existing_description != sanitized_description) {
+                if (sanitized_created_by == kBundledSetCreator) {
+                    spdlog::warn(
+                        "InstructionStore::migrate_from_sqlite: legacy set id='{}' is bundled "
+                        "(created_by is the seed sentinel) and its name/description differ "
+                        "from the already-live row — treating as bundle-vintage drift, "
+                        "Postgres's existing row wins and the legacy content is discarded",
+                        s.id);
+                } else {
+                    failure_detail = std::format(
+                        "legacy set id='{}': IDENTITY mismatch against existing row "
+                        "(created_by='{}' matches but name/description differ) — two "
+                        "independently-authored rows share this id, refusing to guess which "
+                        "is correct",
+                        s.id, sanitized_created_by);
+                    spdlog::error("InstructionStore::migrate_from_sqlite: {}", failure_detail);
+                    return false;
+                }
             }
             // IDENTITY matches — benign, Postgres's existing (possibly since-edited) row wins.
         }

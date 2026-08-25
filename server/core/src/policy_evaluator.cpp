@@ -363,27 +363,32 @@ void PolicyEvaluator::dispatch_due() {
         int64_t interval = std::max<int64_t>(interval_for(p, d_.default_interval_seconds), 60);
         // Claim the due slot under a short lock, then dispatch lock-free.
         int64_t prior_last = 0;
+        uint64_t claim_gen = 0;
         {
             std::lock_guard<std::mutex> lk(mu_);
             auto it = last_eval_.find(p.id);
-            prior_last = (it != last_eval_.end()) ? it->second : 0;
+            prior_last = (it != last_eval_.end()) ? it->second.last_eval : 0;
             if (t - prior_last < interval)
                 continue;
-            last_eval_[p.id] = t; // claim before dispatch (throttle)
+            auto& claim = last_eval_[p.id]; // claim before dispatch (throttle)
+            claim.last_eval = t;
+            claim_gen = ++claim.generation;
         }
         auto result = kickoff_check(p); // does its own brief locking; dispatch runs without mu_
         if (result.outcome == DispatchOutcome::kStoreUnavailable) {
             // A store-unavailable attempt is not a completed evaluation — restore the
             // prior throttle state so the next tick retries immediately instead of
             // waiting out the full interval on a transient InstructionStore failure.
-            // CAS-guarded (gov Gate 3 cpp-safety finding): only restore if this call's own
-            // claim (`t`) is still in place — a concurrent evaluate_now() may have claimed
-            // and successfully dispatched in between, and an unconditional overwrite would
-            // silently clobber that legitimate claim with our stale prior_last.
+            // CAS-guarded on `generation`, not the timestamp (gov Gate 3 cpp-safety +
+            // Gate 8 re-review): only restore if this call's own claim is still the most
+            // recent one — a concurrent evaluate_now() may have claimed and successfully
+            // dispatched in between, and an unconditional (or timestamp-only, ABA-able
+            // within the same second) overwrite would silently clobber that legitimate
+            // claim with our stale prior_last.
             std::lock_guard<std::mutex> lk(mu_);
             auto it = last_eval_.find(p.id);
-            if (it != last_eval_.end() && it->second == t)
-                it->second = prior_last;
+            if (it != last_eval_.end() && it->second.generation == claim_gen)
+                it->second.last_eval = prior_last;
             if (d_.metrics)
                 d_.metrics
                     ->counter("yuzu_server_policy_eval_errors_total", {{"phase", "check"}})
@@ -400,21 +405,26 @@ PolicyEvaluator::DispatchResult PolicyEvaluator::evaluate_now(const std::string&
         return {DispatchOutcome::kSkipped, ""};
     int64_t prior_last = 0;
     int64_t t = now();
+    uint64_t claim_gen = 0;
     {
         std::lock_guard<std::mutex> lk(mu_);
         auto it = last_eval_.find(policy_id);
-        prior_last = (it != last_eval_.end()) ? it->second : 0;
-        last_eval_[policy_id] = t;
+        prior_last = (it != last_eval_.end()) ? it->second.last_eval : 0;
+        auto& claim = last_eval_[policy_id];
+        claim.last_eval = t;
+        claim_gen = ++claim.generation;
     }
     auto result = kickoff_check(*p); // dispatch runs without mu_ held
     if (result.outcome == DispatchOutcome::kStoreUnavailable) {
         // Same throttle-restore-on-store-unavailable fix as dispatch_due (gov Gate 3 cpp-safety
         // finding): a manual "Evaluate Now" that hits a transient InstructionStore failure must
-        // not burn a full background interval either. CAS-guarded against a concurrent claim.
+        // not burn a full background interval either. CAS-guarded on `generation`, not the
+        // timestamp (Gate 8 re-review — a bare timestamp token is ABA-able within the same
+        // second) against a concurrent claim.
         std::lock_guard<std::mutex> lk(mu_);
         auto it = last_eval_.find(policy_id);
-        if (it != last_eval_.end() && it->second == t)
-            it->second = prior_last;
+        if (it != last_eval_.end() && it->second.generation == claim_gen)
+            it->second.last_eval = prior_last;
     }
     return result;
 }
