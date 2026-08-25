@@ -979,7 +979,7 @@ REST: `GET/POST/DELETE /api/v1/offload-targets`, `GET /api/v1/offload-targets/{i
 
 **Known follow-up:** the dispatcher does not yet extract `spec.offload.targets` from the originating definition — `fire_event(target_filter)` honours an explicit caller-supplied filter, but the agent-service fan-out passes none. Wiring the per-instruction filter through `cmd_execution_ids_ → execution_id → definition_id → InstructionStore` is tracked separately so the global fan-out path lands clean first.
 
-**Files:** `server/core/src/offload_target_store.{hpp,cpp}` (Postgres migration, ADR-0059), `server/core/src/offload_routes.{hpp,cpp}`, `server/core/src/server.cpp` (`SecretCodec`-gated construction + backfill + AgentService wiring + route registration), `server/core/src/agent_service_impl.{hpp,cpp}` (`set_offload_target_store` + fire_event at 3 call sites), `docs/yaml-dsl-spec.md` § `spec.offload`, `docs/user-manual/rest-api.md` § Offload Targets, `docs/adr/0059-offload-target-store-postgres-migration.md`, `tests/unit/server/test_offload_target_store.cpp`, `tests/unit/server/test_rest_offload_targets.cpp`.
+**Files:** `server/core/src/offload_target_store.{hpp,cpp}` (Postgres migration, ADR-0059, fresh-start cutover — no backfill), `server/core/src/offload_routes.{hpp,cpp}`, `server/core/src/server.cpp` (`SecretCodec`-gated construction + AgentService wiring + route registration), `server/core/src/agent_service_impl.{hpp,cpp}` (`set_offload_target_store` + fire_event at 3 call sites), `docs/yaml-dsl-spec.md` § `spec.offload`, `docs/user-manual/rest-api.md` § Offload Targets, `docs/adr/0059-offload-target-store-postgres-migration.md`, `tests/unit/server/test_offload_target_store.cpp`, `tests/unit/server/test_rest_offload_targets.cpp`.
 
 ---
 

@@ -2264,65 +2264,33 @@ after this upgrade means generating a new client secret with your identity provi
   redaction behaviour (unchanged by this migration) and `docs/adr/0060-runtime-config-store-postgres-migration.md`
   for the full design.
 
-## Offload-target control plane migrates to Postgres (mandatory backfill, OffloadTargetStore, ADR-0059)
+## ⚠️ Behaviour change: offload targets reset on Postgres cutover (ADR-0059)
 
-`OffloadTargetStore` — the response-offload control plane behind `/api/v1/offload-targets`
-— moves from the SQLite `offload_targets.db` file to the server's PostgreSQL substrate in
-this release, schema `offload_target_store`, on the existing shared pool. Both tables
-(`offload_targets`, `offload_deliveries`) are backfilled — unlike some sibling stores,
-`offload_deliveries` has no TTL/prune, so its history is not treated as skippable
-telemetry.
+`OffloadTargetStore` — the response-offload control plane behind
+`/api/v1/offload-targets` — moves from the SQLite `offload_targets.db` file to the
+server's PostgreSQL substrate in this release, schema `offload_target_store`, on the
+existing shared pool. Like `ResponseStore`/`AnalyticsEventStore`, this is a
+**fresh-start cutover with no data migration** (ADR-0009's 2026-08-25
+fresh-start-by-default amendment — no production fleet has ever run a pre-Postgres
+build of this store, so there is no legacy backfill to protect), so the legacy
+`offload_targets.db` is **never read** on upgrade.
 
-- **What is preserved:** every configured offload target (name, URL, auth type, event
-  filter, batch size, enabled flag) and its full delivery history, with ids unchanged.
-- **Credentials are now encrypted at rest.** `auth_credential` moves from a plaintext
-  SQLite column to an app-side-encrypted Postgres column (ADR-0010) — the legacy
-  plaintext value is transformed (encrypted), never copied, during the backfill. A
-  target's credential state (configured or not) is never altered by the backfill if a
-  Postgres row for that target's id already exists from a prior partial run or a live
-  create — the already-live value always wins.
-- **Fail-closed boot, retried each start.** A backfill that cannot complete — an
-  unreadable/corrupt legacy file, a fingerprint failure, a Postgres write error, an
-  identity conflict against an already-live row, an orphaned delivery row (a legacy
-  delivery whose target no longer exists), or a credential encrypt failure — **refuses
-  the boot** and retries on the next start. This store had no fail-closed guard on
-  SQLite; on Postgres, a reachable database whose schema can't migrate or open is now a
-  fatal startup error too. The boot log's `OffloadTargetStore::migrate_from_sqlite:`
-  lines carry the specific refusal, naming the offending target/delivery id.
-- **Legacy file moved aside after a verified backfill**
-  (`offload_targets.db.migrated-<epoch>`), same one-release rollback window as the
-  sibling stores. Restricted to 0600 (POSIX) even before the move, since it may still
-  hold plaintext credentials until the backfill transforms them.
-- **Fresh installs are unaffected** — no legacy file, nothing to migrate.
+**What happens on first PG boot:**
+- The server logs a one-time `OffloadTargetStore initialized (schema
+  offload_target_store) — fresh start, no legacy backfill` line.
+- Every previously-configured offload target and its delivery history is gone; targets
+  must be re-registered via `POST /api/v1/offload-targets` (including credentials —
+  they were never durably exportable in plaintext form to begin with).
+- No operator action required beyond re-registering targets.
 
-**Operator-visible behaviour changes.**
-
-- A degraded read on `GET /api/v1/offload-targets` or `GET /api/v1/offload-targets/{id}`
-  now returns **503**, distinguishable from a genuine "no targets configured" (empty
-  list) or "no such id" (404) — the earlier SQLite-era behaviour could not tell these
-  apart.
-- `GET`/`list()` responses gain a `has_credential` boolean field alongside the
-  already-redacted `auth_credential`.
-- A delivery whose target has a credential that fails to decrypt (KEK unavailable, a
-  tampered/corrupted stored blob) is now skipped entirely and logged with
-  `error=credential_unavailable` in its delivery record — it is never fired unsigned.
-  This is a new failure mode with no SQLite-era equivalent; if you see it in
-  `GET /api/v1/offload-targets/{id}/deliveries`, check the server's KEK/keys-directory
-  health before assuming the target itself is misconfigured.
-- **Losing the server's KEK/keys directory** (see the "Key management" section
-  elsewhere in this manual) orphans every configured offload credential — the target
-  itself survives, but its credential must be re-entered; deliveries fire unsigned in
-  the meantime for any target where `auth_type` tolerates it, and are skipped
-  (`credential_unavailable`) otherwise.
-
-**Verify:** after the server reports ready, `GET /api/v1/offload-targets` shows the same
-targets as before the upgrade, and `SELECT count(*) FROM
-offload_target_store.offload_targets;` / `offload_target_store.offload_deliveries`
-against Postgres match `sqlite3 offload_targets.db.migrated-<epoch> "SELECT count(*)
-FROM offload_targets; SELECT count(*) FROM offload_deliveries;"`. Fire a test event
-through an existing target and confirm its delivery still succeeds (or fails for the
-same reason it did before the upgrade — a receiver being down is not a migration
-regression).
+**Also in this release:** `auth_credential` is now encrypted at rest app-side
+(ADR-0010) rather than a plaintext column; `GET`/`list()` responses gain a
+`has_credential` boolean alongside the already-redacted `auth_credential`. A delivery
+whose target's credential fails to decrypt (KEK unavailable, a tampered/corrupted
+stored blob) is skipped entirely and logged with `error=credential_unavailable` — it is
+never fired unsigned. A degraded read on `GET /api/v1/offload-targets` or
+`GET /api/v1/offload-targets/{id}` now returns **503**, distinguishable from a genuine
+"no targets configured" (empty list) or "no such id" (404).
 
 ## ⚠️ Behaviour change: quarantine is now enforced at instruction dispatch (#881, #3127)
 

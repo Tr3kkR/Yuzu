@@ -4,9 +4,12 @@
 - **Date:** 2026-08-25
 - **Deciders:** pg workstream, security-guardian + cpp-safety + docs-writer review (ADR-0010
   secrets seam is mandatory on this migration)
-- **Parents:** ADR-0006/0007/0008 (+Correction), ADR-0009, ADR-0012 (substrate/backfill/store
-  contract); ADR-0010 (secrets envelope — this is ADR-0010's third production consumer, after
-  `AuthDB.users.mfa_totp_secret` and `WebhookStore.webhooks.secret`); ADR-0057
+- **Parents:** ADR-0006/0007/0008 (+Correction), ADR-0009 (including its 2026-08-25
+  fresh-start-by-default amendment — no production fleet has ever run a pre-Postgres build of any
+  Yuzu store, so the original mandatory-backfill default is replaced by ResponseStore's
+  unconditional-skip precedent for stores with no other reason to keep a legacy read path), ADR-0012
+  (substrate/store contract); ADR-0010 (secrets envelope — this is ADR-0010's third production
+  consumer, after `AuthDB.users.mfa_totp_secret` and `WebhookStore.webhooks.secret`); ADR-0057
   (`WebhookStore` → PostgreSQL — **in flight, not yet merged as of this writing** — this store's
   direct twin: same targets+deliveries shape, wildcard `event_types`, an `enabled` flag, and the
   first store to work out the `has_credential`/secret-column CHECK-constraint pattern this ADR
@@ -65,8 +68,9 @@ CREATE TABLE offload_deliveries (
 );
 CREATE INDEX idx_offload_delivery_target_ts ON offload_deliveries(target_id, delivered_at);
 CREATE INDEX idx_offload_targets_enabled ON offload_targets(enabled) WHERE enabled;
-CREATE TABLE sqlite_backfill_source (fingerprint TEXT PRIMARY KEY, completed_at BIGINT NOT NULL);
 ```
+
+No `sqlite_backfill_source` marker table — see "No backfill" below.
 
 `created_at`/`delivered_at` stay BIGINT epoch-seconds (not `TIMESTAMPTZ`) — the REST surface emits
 both as integers today, and switching representations would be a wire-contract break for zero
@@ -140,7 +144,7 @@ auth_credential = NULL` on a `has_credential=true` row is refused by Postgres it
   install-wide custody, not a per-store resource). Construction order mirrors `AuthDB`'s/
   `PluginConfigStore`'s block exactly: codec ctor → `OffloadTargetStore` ctor (registers
   `{"offload_target_store","offload_targets","auth_credential","id"}`) → `is_open()` gate →
-  `SecretCodec::init()` on a pinned lease → `migrate_from_sqlite`.
+  `SecretCodec::init()` on a pinned lease. No backfill step follows — see "No backfill" below.
 - **KEK-rotation enrollment.** `offload_secret_codec_` is added to `kek_enrolled_codecs()`
   (server.cpp) so an operator's `/rotate`/`/rewrap` request re-wraps `auth_credential` too — not
   left as an open item the way ADR-3005 (PluginConfigStore) recorded for its own codec. The
@@ -160,49 +164,30 @@ auth_credential = NULL` on a `has_credential=true` row is refused by Postgres it
   WebhookStore/ADR-0057 independently found and fixed for its own (not-yet-migrated-on-this-branch,
   at the time of writing) secret codec.
 
-### Backfill (ADR-0009) — mandatory, fingerprint-verified, both tables
+### No backfill (ADR-0009's 2026-08-25 fresh-start-by-default amendment)
 
-Both `offload_targets` and `offload_deliveries` are MANDATORY backfill — unlike `ResponseStore`,
-there is no TTL/prune on `offload_deliveries`, so the ADR-0009 skippable-telemetry exception does
-not apply (the same ruling ADR-0057 records for webhook deliveries).
+There is no `migrate_from_sqlite` on this store, no legacy-table-reading code, and no
+`sqlite_backfill_source` marker table. The legacy `offload_targets.db` is **never read**, in any
+circumstance — the cutover is unconditional, no flag, same posture as `ResponseStore` and
+`AnalyticsEventStore`.
 
-- **Idempotency model: a per-legacy-CONTENT fingerprint set** (`sqlite_backfill_source`), not a
-  single marker row — SHA-256 over a canonical, length-prefixed serialization of every target and
-  delivery field, run BEFORE the write transaction so an already-migrated legacy file is a cheap
-  no-op read.
-- **Fingerprint excludes the plaintext credential bytes** — a deliberate, security-motivated
-  choice (ADR-0057's identical ruling): hashing a low-entropy legacy credential into an at-rest
-  fingerprint would let a SQL-insider brute-force it offline against the stored hash. Only a
-  has-credential bit is folded in.
-- **Secrets transform, never copy.** Every legacy plaintext credential is encrypted BEFORE the
-  write transaction opens, in one pass over all legacy targets; a single encrypt failure aborts
-  the WHOLE backfill closed (never a partial write, never plaintext at rest). The transient
-  plaintext is cleansed (`OPENSSL_cleanse`) immediately after, via an RAII wiper that fires on
-  every exit path.
-- **Conflict handling, IDENTITY vs the credential.** IDENTITY = `(name, url, auth_type,
-  event_types, batch_size, enabled, created_at)`. On a same-id conflict (a prior partial/
-  interrupted backfill, or a legacy id that happens to collide with a row created live before
-  this backfill ever ran): an identity mismatch fails the backfill closed, naming the row; an
-  identity match is a benign skip, and **`auth_credential`/`has_credential` are never compared or
-  rewritten** on conflict — whatever Postgres already holds wins, unconditionally (the
-  "rotated-secret PG-wins" rule, covered by a dedicated test that live-creates a target, then
-  backfills a same-id legacy row with different credential state, and asserts the live value
-  survives untouched).
-- **Orphaned delivery rows fail closed.** A legacy delivery whose `target_id` matches no target
-  (neither freshly inserted nor pre-existing) hits the `offload_deliveries` FK constraint
-  (SQLSTATE 23503), which this migration classifies distinctly in its log line and fails the
-  whole backfill — never silently dropped.
-- **Sequence fixup — the `OVERRIDING SYSTEM VALUE` gap.** Both tables' identity sequences do NOT
-  auto-advance when rows are inserted with explicit (legacy) ids. Without a `setval(...,
-  MAX(id))` at the end of a non-empty backfill, the first post-backfill `create_target()`/
-  delivery-log write would collide on the PRIMARY KEY. `create_target`'s own conflict handler
-  additionally distinguishes a PK collision (`PG_DIAG_CONSTRAINT_NAME = 'offload_targets_pkey'`)
-  from a genuine duplicate-name collision, so a sequence bug can never masquerade as operator
-  error even if the fixup were ever missed.
-- **Legacy file disposition:** 0600 forced on the file AND `-wal`/`-shm` sidecars (POSIX-only;
-  Windows has no compensating ACL step here — the same carve-out WebhookStore/ADR-0057 records,
-  tracked on issue #3593); moved aside on a verified success, never deleted, sidecars carried
-  across; next-release deletion tracked on the ladder, same as every Wave-3 sibling.
+This is a direct application of ADR-0009's 2026-08-25 amendment: the original "mandatory backfill
+for every store with real legacy content" default assumed a real fleet that has, in fact, never
+existed — no production Yuzu deployment has ever run a pre-Postgres build of `OffloadTargetStore`
+(or any other store). The design this ADR carried through most of its drafting (fingerprint-
+verified backfill of both tables, secret transform-not-copy, sequence fixup, rotated-secret
+PG-wins conflict handling — the full WebhookStore/ADR-0057-derived machinery) is sound and stays
+the reference shape for a store that genuinely does need it, but building and testing it here was
+solving a problem that does not exist on any real deployment. `create_target()`'s own
+identity-sequence-collision guard (`PG_DIAG_CONSTRAINT_NAME = 'offload_targets_pkey'` vs a genuine
+duplicate-name collision, see the Secrets section above) has no backfill-vs-sequence interaction
+to guard against here — it stays purely defensive, matching a fresh Postgres identity column's
+own well-formed sequence.
+
+Construction logs a one-time line — `OffloadTargetStore initialized (schema offload_target_store)
+— fresh start, no legacy backfill` — so an operator upgrading from a pre-Postgres build sees an
+explicit statement of what happened, rather than silence about a legacy file that was never
+touched.
 
 ### Public API modernization
 
@@ -216,6 +201,12 @@ credential-bearing config changes. `get_deliveries`/`fire_event`/`flush_all`/`qu
 
 ## Considered and rejected
 
+- **Mandatory fingerprint-verified backfill of both tables (the pre-amendment ADR-0009
+  default, WebhookStore/ADR-0057's shape).** Fully designed, implemented, and tested against a
+  real legacy SQLite fixture before this ADR was updated — rejected per ADR-0009's 2026-08-25
+  fresh-start-by-default amendment: no production fleet has ever run a pre-Postgres build of this
+  store, so there is no real legacy data the backfill would ever actually protect. See "No
+  backfill" above.
 - **Sharing `webhook_secret_codec_`'s eventual `SecretCodec` instance.** Rejected — ADR-0010's
   "Instance model" is explicit that each secret-bearing store gets its own codec instance;
   sharing the underlying `FileKeyProvider` (not the codec) is the correct and sufficient reuse.
@@ -231,6 +222,10 @@ credential-bearing config changes. `get_deliveries`/`fire_event`/`flush_all`/`qu
 
 ## Consequences
 
+- **Any offload target configured against a pre-Postgres build is lost on upgrade** — the
+  operator re-registers it (including its credential, which was never durably exportable in
+  plaintext form anyway) via `POST /api/v1/offload-targets`. Documented as a fresh-start cutover
+  in `docs/user-manual/upgrading.md`, same treatment as `ResponseStore`/`AnalyticsEventStore`.
 - **Backup/restore pairing invariant applies** (ADR-0010 §Consequences): a `pg_dump` of this
   schema alone recovers no target credentials; the keys directory must be restored alongside it.
   Losing the KEK orphans every configured offload credential — re-issuable, at operator pain
@@ -243,7 +238,5 @@ credential-bearing config changes. `get_deliveries`/`fire_event`/`flush_all`/`qu
 
 ## Follow-ups
 
-- Windows legacy-file ACL hardening (the 0600-equivalent step) is out of scope here, same as
-  webhook's — tracked on #3593, not duplicated.
 - `docs/user-manual/rest-api.md`'s offload-targets section needs the `has_credential` field
   documented in the response shape (docs-writer, Gate 2).

@@ -1853,8 +1853,8 @@ public:
                                  "yuzu_server_offload_delivery_dropped_total"}) {
             metrics_.counter(name);
         }
-        // ADR-0059 (OffloadTargetStore Postgres migration) — three new
-        // counters this migration adds, same pre-seed rule as the six above.
+        // ADR-0059 (OffloadTargetStore Postgres migration) — two new counters
+        // this migration adds, same pre-seed rule as the six above.
         metrics_.describe("yuzu_server_offload_delivery_credential_unavailable_total",
                           "Offload-target deliveries skipped because the target's credential "
                           "failed to decrypt (ADR-0010 fail-closed - never fired unsigned)",
@@ -1865,13 +1865,6 @@ public:
                           "failure) and skipped this tick's dispatch entirely",
                           "counter");
         metrics_.counter("yuzu_server_offload_fire_event_degraded_total");
-        metrics_.describe("yuzu_server_offload_backfill_total",
-                          "OffloadTargetStore legacy-SQLite backfill outcome at boot, by result",
-                          "counter");
-        // Bounded label set ({"ok","failed"}) — both pre-seeded, same rule
-        // as the six no-label counters above.
-        metrics_.counter("yuzu_server_offload_backfill_total", {{"result", "ok"}});
-        metrics_.counter("yuzu_server_offload_backfill_total", {{"result", "failed"}});
         // ADR-0010 §Decision 3. Carried in the gauge family because the
         // authoritative cumulative count lives in SecretCodec and is exported
         // pull-model at scrape time, but it IS a monotonic counter — declared
@@ -5972,9 +5965,12 @@ public:
         // AuthDB block) → SecretCodec (constructed only) → OffloadTargetStore
         // (migrates the schema AND registers auth_credential as a secret
         // column) → SecretCodec::init() (runs AFTER the store so the column
-        // it validates already exists) → migrate_from_sqlite (legacy
-        // offload_targets.db backfill — transforms the plaintext credential
-        // through the just-initialized codec, per ADR-0010).
+        // it validates already exists). NO backfill (ADR-0009's 2026-08-25
+        // fresh-start-by-default amendment, ResponseStore precedent): no
+        // production fleet has ever run a pre-Postgres build of this store,
+        // so there is no legacy `offload_targets.db` content to protect —
+        // the store's own constructor logs the one-time "fresh start, no
+        // legacy backfill" line.
         if (pg_pool_ && !startup_failed_) {
             offload_secret_codec_ = std::make_unique<pg::SecretCodec>(*auth_key_provider_);
             offload_target_store_ =
@@ -6003,16 +5999,7 @@ public:
                         startup_failed_ = true;
                     } else {
                         offload_target_store_->set_metrics(&metrics_);
-                        auto offload_db = cfg_.db_dir() / "offload_targets.db";
-                        if (!offload_target_store_->migrate_from_sqlite(offload_db)) {
-                            spdlog::error(
-                                "[PG] Refusing to start: offload target legacy-SQLite backfill "
-                                "failed ({})",
-                                offload_db.string());
-                            startup_failed_ = true;
-                        } else {
-                            agent_service_.set_offload_target_store(offload_target_store_.get());
-                        }
+                        agent_service_.set_offload_target_store(offload_target_store_.get());
                     }
                 }
             }

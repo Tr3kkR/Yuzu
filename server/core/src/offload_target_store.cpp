@@ -6,25 +6,18 @@
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
 #include "secure_buffer.hpp"
-#include "utf8_sanitize.hpp"
 
 #include <httplib.h>
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
-#include <sqlite3.h>
 #include <yuzu/metrics.hpp>
-
-#include <openssl/crypto.h>
-#include <openssl/evp.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
-#include <iomanip>
 #include <span>
 #include <sstream>
-#include <system_error>
 
 #ifdef _WIN32
 // clang-format off
@@ -33,6 +26,7 @@
 // clang-format on
 #pragma comment(lib, "bcrypt.lib")
 #else
+#include <openssl/evp.h>
 #include <openssl/hmac.h>
 #endif
 
@@ -48,8 +42,7 @@ constexpr const char* kTargetCols =
 // fire_event's enabled-target scan gets a SHORT one — this store sits on a
 // hot dispatch path (perf-S2, the load-bearing partial index below), and a
 // degraded/slow pool must never stall the gRPC/dispatch caller thread that
-// calls fire_event. Construction and backfill are the only unbounded
-// acquires.
+// calls fire_event. Construction is the only unbounded acquire.
 constexpr std::chrono::milliseconds kReadTimeout{1500};
 constexpr std::chrono::milliseconds kWriteTimeout{2000};
 constexpr std::chrono::milliseconds kFireEventAcquireTimeout{300};
@@ -95,15 +88,7 @@ const std::vector<pg::PgMigration>& migrations() {
          // profiles (perf-S2, carried across from the SQLite era — see
          // auth_db.cpp's users_active_idx for this codebase's precedent for
          // the exact `WHERE bool_col` shape on the PG substrate).
-         "CREATE INDEX idx_offload_targets_enabled ON offload_targets(enabled) WHERE enabled;"
-         // Backfill idempotency marker (ADR-0009, WebhookStore/ADR-0057
-         // shape) — a per-legacy-CONTENT fingerprint set, not a single
-         // marker row, so a partially-migrated or re-run backfill can tell
-         // "already done" from "different legacy content" precisely.
-         "CREATE TABLE sqlite_backfill_source ("
-         "  fingerprint  TEXT PRIMARY KEY,"
-         "  completed_at BIGINT NOT NULL"
-         ");"},
+         "CREATE INDEX idx_offload_targets_enabled ON offload_targets(enabled) WHERE enabled;"},
     };
     return kMigrations;
 }
@@ -121,21 +106,6 @@ std::int64_t to_i64(const char* s) {
     return static_cast<std::int64_t>(std::strtoll(s, nullptr, 10));
 }
 bool to_bool(const char* s) { return s != nullptr && (s[0] == 't' || s[0] == 'T' || s[0] == '1'); }
-
-// Applied only to LEGACY (SQLite backfill) text — mirrors ca_store.cpp's
-// sanitize_pg_text: a bad byte at rest in a legacy .db must not brick the
-// mandatory backfill. Live writes (create_target) instead REJECT a control
-// byte outright (has_control_byte below) — dirty OLD data is sanitized so
-// one bad legacy row can't wreck the backfill, bad NEW input is refused.
-std::string sanitize_pg_text(std::string_view s) {
-    std::string out = sanitize_utf8_strict(s);
-    std::size_t pos = 0;
-    while ((pos = out.find('\0', pos)) != std::string::npos) {
-        out.replace(pos, 1, "\xEF\xBF\xBD");
-        pos += 3;
-    }
-    return out;
-}
 
 std::string bytes_to_hex(std::span<const std::uint8_t> bytes) {
     static constexpr char kHex[] = "0123456789abcdef";
@@ -319,7 +289,14 @@ OffloadTargetStore::OffloadTargetStore(pg::PgPool& pool, pg::SecretCodec& secret
     }
 
     open_ = true;
-    spdlog::info("OffloadTargetStore: opened (schema {})", kStoreName);
+    // ADR-0009's 2026-08-25 fresh-start-by-default amendment: no
+    // migrate_from_sqlite here, unconditionally, no flag — same posture as
+    // ResponseStore. No production fleet has ever run a pre-Postgres build
+    // of this store, so there is no legacy `offload_targets.db` content to
+    // protect; the log line says so explicitly rather than leaving an
+    // operator to wonder why an existing legacy file was never read.
+    spdlog::info("OffloadTargetStore initialized (schema {}) — fresh start, no legacy backfill",
+                 kStoreName);
 }
 
 OffloadTargetStore::~OffloadTargetStore() {
@@ -505,12 +482,12 @@ std::expected<int64_t, OffloadWriteError> OffloadTargetStore::create_target(
             const std::string constraint = constraint_p ? constraint_p : "";
             if (constraint == "offload_targets_pkey") {
                 // The id-reservation sequence and the identity column's own
-                // backing sequence have diverged (e.g. a backfill that
-                // inserted OVERRIDING SYSTEM VALUE without a matching
-                // setval()) - this is a real bug, never a legitimate
-                // operator collision, and must never be reported as
-                // "duplicate name" (a sequence bug masquerading as operator
-                // error).
+                // backing sequence have diverged (e.g. an operator manually
+                // resetting the sequence, or restoring a dump that carried
+                // stale sequence state) - this is a real bug/operational
+                // error, never a legitimate operator collision, and must
+                // never be reported as "duplicate name" (a sequence bug
+                // masquerading as operator error).
                 spdlog::critical(
                     "OffloadTargetStore::create_target: PRIMARY KEY collision on reserved id "
                     "{} - the offload_targets identity sequence is out of sync (bug, not "
@@ -1009,471 +986,6 @@ void OffloadTargetStore::flush_all() {
         if (!queued)
             log_dropped_delivery(tgt.url);
     }
-}
-
-// ── Legacy SQLite backfill (ADR-0009 mandatory class; ADR-0010 secrets
-//    transform) ───────────────────────────────────────────────────────────
-
-bool OffloadTargetStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path) {
-    const bool ok = migrate_from_sqlite_impl(legacy_db_path);
-    if (metrics_)
-        metrics_->counter("yuzu_server_offload_backfill_total", {{"result", ok ? "ok" : "failed"}})
-            .increment();
-    return ok;
-}
-
-namespace {
-
-struct LegacyOffloadTarget {
-    int64_t id{0};
-    std::string name;
-    std::string url;
-    std::string auth_type;
-    std::string credential; // plaintext — wiped after encrypt
-    std::string event_types;
-    int batch_size{1};
-    bool enabled{true};
-    int64_t created_at{0};
-};
-
-struct LegacyOffloadDelivery {
-    int64_t id{0};
-    int64_t target_id{0};
-    std::string event_type;
-    int event_count{1};
-    std::string payload;
-    int status_code{0};
-    int64_t delivered_at{0};
-    std::string error;
-};
-
-/// Zeroizes every legacy plaintext credential still resident in `targets` on
-/// destruction — RAII so it fires on every exit path (early return, a
-/// thrown exception) not just the success path.
-struct LegacyCredentialWiper {
-    std::vector<LegacyOffloadTarget>& targets;
-    void wipe_now() {
-        for (auto& t : targets) {
-            if (!t.credential.empty()) {
-                OPENSSL_cleanse(t.credential.data(), t.credential.size());
-                t.credential.clear();
-            }
-        }
-    }
-    ~LegacyCredentialWiper() { wipe_now(); }
-};
-
-} // namespace
-
-bool OffloadTargetStore::migrate_from_sqlite_impl(const std::filesystem::path& legacy_db_path) {
-    std::error_code ec;
-    if (!std::filesystem::exists(legacy_db_path, ec))
-        return true; // fresh install — nothing to migrate, not an error
-
-    // Restrict the legacy file (and any WAL/SHM sidecars) to 0600 — it may
-    // still contain plaintext credentials until this backfill transforms
-    // them, and remains on disk read-only for one release afterward
-    // (ADR-0009/0010). POSIX-only; Windows has no compensating ACL step
-    // here (matches WebhookStore/ADR-0057's identical carve-out).
-#ifndef _WIN32
-    for (const char* suffix : {"", "-wal", "-shm"}) {
-        std::error_code perm_ec;
-        auto p = legacy_db_path.string() + suffix;
-        if (std::filesystem::exists(p, perm_ec))
-            std::filesystem::permissions(
-                p, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-                perm_ec);
-    }
-#endif
-
-    sqlite3* legacy = nullptr;
-    if (sqlite3_open_v2(legacy_db_path.string().c_str(), &legacy, SQLITE_OPEN_READONLY,
-                        nullptr) != SQLITE_OK) {
-        spdlog::error("OffloadTargetStore::migrate_from_sqlite: cannot open legacy file {}: {}",
-                      legacy_db_path.string(), legacy ? sqlite3_errmsg(legacy) : "open failed");
-        if (legacy)
-            sqlite3_close(legacy);
-        return false;
-    }
-
-    std::vector<LegacyOffloadTarget> legacy_targets;
-    std::vector<LegacyOffloadDelivery> legacy_deliveries;
-
-    {
-        const char* sql = "SELECT id, name, url, auth_type, auth_credential, event_types, "
-                          "batch_size, enabled, created_at FROM offload_targets ORDER BY id";
-        sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(legacy, sql, -1, &stmt, nullptr) == SQLITE_OK) {
-            while (sqlite3_step(stmt) == SQLITE_ROW) {
-                LegacyOffloadTarget t;
-                t.id = sqlite3_column_int64(stmt, 0);
-                if (auto v = sqlite3_column_text(stmt, 1))
-                    t.name = reinterpret_cast<const char*>(v);
-                if (auto v = sqlite3_column_text(stmt, 2))
-                    t.url = reinterpret_cast<const char*>(v);
-                if (auto v = sqlite3_column_text(stmt, 3))
-                    t.auth_type = reinterpret_cast<const char*>(v);
-                if (auto v = sqlite3_column_text(stmt, 4))
-                    t.credential = reinterpret_cast<const char*>(v);
-                if (auto v = sqlite3_column_text(stmt, 5))
-                    t.event_types = reinterpret_cast<const char*>(v);
-                t.batch_size = sqlite3_column_int(stmt, 6);
-                t.enabled = sqlite3_column_int(stmt, 7) != 0;
-                t.created_at = sqlite3_column_int64(stmt, 8);
-                // Canonicalize now so every later comparison/insert uses the
-                // same normalized form as a live create_target() call.
-                t.auth_type = offload_auth_type_to_string(offload_auth_type_from_string(t.auth_type));
-                if (t.event_types.empty())
-                    t.event_types = "*";
-                legacy_targets.push_back(std::move(t));
-            }
-        } else {
-            spdlog::error("OffloadTargetStore::migrate_from_sqlite: cannot prepare legacy "
-                          "offload_targets read");
-            sqlite3_finalize(stmt);
-            sqlite3_close(legacy);
-            return false;
-        }
-        sqlite3_finalize(stmt);
-    }
-    {
-        const char* sql = "SELECT id, target_id, event_type, event_count, payload, status_code, "
-                          "delivered_at, error FROM offload_deliveries ORDER BY id";
-        sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(legacy, sql, -1, &stmt, nullptr) == SQLITE_OK) {
-            while (sqlite3_step(stmt) == SQLITE_ROW) {
-                LegacyOffloadDelivery d;
-                d.id = sqlite3_column_int64(stmt, 0);
-                d.target_id = sqlite3_column_int64(stmt, 1);
-                if (auto v = sqlite3_column_text(stmt, 2))
-                    d.event_type = reinterpret_cast<const char*>(v);
-                d.event_count = sqlite3_column_int(stmt, 3);
-                if (auto v = sqlite3_column_text(stmt, 4))
-                    d.payload = reinterpret_cast<const char*>(v);
-                d.status_code = sqlite3_column_int(stmt, 5);
-                d.delivered_at = sqlite3_column_int64(stmt, 6);
-                if (auto v = sqlite3_column_text(stmt, 7))
-                    d.error = reinterpret_cast<const char*>(v);
-                legacy_deliveries.push_back(std::move(d));
-            }
-        } else {
-            spdlog::error("OffloadTargetStore::migrate_from_sqlite: cannot prepare legacy "
-                          "offload_deliveries read");
-            sqlite3_finalize(stmt);
-            sqlite3_close(legacy);
-            return false;
-        }
-        sqlite3_finalize(stmt);
-    }
-    sqlite3_close(legacy);
-
-    LegacyCredentialWiper wipe_legacy_credentials{legacy_targets};
-
-    // Fingerprint over canonical content. Credential bytes are EXCLUDED — a
-    // deliberate, security-motivated choice (ADR-0057's identical ruling):
-    // hashing a low-entropy legacy credential into an at-rest fingerprint
-    // would let a SQL-insider brute-force it offline against the stored
-    // hash, exactly the adversary ADR-0010 exists to defend against. Only a
-    // has-credential bit is folded in.
-    std::string canon;
-    auto append_field = [&canon](std::string_view s) {
-        const uint32_t len = static_cast<uint32_t>(s.size());
-        const char len_be[4] = {static_cast<char>(len >> 24), static_cast<char>(len >> 16),
-                                static_cast<char>(len >> 8), static_cast<char>(len)};
-        canon.append(len_be, 4);
-        canon.append(s);
-    };
-    for (const auto& t : legacy_targets) {
-        append_field(std::to_string(t.id));
-        append_field(t.name);
-        append_field(t.url);
-        append_field(t.auth_type);
-        append_field(t.event_types);
-        append_field(std::to_string(t.batch_size));
-        append_field(t.enabled ? "1" : "0");
-        append_field(std::to_string(t.created_at));
-        append_field(t.credential.empty() ? "0" : "1");
-    }
-    for (const auto& d : legacy_deliveries) {
-        append_field(std::to_string(d.id));
-        append_field(std::to_string(d.target_id));
-        append_field(d.event_type);
-        append_field(std::to_string(d.event_count));
-        append_field(d.payload);
-        append_field(std::to_string(d.status_code));
-        append_field(std::to_string(d.delivered_at));
-        append_field(d.error);
-    }
-
-    std::string fingerprint;
-    {
-        unsigned char digest[EVP_MAX_MD_SIZE];
-        unsigned int digest_len = 0;
-        EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-        if (ctx && EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) == 1 &&
-            EVP_DigestUpdate(ctx, canon.data(), canon.size()) == 1 &&
-            EVP_DigestFinal_ex(ctx, digest, &digest_len) == 1) {
-            fingerprint = bytes_to_hex(std::span<const std::uint8_t>{digest, digest_len});
-        }
-        if (ctx)
-            EVP_MD_CTX_free(ctx);
-    }
-    if (fingerprint.empty()) {
-        spdlog::error("OffloadTargetStore::migrate_from_sqlite: fingerprint computation failed");
-        return false;
-    }
-
-    // Idempotency check.
-    {
-        auto lease = pool_.acquire();
-        if (!lease) {
-            spdlog::error("OffloadTargetStore::migrate_from_sqlite: no database connection "
-                          "({})",
-                          pool_.last_error());
-            return false;
-        }
-        pg::PgResult res = pg::exec_params(
-            lease.get(),
-            "SELECT 1 FROM offload_target_store.sqlite_backfill_source WHERE fingerprint = $1",
-            std::vector<std::string>{fingerprint});
-        if (res.status() != PGRES_TUPLES_OK) {
-            spdlog::error("OffloadTargetStore::migrate_from_sqlite: fingerprint lookup failed: "
-                          "{}",
-                          PQresultErrorMessage(res.get()));
-            return false;
-        }
-        if (PQntuples(res.get()) > 0) {
-            spdlog::info("OffloadTargetStore::migrate_from_sqlite: already migrated "
-                        "(fingerprint match) - no-op");
-            return true;
-        }
-    }
-
-    // Encrypt every non-empty legacy credential BEFORE opening the write
-    // transaction (ADR-0010: never write plaintext, and never a partial
-    // backfill — a single encrypt failure fails the WHOLE backfill closed).
-    std::vector<std::vector<std::uint8_t>> encrypted_credentials(legacy_targets.size());
-    for (std::size_t i = 0; i < legacy_targets.size(); ++i) {
-        auto& t = legacy_targets[i];
-        if (t.credential.empty())
-            continue;
-        auto pk = pg::SecretCodec::encode_bigint_pk(t.id);
-        auto enc = secret_codec_.encrypt(
-            pg::SecretCodec::SecretId{kStoreName, "offload_targets", "auth_credential", pk},
-            std::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(t.credential.data()),
-                                          t.credential.size()});
-        if (!enc.has_value()) {
-            spdlog::error(
-                "OffloadTargetStore::migrate_from_sqlite: credential encrypt failed for legacy "
-                "target id={} - refusing (fail-closed; never writes plaintext or a partial "
-                "backfill)",
-                t.id);
-            return false;
-        }
-        encrypted_credentials[i] = std::move(*enc);
-    }
-    wipe_legacy_credentials.wipe_now(); // explicit early wipe on the common success path
-
-    // One multi-statement atomic unit (targets, deliveries, the fingerprint
-    // marker, both sequence fixups) — with_txn is this codebase's shared
-    // BEGIN/fn/COMMIT-or-ROLLBACK helper (pg_pool.hpp), used here instead of
-    // hand-rolled PQexec("BEGIN"/"COMMIT"/"ROLLBACK") so a thrown exception
-    // mid-loop rolls back automatically rather than leaking an open
-    // transaction on the leased connection.
-    const bool committed = pool_.with_txn([&](PGconn* conn) -> bool {
-    bool ok = true;
-    for (std::size_t i = 0; ok && i < legacy_targets.size(); ++i) {
-        const auto& t = legacy_targets[i];
-        const auto& enc = encrypted_credentials[i];
-        const bool has_cred = !enc.empty();
-        std::vector<std::optional<std::string>> params = {
-            std::to_string(t.id),
-            sanitize_pg_text(t.name),
-            sanitize_pg_text(t.url),
-            t.auth_type,
-            has_cred ? std::optional<std::string>(bytes_to_hex(enc)) : std::nullopt,
-            has_cred ? "true" : "false",
-            sanitize_pg_text(t.event_types),
-            std::to_string(t.batch_size),
-            t.enabled ? "true" : "false",
-            std::to_string(t.created_at),
-        };
-        pg::PgResult res = pg::exec_params(
-            conn,
-            "INSERT INTO offload_target_store.offload_targets "
-            "(id, name, url, auth_type, auth_credential, has_credential, event_types, "
-            " batch_size, enabled, created_at) "
-            "OVERRIDING SYSTEM VALUE VALUES "
-            "($1::bigint, $2, $3, $4, decode($5,'hex'), $6::boolean, $7, $8::integer, "
-            " $9::boolean, $10::bigint) "
-            "ON CONFLICT (id) DO NOTHING RETURNING id",
-            params);
-        if (res.status() != PGRES_TUPLES_OK) {
-            spdlog::error(
-                "OffloadTargetStore::migrate_from_sqlite: legacy target id={} insert failed: {}",
-                t.id, PQresultErrorMessage(res.get()));
-            ok = false;
-            break;
-        }
-        if (PQntuples(res.get()) == 0) {
-            // Conflict: a row with this id already exists (a prior
-            // partial/interrupted backfill run). IDENTITY-compare every
-            // column EXCEPT auth_credential/has_credential — secret state
-            // is never reconciled by backfill (ADR-0057's identical rule):
-            // whatever Postgres already holds wins, unconditionally.
-            pg::PgResult existing = pg::exec_params(
-                conn,
-                "SELECT name, url, auth_type, event_types, batch_size, enabled, created_at, "
-                "has_credential FROM offload_target_store.offload_targets WHERE id = $1",
-                std::vector<std::string>{std::to_string(t.id)});
-            if (existing.status() != PGRES_TUPLES_OK || PQntuples(existing.get()) == 0) {
-                spdlog::error("OffloadTargetStore::migrate_from_sqlite: conflicting row lookup "
-                              "for legacy target id={} failed",
-                              t.id);
-                ok = false;
-                break;
-            }
-            const bool identity_match =
-                col_str(existing.get(), 0, 0) == sanitize_pg_text(t.name) &&
-                col_str(existing.get(), 0, 1) == sanitize_pg_text(t.url) &&
-                col_str(existing.get(), 0, 2) == t.auth_type &&
-                col_str(existing.get(), 0, 3) == sanitize_pg_text(t.event_types) &&
-                to_i64(col(existing.get(), 0, 4)) == t.batch_size &&
-                to_bool(col(existing.get(), 0, 5)) == t.enabled &&
-                to_i64(col(existing.get(), 0, 6)) == t.created_at;
-            if (!identity_match) {
-                spdlog::error(
-                    "OffloadTargetStore::migrate_from_sqlite: legacy target id={} conflicts "
-                    "with an existing Postgres row of different identity - refusing "
-                    "(fail-closed)",
-                    t.id);
-                ok = false;
-                break;
-            }
-            if (to_bool(col(existing.get(), 0, 7)) != has_cred) {
-                spdlog::warn(
-                    "OffloadTargetStore::migrate_from_sqlite: legacy target id={} "
-                    "has_credential mismatch vs the existing Postgres row - keeping the "
-                    "Postgres value (credential state is never reconciled by backfill)",
-                    t.id);
-            }
-        }
-    }
-
-    for (std::size_t i = 0; ok && i < legacy_deliveries.size(); ++i) {
-        const auto& d = legacy_deliveries[i];
-        std::vector<std::string> params = {
-            std::to_string(d.id),         std::to_string(d.target_id),
-            sanitize_pg_text(d.event_type), std::to_string(d.event_count),
-            sanitize_pg_text(d.payload),   std::to_string(d.status_code),
-            std::to_string(d.delivered_at), sanitize_pg_text(d.error),
-        };
-        pg::PgResult res = pg::exec_params(
-            conn,
-            "INSERT INTO offload_target_store.offload_deliveries "
-            "(id, target_id, event_type, event_count, payload, status_code, delivered_at, "
-            "error) "
-            "OVERRIDING SYSTEM VALUE VALUES "
-            "($1::bigint, $2::bigint, $3, $4::integer, $5, $6::integer, $7::bigint, $8) "
-            "ON CONFLICT (id) DO NOTHING",
-            params);
-        if (res.status() != PGRES_COMMAND_OK) {
-            const char* sqlstate_p = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
-            const std::string sqlstate = sqlstate_p ? sqlstate_p : "";
-            if (sqlstate == "23503") {
-                spdlog::error(
-                    "OffloadTargetStore::migrate_from_sqlite: legacy delivery id={} references "
-                    "target_id={} which does not exist - refusing (fail-closed, orphaned "
-                    "delivery row)",
-                    d.id, d.target_id);
-            } else {
-                spdlog::error(
-                    "OffloadTargetStore::migrate_from_sqlite: legacy delivery id={} insert "
-                    "failed: {}",
-                    d.id, PQresultErrorMessage(res.get()));
-            }
-            ok = false;
-            break;
-        }
-    }
-
-    if (ok) {
-        pg::PgResult mark = pg::exec_params(
-            conn,
-            "INSERT INTO offload_target_store.sqlite_backfill_source (fingerprint, "
-            "completed_at) VALUES ($1, $2) ON CONFLICT (fingerprint) DO NOTHING",
-            std::vector<std::string>{fingerprint, std::to_string(epoch_seconds())});
-        ok = mark.status() == PGRES_COMMAND_OK;
-        if (!ok)
-            spdlog::error("OffloadTargetStore::migrate_from_sqlite: fingerprint marker insert "
-                          "failed: {}",
-                          PQresultErrorMessage(mark.get()));
-    }
-
-    // Fix up both identity sequences: OVERRIDING SYSTEM VALUE inserts above
-    // do NOT advance them, so without this the first post-backfill
-    // create_target()/dispatch delivery would collide on the PRIMARY KEY
-    // (and, absent the PG_DIAG_CONSTRAINT_NAME check in create_target,
-    // could even misreport as "duplicate name").
-    if (ok && !legacy_targets.empty()) {
-        pg::PgResult sv = pg::exec_params(
-            conn,
-            "SELECT setval(pg_get_serial_sequence('offload_target_store.offload_targets','id'), "
-            "(SELECT MAX(id) FROM offload_target_store.offload_targets))",
-            std::vector<std::string>{});
-        ok = sv.status() == PGRES_TUPLES_OK;
-        if (!ok)
-            spdlog::error("OffloadTargetStore::migrate_from_sqlite: offload_targets sequence "
-                          "fixup failed: {}",
-                          PQresultErrorMessage(sv.get()));
-    }
-    if (ok && !legacy_deliveries.empty()) {
-        pg::PgResult sv = pg::exec_params(
-            conn,
-            "SELECT setval(pg_get_serial_sequence('offload_target_store.offload_deliveries',"
-            "'id'), (SELECT MAX(id) FROM offload_target_store.offload_deliveries))",
-            std::vector<std::string>{});
-        ok = sv.status() == PGRES_TUPLES_OK;
-        if (!ok)
-            spdlog::error("OffloadTargetStore::migrate_from_sqlite: offload_deliveries "
-                          "sequence fixup failed: {}",
-                          PQresultErrorMessage(sv.get()));
-    }
-
-    return ok;
-    });
-    if (!committed) {
-        spdlog::error("OffloadTargetStore::migrate_from_sqlite: backfill transaction failed or "
-                      "was rolled back (see the preceding log line for the specific step)");
-        return false;
-    }
-
-    // Move the legacy file aside (never delete — ADR-0009 one-release
-    // rollback window), sidecars too. A failure to move is logged but does
-    // NOT fail the backfill — the data is already safely committed, and the
-    // file is already 0600-restricted above.
-    std::error_code mv_ec;
-    const auto migrated_path = legacy_db_path.string() + ".migrated-" +
-                               std::to_string(epoch_seconds());
-    std::filesystem::rename(legacy_db_path, migrated_path, mv_ec);
-    if (mv_ec) {
-        spdlog::warn("OffloadTargetStore::migrate_from_sqlite: backfill succeeded but could not "
-                     "move the legacy file aside ({}); it is left in place, permissions already "
-                     "restricted",
-                     mv_ec.message());
-    } else {
-        for (const char* suffix : {"-wal", "-shm"}) {
-            std::error_code side_ec;
-            const auto side = legacy_db_path.string() + suffix;
-            if (std::filesystem::exists(side, side_ec))
-                std::filesystem::rename(side, migrated_path + suffix, side_ec);
-        }
-    }
-
-    spdlog::info("OffloadTargetStore::migrate_from_sqlite: backfilled {} target(s), {} "
-                "delivery/deliveries",
-                legacy_targets.size(), legacy_deliveries.size());
-    return true;
 }
 
 } // namespace yuzu::server

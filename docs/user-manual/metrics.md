@@ -297,13 +297,12 @@ so `absent()`/`rate()` alerting is meaningful on a healthy server.
 | `yuzu_server_offload_delivery_failed_total` | counter | Offload-target deliveries that failed (connection error, non-2xx, exception, or a tampered non-http(s) URL). |
 | `yuzu_server_offload_delivery_dropped_total` | counter | Offload-target deliveries dropped because the delivery worker pool's bounded queue was full, or the store was quiescing. |
 
-Three more, added with the ADR-0059 Postgres migration (also pre-seeded to `0` at boot):
+Two more, added with the ADR-0059 Postgres migration (also pre-seeded to `0` at boot; this store has no backfill metric — ADR-0009's fresh-start-by-default amendment means there is no legacy migration to report an outcome for):
 
 | Metric | Type | Meaning |
 |---|---|---|
 | `yuzu_server_offload_delivery_credential_unavailable_total` | counter | Offload-target deliveries skipped because the target's credential (ADR-0010) failed to decrypt — the delivery is never fired unsigned. A nonzero rate points at KEK/keys-directory health, not the target's own configuration; cross-check against `yuzu_server_secret_decrypt_failures_total{store="offload_target_store"}` for the specific failure class. |
 | `yuzu_server_offload_fire_event_degraded_total` | counter | `fire_event`'s enabled-target scan could not acquire a database connection within its 300ms bound, or the query itself failed — that tick's events were not delivered to any target. A rising rate under normal load indicates pool exhaustion on the hot dispatch path. |
-| `yuzu_server_offload_backfill_total{result="ok"\|"failed"}` | counter | The one-time legacy-`offload_targets.db` backfill's outcome at boot. `failed` means the server refused to start — see the boot log's `OffloadTargetStore::migrate_from_sqlite:` lines. |
 
 ## Fleet visualization metrics
 

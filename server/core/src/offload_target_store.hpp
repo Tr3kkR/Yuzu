@@ -32,6 +32,13 @@
 /// buffering/dispatch path therefore never hold plaintext credential bytes
 /// outside the one delivery attempt that needs them.
 ///
+/// Backfill: NONE (ADR-0009's 2026-08-25 fresh-start-by-default amendment —
+/// no production fleet has ever run a pre-Postgres build of any Yuzu store,
+/// so there is no real legacy data to protect). Skipped unconditionally, no
+/// flag, same as `ResponseStore`'s pre-existing precedent: the legacy
+/// `offload_targets.db` is never read, and construction logs a one-time
+/// "fresh start, no legacy backfill" line.
+///
 /// Reuses the WebhookStore delivery pattern (bounded-worker-pool dispatch
 /// per delivery, async record - see store_worker_pool.hpp), and adds:
 ///   - typed auth (none / bearer / basic / hmac)
@@ -48,7 +55,6 @@
 #include <chrono>
 #include <cstdint>
 #include <expected>
-#include <filesystem>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -172,16 +178,6 @@ public:
     /// still-draining delivery decrypts the credential on its worker thread
     /// right up until it finishes (see the file header).
     bool quiesce(std::chrono::milliseconds timeout);
-
-    /// One-time, idempotent legacy-`offload_targets.db` backfill (ADR-0009
-    /// MANDATORY class — both tables; there is no TTL/prune on
-    /// `offload_deliveries`, so deliveries are not treated as skippable
-    /// telemetry here, matching ADR-0057's identical ruling for webhook
-    /// deliveries). Runs at boot, before serving, and fails closed on any
-    /// error. The legacy plaintext `auth_credential` column is TRANSFORMED
-    /// (encrypted), never copied (ADR-0010). The legacy file is moved aside
-    /// (never deleted) on a verified success.
-    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
     /// Create a new offload target. `auth_credential` may be empty (no
     /// credential — `has_credential=false`, dispatch sends no auth header
@@ -307,10 +303,6 @@ private:
     /// payload_json. For a batched flush, the events are wrapped in a
     /// JSON array under `{"events":[…]}`.
     static std::string build_batch_body(const std::vector<BufferedEvent>& events);
-
-    /// The actual backfill body; `migrate_from_sqlite` wraps this with the
-    /// `yuzu_server_offload_backfill_total{result}` metric.
-    bool migrate_from_sqlite_impl(const std::filesystem::path& legacy_db_path);
 
     // LAST-DECLARED MEMBER (#3261 governance hardening, ported from the
     // SQLite era) - see the identical comment history on
