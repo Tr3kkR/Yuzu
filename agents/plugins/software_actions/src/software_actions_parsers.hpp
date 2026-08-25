@@ -368,6 +368,25 @@ struct YumUpgradeRow {
     return exit_code != 0 && !rows_empty;
 }
 
+/// May the caller assert "System is up to date" for this scan? Deliberately
+/// separate from `nonzero_exit_with_partial_rows` above -- this is the
+/// converse direction: THIS regression is a false-CLEAN claim coexisting with
+/// a degraded status, not an undeclared-status partial. Governance Gate 4
+/// (unhappy-path) found it live in do_list_upgradable's Windows leg: when
+/// every post-separator line failed the column-alignment check, `rows` ends
+/// up empty EXACTLY like a genuine clean scan, but for a DEGRADED reason (a
+/// CONSTRAINED status was already set for the dropped rows) -- the code fell
+/// through to "up to date" anyway, a positive assertion contradicting the
+/// status it had just set. `table_incomplete` is the caller's OWN record of
+/// whether it already reported a degrade for THIS parse (header_unrecognized,
+/// unmapped_lines, or nonzero_exit_with_partial_rows) -- required because
+/// CommandContext exposes no way to read back a status already set.
+[[nodiscard]] constexpr bool winget_up_to_date_claimable(bool rows_empty, int exit_code,
+                                                          bool separator_found,
+                                                          bool table_incomplete) {
+    return rows_empty && exit_code == 0 && separator_found && !table_incomplete;
+}
+
 /// Parse `yum check-update` / `dnf check-update` output: "package.arch
 /// new_version repo" per line, "Loaded"/"Loading"/"Last metadata" banner
 /// lines skipped.

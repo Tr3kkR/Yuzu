@@ -105,7 +105,18 @@ TEST_CASE("license_scan plugin: surfaces reports probe_status diagnostics via Lo
     // the surface licensing_linux.cpp's runner migration rewrote, and
     // run_pkg_metadata_surface pushes its outcome on EVERY path, so its absence
     // means the migrated surface did not run at all.
-    CHECK(result.captured.find("probe_status|pkg_metadata") != std::string::npos);
+    //
+    // Governance Gate 4 (unhappy-path UP-9): the ORIGINAL substring check here
+    // matched `probe_status|pkg_metadata|ok|...` AND
+    // `probe_status|pkg_metadata|error|rpm_query_failed` equally -- so this
+    // test stayed green even with the migrated argv path completely broken
+    // (a reverted fix, a wrong tool path, a silently reintroduced shell hop
+    // that no-ops), as long as SOME probe_status line for the surface still
+    // appeared. Any dev or CI host running this suite has rpm or dpkg-query,
+    // so pinning `|ok|` specifically proves the migrated argv actually
+    // reached the real tool and succeeded, not merely that the surface was
+    // attempted.
+    CHECK(result.captured.find("probe_status|pkg_metadata|ok|") != std::string::npos);
 #endif
 }
 

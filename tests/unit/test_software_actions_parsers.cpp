@@ -404,6 +404,39 @@ TEST_CASE("nonzero_exit_with_partial_rows: all four truth-table cells",
     CHECK_FALSE(nonzero_exit_with_partial_rows(1, true));
 }
 
+TEST_CASE("winget_up_to_date_claimable: a degrade already reported blocks the claim",
+          "[software_actions]") {
+    // THE regression (Governance Gate 4, unhappy-path UP-2): every
+    // post-separator line failed the column-alignment check (e.g. every
+    // package name is CJK/double-width and this parser's cell model doesn't
+    // cover it), so `rows` ends up empty EXACTLY like a genuine clean scan --
+    // but a CONSTRAINED status was already set moments earlier for the
+    // dropped rows. Without this gate the code fell through to "System is up
+    // to date" anyway: a false-clean claim directly contradicting the status
+    // it had just set.
+    CHECK_FALSE(winget_up_to_date_claimable(/*rows_empty=*/true, /*exit_code=*/0,
+                                            /*separator_found=*/true,
+                                            /*table_incomplete=*/true));
+
+    // A genuine clean scan -- separator found, nothing dropped, clean exit --
+    // is still claimable.
+    CHECK(winget_up_to_date_claimable(true, 0, true, false));
+
+    // No recognisable table at all: never claimable, regardless of
+    // table_incomplete (a separate, already-handled degrade shape).
+    CHECK_FALSE(winget_up_to_date_claimable(true, 0, false, false));
+
+    // A nonzero exit is handled by an earlier branch in the caller and never
+    // reaches this decision with rows_empty=true in practice, but the
+    // function itself must still refuse it defensively.
+    CHECK_FALSE(winget_up_to_date_claimable(true, 1, true, false));
+
+    // Rows non-empty is out of scope for this decision (the caller only asks
+    // when parsed.rows.empty()), but the function is still honest about it --
+    // "up to date" is a claim about zero pending upgrades.
+    CHECK_FALSE(winget_up_to_date_claimable(false, 0, true, false));
+}
+
 // ── macOS: softwareupdate -l ────────────────────────────────────────────────
 
 TEST_CASE("softwareupdate -l: one pending update — REAL capture from this host",

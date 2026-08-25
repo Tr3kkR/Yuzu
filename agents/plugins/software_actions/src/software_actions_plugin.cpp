@@ -198,28 +198,42 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
         return 1;
     }
     auto parsed = yuzu::software_actions::parse_winget_upgrade(res.output);
-    if (parsed.unmapped_lines > 0 && !parsed.header_unrecognized) {
-        // Some post-separator line looked like data but did not fit the
-        // header's columns, so it was dropped rather than emitted with values
-        // borrowed from a neighbouring column. A vanished package must not be
-        // indistinguishable from a host with fewer upgrades.
-        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                              "software_actions:winget_rows_unmapped");
-    }
+
+    // CommandContext exposes no way to READ back a status already set (the
+    // daemon-side store is unconditional last-write-wins, agent.cpp), so this
+    // local flag is the only way to know, a few lines down, that the table is
+    // already known-incomplete -- which is exactly what decides whether "up
+    // to date" may be written. Track ONE reason (else-if, not three
+    // independent ifs): setting a second reason after the first would only
+    // overwrite it with no way to recover the earlier one, silently losing
+    // diagnostic fidelity even though the STATUS itself stays correct either
+    // way (same shape as discovery_scan_plan.hpp's worst_of() accumulator).
+    bool table_incomplete = false;
     if (parsed.header_unrecognized) {
         // The table was found but its header did not yield the five expected
         // column origins, so every row below is reported name-only. Say so —
         // an operator must be able to tell "these packages are upgradable and
         // here are the versions" from "these packages are upgradable and the
         // version columns could not be read".
+        table_incomplete = true;
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               "software_actions:winget_header_unrecognized");
-    }
-    if (yuzu::software_actions::nonzero_exit_with_partial_rows(res.exit_code,
-                                                               parsed.rows.empty())) {
+    } else if (parsed.unmapped_lines > 0) {
+        // Some post-separator line looked like data but did not fit the
+        // header's columns, so it was dropped rather than emitted with values
+        // borrowed from a neighbouring column. A vanished package must not be
+        // indistinguishable from a host with fewer upgrades -- INCLUDING the
+        // degenerate case where every row was dropped this way, which must
+        // not read as "up to date" below.
+        table_incomplete = true;
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "software_actions:winget_rows_unmapped");
+    } else if (yuzu::software_actions::nonzero_exit_with_partial_rows(res.exit_code,
+                                                                      parsed.rows.empty())) {
         // See nonzero_exit_with_partial_rows()'s doc comment: winget exited
         // nonzero but the table still parsed rows, so the caller must not
         // derive "ok" from an undeclared status.
+        table_incomplete = true;
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               "software_actions:winget_partial_exit");
     }
@@ -230,14 +244,20 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
             degrade(ctx, res, "software_actions:winget_failed");
             return 1;
         }
-        if (!parsed.separator_found) {
-            // winget exited cleanly but produced no recognisable table at all,
-            // so nothing about this host's upgrades was established. The
-            // non-committal "-" line is kept for output-shape compatibility;
-            // the status is what tells an operator it is not an "up to date".
-            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
-                                  YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                  "software_actions:winget_no_table");
+        if (!yuzu::software_actions::winget_up_to_date_claimable(
+                /*rows_empty=*/true, res.exit_code, parsed.separator_found, table_incomplete)) {
+            // See winget_up_to_date_claimable()'s doc comment: either no
+            // recognisable table was found at all, or one WAS found but every
+            // row was dropped as unmapped -- in both cases nothing about this
+            // host's upgrades was established, and a CONSTRAINED status may
+            // already be set (table_incomplete) from above. The non-committal
+            // "-" line is kept for output-shape compatibility; the status is
+            // what tells an operator it is not a genuine "up to date".
+            if (!table_incomplete) {
+                ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
+                                      YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                      "software_actions:winget_no_table");
+            }
             ctx.write_output("upgradable|none|-|-");
             return 1;
         }
@@ -302,8 +322,19 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
             }
         }
     }
-    if (found)
+    if (found) {
+        if (apt_tried && !apt_ok) {
+            // apt was tried and FAILED, but yum/dnf still found rows -- yum's
+            // rows are real data and stay in the output, but apt's failure
+            // must not be silently swallowed by yum's later success: a
+            // consumer that only reads status would see a clean CONSTRAINED-
+            // free result even though one of the two managers this host has
+            // installed could not be queried this cycle.
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "software_actions:apt_list_upgradable_failed");
+        }
         return 0;
+    }
 
     // Nothing was emitted. Say WHY. "System is up to date" is a positive
     // assertion about the host and must be reserved for the one case that
@@ -459,7 +490,7 @@ int do_installed_count(yuzu::CommandContext& ctx) {
     auto res = yuzu::agent::run_bounded_subprocess(
         {tool, "--pkgs"}, yuzu::agent::SubprocessOptions{.deadline = kQuickToolDeadline});
     if (!capture_usable(res, res.exit_code == 0)) {
-        degrade(ctx, res, "software_actions:pkgutil_failed");
+        degrade(ctx, res, "software_actions:pkgutil_query_failed");
         return 1;
     }
     ctx.write_output(

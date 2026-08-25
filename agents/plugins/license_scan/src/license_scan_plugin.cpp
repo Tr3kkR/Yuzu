@@ -37,6 +37,7 @@
 
 #include <format>
 #include <string_view>
+#include <vector>
 
 #include "licensing_probes.hpp"
 #include "licensing_record.hpp"
@@ -53,6 +54,34 @@ yuzu::license_scan::SurfaceRun collect_surfaces() {
 #endif
 }
 
+// Governance Gate 4 (unhappy-path UP-1): before this, NEITHER do_list() nor
+// do_surfaces() ever called ctx.set_result_status() -- every surface could
+// error and the call would still report rc 0 with no ABI4 status set at all.
+// This is LESS severe than it first looks: the daily-sync consumer
+// (sync_source_software_licensing.cpp) deliberately does NOT read the ABI4
+// seam for this plugin -- it parses the probe_status| TEXT lines directly
+// (ADR-0024 D3's "empty-vs-error structural guard"), and entitlement_certs is
+// on its kAuthoritativeSurfaces list, so a genuine failure there already
+// correctly blocks a full-replace-to-empty via that path, unaffected by this
+// fix. What was missing is the OTHER, machine-readable channel: any consumer
+// that reads rc/status directly (a live "Get info" dispatch, a future
+// integration) rather than parsing text would see a false-clean result. Added
+// for consistency with software_actions' use of the same seam in this same
+// PR -- rc intentionally stays 0 either way (ADR-0024 D3: "success" is
+// structural, the enumeration sweep itself completed; the existing
+// test_license_scan_actions.cpp test already pins rc==0 as part of the
+// documented contract, unaffected by this change).
+void propagate_surface_status(yuzu::CommandContext& ctx,
+                              const std::vector<yuzu::license_scan::ProbeOutcome>& outcomes) {
+    for (const auto& outcome : outcomes) {
+        if (!outcome.ok) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "license_scan:surface_error");
+            return;
+        }
+    }
+}
+
 int do_list(yuzu::CommandContext& ctx) {
     const auto run = collect_surfaces();
     // §3.1 emission order: all lic| records first, then one probe_status|
@@ -62,6 +91,7 @@ int do_list(yuzu::CommandContext& ctx) {
         ctx.write_output(yuzu::license_scan::render_lic_line(record));
     for (const auto& outcome : run.outcomes)
         ctx.write_output(yuzu::license_scan::render_probe_status_line(outcome));
+    propagate_surface_status(ctx, run.outcomes);
     return 0;
 }
 
@@ -71,6 +101,7 @@ int do_surfaces(yuzu::CommandContext& ctx) {
     // D-10): which surfaces are available and why not.
     for (const auto& outcome : run.outcomes)
         ctx.write_output(yuzu::license_scan::render_probe_status_line(outcome));
+    propagate_surface_status(ctx, run.outcomes);
     return 0;
 }
 
