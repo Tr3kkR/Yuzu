@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -467,6 +468,70 @@ TEST_CASE("WebhookStore[pg]: backfill preserves ids, decrypts-and-verifies the s
     }
     CHECK(moved_copy_found);
 }
+
+#ifndef _WIN32
+TEST_CASE("WebhookStore[pg]: backfill restricts WAL/SHM sidecars to 0600, not just the main file",
+         "[webhook_store][pg]") {
+    // gov external-review finding (PR #3563): move_legacy_aside chmod'd only
+    // the moved-aside main file — the -wal/-shm sidecars, which can carry
+    // the same PLAINTEXT secret pages the main file's own read-time force
+    // exists to protect, were renamed but left at whatever mode they
+    // already had. Prove both sidecars land at owner-only after backfill.
+    WebhookStorePg store;
+    auto legacy_path = yuzu::test::unique_temp_path("yuzu_test_webhook_legacy_wal") += ".db";
+    {
+        LegacyWebhookDb legacy(legacy_path);
+        legacy.insert({.id = 1,
+                      .url = "https://example.com/hook",
+                      .event_types = "*",
+                      .secret = "s",
+                      .enabled = true,
+                      .created_at = 1700000000});
+    }
+    // Simulate an unclean-shutdown leftover: dummy sidecar files, group/
+    // world-readable, sitting beside the legacy db. Content is irrelevant —
+    // move_legacy_aside only needs to see them exist at the expected path.
+    for (const char* suffix : {"-wal", "-shm"}) {
+        auto side = legacy_path;
+        side += suffix;
+        std::ofstream(side) << "dummy-sidecar-content";
+        std::filesystem::permissions(side,
+                                     std::filesystem::perms::owner_read |
+                                         std::filesystem::perms::owner_write |
+                                         std::filesystem::perms::group_read |
+                                         std::filesystem::perms::others_read,
+                                     std::filesystem::perm_options::replace);
+    }
+
+    REQUIRE(store->migrate_from_sqlite(legacy_path));
+
+    std::filesystem::path moved_main, moved_wal, moved_shm;
+    for (const auto& entry :
+        std::filesystem::directory_iterator(legacy_path.parent_path())) {
+        const auto s = entry.path().string();
+        if (!s.starts_with(legacy_path.string() + ".migrated-"))
+            continue;
+        if (s.ends_with("-wal"))
+            moved_wal = entry.path();
+        else if (s.ends_with("-shm"))
+            moved_shm = entry.path();
+        else
+            moved_main = entry.path();
+    }
+    REQUIRE_FALSE(moved_main.empty());
+    REQUIRE_FALSE(moved_wal.empty());
+    REQUIRE_FALSE(moved_shm.empty());
+
+    const auto owner_only =
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write;
+    for (const auto& p : {moved_main, moved_wal, moved_shm}) {
+        std::error_code st_ec;
+        const auto perms = std::filesystem::status(p, st_ec).permissions();
+        REQUIRE_FALSE(st_ec);
+        CHECK((perms & std::filesystem::perms::mask) == owner_only);
+    }
+}
+#endif
 
 TEST_CASE("WebhookStore[pg]: backfill is idempotent — a second run against the moved-aside-free "
          "path is a no-op",

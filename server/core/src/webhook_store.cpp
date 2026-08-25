@@ -304,6 +304,7 @@ void move_legacy_aside(const std::filesystem::path& legacy_db_path) {
                      legacy_db_path.string(), mv_ec.message());
         return;
     }
+    std::vector<std::filesystem::path> side_asides;
     for (const char* suffix : {"-wal", "-shm"}) {
         auto side = legacy_db_path;
         side += suffix;
@@ -313,27 +314,63 @@ void move_legacy_aside(const std::filesystem::path& legacy_db_path) {
         auto side_aside = aside;
         side_aside += suffix;
         std::filesystem::rename(side, side_aside, side_ec);
-        if (side_ec)
+        if (side_ec) {
             spdlog::warn("WebhookStore::migrate_from_sqlite: moved the legacy webhook db but not "
                          "its {} sidecar ({}); the retained copy at {} may not open standalone "
                          "until the sidecar is moved beside it",
                          suffix, side_ec.message(), aside.string());
+        } else {
+            side_asides.push_back(side_aside);
+        }
     }
 #ifndef _WIN32
     // The main file was already forced to 0600 before it was opened for
     // reading (ADR-0010 §Consequences (a)); re-apply to the moved copy too
     // — rename preserves mode, so this is normally a no-op, defence in
     // depth if the move landed on semantics where it wasn't. POSIX-only,
-    // same reason as the read-time force above.
+    // same reason as the read-time force above. The WAL sidecar carries the
+    // same PLAINTEXT secret pages as the main file prior to a checkpoint
+    // (function header comment), so it gets the identical restriction — an
+    // earlier version of this code chmod'd only the main file and logged an
+    // unconditional "(0600, ...)" claim without checking whether the call
+    // actually succeeded (gov external-review finding, PR #3563).
+    bool perm_ok = true;
     std::error_code perm_ec;
     std::filesystem::permissions(aside,
                                  std::filesystem::perms::owner_read |
                                      std::filesystem::perms::owner_write,
                                  std::filesystem::perm_options::replace, perm_ec);
-    spdlog::info("WebhookStore::migrate_from_sqlite: moved legacy webhook db to {} (0600, "
-                 "retained one release per ADR-0009 — still holds the pre-cutover PLAINTEXT "
-                 "signing secret(s); see ADR-0057 for the operator purge/rotate guidance)",
-                 aside.string());
+    if (perm_ec) {
+        perm_ok = false;
+        spdlog::warn("WebhookStore::migrate_from_sqlite: could not set 0600 on moved legacy db "
+                     "{}: {}",
+                     aside.string(), perm_ec.message());
+    }
+    for (const auto& side_aside : side_asides) {
+        std::error_code side_perm_ec;
+        std::filesystem::permissions(side_aside,
+                                     std::filesystem::perms::owner_read |
+                                         std::filesystem::perms::owner_write,
+                                     std::filesystem::perm_options::replace, side_perm_ec);
+        if (side_perm_ec) {
+            perm_ok = false;
+            spdlog::warn("WebhookStore::migrate_from_sqlite: could not set 0600 on moved legacy "
+                         "sidecar {}: {}",
+                         side_aside.string(), side_perm_ec.message());
+        }
+    }
+    if (perm_ok) {
+        spdlog::info("WebhookStore::migrate_from_sqlite: moved legacy webhook db to {} (0600, "
+                     "retained one release per ADR-0009 — still holds the pre-cutover PLAINTEXT "
+                     "signing secret(s); see ADR-0057 for the operator purge/rotate guidance)",
+                     aside.string());
+    } else {
+        spdlog::info("WebhookStore::migrate_from_sqlite: moved legacy webhook db to {} — 0600 "
+                     "restriction could not be fully applied, see warning(s) above — retained "
+                     "one release per ADR-0009 — still holds the pre-cutover PLAINTEXT signing "
+                     "secret(s); see ADR-0057 for the operator purge/rotate guidance",
+                     aside.string());
+    }
 #else
     // No equivalent access-restriction is applied on Windows today (see the
     // read-time force's comment) — the log line must not claim one.
@@ -677,13 +714,14 @@ void WebhookStore::deliver_single(const WebhookDeliveryTarget& wh, const std::st
     int status_code = 0;
     std::string error;
 
-    // Decrypt-on-use, right here, before ANY network work — the raw secret
-    // exists in memory only around the HMAC call below (file header;
-    // ADR-0010 §Consequences' per-delivery-batch cache allowance is
-    // deliberately declined here, ADR-0057). A decrypt failure skips the
-    // delivery ENTIRELY: it must never fire unsigned and must never fire
-    // with an empty secret.
-    std::optional<SecureBuffer> secret;
+    // Decrypt-on-use, right here, before ANY network work, and reduce to the
+    // HMAC hex digest immediately below — the raw secret exists in memory
+    // only for the hmac_sha256 call itself, never across the connect/write/
+    // read of the outbound POST (file header; ADR-0010 §Consequences'
+    // per-delivery-batch cache allowance is deliberately declined here,
+    // ADR-0057). A decrypt failure skips the delivery ENTIRELY: it must
+    // never fire unsigned and must never fire with an empty secret.
+    std::optional<std::string> signature;
     if (wh.has_secret) {
         auto pk = pg::SecretCodec::encode_bigint_pk(wh.id);
         auto dec = secret_codec_.decrypt(
@@ -698,7 +736,12 @@ void WebhookStore::deliver_single(const WebhookDeliveryTarget& wh, const std::st
             record_delivery(wh.id, event_type, payload_json, 0, "secret_unavailable");
             return;
         }
-        secret = std::move(*dec);
+        // Scoped to this block only: the SecureBuffer is wiped by its own
+        // destructor the instant `secret` goes out of scope, before the URL
+        // is even parsed — well before any socket is opened.
+        SecureBuffer secret = std::move(*dec);
+        auto view = std::string_view(reinterpret_cast<const char*>(secret.data()), secret.size());
+        signature = hmac_sha256(view, payload_json);
     }
 
     try {
@@ -732,11 +775,8 @@ void WebhookStore::deliver_single(const WebhookDeliveryTarget& wh, const std::st
         headers.emplace("Content-Type", "application/json");
         headers.emplace("X-Yuzu-Event", event_type);
 
-        if (secret) {
-            auto view =
-                std::string_view(reinterpret_cast<const char*>(secret->data()), secret->size());
-            auto sig = hmac_sha256(view, payload_json);
-            headers.emplace("X-Yuzu-Signature", "sha256=" + sig);
+        if (signature) {
+            headers.emplace("X-Yuzu-Signature", "sha256=" + *signature);
         }
 
         auto result = cli.Post(path, headers, payload_json, "application/json");
@@ -750,10 +790,9 @@ void WebhookStore::deliver_single(const WebhookDeliveryTarget& wh, const std::st
         error = ex.what();
         spdlog::warn("WebhookStore: delivery to {} failed: {}", wh.url, error);
     }
-    // `secret` (if any) goes out of scope here and is wiped by
-    // SecureBuffer's destructor on every exit path, including the catch
-    // above — matches "the raw secret exists in memory only around the
-    // HMAC call".
+    // `signature` is a hex digest, not secret material — nothing left to
+    // wipe here. The SecureBuffer itself was already destroyed (and wiped)
+    // above, before the URL was even parsed.
 
     const bool ok = error.empty() && status_code >= 200 && status_code < 300;
     if (metrics_) {
@@ -891,6 +930,29 @@ bool WebhookStore::migrate_from_sqlite_impl(const std::filesystem::path& legacy_
     std::string fingerprint;
     std::vector<LegacyWebhook> legacy_hooks;
     std::vector<LegacyDelivery> legacy_deliveries;
+
+    // RAII, not a final loop: wipes every legacy plaintext secret still
+    // resident in `legacy_hooks` on EVERY exit from this function, not just
+    // the all-succeed path. The read loop below populates `h.secret`, and
+    // this function has roughly a dozen fail-closed early `return false`
+    // paths between that population point and the end (schema-probe,
+    // mid-scan abort, orphan check, fingerprint hash, marker check/stamp,
+    // encrypt failure) — a cleanse placed only just before the final
+    // `return true` covered none of them. For a fail-closed secrets store a
+    // failure path must be AT LEAST as safe as success, never less (gov
+    // external-review finding, PR #3563).
+    struct LegacySecretWiper {
+        std::vector<LegacyWebhook>& hooks;
+        ~LegacySecretWiper() {
+            for (auto& h : hooks) {
+                if (!h.secret.empty()) {
+                    OPENSSL_cleanse(h.secret.data(), h.secret.size());
+                    h.secret.clear();
+                }
+            }
+        }
+    } wipe_legacy_secrets{legacy_hooks};
+
     if (!legacy_exists) {
         fingerprint = kSourcelessFingerprint;
     } else {
@@ -1127,19 +1189,11 @@ bool WebhookStore::migrate_from_sqlite_impl(const std::filesystem::path& legacy_
         encrypted_secrets[i] = std::move(*enc);
     }
 
-    // Zeroize every legacy plaintext secret now that it's been consumed —
-    // gov Gate 2 security-guardian: an unzeroized std::string here departs
-    // from this same file's own SecureBuffer discipline at the delivery
-    // site (ADR-0010 zeroization rule). legacy_hooks is not `const` past
-    // this point, so every read below must key off `encrypted_secrets[i]`
-    // (populated iff the secret was non-empty), never `h.secret`, which the
-    // has_secret derivation just inside the transaction below now does.
-    for (auto& h : legacy_hooks) {
-        if (!h.secret.empty()) {
-            OPENSSL_cleanse(h.secret.data(), h.secret.size());
-            h.secret.clear();
-        }
-    }
+    // `wipe_legacy_secrets` (declared above, at the top of this function)
+    // wipes every legacy plaintext secret when this function returns —
+    // every read below must key off `encrypted_secrets[i]` (populated iff
+    // the secret was non-empty), never `h.secret`, which the has_secret
+    // derivation just inside the transaction below now does.
 
     std::string failure_detail;
     // ONE transaction: fail closed on any error, nothing partially
@@ -1148,10 +1202,10 @@ bool WebhookStore::migrate_from_sqlite_impl(const std::filesystem::path& legacy_
     const bool ok = pool_.with_txn([&](PGconn* conn) -> bool {
         for (std::size_t i = 0; i < legacy_hooks.size(); ++i) {
             const auto& h = legacy_hooks[i];
-            // has_secret derives from the ENCRYPTED output, not h.secret —
-            // the plaintext was zeroized+cleared right after the encrypt
-            // loop above, so h.secret.empty() would be true unconditionally
-            // by this point.
+            // has_secret derives from the ENCRYPTED output, never h.secret —
+            // the plaintext is only guaranteed wiped when the enclosing
+            // function returns (`wipe_legacy_secrets`'s RAII scope), which
+            // is after this transaction runs.
             const bool has_secret = !encrypted_secrets[i].empty();
             std::vector<std::optional<std::string>> params = {
                 std::to_string(h.id),
