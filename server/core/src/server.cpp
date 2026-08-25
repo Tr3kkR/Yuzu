@@ -5270,6 +5270,17 @@ public:
                 // call that "nothing lost" (gov Gate 8 architect finding).
                 auto policy_count = legacy_sqlite_row_count(legacy_policy_db, "policies");
                 auto fragment_count = legacy_sqlite_row_count(legacy_policy_db, "policy_fragments");
+                // The two tables are read independently, so their outcomes are
+                // independent too: one can be a genuine 0 while the other failed
+                // to read (single-table corruption, not just whole-file/whole-
+                // schema failure). Branch on has_value(), never value_or(0) alone,
+                // or a real-0/unreadable mix silently falls through neither branch
+                // and claims (via the trailing no-warning comment) that both were
+                // confirmed empty when one genuinely wasn't (gov round-5 cpp-safety
+                // finding).
+                auto count_str = [](std::optional<std::int64_t> c) -> std::string {
+                    return c.has_value() ? std::to_string(*c) : std::string("unknown");
+                };
                 if (policy_count.value_or(0) > 0 || fragment_count.value_or(0) > 0) {
                     spdlog::warn(
                         "[PG] A legacy policies.db ({}) has {} policy row(s) and {} fragment "
@@ -5278,17 +5289,19 @@ public:
                         "NOT be carried over. To reconcile manually, re-author the equivalent "
                         "fragments/policies via POST /api/policy-fragments and POST /api/policies "
                         "before relying on this Postgres instance.",
-                        legacy_policy_db.string(), policy_count.value_or(0),
-                        fragment_count.value_or(0));
-                } else if (!policy_count.has_value() && !fragment_count.has_value()) {
-                    // Couldn't read either count (corrupt file, unreadable, unexpected
-                    // schema) — still worth a heads-up, but don't claim a real count.
+                        legacy_policy_db.string(), count_str(policy_count),
+                        count_str(fragment_count));
+                } else if (!policy_count.has_value() || !fragment_count.has_value()) {
+                    // Couldn't read at least one count (corrupt file, unreadable,
+                    // unexpected schema) — still worth a heads-up, but don't claim
+                    // a confirmed-empty result for the table that failed to read.
                     spdlog::warn("[PG] A legacy policies.db ({}) exists but its row counts "
-                                 "couldn't be read (corrupt or unreadable) — PolicyStore no "
-                                 "longer backfills it regardless; if this environment has real "
-                                 "compliance-policy data, inspect the file manually before "
-                                 "relying on this Postgres instance.",
-                                 legacy_policy_db.string());
+                                 "couldn't be fully read (policies={}, policy_fragments={}) — "
+                                 "PolicyStore no longer backfills it regardless; if this "
+                                 "environment has real compliance-policy data, inspect the file "
+                                 "manually before relying on this Postgres instance.",
+                                 legacy_policy_db.string(), count_str(policy_count),
+                                 count_str(fragment_count));
                 }
                 // Both tables read successfully and both are empty: schema-only
                 // file, nothing lost — no warning.
