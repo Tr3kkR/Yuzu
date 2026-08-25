@@ -50,7 +50,8 @@ namespace yuzu::content_dist::exec {
 /// `.exec_verify.expected_size` on the returned options afterward, once the
 /// staged file's hash-verified size is known: this function never touches
 /// the filesystem, so it cannot know that size itself.
-[[nodiscard]] inline yuzu::agent::SubprocessOptions build_execution_options(bool is_linux) {
+[[nodiscard]] inline yuzu::agent::SubprocessOptions build_execution_options(bool is_linux,
+                                                                              bool is_windows) {
     yuzu::agent::SubprocessOptions opts;
 
     // BR-002 (whole-branch review correction -- supersedes an earlier
@@ -125,6 +126,22 @@ namespace yuzu::content_dist::exec {
     // there; Windows verification isn't implemented and fails closed too.
     // Setting this unconditionally would make execute_staged spawn_error on
     // every single invocation on macOS and Windows.
+    // Alex ruling (whole-branch review follow-up): the deleted Windows
+    // launcher passed lpEnvironment=nullptr to CreateProcessW, so a staged
+    // installer inherited the agent's FULL parent environment. The migrated
+    // path set neither inherit_parent_env nor extra_env, which would have
+    // silently narrowed Windows children to the runner's fixed default block
+    // (SystemRoot/windir/PATH/TEMP/TMP) -- an undisclosed behaviour change to
+    // exactly the kind of vendor installer that reads machine/proxy variables.
+    // This mirrors the identical ruling already applied to script_exec's
+    // Windows leg: a convergence refactor must not silently change behaviour.
+    // POSIX is unaffected -- the deleted POSIX launcher inherited the parent
+    // environment implicitly via execvp, which is what the runner's own
+    // default-off path plus this flag's POSIX no-op preserve. Any future
+    // tightening of the environment for staged payloads is a separate,
+    // deliberate, disclosed change -- never a side effect of this migration.
+    opts.inherit_parent_env = is_windows;
+
     opts.exec_verify.enabled = is_linux;
 
     // DELIBERATELY false -- NOT the runner's require_root_owned=true
