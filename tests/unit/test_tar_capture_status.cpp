@@ -36,6 +36,18 @@
  * behaviour: an incomplete tick computes NO events and never touches the
  * baseline, and the next complete tick then diffs against the RETAINED
  * (not reset) baseline.
+ *
+ * Round 3 additions close three more gaps found after Windows/Linux mapdrive
+ * cap paths were found still silently truncating (B3-001) and the Windows
+ * ARP cap check was found off-by-one (B3-004): would_exceed_cap is the
+ * shared, platform-neutral cap-before-push decision every capped collector
+ * loop now applies (exercised directly here since the Windows-only loops
+ * that call it cannot run on this host -- B3-005); collect_or_retain now
+ * catches only the dedicated IncompleteCaptureError type, not bare
+ * std::exception, so a real allocation/programming failure is no longer
+ * misreported as ordinary capture incompleteness (B3-003); and
+ * snapshot_result_line is the `snapshot` action's honesty decision, tested
+ * here as the action-level regression for B3-002.
  */
 
 #include "tar_capture_status.hpp"
@@ -136,10 +148,27 @@ TEST_CASE("collect_or_retain: a successful collector's value is returned in curr
 TEST_CASE("collect_or_retain: a throwing collector yields no current and captures what()",
           "[tar_capture_status][collect_or_retain]") {
     auto res = collect_or_retain([]() -> std::vector<int> {
-        throw std::runtime_error("TAR: fixture incomplete capture");
+        throw IncompleteCaptureError("TAR: fixture incomplete capture");
     });
     CHECK_FALSE(res.current);
     CHECK(res.skip_reason == "TAR: fixture incomplete capture");
+}
+
+// round 3, B3-003: collect_or_retain now catches ONLY IncompleteCaptureError,
+// not bare std::exception -- a real programming/allocation failure (modelled
+// here by std::logic_error; the collector's `throw std::bad_alloc{}` would
+// hit the identical path) must propagate OUT of collect_or_retain rather
+// than being silently reinterpreted as ordinary capture incompleteness and
+// swallowed. This is the exact defect B3-003 named: the previous bare
+// `catch (const std::exception&)` could not tell "this capture legitimately
+// didn't complete" apart from "an allocation just failed mid-collector".
+TEST_CASE("collect_or_retain: a non-IncompleteCaptureError exception is NOT caught -- it "
+          "propagates",
+          "[tar_capture_status][collect_or_retain]") {
+    REQUIRE_THROWS_AS(collect_or_retain([]() -> std::vector<int> {
+                          throw std::logic_error("not a capture-incompleteness signal");
+                      }),
+                      std::logic_error);
 }
 
 // ── collect_or_retain composed with compute_arp_events / compute_mapdrive_events
@@ -191,7 +220,7 @@ TEST_CASE("collect_or_retain + compute_arp_events: an incomplete tick emits no e
     // may run for this tick -- nothing in this block performs either.
     {
         auto res = collect_or_retain([&]() -> std::vector<ArpEntry> {
-            throw std::runtime_error("TAR: arp entry cap 4096 reached");
+            throw IncompleteCaptureError("TAR: arp entry cap 4096 reached");
         });
         REQUIRE_FALSE(res.current);
         CHECK(res.skip_reason == "TAR: arp entry cap 4096 reached");
@@ -259,7 +288,7 @@ TEST_CASE("collect_or_retain + compute_mapdrive_events: an incomplete getfsstat 
     // write may run.
     {
         auto res = collect_or_retain([&]() -> std::vector<MapDriveEntry> {
-            throw std::runtime_error("TAR: getfsstat failed");
+            throw IncompleteCaptureError("TAR: getfsstat failed");
         });
         REQUIRE_FALSE(res.current);
         CHECK(res.skip_reason == "TAR: getfsstat failed");
@@ -282,4 +311,88 @@ TEST_CASE("collect_or_retain + compute_mapdrive_events: an incomplete getfsstat 
         CHECK(events.empty());
         stored_baseline = *res.current;
     }
+}
+
+// ── would_exceed_cap (round 3, B3-004/B3-005) ───────────────────────────────
+//
+// The single decision every capped collector loop must apply BEFORE
+// appending a candidate row. Pure and compiled on every platform, unlike the
+// #ifdef-gated Windows ARP / Windows mapdrive (WNet outbound,
+// NetSessionEnum inbound) loops that now call it -- so this exact boundary
+// is exercised directly here, even though this host cannot run those loops'
+// surrounding Win32 I/O.
+
+TEST_CASE("would_exceed_cap: false below the cap, true at and above it",
+          "[tar_capture_status][cap]") {
+    CHECK_FALSE(would_exceed_cap(0, 3));
+    CHECK_FALSE(would_exceed_cap(2, 3));
+    CHECK(would_exceed_cap(3, 3));  // AT the cap -- one more would exceed it
+    CHECK(would_exceed_cap(4, 3));
+}
+
+TEST_CASE("would_exceed_cap drives a check-before-push loop correctly at the exact-cap "
+          "boundary -- B3-004 regression",
+          "[tar_capture_status][cap]") {
+    // Simulates the fixed collector loop shape (Windows ARP's push loop,
+    // Windows mapdrive's enum_wnet_outbound/collect_sessions): test capacity
+    // BEFORE constructing/appending the candidate, so only a genuine
+    // (cap+1)-th candidate establishes truncation. The pre-fix shape
+    // (push, THEN check size >= cap) declared an EXACT-cap table truncated,
+    // discarding a complete snapshot forever -- this is the case that
+    // regression covers.
+    auto simulate = [](std::size_t candidates, std::size_t cap) {
+        std::vector<int> out;
+        bool truncated = false;
+        for (std::size_t i = 0; i < candidates; ++i) {
+            if (would_exceed_cap(out.size(), cap)) {
+                truncated = true;
+                break;
+            }
+            out.push_back(static_cast<int>(i));
+        }
+        return std::pair{out.size(), truncated};
+    };
+
+    // Exactly `cap` candidates: every one fits -- must NOT be truncated.
+    auto [size_exact, trunc_exact] = simulate(/*candidates=*/3, /*cap=*/3);
+    CHECK(size_exact == 3);
+    CHECK_FALSE(trunc_exact);
+
+    // cap+1 candidates: the (cap+1)-th is refused -- truncated, and the kept
+    // size is still exactly the cap (nothing beyond it was appended).
+    auto [size_over, trunc_over] = simulate(/*candidates=*/4, /*cap=*/3);
+    CHECK(size_over == 3);
+    CHECK(trunc_over);
+
+    // Well under cap: never truncated.
+    auto [size_under, trunc_under] = simulate(/*candidates=*/1, /*cap=*/3);
+    CHECK(size_under == 1);
+    CHECK_FALSE(trunc_under);
+}
+
+// ── snapshot_result_line (round 3, B3-002) ──────────────────────────────────
+//
+// do_snapshot's (tar_plugin.cpp) sole honesty decision: given the names of
+// every enabled source collect_or_retain skipped this pass, produce the
+// exact response line the `snapshot` action writes. Previously the action
+// unconditionally wrote "tar|snapshot|complete" even when arp/service/
+// mapdrive was classified incomplete and silently skipped; this is the
+// action-level regression test for that defect, exercised through the real
+// production function (not a re-implementation) without standing up a live
+// TarPlugin/CommandContext/database.
+
+TEST_CASE("snapshot_result_line: no skipped sources reports complete",
+          "[tar_capture_status][snapshot]") {
+    CHECK(snapshot_result_line({}) == "tar|snapshot|complete");
+}
+
+TEST_CASE("snapshot_result_line: one skipped source reports partial with its name",
+          "[tar_capture_status][snapshot]") {
+    CHECK(snapshot_result_line({"arp"}) == "tar|snapshot|partial|arp");
+}
+
+TEST_CASE("snapshot_result_line: multiple skipped sources are comma-joined, order preserved",
+          "[tar_capture_status][snapshot]") {
+    CHECK(snapshot_result_line({"arp", "service", "mapdrive"}) ==
+          "tar|snapshot|partial|arp,service,mapdrive");
 }

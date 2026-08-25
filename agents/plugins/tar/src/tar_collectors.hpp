@@ -253,7 +253,7 @@ void enumerate_machine_software(std::vector<SoftwareInfo>& out);
  * NET_RT_FLAGS/RTF_LLINFO sysctl fetch) -- see os-capability-matrix.md for the
  * platform-specific field constraints (e.g. macOS's entry_type is always
  * "unknown" and iface is always empty). Hard-capped at kArpEntryCap entries.
- * Completeness contract: THROWS std::runtime_error rather than returning a
+ * Completeness contract: THROWS yuzu::tar::IncompleteCaptureError rather than returning a
  * partial vector when the platform read failed, the kernel/parser reported a
  * truncated read, or the cap was reached before the whole table was consumed
  * (tar_capture_status.hpp) -- callers MUST NOT diff or persist a caught
@@ -277,7 +277,7 @@ std::vector<DnsEntry> enumerate_dns();
  * inbound via `smbstatus` (empty if Samba absent). macOS: outbound only, via
  * getfsstat(2) (no inbound/historical visibility for an unprivileged agent).
  * Hard-capped at kMapDriveEntryCap.
- * Completeness contract: THROWS std::runtime_error rather than returning a
+ * Completeness contract: THROWS yuzu::tar::IncompleteCaptureError rather than returning a
  * partial vector when the underlying capture didn't genuinely complete -- a
  * subprocess capture that didn't run to completion (Linux `smbstatus`,
  * Windows `wevtutil`/`journalctl`; tar_capture_status.hpp's
