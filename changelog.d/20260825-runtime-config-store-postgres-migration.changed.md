@@ -5,6 +5,8 @@
   the treatment webhook signing secrets and offload-target credentials receive. **Existing
   `runtime-config.db` overrides do NOT carry over** — per ADR-0009's fresh-start-by-default
   amendment, this cutover does not read the legacy SQLite file; reapply any Settings overrides
-  (including OIDC configuration) once after upgrading. `GET /api/config` and `PUT
+  (including OIDC configuration) once after upgrading. The legacy `runtime-config.db` is left in
+  place untouched and may still hold a plaintext OIDC client secret from before this release —
+  see `docs/user-manual/upgrading.md` for removal guidance. `GET /api/config` and `PUT
   /api/config/:key` now return an honest 503 on a genuine database error instead of a response
   that looked like "nothing configured" or a validation failure.

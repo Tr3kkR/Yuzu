@@ -2226,6 +2226,12 @@ merged as of this note.
   configuration — once after upgrading past this release.**
 - **`oidc_client_secret` is now encrypted at rest** (SecretCodec envelope, AES-256-GCM)
   instead of plaintext, from the point you reapply it onward.
+- **The legacy `runtime-config.db` is left in place, untouched, and may still contain your
+  old OIDC client secret in plaintext.** Nothing in this release reads, moves, or deletes it.
+  If you previously configured `oidc_client_secret`, delete this file (or otherwise secure it)
+  after confirming you no longer need it — it is not required for the server to run, and
+  leaving it in place is a plaintext-credential-on-disk exposure this migration does not close
+  on your behalf.
 - **`GET`/`PUT /api/config/:key` now return an honest 503** on a genuine database
   error, rather than a response indistinguishable from "nothing configured" (`GET`)
   or a `400` validation failure (`PUT`). No change to either route's success-path

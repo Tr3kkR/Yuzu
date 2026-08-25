@@ -160,6 +160,17 @@ whatever `runtime_config_store` already holds (empty, on a first Postgres boot).
 any Settings overrides — including `oidc_client_secret` — once after upgrading past this release;
 see `docs/user-manual/upgrading.md`.
 
+**Residual plaintext secret risk, specific to this store (`ResponseStore`'s legacy file held no
+secret, so its precedent doesn't cover this).** Since nothing ever reads OR moves the legacy
+`runtime-config.db`, a file containing a plaintext `oidc_client_secret` from a pre-migration
+install is left in place on disk, indefinitely, with no automatic remediation. This is a NEW
+disclosure surface the mandatory-backfill draft did not have — that draft moved the legacy file
+aside on success, and even the moved-aside copy is a stated ADR-0009 rollback-window artifact
+that gets removed the following release, whereas an un-migrated file is never touched at all.
+Not fixed here (auto-deleting an operator's file on their behalf is its own hazard); recorded as
+an operator-facing disclosure instead — see `docs/user-manual/upgrading.md`'s "delete or secure
+it" bullet.
+
 This is a DEVIATION from ADR-0009's stated "mandatory for config/reference stores" default,
 recorded here rather than silently taken: `RuntimeConfigStore` IS a config/reference store by that
 ADR's own classification, and the deviation rests entirely on the fresh-start amendment, not on
