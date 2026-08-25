@@ -136,10 +136,13 @@ void seed_matching_responses(ResponseStore& rs, std::initializer_list<std::strin
 
 struct GroupFromResultsHarness {
     // MEMBER ORDER IS LOAD-BEARING (mirrors FragmentHarness,
-    // test_dashboard_tar_fragments.cpp:106-114): `sink` is declared LAST so
-    // it is destroyed FIRST, while the `DashboardRoutes` whose `this` its
-    // handlers captured is still alive. `rs_*`/`mg_bundle` precede `routes`
-    // because `routes` borrows both via raw pointers.
+    // test_dashboard_tar_fragments.cpp:106-114): `sink` is declared AFTER
+    // `routes` so it is destroyed FIRST, while the `DashboardRoutes` whose
+    // `this` its handlers captured is still alive. `rs_*`/`mg_bundle` precede
+    // `routes` because `routes` borrows both via raw pointers. The members
+    // below `sink` (`audits`, `visible_set_fn`, etc.) are read by value
+    // through `this` at request-handling time, not by `sink`'s own
+    // destructor, so their position relative to `sink` isn't load-bearing.
     std::optional<yuzu::test::PostgresTestDb> rs_db_;
     std::optional<PgPool> rs_pool_;
     std::unique_ptr<ResponseStore> rs_;
