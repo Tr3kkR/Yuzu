@@ -44,6 +44,7 @@
 #include "peer_ip.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
+#include "test_webhook_store_pg_helper.hpp"
 #include "webhook_store.hpp"
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
@@ -2048,9 +2049,9 @@ TEST_CASE("AgentRegistry::sweep_revoked cancels only the revoked, cert-bearing s
     EventBus bus;
     AgentRegistry registry{bus, metrics};
 
-    registry.register_agent(make_agent_info("agent-good"));
-    registry.register_agent(make_agent_info("agent-bad"));
-    registry.register_agent(make_agent_info("agent-nocert"));
+    (void)registry.register_agent(make_agent_info("agent-good"));
+    (void)registry.register_agent(make_agent_info("agent-bad"));
+    (void)registry.register_agent(make_agent_info("agent-nocert"));
 
     // Two contexts stand in for live Subscribe streams; TryCancel on a context
     // with no underlying call is a safe no-op (grpc_call_cancel_with_status
@@ -2085,7 +2086,7 @@ TEST_CASE("AgentRegistry::sweep_revoked is a no-op for a null predicate or no re
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    registry.register_agent(make_agent_info("agent-1"));
+    (void)registry.register_agent(make_agent_info("agent-1"));
     grpc::ServerContext ctx;
     registry.set_stream("agent-1", nullptr, &ctx, "PEM-1");
 
@@ -2098,7 +2099,7 @@ TEST_CASE("AgentRegistry::sweep_revoked skips a session whose stream has been cl
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    registry.register_agent(make_agent_info("agent-1"));
+    (void)registry.register_agent(make_agent_info("agent-1"));
     grpc::ServerContext ctx;
     registry.set_stream("agent-1", nullptr, &ctx, "PEM-1");
     registry.clear_stream("agent-1"); // disconnect → context + pem cleared
@@ -2123,7 +2124,7 @@ TEST_CASE("AgentRegistry::sweep_revoked does NOT cancel a stream whose cert chan
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    registry.register_agent(make_agent_info("agent-1"));
+    (void)registry.register_agent(make_agent_info("agent-1"));
     grpc::ServerContext ctx_old, ctx_new;
     registry.set_stream("agent-1", nullptr, &ctx_old, "PEM-OLD");
 
@@ -2157,12 +2158,13 @@ TEST_CASE("AgentRegistry::sweep_revoked does NOT cancel a stream whose cert chan
 namespace {
 
 /// Minimal harness: a real AgentServiceImpl with no stores wired at
-/// construction. Unlike GatewayResponseHarness this needs no Postgres —
-/// process_gateway_response's response_store_/analytics_store_/
+/// construction. process_gateway_response's response_store_/analytics_store_/
 /// notification_store_/webhook_store_/offload_target_store_/
 /// execution_tracker_ branches are all independently null-guarded
-/// (agent_service_impl.cpp), so a bare AgentServiceImpl exercises the
-/// webhook/offload emission path with no PG dependency.
+/// (agent_service_impl.cpp), so a bare AgentServiceImpl by itself needs no
+/// PG dependency — EventSinkScope below is what actually pulls one in now
+/// that WebhookStore is Postgres-backed (ADR-0057); every TEST_CASE that
+/// constructs one is tagged [pg].
 struct BareServiceHarness {
     yuzu::MetricsRegistry metrics;
     EventBus bus;
@@ -2189,13 +2191,16 @@ struct BareServiceHarness {
 /// the whole story before the pool existed, and left a narrow gap if a
 /// REQUIRE failed mid-poll and unwound straight into this destructor).
 struct EventSinkScope {
-    std::unique_ptr<WebhookStore> webhooks;
+    // Self-contained (skip-if-no-PG, owns its own ephemeral DB/keys dir) —
+    // see test_webhook_store_pg_helper.hpp. Declared FIRST so it destructs
+    // LAST (reverse declaration order): harmless either way since webhooks
+    // and offloads share no state, but matches the shared helper's own
+    // "declare before what borrows it" convention.
+    yuzu::test::WebhookStorePg webhooks;
     std::unique_ptr<OffloadTargetStore> offloads;
     AgentServiceImpl* svc{nullptr};
 
     explicit EventSinkScope(AgentServiceImpl& s) : svc(&s) {
-        webhooks = std::make_unique<WebhookStore>(":memory:");
-        REQUIRE(webhooks->is_open());
         offloads = std::make_unique<OffloadTargetStore>(":memory:");
         REQUIRE(offloads->is_open());
         svc->set_webhook_store(webhooks.get());
@@ -2216,12 +2221,13 @@ struct EventSinkScope {
         // discipline: it blocks (bounded) until every queued/in-flight
         // delivery on the pool has actually finished, so reset() below is
         // always safe regardless of how this scope exits.
-        if (webhooks)
-            webhooks->quiesce(std::chrono::seconds(5));
+        webhooks->quiesce(std::chrono::seconds(5));
         if (offloads)
             offloads->quiesce(std::chrono::seconds(5));
         offloads.reset();
-        webhooks.reset();
+        // webhooks (WebhookStorePg) destructs after this body returns,
+        // via its own member order — no explicit .reset() available/needed
+        // (it is a value member, not a unique_ptr).
     }
 
     EventSinkScope(const EventSinkScope&) = delete;
@@ -2254,12 +2260,14 @@ auto poll_deliveries(Get get, std::size_t min_count = 1) {
 
 TEST_CASE("process_gateway_response: wired webhook + offload sinks receive "
           "execution.completed (#3261)",
-          "[agent_service][issue3261]") {
+          "[pg][agent_service][issue3261]") {
     BareServiceHarness h;
     EventSinkScope sinks(h.svc);
 
-    auto wh_id =
+    auto wh_id_result =
         sinks.webhooks->create_webhook("http://127.0.0.1:1/hook", "execution.completed", "s3cret");
+    REQUIRE(wh_id_result.has_value());
+    auto wh_id = *wh_id_result;
     REQUIRE(wh_id > 0);
     // batch_size=2 so the single event fired below buffers deterministically
     // instead of dispatching immediately (test_offload_target_store.cpp's
@@ -2387,8 +2395,10 @@ TEST_CASE("Register: notification fires once on first enrollment; webhook/offloa
     EventSinkScope sinks(h.svc);
     NotificationScope nscope(h.svc, npool);
 
-    auto wh_id =
+    auto wh_id_result =
         sinks.webhooks->create_webhook("http://127.0.0.1:1/hook", "agent.registered", "");
+    REQUIRE(wh_id_result.has_value());
+    auto wh_id = *wh_id_result;
     REQUIRE(wh_id > 0);
     auto off_id = sinks.offloads->create_target("t1", "http://127.0.0.1:1/off",
                                                 OffloadAuthType::None, "", "agent.registered",

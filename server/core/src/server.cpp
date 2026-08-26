@@ -94,6 +94,8 @@
 #include "notification_store.hpp"
 #include "nvd_db.hpp"
 #include "policy_store.hpp"
+#include "sqlite_raii.hpp" // read-only legacy-file row count, PolicyStore boot detect-and-warn
+#include <sqlite3.h> // direct include per house IWYU convention (baseline_store.cpp, ca_store.cpp, etc.), not relied on transitively via sqlite_raii.hpp
 #include "guaranteed_state_store.hpp"
 #include "baseline_store.hpp"
 #include "guardian_push_builder.hpp"
@@ -326,6 +328,43 @@ namespace {
 bool is_custom_properties_db_error(const std::string& err) {
     return err.starts_with(kCustomPropertiesDbErrorPrefix);
 }
+
+// Best-effort row count for a legacy-file detect-and-warn check (currently
+// PolicyStore's boot path; postgres-store-playbook.md's Backfill bullet
+// mandates a count, not just file-existence, so a schema-only legacy file
+// left by a dev/UAT box that never wrote a real row doesn't read as data
+// loss — gov Gate 6 sre + enterprise-readiness, independently). Read-only,
+// diagnostic-only: any failure (missing table, corrupt file, wrong schema
+// version) returns nullopt and the caller falls back to a countless warning
+// rather than treating this as fatal — it must never affect boot outcome.
+// `table` MUST be a compile-time literal, never request/config-derived —
+// there is no bind placeholder for a table name (gov Gate 8 security-guardian).
+// Known accepted limitation (gov Gate 8 security-guardian, LOW): if the
+// legacy file was left mid-lifecycle in WAL mode with an unchecked-out
+// -wal/-shm pair, SQLite's reader can create a -shm index sidecar even
+// under SQLITE_OPEN_READONLY (the main file's bytes are never written —
+// READONLY guarantees that — only a transient sibling file can appear).
+// Avoiding this needs SQLITE_OPEN_URI + `immutable=1`, which requires
+// correctly percent-encoding `path` for the file: URI form; not done here
+// to avoid introducing a path-escaping bug for a narrow, low-severity gap
+// on a diagnostic-only path — revisit if this pattern gets a second caller.
+std::optional<std::int64_t> legacy_sqlite_row_count(const std::filesystem::path& path,
+                                                     const char* table) {
+    std::error_code reg_ec;
+    if (!std::filesystem::is_regular_file(path, reg_ec) || reg_ec)
+        return std::nullopt; // refuse a FIFO/symlink/device node — never block on open()
+    yuzu::server::SqliteDb db;
+    if (sqlite3_open_v2(path.string().c_str(), db.addr(), SQLITE_OPEN_READONLY, nullptr) !=
+        SQLITE_OK)
+        return std::nullopt;
+    yuzu::server::SqliteStmt stmt;
+    const std::string sql = std::string("SELECT count(*) FROM ") + table;
+    if (sqlite3_prepare_v2(db.get(), sql.c_str(), -1, stmt.addr(), nullptr) != SQLITE_OK)
+        return std::nullopt;
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW)
+        return std::nullopt;
+    return sqlite3_column_int64(stmt.get(), 0);
+}
 } // namespace
 } // namespace yuzu::server
 
@@ -464,6 +503,22 @@ public:
                           "gauge");
         metrics_.describe("yuzu_agents_registered_total", "Total number of agent registrations",
                           "counter");
+        // #3401: a re-registration was refused, either because the W1.5/#823 device-token
+        // revoke-by-device sweep itself failed (fail-closed, ADR-0012 §1) or because a
+        // concurrent registration for the same agent_id already won (see register_agent's
+        // phase-2 supersede check) — either way the agent retries on its normal reconnect
+        // backoff. Pre-seed both reason values so absent()-style alerting works from a healthy
+        // boot (kNvdCountedReasons precedent above). Dormant today for the revoke-failure reason
+        // (device_token_store_ is never wired live); the supersede reason is live regardless.
+        metrics_.describe("yuzu_agents_registration_refused_total",
+                          "Agent registration refused because a required pre-install step "
+                          "failed, or because a concurrent registration for the same agent_id "
+                          "already won. Labelled reason.",
+                          "counter");
+        for (const char* reason :
+             {"device_token_revoke_failed", "superseded_by_concurrent_registration"}) {
+            metrics_.counter("yuzu_agents_registration_refused_total", {{"reason", reason}});
+        }
         metrics_.describe("yuzu_commands_dispatched_total",
                           "Total number of commands dispatched to agents", "counter");
         metrics_.describe("yuzu_commands_completed_total",
@@ -1735,6 +1790,31 @@ public:
                           "Webhook deliveries dropped because the delivery worker pool's queue "
                           "was full or the store was quiescing",
                           "counter");
+        // ADR-0057 (gov Gate 3 sre): these three joined the family above but
+        // were missing describe()/pre-seed, the same HC-1-class parity gap
+        // the comment above this block already names for their siblings.
+        metrics_.describe("yuzu_server_webhook_delivery_secret_unavailable_total",
+                          "Webhook deliveries skipped because the signing secret could not be "
+                          "decrypted (tamper, KEK loss, or a malformed blob) — never fired "
+                          "unsigned or with an empty secret",
+                          "counter");
+        metrics_.describe("yuzu_server_webhook_fire_event_degraded_total",
+                          "fire_event ticks that skipped their enabled-webhook scan because the "
+                          "Postgres pool did not yield a connection within the bounded acquire, "
+                          "or the enabled-webhook query failed after a connection was acquired",
+                          "counter");
+        metrics_.describe("yuzu_server_webhook_delivery_log_failed_total",
+                          "Delivery-log INSERTs (webhook_deliveries) that failed against an open "
+                          "store — the delivery itself still ran; only its record did not persist",
+                          "counter");
+        metrics_.describe("yuzu_server_webhook_backfill_total",
+                          "One-time legacy webhooks.db -> webhook_store PostgreSQL backfill "
+                          "outcome on every boot, by result (success = fresh install, "
+                          "already-migrated skip, or a completed migration; failed = fail-closed, "
+                          "boot refused, next start retries). ADR-0057.",
+                          "counter");
+        for (const auto result : {"success", "failed"})
+            metrics_.counter("yuzu_server_webhook_backfill_total", {{"result", result}});
         metrics_.describe("yuzu_server_offload_delivery_success_total",
                           "Offload-target deliveries that completed with a 2xx response", "counter");
         metrics_.describe("yuzu_server_offload_delivery_failed_total",
@@ -1764,6 +1844,9 @@ public:
         for (const char* name : {"yuzu_server_webhook_delivery_success_total",
                                  "yuzu_server_webhook_delivery_failed_total",
                                  "yuzu_server_webhook_delivery_dropped_total",
+                                 "yuzu_server_webhook_delivery_secret_unavailable_total",
+                                 "yuzu_server_webhook_fire_event_degraded_total",
+                                 "yuzu_server_webhook_delivery_log_failed_total",
                                  "yuzu_server_offload_delivery_success_total",
                                  "yuzu_server_offload_delivery_failed_total",
                                  "yuzu_server_offload_delivery_dropped_total"}) {
@@ -2900,11 +2983,13 @@ public:
         // forensics. One describe site only (#2446 last-write-wins on dup).
         metrics_.describe("yuzu_engine_principal_confirm_total",
                           "Engine-credential rotation confirm outcomes by surface (rest|mcp) and "
-                          "result (success|conflict|client_error|transient); store-reaching calls "
-                          "only, pre-store denials excluded (#2404)",
+                          "result (success|conflict|client_error|transient|secret_mismatch); "
+                          "store-reaching calls only, pre-store denials excluded (#2404; "
+                          "secret_mismatch added #3015 proof-of-possession)",
                           "counter");
         for (auto surface : {"rest", "mcp"}) {
-            for (auto result : {"success", "conflict", "client_error", "transient"}) {
+            for (auto result :
+                {"success", "conflict", "client_error", "transient", "secret_mismatch"}) {
                 metrics_.counter("yuzu_engine_principal_confirm_total",
                                  {{"surface", surface}, {"result", result}});
             }
@@ -2949,12 +3034,14 @@ public:
         // diverge into a shadow series.
         metrics_.describe(kApiTokenConfirmTotalMetric,
                           "Human API-token rotation confirm outcomes by surface (rest|mcp) and "
-                          "result (success|conflict|client_error|transient); store-reaching calls "
-                          "only, pre-store denials excluded - the human-owned twin of "
-                          "yuzu_engine_principal_confirm_total",
+                          "result (success|conflict|client_error|transient|secret_mismatch); "
+                          "store-reaching calls only, pre-store denials excluded - the "
+                          "human-owned twin of yuzu_engine_principal_confirm_total "
+                          "(secret_mismatch added #3015 proof-of-possession)",
                           "counter");
         for (auto surface : {"rest", "mcp"}) {
-            for (auto result : {"success", "conflict", "client_error", "transient"}) {
+            for (auto result :
+                {"success", "conflict", "client_error", "transient", "secret_mismatch"}) {
                 metrics_.counter(kApiTokenConfirmTotalMetric,
                                  {{"surface", surface}, {"result", result}});
             }
@@ -4437,14 +4524,46 @@ public:
                         }
                         return;
                     }
-                    // Per-agent filtering as the fan-out (M4): only rules that target
-                    // this agent's OS and name it in scope. Cache scope membership
-                    // across rules sharing a scope_expr within this one reconcile.
                     // Baseline gate (docs/guardian-baseline-model.md): the rule source
                     // is the union of member Guards of *deployed* Baselines, so an
                     // enabled-but-undeployed Guard is never reconciled onto an agent.
+                    // ADR-0055 catastrophic-read set: a degraded read MUST abort this
+                    // reconcile, never fan out an empty deployed-set it cannot
+                    // distinguish from "nothing deployed" — mirrors the list_rules
+                    // degrade handling immediately above.
+                    auto deployed_result = deployed_member_rule_ids();
+                    if (!deployed_result) {
+                        metrics_
+                            .counter("yuzu_server_guardian_reconciles_total",
+                                     {{"result", "degraded"}})
+                            .increment();
+                        spdlog::warn("Guardian heartbeat reconcile: deployed_member_rule_ids "
+                                     "degraded ({}) — aborting re-push for agent_id={}",
+                                     deployed_result.error(), agent_id);
+                        if (audit_store_ && audit_store_->is_open()) {
+                            AuditEvent ev;
+                            ev.timestamp =
+                                std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+                            ev.principal = "system";
+                            ev.action = "guaranteed_state.reconcile";
+                            ev.target_type = "GuaranteedState";
+                            ev.target_id = agent_id;
+                            ev.detail = "heartbeat reconcile ABORTED — baseline store degraded (" +
+                                        deployed_result.error() +
+                                        "); agent rules did not converge (generation " +
+                                        std::to_string(agent_gen) + ")";
+                            ev.result = "degraded";
+                            (void)audit_store_->log(ev);
+                        }
+                        return;
+                    }
+                    // Per-agent filtering as the fan-out (M4): only rules that target
+                    // this agent's OS and name it in scope. Cache scope membership
+                    // across rules sharing a scope_expr within this one reconcile.
                     const auto rules =
-                        guardian::filter_deployed_members(*rules_result, deployed_member_rule_ids());
+                        guardian::filter_deployed_members(*rules_result, *deployed_result);
                     std::unordered_map<std::string, bool> scope_member;
                     auto push = guardian::build_agent_push(
                         rules, sess->os,
@@ -5125,12 +5244,76 @@ public:
             }
         }
 
-        // Phase 5: Policy Engine
-        {
-            auto policy_db = cfg_.db_dir() / "policies.db";
-            policy_store_ = std::make_unique<PolicyStore>(policy_db);
-            if (policy_store_ && policy_store_->is_open()) {
-                spdlog::info("PolicyStore initialized at {}", policy_db.string());
+        // Phase 5: Policy Engine. Migrated Postgres store (ADR-0006/ADR-0056,
+        // schema `policy_store`) — construction fail-CLOSED per ADR-0012 §1
+        // (same template as ResultSetStore above): a reachable database whose
+        // schema can't migrate/open is a fatal startup error. No legacy-SQLite
+        // backfill (retired: no production fleet ever ran the pre-Postgres
+        // build, so there was never real data to carry over) — but per
+        // postgres-store-playbook.md's detect-and-warn requirement for a
+        // skip-by-default store that holds real operator-authored data,
+        // still check whether a legacy file exists and warn loudly rather
+        // than silently proceeding fresh-started if the "no production
+        // fleet" premise ever turns out to be locally wrong.
+        if (pg_pool_ && !startup_failed_) {
+            std::error_code legacy_ec;
+            auto legacy_policy_db = cfg_.db_dir() / "policies.db";
+            if (std::filesystem::exists(legacy_policy_db, legacy_ec) && !legacy_ec) {
+                // A schema-only file (created but never written to — any dev/UAT box
+                // that booted the pre-Postgres build once, even with zero real
+                // policies) must not trip this warning: count rows, don't just check
+                // existence, per postgres-store-playbook.md's own requirement. Check
+                // BOTH `policies` and `policy_fragments` — the dependency runs
+                // policies.fragment_id -> policy_fragments(id), not the reverse, so
+                // an operator could have authored real fragments with zero policies
+                // created from them yet; counting `policies` alone would silently
+                // call that "nothing lost" (gov Gate 8 architect finding).
+                auto policy_count = legacy_sqlite_row_count(legacy_policy_db, "policies");
+                auto fragment_count = legacy_sqlite_row_count(legacy_policy_db, "policy_fragments");
+                // The two tables are read independently, so their outcomes are
+                // independent too: one can be a genuine 0 while the other failed
+                // to read (single-table corruption, not just whole-file/whole-
+                // schema failure). Branch on has_value(), never value_or(0) alone,
+                // or a real-0/unreadable mix silently falls through neither branch
+                // and claims (via the trailing no-warning comment) that both were
+                // confirmed empty when one genuinely wasn't (gov round-5 cpp-safety
+                // finding).
+                auto count_str = [](std::optional<std::int64_t> c) -> std::string {
+                    return c.has_value() ? std::to_string(*c) : std::string("unknown");
+                };
+                if (policy_count.value_or(0) > 0 || fragment_count.value_or(0) > 0) {
+                    spdlog::warn(
+                        "[PG] A legacy policies.db ({}) has {} policy row(s) and {} fragment "
+                        "row(s) but PolicyStore no longer backfills it (retired 2026-08-25 — no "
+                        "production fleet has ever run a pre-Postgres build). This content will "
+                        "NOT be carried over. To reconcile manually, re-author the equivalent "
+                        "fragments/policies via POST /api/policy-fragments and POST /api/policies "
+                        "before relying on this Postgres instance.",
+                        legacy_policy_db.string(), count_str(policy_count),
+                        count_str(fragment_count));
+                } else if (!policy_count.has_value() || !fragment_count.has_value()) {
+                    // Couldn't read at least one count (corrupt file, unreadable,
+                    // unexpected schema) — still worth a heads-up, but don't claim
+                    // a confirmed-empty result for the table that failed to read.
+                    spdlog::warn("[PG] A legacy policies.db ({}) exists but its row counts "
+                                 "couldn't be fully read (policies={}, policy_fragments={}) — "
+                                 "PolicyStore no longer backfills it regardless; if this "
+                                 "environment has real compliance-policy data, inspect the file "
+                                 "manually before relying on this Postgres instance.",
+                                 legacy_policy_db.string(), count_str(policy_count),
+                                 count_str(fragment_count));
+                }
+                // Both tables read successfully and both are empty: schema-only
+                // file, nothing lost — no warning.
+            }
+            policy_store_ = std::make_unique<PolicyStore>(*pg_pool_);
+            if (!policy_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: policy store migration/open failed "
+                              "(database reachable but the policy_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                spdlog::info("PolicyStore initialized (schema policy_store)");
             }
         }
 
@@ -5258,11 +5441,39 @@ public:
         // Guardian Baselines — the deployable collection of Guards (M:N members +
         // included/excluded management-group assignment). Control-plane only; the
         // agent never hears the word "Baseline". See docs/guardian-baseline-model.md.
-        {
-            auto bl_db = cfg_.db_dir() / "guardian-baselines.db";
-            baseline_store_ = std::make_unique<BaselineStore>(bl_db);
-            if (baseline_store_ && baseline_store_->is_open())
-                spdlog::info("BaselineStore initialized at {}", bl_db.string());
+        // Migrated Postgres store (ADR-0006/0055, schema `baseline_store`) —
+        // construction fail-CLOSED per ADR-0012 §1 (same template as
+        // GuaranteedStateStore above, its closest Guardian-domain sibling): a
+        // reachable database whose schema can't migrate/open is a fatal startup
+        // error, never a serve-degraded state. `migrate_from_sqlite` runs the
+        // one-time, idempotent legacy-`guardian-baselines.db` backfill (ADR-0009)
+        // — every table here is AUTHORITATIVE operator-authored enforcement
+        // config, so a backfill failure is ALSO fatal (never serve on top of a
+        // partially-migrated Baseline set).
+        if (pg_pool_ && !startup_failed_) {
+            baseline_store_ = std::make_unique<BaselineStore>(*pg_pool_);
+            if (!baseline_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: baseline store migration/open failed "
+                              "(database reachable but the baseline_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                auto bl_db = cfg_.db_dir() / "guardian-baselines.db";
+                if (!baseline_store_->migrate_from_sqlite(bl_db)) {
+                    spdlog::error(
+                        "[PG] Refusing to start: Guardian Baseline legacy-SQLite backfill failed "
+                        "(see prior log lines) — Baselines are authoritative enforcement config "
+                        "and must not serve partially-migrated data. Operator remediation: "
+                        "repair {} or move it aside to skip the backfill (Baselines in it will "
+                        "NOT carry over)",
+                        bl_db.string());
+                    startup_failed_ = true;
+                } else {
+                    spdlog::info("BaselineStore initialized (schema baseline_store; legacy "
+                                 "backfill source {})",
+                                 bl_db.string());
+                }
+            }
         }
 
         // Phase 7: Runtime Configuration + Custom Properties
@@ -5429,12 +5640,114 @@ public:
                 }
             }
         }
-        // Webhook store
-        {
-            auto webhook_db = cfg_.db_dir() / "webhooks.db";
-            webhook_store_ = std::make_unique<WebhookStore>(webhook_db);
-            webhook_store_->set_metrics(&metrics_);
-            agent_service_.set_webhook_store(webhook_store_.get());
+        // WebhookStore (ADR-0057, Wave 3) — Postgres-backed, construction
+        // fail-closed (ADR-0012 §1). First store past AuthDB to carry a
+        // real SecretCodec migration (`webhooks.secret`, the webhook HMAC
+        // signing secret) — the ADR-0057 template for OffloadTargetStore/
+        // RuntimeConfigStore. Construction order mirrors AuthDB's block
+        // above EXACTLY (docs/postgres-store-playbook.md step 3,
+        // "Instance model" — one codec per secret-bearing store, reusing
+        // auth_key_provider_ rather than minting a second KeyProvider over
+        // the same install-wide KEK): SecretCodec (ctor only) -> WebhookStore
+        // (this ctor registers `secret` as the secret column) ->
+        // SecretCodec::init() -> migrate_from_sqlite (MANDATORY backfill,
+        // ADR-0009 — webhook configs+secrets are unconditionally mandatory,
+        // and ADR-0057 also treats the delivery log as mandatory: it is
+        // not TTL'd, so ResponseStore's "ages out" skip-justification does
+        // not hold, and one transaction already covers both tables at this
+        // scale). auth_key_provider_ is guaranteed non-null whenever this
+        // guard is reached — same reasoning as the plugin_config_store_
+        // block above.
+        if (pg_pool_ && !startup_failed_) {
+            webhook_secret_codec_ = std::make_unique<pg::SecretCodec>(*auth_key_provider_);
+            webhook_store_ = std::make_unique<WebhookStore>(*pg_pool_, *webhook_secret_codec_);
+            if (!webhook_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: webhook store migration/open failed "
+                              "(database reachable but the webhook_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                auto lease = pg_pool_->acquire();
+                if (!lease) {
+                    spdlog::error("[PG] Refusing to start: could not acquire a connection to run "
+                                  "SecretCodec::init() for webhook_store ({})",
+                                  pg_pool_->last_error());
+                    startup_failed_ = true;
+                } else {
+                    auto init_res = webhook_secret_codec_->init(lease.get());
+                    lease.reset();
+                    if (!init_res) {
+                        spdlog::error(
+                            "[PG] Refusing to start: webhook_store SecretCodec::init() failed — "
+                            "{}: {}",
+                            pg::SecretCodec::to_string(init_res.error().kind),
+                            init_res.error().message);
+                        startup_failed_ = true;
+                    } else {
+                        // set_metrics() BEFORE migrate_from_sqlite() — gov
+                        // Gate 3 sre: the old ordering left
+                        // yuzu_server_webhook_backfill_total{result} dead on
+                        // every production boot (metrics_ was still null at
+                        // the sole call site inside migrate_from_sqlite).
+                        // NotificationStore's equivalent block (above) is
+                        // the reference ordering this now matches.
+                        webhook_store_->set_metrics(&metrics_);
+                        auto webhook_db = cfg_.db_dir() / "webhooks.db";
+                        if (!webhook_store_->migrate_from_sqlite(webhook_db)) {
+                            spdlog::error(
+                                "[PG] Refusing to start: webhook legacy-SQLite backfill failed "
+                                "(see prior log lines) — webhook_store is authoritative and must "
+                                "not serve partially-migrated secret-bearing data. Operator "
+                                "remediation: repair {} or move it aside to skip the backfill "
+                                "(existing webhooks/signing secrets in it will NOT carry over)",
+                                webhook_db.string());
+                            startup_failed_ = true;
+                        } else {
+                            spdlog::info("WebhookStore initialized (schema webhook_store; legacy "
+                                         "backfill source {})",
+                                         webhook_db.string());
+                            // #3261/#3294 lesson 10: wire the consumer only
+                            // inside the full-success branch — a top-of-ctor
+                            // wiring block that ran before this store
+                            // existed silently never fired.
+                            agent_service_.set_webhook_store(webhook_store_.get());
+                            // ADR-0010 §Decision 3 evidence surface (gov Gate
+                            // 6 compliance-officer, contract floor — the
+                            // decrypt-failure metric alone does not satisfy
+                            // ADR-0010's "emit an audit event + metric" rule).
+                            // Mirrors auth_secret_codec_'s hook exactly
+                            // (server.cpp:4176) — audit_store_ already exists
+                            // by this point (constructed above at :4093), so
+                            // no deferred-wiring step is needed here the way
+                            // AuthDB's block needed one. Lifetime: the lambda
+                            // captures `this` and reads `audit_store_` at
+                            // call time, never the pointer, so a later reset
+                            // store cannot dangle; stop() clears the hook
+                            // before destroying the codec (below).
+                            webhook_secret_codec_->set_audit_hook(
+                                [this](std::string_view verb, const std::string& detail_json) {
+                                    if (!audit_store_ || !audit_store_->is_open())
+                                        return;
+                                    const bool failure = (verb == "secret.decrypt_failure");
+                                    (void)audit_store_->log(
+                                        {.timestamp = std::time(nullptr),
+                                         .principal = "system:secret-codec",
+                                         .principal_role = "system",
+                                         .action = std::string(verb),
+                                         .target_type = "Secret",
+                                         .target_id = "webhook_store",
+                                         // detail_json carries AAD
+                                         // coordinates, kek_version and the
+                                         // failure class ONLY — never
+                                         // ciphertext, plaintext, DEK or key
+                                         // bytes (secret_codec.hpp).
+                                         .detail = detail_json,
+                                         .result = failure ? "failure" : "success"});
+                                });
+                        }
+                    }
+                }
+            }
         }
         {
             auto offload_db = cfg_.db_dir() / "offload_targets.db";
@@ -6877,8 +7190,12 @@ public:
                 // count, so this is a `set()` of a monotonic total, not an
                 // increment, and a scrape that races a failure simply reports
                 // it on the next one.
-                if (auth_secret_codec_) {
-                    for (const auto& [key, count] : auth_secret_codec_->decrypt_failure_counts()) {
+                // Iterates every KEK-enrolled codec (kek_enrolled_codecs()) —
+                // was auth_secret_codec_-only, which silently missed
+                // plugin_config_secret_codec_'s decrypt failures; webhook_
+                // secret_codec_ joins the same enrolled set (ADR-0057).
+                for (auto* codec : kek_enrolled_codecs()) {
+                    for (const auto& [key, count] : codec->decrypt_failure_counts()) {
                         const auto& [store, cls] = key;
                         metrics_
                             .gauge("yuzu_server_secret_decrypt_failures_total",
@@ -7472,15 +7789,37 @@ public:
         // auto-reconnect churn for the whole 30s window — it only happens
         // once the socket is genuinely about to stop accepting anyway.
         //
-        // NOT wired into the MCP GET/streamed-POST surfaces: McpStreamPump's
-        // teardown is driven by session_alive_/session-registry
-        // revalidation, a materially different mechanism (see
-        // StreamBudget::closing()'s doc comment) — an open MCP stream still
-        // relies on the bounded web-thread join below as its backstop.
-        // Tracked as a named follow-up (#2371 comment, 2026-08-11), not
-        // silently left uncovered.
+        // The MCP GET/streamed-POST surfaces are NOT on StreamBudget::closing()
+        // (see its doc comment) — a different mechanism closes them, below.
         if (stream_budget_)
             stream_budget_->begin_closing();
+
+        // #3042: close-signal every live MCP session BEFORE web_server_->stop().
+        // httplib's own chunked-write loop already re-checks its shutdown flag
+        // between provider calls, so a healthy MCP stream would drain within
+        // about one tick (~3s) even without this — but that path is a bare
+        // connection drop, no close frame, no reason. mcp_sessions_->shutdown()
+        // stickily refuses new mints and closes every live session's stream
+        // state (McpStreamState::close(), same mechanism a DELETE or idle-GC
+        // uses) — a GET pump has that state as its own sink, so it wakes its
+        // wait predicate immediately; a streamed-POST pump's sink is a separate
+        // SseSinkState this close() never touches, so it instead notices on its
+        // own next tick via session_alive_(). Either way the pump exits with a
+        // clean `session_terminated` close frame instead of riding out to a
+        // silent drop. What this does NOT fix: a stream whose pump is blocked
+        // *inside* a single write (a blackholed or drip-feeding peer, bounded
+        // by the write timeout, not the tick) never sees the flip until that
+        // write resolves — that residual case is still the bounded web-thread
+        // join + `_Exit` escalation below.
+        if (mcp_sessions_) {
+            // `n` is every registry entry drained, not just ones with an attached sink
+            // (close() no-ops on an entry with none) — say "removed", not "live", so this
+            // line can't overstate how many clients were actually connected.
+            const std::size_t n = mcp_sessions_->shutdown();
+            if (n > 0) {
+                spdlog::info("MCP sessions: removed {} session(s) for shutdown", n);
+            }
+        }
 
         // Stop cert reloader before web server (it holds a pointer to
         // web_server_) — moved up alongside web_server_->stop() for the
@@ -7606,8 +7945,9 @@ public:
         // web_server_->listen() returns (already closed above) and this
         // waits on that signal instead of a bare join(). On the fast path —
         // the common case once the close-signal above has drained every
-        // /events / /api/v1/events / dashboard-drawer stream — this returns
-        // within one keep-alive tick, well under the bound.
+        // /events / /api/v1/events / dashboard-drawer stream, and #3042's
+        // mcp_sessions_->shutdown() has woken every live MCP pump — this
+        // returns within one keep-alive tick, well under the bound.
         //
         // Escalation is a deliberate std::_Exit, NOT the nvd_sync
         // leak-and-continue precedent a few lines above: nvd_sync's leak
@@ -7620,11 +7960,11 @@ public:
         // farm, not a leak. `_Exit` skips the remaining teardown below
         // (including offload_target_store_->flush_all(), the RESTART-1 fix)
         // exactly the same way a supervisor SIGKILL would — strictly no
-        // worse, and it only fires when the close-signal above did NOT
-        // reach every stream: an open MCP GET/streamed-POST connection (the
-        // one surface item 2 does not close-signal — see
-        // StreamBudget::closing()'s doc comment) or a genuinely wedged
-        // handler.
+        // worse, and by #3042 it should now fire only for a handler stuck
+        // *inside* a single write (a blackholed or drip-feeding peer, bounded
+        // by the write timeout rather than the tick — the close-signals above
+        // wake a WAITING pump, not one already mid-write) or a genuinely
+        // wedged handler unrelated to any stream.
         if (web_thread_.joinable()) {
             // #3007 governance (sre, unhappy-path UP-7/UP-8): stop() now runs off the
             // signal handler, so this wait is silent-by-design up to 15s with no
@@ -7868,6 +8208,15 @@ public:
         // which was inaccurate — the thread exists, it is simply already
         // joined by the time execution reaches this line.
         custom_properties_store_.reset();
+        // PolicyStore (ADR-0056) borrows pg_pool_ — same discipline, and the
+        // same reasoning as the comment above: PolicyEvaluator holds a raw
+        // `policy_store` pointer on its background policy_eval_thread_,
+        // already joined earlier in this same stop() before this reset runs.
+        // Unlike on SQLite (where policy_store_ owned its own standalone
+        // sqlite3* with no shared dependency, so implicit declaration-order
+        // destruction was safe), it now borrows the pool and needs the same
+        // explicit belt-and-braces reset every other migrated store gets.
+        policy_store_.reset();
         // ResultSetStore borrows pg_pool_ — drop before the pool. The maintenance
         // thread that leased it is already joined above; every HTTP/gRPC handler
         // holding the raw pointer is quiesced by the drains above.
@@ -7933,7 +8282,7 @@ public:
         // plugin_config_secret_codec_, which borrows the SAME
         // auth_key_provider_ auth_secret_codec_ above borrows — so both
         // stores/codecs must be gone before auth_key_provider_.reset()
-        // below (docs/postgres-store-playbook.md:112 destruct-before-pool,
+        // (docs/postgres-store-playbook.md:112 destruct-before-pool,
         // applied transitively to the shared key provider too). No audit
         // hook to clear: PluginConfigStore's SecretCodec is never wired to
         // audit_store_ (its own audit trail runs through
@@ -7945,19 +8294,26 @@ public:
         // the pool. Every HTTP handler holding the raw pointer is quiesced
         // by the drains above.
         upload_grant_store_.reset();
-        auth_key_provider_.reset();
+        // auth_key_provider_.reset() does NOT happen here (ADR-0057). It
+        // used to, but webhook_secret_codec_/webhook_store_ ALSO borrow it
+        // transitively, and webhook_store_ does not reset until AFTER the
+        // up-to-60s delivery-pool quiesce() below — an in-flight delivery
+        // decrypts (touches the KeyProvider) right up until it drains. See
+        // the auth_key_provider_.reset() call further down, right after
+        // that drain, for the actual reset point and its own comment.
         // AuditStore (ADR-0040) borrows pg_pool_ via its retention thread — that
-        // thread is joined at stop_cleanup() above; drop the store before the
-        // pool so no late lease touches a destroyed pool. Unwire the borrowed
-        // pointer from every writer FIRST (belt-and-braces, matching the sibling
+        // thread is joined at stop_cleanup() above. Unwire the borrowed pointer
+        // from every OTHER writer HERE (belt-and-braces, matching the sibling
         // stores above + ADR-0040 §Lifecycle) rather than relying on RPC/HTTP
-        // drain ordering — a late log() must not touch a reset store.
+        // drain ordering — a late log() from THESE consumers must not touch a
+        // reset store. The actual `audit_store_.reset()` call, though, does
+        // NOT happen here — see its new position below, after the webhook
+        // delivery-pool drain, and that comment for why.
         agent_service_.set_audit_store(nullptr);
         if (gateway_service_)
             gateway_service_->set_audit_store(nullptr);
         if (fleet_topology_store_)
             fleet_topology_store_->set_audit_store(nullptr);
-        audit_store_.reset();
         // NotificationStore (ADR-0046) borrows pg_pool_ — unwire the borrowed
         // raw pointer from agent_service_ (enrollment/execution-failure toast
         // events), then drop the store, BEFORE the pool. No background
@@ -8182,6 +8538,48 @@ public:
         agent_service_.set_offload_target_store(nullptr);
         webhook_store_.reset();
         offload_target_store_.reset();
+        // ADR-0057: webhook_secret_codec_ borrows auth_key_provider_ — same
+        // contract as auth_secret_codec_/plugin_config_secret_codec_ above
+        // (clear the audit hook before the codec dies, then drop it) —
+        // except this pair sits HERE, after the delivery-pool quiesce()
+        // just above, not up with the other codecs: an in-flight delivery
+        // decrypts (touches webhook_secret_codec_, transitively
+        // auth_key_provider_) right up until quiesce() proves it drained,
+        // so resetting either any earlier would UAF a still-draining
+        // delivery. auth_key_provider_.reset() ALSO moved here from its
+        // former position up with the other codecs, for the identical
+        // reason — see that block's comment.
+        //
+        // audit_store_.reset() ALSO moved here (gov Gate 8 cpp-safety,
+        // hardening round) — for a THIRD, distinct reason from the two
+        // above, not merely "matches the pattern": webhook_secret_codec_'s
+        // audit hook (registered near its construction site) is a LIVE
+        // CALLBACK into audit_store_ for as long as a delivery can still
+        // decrypt through it, i.e. right up until webhook_store_->quiesce()
+        // above proves it drained. The earlier position (up with
+        // set_audit_store(nullptr) et al., before this drain) let
+        // audit_store_ die while that callback was still reachable; the
+        // hook's own `if (!audit_store_ || !audit_store_->is_open())
+        // return;` guard made this memory-safe, never a UAF, but it SILENTLY
+        // DROPPED every decrypt-failure audit event fired during that
+        // window — exactly the ADR-0010 §Decision-3 evidence ("emit an
+        // audit event + metric" on every decrypt failure) this codec exists
+        // to guarantee. This is NOT symmetric with auth_secret_codec_'s own
+        // hook-clear position (still correctly up near set_audit_store,
+        // unmoved): auth_db_'s reaper thread — the only thing that could
+        // still call auth_secret_codec_->decrypt() — is already joined by
+        // ~AuthDB before auth_db_.reset() runs a few lines above that
+        // block, so auth_secret_codec_'s caller is provably dead before its
+        // hook is cleared; webhook_secret_codec_'s caller (a StoreWorkerPool
+        // delivery thread) is deliberately kept alive past that point by
+        // this exact quiesce(), so its hook — and the audit_store_ it
+        // reads — must stay live until the quiesce proves the caller is
+        // gone too.
+        if (webhook_secret_codec_)
+            webhook_secret_codec_->set_audit_hook({});
+        webhook_secret_codec_.reset();
+        auth_key_provider_.reset();
+        audit_store_.reset();
         // TagStore (ADR-0050) borrows pg_pool_ — unwire the borrowed raw
         // pointer from agent_service_ (the Register sync_agent_tags ingest —
         // Register-only, heartbeats do not sync tags; governance perf-F8),
@@ -16804,8 +17202,10 @@ private:
                 if (stop_requested_.load(std::memory_order_acquire))
                     break;
                 if (policy_evaluator_) {
-                    // tick() touches JSON parsing, the CEL evaluator and SQLite —
-                    // any of which can throw on a malformed policy/result. An
+                    // tick() touches JSON parsing and the CEL evaluator (Postgres
+                    // reads/writes go through PolicyStore's std::expected/bool
+                    // contracts, not exceptions) — any of the former can throw on
+                    // a malformed policy/result. An
                     // exception escaping a std::thread entry calls std::terminate,
                     // so a single bad policy must not take the process (or silently
                     // kill compliance evaluation). Catch, log, and keep ticking.
@@ -19328,8 +19728,19 @@ private:
                 // Baseline gate: push only Guards that are members of a *deployed*
                 // Baseline (docs/guardian-baseline-model.md). With nothing deployed
                 // the set is empty and a full_sync converges agents to zero guards.
+                // ADR-0055 catastrophic-read set: a degraded read MUST abort the
+                // push, never fan out an empty deployed-set indistinguishable from
+                // "nothing deployed" — same -2 sentinel as the list_rules degrade
+                // just above, so the REST caller maps it to 503.
+                auto deployed_result = deployed_member_rule_ids();
+                if (!deployed_result) {
+                    spdlog::warn("Guardian push: deployed_member_rule_ids degraded ({}) — "
+                                 "aborting push (scope={})",
+                                 deployed_result.error(), scope);
+                    return -2;
+                }
                 const auto rules =
-                    guardian::filter_deployed_members(*rules_result, deployed_member_rule_ids());
+                    guardian::filter_deployed_members(*rules_result, *deployed_result);
 
                 // Resolve the agent set this push is ADDRESSED to. H1 scopes a single
                 // toggle to the affected rule's scope_expr (was the whole fleet); an
@@ -20386,12 +20797,16 @@ private:
     // fan-out and the heartbeat reconcile filter their rule source through this via
     // guardian::filter_deployed_members. Empty when nothing is deployed — a
     // full_sync push then converges agents to zero guards (correct by model).
-    // Delegates to BaselineStore (one shared lock; the store owns the snapshot
+    // Delegates to BaselineStore (one pool lease; the store owns the snapshot
     // format) so an edit to a deployed Baseline's members does not change what the
     // fleet enforces until a Push-gated re-deploy rewrites the snapshot.
-    std::unordered_set<std::string> deployed_member_rule_ids() const {
+    // CATASTROPHIC-READ SET (CLAUDE.md Guardian invariant, ADR-0055): typed
+    // `std::expected` — a degraded read is `std::unexpected`, NEVER a silent
+    // empty set. Every caller MUST abort (503 / no-op push) on `!result`,
+    // mirroring how `list_rules()`'s degrade is handled just above.
+    std::expected<std::unordered_set<std::string>, std::string> deployed_member_rule_ids() const {
         if (!baseline_store_)
-            return {};
+            return std::unexpected("baseline store not wired");
         return baseline_store_->deployed_member_rule_ids();
     }
 
@@ -20466,6 +20881,13 @@ private:
             out.push_back(auth_secret_codec_.get());
         if (plugin_config_secret_codec_)
             out.push_back(plugin_config_secret_codec_.get());
+        // WebhookStore's SecretCodec (ADR-0057) — reuses auth_key_provider_
+        // (same "one KeyProvider instance backing multiple independent
+        // SecretCodec instances" shape as plugin_config_secret_codec_
+        // above), enrolled so its secret never stays pinned to whatever KEK
+        // version was active when it was written once rotation runs.
+        if (webhook_secret_codec_)
+            out.push_back(webhook_secret_codec_.get());
         return out;
     }
 
@@ -20537,6 +20959,16 @@ private:
 
     // Notification & Webhook stores
     std::unique_ptr<NotificationStore> notification_store_;
+    // WebhookStore's own SecretCodec (ADR-0057/ADR-0010) — declared BEFORE
+    // webhook_store_ (borrows it by reference) so normal ~ServerImpl
+    // (reverse declaration order) tears the store down first. stop()
+    // additionally moves auth_key_provider_.reset() to AFTER this store's
+    // drain+reset (see that block's comment) — declaration order alone is
+    // NOT sufficient there, because webhook_store_ only resets after the
+    // up-to-60s delivery-pool quiesce(), well past auth_key_provider_'s old
+    // reset point, and an in-flight delivery decrypts (touches the
+    // KeyProvider transitively) right up until it drains.
+    std::unique_ptr<pg::SecretCodec> webhook_secret_codec_;
     std::unique_ptr<WebhookStore> webhook_store_;
     std::unique_ptr<OffloadTargetStore> offload_target_store_;
 

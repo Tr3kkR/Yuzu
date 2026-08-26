@@ -529,7 +529,7 @@ This table replaces the previous per-OS tables (Sections 9, 10, 11 of the origin
 | `network.config.get` | `network_config` | Y | Y | Y | Verified | Interfaces, IPs, ARP table |
 | `network.route.list` | `network_config` | Y | Y | Y | Verified | Routing table |
 | `network.connection.list` | `netstat` | Y | Y | Y | Verified | TCP/UDP connections |
-| `network.socket.owner` | `sockwho` | Y | Y | Y | Verified | Socket → process mapping |
+| `network.socket.owner` | `netstat` (`attribution` action) | Y | Y | Y | Verified | Socket → process mapping (folded from the retired sockwho plugin, #3403) |
 | `network.dns.flush` | `network_actions` | Y | Y | Y | Verified | Flush DNS cache |
 | `network.diagnostics.run` | `network_diag` | Y | Y | Y | Verified | Ping, traceroute |
 | `network.adapter.enable` | `network_actions` | Y | Y | Y | Verified | Enable network adapter |

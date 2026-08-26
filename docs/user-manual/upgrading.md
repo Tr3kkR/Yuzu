@@ -118,6 +118,24 @@ login** (mirrors OIDC's `group_count_exceeded` behaviour) — see "SAML Fine-Gra
 RBAC" in `authentication.md` for the full detail, including the practical httplib
 form-body-size caveat on how large an assertion can realistically reach `/saml/acs`.
 
+## Behaviour change: token-rotation confirm now requires proof of possession (#3015)
+
+`confirm` on a rotation — REST `POST /api/v1/tokens/{id}/confirm` and `POST /api/v1/engine-principals/{id}/credentials/confirm`, plus the MCP twins `confirm_api_token_rotation`/`confirm_engine_rotation` — previously admitted on caller identity plus the successor's `token_id` alone. A caller who recovered an unknown successor's `token_id` out-of-band (a support ticket, a log line) could confirm — and thereby revoke the predecessor for — a rotation whose secret they never actually received. All four confirm surfaces now additionally require the raw successor secret itself in the request body/args, verified with a constant-time hash comparison against the successor's stored hash, checked LAST — strictly after ownership, pair-state, the `token_id` pin, tier, scope, and the initiator binding have all already passed — before the predecessor is touched.
+
+**Who this affects:** any caller (human or automation) confirming a rotation with only the `token_id`, and any caller confirming with the wrong secret.
+
+- **REST:** a confirm body carrying no `secret` field (or an empty one) now gets `400` instead of succeeding; a wrong `secret` gets `403`.
+- **MCP:** `confirm_api_token_rotation`/`confirm_engine_rotation` called without a `secret` arg now get `kInvalidParams`; a wrong one gets `kPermissionDenied`.
+
+Correctly-implemented automation already holds the secret — it's the same raw value the `rotate` response returns exactly once (REST `data.token`) — so a caller that installs the successor from that response and passes it straight through to `confirm` sees no change in behavior.
+
+**What to do if you lose the rotate response before confirming:** you can no longer confirm — there's no way to manufacture the secret from the `token_id` alone. Two recovery paths, and neither is new — this change makes the mechanism enforce guidance already documented in [`authentication.md`](authentication.md#rotating-a-token) "Rotating a Token" (don't look the successor up and confirm blind):
+
+1. **Wait for the automatic overlap-window sweep.** Proof of possession gates this immediate, explicit `confirm` call only — the 60-second background sweep is unaffected by this change and still auto-revokes the predecessor on its own schedule with no secret required, provided the successor secret was actually installed and presented (used) at least once.
+2. **Revoke the unknown successor and start a new rotation.** This keeps the predecessor working immediately, at the cost of restarting the rotation.
+
+See [`authentication.md`](authentication.md#rotating-a-token) and [`engine-principals.md`](engine-principals.md) for the full detail, and [`rest-api.md`](rest-api.md) for the exact REST error bodies.
+
 ## Behaviour change: MCP approval-store permanent failures now say don't retry (#2786)
 
 An MCP approval-ticket recall that hits a store fault has always returned `-32603` with a `retry_after_ms` hint. Previously that hint was `5000` (retry after 5 seconds) for every store fault except a never-opened store, including one that was open but failing in a way no amount of retrying clears — SQLite corruption, not-a-database, a read-only filesystem, or a full disk. Those four cases now correctly get `retry_after_ms: null` (the same "escalate to an operator" response a never-opened store gets) instead of the transient retry hint.
@@ -756,6 +774,56 @@ it was never in `ca.db` and stays a local file behind `KeyProvider` (`--ca-dir`)
   backend behind it (a host crash or network partition can leave one held
   until Postgres notices the dead session) and `pg_terminate_backend` it — see
   `docs/pki-architecture.md`'s operator runbook.
+
+## ⚠️ Behaviour change: webhook store moves to Postgres (ADR-0057)
+
+`WebhookStore` (operator-registered outbound webhooks and their delivery log —
+everything behind `GET`/`POST`/`DELETE /api/webhooks` and
+`GET /api/webhooks/{id}/deliveries`) moves from the SQLite `webhooks.db` file
+to the server's PostgreSQL substrate in this release (schema `webhook_store`).
+The webhook HMAC signing secret is now envelope-encrypted at rest
+(`SecretCodec`, AES-256-GCM, ADR-0010) instead of a plaintext column.
+
+- **Mandatory, automatic backfill on first boot, both tables.** The legacy
+  `webhooks.db` (if present) is read once at startup; every webhook's signing
+  secret is re-encrypted (never copied in plaintext), and every delivery
+  record carries over too (the delivery log has no expiry, so — unlike
+  `ResponseStore` below — it is not treated as skippable). A failed backfill
+  refuses to start the server (see remediation below).
+- **New fail-closed-at-boot behaviour.** A Postgres/`SecretCodec` error at any
+  point in this store's boot sequence (schema migration, KEK verification, or
+  the backfill itself) now refuses to start the server, rather than starting
+  with webhooks silently unwired.
+- **If the backfill fails:** the boot log names the exact remediation — repair
+  `webhooks.db`, or move it aside to skip the backfill. Skipping means any
+  webhooks/signing secrets it held do **not** carry over; recreate them via
+  `POST /api/webhooks` after the server starts.
+- **Legacy file retention.** On a verified successful backfill, `webhooks.db`
+  is renamed to `webhooks.db.migrated-<unix-epoch>` alongside its `-wal`/`-shm`
+  sidecars — never deleted — and access is restricted to the owner where the
+  platform supports it. It still holds every pre-cutover signing secret in
+  **plaintext** for the one-release rollback window (ADR-0009); see
+  [`rest-api.md`](rest-api.md#post-apiwebhooks) for the rotation guidance if
+  your backup posture for that window is unknown.
+- **`POST`/`DELETE /api/webhooks` now distinguish a caller error from a store
+  failure**: `POST` returns `400` for an invalid URL scheme (previously an
+  ambiguous non-error response), and `GET`/`POST`/`DELETE /api/webhooks`
+  (list/create/delete) return `503` on a genuine database error instead of a
+  silently-empty or silently-failed result. `GET /api/webhooks/{id}/deliveries`'s
+  degrade-vs-error handling specifically is unchanged by this migration — a
+  degraded read there still renders an empty delivery list rather than a
+  `503`, the same as before the cutover.
+- **`GET /api/webhooks/{id}/deliveries`'s `?limit=` handling changed.**
+  `limit=0` (or any non-positive value) previously meant "return zero rows";
+  it now falls back to the default of 50, the same as an omitted `limit`. A
+  value above 10000 was previously passed through unbounded; it is now
+  silently capped at 10000. If your integration relies on `limit=0` meaning
+  "give me nothing," or on retrieving more than 10000 rows in one call,
+  update it.
+- Every other webhook behavior — event-type matching, HMAC-SHA256 signature
+  format (`X-Yuzu-Signature: sha256=<hex>`), unsigned delivery when no secret
+  is configured — is unchanged. Detail:
+  `docs/adr/0057-webhook-store-postgres-migration.md`.
 
 ## ⚠️ Behaviour change: response history resets on Postgres cutover (ADR-0039)
 
@@ -1960,6 +2028,125 @@ shape (`YuzuProductPackBackfillNotCompleted`) keys on the ABSENCE of any
 `success`/`fresh` sample across a 15-minute window, not on any single value — a
 refused boot never serves `/metrics` at all, so no server in the window reporting
 either outcome is itself the signal of a fail-closed boot-refusal loop.
+
+## Guardian Baselines migrate to Postgres (mandatory backfill, BaselineStore, ADR-0055)
+
+`BaselineStore` — Guardian's deployable Baseline unit (`/guardian` → Baselines,
+`GET /api/v1/guaranteed-state/device-compliance`) — moves from the SQLite
+`guardian-baselines.db` file to the server's PostgreSQL substrate in this release,
+schema `baseline_store`, on the existing shared pool. A **Baseline** is the only
+deployable unit in Guardian: what a deploy enforces across the fleet is read from
+each Baseline's `deployed_snapshot`, never its live member set — so, like every
+other store feeding an enforcement decision, the backfill is mandatory and fails
+closed rather than degrading silently.
+
+- **What is preserved:** every Baseline (`baselines`), its member Guards
+  (`baseline_rules`), and its assignment of included/excluded management groups
+  (`baseline_groups`) — read inside one deferred SQLite transaction so the parent
+  and its children fingerprint against the same instant. A Baseline already live
+  in Postgres (a second replica booting against shared state, or a re-run after a
+  partial pass) keeps its own current members/assignment untouched by the legacy
+  backfill — only a freshly-inserted parent's children are copied.
+- **Fail-closed boot, retried each start.** A backfill that cannot complete —
+  an unreadable/corrupt legacy file, a SHA-256 fingerprint failure, a Postgres
+  write error, an invalid legacy `lifecycle`/assignment `disposition` value, a
+  name collision against a different already-live baseline_id, or a row-direction
+  conflict (below) — **refuses the boot** and retries on the next start. The boot
+  log's `BaselineStore: migrate_from_sqlite:` lines carry the specific refusal,
+  naming the offending Baseline id.
+- **Fingerprint-verified whole-file marker, with per-row direction-aware
+  conflicts.** A completed backfill is recorded once per distinct SHA-256
+  fingerprint over the legacy file's full canonicalized content (the
+  `DiscoveryStore`/`ProductPackStore` shape — a later-booting replica still
+  holding its own legacy file re-verifies against the recorded fingerprint before
+  trusting an already-set completion marker). Independently, if Postgres already
+  holds a row for a legacy Baseline's id, that ROW is compared on `updated_at`
+  (the `TagStore` shape): Postgres strictly ahead, or identical content, is a
+  benign skip; the legacy side strictly ahead (or tied with differing content)
+  **refuses the boot** — the legacy file demonstrably holds a later write that
+  silently keeping Postgres's value would discard. Treat this refusal as a
+  data-integrity incident, not an availability one: the log names the exact
+  Baseline id and both `updated_at` values; decide which side is authoritative
+  before restarting.
+- **Legacy file moved aside after a verified backfill**
+  (`guardian-baselines.db.migrated-<epoch>`), same one-release rollback window as
+  the sibling stores.
+- **Fresh installs are unaffected** — no legacy file, nothing to migrate.
+
+**Operator-visible behaviour changes (fail-closed reads).** A degraded read on
+the enforcement-feeding path (`deployed_member_rule_ids()` — the source for the
+push fan-out, the heartbeat reconcile, and the per-device compliance view) now
+returns a distinguishable failure that the caller resolves to an explicit
+abort/503, never a silent empty/"fully compliant" enforced set. `GET
+/api/v1/guaranteed-state/device-compliance` returns **503** rather than a
+misleadingly-empty or false-compliant result when the underlying read degrades;
+Guardian deploy/delete dashboard actions show a degraded-modal rather than
+reporting success. There is no dedicated backfill-outcome metric for this store
+(matching its own precedent stores, `GuaranteedStateStore`/`DeviceTokenStore`,
+which also rely on the boot log + `/readyz` rather than a Prometheus counter for
+a boot-fatal event) — a refused boot never serves `/metrics` at all, so the boot
+log and `/readyz` are the channels to watch during an upgrade.
+
+**Verify:** after the server reports ready, `/guardian` shows the same Baselines
+(and each one's members/assignment) as before the upgrade, and
+`SELECT count(*) FROM baseline_store.baselines;` against Postgres matches
+`sqlite3 guardian-baselines.db.migrated-<epoch> "SELECT count(*) FROM baselines;"`.
+
+## Compliance policy engine moves to Postgres (PolicyStore, ADR-0056)
+
+The `PolicyStore` — compliance policy fragments/policies behind `POST/DELETE
+/api/policy-fragments*`, `POST/DELETE /api/policies*`, `POST /api/policies/{id}/{enable,
+disable,invalidate,evaluate,remediate}`, `GET /api/compliance*`, and every dispatched
+compliance check/fix/verify — runs on the server's PostgreSQL substrate, schema
+`policy_store`, on the existing shared pool. Six operator-authored tables (fragments,
+policies, and their input/trigger/group associations, plus per-agent `policy_status`)
+plus a new operational-only seventh table, `policy_dispatch_state`, which coordinates
+fleet-wide compliance-check dispatch across replicas.
+
+**No legacy-SQLite migration path.** No production fleet ever ran a pre-Postgres build
+of this store, so there was no real `policies.db` data to carry over — the one-time
+backfill mechanism this section originally described was retired shortly after this
+store's Postgres migration merged, under ADR-0009's fresh-start-by-default amendment.
+
+These are two SEPARATE failure/detection behaviors, not one — do not conflate them:
+
+- A reachable Postgres database whose schema can't migrate or open **is** a fatal
+  startup error (fail-closed, matching the ladder's "authoritative" posture for this
+  store), same as every other born-on-Postgres store.
+- A legacy `policies.db` file with real content **does NOT** fail startup and its
+  content is **never imported** — the server opens it read-only, purely to count rows
+  for a diagnostic warning, then boots fresh-started regardless of what it finds. If
+  either the `policies` or `policy_fragments` table has rows, it logs `A legacy
+  policies.db (<path>) has <N> policy row(s) and <N> fragment row(s) but PolicyStore no
+  longer backfills it...` at WARN; if the file exists but its row counts can't be read
+  (corrupt, unreadable, or a locked file), it logs a similar countless warning instead.
+  Either way, boot proceeds unaffected. If you see either warning and the environment
+  genuinely has real compliance-policy data to keep, there is no automated recovery
+  path: re-author the equivalent fragments and policies against the new Postgres-backed
+  store via `POST /api/policy-fragments` and `POST /api/policies` before relying on it.
+
+**Operator-visible behaviour changes (fail-closed reads/writes).**
+
+- A genuine store degrade on any of the six policy/fragment mutator routes, `/evaluate`,
+  or `/remediate` now returns **503** (`{"error":{"code":503,"message":...}}`) instead
+  of collapsing into the same `400`/`500` a validation error or business rejection gets
+  — the earlier behaviour leaked the internal error string into the response body and
+  gave callers no way to distinguish "retry" from "don't retry."
+- Compliance-check dispatch is now a durable, fleet-wide single-sweeper claim
+  (`pg_try_advisory_xact_lock`) rather than each replica's own in-memory timer — a
+  persistently-failing claim (compliance checks silently stop running fleet-wide) now
+  logs at `error` and increments `yuzu_server_policy_eval_errors_total{phase="claim"}`,
+  where it previously only warned with no counter.
+- `POST /api/policies/{id}/remediate` now rejects (409) a second call for the same
+  policy while a remediation it already started is still in flight — same-process
+  dedup only; a cross-replica race is a documented, tracked gap, not yet closed.
+- The compliance dashboard's hero no longer claims a "Last evaluated: just now"
+  freshness that the server was not actually tracking — no dashboard regression, since
+  no timestamp was ever computed; the freshness claim itself has simply been removed
+  rather than shipped false. A real evaluation-health signal is tracked as a follow-up.
+
+**Verify:** after the server reports ready, `GET /api/compliance` returns the expected
+policies and fleet compliance percentage.
 
 ## ⚠️ Behaviour change: quarantine is now enforced at instruction dispatch (#881, #3127)
 
