@@ -13,15 +13,23 @@
  * explicitly does NOT treat AuditStore as a removal candidate (audit
  * evidence cannot be regenerated the way config/cache state can), so its
  * backfill stays live and boot-invoked indefinitely, not just "for now."
- * It is called by the metrics-wiring test below (metrics pre-seeding, not
- * backfill correctness) and by one reinstated regression test (#2854, the
- * liveness-gauge same-instance reseed ordering bug) that governance flagged
- * as still guarding a real bug on a still-live path.
+ * It is called by "AuditStore: wiring metrics pre-seeds both closed label
+ * sets" (metrics pre-seeding, not backfill correctness) and by one
+ * reinstated regression test, "AuditStore #2854: the liveness gauge is
+ * seeded from a legacy anchor without a restart" (the liveness-gauge
+ * same-instance reseed ordering bug), that governance flagged as still
+ * guarding a real bug on a still-live path.
  *
  * PG-gated: skips when YUZU_TEST_POSTGRES_DSN is unset, fails when it is set but
- * broken. Store-behaviour tests use a pre-migrated template clone; the metrics
- * test above that still calls migrate_from_sqlite() uses plain
- * YUZU_REQUIRE_PG_DB, per that macro's plain-migration-test carve-out.
+ * broken. Store-behaviour tests use a pre-migrated template clone; that
+ * includes "wiring metrics pre-seeds both closed label sets", since its
+ * migrate_from_sqlite() calls exercise the marker/metrics contract, not the
+ * DDL migration path. "#2854: the liveness gauge is seeded from a legacy
+ * anchor without a restart" still calls migrate_from_sqlite() against a
+ * genuinely fresh backfill/anchor state, so it keeps plain
+ * YUZU_REQUIRE_PG_DB, per that macro's plain-migration-test carve-out — do
+ * not convert it without first confirming AuditStore still has no
+ * first-boot data-dependent seeding that this test would stop exercising.
  */
 
 #include "audit_store.hpp"
@@ -572,7 +580,7 @@ TEST_CASE("AuditStore #2854: an ordinary restart seeds the liveness gauge from t
 // leaves it at 0 rather than incrementing something untrue.
 TEST_CASE("AuditStore: wiring metrics pre-seeds both closed label sets",
           "[pg][audit_store][metrics]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AuditStore store(pool);
     REQUIRE(store.is_open());
