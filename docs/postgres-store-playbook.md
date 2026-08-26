@@ -291,6 +291,16 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   to get subtly wrong by reasoning alone.
 - A plaintext secret column. Use `SecretCodec` / verify-only hash.
 - A new server **SQLite** store (ADR-0006 forbids it without an exception ADR).
+- **Editing an already-shipped migration's DDL in place.** `PgMigrationRunner` tracks only an
+  integer `version` per store in `schema_meta` (no content/checksum verification) — so an in-place
+  edit to a migration that already ran against a real deployed database silently diverges that
+  deployment's actual schema from what a fresh install now creates, with nothing to detect the
+  drift. Safe **only** when the migration has never shipped to any real deployment (confirm via
+  `git merge-base --is-ancestor <the-migrating-PR> origin/main` returning false, or an equivalent
+  release-history check) — PolicyStore's `sqlite_backfill_source` table removal (ADR-0009's
+  fresh-start-by-default retirement, 2026-08-25) is the reference case: its PG migration never
+  reached a release, so the edit carried no drift risk. Every other case needs a proper
+  version-bumped migration, never a copy of that shortcut.
 - A `CREATE INDEX CONCURRENTLY` / `VACUUM` / `ALTER TYPE ADD VALUE` smuggled into a
   `PgMigration` — it cannot run in the runner's transaction (see below).
 - A **counting aggregate** (`count(*)`, `count(*) FILTER (...)`) where the question is only

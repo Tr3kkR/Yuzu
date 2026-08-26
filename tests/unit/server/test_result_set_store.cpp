@@ -6,6 +6,13 @@
  * materialisation, touch TTL extension, and GC sweep. Migrated Postgres store
  * (ADR-0036, schema `result_set_store`). PG-gated: skips when
  * YUZU_TEST_POSTGRES_DSN is unset, fails when it is set but broken.
+ *
+ * No legacy-SQLite backfill test coverage: the dedicated migrate_from_sqlite
+ * TEST_CASE suite was removed as part of a fresh-start-by-default policy
+ * change (ADR-0009 amendment) -- no production fleet has ever run a
+ * pre-Postgres build. ResultSetStore::migrate_from_sqlite() itself is
+ * UNCHANGED and still present in production code; only this file's test
+ * coverage of it was removed.
  */
 
 #include "result_set_store.hpp"
@@ -18,10 +25,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
-#include <sqlite3.h>
 
 #include <chrono>
-#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -77,103 +82,6 @@ std::string query_scalar(const std::string& dsn, const std::string& sql) {
     if (PQntuples(r.get()) == 0)
         return "";
     return PQgetvalue(r.get(), 0, 0);
-}
-
-// Build a legacy SQLite `result_sets.db` at `path` with the pre-migration
-// schema `migrate_from_sqlite` reads (S3a) — one ground row + one child row
-// (parent_id exercises the created_at/id ORDER BY, B3a) + member rows for
-// each. Raw sqlite3 C API: this test targets the legacy reader, not the
-// live store (which never opens SQLite at all post-migration).
-void write_legacy_sqlite_db(const std::filesystem::path& path, const std::string& parent_id,
-                            const std::string& child_id) {
-    sqlite3* db = nullptr;
-    REQUIRE(sqlite3_open(path.string().c_str(), &db) == SQLITE_OK);
-    const char* ddl =
-        "CREATE TABLE result_sets ("
-        "  id TEXT PRIMARY KEY, name TEXT, owner_principal TEXT NOT NULL,"
-        "  created_at INTEGER NOT NULL, ttl_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL,"
-        "  pinned INTEGER NOT NULL DEFAULT 0, parent_id TEXT,"
-        "  source_kind TEXT NOT NULL, source_payload TEXT NOT NULL,"
-        "  status TEXT NOT NULL DEFAULT 'materialized',"
-        "  source_execution_id TEXT NOT NULL DEFAULT '', matcher TEXT NOT NULL DEFAULT '',"
-        "  device_count INTEGER NOT NULL DEFAULT 0);"
-        "CREATE TABLE result_set_members (result_set_id TEXT NOT NULL, device_id TEXT NOT NULL,"
-        "  PRIMARY KEY (result_set_id, device_id));";
-    REQUIRE(sqlite3_exec(db, ddl, nullptr, nullptr, nullptr) == SQLITE_OK);
-
-    auto insert_set = [&](const std::string& id, const std::optional<std::string>& parent,
-                          int64_t created_at, int device_count) {
-        std::string sql = "INSERT INTO result_sets (id, name, owner_principal, created_at, "
-                          "ttl_at, last_used_at, pinned, parent_id, source_kind, "
-                          "source_payload, status, source_execution_id, matcher, "
-                          "device_count) VALUES ('" +
-                          id + "', 'legacy-" + id + "', 'alice', " + std::to_string(created_at) +
-                          ", " + std::to_string(created_at + 3600) + ", " +
-                          std::to_string(created_at) + ", 0, " +
-                          (parent ? "'" + *parent + "'" : "NULL") +
-                          ", 'manual_curate', '{}', 'materialized', '', '', " +
-                          std::to_string(device_count) + ");";
-        REQUIRE(sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
-    };
-    // Parent created first (earlier created_at) — B3a ordering exercised on
-    // read even though this helper controls insertion order directly; the
-    // migrate_from_sqlite SELECT re-derives the order regardless of how the
-    // legacy rows happen to be stored on disk.
-    insert_set(parent_id, std::nullopt, 1000, 2);
-    insert_set(child_id, parent_id, 2000, 1);
-
-    auto insert_member = [&](const std::string& rsid, const std::string& dev) {
-        std::string sql = "INSERT INTO result_set_members (result_set_id, device_id) VALUES ('" +
-                          rsid + "', '" + dev + "');";
-        REQUIRE(sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
-    };
-    insert_member(parent_id, "dev-a");
-    insert_member(parent_id, "dev-b");
-    insert_member(child_id, "dev-a");
-
-    sqlite3_close(db);
-}
-
-// A second legacy-writer, local to the mid-scan-truncation test below: one
-// result_sets row plus `member_count` result_set_members rows with long-ish
-// device ids, deliberately sized to span multiple SQLite pages (the fixed
-// 3-row write_legacy_sqlite_db() above stays page-1-sized and is shared by
-// two happy-path backfill tests — reshaping it to be "big" would perturb
-// those instead of adding a clean new fixture).
-void write_legacy_sqlite_db_bulk(const std::filesystem::path& path, const std::string& set_id,
-                                 int member_count) {
-    sqlite3* db = nullptr;
-    REQUIRE(sqlite3_open(path.string().c_str(), &db) == SQLITE_OK);
-    const char* ddl =
-        "CREATE TABLE result_sets ("
-        "  id TEXT PRIMARY KEY, name TEXT, owner_principal TEXT NOT NULL,"
-        "  created_at INTEGER NOT NULL, ttl_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL,"
-        "  pinned INTEGER NOT NULL DEFAULT 0, parent_id TEXT,"
-        "  source_kind TEXT NOT NULL, source_payload TEXT NOT NULL,"
-        "  status TEXT NOT NULL DEFAULT 'materialized',"
-        "  source_execution_id TEXT NOT NULL DEFAULT '', matcher TEXT NOT NULL DEFAULT '',"
-        "  device_count INTEGER NOT NULL DEFAULT 0);"
-        "CREATE TABLE result_set_members (result_set_id TEXT NOT NULL, device_id TEXT NOT NULL,"
-        "  PRIMARY KEY (result_set_id, device_id));";
-    REQUIRE(sqlite3_exec(db, ddl, nullptr, nullptr, nullptr) == SQLITE_OK);
-
-    std::string ins_set =
-        "INSERT INTO result_sets (id, name, owner_principal, created_at, ttl_at, last_used_at, "
-        "pinned, parent_id, source_kind, source_payload, status, source_execution_id, matcher, "
-        "device_count) VALUES ('" +
-        set_id + "', 'legacy-bulk', 'alice', 1000, 4600, 1000, 0, NULL, 'manual_curate', '{}', "
-                "'materialized', '', '', " +
-        std::to_string(member_count) + ");";
-    REQUIRE(sqlite3_exec(db, ins_set.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
-
-    for (int i = 0; i < member_count; ++i) {
-        std::string dev =
-            "dev-with-a-reasonably-long-identifier-padding-" + std::to_string(100000 + i);
-        std::string sql = "INSERT INTO result_set_members (result_set_id, device_id) VALUES ('" +
-                          set_id + "', '" + dev + "');";
-        REQUIRE(sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
-    }
-    sqlite3_close(db);
 }
 
 // Unwrap helpers for the four type-distinguishable-error reads (ADR-0036 /
@@ -582,79 +490,6 @@ TEST_CASE("ResultSetStore reports !is_open on a migration failure", "[pg][result
     CHECK_FALSE(store.is_open()); // → server.cpp sets startup_failed_ = true
 }
 
-// Backfill (ADR-0009): idempotent, fails closed on a legacy-file read error,
-// and is a safe no-op stamping the marker when no legacy file exists.
-TEST_CASE("ResultSetStore::migrate_from_sqlite backfill contract", "[pg][result_set][backfill]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    ResultSetStore store(pool);
-    REQUIRE(store.is_open());
-
-    SECTION("no legacy file: stamps the marker and returns true, idempotently") {
-        auto missing = yuzu::test::unique_temp_path("yuzu_test_rs_missing") / "result_sets.db";
-        CHECK(store.migrate_from_sqlite(missing));
-        CHECK(store.migrate_from_sqlite(missing)); // second call is a no-op success
-    }
-
-    SECTION("already backfilled: a second call is a cheap no-op success") {
-        auto missing = yuzu::test::unique_temp_path("yuzu_test_rs_missing2") / "result_sets.db";
-        REQUIRE(store.migrate_from_sqlite(missing));
-        // Even though the (still-missing) path never changes, the marker row
-        // short-circuits before any filesystem check on the second call.
-        CHECK(store.migrate_from_sqlite(missing));
-    }
-}
-
-// S3a (2026-07-26 hardening round): a populated legacy file must have its
-// rows AND members copied into Postgres, and a second migrate_from_sqlite
-// call — even against the SAME still-present legacy file — must be a no-op
-// (marker idempotency, not "re-read the file every boot").
-TEST_CASE("ResultSetStore::migrate_from_sqlite copies a populated legacy file exactly once",
-          "[pg][result_set][backfill]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    ResultSetStore store(pool);
-    REQUIRE(store.is_open());
-
-    const std::string parent_id = "rs_legacyparent";
-    const std::string child_id = "rs_legacychild";
-    auto legacy_path =
-        yuzu::test::unique_temp_path("yuzu_test_rs_populated") / "result_sets.db";
-    std::filesystem::create_directories(legacy_path.parent_path());
-    write_legacy_sqlite_db(legacy_path, parent_id, child_id);
-
-    REQUIRE(store.migrate_from_sqlite(legacy_path));
-
-    // Rows copied, including the self-FK parent/child edge (proves the
-    // ORDER BY created_at, id ASC read — B3a — landed the parent before the
-    // child so the FK insert never violated).
-    auto parent = get_ok(store, parent_id);
-    REQUIRE(parent.has_value());
-    CHECK(parent->owner_principal == "alice");
-    CHECK(parent->device_count == 2);
-    CHECK_FALSE(parent->parent_id.has_value());
-
-    auto child = get_ok(store, child_id);
-    REQUIRE(child.has_value());
-    REQUIRE(child->parent_id.has_value());
-    CHECK(*child->parent_id == parent_id);
-
-    // Members copied.
-    CHECK(contains_ok(store, parent_id, "dev-a"));
-    CHECK(contains_ok(store, parent_id, "dev-b"));
-    CHECK(contains_ok(store, child_id, "dev-a"));
-
-    // Second call against the SAME populated file is a no-op (marker
-    // idempotency) — re-running must not error (e.g. on a duplicate-key
-    // conflict) and must not change the already-copied data.
-    REQUIRE(store.migrate_from_sqlite(legacy_path));
-    auto parent_again = get_ok(store, parent_id);
-    REQUIRE(parent_again.has_value());
-    CHECK(parent_again->device_count == 2); // unchanged, not doubled
-}
-
 // S3b (2026-07-26 hardening round): with the backing table dropped, the
 // four type-distinguishable reads must each report DbError distinctly from
 // "not found"/"not a member" — REQUIRE_FALSE(has_value()) +
@@ -694,61 +529,6 @@ TEST_CASE("ResultSetStore: get/contains/resolve_alias report DbError on a genuin
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error() == ResultSetError::DbError);
     }
-}
-
-// H2 net (governance regression, 2026-07-29 hardening round): a legacy
-// SQLite file that dies MID-SCAN (a corrupt page / short read, not simply
-// "file absent" or "well-formed and empty") must abort the backfill without
-// stamping the marker — verified empirically: truncating a multi-page legacy
-// file to roughly half its size deterministically yields SQLITE_CORRUPT (11,
-// "database disk image is malformed") on the very first sqlite3_step of the
-// result_sets scan, never a spurious SQLITE_DONE-with-zero-rows that would
-// misread as "legitimately empty".
-TEST_CASE("ResultSetStore::migrate_from_sqlite aborts unstamped on a mid-scan legacy read failure",
-          "[pg][result_set][backfill]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    ResultSetStore store(pool);
-    REQUIRE(store.is_open());
-
-    auto legacy_path = yuzu::test::unique_temp_path("yuzu_test_rs_truncated") / "result_sets.db";
-    std::filesystem::create_directories(legacy_path.parent_path());
-    // 400 long-ish device rows reliably spans several SQLite pages at the
-    // default 4096-byte page size — a fixture big enough that "truncate the
-    // tail" lands inside the table's b-tree rather than merely shortening an
-    // otherwise-intact single-page file.
-    write_legacy_sqlite_db_bulk(legacy_path, "rs_bulkparent", 400);
-
-    auto full_size = std::filesystem::file_size(legacy_path);
-    REQUIRE(full_size > 8192); // sanity: really did span more than one page
-
-    // Cut the file to half its size. sqlite's pager cross-checks the file's
-    // actual byte length against the page count recorded in the header at
-    // open/first-read time, so any material truncation of a multi-page file
-    // — not just a cut mid-final-page — reliably corrupts it from the very
-    // first read, which is exactly the "corrupt page or I/O error mid-scan"
-    // case the production terminal-rc check (step_rc != SQLITE_DONE) guards.
-    std::filesystem::resize_file(legacy_path, full_size / 2);
-
-    CHECK_FALSE(store.migrate_from_sqlite(legacy_path));
-
-    // No partial rows landed. (In this codepath the SQLite scan fully
-    // completes — or fails — before the Postgres transaction ever opens, so
-    // "no partial rows" holds trivially here; the marker-idempotency check
-    // below is the assertion that actually distinguishes "aborted cleanly"
-    // from "silently stamped over a partial copy".)
-    CHECK_FALSE(get_ok(store, "rs_bulkparent").has_value());
-
-    // A subsequent migrate_from_sqlite against a freshly-written, INTACT
-    // file at the SAME Postgres database succeeds — proving the aborted pass
-    // never stamped the sqlite_backfill marker (the marker check is the only
-    // thing that could have short-circuited this second call to a no-op).
-    auto intact_path = yuzu::test::unique_temp_path("yuzu_test_rs_intact") / "result_sets.db";
-    std::filesystem::create_directories(intact_path.parent_path());
-    write_legacy_sqlite_db_bulk(intact_path, "rs_bulkparent", 10);
-    REQUIRE(store.migrate_from_sqlite(intact_path));
-    CHECK(get_ok(store, "rs_bulkparent").has_value());
 }
 
 // gc_sweep cap (2026-07-29 hardening round): bulk-insert kGcSweepCapPerPass+1

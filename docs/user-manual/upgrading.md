@@ -2151,55 +2151,38 @@ log and `/readyz` are the channels to watch during an upgrade.
 `SELECT count(*) FROM baseline_store.baselines;` against Postgres matches
 `sqlite3 guardian-baselines.db.migrated-<epoch> "SELECT count(*) FROM baselines;"`.
 
-## Compliance policy engine migrates to Postgres (mandatory backfill, PolicyStore, ADR-0056)
+## Compliance policy engine moves to Postgres (PolicyStore, ADR-0056)
 
 The `PolicyStore` — compliance policy fragments/policies behind `POST/DELETE
 /api/policy-fragments*`, `POST/DELETE /api/policies*`, `POST /api/policies/{id}/{enable,
 disable,invalidate,evaluate,remediate}`, `GET /api/compliance*`, and every dispatched
-compliance check/fix/verify — moves from the SQLite `policies.db` file to the server's
-PostgreSQL substrate in this release, schema `policy_store`, on the existing shared
-pool. Six operator-authored tables (fragments, policies, and their input/trigger/group
-associations, plus per-agent `policy_status`) plus a new operational-only seventh table,
-`policy_dispatch_state`, which coordinates fleet-wide compliance-check dispatch across
-replicas and is never backfilled.
+compliance check/fix/verify — runs on the server's PostgreSQL substrate, schema
+`policy_store`, on the existing shared pool. Six operator-authored tables (fragments,
+policies, and their input/trigger/group associations, plus per-agent `policy_status`)
+plus a new operational-only seventh table, `policy_dispatch_state`, which coordinates
+fleet-wide compliance-check dispatch across replicas.
 
-**Before you upgrade**, sanity-check the legacy `policies.db`:
+**No legacy-SQLite migration path.** No production fleet ever ran a pre-Postgres build
+of this store, so there was no real `policies.db` data to carry over — the one-time
+backfill mechanism this section originally described was retired shortly after this
+store's Postgres migration merged, under ADR-0009's fresh-start-by-default amendment.
 
-```bash
-sqlite3 /path/to/policies.db "SELECT count(*) FROM policies; SELECT count(*) FROM policy_status;"
-```
+These are two SEPARATE failure/detection behaviors, not one — do not conflate them:
 
-- **What is preserved:** every policy fragment and policy definition, and per-agent
-  compliance status history (`policy_status` — `compliant`/`non_compliant`/`unknown`/
-  `error`, plus the fix-attempt counter) via a direction-aware LIFECYCLE merge rather
-  than a fresh start: the default 3600s evaluation interval would otherwise leave up to
-  an hour of false-`unknown` fleet compliance on an operator-visible dashboard after
-  every upgrade. Fragments and policies write once (no update path exists once created —
-  only enable/disable and status mutate post-creation), so the identity side of the
-  backfill is unusually clean.
-- **Fail-closed boot, retried each start.** A backfill that cannot complete — an
-  unreadable/corrupt `policies.db`, a Postgres write error, a fingerprint mismatch, or a
-  legacy `policy_status` row demonstrably ahead of an already-migrated Postgres row —
-  **refuses the boot** and retries on the next start. This store had no fail-closed
-  guard on SQLite; on Postgres, a reachable database whose schema can't migrate or open
-  is now a fatal startup error too, matching the ladder's existing "authoritative"
-  posture for this store. The boot log's `PolicyStore`/`[PG] Refusing to start` lines
-  carry the specific refusal, and `docs/ops-runbooks/policy-store-backfill-recovery.md`
-  maps each message to its recovery.
-- **"Move it aside" drops status history, not just definitions.** The documented
-  operator remediation for a stuck backfill — move `policies.db` aside to skip it — is
-  correctly described in the boot log itself: doing so drops both the policy
-  definitions AND per-agent compliance status history that only exists in the legacy
-  file. See the runbook for why, and for the "leave it in place as a backup" trap (the
-  legacy-ahead check re-runs on every boot for as long as the file exists at its
-  configured path, so a stale backup file left behind reproduces the refusal as a boot
-  crash loop on any later clock skew).
-- Tolerates a legacy `policies.db` predating the `fix_attempt_count` column
-  (defaults missing rows to 0); a probe failure reading that column now fails the
-  backfill closed rather than silently defaulting every row to 0.
-- Real FK + `ON DELETE CASCADE` added from `policy_status` to `policies` — the SQLite
-  original had none, and `delete_policy` hand-wrote a second `DELETE` whose failure was
-  silently swallowed.
+- A reachable Postgres database whose schema can't migrate or open **is** a fatal
+  startup error (fail-closed, matching the ladder's "authoritative" posture for this
+  store), same as every other born-on-Postgres store.
+- A legacy `policies.db` file with real content **does NOT** fail startup and its
+  content is **never imported** — the server opens it read-only, purely to count rows
+  for a diagnostic warning, then boots fresh-started regardless of what it finds. If
+  either the `policies` or `policy_fragments` table has rows, it logs `A legacy
+  policies.db (<path>) has <N> policy row(s) and <N> fragment row(s) but PolicyStore no
+  longer backfills it...` at WARN; if the file exists but its row counts can't be read
+  (corrupt, unreadable, or a locked file), it logs a similar countless warning instead.
+  Either way, boot proceeds unaffected. If you see either warning and the environment
+  genuinely has real compliance-policy data to keep, there is no automated recovery
+  path: re-author the equivalent fragments and policies against the new Postgres-backed
+  store via `POST /api/policy-fragments` and `POST /api/policies` before relying on it.
 
 **Operator-visible behaviour changes (fail-closed reads/writes).**
 
@@ -2221,10 +2204,8 @@ sqlite3 /path/to/policies.db "SELECT count(*) FROM policies; SELECT count(*) FRO
   no timestamp was ever computed; the freshness claim itself has simply been removed
   rather than shipped false. A real evaluation-health signal is tracked as a follow-up.
 
-**Verify:** after the server reports ready, `GET /api/compliance` shows the same
-policies and fleet compliance percentage as before the upgrade, and `SELECT count(*)
-FROM policy_store.policies;` / `policy_store.policy_status` against Postgres match the
-legacy file's counts.
+**Verify:** after the server reports ready, `GET /api/compliance` returns the expected
+policies and fleet compliance percentage.
 
 ## ⚠️ Behaviour change: quarantine is now enforced at instruction dispatch (#881, #3127)
 

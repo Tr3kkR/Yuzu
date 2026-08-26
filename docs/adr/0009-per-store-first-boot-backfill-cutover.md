@@ -77,8 +77,10 @@ data).
   version of this paragraph claimed "a one-time loud boot log records 'response history
   reset on Postgres cutover'" — no such log exists; `ResponseStore` logs only its generic
   `"ResponseStore initialized (schema {}, retention={}d)"` line, with nothing distinguishing
-  a fresh start from any other boot. See the fresh-start-by-default Update below for the new
-  detect-and-warn requirement this gap motivates for stores holding real operator data.)
+  a fresh start from any other boot. See `docs/postgres-store-playbook.md`'s Backfill bullet
+  for the detect-and-warn requirement this gap motivates for a future skip-by-default store
+  holding real operator data — that requirement lives in the playbook's authoring guidance,
+  not restated in full here.)
   There is no compliance or config-durability requirement to preserve response rows across
   the cut (unlike the config/reference and audit classes above), so a conditional flag would
   add a knob nobody has a reason to turn off. `ResponseStore` is the reference case for this
@@ -145,12 +147,15 @@ data).
   `ResponseStore` already does** (Update above), rather than build a backfill and plan to
   remove it later. This is not a narrowing of what backfill protects — the mandate's
   entire premise (preserving real operator config / real SOC 2 audit history across a real
-  upgrade) is empty while there is nothing real to preserve.
+  upgrade) is empty while there is nothing real to preserve. Retired for the same reason,
+  same day: `PolicyStore`'s already-shipped backfill (ADR-0056, commit `f46cefe8e`) — see
+  `docs/postgres-migration-ladder.md`'s `PolicyStore` row.
 
   (`WebhookStore`/PR #3563 merged with a full `migrate_from_sqlite()` already built the
   same day this amendment landed, ahead of it reaching that PR — too late for the "don't
-  build it" guidance to apply retroactively. Its backfill stays for now, same as every
-  other already-migrated store's.)
+  build it" guidance to apply retroactively. Its backfill TEST suite is being retired in
+  the same pass as the other already-migrated stores' backfill tests below; its production
+  `migrate_from_sqlite()` stays for now, same as the others.)
 
   (`InstructionStore`/PR #3602 is a DIFFERENT situation from `WebhookStore`'s, not the same
   one — it is still OPEN, unmerged, as of this amendment landing, with a full mandatory
@@ -169,13 +174,17 @@ data).
   changes. `AuditStore` (already migrated, ADR-0040, backfill built and shipped) is the
   one store where this would matter most if the premise ever flips retroactively: audit
   evidence cannot be regenerated the way config or cache state can, so its already-built
-  backfill is deliberately not a candidate for retroactive removal. A future store whose
-  data is similarly irreplaceable (not just operator-authored-and-reconstructible) should
-  weigh that before defaulting to skip.
+  backfill is deliberately NOT being retired alongside `PolicyStore`'s, and is not a
+  candidate for retroactive removal generally — see the ladder's `AuditStore` row. A future
+  store whose data is similarly irreplaceable (not just operator-authored-and-reconstructible)
+  should weigh that before defaulting to skip.
 
   **Existing stores already migrated WITH a backfill are unaffected by this update** —
-  removing an already-built `migrate_from_sqlite()` is a separate decision, tracked
-  per-store, not mandated by this ADR.
+  removing their already-built `migrate_from_sqlite()` is a separate decision (tracked as
+  ongoing cleanup, not mandated by this ADR), and per `docs/postgres-store-playbook.md`'s
+  authoring contract, an in-place schema-DDL edit is safe only for a store whose schema
+  version was never shipped (`PolicyStore`'s case); every other store's removal needs a
+  proper version-bumped migration, not a copy of that shortcut.
 
   **This supersedes two specific sentences above for a skip-by-default store, and no others:**
   the Decision bullet requiring "each per-store migration's upgrade-test must assert that
