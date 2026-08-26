@@ -118,6 +118,65 @@ login** (mirrors OIDC's `group_count_exceeded` behaviour) — see "SAML Fine-Gra
 RBAC" in `authentication.md` for the full detail, including the practical httplib
 form-body-size caveat on how large an assertion can realistically reach `/saml/acs`.
 
+## Behaviour change: InstructionStore moves to PostgreSQL — deleted content no longer resurrects (ADR-0058)
+
+`InstructionStore` (InstructionDefinitions and InstructionSets — the operator- and
+build-time-shipped instruction/question catalog) moves from per-replica SQLite to the shared
+PostgreSQL substrate (ADR-0006/0007), like every other migrated store. **No legacy-SQLite
+backfill** (ADR-0009's fresh-start-by-default class, following `ResponseStore`'s precedent): no
+production fleet has ever run a pre-Postgres build of any Yuzu store, so the pre-migration
+`instructions.db` is never read. On upgrade, the bundled catalog reseeds fresh on first boot the
+same way it always does, and any operator-authored content must be re-created via the normal
+API (`POST /api/instructions`, `POST /api/instruction-sets`) — there is no automatic carry-over.
+
+**Breaking, deliberate: an operator-deleted bundled definition/set no longer reappears.**
+Since 0.12.x (see that row above), deleting a build-time-shipped definition and rebooting made
+it silently reappear — the old per-replica SQLite reseed logic couldn't distinguish "never
+seeded" from "deliberately deleted", so `enabled: false` was the documented workaround for
+permanent suppression. **That workaround is no longer necessary but still works.** Post-upgrade,
+a deleted bundled id stays deleted — across every reboot, every replica, and every future
+release — via a tombstone the reseed loop consults. **Recovery path:** the tombstone only
+gates the build-time-trusted reseed path; an operator can still freely bring the id back at any
+time via a normal `POST /api/instructions` create or `POST /api/instructions/import`.
+
+**A side effect worth knowing:** delete-and-reboot was also, incidentally, the only existing
+way to force an existing bundled definition to pick up *newer* bundled content shipped in a
+later release (delete it, then the next boot's reseed re-inserts the current version). That
+side channel is now closed along with the resurrection bug it depended on — an existing bundled
+row, edited or not, never automatically picks up newer shipped content. There is currently no
+other refresh mechanism; tracked in [#2555](https://github.com/Tr3kkR/Yuzu/issues/2555).
+
+**REST contract change** on the direct `/api/instructions*` / `/api/instruction-sets*` routes:
+`DELETE` on a missing id now returns `404` (was `200 {"deleted": false}`); `create`/`update`/
+`import`/`create-set` now return `503` on a genuine database failure instead of a misleading
+`400`. See [`rest-api.md`](rest-api.md#instructions) for the full per-route response-code
+reference. Any automation that specifically parsed the old `200 {"deleted": false}` shape or
+treated every non-2xx response as a validation error should be updated.
+
+No operator action is required to upgrade; the reseed loop runs automatically at boot. See
+`docs/adr/0058-instruction-store-postgres-migration.md` for the full design record.
+
+**Caveat (rollback direction):** the above covers forward migration only. `instructions.db`
+still exists after the upgrade (it keeps backing the still-SQLite
+`ExecutionTracker`/`ApprovalManager`/`ScheduleEngine` siblings), but this binary never writes
+InstructionDefinition/InstructionSet rows to it. If you roll the server *binary* back to a
+pre-migration release, the outcome depends on your deployment's history and is never an empty
+catalog either way — the pre-migration binary's own boot sequence unconditionally
+`CREATE TABLE IF NOT EXISTS`-es the catalog tables and runs its own every-boot bundled-content
+reseed loop, the same way this store always has:
+- **A deployment that upgraded from a pre-migration install** still has its old
+  `instructions.db` catalog tables, untouched by the new binary. The rolled-back binary reads
+  them and serves that pre-cutover snapshot — including re-resurrecting any bundled definition
+  or set an operator deliberately deleted in Postgres after cutover, since the old binary has
+  no concept of the tombstone table.
+- **A deployment that was Postgres-first from its first boot** has no catalog tables in
+  `instructions.db` yet. The rolled-back binary creates them fresh and reseeds that old
+  release's full bundled catalog — a stale but non-empty catalog, not an empty one.
+- **Either way, anything created or edited via the API while running the new (Postgres)
+  binary is invisible during the rollback** — it lives only in Postgres, which the old binary
+  never reads — and, because there is no backfill, is not recovered automatically when you
+  roll forward again either; content authored while rolled back must be re-entered.
+
 ## Behaviour change: token-rotation confirm now requires proof of possession (#3015)
 
 `confirm` on a rotation — REST `POST /api/v1/tokens/{id}/confirm` and `POST /api/v1/engine-principals/{id}/credentials/confirm`, plus the MCP twins `confirm_api_token_rotation`/`confirm_engine_rotation` — previously admitted on caller identity plus the successor's `token_id` alone. A caller who recovered an unknown successor's `token_id` out-of-band (a support ticket, a log line) could confirm — and thereby revoke the predecessor for — a rotation whose secret they never actually received. All four confirm surfaces now additionally require the raw successor secret itself in the request body/args, verified with a constant-time hash comparison against the successor's stored hash, checked LAST — strictly after ownership, pair-state, the `token_id` pin, tier, scope, and the initiator binding have all already passed — before the predecessor is touched.

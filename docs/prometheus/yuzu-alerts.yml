@@ -2968,6 +2968,40 @@ groups:
             Read the server BOOT log for the exact pack/item id and repair or
             move the losing replica's legacy file aside before restarting.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#product-packs-migrate-to-postgres-mandatory-backfill-productpackstore-adr-0054"
+      - alert: YuzuInstructionBundledContentNotClean
+        # Same absent-success shape as YuzuProductPackBackfillNotCompleted above, adapted
+        # for an EVERY-BOOT (not one-time) outcome (gov Gate 4 UP-4/Gate 8 fix): the
+        # InstructionStore bundled-content reseed loop (232 definitions / 10 sets as of
+        # this writing) runs during server CONSTRUCTION, and a genuine DB error on any
+        # item sets startup_failed_ — the HTTP listener never starts, /metrics is never
+        # served, and a result="errored" sample is never scraped. What IS observable is
+        # the ABSENCE of a clean outcome. THIS RULE DEPENDS ON THE PRE-SEED in
+        # server.cpp's InstructionStore construction block (describe() + zero-loop over
+        # clean/errored). TWO-WAY result split: clean | errored; expr matches the good
+        # outcome only (unlike the ProductPack rule, there is no third "fresh" state —
+        # this store reseeds every boot, never skips as "nothing to migrate"). LIMITS:
+        # multi-replica — one wedged replica among healthy ones shows as up == 0, not
+        # this; a single-shot with_txn_for has no internal retry, so a transient
+        # Postgres blip during a rolling deploy is a real, not hypothetical, trigger —
+        # the existing crash-loop-backoff is the intended recovery. The BOOT LOG carries
+        # the per-item id/error. This is the outside-in backstop, not the primary signal.
+        expr: |
+          absent_over_time(yuzu_server_instruction_bundled_content_total{result="clean"}[15m])
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No server is reporting a clean InstructionStore bundled-content reseed (possible boot refusal)"
+          description: >-
+            No scraped Yuzu server has reported a clean bundled-content reseed
+            (ADR-0058) in the last 15 minutes. A server that hit a genuine DB
+            error importing any bundled definition/set fails CLOSED, refuses
+            to serve, and retries on the next start — a restart loop with the
+            whole server down. Read the server BOOT log for the exact
+            definition/set id and error before assuming Postgres itself is
+            down; a transient blip on one of ~240 sequential items is enough
+            to trigger this even when Postgres is otherwise healthy.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#behaviour-change-instructionstore-moves-to-postgresql--deleted-content-no-longer-resurrects-adr-0058"
       - alert: YuzuInventoryIngestSlow
         # Leading indicator for ingest transaction-hold saturation: full-payload
         # ingests taking >10s. Distinct from the yuzu_pg_acquire_* family, which

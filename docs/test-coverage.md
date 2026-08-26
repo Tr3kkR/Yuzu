@@ -125,7 +125,7 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 | `test_concurrency_manager.cpp` | Concurrency manager | 5 enforcement modes, lock/release |
 | `test_error_codes.cpp` | Error taxonomy | Error code ranges (1xxx-4xxx), message formatting |
 | `test_execution_tracker.cpp` | Execution tracker | Progress tracking, per-agent status, completion |
-| `test_instruction_store.cpp` | Instruction store | Definition CRUD, YAML persistence, denormalized queries |
+| `test_instruction_store.cpp` | Instruction store | Definition/set CRUD (PostgreSQL, ADR-0058), YAML persistence, denormalized queries, seed-vs-live tombstone semantics (delete survives reseed, resurrection-on-delete removed) |
 | `test_legacy_shim.cpp` | Legacy command shim | Raw command-to-instruction translation |
 | `test_management_group_store.cpp` | Management groups | Group CRUD, hierarchy, device membership |
 | `test_migration_runner.cpp` | Schema migrations | Migration execution, version tracking |

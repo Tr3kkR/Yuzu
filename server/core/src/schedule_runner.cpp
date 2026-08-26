@@ -64,18 +64,36 @@ void ScheduleRunner::tick() {
 }
 
 void ScheduleRunner::fire(const InstructionSchedule& s) {
-    auto def = d_.instruction_store->get_definition(s.definition_id);
-    if (!def || !def->enabled) {
+    auto def_result = d_.instruction_store->get_definition(s.definition_id);
+    if (!def_result) {
+        // ADR-0058: a genuine DB error (Postgres blip) — distinguished from
+        // "unknown" (id doesn't exist) below so an operator doesn't mistake a
+        // transient infrastructure issue for a stale/deleted schedule reference.
+        // Do NOT advance: a store-unavailable attempt is not a completed
+        // occurrence — advancing would permanently consume this schedule's due
+        // slot on a transient failure. Leaving it un-advanced means evaluate_due()
+        // returns it again next tick, matching PolicyEvaluator::dispatch_due's
+        // throttle-restore-on-store-unavailable fix (gov Gate 3 sibling finding).
+        count("yuzu_schedule_fire_failures_total");
+        spdlog::warn("schedule_runner: schedule '{}' (id={}) instruction store read failed for "
+                     "'{}' — retrying next tick",
+                     s.name, s.id, s.definition_id);
+        audit(s, "instruction.schedule_fired", "failure",
+              "definition_store_unavailable schedule_id=" + s.id);
+        return;
+    }
+    if (!*def_result || !(*def_result)->enabled) {
         count("yuzu_schedule_fire_failures_total");
         spdlog::warn("schedule_runner: schedule '{}' (id={}) references {} definition '{}' — "
                      "occurrence skipped",
-                     s.name, s.id, def ? "disabled" : "unknown", s.definition_id);
+                     s.name, s.id, *def_result ? "disabled" : "unknown", s.definition_id);
         audit(s, "instruction.schedule_fired", "failure",
-              std::string(def ? "definition_disabled" : "definition_unknown") +
+              std::string(*def_result ? "definition_disabled" : "definition_unknown") +
                   " schedule_id=" + s.id);
         d_.schedule_engine->advance_schedule(s.id);
         return;
     }
+    const auto& def = **def_result;
 
     // D7 (PLAN-003): re-verify the arming principal BEFORE the
     // approval/direct branch below, so BOTH arms are covered — a check
@@ -85,14 +103,14 @@ void ScheduleRunner::fire(const InstructionSchedule& s) {
     // lockdown) denies the fire exactly like an explicit `false`. Always
     // advance so a permanently-denied schedule cannot spin retrying every
     // tick forever.
-    if (!d_.arming_check || !d_.arming_check(s.created_by, def->plugin, def->action)) {
+    if (!d_.arming_check || !d_.arming_check(s.created_by, def.plugin, def.action)) {
         count("yuzu_schedule_arming_denied_total");
         spdlog::warn("schedule_runner: schedule '{}' (id={}) arming check denied — "
                      "principal='{}' target={}.{}",
-                     s.name, s.id, s.created_by, def->plugin, def->action);
+                     s.name, s.id, s.created_by, def.plugin, def.action);
         audit(s, "instruction.schedule_fired", "denied",
               "arming_check_denied schedule_id=" + s.id + " principal=" + s.created_by +
-                  " plugin=" + def->plugin + " action=" + def->action);
+                  " plugin=" + def.plugin + " action=" + def.action);
         d_.schedule_engine->advance_schedule(s.id);
         return;
     }
@@ -101,7 +119,7 @@ void ScheduleRunner::fire(const InstructionSchedule& s) {
     // directly, everything else (always / role-gated / unknown) requires an
     // approval ticket. There is no operator session here, so role-gated
     // cannot be bypassed and fails closed to require-approval.
-    const bool needs_approval = s.requires_approval || def->approval_mode != "auto";
+    const bool needs_approval = s.requires_approval || def.approval_mode != "auto";
     if (needs_approval) {
         if (!d_.approval_manager) {
             // Fail closed: never dispatch an approval-gated instruction
@@ -115,12 +133,12 @@ void ScheduleRunner::fire(const InstructionSchedule& s) {
             d_.schedule_engine->advance_schedule(s.id);
             return;
         }
-        if (fire_with_approval(s, def->plugin, def->action))
+        if (fire_with_approval(s, def.plugin, def.action))
             d_.schedule_engine->advance_schedule(s.id);
         return; // pending → stays due, re-checked next tick
     }
 
-    dispatch_tracked(s, def->plugin, def->action, /*approval_id=*/"");
+    dispatch_tracked(s, def.plugin, def.action, /*approval_id=*/"");
     d_.schedule_engine->advance_schedule(s.id);
 }
 

@@ -4843,16 +4843,29 @@ public:
             gateway_service_->set_analytics_store(analytics_store_);
         }
 
-        // Initialize instruction store (Phase 2)
-        {
-            auto instr_db = cfg_.db_dir() / "instructions.db";
-            instruction_store_ = std::make_unique<InstructionStore>(instr_db);
-            // #1073 / W7.4 sibling-gap: InstructionStore ctor sets
-            // require_signed_definitions_=true. Wire the operator opt-out
-            // immediately after construction, before any import path can
-            // execute, so legacy unsigned imports are accepted iff the
-            // operator explicitly enabled --allow-unsigned-definitions.
-            if (instruction_store_) {
+        // Initialize instruction store (Phase 2) — Migrated Postgres store
+        // (ADR-0006/0009/0058, schema `instruction_store`). Construction fail-CLOSED per
+        // ADR-0012 §1 (ProductPackStore template): a reachable database whose schema can't
+        // migrate/open is a fatal startup error, never a serve-degraded instruction catalog —
+        // execute_instruction resolves definitions here, so a silent-empty read would break
+        // dispatch. No legacy-SQLite backfill (ADR-0009's fresh-start-by-default class,
+        // ResponseStore precedent): no production fleet has ever run a pre-Postgres build of
+        // any Yuzu store, so there is no legacy `instructions.db` content to protect.
+        if (pg_pool_ && !startup_failed_) {
+            instruction_store_ = std::make_unique<InstructionStore>(*pg_pool_);
+            if (!instruction_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: instruction store migration/open failed "
+                              "(database reachable but the instruction_store schema could not "
+                              "be created/opened)");
+                startup_failed_ = true;
+            } else {
+                spdlog::info("InstructionStore initialized (schema instruction_store) — fresh "
+                             "start, no legacy backfill");
+                // #1073 / W7.4 sibling-gap: InstructionStore ctor sets
+                // require_signed_definitions_=true. Wire the operator opt-out
+                // immediately after construction, before any import path can
+                // execute, so legacy unsigned imports are accepted iff the
+                // operator explicitly enabled --allow-unsigned-definitions.
                 instruction_store_->set_require_signed_definitions(
                     !cfg_.allow_unsigned_definitions);
                 if (cfg_.allow_unsigned_definitions) {
@@ -4861,145 +4874,228 @@ public:
                                  "YUZU_ALLOW_UNSIGNED_DEFINITIONS) — unsigned "
                                  "instruction imports will be accepted");
                 }
+                instruction_store_->set_metrics(&metrics_);
+                metrics_.describe("yuzu_server_instruction_read_degrade_total",
+                                  "InstructionStore reads that degraded instead of answering, "
+                                  "by reason",
+                                  "counter");
+                for (auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"}) {
+                    metrics_.counter("yuzu_server_instruction_read_degrade_total",
+                                     {{"reason", reason}});
+                }
+                metrics_.describe("yuzu_server_instruction_write_degrade_total",
+                                  "InstructionStore writes that degraded instead of succeeding, "
+                                  "by call site",
+                                  "counter");
+                for (auto reason : {"insert_definition_row", "update_definition",
+                                    "delete_definition", "insert_set_row", "delete_set"}) {
+                    metrics_.counter("yuzu_server_instruction_write_degrade_total",
+                                     {{"reason", reason}});
+                }
+                // Gate 4 UP-4: distinct from the runtime write-degrade counter above — this
+                // is the ONE-BOOT reseed-loop outcome, alertable on its own so "reseed lost
+                // N/232 items at boot" is distinguishable from an ordinary operator-write
+                // blip sharing the same reason labels.
+                metrics_.describe("yuzu_server_instruction_bundled_content_total",
+                                  "Bundled-content boot-time reseed outcome by result (clean = "
+                                  "zero import errors; errored = at least one definition/set "
+                                  "failed to import against an open store — the boot refuses "
+                                  "to serve, ADR-0058 Gate 8). Every-boot, not one-time, unlike "
+                                  "sibling *_backfill_total counters.",
+                                  "counter");
+                for (auto result : {"clean", "errored"}) {
+                    metrics_.counter("yuzu_server_instruction_bundled_content_total",
+                                     {{"result", result}});
+                }
             }
-            if (instruction_store_ && instruction_store_->is_open()) {
-                // RAII pool owns the shared connection (fixes G3-ARCH-T2-002).
-                // Declare instr_db_pool_ before the consumers in the member list
-                // so that consumers are destroyed before the pool closes the DB.
-                instr_db_pool_ = std::make_unique<InstructionDbPool>(instr_db);
-                if (instr_db_pool_->is_open()) {
-                    // PR 3 — per-execution SSE event bus. Constructed
-                    // before the tracker so the tracker can attach
-                    // immediately and we keep the "bus outlives tracker"
-                    // invariant that the member-order comment encodes.
-                    execution_event_bus_ = std::make_unique<ExecutionEventBus>();
-                    execution_tracker_ = std::make_unique<ExecutionTracker>(instr_db_pool_->get());
-                    execution_tracker_->create_tables();
-                    execution_tracker_->set_event_bus(execution_event_bus_.get());
-                    // UAT 2026-05-06 #8: AgentServiceImpl notifies the
-                    // tracker on every response so the per-agent KPI
-                    // table populates and SSE agent-transition fires
-                    // for live drawer updates.
-                    agent_service_.set_execution_tracker(execution_tracker_.get());
+        }
 
-                    approval_manager_ = std::make_unique<ApprovalManager>(instr_db_pool_->get());
-                    approval_manager_->create_tables();
+        // InstructionDbPool — a SEPARATE SQLite pool onto the SAME instructions.db file,
+        // backing the still-unmigrated ExecutionTracker/ApprovalManager/ScheduleEngine
+        // (ADR-0058: only instruction_definitions/instruction_sets moved to Postgres; these
+        // three siblings are unaffected and keep reading/writing the physical file directly —
+        // it is not retired by this migration). Deliberately NOT gated on instruction_store_'s
+        // (now Postgres) is_open() — the two are independent post-migration, unlike
+        // pre-migration where they happened to share one SQLite-open check. RAII pool owns the
+        // shared connection (fixes G3-ARCH-T2-002); declared before the consumers in the member
+        // list so that consumers are destroyed before the pool closes the DB.
+        if (!startup_failed_) {
+            auto instr_db = cfg_.db_dir() / "instructions.db";
+            instr_db_pool_ = std::make_unique<InstructionDbPool>(instr_db);
+            if (instr_db_pool_->is_open()) {
+                // PR 3 — per-execution SSE event bus. Constructed
+                // before the tracker so the tracker can attach
+                // immediately and we keep the "bus outlives tracker"
+                // invariant that the member-order comment encodes.
+                execution_event_bus_ = std::make_unique<ExecutionEventBus>();
+                execution_tracker_ = std::make_unique<ExecutionTracker>(instr_db_pool_->get());
+                execution_tracker_->create_tables();
+                execution_tracker_->set_event_bus(execution_event_bus_.get());
+                // UAT 2026-05-06 #8: AgentServiceImpl notifies the
+                // tracker on every response so the per-agent KPI
+                // table populates and SSE agent-transition fires
+                // for live drawer updates.
+                agent_service_.set_execution_tracker(execution_tracker_.get());
 
-                    schedule_engine_ = std::make_unique<ScheduleEngine>(instr_db_pool_->get());
-                    schedule_engine_->create_tables();
+                approval_manager_ = std::make_unique<ApprovalManager>(instr_db_pool_->get());
+                approval_manager_->create_tables();
+
+                schedule_engine_ = std::make_unique<ScheduleEngine>(instr_db_pool_->get());
+                schedule_engine_->create_tables();
+            }
+        }
+
+        // Auto-import shipped content from content/definitions/ and content/packs/ — the
+        // every-boot bundled-content reseed loop (ADR-0058). The build-time embed_content.py
+        // script converts each YAML doc to a JSON envelope; we walk the arrays and upsert.
+        // Conflicts on already-existing ids are expected on second-and-later startups and
+        // silently skipped — content is the source of truth at boot, not override of in-place
+        // operator edits. Requires the Postgres instruction_store to be open; the
+        // `!startup_failed_` guard skips this on a construction failure that is about to refuse
+        // boot anyway.
+        //
+        // Conflict detection uses is_conflict_error() against the
+        // shared kConflictPrefix (Gate 4 C-B1 / arch-B1). Substring
+        // matching on "already exists" was fragile to localization
+        // and to error-string drift in the store layer.
+        //
+        // Audit emission: each successful import or skip writes one
+        // audit_store entry with principal="system" — closes Gate 6
+        // COMP-1 / sec-M2. Errors include the JSON envelope's `id`
+        // field in both the audit detail and the spdlog warning so
+        // operators can triage without reading 200+ envelopes by
+        // hand (Gate 6 SRE-O2).
+        //
+        // Gate 4 UP-4 (BLOCKING, HIGH-derived): a genuine DB error on any item was
+        // previously only counted (defs_errored/sets_errored) and logged at INFO — never
+        // checked against startup_failed_, unlike every OTHER store construction in this
+        // function. The server would boot and serve a silently partial catalog with no
+        // readiness signal. This loop is entirely synchronous inside the constructor —
+        // web_server_->listen() runs strictly after it returns — so there is no window
+        // where a partially-reseeded server is already accepting traffic; failing closed
+        // here means refusing to ever start serving, not interrupting an in-progress
+        // serve. A single-shot with_txn_for has no internal retry, so a transient blip on
+        // one of ~232 sequential items is a real, not hypothetical, trigger; the existing
+        // orchestrator crash-loop-backoff is the intended recovery (a failed item was
+        // never inserted, so a clean restart against a healthy Postgres re-imports it —
+        // ADR-0058's every-boot reseed already makes this self-healing).
+        if (instruction_store_ && instruction_store_->is_open() && !startup_failed_) {
+            auto audit_bundle = [this](std::string_view target_type, const std::string& target_id,
+                                       std::string_view result, const std::string& detail) {
+                // Hardening round 1 INFO — audit_store_ is
+                // initialized at server.cpp:394, before this
+                // block at :441; the null branch is unreachable
+                // today. Guard with an error log so a future
+                // re-ordering surfaces immediately rather than
+                // silently dropping boot-content audit events.
+                if (!audit_store_) {
+                    spdlog::error("bundled_content audit dropped: "
+                                  "audit_store_ not initialized "
+                                  "(target_type={} target_id={})",
+                                  target_type, target_id);
+                    return;
                 }
-
-                // Auto-import shipped content from content/definitions/ and
-                // content/packs/. The build-time embed_content.py script
-                // converts each YAML doc to a JSON envelope; we walk the
-                // arrays and upsert. Conflicts on already-existing ids are
-                // expected on second-and-later startups and silently
-                // skipped — content is the source of truth at boot, not
-                // override of in-place operator edits.
-                //
-                // Conflict detection uses is_conflict_error() against the
-                // shared kConflictPrefix (Gate 4 C-B1 / arch-B1). Substring
-                // matching on "already exists" was fragile to localization
-                // and to error-string drift in the store layer.
-                //
-                // Audit emission: each successful import or skip writes one
-                // audit_store entry with principal="system" — closes Gate 6
-                // COMP-1 / sec-M2. Errors include the JSON envelope's `id`
-                // field in both the audit detail and the spdlog warning so
-                // operators can triage without reading 200+ envelopes by
-                // hand (Gate 6 SRE-O2).
-                {
-                    auto audit_bundle = [this](std::string_view target_type,
-                                               const std::string& target_id,
-                                               std::string_view result, const std::string& detail) {
-                        // Hardening round 1 INFO — audit_store_ is
-                        // initialized at server.cpp:394, before this
-                        // block at :441; the null branch is unreachable
-                        // today. Guard with an error log so a future
-                        // re-ordering surfaces immediately rather than
-                        // silently dropping boot-content audit events.
-                        if (!audit_store_) {
-                            spdlog::error("bundled_content audit dropped: "
-                                          "audit_store_ not initialized "
-                                          "(target_type={} target_id={})",
-                                          target_type, target_id);
-                            return;
-                        }
-                        AuditEvent ev{};
-                        ev.timestamp = std::time(nullptr);
-                        ev.principal = "system";
-                        ev.principal_role = "system";
-                        ev.action = "content.bundled_import";
-                        ev.target_type = std::string(target_type);
-                        ev.target_id = target_id;
-                        ev.detail = detail;
-                        ev.result = std::string(result);
-                        (void)audit_store_->log(ev);
-                    };
-                    auto envelope_id = [](const std::string& env) -> std::string {
-                        auto p = nlohmann::json::parse(env, nullptr, false);
-                        return p.is_discarded() ? std::string{} : p.value("id", std::string{});
-                    };
-                    int defs_imported = 0, defs_skipped = 0, defs_errored = 0;
-                    for (const auto& env : kBundledDefinitions) {
-                        auto id = envelope_id(env);
-                        // #1073 / W7.4 sibling-gap: bundled content is
-                        // authenticated by build-time binary linkage; route
-                        // through the trusted variant so the runtime
-                        // signature gate doesn't reject definitions baked
-                        // into yuzu-server at compile time. The public
-                        // `import_definition_json` is reserved for
-                        // operator/network-supplied input.
-                        auto r = instruction_store_->import_definition_json_trusted(env);
-                        if (r) {
-                            ++defs_imported;
-                            audit_bundle("InstructionDefinition", *r, "success",
-                                         "boot-time content embed");
-                        } else if (is_conflict_error(r.error())) {
-                            ++defs_skipped;
-                        } else {
-                            ++defs_errored;
-                            spdlog::warn("bundled definition import failed: id={} error={}", id,
-                                         r.error());
-                            audit_bundle("InstructionDefinition", id, "error", r.error());
-                        }
-                    }
-                    int sets_imported = 0, sets_skipped = 0, sets_errored = 0;
-                    for (const auto& env : kBundledSets) {
-                        auto parsed = nlohmann::json::parse(env, nullptr, false);
-                        if (parsed.is_discarded()) {
-                            ++sets_errored;
-                            continue;
-                        }
-                        InstructionSet s;
-                        s.id = parsed.value("id", "");
-                        s.name = parsed.value("name", s.id);
-                        s.description = parsed.value("description", "");
-                        s.created_by = parsed.value("created_by", "system");
-                        if (s.id.empty()) {
-                            ++sets_errored;
-                            continue;
-                        }
-                        auto r = instruction_store_->create_set(s);
-                        if (r) {
-                            ++sets_imported;
-                            audit_bundle("InstructionSet", *r, "success",
-                                         "boot-time content embed");
-                        } else if (is_conflict_error(r.error())) {
-                            ++sets_skipped;
-                        } else {
-                            ++sets_errored;
-                            spdlog::warn("bundled set import failed: id={} error={}", s.id,
-                                         r.error());
-                            audit_bundle("InstructionSet", s.id, "error", r.error());
-                        }
-                    }
-                    spdlog::info(
-                        "bundled content: {} definitions imported / {} skipped / {} errored; "
-                        "{} sets imported / {} skipped / {} errored",
-                        defs_imported, defs_skipped, defs_errored, sets_imported, sets_skipped,
-                        sets_errored);
+                AuditEvent ev{};
+                ev.timestamp = std::time(nullptr);
+                ev.principal = "system";
+                ev.principal_role = "system";
+                ev.action = "content.bundled_import";
+                ev.target_type = std::string(target_type);
+                ev.target_id = target_id;
+                ev.detail = detail;
+                ev.result = std::string(result);
+                (void)audit_store_->log(ev);
+            };
+            auto envelope_id = [](const std::string& env) -> std::string {
+                auto p = nlohmann::json::parse(env, nullptr, false);
+                return p.is_discarded() ? std::string{} : p.value("id", std::string{});
+            };
+            int defs_imported = 0, defs_skipped = 0, defs_errored = 0;
+            for (const auto& env : kBundledDefinitions) {
+                auto id = envelope_id(env);
+                // #1073 / W7.4 sibling-gap: bundled content is
+                // authenticated by build-time binary linkage; route
+                // through the trusted variant so the runtime
+                // signature gate doesn't reject definitions baked
+                // into yuzu-server at compile time. The public
+                // `import_definition_json` is reserved for
+                // operator/network-supplied input. ADR-0058: this variant ALSO routes through
+                // the seed-aware insert path (deleted_seed_content-consulting) internally.
+                auto r = instruction_store_->import_definition_json_trusted(env);
+                if (r) {
+                    ++defs_imported;
+                    audit_bundle("InstructionDefinition", *r, "success",
+                                 "boot-time content embed");
+                } else if (is_conflict_error(r.error())) {
+                    ++defs_skipped;
+                } else {
+                    ++defs_errored;
+                    spdlog::warn("bundled definition import failed: id={} error={}", id,
+                                 r.error());
+                    // Gate 8 re-review (security-guardian): the boot log line above already
+                    // carries the raw driver text for operators — the persisted audit row
+                    // gets the genericized form, same shape as the other 3 sites this round
+                    // fixed (r.error() can carry a genuine kDbErrorPrefix failure, not just
+                    // an is_conflict_error, since that branch is handled above).
+                    audit_bundle("InstructionDefinition", id, "error",
+                                 genericize_db_error("bundled_content reseed", r.error()));
                 }
+            }
+            int sets_imported = 0, sets_skipped = 0, sets_errored = 0;
+            for (const auto& env : kBundledSets) {
+                auto parsed = nlohmann::json::parse(env, nullptr, false);
+                if (parsed.is_discarded()) {
+                    ++sets_errored;
+                    continue;
+                }
+                InstructionSet s;
+                s.id = parsed.value("id", "");
+                s.name = parsed.value("name", s.id);
+                s.description = parsed.value("description", "");
+                s.created_by = parsed.value("created_by", "system");
+                if (s.id.empty()) {
+                    ++sets_errored;
+                    continue;
+                }
+                // ADR-0058: the seed-aware entry point (consults deleted_seed_content so an
+                // operator-deleted bundled set is never resurrected) — NOT plain create_set,
+                // which is the REST-facing "create a custom set" path.
+                auto r = instruction_store_->create_set_seed(s);
+                if (r) {
+                    ++sets_imported;
+                    audit_bundle("InstructionSet", *r, "success",
+                                 "boot-time content embed");
+                } else if (is_conflict_error(r.error())) {
+                    ++sets_skipped;
+                } else {
+                    ++sets_errored;
+                    spdlog::warn("bundled set import failed: id={} error={}", s.id, r.error());
+                    // Gate 8 re-review (security-guardian): see the matching comment on the
+                    // definitions loop above.
+                    audit_bundle("InstructionSet", s.id, "error",
+                                 genericize_db_error("bundled_content reseed", r.error()));
+                }
+            }
+            if (defs_errored > 0 || sets_errored > 0) {
+                spdlog::error(
+                    "bundled content: {} definitions imported / {} skipped / {} errored; "
+                    "{} sets imported / {} skipped / {} errored — refusing to start "
+                    "(ADR-0058 Gate 8: a partial catalog is never served silently)",
+                    defs_imported, defs_skipped, defs_errored, sets_imported, sets_skipped,
+                    sets_errored);
+                metrics_.counter("yuzu_server_instruction_bundled_content_total",
+                                 {{"result", "errored"}})
+                    .increment();
+                startup_failed_ = true;
+            } else {
+                spdlog::info(
+                    "bundled content: {} definitions imported / {} skipped / {} errored; "
+                    "{} sets imported / {} skipped / {} errored",
+                    defs_imported, defs_skipped, defs_errored, sets_imported, sets_skipped,
+                    sets_errored);
+                metrics_.counter("yuzu_server_instruction_bundled_content_total",
+                                 {{"result", "clean"}})
+                    .increment();
             }
         }
 
@@ -15442,7 +15538,17 @@ private:
                 return;
             }
 
-            auto defs = instruction_store_->query_definitions(q);
+            // ADR-0058: query_definitions now returns std::expected — a genuine DB
+            // error 503s rather than silently rendering an empty list.
+            auto defs_result = instruction_store_->query_definitions(q);
+            if (!defs_result) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"instruction store read failed"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            const auto& defs = *defs_result;
             nlohmann::json arr = nlohmann::json::array();
             for (const auto& d : defs) {
                 arr.push_back({{"id", d.id},
@@ -15512,6 +15618,26 @@ private:
 
                 auto result = instruction_store_->create_definition(def);
                 if (!result) {
+                    // ADR-0058: a genuine DB/lease failure 503s — never falls through to
+                    // the conflict/validation split below (see delete routes for the
+                    // same check).
+                    if (result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0) {
+                        // R2: checked, not discarded — a create denial is a security-relevant
+                        // evidence-chain audit (see audit_log's [[nodiscard]] comment).
+                        // "error", not "denied" (gov Gate 6 compliance-officer finding): an
+                        // infra degrade is not an operator denial — matches policy.evaluate's
+                        // own error-vs-denied convention (rest-api.md's classification rule).
+                        const bool audit_ok = audit_log(req, "instruction.create", "error",
+                                                        "InstructionDefinition", def.id,
+                                                        "db_error");
+                        if (!audit_ok)
+                            res.set_header("Sec-Audit-Failed", "true");
+                        res.status = 503;
+                        res.set_content(
+                            R"({"error":{"code":503,"message":"instruction store unavailable"},"meta":{"api_version":"v1"}})",
+                            "application/json");
+                        return;
+                    }
                     // #402: store-level kConflictPrefix maps to HTTP 409. The
                     // prefix is an internal store↔route contract — strip it
                     // before placing the message in the operator-facing JSON
@@ -15561,29 +15687,39 @@ private:
             }
 
             auto id = req.matches[1].str();
-            auto def = instruction_store_->get_definition(id);
-            if (!def) {
+            // ADR-0058: get_definition now returns std::expected — distinguish a genuine
+            // DB error (503) from "no such definition" (404, unchanged).
+            auto def_result = instruction_store_->get_definition(id);
+            if (!def_result) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"instruction store read failed"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            if (!*def_result) {
                 res.status = 404;
                 res.set_content(
                     R"({"error":{"code":404,"message":"not found"},"meta":{"api_version":"v1"}})",
                     "application/json");
                 return;
             }
+            const auto& def = **def_result;
 
-            res.set_content(nlohmann::json({{"id", def->id},
-                                            {"name", def->name},
-                                            {"version", def->version},
-                                            {"type", def->type},
-                                            {"plugin", def->plugin},
-                                            {"action", def->action},
-                                            {"description", def->description},
-                                            {"enabled", def->enabled},
-                                            {"instruction_set_id", def->instruction_set_id},
-                                            {"gather_ttl_seconds", def->gather_ttl_seconds},
-                                            {"response_ttl_days", def->response_ttl_days},
-                                            {"created_by", def->created_by},
-                                            {"created_at", def->created_at},
-                                            {"updated_at", def->updated_at}})
+            res.set_content(nlohmann::json({{"id", def.id},
+                                            {"name", def.name},
+                                            {"version", def.version},
+                                            {"type", def.type},
+                                            {"plugin", def.plugin},
+                                            {"action", def.action},
+                                            {"description", def.description},
+                                            {"enabled", def.enabled},
+                                            {"instruction_set_id", def.instruction_set_id},
+                                            {"gather_ttl_seconds", def.gather_ttl_seconds},
+                                            {"response_ttl_days", def.response_ttl_days},
+                                            {"created_by", def.created_by},
+                                            {"created_at", def.created_at},
+                                            {"updated_at", def.updated_at}})
                                 .dump(),
                             "application/json");
         });
@@ -15604,9 +15740,18 @@ private:
             try {
                 auto j = nlohmann::json::parse(req.body);
 
-                // Read existing definition to preserve fields not in the update
-                auto existing = instruction_store_->get_definition(id);
-                if (!existing) {
+                // Read existing definition to preserve fields not in the update.
+                // ADR-0058: get_definition now returns std::expected — distinguish a
+                // genuine DB error (503) from "no such definition" (404, unchanged).
+                auto existing_result = instruction_store_->get_definition(id);
+                if (!existing_result) {
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"instruction store read failed"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
+                if (!*existing_result) {
                     res.status = 404;
                     res.set_content(
                         R"({"error":{"code":404,"message":"instruction definition not found"},"meta":{"api_version":"v1"}})",
@@ -15614,7 +15759,7 @@ private:
                     return;
                 }
 
-                InstructionDefinition def = *existing;
+                InstructionDefinition def = **existing_result;
                 if (j.contains("name"))
                     def.name = j["name"].get<std::string>();
                 if (j.contains("version"))
@@ -15652,8 +15797,33 @@ private:
 
                 auto result = instruction_store_->update_definition(def);
                 if (!result) {
-                    res.status = 400;
-                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
+                    // ADR-0058: a genuine DB/lease failure 503s; "not_found: " -> 404 (mirrors
+                    // the DELETE route immediately below); everything else is a 400 validation
+                    // error. Previously not_found fell through to the 400 branch, indistinguishable
+                    // from a validation failure (consistency-auditor Gate 8 finding).
+                    bool db_error = result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0;
+                    bool not_found = !db_error && result.error().rfind("not_found: ", 0) == 0;
+                    // Audited on db_error (existing convention) and not_found (matches the
+                    // DELETE route's audited not_found branch just below); a plain validation
+                    // 400 stays unaudited, matching create_definition's equivalent branch.
+                    // R2: checked, not discarded — an update denial is a security-relevant
+                    // evidence-chain audit (see audit_log's [[nodiscard]] comment).
+                    bool audit_ok = true;
+                    if (db_error)
+                        // "error", not "denied" (gov Gate 6 compliance-officer finding): an
+                        // infra degrade is not an operator denial.
+                        audit_ok = audit_log(req, "instruction.update", "error",
+                                             "InstructionDefinition", id, "db_error");
+                    else if (not_found)
+                        audit_ok = audit_log(req, "instruction.update", "denied",
+                                             "InstructionDefinition", id, "not_found");
+                    if ((db_error || not_found) && !audit_ok)
+                        res.set_header("Sec-Audit-Failed", "true");
+                    res.status = db_error ? 503 : (not_found ? 404 : 400);
+                    res.set_content(nlohmann::json({{"error", db_error
+                                                                   ? "instruction store unavailable"
+                                                                   : result.error()}})
+                                        .dump(),
                                     "application/json");
                     return;
                 }
@@ -15682,15 +15852,41 @@ private:
             }
 
             auto id = req.matches[1].str();
-            bool deleted = instruction_store_->delete_definition(id);
-            if (deleted) {
-                (void)audit_log(req, "instruction.delete", "success", "InstructionDefinition", id);
-                emit_event("instruction.deleted", req, {}, {{"instruction_id", id}});
-                res.set_header(
-                    "HX-Trigger",
-                    R"({"showToast":{"message":"Instruction definition deleted","level":"success"}})");
+            // ADR-0058: delete_definition now returns std::expected<void, std::string> —
+            // a genuine DB error 503s distinctly; "not_found: " -> 404 (mirrors
+            // ProductPackStore::uninstall's identical REST contract change,
+            // workflow_routes.cpp product_pack_error_status).
+            auto del_result = instruction_store_->delete_definition(id);
+            // R2: checked, not discarded — a delete denial is a security-relevant
+            // evidence-chain audit (see audit_log's [[nodiscard]] comment).
+            if (!del_result && del_result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0) {
+                // "error", not "denied" (gov Gate 6 compliance-officer finding): an infra
+                // degrade is not an operator denial.
+                if (!audit_log(req, "instruction.delete", "error", "InstructionDefinition", id,
+                               "db_error"))
+                    res.set_header("Sec-Audit-Failed", "true");
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"instruction store delete failed"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
             }
-            res.set_content(nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
+            if (!del_result) {
+                if (!audit_log(req, "instruction.delete", "denied", "InstructionDefinition", id,
+                               "not_found"))
+                    res.set_header("Sec-Audit-Failed", "true");
+                res.status = 404;
+                res.set_content(
+                    R"({"error":{"code":404,"message":"instruction definition not found"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            (void)audit_log(req, "instruction.delete", "success", "InstructionDefinition", id);
+            emit_event("instruction.deleted", req, {}, {{"instruction_id", id}});
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Instruction definition deleted","level":"success"}})");
+            res.set_content(nlohmann::json({{"deleted", true}}).dump(), "application/json");
         });
 
         web_server_->Get(R"(/api/instructions/([^/]+)/export)", [this](const httplib::Request& req,
@@ -15706,8 +15902,17 @@ private:
             }
 
             auto id = req.matches[1].str();
-            auto json = instruction_store_->export_definition_json(id);
-            res.set_content(json, "application/json");
+            // ADR-0058: export_definition_json now returns std::expected — a genuine
+            // DB error 503s rather than silently rendering an empty/malformed body.
+            auto json_result = instruction_store_->export_definition_json(id);
+            if (!json_result) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"instruction store read failed"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            res.set_content(*json_result, "application/json");
         });
 
         web_server_->Post("/api/instructions/import", [this](const httplib::Request& req,
@@ -15724,6 +15929,22 @@ private:
 
             auto result = instruction_store_->import_definition_json(req.body);
             if (!result) {
+                // ADR-0058: a genuine DB/lease failure 503s — never falls through to the
+                // conflict/validation split below. R4: audited the same as every other
+                // rejection branch below (gov Gate 6 compliance-officer finding).
+                if (result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0) {
+                    // "error", not "denied" (gov Gate 6 compliance-officer finding, second
+                    // round): an infra degrade is not an operator denial.
+                    const bool audit_ok = audit_log(req, "instruction.import", "error",
+                                                    "InstructionDefinition", "", "db_error");
+                    if (!audit_ok)
+                        res.set_header("Sec-Audit-Failed", "true");
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"instruction store unavailable"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
                 // iter-H2: /import shares the create_definition_impl path,
                 // so it inherits the kConflictPrefix → 409 mapping that the
                 // POST handler does. Without this mapping the import path
@@ -15799,7 +16020,17 @@ private:
                 return;
             }
 
-            auto sets = instruction_store_->list_sets();
+            // ADR-0058: list_sets now returns std::expected — a genuine DB error 503s
+            // rather than silently rendering an empty list.
+            auto sets_result = instruction_store_->list_sets();
+            if (!sets_result) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"instruction store read failed"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            const auto& sets = *sets_result;
             nlohmann::json arr = nlohmann::json::array();
             for (const auto& s : sets) {
                 arr.push_back({{"id", s.id},
@@ -15830,9 +16061,31 @@ private:
             s.description = desc;
             auto result = instruction_store_->create_set(s);
             if (!result) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
-                                "application/json");
+                // ADR-0058: a genuine DB/lease failure 503s, never falls through to
+                // the conflict/validation split below.
+                // Not audited: this route has no audit logging at all (success or failure),
+                // pre-existing and unrelated to this migration — tracked separately, not
+                // asymmetrically half-fixed here (see the instruction-sets audit-gap issue).
+                bool db_error = result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0;
+                if (db_error) {
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":"instruction store unavailable"})",
+                        "application/json");
+                    return;
+                }
+                // Gate 4 Finding A / Gate 6 enterprise-readiness: this route was the one
+                // sibling of instruction.create/update/delete that never added the
+                // is_conflict_error branch store_errors.hpp's kConflictPrefix comment says
+                // every duplicate-class error site must handle — a duplicate id fell
+                // through to plain 400 with the raw unstripped "conflict:" prefix in the
+                // body. Matches instruction.create's pattern (this route still has no audit
+                // logging at all, pre-existing gap, not fixed here).
+                bool is_conflict = is_conflict_error(result.error());
+                res.status = is_conflict ? 409 : 400;
+                auto body_msg = is_conflict ? std::string(strip_conflict_prefix(result.error()))
+                                            : result.error();
+                res.set_content(nlohmann::json({{"error", body_msg}}).dump(), "application/json");
                 return;
             }
             res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
@@ -15851,8 +16104,37 @@ private:
             }
 
             auto id = req.matches[1].str();
-            bool deleted = instruction_store_->delete_set(id);
-            res.set_content(nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
+            // ADR-0058: delete_set now returns std::expected<void, std::string> — a
+            // genuine DB error 503s distinctly; "not_found: " -> 404 (mirrors
+            // ProductPackStore::uninstall's identical REST contract change).
+            auto del_result = instruction_store_->delete_set(id);
+            // R2 / gov Gate 4 consistency-auditor finding: these 404/503 denial branches are
+            // new in this migration (pre-migration delete_set was an undifferentiated
+            // 200 {"deleted": bool} with no distinguishable denial to audit) — unlike
+            // create_set (still undifferentiated 400/503 today, tracked separately, see the
+            // instruction-sets audit-gap issue), these are new-in-this-diff and must not ship
+            // unaudited from birth.
+            if (!del_result && del_result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0) {
+                if (!audit_log(req, "instruction_set.delete", "error", "InstructionSet", id,
+                               "db_error"))
+                    res.set_header("Sec-Audit-Failed", "true");
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"instruction store delete failed"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            if (!del_result) {
+                if (!audit_log(req, "instruction_set.delete", "denied", "InstructionSet", id,
+                               "not_found"))
+                    res.set_header("Sec-Audit-Failed", "true");
+                res.status = 404;
+                res.set_content(
+                    R"({"error":{"code":404,"message":"instruction set not found"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            res.set_content(nlohmann::json({{"deleted", true}}).dump(), "application/json");
         });
 
         // -- Execution API ----------------------------------------------------
@@ -16469,7 +16751,14 @@ private:
                     return;
                 }
 
-                auto defs = instruction_store_->query_definitions();
+                // ADR-0058: query_definitions now returns std::expected — a genuine DB
+                // error degrades to the same "Not available" fragment as a null store.
+                auto defs_result = instruction_store_->query_definitions();
+                if (!defs_result) {
+                    res.set_content("<div class=\"empty-state\">Not available</div>", "text/html");
+                    return;
+                }
+                const auto& defs = *defs_result;
 
                 // Check if user has PlatformEngineer or Administrator role
                 // PlatformEngineer or Administrator can author definitions.
@@ -16571,37 +16860,41 @@ private:
             std::string tmpl(kInstructionEditorHtml);
             auto def_id = req.get_param_value("id");
             if (!def_id.empty() && instruction_store_) {
-                auto def = instruction_store_->get_definition(def_id);
-                if (def) {
+                // ADR-0058: a DB-error outer result skips this best-effort pre-fill (the
+                // form falls back to unreplaced placeholders), same as a not-found inner
+                // optional did pre-migration.
+                auto def_result = instruction_store_->get_definition(def_id);
+                if (def_result && *def_result) {
+                    const auto& def = **def_result;
                     auto replace = [&](const std::string& key, const std::string& val) {
                         for (auto pos = tmpl.find(key); pos != std::string::npos;
                              pos = tmpl.find(key))
                             tmpl.replace(pos, key.size(), html_escape(val));
                     };
                     replace("{{TITLE}}", "Edit Definition");
-                    replace("{{DEF_ID}}", def->id);
-                    replace("{{DEF_NAME}}", def->name);
-                    replace("{{DEF_VERSION}}", def->version);
-                    replace("{{DEF_PLUGIN}}", def->plugin);
-                    replace("{{DEF_ACTION}}", def->action);
-                    replace("{{DEF_DESCRIPTION}}", def->description);
-                    replace("{{DEF_PLATFORMS}}", def->platforms);
-                    replace("{{YAML_SOURCE}}", def->yaml_source);
+                    replace("{{DEF_ID}}", def.id);
+                    replace("{{DEF_NAME}}", def.name);
+                    replace("{{DEF_VERSION}}", def.version);
+                    replace("{{DEF_PLUGIN}}", def.plugin);
+                    replace("{{DEF_ACTION}}", def.action);
+                    replace("{{DEF_DESCRIPTION}}", def.description);
+                    replace("{{DEF_PLATFORMS}}", def.platforms);
+                    replace("{{YAML_SOURCE}}", def.yaml_source);
                     // Set dropdowns
-                    replace("{{SEL_QUESTION}}", def->type == "question" ? "selected" : "");
-                    replace("{{SEL_ACTION}}", def->type == "action" ? "selected" : "");
-                    replace("{{SEL_APPR_AUTO}}", def->approval_mode == "auto" ? "selected" : "");
+                    replace("{{SEL_QUESTION}}", def.type == "question" ? "selected" : "");
+                    replace("{{SEL_ACTION}}", def.type == "action" ? "selected" : "");
+                    replace("{{SEL_APPR_AUTO}}", def.approval_mode == "auto" ? "selected" : "");
                     replace("{{SEL_APPR_ROLE}}",
-                            def->approval_mode == "role-gated" ? "selected" : "");
+                            def.approval_mode == "role-gated" ? "selected" : "");
                     replace("{{SEL_APPR_ALWAYS}}",
-                            def->approval_mode == "always" ? "selected" : "");
+                            def.approval_mode == "always" ? "selected" : "");
                     replace("{{SEL_CC_UNLIM}}",
-                            def->concurrency_mode == "unlimited" ? "selected" : "");
+                            def.concurrency_mode == "unlimited" ? "selected" : "");
                     replace("{{SEL_CC_DEV}}",
-                            def->concurrency_mode == "per-device" ? "selected" : "");
+                            def.concurrency_mode == "per-device" ? "selected" : "");
                     replace("{{SEL_CC_DEF}}",
-                            def->concurrency_mode == "per-definition" ? "selected" : "");
-                    replace("{{SEL_CC_SET}}", def->concurrency_mode == "per-set" ? "selected" : "");
+                            def.concurrency_mode == "per-definition" ? "selected" : "");
+                    replace("{{SEL_CC_SET}}", def.concurrency_mode == "per-set" ? "selected" : "");
                 }
             } else {
                 // New definition — clear all placeholders
@@ -16732,7 +17025,14 @@ private:
                 if (!result) {
                     spdlog::warn("instruction yaml update failed: id={} error={}",
                                  log_safe(def_id), result.error());
-                    respond("Update failed: " + result.error(), false);
+                    // A db_error-prefixed message can carry libpq internals (PQerrorMessage
+                    // fragments) — generic-ize it before it reaches the operator, matching
+                    // workflow_routes.cpp's product_pack_client_message convention (gov Gate 4
+                    // consistency finding).
+                    bool db_error = result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0;
+                    respond("Update failed: " +
+                                (db_error ? "instruction store unavailable" : result.error()),
+                            false);
                     return;
                 }
                 (void)audit_log(req, "instruction.update", "success", "InstructionDefinition",
@@ -16762,7 +17062,11 @@ private:
                                     std::string(strip_conflict_prefix(result.error())),
                                 false);
                     } else {
-                        respond("Create failed: " + result.error(), false);
+                        // See the update-branch comment above (gov Gate 4 consistency finding).
+                        bool db_error = result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0;
+                        respond("Create failed: " +
+                                    (db_error ? "instruction store unavailable" : result.error()),
+                                false);
                     }
                     return;
                 }

@@ -192,9 +192,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             std::string def_label;
             std::string def_title;
             if (instruction_store && instruction_store->is_open() && !e.definition_id.empty()) {
-                auto def = instruction_store->get_definition(e.definition_id);
-                if (def && !def->name.empty()) {
-                    def_label = def->name;
+                // ADR-0058: a DB-error outer result falls through to the id-truncated
+                // fallback below, same as a not-found inner optional did pre-migration
+                // — this is a best-effort display label, not a security/dispatch path.
+                auto def_result = instruction_store->get_definition(e.definition_id);
+                if (def_result && *def_result && !(*def_result)->name.empty()) {
+                    def_label = (*def_result)->name;
                     def_title = e.definition_id;
                 }
             }
@@ -317,9 +320,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // -- Definition lookup -------------------------------------------
             std::string def_name = exec.definition_id;
             if (instruction_store && instruction_store->is_open() && !exec.definition_id.empty()) {
-                if (auto def = instruction_store->get_definition(exec.definition_id);
-                    def && !def->name.empty()) {
-                    def_name = def->name;
+                // ADR-0058: a DB-error outer result falls through to the id fallback
+                // above, same as a not-found inner optional did pre-migration.
+                if (auto def_result = instruction_store->get_definition(exec.definition_id);
+                    def_result && *def_result && !(*def_result)->name.empty()) {
+                    def_name = (*def_result)->name;
                 }
             }
 
@@ -1359,8 +1364,20 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 if (!session)
                     return;
                 for (const auto& step : workflow->steps) {
-                    auto step_def = instruction_store->get_definition(step.instruction_id);
-                    if (!step_def) {
+                    // ADR-0058: get_definition now returns std::expected — distinguish a
+                    // genuine DB error (503) from "no such instruction" (400, unchanged).
+                    auto step_def_result = instruction_store->get_definition(step.instruction_id);
+                    if (!step_def_result) {
+                        res.status = 503;
+                        res.set_content(
+                            nlohmann::json({{"error", {{"code", 503},
+                                                       {"message", "instruction store unavailable"}}},
+                                            {"meta", {{"api_version", "v1"}}}})
+                                .dump(),
+                            "application/json");
+                        return;
+                    }
+                    if (!*step_def_result) {
                         res.status = 400;
                         res.set_content(
                             nlohmann::json({{"error",
@@ -1373,12 +1390,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                             "application/json");
                         return;
                     }
-                    if (step_def->approval_mode == "auto")
+                    const auto& step_def = **step_def_result;
+                    if (step_def.approval_mode == "auto")
                         continue;
                     bool blocked = false;
-                    if (step_def->approval_mode == "always") {
+                    if (step_def.approval_mode == "always") {
                         blocked = true;
-                    } else if (step_def->approval_mode == "role-gated") {
+                    } else if (step_def.approval_mode == "role-gated") {
                         // effective_role so an active JIT admin elevation bypasses
                         // role-gated approval, consistent with require_admin.
                         blocked = (auth::effective_role(*session) != auth::Role::admin);
@@ -1394,7 +1412,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                    {"message",
                                     "workflow step '" + step.label + "' references instruction '" +
                                         step.instruction_id + "' which requires approval (mode: " +
-                                        step_def->approval_mode +
+                                        step_def.approval_mode +
                                         "). Submit each instruction individually for approval."}}},
                                  {"meta", {{"api_version", "v1"}}}})
                                 .dump(),
@@ -1417,9 +1435,20 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             if (!instruction_store || !instruction_store->is_open())
                 return std::unexpected<std::string>("instruction store not available");
 
-            auto def = instruction_store->get_definition(instruction_id);
-            if (!def)
+            // ADR-0058: get_definition now returns std::expected — a genuine DB error
+            // and "no such instruction" are distinct dispatch-path failures, both
+            // fail the step (neither can silently widen or narrow the target set).
+            auto def_result = instruction_store->get_definition(instruction_id);
+            if (!def_result)
+                // Gate 2 SEC-1: def_result.error() carries raw PQerrorMessage() text on a
+                // genuine DB failure — genericized before it reaches the stored step result
+                // (GET /api/workflow-executions/:id echoes this verbatim to any Workflow:Read
+                // holder).
+                return std::unexpected<std::string>(yuzu::server::genericize_db_error(
+                    "dispatch_fn instruction lookup", def_result.error()));
+            if (!*def_result)
                 return std::unexpected<std::string>("unknown instruction: " + instruction_id);
+            const auto& def = **def_result;
 
             // Parse agent_ids from JSON array
             std::vector<std::string> target_ids;
@@ -1468,7 +1497,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // record_execution_id is skipped and responses arrive with
             // the legacy sentinel (legacy fallback in detail handler
             // covers the rendering).
-            auto [command_id, sent] = cmd_dispatch(def->plugin, def->action, target_ids, "", params,
+            auto [command_id, sent] = cmd_dispatch(def.plugin, def.action, target_ids, "", params,
                                                    /*execution_id=*/"", caller);
 
             if (sent == 0)
@@ -1572,14 +1601,25 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         auto def_id = req.matches[1].str();
-        auto def = instruction_store->get_definition(def_id);
-        if (!def) {
+        // ADR-0058: get_definition now returns std::expected — distinguish a genuine
+        // DB error (503, same shape as the store-unavailable check above) from
+        // "no such definition" (404, unchanged).
+        auto def_result = instruction_store->get_definition(def_id);
+        if (!def_result) {
+            res.status = 503;
+            res.set_content(
+                R"({"error":{"code":503,"message":"instruction store not available"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
+        if (!*def_result) {
             res.status = 404;
             res.set_content(
                 R"({"error":{"code":404,"message":"instruction definition not found"},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }
+        const auto& def = **def_result;
 
         // Parse request body
         nlohmann::json j;
@@ -1682,21 +1722,21 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // available, create a pending approval instead of dispatching immediately.
         // Unknown approval_mode values are treated as requiring approval
         // (fail-closed) to prevent typos from silently bypassing the gate.
-        if (!approval_manager && def->approval_mode != "auto") {
+        if (!approval_manager && def.approval_mode != "auto") {
             spdlog::error("instruction '{}' requires approval (mode={}) but "
                           "approval_manager is not available — rejecting execution",
-                          def_id, def->approval_mode);
+                          def_id, def.approval_mode);
             res.status = 503;
             res.set_content(
                 R"({"error":{"code":503,"message":"approval system unavailable — cannot execute approval-gated instruction"},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }
-        if (approval_manager && def->approval_mode != "auto") {
+        if (approval_manager && def.approval_mode != "auto") {
             bool needs_approval = false;
-            if (def->approval_mode == "always") {
+            if (def.approval_mode == "always") {
                 needs_approval = true;
-            } else if (def->approval_mode == "role-gated") {
+            } else if (def.approval_mode == "role-gated") {
                 // role-gated: admins (incl. an active JIT elevation) bypass, all
                 // others need approval — effective_role for elevation consistency.
                 needs_approval = (auth::effective_role(*session) != auth::Role::admin);
@@ -1704,7 +1744,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 // Unknown mode — fail closed (require approval)
                 spdlog::warn("instruction '{}' has unrecognized approval_mode '{}' "
                              "— requiring approval (fail-closed)",
-                             def_id, def->approval_mode);
+                             def_id, def.approval_mode);
                 needs_approval = true;
             }
 
@@ -1733,7 +1773,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     return;
                 }
                 audit_fn(req, "instruction.approval_required", "pending", "instruction", def_id,
-                         "approval_id=" + *result + " mode=" + def->approval_mode);
+                         "approval_id=" + *result + " mode=" + def.approval_mode);
                 emit_fn("approval.created", req);
                 res.set_header(
                     "HX-Trigger",
@@ -1802,7 +1842,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 caller_fn ? caller_fn(req)
                           : yuzu::server::DispatchCaller{
                                 .exec_visible = yuzu::server::authz::deny_all()};
-            std::tie(command_id, sent) = cmd_dispatch(def->plugin, def->action, agent_ids,
+            std::tie(command_id, sent) = cmd_dispatch(def.plugin, def.action, agent_ids,
                                                       dispatch_scope, params, execution_id,
                                                       caller);
         } catch (const std::exception& e) {
@@ -2032,7 +2072,19 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // YAML so we don't echo it into target_id (would create an
             // attacker-influenced audit key); the pack name is recoverable
             // from the request body if forensics need it.
-            audit_fn(req, "product_pack.install", "denied", "ProductPack", "", result.error());
+            //
+            // Gate 4 Finding B / Gate 6 CO-1 (third instance of SEC-1/ARCH-1's class):
+            // result.error() can carry a genuine kDbErrorPrefix failure from any
+            // install_fn arm (InstructionStore/PolicyStore/WorkflowEngine) — the response
+            // body was already genericized below via product_pack_client_message, but this
+            // audit row previously stored the raw driver text verbatim AND hardcoded
+            // "denied" even on an infrastructure failure, misclassifying an outage as an
+            // access decision (the exact vocabulary bug commit 849cf6a34 fixed at 7 other
+            // sites, missed here).
+            audit_fn(req, "product_pack.install",
+                     yuzu::server::is_generic_db_error(result.error()) ? "error" : "denied",
+                     "ProductPack", "",
+                     yuzu::server::genericize_db_error("product_pack.install", result.error()));
             res.status = product_pack_error_status(result.error());
             res.set_content(detail::a4_error(res, product_pack_client_message(
                                                        "POST /api/product-packs", result.error())),
@@ -2123,19 +2175,40 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         auto id = req.matches[1].str();
 
-        // Uninstall callback: delegate to the appropriate store
-        auto uninstall_fn = [instruction_store, policy_store, workflow_engine](
-                                const std::string& kind, const std::string& item_id) -> bool {
+        // Uninstall callback: delegate to the appropriate store. InstructionDefinition passes
+        // through InstructionStore's real db_error/not_found split (ADR-0058) so a genuine DB
+        // failure aborts the whole pack uninstall instead of being silently tolerated as a
+        // removed item (product_pack_store.cpp's uninstall() checks the prefix). PolicyFragment/
+        // Policy/Workflow's origin stores are still bool-only — `false` there maps to a tolerated
+        // not_found, matching pre-ADR-0058 behaviour for those kinds.
+        auto uninstall_fn = [instruction_store, policy_store,
+                             workflow_engine](const std::string& kind, const std::string& item_id)
+            -> std::expected<void, std::string> {
             if (kind == "InstructionDefinition") {
-                return instruction_store && instruction_store->delete_definition(item_id);
+                // db_error, not not_found (gov Gate 3/4 finding): a null instruction_store is
+                // a genuine unavailability, not "this item doesn't exist" — using the tolerated
+                // prefix here would let ProductPackStore::uninstall delete the pack row while
+                // the (never-touched) instruction definition stays live. Currently unreachable
+                // (instruction_store_ and product_pack_store_ share one boot latch — cpp-expert
+                // Gate 3), kept correct as defense-in-depth against that invariant changing.
+                if (!instruction_store)
+                    return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                                           "instruction store unavailable");
+                return instruction_store->delete_definition(item_id);
             } else if (kind == "PolicyFragment") {
-                return policy_store && policy_store->delete_fragment(item_id);
+                if (policy_store && policy_store->delete_fragment(item_id))
+                    return {};
+                return std::unexpected("not_found: policy fragment '" + item_id + "'");
             } else if (kind == "Policy") {
-                return policy_store && policy_store->delete_policy(item_id);
+                if (policy_store && policy_store->delete_policy(item_id))
+                    return {};
+                return std::unexpected("not_found: policy '" + item_id + "'");
             } else if (kind == "Workflow") {
-                return workflow_engine && workflow_engine->delete_workflow(item_id);
+                if (workflow_engine && workflow_engine->delete_workflow(item_id))
+                    return {};
+                return std::unexpected("not_found: workflow '" + item_id + "'");
             }
-            return false;
+            return std::unexpected("not_found: unsupported item kind '" + kind + "'");
         };
 
         auto result = product_pack_store->uninstall(id, uninstall_fn);

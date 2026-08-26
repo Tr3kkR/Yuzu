@@ -124,9 +124,10 @@ public:
     /// the dispatch execution_id, or "" if the policy is missing / has no check
     /// instruction / matches no agents / already has one in flight — a
     /// legitimate no-op, never an error. `unexpected` means an internal store
-    /// failure (degraded policy read, or the durable-dispatch-claim stamp
-    /// failed) — the caller must surface this as degraded, not as "no
-    /// targets."
+    /// failure (degraded policy read, the durable-dispatch-claim stamp failed,
+    /// or — ADR-0058 — InstructionStore itself errored resolving the check
+    /// instruction) — the caller must surface this as degraded (503), not as
+    /// "no targets" (409).
     [[nodiscard]] std::expected<std::string, std::string>
     evaluate_now(const std::string& policy_id);
 
@@ -138,7 +139,10 @@ public:
         // string prefix on `error`. A previous route-layer version keyed off
         // `error.starts_with("policy store")`, an unshared, untested string
         // contract a future reword of any degrade message would silently
-        // break (consistency-auditor SHOULD-2).
+        // break (consistency-auditor SHOULD-2). Covers a genuine PolicyStore
+        // degrade AND — ADR-0058 — InstructionStore erroring resolving the
+        // fix instruction; both are the same "internal store failure, not a
+        // business rejection" shape to every caller.
         bool degraded{false};
         std::string execution_id; // fix-dispatch execution id when ok
         int agents{0};            // agents the fix was dispatched to
@@ -197,11 +201,16 @@ private:
     std::expected<std::string, std::string> kickoff_check(const Policy& p);
 
     // Dispatch `instruction_id` to `targets`; returns a fresh execution_id, or
-    // "" on failure (unknown definition / empty targets). Must be called WITHOUT
+    // "" on a legitimate no-op (unknown definition / empty targets — same as
+    // pre-migration). `unexpected` when InstructionStore::get_definition itself
+    // errors (ADR-0058: a genuine DB/lease failure must never collapse into the
+    // same "" a not-found id returns — every caller propagates this the same
+    // way it propagates its own other degrade paths). Must be called WITHOUT
     // mu_ held (invokes the blocking dispatch_fn).
-    std::string dispatch_instruction(const std::string& instruction_id,
-                                     const std::unordered_map<std::string, std::string>& parameters,
-                                     const std::vector<std::string>& targets);
+    std::expected<std::string, std::string>
+    dispatch_instruction(const std::string& instruction_id,
+                         const std::unordered_map<std::string, std::string>& parameters,
+                         const std::vector<std::string>& targets);
 
     int64_t now() const;
     static std::string gen_execution_id();

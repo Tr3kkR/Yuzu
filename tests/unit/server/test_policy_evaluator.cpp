@@ -2,8 +2,8 @@
  * test_policy_evaluator.cpp — Unit tests for the compliance check -> verdict
  * pipeline (PolicyEvaluator).
  *
- * Strategy: real PolicyStore (Postgres, ADR-0056) / InstructionStore (still
- * SQLite) / ResponseStore (Postgres, ADR-0039) / ManagementGroupStore
+ * Strategy: real PolicyStore (Postgres, ADR-0056) / InstructionStore (Postgres,
+ * ADR-0058) / ResponseStore (Postgres, ADR-0039) / ManagementGroupStore
  * (Postgres, ADR-0042) on a shared pool + per-test temp files, target
  * resolution via a static management group (so no AgentRegistry is needed),
  * a FAKE dispatch_fn that synchronously seeds canned ResponseStore rows
@@ -77,9 +77,11 @@ std::string out_json2(const std::string& c1, const std::string& v1, const std::s
 }
 
 struct Harness {
-    yuzu::test::TempDbFile insdb{std::string_view("ins-")};
+    // PolicyStore (ADR-0056) and InstructionStore (ADR-0058) are both migrated
+    // Postgres stores now — share the same pool/database as ResponseStore
+    // below (schema-per-store, ADR-0008).
     PolicyStore ps;
-    InstructionStore is{insdb.path};
+    InstructionStore is;
     ResponseStore rs;
     yuzu::test::ManagementGroupStorePg mg_bundle;
     ManagementGroupStore& mg = *mg_bundle;
@@ -92,7 +94,7 @@ struct Harness {
 
     std::string group_id;
 
-    explicit Harness(pg::PgPool& pool) : ps(pool), rs(pool) {
+    explicit Harness(pg::PgPool& pool) : ps(pool), is(pool), rs(pool) {
         auto def = [&](const std::string& id, const std::string& plugin) {
             InstructionDefinition d;
             d.id = id;
@@ -282,6 +284,30 @@ TEST_CASE("policy evaluator: non-responder -> unknown, plugin failure -> error",
 
     CHECK(h.status_of(pid, "agentA") == "error");
     CHECK(h.status_of(pid, "agentB") == "unknown");
+}
+
+TEST_CASE("policy evaluator: InstructionStore DB error on dispatch is distinct from unknown "
+          "instruction (ADR-0058: must not collapse a genuine failure into the same skip)",
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    auto pid = h.author("result.hostname != ''");
+
+    // A second InstructionStore backed by an unreachable pool simulates a genuine DB failure —
+    // swapped in for this test only, in place of the harness's normally-open store.
+    PgPool broken_pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 1}};
+    REQUIRE_FALSE(broken_pool.valid());
+    InstructionStore broken_is{broken_pool};
+    REQUIRE_FALSE(broken_is.is_open());
+
+    auto deps = h.deps();
+    deps.instruction_store = &broken_is;
+    PolicyEvaluator ev(deps);
+
+    auto result = ev.evaluate_now(pid);
+    CHECK_FALSE(result.has_value()); // degraded, never a silent "no targets" empty string
+    CHECK(h.dispatch_calls == 0); // never reached dispatch_fn — failed resolving the definition
 }
 
 TEST_CASE("policy evaluator: missing CEL field resolves empty -> non_compliant",

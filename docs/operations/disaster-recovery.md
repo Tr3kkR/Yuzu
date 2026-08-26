@@ -12,9 +12,11 @@
 
 > Shipped InstructionDefinitions live inside the `yuzu-server` binary
 > (embedded at build time by `server/core/scripts/embed_content.py`)
-> and are re-seeded into `instructions.db` on first boot. Operator
-> edits to definitions persist in `instructions.db`, which is already
-> covered above.
+> and are reseeded on every boot into the PostgreSQL `instruction_store`
+> schema (ADR-0058) — not `instructions.db`, which this store no longer
+> reads or writes. Operator edits to definitions persist in Postgres;
+> back them up via the `pg_dump`/`pg_restore` procedure covered
+> elsewhere in this document for the server's Postgres substrate.
 
 ## Backup Strategy
 

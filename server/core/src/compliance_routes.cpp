@@ -933,6 +933,15 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             }
             auto exec_res = policy_evaluator_->evaluate_now(id);
             if (!exec_res) {
+                // ADR-0058 / gov Gate 6: this 503 covers a genuine InstructionStore DB/lease
+                // failure (among the other internal-degrade causes evaluate_now can return) —
+                // audited the same as every other denial branch on this route, re-applied here
+                // in evaluate_now's new std::expected shape after ADR-0056's durable-claim
+                // rework (governance ledger finding gov8r1-cas-timestamp-aba's re-verify).
+                // "error", not "denied" (merge-time re-verify finding): an infra degrade is not
+                // an operator denial — matches /remediate's own degraded ? "error" : "denied"
+                // convention a few lines below, which this re-add had missed.
+                audit_fn_(req, "policy.evaluate", "error", "policy", id, "degraded");
                 res.status = 503;
                 res.set_content(
                     nlohmann::json({{"error", {{"code", 503}, {"message", "policy evaluation degraded"}}},

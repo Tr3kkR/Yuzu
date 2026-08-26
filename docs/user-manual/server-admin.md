@@ -513,13 +513,15 @@ declared id).
 **What to do.** Before upgrading, check for affected content. Query the instruction database
 directly rather than the REST list route: `GET /api/v1/definitions` caps its result at 100
 definitions, and the shipped content alone exceeds that, so an API-based check can report a
-false all-clear. `GLOB` rather than `LIKE` because SQLite's `LIKE` is case-insensitive and
-the reservation is not — `MCP.foo` is a different id everywhere else in the system and is
-not reserved.
+false all-clear. Use a case-sensitive glob-style match — Postgres `LIKE` is case-sensitive by
+default, but `~` (POSIX regex) is used below for an explicit anchor — the reservation is
+case-sensitive: `MCP.foo` is a different id everywhere else in the system and is not reserved.
+(Superseded — `instruction_definitions` moved to PostgreSQL under ADR-0058; this is no longer
+a `sqlite3` query against `instructions.db`, see the PostgreSQL Substrate section below.)
 
 ```bash
-sqlite3 /var/lib/yuzu/instructions.db \
-  "SELECT id FROM instruction_definitions WHERE id GLOB 'mcp.*';"
+psql "$YUZU_POSTGRES_DSN" -c \
+  "SELECT id FROM instruction_store.instruction_definitions WHERE id ~ '^mcp\.';"
 ```
 
 Any id listed keeps executing after the upgrade and can still be edited through
@@ -1429,6 +1431,16 @@ Plugin signature verification ships in two parts: an agent-side CMS verifier and
 **Fleet-suicide caveat.** The Yuzu release pipeline does not yet sign the 44 in-tree plugins under `agents/plugins/`. **Do NOT enable "Require signed plugins" until you have signed every plugin your fleet uses, including the in-tree ones.** Use the transitional mode (bundle uploaded, Require off) during rollout. The Settings card surfaces this warning inline.
 
 ### vNEXT — Response templates (#254, Phase 8.2)
+
+**Superseded (ADR-0058).** `instruction_definitions`/`instruction_sets` moved from
+per-replica SQLite to the shared PostgreSQL substrate — the `sqlite3 instructions.db`
+commands and the SQLite `schema_meta` v1→v3 probe-and-stamp mechanism described below **no
+longer apply**; that mechanism doesn't exist in the current codebase. For backup/restore and
+schema-version checks on this store today, use the PostgreSQL Substrate section's `pg_dump`/
+`pg_restore` procedure against the `instruction_store` schema, not the commands in this
+subsection. Left as-written below for historical reference (this is what the Phase 8.2
+migration looked like on SQLite, in case an operator is diagnosing an upgrade that predates
+the Postgres cutover).
 
 Phase 8.2 ships named response-view configurations attached to each `InstructionDefinition`: a column subset, sort order, and filter presets the dashboard's filter-bar **View** dropdown surfaces. The feature is purely additive — operators who never author a template see a synthesised `__default__` view that is byte-identical in behaviour to the prior "show all columns, sort by Agent" default.
 
