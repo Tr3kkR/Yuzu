@@ -42,6 +42,7 @@
 #include "runtime_config_store.hpp"
 #include "runtime_config_view.hpp"
 #include "../test_helpers.hpp"
+#include "test_runtime_config_helpers.hpp"
 
 #include <libpq-fe.h>
 
@@ -168,36 +169,30 @@ struct Wired {
 // every AuditLog:Read holder (Operator among them) can read -- a durable sink that
 // cannot be rotated away, and one this file's earlier tests passed straight over
 // because they only checked key REGISTRATION, never emitter consultation.
-TEST_CASE("get_all() redacts secrets; get_all_with_secrets() does not",
+TEST_CASE("get_all() redacts secrets; read_secret() returns the real decrypted value",
           "[pg][runtime_config][secret]") {
     YUZU_REQUIRE_PG_DB_TPL(db, redaction_tpl);
     Wired w{db.dsn()};
     REQUIRE(w.store.set("oidc_client_secret", "s3cr3t-value", "tester").has_value());
     REQUIRE(w.store.set("oidc_issuer", "https://idp.example.com", "tester").has_value());
 
-    std::string redacted_secret, redacted_issuer, real_secret, real_issuer;
+    std::string redacted_secret, redacted_issuer;
     auto redacted = w.store.get_all();
     REQUIRE(redacted.has_value());
     for (const auto& e : *redacted) {
         if (e.key == "oidc_client_secret") redacted_secret = e.value;
         if (e.key == "oidc_issuer")        redacted_issuer = e.value;
     }
-    auto real = w.store.get_all_with_secrets();
-    REQUIRE(real.has_value());
-    for (const auto& e : *real) {
-        if (e.key == "oidc_client_secret") real_secret = e.value;
-        if (e.key == "oidc_issuer")        real_issuer = e.value;
-    }
 
     // The default must never hand back the credential.
     CHECK(redacted_secret == RuntimeConfigStore::redacted_placeholder());
     CHECK(redacted_secret != "s3cr3t-value");
-    // A non-secret key is untouched by either accessor -- redacting configuration
-    // would cost real diagnostic signal.
+    // A non-secret key is untouched -- redacting configuration would cost real
+    // diagnostic signal.
     CHECK(redacted_issuer == "https://idp.example.com");
-    // The named accessor still works, or the startup override pass breaks.
-    CHECK(real_secret == "s3cr3t-value");
-    CHECK(real_issuer == "https://idp.example.com");
+    // The dedicated accessor still hands back the real credential, or the startup
+    // override pass breaks.
+    CHECK(decrypt_for_test(w.store, "oidc_client_secret") == "s3cr3t-value");
 }
 
 TEST_CASE("an EMPTY secret survives redaction as empty, so is_set can be false",
@@ -273,7 +268,7 @@ TEST_CASE("build_overrides_json omits a secret's value and reports is_set",
     CHECK_FALSE(j2.at("oidc_client_secret").contains("value"));
 }
 
-TEST_CASE("the single-key accessors redact too, and the _with_secrets pair does not",
+TEST_CASE("get()/get_value() redact secrets too; read_secret() returns the real value",
           "[pg][runtime_config][secret]") {
     // get()/get_value() were the asymmetry: get_all() redacted while the single-key
     // reads returned plaintext, so the header's "every accessor is safe by default"
@@ -291,25 +286,20 @@ TEST_CASE("the single-key accessors redact too, and the _with_secrets pair does 
     CHECK((*sec)->value != "s3cr3t-value");
     CHECK(w.store.get_value("oidc_client_secret") == RuntimeConfigStore::redacted_placeholder());
 
-    // The named variants still hand back the real credential, or the startup
+    // The dedicated accessor still hands back the real credential, or the startup
     // override pass and any future legitimate consumer break.
-    auto real = w.store.get_with_secrets("oidc_client_secret");
-    REQUIRE(real.has_value());
-    REQUIRE(real->has_value());
-    CHECK((*real)->value == "s3cr3t-value");
-    CHECK(w.store.get_value_with_secrets("oidc_client_secret") == "s3cr3t-value");
+    CHECK(decrypt_for_test(w.store, "oidc_client_secret") == "s3cr3t-value");
 
-    // A non-secret key is untouched by any of the four.
+    // A non-secret key is untouched by get()/get_value(), and has no secrets-table
+    // row at all -- read_secret() on it is nullopt, not an error.
     auto iss = w.store.get("oidc_issuer");
     REQUIRE(iss.has_value());
     REQUIRE(iss->has_value());
     CHECK((*iss)->value == "https://idp.example.com");
     CHECK(w.store.get_value("oidc_issuer") == "https://idp.example.com");
-    auto iss_secrets = w.store.get_with_secrets("oidc_issuer");
-    REQUIRE(iss_secrets.has_value());
-    REQUIRE(iss_secrets->has_value());
-    CHECK((*iss_secrets)->value == "https://idp.example.com");
-    CHECK(w.store.get_value_with_secrets("oidc_issuer") == "https://idp.example.com");
+    auto iss_secret = w.store.read_secret("oidc_issuer");
+    REQUIRE(iss_secret.has_value());
+    CHECK_FALSE(iss_secret->has_value());
 
     // An empty secret stays empty here too, matching get_all().
     REQUIRE(w.store.set("oidc_client_secret", "", "tester").has_value());
@@ -332,7 +322,7 @@ TEST_CASE("set() refuses the redaction placeholder as a credential",
     CHECK(rejected.error().find("placeholder") != std::string::npos);
 
     // And the real secret is still intact -- a refused write must not clobber.
-    CHECK(w.store.get_value_with_secrets("oidc_client_secret") == "real-secret");
+    CHECK(decrypt_for_test(w.store, "oidc_client_secret") == "real-secret");
 
     // The same literal is a legal value for a NON-secret key; the guard is scoped.
     CHECK(w.store.set("oidc_issuer", RuntimeConfigStore::redacted_placeholder(), "tester")
@@ -356,7 +346,7 @@ TEST_CASE("set() refuses a WHITESPACE-PADDED placeholder, not just the exact str
         INFO("padded form: [" << padded << "]");
         REQUIRE_FALSE(rejected.has_value());
         // ...and the real credential is still intact after every refused write.
-        CHECK(w.store.get_value_with_secrets("oidc_client_secret") == "real-secret");
+        CHECK(decrypt_for_test(w.store, "oidc_client_secret") == "real-secret");
     }
 
     // A value CONTAINING the placeholder is refused too, deliberately. No trim charset
@@ -366,7 +356,7 @@ TEST_CASE("set() refuses a WHITESPACE-PADDED placeholder, not just the exact str
     // message, rather than a padded placeholder silently destroying a real credential.
     CHECK_FALSE(
         w.store.set("oidc_client_secret", "prefix<redacted>suffix", "tester").has_value());
-    CHECK(w.store.get_value_with_secrets("oidc_client_secret") == "real-secret");
+    CHECK(decrypt_for_test(w.store, "oidc_client_secret") == "real-secret");
     // Zero-width paste artefacts are covered by the same rule.
     CHECK_FALSE(
         w.store.set("oidc_client_secret", "\xef\xbb\xbf<redacted>", "tester").has_value());

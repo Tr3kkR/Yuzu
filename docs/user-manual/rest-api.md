@@ -3447,12 +3447,15 @@ Returns current configuration values and any active runtime overrides.
 > the value too.
 
 **Error (503) - runtime config store unavailable.** If the store is closed, failed to open, or a
-read against an otherwise-open store fails (a transient database error, or a secret that fails to
-decrypt), this returns 503 rather than an empty `overrides`, so a degraded store is never read as
-"nothing is configured". That distinction matters here specifically: this route no longer returns a secret's
-value, so key presence and `is_set` are the only way to answer "is the OIDC secret set on this
-server?" - the question [Security hardening](security-hardening.md#oidc-hardening) sends operators to
-before deciding whether to rotate.
+read against an otherwise-open store fails (a transient database error), this returns 503 rather
+than an empty `overrides`, so a degraded store is never read as "nothing is configured". This
+route never decrypts `oidc_client_secret` to answer `GET` — `is_set` is derived from whether a
+secrets-table row exists for the key, not from its (never-fetched) value — so a corrupted or
+undecryptable secret cannot 503 this route; that failure mode is confined to server boot instead
+(see `docs/adr/0060-runtime-config-store-postgres-migration.md`). Key presence and `is_set` are
+still the only way to answer "is the OIDC secret set on this server?" - the question
+[Security hardening](security-hardening.md#oidc-hardening) sends operators to before deciding
+whether to rotate.
 
 ```json
 { "error": { "code": 503, "message": "runtime configuration store unavailable" }, "meta": { "api_version": "v1" } }
@@ -3599,6 +3602,13 @@ another OIDC field, restart first so the process is not holding the old value.
 > unavailable (`GET` says "runtime configuration store unavailable", `PUT` says "runtime config store
 > unavailable"). Note `503` is emitted by **both** sources, so status alone does not tell you which
 > shape you have: test for `error.correlation_id` rather than assuming it, on every status.
+
+**Error (503) - runtime config store unavailable.** A genuine DB/crypto write failure, distinguished
+from caller-input validation at the seam so it never returns a `400`-shaped body instead:
+
+```json
+{ "error": { "code": 503, "message": "runtime config store unavailable" }, "meta": { "api_version": "v1" } }
+```
 
 **Error (400) - key not configurable.** This one is a bare `error` string with no envelope:
 

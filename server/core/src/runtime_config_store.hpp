@@ -10,23 +10,21 @@
 /// feeds auth/OIDC behaviour (the startup override pass populates
 /// `cfg_.oidc_client_secret`) and DEX alerting config — a silently-empty
 /// read on a degraded store is a fail-open, not a benign "nothing
-/// configured". `get_all()`/`get_all_with_secrets()`/`get()`/
-/// `get_with_secrets()` return `std::expected<..., std::string>`
+/// configured". `get_all()`/`get()` return `std::expected<..., std::string>`
 /// (ADR-0036 typed-read policy) so a genuine DB error is never collapsed
-/// into "no overrides set". `get_value()`/`get_value_with_secrets()` stay
-/// plain `std::string` convenience wrappers — deliberately NOT widened.
-/// Every current call site was audited (kickoff review, 2026-08-25): DEX
-/// alert-routing knobs are deny-or-benign (a degraded read just means no
-/// routes/defaults, not a security decision); `plugin_signing_required`
-/// feeds only a UI status badge and an admin-only manual-fetch distribution
-/// endpoint (`GET /api/v1/agent/plugin-policy` — server-side pack-install
-/// enforcement is gated by `ProductPackStore::require_signed_packs_`, set
-/// from the CLI flag at boot, never from this store; confirmed no agent
-/// code consumes that route today, `agents/` grep). If a future caller
-/// wires either into a real grant/enforce/skip decision, it MUST switch to
-/// `get()`/`get_with_secrets()` and treat `unexpected` as fail-closed —
-/// this deferral is explicit, per the playbook's "say so" escape hatch, not
-/// an oversight.
+/// into "no overrides set". `get_value()` stays a plain `std::string`
+/// convenience wrapper — deliberately NOT widened. Every current call site
+/// was audited (kickoff review, 2026-08-25): DEX alert-routing knobs are
+/// deny-or-benign (a degraded read just means no routes/defaults, not a
+/// security decision); `plugin_signing_required` feeds only a UI status
+/// badge and an admin-only manual-fetch distribution endpoint (`GET
+/// /api/v1/agent/plugin-policy` — server-side pack-install enforcement is
+/// gated by `ProductPackStore::require_signed_packs_`, set from the CLI
+/// flag at boot, never from this store; confirmed no agent code consumes
+/// that route today, `agents/` grep). If a future caller wires either into
+/// a real grant/enforce/skip decision, it MUST switch to `get()` and treat
+/// `unexpected` as fail-closed — this deferral is explicit, per the
+/// playbook's "say so" escape hatch, not an oversight.
 ///
 /// Substrate contract (ADR-0008): the store holds a `pg::PgPool&` (not a
 /// `sqlite3*`), runs its schema migration at construction on a pinned,
@@ -43,11 +41,15 @@
 /// `configs`/`secrets` split, ADR-3005, the closest existing precedent for
 /// "some keys in this namespace are secret, most aren't"); every other
 /// value — including an EMPTY secret — lives in the plain `runtime_config`
-/// table. Reading a secret key checks `runtime_config_secrets` first and
-/// falls back to `runtime_config` only for legacy/transitional plaintext
-/// (see `set()`'s doc comment for the becomes-secret-later story); this
-/// means presence in `runtime_config_secrets` is a HARD invariant that the
-/// row is never empty, so `set()` never encrypts an empty string — it
+/// table. `get_all()`/`get()` read BOTH tables in one statement and let a
+/// `runtime_config_secrets` row win when present (see `set()`'s doc comment
+/// for the becomes-secret-later story); `read_secret()` — the only accessor
+/// that returns a real decrypted value — checks `runtime_config_secrets`
+/// first and falls back to a non-empty plain-table row for the SAME
+/// transitional state (never decrypting there, since there is nothing
+/// encrypted to decrypt). Presence in `runtime_config_secrets` is still a
+/// HARD invariant that the row is never empty, so `set()` never encrypts an
+/// empty string — it
 /// deletes any stale ciphertext row instead and stores `value=''` in the
 /// plain table (same table an empty NON-secret value would use), which is
 /// what lets an empty secret keep its `updated_by`/`updated_at`
@@ -58,6 +60,18 @@
 /// registers `runtime_config_secrets.sealed_value` immediately after its
 /// own schema migration, and the caller runs `SecretCodec::init()` on a
 /// pinned lease right after construction returns (register-before-init).
+///
+/// **Concurrent `set()` on the SAME secret key is serialized by a
+/// transaction-scoped advisory lock** (`pg_advisory_xact_lock(hashtextextended(
+/// 'runtime_config_store:secret:' || key, 0))`, taken first inside the
+/// transaction, mirrors `ResultSetStore::pin`'s per-owner lock convention).
+/// Without it, two concurrent `PUT`s on the same secret key — one clearing
+/// it, one setting a real value — could interleave across their independent
+/// transactions so the clearing caller received `applied:true` while the
+/// concurrently-set secret silently survived (governance Gate 4/5 chaos-
+/// confirmed finding, derives HIGH/BLOCKING: I3 wrong-result-presented-as-
+/// correct). `set()` on a NON-secret key needs no lock — it is already one
+/// atomic `INSERT ... ON CONFLICT` statement.
 ///
 /// **Backfill: SKIPPED unconditionally (ADR-0009's 2026-08-25
 /// fresh-start-by-default amendment).** No `migrate_from_sqlite()` — the
@@ -72,15 +86,24 @@
 /// bullet.** Unlike `ResponseStore` (purely TTL'd telemetry — a silent
 /// reset is genuinely benign), this store holds real operator-authored
 /// config, so a silent reset would be a fail-open if the "no production
-/// fleet" premise ever turns out to be locally wrong. `detect_legacy_data()`
+/// fleet" premise ever turns out to be locally wrong. `warn_if_legacy_data_present()`
 /// opens the legacy file READ-ONLY (never migrates, never mutates, never
 /// moves it aside) purely to check whether it exists and holds any rows;
 /// the caller logs a loud, count-bearing warning only when it does —
-/// silence is the expected, unremarkable case (a genuinely fresh install
-/// or an already-cutover boot), not something to warn about on every
-/// start.
+/// silence is the expected, unremarkable case for a genuinely fresh
+/// install (no legacy file, or an empty one), not something to warn
+/// about on every start. This check only ever inspects the LEGACY
+/// SQLite file — it does not, and cannot, tell whether an operator has
+/// already reapplied a warned-about override via Settings, so it
+/// deliberately re-warns on EVERY boot the legacy file still holds
+/// rows, not only the first one after cutover (an operator who has
+/// reapplied every override and wants silence must remove or empty the
+/// legacy file — see `docs/user-manual/upgrading.md`'s RuntimeConfigStore
+/// section).
 
 #include "config_secret_keys.hpp"
+#include "secure_buffer.hpp"
+#include "store_errors.hpp"
 
 #include <cstdint>
 #include <expected>
@@ -110,9 +133,11 @@ struct RuntimeConfigEntry {
 /// Machine-checkable prefix on every `RuntimeConfigStore` `unexpected()` that
 /// represents a genuine DB/lease/crypto failure rather than caller-input
 /// validation (unknown key, bad value shape, the redaction-placeholder
-/// guard). Callers classify: this prefix -> 503, else -> 400 (mirrors
-/// `TagStore::kTagDbErrorPrefix` / `ProductPackStore::kProductPackDbErrorPrefix`).
-inline constexpr const char* kRuntimeConfigDbErrorPrefix = "db_error: ";
+/// guard). Callers classify: this prefix -> 503, else -> 400. Aliases the
+/// shared `kDbErrorPrefix` (`store_errors.hpp`), not a fresh literal — see
+/// `ProductPackStore::kProductPackDbErrorPrefix` / `InstructionStore::
+/// kInstructionStoreDbErrorPrefix` for the same convention.
+inline constexpr std::string_view kRuntimeConfigDbErrorPrefix = kDbErrorPrefix;
 
 class RuntimeConfigStore {
 public:
@@ -137,51 +162,42 @@ public:
     /// in unit tests) disables emission.
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
 
-    /// THE THREE PLAIN READ ACCESSORS REDACT; plaintext requires a
-    /// `_with_secrets` name. Naming it at the call site is the point: an
-    /// emitter that does not think about secrets gets the safe behaviour.
-    ///
-    /// A secret's value is replaced by `redacted_placeholder()`. An EMPTY
-    /// secret is left empty: there is nothing to protect, and the
-    /// emptiness is the only set-vs-unset signal a caller has
-    /// (`GET /api/config` derives `is_set` from it).
+    /// THE READ ACCESSORS BELOW NEVER RETURN A SECRET'S REAL VALUE. Redaction
+    /// is decided by `is_secret_key()` on the KEY, not by which table a value
+    /// happens to live in — usually the same thing (`runtime_config_secrets`
+    /// row presence means a real non-empty value, the table-split invariant —
+    /// see `set()`), but NOT always: a becomes-secret-later transitional
+    /// state (a stale row still sitting in the plain `runtime_config` table
+    /// for a key that IS classified secret today) has a real, non-empty
+    /// value there too, and it is redacted just the same — never decrypted
+    /// to redact it, since redaction only needs to know THAT a real value
+    /// exists, not what it is. An EMPTY secret is left empty: there is
+    /// nothing to protect, and the emptiness is the only set-vs-unset signal
+    /// a caller has (`GET /api/config` derives `is_set` from it).
     ///
     /// `unexpected(msg)` (prefixed `kRuntimeConfigDbErrorPrefix`) is a
-    /// genuine read failure (lease timeout, query error, or a
-    /// `runtime_config_secrets` row that fails to decrypt) — NEVER treat it
+    /// genuine read failure (lease timeout or query error) — NEVER treat it
     /// as "nothing configured". A caller feeding a grant/enforce/skip
     /// decision from this store must fail closed on it (ADR-0036); the two
     /// production callers today (the boot override pass, `GET
     /// /api/config`) both do.
+    ///
+    /// Both `get_all()` and `get()` read the plain and secrets tables in
+    /// ONE statement (`UNION ALL`), not two separate round trips — a single
+    /// statement is one MVCC snapshot, so a concurrent `set()` moving a key
+    /// between tables (the becomes-secret / empty-secret transitions) can
+    /// never make that key transiently vanish from either read (governance
+    /// Gate 3/4 architect finding on the prior two-SELECT merge; resolved by
+    /// this redesign, not accepted as a residual race).
 
-    /// All entries, secrets redacted.
+    /// All entries, secrets redacted. Never decrypts — see above.
     [[nodiscard]] std::expected<std::vector<RuntimeConfigEntry>, std::string> get_all() const;
 
-    /// All entries with real values. ONE legitimate caller today: the
-    /// startup override pass, which must apply the real secret. Anything
-    /// that EMITS -- a log, an API response, an audit detail, a dashboard
-    /// fragment -- must not use this.
-    ///
-    /// Runs the plain-table and secrets-table SELECTs as two separate
-    /// statements on one lease, not one transaction: a concurrent `set()`
-    /// moving a key between tables (the becomes-secret / empty-secret
-    /// transitions) can make that key transiently ABSENT from this merge if
-    /// it lands between the two reads (already deleted from one table, not
-    /// yet visible in the other's post-commit read). Accepted -- an admin
-    /// config read racing an admin config write, not a security boundary --
-    /// matching `ProductPackStore`'s recorded-not-fixed uninstall race.
-    [[nodiscard]] std::expected<std::vector<RuntimeConfigEntry>, std::string>
-    get_all_with_secrets() const;
-
     /// A single config entry, secret redacted. `nullopt` = read fine,
-    /// genuinely no override set for this key (use the default).
+    /// genuinely no override set for this key (use the default). Never
+    /// decrypts — see above.
     [[nodiscard]] std::expected<std::optional<RuntimeConfigEntry>, std::string>
     get(const std::string& key) const;
-
-    /// A single entry with its real value. Same rule as
-    /// `get_all_with_secrets()`.
-    [[nodiscard]] std::expected<std::optional<RuntimeConfigEntry>, std::string>
-    get_with_secrets(const std::string& key) const;
 
     /// Convenience string getter, secret redacted. NOT typed: a DB error
     /// collapses to "", the same as "key not set" -- see the file header
@@ -190,10 +206,31 @@ public:
     /// anything that does.
     [[nodiscard]] std::string get_value(const std::string& key) const;
 
-    /// Convenience string getter, real value. Same non-typed caveat as
-    /// `get_value()`, plus the `get_with_secrets()` scoping rule: use only
-    /// where the credential itself is required.
-    [[nodiscard]] std::string get_value_with_secrets(const std::string& key) const;
+    /// THE ONLY store method that returns a secret's REAL value. Returns the
+    /// zeroizing `SecureBuffer` type, never `std::string` (ADR-0010 §1
+    /// "Zeroization" — a plain-`std::string` return was a governance-
+    /// blocking finding on this store's first version; see ADR-0060
+    /// "Zeroization fix"). `nullopt` = genuinely nothing for this key (a
+    /// non-secret key, an unset secret, or an explicitly-cleared secret).
+    /// For a SECRET key with no `runtime_config_secrets` row, this also
+    /// checks the plain table for a non-empty becomes-secret-later
+    /// transitional value (see the file header) and returns THAT — copied,
+    /// not decrypted, since it was never encrypted — with a `spdlog::warn`
+    /// naming the key. Skipping this fallback would silently apply nothing
+    /// while `get_all()` reports the key as `is_set`, the same wrong-result-
+    /// presented-as-correct shape the `set()` advisory-lock fix exists to
+    /// prevent, reached a different way. ONE legitimate caller today: the
+    /// boot override pass, which must apply the real OIDC client secret into
+    /// `Config::oidc_client_secret` — itself a plain `std::string` by
+    /// pre-existing design (populated identically from `--oidc-client-secret`),
+    /// so the caller's own copy-out is the point where zeroization ends;
+    /// keep that copy as tight in scope as `WebhookStore::deliver_one`'s
+    /// signing-secret use (decrypt, use immediately, let the buffer's
+    /// destructor wipe it — never store the `SecureBuffer` itself past the
+    /// copy). Any FUTURE caller needing a real secret uses this, never
+    /// `decrypt_sealed_value`'s old `std::string`-returning shape (removed).
+    [[nodiscard]] std::expected<std::optional<SecureBuffer>, std::string>
+    read_secret(const std::string& key) const;
 
     /// Set a config value. Returns an error if the key is not in the
     /// allow-list, if validation fails, or if the value is the redaction

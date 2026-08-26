@@ -41,9 +41,9 @@ Wave 2 and Wave 3 — not scoped to one wave; `InstructionStore` is Wave 2, `Web
 `OffloadTargetStore` are Wave 3) — every other server store either had already migrated to
 Postgres or had a migration in flight at the time this ADR was drafted (`WebhookStore`/ADR-0057,
 `InstructionStore`/ADR-0058, `OffloadTargetStore`/ADR-0059, none part of this change).
-`WebhookStore`/ADR-0057 has since merged; `InstructionStore`/ADR-0058 has an open PR (#3602) in
-flight; `OffloadTargetStore`/ADR-0059 remains not yet started as of this writing. Once all four
-land, every server store is on the Postgres substrate (NvdDatabase excluded by a recorded owner
+`WebhookStore`/ADR-0057 and `InstructionStore`/ADR-0058 have both since merged;
+`OffloadTargetStore`/ADR-0059 is now the only server store remaining on the ladder. Once it
+lands, every server store is on the Postgres substrate (NvdDatabase excluded by a recorded owner
 override, M1a).
 
 **The headline problem this ADR resolves is per-KEY, not per-column, secrecy.** Unlike
@@ -108,10 +108,13 @@ redact, not which table the value came from.
 **Becomes-secret-later story.** A key not currently in `kSecretKeys` that gains a plaintext row
 in `runtime_config`, then LATER gets added to `kSecretKeys` in some future release, is not
 retroactively encrypted by this migration — it keeps its plaintext row in `runtime_config` until
-the NEXT `set()` call. Reads (`get_with_secrets`/`get_all_with_secrets`) check
-`runtime_config_secrets` FIRST and fall back to the plain `runtime_config` row for a key that
-`is_secret_config_key` now classifies as secret but has no ciphertext row yet — so the value is
-never silently lost, just not yet encrypted. `set()` is the ONLY path that materializes the
+the NEXT `set()` call. `is_secret_config_key(key)`, not storage location, is what decides
+redaction: `get_all()`/`get()` redact a plain-table row for a key classified secret today the
+same as a secrets-table row, and `read_secret()` — the sole accessor returning a real value —
+checks `runtime_config_secrets` FIRST and falls back to a non-empty plain-table row for the same
+transitional key, so the value is never silently lost (nor silently reported as unset to a caller
+that needed it — see "Zeroization fix" below for why this fallback specifically had to be
+restored during review), just not yet encrypted. `set()` is the ONLY path that materializes the
 transform: writing a non-empty value for a secret key encrypts it into
 `runtime_config_secrets` AND deletes any stale `runtime_config` row for the same key in the SAME
 transaction, so the plaintext echo does not persist past the next write. "Next write envelopes
@@ -121,29 +124,150 @@ the ladder implements either.
 ### Posture: authoritative / fail-closed (ADR-0012 §1)
 
 Runtime config feeds auth/OIDC behaviour directly: the startup override pass
-(`apply_runtime_config_overrides`) populates `cfg_.oidc_client_secret` from
-`get_all_with_secrets()`, and `GET /api/config` is the route `security-hardening.md` tells an
-operator to check before deciding whether to rotate a disclosed credential. A silently-empty read
-on either path is a fail-open (the pre-existing, tracked CH-2/Task#10 defect this migration
-closes as a side effect of adopting the ADR-0036 typed-read contract, not as separately-scoped
-work). Widened to `std::expected<..., std::string>`: `get_all()`, `get_all_with_secrets()`,
-`get()`, `get_with_secrets()`. `set()` already returned `std::expected<void, std::string>`
-pre-migration; DB/crypto failures now carry the `kRuntimeConfigDbErrorPrefix` marker so
-`server.cpp`'s PUT handler classifies 503 (genuine failure) vs. 400 (caller-input validation),
-mirroring `ProductPackStore`/`TagStore`'s `*DbErrorPrefix` convention.
+(`apply_runtime_config_overrides`) applies the real OIDC client secret via `read_secret()`, and
+`GET /api/config` is the route `security-hardening.md` tells an operator to check before deciding
+whether to rotate a disclosed credential. A silently-empty read on either path is a fail-open (the
+pre-existing, tracked CH-2/Task#10 defect this migration closes as a side effect of adopting the
+ADR-0036 typed-read contract, not as separately-scoped work). Widened to
+`std::expected<..., std::string>`: `get_all()`, `get()`, `read_secret()`. `set()` already returned
+`std::expected<void, std::string>` pre-migration; DB/crypto failures now carry the
+`kRuntimeConfigDbErrorPrefix` marker (aliasing the shared `kDbErrorPrefix`, `store_errors.hpp` —
+NOT an independent literal, governance Gate 4 consistency-auditor finding on the first version of
+this migration) so `server.cpp`'s PUT handler classifies 503 (genuine failure) vs. 400
+(caller-input validation), mirroring `ProductPackStore`/`InstructionStore`'s convention.
 
-**`get_value()`/`get_value_with_secrets()` are deliberately NOT widened** — the playbook's
-explicit deferral clause ("say so, don't leave it unstated"). Every current call site was audited:
-DEX alert-routing/blast-radius/cohort-export knobs are deny-or-benign (a degraded read means "no
-routes configured," not a security decision); `plugin_signing_required` feeds only a UI status
-badge (`render_plugin_signing_fragment`) and an ADMIN-ONLY, manually-`curl`'d distribution
-endpoint (`GET /api/v1/agent/plugin-policy`, `docs/user-manual/agent-plugins.md`: "the manual
-workflow today is `curl` + `jq` + write... Automatic agent-side fetch is a forthcoming change") —
-confirmed by grep that no code in `agents/` consumes that route today, and confirmed that the
-REAL server-side pack-install enforcement gate (`ProductPackStore::require_signed_packs_`) is set
-from the `--allow-unsigned-packs` CLI flag at boot (`server.cpp`), never from this store. If a
-future caller wires either into a genuine grant/enforce/skip decision, it must switch to
-`get()`/`get_with_secrets()`.
+**`get_value()` is deliberately NOT widened** — the playbook's explicit deferral clause ("say so,
+don't leave it unstated"). Every current call site was audited: DEX alert-routing/blast-radius/
+cohort-export knobs are deny-or-benign (a degraded read means "no routes configured," not a
+security decision); `plugin_signing_required` feeds only a UI status badge
+(`render_plugin_signing_fragment`) and an ADMIN-ONLY, manually-`curl`'d distribution endpoint
+(`GET /api/v1/agent/plugin-policy`, `docs/user-manual/agent-plugins.md`: "the manual workflow
+today is `curl` + `jq` + write... Automatic agent-side fetch is a forthcoming change") — confirmed
+by grep that no code in `agents/` consumes that route today, and confirmed that the REAL
+server-side pack-install enforcement gate (`ProductPackStore::require_signed_packs_`) is set from
+the `--allow-unsigned-packs` CLI flag at boot (`server.cpp`), never from this store. If a future
+caller wires either into a genuine grant/enforce/skip decision, it must switch to `get()`.
+
+### Zeroization fix: `read_secret()` replaces `get_all_with_secrets()`/`get_with_secrets()`/`get_value_with_secrets()`
+
+The version of this store first proposed for governance review had `get_all_with_secrets()`/
+`get_with_secrets()`/`get_value_with_secrets()` — a public API returning a real decrypted secret
+as plain `std::string`, via an anonymous-namespace `decrypt_sealed_value()` helper that discarded
+the `SecureBuffer` `SecretCodec::decrypt()` returns into a `std::string` copy. `cpp-safety`
+(governance Gate 3) flagged this as a policy-floor violation of ADR-0010 §1's explicit
+requirement — "Store methods that return recovered secrets to in-process callers return the
+zeroizing buffer type as well, not `std::string`" — independently affirmed by `compliance-officer`
+against `WebhookStore::deliver_one`'s already-compliant in-tree pattern (decrypt, use the
+`SecureBuffer` immediately, let its destructor wipe it, never copy to `std::string`). This is a
+policy floor, not operational severity, so it gated regardless of derived band; per this
+program's standing rule that a self-granted exception to an explicit ADR requirement needs
+adjudication by someone other than its proposer, the resolution here is a code fix, not a
+documented exception.
+
+**The fix, once traced, also closed two other open items for free.** `set()`'s own branches
+guarantee, by construction, that a `runtime_config_secrets` row exists if and only if a key's
+real value is non-empty — meaning `get_all()`/`get()` never actually needed to decrypt anything to
+answer "is this secret set": row PRESENCE is the whole signal. So:
+
+- `decrypt_sealed_value()` now returns `std::expected<SecureBuffer, std::string>`.
+- A new `read_secret(key) -> std::expected<std::optional<SecureBuffer>, std::string>` is the ONLY
+  store method that ever returns a real secret value, and the ONLY thing left calling
+  `decrypt_sealed_value()`. Its sole production caller (`apply_runtime_config_overrides()`) copies
+  from the buffer straight into `cfg_.oidc_client_secret` — itself a plain, non-zeroizing
+  `std::string` by pre-existing design (populated identically from `--oidc-client-secret` at
+  boot) — and lets the buffer wipe itself the instant that copy is made, mirroring
+  `WebhookStore::deliver_one`'s scoping discipline.
+- `get_all()`/`get()` are rewritten to derive redaction from `runtime_config_secrets` row
+  presence (plus an `is_secret_key()` check for the becomes-secret-later transitional case, where
+  a real value can still be sitting in the plain table) and NEVER decrypt at all. This also
+  resolves the two-SELECT atomicity race the first version of this ADR recorded as accepted (see
+  "Considered and rejected" below) — both functions now read both tables in ONE `UNION ALL`
+  statement, one MVCC snapshot, no window for a concurrent `set()` to make a key transiently
+  vanish.
+- This also shrinks the practical residual of the decrypt-failure blast-radius question below: the
+  live `GET /api/config` route no longer decrypts at all, so a bad secret can only ever fail
+  BOOT, never a live read.
+
+`get_all_with_secrets()`/`get_with_secrets()`/`get_value_with_secrets()` are removed outright, not
+kept as an unused-in-production convenience — leaving them in place, even unreferenced, would
+still be a store method returning a real secret as `std::string`, the exact shape the floor
+exists to close. Test call sites that asserted against them (`test_runtime_config_store.cpp`,
+`test_runtime_config_secret_redaction.cpp`, `test_settings_routes_oidc.cpp`) now go through
+`read_secret()` via a small test-local helper that materializes the buffer into a `std::string`
+purely to compare against a literal the test itself hardcoded — a test-only convenience over a
+synthetic value with no real confidentiality at stake, not the production pattern.
+
+### Concurrency fix: advisory lock on `set()` (and `remove()`) for a secret key
+
+Governance's unhappy-path/chaos-injection passes found and empirically reproduced a race: two
+concurrent `PUT /api/config/oidc_client_secret` calls — one clearing the secret (empty value),
+one setting a real one — each run in their own `with_txn_for` transaction with no lock between
+them. Depending on commit order, the clearing caller's `DELETE` on `runtime_config_secrets` could
+land before the setting caller's `INSERT`, so the CLEAR reports `applied: true` while the
+concurrently-set secret silently survives. Derived severity: I3 (wrong result presented as
+correct — the caller cannot tell), EXPOSURE E3 (an authenticated actor at its own privilege,
+no downgrade), band HIGH — BLOCKING. `set()` now takes a transaction-scoped
+`pg_advisory_xact_lock(hashtextextended('runtime_config_store:secret:' || key, 0))` as the FIRST
+statement in both of its secret-key branches (empty-clear and non-empty-set), serializing any two
+concurrent writers to the SAME key — the same per-key advisory-lock idiom as
+`ResultSetStore::pin`/`software_licensing_store.cpp`. A non-secret key's `set()` needs no lock: it
+is already one atomic `INSERT ... ON CONFLICT` statement. Regression-tested with the same
+held-lock technique as `BaselineStore`'s row-lock TOCTOU test (`test_baseline_store.cpp`): a
+second connection holds the identical advisory lock, and `set()` (and, after the Gate 8 fix below,
+`remove()`) is asserted to genuinely BLOCK on it before returning successfully once released. The
+proof polls `pg_locks` for the caller to appear queued as a waiter before starting a further fixed
+hold (quality-engineer, Gate 8) rather than sleeping a fixed window before releasing and hoping the
+caller was scheduled in time — a scheduling-luck source of flakiness on a contended CI box that a
+bare sleep-then-release shape does not eliminate.
+
+**Gate 8 re-review (architect + security-guardian, independently) found the same lock missing from
+`remove()`** — it deletes from both tables for any key with no lock at all, so a concurrent
+`remove()` racing a `set()` on the same secret key was still unserialized. Not proven to reproduce
+the identical false-`applied:true` shape the `set()`-vs-`set()` race did (`remove()` only ever
+deletes, never inserts, so there is no "wrong value silently survives" outcome to construct the
+same way) and zero production callers exist today (`server.cpp`/`settings_routes.cpp`/
+`rest_api_v1.cpp` never call it) — latent, not live — but the fix is the same three lines, so it
+shipped in this round rather than deferred. `remove()` now takes the identical
+`kSecretKeyLockSql` unconditionally, before either `DELETE`, regardless of whether `key` classifies
+as secret — deliberately asymmetric with `set()`, which locks only its secret-key branches.
+`remove()` is cold path (no hot-path cost to taking a lock unconditionally) and always touches both
+tables regardless of key classification, so there is no equivalent "which branch" question to
+answer the way `set()`'s does.
+
+### Decrypt-failure blast radius: adjudicated MEDIUM, not HIGH — record kept, not silently resolved
+
+A separate chaos-confirmed finding: if `oidc_client_secret`'s stored ciphertext ever becomes
+undecryptable (KEK/DB pairing mismatch after a restore, corrupted envelope), `read_secret()`
+fails, and `apply_runtime_config_overrides()` fails the WHOLE boot closed — not just the OIDC
+feature. Two readings were on the table. The first-pass sketch called this HIGH under I5's
+raise-clause (a), reasoning that `GET /api/config` (before the Zeroization-fix redesign above) was
+an "ordinary request path" reachable without special conditions. On review, the correct read is
+MEDIUM: I5's raise clause is for an ACTOR-triggerable crash on a request path, and a KEK/DB
+pairing mismatch is an environmental condition (E0/E5), not an actor action; more importantly,
+**fail-closed boot on a substrate/crypto failure is this codebase's deliberate, existing posture**
+for every store on the SecretCodec seam — `AuthDB`'s TOTP secrets and `WebhookStore`'s signing
+secret already carry the identical contract (`docs/user-manual/server-admin.md`'s "Key management
+(secrets KEK)" section, `kek_unresolvable`/`kek_corrupt` startup error prefixes already
+documented there). The CONTRACT is not new — fail-closed on an undecryptable secret. The
+PER-FAILURE BLAST RADIUS is not identical, though, and the adjudication should say so plainly
+(sre, Gate 8; correction, docs-writer, Gate 8): a whole-KEK/DB pairing mismatch is caught by the
+shared boot-time fingerprint check for the entire `secrets` schema and is already boot-fatal for
+every SecretCodec consumer alike, so it is NOT the differentiator here. The genuine differentiator
+is a single corrupted envelope (one row) under an otherwise-healthy KEK: `AuthDB` and
+`WebhookStore` both decrypt their secret lazily, per-request, so one corrupted row denies exactly
+the one login attempt or the one delivery that touches it. `RuntimeConfigStore` decrypts
+`oidc_client_secret` eagerly, inline during `apply_runtime_config_overrides()`, which every other
+startup step is sequenced after — so the same one-row failure denies the entire server boot.
+That is a genuinely wider blast radius than either sibling for the identical class of failure, not
+an equivalent one — and MEDIUM still stands despite it, for a reason wider than "matches
+precedent": the alternative
+is fail-OPEN, not a narrower fail-closed. A server that instead booted past an undecryptable
+`oidc_client_secret` would come up with SSO silently broken (empty client secret, auth attempts
+failing downstream with no boot-time signal an operator would see) — a worse outcome than a loud,
+diagnosable refusal to start. The residual fix is proportionate to MEDIUM: an actionable error
+message at the point `apply_runtime_config_overrides()` fails, naming the KEK-mismatch recovery
+path, not a behavior change. Both readings are recorded here — this is the adjudication, not a
+downgrade applied without one.
 
 ### Backfill: SKIPPED, per ADR-0009's fresh-start-by-default amendment (landed 2026-08-25, PR #3622)
 
@@ -227,14 +351,19 @@ startup error (`startup_failed_ = true`), never a serve-degraded config plane.
   every read/write, which a table split gets for free via presence. `PluginConfigStore`'s table
   split remains the correct precedent here on ergonomic grounds, not because the alternative is
   unworkable.
-- **Widening `get_value()`/`get_value_with_secrets()` to `std::expected`.** Rejected as
-  disproportionate — no live call site feeds a security decision (verified above), and widening
-  would touch ~15 call sites across `server.cpp`/`settings_routes.cpp` and two test files for no
-  behavioral benefit. Recorded explicitly per the playbook's deferral clause rather than left
-  unstated.
+- **Widening `get_value()` to `std::expected`.** Rejected as disproportionate — no live call site
+  feeds a security decision (verified above), and widening would touch several call sites across
+  `server.cpp`/`settings_routes.cpp` for no behavioral benefit. Recorded explicitly per the
+  playbook's deferral clause rather than left unstated.
+- **Keeping `get_all_with_secrets()`/`get_with_secrets()`/`get_value_with_secrets()` around,
+  unused in production, once `read_secret()` existed.** Considered as a smaller diff during the
+  Zeroization fix (see "Decision" above) — rejected because an unused-but-present method
+  returning a real secret as `std::string` is still the exact shape the governance floor exists
+  to close, and because leaving it in place invites a future caller to reach for the familiar
+  name instead of the compliant one.
 - **Retroactively re-encrypting a becomes-secret-later plaintext row at boot**, instead of
   "next write envelopes it." Rejected — no other store on the ladder does this, and a boot-time
-  encrypt-on-read would mean `get_with_secrets` (a read) has a write side effect, which none of
+  encrypt-on-read would mean `read_secret()` (a read) has a write side effect, which none of
   its callers expect and which would need its own transaction/failure-handling story for a
   scenario that (today) can never actually occur — `kSecretKeys` has exactly one entry and it
   has always been secret.
@@ -266,11 +395,10 @@ startup error (`startup_failed_ = true`), never a serve-degraded config plane.
   `(pg::PgPool&, pg::SecretCodec&)` — every construction site (`server.cpp`,
   `test_settings_routes_oidc.cpp`, `test_settings_routes_dex_alerts.cpp`,
   `test_runtime_config_secret_redaction.cpp`) updated to the PG substrate contract.
-- `get_all()`, `get_all_with_secrets()`, `get()`, `get_with_secrets()` return
-  `std::expected<..., std::string>` instead of a plain container/`optional` — closes the
-  pre-existing CH-2/Task#10 defect (a degraded store silently reading as "nothing configured") as
-  a consequence of adopting the ADR-0036 typed-read contract this migration requires anyway, not
-  as separately-scoped work.
+- `get_all()`, `get()`, `read_secret()` return `std::expected<..., std::string>` instead of a
+  plain container/`optional` — closes the pre-existing CH-2/Task#10 defect (a degraded store
+  silently reading as "nothing configured") as a consequence of adopting the ADR-0036 typed-read
+  contract this migration requires anyway, not as separately-scoped work.
 - `PUT /api/config/:key` now returns 503 (not 400) on a genuine DB/crypto write failure,
   distinguished via the `kRuntimeConfigDbErrorPrefix` marker on `set()`'s error string; `GET
   /api/config` returns 503 on a genuine read failure from `get_all()` (previously this route
@@ -287,13 +415,14 @@ startup error (`startup_failed_ = true`), never a serve-degraded config plane.
   warning and the "reapply your overrides" instruction.
 - `test_runtime_config_store.cpp` is new (no general store test file existed pre-migration) and
   has no legacy-copy/backfill coverage by design, though it does cover the detect-and-warn
-  obligation (`warn_if_legacy_data_present()`); `test_runtime_config_secret_redaction.cpp` keeps
-  every pre-migration assertion's INTENT, adapted to the widened `std::expected` API and
-  `PgTestTemplate` construction.
-- `get_all_with_secrets()`/`get_with_secrets()` gain a `yuzu_server_runtime_config_read_degrade_total{reason}`
-  counter (`store_not_open`/`pool_acquire_timeout`/`query_error`/`crypto_error`), matching
+  obligation (`warn_if_legacy_data_present()`) and the `set()` advisory-lock race fix (held-lock
+  regression test, `BaselineStore` technique); `test_runtime_config_secret_redaction.cpp` and
+  `test_settings_routes_oidc.cpp` keep every pre-migration assertion's INTENT, adapted to the
+  widened `std::expected` API, `read_secret()`, and `PgTestTemplate` construction.
+- `get_all()`, `get()`, and `read_secret()` each gain a
+  `yuzu_server_runtime_config_read_degrade_total{reason}` counter
+  (`store_not_open`/`pool_acquire_timeout`/`query_error`/`crypto_error`), matching
   `ProductPackStore`/`CustomPropertiesStore`'s #1675 observability convention.
-- `get_all_with_secrets()` runs its plain-table and secrets-table SELECTs as two statements on one
-  lease, not one transaction: a concurrent `set()` moving a key between tables can make that key
-  transiently absent from one merged read. Recorded, not fixed — an admin config read racing an
-  admin config write, not a security boundary (see the method's header doc).
+- `get_all()`/`get()` read the plain and secrets tables in ONE `UNION ALL` statement, not two
+  separate SELECTs — the two-SELECT atomicity race an earlier version of this migration recorded
+  as accepted is resolved by this shape, not left open (see "Zeroization fix" above).

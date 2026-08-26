@@ -11,6 +11,7 @@
 #include "utf8_sanitize.hpp"
 
 #include <yuzu/metrics.hpp>
+#include <yuzu/secure_zero.hpp>
 
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
@@ -189,6 +190,15 @@ constexpr const char* kReasonCryptoError = "crypto_error";
 constexpr std::uint64_t kReadDegradeLogSample = 100;
 constexpr std::int64_t kDegradeEpisodeGapSecs = 60;
 
+// Per-key advisory lock serializing writers on a single secret key across
+// set()/remove(). Shared by both so a clear-vs-set race (governance-found)
+// and a concurrent remove-vs-set race can't interleave. Taken unconditionally
+// in remove() (cold path, always both tables) but only in set()'s secret-key
+// branches (hot path split by key classification) -- same lock id either way.
+constexpr const char* kSecretKeyLockSql =
+    "SELECT pg_advisory_xact_lock(hashtextextended("
+    "'runtime_config_store:secret:' || $1, 0))";
+
 struct DegradeSampler {
     std::atomic<std::uint64_t> count{0};
     std::atomic<std::int64_t> last_ts{0};
@@ -205,10 +215,11 @@ bool note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason, Degra
     return new_episode || (n % kReadDegradeLogSample) == 0;
 }
 
-// One sampler per distinct read call site (a shared sampler would let a hot get_all_with_secrets()
-// degrade mask a cold get_with_secrets() one from ever logging).
+// One sampler per distinct read call site (a shared sampler would let a hot get_all()
+// degrade mask a cold get()/read_secret() one from ever logging).
 DegradeSampler g_get_all_sampler;
 DegradeSampler g_get_sampler;
+DegradeSampler g_read_secret_sampler;
 
 } // namespace
 
@@ -253,7 +264,7 @@ RuntimeConfigStore::RuntimeConfigStore(pg::PgPool& pool, pg::SecretCodec& secret
 
 namespace {
 
-std::expected<std::string, std::string>
+std::expected<SecureBuffer, std::string>
 decrypt_sealed_value(pg::SecretCodec& codec, const std::string& key, const char* hex) {
     const auto bytes = hex_to_bytes(hex);
     auto dec = codec.decrypt(pg::SecretCodec::SecretId{kStoreName, "runtime_config_secrets",
@@ -265,69 +276,89 @@ decrypt_sealed_value(pg::SecretCodec& codec, const std::string& key, const char*
         return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) +
                                "secret decrypt failed for key '" + key + "'");
     }
-    return std::string(reinterpret_cast<const char*>(dec->data()), dec->size());
+    return std::move(*dec); // SecureBuffer -- ADR-0010 §1, never collapsed to std::string here
+}
+
+// True if the row at `i` in a `runtime_config UNION ALL runtime_config_secrets`-shaped
+// result is from the secrets side -- the literal `is_secret_row` column selected below.
+// Takes the column index explicitly: get_all()'s query carries `key` (5 columns, index
+// 4) but get()'s single-key query does not (4 columns, index 3) -- a shared hardcoded
+// index silently read past the end of the narrower shape (out-of-range column access,
+// caught by the resulting "column number N is out of range" libpq warning on every
+// get() call once this landed).
+bool row_is_secret(PGresult* r, int i, int col_idx) {
+    return std::string(col(r, i, col_idx)) == "t";
 }
 
 } // namespace
 
-std::expected<std::vector<RuntimeConfigEntry>, std::string>
-RuntimeConfigStore::get_all_with_secrets() const {
+std::expected<std::vector<RuntimeConfigEntry>, std::string> RuntimeConfigStore::get_all() const {
     if (!open_) {
         if (note_read_degrade(metrics_, kReasonStoreNotOpen, g_get_all_sampler))
-            spdlog::warn("RuntimeConfigStore: get_all_with_secrets degraded - store not open");
+            spdlog::warn("RuntimeConfigStore: get_all degraded - store not open");
         return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) + "store not open");
     }
 
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         if (note_read_degrade(metrics_, kReasonPoolTimeout, g_get_all_sampler))
-            spdlog::warn("RuntimeConfigStore: get_all_with_secrets degraded - pool acquire timeout");
+            spdlog::warn("RuntimeConfigStore: get_all degraded - pool acquire timeout");
         return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) +
                                "no database connection in time");
     }
 
-    std::map<std::string, RuntimeConfigEntry> merged;
-
-    pg::PgResult plain = pg::exec_params(
+    // ONE statement, ONE MVCC snapshot (governance Gate 3/4 architect finding on the
+    // prior two-SELECT merge — resolved, not accepted, by folding both tables into a
+    // single UNION ALL). Never touches `sealed_value`: a secret's presence in the
+    // secrets table is redaction's entire signal (the table-split invariant — see
+    // header), so this never decrypts.
+    pg::PgResult res = pg::exec_params(
         lease.get(),
-        "SELECT key, value, updated_by, updated_at FROM runtime_config_store.runtime_config "
+        "SELECT key, value, updated_by, updated_at, false AS is_secret_row "
+        "FROM runtime_config_store.runtime_config "
+        "UNION ALL "
+        "SELECT key, ''::text, updated_by, updated_at, true "
+        "FROM runtime_config_store.runtime_config_secrets "
         "ORDER BY key",
         std::vector<std::string>{});
-    if (plain.status() != PGRES_TUPLES_OK) {
+    if (res.status() != PGRES_TUPLES_OK) {
         if (note_read_degrade(metrics_, kReasonQueryError, g_get_all_sampler))
-            spdlog::warn("RuntimeConfigStore: get_all_with_secrets degraded - plain query error");
+            spdlog::warn("RuntimeConfigStore: get_all degraded - query error");
         return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) + "database read failed");
-    }
-    for (int i = 0; i < PQntuples(plain.get()); ++i) {
-        auto e = plain_row(plain.get(), i);
-        const std::string k = e.key;
-        merged[k] = std::move(e);
     }
 
-    pg::PgResult secrets = pg::exec_params(
-        lease.get(),
-        "SELECT key, encode(sealed_value, 'hex'), updated_by, updated_at "
-        "FROM runtime_config_store.runtime_config_secrets ORDER BY key",
-        std::vector<std::string>{});
-    if (secrets.status() != PGRES_TUPLES_OK) {
-        if (note_read_degrade(metrics_, kReasonQueryError, g_get_all_sampler))
-            spdlog::warn("RuntimeConfigStore: get_all_with_secrets degraded - secrets query error");
-        return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) + "database read failed");
+    // Two passes over the ONE fetched result set (no second query): plain rows first,
+    // then secret rows overwrite -- secrets-table presence always wins (see header),
+    // and this makes that true regardless of which side UNION ALL happened to emit
+    // first for a given key.
+    std::map<std::string, RuntimeConfigEntry> merged;
+    for (int i = 0; i < PQntuples(res.get()); ++i) {
+        if (row_is_secret(res.get(), i, 4))
+            continue;
+        merged[col_str(res.get(), i, 0)] = plain_row(res.get(), i);
     }
-    for (int i = 0; i < PQntuples(secrets.get()); ++i) {
-        const std::string key = col_str(secrets.get(), i, 0);
-        auto real = decrypt_sealed_value(secret_codec_, key, col(secrets.get(), i, 1));
-        if (!real.has_value()) {
-            if (note_read_degrade(metrics_, kReasonCryptoError, g_get_all_sampler))
-                spdlog::warn("RuntimeConfigStore: get_all_with_secrets degraded - decrypt failed");
-            return std::unexpected(real.error());
-        }
+    for (int i = 0; i < PQntuples(res.get()); ++i) {
+        if (!row_is_secret(res.get(), i, 4))
+            continue;
         RuntimeConfigEntry e;
-        e.key = key;
-        e.value = *real;
-        e.updated_by = col_str(secrets.get(), i, 2);
-        e.updated_at = to_i64(col(secrets.get(), i, 3));
-        merged[key] = std::move(e); // secrets-table presence always wins (see header)
+        e.key = col_str(res.get(), i, 0);
+        // Presence here means non-empty by construction (the invariant) -- redact
+        // directly, never decrypt to find out.
+        e.value = redacted_placeholder();
+        e.updated_by = col_str(res.get(), i, 2);
+        e.updated_at = to_i64(col(res.get(), i, 3));
+        merged[e.key] = std::move(e);
+    }
+    // The becomes-secret-later transitional state (see set()'s doc comment): a stale
+    // PLAIN-table row for a key that IS classified secret today, left over from before
+    // it was added to kSecretKeys or from an older release. is_secret_key() is the
+    // actual authority, not which table a value happens to sit in -- redact it here
+    // too, or a transitional secret leaks through get_all()/GET /api/config unredacted.
+    // No-op on an already-redacted secrets-table entry (placeholder is non-empty) and
+    // on a genuinely-cleared secret (value already empty).
+    for (auto& [key, e] : merged) {
+        if (is_secret_key(key) && !e.value.empty())
+            e.value = redacted_placeholder();
     }
 
     std::vector<RuntimeConfigEntry> out;
@@ -337,86 +368,59 @@ RuntimeConfigStore::get_all_with_secrets() const {
     return out;
 }
 
-std::expected<std::vector<RuntimeConfigEntry>, std::string> RuntimeConfigStore::get_all() const {
-    auto entries = get_all_with_secrets();
-    if (!entries.has_value())
-        return entries;
-    for (auto& e : *entries) {
-        // An EMPTY secret stays empty. There is nothing to protect, and replacing it
-        // with the non-empty placeholder destroys the only signal a caller has for
-        // set-vs-unset: GET /api/config derives `is_set` from !value.empty(), so
-        // blanket replacement made `is_set` unconditionally true and no stored
-        // secret could ever report false.
-        if (is_secret_key(e.key) && !e.value.empty())
-            e.value = redacted_placeholder();
-    }
-    return entries;
-}
-
 std::expected<std::optional<RuntimeConfigEntry>, std::string>
-RuntimeConfigStore::get_with_secrets(const std::string& key) const {
+RuntimeConfigStore::get(const std::string& key) const {
     if (!open_) {
         if (note_read_degrade(metrics_, kReasonStoreNotOpen, g_get_sampler))
-            spdlog::warn("RuntimeConfigStore: get_with_secrets degraded - store not open");
+            spdlog::warn("RuntimeConfigStore: get degraded - store not open");
         return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) + "store not open");
     }
 
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         if (note_read_degrade(metrics_, kReasonPoolTimeout, g_get_sampler))
-            spdlog::warn("RuntimeConfigStore: get_with_secrets degraded - pool acquire timeout");
+            spdlog::warn("RuntimeConfigStore: get degraded - pool acquire timeout");
         return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) +
                                "no database connection in time");
     }
 
-    pg::PgResult secret = pg::exec_params(
+    // Same one-statement shape as get_all(), scoped to one key. Never decrypts.
+    pg::PgResult res = pg::exec_params(
         lease.get(),
-        "SELECT encode(sealed_value, 'hex'), updated_by, updated_at "
+        "SELECT value, updated_by, updated_at, false AS is_secret_row "
+        "FROM runtime_config_store.runtime_config WHERE key = $1 "
+        "UNION ALL "
+        "SELECT ''::text, updated_by, updated_at, true "
         "FROM runtime_config_store.runtime_config_secrets WHERE key = $1",
         std::vector<std::string>{key});
-    if (secret.status() != PGRES_TUPLES_OK) {
+    if (res.status() != PGRES_TUPLES_OK) {
         if (note_read_degrade(metrics_, kReasonQueryError, g_get_sampler))
-            spdlog::warn("RuntimeConfigStore: get_with_secrets degraded - secret query error");
+            spdlog::warn("RuntimeConfigStore: get degraded - query error");
         return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) + "database read failed");
     }
-    if (PQntuples(secret.get()) > 0) {
-        auto real = decrypt_sealed_value(secret_codec_, key, col(secret.get(), 0, 0));
-        if (!real.has_value()) {
-            if (note_read_degrade(metrics_, kReasonCryptoError, g_get_sampler))
-                spdlog::warn("RuntimeConfigStore: get_with_secrets degraded - decrypt failed");
-            return std::unexpected(real.error());
-        }
-        RuntimeConfigEntry e;
-        e.key = key;
-        e.value = *real;
-        e.updated_by = col_str(secret.get(), 0, 1);
-        e.updated_at = to_i64(col(secret.get(), 0, 2));
-        return std::optional<RuntimeConfigEntry>(std::move(e));
-    }
-
-    pg::PgResult plain = pg::exec_params(
-        lease.get(),
-        "SELECT key, value, updated_by, updated_at FROM runtime_config_store.runtime_config "
-        "WHERE key = $1",
-        std::vector<std::string>{key});
-    if (plain.status() != PGRES_TUPLES_OK) {
-        if (note_read_degrade(metrics_, kReasonQueryError, g_get_sampler))
-            spdlog::warn("RuntimeConfigStore: get_with_secrets degraded - plain query error");
-        return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) + "database read failed");
-    }
-    if (PQntuples(plain.get()) == 0)
+    if (PQntuples(res.get()) == 0)
         return std::optional<RuntimeConfigEntry>(std::nullopt);
-    return std::optional<RuntimeConfigEntry>(plain_row(plain.get(), 0));
-}
 
-std::expected<std::optional<RuntimeConfigEntry>, std::string>
-RuntimeConfigStore::get(const std::string& key) const {
-    auto entry = get_with_secrets(key);
-    if (!entry.has_value())
-        return entry;
-    if (*entry && is_secret_key((*entry)->key) && !(*entry)->value.empty())
-        (*entry)->value = redacted_placeholder();
-    return entry;
+    // Prefer a secrets-side row if (against the invariant) both somehow appear,
+    // rather than trusting row order.
+    int row = 0;
+    for (int i = 0; i < PQntuples(res.get()); ++i) {
+        if (row_is_secret(res.get(), i, 3)) {
+            row = i;
+            break;
+        }
+    }
+    RuntimeConfigEntry e;
+    e.key = key;
+    e.updated_by = col_str(res.get(), row, 1);
+    e.updated_at = to_i64(col(res.get(), row, 2));
+    const bool from_secrets_table = row_is_secret(res.get(), row, 3);
+    e.value = from_secrets_table ? redacted_placeholder() : col_str(res.get(), row, 0);
+    // Transitional-state redaction (see get_all()'s equivalent pass): a plain-table
+    // row for a key classified secret today is still a secret, storage lag aside.
+    if (!from_secrets_table && is_secret_key(key) && !e.value.empty())
+        e.value = redacted_placeholder();
+    return std::optional<RuntimeConfigEntry>(std::move(e));
 }
 
 std::string RuntimeConfigStore::get_value(const std::string& key) const {
@@ -426,11 +430,79 @@ std::string RuntimeConfigStore::get_value(const std::string& key) const {
     return (*entry)->value;
 }
 
-std::string RuntimeConfigStore::get_value_with_secrets(const std::string& key) const {
-    auto entry = get_with_secrets(key);
-    if (!entry.has_value() || !*entry)
-        return {};
-    return (*entry)->value;
+std::expected<std::optional<SecureBuffer>, std::string>
+RuntimeConfigStore::read_secret(const std::string& key) const {
+    if (!open_) {
+        if (note_read_degrade(metrics_, kReasonStoreNotOpen, g_read_secret_sampler))
+            spdlog::warn("RuntimeConfigStore: read_secret degraded - store not open");
+        return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) + "store not open");
+    }
+
+    auto lease = pool_.try_acquire_for(kAcquireTimeout);
+    if (!lease) {
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, g_read_secret_sampler))
+            spdlog::warn("RuntimeConfigStore: read_secret degraded - pool acquire timeout");
+        return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) +
+                               "no database connection in time");
+    }
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT encode(sealed_value, 'hex') "
+        "FROM runtime_config_store.runtime_config_secrets WHERE key = $1",
+        std::vector<std::string>{key});
+    if (res.status() != PGRES_TUPLES_OK) {
+        if (note_read_degrade(metrics_, kReasonQueryError, g_read_secret_sampler))
+            spdlog::warn("RuntimeConfigStore: read_secret degraded - query error");
+        return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) + "database read failed");
+    }
+    if (PQntuples(res.get()) == 0) {
+        // No secrets-table row. For a NON-secret key that's simply "not a secret" --
+        // nullopt, no fallback. For a secret key it's ambiguous by design: either
+        // genuinely unset/cleared, OR the becomes-secret-later transitional state (a
+        // stale PLAIN-table row from before this key was classified secret, or from
+        // an older release — see set()'s doc comment). Falling back here, not just in
+        // the redacted readers, matters: without it, get_all()/GET /api/config would
+        // report is_set=true (a plain-table row exists here per the redaction pass
+        // above) while this — the boot override pass's only source of the real value
+        // — silently applies nothing. That is the exact wrong-result-presented-as-
+        // correct shape the concurrent-set() race fix exists to prevent, reached a
+        // different way.
+        if (!is_secret_key(key))
+            return std::optional<SecureBuffer>(std::nullopt);
+        pg::PgResult plain = pg::exec_params(
+            lease.get(),
+            "SELECT value FROM runtime_config_store.runtime_config WHERE key = $1",
+            std::vector<std::string>{key});
+        if (plain.status() != PGRES_TUPLES_OK) {
+            if (note_read_degrade(metrics_, kReasonQueryError, g_read_secret_sampler))
+                spdlog::warn("RuntimeConfigStore: read_secret degraded - fallback query error");
+            return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) +
+                                   "database read failed");
+        }
+        if (PQntuples(plain.get()) == 0)
+            return std::optional<SecureBuffer>(std::nullopt); // genuinely unset
+        std::string value = col_str(plain.get(), 0, 0);
+        if (value.empty())
+            return std::optional<SecureBuffer>(std::nullopt); // explicitly cleared
+        spdlog::warn("RuntimeConfigStore: read_secret for '{}' used a stale PLAINTEXT row "
+                    "(becomes-secret-later transitional state) -- the next set() envelopes it",
+                    key);
+        SecureBuffer buf{std::span<const std::uint8_t>{
+            reinterpret_cast<const std::uint8_t*>(value.data()), value.size()}};
+        yuzu::secure_zero(value); // this copy already sat in cleartext in the plain
+                                  // table -- no less protected than before, but don't
+                                  // leave a second unwiped copy behind here too
+        return std::optional<SecureBuffer>(std::move(buf));
+    }
+
+    auto real = decrypt_sealed_value(secret_codec_, key, col(res.get(), 0, 0));
+    if (!real.has_value()) {
+        if (note_read_degrade(metrics_, kReasonCryptoError, g_read_secret_sampler))
+            spdlog::warn("RuntimeConfigStore: read_secret degraded - decrypt failed");
+        return std::unexpected(real.error());
+    }
+    return std::optional<SecureBuffer>(std::move(*real));
 }
 
 // ── Mutations ────────────────────────────────────────────────────────────────
@@ -482,11 +554,22 @@ std::expected<void, std::string> RuntimeConfigStore::set(const std::string& key,
     const auto now = now_secs();
 
     if (is_secret_key(key)) {
+        // Serializes two concurrent set() calls on the SAME secret key (e.g. one
+        // clearing it, one setting a real value) across their independent
+        // transactions. Without this, the clear branch's DELETE could commit
+        // after the set branch's INSERT, leaving the secret intact while the
+        // clearing caller was already told `applied:true` (governance Gate 4/5
+        // chaos-confirmed finding — see header). Namespaced like
+        // ResultSetStore::pin's per-owner lock; released automatically at
+        // transaction end, never held past this function.
         if (sanitized_value.empty()) {
             // Empty-stays-empty (see header): no ciphertext, ever. Clear any
             // stale ciphertext row and record the clear in the plain table so
             // updated_by/updated_at survive.
             const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+                pg::PgResult lk = pg::exec_params(c, kSecretKeyLockSql, std::vector<std::string>{key});
+                if (lk.status() != PGRES_TUPLES_OK)
+                    return false;
                 pg::PgResult del = pg::exec_params(
                     c, "DELETE FROM runtime_config_store.runtime_config_secrets WHERE key = $1",
                     std::vector<std::string>{key});
@@ -517,6 +600,9 @@ std::expected<void, std::string> RuntimeConfigStore::set(const std::string& key,
             }
             const std::string hex = bytes_to_hex(*enc);
             const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+                pg::PgResult lk = pg::exec_params(c, kSecretKeyLockSql, std::vector<std::string>{key});
+                if (lk.status() != PGRES_TUPLES_OK)
+                    return false;
                 pg::PgResult del = pg::exec_params(
                     c, "DELETE FROM runtime_config_store.runtime_config WHERE key = $1",
                     std::vector<std::string>{key});
@@ -567,6 +653,15 @@ bool RuntimeConfigStore::remove(const std::string& key) {
 
     bool removed = false;
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        // Unconditional (unlike set()'s secret-key-branch-only lock): remove()
+        // always touches both tables regardless of key classification, and is
+        // cold-path, so there is no hot-path cost to taking it every time.
+        // Same lock id as set()'s secret-key branches -- this is what actually
+        // serializes a concurrent remove() against a concurrent set() on the
+        // same key.
+        pg::PgResult lk = pg::exec_params(c, kSecretKeyLockSql, std::vector<std::string>{key});
+        if (lk.status() != PGRES_TUPLES_OK)
+            return false;
         pg::PgResult r1 = pg::exec_params(
             c, "DELETE FROM runtime_config_store.runtime_config WHERE key = $1 RETURNING key",
             std::vector<std::string>{key});
@@ -621,8 +716,32 @@ void RuntimeConfigStore::warn_if_legacy_data_present(
         return;
     }
     const int table_rc = sqlite3_step(table_check.get());
-    if (table_rc != SQLITE_ROW)
-        return; // no runtime_config table -- nothing this store ever wrote, silent
+    if (table_rc == SQLITE_DONE)
+        return; // query ran fine, zero rows -- no runtime_config table, silent
+    if (table_rc != SQLITE_ROW) {
+        // Anything else (SQLITE_BUSY from a concurrent lock-holder, SQLITE_IOERR,
+        // SQLITE_CORRUPT, ...) is an execution FAILURE, not "no such table" -- and is
+        // exactly the case this obligation must not silently wave through: a locked
+        // or failing file could be hiding a real override. Distinguishing this from
+        // SQLITE_DONE above is the same open()-is-lazy lesson as the table-existence
+        // check itself, one call deeper (prepare succeeded, step failed). NOTE
+        // (correction, Gate 8): an earlier revision of this comment claimed a held
+        // BEGIN EXCLUSIVE chaos-confirms THIS branch specifically. A governance
+        // regression attempt using that exact technique (a fresh connection's cold
+        // schema cache needs its own lock just to read sqlite_master) instead landed
+        // in the PREPARE-fails branch above, not here -- so that claim was wrong and
+        // has been removed rather than repeated. This branch is still real defensive
+        // coverage (SQLITE_IOERR/SQLITE_CORRUPT can surface at step rather than
+        // prepare depending on where the bad page falls) but is not independently
+        // demonstrated to be reachable via an external lock the way the branch above
+        // is; see the corrupt-file test's comment in test_runtime_config_store.cpp
+        // for the accepted-without-a-test disposition.
+        spdlog::warn("RuntimeConfigStore: legacy {} exists but its schema could not be checked "
+                    "({}) -- verify manually whether it holds operator overrides that need "
+                    "reapplying",
+                    legacy_db_path.string(), sqlite3_errmsg(db.get()));
+        return;
+    }
 
     SqliteStmt stmt;
     if (sqlite3_prepare_v2(db.get(), "SELECT COUNT(*) FROM runtime_config", -1, stmt.addr(),

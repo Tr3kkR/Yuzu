@@ -11,12 +11,14 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "key_provider.hpp"
@@ -29,6 +31,7 @@
 
 #include "../test_helpers.hpp"
 #include "../test_log_capture.hpp"
+#include "test_runtime_config_helpers.hpp"
 
 #include <libpq-fe.h>
 #include <sqlite3.h>
@@ -64,22 +67,21 @@ TEST_CASE("a store that failed to open reports every read/write as unexpected, n
     REQUIRE_FALSE(all.has_value());
     CHECK(all.error().starts_with(kRuntimeConfigDbErrorPrefix));
 
-    auto all_secrets = store.get_all_with_secrets();
-    REQUIRE_FALSE(all_secrets.has_value());
-    CHECK(all_secrets.error().starts_with(kRuntimeConfigDbErrorPrefix));
-
     auto one = store.get("log_level");
     REQUIRE_FALSE(one.has_value());
     CHECK(one.error().starts_with(kRuntimeConfigDbErrorPrefix));
+
+    auto secret = store.read_secret("oidc_client_secret");
+    REQUIRE_FALSE(secret.has_value());
+    CHECK(secret.error().starts_with(kRuntimeConfigDbErrorPrefix));
 
     auto set_result = store.set("log_level", "debug", "tester");
     REQUIRE_FALSE(set_result.has_value());
     CHECK(set_result.error().starts_with(kRuntimeConfigDbErrorPrefix));
 
-    // The non-typed convenience getters collapse a degraded read to "" (the
+    // The non-typed convenience getter collapses a degraded read to "" (the
     // same as "not set") -- documented, not a bug; see the header.
     CHECK(store.get_value("log_level").empty());
-    CHECK(store.get_value_with_secrets("oidc_client_secret").empty());
 
     CHECK_FALSE(store.remove("log_level"));
 }
@@ -156,7 +158,11 @@ TEST_CASE("warn_if_legacy_data_present warns with a row count when real override
     RuntimeConfigStore::warn_if_legacy_data_present(legacy.path);
     cap.stop();
     const std::string text = cap.text();
-    CHECK(text.find("2") != std::string::npos);
+    // NOT text.find("2") -- spdlog's default pattern stamps every line with the
+    // current year ("2026"), which made this assertion pass regardless of the
+    // actual row count (governance quality-engineer finding). Assert the real
+    // count substring instead.
+    CHECK(text.find("holds 2 override(s)") != std::string::npos);
     CHECK(text.find(legacy.path.string()) != std::string::npos);
     // The secret's plaintext value must never appear in the warning.
     CHECK(text.find("s3cr3t") == std::string::npos);
@@ -176,6 +182,23 @@ TEST_CASE("warn_if_legacy_data_present warns defensively when the legacy file is
     cap.stop();
     CHECK(cap.text().find("legacy") != std::string::npos);
 }
+
+// No test exists for the sqlite3_step()-failure branch (distinct from the
+// prepare()-failure branch the corrupt-file test above covers) beyond the one
+// bounded attempt below (cpp-safety + advisor, Gate 8), which came back
+// negative rather than green: a second connection holding BEGIN EXCLUSIVE on
+// the legacy file, then a fresh RuntimeConfigStore::warn_if_legacy_data_present()
+// call against it, landed in the PREPARE-fails branch, not the step-fails one --
+// a brand-new SqliteDb has a cold schema cache, so its FIRST prepare() (reading
+// sqlite_master) needs the same lock the later step() would have needed, and
+// bites first. No externally-triggerable repro for the step-fails branch
+// specifically was found in one attempt, and per governance's false-green
+// floor a test that can't discriminate which branch it hit is not coverage of
+// the branch it was meant to prove -- so none is shipped here.
+// disposition: accepted-with-rationale (cpp-safety, Gate 8) -- the branch
+// itself is retained on defensive-coverage grounds (see the code comment at
+// its call site), not because it has been independently demonstrated
+// reachable via an external lock the way the branch above has.
 
 // ── Migration / fresh-database (plain YUZU_REQUIRE_PG_DB, per the playbook's
 //    §7 rule — these exercise migration itself) ────────────────────────────
@@ -238,6 +261,33 @@ std::size_t count_rows(const std::string& dsn, const char* table) {
     PgResult r{PQexec(conn.get(), (std::string("SELECT count(*) FROM ") + table).c_str())};
     REQUIRE(r.status() == PGRES_TUPLES_OK);
     return static_cast<std::size_t>(std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10));
+}
+
+// Polls `pg_locks` on `conn` until at least one advisory-lock waiter is queued
+// (not granted), or `deadline` elapses. Used by the advisory-lock regression
+// tests below so the proof that a caller blocked doesn't depend on scheduling
+// luck within a fixed sleep window (quality-engineer, Gate 8): the fixed hold
+// only starts counting once the waiter is genuinely observed queued.
+//
+// Filtered to `current_database()` (quality-engineer, Gate 8, citing the
+// identical #2530 G7-B3 hazard in test_kek_op_lock_holder.cpp): `pg_locks` is
+// a CLUSTER-WIDE view, and the 4 server test shards share one Postgres
+// container (one database per shard) -- an unfiltered query here could
+// observe a SIBLING SHARD's unrelated advisory-lock waiter and return `true`
+// before THIS test's own spawned thread has actually queued, silently
+// reintroducing the scheduling-luck gamble this helper exists to remove.
+bool wait_for_advisory_waiter(PGconn* conn, std::chrono::milliseconds deadline) {
+    const auto start = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - start < deadline) {
+        PgResult r{PQexec(conn, "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' "
+                                "AND NOT granted AND database = (SELECT oid FROM pg_database "
+                                "WHERE datname = current_database())")};
+        if (r.status() == PGRES_TUPLES_OK && PQntuples(r.get()) > 0 &&
+            std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10) > 0)
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return false;
 }
 
 } // namespace
@@ -358,20 +408,11 @@ TEST_CASE("RuntimeConfigStore: a secret value round-trips through the SecretCode
             CHECK(std::string(PQgetvalue(r.get(), i, 0)).empty());
     }
 
-    CHECK(w.store.get_value_with_secrets("oidc_client_secret") == "s3cr3t");
-    auto real = w.store.get_all_with_secrets();
-    REQUIRE(real.has_value());
-    bool found = false;
-    for (const auto& e : *real)
-        if (e.key == "oidc_client_secret") {
-            CHECK(e.value == "s3cr3t");
-            found = true;
-        }
-    CHECK(found);
+    CHECK(decrypt_for_test(w.store, "oidc_client_secret") == "s3cr3t");
 
     // A second write re-encrypts under a fresh DEK and fully replaces the row.
     REQUIRE(w.store.set("oidc_client_secret", "rotated", "bob").has_value());
-    CHECK(w.store.get_value_with_secrets("oidc_client_secret") == "rotated");
+    CHECK(decrypt_for_test(w.store, "oidc_client_secret") == "rotated");
     CHECK(count_rows(db.dsn(), "runtime_config_store.runtime_config_secrets") == 1);
 }
 
@@ -385,9 +426,9 @@ TEST_CASE("RuntimeConfigStore: an empty secret clears ciphertext but keeps attri
 
     REQUIRE(w.store.set("oidc_client_secret", "", "bob").has_value());
     CHECK(count_rows(db.dsn(), "runtime_config_store.runtime_config_secrets") == 0);
-    CHECK(w.store.get_value_with_secrets("oidc_client_secret").empty());
+    CHECK(decrypt_for_test(w.store, "oidc_client_secret").empty());
 
-    auto e = w.store.get_with_secrets("oidc_client_secret");
+    auto e = w.store.get("oidc_client_secret");
     REQUIRE(e.has_value());
     REQUIRE(e->has_value());
     CHECK((*e)->value.empty());
@@ -417,13 +458,13 @@ TEST_CASE("RuntimeConfigStore: a stale legacy-plaintext row for a secret key is 
     }
 
     // Fallback: the real value is readable even though it's still plaintext.
-    CHECK(w.store.get_value_with_secrets("oidc_client_secret") == "legacy-plaintext");
+    CHECK(decrypt_for_test(w.store, "oidc_client_secret") == "legacy-plaintext");
     // Redaction still applies -- is_secret_key() decides, not storage location.
     CHECK(w.store.get_value("oidc_client_secret") == RuntimeConfigStore::redacted_placeholder());
 
     // The next write envelopes it and cleans up the stale plaintext row.
     REQUIRE(w.store.set("oidc_client_secret", "fresh-encrypted", "operator").has_value());
-    CHECK(w.store.get_value_with_secrets("oidc_client_secret") == "fresh-encrypted");
+    CHECK(decrypt_for_test(w.store, "oidc_client_secret") == "fresh-encrypted");
     CHECK(count_rows(db.dsn(), "runtime_config_store.runtime_config_secrets") == 1);
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
@@ -446,8 +487,122 @@ TEST_CASE("RuntimeConfigStore: remove() deletes from both tables",
 
     CHECK(w.store.remove("oidc_client_secret"));
     CHECK(count_rows(db.dsn(), "runtime_config_store.runtime_config_secrets") == 0);
-    CHECK(w.store.get_value_with_secrets("oidc_client_secret").empty());
+    CHECK(decrypt_for_test(w.store, "oidc_client_secret").empty());
 
     CHECK(w.store.remove("log_level"));
     CHECK(w.store.get_value("log_level").empty());
+}
+
+TEST_CASE("set() on a secret key blocks on a held advisory lock for the SAME key "
+          "(genuine serialization proof, not thread-timing luck)",
+          "[pg][runtime_config][store][secret][concurrency]") {
+    // Regression test for the concurrent clear-vs-set race (governance Gate 4/5
+    // chaos-confirmed BLOCKING finding): two concurrent set() calls on the SAME
+    // secret key, one clearing it and one setting a real value, could interleave
+    // across their independent transactions so the clearing caller was told
+    // `applied:true` while the concurrently-set secret silently survived. The
+    // fix is a transaction-scoped pg_advisory_xact_lock keyed by the secret key.
+    // Same technique as BaselineStore's row-lock TOCTOU test: hold the identical
+    // lock from a second connection so set() is made to genuinely BLOCK, rather
+    // than hoping two threads happen to race.
+    YUZU_REQUIRE_PG_DB_TPL(db, rtcfg_store_tpl);
+    Wired w{db.dsn()};
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    {
+        PgResult r{PQexec(locker.get(), "BEGIN")};
+        REQUIRE(r.ok());
+    }
+    {
+        // Identical hash input to set()'s own kSecretKeyLockSql -- same key, same lock ID.
+        PgResult r{PQexec(
+            locker.get(),
+            "SELECT pg_advisory_xact_lock(hashtextextended("
+            "'runtime_config_store:secret:' || 'oidc_client_secret', 0))")};
+        REQUIRE(r.ok());
+    }
+
+    bool set_ok = false;
+    std::string set_error;
+    std::chrono::steady_clock::duration call_duration{};
+    std::thread t([&] {
+        const auto call_start = std::chrono::steady_clock::now();
+        auto r = w.store.set("oidc_client_secret", "new-value", "tester");
+        call_duration = std::chrono::steady_clock::now() - call_start;
+        set_ok = r.has_value();
+        if (!r)
+            set_error = r.error();
+    });
+    // Wait until the thread is genuinely queued on the lock (not a fixed sleep
+    // gambling that scheduling was fast enough to reach it) before starting the
+    // deliberate hold below.
+    REQUIRE(wait_for_advisory_waiter(locker.get(), std::chrono::seconds(5)));
+    // This hold is what the timed assertion below measures -- it only starts
+    // once the waiter above is confirmed queued, so it is not gambling on
+    // scheduling luck the way a bare pre-spawn sleep would.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    // Join BEFORE any assertion that could throw -- a REQUIRE between spawning
+    // `t` and joining it would unwind past a still-joinable std::thread on
+    // failure and call std::terminate, aborting the whole shard.
+    PgResult rollback_result{PQexec(locker.get(), "ROLLBACK")};
+    const bool rollback_ok = rollback_result.ok();
+    t.join();
+    REQUIRE(rollback_ok);
+    INFO(set_error);
+
+    // Self-verifying against a future regression that drops the lock silently:
+    // if set() did not actually block on it, this would return almost
+    // immediately, well under the 200ms this test controls.
+    CHECK(call_duration >= std::chrono::milliseconds(150));
+
+    REQUIRE(set_ok);
+    CHECK(decrypt_for_test(w.store, "oidc_client_secret") == "new-value");
+}
+
+TEST_CASE("remove() on a secret key blocks on a held advisory lock for the SAME key "
+          "(genuine serialization proof, not thread-timing luck)",
+          "[pg][runtime_config][store][secret][concurrency]") {
+    // Regression test for the Gate 8 finding (architect + security-guardian,
+    // independently converged): remove() deletes from both tables with no lock
+    // at all, so a concurrent remove()-vs-set() race on the same secret key was
+    // unserialized the same way the original set()-vs-set() race was. remove()
+    // now takes the identical per-key advisory lock, unconditionally, before
+    // either DELETE -- verify it genuinely blocks rather than assuming the
+    // three-line fix works because it compiles.
+    YUZU_REQUIRE_PG_DB_TPL(db, rtcfg_store_tpl);
+    Wired w{db.dsn()};
+    REQUIRE(w.store.set("oidc_client_secret", "real-secret", "alice").has_value());
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    {
+        PgResult r{PQexec(locker.get(), "BEGIN")};
+        REQUIRE(r.ok());
+    }
+    {
+        PgResult r{PQexec(
+            locker.get(),
+            "SELECT pg_advisory_xact_lock(hashtextextended("
+            "'runtime_config_store:secret:' || 'oidc_client_secret', 0))")};
+        REQUIRE(r.ok());
+    }
+
+    bool remove_ok = false;
+    std::chrono::steady_clock::duration call_duration{};
+    std::thread t([&] {
+        const auto call_start = std::chrono::steady_clock::now();
+        remove_ok = w.store.remove("oidc_client_secret");
+        call_duration = std::chrono::steady_clock::now() - call_start;
+    });
+    REQUIRE(wait_for_advisory_waiter(locker.get(), std::chrono::seconds(5)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    PgResult rollback_result{PQexec(locker.get(), "ROLLBACK")};
+    const bool rollback_ok = rollback_result.ok();
+    t.join();
+    REQUIRE(rollback_ok);
+
+    CHECK(call_duration >= std::chrono::milliseconds(150));
+    REQUIRE(remove_ok);
+    CHECK(count_rows(db.dsn(), "runtime_config_store.runtime_config_secrets") == 0);
 }

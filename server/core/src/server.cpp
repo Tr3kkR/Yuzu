@@ -174,6 +174,7 @@
 #include "workflow_routes.hpp"
 #include "runtime_config_store.hpp"
 #include "runtime_config_view.hpp"
+#include "secure_buffer.hpp"
 #include "schedule_engine.hpp"
 #include "scope_engine.hpp"
 #include "instruction_db_pool.hpp"
@@ -3244,6 +3245,22 @@ public:
             // trimmed value too.
             cfg_.oidc_admin_group = trim_ascii_whitespace(cfg_.oidc_admin_group);
 
+            // Pre-existing, migration-independent gap (governance enterprise-readiness
+            // finding on the RuntimeConfigStore/ADR-0060 PR, not caused by it): this
+            // provider is built HERE, before apply_runtime_config_overrides() runs
+            // (Phase 7, later in boot), and nothing rebuilds it afterward. A
+            // Settings-only-configured client secret is therefore never picked up by
+            // the live provider on any boot — only --oidc-client-secret/env do. Loudly
+            // flag it rather than let token exchange fail opaquely at the IdP later.
+            if (cfg_.oidc_client_secret.empty())
+                spdlog::warn(
+                    "OIDC configured (issuer/client_id set) but the client secret is empty at "
+                    "startup -- if you configured it via Settings rather than "
+                    "--oidc-client-secret/the environment, it will NOT take effect: this "
+                    "provider is built once at boot, before stored runtime config is applied, "
+                    "and is never rebuilt. Set the secret via --oidc-client-secret or the "
+                    "environment instead.");
+
             oidc::OidcConfig oidc_cfg;
             oidc_cfg.issuer = cfg_.oidc_issuer;
             oidc_cfg.client_id = cfg_.oidc_client_id;
@@ -5588,7 +5605,12 @@ public:
         // obligation applies: warn_if_legacy_data_present() opens the
         // legacy file read-only to check for real rows and warns loudly
         // (with a count) only when it finds them -- silence is the
-        // unremarkable case (fresh install, or an already-cutover boot).
+        // unremarkable case (a genuinely fresh install). This check ONLY
+        // ever inspects the legacy SQLite file -- it has no way to know
+        // whether the operator already reapplied a warned-about override,
+        // so a real-data warning repeats on EVERY boot the legacy file
+        // still holds rows, not just the first one after cutover (see
+        // docs/user-manual/upgrading.md's RuntimeConfigStore section).
         //
         // Own SecretCodec instance (ADR-0010 per-store model, mirrors
         // plugin_config_store_'s construction sequence exactly, see that
@@ -5629,6 +5651,15 @@ public:
                         startup_failed_ = true;
                     } else {
                         runtime_config_store_->set_metrics(&metrics_);
+                        metrics_.describe("yuzu_server_runtime_config_read_degrade_total",
+                                          "RuntimeConfigStore reads that degraded instead of "
+                                          "answering, by reason",
+                                          "counter");
+                        for (auto reason : {"store_not_open", "pool_acquire_timeout",
+                                             "query_error", "crypto_error"}) {
+                            metrics_.counter("yuzu_server_runtime_config_read_degrade_total",
+                                             {{"reason", reason}});
+                        }
                         // Detect-and-warn (docs/postgres-store-playbook.md's Backfill bullet):
                         // silent unless the legacy file actually holds real overrides this
                         // cutover will not carry over -- see the store's own doc comment.
@@ -8815,6 +8846,12 @@ public:
         // (adversarial-review MEDIUM, 2026-08-20 — matches the sibling stores' own
         // explicit-reset discipline in this function).
         ca_store_.reset();
+        // RuntimeConfigStore (ADR-0060) borrows both pg_pool_ and its own SecretCodec
+        // — explicit reset here, store before codec (the store holds a reference to
+        // it), rather than relying on declaration-order destruction alone. Same
+        // discipline as ca_store_ above (governance Gate 2/3 SHOULD).
+        runtime_config_store_.reset();
+        runtime_config_secret_codec_.reset();
         pg_pool_.reset();
 
         // ONLY on full completion — a path above that escalates via std::_Exit(1)
@@ -10971,8 +11008,10 @@ private:
     [[nodiscard]] bool apply_runtime_config_overrides() {
         if (!runtime_config_store_ || !runtime_config_store_->is_open())
             return true; // nothing to apply; not itself a failure
-        // The ONE caller entitled to plaintext: it must apply the real secret.
-        auto entries_result = runtime_config_store_->get_all_with_secrets();
+        // Redacted read: never decrypts (ADR-0010 §1 / ADR-0060). The one real
+        // secret this store carries (oidc_client_secret) is applied separately
+        // below via read_secret(), the only accessor entitled to plaintext.
+        auto entries_result = runtime_config_store_->get_all();
         if (!entries_result.has_value()) {
             spdlog::error("apply_runtime_config_overrides: read failed: {}",
                           entries_result.error());
@@ -10981,10 +11020,8 @@ private:
         for (const auto& e : *entries_result) {
             // Never log a credential. This line wrote the OIDC client secret verbatim
             // into yuzu-server.log on every boot once it had been set via Settings.
-            spdlog::info("Applying runtime config override: {} = {}", e.key,
-                         RuntimeConfigStore::is_secret_key(e.key)
-                             ? RuntimeConfigStore::redacted_placeholder()
-                             : e.value.c_str());
+            // get_all() already redacts, so e.value is never the real secret here.
+            spdlog::info("Applying runtime config override: {} = {}", e.key, e.value.c_str());
             if (e.key == "log_level") {
                 spdlog::set_level(spdlog::level::from_str(e.value));
             } else if (e.key == "heartbeat_timeout") {
@@ -11008,13 +11045,12 @@ private:
             // else reads it back from this store either. GET /api/config reports it
             // derived from whether any auto-approve rule exists, so a stored value
             // has no effect at all. See docs/user-manual/rest-api.md.
-            // OIDC settings — runtime-configurable via Settings UI
+            // OIDC settings — runtime-configurable via Settings UI. oidc_client_secret
+            // is handled below, never from this (redacted) loop.
             else if (e.key == "oidc_issuer" && !e.value.empty())
                 cfg_.oidc_issuer = e.value;
             else if (e.key == "oidc_client_id" && !e.value.empty())
                 cfg_.oidc_client_id = e.value;
-            else if (e.key == "oidc_client_secret" && !e.value.empty())
-                cfg_.oidc_client_secret = e.value;
             else if (e.key == "oidc_redirect_uri")
                 cfg_.oidc_redirect_uri = e.value;
             else if (e.key == "oidc_admin_group")
@@ -11022,6 +11058,37 @@ private:
             else if (e.key == "oidc_skip_tls_verify")
                 cfg_.oidc_skip_tls_verify = (e.value == "true");
         }
+
+        // The one secret this store carries. read_secret() returns the zeroizing
+        // SecureBuffer type (ADR-0010 §1) -- copy into cfg_.oidc_client_secret (a
+        // plain std::string by pre-existing design, populated identically from
+        // --oidc-client-secret at boot; see ADR-0060 "Zeroization fix") and let the
+        // buffer wipe itself the instant this scope ends, mirroring
+        // WebhookStore::deliver_one's signing-secret pattern.
+        auto secret_result = runtime_config_store_->read_secret("oidc_client_secret");
+        if (!secret_result.has_value()) {
+            // A KEK/decrypt failure here fails the boot closed (ADR-0006/ADR-0010
+            // fail-closed posture, same CONTRACT as AuthDB's TOTP secrets and
+            // WebhookStore's signing secret) -- but a WIDER blast radius: this
+            // denies the entire boot, not just one login or one delivery. See
+            // ADR-0060's "Decrypt-failure blast radius" section for why MEDIUM
+            // still stands despite that (fail-closed beats the fail-open
+            // alternative). Point at the recovery procedure rather than just the
+            // raw store error.
+            spdlog::error("apply_runtime_config_overrides: oidc_client_secret could not be "
+                          "decrypted ({}) -- see \"Key management (secrets KEK)\" in the server "
+                          "admin guide for recovery (a keys directory that does not match this "
+                          "database, e.g. after a restore without its paired backup, is the "
+                          "common cause)",
+                          secret_result.error());
+            return false;
+        }
+        if (secret_result->has_value() && !(*secret_result)->empty()) {
+            const auto& secret = **secret_result;
+            cfg_.oidc_client_secret.assign(reinterpret_cast<const char*>(secret.data()),
+                                           secret.size());
+        }
+
         // F1 DEX alerting config — both consumers accept live updates, so the
         // same call applies at boot and from the settings POST handlers.
         apply_dex_alert_config();

@@ -37,6 +37,7 @@
 #include "runtime_config_store.hpp"
 #include "test_route_sink.hpp"
 #include "../test_helpers.hpp"
+#include "test_runtime_config_helpers.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
 #include <yuzu/server/server.hpp>
@@ -194,7 +195,7 @@ TEST_CASE("Settings OIDC: the redaction placeholder means UNCHANGED, never a new
 
     // The stored credential is untouched -- not overwritten with the placeholder,
     // and not blanked.
-    CHECK(h.runtime_config->get_value_with_secrets("oidc_client_secret") == "real-secret");
+    CHECK(decrypt_for_test(*h.runtime_config, "oidc_client_secret") == "real-secret");
     // And no failure was reported, because submitting the placeholder is a no-op on
     // the secret rather than an error.
     CHECK(res->body.find("could NOT be saved") == std::string::npos);
@@ -211,7 +212,7 @@ TEST_CASE("Settings OIDC: a placeholder with stray whitespace is also treated as
     auto res = h.sink.Post("/api/settings/oidc", oidc_form("  <redacted>  "),
                            "application/x-www-form-urlencoded");
     REQUIRE(res);
-    CHECK(h.runtime_config->get_value_with_secrets("oidc_client_secret") == "real-secret");
+    CHECK(decrypt_for_test(*h.runtime_config, "oidc_client_secret") == "real-secret");
 }
 
 TEST_CASE("Settings OIDC: a real secret is persisted and reported saved",
@@ -222,7 +223,7 @@ TEST_CASE("Settings OIDC: a real secret is persisted and reported saved",
                            "application/x-www-form-urlencoded");
     REQUIRE(res);
     CHECK(res->status == 200);
-    CHECK(h.runtime_config->get_value_with_secrets("oidc_client_secret") == "brand-new-secret");
+    CHECK(decrypt_for_test(*h.runtime_config, "oidc_client_secret") == "brand-new-secret");
     CHECK(res->body.find("could NOT be saved") == std::string::npos);
 }
 
@@ -260,7 +261,7 @@ TEST_CASE("Settings OIDC: a non-admin cannot set the client secret and nothing p
                            "application/x-www-form-urlencoded");
     REQUIRE(res);
     CHECK(res->status == 403);
-    CHECK(h.runtime_config->get_value_with_secrets("oidc_client_secret") == "real-secret");
+    CHECK(decrypt_for_test(*h.runtime_config, "oidc_client_secret") == "real-secret");
     CHECK(h.audited.empty());
 }
 
@@ -282,7 +283,7 @@ TEST_CASE("Settings OIDC: a secret CONTAINING the placeholder is refused, not si
     CHECK(res->body.find("could NOT be saved") != std::string::npos);
     CHECK(res->body.find("oidc_client_secret") != std::string::npos);
     // The stored credential is untouched either way - the sink refused the write.
-    CHECK(h.runtime_config->get_value_with_secrets("oidc_client_secret") == "real-secret");
+    CHECK(decrypt_for_test(*h.runtime_config, "oidc_client_secret") == "real-secret");
     // ...and it is audited as a failure.
     REQUIRE_FALSE(h.audited.empty());
     CHECK(h.audited.back().find("persist failed") != std::string::npos);
@@ -335,5 +336,5 @@ TEST_CASE("Settings OIDC: an EXACT placeholder still means unchanged, and report
                            "application/x-www-form-urlencoded");
     REQUIRE(res);
     CHECK(res->body.find("could NOT be saved") == std::string::npos);
-    CHECK(h.runtime_config->get_value_with_secrets("oidc_client_secret") == "real-secret");
+    CHECK(decrypt_for_test(*h.runtime_config, "oidc_client_secret") == "real-secret");
 }
