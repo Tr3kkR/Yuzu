@@ -5,11 +5,20 @@
  * Non-PG tests: pure-function coverage (hmac_sha256 against RFC 4231
  * vectors) that needs no database.
  *
- * [pg] tests: CRUD, cascade delete, the ADR-0010 secrets seam
+ * [pg] tests: CRUD, cascade delete, and the ADR-0010 secrets seam
  * (has_secret invariant, tamper -> skip-not-unsigned-fire, no-secret ->
- * unsigned fire preserved), and the ADR-0009 legacy-SQLite backfill
- * (id preservation, decrypt-and-compare verification, orphan/fingerprint
- * handling).
+ * unsigned fire preserved).
+ *
+ * Most of the dedicated legacy-SQLite backfill TEST_CASE suite (2026-08-25)
+ * was removed as part of a fresh-start-by-default policy change (ADR-0009
+ * amendment). WebhookStore::migrate_from_sqlite()/migrate_from_sqlite_impl()
+ * themselves are UNCHANGED and still present (their removal is a separate,
+ * later step) -- this store shipped its backfill (PR #3563) the same day
+ * the amendment landed, too late for the "don't build it" guidance to
+ * reach it. Two cases were reinstated (governance flagged their removal):
+ * the WAL/SHM sidecar 0600 permission-enforcement pair, both regression
+ * tests for real findings from PR #3563's own governance/chaos rounds on
+ * this still-live, secrets-adjacent boot path.
  */
 
 #include "webhook_store.hpp"
@@ -18,6 +27,8 @@
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
 #include "test_webhook_store_pg_helper.hpp"
+
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -64,6 +75,9 @@ namespace {
 
 /// Writes a minimal legacy `webhooks.db` (+ optional `webhook_deliveries`)
 /// SQLite file at `path`, matching the pre-migration SQLite schema exactly.
+/// Reinstated for the two WAL/SHM 0600-enforcement regression tests below
+/// only — governance flagged their removal, since they're real regression
+/// tests for findings from PR #3563's own review, on a still-live path.
 class LegacyWebhookDb {
 public:
     struct Row {
@@ -417,103 +431,11 @@ TEST_CASE("WebhookStore[pg]: a non-NULL secret with has_secret=false is also a C
     CHECK(res.status() == PGRES_FATAL_ERROR); // CHECK constraint violation
 }
 
-// ── ADR-0009 legacy backfill ─────────────────────────────────────────────
-
-TEST_CASE("WebhookStore[pg]: backfill preserves ids, decrypts-and-verifies the secret, and "
-         "carries deliveries",
-         "[webhook_store][pg]") {
-    WebhookStorePg store;
-    auto legacy_path = yuzu::test::unique_temp_path("yuzu_test_webhook_legacy") += ".db";
-
-    {
-        LegacyWebhookDb legacy(legacy_path);
-        legacy.insert({.id = 5,
-                      .url = "https://example.com/hook",
-                      .event_types = "agent.registered",
-                      .secret = "legacy-plaintext-secret",
-                      .enabled = true,
-                      .created_at = 1700000000});
-        legacy.insert({.id = 9,
-                      .url = "https://noauth.example.com/hook",
-                      .event_types = "*",
-                      .secret = "",
-                      .enabled = false,
-                      .created_at = 1700000100});
-        legacy.insert(LegacyWebhookDb::DeliveryRow{.id = 42,
-                                                   .webhook_id = 5,
-                                                   .event_type = "agent.registered",
-                                                   .payload = R"({"a":1})",
-                                                   .status_code = 200,
-                                                   .delivered_at = 1700000050,
-                                                   .error = ""});
-    }
-
-    REQUIRE(store->migrate_from_sqlite(legacy_path));
-
-    auto hooks = store->list();
-    REQUIRE(hooks.has_value());
-    REQUIRE(hooks->size() == 2);
-
-    const Webhook* signed_hook = nullptr;
-    const Webhook* unsigned_hook = nullptr;
-    for (const auto& w : *hooks) {
-        if (w.id == 5)
-            signed_hook = &w;
-        else if (w.id == 9)
-            unsigned_hook = &w;
-    }
-    REQUIRE(signed_hook != nullptr);
-    REQUIRE(unsigned_hook != nullptr);
-    CHECK(signed_hook->url == "https://example.com/hook");
-    CHECK(signed_hook->has_secret == true);
-    CHECK(signed_hook->enabled == true);
-    CHECK(signed_hook->created_at == 1700000000);
-    CHECK(unsigned_hook->has_secret == false);
-    CHECK(unsigned_hook->enabled == false);
-
-    // Decrypt-and-compare verification (ADR-0010 — ciphertext is
-    // nondeterministic, never byte-compare): read the raw blob back and
-    // decrypt it through the SAME codec the store uses.
-    {
-        auto lease = store.pool().acquire();
-        REQUIRE(lease);
-        auto res = yuzu::server::pg::exec_params(
-            lease.get(), "SELECT encode(secret,'hex') FROM webhook_store.webhooks WHERE id=5",
-            std::vector<std::string>{});
-        REQUIRE(res.status() == PGRES_TUPLES_OK);
-        REQUIRE(PQntuples(res.get()) == 1);
-        std::string hex = PQgetvalue(res.get(), 0, 0);
-        std::vector<std::uint8_t> blob;
-        blob.reserve(hex.size() / 2);
-        for (std::size_t i = 0; i + 1 < hex.size(); i += 2)
-            blob.push_back(static_cast<std::uint8_t>(std::stoi(hex.substr(i, 2), nullptr, 16)));
-        auto pk = yuzu::server::pg::SecretCodec::encode_bigint_pk(5);
-        auto dec = store.codec().decrypt(
-            yuzu::server::pg::SecretCodec::SecretId{"webhook_store", "webhooks", "secret", pk},
-            blob);
-        REQUIRE(dec.has_value());
-        std::string plaintext(reinterpret_cast<const char*>(dec->data()), dec->size());
-        CHECK(plaintext == "legacy-plaintext-secret");
-    }
-
-    // Delivery id preserved, correctly re-parented via the preserved
-    // webhook id.
-    auto deliveries = store->get_deliveries(5);
-    REQUIRE(deliveries.size() == 1);
-    CHECK(deliveries[0].id == 42);
-    CHECK(deliveries[0].webhook_id == 5);
-    CHECK(deliveries[0].payload == R"({"a":1})");
-
-    // Legacy file moved aside (never deleted, ADR-0009).
-    CHECK_FALSE(std::filesystem::exists(legacy_path));
-    bool moved_copy_found = false;
-    for (const auto& entry :
-        std::filesystem::directory_iterator(legacy_path.parent_path())) {
-        if (entry.path().string().starts_with(legacy_path.string() + ".migrated-"))
-            moved_copy_found = true;
-    }
-    CHECK(moved_copy_found);
-}
+// ── Legacy-SQLite backfill: WAL/SHM sidecar permission enforcement ─────────
+// Reinstated (governance flagged their removal from the 2026-08-25
+// fresh-start-by-default sweep): both are regression tests for real
+// findings against PR #3563's own review rounds, on WebhookStore's
+// still-live, secrets-adjacent `migrate_from_sqlite()` boot path.
 
 #ifndef _WIN32
 TEST_CASE("WebhookStore[pg]: backfill restricts WAL/SHM sidecars to 0600, not just the main file",
@@ -683,78 +605,3 @@ TEST_CASE("WebhookStore[pg]: a sidecar that fails to move is still 0600 at its o
 }
 #endif
 
-TEST_CASE("WebhookStore[pg]: backfill is idempotent — a second run against the moved-aside-free "
-         "path is a no-op",
-         "[webhook_store][pg]") {
-    WebhookStorePg store;
-    auto legacy_path = yuzu::test::unique_temp_path("yuzu_test_webhook_legacy2") += ".db";
-    {
-        LegacyWebhookDb legacy(legacy_path);
-        legacy.insert({.id = 1,
-                      .url = "https://example.com/hook",
-                      .event_types = "*",
-                      .secret = "s",
-                      .enabled = true,
-                      .created_at = 1700000000});
-    }
-    REQUIRE(store->migrate_from_sqlite(legacy_path));
-    // The legacy file was moved aside — a second call against the ORIGINAL
-    // (now-absent) path must also succeed cleanly (sourceless: "nothing to
-    // migrate", not a fresh re-import).
-    REQUIRE(store->migrate_from_sqlite(legacy_path));
-    auto hooks = store->list();
-    REQUIRE(hooks.has_value());
-    CHECK(hooks->size() == 1); // not duplicated
-}
-
-TEST_CASE("WebhookStore[pg]: backfill with no legacy file is a clean no-op",
-         "[webhook_store][pg]") {
-    WebhookStorePg store;
-    auto legacy_path = yuzu::test::unique_temp_path("yuzu_test_webhook_legacy_absent") += ".db";
-    REQUIRE(store->migrate_from_sqlite(legacy_path));
-    auto hooks = store->list();
-    REQUIRE(hooks.has_value());
-    CHECK(hooks->empty());
-}
-
-TEST_CASE("WebhookStore[pg]: backfill refuses (fail-closed) on an orphaned delivery row",
-         "[webhook_store][pg]") {
-    // gov Gate 3/4 (PR #3563 fix round): also seed a secret-bearing webhook
-    // row so this fail-closed early-return path exercises
-    // `LegacySecretWiper`'s destructor over real, non-empty legacy secret
-    // data — not just an empty `legacy_hooks`. The wiper's own correctness
-    // isn't independently observable from outside the process (zeroized
-    // memory can't be asserted on without UB), so this only proves the
-    // early-return itself still behaves correctly with a populated
-    // `legacy_hooks`; it doesn't add a new assertion of its own.
-    WebhookStorePg store;
-    auto legacy_path = yuzu::test::unique_temp_path("yuzu_test_webhook_legacy_orphan") += ".db";
-    {
-        LegacyWebhookDb legacy(legacy_path);
-        legacy.insert({.id = 1,
-                      .url = "https://example.com/hook",
-                      .event_types = "*",
-                      .secret = "orphan-test-plaintext-secret",
-                      .enabled = true,
-                      .created_at = 1700000000});
-        // A delivery referencing a webhook_id that was never inserted — the
-        // legacy AND migrated schema both enforce this via FK CASCADE, so
-        // this shape is corruption, not a real upgrade artifact.
-        legacy.insert(LegacyWebhookDb::DeliveryRow{.id = 1,
-                                                   .webhook_id = 999,
-                                                   .event_type = "x",
-                                                   .payload = "{}",
-                                                   .status_code = 200,
-                                                   .delivered_at = 1700000000,
-                                                   .error = ""});
-    }
-    CHECK_FALSE(store->migrate_from_sqlite(legacy_path));
-    // Refusing must leave the legacy file untouched (never moved aside on
-    // a failed backfill — ADR-0009).
-    CHECK(std::filesystem::exists(legacy_path));
-    // The secret-bearing row must NOT have been written on a refused
-    // backfill (fail-closed also means "never a partial write").
-    auto hooks = store->list();
-    REQUIRE(hooks.has_value());
-    CHECK(hooks->empty());
-}
