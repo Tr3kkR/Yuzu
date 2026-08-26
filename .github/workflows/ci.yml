@@ -511,6 +511,33 @@ jobs:
           # PRs: only gcc-15 debug (fast feedback)
           - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
           - compiler: ${{ github.event_name == 'pull_request' && 'clang-21' || 'NONE' }}
+        # pg_mode (#3443 Phase 2) is a DERIVED per-leg key via include:, never a
+        # third axis (2x matrix, breaks max-parallel:3's 4-runner arithmetic) and
+        # never in `name:` (job names are the ruleset's required-check contexts,
+        # docs-required-checks below must stay in lockstep). A key-only include
+        # entry attaches to every combination surviving exclude:; a later include
+        # that ALSO matches a given combination can overwrite a value an earlier
+        # include added (never an original axis value) — this is GitHub's
+        # documented include: behavior, treated here as confirmed-by-observation
+        # (the PR run below), not asserted certainty. So: default smoke first,
+        # then the gcc-15/debug override to full. On a PR the exclude above has
+        # already trimmed the matrix to the single gcc-15/debug leg, so both
+        # include entries match that one leg and the net result is pg_mode=full
+        # — PR coverage is unaffected. On a push, gcc-15/debug ends up full and
+        # the other three legs (clang-21/debug, gcc-15/release, clang-21/release)
+        # stay smoke. Item 4 of the original plan (a periodic full clang-release
+        # PG run to cover the optimizer/NDEBUG-sensitive residual smoke can't
+        # reach) is deliberately DEFERRED — Phase 6A (the nightly slot-gate
+        # narrowing this would need to join) is shelved and nightly.yml only
+        # fires against `main`, which trails `dev` by thousands of commits right
+        # now; landing an ungated periodic leg would reintroduce exactly the
+        # uncoordinated-contention problem Phase 6A exists to close. Tracked on
+        # #3443, not silently dropped.
+        include:
+          - pg_mode: smoke
+          - compiler: gcc-15
+            build_type: debug
+            pg_mode: full
 
     steps:
       # PR-5 of the CI overhaul plan: normal CI keeps clean:false to preserve
@@ -786,7 +813,66 @@ jobs:
       - name: Ensure Postgres (server tests)
         run: bash scripts/ci/ensure-postgres.sh
 
-      - name: Test
+      # #3443 Phase 2: fail fast on a broken DSN or an unrecognized pg_mode
+      # BEFORE any test invocation runs — not just the PG ones — so a
+      # provisioning or matrix-include problem surfaces immediately instead
+      # of after several minutes of unrelated non-PG suite time. `Ensure
+      # Postgres` above already runs unconditionally in BOTH modes
+      # (Correction 1's fix: pg_mode selects which TEST INVOCATION runs,
+      # never whether Postgres is provisioned — gating provisioning itself
+      # would mean the [pg]-tagged cases silently SKIP instead of failing,
+      # since they skip cleanly whenever YUZU_TEST_POSTGRES_DSN is unset; a
+      # smoke leg would go green having run zero PG tests). This step is the
+      # loud-fail backstop for that class of defect, for every leg.
+      - name: Resolve pg_mode + assert Postgres DSN
+        env:
+          PG_MODE: ${{ matrix.pg_mode }}
+        run: |
+          case "$PG_MODE" in
+            full|smoke) ;;
+            *)
+              echo "::error::pg_mode is '$PG_MODE', expected 'full' or 'smoke' — matrix include: may be misconfigured"
+              exit 1
+              ;;
+          esac
+          if [[ -z "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
+            echo "::error::YUZU_TEST_POSTGRES_DSN is unset after Ensure Postgres — refusing to proceed to any PG-tagged test invocation (pg_mode=$PG_MODE) rather than let it silently skip"
+            exit 1
+          fi
+          echo "pg_mode=$PG_MODE"
+
+      # Verified NOT to select the #3443 Phase 2 'server pg smoke' entry: the
+      # --suite list below omits server-pg-smoke, and the by-name line
+      # matches none of its four names against it — meson's positional
+      # test-name matching is an EXACT match (fnmatch with no glob characters
+      # in a literal name, mtest.py's tests_from_args), not a substring one.
+      # See 'Test (pg shards, full)' below for the full #3443 concurrency-
+      # tuning history (with-test-slot.sh slot counts, --num-processes,
+      # shard timeouts) — kept there since it's about the PG-shard
+      # invocation specifically, not this non-PG one.
+      - name: Test (non-pg suites)
+        # Split into 2 invocations, cheap-first (fail-fast — bash -e aborts
+        # the remaining lines on the first non-zero exit): 21 tests across 5
+        # cheap suites (agent/docs/proto/tar/gateway) run first, then the 3
+        # non-pg server tests (2 shards + the mcp bridge teardown budget test
+        # + the pg shard partition invariant, #3443 Phase 1 — needs no
+        # Postgres DSN, --list-tests only enumerates TEST_CASE macros). Both
+        # UNCAPPED (no --num-processes) since neither touches Postgres. Only
+        # the pg-tagged invocations (full shards or smoke, #3443 Phase 2) go
+        # through their own dedicated steps below.
+        run: |
+          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --suite agent --suite docs --suite proto --suite tar --suite gateway
+          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs "server unit tests shard A" "server unit tests shard B" "mcp bridge teardown allocation budget" "server pg shard partition invariant"
+
+      - name: Test (pg shards, full)
+        if: matrix.pg_mode == 'full'
+        # #3443 Phase 2: this step now runs ONLY on the leg(s) whose pg_mode
+        # resolved to 'full' (today: gcc-15/debug, every PR and its matching
+        # push leg) — the other 3 push legs run 'Test (pg smoke)' below
+        # instead. Everything from here down is the pre-Phase-2 concurrency-
+        # tuning history for THIS invocation (with-test-slot.sh, --num-
+        # processes, shard timeouts) — unchanged by Phase 2, kept in full.
+        #
         # --num-processes 2: without a cap, meson fans every test() entry out at
         # once — its default worker count is an uncapped, non-affinity-aware
         # cpu_count() (this runner's job is genuinely confined to execute on 16
@@ -1016,10 +1102,24 @@ jobs:
           YUZU_TEST_SLOT_NAME: yuzu-bigtam-heavy
           YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
         run: |
-          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --suite agent --suite docs --suite proto --suite tar --suite gateway
-          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs "server unit tests shard A" "server unit tests shard B" "mcp bridge teardown allocation budget" "server pg shard partition invariant"
           bash scripts/ci/with-test-slot.sh 3 -- \
             python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 --suite server-pg
+
+      # #3443 Phase 2: the 3 non-primary Linux push legs (pg_mode=smoke) run
+      # this small tagged subset INSTEAD of the 10-shard server-pg suite
+      # above — see tests/meson.build's 'server pg smoke' entry for the full
+      # rationale (tag membership, why --allow-running-no-tests is REQUIRED
+      # here unlike Correction 1's original "no flag" wording, why it's a
+      # separate suite from server-pg, why by-name invocation). Deliberately
+      # UNGATED by with-test-slot.sh: ~11 cases / ~2.8s measured locally
+      # (280 assertions, all passed) is far cheaper than the up-to-30-minute
+      # slot wait the gate exists to bound — gating it would make the wait
+      # dominate the work. The DSN/pg_mode correctness this depends on was
+      # already asserted above, before any PG invocation ran.
+      - name: Test (pg smoke)
+        if: matrix.pg_mode == 'smoke'
+        run: python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs "server pg smoke"
+
 
       # Break-glass MFA-reset CLI contract (#1226) — exit codes + JSON output of
       # `yuzu-server --mfa-reset` are not exercisable by the Catch2 suite (which
