@@ -2,17 +2,26 @@
  * test_policy_evaluator.cpp — Unit tests for the compliance check -> verdict
  * pipeline (PolicyEvaluator).
  *
- * Strategy: real PolicyStore / InstructionStore / ResponseStore /
- * ManagementGroupStore on :memory:-style temp DBs, target resolution via a
- * static management group (so no AgentRegistry is needed), a FAKE dispatch_fn
- * that synchronously seeds canned ResponseStore rows under the execution_id it
- * is handed (keyed by agent + plugin), and an injectable clock to drive the
- * grace window deterministically.
+ * Strategy: real PolicyStore (Postgres, ADR-0056) / InstructionStore (Postgres,
+ * ADR-0058) / ResponseStore (Postgres, ADR-0039) / ManagementGroupStore
+ * (Postgres, ADR-0042) on a shared pool + per-test temp files, target
+ * resolution via a static management group (so no AgentRegistry is needed),
+ * a FAKE dispatch_fn that synchronously seeds canned ResponseStore rows
+ * under the execution_id it is handed (keyed by agent + plugin), and an
+ * injectable clock to drive the grace window deterministically.
+ *
+ * The final TEST_CASE is the regression test for ADR-0056's headline design:
+ * two PolicyEvaluator instances sharing one PolicyStore assert exactly one
+ * dispatch per policy per interval (the durable claim_due_policies lease),
+ * and that only the dispatching instance ever collects its own in-flight
+ * check (the other instance's tick claims nothing for it, by design — see
+ * policy_store.hpp's header comment on why collect stays per-replica).
  */
 
 #include "instruction_store.hpp"
 #include "management_group_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "test_mgmt_group_pg_helper.hpp"
 #include "policy_evaluator.hpp"
 #include "policy_store.hpp"
@@ -21,6 +30,7 @@
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
 
 #include <map>
 #include <stdexcept>
@@ -30,12 +40,21 @@
 #include <vector>
 
 using namespace yuzu::server;
+using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
+using yuzu::server::pg::PgResult;
 
 namespace {
 
-// ResponseStore is now a migrated Postgres store (ADR-0039) — shares the
-// "responsestore" template key with test_response_store.cpp (identical setup).
+// ResponseStore is a migrated Postgres store (ADR-0039) — shares the
+// "responsestore" template key with test_response_store.cpp (identical
+// setup). PolicyStore (ADR-0056) is constructed against the SAME pool/DB
+// (a different schema namespace, `policy_store` vs `response_store` —
+// exactly how they coexist in production's one shared pg_pool_); it is not
+// part of this template's pre-baked setup, so each fresh clone pays its own
+// migration on first construction — a fine trade-off here (this file is not
+// benchmarking migration cost), and avoids adding PolicyStore's migration
+// cost to every OTHER test file that shares the "responsestore" key.
 yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::string& dsn) {
     PgPool pool{{.conninfo = dsn, .size = 1}};
     ResponseStore store{pool};
@@ -58,9 +77,11 @@ std::string out_json2(const std::string& c1, const std::string& v1, const std::s
 }
 
 struct Harness {
-    yuzu::test::TempDbFile poldb{std::string_view("pol-")}, insdb{std::string_view("ins-")};
-    PolicyStore ps{poldb.path};
-    InstructionStore is{insdb.path};
+    // PolicyStore (ADR-0056) and InstructionStore (ADR-0058) are both migrated
+    // Postgres stores now — share the same pool/database as ResponseStore
+    // below (schema-per-store, ADR-0008).
+    PolicyStore ps;
+    InstructionStore is;
     ResponseStore rs;
     yuzu::test::ManagementGroupStorePg mg_bundle;
     ManagementGroupStore& mg = *mg_bundle;
@@ -73,7 +94,7 @@ struct Harness {
 
     std::string group_id;
 
-    explicit Harness(pg::PgPool& pool) : rs(pool) {
+    explicit Harness(pg::PgPool& pool) : ps(pool), is(pool), rs(pool) {
         auto def = [&](const std::string& id, const std::string& plugin) {
             InstructionDefinition d;
             d.id = id;
@@ -110,6 +131,7 @@ struct Harness {
         d.mgmt_group_store = &mg;
         d.grace_seconds = 15;
         d.default_interval_seconds = 3600;
+        d.fixing_stale_seconds = 1800;
         d.now_fn = [this] { return fake_now; };
         d.dispatch_fn = [this](const std::string& plugin, const std::string&,
                                const std::vector<std::string>& agents, const std::string&,
@@ -139,7 +161,8 @@ struct Harness {
     }
 
     // Author a fragment + policy bound to the static group. Returns policy id.
-    std::string author(const std::string& check_cel, bool with_fix = false) {
+    std::string author(const std::string& check_cel, bool with_fix = false,
+                       int64_t interval_seconds = 0) {
         std::string frag = std::string("apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\n") +
                            "spec:\n  check:\n    instruction: test.check\n    compliance: \"" +
                            check_cel + "\"\n";
@@ -153,6 +176,10 @@ struct Harness {
 
         std::string pol = std::string("apiVersion: yuzu.io/v1alpha1\nkind: Policy\n") + "spec:\n  fragment: " +
                           *fid + "\n  managementGroups:\n    - " + group_id + "\n";
+        if (interval_seconds > 0) {
+            pol += "  triggers:\n    - type: interval\n      interval_seconds: " +
+                   std::to_string(interval_seconds) + "\n";
+        }
         auto pid = ps.create_policy(pol);
         REQUIRE(pid.has_value());
         return *pid;
@@ -160,7 +187,9 @@ struct Harness {
 
     std::string status_of(const std::string& pid, const std::string& agent) {
         auto s = ps.get_agent_status(pid, agent);
-        return s ? s->status : std::string("<none>");
+        if (!s || !*s)
+            return "<none>";
+        return (*s)->status;
     }
 };
 
@@ -176,12 +205,67 @@ TEST_CASE("policy evaluator: compliant + non_compliant verdicts (multi-agent fan
     auto pid = h.author("result.hostname != ''");
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).empty());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20; // past grace
     ev.tick();
 
     CHECK(h.status_of(pid, "agentA") == "compliant");
     CHECK(h.status_of(pid, "agentB") == "non_compliant");
+}
+
+TEST_CASE("policy evaluator: evaluate_now does not dispatch when record_dispatch fails "
+          "(adversarial review, round 2)",
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    auto pid = h.author("result.hostname != ''");
+
+    // Drop the durable claim table out from under the live store — a
+    // reproducible stand-in for a transient connection loss / botched
+    // migration. record_dispatch() (called first inside evaluate_now())
+    // must now fail, and evaluate_now() must NOT proceed to dispatch: a
+    // dispatch that runs without a durable stamp is exactly the "next
+    // automatic tick sees no row and re-claims immediately" bug this
+    // store's dispatch-claim design exists to prevent.
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult r{PQexec(conn.get(), "DROP TABLE policy_store.policy_dispatch_state CASCADE")};
+        REQUIRE(r.ok());
+    }
+
+    PolicyEvaluator ev(h.deps());
+    auto result = ev.evaluate_now(pid);
+    CHECK_FALSE(result.has_value()); // degraded, never a silent "no targets" empty string
+    CHECK(h.dispatch_calls == 0);
+}
+
+TEST_CASE("policy evaluator: evaluate_now degrades (not a silent no-op) when the fragment "
+          "table is unavailable (governance, 2026-08-24)",
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    auto pid = h.author("result.hostname != ''");
+
+    // record_dispatch() (the durable claim stamp) touches only
+    // policy_dispatch_state and must still succeed here — this test targets
+    // kickoff_check()'s OWN get_fragment() read, which used to collapse a
+    // degraded read into the same "" a genuine "no check instruction /
+    // matches no agents" no-op returns, so a false REST 409 masked what was
+    // actually a 503.
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult r{PQexec(conn.get(), "DROP TABLE policy_store.policy_fragments CASCADE")};
+        REQUIRE(r.ok());
+    }
+
+    PolicyEvaluator ev(h.deps());
+    auto result = ev.evaluate_now(pid);
+    CHECK_FALSE(result.has_value());
+    CHECK(h.dispatch_calls == 0);
 }
 
 TEST_CASE("policy evaluator: non-responder -> unknown, plugin failure -> error",
@@ -194,12 +278,36 @@ TEST_CASE("policy evaluator: non-responder -> unknown, plugin failure -> error",
     auto pid = h.author("result.hostname != ''");
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).empty());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
     ev.tick();
 
     CHECK(h.status_of(pid, "agentA") == "error");
     CHECK(h.status_of(pid, "agentB") == "unknown");
+}
+
+TEST_CASE("policy evaluator: InstructionStore DB error on dispatch is distinct from unknown "
+          "instruction (ADR-0058: must not collapse a genuine failure into the same skip)",
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    auto pid = h.author("result.hostname != ''");
+
+    // A second InstructionStore backed by an unreachable pool simulates a genuine DB failure —
+    // swapped in for this test only, in place of the harness's normally-open store.
+    PgPool broken_pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 1}};
+    REQUIRE_FALSE(broken_pool.valid());
+    InstructionStore broken_is{broken_pool};
+    REQUIRE_FALSE(broken_is.is_open());
+
+    auto deps = h.deps();
+    deps.instruction_store = &broken_is;
+    PolicyEvaluator ev(deps);
+
+    auto result = ev.evaluate_now(pid);
+    CHECK_FALSE(result.has_value()); // degraded, never a silent "no targets" empty string
+    CHECK(h.dispatch_calls == 0); // never reached dispatch_fn — failed resolving the definition
 }
 
 TEST_CASE("policy evaluator: missing CEL field resolves empty -> non_compliant",
@@ -215,7 +323,7 @@ TEST_CASE("policy evaluator: missing CEL field resolves empty -> non_compliant",
     auto pid = h.author("result.hostname != ''");
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).empty());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
     ev.tick();
 
@@ -235,7 +343,7 @@ TEST_CASE("policy evaluator: CEL evaluation error -> error", "[pg][policy][evalu
     auto pid = h.author("result.num / result.den");
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).empty());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
     ev.tick();
 
@@ -251,7 +359,7 @@ TEST_CASE("policy evaluator: interval throttles re-dispatch", "[pg][policy][eval
     auto pid = h.author("result.hostname != ''");
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).empty()); // dispatch #1
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty()); // dispatch #1
     CHECK(h.dispatch_calls == 1);
 
     h.fake_now += 20;
@@ -275,7 +383,7 @@ TEST_CASE("policy evaluator: empty compliance CEL -> error (no false compliant)"
     auto pid = h.author(/*check_cel=*/"");
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).empty());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
     ev.tick();
 
@@ -292,7 +400,7 @@ TEST_CASE("policy evaluator: remediation attempt cap -> error after 3 fixing tra
     h.canned["agentA|fixp"] = {1, "ok"};
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).empty());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
     ev.tick();
     REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
@@ -300,13 +408,62 @@ TEST_CASE("policy evaluator: remediation attempt cap -> error after 3 fixing tra
     // Drive remediation with an explicit (in-scope) agent list. Each call marks
     // the agent 'fixing'; PolicyStore caps fix attempts at 3 and forces 'error'
     // on the transition that would exceed it. Verify the cap is reached.
+    //
+    // Governance UP-3 (2026-08-24): remediate() now refuses a second call
+    // while the prior attempt's FixWait is still outstanding (closes a
+    // double-dispatch / double-attempt-count hazard), so each attempt must
+    // mature — advance time past grace, tick() — before the next call. This
+    // is the realistic shape anyway: an operator waits for one fix attempt to
+    // resolve before retrying.
     for (int i = 0; i < 4; ++i) {
         auto rr = ev.remediate(pid, {"agentA"});
         // The first three dispatch the fix; the 4th still dispatches but the
         // status write trips the cap. remediate reports dispatch success either way.
         REQUIRE(rr.ok);
+        if (i < 3) {
+            // Mature this attempt's FixWait (clearing it from in_flight_) so the
+            // NEXT remediate() call isn't refused as already-in-flight. Skip
+            // this on the 4th/final call — collect_ready()'s own verify-phase
+            // write (no canned "agentA|verifyp" response here -> non-responder
+            // -> "unknown") would otherwise overwrite the cap's "error" write
+            // this assertion is checking for.
+            h.fake_now += 20;
+            ev.tick();
+        }
     }
     CHECK(h.status_of(pid, "agentA") == "error");
+}
+
+TEST_CASE("policy evaluator: remediate refuses a second call while a FixWait is already "
+          "in flight for the policy (governance UP-3, 2026-08-24)",
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "")}; // non_compliant
+    auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
+    h.canned["agentA|fixp"] = {1, "ok"};
+
+    PolicyEvaluator ev(h.deps());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    h.fake_now += 20;
+    ev.tick();
+    REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
+
+    auto rr1 = ev.remediate(pid, {"agentA"});
+    REQUIRE(rr1.ok);
+    const int calls_after_first = h.dispatch_calls;
+
+    // NO tick() here — the first call's FixWait entry is still in in_flight_
+    // (collect_ready() is the only thing that clears it, and its grace
+    // window hasn't elapsed). A second call for the SAME policy must be
+    // refused rather than dispatching another fix and burning a second
+    // attempt against the retry cap on top of the first.
+    auto rr2 = ev.remediate(pid, {"agentA"});
+    CHECK_FALSE(rr2.ok);
+    CHECK_FALSE(rr2.degraded); // this is a business rejection, not a store degrade
+    CHECK(rr2.error.find("already in flight") != std::string::npos);
+    CHECK(h.dispatch_calls == calls_after_first); // no second dispatch happened
 }
 
 TEST_CASE("policy evaluator: verify dispatch failure -> error", "[pg][policy][evaluator]") {
@@ -318,7 +475,7 @@ TEST_CASE("policy evaluator: verify dispatch failure -> error", "[pg][policy][ev
     auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).empty());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
     ev.tick();
     REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
@@ -345,7 +502,7 @@ TEST_CASE("policy evaluator: manual remediation fix -> verify -> compliant",
     auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).empty());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
     ev.tick();
     REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
@@ -375,7 +532,7 @@ TEST_CASE("policy evaluator: remediation rejected when no fix_instruction",
     auto pid = h.author("result.hostname != ''", /*with_fix=*/false);
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).empty());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
     ev.tick();
     REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
@@ -383,4 +540,63 @@ TEST_CASE("policy evaluator: remediation rejected when no fix_instruction",
     auto rr = ev.remediate(pid, {});
     CHECK_FALSE(rr.ok);
     CHECK(rr.error.find("remediation pathway") != std::string::npos);
+}
+
+// ============================================================================
+// Multi-replica dispatch claim (ADR-0056) — the regression test for the
+// design this migration exists to settle.
+// ============================================================================
+
+TEST_CASE("policy evaluator: two instances sharing one store dispatch a policy exactly once "
+          "per interval, and only the dispatcher collects it",
+          "[pg][policy][evaluator][claim]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 8}};
+    Harness h(pool);
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "yuzu-a")};
+    h.canned["agentB|checkp"] = {1, out_json("hostname", "")};
+    // A short, explicit interval so dispatch_due() actually claims on tick()
+    // rather than relying on evaluate_now()'s bypass.
+    auto pid = h.author("result.hostname != ''", /*with_fix=*/false, /*interval_seconds=*/300);
+
+    // Two independent PolicyEvaluator instances, sharing the SAME
+    // PolicyStore/DB (simulating two server replicas) but each with its OWN
+    // in-memory in_flight_ (Deps carries no shared state between them) and
+    // its OWN dispatch counter via a shared Harness dispatch_fn (dispatch
+    // calls are counted process-wide in `h`, which is enough to prove
+    // dedup — both evaluators funnel through the same fake dispatch_fn).
+    PolicyEvaluator evA(h.deps());
+    PolicyEvaluator evB(h.deps());
+
+    // Both tick at the same logical moment. Only one may win the advisory
+    // lock and claim the due policy; the other's dispatch_due() must claim
+    // nothing this tick.
+    evA.tick();
+    evB.tick();
+    CHECK(h.dispatch_calls == 1);
+
+    // A second simultaneous tick round, still within the 300s interval:
+    // neither dispatches again (the durable claim, not either evaluator's
+    // own memory, is what prevents the second dispatch).
+    h.fake_now += 20;
+    evA.tick();
+    evB.tick();
+    CHECK(h.dispatch_calls == 1);
+
+    // Whichever evaluator dispatched is the only one whose in_flight_ holds
+    // the check — advance past grace and let BOTH collect. The verdict must
+    // land exactly once, correctly, regardless of which instance dispatched
+    // (the other's collect_ready() has nothing in its own in_flight_ for
+    // this execution, so it is a no-op for this check).
+    h.fake_now += 300; // past grace AND past the 300s interval
+    evA.tick();
+    evB.tick();
+
+    CHECK(h.status_of(pid, "agentA") == "compliant");
+    CHECK(h.status_of(pid, "agentB") == "non_compliant");
+    // The interval elapsed during that last round, so a THIRD dispatch is
+    // expected (from whichever instance's dispatch_due() wins the claim
+    // this time) — total calls is 2, not 3+, proving the second round above
+    // truly claimed nothing.
+    CHECK(h.dispatch_calls == 2);
 }

@@ -248,7 +248,8 @@ Not implemented. Enumerate connected printers for asset tracking.
 
 ### 4.3 Listening Endpoint Enumeration :white_check_mark: `T1`
 
-`netstat` and `sockwho` plugins.
+`netstat` plugin (`netstat_list` action; `attribution` adds owning-process
+resolution -- folded from the retired sockwho plugin, #3403).
 
 ### 4.4 ARP Table :white_check_mark: `T1`
 
@@ -1259,7 +1260,6 @@ Not implemented (PRs 12, 15). HMAC rule signing (HKDF per design §11.2) with pe
 | users | Y | Y | Y | User |
 | network_config | Y | Y | Y | Network |
 | netstat | Y | Y | Y | Network |
-| sockwho | Y | Y | Y | Network |
 | network_diag | Y | Y | Y | Network |
 | network_actions | Y | Y | Y | Network |
 | wifi | Y | Y | Y | Network |

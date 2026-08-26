@@ -101,6 +101,16 @@ yuzu::test::PgTestTemplate guardianstate_tpl{"guardianstate", [](const std::stri
         throw std::runtime_error("guardianstate template: store failed to migrate");
 }};
 
+// Shared key "baselinestore" — SAME setup-callback shape as
+// test_baseline_store.cpp's own template (ADR-0055 migration), so the
+// shared-key replay verification (test_helpers.hpp) passes.
+yuzu::test::PgTestTemplate baselinestore_tpl{"baselinestore", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    BaselineStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("baselinestore template: store failed to migrate");
+}};
+
 struct RestGsHarness {
     // Each TempDbFile sits ABOVE its store unique_ptr: members destruct in
     // reverse order, so the store closes its SQLite handle before the backing
@@ -134,7 +144,10 @@ struct RestGsHarness {
     yuzu::server::authz::VisibleSet exec_visible_override{};
 
     // BaselineStore for the baseline-anchored per-device status route.
-    yuzu::test::TempDbFile bl_db_file{"yuzu_test_rest_gs_bl-"};
+    // Migrated to Postgres (ADR-0055) — separate clone/pool from gs_db_pg/
+    // gs_pool above (its own "baselinestore" template; independent schema).
+    std::optional<yuzu::test::PostgresTestDb> bl_db_pg;
+    std::optional<yuzu::server::pg::PgPool> bl_pool;
     std::unique_ptr<BaselineStore> baseline_store;
 
     // ADR-0017 authorize_list_read confinement for the fleet /guaranteed-state/status
@@ -306,7 +319,13 @@ struct RestGsHarness {
         // retention_days=0 makes compute_ttl_epoch() return the "never expire" sentinel).
         store = std::make_unique<GuaranteedStateStore>(*gs_pool, /*retention_days=*/0);
         REQUIRE(store->is_open());
-        baseline_store = std::make_unique<BaselineStore>(bl_db_file.path);
+        bl_db_pg.emplace(baselinestore_tpl);
+        INFO("[RestGsHarness] baseline fixture status (blank == database came up OK): "
+             << bl_db_pg->error());
+        REQUIRE(bl_db_pg->available());
+        bl_pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = bl_db_pg->dsn(), .size = 4});
+        REQUIRE(bl_pool->valid());
+        baseline_store = std::make_unique<BaselineStore>(*bl_pool);
         REQUIRE(baseline_store->is_open());
 
         auth_routes_ =
