@@ -3179,6 +3179,21 @@ McpServer::HandlerFn McpServer::build_handler(
                     const auto cid = yuzu::server::detail::make_correlation_id();
                     session_audit("mcp.session.reject", "failure", "",
                                   "reason=" + mint.reject_reason + " cid=" + cid);
+                    // #3042: the registry's shutdown() flag rejects every mint with this
+                    // reason once ServerImpl::stop() has begun draining sessions — a
+                    // distinct, transient condition from the cap reject below (no session
+                    // to end, no timeout to wait out; the whole server is going away). No
+                    // retry_after_ms: this process has no visibility into when the
+                    // server will be back.
+                    if (mint.reject_reason == "shutdown") {
+                        res.status = 503;
+                        res.set_content(
+                            error_response_a4(id, kMcpShuttingDown, "Server is shutting down",
+                                              cid, "reconnect and re-initialize once the "
+                                                   "server is back"),
+                            "application/json");
+                        return;
+                    }
                     res.status = 429;
                     res.set_content(
                         error_response_a4(
@@ -3435,7 +3450,15 @@ McpServer::HandlerFn McpServer::build_handler(
             if (uri == "yuzu://compliance/fleet" && policy_store) {
                 if (!perm_fn(req, res, "Policy", "Read"))
                     return;
-                auto fc = policy_store->get_fleet_compliance();
+                // ADR-0056: degrade-distinguishable read — surface an error,
+                // never a false 0%/empty fleet-compliance resource.
+                auto fc_res = policy_store->get_fleet_compliance();
+                if (!fc_res) {
+                    res.set_content(error_response(id, kInternalError, "Policy store degraded"),
+                                    "application/json");
+                    return;
+                }
+                const auto& fc = *fc_res;
                 auto content = JObj()
                                    .add("total_checks", fc.total_checks)
                                    .add("compliant", fc.compliant)
@@ -4973,9 +4996,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 InstructionQuery iq;
                 iq.plugin_filter = param_str(args, "plugin");
                 iq.type_filter = param_str(args, "type");
-                auto defs = instruction_store->query_definitions(iq);
+                auto defs_result = instruction_store->query_definitions(iq);
+                if (!defs_result) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Instruction store unavailable"),
+                        "application/json");
+                    return;
+                }
                 JArr arr;
-                for (const auto& d : defs) {
+                for (const auto& d : *defs_result) {
                     arr.add(JObj()
                                 .add("id", d.id)
                                 .add("name", d.name)
@@ -5013,25 +5042,32 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto def_id = param_str(args, "id");
-                auto def = instruction_store->get_definition(def_id);
-                if (!def) {
+                auto def_result = instruction_store->get_definition(def_id);
+                if (!def_result) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Instruction store unavailable"),
+                        "application/json");
+                    return;
+                }
+                if (!*def_result) {
                     res.set_content(
                         error_response(id, kInvalidParams, "Definition not found: " + def_id),
                         "application/json");
                     return;
                 }
+                const auto& def = **def_result;
                 auto obj = JObj()
-                               .add("id", def->id)
-                               .add("name", def->name)
-                               .add("version", def->version)
-                               .add("type", def->type)
-                               .add("plugin", def->plugin)
-                               .add("action", def->action)
-                               .add("description", def->description)
-                               .add("approval_mode", def->approval_mode)
-                               .add("parameter_schema", def->parameter_schema)
-                               .add("result_schema", def->result_schema)
-                               .add("yaml_source", def->yaml_source);
+                               .add("id", def.id)
+                               .add("name", def.name)
+                               .add("version", def.version)
+                               .add("type", def.type)
+                               .add("plugin", def.plugin)
+                               .add("action", def.action)
+                               .add("description", def.description)
+                               .add("approval_mode", def.approval_mode)
+                               .add("parameter_schema", def.parameter_schema)
+                               .add("result_schema", def.result_schema)
+                               .add("yaml_source", def.yaml_source);
                 mcp_audit("success", def_id);
                 res.set_content(success_response(id, tool_result(obj.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -5918,9 +5954,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 PolicyQuery pq;
-                auto policies = policy_store->query_policies(pq);
+                auto policies_res = policy_store->query_policies(pq);
+                if (!policies_res) {
+                    mcp_audit("failure", "store degraded; list_policies");
+                    res.set_content(
+                        a4_error(kInternalError, "Policy store degraded — query failed", {},
+                                 /*retry_after_ms=*/5000),
+                        "application/json");
+                    return;
+                }
                 JArr arr;
-                for (const auto& p : policies) {
+                for (const auto& p : *policies_res) {
                     arr.add(JObj()
                                 .add("id", p.id)
                                 .add("name", p.name)
@@ -5954,7 +5998,16 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto policy_id = param_str(args, "policy_id");
-                auto cs = policy_store->get_compliance_summary(policy_id);
+                auto cs_res = policy_store->get_compliance_summary(policy_id);
+                if (!cs_res) {
+                    mcp_audit("failure", "store degraded; " + policy_id);
+                    res.set_content(
+                        a4_error(kInternalError, "Policy store degraded — query failed", {},
+                                 /*retry_after_ms=*/5000),
+                        "application/json");
+                    return;
+                }
+                const auto& cs = *cs_res;
                 auto obj = JObj()
                                .add("policy_id", cs.policy_id)
                                .add("compliant", cs.compliant)
@@ -5984,7 +6037,16 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto fc = policy_store->get_fleet_compliance();
+                auto fc_res = policy_store->get_fleet_compliance();
+                if (!fc_res) {
+                    mcp_audit("failure", "store degraded; get_fleet_compliance");
+                    res.set_content(
+                        a4_error(kInternalError, "Policy store degraded — query failed", {},
+                                 /*retry_after_ms=*/5000),
+                        "application/json");
+                    return;
+                }
+                const auto& fc = *fc_res;
                 auto obj = JObj()
                                .add("total_checks", fc.total_checks)
                                .add("compliant", fc.compliant)
@@ -9430,14 +9492,22 @@ McpServer::HandlerFn McpServer::build_handler(
                     .add("offline_note", "MCP posture v1 sees currently registered agents; durable "
                                          "offline counts are a follow-up source.");
                 JObj policy_obj;
-                if (policy_store) {
-                    const auto fc = policy_store->get_fleet_compliance();
+                std::expected<FleetCompliance, PolicyReadError> fc_res =
+                    std::unexpected(PolicyReadError::kDegraded);
+                if (policy_store)
+                    fc_res = policy_store->get_fleet_compliance();
+                if (fc_res) {
+                    const auto& fc = *fc_res;
                     policy_obj.add("total_checks", fc.total_checks)
                         .add("compliant", fc.compliant)
                         .add("non_compliant", fc.non_compliant)
                         .add("unknown", fc.unknown)
                         .add("compliance_pct", fc.compliance_pct);
                 } else {
+                    // No store wired, or ADR-0056 degrade — either way this is a
+                    // best-effort aggregate view, so fold both into the same
+                    // "available: false" shape rather than failing the whole
+                    // multi-source response over one degraded source.
                     policy_obj.add("available", false);
                 }
 
@@ -12647,7 +12717,22 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                auto doc = yuzu::server::build_instructions_catalog(*instruction_store);
+                yuzu::server::DiscoveryDoc doc;
+                try {
+                    doc = yuzu::server::build_instructions_catalog(*instruction_store);
+                } catch (const std::exception&) {
+                    // ADR-0058: query_definitions can now throw on a genuine
+                    // std::expected DB-error (a Postgres blip) — surface the same
+                    // JSON-RPC-shaped error this handler already uses for
+                    // store-unavailable above, rather than letting httplib's
+                    // uncaught-exception path fall through to a bare empty-body 500
+                    // (no server-wide set_exception_handler is installed on
+                    // web_server_ — see rest_api_v1.cpp's identical note).
+                    res.set_content(
+                        error_response(id, kInternalError, "Instruction store unavailable"),
+                        "application/json");
+                    return;
+                }
                 auto result = tool_result(doc.json, kObjectOutputSchema);
                 mcp_audit("success");
                 res.set_content(success_response(id, result), "application/json");

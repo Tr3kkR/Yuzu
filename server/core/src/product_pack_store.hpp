@@ -57,6 +57,8 @@
 /// storage hygiene only; it does not re-verify the Ed25519 signature over the sanitized bytes —
 /// `verify_signature` runs once, before sanitization, over the exact bytes that were signed.
 
+#include "store_errors.hpp"
+
 #include <atomic>
 #include <cstdint>
 #include <expected>
@@ -79,9 +81,11 @@ namespace yuzu::server {
 /// Machine-checkable prefix on every `ProductPackStore` `unexpected()` that represents a genuine
 /// DB/lease failure rather than caller-input validation, a signature/policy rejection, or a
 /// not-found error (mirrors `LicenseStore::kLicenseDbErrorPrefix` / `AccessReviewStore`'s
-/// `"not_found: "` idiom). Callers classify: `"not_found:"` prefix -> 404, this prefix -> 503,
-/// else -> 400 (see `workflow_routes.cpp`'s `product_pack_error_status`).
-inline constexpr const char* kProductPackDbErrorPrefix = "db_error: ";
+/// `"not_found: "` idiom, and `InstructionStore::kInstructionStoreDbErrorPrefix` — both alias
+/// the single shared `kDbErrorPrefix`, `store_errors.hpp`). Callers classify: `"not_found:"`
+/// prefix -> 404, this prefix -> 503, else -> 400 (see `workflow_routes.cpp`'s
+/// `product_pack_error_status`).
+inline constexpr std::string_view kProductPackDbErrorPrefix = kDbErrorPrefix;
 
 // ── Data types ───────────────────────────────────────────────────────────────
 
@@ -117,8 +121,13 @@ struct ProductPackQuery {
 using ItemInstallFn = std::function<std::expected<std::string, std::string>(
     const std::string& kind, const std::string& yaml_source)>;
 
-/// Called for each item during uninstall to remove it from its origin store.
-using ItemUninstallFn = std::function<bool(const std::string& kind, const std::string& item_id)>;
+/// Called for each item during uninstall to remove it from its origin store. `{}` on success;
+/// `unexpected("db_error: ...")` on a genuine store failure — `uninstall()` aborts the whole
+/// operation on this (never deletes the pack row while a contained item may still be live);
+/// any other `unexpected(...)` (not-found, unsupported kind) is tolerated and logged, matching
+/// pre-ADR-0058 behaviour for kinds whose origin store doesn't yet distinguish the two.
+using ItemUninstallFn = std::function<std::expected<void, std::string>(const std::string& kind,
+                                                                        const std::string& item_id)>;
 
 // ── ProductPackStore ────────────────────────────────────────────────────────
 

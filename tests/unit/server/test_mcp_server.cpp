@@ -94,6 +94,13 @@ yuzu::test::PgTestTemplate mcp_audit_tpl{"mcpaudit", [](const std::string& dsn) 
     if (!store.is_open())
         throw std::runtime_error("mcpaudit template: store failed to migrate");
 }};
+// InstructionStore is now a migrated Postgres store (ADR-0058).
+yuzu::test::PgTestTemplate mcp_instr_tpl{"mcpinstr", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::InstructionStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("mcpinstr template: store failed to migrate");
+}};
 } // namespace
 
 // ── JSON-RPC 2.0 parsing ─────────────────────────────────────────────────
@@ -581,8 +588,10 @@ TEST_CASE("MCP ResponseStore: query with filters", "[pg][mcp][response]") {
 
 // ── Instruction store integration (used by list_definitions) ──────────────
 
-TEST_CASE("MCP InstructionStore: query definitions", "[mcp][instruction]") {
-    InstructionStore store(":memory:");
+TEST_CASE("MCP InstructionStore: query definitions", "[mcp][instruction][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_instr_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
     REQUIRE(store.is_open());
 
     InstructionDefinition def;
@@ -598,12 +607,14 @@ TEST_CASE("MCP InstructionStore: query definitions", "[mcp][instruction]") {
 
     InstructionQuery iq;
     auto defs = store.query_definitions(iq);
-    CHECK(defs.size() >= 1);
+    REQUIRE(defs.has_value());
+    CHECK(defs->size() >= 1);
 
     auto found = store.get_definition("test.ping");
     REQUIRE(found.has_value());
-    CHECK(found->plugin == "example");
-    CHECK(found->action == "ping");
+    REQUIRE(found->has_value());
+    CHECK((*found)->plugin == "example");
+    CHECK((*found)->action == "ping");
 }
 
 // ── Audit store integration (used by query_audit_log) ─────────────────────
@@ -3196,8 +3207,10 @@ TEST_CASE("MCP Integration: discover_permissions wired vs unwired",
 }
 
 TEST_CASE("MCP Integration: discover_instructions wired vs unwired",
-          "[mcp][integration][discovery]") {
-    yuzu::server::InstructionStore instr(":memory:");
+          "[mcp][integration][discovery][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore instr(instr_pool);
     REQUIRE(instr.is_open());
     yuzu::server::InstructionDefinition def;
     def.name = "Get Hostname";
@@ -13176,6 +13189,48 @@ TEST_CASE("MCP 2f: streaming OFF mints no session header (byte-compat)", "[mcp][
     auto res = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}})");
     CHECK(res->status == 200);
     CHECK(res->get_header_value("Mcp-Session-Id").empty()); // no minting when streaming off
+}
+
+TEST_CASE("MCP #3042: initialize during shutdown gets a 503, distinct from the cap reject",
+          "[mcp][transport][2f]") {
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.start();
+
+    CHECK(reg.shutdown() == 0); // ServerImpl::stop()'s call, in miniature — nothing live yet
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}})");
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Mcp-Session-Id").empty()); // never minted
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == mcp::kMcpShuttingDown);
+    auto reject_it =
+        std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.session.reject|failure");
+    REQUIRE(reject_it != ts.audit_log.end());
+    // Pin the reason, not just the action/result — a refactor that changed or dropped
+    // it while keeping the 503 would otherwise sail through this test (adv-review #3042).
+    const auto reject_idx = std::distance(ts.audit_log.begin(), reject_it);
+    CHECK(ts.audit_details[reject_idx].find("reason=shutdown") != std::string::npos);
+}
+
+TEST_CASE("MCP #3042: a session live before shutdown 404s afterward, like any unknown session",
+          "[mcp][transport][2f][stream]") {
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.start();
+    const auto sid = mint_session(ts);
+    REQUIRE_FALSE(sid.empty());
+
+    CHECK(reg.shutdown() == 1);
+
+    auto get_res = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                           {"Accept", "text/event-stream"}});
+    CHECK(get_res->status == 404);
+    auto post_res = ts.call_raw("POST", R"({"jsonrpc":"2.0","method":"tools/list","id":9})",
+                                {{"Mcp-Session-Id", sid}});
+    CHECK(post_res->status == 404);
 }
 
 TEST_CASE("MCP 2f: initialize mints a principal-bound session + open audit", "[mcp][transport][2f]") {
