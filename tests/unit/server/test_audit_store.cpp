@@ -19,8 +19,11 @@
  * as still guarding a real bug on a still-live path.
  *
  * PG-gated: skips when YUZU_TEST_POSTGRES_DSN is unset, fails when it is set but
- * broken. Store-behaviour tests use a pre-migrated template clone; the metrics
- * test above that still calls migrate_from_sqlite() uses plain
+ * broken. Store-behaviour tests use a pre-migrated template clone; that
+ * includes the metrics-wiring test above, since its migrate_from_sqlite()
+ * calls exercise the marker/metrics contract, not the DDL migration path.
+ * The #2854 regression test below still calls migrate_from_sqlite() against
+ * a genuinely fresh backfill/anchor state, so it keeps plain
  * YUZU_REQUIRE_PG_DB, per that macro's plain-migration-test carve-out.
  */
 
@@ -572,7 +575,7 @@ TEST_CASE("AuditStore #2854: an ordinary restart seeds the liveness gauge from t
 // leaves it at 0 rather than incrementing something untrue.
 TEST_CASE("AuditStore: wiring metrics pre-seeds both closed label sets",
           "[pg][audit_store][metrics]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AuditStore store(pool);
     REQUIRE(store.is_open());
