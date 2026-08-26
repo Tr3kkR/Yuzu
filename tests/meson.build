@@ -1338,6 +1338,12 @@ if build_server
   # --list-tests on the built binary: E 193 + I 212 = 405 (old E's total,
   # exact), G 207 + J 144 = 351 (old G's total, exact), all four combined =
   # 756 (old E+G total, exact) — zero cases lost, zero cases duplicated.
+  # These four figures (193/212/207/144, and the 405/351/756 sums) are
+  # SPLIT-TIME snapshots, not a maintained invariant — like the D/C counts
+  # noted elsewhere in this file, they drift as the case population changes
+  # and re-verifying them isn't this split's (or any single commit's)
+  # concern. Post-#3626-prune (2026-08-26) actuals, for reference only:
+  # I=181, E=188 — see the 2026-08-26 note below shard I's definition.
   # E and I both survived a DSN-less all-skip without --allow-running-no-tests
   # at split time (E: 6 non-DSN cases; I: 1) — G and J both needed it, same as
   # old G did (every one of G's original ten tags is DSN-gated;
@@ -1385,8 +1391,13 @@ if build_server
   # same "no tests ran" exit(4) shard E/I were split off to avoid needing
   # this flag for. Verified via --list-tests + a DSN-less local run before
   # trusting it (0/181 cases execute without the flag; --allow-running-no-tests
-  # makes the identical filter exit 0). No other shard's non-DSN survivor
-  # count changed by this branch's test removals.
+  # makes the identical filter exit 0). This branch's pruning sweep also
+  # dropped shard B's own "RbacStore: migrate_from_sqlite returns false on
+  # an unopened store" non-DSN case (its exact structural twin) -- B's
+  # survivor count fell 4->3 but didn't reach zero, so B needed no flag
+  # change. I was the only shard whose non-DSN survivor count reached zero;
+  # verified empirically for every currently-flagless shard (A/B/C/E/F), not
+  # just B, before trusting this claim.
   test('server pg unit tests shard I', server_test_exe,
        args: ['[pg][engine_principal]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[guaranteed_state]~[oidc]~[software_inventory],[pg][rbac]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[guaranteed_state]~[oidc]~[software_inventory],[pg][custom_props]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[guaranteed_state]~[oidc]~[software_inventory],[pg][quarantine]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[guaranteed_state]~[oidc]~[software_inventory],[pg][management_group]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[guaranteed_state]~[oidc]~[software_inventory],[pg][notification_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[guaranteed_state]~[oidc]~[software_inventory]',
               '--allow-running-no-tests'],
