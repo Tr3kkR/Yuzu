@@ -858,6 +858,17 @@ jobs:
             echo "::error::gcc-15/debug resolved to pg_mode=$PG_MODE, expected 'full' — the matrix include: mapping is broken; this leg must keep full PG-shard coverage on every PR and push"
             exit 1
           fi
+          # Symmetric guard (governance Gate 6 sre nit): the check above only
+          # catches the primary leg losing full coverage. It says nothing if a
+          # future include: edit instead sends every leg back to 'full' -
+          # every existing check (this one included) stays green while the
+          # 4-leg PG-shard contention this change exists to fix silently
+          # returns. GITHUB_EVENT_NAME is one of GitHub Actions' own default
+          # step env vars, set on every run - no extra wiring needed.
+          if [[ "$GITHUB_EVENT_NAME" == "push" && ! ( "$MATRIX_COMPILER" == "gcc-15" && "$MATRIX_BUILD_TYPE" == "debug" ) && "$PG_MODE" != "smoke" ]]; then
+            echo "::error::$MATRIX_COMPILER/$MATRIX_BUILD_TYPE on a push resolved to pg_mode=$PG_MODE, expected 'smoke' — the matrix include: mapping is broken; this reintroduces the 4-leg full-PG-shard contention #3443 Phase 2 exists to fix"
+            exit 1
+          fi
           echo "pg_mode=$PG_MODE"
 
       # Verified NOT to select the #3443 Phase 2 'server pg smoke' entry: the
