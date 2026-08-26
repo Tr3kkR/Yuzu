@@ -998,17 +998,24 @@ if build_server
   #   - no entry name may be a substring of another (flake-retry maps
   #     meson-junit names by longest substring match) — 'shard A'/'shard B'/
   #     'shard C'/'shard D'/'shard E'/'shard F'/'shard G'/'shard H'/'shard I'/
-  #     'shard J' and 'server unit tests' are pairwise non-substring.
-  #   - `.github/workflows/ci.yml`'s Linux Test step HARDCODES the full list of
-  #     server pg shard names (to isolate them into their own with-test-slot.sh
-  #     invocation, separate from the cheap suites) and separately hardcodes the
-  #     3 non-pg server test names. Renaming/adding/removing a shard, or adding a
-  #     new server test() entry (pg or not), or adding a new top-level `suite:`
-  #     anywhere in the build (tests/meson.build or the root meson.build — see
-  #     the 'gateway' suite, registered there, not here) needs a matching update
-  #     to that step, or the new/renamed test silently stops running in CI. No
-  #     automated check enforces this yet — verify with meson test --list against
-  #     each of the 3 invocations before trusting a change to either side.
+  #     'shard J', 'server pg smoke', and 'server unit tests' are pairwise
+  #     non-substring.
+  #   - UPDATED Phase 2 (#3443) — this used to say ci.yml's Linux Test step
+  #     hardcodes the full pg shard name list with "No automated check
+  #     enforces this yet"; that was true before Phase 1 and is stale now.
+  #     Since Phase 1, the 10 pg shards are selected structurally via
+  #     `--suite server-pg` — adding/splitting/rebalancing a shard needs only
+  #     the right suite: kwarg here, ci.yml is untouched, and the partition
+  #     invariant below proves the property. ci.yml DOES still hardcode BY
+  #     NAME: the 2 non-pg server test names, 'mcp bridge teardown allocation
+  #     budget', 'server pg shard partition invariant', and (Phase 2) 'server
+  #     pg smoke' — renaming any of those, or adding a new top-level `suite:`
+  #     anywhere in the build (tests/meson.build or the root meson.build —
+  #     see the 'gateway' suite, registered there, not here), still needs a
+  #     matching ci.yml update, and by-name selection fails LOUD on a
+  #     mismatch (meson errors on an unmatched positional test name) rather
+  #     than silently dropping coverage — verify with meson test --list
+  #     against each ci.yml invocation before trusting a change to either side.
   # If a quiet leg pushes a shard past the #2093 80%-of-budget warning, the first
   # move is the concurrency gate / per-op cost (Defender TEMP exclusion, RAM disk),
   # then split or rebalance — raising the number is the last resort, not the first.
@@ -1421,7 +1428,63 @@ if build_server
        args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]'],
        suite: ['server', 'server-pg'], timeout: 700)
 
-  # Structural partition-invariant check (Phase 1, #3443): proves every
+  # #3443 Phase 2: PG portability smoke subset - runs INSTEAD of the 10 shards
+  # above on the 3 non-primary Linux push legs (ci.yml pg_mode=smoke); the
+  # gcc-15/debug leg (every PR, plus the primary push leg) keeps the full
+  # server-pg suite unchanged. Membership is the [pg-smoke] tag, hand-picked
+  # across 11 existing cases for libpq connection/RAII, migration, CRUD,
+  # NULL-vs-empty, pool exhaustion/reconnect, GUC hardening, transaction
+  # rollback, a real BYTEA+bigint wire round-trip, and UTF-8 truncation -
+  # enough to prove libpq linkage + basic runtime behavior without paying
+  # full PG-shard cost. Measured live (this box, warm cache): 280 assertions
+  # in 11 cases, ~2.8s.
+  #
+  # 'server pg shard partition invariant' below proves this is a nonzero,
+  # EXACT-count (SMOKE_EXACT_CASES in check-pg-shard-partition.py), correctly-
+  # named, correctly-flagged subset of [pg] - not a hand-maintained duplicate
+  # of the tag list, the exact defect class Phase 1 exists to cure.
+  #
+  # NOT in suite server-pg: the partition invariant above would see these 11
+  # cases as double-claimed (already owned by their real shards). suite:
+  # 'server-pg-smoke' is a dedicated suite so the smoke entry stays outside
+  # that partition while still being --suite-selectable on its own.
+  #
+  # --allow-running-no-tests is REQUIRED here (unlike Correction 1's original
+  # "no flag" wording): every [pg-smoke] case is all-DSN-gated, so a flagless
+  # entry would exit 4 (Catch2's AllTestsSkippedExitCode) on every DSN-less
+  # UNFILTERED `meson test` - local dev without Postgres, and any future
+  # sanitizer/nightly leg that runs the whole suite - breaking the documented
+  # skip contract in test_helpers.hpp. Loud-fail duty for a broken/missing DSN
+  # moves to ci.yml's own "Resolve pg_mode + assert Postgres DSN" step instead
+  # (checked BEFORE this or any other PG invocation runs) and to the checker's
+  # exact-count + flag-present assertions below.
+  #
+  # Invoked BY NAME from ci.yml, not by --suite: meson's positional test-name
+  # matching is an exact match (fnmatch with no glob characters in a literal
+  # name, mtest.py's tests_from_args) - a rename that doesn't update the
+  # ci.yml invocation errors loud ("test name does not match any test"), it
+  # does not silently keep matching on a substring. A --suite typo, by
+  # contrast, would exit 0 silently on a plain `meson test` RUN (mtest.py's
+  # get_tests/doit print "No suitable tests defined" and return success) -
+  # by-name selection is the one that fails safe on the real CI invocation.
+  # NOTE (adversarial review, both reviewers independently probed this):
+  # `meson test --list --suite <bad>` is a DIFFERENT code path and exits 1 -
+  # only the plain run (what ci.yml actually invokes, no --list) exits 0.
+  #
+  # Runs REDUNDANTLY (harmless, ~11 cases/seconds) under any unfiltered
+  # `meson test` - local dev, nightly.yml's 3 unfiltered legs,
+  # sanitizer-tests.yml's 2 unfiltered legs - since every test() entry runs
+  # once there regardless of suite; these 11 cases already run once via their
+  # owning shard too. Not worth special-casing for that cost.
+  #
+  # timeout: 60s is ~20x the measured solo cost (2.8s, 280 assertions) -
+  # generous margin for CI box contention (this step is deliberately UNGATED
+  # by with-test-slot.sh, see ci.yml) while still catching a genuine hang.
+  test('server pg smoke', server_test_exe,
+       args: ['[pg-smoke]', '--allow-running-no-tests'],
+       suite: ['server', 'server-pg-smoke'], timeout: 60)
+
+  # Structural partition-invariant check (Phase 1, #3443). Proves every
   # [pg]-tagged case above lands in EXACTLY ONE 'server-pg'-suite shard --
   # against the real compiled binary via --list-tests, not a hand-maintained
   # pin of the filter strings above (the pin that replaced -- see
@@ -1434,6 +1497,11 @@ if build_server
   # depends: ensures ninja builds the binary before this runs; it needs no
   # Postgres DSN (--list-tests only enumerates TEST_CASE macros, never runs
   # one).
+  #
+  # EXTENDED Phase 2 (#3443) to also prove 'server pg smoke' above (suite:
+  # 'server-pg-smoke') is a genuine subset: exactly one entry, the expected
+  # name, the expected exact case count, --allow-running-no-tests present,
+  # and every matched case also carries [pg] (script's check_smoke()).
   _pg_shard_python3 = find_program('python3', 'python')
   test('server pg shard partition invariant',
     _pg_shard_python3,

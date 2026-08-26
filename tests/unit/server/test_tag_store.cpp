@@ -114,7 +114,7 @@ void require_ok(const std::expected<void, std::string>& r) {
 // Lifecycle
 // ============================================================================
 
-TEST_CASE("TagStore: migrates at construction and reopens idempotently", "[pg][tag_store][db]") {
+TEST_CASE("TagStore: migrates at construction and reopens idempotently", "[pg][tag_store][db][pg-smoke]") {
     YUZU_REQUIRE_PG_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
@@ -157,7 +157,7 @@ TEST_CASE("TagStore: validate_value", "[tag_store][validation]") {
 // CRUD
 // ============================================================================
 
-TEST_CASE("TagStore: set and get", "[pg][tag_store]") {
+TEST_CASE("TagStore: set and get", "[pg][tag_store][pg-smoke]") {
     TAGS_SHARED(store);
 
     require_ok(store.set_tag("agent-1", "env", "production"));
@@ -173,7 +173,7 @@ TEST_CASE("TagStore: get nonexistent returns nullopt (not degraded)", "[pg][tag_
 }
 
 TEST_CASE("TagStore: a present tag with an empty value is engaged, distinguishable from absent",
-          "[pg][tag_store]") {
+          "[pg][tag_store][pg-smoke]") {
     TAGS_SHARED(store);
     require_ok(store.set_tag("agent-1", "note", ""));
     auto v = require_ok(store.get_tag("agent-1", "note"));

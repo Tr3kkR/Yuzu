@@ -28,12 +28,14 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
 SUITE = _mod.SERVER_PG_SUITE
+SMOKE_SUITE = _mod.SERVER_PG_SMOKE_SUITE
 
 
-def _entry(name, exe="/fake/exe", spec="[pg][x]", extra_args=None):
-    """One `meson introspect --tests` entry, server-pg-suite by default."""
+def _entry(name, exe="/fake/exe", spec="[pg][x]", extra_args=None, suite=SUITE):
+    """One `meson introspect --tests` entry, server-pg-suite by default.
+    Pass suite=SMOKE_SUITE for a server-pg-smoke fixture (#3443 Phase 2)."""
     cmd = [exe, spec] + (extra_args or [])
-    return {"name": name, "cmd": cmd, "suite": ["yuzu:server", SUITE]}
+    return {"name": name, "cmd": cmd, "suite": ["yuzu:server", suite]}
 
 
 def _xml(cases):
@@ -186,6 +188,161 @@ def test_parse_list_tests_xml(failures):
           "parse_list_tests_xml: extracts (name, file, line) correctly", failures)
 
 
+# ============================================================================
+# check_smoke() / parse_smoke_entries() — #3443 Phase 2
+# ============================================================================
+
+def _smoke_cases(n):
+    """n synthetic (name, file, line) tuples, all distinct."""
+    return {(f"smoke case {i}", "f.cpp", str(i)) for i in range(n)}
+
+
+def _with_exact_cases(n, fn):
+    """Run fn() with _mod.SMOKE_EXACT_CASES temporarily set to n, always
+    restoring the real (measured-against-the-binary) value afterward — the
+    real value must never leak stale across tests or survive a failure."""
+    saved = _mod.SMOKE_EXACT_CASES
+    _mod.SMOKE_EXACT_CASES = n
+    try:
+        fn()
+    finally:
+        _mod.SMOKE_EXACT_CASES = saved
+
+
+def _smoke_entry(name=_mod.SMOKE_ENTRY_NAME, exe="/fake/exe", spec=None,
+                  flagged=True):
+    spec = spec if spec is not None else _mod.SMOKE_SPEC
+    extra = [_mod.ALLOW_NO_TESTS_FLAG] if flagged else []
+    return _entry(name, exe=exe, spec=spec, extra_args=extra, suite=SMOKE_SUITE)
+
+
+def test_parse_smoke_entries_happy_path(failures):
+    tests = [_smoke_entry(), _entry("some shard", spec="[pg][a]")]  # shard entry ignored
+    entries, errors = _mod.parse_smoke_entries(tests)
+    check(errors == [], "smoke happy path: no shape errors", failures)
+    check(len(entries) == 1, "smoke happy path: only the 1 smoke entry found", failures)
+    check(entries[0] == (_mod.SMOKE_ENTRY_NAME, "/fake/exe", _mod.SMOKE_SPEC,
+                         [_mod.ALLOW_NO_TESTS_FLAG]),
+          "smoke happy path: 4-tuple shape correct (opts included)", failures)
+
+
+def test_check_smoke_happy_path(failures):
+    def run():
+        entries, _ = _mod.parse_smoke_entries([_smoke_entry()])
+        cases = _smoke_cases(_mod.SMOKE_EXACT_CASES)
+        list_fn = lambda exe, spec: cases if spec == _mod.SMOKE_SPEC else cases | {("other", "g.cpp", "1")}
+        ok, fail_msgs, stats = _mod.check_smoke(entries, "/fake/exe", list_fn)
+        check(ok, "smoke clean: reports OK", failures)
+        check(fail_msgs == [], "smoke clean: no failure messages", failures)
+        check(stats == {"smoke_case_count": _mod.SMOKE_EXACT_CASES},
+              "smoke clean: stats correct", failures)
+    _with_exact_cases(3, run)
+
+
+def test_check_smoke_missing_entry(failures):
+    ok, fail_msgs, _ = _mod.check_smoke([], "/fake/exe", lambda exe, spec: set())
+    check(not ok, "smoke missing: reports not-ok", failures)
+    check(any("hollow discovery" in m for m in fail_msgs),
+          "smoke missing: failure message says hollow discovery", failures)
+
+
+def test_check_smoke_duplicate_entry(failures):
+    entries, _ = _mod.parse_smoke_entries([
+        _smoke_entry(name="server pg smoke"),
+        {"name": "server pg smoke 2", "cmd": ["/fake/exe", _mod.SMOKE_SPEC,
+                                              _mod.ALLOW_NO_TESTS_FLAG],
+         "suite": ["yuzu:server", SMOKE_SUITE]},
+    ])
+    ok, fail_msgs, _ = _mod.check_smoke(entries, "/fake/exe", lambda exe, spec: set())
+    check(not ok, "smoke duplicate: reports not-ok", failures)
+    check(any("expected exactly one" in m for m in fail_msgs),
+          "smoke duplicate: failure message says expected exactly one", failures)
+
+
+def test_check_smoke_wrong_spec(failures):
+    entries, _ = _mod.parse_smoke_entries([_smoke_entry(spec="[pg][wrong]")])
+    ok, fail_msgs, _ = _mod.check_smoke(entries, "/fake/exe", lambda exe, spec: {("t", "f", "1")})
+    check(not ok, "smoke wrong spec: reports not-ok", failures)
+    check(any("spec is" in m and "[pg][wrong]" in m for m in fail_msgs),
+          "smoke wrong spec: failure message names the bad spec", failures)
+
+
+def test_check_smoke_wrong_name(failures):
+    entries, _ = _mod.parse_smoke_entries([_smoke_entry(name="server pg smoke typo")])
+    ok, fail_msgs, _ = _mod.check_smoke(entries, "/fake/exe", lambda exe, spec: {("t", "f", "1")})
+    check(not ok, "smoke wrong name: reports not-ok", failures)
+    check(any("name is" in m and "server pg smoke typo" in m for m in fail_msgs),
+          "smoke wrong name: failure message names the bad entry name", failures)
+
+
+def test_check_smoke_flag_absent(failures):
+    entries, _ = _mod.parse_smoke_entries([_smoke_entry(flagged=False)])
+    ok, fail_msgs, _ = _mod.check_smoke(entries, "/fake/exe", lambda exe, spec: {("t", "f", "1")})
+    check(not ok, "smoke flag absent: reports not-ok", failures)
+    check(any(_mod.ALLOW_NO_TESTS_FLAG in m and "missing" in m for m in fail_msgs),
+          "smoke flag absent: failure message names the missing flag (D2)", failures)
+
+
+def test_check_smoke_zero_cases(failures):
+    entries, _ = _mod.parse_smoke_entries([_smoke_entry()])
+    ok, fail_msgs, _ = _mod.check_smoke(entries, "/fake/exe", lambda exe, spec: set())
+    check(not ok, "smoke zero cases: reports not-ok", failures)
+    check(any("matched ZERO cases" in m for m in fail_msgs),
+          "smoke zero cases: failure message says so", failures)
+
+
+def test_check_smoke_count_one_below(failures):
+    # Sol: an off-by-one in EITHER direction must be caught, not just a
+    # coarse band — this is the case D7's exact-count design exists for.
+    def run():
+        entries, _ = _mod.parse_smoke_entries([_smoke_entry()])
+        cases = _smoke_cases(_mod.SMOKE_EXACT_CASES - 1)
+        ok, fail_msgs, stats = _mod.check_smoke(entries, "/fake/exe", lambda exe, spec: cases)
+        check(not ok, "smoke count -1: reports not-ok", failures)
+        check(any("expected exactly" in m for m in fail_msgs),
+              "smoke count -1: failure message states the exact expectation", failures)
+        check(stats.get("smoke_case_count") == _mod.SMOKE_EXACT_CASES - 1,
+              "smoke count -1: stats still report the actual count found", failures)
+    _with_exact_cases(3, run)
+
+
+def test_check_smoke_count_one_above(failures):
+    def run():
+        entries, _ = _mod.parse_smoke_entries([_smoke_entry()])
+        cases = _smoke_cases(_mod.SMOKE_EXACT_CASES + 1)
+        ok, fail_msgs, _ = _mod.check_smoke(entries, "/fake/exe", lambda exe, spec: cases)
+        check(not ok, "smoke count +1: reports not-ok", failures)
+        check(any("expected exactly" in m for m in fail_msgs),
+              "smoke count +1: failure message states the exact expectation", failures)
+    _with_exact_cases(3, run)
+
+
+def test_check_smoke_not_subset_of_pg(failures):
+    def run():
+        entries, _ = _mod.parse_smoke_entries([_smoke_entry()])
+        smoke_cases = _smoke_cases(_mod.SMOKE_EXACT_CASES)
+        stray = ("not tagged pg", "f.cpp", "99")
+        smoke_with_stray = (smoke_cases - {next(iter(smoke_cases))}) | {stray}
+
+        def list_fn(exe, spec):
+            if spec == _mod.SMOKE_SPEC:
+                return smoke_with_stray
+            return smoke_cases  # "[pg]" reference set — missing `stray`
+        ok, fail_msgs, _ = _mod.check_smoke(entries, "/fake/exe", list_fn)
+        check(not ok, "smoke not-subset: reports not-ok", failures)
+        check(any("not tagged [pg]" in m and "not tagged pg" in m for m in fail_msgs),
+              "smoke not-subset: failure message names the over-matched case", failures)
+    _with_exact_cases(3, run)
+
+
+def test_check_smoke_exe_mismatch(failures):
+    entries, _ = _mod.parse_smoke_entries([_smoke_entry(exe="/exe/two")])
+    ok, fail_msgs, _ = _mod.check_smoke(entries, "/exe/one", lambda exe, spec: {("t", "f", "1")})
+    check(not ok, "smoke exe mismatch: reports not-ok", failures)
+    check(any("binary" in m and "/exe/two" in m for m in fail_msgs),
+          "smoke exe mismatch: failure message names the mismatched binary", failures)
+
+
 def main():
     failures = []
     test_parse_shard_entries_happy_path(failures)
@@ -199,6 +356,18 @@ def main():
     test_check_partition_empty_reference(failures)
     test_check_partition_zero_case_shard(failures)
     test_parse_list_tests_xml(failures)
+    test_parse_smoke_entries_happy_path(failures)
+    test_check_smoke_happy_path(failures)
+    test_check_smoke_missing_entry(failures)
+    test_check_smoke_duplicate_entry(failures)
+    test_check_smoke_wrong_spec(failures)
+    test_check_smoke_wrong_name(failures)
+    test_check_smoke_flag_absent(failures)
+    test_check_smoke_zero_cases(failures)
+    test_check_smoke_count_one_below(failures)
+    test_check_smoke_count_one_above(failures)
+    test_check_smoke_not_subset_of_pg(failures)
+    test_check_smoke_exe_mismatch(failures)
 
     if failures:
         print(f"\ncheck-pg-shard-partition selftest: {len(failures)} FAILED")

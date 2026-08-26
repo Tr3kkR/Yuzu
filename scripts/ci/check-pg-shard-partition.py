@@ -2,7 +2,10 @@
 """check-pg-shard-partition.py — prove the PG-tagged Catch2 case population is
 exactly partitioned across this build's ``server-pg``-suite meson test()
 entries: every ``[pg]`` case lands in exactly one shard, none lost, none
-duplicated.
+duplicated. Also proves the ``server-pg-smoke`` entry (#3443 Phase 2) is a
+genuine, bounded, correctly-flagged subset of ``[pg]`` — one entry, the
+expected name, the expected exact case count, tagged ``--allow-running-
+no-tests``, and every matched case also carries ``[pg]``.
 
 Replaces flake-retry.py's old verbatim positional-filter pin (a hardcoded
 copy of every shard's tag-filter string, hand-updated on every split/
@@ -62,6 +65,19 @@ import xml.etree.ElementTree as ET  # stdlib, not defusedxml: this parses our
 # with that precedent for no real risk reduction here.
 
 SERVER_PG_SUITE = "yuzu:server-pg"
+SERVER_PG_SMOKE_SUITE = "yuzu:server-pg-smoke"
+SMOKE_SPEC = "[pg-smoke]"
+SMOKE_ENTRY_NAME = "server pg smoke"
+# Measured against the real binary once the [pg-smoke] tags landed (#3443
+# Phase 2) — NOT a guess and NOT a MIN/MAX range. A range let a same-count
+# drop-and-add, or a single stripped tag, pass silently; an exact count
+# catches any single addition or removal. Documented residual: a same-count
+# SUBSTITUTION (swap one intended case for a different [pg] case) is not
+# statically caught here — that is a reviewable diff on the tag itself, and
+# pinning exact case identity in this checker would recreate a duplicate
+# hand-maintained manifest, the exact defect class this script exists to cure.
+SMOKE_EXACT_CASES = 11
+ALLOW_NO_TESTS_FLAG = "--allow-running-no-tests"
 
 
 def gh(kind, msg):
@@ -89,34 +105,41 @@ def introspect_tests(builddir):
     return json.loads(out.stdout)
 
 
-def parse_shard_entries(tests):
-    """Return (entries, errors) for every server-pg-suite entry in `tests`.
+def _parse_suite_entries(tests, suite):
+    """Return (entries, errors) for every entry in `tests` carrying `suite`.
 
-    entries: [(name, exe, tag_filter_spec), ...] for well-shaped entries.
+    entries: [(name, exe, tag_filter_spec, opts), ...] for well-shaped
+    entries — exe as cmd[0], exactly one positional (non-'-'-prefixed)
+    Catch2 tag-filter spec, and the list of '-'-prefixed options (e.g.
+    --allow-running-no-tests) alongside it.
     errors: human-readable strings for every malformed entry found.
 
     Pure function — no I/O, no sys.exit — so a synthetic `tests` list (as
     `meson introspect --tests` would emit) exercises this without a real
     build. Collects EVERY malformed entry rather than stopping at the first
     (governance Gate 4 consistency-auditor F2): two simultaneously-broken
-    shard entries used to report only the first found.
+    entries used to report only the first found.
 
-    A server-pg entry must carry the exe as cmd[0] and exactly one
-    positional (non-'-'-prefixed) tag-filter spec as its only other cmd
-    element — this mirrors the same hygiene guard flake-retry.py's selftest
-    already enforces (options are permitted, e.g. --allow-running-no-tests
-    on an all-skip shard; two or more positional specs, or zero, is a shape
+    An entry must carry the exe as cmd[0] and exactly one positional
+    (non-'-'-prefixed) tag-filter spec as its only other cmd element — this
+    mirrors the same hygiene guard flake-retry.py's selftest already
+    enforces (options are permitted, e.g. --allow-running-no-tests on an
+    all-skip shard; two or more positional specs, or zero, is a shape
     violation).
+
+    Shared by parse_shard_entries (SERVER_PG_SUITE) and parse_smoke_entries
+    (SERVER_PG_SMOKE_SUITE, #3443 Phase 2) — same shape rules, different
+    suite and (for smoke) a caller that also needs `opts`.
     """
     entries = []
     errors = []
     for t in tests:
-        if SERVER_PG_SUITE not in t.get("suite", []):
+        if suite not in t.get("suite", []):
             continue
         cmd = t.get("cmd", [])
         name = t.get("name", "<unnamed>")
         if len(cmd) < 2:
-            errors.append(f"{name!r} in suite {SERVER_PG_SUITE!r} has no "
+            errors.append(f"{name!r} in suite {suite!r} has no "
                            f"positional Catch2 spec")
             continue
         exe, rest = cmd[0], cmd[1:]
@@ -127,8 +150,33 @@ def parse_shard_entries(tests):
                            f"tag-filter spec, found {specs!r} (options "
                            f"{opts!r} are fine, e.g. --allow-running-no-tests)")
             continue
-        entries.append((name, exe, specs[0]))
+        entries.append((name, exe, specs[0], opts))
     return entries, errors
+
+
+def parse_shard_entries(tests):
+    """Return (entries, errors) for every server-pg-suite entry in `tests`.
+
+    entries: [(name, exe, tag_filter_spec), ...] for well-shaped entries
+    (3-tuple — pinned by test_check_pg_shard_partition.py). errors:
+    human-readable strings for every malformed entry found. See
+    _parse_suite_entries for the shared shape rules.
+    """
+    entries, errors = _parse_suite_entries(tests, SERVER_PG_SUITE)
+    return [(name, exe, spec) for name, exe, spec, _opts in entries], errors
+
+
+def parse_smoke_entries(tests):
+    """Return (entries, errors) for every server-pg-smoke-suite entry in
+    `tests` (#3443 Phase 2). entries: [(name, exe, tag_filter_spec, opts),
+    ...] — keeps `opts` (unlike parse_shard_entries) because check_smoke
+    must verify --allow-running-no-tests is present (D2: an all-DSN-gated
+    flagless entry would fail every DSN-less unfiltered `meson test`, e.g.
+    local dev without Postgres or the sanitizer legs, breaking the
+    documented skip contract in test_helpers.hpp). See _parse_suite_entries
+    for the shared shape rules.
+    """
+    return _parse_suite_entries(tests, SERVER_PG_SMOKE_SUITE)
 
 
 def list_cases(exe, filt):
@@ -222,6 +270,74 @@ def check_partition(entries, list_cases_fn):
     return not failures, failures, stats
 
 
+def check_smoke(smoke_entries, shard_exe, list_cases_fn):
+    """Given server-pg-smoke entries (from parse_smoke_entries) and the
+    shard binary path (from check_partition — so both checks agree on which
+    binary is authoritative), prove the smoke set (#3443 Phase 2) is a
+    genuine, bounded, correctly-flagged subset of [pg]:
+      - exactly one entry in the suite (hollow / duplicate guard)
+      - its name is exactly SMOKE_ENTRY_NAME
+      - its exe matches shard_exe (one binary across both suites)
+      - its spec is exactly SMOKE_SPEC
+      - it carries ALLOW_NO_TESTS_FLAG (D2 — see parse_smoke_entries)
+      - list_cases_fn(exe, SMOKE_SPEC) is nonempty and == SMOKE_EXACT_CASES
+        exactly, not a range (a range let a same-count drop-and-add, or a
+        single stripped tag, pass silently)
+      - every matched case also carries [pg]
+
+    Pure with respect to I/O — list_cases_fn is injected, same pattern as
+    check_partition. Returns (ok: bool, failures: list[str], stats: dict).
+    The count here is DISCOVERED via --list-tests, never "executed" — this
+    check needs no DSN and never runs a test body.
+    """
+    if len(smoke_entries) == 0:
+        return False, [f"no entry found in suite {SERVER_PG_SMOKE_SUITE!r} "
+                        f"— hollow discovery (expected the smoke entry)"], {}
+    if len(smoke_entries) > 1:
+        names = sorted(n for n, _, _, _ in smoke_entries)
+        return False, [f"{len(smoke_entries)} entries found in suite "
+                        f"{SERVER_PG_SMOKE_SUITE!r} — expected exactly one: "
+                        f"{names!r} (not a partition — pick one)"], {}
+
+    name, exe, spec, opts = smoke_entries[0]
+    failures = []
+    if name != SMOKE_ENTRY_NAME:
+        failures.append(f"smoke entry name is {name!r}, expected "
+                         f"{SMOKE_ENTRY_NAME!r}")
+    if exe != shard_exe:
+        failures.append(f"smoke entry uses binary {exe!r}, expected the "
+                         f"same binary as the server-pg shards ({shard_exe!r})")
+    if spec != SMOKE_SPEC:
+        failures.append(f"smoke entry spec is {spec!r}, expected {SMOKE_SPEC!r}")
+    if ALLOW_NO_TESTS_FLAG not in opts:
+        failures.append(f"smoke entry is missing {ALLOW_NO_TESTS_FLAG!r} — "
+                         f"an all-DSN-gated entry without it fails every "
+                         f"DSN-less unfiltered `meson test` (local dev, "
+                         f"sanitizer legs), breaking the documented skip "
+                         f"contract (D2, #3443 Phase 2)")
+    if failures:
+        return False, failures, {}
+
+    cases = list_cases_fn(exe, spec)
+    n = len(cases)
+    if n == 0:
+        return False, [f"{SMOKE_SPEC!r} matched ZERO cases"], {}
+    if n != SMOKE_EXACT_CASES:
+        return False, [f"{SMOKE_SPEC!r} matched {n} case(s), expected "
+                        f"exactly {SMOKE_EXACT_CASES} — a smoke-set edit "
+                        f"must update SMOKE_EXACT_CASES in the same change"], \
+               {"smoke_case_count": n}
+
+    pg_ref = list_cases_fn(exe, "[pg]")
+    not_pg = cases - pg_ref
+    if not_pg:
+        sample = ", ".join(_fmt_case(c) for c in sorted(not_pg)[:5])
+        return False, [f"{len(not_pg)} case(s) tagged {SMOKE_SPEC!r} are "
+                        f"not tagged [pg]: {sample}"], {"smoke_case_count": n}
+
+    return True, [], {"smoke_case_count": n}
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--builddir", required=True)
@@ -229,8 +345,10 @@ def main(argv=None):
 
     tests = introspect_tests(args.builddir)
     entries, shape_errors = parse_shard_entries(tests)
-    if shape_errors:
-        for e in shape_errors:
+    smoke_entries, smoke_shape_errors = parse_smoke_entries(tests)
+    all_shape_errors = shape_errors + smoke_shape_errors
+    if all_shape_errors:
+        for e in all_shape_errors:
             gh("error", f"check-pg-shard-partition: {e}")
         return 1
 
@@ -246,9 +364,18 @@ def main(argv=None):
             gh("error", f"check-pg-shard-partition: {f}")
         return 1
 
+    shard_exe = entries[0][1]  # check_partition already proved one exe across all entries
+    smoke_ok, smoke_failures, smoke_stats = check_smoke(smoke_entries, shard_exe, list_cases)
+    if not smoke_ok:
+        for f in smoke_failures:
+            gh("error", f"check-pg-shard-partition (smoke): {f}")
+        return 1
+
     print(f"check-pg-shard-partition: OK — {stats['shard_count']} shards, "
           f"{stats['case_count']} cases, exact partition (no loss, no "
-          f"duplication)")
+          f"duplication); smoke: {smoke_stats['smoke_case_count']} cases "
+          f"matched (not executed — see ci.yml's DSN assert + the live "
+          f"test run for execution proof)")
     return 0
 
 
