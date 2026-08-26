@@ -518,8 +518,11 @@ jobs:
         # entry attaches to every combination surviving exclude:; a later include
         # that ALSO matches a given combination can overwrite a value an earlier
         # include added (never an original axis value) — this is GitHub's
-        # documented include: behavior, treated here as confirmed-by-observation
-        # (the PR run below), not asserted certainty. So: default smoke first,
+        # documented include: behavior — confirmed by observation (the PR run
+        # below) AND now actively guarded: the "Resolve pg_mode" step asserts
+        # gcc-15/debug resolves to full and fails the job loudly if it doesn't
+        # (adversarial-review hardening; this comment no longer describes an
+        # unchecked assumption). So: default smoke first,
         # then the gcc-15/debug override to full. On a PR the exclude above has
         # already trimmed the matrix to the single gcc-15/debug leg, so both
         # include entries match that one leg and the net result is pg_mode=full
@@ -824,9 +827,21 @@ jobs:
       # since they skip cleanly whenever YUZU_TEST_POSTGRES_DSN is unset; a
       # smoke leg would go green having run zero PG tests). This step is the
       # loud-fail backstop for that class of defect, for every leg.
+      #
+      # The gcc-15/debug assertion below hardens a gap adversarial review
+      # raised (both reviewers, one deemed it non-blocking): the matrix
+      # include: block's own comment already flags "confirmed-by-observation,
+      # not asserted certainty" that this leg resolves to pg_mode=full — this
+      # turns that into an actual static guarantee instead of an assumption
+      # nothing checks. A future edit that inverts/breaks the two include:
+      # entries would otherwise silently drop full PG-shard coverage from
+      # every PR and push while every other check (DSN assert, partition
+      # invariant) kept passing.
       - name: Resolve pg_mode + assert Postgres DSN
         env:
           PG_MODE: ${{ matrix.pg_mode }}
+          MATRIX_COMPILER: ${{ matrix.compiler }}
+          MATRIX_BUILD_TYPE: ${{ matrix.build_type }}
         run: |
           case "$PG_MODE" in
             full|smoke) ;;
@@ -837,6 +852,10 @@ jobs:
           esac
           if [[ -z "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
             echo "::error::YUZU_TEST_POSTGRES_DSN is unset after Ensure Postgres — refusing to proceed to any PG-tagged test invocation (pg_mode=$PG_MODE) rather than let it silently skip"
+            exit 1
+          fi
+          if [[ "$MATRIX_COMPILER" == "gcc-15" && "$MATRIX_BUILD_TYPE" == "debug" && "$PG_MODE" != "full" ]]; then
+            echo "::error::gcc-15/debug resolved to pg_mode=$PG_MODE, expected 'full' — the matrix include: mapping is broken; this leg must keep full PG-shard coverage on every PR and push"
             exit 1
           fi
           echo "pg_mode=$PG_MODE"
@@ -853,13 +872,13 @@ jobs:
       - name: Test (non-pg suites)
         # Split into 2 invocations, cheap-first (fail-fast — bash -e aborts
         # the remaining lines on the first non-zero exit): 21 tests across 5
-        # cheap suites (agent/docs/proto/tar/gateway) run first, then the 3
-        # non-pg server tests (2 shards + the mcp bridge teardown budget test
-        # + the pg shard partition invariant, #3443 Phase 1 — needs no
-        # Postgres DSN, --list-tests only enumerates TEST_CASE macros). Both
-        # UNCAPPED (no --num-processes) since neither touches Postgres. Only
-        # the pg-tagged invocations (full shards or smoke, #3443 Phase 2) go
-        # through their own dedicated steps below.
+        # cheap suites (agent/docs/proto/tar/gateway) run first, then the 4
+        # non-pg server entries by name (2 shards + the mcp bridge teardown
+        # budget test + the pg shard partition invariant, #3443 Phase 1 —
+        # needs no Postgres DSN, --list-tests only enumerates TEST_CASE
+        # macros). Both UNCAPPED (no --num-processes) since neither touches
+        # Postgres. Only the pg-tagged invocations (full shards or smoke,
+        # #3443 Phase 2) go through their own dedicated steps below.
         run: |
           python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --suite agent --suite docs --suite proto --suite tar --suite gateway
           python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs "server unit tests shard A" "server unit tests shard B" "mcp bridge teardown allocation budget" "server pg shard partition invariant"
@@ -923,16 +942,20 @@ jobs:
         # build time before Test even starts, so a slow build can still leave
         # less than 30 minutes of headroom when the wait begins.
         #
-        # Split into 3 invocations, cheap-first (fail-fast — bash -e aborts the
-        # remaining lines on the first non-zero exit): 21 tests across 5 cheap
-        # suites (agent/docs/proto/tar/gateway) run first, then the 3 non-pg
-        # server tests, both UNCAPPED (no --num-processes at all) since neither
-        # touches Postgres. Only the pg shards — isolated by exact name — go
-        # through with-test-slot.sh + a cap, so they get the full pool dedicated
-        # to them. 21+3+10 = 34, the whole registered test set as of the
-        # 2026-08-25 E->E+I / G->G+J split below — re-verified as an exact
-        # partition (meson test --list, diffed against the unfiltered full
-        # list) at that split, not assumed carried over from the prior 32.
+        # HISTORICAL (pre-#3443-Phase-2) — describes what was then a single
+        # step's internal 3-invocation split: 21 tests across 5 cheap suites
+        # (agent/docs/proto/tar/gateway) run first, then the 4 non-pg server
+        # entries by name (corrected count — this paragraph originally said
+        # "3", found stale by adversarial review), both UNCAPPED (no
+        # --num-processes at all) since neither touches Postgres. Only the pg
+        # shards — isolated by exact name — go through with-test-slot.sh + a
+        # cap, so they get the full pool dedicated to them. 21+4+10 = 35, the
+        # whole registered test set as of the 2026-08-25 E->E+I / G->G+J split
+        # below — re-verified as an exact partition (meson test --list,
+        # diffed against the unfiltered full list) at that split, not assumed
+        # carried over from the prior 32. Phase 2 moved the first two
+        # invocations into their own "Test (non-pg suites)" step above; only
+        # the third (this one, now with-test-slot.sh-gated) remains here.
         #
         # Root cause, corrected after Gate 3 governance re-derived it from the
         # actual failing run's timestamps rather than the first-draft guess this

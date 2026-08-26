@@ -659,10 +659,16 @@ that doesn't update it — Meson's positional test-name matching is an EXACT
 match (`fnmatch` against a literal with no glob characters, `mtest.py`'s
 `tests_from_args`), not a substring one, so this is a hard failure
 (`MesonException`), not a silent near-miss. A `--suite` typo, by contrast,
-exits 0 silently (`mtest.py`'s `get_tests`/`doit` print "No suitable tests
-defined." and return success) — this is exactly why the smoke and non-pg
-invocations select by explicit name/suite list rather than a broader
-subtractive filter.
+exits 0 silently **on a plain `meson test` run** — the invocation shape
+ci.yml actually uses — (`mtest.py`'s `get_tests`/`doit` print "No suitable
+tests defined." and return success); this is exactly why the smoke and
+non-pg invocations select by explicit name/suite list rather than a broader
+subtractive filter. Caveat found during adversarial review (both reviewers
+independently probed this, one initially over-read it as a documentation
+error): `meson test --list --suite <bad>` is a different code path and
+exits 1 — the silent-0 behavior is specific to the real run, not `--list`.
+Don't use `--list` locally to sanity-check whether a suite name would fail
+loud in CI; it gives the opposite answer.
 
 The smoke step is deliberately UNGATED by `with-test-slot.sh` (~11 cases,
 280 assertions, ~2.8s measured locally — the up-to-30-minute slot wait the

@@ -1464,8 +1464,12 @@ if build_server
   # name, mtest.py's tests_from_args) - a rename that doesn't update the
   # ci.yml invocation errors loud ("test name does not match any test"), it
   # does not silently keep matching on a substring. A --suite typo, by
-  # contrast, would exit 0 silently (meson prints "No suitable tests defined"
-  # and returns success) - by-name selection is the one that fails safe here.
+  # contrast, would exit 0 silently on a plain `meson test` RUN (mtest.py's
+  # get_tests/doit print "No suitable tests defined" and return success) -
+  # by-name selection is the one that fails safe on the real CI invocation.
+  # NOTE (adversarial review, both reviewers independently probed this):
+  # `meson test --list --suite <bad>` is a DIFFERENT code path and exits 1 -
+  # only the plain run (what ci.yml actually invokes, no --list) exits 0.
   #
   # Runs REDUNDANTLY (harmless, ~11 cases/seconds) under any unfiltered
   # `meson test` - local dev, nightly.yml's 3 unfiltered legs,
