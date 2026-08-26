@@ -67,12 +67,16 @@ SERVER_PG_SUITE = "yuzu:server-pg"
 def gh(kind, msg):
     """Emit a GitHub Actions annotation (::warning::/::notice::/::error::).
 
-    Mirrors flake-retry.py's own gh() helper — every failure path in this
-    script routes through here now, not just some of them (governance Gate 4
-    consistency-auditor F2: the partition-violation findings, this script's
-    entire reason to exist, previously got a plain stderr print with no GH
-    inline-annotation prefix, unlike every shape-violation exit path in the
-    same file).
+    Mirrors flake-retry.py's own gh() helper — every ANTICIPATED shape- or
+    partition-violation exit path in main()/check_partition() routes through
+    here now (governance Gate 4 consistency-auditor F2: the partition-
+    violation findings, this script's entire reason to exist, previously got
+    a plain stderr print with no GH inline-annotation prefix, unlike every
+    shape-violation exit path in the same file). Does NOT cover an
+    unanticipated subprocess/parse failure (meson introspect crashing, a
+    corrupt --list-tests XML document) — those propagate as an uncaught
+    Python traceback, which still fails the job loudly, just without a
+    ::error:: prefix (governance Gate 8 unhappy-path UP-1, #3628).
     """
     print(f"::{kind}::{msg}", flush=True)
 
