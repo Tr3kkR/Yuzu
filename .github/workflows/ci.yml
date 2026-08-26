@@ -1143,7 +1143,6 @@ jobs:
         if: matrix.pg_mode == 'smoke'
         run: python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs "server pg smoke"
 
-
       # Break-glass MFA-reset CLI contract (#1226) — exit codes + JSON output of
       # `yuzu-server --mfa-reset` are not exercisable by the Catch2 suite (which
       # does not drive main()), so cover them here against the just-built binary.
