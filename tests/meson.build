@@ -1691,6 +1691,20 @@ test('flake-retry integration selftest',
   timeout: 30,
 )
 
+# check-pg-shard-partition.py's own detection logic (#3443 Phase 1, governance
+# Gate 3/4: shipped with no permanent regression test, only ad-hoc uncommitted
+# manual mutation testing). Pure-function unit test against synthetic
+# `meson introspect`/Catch2-XML fixtures -- no real build needed, matching why
+# this lives in the cheap docs suite alongside flake-retry's own selftests
+# rather than needing a real yuzu_server_tests binary the way the checker's
+# OWN meson test() entry (search 'server pg shard partition invariant') does.
+test('check-pg-shard-partition selftest',
+  _python3_test,
+  args: [files('../scripts/ci/test_check_pg_shard_partition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Issue-lifecycle hygiene (ADR-3001 A1): CLAUDE.md character budget,
 # do-not-close.txt parses clean (the never-close guard every automated close
 # path reads), and issue-standard.md keeps its never-close section.

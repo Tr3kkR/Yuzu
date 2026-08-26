@@ -569,14 +569,30 @@ comfortably inside budget. The margin against the 90-min ceiling is real but
 thin (under 2 minutes) and is the load-bearing reason this bump stays
 temporary and per-shard-revisitable rather than a permanent 700s floor.
 
-**Drift risk, not yet automated:** the 3-way split hardcodes the 10 pg shard
-names and the 3 non-pg server test names directly in `ci.yml`. A new/renamed
-server test() entry or a new top-level `suite:` (`tests/meson.build` or the
-root `meson.build` — the `gateway` suite lives there, not in `tests/
-meson.build`, and was nearly missed entirely while writing this split) needs a
-matching update on both sides or silently stops running in CI. See the
-cross-reference comment at the shard-naming-invariant block in
-`tests/meson.build`.
+**Drift risk — automated (#3443 Phase 1, 2026-08-26):** this used to hardcode
+the 10 pg shard names and the 3 non-pg server test names directly in `ci.yml`,
+hand-synced against `tests/meson.build`'s own tag filters and
+`flake-retry.py`'s verbatim positional-filter pins — a 3-way triplication that
+broke CI on 3 separate shard-layout changes in as many weeks, each silently,
+because nothing proved the three copies still agreed. Replaced with a
+structural contract: every pg shard's `test()` entry in `tests/meson.build`
+now carries `suite: ['server', 'server-pg']`, so `ci.yml` selects the whole
+group with `--suite server-pg` instead of enumerating names, and a new
+`scripts/ci/check-pg-shard-partition.py` runs as its own meson test
+(`'server pg shard partition invariant'`, `suite: 'server'`) that discovers
+every `server-pg`-suite entry via `meson introspect --tests` and proves, via
+`--list-tests --reporter xml` against the real compiled binary, that every
+`[pg]`-tagged Catch2 case lands in exactly one shard — none lost, none
+duplicated. A shard add/split/rebalance needs no update to this check at all,
+only a correct `suite:` kwarg on the changed `test()` entry.
+`flake-retry.py`'s own selftest keeps a small, genuinely-static 2-entry pin
+for the two non-pg server shards (the auth/mcp split, which has never needed
+rebalancing) plus a count-based sanity check that pg-shard extraction still
+finds a real population — a second, independent hollow-discovery signal, not
+a rebuild of what the structural check above already proves. See
+`scripts/ci/check-pg-shard-partition.py`'s module docstring and
+`tests/meson.build`'s own shard-history comment block (search
+"Sharded 2026-07-13") for the full incident history this replaces.
 
 **Cross-job — runner acquisition, a fourth layer (2026-08-25, same day as the
 split/timeout extension above):** the "Cross-job (fixed second, #3443 AC4)"
