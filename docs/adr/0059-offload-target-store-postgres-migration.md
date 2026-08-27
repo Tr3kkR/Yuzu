@@ -161,8 +161,7 @@ auth_credential = NULL` on a `has_credential=true` row is refused by Postgres it
   delivery's `KeyProvider::unwrap_dek` call. `stop()`'s `auth_key_provider_.reset()` call is moved
   to run immediately after `offload_target_store_.reset()` (which itself runs after the
   `quiesce(60s)` bound both webhook and offload deliveries already share) — the same class of bug
-  WebhookStore/ADR-0057 independently found and fixed for its own (not-yet-migrated-on-this-branch,
-  at the time of writing) secret codec.
+  WebhookStore/ADR-0057 independently found and fixed for its own secret codec (merged, PR #3563).
 
 ### No backfill (ADR-0009's 2026-08-25 fresh-start-by-default amendment)
 
@@ -238,5 +237,5 @@ credential-bearing config changes. `get_deliveries`/`fire_event`/`flush_all`/`qu
 
 ## Follow-ups
 
-- `docs/user-manual/rest-api.md`'s offload-targets section needs the `has_credential` field
-  documented in the response shape (docs-writer, Gate 2).
+None outstanding — `docs/user-manual/rest-api.md`'s `has_credential` field and 400-cause list are
+both covered as of this migration's governance round.

@@ -6000,6 +6000,36 @@ public:
                     } else {
                         offload_target_store_->set_metrics(&metrics_);
                         agent_service_.set_offload_target_store(offload_target_store_.get());
+                        // ADR-0010 §Decision 3 evidence surface (gov Gate 6
+                        // compliance-officer, contract floor — the
+                        // decrypt-failure metric alone does not satisfy
+                        // ADR-0010's "emit an audit event + metric" rule).
+                        // Mirrors webhook_secret_codec_'s hook exactly
+                        // (server.cpp:5932) — audit_store_ already exists by
+                        // this point, so no deferred-wiring step is needed.
+                        // Lifetime: the lambda captures `this` and reads
+                        // `audit_store_` at call time, never the pointer, so
+                        // a later reset store cannot dangle; stop() clears
+                        // the hook before destroying the codec (below).
+                        offload_secret_codec_->set_audit_hook(
+                            [this](std::string_view verb, const std::string& detail_json) {
+                                if (!audit_store_ || !audit_store_->is_open())
+                                    return;
+                                const bool failure = (verb == "secret.decrypt_failure");
+                                (void)audit_store_->log(
+                                    {.timestamp = std::time(nullptr),
+                                     .principal = "system:secret-codec",
+                                     .principal_role = "system",
+                                     .action = std::string(verb),
+                                     .target_type = "Secret",
+                                     .target_id = "offload_target_store",
+                                     // detail_json carries AAD coordinates,
+                                     // kek_version and the failure class
+                                     // ONLY — never ciphertext, plaintext,
+                                     // DEK or key bytes (secret_codec.hpp).
+                                     .detail = detail_json,
+                                     .result = failure ? "failure" : "success"});
+                            });
                     }
                 }
             }

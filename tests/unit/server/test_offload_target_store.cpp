@@ -184,6 +184,43 @@ TEST_CASE("OffloadTargetStore[pg]: rejects duplicate name", "[offload_store][pg]
     CHECK(second.error() == OffloadWriteError::invalid_input);
 }
 
+TEST_CASE("OffloadTargetStore[pg]: a PK collision from an out-of-sync identity sequence is "
+          "db_error, never mistaken for a duplicate name",
+          "[offload_store][pg]") {
+    OffloadTargetStorePg store;
+
+    // Force the sequence out of sync with a second connection: consume the
+    // sequence's next value, then pre-insert a row at the value the store's
+    // OWN next nextval() call will therefore return next. This reproduces an
+    // operator manually resetting the sequence, or restoring a dump with
+    // stale sequence state — never a legitimate name collision.
+    int64_t collide_id = -1;
+    {
+        pg::PgConn conn{PQconnectdb(store.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult seqres = pg::exec_params(
+            conn.get(),
+            "SELECT nextval(pg_get_serial_sequence('offload_target_store.offload_targets','id'))",
+            std::vector<std::string>{});
+        REQUIRE(seqres.status() == PGRES_TUPLES_OK);
+        collide_id = std::stoll(PQgetvalue(seqres.get(), 0, 0)) + 1;
+        pg::PgResult insres = pg::exec_params(
+            conn.get(),
+            "INSERT INTO offload_target_store.offload_targets "
+            "(id, name, url, auth_type, auth_credential, has_credential, event_types, "
+            " batch_size, enabled, created_at) OVERRIDING SYSTEM VALUE VALUES "
+            "($1::bigint, 'pre-existing', 'https://x.example.com/h', 'none', NULL, false, "
+            " '*', 1, true, 0)",
+            std::vector<std::string>{std::to_string(collide_id)});
+        REQUIRE(insres.status() == PGRES_COMMAND_OK);
+    }
+
+    auto result = store->create_target("desynced", "https://y.example.com/h",
+                                       OffloadAuthType::None, "", "*");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == OffloadWriteError::db_error); // NOT invalid_input
+}
+
 // ── batch_size validation ──────────────────────────────────────────────────
 
 TEST_CASE("OffloadTargetStore[pg]: rejects batch_size < 1", "[offload_store][pg]") {

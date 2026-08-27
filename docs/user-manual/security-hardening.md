@@ -299,15 +299,14 @@ Audit events include: `timestamp`, `principal`, `action`, `target_type`, `target
 
 ### Current encryption posture (interim, disclosed)
 
-One secret class is currently stored **plaintext inside a 0600-mode server-side
-database file** (not encrypted at the column level): offload-target credentials
-(`offload_targets.db`). Protection today is file permissions + the host-level
-encryption above. ADR-0010 (`docs/adr/0010-secrets-at-rest-envelope-encryption.md`)
-is the adopted roadmap: app-side AES-256-GCM envelope encryption lands with each
-store's PostgreSQL migration. Until then, treat server data-directory backups as
-secret-bearing.
+No secret class is now stored plaintext at the column level — the last remaining
+exception (offload-target credentials) closes with this migration (ADR-0059).
+ADR-0010 (`docs/adr/0010-secrets-at-rest-envelope-encryption.md`) is the completed
+roadmap: app-side AES-256-GCM envelope encryption landed with each store's
+PostgreSQL migration. Host-level encryption (above) remains defence-in-depth
+regardless.
 
-Four classes that used to appear on that list no longer belong on it:
+Five classes that used to appear on this list no longer belong on it:
 
 - **MFA TOTP secrets** (`auth.users.mfa_totp_secret`) are `SecretCodec`-encrypted
   as of 2026-07-16 — the first store to land the ADR-0010 seam. This changes the
