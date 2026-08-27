@@ -3966,7 +3966,7 @@ All five endpoints require the `Infrastructure` securable type — `Read` for `G
 
 #### `GET /api/v1/offload-targets`
 
-List all configured offload targets.
+List all configured offload targets. 503 on a degraded read (distinguishable from a genuine empty list).
 
 **Response:**
 

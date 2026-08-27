@@ -2275,6 +2275,13 @@ fresh-start-by-default amendment — no production fleet has ever run a pre-Post
 build of this store, so there is no legacy backfill to protect), so the legacy
 `offload_targets.db` is **never read** on upgrade.
 
+**Before you upgrade, if you have offload targets configured:** the non-secret fields
+(`name`, `url`, `auth_type`, `event_types`, `batch_size`, `enabled`) are recoverable via
+`GET /api/v1/offload-targets` — list them now to speed up re-registration after the
+cutover. Credential values themselves were never GET-recoverable even before this
+migration (`auth_credential` has always been redacted from every response), so there
+is nothing new to lose there — only the non-secret configuration is worth capturing.
+
 **What happens on first PG boot:**
 - The server logs a one-time `OffloadTargetStore initialized (schema
   offload_target_store) — fresh start, no legacy backfill` line.
@@ -2291,6 +2298,13 @@ stored blob) is skipped entirely and logged with `error=credential_unavailable` 
 never fired unsigned. A degraded read on `GET /api/v1/offload-targets` or
 `GET /api/v1/offload-targets/{id}` now returns **503**, distinguishable from a genuine
 "no targets configured" (empty list) or "no such id" (404).
+
+**Rolling back:** because the legacy `offload_targets.db` is never touched by the
+Postgres-backed binary (not read, not moved, not deleted), reverting to a pre-cutover
+binary restores whatever was in that file **before** the cutover, exactly as it was.
+Any target registered through `POST /api/v1/offload-targets` on the Postgres-backed
+binary lives only in Postgres and is lost on rollback (re-register it after rolling
+forward again).
 
 ## ⚠️ Behaviour change: quarantine is now enforced at instruction dispatch (#881, #3127)
 

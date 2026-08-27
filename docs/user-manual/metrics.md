@@ -294,7 +294,7 @@ so `absent()`/`rate()` alerting is meaningful on a healthy server.
 | `yuzu_server_webhook_delivery_log_failed_total` | counter | Delivery-log `INSERT`s (`webhook_deliveries`) that failed against an open store — the delivery itself still ran; only its record did not persist. |
 | `yuzu_server_webhook_backfill_total{result}` | counter | One-time legacy `webhooks.db` → `webhook_store` Postgres backfill outcome on every boot, `result` ∈ `{success, failed}` (`success` covers a fresh install, an already-migrated skip, and a completed migration alike). ADR-0057. |
 | `yuzu_server_offload_delivery_success_total` | counter | Offload-target deliveries that completed with a 2xx response. |
-| `yuzu_server_offload_delivery_failed_total` | counter | Offload-target deliveries that failed (connection error, non-2xx, exception, or a tampered non-http(s) URL). |
+| `yuzu_server_offload_delivery_failed_total` | counter | Offload-target deliveries that failed (connection error, non-2xx, exception, a tampered non-http(s) URL, or a stored `auth_type` that doesn't resolve to a recognized value — a tampered/legacy row, refused rather than dispatched unauthenticated). |
 | `yuzu_server_offload_delivery_dropped_total` | counter | Offload-target deliveries dropped because the delivery worker pool's bounded queue was full, or the store was quiescing. |
 
 Two more, added with the ADR-0059 Postgres migration (also pre-seeded to `0` at boot; this store has no backfill metric — ADR-0009's fresh-start-by-default amendment means there is no legacy migration to report an outcome for):
