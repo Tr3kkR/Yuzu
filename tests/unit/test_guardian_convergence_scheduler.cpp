@@ -203,11 +203,13 @@ TEST_CASE("jittered stays within the shared jitter-span bound at nonzero jitter_
     // Independently computed via the SAME shared formula jittered() itself calls -
     // not re-derived inline, which is the whole point of the extraction (#3388).
     const std::uint64_t span = guardian_jitter_span_ms(base_ms, cfg.jitter_pct);
-    // A range-containment check over sampled draws can't by itself catch a +/-1
-    // off-by-one at the boundary - std::uniform_int_distribution's endpoints are
-    // standard-guaranteed inclusive, so pinning the exact span value at compile time
-    // is what makes the sampled REQUIREs below an exact bound check, not merely an
-    // observed one (#3531).
+    // Pins guardian_jitter_span_ms's OWN output for these constants, so a future
+    // change to the formula (or the constants) that silently shifts this test's
+    // bound fails loudly here. This does NOT close the separate boundary-value gap
+    // in jittered()'s own dist(-span, span) construction (a different translation
+    // unit) - a +/-1 there would still pass every REQUIRE below undetected; that
+    // residual gap needs a directly-testable {lo, hi} seam to close, not this
+    // assert (#3531, quality-engineer Gate 8).
     static_assert(guardian_jitter_span_ms(kGuardianServiceLaneCadenceMs, kGuardianLaneJitterPct) ==
                       12'000,
                   "this test's bound depends on this exact span - re-derive both if "
