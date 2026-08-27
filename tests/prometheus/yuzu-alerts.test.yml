@@ -1751,6 +1751,75 @@ tests:
         eval_time: 20m
         exp_samples: []
 
+  # ── YuzuRuntimeConfigReadDegraded (ADR-0060) ────────────────────────────
+  #
+  # `sum(rate(yuzu_server_runtime_config_read_degrade_total[5m])) by (reason)
+  # > 0`, for: 5m, warning. Two failure families share one metric: ordinary
+  # substrate trouble (store_not_open/pool_acquire_timeout/query_error) and
+  # crypto_error (the OIDC client secret cannot be decrypted).
+
+  # CASE 67 -- a sustained substrate-trouble reason pages, carrying its
+  # reason label.
+  - interval: 1m
+    name: runtime config read degraded - a sustained substrate reason pages
+    input_series:
+      - series: 'yuzu_server_runtime_config_read_degrade_total{job="yuzu",instance="s1",reason="pool_acquire_timeout"}'
+        values: "0+1x20"
+    promql_expr_test:
+      # for: 5m pinned both sides (the file's bracketing convention): the
+      # rate is non-zero from t=1m, so firing begins ~t=6m -- still quiet
+      # at 5m, firing by 15m. A for: regression in either direction reds
+      # one of these two evals.
+      - expr: 'ALERTS{alertname="YuzuRuntimeConfigReadDegraded", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuRuntimeConfigReadDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRuntimeConfigReadDegraded", alertstate="firing", reason="pool_acquire_timeout", severity="warning"}'
+            value: 1
+
+  # CASE 68 -- exercises the rule mechanically for the crypto_error reason,
+  # keyed by its own label under the SAME rule (no separate alert for the
+  # crypto failure family). NOTE: this synthetic "sustained" shape is not how
+  # crypto_error can actually arise in production -- see the alert's own
+  # comment in docs/prometheus/yuzu-alerts.yml (correction, docs-writer,
+  # Gate 8): its one production call site is boot-time-only and a failure
+  # there exits the process before /metrics ever binds, so this reason is not
+  # actually scrapeable today. This case still proves the rule fires
+  # correctly IF the metric ever carries this value (a future non-boot call
+  # site, or a manual/test scrape), which is what it is testing.
+  - interval: 1m
+    name: runtime config read degraded - a sustained crypto_error pages
+    input_series:
+      - series: 'yuzu_server_runtime_config_read_degrade_total{job="yuzu",instance="s1",reason="crypto_error"}'
+        values: "0+1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRuntimeConfigReadDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRuntimeConfigReadDegraded", alertstate="firing", reason="crypto_error", severity="warning"}'
+            value: 1
+
+  # CASE 69 -- the boot-time pre-seed alone (all reasons present at zero,
+  # never incremented) must stay quiet: present-at-zero is the HEALTHY
+  # steady state, not a degrade.
+  - interval: 1m
+    name: runtime config read degraded - pre-seeded flat counters stay quiet
+    input_series:
+      - series: 'yuzu_server_runtime_config_read_degrade_total{job="yuzu",instance="s1",reason="store_not_open"}'
+        values: "0x30"
+      - series: 'yuzu_server_runtime_config_read_degrade_total{job="yuzu",instance="s1",reason="pool_acquire_timeout"}'
+        values: "0x30"
+      - series: 'yuzu_server_runtime_config_read_degrade_total{job="yuzu",instance="s1",reason="query_error"}'
+        values: "0x30"
+      - series: 'yuzu_server_runtime_config_read_degrade_total{job="yuzu",instance="s1",reason="crypto_error"}'
+        values: "0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRuntimeConfigReadDegraded"}'
+        eval_time: 20m
+        exp_samples: []
+
   # ── YuzuTagStoreBackfillNotCompleted (ADR-0050) ─────────────────────────
   #
   # `absent_over_time(..._backfill_total{result=~"success|fresh"}[15m])`,
