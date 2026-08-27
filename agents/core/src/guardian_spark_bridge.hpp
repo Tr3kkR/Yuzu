@@ -248,13 +248,16 @@ rule_assertion_from_rule(const yuzu::guardian::v1::GuaranteedStateRule& rule) {
         // Unreachable today - kept as a loud, logged degrade rather than a silent one
         // (#3531). No assert: this project leaves b_ndebug unset, so asserts are LIVE
         // in release builds, and aborting here is exactly what the #3388 ledger ruled
-        // out in favor of safe degrade. Falling back to the legacy 1000ms is safe (it
+        // out in favor of safe degrade. Falling back to the legacy default is safe (it
         // just re-admits the per-sweep flood for this one rule until the switch above
-        // is updated for the new SparkType), but it must never be silent.
+        // is updated for the new SparkType), but it must never be silent. Reuses
+        // parse_resilience_params' own kGuardianLegacyDebounceMs rather than repeating
+        // the literal, so a future change to the legacy default can't leave this
+        // fallback silently stale.
+        default_debounce_ms = kGuardianLegacyDebounceMs;
         spdlog::error("Guardian: rule '{}' has spark type '{}' unhandled by the debounce-"
-                      "default switch - falling back to the legacy 1000ms default (#3531)",
-                      out.rule_id, spark_type_token(*spark_type));
-        default_debounce_ms = 1000;
+                      "default switch - falling back to the legacy {}ms default (#3531)",
+                      out.rule_id, spark_type_token(*spark_type), *default_debounce_ms);
     }
     (void)parse_resilience_params(get, out.debounce_ms, *default_debounce_ms);
 
