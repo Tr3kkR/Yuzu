@@ -241,6 +241,11 @@ const char* to_string(McpStreamClose reason) {
 // close_remediation above is TU-local but name-visible here.
 std::string make_stream_closed_frame(McpStreamClose reason, std::string_view correlation_id,
                                      std::string_view extra_params_json) {
+    // #3344: retry_after_ms stays null here — `close_remediation(reason)`
+    // already carries per-reason reconnect guidance (e.g. re-initialize vs.
+    // wait out a cap), and the admission paths that actually gate a
+    // reconnect (kMcpStreamCapRetryAfterMs / kMcpHandoverRetryAfterMs) carry
+    // their own honest hints on the 429 the client hits when it reconnects.
     std::string body =
         "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/yuzu.stream_closed\",\"params\":{\"reason\":";
     body += detail::json_quoted(to_string(reason));
@@ -802,6 +807,14 @@ void McpStreamState::close_sink(const std::shared_ptr<McpStreamSink>& sink, McpS
 }
 
 void McpStreamState::close(McpStreamClose reason) {
+    // Only live_ — draining_, if any, is never left unsignaled by this omission: a
+    // takeover closes the superseded sink synchronously and unconditionally the
+    // moment it becomes draining_ (attach_and_replay's "wake the superseded provider"
+    // step, above), so a mid-handover session reaching a caller of close() (gc(),
+    // terminate(), shutdown() (#3042)) always has an already-closed draining_ sink.
+    // This relies on that invariant holding at every attach site — if a future change
+    // ever defers or batches the takeover's own close-signal, this call would need to
+    // close draining_ too.
     std::shared_ptr<McpStreamSink> live;
     {
         std::lock_guard<std::mutex> lk(mu_);

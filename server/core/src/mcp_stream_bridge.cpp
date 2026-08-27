@@ -2767,6 +2767,12 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
                         terminal_build_fault_.fetch_sub(1, std::memory_order_acq_rel) > 0) {
                         throw std::bad_alloc{};  // inject_terminal_build_fault_for_test
                     }
+                    // #3344: retry_after_ms stays null — the ring dropped this
+                    // terminal, so retrying THIS resume can never succeed
+                    // (there is nothing left here to find). The honest
+                    // recovery path is the redirect below to get_execution_status
+                    // / query_responses, both of which now carry their own
+                    // success-shaped retry_after_ms hint while not-ready.
                     std::string data =
                         std::string(R"({"execution_id":)") + detail::json_quoted(exec_id) +
                         R"(,"correlation_id":)" +

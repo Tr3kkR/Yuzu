@@ -73,10 +73,125 @@ data).
   **Update (`ResponseStore`/#2691, 2026-08-08):** "behind a flag" above overstated the
   mechanism for the first store to actually exercise the skippable class. No flag was
   built, and none is needed: `ResponseStore` skips backfill **unconditionally** — on
-  cutover the legacy `responses.db` is never read, and a one-time loud boot log records
-  "response history reset on Postgres cutover." There is no compliance or config-durability
-  requirement to preserve response rows across the cut (unlike the config/reference and
-  audit classes above), so a conditional flag would add a knob nobody has a reason to turn
-  off. `ResponseStore` is the reference case for this class: a future purely-TTL'd,
-  purely-ephemeral store should also skip unconditionally, not gate the skip behind a flag,
-  unless a specific store has a reason this one doesn't.
+  cutover the legacy `responses.db` is never read. (Correction, 2026-08-25: an earlier
+  version of this paragraph claimed "a one-time loud boot log records 'response history
+  reset on Postgres cutover'" — no such log exists; `ResponseStore` logs only its generic
+  `"ResponseStore initialized (schema {}, retention={}d)"` line, with nothing distinguishing
+  a fresh start from any other boot. See `docs/postgres-store-playbook.md`'s Backfill bullet
+  for the detect-and-warn requirement this gap motivates for a future skip-by-default store
+  holding real operator data — that requirement lives in the playbook's authoring guidance,
+  not restated in full here.)
+  There is no compliance or config-durability requirement to preserve response rows across
+  the cut (unlike the config/reference and audit classes above), so a conditional flag would
+  add a knob nobody has a reason to turn off. `ResponseStore` is the reference case for this
+  class: a future purely-TTL'd, purely-ephemeral store should also skip unconditionally, not
+  gate the skip behind a flag, unless a specific store has a reason this one doesn't.
+
+  **Update (`ProductPackStore`/ADR-0054, 2026-08-23):** the "must... delete the same
+  subject/device from the rollback copy" sentence above literally names mutating the
+  retained legacy file as the mechanism. `ProductPackStore` satisfies the clause's
+  *purpose* — rollback cannot resurrect data whose erasure was reported successful — via a
+  different, and for this store's shape a *stronger*, mechanism: `uninstall()` stamps a
+  durable Postgres-side tombstone (`deleted_pack_ids`) in the same transaction as its
+  delete, under an advisory lock closing the obvious check-then-insert race. The FIRST TIME
+  a given legacy file's exact content is seen (its whole-file fingerprint has no prior
+  marker), `migrate_from_sqlite()` checks every unmatched row against the tombstone before
+  treating it as fresh content; a later pass against byte-identical content is a safe
+  no-op skip (that content was already fully reconciled, tombstone-checked, in the
+  transaction that stamped its marker) rather than a re-check. This closes the *permanent,
+  shared* resurrection hazard (a redeployed or newly-joined replica's own stale
+  legacy-file copy) that a literal per-file mutation cannot reach at all, since that
+  mechanism only protects the one replica whose file was written — it does nothing for a
+  sibling replica's separate copy. The literal mechanism is deliberately NOT also
+  implemented: writing to the legacy file at `uninstall()` time would introduce a write
+  path into the one artifact that exists specifically as a rollback safety net, so a
+  partial/failed write during an uninstall could corrupt the rollback net itself — while
+  still only covering a single replica. That is a strictly worse trade for a benefit the
+  tombstone doesn't need.
+
+  **What the tombstone substitution does NOT close:** an operator who rolls the server
+  BINARY back to the pre-migration (SQLite-only) release, during the one-release rollback
+  window, reads `product-packs.db` directly — that binary has no knowledge Postgres or
+  `deleted_pack_ids` exist, so an uninstalled pack's catalog row can reappear for the
+  duration of the rollback. This residual is accepted, on grounds specific to
+  `ProductPackStore` and NOT a general precedent: the resurrection is metadata-only. The
+  pack's actual content (`InstructionDefinition`/`PolicyFragment`/`Workflow` rows) lives in
+  separate, still-live SQLite stores that `uninstall()`'s `uninstall_fn` callback attempts
+  to delete — ordinarily permanently, though a `PolicyFragment` still referenced by another
+  policy is a documented, logged exception (`uninstall()` tolerates that one failure and
+  still completes the pack-level delete + tombstone; see `PolicyStore::delete_fragment`'s
+  own referential-integrity refusal) — a binary rollback does not restore anything that
+  *was* deleted, and there is no automatic/boot-time caller of `install()` anywhere in this
+  codebase, so nothing re-materializes pack content short of a fresh, explicit `install()`
+  call (the `#802` signature gate constrains what such a call may install; it is not itself
+  what prevents an automatic reinstall). Nothing executable resurfaces; the operator sees a
+  stale catalog listing, not reinstated content — though a lookup that follows one of that
+  listing's item ids into another endpoint (fetch/execute an instruction by id, for
+  example) will 404 against content already deleted, which is expected during the window,
+  not a new fault. Re-uninstalling under the old binary mutates the legacy file directly
+  (the pre-migration code path always did); once the row is absent from a later re-scan of
+  that file, there is nothing left to resurrect regardless of the tombstone.
+
+  **This reasoning is store-scoped and MUST be re-derived, not copied, by the next store
+  whose wired erasure path covers genuinely personal or regulated subject/device data**
+  (the clause's original target) rather than operator-authored catalog metadata over
+  separately-erased content. That store will likely need the literal per-file mechanism
+  this update declines for `ProductPackStore`.
+
+  **Update (fresh-start-by-default, 2026-08-25 — operator directive):** the "Backfill is
+  mandatory for config/reference stores" bullet above assumed a real fleet with real
+  legacy data to protect. That has never been true — no production fleet has ever run a
+  pre-Postgres build of any Yuzu store — so for every migration still to come (as of this
+  writing: `InstructionStore`, `OffloadTargetStore`, `RuntimeConfigStore`), the default
+  flips: **skip `migrate_from_sqlite()` entirely, unconditionally, the same way
+  `ResponseStore` already does** (Update above), rather than build a backfill and plan to
+  remove it later. This is not a narrowing of what backfill protects — the mandate's
+  entire premise (preserving real operator config / real SOC 2 audit history across a real
+  upgrade) is empty while there is nothing real to preserve. Retired for the same reason,
+  same day: `PolicyStore`'s already-shipped backfill (ADR-0056, commit `f46cefe8e`) — see
+  `docs/postgres-migration-ladder.md`'s `PolicyStore` row.
+
+  (`WebhookStore`/PR #3563 merged with a full `migrate_from_sqlite()` already built the
+  same day this amendment landed, ahead of it reaching that PR — too late for the "don't
+  build it" guidance to apply retroactively. Its backfill TEST suite is being retired in
+  the same pass as the other already-migrated stores' backfill tests below; its production
+  `migrate_from_sqlite()` stays for now, same as the others.)
+
+  (`InstructionStore`/PR #3602 is a DIFFERENT situation from `WebhookStore`'s, not the same
+  one — it is still OPEN, unmerged, as of this amendment landing, with a full mandatory
+  backfill already built under the pre-amendment text. Unlike `WebhookStore`, nothing here
+  is retroactive: #3602 should drop that backfill before merging, not keep it — this default
+  now governs it directly, the same as any other not-yet-merged `InstructionStore` work. Its
+  reviewer had already separately requested changes for unrelated bugs in the backfill's
+  conflict-resolution logic; removing the backfill entirely resolves those findings along
+  with bringing the PR into line with this default.)
+
+  **This default is conditional on the fact, not permanent policy.** It holds only while
+  "no production fleet" stays true. If a real external deployment (a design partner, a
+  pilot customer, a dogfooded production instance) exists or is committed to before a
+  given store migrates, that store's own per-store ADR must re-derive whether backfill is
+  needed for IT specifically — do not cite this update as blanket cover once the premise
+  changes. `AuditStore` (already migrated, ADR-0040, backfill built and shipped) is the
+  one store where this would matter most if the premise ever flips retroactively: audit
+  evidence cannot be regenerated the way config or cache state can, so its already-built
+  backfill is deliberately NOT being retired alongside `PolicyStore`'s, and is not a
+  candidate for retroactive removal generally — see the ladder's `AuditStore` row. A future
+  store whose data is similarly irreplaceable (not just operator-authored-and-reconstructible)
+  should weigh that before defaulting to skip.
+
+  **Existing stores already migrated WITH a backfill are unaffected by this update** —
+  removing their already-built `migrate_from_sqlite()` is a separate decision (tracked as
+  ongoing cleanup, not mandated by this ADR), and per `docs/postgres-store-playbook.md`'s
+  authoring contract, an in-place schema-DDL edit is safe only for a store whose schema
+  version was never shipped (`PolicyStore`'s case); every other store's removal needs a
+  proper version-bumped migration, not a copy of that shortcut.
+
+  **This supersedes two specific sentences above for a skip-by-default store, and no others:**
+  the Decision bullet requiring "each per-store migration's upgrade-test must assert that
+  config/reference/audit data survives the previous-release-SQLite → new-release-Postgres
+  transition" does not apply — there is no transition to assert for a store with nothing
+  copied across; and the Consequences bullet stating "each per-store migration carries a
+  `migrate_from_sqlite()` implementation and an upgrade-test assertion" is no longer a blanket
+  requirement for a migration that lands under this default. Every other Decision/Consequences
+  bullet (the legacy-file rollback-window retention, the fail-closed construction posture, the
+  secret-transform-never-copy rule for the documented-exception case) is untouched.

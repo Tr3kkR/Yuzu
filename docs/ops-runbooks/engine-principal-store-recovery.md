@@ -160,7 +160,7 @@ step, not a routine failure mode.
    one-shot migration flag — so a clean pass confirms the collision is
    fully resolved.
 
-## Alert: `EngineRevalidateStoreUnreachable` (#2367)
+## Alert: `YuzuMcpEngineRevalidateStoreUnreachable` (#2367)
 
 **What fired.** `yuzu_server_engine_revalidate_backoff_suppressed_total` moved.
 That counter increments ONLY when a liveness re-check for an engine principal
@@ -168,7 +168,19 @@ was answered `StoreUnreachable` from the failure backoff — i.e. the store was
 already found unreachable moments earlier, and the server is deliberately not
 re-asking on every stream tick. It cannot move while the store is healthy, so
 this is a true-positive signal about store reachability, not a cache-tuning
-metric.
+metric. The backoff arms only on CONFIRMED unreachability — the store closed,
+a query actually ran and failed, or PgPool's own connect-failure breaker is
+open (`connect_breaker_open()`, armed only by recent connect failures, never
+by pool saturation alone) — so **this alert firing already rules out ordinary
+pool saturation with a healthy database**; a bare lease-acquire timeout under
+those conditions does not move this counter. One residual edge: if the
+transport hangs rather than refusing (a silent firewall drop, a blackholed
+route), the breaker only arms once a connect attempt actually times out
+(bounded by the pool's `connect_timeout`, default 10s — set per-deployment
+with a `connect_timeout=<seconds>` keyword in the `--postgres-dsn` connection
+string, NOT a separate flag) — so the very first ~10s of that specific
+failure mode can still be ambiguous and not arm the backoff; it self-corrects
+once that first connect attempt fails.
 
 **What is happening to streams meanwhile.** Held-open MCP/SSE streams
 authenticated by an engine principal are being told "indeterminate", which is
@@ -183,11 +195,14 @@ particular signal.
    conjunction includes `engine_principal_store`. If `/readyz` is failing, this
    is a store-availability incident: go to "Detection signal" above and to
    `docs/postgres-store-playbook.md`.
-2. Is it the pool rather than the database? Check
-   `yuzu_pg_acquire_wait_seconds` and `yuzu_pg_pool_in_use`. Saturation with a
-   healthy database means lease starvation, not an outage — see the
-   pool-sizing guidance in `docs/user-manual/server-admin.md` and note the
-   boot warning about SSE stream capacity versus `--postgres-pool-size`.
+2. Check `yuzu_pg_acquire_wait_seconds` and `yuzu_pg_pool_in_use` for
+   corroborating detail — but note this alert firing already means the
+   confirmed-unreachable path was taken (store closed, a query ran and
+   failed, or the connect-failure breaker is open), not ordinary pool
+   saturation with a healthy database; see the pool-sizing guidance in
+   `docs/user-manual/server-admin.md` and the boot warning about SSE stream
+   capacity versus `--postgres-pool-size` if you want to rule out contention
+   as a contributing factor regardless.
 3. How much damage? `yuzu_mcp_stream_closes_total{reason="auth_unavailable"}`
    counts streams that already exhausted their grace window. A flat count
    means the backoff is absorbing the incident without killing sessions.
@@ -199,13 +214,62 @@ particular signal.
 
 **Recovery.** No operator action restores the streams directly — clients
 reconnect and resume via `Last-Event-ID`, and durable results remain fetchable
-by `execution_id`. Fix the underlying store or pool problem; the backoff
-re-probes within seconds of recovery, so streams re-establish on their own.
+by `execution_id`. For a transient connectivity problem (network blip, a
+restart), fix it and the backoff re-probes within seconds, so streams
+re-establish on their own. **This does NOT apply to a permanent condition** —
+check the server log for the `get_for_auth denied` warn line: one naming a
+SQLSTATE class-42 error ("NOT a transient PG-availability condition... schema
+or access-rule problem") means a missing table or a revoked grant, which will
+retry-fail indefinitely until an operator actually fixes the schema/grant; the
+backoff re-probing changes nothing for that case.
 
 **Do NOT** reflexively raise `--postgres-pool-size` in response to this alert.
 Adding connections to an already-struggling database makes matters worse;
 confirm the database is healthy first, and consider lowering SSE stream
 capacity instead.
+
+## Metric: `yuzu_server_engine_revalidate_generation_capacity_fallback_total` (#2454/#3385)
+
+**What it means.** This counts how often the per-principal poisoning-guard
+map (the TOCTOU defense behind `get_for_auth_revalidate`'s cache) was full —
+even after sweeping aged-out entries — and a principal's invalidate fell back
+to the coarse global epoch instead of getting its own slot. It is NOT an
+availability signal: the guard stays sound either way (the fallback still
+poisons every in-flight reader, just less precisely — see the field comment
+on `revoke_generation_by_principal_` in `engine_principal_store.hpp`), and no
+stream is dropped or denied because of this metric alone.
+
+**Since #3385, this is a recoverable condition, not a permanent one.** The map
+now sweeps entries whose `last_bumped_at` is older than
+`kRevokeGenerationEntryTtl` (63s) on its own insert path — the same lazy,
+capacity-triggered sweep the revalidate cache and failure-backoff maps
+already use. So the fallback firing means `max_entries_` (1024 by default)
+*distinct* principals had their generation entry bumped within the same
+63-second window, not merely 1024 distinct principals bumped at any point
+over the process's uptime (the pre-#3385 shape, where the fallback was
+permanent for the rest of the process's life once tripped once).
+
+**Triage.**
+
+1. Is this expected load? A large batch operation that revokes or transfers
+   ownership of many engine principals in a short window is the ordinary
+   trigger — the fallback recovers on its own once the burst passes and
+   entries age past the TTL.
+2. Is it climbing steadily rather than in a burst? That suggests sustained
+   churn above the ceiling (more than ~16 distinct principals/second,
+   sustained) rather than a one-off batch — the guard is running at reduced
+   (global-epoch, not per-principal) precision for as long as this continues,
+   which is safe but coarser: an invalidate anywhere defeats every OTHER
+   principal's concurrent cache-write too while the epoch keeps moving.
+
+**Recovery.** No restart is required — the condition self-clears once the
+churn rate drops back under the ceiling within a 63-second window; the next
+sweep reclaims capacity automatically. If it climbs persistently in normal
+operation (not a known batch job), that is a signal the ceiling itself may
+need raising rather than an operational fault to clear — there is no runtime
+admin surface for `max_entries_` today (it is a fixed constant,
+`kAuthCacheMaxEntries`), so raising it requires a code change and a new
+release, not a live toggle.
 
 ## Cross-references
 

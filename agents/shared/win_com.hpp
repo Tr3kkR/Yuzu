@@ -11,8 +11,7 @@
 // compiles its own inline copy, so there is no exported symbol to interpose
 // across the plugin ABI boundary (same reasoning as agents/shared/win_str.hpp).
 
-#ifndef YUZU_SHARED_WIN_COM_HPP
-#define YUZU_SHARED_WIN_COM_HPP
+#pragma once
 
 #ifdef _WIN32
 
@@ -105,5 +104,3 @@ private:
 } // namespace yuzu::shared::win
 
 #endif // _WIN32
-
-#endif // YUZU_SHARED_WIN_COM_HPP

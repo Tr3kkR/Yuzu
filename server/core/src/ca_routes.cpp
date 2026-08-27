@@ -59,7 +59,7 @@ std::string fmt_epoch(int64_t epoch) {
     return std::string(buf);
 }
 
-/// Validate + normalise a serial to the canonical uppercase hex `ca.db` stores.
+/// Validate + normalise a serial to the canonical uppercase hex form `ca_store` stores.
 /// Returns empty if it is not 1–64 hex digits. Shared by the REST + dashboard
 /// revoke paths so both reject the same inputs and match the same stored serial.
 std::string normalize_serial(std::string s) {
@@ -74,7 +74,10 @@ std::string normalize_serial(std::string s) {
 /// Outcome of the shared revoke_core (replaces a tri-state int — cpp-expert
 /// PR4b). `audit_ok` is false when any audit row failed to persist, so both
 /// revoke surfaces can raise Sec-Audit-Failed (#1240 M1/M2).
-enum class RevokeOutcome { NotFound, RevokedCrlStale, RevokedCrlPublished };
+// ADR-0053: StoreError is a NEW, distinct outcome from NotFound — a genuine ca_store DB/lease
+// failure must never be audited/reported as "serial not found or already revoked" (a false
+// compliance record; a 503 outage misreported as a 404/idempotent-denial).
+enum class RevokeOutcome { NotFound, StoreError, RevokedCrlStale, RevokedCrlPublished };
 struct RevokeResult {
     RevokeOutcome outcome;
     bool audit_ok;
@@ -87,7 +90,10 @@ struct RevokeResult {
 std::string render_ca_fragment(CaStore* ca_store) {
     if (!ca_store || !ca_store->is_open())
         return "<span style=\"color:#484f58\">Certificate authority unavailable.</span>";
-    auto root = ca_store->get_root();
+    auto root_or_err = ca_store->get_root();
+    if (!root_or_err)
+        return "<span style=\"color:#f85149\">Certificate authority store error.</span>";
+    auto& root = *root_or_err;
     std::string html;
     if (!root) {
         html += "<p style=\"color:#484f58\">No internal CA on this install (operator-supplied "
@@ -154,7 +160,11 @@ std::string render_ca_fragment(CaStore* ca_store) {
             "type=\"submit\">Import signed chain</button></form></details>";
 
     constexpr int kPanelLimit = 500;
-    auto issued = ca_store->list_issued(kPanelLimit, 0);
+    auto issued_or_err = ca_store->list_issued(kPanelLimit, 0);
+    if (!issued_or_err)
+        return html + "<p style=\"color:#f85149\">Certificate inventory unavailable "
+                      "(store error).</p>";
+    auto& issued = *issued_or_err;
     html += "<table class=\"user-table\">"
             "<thead><tr><th>Serial</th><th>Subject</th><th>Purpose</th><th>Expires</th>"
             "<th>Status</th><th></th></tr></thead><tbody>";
@@ -181,7 +191,7 @@ std::string render_ca_fragment(CaStore* ca_store) {
                 // see web_utils.hpp), so the double-quoted value="" is safe for any
                 // serial (and a single-quoted hx-vals would have been too) — the
                 // form is just the clearer, codebase-standard pattern. The serial
-                // is hex-only in practice; this renders whatever ca.db holds safely.
+                // is hex-only in practice; this renders whatever ca_store holds safely.
                 html += "<form hx-post=\"/api/settings/ca/revoke\" hx-target=\"#ca-section\" "
                         "hx-swap=\"innerHTML\" style=\"display:inline-flex;gap:0.3rem\" "
                         "hx-confirm=\"Revoke certificate for &quot;" +
@@ -243,7 +253,16 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
     auto revoke_core = [ca_store, audit_fn, publish_crl_fn](
                            const httplib::Request& req, const std::string& serial,
                            const std::string& reason) -> RevokeResult {
-        if (!ca_store->revoke(serial, reason)) {
+        auto revoked_or_err = ca_store->revoke(serial, reason);
+        if (!revoked_or_err) {
+            // ADR-0053: a genuine DB/lease failure — distinct from "not found or already
+            // revoked" (a business fact). Must NOT be folded into "denied": that would falsely
+            // audit a database outage as a rejected revoke attempt.
+            const bool ok = audit_fn(req, "ca.cert.revoked", "failure", "AgentCertificate", serial,
+                                     revoked_or_err.error());
+            return {RevokeOutcome::StoreError, ok};
+        }
+        if (!*revoked_or_err) {
             // #1240: unknown/already-revoked is reject-without-state-change →
             // result="denied" (matches every destructive sibling + idempotent
             // retry-safe); "failure" is reserved for an authorized-but-errored op.
@@ -277,7 +296,15 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
             res.set_content(error_json_a4(503, "CA not available", make_correlation_id()), kJson);
             return;
         }
-        auto root = ca_store->get_root();
+        auto root_or_err = ca_store->get_root();
+        if (!root_or_err) {
+            res.status = 503;
+            res.set_content(error_json_a4(503, "CA store unavailable — try again",
+                                          make_correlation_id()),
+                            kJson);
+            return;
+        }
+        auto& root = *root_or_err;
         if (!root) {
             res.status = 404;
             res.set_content(error_json_a4(404, "no CA root", make_correlation_id(),
@@ -341,7 +368,15 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                 // be able to tell when to stop, not guess from count<limit). The
                 // probe row is trimmed before render. list_issued clamps at 10000,
                 // so limit+1 (<=1001) is always in range.
-                auto records = ca_store->list_issued(limit + 1, offset);
+                auto records_or_err = ca_store->list_issued(limit + 1, offset);
+                if (!records_or_err) {
+                    res.status = 503;
+                    res.set_content(error_json_a4(503, "CA store unavailable — try again",
+                                                  make_correlation_id()),
+                                    kJson);
+                    return;
+                }
+                auto records = std::move(*records_or_err);
                 const bool has_more = static_cast<int>(records.size()) > limit;
                 if (has_more)
                     records.resize(static_cast<std::size_t>(limit));
@@ -378,7 +413,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
 
     // ── POST /api/v1/ca/revoke ── Security:Delete: revoke a serial. ───────────
     // Body: {"serial_hex": "...", "reason": "..."}. Revocation takes effect
-    // server-side immediately (the mTLS accept gate consults ca.db, not the CRL);
+    // server-side immediately (the mTLS accept gate consults ca_store, not the CRL);
     // republishing the CRL propagates it to external consumers.
     sink.Post("/api/v1/ca/revoke", [perm_fn, ca_store, revoke_core](
                                       const httplib::Request& req, httplib::Response& res) {
@@ -432,7 +467,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
         // inject newlines into the audit detail (log-injection defence in depth).
         std::erase_if(reason, [](char c) { return c == '\n' || c == '\r'; });
         // Hermes M4: validate + normalise serial_hex (1..64 hex, uppercase) so a
-        // lowercase-input revoke still matches the canonical ca.db form.
+        // lowercase-input revoke still matches the canonical ca_store form.
         const std::string serial = normalize_serial(body.value("serial_hex", ""));
         if (serial.empty()) {
             res.status = 400;
@@ -443,6 +478,15 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
             return;
         }
         const RevokeResult rv = revoke_core(req, serial, reason);
+        if (rv.outcome == RevokeOutcome::StoreError) {
+            if (!rv.audit_ok)
+                res.set_header("Sec-Audit-Failed", "true");
+            res.status = 503;
+            res.set_content(error_json_a4(503, "CA store unavailable — try again",
+                                          make_correlation_id()),
+                            kJson);
+            return;
+        }
         if (rv.outcome == RevokeOutcome::NotFound) {
             // M1 (#1240): a dropped denied-row is the same evidence gap as a lost
             // success row — surface it.
@@ -704,6 +748,12 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
             return;
         }
         const RevokeResult rv = revoke_core(req, serial, reason);
+        if (rv.outcome == RevokeOutcome::StoreError) {
+            if (!rv.audit_ok)
+                res.set_header("Sec-Audit-Failed", "true");
+            error_panel(503, "Certificate authority store error — try again.");
+            return;
+        }
         if (rv.outcome == RevokeOutcome::NotFound) {
             // Don't render a success-looking panel for a no-op revoke (Hermes
             // PR4b INFO) — tell the operator the serial was unknown/already gone.

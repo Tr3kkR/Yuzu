@@ -44,7 +44,7 @@ bool table_exists(PGconn* conn, const std::string& schema, const std::string& ta
 
 } // namespace
 
-TEST_CASE("PgMigrationRunner versioning", "[pg][migration]") {
+TEST_CASE("PgMigrationRunner versioning", "[pg][migration][pg-smoke]") {
     YUZU_REQUIRE_PG_DB(db);
     PgConn conn = connect(db.dsn());
 

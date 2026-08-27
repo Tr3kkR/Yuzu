@@ -51,29 +51,40 @@ client-identity binding becomes cryptographic with no new mechanism.
 |---|---|
 | `server/core/src/x509_ca.{hpp,cpp}` (`yuzu::server::pki`) | Pure-OpenSSL engine: EC keygen, self-sign root, sign leaf from CSR (POP-verified, server-chosen subject/SAN/EKU), build CRL, SHA-256 fingerprint, parse, `verify_chain`. No SQLite / config / store deps — value types + PEM/DER strings only. |
 | `server/core/src/key_provider.{hpp,cpp}` | `KeyProvider` interface + `FileKeyProvider` (0600 PEM in a 0700 dir). The HSM/PKCS#11 seam — `key_ref` is an opaque token (the absolute path today). |
-| `server/core/src/ca_store.{hpp,cpp}` (`ca.db`) | SQLite inventory + lifecycle: `ca_root`, `ca_issued`, `ca_crl_versions`. **Metadata only — the root private key is never in the DB**, only its opaque `key_ref`. |
+| `server/core/src/ca_store.{hpp,cpp}` (Postgres schema `ca_store`, ADR-0053) | Inventory + lifecycle: `ca_root`, `ca_issued`, `ca_crl_versions`. **Metadata only — the root private key is never in the DB**, only its opaque `key_ref`. |
 | `server/core/src/default_certs.{hpp,cpp}` | First-boot bootstrap: root + 3 server leaves + `default-marker.json`. Idempotent; regenerate-whole-set on corruption / clock-skew. |
 | `agents/core/src/agent_csr.{hpp,cpp}` | Agent-side, self-contained OpenSSL (the agent cannot link `x509_ca`): EC P-256 keypair + CSR generation, 0600 leaf persistence, renew-at-2/3 inspection. |
 | `server/core/src/ca_routes.{hpp,cpp}` | The `/api/v1/ca/*` REST surface (PR4). |
 
-## `ca.db` (schema + invariants)
+## The `ca_store` Postgres schema (schema + invariants)
 
-Created via `MigrationRunner` (namespace `ca_store`), opened `FULLMUTEX` + WAL +
-`busy_timeout`, file mode 0600. Tables:
+Postgres substrate (ADR-0006/0053), schema `ca_store`, migrated at construction via
+`PgMigrationRunner`. Root-key custody is unchanged by the Postgres migration — this store never
+holds key material, only metadata; see "Key custody + threat model" below. Tables:
 
 - `ca_root(id=1, cert_pem, key_ref, algo, not_before, not_after,
-  fingerprint_sha256, mode, created_at)` — a single root row (REPLACEd on
-  subordinate import, PR6).
+  fingerprint_sha256, mode, created_at, chain_pem)` — a single root row.
+  **First-boot establishment is race-safe** (`CaStore::try_insert_root`, `ON CONFLICT (id) DO
+  NOTHING RETURNING`) — a shared Postgres substrate makes it possible for two server instances to
+  race first-boot root generation, which per-instance SQLite never could; at most one instance's
+  root is ever inserted, and every caller reads back whichever root is now canonical.
+  `CaStore::set_root` (unconditional REPLACE) is reserved for PR6 subordinate-CA import — an
+  explicit, single-writer, operator-triggered re-root of an ALREADY-established root — and test
+  seeding; it must never be used for first-boot generation. See ADR-0053.
 - `ca_issued(serial_hex PRIMARY KEY, subject, san, purpose, not_after, status,
   revocation_reason, revoked_at, issued_at, issued_by, enrollment_request_id,
   cert_pem, issuer_fingerprint, issuer_key_id)`.
-- `ca_crl_versions(version PRIMARY KEY, der, this_update, next_update,
+- `ca_crl_versions(version PRIMARY KEY, der BYTEA, this_update, next_update,
   published_at, issuer_fingerprint, issuer_key_id)`.
 
-Invariants: `key_ref` is opaque (pass to `load_key`, never parse). `revoke()`
-uses `RETURNING` for change detection — never `sqlite3_changes()` on the shared
-connection (#1033). `serial_hex` is canonical uppercase `BN_bn2hex` on both the
-issuance and parse sides, so revocation lookups match exactly.
+Invariants: `key_ref` is opaque (pass to `load_key`, never parse). `revoke()` uses `RETURNING` for
+change detection — never `sqlite3_changes()`-style counting (#1033's Postgres analogue: trust
+`PQntuples()`/`RETURNING`, not a bare command-status). `serial_hex` is canonical uppercase
+`BN_bn2hex` on both the issuance and parse sides, so revocation lookups match exactly.
+`CaStore::is_revoked()` — the mTLS-accept security gate — is a plain `bool` that fails CLOSED
+(`true`, "treat as revoked") on every degradation mode, including a Postgres lease/query failure,
+not only a non-hex serial: degrade → error → treat as revoked / refuse, never silent-pass
+(ADR-0053).
 
 ## Default certificates (PR2)
 
@@ -132,9 +143,14 @@ retry-safe — matches the destructive-sibling convention); `result=failure` is
 reserved for an authorized-but-errored op (e.g. a `ca.crl.published` build/record
 failure). Metrics: `yuzu_server_ca_cert_issued_total{purpose}`,
 `yuzu_grpc_revoked_cert_total{rpc}`, `yuzu_server_ca_crl_publish_failures_total`,
-`yuzu_server_ca_reissue_blocked_total`. Errors use the A4 envelope
+`yuzu_server_ca_reissue_blocked_total`,
+`yuzu_server_ca_revocation_sweep_read_failures_total` (ADR-0053 UP-1: the ~15s
+revocation-sweep tick's `list_revoked_serials()` read failed, so that tick's sweep
+was skipped entirely rather than treating every live agent as revoked — a sustained
+Postgres outage shows here, not as a burst of `session.cert_revoked` audit rows).
+Errors use the A4 envelope
 (`docs/agentic-first-principle.md`). Revocation takes effect server-side
-**immediately** (the mTLS accept gate reads `ca.db`, not the CRL); the CRL
+**immediately** (the mTLS accept gate reads `ca_store`, not the CRL); the CRL
 republish propagates it to external consumers. A republish failure is honest:
 `publish_crl()` returns failure (not the previously-built DER) when the CRL
 cannot be persisted, so the response reports `crl_republished:false`, the
@@ -458,8 +474,8 @@ the full mTLS topology with `--cert-group` + the mounted gateway sys.config).
 The CA root key is a 0600 PEM in a 0700 directory via `FileKeyProvider`; it is
 loaded transiently per signature (issuance, CRL build) and zeroed via RAII —
 never resident for the process lifetime. The Milestone-1 threat model is
-**local-host compromise**: an attacker who can read the 0600 key (or write
-`ca.db`) is already past the boundary and holds the crown jewel regardless. For
+**local-host compromise**: an attacker who can read the 0600 key (or gain write access to the `ca_store`
+database) is already past the boundary and holds the crown jewel regardless. For
 stronger custody, replace the default certs with operator/HSM-backed material;
 `KeyProvider` is the seam a future `Pkcs11KeyProvider` implements with
 `key_ref` = a PKCS#11 URI and zero change to callers. On Windows the agent leaf
@@ -484,7 +500,7 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
   routes in `ca_routes.cpp`, output `html_escaped`). Either way it
   is effective immediately server-side; the agent is refused on its next
   Subscribe/Heartbeat/CheckForUpdate/OTA call (Register re-auth + the data-plane
-  gates consult `ca.db` directly). An agent holding an **already-open** Subscribe
+  gates consult `ca_store` directly). An agent holding an **already-open** Subscribe
   stream is torn down by the server's periodic revocation sweep (~15s; PR3 H-1,
   `yuzu_grpc_revoked_cert_total{rpc=stream_sweep}`, audited `session.cert_revoked`
   `source=stream_sweep`) — it does not survive on the data plane until a voluntary
@@ -502,8 +518,42 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
   increments `yuzu_server_ca_crl_publish_failures_total` and audits
   `ca.crl.published` `result=failure` — alert on it: the public CRL is stale while
   server-side enforcement is already live.
-- **Back up** `<ca-dir>/default-ca.key` (0600) + `ca.db` to offline storage —
-  losing the root key forces a full fleet re-enrollment.
+- **Back up** `<ca-dir>/default-ca.key` (0600) to offline storage — losing the root key forces a
+  full fleet re-enrollment. The issued-cert inventory + CRL history live in the server's Postgres
+  substrate (`ca_store` schema) — back it up with the rest of the database (`docs/postgres-store-
+  playbook.md`), not as a separate local file.
+- **Deliberate clean re-root** (wipe an established root, e.g. after root-key compromise):
+  `default_certs.cpp`'s B-2 guard refuses to regenerate while `ca_store.ca_root` already holds a
+  row, so there is no in-product "reset" action. This procedure is for a root the fleet is
+  actually enrolled under — a first boot that crashed before completing (no agents enrolled yet,
+  same host, local `<ca-dir>` key material intact) self-heals automatically on the next start
+  instead (ADR-0053, UP-2); you only need the steps below when that self-heal condition does not
+  hold (different host, wiped `<ca-dir>`, or a root you deliberately want to retire). **Stop every
+  server instance sharing this Postgres substrate first** — `ca_store` is live, shared state:
+  `is_revoked()`/`list_revoked()` are read on the mTLS-accept hot path with no cache, so a
+  `TRUNCATE` against a still-running server (or any OTHER replica still running against the same
+  substrate) makes every previously-revoked certificate transiently read as not-revoked between the
+  truncate and that process's restart — reopening exactly what `is_revoked()`'s fail-closed design
+  exists to prevent. Take a fresh `pg_dump` of the `ca_store` schema immediately before truncating
+  as a rollback point (the operation itself is irreversible). Then, with every instance stopped,
+  the operator clears the store directly —
+  `TRUNCATE ca_store.ca_root, ca_store.ca_issued, ca_store.ca_crl_versions` against the server's
+  Postgres substrate (`docs/postgres-store-playbook.md` for connecting) — and removes the on-disk
+  `<ca-dir>/default-*.{pem,key}` + `default-marker.json` on every instance, then restarts all of
+  them together. This orphans every currently-enrolled agent (their leaves chain to the destroyed
+  root); a full fleet re-enrollment follows, same as a root-key loss. Prefer `POST /ca/import-chain`
+  (Subordinate-CA, PR6) when the
+  goal is re-keying under a new authority without an enrollment outage.
+- **A bootstrap that seems permanently stuck** (multi-replica default-cert self-heal, ADR-0053
+  C5-1/Gate 8 — an unsupported topology, `docs/user-manual/upgrading.md`'s HA note): check
+  `pg_locks` for a lingering `yuzu:default_certs_bootstrap` session advisory lock —
+  `SELECT pid, granted FROM pg_locks WHERE locktype = 'advisory' AND objid = <key>` (the lock key is
+  `default_certs_bootstrap_lock_key()`'s fixed classid/objid pair). A host crash or network
+  partition can leave the lock held with no live backend behind it until Postgres itself notices
+  the dead session (TCP keepalive timeout, `idle_session_timeout` if set) — `SELECT
+  pg_terminate_backend(pid)` on that `pid` releases it immediately rather than waiting. Every other
+  replica's retry loop (`kBootstrapLockAcquireTimeout`/`kBootstrapLockRetryInterval`,
+  `default_certs.cpp`) picks the now-free lock up on its own next attempt — no restart required.
 
 ## Roadmap
 
@@ -562,7 +612,7 @@ they set an advisory `yuzu_gw` env that nothing consumes, R-2);
 `enrollment_request_id`→enrollment-decision correlation; `crlNumber` in the
 `ca.crl.published` audit detail; a `yuzu_server_ca_cert_revoked_total` counter +
 `/readyz` `ca_crl_published` signal; a dedicated public-CA rate-limit bucket;
-dropping expired entries from the CRL; `ca.db` expired-row pruning;
+dropping expired entries from the CRL; `ca_store` expired-row pruning;
 `yuzu_server_ca_*_expiry_seconds` gauges + alerting; a `docs/security-reviews/`
 PKI record + risk-register entries; ACME (P3).
 

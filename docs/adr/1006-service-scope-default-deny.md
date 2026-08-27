@@ -246,8 +246,20 @@ reasoning): `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md
   the tag being written IS the confinement boundary. A third, related
   finding — a live agent's in-memory self-reported tags shadowing the store
   during scope-DSL evaluation (`agent_registry.cpp`), independent of any
-  TagStore write — surfaced during the same review and is tracked
-  separately (#3295), not folded into this fix.
+  TagStore write — surfaced during the same review and was tracked
+  separately as #3295; it is now CLOSED: the `evaluate_scope` `tag:<key>`
+  resolver is store-first (a TagStore row of any source wins over a
+  connected agent's live claim; the in-memory value answers only when the
+  store has no row at all — e.g. a gateway-proxied agent, whose tags never
+  reach the store), and `register_agent` drops an agent-claimed `service`
+  key from the session entirely at ingest, the same way sync already drops
+  it from the store. `derive_exec_visible` and the dynamic service
+  management groups (`server.cpp`) were already store-only and unaffected
+  by #3295 either way — the confinement ceiling this ADR establishes was
+  never in question; the fix closes a narrower gap in dispatch-targeting
+  and cohort-selection scope-DSL evaluation. Full precedence rule:
+  `docs/asset-tagging-guide.md` "Tag source precedence (read time,
+  scope-DSL, #3295)".
 - **No cached derived confinement sets.** Every check in this design reads
   live state (RBAC grants, the allow-list, tag data) — no precomputed
   "this token can see these agents" cache is introduced, avoiding a whole

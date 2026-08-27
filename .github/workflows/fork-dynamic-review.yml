@@ -50,7 +50,7 @@ jobs:
       - name: Install trusted host prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y autoconf automake bison ccache cmake flex libtool ninja-build
+          sudo apt-get install -y autoconf automake bison ccache cmake flex libblkid-dev libtool ninja-build
           python3 -m venv /tmp/yuzu-review-venv
           /tmp/yuzu-review-venv/bin/pip install --require-hashes -r requirements-ci.txt
           echo "/tmp/yuzu-review-venv/bin" >> "$GITHUB_PATH"

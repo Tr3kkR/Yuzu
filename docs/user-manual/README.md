@@ -62,6 +62,7 @@ The following features are documented within the files listed above:
 | Section | Description |
 |---|---|
 | [Troubleshooting](../operations/troubleshooting.md) | Common issues, log diagnosis, and resolution steps |
+| [High-Availability PostgreSQL](ha-postgres.md) | Opt-in Patroni + etcd + HAProxy failover profile — durability tiers, RTO/RPO, and production hardening requirements |
 | [Disaster Recovery](../operations/disaster-recovery.md) | Backup strategy, restore procedures, and failover architecture |
 | [Certificate Renewal](../operations/certificate-renewal.md) | TLS certificate lifecycle, rotation, and automated renewal |
 | [Capacity Planning](../operations/capacity-planning.md) | Server sizing, storage growth, network bandwidth, and scaling patterns |

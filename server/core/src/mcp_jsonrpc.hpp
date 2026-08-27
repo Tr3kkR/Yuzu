@@ -33,6 +33,8 @@ constexpr int kMcpStreamCap          = -32012;  // per-principal/global stream c
 constexpr int kMcpStreamPoisoned     = -32013;  // terminal delivery failed twice        → HTTP 410
 constexpr int kMcpTerminalUnavailable = -32014;  // parked result forced-expired under pressure -
                                                  // fetch by execution_id (bridge sweep, 2f PR 3)
+constexpr int kMcpShuttingDown = -32015;  // registry refused mint(): ServerImpl::stop() is
+                                          // draining sessions (#3042) → HTTP 503
 
 // ── Request ───────────────────────────────────────────────────────────────
 

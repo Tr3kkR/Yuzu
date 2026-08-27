@@ -1,9 +1,18 @@
 // InventoryStore tests (ADR-0037): the generic per-source blob store's
 // Postgres migration. Covers the authoritative read contract (degrade vs
 // genuinely-absent vs found/empty), fail-soft ingest, delete_agent's
-// empty-id guard, and the ADR-0009 first-boot backfill from a legacy SQLite
-// `inventory.db` (idempotent, never clobbers a live row, fails closed on a
-// broken legacy file).
+// empty-id guard, and the Postgres schema-migration-runner upgrade path
+// (published v2 -> v4, repairing an incomplete v3 state).
+//
+// No legacy-SQLite backfill test coverage: the dedicated migrate_from_sqlite
+// TEST_CASE suite (2026-08-25) was removed as part of a fresh-start-by-default
+// policy change (ADR-0009 amendment) -- no production fleet has ever run a
+// pre-Postgres build. InventoryStore::migrate_from_sqlite() itself is
+// UNCHANGED and still present (its removal is a separate, later step) -- it
+// is still called by the "degrades on a broken pool" test below (a general
+// closed-store fail-closed sweep, not backfill correctness) and by the kept
+// schema-migration-runner test (which uses it only as a trigger to exercise
+// the schema-version-upgrade repair path, not to test backfill itself).
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -11,19 +20,15 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
-#include "sqlite_raii.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <yuzu/metrics.hpp>
 
 #include <libpq-fe.h>
-#include <sqlite3.h>
 
 #include <chrono>
 #include <cstdint>
-#include <filesystem>
-#include <fstream>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -87,47 +92,6 @@ void inventory_reset() {
     InventoryStore store{pool};                                                                    \
     REQUIRE(store.is_open())
 
-// Seed a legacy SQLite `inventory.db` with the pre-migration schema (matches
-// the store's original CREATE TABLE) at `path`, containing `rows`.
-void seed_legacy_db(const std::filesystem::path& path, const std::vector<InventoryRecord>& rows) {
-    yuzu::server::SqliteDb db;
-    REQUIRE(sqlite3_open_v2(path.string().c_str(), db.addr(),
-                            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
-    REQUIRE(sqlite3_exec(db.get(),
-                         "CREATE TABLE inventory_data ("
-                         "  agent_id TEXT NOT NULL,"
-                         "  plugin TEXT NOT NULL,"
-                         "  data_json TEXT NOT NULL DEFAULT '{}',"
-                         "  collected_at INTEGER NOT NULL DEFAULT 0,"
-                         "  PRIMARY KEY (agent_id, plugin));",
-                         nullptr, nullptr, nullptr) == SQLITE_OK);
-    for (const auto& r : rows) {
-        yuzu::server::SqliteStmt stmt;
-        REQUIRE(sqlite3_prepare_v2(db.get(),
-                                   "INSERT INTO inventory_data (agent_id, plugin, data_json, "
-                                   "collected_at) VALUES (?, ?, ?, ?)",
-                                   -1, stmt.addr(), nullptr) == SQLITE_OK);
-        sqlite3_bind_text(stmt.get(), 1, r.agent_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt.get(), 2, r.plugin.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt.get(), 3, r.data_json.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt.get(), 4, r.collected_at);
-        REQUIRE(sqlite3_step(stmt.get()) == SQLITE_DONE);
-    }
-}
-
-void seed_oversized_legacy_blob(const std::filesystem::path& path) {
-    yuzu::server::SqliteDb db;
-    REQUIRE(sqlite3_open_v2(path.string().c_str(), db.addr(), SQLITE_OPEN_READWRITE, nullptr) ==
-            SQLITE_OK);
-    // Generate the payload inside SQLite: the test does not need an 8 MiB
-    // client-side std::string merely to prove the pre-copy guard.
-    REQUIRE(sqlite3_exec(db.get(),
-                         "INSERT INTO inventory_data "
-                         "(agent_id, plugin, data_json, collected_at) VALUES "
-                         "('legacy-oversized', 'custom_oversized', zeroblob(8388609), 600)",
-                         nullptr, nullptr, nullptr) == SQLITE_OK);
-}
-
 // Wall-clock now, mirroring the store's internal `now_secs()` — used only to
 // bound assertions on the store's own clamping, never to construct fixture
 // data that would itself need clamping.
@@ -135,19 +99,6 @@ std::int64_t test_now_secs() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
-}
-
-std::int64_t legacy_agent_rows(const std::filesystem::path& path, std::string_view agent_id) {
-    yuzu::server::SqliteDb db;
-    REQUIRE(sqlite3_open_v2(path.string().c_str(), db.addr(), SQLITE_OPEN_READONLY, nullptr) ==
-            SQLITE_OK);
-    yuzu::server::SqliteStmt stmt;
-    REQUIRE(sqlite3_prepare_v2(db.get(), "SELECT COUNT(*) FROM inventory_data WHERE agent_id = ?",
-                               -1, stmt.addr(), nullptr) == SQLITE_OK);
-    sqlite3_bind_text(stmt.get(), 1, agent_id.data(), static_cast<int>(agent_id.size()),
-                      SQLITE_TRANSIENT);
-    REQUIRE(sqlite3_step(stmt.get()) == SQLITE_ROW);
-    return sqlite3_column_int64(stmt.get(), 0);
 }
 
 } // namespace
@@ -412,19 +363,6 @@ TEST_CASE("InventoryStore query: aggregate blob bytes are bounded before libpq m
     CHECK(rows->size() == 2);
 }
 
-TEST_CASE("InventoryStore migrate_from_sqlite: no legacy file is a clean no-op",
-          "[pg][inventory]") {
-    INVENTORY_SHARED(store, pool);
-
-    CHECK(store.migrate_from_sqlite("/nonexistent/path/inventory.db"));
-    auto c = store.count();
-    REQUIRE(c.has_value());
-    CHECK(*c == 0);
-
-    // Idempotent: a second call (already stamped) is still a clean success.
-    CHECK(store.migrate_from_sqlite("/nonexistent/path/inventory.db"));
-}
-
 TEST_CASE("InventoryStore migration upgrades published v2 and repairs the incomplete v3 state",
           "[pg][inventory][migration]") {
     // Migration tests deliberately use one private database rather than the
@@ -515,270 +453,4 @@ TEST_CASE("InventoryStore migration upgrades published v2 and repairs the incomp
 
     seed_historical_schema(3);
     require_upgrade_and_stamp();
-}
-
-TEST_CASE("InventoryStore migrate_from_sqlite: backfills legacy rows, idempotent, "
-          "never clobbers a live row",
-          "[pg][inventory]") {
-    INVENTORY_SHARED(store, pool);
-
-    yuzu::test::TempDbFile legacy{"yuzu_test_"};
-    InventoryRecord r1;
-    r1.agent_id = "legacy-agent-1";
-    r1.plugin = "custom_source";
-    r1.data_json = R"({"legacy":true})";
-    r1.collected_at = 500;
-    InventoryRecord r2;
-    r2.agent_id = "legacy-agent-2";
-    r2.plugin = "custom_other";
-    r2.data_json = R"({"legacy":true})";
-    r2.collected_at = 600;
-    // Round-2 governance LOW: a legacy row written by a pre-clamp deployment
-    // carries a far-future collected_at — the backfill's own INSERT must
-    // clamp it too (`std::min(r.collected_at, now_secs())`), or this row
-    // would survive the backfill and freeze out every later honest upsert
-    // exactly like the pre-clamp ingest bug (H2).
-    const std::int64_t now_before = test_now_secs();
-    InventoryRecord r3;
-    r3.agent_id = "legacy-agent-3";
-    r3.plugin = "custom_future";
-    r3.data_json = R"({"legacy":true})";
-    r3.collected_at = now_before + 10'000'000;
-    InventoryRecord typed;
-    typed.agent_id = "legacy-typed";
-    typed.plugin = "installed_software";
-    typed.data_json = R"({"must_not_cross_securables":true})";
-    typed.collected_at = 700;
-    seed_legacy_db(legacy.path, {r1, r2, r3, typed});
-
-    // A live agent has already reported for (legacy-agent-1, installed_software)
-    // BEFORE the backfill runs — the backfill must never clobber it.
-    store.upsert("legacy-agent-1", "custom_source", R"({"live":true})", 9000);
-
-    REQUIRE(store.migrate_from_sqlite(legacy.path));
-
-    auto live_row = store.get("legacy-agent-1", "custom_source");
-    REQUIRE(live_row.has_value());
-    REQUIRE(live_row->has_value());
-    CHECK((*live_row)->data_json == R"({"live":true})"); // live row wins, not clobbered
-
-    auto backfilled = store.get("legacy-agent-2", "custom_other");
-    REQUIRE(backfilled.has_value());
-    REQUIRE(backfilled->has_value());
-    CHECK((*backfilled)->data_json == R"({"legacy":true})");
-    CHECK((*backfilled)->collected_at == 600);
-
-    const std::int64_t now_after = test_now_secs();
-    auto clamped = store.get("legacy-agent-3", "custom_future");
-    REQUIRE(clamped.has_value());
-    REQUIRE(clamped->has_value());
-    CHECK((*clamped)->data_json == R"({"legacy":true})");
-    CHECK((*clamped)->collected_at <= now_after); // clamped, NOT the far-future value seeded
-    CHECK((*clamped)->collected_at >= now_before);
-
-    auto typed_row = store.get("legacy-typed", "installed_software");
-    REQUIRE(typed_row.has_value());
-    CHECK_FALSE(typed_row->has_value());
-
-    // Whole-device erasure also reaches the retained rollback file, so a
-    // rollback cannot resurrect data after a successful decommission.
-    REQUIRE(legacy_agent_rows(legacy.path, "legacy-agent-2") == 1);
-    REQUIRE(store.delete_agent("legacy-agent-2"));
-    CHECK(legacy_agent_rows(legacy.path, "legacy-agent-2") == 0);
-    auto erased = store.get("legacy-agent-2", "custom_other");
-    REQUIRE(erased.has_value());
-    CHECK_FALSE(erased->has_value());
-
-    // Idempotent: a second call is a cheap no-op (already stamped) and does not
-    // error or duplicate rows.
-    REQUIRE(store.migrate_from_sqlite(legacy.path));
-    auto c = store.count();
-    REQUIRE(c.has_value());
-    // live legacy-agent-1 + future-clamped legacy-agent-3; agent-2 was erased
-    // from both stores and the typed source was never copied.
-    CHECK(*c == 2);
-
-    auto lease = pool.acquire();
-    REQUIRE(lease);
-    auto stamp = pg::exec_params(lease.get(),
-                                 "SELECT legacy_rows, source_rows, conflicts, skipped_typed "
-                                 "FROM inventory_store.backfill_state WHERE id = 1",
-                                 std::vector<std::string>{});
-    REQUIRE(stamp.status() == PGRES_TUPLES_OK);
-    REQUIRE(PQntuples(stamp.get()) == 1);
-    CHECK(std::string(PQgetvalue(stamp.get(), 0, 0)) == "2");
-    CHECK(std::string(PQgetvalue(stamp.get(), 0, 1)) == "4");
-    CHECK(std::string(PQgetvalue(stamp.get(), 0, 2)) == "1");
-    CHECK(std::string(PQgetvalue(stamp.get(), 0, 3)) == "1");
-}
-
-TEST_CASE("InventoryStore migrate_from_sqlite fails closed on an unreadable legacy file",
-          "[pg][inventory]") {
-    INVENTORY_SHARED(store, pool);
-
-    // A file that exists but is not a valid SQLite database — the legacy open/
-    // prepare must fail, and the backfill must fail CLOSED (false), never
-    // silently proceed as "nothing to backfill".
-    yuzu::test::TempDbFile corrupt{"yuzu_test_"};
-    {
-        std::ofstream f(corrupt.path, std::ios::binary);
-        f << "not a sqlite database";
-    }
-    CHECK_FALSE(store.migrate_from_sqlite(corrupt.path));
-}
-
-TEST_CASE("InventoryStore migrate_from_sqlite leaves no stamp or rows on retryable PG failure",
-          "[pg][inventory]") {
-    // DDL fault injection is deliberately isolated from the shared fixture:
-    // TRUNCATE cannot remove a trigger, and randomized/filtered runs must not
-    // inherit it.
-    YUZU_REQUIRE_PG_DB_TPL(db, inventory_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
-    REQUIRE(pool.valid());
-    InventoryStore store{pool};
-    REQUIRE(store.is_open());
-    auto lease = pool.acquire();
-    REQUIRE(lease);
-    auto function =
-        pg::exec_params(lease.get(),
-                        "CREATE FUNCTION inventory_store.reject_infra_row() RETURNS trigger "
-                        "LANGUAGE plpgsql AS $fn$ BEGIN "
-                        "IF NEW.plugin = 'infra_fail' THEN "
-                        "RAISE EXCEPTION 'injected cancellation' USING ERRCODE = '57014'; "
-                        "END IF; RETURN NEW; END $fn$",
-                        std::vector<std::string>{});
-    REQUIRE(function.status() == PGRES_COMMAND_OK);
-    auto trigger = pg::exec_params(
-        lease.get(),
-        "CREATE TRIGGER reject_infra_row BEFORE INSERT ON inventory_store.inventory_data "
-        "FOR EACH ROW EXECUTE FUNCTION inventory_store.reject_infra_row()",
-        std::vector<std::string>{});
-    REQUIRE(trigger.status() == PGRES_COMMAND_OK);
-    lease.reset();
-
-    yuzu::test::TempDbFile legacy{"yuzu_test_"};
-    seed_legacy_db(legacy.path, {{.agent_id = "good-before-failure",
-                                  .plugin = "custom_good",
-                                  .data_json = "{}",
-                                  .collected_at = 1},
-                                 {.agent_id = "injected-failure",
-                                  .plugin = "infra_fail",
-                                  .data_json = "{}",
-                                  .collected_at = 2}});
-    CHECK_FALSE(store.migrate_from_sqlite(legacy.path));
-
-    auto check = pool.acquire();
-    REQUIRE(check);
-    auto state = pg::exec_params(check.get(),
-                                 "SELECT (SELECT COUNT(*) FROM inventory_store.inventory_data), "
-                                 "(SELECT COUNT(*) FROM inventory_store.backfill_state)",
-                                 std::vector<std::string>{});
-    REQUIRE(state.status() == PGRES_TUPLES_OK);
-    REQUIRE(PQntuples(state.get()) == 1);
-    CHECK(std::string(PQgetvalue(state.get(), 0, 0)) == "0");
-    CHECK(std::string(PQgetvalue(state.get(), 0, 1)) == "0");
-}
-
-TEST_CASE("InventoryStore migrate_from_sqlite skips invalid, oversized, and blank-key rows "
-          "without bricking boot — good rows still land",
-          "[pg][inventory]") {
-    // IB2/UP-1: InventoryStore is FAIL-SOFT/self-healing (the agent re-pushes), so
-    // a single malformed legacy row must never abort the whole backfill/boot.
-    INVENTORY_SHARED(store, pool);
-
-    yuzu::test::TempDbFile legacy{"yuzu_test_"};
-    InventoryRecord good;
-    good.agent_id = "legacy-good";
-    good.plugin = "custom_good";
-    good.data_json = R"({"ok":true})";
-    good.collected_at = 100;
-
-    // Invalid-UTF-8 bytes (a lone continuation byte + overlong sequence) — SQLite
-    // stores TEXT as raw bytes with no encoding validation, but Postgres's UTF8
-    // client/server encoding validation rejects this on INSERT — the per-row
-    // SAVEPOINT must recover from exactly this failure mode.
-    InventoryRecord bad;
-    bad.agent_id = "legacy-bad";
-    bad.plugin = "custom_bad";
-    bad.data_json = std::string("\xFF\xFE\xFA\xFB");
-    bad.collected_at = 200;
-
-    InventoryRecord blank_id;
-    blank_id.agent_id = "";
-    blank_id.plugin = "custom_blank_id";
-    blank_id.data_json = R"({"orphan":true})";
-    blank_id.collected_at = 300;
-
-    InventoryRecord blank_plugin;
-    blank_plugin.agent_id = "legacy-blank-plugin";
-    blank_plugin.plugin = "";
-    blank_plugin.data_json = R"({"orphan":true})";
-    blank_plugin.collected_at = 400;
-
-    InventoryRecord good2;
-    good2.agent_id = "legacy-good-2";
-    good2.plugin = "custom_good_2";
-    good2.data_json = R"({"ok":true})";
-    good2.collected_at = 500;
-
-    // Bad/blank rows interleaved with good ones so the SAVEPOINT recovery must
-    // actually resume the loop, not just tolerate a trailing failure.
-    seed_legacy_db(legacy.path, {good, bad, blank_id, blank_plugin, good2});
-    seed_oversized_legacy_blob(legacy.path);
-
-    REQUIRE(store.migrate_from_sqlite(legacy.path)); // must NOT fail closed — no infra error
-
-    auto g1 = store.get("legacy-good", "custom_good");
-    REQUIRE(g1.has_value());
-    REQUIRE(g1->has_value());
-    CHECK((*g1)->data_json == R"({"ok":true})");
-
-    auto g2 = store.get("legacy-good-2", "custom_good_2");
-    REQUIRE(g2.has_value());
-    REQUIRE(g2->has_value());
-
-    auto bad_row = store.get("legacy-bad", "custom_bad");
-    REQUIRE(bad_row.has_value());      // not a degrade
-    CHECK_FALSE(bad_row->has_value()); // skipped, never landed
-
-    auto blank_plugin_row = store.get_agent_inventory("legacy-blank-plugin");
-    REQUIRE(blank_plugin_row.has_value());
-    CHECK(blank_plugin_row->empty()); // skipped, never landed
-
-    auto oversized = store.get("legacy-oversized", "custom_oversized");
-    REQUIRE(oversized.has_value());
-    CHECK_FALSE(oversized->has_value());
-
-    auto c = store.count();
-    REQUIRE(c.has_value());
-    CHECK(*c == 2); // only two good rows; bad, oversized, and blank-key rows skipped
-
-    // Governance H1: `skipped_bad` makes the row-data skip AUDITABLE after the
-    // fact via `backfill_state`, independent of the in-memory counters above —
-    // read it back over a second connection the way an operator/tool would.
-    // Invalid UTF-8 and the oversized blob increment skipped_bad; the two
-    // blank-key rows take the separate GDPR-orphan-guard path.
-    {
-        auto lease = pool.acquire();
-        REQUIRE(lease);
-        pg::PgResult stamp = pg::exec_params(
-            lease.get(),
-            "SELECT legacy_rows, skipped_bad, source_rows, conflicts, skipped_blank_key, "
-            "skipped_typed FROM inventory_store.backfill_state WHERE id = 1",
-            std::vector<std::string>{});
-        REQUIRE(stamp.status() == PGRES_TUPLES_OK);
-        REQUIRE(PQntuples(stamp.get()) == 1);
-        CHECK(std::string(PQgetvalue(stamp.get(), 0, 0)) == "2"); // legacy_rows == good-row count
-        CHECK(std::string(PQgetvalue(stamp.get(), 0, 1)) == "2"); // bad UTF-8 + oversized
-        CHECK(std::string(PQgetvalue(stamp.get(), 0, 2)) == "6"); // every source row seen
-        CHECK(std::string(PQgetvalue(stamp.get(), 0, 3)) == "0");
-        CHECK(std::string(PQgetvalue(stamp.get(), 0, 4)) == "2");
-        CHECK(std::string(PQgetvalue(stamp.get(), 0, 5)) == "0");
-    }
-
-    // Idempotent: a second call is a cheap no-op (already stamped).
-    REQUIRE(store.migrate_from_sqlite(legacy.path));
-    auto c2 = store.count();
-    REQUIRE(c2.has_value());
-    CHECK(*c2 == 2);
 }

@@ -89,7 +89,7 @@ CI history is separate and per runner: Big Tam stores `/srv/ci/work-N/_tool/yuzu
 
 The content plane: YAML-defined `InstructionDefinition` → `InstructionSet` → `ProductPack`, executed via `CommandRequest`; `yaml_source` authoritative, denormalized columns for queries. Architecture: `docs/Instruction-Engine.md`; DSL: `docs/yaml-dsl-spec.md`; tutorial: `docs/getting-started.md`.
 
-**Build-time gotcha:** PyYAML is a **hard build dependency** (`meson setup` fails without it). Shipped content is build-time embedded (`embed_content.py` → `bundled_content.cpp`, seeded into `instructions.db` on first boot); the runtime never reads YAML from disk (no `--content-dir` flag). See `docs/Instruction-Engine.md`.
+**Build-time gotcha:** PyYAML is a **hard build dependency** (`meson setup` fails without it). Shipped content is build-time embedded (`embed_content.py` → `bundled_content.cpp`, reseeded into the Postgres `instruction_store` schema on every boot, ADR-0058); the runtime never reads YAML from disk (no `--content-dir` flag). See `docs/Instruction-Engine.md`.
 
 ## Enterprise Readiness and SOC 2
 

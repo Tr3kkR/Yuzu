@@ -161,11 +161,29 @@ not the numbers:
 
 ## Ranked backlog for subsequent migrations
 
-1. **Bucket 1a — retire the provably-dead after-gate REST denies.** Each one's deny fires
-   after its route's own `perm_fn` already ran, so retirement is zero-behavior-change:
-   `schedule_routes.cpp:67`, `server.cpp`'s three schedule routes, `mcp_server.cpp`'s
-   `get_dex_group_app_perf`. No route migration needed — just delete the dead call + its
-   stale doc comment.
+1. **Bucket 1a — retire the provably-dead after-gate REST denies. DONE (2026-08-21).**
+   Each one's deny fired after its route's own `perm_fn` already ran, so retirement was
+   zero-behavior-change: `schedule_routes.cpp:67`, `server.cpp`'s three schedule routes
+   (`schedule.list`/`.delete`/`.enable`), `mcp_server.cpp`'s `get_dex_group_app_perf`. No
+   route migration needed — deleted the dead calls + updated the stale doc comments;
+   `deny_service_scoped_schedule` (`schedule_routes.{hpp,cpp}`) had all four of its call
+   sites removed and was retired entirely (declaration, definition, and its direct
+   unit-test block). One real gap found while verifying the `schedule.enable` site's
+   reachability, deliberately NOT fixed here (own PR only, per author's own scope
+   decision): the route's `require_permission(Schedule,Write)` gate fires unconditionally
+   before `enabled` is even parsed, so the documented "disable stays reachable as the kill
+   switch for a service-scoped token" guarantee does not currently hold — filed as #3378.
+   One test-fixture gap found and fixed: `test_mcp_server.cpp`'s `get_dex_group_app_perf`
+   deny test relied on the now-retired interim deny for its assertions; `McpTestServer`'s
+   fake `perm_fn` defaults to "always allow" (unlike production's real
+   `require_permission`), so the test needed an explicit `perm_override_for_test` to keep
+   proving the tool still denies a service-scoped token post-retirement — without it, the
+   test would have silently started asserting nothing. Governance's own Gate 3
+   quality-engineer pass surfaced a second, related gap this PR does not fix: only
+   `POST /api/schedules` (create) has real route-level end-to-end test coverage — list,
+   delete, and enable never did (their only prior "coverage" was the now-deleted direct
+   unit test of the retired helper, which never went through the real routes at all).
+   This is the exact shape that let #3378 go undetected — filed as #3390.
 2. **Read-only fleet reads, by plausible ITServiceOwner value** (this migration's own
    reasoning, applied forward): device/network lists (`list_dex_perf_devices`,
    `list_network_devices` + REST twins) → `list_schedules` → DEX/Guardian reads.

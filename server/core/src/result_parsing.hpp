@@ -47,10 +47,14 @@ inline const std::vector<std::string>& columns_for_plugin(const std::string& plu
     static const std::unordered_map<std::string, std::vector<std::string>> kSchemas{
         {"chargen",     {"Agent", "Output"}},
         {"procfetch",   {"Agent", "PID", "Name", "Path", "SHA-1"}},
+        // netstat: static fallback for the netstat_list action (7 cols after
+        // Agent). The `attribution` action's 9-column schema (adds Process
+        // Name/Process Path) rides the content-definition result_schema via
+        // DashboardRoutes::resolve_render_columns instead of a kSchemas
+        // entry here -- see roadmap D2 (#3403) -- so this stays netstat_list
+        // shaped rather than trying to serve both actions from one static row.
         {"netstat",     {"Agent", "Proto", "Local Addr", "Local Port",
                          "Remote Addr", "Remote Port", "State", "PID"}},
-        {"sockwho",     {"Agent", "PID", "Name", "Path", "Proto",
-                         "Local Addr", "Local Port", "Remote Addr", "Remote Port", "State"}},
         {"vuln_scan",   {"Agent", "Severity", "Category", "Title", "Detail"}},
         {"tar",         {"Agent", "Output"}}, // Dynamic: overridden by __schema__ protocol
     };

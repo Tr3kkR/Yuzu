@@ -248,7 +248,8 @@ Not implemented. Enumerate connected printers for asset tracking.
 
 ### 4.3 Listening Endpoint Enumeration :white_check_mark: `T1`
 
-`netstat` and `sockwho` plugins.
+`netstat` plugin (`netstat_list` action; `attribution` adds owning-process
+resolution -- folded from the retired sockwho plugin, #3403).
 
 ### 4.4 ARP Table :white_check_mark: `T1`
 
@@ -374,14 +375,16 @@ Not implemented. Desktop interaction to enumerate visible application windows.
 
 ### 8.1 Installed Update Enumeration :white_check_mark: `T1`
 
-`windows_updates` plugin with `installed` action. Cross-platform: Windows (Get-HotFix), Linux (rpm/apt), macOS (system_profiler).
+`windows_updates` plugin with `installed` action. Cross-platform: Windows (bounded WMI `Win32_QuickFixEngineering` query, capped at 512 rows, unsorted — WQL has no `ORDER BY` for a data-class query, a disclosed behaviour change from the retired PowerShell path's 50-most-recent-sorted output), Linux (rpm/apt), macOS (system_profiler).
 
 ### 8.2 Pending Reboot Detection :white_check_mark: `T1`
 
 `windows_updates` plugin `pending_reboot` action. Cross-platform reboot-pending detection:
 Windows (3 registry keys: WindowsUpdate RebootRequired, CBS RebootPending, Session Manager PendingFileRenameOperations),
 Linux (reboot-required file + kernel version comparison + needs-restarting fallback),
-macOS (softwareupdate restart flag). Reports per-source status and aggregate boolean.
+macOS (softwareupdate restart flag, bounded to a 60s deadline — replaces the plugin's
+own prior unbounded `popen()` call, which could hang indefinitely on a headless/offline
+Mac). Reports per-source status and aggregate boolean.
 
 ### 8.3 Patch Deployment :white_check_mark: `T2`
 
@@ -433,9 +436,13 @@ pf packet filter demoted to a secondary row; `rules` lists pf rules.
 
 ### 9.3 Disk Encryption Status :white_check_mark: `T1`
 
-`bitlocker` plugin (cross-platform): Windows BitLocker (`manage-bde`), Linux
-LUKS (`list_luks_volumes`), and macOS FileVault (`fdesetup` + per-APFS-volume
-`diskutil apfs list`) — all three dispatched from the plugin's `state` action.
+`bitlocker` plugin (cross-platform): Windows BitLocker via an in-process
+Win32_EncryptableVolume WMI query + per-volume `GetConversionStatus()`
+method call (rung 1, no subprocess), Linux LUKS via in-process libblkid
+enumeration + plain `/sys/class/block/dm-*/dm/uuid` reads (`list_luks_volumes`,
+rung 1, no subprocess), and macOS FileVault (`fdesetup` + per-APFS-volume
+`diskutil apfs list`, direct argv through the bounded subprocess runner,
+rung 2) — all three dispatched from the plugin's `state` action.
 
 ### 9.4 Vulnerability Scanning :large_orange_diamond: `T1`
 
@@ -799,7 +806,7 @@ Session-cookie auth with PBKDF2-hashed passwords.
 
 ### 18.8 Device Authorization Tokens :white_check_mark: `T2`
 
-`DeviceTokenStore` (SQLite) with SHA-256 hashed tokens, device_id and definition_id scoping. REST: `GET/POST/DELETE /api/v1/device-tokens`. Integrated into auth chain.
+`DeviceTokenStore` (PostgreSQL, ADR-0052) with SHA-256 hashed tokens, device_id and definition_id scoping. REST: `GET/POST/DELETE /api/v1/device-tokens`. **Dormant** (same family as `LicenseStore`/ADR-0048 and `SoftwareDeploymentStore`/ADR-0051) — the store is migrated and tested but not constructed by the server, so these routes do not register today.
 
 ### 18.9 HTTPS for Web Dashboard :white_check_mark: `T1`
 
@@ -875,7 +882,7 @@ Named response-view configurations (column subset, sort order, filter presets) a
 
 ### 20.7 Response Offloading :white_check_mark: `T3`
 
-Operator-registered external HTTP endpoints (*offload targets*) that receive a copy of `agent.registered` and `execution.completed` events as they fire. Sibling `OffloadTargetStore` (`offload_targets.db`, migration v1) wired into `AgentServiceImpl` next to the existing webhook fan-out — every event that fires a webhook also fans out to every enabled offload target whose `event_types` filter matches. Typed auth: none / bearer / basic / hmac (Authorization headers are CRLF-guarded against header injection). Server-side batching: `batch_size > 1` accumulates events into a per-target buffer and flushes on threshold; flush body is JSON of shape `{"events":[…]}`. REST CRUD at `/api/v1/offload-targets` gated on `Infrastructure:Read`/`Write`. `auth_credential` is persisted but never returned by any read endpoint (paranoia-double-check assertion in REST tests). YAML authoring via `spec.offload.targets` is documented; dispatcher-side correlation (per-instruction filter honouring) deferred to a follow-up. Phase 8.3, issue #255.
+Operator-registered external HTTP endpoints (*offload targets*) that receive a copy of `agent.registered` and `execution.completed` events as they fire. Sibling `OffloadTargetStore` (Postgres schema `offload_target_store`, ADR-0059) wired into `AgentServiceImpl` next to the existing webhook fan-out — every event that fires a webhook also fans out to every enabled offload target whose `event_types` filter matches. Typed auth: none / bearer / basic / hmac (Authorization headers are CRLF-guarded against header injection). Server-side batching: `batch_size > 1` accumulates events into a per-target buffer and flushes on threshold; flush body is JSON of shape `{"events":[…]}`. REST CRUD at `/api/v1/offload-targets` gated on `Infrastructure:Read`/`Write`. `auth_credential` is `SecretCodec`-encrypted at rest (ADR-0010) and never returned by any read endpoint (a `has_credential` flag reports whether one is configured; paranoia-double-check assertion in REST tests). YAML authoring via `spec.offload.targets` is documented; dispatcher-side correlation (per-instruction filter honouring) deferred to a follow-up. Phase 8.3, issue #255.
 
 ---
 
@@ -923,7 +930,7 @@ Kubernetes-style health probes: `/livez` (always 200) and `/readyz` (checks stor
 
 ### 22.4 Platform Configuration (TTLs, Limits) :white_check_mark: `T2`
 
-`RuntimeConfigStore`. Persistent runtime configuration overrides in SQLite. Allow-listed keys only, **including one credential** (`oidc_client_secret`, plaintext at rest until ADR-0010 envelope encryption reaches this store) - `is_secret_key` gates every emitter (startup log, `GET /api/config`, the `config.update` audit detail, and the `PUT` response echo) so the value is not returned or logged; pre-existing audit rows are redacted when read. Set/get/remove with `updated_by` attribution. **Only some keys take effect without a restart**: the three retention keys are stored-only until a restart, DEX-alert keys until a restart or a Settings-UI save, OIDC keys apply ONLY via a Settings-UI save (a restart does not apply them), and `auto_approve_enabled` is never read back from this store - see `docs/user-manual/rest-api.md` "Runtime Configuration". REST API for configuration CRUD. Startup defaults overridden by stored values.
+`RuntimeConfigStore`. Persistent runtime configuration overrides in PostgreSQL (ADR-0060). Allow-listed keys only, **including one credential** (`oidc_client_secret`, SecretCodec-envelope-encrypted at rest, ADR-0010) - `is_secret_key` gates every emitter (startup log, `GET /api/config`, the `config.update` audit detail, and the `PUT` response echo) so the value is not returned or logged; pre-existing audit rows are redacted when read. Set/get/remove with `updated_by` attribution. **Only some keys take effect without a restart**: the three retention keys are stored-only until a restart, DEX-alert keys until a restart or a Settings-UI save, OIDC keys apply ONLY via a Settings-UI save (a restart does not apply them), and `auto_approve_enabled` is never read back from this store - see `docs/user-manual/rest-api.md` "Runtime Configuration". REST API for configuration CRUD. Startup defaults overridden by stored values.
 
 ### 22.5 Gateway / Scale-Out Architecture :white_check_mark: `T2`
 
@@ -1253,7 +1260,6 @@ Not implemented (PRs 12, 15). HMAC rule signing (HKDF per design §11.2) with pe
 | users | Y | Y | Y | User |
 | network_config | Y | Y | Y | Network |
 | netstat | Y | Y | Y | Network |
-| sockwho | Y | Y | Y | Network |
 | network_diag | Y | Y | Y | Network |
 | network_actions | Y | Y | Y | Network |
 | wifi | Y | Y | Y | Network |
