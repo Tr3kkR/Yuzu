@@ -1046,18 +1046,24 @@ if build_server
   #   - no entry name may be a substring of another (flake-retry maps
   #     meson-junit names by longest substring match) — 'shard A'/'shard B'/
   #     'shard C'/'shard D'/'shard E'/'shard F'/'shard G'/'shard H'/'shard I'/
-  #     'shard J', 'server pg smoke', and 'server unit tests' are pairwise
-  #     non-substring.
+  #     'shard J'/'shard K', 'server pg smoke', and 'server unit tests' are
+  #     pairwise non-substring. The Windows CI test-phase-split PR (#3443,
+  #     2026-08-28) added a second non-pg 'shard C' ('server unit tests
+  #     shard C', distinct from the pg 'server pg unit tests shard C') —
+  #     the full prefixed names stay pairwise non-substring (checked: neither
+  #     contains the other, since 'server pg unit tests shard C' never
+  #     contains the contiguous text 'server unit tests shard C').
   #   - UPDATED Phase 2 (#3443) — this used to say ci.yml's Linux Test step
   #     hardcodes the full pg shard name list with "No automated check
   #     enforces this yet"; that was true before Phase 1 and is stale now.
-  #     Since Phase 1, the 10 pg shards are selected structurally via
-  #     `--suite server-pg` — adding/splitting/rebalancing a shard needs only
-  #     the right suite: kwarg here, ci.yml is untouched, and the partition
-  #     invariant below proves the property. ci.yml DOES still hardcode BY
-  #     NAME: the 2 non-pg server test names, 'mcp bridge teardown allocation
-  #     budget', 'server pg shard partition invariant', and (Phase 2) 'server
-  #     pg smoke' — renaming any of those, or adding a new top-level `suite:`
+  #     Since Phase 1, the 11 pg shards (10 + K, added 2026-08-28) are
+  #     selected structurally via `--suite server-pg` — adding/splitting/
+  #     rebalancing a shard needs only the right suite: kwarg here, ci.yml
+  #     is untouched, and the partition invariant below proves the property.
+  #     ci.yml DOES still hardcode BY NAME: the 3 non-pg server test names
+  #     (A/B/C), 'mcp bridge teardown allocation budget', 'server pg shard
+  #     partition invariant', and (Phase 2) 'server pg smoke' — renaming any
+  #     of those, or adding a new top-level `suite:`
   #     anywhere in the build (tests/meson.build or the root meson.build —
   #     see the 'gateway' suite, registered there, not here), still needs a
   #     matching ci.yml update, and by-name selection fails LOUD on a
@@ -1083,6 +1089,30 @@ if build_server
   # tidier but is DELIBERATELY not used: those are options, not positional specs,
   # so flake-retry.py's _cmd_without_test_specs would keep them across an isolated
   # case retry and silently filter out the very case being retried.
+  #
+  # WINDOWS CI TEST-PHASE-SPLIT (#3443, 2026-08-28): two more carves, sized by
+  # WINDOWS per-case time (0.34-1.40s/case across the old pg shards, so count
+  # alone would misbalance) rather than by case count:
+  #   pg: shard C (~640 cases, the Windows makespan floor at 310s) split into
+  #     C (~426 cases, kept) + K (~406 cases, carved: 10 named store tags —
+  #     policy_store/instruction_store/ca_store/device_token/tag_store/bundle/
+  #     pki/offload_store/webhook_store/baseline_store — none claimed by any
+  #     other shard's filter). Exact partition verified locally against the
+  #     real binary (832 = 406 + 426); a DSN-less run of K exits 0 (same as
+  #     C's own precedent, no --allow-running-no-tests needed).
+  #   non-pg: shard B split into B (kept, narrowed by excluding auth/mcp/cel/
+  #     viz/scope/dispatch/nvd/dex, already carved to A/its own [auth][mcp]
+  #     split earlier) + a NEW non-pg 'shard C' (the six excluded tag groups).
+  #     Named 'shard C', not 'shard B2' — the pairwise-non-substring rule
+  #     above rejects any name that is a substring of another live entry;
+  #     'shard B2' is not itself a substring hazard, but 'shard C' keeps the
+  #     single-letter-per-shard convention this file already uses everywhere
+  #     else, and the pg/non-pg 'shard C' pair is proven non-colliding above.
+  # This is shared infrastructure (`tests/meson.build` is not platform-gated),
+  # so both new shards run on Linux too, not only Windows — Linux's own pg
+  # shard count moves from 10 to 11 as a direct consequence; see the
+  # "Worst-case job-budget arithmetic" note in docs/ci-architecture.md for
+  # what that does to the Linux degenerate-case timeout ceiling.
   test('server unit tests shard A', server_test_exe,
        args: ['~[pg][auth],~[pg][mcp]'], suite: ['server', 'server-nonpg'], timeout: 600,
        priority: 20)
