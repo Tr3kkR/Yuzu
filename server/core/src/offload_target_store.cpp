@@ -733,6 +733,23 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
         return;
     }
 
+    // Defence-in-depth, same class as the URL-scheme re-check above: a
+    // stored auth_type value that doesn't round-trip through
+    // offload_auth_type_to_string (a tampered row, or a value from a
+    // since-retired enum member) resolves to None via the lenient
+    // from-string parser used to build `tgt` — never silently dispatch a
+    // configured credential with no authentication applied.
+    if (tgt.has_credential &&
+        offload_auth_type_to_string(tgt.auth_type) != tgt.auth_type_raw) {
+        record_delivery(tgt.id, event_type, event_count, payload_body, 0, "invalid_auth_type");
+        spdlog::warn("OffloadTargetStore: refused dispatch for target {} - stored auth_type "
+                     "({}) is not a recognized value and a credential is configured",
+                     tgt.id, tgt.auth_type_raw);
+        if (metrics_)
+            metrics_->counter("yuzu_server_offload_delivery_failed_total").increment();
+        return;
+    }
+
     // Decrypt-on-use at the dispatch site, right before the credential is
     // needed for the auth header/signature — never cached/batched across
     // this target's flush lifetime (ADR-0010 §Consequences permits caching
@@ -898,7 +915,8 @@ void OffloadTargetStore::fire_event(const std::string& event_type,
             t.id = to_i64(col(res.get(), i, 0));
             t.name = col_str(res.get(), i, 1);
             t.url = col_str(res.get(), i, 2);
-            t.auth_type = offload_auth_type_from_string(col_str(res.get(), i, 3));
+            t.auth_type_raw = col_str(res.get(), i, 3);
+            t.auth_type = offload_auth_type_from_string(t.auth_type_raw);
             t.has_credential = to_bool(col(res.get(), i, 5));
             if (t.has_credential)
                 t.credential_blob = hex_to_bytes(col_str(res.get(), i, 4));
@@ -990,7 +1008,8 @@ void OffloadTargetStore::flush_all() {
             tgt.id = to_i64(col(res.get(), 0, 0));
             tgt.name = col_str(res.get(), 0, 1);
             tgt.url = col_str(res.get(), 0, 2);
-            tgt.auth_type = offload_auth_type_from_string(col_str(res.get(), 0, 3));
+            tgt.auth_type_raw = col_str(res.get(), 0, 3);
+            tgt.auth_type = offload_auth_type_from_string(tgt.auth_type_raw);
             tgt.has_credential = to_bool(col(res.get(), 0, 5));
             if (tgt.has_credential)
                 tgt.credential_blob = hex_to_bytes(col_str(res.get(), 0, 4));

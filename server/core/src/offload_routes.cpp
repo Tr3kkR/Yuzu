@@ -122,6 +122,8 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       // A present-but-wrong-typed field (e.g. batch_size as a
                       // string) throws type_error out of body.value() — that's
                       // still a caller mistake, not a server fault (#3097).
+                      audit_fn(req, "offload_target.create", "denied", "offload_target", name,
+                               "invalid_field_type");
                       send_bad_json(res);
                       return;
                   }
@@ -140,6 +142,8 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       // "bearre" into an unauthenticated target instead of
                       // rejecting it — round-trip through to_string() to catch
                       // exactly that case without touching the shared helper.
+                      audit_fn(req, "offload_target.create", "denied", "offload_target", name,
+                               "invalid_auth_type");
                       res.status = 400;
                       res.set_content(
                           R"({"error":{"code":400,"message":"unrecognized auth_type"},"meta":{"api_version":"v1"}})",
@@ -238,8 +242,14 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                     }
                     auto result = offload_store->delete_target(*id_opt);
                     if (!result.has_value()) {
+                        // Same #3097 classification as create's 503 branch
+                        // above — distinct in the audit record even though
+                        // the HTTP status collapses to 503 for both.
+                        const char* detail = result.error() == OffloadWriteError::store_unavailable
+                                                ? "store_unavailable"
+                                                : "db_error";
                         audit_fn(req, "offload_target.delete", "denied", "offload_target",
-                                 std::to_string(*id_opt), "store_unavailable");
+                                 std::to_string(*id_opt), detail);
                         send_unavailable(res);
                         return;
                     }

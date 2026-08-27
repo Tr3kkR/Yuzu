@@ -558,6 +558,44 @@ TEST_CASE("OffloadTargetStore[pg]: a tampered credential blob is skipped, never 
     CHECK(saw_tag_mismatch);
 }
 
+TEST_CASE("OffloadTargetStore[pg]: a stored auth_type that doesn't round-trip is refused "
+          "dispatch, never fired with the credential unauthenticated",
+          "[offload_store][pg][security]") {
+    OffloadTargetStorePg store;
+    auto result = store->create_target("desynced-auth", "http://127.0.0.1:1/h",
+                                       OffloadAuthType::Bearer, "shared-secret", "*");
+    REQUIRE(result.has_value());
+    auto id = *result;
+
+    // Simulate a tampered/legacy row via a second connection: a stored
+    // auth_type string outside {none,bearer,basic,hmac}. The lenient
+    // from-string parser folds this to None on read, so without the
+    // defence-in-depth check this would dispatch the configured credential
+    // completely unauthenticated instead of being refused.
+    {
+        pg::PgConn conn{PQconnectdb(store.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult res = pg::exec_params(
+            conn.get(),
+            "UPDATE offload_target_store.offload_targets SET auth_type = 'oauth2' WHERE id = $1",
+            std::vector<std::string>{std::to_string(id)});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    store->fire_event("execution.completed", R"({"k":"v"})");
+    std::vector<OffloadDelivery> deliveries;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (std::chrono::steady_clock::now() < deadline) {
+        deliveries = store->get_deliveries(id);
+        if (!deliveries.empty())
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    REQUIRE(deliveries.size() == 1);
+    CHECK(deliveries[0].status_code == 0);
+    CHECK(deliveries[0].error == "invalid_auth_type"); // never dispatched unauthenticated
+}
+
 TEST_CASE("OffloadTargetStore[pg]: NULL auth_credential with has_credential=true is a hard "
           "CHECK violation",
           "[offload_store][pg][security]") {

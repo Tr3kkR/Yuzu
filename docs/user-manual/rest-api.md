@@ -3994,7 +3994,7 @@ Fetch a single target by numeric id. `auth_credential` is redacted (`has_credent
 
 #### `POST /api/v1/offload-targets`
 
-Create a new offload target. Returns 201 + `{id, status}` on success, 400 when validation fails (invalid URL scheme, empty `name`, `batch_size < 1`, duplicate `name`, a present-but-wrong-typed field such as `batch_size` sent as a string, or an unrecognized `auth_type`).
+Create a new offload target. Returns 201 + `{id, status}` on success, 400 when validation fails (invalid URL scheme, empty `name`, `batch_size < 1`, duplicate `name`, a control byte in a free-text field, a present-but-wrong-typed field such as `batch_size` sent as a string, or an unrecognized `auth_type`).
 
 | Field | Type | Required | Description |
 |---|---|---|---|

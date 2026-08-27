@@ -276,6 +276,12 @@ private:
         std::string name;
         std::string url;
         OffloadAuthType auth_type{OffloadAuthType::None};
+        /// The raw `auth_type` column value `auth_type` was parsed from —
+        /// carried alongside the enum so `deliver_single` can defend against
+        /// a stored value that doesn't round-trip (a tampered row, or a
+        /// value from a since-retired enum member), which the lenient
+        /// from-string parser would otherwise silently fold to `None`.
+        std::string auth_type_raw;
         std::vector<std::uint8_t> credential_blob; // empty iff !has_credential
         bool has_credential{false};
         int batch_size{1};
