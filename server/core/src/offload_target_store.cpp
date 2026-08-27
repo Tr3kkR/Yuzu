@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <span>
 #include <sstream>
+#include <stdexcept>
 
 #ifdef _WIN32
 // clang-format off
@@ -197,7 +198,8 @@ OffloadAuthType offload_auth_type_from_string(const std::string& s) {
 
 // ── HMAC-SHA256 ─────────────────────────────────────────────────────────────
 
-std::string OffloadTargetStore::hmac_sha256(std::string_view secret, std::string_view data) {
+std::optional<std::string> OffloadTargetStore::hmac_sha256(std::string_view secret,
+                                                            std::string_view data) {
     uint8_t hash[32] = {};
 
 #ifdef _WIN32
@@ -205,23 +207,34 @@ std::string OffloadTargetStore::hmac_sha256(std::string_view secret, std::string
     auto status = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr,
                                               BCRYPT_ALG_HANDLE_HMAC_FLAG);
     if (!BCRYPT_SUCCESS(status))
-        return {};
+        return std::nullopt;
 
     BCRYPT_HASH_HANDLE hHash = nullptr;
     status = BCryptCreateHash(alg, &hHash, nullptr, 0,
                               reinterpret_cast<PUCHAR>(const_cast<char*>(secret.data())),
                               static_cast<ULONG>(secret.size()), 0);
-    if (BCRYPT_SUCCESS(status)) {
-        BCryptHashData(hHash, reinterpret_cast<PUCHAR>(const_cast<char*>(data.data())),
-                       static_cast<ULONG>(data.size()), 0);
-        BCryptFinishHash(hHash, hash, 32, 0);
-        BCryptDestroyHash(hHash);
+    bool ok = BCRYPT_SUCCESS(status);
+    if (ok) {
+        status = BCryptHashData(hHash, reinterpret_cast<PUCHAR>(const_cast<char*>(data.data())),
+                                static_cast<ULONG>(data.size()), 0);
+        ok = BCRYPT_SUCCESS(status);
     }
+    if (ok) {
+        status = BCryptFinishHash(hHash, hash, 32, 0);
+        ok = BCRYPT_SUCCESS(status);
+    }
+    // hHash is destroyed whenever it was created, regardless of whether a
+    // later step in the chain failed — cleanup must not depend on `ok`.
+    if (hHash)
+        BCryptDestroyHash(hHash);
     BCryptCloseAlgorithmProvider(alg, 0);
+    if (!ok)
+        return std::nullopt;
 #else
     unsigned int len = 32;
-    HMAC(EVP_sha256(), secret.data(), static_cast<int>(secret.size()),
-         reinterpret_cast<const unsigned char*>(data.data()), data.size(), hash, &len);
+    if (!HMAC(EVP_sha256(), secret.data(), static_cast<int>(secret.size()),
+              reinterpret_cast<const unsigned char*>(data.data()), data.size(), hash, &len))
+        return std::nullopt;
 #endif
 
     return bytes_to_hex(std::span<const std::uint8_t>{hash, 32});
@@ -804,7 +817,14 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
                 auto view = std::string_view(reinterpret_cast<const char*>(credential->data()),
                                              credential->size());
                 auto sig = hmac_sha256(view, payload_body);
-                headers.emplace("X-Yuzu-Signature", "sha256=" + sig);
+                if (!sig) {
+                    // Fail closed — never send a predictable all-zero
+                    // signature as if it were real. Throwing here (caught
+                    // below, same as a connection failure) skips the POST
+                    // entirely.
+                    throw std::runtime_error("hmac_failed");
+                }
+                headers.emplace("X-Yuzu-Signature", "sha256=" + *sig);
             }
             break;
         case OffloadAuthType::None:

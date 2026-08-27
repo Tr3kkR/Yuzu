@@ -249,8 +249,12 @@ public:
     /// never `std::string` (ADR-0010 zeroization rule — a decrypted
     /// credential's bytes must not be copied into an unzeroized
     /// `std::string` on the way here). Same primitive as
-    /// WebhookStore::hmac_sha256.
-    [[nodiscard]] static std::string hmac_sha256(std::string_view secret, std::string_view data);
+    /// WebhookStore::hmac_sha256. Returns `nullopt` on a crypto-provider
+    /// failure (OpenSSL `HMAC()` / a BCrypt step) rather than a
+    /// zero-filled hash — a caller must fail the delivery closed, never
+    /// send a predictable all-zero signature as if it were real.
+    [[nodiscard]] static std::optional<std::string> hmac_sha256(std::string_view secret,
+                                                                 std::string_view data);
 
     /// Base64-encode bytes for the Basic auth header. `data` is a view for
     /// the same zeroization reason as `hmac_sha256`.

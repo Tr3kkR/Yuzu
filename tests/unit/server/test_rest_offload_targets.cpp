@@ -289,6 +289,28 @@ TEST_CASE("REST offload-targets: POST 400 on bad URL scheme",
     CHECK(h.audit_log[0].result == "denied");
 }
 
+TEST_CASE("REST offload-targets: POST 400 (not 500) on type-mismatched field",
+          "[rest][offload][pg]") {
+    OffloadHarness h;
+    // batch_size as a string throws nlohmann::json::type_error out of
+    // body.value() — must be a caller-mistake 400, never an unhandled 500.
+    auto res = h.sink.Post(
+        "/api/v1/offload-targets",
+        R"({"name":"x","url":"https://x.example.com/h","batch_size":"not-an-int"})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+}
+
+TEST_CASE("REST offload-targets: POST 400 on unrecognized auth_type",
+          "[rest][offload][pg]") {
+    OffloadHarness h;
+    auto res = h.sink.Post(
+        "/api/v1/offload-targets",
+        R"({"name":"x","url":"https://x.example.com/h","auth_type":"bearre"})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+}
+
 TEST_CASE("REST offload-targets: 403 when perm_fn denies", "[rest][offload][pg][rbac]") {
     OffloadHarness h;
     h.perm_grant = false;

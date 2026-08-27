@@ -249,7 +249,8 @@ TEST_CASE("OffloadTargetStore: base64 RFC 4648 vectors", "[offload_store]") {
 TEST_CASE("OffloadTargetStore: hmac_sha256 known vector", "[offload_store]") {
     // RFC 4231 test case 2: key="Jefe", data="what do ya want for nothing?".
     auto sig = OffloadTargetStore::hmac_sha256("Jefe", "what do ya want for nothing?");
-    CHECK(sig == "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    REQUIRE(sig.has_value());
+    CHECK(*sig == "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
 }
 
 // ── fire_event matching: target_filter scoping ─────────────────────────────

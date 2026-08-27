@@ -107,8 +107,24 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       send_bad_json(res);
                       return;
                   }
-                  auto name = body.value("name", std::string{});
-                  auto url = body.value("url", std::string{});
+                  std::string name, url, auth_type_str, auth_credential, event_types;
+                  int batch_size = 1;
+                  bool enabled = true;
+                  try {
+                      name = body.value("name", std::string{});
+                      url = body.value("url", std::string{});
+                      auth_type_str = body.value("auth_type", std::string{"none"});
+                      auth_credential = body.value("auth_credential", std::string{});
+                      event_types = body.value("event_types", std::string{"*"});
+                      batch_size = body.value("batch_size", 1);
+                      enabled = body.value("enabled", true);
+                  } catch (const nlohmann::json::exception&) {
+                      // A present-but-wrong-typed field (e.g. batch_size as a
+                      // string) throws type_error out of body.value() — that's
+                      // still a caller mistake, not a server fault (#3097).
+                      send_bad_json(res);
+                      return;
+                  }
                   if (name.empty() || url.empty()) {
                       res.status = 400;
                       res.set_content(
@@ -116,12 +132,20 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                           "application/json");
                       return;
                   }
-                  auto auth_type_str = body.value("auth_type", std::string{"none"});
                   auto auth_type = offload_auth_type_from_string(auth_type_str);
-                  auto auth_credential = body.value("auth_credential", std::string{});
-                  auto event_types = body.value("event_types", std::string{"*"});
-                  auto batch_size = body.value("batch_size", 1);
-                  auto enabled = body.value("enabled", true);
+                  if (offload_auth_type_to_string(auth_type) != auth_type_str) {
+                      // offload_auth_type_from_string() folds any unrecognized
+                      // string to None for defensive DB-read tolerance; at the
+                      // REST boundary that would silently turn a typo like
+                      // "bearre" into an unauthenticated target instead of
+                      // rejecting it — round-trip through to_string() to catch
+                      // exactly that case without touching the shared helper.
+                      res.status = 400;
+                      res.set_content(
+                          R"({"error":{"code":400,"message":"unrecognized auth_type"},"meta":{"api_version":"v1"}})",
+                          "application/json");
+                      return;
+                  }
 
                   auto result = offload_store->create_target(name, url, auth_type, auth_credential,
                                                              event_types, batch_size, enabled);

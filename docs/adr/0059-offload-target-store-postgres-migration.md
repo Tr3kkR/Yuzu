@@ -1,6 +1,6 @@
 # ADR-0059: OffloadTargetStore → PostgreSQL
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-08-25
 - **Deciders:** pg workstream, security-guardian + cpp-safety + docs-writer review (ADR-0010
   secrets seam is mandatory on this migration)
@@ -10,7 +10,7 @@
   unconditional-skip precedent for stores with no other reason to keep a legacy read path), ADR-0012
   (substrate/store contract); ADR-0010 (secrets envelope — this is ADR-0010's third production
   consumer, after `AuthDB.users.mfa_totp_secret` and `WebhookStore.webhooks.secret`); ADR-0057
-  (`WebhookStore` → PostgreSQL — **in flight, not yet merged as of this writing** — this store's
+  (`WebhookStore` → PostgreSQL — **merged (PR #3563)** — this store's
   direct twin: same targets+deliveries shape, wildcard `event_types`, an `enabled` flag, and the
   first store to work out the `has_credential`/secret-column CHECK-constraint pattern this ADR
   adopts verbatim); `docs/postgres-store-playbook.md`; `docs/postgres-migration-ladder.md`
