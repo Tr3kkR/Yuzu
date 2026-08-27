@@ -271,10 +271,10 @@ implementation is.
 | disk_space | free | macos | supported | 1 | statfs(2) | - |
 | disk_space | free | windows | supported | 1 | GetDiskFreeSpaceExW | - |
 | event_logs | errors | linux | supported | 1 | sd_journal (bounded local read, PRIORITY<=err) | falls back to a bounded journalctl argv invocation (rung 2) when libsystemd is compiled out (-Dsystemd_guard) or the journal is unreachable |
-| event_logs | errors | macos | supported | 2 | log_show | - |
+| event_logs | errors | macos | supported | 2 | log_show | requires root or a real login session to open the local unified-log data store — a non-root headless process gets EX_NOPERM/77 regardless of Full Disk Access (docs/darwin-compat.md); no gap in production, which runs as a root LaunchDaemon |
 | event_logs | errors | windows | supported | 1 | wevtapi (EvtQuery/EvtRender, Level=2, bounded EvtNext) | - |
 | event_logs | query | linux | supported | 1 | sd_journal (bounded local read, keyword match) | falls back to a bounded journalctl argv invocation (rung 2) when libsystemd is compiled out (-Dsystemd_guard) or the journal is unreachable |
-| event_logs | query | macos | supported | 2 | log_show | - |
+| event_logs | query | macos | supported | 2 | log_show | requires root or a real login session to open the local unified-log data store — a non-root headless process gets EX_NOPERM/77 regardless of Full Disk Access (docs/darwin-compat.md); no gap in production, which runs as a root LaunchDaemon |
 | event_logs | query | windows | supported | 1 | wevtapi (EvtQuery/EvtRender, bounded EvtNext) | - |
 | example | ping | linux | supported | 1 | in-process | - |
 | example | ping | macos | supported | 1 | in-process | - |

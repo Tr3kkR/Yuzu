@@ -116,6 +116,28 @@ bool every_nonempty_line_has_prefix(std::string_view captured, std::string_view 
     }
 }
 
+// macOS-only: `log show`'s "permission_denied" tag (event_logs_macos.hpp's
+// LogShowOutcome::store_permission_denied) means this process's privilege
+// tier -- non-root, no login session -- cannot open the local unified-log
+// data store AT ALL (EX_NOPERM/77), independent of Full Disk Access. Proven
+// by a differential probe (darwin-guardian investigation, PR #3578): a root
+// headless daemon opens the store and gets real rows; the identical predicate
+// as a non-root headless service account (every CI runner, by the agent
+// privilege model's own design -- docs/agent-privilege-model.md) gets
+// EX_NOPERM every time, even with every FDA grant tried. A real login
+// session (this is why it never reproduces on a developer's own Mac) also
+// opens the store. Production is unaffected: the macOS agent runs as a root
+// LaunchDaemon. SKIP rather than FAIL here so this test still catches a
+// genuine acquisition regression (wrong tool, wrong argv, a shell hop that
+// silently no-ops) on any host that CAN open the store, while never
+// red-ing CI purely because of the runner's privilege tier -- see
+// docs/darwin-compat.md.
+#if defined(__APPLE__)
+bool is_macos_log_store_permission_denied(const std::string& captured) {
+    return captured.find("|permission_denied|") != std::string::npos;
+}
+#endif
+
 } // namespace
 
 TEST_CASE("event_logs plugin: errors executes the real acquisition leg, every row error|-prefixed",
@@ -126,6 +148,13 @@ TEST_CASE("event_logs plugin: errors executes the real acquisition leg, every ro
     yuzu::agent::LocalDispatcher dispatcher;
     std::vector<YuzuParam> params{{"log", "System"}, {"hours", "1"}};
     auto result = dispatcher.run(plugin->descriptor, "errors", params);
+#if defined(__APPLE__)
+    if (is_macos_log_store_permission_denied(result.captured)) {
+        SKIP("macOS log show could not open the local log store in this process's privilege "
+             "tier (non-root, no login session) -- see docs/darwin-compat.md. Not a plugin "
+             "regression: production runs as a root LaunchDaemon, which can open the store.");
+    }
+#endif
     CHECK(result.rc == 0);
     // A leg that silently emitted NOTHING would satisfy rc==0 and vacuously
     // satisfy the prefix check below (every_nonempty_line_has_prefix is true
@@ -161,6 +190,13 @@ TEST_CASE("event_logs plugin: query executes the real acquisition leg, every row
     yuzu::agent::LocalDispatcher dispatcher;
     std::vector<YuzuParam> params{{"log", "System"}, {"filter", "a"}, {"count", "5"}};
     auto result = dispatcher.run(plugin->descriptor, "query", params);
+#if defined(__APPLE__)
+    if (is_macos_log_store_permission_denied(result.captured)) {
+        SKIP("macOS log show could not open the local log store in this process's privilege "
+             "tier (non-root, no login session) -- see docs/darwin-compat.md. Not a plugin "
+             "regression: production runs as a root LaunchDaemon, which can open the store.");
+    }
+#endif
     CHECK(result.rc == 0);
     CHECK_FALSE(result.captured.empty()); // bare silence is a regression, not a pass
     CHECK(every_nonempty_line_has_prefix(result.captured, "event|"));

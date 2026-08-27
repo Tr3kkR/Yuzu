@@ -36,13 +36,36 @@ namespace yuzu::event_logs_macos {
 
 namespace parsers = yuzu::event_logs_parsers;
 
+// EX_NOPERM (sysexits.h): "you did not have sufficient permission to perform
+// the operation." Empirically confirmed (darwin-guardian investigation,
+// PR #3578) as the exit code `log show` returns when it cannot open the
+// local unified-log data store at all -- distinct from a TCC/Full-Disk-
+// Access redaction (which still succeeds, just with `<private>` fields).
+// A differential probe on the CI host proved the axis is PRIVILEGE TIER, not
+// FDA: a root headless daemon opens the store and returns real rows (exit 0);
+// the identical predicate as the non-root, non-login-session CI service
+// account gets EX_NOPERM every time, even with every FDA grant tried. A real
+// login session (interactive or GUI) also opens the store, which is why this
+// never reproduces on a developer's own Mac.
+constexpr int kLogShowExitNoPerm = 77;
+
 enum class LogShowOutcome {
-    ok,          // Completed normally; result.lines (possibly empty) is the
-                 // whole honest picture -- callers may report rc 0.
-    timed_out,   // Wall-clock deadline elapsed before `log show` finished.
-    unavailable, // `log show` never ran, exited non-zero, or its captured
-                 // output was truncated -- distinguishable from a genuine
-                 // empty search, never folded into it.
+    ok,                      // Completed normally; result.lines (possibly
+                             // empty) is the whole honest picture -- callers
+                             // may report rc 0.
+    timed_out,               // Wall-clock deadline elapsed before `log show`
+                             // finished.
+    store_permission_denied, // `log show` ran and exited EX_NOPERM (77) --
+                             // this process's privilege tier (non-root,
+                             // no login session) cannot open the local log
+                             // data store at all. NOT a code defect and NOT
+                             // an FDA gap -- see docs/darwin-compat.md. The
+                             // production agent runs as a root LaunchDaemon,
+                             // so this never occurs there.
+    unavailable,             // `log show` never ran, exited non-zero for some
+                             // other reason, or its captured output was
+                             // truncated -- distinguishable from a genuine
+                             // empty search, never folded into it.
 };
 
 // `outcome == ok` carries an empty `reason`; `timed_out`/`unavailable`
@@ -75,9 +98,18 @@ classify_log_show_result(const yuzu::agent::SubprocessResult& result) {
     if (result.termination_reason == yuzu::agent::TerminationReason::line_limit)
         return {LogShowOutcome::ok, {}};
 
-    // log show ran and reported a real problem (bad predicate, permission
-    // denial, etc) -- a nonzero exit is never silently treated as "no
-    // matches".
+    // EX_NOPERM specifically means the log data store itself could not be
+    // opened by this process's privilege tier -- distinguished from other
+    // nonzero exits (bad predicate, etc) so callers can tell "this
+    // environment structurally cannot do this" apart from "log show broke."
+    if (result.exit_code == kLogShowExitNoPerm) {
+        return {LogShowOutcome::store_permission_denied,
+                "log show could not open the local log store (requires root or a "
+                "login session -- see docs/darwin-compat.md)"};
+    }
+
+    // log show ran and reported some other real problem (bad predicate,
+    // etc) -- a nonzero exit is never silently treated as "no matches".
     if (result.exit_code != 0)
         return {LogShowOutcome::unavailable, "log show exited with an error"};
 
@@ -142,11 +174,14 @@ inline std::string format_log_show_line(std::string_view row_prefix, const std::
 // branches ("errors" passes row_prefix "error" + its "No error events
 // found" message; "query" passes "event" + "No matching events found").
 // Covers every case:
-//   (a) timed_out          -> partial lines, then an honest timeout row, rc 1
-//   (b) unavailable         -> partial lines, then an honest unavailable row, rc 1
-//       (!tool_ran / nonzero exit_code / output_truncated)
-//   (c) ok + no lines       -> the clean-empty row, rc 0
-//   (d) ok + lines          -> the formatted lines, rc 0
+//   (a) timed_out              -> partial lines, then an honest timeout row, rc 1
+//   (b) store_permission_denied -> partial lines, then an honest
+//       "permission_denied" row, rc 1 (EX_NOPERM -- privilege-tier gap,
+//       never occurs under the production root LaunchDaemon)
+//   (c) unavailable            -> partial lines, then an honest unavailable
+//       row, rc 1 (!tool_ran / other nonzero exit_code / output_truncated)
+//   (d) ok + no lines          -> the clean-empty row, rc 0
+//   (e) ok + lines             -> the formatted lines, rc 0
 // The plugin shell's job is reduced to calling this and emitting what it
 // returns -- it makes no rows/rc decision of its own.
 inline LogShowDecision decide_log_show_output(const yuzu::agent::SubprocessResult& result,
@@ -162,8 +197,23 @@ inline LogShowDecision decide_log_show_output(const yuzu::agent::SubprocessResul
         // same 4-column shape.
         for (const auto& line : result.lines)
             decision.rows.push_back(format_log_show_line(row_prefix, line));
-        const char* tag =
-            classification.outcome == LogShowOutcome::timed_out ? "timeout" : "unavailable";
+        const char* tag;
+        switch (classification.outcome) {
+        case LogShowOutcome::timed_out:
+            tag = "timeout";
+            break;
+        case LogShowOutcome::store_permission_denied:
+            // Distinct, greppable tag (not folded into "unavailable") so a
+            // caller -- the plugin's own action-dispatch test, in
+            // particular -- can tell a privilege-tier environment gap apart
+            // from a genuine acquisition regression without re-parsing
+            // free-text reasons.
+            tag = "permission_denied";
+            break;
+        default:
+            tag = "unavailable";
+            break;
+        }
         decision.rows.push_back(
             std::format("{}|{}|-|{}", row_prefix, tag, classification.reason));
         decision.rc = 1;
