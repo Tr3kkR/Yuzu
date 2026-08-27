@@ -192,12 +192,52 @@ rule_assertion_from_rule(const yuzu::guardian::v1::GuaranteedStateRule& rule) {
     // returned ResilienceConfig itself (remediation MODE) is intentionally
     // discarded: spark is detection-only through this rung (enforcement lands
     // rung 3), so only the debounce window applies here.
+    //
+    // Fallback default (#3388): legacy's 1000ms default suits its notification-
+    // driven model (no scheduled re-evaluation). Spark's convergence scheduler
+    // re-evaluates every armed rule on a fixed per-type cadence, so a 1000ms
+    // debounce expires before every single sweep, and a persistently-drifted
+    // rule re-emits drift.detected on every sweep of its lane - jitter-adjusted
+    // worst case ~1800/day on the 60s service/registry lanes, ~180/day on the
+    // 600s file lane (naive no-jitter figures of 1440/144 understate the worst
+    // case; full jitter-floor derivation in docs/spark-legacy-delta-registry.md's
+    // D3 row).
+    // Interim fix (owner decision, pending a possible full M1-shaped
+    // edge+refresh redesign later): default to the rule's own lane
+    // cadence plus the scheduler's own jitter span, so debounce reliably
+    // survives at least one full sweep even at the jitter-shortened extreme -
+    // roughly halves steady-state re-emission frequency. Reuses the SAME
+    // cadence/jitter constants AND the same jitter-span formula the convergence
+    // scheduler itself uses (guardian_jitter_span_ms, spark.hpp), so the two
+    // can't silently drift apart on either axis.
     const auto& rem = rule.remediation();
     auto get = [&rem](std::string_view k) -> std::string {
         const auto it = rem.params().find(std::string(k));
         return it != rem.params().end() ? it->second : std::string{};
     };
-    (void)parse_resilience_params(get, out.debounce_ms);
+    std::uint64_t default_debounce_ms = 1000; // unreachable: *spark_type is always File/Service/Registry
+    switch (*spark_type) {
+    case SparkType::File:
+        default_debounce_ms =
+            kGuardianFileLaneCadenceMs + guardian_jitter_span_ms(kGuardianFileLaneCadenceMs,
+                                                                 kGuardianLaneJitterPct);
+        break;
+    case SparkType::Registry:
+        default_debounce_ms =
+            kGuardianRegistryLaneCadenceMs + guardian_jitter_span_ms(kGuardianRegistryLaneCadenceMs,
+                                                                     kGuardianLaneJitterPct);
+        break;
+    case SparkType::Service:
+        default_debounce_ms =
+            kGuardianServiceLaneCadenceMs + guardian_jitter_span_ms(kGuardianServiceLaneCadenceMs,
+                                                                    kGuardianLaneJitterPct);
+        break;
+    case SparkType::Interval:
+    case SparkType::Startup:
+    case SparkType::Disk:
+        break; // unreachable here (spark_type_from_token already rejected these above)
+    }
+    (void)parse_resilience_params(get, out.debounce_ms, default_debounce_ms);
 
     const std::string& atype = assertion.type();
     switch (*spark_type) {

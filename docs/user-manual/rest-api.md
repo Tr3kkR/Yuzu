@@ -2528,7 +2528,7 @@ Remove a template. Returns 400 when `template_id` is `__default__`.
 | 500 | Persist failure |
 | 503 | Service unavailable |
 
-**Audit events emitted:** `response_template.create`, `response_template.update`, `response_template.delete` — target type `InstructionDefinition`, target id = definition id, detail = template id (success) or `reason=<r>` (audit-path failure). 4xx branches emit `result=denied`; 500 persist failures emit `result=failure`. See `audit-log.md` for the full reason vocabulary.
+**Audit events emitted:** `response_template.create`, `response_template.update`, `response_template.delete` — target type `InstructionDefinition`, target id = definition id, detail = template id (success) or `reason=<r>` (audit-path failure). 4xx branches emit `result=denied`; 500 persist failures emit `result=failure`; the 503 store-unavailable branch emits `result=error` (an infra degrade is not an operator denial — ADR-0058). See `audit-log.md` for the full reason vocabulary.
 
 ---
 
@@ -2695,15 +2695,18 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `auth.lockout.cleared` | Account-lockout counter reset. `result` ∈ {`ok`, `error`}, `target_type=User`. `detail=admin_unlock` for `POST /api/v1/users/{name}/unlock`, or `reset_on_successful_login` when the user's next successful login clears a non-zero counter. |
 | `execution.live_subscribe` | Server-Sent Events subscribe to `/sse/executions/{id}`. `result=success`. Emitted on every successful subscribe (no per-session-per-execution dedup currently — see #700). The forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`. |
 | `api.v1.events.subscribe` | Agentic-first SSE subscribe to `/api/v1/events?execution_id=<id>` (sprint W5.1). `result=success`. Detail format: `correlation_id=req-<hex-ms>-<hex-seq>` so SIEM rules can join the audit row to the response's `X-Correlation-Id` header. Deliberately separated from `execution.live_subscribe` so the SIEM can distinguish browser-tier vs agentic-worker consumers. Same no-dedup policy (#700). Post-auth denial branches (404 unknown execution / 410 terminal / 503 unavailable) do not audit but write a `spdlog::warn` row carrying the cid and the authenticated principal so an operator can reconstruct what happened without the client surfacing the cid. |
-| `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). |
+| `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). `error` detail `db_error` on a genuine InstructionStore DB/lease failure (503, ADR-0058) — distinct from `denied`, since an infra degrade is not an operator denial. |
+| `instruction.update` | Instruction definition updated via `PUT /api/instructions/{id}`. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). A plain 400 validation error is not audited (matches `instruction.create`'s equivalent branch). |
+| `instruction.delete` | Instruction definition deleted via `DELETE /api/instructions/{id}`. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). |
+| `instruction_set.delete` | Instruction set deleted via `DELETE /api/instruction-sets/{id}`. `result` ∈ {`denied`, `error`}. Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). Success is not audited (`create_set`/`delete_set` predate any audit coverage on this pair — tracked separately, #3598 — the 404/503 denial branches above are new with ADR-0058 and audited from the start rather than shipped asymmetrically). |
 | `instruction.scope_resolution_failed` | Emitted at dispatch when a `from_result_set:` reference in the scope cannot be resolved (set absent, TTL-expired, or not owned by the dispatching principal). `result=failure`. Detail format: `INSTRUCTION_SCOPE_RESOLUTION_FAILED command=<command_id> ref=<id-or-alias> reason=...`. Fires on all scoped dispatch paths (generic REST, tracked, MCP) and increments the `yuzu_scope_resolution_failed_total` metric; as of governance M1 (2026-07-29) the **entire dispatch is aborted** — no devices are targeted, including from other scope atoms — recorded by a paired `scope.evaluation_aborted` row with `reason=owner_check_failed`. |
 | `scope.evaluation_aborted` | Emitted when a scoped dispatch is aborted fail-closed before any device is targeted. `result=failure`. Reasons: `db_degraded` (a `from_result_set:<id>` alias/owner/membership read against the result-set store could not answer — ADR-0036 — **or** a `props.<key>` bulk preload against the custom-properties store could not answer — ADR-0045; both abort the same way and share this reason value), `owner_check_failed` (a referenced set is absent, expired, or not owned — paired with per-ref `instruction.scope_resolution_failed` rows), `principal_unresolved` (a tracked/MCP dispatch could not recover the dispatching operator). Fires on all three scoped dispatch paths, plus the no-principal tracked-closure guard (principal_unresolved only). |
 | `bundle.dispatch` | Live-query bundle dispatched via `POST /api/v1/bundles` (ADR-0011). `target_type=Execution`. `result=success` (`target_id=<bundle-… correlation id>`, detail `agent=<id> steps=<n>`) or `result=failure` (dispatch threw — `target_id` empty, detail `agent=<id> error=<…>`). |
 | `bundle.<plugin>.<action>` | One step of a live-query bundle, emitted per step at dispatch — the device-access lens. `target_type=Agent`, `target_id=<agent_id>`. `result=dispatched` (reached the agent) or `result=no_agents` (reached zero agents → `dispatch_failed` on collate). A bundle of N steps emits N of these, so it is exactly as auditable as N separate executions (works-council parity). Emitted on **both** the REST and MCP surfaces (the per-step verb is transport-agnostic; the MCP tool-call envelope additionally audits as `mcp.execute_bundle`). |
 | `bundle.collate` | Live-query bundle collated via `GET /api/v1/bundles/{id}`. `target_type=Execution`, `target_id=<correlation id>`. `result=success` (detail `complete=0\|1`), `result=denied` (`not found or not owned` — the 404 covers both an unknown id and a non-owner, so the audit row is where the real reason is recorded), or `result=failure` (`response store degraded` — a 503, distinct from `denied`: the bundle WAS found and owned, the read just could not be served; retryable, `retry_after_ms:5000`). |
 | `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_name` (409, fragment with the same `name` already exists). |
-| `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result=success`. Detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row. |
-| `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`}. Success detail `execution_id=<id> agents=<n>`; denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents). |
+| `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result` ∈ {`success`, `error`}. Success detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row; the `503` degraded-evaluation case (`policy_evaluator_->evaluate_now` returning an error, e.g. an InstructionStore DB/lease failure per ADR-0058) DOES audit, `result=error` detail `degraded` — matches `policy.remediate`'s own `error`-vs-`denied` convention: an infra degrade is not an operator denial. |
+| `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`, `error`}. Success detail `execution_id=<id> agents=<n>`; denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents, a remediation for this policy is already in flight); `error` is a genuine store/evaluator degrade, distinct from `denied`. |
 | `quarantine.enable` | Device quarantined |
 | `quarantine.disable` | Device released from quarantine |
 | `ca.cert.issued` | Internal CA signed a per-agent client certificate at enrollment. `target_type=AgentCertificate`, `target_id=<serial>`, `result=success`. |
@@ -3050,7 +3053,7 @@ Create a new policy fragment from YAML.
 
 **Response (409):** Returned when a fragment with the same `name` already exists. Body is `{"error": "policy fragment named '<name>' already exists"}`. Audit event recorded as `policy_fragment.create / denied / duplicate_name`. Choose a different name (existing fragments are immutable on rename).
 
-**Response (503):** Policy store not yet initialized.
+**Response (503):** Policy store not yet initialized, or a genuine internal store failure on the write (safe to retry — distinct from the 400/409 rejections above, and the internal error string is never included in the body).
 
 ---
 
@@ -3134,6 +3137,10 @@ Create a new policy from YAML.
 }
 ```
 
+**Response (400):** YAML missing required fields, unknown `fragment_id`, invalid scope expression. Body is `{"error": "<reason>"}`.
+
+**Response (503):** A genuine internal store failure on the write — safe to retry, and the internal error string is never included in the body.
+
 ---
 
 #### `GET /api/policies/{id}`
@@ -3202,6 +3209,10 @@ Enable a previously disabled policy.
 }
 ```
 
+**Response (400):** `policy not found`. **Response (503):** a genuine internal
+store failure on the write — safe to retry, internal error string never
+included in the body.
+
 ---
 
 #### `POST /api/policies/{id}/disable`
@@ -3217,6 +3228,10 @@ Disable a policy, pausing compliance checks.
   "status": "disabled"
 }
 ```
+
+**Response (400):** `policy not found`. **Response (503):** a genuine internal
+store failure on the write — safe to retry, internal error string never
+included in the body.
 
 ---
 
@@ -3235,6 +3250,9 @@ Invalidate agent-side compliance cache for a specific policy. Resets all agent s
 }
 ```
 
+**Response (503):** a genuine internal store failure on the write — safe to
+retry, internal error string never included in the body.
+
 ---
 
 #### `POST /api/policies/invalidate-all`
@@ -3251,6 +3269,9 @@ Invalidate compliance cache for all policies across all agents.
   "total_invalidated": 210
 }
 ```
+
+**Response (503):** a genuine internal store failure on the write — safe to
+retry, internal error string never included in the body.
 
 ---
 
@@ -3277,10 +3298,16 @@ verdicts appear a few seconds later.
 ```
 
 **Response (404):** policy not found. **Response (409):** the policy's fragment
-has no `check` instruction, or the policy matches no agents. **Response (503):**
-policy evaluation not available.
+has no `check` instruction, the policy matches no agents, or a check for this
+policy is already in flight. **Response (503):** either the policy evaluator
+isn't wired ("policy evaluation not available"), or a genuine internal store
+failure occurred while reading the policy or fragment, recording the dispatch
+claim, or (ADR-0058) resolving the check instruction against InstructionStore
+("policy store degraded" / "policy evaluation degraded") — a transient failure
+of this kind is safe to retry and is never reported as a 409.
 
-**Audit:** `policy.evaluate`.
+**Audit:** `policy.evaluate` — including on the 503 degraded-evaluation case above
+(`result=error`, detail `degraded`).
 
 ---
 
@@ -3317,10 +3344,19 @@ is remediated.
 ```
 
 **Response (404):** policy not found. **Response (409):** the fragment defines no
-`fix` instruction, or there are no non-compliant agents to remediate.
-**Response (503):** policy evaluation not available.
+`fix` instruction, there are no non-compliant agents to remediate, or a
+remediation for this policy is already in flight (dispatched but not yet past
+its `postCheck` — same-process dedup only, see the ADR-0056 Follow-ups for the
+cross-replica gap).
+**Response (503):** either the policy evaluator isn't wired ("policy evaluation
+not available"), or a genuine internal store failure occurred while resolving
+the policy or its remediation targets, including (ADR-0058) InstructionStore
+resolving the fix instruction ("policy store degraded" / "policy store
+unavailable") — safe to retry, and distinguished from the 400/409 business
+rejections above.
 
-**Audit:** `policy.remediate` (`result` ∈ {`success`, `denied`}).
+**Audit:** `policy.remediate` (`result` ∈ {`success`, `denied`, `error`} — `error`
+is a store degrade, never a business rejection).
 
 ---
 
@@ -3334,7 +3370,7 @@ Fleet compliance summary across all active policies.
 
 **Permission:** `Policy:Read`
 
-**Response:**
+**Response (200):**
 
 ```json
 {
@@ -3348,6 +3384,10 @@ Fleet compliance summary across all active policies.
 }
 ```
 
+**Response (503):** `policy store degraded` — a genuine internal store failure,
+distinct from a genuine 0% (no policies enabled yet reads as all-zero counts
+with `200`, never a 503).
+
 ---
 
 #### `GET /api/compliance/{policy_id}`
@@ -3356,7 +3396,7 @@ Per-policy compliance detail with per-agent statuses.
 
 **Permission:** `Policy:Read`
 
-**Response:**
+**Response (200):**
 
 ```json
 {
@@ -3379,6 +3419,9 @@ Per-policy compliance detail with per-agent statuses.
   ]
 }
 ```
+
+**Response (503):** `policy store degraded`, on either the summary or the
+per-agent-status read.
 
 ---
 
@@ -3814,12 +3857,15 @@ List all configured webhooks.
       "id": 1,
       "url": "https://example.com/hooks/yuzu",
       "event_types": ["agent.registered", "command.completed"],
+      "has_secret": true,
       "enabled": true,
       "created_at": 1710849600
     }
   ]
 }
 ```
+
+`has_secret` reports whether a signing secret is configured — the secret itself is never returned by this or any other endpoint, encrypted or otherwise.
 
 #### `POST /api/webhooks`
 
@@ -3837,7 +3883,7 @@ Create a new webhook subscription.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `url` | string | Yes | HTTPS endpoint to receive POST notifications |
+| `url` | string | Yes | Endpoint to receive POST notifications (`http://` or `https://`; see the cleartext-HTTP warning below) |
 | `event_types` | array | Yes | Events to subscribe to (see the table below) |
 | `secret` | string | No | HMAC-SHA256 secret for payload signing |
 
@@ -3855,13 +3901,36 @@ Create a new webhook subscription.
 
 If a `secret` is provided, each delivery includes an `X-Yuzu-Signature` header containing the HMAC-SHA256 hex digest of the request body.
 
+**Security — secret storage and the legacy-file retention window.** A configured signing secret
+is envelope-encrypted at rest (AES-256-GCM, ADR-0010) — a stolen database backup alone cannot
+recover it. There is no rotation endpoint today: to change a secret, delete the webhook and
+recreate it. Deployments that upgraded from a release before the Postgres cutover retain the
+pre-cutover SQLite `webhooks.db` file for one release as a rollback net (ADR-0009); that file
+still holds signing secrets in **plaintext**. If your backup posture for that one-release window
+is unknown, rotate (delete-and-recreate) every webhook's secret once the window has closed.
+
+**Cleartext HTTP warning.** When `url` is `http://` (not `https://`), the delivered event
+payload is transmitted in cleartext. Production deployments should use `https://` only. The
+store accepts `http://` for development convenience — same posture as Offload Targets below.
+
+**Errors.** `400` for an empty/missing `url`, invalid JSON, or a URL that isn't `http://`/`https://`.
+`503` for a store/database degradation. Every error response is audited (`webhook.create`,
+result `failure`, a distinct detail string per cause).
+
 #### `DELETE /api/webhooks/{id}`
 
-Delete a webhook by numeric ID.
+Delete a webhook by numeric ID. `200` on success, `404` if no webhook has that id, `503` on a
+store/database error. Every outcome (including `404`) is audited as `webhook.delete`; a
+successful delete's audit detail carries the webhook's URL (captured just before deletion), so
+the record of where a webhook pointed survives its removal.
 
 #### `GET /api/webhooks/{id}/deliveries`
 
-List recent delivery attempts for a webhook. Includes HTTP status code, response time, and any error message for failed deliveries.
+List recent delivery attempts for a webhook, newest first. Includes HTTP status code, response
+time, and any error message for failed deliveries. `?limit=` defaults to 50 (any non-positive
+value also falls back to 50) and is capped at 10000; no `offset`/pagination parameter exists. A
+degraded read renders an empty list rather than a `503` — delivery history is audit convenience,
+not a decision surface.
 
 **Usage guide:**
 
@@ -6496,11 +6565,19 @@ Returns a catalog of all available plugins and their supported actions, as repor
 
 #### `GET /api/instructions`
 
-List all instruction definitions stored in the server.
+List instruction definitions stored in the server. Query params: `name`, `plugin`, `type`,
+`set_id`, `enabled_only`, `limit`.
+
+**Response (503):** InstructionStore not yet initialized, or a genuine database/lease failure
+(ADR-0058) — the list is never silently rendered empty on a degraded store.
 
 #### `GET /api/instructions/{id}`
 
 Get a single instruction definition by ID.
+
+**Response (404):** Unknown id.
+
+**Response (503):** A genuine database/lease failure (ADR-0058), distinct from 404.
 
 #### `POST /api/instructions`
 
@@ -6538,19 +6615,51 @@ exists in the store. Body is
 Audit event recorded as `instruction.create / denied / duplicate_id`. To
 update the existing definition use `PUT /api/instructions/{id}`.
 
-**Response (503):** Instruction store not yet initialized.
+**Response (503):** Instruction store not yet initialized, or a genuine database/lease failure
+(ADR-0058) — distinct from the validation/conflict cases above, and worth a client retry.
+Audit event recorded as `instruction.create / error / db_error`.
 
 #### `PUT /api/instructions/{id}`
 
 Update an existing instruction definition.
 
+**Permission:** `InstructionDefinition:Write`
+
+**Response (400):** Validation error (same shape as `POST` above).
+
+**Response (404):** Unknown id. Body is `{"error": "not_found: definition not found: <id>"}`.
+Audit event recorded as `instruction.update / denied / not_found`.
+
+**Response (503):** A genuine database/lease failure (ADR-0058) — distinct from 404, and worth
+a client retry. Audit event recorded as `instruction.update / error / db_error`.
+
 #### `DELETE /api/instructions/{id}`
 
 Delete an instruction definition.
 
+**Permission:** `InstructionDefinition:Delete`
+
+**Response (200):** `{"deleted": true}`.
+
+**Response (404):** Unknown id. **Breaking change (ADR-0058):** prior to this store's
+PostgreSQL migration, a missing id returned `200 {"deleted": false}`; it now returns 404. Any
+automation keying off the old `deleted: false` shape must be updated to handle 404 instead.
+Audit event recorded as `instruction.delete / denied / not_found`.
+
+**Response (503):** A genuine database/lease failure (ADR-0058) — distinct from 404, and worth
+a client retry. Audit event recorded as `instruction.delete / error / db_error`.
+
 #### `GET /api/instructions/{id}/export`
 
 Export an instruction definition in a portable format.
+
+**Response (200) on an unknown id:** `{}` (an empty JSON object, not an error) — pre-existing
+behavior, unchanged by ADR-0058; unlike every other route on this store, an unknown id here
+returns `200 {}` rather than `404`. Callers must check for an empty body, not a status code,
+to detect not-found.
+
+**Response (503):** A genuine InstructionStore database/lease failure (ADR-0058) reading the
+definition, distinct from the empty-body not-found case above, and worth a client retry.
 
 #### `POST /api/instructions/import`
 
@@ -6578,6 +6687,9 @@ Import an InstructionDefinition (JSON envelope). Requires `InstructionDefinition
 A failed signature ALWAYS rejects, even when enforcement is off — `--allow-unsigned-definitions` only widens the unsigned-path policy, it does not skip crypto on present signatures.
 
 **Audit:** every import attempt emits `instruction.import` with `result=success` on success, `result=denied` on rejection. The `target_id` is the definition's `id` on success; empty on rejection.
+
+**Response (503):** A genuine database/lease failure (ADR-0058) — audited the same as every
+other rejection above, distinct from a signature/validation/conflict `400`/`409`.
 
 #### `POST /api/instructions/yaml`
 
@@ -6672,13 +6784,45 @@ Returned when the definition's `approval_mode` is `role-gated` or `always` and t
 
 List all instruction sets.
 
+**Response (503):** InstructionStore not yet initialized, or a genuine database/lease failure
+(ADR-0058) — the list is never silently rendered empty on a degraded store.
+
 #### `POST /api/instruction-sets`
 
 Create a new instruction set (a named collection of definitions).
 
+**Permission:** `InstructionSet:Write`
+
+**Response (200):** `{"id": "<id>"}` for the newly-created set. The id is always
+server-generated (this route does not accept a caller-supplied `id`), so the `409` case below
+is not reachable via normal use of this endpoint today — documented for API-contract
+consistency with the sibling `POST /api/instructions` route, not because it fires in practice.
+
+**Response (400):** Validation error.
+
+**Response (409):** A set with that id already exists (gov Gate 4/6, fixed to match
+`POST /api/instructions`'s equivalent branch — the response no longer leaks the raw internal
+`conflict:` prefix).
+
+**Response (503):** A genuine database/lease failure (ADR-0058).
+
 #### `DELETE /api/instruction-sets/{id}`
 
-Delete an instruction set.
+Delete an instruction set. Definitions that referenced the deleted set have their
+`instruction_set_id` cleared, not deleted.
+
+**Permission:** `InstructionSet:Delete`
+
+**Response (200):** `{"deleted": true}`.
+
+**Response (404):** Unknown id. **Breaking change (ADR-0058):** prior to this store's
+PostgreSQL migration, a missing id returned `200 {"deleted": false}`; it now returns 404.
+
+**Response (503):** A genuine database/lease failure (ADR-0058).
+
+**Audit:** `instruction_set.delete` on the 404 (`result=denied` detail `not_found`) and 503
+(`result=error` detail `db_error`) branches; the 200 success path is not audited (see the audit
+table entry above).
 
 ---
 

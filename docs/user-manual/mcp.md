@@ -405,8 +405,8 @@ for the tool to execute.
 | 1 | `list_agents` | List all connected agents with hostname, OS, architecture, and version. | `Infrastructure:Read` |
 | 2 | `get_agent_details` | Get detailed info for a single agent including tags and inventory. | `Infrastructure:Read` |
 | 3 | `query_audit_log` | Query the audit log with filters (principal, action, target, time range). | `AuditLog:Read` |
-| 4 | `list_definitions` | List available instruction definitions (filterable by plugin, type, enabled). | `InstructionDefinition:Read` |
-| 5 | `get_definition` | Get a single instruction definition with parameter and result schemas. | `InstructionDefinition:Read` |
+| 4 | `list_definitions` | List available instruction definitions (filterable by plugin, type, enabled). A degraded InstructionStore returns `kInternalError` (-32603, "Instruction store unavailable") — retryable, never an empty list (ADR-0058). | `InstructionDefinition:Read` |
+| 5 | `get_definition` | Get a single instruction definition with parameter and result schemas. A degraded InstructionStore returns `kInternalError` (-32603, "Instruction store unavailable") — retryable, distinct from `kInvalidParams` ("Definition not found") for a genuinely unknown id (ADR-0058). | `InstructionDefinition:Read` |
 | 6 | `query_responses` | Query command response data. Pass `execution_id` to collect exactly the responses from one `execute_instruction` dispatch (closes the dispatch→collect loop), or `instruction_id` for all responses to a definition. At least one required (execution_id wins if both given); returns up to `limit` rows (max 1000). **A per-agent management-group drop filter is applied** (out-of-scope rows dropped, audited `result=denied`) — but **not yet effective under the global `Response:Read` gate (ADR-0017; logic fix tracked #1634 / #1718 PR-B):** a confined operator is denied at the gate, a global operator's filter is a no-op, so results are not narrowed by management group today. The result object may carry three outer fields: `audit_persisted:false` if the access-audit row could not be written (SOC 2 evidence gap — investigate); `result_truncated_by_cap:true` if the raw query hit the 1000-row cap (the page is incomplete — do **not** treat `count<limit` as "done"; paginate via the keyset follow-up); and (#3344) `retry_after_ms` when `execution_id` was supplied and the dispatch is confirmed still in flight — its **absence**, even with zero rows, means either no rows currently match or (instruction_id-only queries) in-flight-ness could not be determined. | `Response:Read` |
 | 7 | `aggregate_responses` | Aggregate response data (COUNT, SUM, AVG, MIN, MAX) grouped by a column. **Hardening (#1634, partial):** a per-agent management-group filter is applied before aggregation, but it is **inert under the current global `Response:Read` gate** — a normal `Response:Read` holder still aggregates across all agents (effective scoping needs the gate change tracked in #1634). Its active effect today is failing **closed** (and a JSON-RPC error, not empty totals) when the RBAC store is corrupt or the response store read errors. A distinct `result=denied` audit row is emitted when any agent is filtered out; the result carries `audit_persisted:false` if that row could not be written (SOC 2 evidence gap — investigate). | `Response:Read` |
 | 8 | `query_inventory` | Query **generic** per-source inventory blobs across agents (filterable by agent, plugin). For the **typed** installed-software inventory use `query_installed_software` (#37) instead. | `Infrastructure:Read` |
@@ -1221,6 +1221,28 @@ The parked-result path this arises from is reachable whenever
 streamed POST is parked without having delivered its final (the client
 disconnected, the response cap elapsed, or the server could not complete the
 stream). Pass `--no-mcp-streamed-post` to rule this path out entirely.
+
+### -32015: Server is shutting down (HTTP 503)
+
+**Symptom**: `initialize` (with streaming on) returns `-32015` / HTTP `503`,
+"Server is shutting down", no `Mcp-Session-Id` header.
+
+**Cause**: `ServerImpl::stop()` (#3042) close-signals the session registry
+before closing the listening socket — every live session is closed, and an
+`initialize` that reaches the registry after its closing flag is set is
+refused rather than raced against the socket close or left to mint a session
+that is about to be torn down anyway. (A request whose `mint()` call happens
+to win the registry's lock a hair earlier still succeeds, but that session is
+then closed by the same drain a moment later — same outcome, no client-visible
+difference, just not literally "refused.") This is a narrow, transient window
+(seconds, not the deploy's whole grace period).
+
+**Fix**: Reconnect and re-`initialize` once the server is back — no
+`retry_after_ms` is given, since this process has no visibility into
+when that will be. A session that was already live when
+shutdown began instead receives a `notifications/yuzu.stream_closed` frame
+with `reason: session_terminated` (see that entry above) and should
+re-`initialize` the same way.
 
 ### A streamed final can be dropped entirely
 
