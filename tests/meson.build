@@ -38,9 +38,10 @@ if host_os == 'windows'
     # Catch2 satisfies the leftover refs.
     dependencies: [_libcatch2main, _libcatch2],
   )
-  # No-main variant for yuzu_agent_tests (#1648 diagnostic): the suite
-  # supplies its own main() via unit/test_runner_main.cpp so it can log
-  # Catch2's real return code, so it must NOT also pull in Catch2Main.
+  # No-main variant for yuzu_agent_tests AND yuzu_server_tests (#1648/#3507):
+  # both suites supply their own main() via the shared unit/test_runner_main.cpp
+  # so they can log Catch2's real return code and, on Windows, hard_exit()
+  # immediately after a clean run — so neither must also pull in Catch2Main.
   catch2_nomain_dep = declare_dependency(
     include_directories: _vcpkg_inc_win,
     dependencies: [_libcatch2],
@@ -624,6 +625,10 @@ if build_server
   server_test_exe = executable(
     'yuzu_server_tests',
     files(
+      # Custom Catch2 entry point (#1648/#3507 diagnostic + Windows-only
+      # hard_exit) — logs Session::run()'s real return value; see
+      # unit/test_runner_main.cpp and catch2_nomain_dep above.
+      'unit/test_runner_main.cpp',
       'unit/server/test_auth.cpp',
       'unit/server/test_auth_routes.cpp',
       'unit/server/test_auth_list_read_gate.cpp',
@@ -975,7 +980,10 @@ if build_server
     # makes the dependency visible to Meson's graph and survives a
     # future static-merge refactor of yuzu_server_core (governance
     # hardening round 1, qe-B2).
-    dependencies: [yuzu_server_core_dep, catch2_dep, dependency('openssl', required: true, include_type: 'system')],
+    # catch2_nomain_dep (#1648/#3507): yuzu_server_tests supplies its own
+    # main() via unit/test_runner_main.cpp (shared with yuzu_agent_tests), so
+    # it links Catch2 without Catch2Main.
+    dependencies: [yuzu_server_core_dep, catch2_nomain_dep, dependency('openssl', required: true, include_type: 'system')],
   )
   # Sharded 2026-07-13 (#2092 — the split the 2026-07-12 recalibration comment
   # promised): test() entries over the SAME binary, partitioned by Catch2
