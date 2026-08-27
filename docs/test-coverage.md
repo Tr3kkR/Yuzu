@@ -75,7 +75,7 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 | script_exec | `split_args()` in string_utils | CreateProcess/fork/execvp |
 | installed_apps | `icontains()`, `sanitize_utf8()`, and (blob v2) the full `installed_apps_inventory.hpp` parse/format surface — see `test_installed_apps_inventory.cpp` above | Registry enum, dpkg/rpm/pacman/apk subprocess invocation, `/etc/os-release` file I/O |
 | vuln_scan | `compare_versions()`, `icontains()`, `escape_pipes()` | Registry, package queries |
-| event_logs | `sanitize_input()` | PowerShell, journalctl, log |
+| event_logs | full `event_logs_parsers.hpp` surface (rendered-event XML walk, journal rows, short-iso parse — `test_event_logs_parsers.cpp`) + `event_logs_macos.hpp` `log show` classifier (`test_event_logs_macos.cpp`); the journalctl fallback outcome classifier (`event_logs_journalctl.hpp` — `test_event_logs_journalctl.cpp`); real-plugin dispatch runs in `test_event_logs_{posix,win}_actions.cpp` | wevtapi EvtQuery/EvtNext, sd_journal reads, `log show` invocation |
 | os_info | `format_uptime()` | uname, sysctl, registry |
 | netstat | TCP state enums, IP parsing | GetExtendedTcpTable, /proc/net |
 | firewall | Netsh output parsing; macOS parsers (`firewall_parsers.hpp` — socketfilterfw global state, pfctl status) in `test_firewall_parsers.cpp` | netsh, firewall-cmd, ufw, socketfilterfw, pfctl |

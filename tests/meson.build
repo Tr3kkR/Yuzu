@@ -293,6 +293,14 @@ agent_test_exe = executable(
     'unit/test_capability_descriptor.cpp',    # PR1.1: ABI4 descriptor + plugin->host result seam + declared-vs-observable honesty
     'unit/test_filesystem_macos_sig.cpp',     # #2273/1.14: pure codesign/plutil classifiers
     'unit/test_event_logs_macos.cpp',         # BR-08: pure `log show` SubprocessResult classifier
+    'unit/test_event_logs_parsers.cpp',       # Wave 4 PR4.2: pure Windows event-XML / journal row parse+format helpers
+    'unit/test_event_logs_journalctl.cpp',    # Wave 4 PR4.2: pure Linux journalctl-fallback outcome classifier (runs on every host)
+    'unit/test_event_logs_posix_actions.cpp', # Wave 4 PR4.2 remediation: real event_logs.dylib/.so driven
+                                                # end to end via LocalDispatcher (POSIX-only; a no-op
+                                                # TU on Windows via the file's own #ifndef _WIN32 guard)
+    'unit/test_event_logs_win_actions.cpp',   # Wave 4 PR4.2 remediation: real event_logs.dll driven
+                                                # end to end via LocalDispatcher (Windows-only; a no-op
+                                                # TU elsewhere via the file's own #ifdef _WIN32 guard)
     'unit/test_users_macos_last.cpp',         # qe-M1: pure `last -y` timestamp/weekday parsers
     'unit/test_user_profile_model.cpp',       # PR1.7: pure ProfileList/HKU model (runs on every host)
     'unit/test_value_enumeration.cpp',        # Wave 3 gate-2 remediation: pure registry-enumeration
@@ -436,6 +444,8 @@ agent_test_exe = executable(
   # windows_updates_plugin_lib / sccm_plugin_lib: same reasoning for
   # test_windows_updates_{posix,win}_actions.cpp / test_sccm_win_actions.cpp
   # (Wave 3 PR33d code-review remediation).
+  # event_logs_plugin_lib: same reasoning for test_event_logs_{posix,win}_actions.cpp
+  # (Wave 4 PR4.2 native-acquisition migration remediation).
   # installed_apps_plugin_lib / msi_packages_plugin_lib
   # (agents/plugins/{installed_apps,msi_packages}/meson.build):
   # test_installed_apps_actions.cpp / test_msi_packages_actions.cpp load both
@@ -444,7 +454,7 @@ agent_test_exe = executable(
                 users_plugin_lib, os_info_plugin_lib, processes_plugin_lib,
                 network_diag_plugin_lib, ioc_plugin_lib,
                 hardware_plugin_lib, device_identity_plugin_lib, netstat_plugin_lib,
-                windows_updates_plugin_lib, sccm_plugin_lib,
+                windows_updates_plugin_lib, sccm_plugin_lib, event_logs_plugin_lib,
                 installed_apps_plugin_lib, msi_packages_plugin_lib],
 )
 # Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
