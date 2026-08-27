@@ -14,6 +14,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/agent/cert_discovery.hpp>
 #include <yuzu/agent/cert_store.hpp>
 #include <yuzu/agent/cloud_identity.hpp>
+#include <yuzu/agent/command_dedup_store.hpp>
 #include <yuzu/agent/dex_observer.hpp>
 #include <yuzu/agent/guardian_engine.hpp>
 #include <yuzu/agent/kv_store.hpp>
@@ -82,7 +83,6 @@ __declspec(allocate(".CRT$XCB"))
 #include <string>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace yuzu::agent {
@@ -721,6 +721,26 @@ public:
             } else {
                 spdlog::error("Failed to open KV store: {}", kv_result.error().message);
                 spdlog::warn("Plugin KV storage will be unavailable");
+            }
+        }
+
+        // 1b'. Open the durable command-dedup store (HA WS-0, ADR-2002). Survives
+        // restart and remembers each command's terminal outcome so a redelivered
+        // duplicate replays the original result instead of a bare REJECTED. A
+        // failure to open is NOT fatal — the agent runs with replay protection
+        // degraded (a redelivered command may re-execute), which is logged loudly.
+        {
+            auto dedup_path = cfg_.data_dir / "command_dedup.db";
+            auto dedup_result = CommandDedupStore::open(dedup_path);
+            if (dedup_result.has_value()) {
+                command_dedup_ =
+                    std::make_unique<CommandDedupStore>(std::move(*dedup_result));
+                spdlog::info("Command dedup store ready: {}", dedup_path.string());
+            } else {
+                spdlog::error("Failed to open command dedup store: {}",
+                              dedup_result.error().message);
+                spdlog::warn("Durable command replay protection unavailable — a redelivered "
+                             "command may re-execute");
             }
         }
 
@@ -2512,40 +2532,76 @@ public:
                     });
                 }
 
-                // 5. Read commands from server and dispatch to plugins
-                dedup_current_.clear(); // Fresh dedup sets per connection
-                dedup_previous_.clear();
+                // 5. Read commands from server and dispatch to plugins.
+                // Command replay protection is now durable (command_dedup_, HA
+                // WS-0): it survives reconnect AND restart, so there is no
+                // per-connection reset here.
                 bool update_verified = false;
                 pb::CommandRequest cmd;
                 while (stream->Read(&cmd)) {
                     if (stop_requested_.load(std::memory_order_acquire))
                         break;
 
-                    // Command replay protection: reject duplicate command_ids
+                    // Command replay protection (HA WS-0, ADR-2002). claim() is the
+                    // atomic first-writer-wins gate: on a duplicate we REPLAY the
+                    // original terminal outcome (never a bare REJECTED that would
+                    // lose the first result), or answer RUNNING while the first
+                    // attempt is still in flight — we never re-execute, because
+                    // re-running a destructive command is the failure the whole HA
+                    // design forbids. An empty command_id cannot be keyed and
+                    // proceeds unprotected; a store failure (Error) degrades to no
+                    // dedup for that one command, both falling through to dispatch.
+                    // Reserved-plugin dispatches (the Guardian __guard__ side
+                    // channel below) are NOT normal command execution — they carry
+                    // no dedupable side effect and must stay free to re-run (e.g.
+                    // reconcile). They bypass the claim entirely: claiming one would
+                    // leak an unresolved in-flight record (that branch continues via
+                    // its own write) AND wrongly answer a re-sent control command
+                    // RUNNING instead of re-running it.
                     if (cmd.command_id().empty()) {
                         spdlog::warn("Received command with empty command_id — replay "
                                      "protection cannot apply");
-                    } else {
-                        if (dedup_current_.count(cmd.command_id()) ||
-                            dedup_previous_.count(cmd.command_id())) {
-                            spdlog::warn("Replay detected: duplicate command_id={} — rejecting",
-                                         cmd.command_id());
-                            pb::CommandResponse replay_resp;
-                            replay_resp.set_command_id(cmd.command_id());
-                            replay_resp.set_status(pb::CommandResponse::REJECTED);
-                            replay_resp.set_output("command replay rejected: duplicate command_id");
+                    } else if (command_dedup_ && !is_reserved_plugin_name(cmd.plugin())) {
+                        auto claim = command_dedup_->claim(cmd.command_id());
+                        if (claim.status == ClaimStatus::Duplicate) {
+                            pb::CommandResponse dup_resp;
+                            bool replayed = false;
+                            if (claim.state == DedupState::Terminal) {
+                                pb::CommandResponse stored;
+                                if (stored.ParseFromString(claim.response)) {
+                                    dup_resp = std::move(stored);
+                                    auto now_ms =
+                                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::system_clock::now().time_since_epoch())
+                                            .count();
+                                    dup_resp.mutable_sent_at()->set_millis_epoch(now_ms);
+                                    replayed = true;
+                                    spdlog::info("Replay of command {} — returning stored "
+                                                 "terminal outcome",
+                                                 cmd.command_id());
+                                } else {
+                                    spdlog::error("Stored terminal outcome for {} failed to "
+                                                  "parse — answering RUNNING",
+                                                  cmd.command_id());
+                                }
+                            }
+                            if (!replayed) {
+                                dup_resp.set_command_id(cmd.command_id());
+                                dup_resp.set_status(pb::CommandResponse::RUNNING);
+                                dup_resp.set_output("__dedup__|duplicate command still in flight");
+                                if (claim.state == DedupState::InFlight)
+                                    spdlog::warn("Duplicate command {} still in flight — "
+                                                 "answering RUNNING",
+                                                 cmd.command_id());
+                            }
                             std::lock_guard lock(stream_write_mu_);
-                            stream->Write(replay_resp, grpc::WriteOptions());
+                            stream->Write(dup_resp, grpc::WriteOptions());
                             continue;
                         }
-                        // Double-buffer rotation: when current fills, discard previous,
-                        // swap current → previous, start fresh current.
-                        if (dedup_current_.size() >= kMaxDedupEntries) {
-                            spdlog::debug("Dedup buffer rotation ({} entries)", kMaxDedupEntries);
-                            dedup_previous_ = std::move(dedup_current_);
-                            dedup_current_.clear();
-                        }
-                        dedup_current_.insert(cmd.command_id());
+                        // Claimed / Error both fall through: Claimed owns the
+                        // in-flight record (resolved at a terminal write below or
+                        // released if the dispatch queue is full); Error runs
+                        // undeduplicated for this one command.
                     }
 
                     // Write health marker after first successful read (OTA rollback guard)
@@ -2628,6 +2684,12 @@ public:
                         resp.set_command_id(cmd.command_id());
                         resp.set_status(pb::CommandResponse::REJECTED);
                         resp.set_output("plugin not found: " + cmd.plugin());
+                        // Deterministic terminal for a claimed command (the plugin
+                        // set is fixed at boot): memoise so a redelivery replays
+                        // this REJECTED rather than re-running the claim path.
+                        if (command_dedup_)
+                            command_dedup_->record_terminal(cmd.command_id(),
+                                                            resp.SerializeAsString());
                         std::lock_guard lock(stream_write_mu_);
                         stream->Write(resp, grpc::WriteOptions());
                         continue;
@@ -2668,6 +2730,11 @@ public:
                         reject_resp.set_command_id(cmd.command_id());
                         reject_resp.set_status(pb::CommandResponse::REJECTED);
                         reject_resp.set_output("agent overloaded: command queue full");
+                        // Queue-full is TRANSIENT and the command never executed —
+                        // release the claim so a redelivery can be attempted, never
+                        // memoise it as a terminal outcome.
+                        if (command_dedup_)
+                            command_dedup_->release(cmd.command_id());
                         std::lock_guard lock(stream_write_mu_);
                         stream->Write(reject_resp, grpc::WriteOptions());
                     }
@@ -3012,6 +3079,11 @@ private:
                                      .count();
                     expired_resp.mutable_sent_at()->set_millis_epoch(epoch);
 
+                    // Deterministic terminal (expires_at is fixed): memoise so a
+                    // redelivery replays this rather than sleeping the stagger again.
+                    if (command_dedup_)
+                        command_dedup_->record_terminal(cmd.command_id(),
+                                                        expired_resp.SerializeAsString());
                     std::lock_guard lock(stream_write_mu_);
                     stream->Write(expired_resp, grpc::WriteOptions());
                     return;
@@ -3124,6 +3196,12 @@ private:
                                  .count();
             final_resp.mutable_sent_at()->set_millis_epoch(now_epoch);
 
+            // Persist the terminal outcome BEFORE the wire send (HA WS-0): the
+            // durable record is the source of truth, the send is best-effort and
+            // replayable. record_terminal is noexcept + runs before the terminal
+            // Write, so it cannot cause the #2037 second-terminal hazard.
+            if (command_dedup_)
+                command_dedup_->record_terminal(cmd.command_id(), final_resp.SerializeAsString());
             std::lock_guard lock(stream_write_mu_);
             stream->Write(final_resp, grpc::WriteOptions());
         }
@@ -3151,6 +3229,11 @@ private:
                              std::chrono::system_clock::now().time_since_epoch())
                              .count();
             resp.mutable_sent_at()->set_millis_epoch(epoch);
+            // Terminal outcome for a claimed command whose task threw before its
+            // own terminal write — memoise it so a redelivery replays this FAILURE
+            // instead of re-running (HA WS-0).
+            if (command_dedup_)
+                command_dedup_->record_terminal(command_id, resp.SerializeAsString());
             std::lock_guard lock(stream_write_mu_);
             if (stream)
                 stream->Write(resp, grpc::WriteOptions());
@@ -3487,14 +3570,13 @@ private:
     std::string latest_snapshot_;                  // last JSON produced by pump
     std::atomic<uint64_t> latest_snapshot_seq_{0}; // monotonically increases on each new snapshot
 
-    // M8: Command replay protection — double-buffer dedup of command IDs.
-    // Two sets: "current" and "previous". When current fills, previous is
-    // discarded, current becomes previous, and a fresh current starts.
-    // Both sets are checked for duplicates, so recently-seen IDs are always
-    // protected. Cleared on each reconnect.
-    static constexpr size_t kMaxDedupEntries = 5000;
-    std::unordered_set<std::string> dedup_current_;
-    std::unordered_set<std::string> dedup_previous_;
+    // HA WS-0 (ADR-2002): durable command replay protection + terminal-outcome
+    // replay. Replaces the former in-memory double-buffer dedup sets (cleared on
+    // every reconnect, no outcome memory). Nullable — if the store fails to open
+    // the agent runs with replay protection degraded (logged at boot). Set once
+    // during startup and never reassigned, so the reader thread and the dispatch
+    // workers read the pointer freely; the store serialises its own access.
+    std::unique_ptr<CommandDedupStore> command_dedup_;
 };
 
 // Factory
