@@ -1170,6 +1170,13 @@ public:
             metrics_.gauge("yuzu_server_quarantine_endpoint_unconfirmed",
                            {{"reachability", reachability}})
                 .set(0);
+        // Freshness signal for the gauge above (#3425 review, Doomgoose
+        // #3567): pre-seeded optimistic (1) since the reconciler's tick
+        // thread starts within a boot-time window measured in seconds, not
+        // minutes — a brief false-healthy read before the first real tick
+        // is a negligible tradeoff against the alternative of a 0 (falsely
+        // degraded) or absent (loses absent()-alertability) default.
+        metrics_.gauge("yuzu_server_quarantine_reconciler_tick_healthy").set(1);
 
         // The quarantine read-degrade family was never pre-seeded, unlike its
         // mgmt-group and discovery siblings above, so every reason read as

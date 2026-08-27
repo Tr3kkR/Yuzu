@@ -67,6 +67,18 @@ void QuarantineContainmentReconciler::count(const char* result) const {
             .increment();
 }
 
+void QuarantineContainmentReconciler::publish_tick_health(bool healthy) const {
+    // #3425 review (Doomgoose, #3567): the freshness signal for
+    // `yuzu_server_quarantine_endpoint_unconfirmed`, which otherwise
+    // silently freezes at its last value on either early-return path above.
+    // 1 only on a tick that reached the real publish; 0 on either early
+    // return. Not per-label — one series, tick()-only (notify_agent_heartbeat's
+    // fast path never calls this: a cache-hit heartbeat says nothing about
+    // whether the LAST tick's own read succeeded).
+    if (d_.metrics)
+        d_.metrics->gauge("yuzu_server_quarantine_reconciler_tick_healthy").set(healthy ? 1 : 0);
+}
+
 void QuarantineContainmentReconciler::audit_event(const std::string& agent_id,
                                                    const std::string& detail,
                                                    const char* result) const {
@@ -132,6 +144,16 @@ void QuarantineContainmentReconciler::audit_unstamped(const std::string& agent_i
 
 void QuarantineContainmentReconciler::tick() {
     if (!d_.quarantine_store) {
+        // #3425 review (Doomgoose, #3567): both early returns below skip the
+        // `yuzu_server_quarantine_endpoint_unconfirmed` publish entirely, so
+        // that gauge silently FREEZES at its last value for the whole
+        // duration of an outage rather than reflecting current (unknown)
+        // state — exactly during the outage window an operator most needs
+        // to distinguish "genuinely 0 unconfirmed" from "haven't been able
+        // to check." `yuzu_server_quarantine_reconciler_tick_healthy` is
+        // that freshness signal: 1 only on a tick that actually reached the
+        // publish below, 0 on either early return.
+        publish_tick_health(false);
         count("degraded");
         return;
     }
@@ -140,6 +162,7 @@ void QuarantineContainmentReconciler::tick() {
         // Fail closed: a degraded read is NEVER treated as "nothing active"
         // — that would silently stop reconciling every currently-contained
         // device for as long as the read stays degraded.
+        publish_tick_health(false);
         count("degraded");
         return;
     }
@@ -218,6 +241,7 @@ void QuarantineContainmentReconciler::tick() {
             ->gauge("yuzu_server_quarantine_endpoint_unconfirmed", {{"reachability", "offline"}})
             .set(unconfirmed_offline);
     }
+    publish_tick_health(true);
 
     std::size_t dispatched = 0;
     for (std::size_t i = 0; i < to_reconcile.size(); ++i) {

@@ -903,6 +903,41 @@ TEST_CASE("QuarantineContainmentReconciler: a degraded quarantine-store read abo
     // Must not crash and must not fabricate any dispatch.
     reconciler.tick();
     CHECK(dispatch.calls.empty());
+
+    // #3425 review (Doomgoose, #3567): a degraded tick must NOT leave the
+    // freshness gauge silently at whatever it was before — it must publish
+    // 0, distinguishing "couldn't check" from "checked, genuinely healthy".
+    CHECK(metrics.gauge("yuzu_server_quarantine_reconciler_tick_healthy").value() == 0);
+}
+
+TEST_CASE("QuarantineContainmentReconciler: a successful tick publishes tick_healthy=1 "
+          "(#3425 gate10-review #3567)",
+          "[pg][quarantine][reconciler]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_recon_tpl);
+    PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineStore qstore{qpool};
+    REQUIRE(qstore.is_open());
+    // No active record at all — an empty fleet is still a HEALTHY read, not
+    // a degraded one; publish_tick_health must fire on this path too, not
+    // only when there's something to reconcile.
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry{bus, metrics};
+
+    MockDispatch dispatch;
+    QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
+        .quarantine_store = &qstore,
+        .response_store = nullptr,
+        .registry = &registry,
+        .metrics = &metrics,
+        .audit_store = nullptr,
+        .dispatch_fn = dispatch.fn(),
+        .now_fn = {},
+    });
+
+    reconciler.tick();
+    CHECK(metrics.gauge("yuzu_server_quarantine_reconciler_tick_healthy").value() == 1);
 }
 
 // ── Adversarial-review regression tests (2026-08-24) ───────────────────────

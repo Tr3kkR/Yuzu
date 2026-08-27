@@ -276,6 +276,9 @@ private:
     // reaching the periodic backstop.
     bool reconcile_one(const std::string& agent_id, std::string_view trigger);
     void count(const char* result) const;
+    // #3425 review (Doomgoose, #3567): freshness signal for
+    // yuzu_server_quarantine_endpoint_unconfirmed — see tick()'s call sites.
+    void publish_tick_health(bool healthy) const;
     void audit_event(const std::string& agent_id, const std::string& detail,
                      const char* result) const;
     // record_id (governance Gate 6, compliance-officer Finding 2): the
