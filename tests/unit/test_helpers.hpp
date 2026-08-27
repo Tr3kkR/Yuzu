@@ -1234,6 +1234,38 @@ inline PostgresTestDb::PostgresTestDb(PgTestTemplate& tpl) {
          << var.error());                                                                          \
     REQUIRE(var.available())
 
+/// FAIL-CLOSED runtime predicate for YUZU_REQUIRE_PG_MIGRATION_DB (below):
+/// skip on Windows unless the operator explicitly opted back in with the
+/// EXACT value "1". Any other set value (empty, "0", a typo, a stale value
+/// left in the runner's shared environment — four CI agents share one OS
+/// identity on Wee Tam) stays skipped rather than silently un-skipping an
+/// expensive fresh-migration test on a shared, persistent runner.
+inline bool pg_fresh_db_migration_skipped_here() noexcept {
+#ifdef _WIN32
+    const char* v = std::getenv("YUZU_TEST_PG_MIGRATION_DDL");
+    return !(v != nullptr && std::string_view(v) == "1");
+#else
+    return false;
+#endif
+}
+
+/// Same contract as YUZU_REQUIRE_PG_DB, for migration-IN-SUBSTANCE fresh-DB
+/// tests only (a fresh migrate, "!is_open on a migration failure", backfill/
+/// upgrade, drift-detection). On Windows these SKIP by default: each
+/// fresh-DB case pays EXEC_BACKEND CreateProcess-per-connection (~19 ms) +
+/// CREATE DATABASE ... TEMPLATE (~26 ms) plus the migration DDL itself
+/// (#2354), and the behaviour stays covered on Linux on every PR and push.
+/// `--list-tests` still enumerates a skipped case (SKIP is a runtime throw,
+/// not a compile-time exclusion), so the pg-shard partition checker and any
+/// exact-case-count pin are unaffected by this macro. Set
+/// YUZU_TEST_PG_MIGRATION_DDL=1 to force these back on for local Windows
+/// debugging or a future dedicated leg.
+#define YUZU_REQUIRE_PG_MIGRATION_DB(var)                                                          \
+    if (yuzu::test::pg_fresh_db_migration_skipped_here()) {                                        \
+        SKIP("fresh-DB migration DDL skipped on Windows (#2354; covered on Linux)");               \
+    }                                                                                              \
+    YUZU_REQUIRE_PG_DB(var)
+
 #endif // YUZU_TEST_ENABLE_PG
 
 /// RAII owner for a raw `sqlite3*` a test opened itself (typically `:memory:`).

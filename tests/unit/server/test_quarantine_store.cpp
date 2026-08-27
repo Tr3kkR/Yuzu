@@ -65,7 +65,7 @@ yuzu::test::PgTestTemplate quarantine_tpl{"quarantinestore", [](const std::strin
 // ── Construction fail-closed ────────────────────────────────────────────────
 
 TEST_CASE("QuarantineStore: construction fails closed on migration drift", "[pg][quarantine]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
 
     // Pre-seed: create the quarantine_store schema + a conflicting table, but
     // no public.schema_meta row — the drift guard refuses (version 0 but

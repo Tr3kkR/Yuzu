@@ -106,7 +106,7 @@ TEST_CASE("VulnFindingStore ctor fail-closed + idempotent migration", "[pg][vuln
         CHECK_FALSE(store.is_open());
     }
     SECTION("good pool → is_open; re-construct is idempotent") {
-        YUZU_REQUIRE_PG_DB(db);
+        YUZU_REQUIRE_PG_MIGRATION_DB(db);
         PgPool pool{{.conninfo = db.dsn(), .size = 4}};
         REQUIRE(pool.valid());
         VulnFindingStore s1{pool};
@@ -436,7 +436,7 @@ TEST_CASE("VulnFindingStore bad row rolls the whole batch back", "[pg][vuln][sto
 
 // (14) migration idempotency (construct twice on the same DB).
 TEST_CASE("VulnFindingStore migration is idempotent", "[pg][vuln][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore a{pool};

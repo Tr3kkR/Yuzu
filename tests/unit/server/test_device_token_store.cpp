@@ -80,7 +80,7 @@ int64_t now_epoch() {
 // ── Construction fail-closed ────────────────────────────────────────────────
 
 TEST_CASE("DeviceTokenStore reports !is_open on a migration failure", "[device_token][pg]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);

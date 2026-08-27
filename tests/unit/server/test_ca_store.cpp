@@ -101,7 +101,7 @@ CaRoot sample_root(const std::string& fingerprint = "AB:CD:EF") {
 // ── Construction fail-closed ────────────────────────────────────────────────
 
 TEST_CASE("CaStore reports !is_open on a migration failure", "[ca_store][pg]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
