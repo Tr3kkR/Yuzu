@@ -53,6 +53,29 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
    reach for it without a specific reason; the per-store model is the one this ADR/playbook
    actually prescribes and the one `AuthDB` demonstrates. See ADR-0010's "Instance model" note
    for the full rationale.
+
+   **Two lessons from `WebhookStore` (ADR-0057, `SecretCodec`'s second production consumer)
+   for `OffloadTargetStore`/`RuntimeConfigStore` — only the second still applies as written
+   under ADR-0009's 2026-08-25 fresh-start-by-default amendment (see the Backfill bullet
+   above): those two stores skip `migrate_from_sqlite()` by default, so the first lesson
+   below — WebhookStore's backfill-fingerprint design — is not a template to copy unless you
+   land in that bullet's documented-exception case. Kept here, not deleted, because it's still
+   the right answer IF that exception applies:**
+   - **(Only if you build a backfill under the documented-exception case.) A backfill
+     idempotency fingerprint over a secret-bearing legacy table must hash only a has-secret
+     bit, never the plaintext or a hash of it.** A stored hash of the secret would be a
+     SQL-insider brute-force oracle against every legacy signing secret; ADR-0057's fingerprint
+     deliberately excludes the secret bytes entirely from what gets hashed for fingerprint-set
+     idempotency, while the per-row IDENTITY/LIFECYCLE conflict rule (unaffected by this) still
+     protects the row itself.
+   - **A secret-bearing store's `KeyProvider`/`SecretCodec` reset in `stop()` must run only
+     AFTER that store's own delivery/worker-pool drain completes** — not at the shared top of
+     the teardown block alongside every other store's reset. `WebhookStore`'s first fix-round
+     attempt got this wrong (the codec reset ran before the delivery-pool drain, silently
+     dropping in-flight decrypt-failure audit events during shutdown); the corrected ordering is
+     `server.cpp`'s webhook teardown block. Copy that block's *shape*, not necessarily its
+     literal position — a store with no worker-pool/background-delivery surface may not need
+     this reordering at all.
 4. **Authoritative reads must be type-distinguishable (2026-07-25 program policy, ADR-0036).**
    On an **authoritative** store, every read whose result can feed a grant/target/enforce/skip
    decision MUST make a runtime DB error TYPE-DISTINGUISHABLE from "no rows" at the call site —
@@ -155,11 +178,33 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
 
 ## Extra steps when migrating an existing SQLite store
 
-- **Backfill** (ADR-0009): a one-time, idempotent `migrate_from_sqlite()` that runs at startup,
-  before serving, and **fails closed** on any error. Mandatory for config/reference and `audit`
-  (SOC 2); skippable behind a flag only for purely TTL'd ephemeral stores (`response`).
-- **Secret columns transform, never copy** (ADR-0010): a backfill that touches secret material
-  encrypts/hashes on the way in — a plain column copy of a secret is forbidden.
+- **Backfill — fresh-start-by-default (ADR-0009, amended 2026-08-25): do NOT build
+  `migrate_from_sqlite()` for a new migration unless you have a specific, documented reason to.**
+  No production fleet has ever run a pre-Postgres build of any Yuzu store, so the original
+  "mandatory for config/reference and audit" default assumed real legacy data that has never
+  existed — skip the legacy-file *copy* entirely, the same unconditional way `ResponseStore`
+  already does (no flag, no `migrate_from_sqlite()`, no legacy-file read; note `ResponseStore`
+  does NOT log anything beyond its generic "initialized" line — there is no distinct fresh-start
+  log anywhere in this codebase today to model a new one on). **New requirement, not inherited
+  from that precedent: for a store holding real operator-authored config or secrets (this bites
+  hardest for the two Wave 3 stores below), skip the data copy but do NOT skip detection** — check
+  whether the legacy file exists and is non-empty, and if so `spdlog::warn` a row/key count
+  before proceeding fresh-started, so an environment where the "no production fleet" premise
+  turns out to be locally wrong gets a loud signal instead of the silent loss `ResponseStore`'s
+  actual (undetected) behavior would otherwise reproduce for stateful config. This default
+  holds only while "no production fleet" stays true — if a real external deployment exists or
+  is committed to before your store migrates, re-derive whether backfill is actually needed for
+  THIS store in its own per-store ADR; don't cite this bullet as blanket cover once the premise
+  has changed. (Historical note: the original mandatory-backfill mechanism this bullet used to
+  describe — a one-time, idempotent `migrate_from_sqlite()` running at startup, before serving,
+  failing closed on any error — is still what every already-migrated store built, and stays in
+  place for those stores. See ADR-0009's amendment for the full rationale.)
+- **Secret columns transform, never copy** (ADR-0010): applies only if you DO build a backfill
+  under the documented-exception case above — a backfill that touches secret material
+  encrypts/hashes on the way in, a plain column copy of a secret is forbidden. For the
+  skip-by-default case, this bullet doesn't apply (there's no column copy to transform); see the
+  detect-and-warn requirement above instead for that case's own obligation on secret-bearing
+  legacy files.
 - **Rollback window**: retain the legacy `<name>.db` for exactly one release, then remove it.
   Backfill opens it read-only; a wired subject/device erasure path must delete that identity
   from the rollback copy so rollback cannot resurrect erased data. The upgrade-test
@@ -246,6 +291,16 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   to get subtly wrong by reasoning alone.
 - A plaintext secret column. Use `SecretCodec` / verify-only hash.
 - A new server **SQLite** store (ADR-0006 forbids it without an exception ADR).
+- **Editing an already-shipped migration's DDL in place.** `PgMigrationRunner` tracks only an
+  integer `version` per store in `schema_meta` (no content/checksum verification) — so an in-place
+  edit to a migration that already ran against a real deployed database silently diverges that
+  deployment's actual schema from what a fresh install now creates, with nothing to detect the
+  drift. Safe **only** when the migration has never shipped to any real deployment (confirm via
+  `git merge-base --is-ancestor <the-migrating-PR> origin/main` returning false, or an equivalent
+  release-history check) — PolicyStore's `sqlite_backfill_source` table removal (ADR-0009's
+  fresh-start-by-default retirement, 2026-08-25) is the reference case: its PG migration never
+  reached a release, so the edit carried no drift risk. Every other case needs a proper
+  version-bumped migration, never a copy of that shortcut.
 - A `CREATE INDEX CONCURRENTLY` / `VACUUM` / `ALTER TYPE ADD VALUE` smuggled into a
   `PgMigration` — it cannot run in the runner's transaction (see below).
 - A **counting aggregate** (`count(*)`, `count(*) FILTER (...)`) where the question is only

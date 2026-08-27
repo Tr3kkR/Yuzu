@@ -253,7 +253,7 @@ TEST_CASE("ProductRegistryStore alias upsert/resolve round-trip + re-point seman
 
 TEST_CASE("ProductRegistryStore reads are AUTHORITATIVE: degrade ≠ empty, and writes fail soft",
           "[pg][product_registry]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, prod_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     ProductRegistryStore store{pool};

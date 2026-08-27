@@ -13,6 +13,14 @@
   reap sweeper) and `AnalyticsEventStore`/ADR-0049 (3-phase CLAIM/SEND/REVERT when a lease can't
   span external I/O) — this store needs a third variant, below.
 
+> **Status note (2026-08-25):** the legacy-SQLite backfill this ADR specifies below (`migrate_from_sqlite`,
+> "Backfill (ADR-0009)") was retired the same day this ADR's PR merged, before any release shipped it —
+> no production fleet ever ran a pre-Postgres build of this store, so there was no real `policies.db` data
+> to protect. See `docs/postgres-migration-ladder.md`'s `PolicyStore` row and commit `f46cefe8e`. The body
+> below is preserved UNEDITED as the historical record of the original design; do not treat its "MANDATORY
+> backfill" language as describing current code. See ADR-0009's amendment for the fresh-start-by-default
+> policy this retirement follows.
+
 ## Context
 
 `PolicyStore` (`server/core/src/policy_store.{hpp,cpp}`, ~190+1308 lines) is the compliance

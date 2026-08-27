@@ -118,6 +118,65 @@ login** (mirrors OIDC's `group_count_exceeded` behaviour) — see "SAML Fine-Gra
 RBAC" in `authentication.md` for the full detail, including the practical httplib
 form-body-size caveat on how large an assertion can realistically reach `/saml/acs`.
 
+## Behaviour change: InstructionStore moves to PostgreSQL — deleted content no longer resurrects (ADR-0058)
+
+`InstructionStore` (InstructionDefinitions and InstructionSets — the operator- and
+build-time-shipped instruction/question catalog) moves from per-replica SQLite to the shared
+PostgreSQL substrate (ADR-0006/0007), like every other migrated store. **No legacy-SQLite
+backfill** (ADR-0009's fresh-start-by-default class, following `ResponseStore`'s precedent): no
+production fleet has ever run a pre-Postgres build of any Yuzu store, so the pre-migration
+`instructions.db` is never read. On upgrade, the bundled catalog reseeds fresh on first boot the
+same way it always does, and any operator-authored content must be re-created via the normal
+API (`POST /api/instructions`, `POST /api/instruction-sets`) — there is no automatic carry-over.
+
+**Breaking, deliberate: an operator-deleted bundled definition/set no longer reappears.**
+Since 0.12.x (see that row above), deleting a build-time-shipped definition and rebooting made
+it silently reappear — the old per-replica SQLite reseed logic couldn't distinguish "never
+seeded" from "deliberately deleted", so `enabled: false` was the documented workaround for
+permanent suppression. **That workaround is no longer necessary but still works.** Post-upgrade,
+a deleted bundled id stays deleted — across every reboot, every replica, and every future
+release — via a tombstone the reseed loop consults. **Recovery path:** the tombstone only
+gates the build-time-trusted reseed path; an operator can still freely bring the id back at any
+time via a normal `POST /api/instructions` create or `POST /api/instructions/import`.
+
+**A side effect worth knowing:** delete-and-reboot was also, incidentally, the only existing
+way to force an existing bundled definition to pick up *newer* bundled content shipped in a
+later release (delete it, then the next boot's reseed re-inserts the current version). That
+side channel is now closed along with the resurrection bug it depended on — an existing bundled
+row, edited or not, never automatically picks up newer shipped content. There is currently no
+other refresh mechanism; tracked in [#2555](https://github.com/Tr3kkR/Yuzu/issues/2555).
+
+**REST contract change** on the direct `/api/instructions*` / `/api/instruction-sets*` routes:
+`DELETE` on a missing id now returns `404` (was `200 {"deleted": false}`); `create`/`update`/
+`import`/`create-set` now return `503` on a genuine database failure instead of a misleading
+`400`. See [`rest-api.md`](rest-api.md#instructions) for the full per-route response-code
+reference. Any automation that specifically parsed the old `200 {"deleted": false}` shape or
+treated every non-2xx response as a validation error should be updated.
+
+No operator action is required to upgrade; the reseed loop runs automatically at boot. See
+`docs/adr/0058-instruction-store-postgres-migration.md` for the full design record.
+
+**Caveat (rollback direction):** the above covers forward migration only. `instructions.db`
+still exists after the upgrade (it keeps backing the still-SQLite
+`ExecutionTracker`/`ApprovalManager`/`ScheduleEngine` siblings), but this binary never writes
+InstructionDefinition/InstructionSet rows to it. If you roll the server *binary* back to a
+pre-migration release, the outcome depends on your deployment's history and is never an empty
+catalog either way — the pre-migration binary's own boot sequence unconditionally
+`CREATE TABLE IF NOT EXISTS`-es the catalog tables and runs its own every-boot bundled-content
+reseed loop, the same way this store always has:
+- **A deployment that upgraded from a pre-migration install** still has its old
+  `instructions.db` catalog tables, untouched by the new binary. The rolled-back binary reads
+  them and serves that pre-cutover snapshot — including re-resurrecting any bundled definition
+  or set an operator deliberately deleted in Postgres after cutover, since the old binary has
+  no concept of the tombstone table.
+- **A deployment that was Postgres-first from its first boot** has no catalog tables in
+  `instructions.db` yet. The rolled-back binary creates them fresh and reseeds that old
+  release's full bundled catalog — a stale but non-empty catalog, not an empty one.
+- **Either way, anything created or edited via the API while running the new (Postgres)
+  binary is invisible during the rollback** — it lives only in Postgres, which the old binary
+  never reads — and, because there is no backfill, is not recovered automatically when you
+  roll forward again either; content authored while rolled back must be re-entered.
+
 ## Behaviour change: token-rotation confirm now requires proof of possession (#3015)
 
 `confirm` on a rotation — REST `POST /api/v1/tokens/{id}/confirm` and `POST /api/v1/engine-principals/{id}/credentials/confirm`, plus the MCP twins `confirm_api_token_rotation`/`confirm_engine_rotation` — previously admitted on caller identity plus the successor's `token_id` alone. A caller who recovered an unknown successor's `token_id` out-of-band (a support ticket, a log line) could confirm — and thereby revoke the predecessor for — a rotation whose secret they never actually received. All four confirm surfaces now additionally require the raw successor secret itself in the request body/args, verified with a constant-time hash comparison against the successor's stored hash, checked LAST — strictly after ownership, pair-state, the `token_id` pin, tier, scope, and the initiator binding have all already passed — before the predecessor is touched.
@@ -774,6 +833,56 @@ it was never in `ca.db` and stays a local file behind `KeyProvider` (`--ca-dir`)
   backend behind it (a host crash or network partition can leave one held
   until Postgres notices the dead session) and `pg_terminate_backend` it — see
   `docs/pki-architecture.md`'s operator runbook.
+
+## ⚠️ Behaviour change: webhook store moves to Postgres (ADR-0057)
+
+`WebhookStore` (operator-registered outbound webhooks and their delivery log —
+everything behind `GET`/`POST`/`DELETE /api/webhooks` and
+`GET /api/webhooks/{id}/deliveries`) moves from the SQLite `webhooks.db` file
+to the server's PostgreSQL substrate in this release (schema `webhook_store`).
+The webhook HMAC signing secret is now envelope-encrypted at rest
+(`SecretCodec`, AES-256-GCM, ADR-0010) instead of a plaintext column.
+
+- **Mandatory, automatic backfill on first boot, both tables.** The legacy
+  `webhooks.db` (if present) is read once at startup; every webhook's signing
+  secret is re-encrypted (never copied in plaintext), and every delivery
+  record carries over too (the delivery log has no expiry, so — unlike
+  `ResponseStore` below — it is not treated as skippable). A failed backfill
+  refuses to start the server (see remediation below).
+- **New fail-closed-at-boot behaviour.** A Postgres/`SecretCodec` error at any
+  point in this store's boot sequence (schema migration, KEK verification, or
+  the backfill itself) now refuses to start the server, rather than starting
+  with webhooks silently unwired.
+- **If the backfill fails:** the boot log names the exact remediation — repair
+  `webhooks.db`, or move it aside to skip the backfill. Skipping means any
+  webhooks/signing secrets it held do **not** carry over; recreate them via
+  `POST /api/webhooks` after the server starts.
+- **Legacy file retention.** On a verified successful backfill, `webhooks.db`
+  is renamed to `webhooks.db.migrated-<unix-epoch>` alongside its `-wal`/`-shm`
+  sidecars — never deleted — and access is restricted to the owner where the
+  platform supports it. It still holds every pre-cutover signing secret in
+  **plaintext** for the one-release rollback window (ADR-0009); see
+  [`rest-api.md`](rest-api.md#post-apiwebhooks) for the rotation guidance if
+  your backup posture for that window is unknown.
+- **`POST`/`DELETE /api/webhooks` now distinguish a caller error from a store
+  failure**: `POST` returns `400` for an invalid URL scheme (previously an
+  ambiguous non-error response), and `GET`/`POST`/`DELETE /api/webhooks`
+  (list/create/delete) return `503` on a genuine database error instead of a
+  silently-empty or silently-failed result. `GET /api/webhooks/{id}/deliveries`'s
+  degrade-vs-error handling specifically is unchanged by this migration — a
+  degraded read there still renders an empty delivery list rather than a
+  `503`, the same as before the cutover.
+- **`GET /api/webhooks/{id}/deliveries`'s `?limit=` handling changed.**
+  `limit=0` (or any non-positive value) previously meant "return zero rows";
+  it now falls back to the default of 50, the same as an omitted `limit`. A
+  value above 10000 was previously passed through unbounded; it is now
+  silently capped at 10000. If your integration relies on `limit=0` meaning
+  "give me nothing," or on retrieving more than 10000 rows in one call,
+  update it.
+- Every other webhook behavior — event-type matching, HMAC-SHA256 signature
+  format (`X-Yuzu-Signature: sha256=<hex>`), unsigned delivery when no secret
+  is configured — is unchanged. Detail:
+  `docs/adr/0057-webhook-store-postgres-migration.md`.
 
 ## ⚠️ Behaviour change: response history resets on Postgres cutover (ADR-0039)
 
@@ -2042,55 +2151,38 @@ log and `/readyz` are the channels to watch during an upgrade.
 `SELECT count(*) FROM baseline_store.baselines;` against Postgres matches
 `sqlite3 guardian-baselines.db.migrated-<epoch> "SELECT count(*) FROM baselines;"`.
 
-## Compliance policy engine migrates to Postgres (mandatory backfill, PolicyStore, ADR-0056)
+## Compliance policy engine moves to Postgres (PolicyStore, ADR-0056)
 
 The `PolicyStore` — compliance policy fragments/policies behind `POST/DELETE
 /api/policy-fragments*`, `POST/DELETE /api/policies*`, `POST /api/policies/{id}/{enable,
 disable,invalidate,evaluate,remediate}`, `GET /api/compliance*`, and every dispatched
-compliance check/fix/verify — moves from the SQLite `policies.db` file to the server's
-PostgreSQL substrate in this release, schema `policy_store`, on the existing shared
-pool. Six operator-authored tables (fragments, policies, and their input/trigger/group
-associations, plus per-agent `policy_status`) plus a new operational-only seventh table,
-`policy_dispatch_state`, which coordinates fleet-wide compliance-check dispatch across
-replicas and is never backfilled.
+compliance check/fix/verify — runs on the server's PostgreSQL substrate, schema
+`policy_store`, on the existing shared pool. Six operator-authored tables (fragments,
+policies, and their input/trigger/group associations, plus per-agent `policy_status`)
+plus a new operational-only seventh table, `policy_dispatch_state`, which coordinates
+fleet-wide compliance-check dispatch across replicas.
 
-**Before you upgrade**, sanity-check the legacy `policies.db`:
+**No legacy-SQLite migration path.** No production fleet ever ran a pre-Postgres build
+of this store, so there was no real `policies.db` data to carry over — the one-time
+backfill mechanism this section originally described was retired shortly after this
+store's Postgres migration merged, under ADR-0009's fresh-start-by-default amendment.
 
-```bash
-sqlite3 /path/to/policies.db "SELECT count(*) FROM policies; SELECT count(*) FROM policy_status;"
-```
+These are two SEPARATE failure/detection behaviors, not one — do not conflate them:
 
-- **What is preserved:** every policy fragment and policy definition, and per-agent
-  compliance status history (`policy_status` — `compliant`/`non_compliant`/`unknown`/
-  `error`, plus the fix-attempt counter) via a direction-aware LIFECYCLE merge rather
-  than a fresh start: the default 3600s evaluation interval would otherwise leave up to
-  an hour of false-`unknown` fleet compliance on an operator-visible dashboard after
-  every upgrade. Fragments and policies write once (no update path exists once created —
-  only enable/disable and status mutate post-creation), so the identity side of the
-  backfill is unusually clean.
-- **Fail-closed boot, retried each start.** A backfill that cannot complete — an
-  unreadable/corrupt `policies.db`, a Postgres write error, a fingerprint mismatch, or a
-  legacy `policy_status` row demonstrably ahead of an already-migrated Postgres row —
-  **refuses the boot** and retries on the next start. This store had no fail-closed
-  guard on SQLite; on Postgres, a reachable database whose schema can't migrate or open
-  is now a fatal startup error too, matching the ladder's existing "authoritative"
-  posture for this store. The boot log's `PolicyStore`/`[PG] Refusing to start` lines
-  carry the specific refusal, and `docs/ops-runbooks/policy-store-backfill-recovery.md`
-  maps each message to its recovery.
-- **"Move it aside" drops status history, not just definitions.** The documented
-  operator remediation for a stuck backfill — move `policies.db` aside to skip it — is
-  correctly described in the boot log itself: doing so drops both the policy
-  definitions AND per-agent compliance status history that only exists in the legacy
-  file. See the runbook for why, and for the "leave it in place as a backup" trap (the
-  legacy-ahead check re-runs on every boot for as long as the file exists at its
-  configured path, so a stale backup file left behind reproduces the refusal as a boot
-  crash loop on any later clock skew).
-- Tolerates a legacy `policies.db` predating the `fix_attempt_count` column
-  (defaults missing rows to 0); a probe failure reading that column now fails the
-  backfill closed rather than silently defaulting every row to 0.
-- Real FK + `ON DELETE CASCADE` added from `policy_status` to `policies` — the SQLite
-  original had none, and `delete_policy` hand-wrote a second `DELETE` whose failure was
-  silently swallowed.
+- A reachable Postgres database whose schema can't migrate or open **is** a fatal
+  startup error (fail-closed, matching the ladder's "authoritative" posture for this
+  store), same as every other born-on-Postgres store.
+- A legacy `policies.db` file with real content **does NOT** fail startup and its
+  content is **never imported** — the server opens it read-only, purely to count rows
+  for a diagnostic warning, then boots fresh-started regardless of what it finds. If
+  either the `policies` or `policy_fragments` table has rows, it logs `A legacy
+  policies.db (<path>) has <N> policy row(s) and <N> fragment row(s) but PolicyStore no
+  longer backfills it...` at WARN; if the file exists but its row counts can't be read
+  (corrupt, unreadable, or a locked file), it logs a similar countless warning instead.
+  Either way, boot proceeds unaffected. If you see either warning and the environment
+  genuinely has real compliance-policy data to keep, there is no automated recovery
+  path: re-author the equivalent fragments and policies against the new Postgres-backed
+  store via `POST /api/policy-fragments` and `POST /api/policies` before relying on it.
 
 **Operator-visible behaviour changes (fail-closed reads/writes).**
 
@@ -2112,10 +2204,8 @@ sqlite3 /path/to/policies.db "SELECT count(*) FROM policies; SELECT count(*) FRO
   no timestamp was ever computed; the freshness claim itself has simply been removed
   rather than shipped false. A real evaluation-health signal is tracked as a follow-up.
 
-**Verify:** after the server reports ready, `GET /api/compliance` shows the same
-policies and fleet compliance percentage as before the upgrade, and `SELECT count(*)
-FROM policy_store.policies;` / `policy_store.policy_status` against Postgres match the
-legacy file's counts.
+**Verify:** after the server reports ready, `GET /api/compliance` returns the expected
+policies and fleet compliance percentage.
 
 ## ⚠️ Behaviour change: quarantine is now enforced at instruction dispatch (#881, #3127)
 

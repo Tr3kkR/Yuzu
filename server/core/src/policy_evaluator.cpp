@@ -21,6 +21,7 @@
 #include <algorithm>
 
 #include <chrono>
+#include <format>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -148,8 +149,20 @@ std::string verdict_for(const StoredResponse& r, const std::string& instruction_
 
     std::string schema;
     if (istore) {
-        if (auto def = istore->get_definition(instruction_id))
-            schema = def->result_schema;
+        // ADR-0058: get_definition now returns std::expected<optional<...>, string>. A
+        // not-found id leaves schema empty, matching pre-migration behaviour (parse_result
+        // tolerates an empty schema) — the check already dispatched successfully against a
+        // known instruction, so a since-deleted definition is a narrow edge case, not a
+        // reason to error the verdict. A genuine DB error is NOT the same: proceeding with
+        // an empty schema on a type-blind parse could silently produce a WRONG
+        // compliant/non_compliant verdict instead of surfacing the infrastructure failure
+        // (gov Gate 3 architect finding) — persisted straight into SOC2-relevant compliance
+        // posture data via update_agent_status.
+        auto def_result = istore->get_definition(instruction_id);
+        if (!def_result)
+            return "error";
+        if (*def_result)
+            schema = (*def_result)->result_schema;
     }
     InstructionResult ir = parse_result(r.output, schema);
     // CEL resolves `result.<field>` by stripping the `result.` prefix and
@@ -231,19 +244,41 @@ std::vector<std::string> PolicyEvaluator::resolve_targets(const Policy& p) const
     return out;
 }
 
-std::string
+std::expected<std::string, std::string>
 PolicyEvaluator::dispatch_instruction(const std::string& instruction_id,
                                       const std::unordered_map<std::string, std::string>& parameters,
                                       const std::vector<std::string>& targets) {
-    if (targets.empty() || !d_.instruction_store || !d_.dispatch_fn)
+    if (targets.empty() || !d_.dispatch_fn)
         return "";
-    auto def = d_.instruction_store->get_definition(instruction_id);
-    if (!def) {
+    // db_error, not a legitimate no-op (gov Gate 3 architect finding): a null
+    // instruction_store is a genuine unavailability, not "no targets"/"unknown
+    // instruction" — collapsing it into the same "" those return would silently
+    // skip dispatch instead of surfacing degraded. Currently unreachable (this
+    // Deps struct is only ever constructed with a live instruction_store — same
+    // boot-latch shape as workflow_routes.cpp's uninstall_fn), kept correct as
+    // defense-in-depth against that invariant changing.
+    if (!d_.instruction_store)
+        return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) +
+                               "instruction store unavailable");
+    // ADR-0058: get_definition now returns std::expected<optional<...>, string>.
+    // A genuine DB error must surface as `unexpected` — never collapse into the
+    // same "" a not-found id legitimately returns (that fail-open is exactly
+    // what ADR-0036 exists to close on an authorization/dispatch-adjacent
+    // read). Every caller already propagates a std::expected error the same
+    // way it propagates its own other degrade paths.
+    auto def_result = d_.instruction_store->get_definition(instruction_id);
+    if (!def_result) {
+        spdlog::warn("policy_evaluator: instruction store unavailable resolving '{}': {}",
+                     instruction_id, def_result.error());
+        return std::unexpected(def_result.error());
+    }
+    if (!*def_result) {
         spdlog::warn("policy_evaluator: unknown check/fix instruction '{}'", instruction_id);
         return "";
     }
+    const auto& def = **def_result;
     auto execid = gen_execution_id();
-    d_.dispatch_fn(def->plugin, def->action, targets, /*scope_expr=*/"", parameters, execid);
+    d_.dispatch_fn(def.plugin, def.action, targets, /*scope_expr=*/"", parameters, execid);
     return execid;
 }
 
@@ -282,9 +317,14 @@ std::expected<std::string, std::string> PolicyEvaluator::kickoff_check(const Pol
 
     auto params = build_params(frag.check_parameters, p.inputs);
     // dispatch_instruction invokes the blocking dispatch_fn — call it WITHOUT mu_.
-    auto execid = dispatch_instruction(frag.check_instruction, params, targets);
-    if (execid.empty())
+    // ADR-0058: a genuine InstructionStore error propagates as `unexpected` here
+    // too, the same way the degraded-fragment-read path above does.
+    auto execid_result = dispatch_instruction(frag.check_instruction, params, targets);
+    if (!execid_result)
+        return std::unexpected(execid_result.error());
+    if (execid_result->empty())
         return "";
+    const std::string& execid = *execid_result;
 
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -310,6 +350,10 @@ void PolicyEvaluator::dispatch_due() {
     // tick. Lock-not-acquired returns an empty, non-error result (another
     // replica claimed this tick); a genuine DB error is `unexpected` and
     // MUST be treated as "skip this tick", never silently as "nothing due".
+    // This durable claim also structurally closes the ABA hazard the earlier
+    // in-memory last_eval_/EvalClaim generation-counter CAS (gov Gate 8) was
+    // patching — that mechanism no longer exists here; see ADR-0058's
+    // Consequences.
     auto claimed =
         d_.policy_store->claim_due_policies(now(), d_.default_interval_seconds,
                                             d_.fixing_stale_seconds);
@@ -334,7 +378,10 @@ void PolicyEvaluator::dispatch_due() {
             // transaction — a degraded kickoff_check here leaves it claimed
             // but never actually dispatched, silently skipping this policy
             // for the rest of its interval. Same consequence class as the
-            // claim-failure counter above; give it the same visibility.
+            // claim-failure counter above; give it the same visibility. This
+            // also covers a genuine InstructionStore error (ADR-0058) —
+            // kickoff_check propagates it as `unexpected` the same way it
+            // propagates a degraded fragment read.
             spdlog::warn("policy_evaluator: dispatch_due: kickoff_check degraded for policy {}: {}",
                         p.id, k.error());
             if (d_.metrics)
@@ -523,11 +570,22 @@ PolicyEvaluator::remediate(const std::string& policy_id,
     // burn an attempt against the retry cap even when the dispatch fails (unknown
     // instruction / all targets offline), eventually locking the agent to 'error'
     // with no fix ever sent. dispatch_instruction must run without mu_ held.
-    auto execid = dispatch_instruction(frag->fix_instruction, fix_params, targets);
-    if (execid.empty()) {
+    auto dispatch_result = dispatch_instruction(frag->fix_instruction, fix_params, targets);
+    if (!dispatch_result) {
+        out.degraded = true;
+        // Gate 3 ARCH-1: dispatch_result.error() carries raw PQerrorMessage() text on a
+        // genuine DB failure — genericized here at the source so both consumers
+        // (compliance_routes.cpp's audit row AND its POST /api/policies/:id/remediate
+        // response body, both of which echo `out.error` verbatim) get the fix for free.
+        out.error = yuzu::server::genericize_db_error("PolicyEvaluator::remediate dispatch",
+                                                       dispatch_result.error());
+        return out;
+    }
+    if (dispatch_result->empty()) {
         out.error = "fix dispatch failed (unknown instruction or no agents)";
         return out;
     }
+    const auto& execid = *dispatch_result;
 
     // Now mark fixing (increments the attempt counter; >3 auto-transitions to error).
     for (const auto& tgt : targets) {
@@ -625,12 +683,12 @@ void PolicyEvaluator::collect_ready() {
             }
             if (!verify_targets.empty()) {
                 auto vparams = params_from_json_obj(f.verify_parameters_json);
-                auto execid = dispatch_instruction(f.verify_instruction, vparams, verify_targets);
-                if (!execid.empty()) {
+                auto result = dispatch_instruction(f.verify_instruction, vparams, verify_targets);
+                if (result && !result->empty()) {
                     std::lock_guard<std::mutex> lk(mu_);
                     in_flight_.push_back(InFlight{.phase = Phase::Check,
                                                   .policy_id = f.policy_id,
-                                                  .execution_id = execid,
+                                                  .execution_id = *result,
                                                   .instruction_id = f.verify_instruction,
                                                   .compliance_expr = f.verify_compliance,
                                                   .targets = verify_targets,
@@ -639,10 +697,14 @@ void PolicyEvaluator::collect_ready() {
                                                   .verify_compliance = "",
                                                   .verify_parameters_json = ""});
                 } else if (d_.policy_store) {
+                    // A store-unavailable verify dispatch is a transient infra failure, not
+                    // a genuine post-fix verification failure — the result JSON records which
+                    // it was rather than collapsing both into the same "dispatch_failed".
+                    const char* result_tag = !result ? "store_unavailable" : "dispatch_failed";
                     for (const auto& tgt : verify_targets) {
                         auto r = d_.policy_store->update_agent_status(
                             f.policy_id, tgt, "error",
-                            R"({"phase":"verify","result":"dispatch_failed"})");
+                            std::format(R"({{"phase":"verify","result":"{}"}})", result_tag));
                         if (!r)
                             spdlog::warn("policy_evaluator: verify-dispatch-failed status write "
                                         "failed for {}/{}: {}",
