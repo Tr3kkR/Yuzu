@@ -565,7 +565,6 @@ std::expected<void, std::string> RuntimeConfigStore::set(const std::string& key,
             return std::unexpected("value must be one of: trace, debug, info, warn, error");
     }
 
-    const std::string sanitized_value = sanitize_pg_text(value);
     const std::string sanitized_by = sanitize_pg_text(updated_by);
     const auto now = now_secs();
 
@@ -646,6 +645,14 @@ std::expected<void, std::string> RuntimeConfigStore::set(const std::string& key,
                                        "database write failed");
         }
     } else {
+        // Sanitized only here, not up front: the secret-key branches above encrypt
+        // the raw value (sealed_value is BYTEA, sanitizing it would silently
+        // corrupt an embedded NUL/invalid-UTF-8 byte before sealing -- external
+        // adversarial-review finding), so computing this unconditionally would
+        // leave a wasted, unwiped near-copy of the credential sitting in the
+        // stack frame on every secret set() for no purpose (cpp-expert, governance
+        // Gate 3 finding on that fix).
+        const std::string sanitized_value = sanitize_pg_text(value);
         auto lease = pool_.try_acquire_for(kWriteTimeout);
         if (!lease)
             return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) +

@@ -8771,6 +8771,19 @@ public:
         if (webhook_secret_codec_)
             webhook_secret_codec_->set_audit_hook({});
         webhook_secret_codec_.reset();
+        // RuntimeConfigStore (ADR-0060) borrows both pg_pool_ and its own SecretCodec,
+        // which is itself constructed from *auth_key_provider_ — reset both HERE,
+        // before auth_key_provider_ below, not down near pg_pool_.reset() where an
+        // earlier revision of this teardown placed them (external adversarial-review
+        // finding: that placement left the codec holding a dangling KeyProvider&
+        // reference for the whole interval between auth_key_provider_.reset() and
+        // this store's own reset -- unreachable today only because kek_ops's
+        // rotate/rewrap/status handlers are already unreachable by the time this
+        // runs, per web_thread_'s join well above, not because the ordering was
+        // actually safe). pg_pool_ itself is still alive at this point (reset last,
+        // below), so moving these two lines earlier is safe.
+        runtime_config_store_.reset();
+        runtime_config_secret_codec_.reset();
         auth_key_provider_.reset();
         audit_store_.reset();
         // TagStore (ADR-0050) borrows pg_pool_ — unwire the borrowed raw
@@ -8846,12 +8859,8 @@ public:
         // (adversarial-review MEDIUM, 2026-08-20 — matches the sibling stores' own
         // explicit-reset discipline in this function).
         ca_store_.reset();
-        // RuntimeConfigStore (ADR-0060) borrows both pg_pool_ and its own SecretCodec
-        // — explicit reset here, store before codec (the store holds a reference to
-        // it), rather than relying on declaration-order destruction alone. Same
-        // discipline as ca_store_ above (governance Gate 2/3 SHOULD).
-        runtime_config_store_.reset();
-        runtime_config_secret_codec_.reset();
+        // RuntimeConfigStore/runtime_config_secret_codec_ already reset above,
+        // before auth_key_provider_ (the codec borrows it) — see that comment.
         pg_pool_.reset();
 
         // ONLY on full completion — a path above that escalates via std::_Exit(1)

@@ -233,9 +233,9 @@ TEST_CASE("warn_if_legacy_data_present restricts the legacy file AND its WAL/SHM
     const auto owner_only =
         std::filesystem::perms::owner_read | std::filesystem::perms::owner_write;
     std::error_code st_ec;
-    CHECK((std::filesystem::status(legacy.path, st_ec).permissions() &
-           std::filesystem::perms::mask) == owner_only);
+    const auto main_perms = std::filesystem::status(legacy.path, st_ec).permissions();
     REQUIRE_FALSE(st_ec);
+    CHECK((main_perms & std::filesystem::perms::mask) == owner_only);
     for (const auto& side : sidecars) {
         std::error_code side_ec;
         const auto perms = std::filesystem::status(side, side_ec).permissions();
