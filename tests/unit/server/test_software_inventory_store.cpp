@@ -459,7 +459,7 @@ TEST_CASE("migration v5 backfills '' into v2 columns for pre-existing rows and r
 }
 
 TEST_CASE("ingest boundary-truncates an over-long multibyte field so PG accepts it (UP-10)",
-          "[pg][software_inventory][seam]") {
+          "[pg][software_inventory][seam][pg-smoke]") {
     // Regression for the UTF-8 byte-cut: a raw field whose multibyte codepoint
     // straddles the 1024-byte cap must be truncated on the codepoint boundary, NOT
     // mid-sequence — otherwise the INSERT into the UTF8 TEXT column is rejected by

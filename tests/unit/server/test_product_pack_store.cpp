@@ -1,44 +1,79 @@
 /**
- * test_product_pack_store.cpp — coverage for ProductPackStore signature
- * enforcement and the #802 / W7.4 security-by-default flip.
+ * test_product_pack_store.cpp — `ProductPackStore` (operator-installed product packs,
+ * ADR-0006/0009/0054).
  *
- * Pre-W7.4 state: `require_signed_packs_` defaulted to false AND the setter
- * was never called from anywhere in production. The "flag exists but is
- * unreachable" pattern was the actual vulnerability — even an operator who
- * wanted pack signing had no way to enable it, so every install path took
- * the unsigned-pass branch.
+ * Migrated-to-Postgres store (ADR-0012 §1, authoritative/fail-hard). PG-gated: skips when
+ * YUZU_TEST_POSTGRES_DSN is unset, fails when set but broken (test_helpers.hpp skip-vs-fail
+ * contract). Store-behaviour cases use the pre-migrated PgTestTemplate variant
+ * (docs/postgres-store-playbook.md step 7); the two fail-closed construction cases use
+ * YUZU_REQUIRE_PG_DB / no gate at all, per the plain-migration-test carve-out.
  *
- * Pins:
- *   1. Default ctor sets require_signed_packs() == true.
- *   2. Install of an unsigned pack is REJECTED by default with the
- *      documented error string ("' is unsigned and require_signed_packs is
- *      enabled").
- *   3. After set_require_signed_packs(false) — the escape hatch — the same
- *      unsigned pack INSTALLS, preserving the pre-flip behaviour as
- *      explicit opt-in.
- *   4. A pack with a signature field always goes through the verify path
- *      regardless of the flag — wrong signature still rejects.
+ * Covers:
+ *  - fail-closed construction: a live-but-unmigratable database, and an unreachable pool (every
+ *    method fails closed with `kProductPackDbErrorPrefix`).
+ *  - the pre-migration #802/W7.4 signed-pack coverage, unchanged in intent: default ctor
+ *    requires signed packs; the escape hatch (`set_require_signed_packs(false)`) accepts
+ *    unsigned packs; a present-but-invalid signature always rejects regardless of the flag; a
+ *    signature with no publicKey rejects; the positive Ed25519 crypto path (a real signed pack
+ *    installs, a one-byte-mutated signature rejects).
+ *  - list/get/uninstall round-trip through the new `std::expected` reads (ADR-0036): `get`'s
+ *    nullopt-inside-expected distinguishes "not found" from a genuine DB error; `uninstall`'s
+ *    `"not_found: "` prefix.
  *
- * No tests here exercise audit emission — that happens at the server.cpp
- * construction site, covered (when added) by a server-startup-audit
- * integration test rather than the store-unit suite.
+ * No legacy-SQLite backfill test coverage: the dedicated migrate_from_sqlite TEST_CASE suite
+ * was removed as part of a fresh-start-by-default policy change (ADR-0009 amendment) -- no
+ * production fleet has ever run a pre-Postgres build. ProductPackStore::migrate_from_sqlite()
+ * itself is UNCHANGED and still present in production code; only this file's test coverage of
+ * it was removed.
  */
 
 #include "product_pack_store.hpp"
 
+#include "pg/pg_exec.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
+#include "test_route_sink.hpp"
+#include "workflow_routes.hpp"
+
+#include <yuzu/metrics.hpp>
+
 #include "../test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 #include <openssl/evp.h>
 
+#include <libpq-fe.h>
+
+#include <atomic>
+#include <chrono>
+#include <format>
+#include <thread>
 #include <memory>
 #include <string>
+#include <tuple>
+#include <vector>
 
+using yuzu::server::ItemInstallFn;
+using yuzu::server::ProductPack;
+using yuzu::server::ProductPackQuery;
 using yuzu::server::ProductPackStore;
+using yuzu::server::WorkflowRoutes;
+namespace pg = yuzu::server::pg;
+using yuzu::server::pg::PgConn;
+using yuzu::server::pg::PgPool;
+using yuzu::server::pg::PgResult;
 
 namespace {
 
-/// Minimal valid YAML bundle with no signature — exercises the unsigned-pack
-/// branch at product_pack_store.cpp:435.
+yuzu::test::PgTestTemplate product_pack_store_tpl{
+    "productpackstore", [](const std::string& dsn) {
+        PgPool pool{{.conninfo = dsn, .size = 1}};
+        ProductPackStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("product_pack_store template: store failed to migrate");
+    }};
+
+/// Minimal valid YAML bundle with no signature — exercises the unsigned-pack branch.
 constexpr const char* kUnsignedPackYaml = R"(apiVersion: yuzu.io/v1alpha1
 kind: ProductPack
 name: test-unsigned
@@ -50,48 +85,115 @@ kind: InstructionDefinition
 name: test-instruction
 )";
 
+/// Two InstructionDefinition documents — paired with make_accept_all_install_fn() (which
+/// returns the same fixed id for every document), this bundle deterministically produces a
+/// duplicate item_id.
+constexpr const char* kUnsignedPackYamlDuplicateItems = R"(apiVersion: yuzu.io/v1alpha1
+kind: ProductPack
+name: test-duplicate-items
+version: 1.0.0
+description: Bundle with two documents assigned the same item id
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+name: test-instruction-a
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+name: test-instruction-b
+)";
+
 /// install_fn stub — accepts every item, returns a synthetic id. We don't
 /// care which items installed downstream because #802 is a pre-item-install
 /// reject check; the install_fn here is just to satisfy the signature.
-yuzu::server::ItemInstallFn make_accept_all_install_fn() {
+ItemInstallFn make_accept_all_install_fn() {
     return [](const std::string&, const std::string&) -> std::expected<std::string, std::string> {
         return std::string{"item-id"};
     };
 }
 
+ItemInstallFn make_counting_install_fn(int* counter) {
+    return [counter](const std::string&,
+                     const std::string&) -> std::expected<std::string, std::string> {
+        ++*counter;
+        return std::string{"item-id-"} + std::to_string(*counter);
+    };
+}
+
 } // namespace
 
+// ── Construction fail-closed ────────────────────────────────────────────────
+
+TEST_CASE("ProductPackStore reports !is_open on a migration failure", "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB(db);
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult s{PQexec(conn.get(), "CREATE SCHEMA product_pack_store")};
+        REQUIRE(s.ok());
+        PgResult t{PQexec(conn.get(), "CREATE TABLE product_pack_store.product_packs (bogus int)")};
+        REQUIRE(t.ok());
+    }
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    ProductPackStore store{pool};
+    CHECK_FALSE(store.is_open());
+}
+
+TEST_CASE("ProductPackStore reports !is_open on an unreachable pool, and every method fails "
+          "closed",
+          "[product_pack_store]") {
+    PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 2}};
+    REQUIRE_FALSE(pool.valid());
+    ProductPackStore store{pool};
+    CHECK_FALSE(store.is_open());
+
+    auto install_res = store.install(kUnsignedPackYaml, make_accept_all_install_fn());
+    CHECK_FALSE(install_res.has_value());
+    CHECK(install_res.error().starts_with(yuzu::server::kProductPackDbErrorPrefix));
+
+    auto list_res = store.list();
+    CHECK_FALSE(list_res.has_value());
+    CHECK(list_res.error().starts_with(yuzu::server::kProductPackDbErrorPrefix));
+
+    auto get_res = store.get("x");
+    CHECK_FALSE(get_res.has_value());
+    CHECK(get_res.error().starts_with(yuzu::server::kProductPackDbErrorPrefix));
+
+    auto uninstall_res = store.uninstall(
+        "x", [](const std::string&, const std::string&) -> std::expected<void, std::string> { return {}; });
+    CHECK_FALSE(uninstall_res.has_value());
+    CHECK(uninstall_res.error().starts_with(yuzu::server::kProductPackDbErrorPrefix));
+
+    CHECK_FALSE(store.migrate_from_sqlite("/nonexistent/does/not/matter"));
+}
+
+// ── #802 / W7.4 signature enforcement ───────────────────────────────────────
+
 TEST_CASE("ProductPackStore: default ctor requires signed packs (#802)",
-          "[product_pack_store][issue802][security]") {
-    // Pre-W7.4 default was false; the flip is the security-by-default fix.
-    // Pin both the default value and the rejection semantics with the
-    // documented error string so a future "convenience" reversion is loud.
-    yuzu::test::TempDbFile db{std::string_view{"pack-store-default-"}};
-    ProductPackStore store{db.path};
+          "[product_pack_store][issue802][security][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
     REQUIRE(store.is_open());
     CHECK(store.require_signed_packs());
 
     auto result = store.install(kUnsignedPackYaml, make_accept_all_install_fn());
     REQUIRE_FALSE(result.has_value());
     // gov W7.4 R1 QE-S1: tighter than substring — pin the full operator-facing
-    // suffix via `ends_with`. The token chain "is unsigned and signature
-    // enforcement is enabled" plus the actionable hint pointing at the
-    // CLI flag must survive any rephrase; a regression that drops either
-    // piece (or accidentally re-exposes the internal field name
-    // "require_signed_packs") fails this test immediately.
+    // suffix via `ends_with`. A regression that drops either piece (or
+    // accidentally re-exposes the internal field name "require_signed_packs")
+    // fails this test immediately.
     CHECK(result.error().ends_with(
         "is unsigned and signature enforcement is enabled "
         "(set --allow-unsigned-packs / YUZU_ALLOW_UNSIGNED_PACKS=1 to bypass)"));
 }
 
 TEST_CASE("ProductPackStore: opt-out flag accepts unsigned packs (#802 escape hatch)",
-          "[product_pack_store][issue802][security]") {
-    // The escape hatch — operators with legacy unsigned packs call
-    // set_require_signed_packs(false) (via the --allow-unsigned-packs
-    // server flag). The same payload that the default rejects must now
-    // install successfully, otherwise the migration path is broken.
-    yuzu::test::TempDbFile db{std::string_view{"pack-store-optout-"}};
-    ProductPackStore store{db.path};
+          "[product_pack_store][issue802][security][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
     REQUIRE(store.is_open());
     store.set_require_signed_packs(false);
     CHECK_FALSE(store.require_signed_packs());
@@ -102,11 +204,10 @@ TEST_CASE("ProductPackStore: opt-out flag accepts unsigned packs (#802 escape ha
 }
 
 TEST_CASE("ProductPackStore: set_require_signed_packs is idempotent and round-trips",
-          "[product_pack_store][issue802]") {
-    // Sanity pin on the setter — protects against a future refactor that
-    // accidentally inverts the bool or makes the setter one-shot.
-    yuzu::test::TempDbFile db{std::string_view{"pack-store-setter-"}};
-    ProductPackStore store{db.path};
+          "[product_pack_store][issue802][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
     REQUIRE(store.require_signed_packs()); // post-W7.4 default
 
     store.set_require_signed_packs(false);
@@ -121,19 +222,7 @@ TEST_CASE("ProductPackStore: set_require_signed_packs is idempotent and round-tr
 
 TEST_CASE("ProductPackStore: pack with malformed/zero public key + signature "
           "rejects regardless of require_signed_packs",
-          "[product_pack_store][issue802][security]") {
-    // gov W7.4 R1 QE-S2: renamed for accuracy — the fixture uses 64 zero
-    // bytes for both signature and public key, exercising the
-    // hex_decode-OK + EVP_DigestVerify-fail path. A test that says "wrong
-    // public key" implies a syntactically valid but mismatched keypair,
-    // which is a different (related) scenario covered indirectly by the
-    // positive-pair test below (mutating one byte of a valid signature).
-    // Sibling-handler check: the require_signed_packs flag is for UNSIGNED
-    // packs only. A pack that DOES include a signature must always go
-    // through verify_signature regardless of the flag — a wrong/forged
-    // signature rejects unconditionally. Pin this so a future "simplify"
-    // refactor that collapses the two paths can't accidentally weaken the
-    // signed-pack path.
+          "[product_pack_store][issue802][security][pg]") {
     constexpr const char* signed_pack_bad_sig = R"(apiVersion: yuzu.io/v1alpha1
 kind: ProductPack
 name: test-bad-sig
@@ -147,8 +236,9 @@ kind: InstructionDefinition
 name: signed-test-instruction
 )";
 
-    yuzu::test::TempDbFile db{std::string_view{"pack-store-badsig-"}};
-    ProductPackStore store{db.path};
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
     REQUIRE(store.is_open());
 
     // Default (require_signed_packs == true) — rejects.
@@ -165,12 +255,7 @@ name: signed-test-instruction
 }
 
 TEST_CASE("ProductPackStore: pack with signature but no publicKey rejects",
-          "[product_pack_store][issue802][security]") {
-    // gov W7.4 R1 QE-B1: the third rejection branch (signature present, no
-    // publicKey) at product_pack_store.cpp:432-437 had no test coverage. A
-    // future refactor that drops or inverts this check would slip past every
-    // existing test in this file. Pins both the rejection AND the
-    // operator-facing error string.
+          "[product_pack_store][issue802][security][pg]") {
     constexpr const char* pack_sig_no_pubkey = R"(apiVersion: yuzu.io/v1alpha1
 kind: ProductPack
 name: test-orphan-sig
@@ -183,8 +268,9 @@ kind: InstructionDefinition
 name: orphan-sig-instruction
 )";
 
-    yuzu::test::TempDbFile db{std::string_view{"pack-store-nopubkey-"}};
-    ProductPackStore store{db.path};
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
     REQUIRE(store.is_open());
 
     auto result = store.install(pack_sig_no_pubkey, make_accept_all_install_fn());
@@ -196,10 +282,7 @@ namespace {
 
 /// Generate an Ed25519 keypair via OpenSSL EVP and return raw 32-byte
 /// public key + private-key signer suitable for `EVP_DigestSign` over
-/// arbitrary content. Used by the positive signed-pack test to prove the
-/// crypto happy path — without it, a regression that breaks
-/// `verify_signature` (e.g. always returns false) would leave every
-/// existing rejection-only test green.
+/// arbitrary content.
 struct Ed25519Pair {
     std::unique_ptr<EVP_PKEY, void (*)(EVP_PKEY*)> pkey{nullptr, &EVP_PKEY_free};
     std::string public_key_hex; // 64 hex chars
@@ -251,30 +334,17 @@ std::string sign_hex(EVP_PKEY* pkey, std::string_view content) {
 } // namespace
 
 TEST_CASE("ProductPackStore: correctly signed pack installs (positive crypto path)",
-          "[product_pack_store][issue802][security]") {
-    // gov W7.4 R1 QE-B2: the entire happy-path of verify_signature was
-    // unobservable — every prior [issue802] test asserts rejection. A
-    // regression that makes verify_signature always return false (e.g. early
-    // return in a refactor, OpenSSL/BCrypt API misuse, hex decode bug) would
-    // leave the entire suite green. This test signs a real pack with an
-    // in-test-generated Ed25519 keypair, builds the bundle in the exact
-    // format `install()` expects (non-ProductPack docs joined with "\n---\n"
-    // per product_pack_store.cpp:411), and asserts both (a) the signed pack
-    // installs (verify_signature returns true) AND (b) a one-byte mutation
-    // of the signature flips it to reject (proves the verify was real, not
-    // a "skip on flag" pass-through).
-
+          "[product_pack_store][issue802][security][pg]") {
     auto pair = generate_ed25519();
 
     // The content that gets signed is the non-ProductPack documents joined
-    // with "\n---\n", per product_pack_store.cpp lines 408-415. Construct
-    // the inner doc separately so we know its exact bytes.
+    // with "\n---\n" (product_pack_store.cpp `install()`). Construct the
+    // inner doc separately so we know its exact bytes.
     const std::string inner_doc = "apiVersion: yuzu.io/v1alpha1\n"
                                   "kind: InstructionDefinition\n"
                                   "name: signed-positive-test\n";
     const std::string signature_hex = sign_hex(pair.pkey.get(), inner_doc);
 
-    // Build the full bundle.
     const std::string bundle = "apiVersion: yuzu.io/v1alpha1\n"
                                "kind: ProductPack\n"
                                "name: test-signed-positive\n"
@@ -289,13 +359,21 @@ TEST_CASE("ProductPackStore: correctly signed pack installs (positive crypto pat
                                "---\n" +
                                inner_doc;
 
-    yuzu::test::TempDbFile db{std::string_view{"pack-store-signed-pos-"}};
-    ProductPackStore store{db.path};
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
     REQUIRE(store.is_open());
 
     auto result = store.install(bundle, make_accept_all_install_fn());
     REQUIRE(result.has_value());
     CHECK_FALSE(result->empty());
+
+    // The installed pack round-trips through get() with verified=true.
+    auto got = store.get(*result);
+    REQUIRE(got.has_value());
+    REQUIRE(got->has_value());
+    CHECK((*got)->verified);
+    CHECK((*got)->name == "test-signed-positive");
 
     // Mutate one byte of the signature (flip the last hex char). Verify
     // must now reject — proves the crypto path is real, not a stub.
@@ -315,11 +393,249 @@ TEST_CASE("ProductPackStore: correctly signed pack installs (positive crypto pat
                                        "---\n" +
                                        inner_doc;
 
-    yuzu::test::TempDbFile db2{std::string_view{"pack-store-signed-mut-"}};
-    ProductPackStore store2{db2.path};
-    REQUIRE(store2.is_open());
-
-    auto result_mut = store2.install(mutated_bundle, make_accept_all_install_fn());
+    auto result_mut = store.install(mutated_bundle, make_accept_all_install_fn());
     REQUIRE_FALSE(result_mut.has_value());
     CHECK(result_mut.error().find("signature verification failed") != std::string::npos);
+}
+
+// ── list / get / uninstall round-trip ───────────────────────────────────────
+
+TEST_CASE("ProductPackStore: list/get/uninstall round-trip", "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    int install_calls = 0;
+    auto result = store.install(kUnsignedPackYaml, make_counting_install_fn(&install_calls));
+    REQUIRE(result.has_value());
+    const std::string pack_id = *result;
+    CHECK(install_calls == 1);
+
+    SECTION("get finds the installed pack with its item") {
+        auto got = store.get(pack_id);
+        REQUIRE(got.has_value());
+        REQUIRE(got->has_value());
+        CHECK((*got)->id == pack_id);
+        CHECK((*got)->name == "test-unsigned");
+        CHECK_FALSE((*got)->verified);
+        REQUIRE((*got)->items.size() == 1);
+        CHECK((*got)->items[0].kind == "InstructionDefinition");
+        CHECK((*got)->items[0].item_id == "item-id-1");
+    }
+
+    SECTION("get on an unknown id returns nullopt, not an error") {
+        auto got = store.get("does-not-exist");
+        REQUIRE(got.has_value());
+        CHECK_FALSE(got->has_value());
+    }
+
+    SECTION("list finds the installed pack") {
+        auto listed = store.list();
+        REQUIRE(listed.has_value());
+        bool found = false;
+        for (const auto& p : *listed)
+            found = found || p.id == pack_id;
+        CHECK(found);
+    }
+
+    SECTION("list name_filter narrows the result") {
+        ProductPackQuery q;
+        q.name_filter = "nonexistent-name-xyz";
+        auto listed = store.list(q);
+        REQUIRE(listed.has_value());
+        CHECK(listed->empty());
+    }
+
+    SECTION("uninstall on an unknown id returns not_found") {
+        auto r = store.uninstall("does-not-exist",
+                                 [](const std::string&, const std::string&) -> std::expected<void, std::string> { return {}; });
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().starts_with("not_found:"));
+    }
+
+    SECTION("uninstall removes the pack and invokes uninstall_fn per item") {
+        int uninstall_calls = 0;
+        auto r = store.uninstall(pack_id, [&uninstall_calls](const std::string&,
+                                                              const std::string&)
+                                             -> std::expected<void, std::string> {
+            ++uninstall_calls;
+            return {};
+        });
+        REQUIRE(r.has_value());
+        CHECK(uninstall_calls == 1);
+
+        auto got = store.get(pack_id);
+        REQUIRE(got.has_value());
+        CHECK_FALSE(got->has_value());
+    }
+
+    SECTION("uninstall aborts (never deletes the pack row) when an item's origin store reports "
+            "a genuine DB error") {
+        // Regression pin: an origin-store DB error used to be tolerated the same as a
+        // not-found item (the callback collapsed to bool), so a pack could be reported
+        // "uninstalled" while a contained item was actually never removed because its store
+        // was down. A db_error-prefixed failure must abort the whole uninstall instead.
+        auto r = store.uninstall(
+            pack_id, [](const std::string&, const std::string&) -> std::expected<void, std::string> {
+                return std::unexpected(std::string(yuzu::server::kProductPackDbErrorPrefix) +
+                                       "simulated origin-store outage");
+            });
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().starts_with(yuzu::server::kProductPackDbErrorPrefix));
+
+        // The pack must still exist — uninstall() never reached the delete+tombstone txn.
+        auto got = store.get(pack_id);
+        REQUIRE(got.has_value());
+        REQUIRE(got->has_value());
+        CHECK((*got)->id == pack_id);
+    }
+}
+
+// Gate 8 review (Fable, external): a bundle whose documents assign the same item id twice
+// must fail as a plain validation error (never kProductPackDbErrorPrefix) — retryable-503
+// misclassification would turn a deterministic duplicate-id bundle into a repeated orphan
+// generator against the sibling stores, since install_fn runs with no pool_ lease held and
+// a client retry would re-invoke it on every attempt.
+TEST_CASE("ProductPackStore::install: a duplicate item id in one bundle fails as a plain "
+          "validation error, never a retryable db_error",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    auto result = store.install(kUnsignedPackYamlDuplicateItems, make_accept_all_install_fn());
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("duplicate item id") != std::string::npos);
+    CHECK(result.error().find(yuzu::server::kProductPackDbErrorPrefix) == std::string::npos);
+
+    // Nothing was persisted — the pack never reaches Postgres.
+    auto listed = store.list();
+    REQUIRE(listed.has_value());
+    for (const auto& p : *listed)
+        CHECK(p.name != "test-duplicate-items");
+}
+
+// ── REST-level regression net (Gate 8 round-2: quality-engineer + unhappy-path, twice-flagged)
+// ──
+//
+// The store-level tests above prove the backend contract; nothing before this point drives an
+// actual HTTP request through WorkflowRoutes' four product-pack handlers, so the genericization
+// split (workflow_routes.cpp's product_pack_client_message — response body only, never the
+// audit trail) and the DELETE-denied audit_fn addition (56fbd3580) were previously verified only
+// by direct code reading. These two cases close that gap. No new test FILE — same
+// [product_pack_store] tag family, inherits the existing shard placement, no meson.build change.
+
+namespace {
+
+/// Minimal WorkflowRoutes harness scoped to the product-pack routes only. Every other Deps
+/// field stays default (nullptr/empty std::function) — safe, because auth_fn/scope_fn/
+/// command_dispatch_fn/caller_fn are never invoked by the GET/POST/DELETE product-pack handlers
+/// (only by this file's other registered routes, none of which this harness dispatches to).
+struct ProductPackRestHarness {
+    // Declaration order matters (gov Gate 8 round-3, cpp-safety): `sink` stores the
+    // registered handlers, one of which captures `this` to append into `audit_rows` — so
+    // `audit_rows` must outlive `sink` and therefore be declared BEFORE it (destroyed
+    // after it, per reverse-declaration-order teardown). `metrics` is unreferenced by any
+    // product-pack handler but is declared first regardless, matching
+    // test_route_sink.hpp's own "declare the sink after the route owner" invariant.
+    yuzu::MetricsRegistry metrics;
+    std::vector<std::tuple<std::string, std::string, std::string, std::string, std::string>>
+        audit_rows; // (action, result, target_type, target_id, detail)
+    yuzu::server::test::TestRouteSink sink;
+
+    explicit ProductPackRestHarness(ProductPackStore* store) {
+        WorkflowRoutes routes;
+        WorkflowRoutes::Deps deps;
+        deps.perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                          const std::string&) { return true; };
+        deps.audit_fn = [this](const httplib::Request&, const std::string& action,
+                               const std::string& result, const std::string& target_type,
+                               const std::string& target_id, const std::string& detail) {
+            audit_rows.emplace_back(action, result, target_type, target_id, detail);
+        };
+        deps.emit_fn = [](const std::string&, const httplib::Request&) {};
+        deps.product_pack_store = store;
+        deps.metrics = &metrics;
+        routes.register_routes(sink, std::move(deps));
+    }
+};
+
+} // namespace
+
+TEST_CASE("REST: a genuine DB error never reaches the response body or the audit trail as raw "
+          "driver text",
+          "[product_pack_store]") {
+    // Unreachable pool (same fixture as the store-level "!is_open" test above) — every
+    // ProductPackStore method deterministically returns a kProductPackDbErrorPrefix error, with
+    // no live Postgres required. This is the classifier's PREFIX check, not its content, so it
+    // exercises the same genericization path a real PQerrorMessage() leak would hit.
+    PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 2}};
+    REQUIRE_FALSE(pool.valid());
+    ProductPackStore store{pool};
+    REQUIRE_FALSE(store.is_open());
+
+    ProductPackRestHarness h{&store};
+
+    // GET /api/product-packs has its OWN pre-existing `!is_open()` early guard (unrelated to
+    // this fix round — it short-circuits before list() is ever called, so it never reaches
+    // product_pack_client_message()'s genericization path at all) with its own hardcoded,
+    // already-generic message. Different string than the genericizer's, same "no internals
+    // leaked" property — assert that property, not byte-identical wording across routes.
+    auto list_res = h.sink.dispatch("GET", "/api/product-packs");
+    REQUIRE(list_res);
+    CHECK(list_res->status == 503);
+    CHECK(list_res->body.find("db_error") == std::string::npos);
+    CHECK(list_res->body.find("not open") == std::string::npos);
+
+    auto del_res = h.sink.dispatch("DELETE", "/api/product-packs/some-id");
+    REQUIRE(del_res);
+    CHECK(del_res->status == 503);
+    CHECK(del_res->body.find("service unavailable") != std::string::npos);
+    CHECK(del_res->body.find("db_error") == std::string::npos);
+    CHECK(del_res->body.find("not open") == std::string::npos);
+
+    // Regression net for 56fbd3580: the audit `detail` must be genericized identically to the
+    // response body, not the raw "db_error: database not open" the store returned.
+    REQUIRE(h.audit_rows.size() == 1);
+    const auto& [action, result, target_type, target_id, detail] = h.audit_rows[0];
+    CHECK(action == "product_pack.uninstall");
+    CHECK(result == "denied");
+    CHECK(target_type == "ProductPack");
+    CHECK(target_id == "some-id");
+    CHECK(detail == "service unavailable");
+    CHECK(detail.find("db_error") == std::string::npos);
+    CHECK(detail.find("not open") == std::string::npos);
+}
+
+TEST_CASE("REST: a not-found rejection is echoed verbatim in both the response and the audit "
+          "trail",
+          "[product_pack_store][pg]") {
+    // Live store: not_found never carries kProductPackDbErrorPrefix, so it must pass through
+    // product_pack_client_message() unchanged in both the response body and the audit detail —
+    // the positive-path counterpart to the genericization test above.
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+
+    ProductPackRestHarness h{&store};
+
+    auto del_res = h.sink.dispatch("DELETE", "/api/product-packs/does-not-exist");
+    REQUIRE(del_res);
+    CHECK(del_res->status == 404);
+    CHECK((del_res->body.find("not_found") != std::string::npos ||
+          del_res->body.find("does-not-exist") != std::string::npos));
+
+    REQUIRE(h.audit_rows.size() == 1);
+    const auto& [action, result, target_type, target_id, detail] = h.audit_rows[0];
+    CHECK(action == "product_pack.uninstall");
+    CHECK(result == "denied");
+    CHECK(target_type == "ProductPack");
+    CHECK(target_id == "does-not-exist");
+    CHECK(detail.starts_with("not_found:"));
+    CHECK(detail.find("does-not-exist") != std::string::npos);
 }

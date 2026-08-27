@@ -116,7 +116,9 @@ struct DiscoverHarness {
         REQUIRE(rbac_pool->valid());
         rbac = std::make_unique<RbacStore>(*rbac_pool);
         REQUIRE(rbac->is_open());
-        instr = std::make_unique<InstructionStore>(":memory:");
+        // ADR-0058: InstructionStore is now a migrated Postgres store — shares
+        // the same pool/database as RbacStore above (schema-per-store, ADR-0008).
+        instr = std::make_unique<InstructionStore>(*rbac_pool);
         REQUIRE(instr->is_open());
 
         // The /discover/plugins parameter_schema enrichment is gated on the
@@ -573,7 +575,7 @@ TEST_CASE("CROSS-CHECK: scope_kind_catalog entries are honored by evaluate_scope
     AgentRegistry registry(bus, metrics);
     auto info = make_agent_info("agent-1", "windows", "WIN-TESTBOX");
     (*info.mutable_scopable_tags())["department"] = "finance";
-    registry.register_agent(info);
+    (void)registry.register_agent(info);
 
     // tag:department and props.owner need their respective stores; both are
     // optional (nullptr) parameters to evaluate_scope, so kinds backed solely
@@ -678,7 +680,7 @@ TEST_CASE("discover.plugins: wraps AgentRegistry::help_json with a limitation no
     p->set_description("Process enumeration");
     p->add_capabilities("list");
     p->add_capabilities("query");
-    h.registry.register_agent(info);
+    (void)h.registry.register_agent(info);
 
     auto res = h.sink.Get("/api/v1/discover/plugins");
     REQUIRE(res);
@@ -727,7 +729,7 @@ TEST_CASE("discover.plugins: parameter_schema enriched when caller holds Instruc
     auto* p = info.add_plugins();
     p->set_name("system_info");
     p->add_capabilities("query");
-    h.registry.register_agent(info);
+    (void)h.registry.register_agent(info);
 
     auto res = h.sink.Get("/api/v1/discover/plugins");
     REQUIRE(res);
@@ -765,7 +767,7 @@ TEST_CASE("discover.plugins: enrichment withheld when caller lacks InstructionDe
     auto* p = info.add_plugins();
     p->set_name("system_info");
     p->add_capabilities("query");
-    h.registry.register_agent(info);
+    (void)h.registry.register_agent(info);
 
     auto res = h.sink.Get("/api/v1/discover/plugins");
     REQUIRE(res);

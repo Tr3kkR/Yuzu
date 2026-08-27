@@ -304,6 +304,12 @@ agent_test_exe = executable(
     'unit/test_certificates_x509.cpp',        # Wave 2 WP-B: pure libcrypto PEM/DER field extraction
     'unit/test_quarantine_parsers.cpp',       # Wave 2 WP-F: pure netsh/iptables/pfctl output parsers
     'unit/test_quarantine_argv.cpp',          # Wave 2 WP-F remediation: pure mutating-argv construction (FN-03)
+    'unit/test_quarantine_serialization.cpp', # Wave 2 P4: MutationGate bounded-wait serialization (#3286)
+    'unit/test_server_address_parsers.cpp',   # #3429 round 4: pure host:port / IP-literal helpers for
+                                                # server_address_resolver.cpp's boot-time DNS resolution
+    'unit/test_server_address_resolver.cpp',  # #3429 round 4 fix: resolve_bounded's deadline wrapper,
+                                                # resolver injected (no network) -- proves the caller
+                                                # returns at the deadline, not after the resolver finishes
     'unit/test_network_actions_parsers.cpp',  # Wave 2 WP-D: pure resolver-flush-flag selection
     'unit/test_wol_check_plan.cpp',           # Wave 2 WP-E: pure check-mechanism decision logic
     'unit/test_services_parsers.cpp',         # Wave 2 WP-G: pure systemctl/launchctl output parsers
@@ -312,6 +318,12 @@ agent_test_exe = executable(
     'unit/test_route_sysctl_arp.cpp',         # Wave 2 WP-C: pure sysctl NET_RT_FLAGS/RTF_LLINFO binary parser
     'unit/test_bounded_wait.cpp',             # Wave 2 WP-C remediation: uncancellable-call timeout wrapper
     'unit/agent/test_socket_walk.cpp',        # Wave 3 PR3.1: macos_socket_walk.hpp libproc walk (Darwin-only, self-gated)
+    'unit/agent/test_netstat_attribution.cpp', # gate-1 remediation (#3403/#3404): real netstat.dylib
+                                                # attribution action driven end to end via LocalDispatcher
+                                                # (Darwin-only, self-gated) -- same shape as
+                                                # test_wave3_pr31_macos_actions.cpp
+    'unit/test_netstat_parsers.cpp',          # gate-2 remediation: pure escape_pipes() CR/LF handling
+                                                # (netstat_parsers.hpp, portable, every host)
     'unit/test_os_info_macos.cpp',            # Wave 3 PR3.1: os_info_macos.hpp SystemVersion.plist extractor (pure, every host)
     'unit/agent/test_wave3_pr31_macos_actions.cpp', # Wave 3 PR3.1 remediation: real os_info/processes/
                                                 # network_diag/ioc .dylib driven end to end via
@@ -324,6 +336,11 @@ agent_test_exe = executable(
                                                 # hardware.dylib/device_identity.dylib driven end to end
                                                 # via LocalDispatcher (macOS-only; a no-op TU elsewhere
                                                 # via the file's own #if defined(__APPLE__) guard)
+    'unit/test_windows_updates_parsers.cpp',  # Wave 3: pure installed/missing parse+format helpers
+    'unit/test_windows_updates_posix_actions.cpp', # Wave 3 PR33d remediation: real windows_updates.dylib/.so driven (Linux/macOS)
+    'unit/test_windows_updates_win_actions.cpp',   # Wave 3 PR33d remediation: real windows_updates.dll driven (Windows WMI)
+    'unit/test_sccm_parsers.cpp',             # Wave 3 PR33d: pure SCM-status mirror + real authority-key/IDispatch decision logic
+    'unit/test_sccm_win_actions.cpp',         # Wave 3 PR33d remediation: real sccm.dll driven (Windows SCM/COM)
     'unit/test_bitlocker_windows_wmi.cpp',    # Wave 3: pure WMI-row -> BitLocker output-row mapping
     'unit/test_bitlocker_linux_parsers.cpp',  # Wave 3: pure dm-crypt uuid / LUKS state parser
     'unit/test_antivirus_local_dispatcher.cpp', # Wave 3 gate remediation: real antivirus.dll driven
@@ -359,6 +376,9 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/discovery/src'),      # discovery_parsers.hpp (Wave 2 WP-C pure parser)
     include_directories('../agents/plugins/os_info/src'),        # os_info_macos.hpp (Wave 3 PR3.1 pure plist parser)
     include_directories('../agents/plugins/device_identity/src'), # device_identity_macos.hpp (Wave 3 PR3.2 pure parser)
+    include_directories('../agents/plugins/netstat/src'),        # netstat_parsers.hpp (gate-2 remediation pure parser)
+    include_directories('../agents/plugins/windows_updates/src'), # windows_updates_parsers.hpp (Wave 3 pure parser)
+    include_directories('../agents/plugins/sccm/src'),           # sccm_parsers.hpp (Wave 3 PR33d pure parser)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
@@ -386,10 +406,17 @@ agent_test_exe = executable(
   # hardware_plugin_lib / device_identity_plugin_lib (agents/plugins/{hardware,device_identity}/meson.build):
   # test_hardware_device_identity_posix_actions.cpp loads both real plugins by
   # path for the identical reason (Wave 3 PR3.2 gate-1 remediation).
+  # netstat_plugin_lib (agents/plugins/netstat/meson.build): test_netstat_attribution.cpp
+  # loads the real netstat plugin by path for the identical reason (gate-1 remediation,
+  # #3403/#3404 netstat.attribution + hardware WMI bounded-migration test-coverage gap).
+  # windows_updates_plugin_lib / sccm_plugin_lib: same reasoning for
+  # test_windows_updates_{posix,win}_actions.cpp / test_sccm_win_actions.cpp
+  # (Wave 3 PR33d code-review remediation).
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin,
                 users_plugin_lib, os_info_plugin_lib, processes_plugin_lib,
                 network_diag_plugin_lib, ioc_plugin_lib,
-                hardware_plugin_lib, device_identity_plugin_lib],
+                hardware_plugin_lib, device_identity_plugin_lib, netstat_plugin_lib,
+                windows_updates_plugin_lib, sccm_plugin_lib],
 )
 # Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
 # threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it
@@ -675,6 +702,8 @@ if build_server
       'unit/server/test_rest_access_review.cpp',
       'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
+      'unit/server/test_quarantine_dispatch_decision.cpp', # #3127: pure write/response classification — no Postgres, no MCP transport, no agent
+      'unit/server/test_quarantine_dispatch_gate.cpp',     # #881: containment gate at the dispatch chokepoint — pure arm/degradation logic, no store
       'unit/server/test_result_set_store.cpp',
       'unit/server/test_result_set_matcher.cpp',
       'unit/server/test_rest_result_sets_async.cpp',
@@ -720,6 +749,7 @@ if build_server
       'unit/server/test_tag_scope_authz.cpp',
       'unit/server/test_notification_store.cpp',
       'unit/server/test_webhook_store.cpp',
+      'unit/server/test_webhook_routes.cpp',
       'unit/server/test_migration_runner.cpp',
       'unit/server/test_rate_limiter.cpp',
       'unit/server/test_cert_reloader.cpp',
@@ -967,8 +997,25 @@ if build_server
   #     (2026-08-17, see scripts/ci/flake-retry.py's _cmd_for_case_retry);
   #   - no entry name may be a substring of another (flake-retry maps
   #     meson-junit names by longest substring match) — 'shard A'/'shard B'/
-  #     'shard C'/'shard D'/'shard E'/'shard F'/'shard G'/'shard H' and 'server
-  #     unit tests' are pairwise non-substring.
+  #     'shard C'/'shard D'/'shard E'/'shard F'/'shard G'/'shard H'/'shard I'/
+  #     'shard J', 'server pg smoke', and 'server unit tests' are pairwise
+  #     non-substring.
+  #   - UPDATED Phase 2 (#3443) — this used to say ci.yml's Linux Test step
+  #     hardcodes the full pg shard name list with "No automated check
+  #     enforces this yet"; that was true before Phase 1 and is stale now.
+  #     Since Phase 1, the 10 pg shards are selected structurally via
+  #     `--suite server-pg` — adding/splitting/rebalancing a shard needs only
+  #     the right suite: kwarg here, ci.yml is untouched, and the partition
+  #     invariant below proves the property. ci.yml DOES still hardcode BY
+  #     NAME: the 2 non-pg server test names, 'mcp bridge teardown allocation
+  #     budget', 'server pg shard partition invariant', and (Phase 2) 'server
+  #     pg smoke' — renaming any of those, or adding a new top-level `suite:`
+  #     anywhere in the build (tests/meson.build or the root meson.build —
+  #     see the 'gateway' suite, registered there, not here), still needs a
+  #     matching ci.yml update, and by-name selection fails LOUD on a
+  #     mismatch (meson errors on an unmatched positional test name) rather
+  #     than silently dropping coverage — verify with meson test --list
+  #     against each ci.yml invocation before trusting a change to either side.
   # If a quiet leg pushes a shard past the #2093 80%-of-budget warning, the first
   # move is the concurrency gate / per-op cost (Defender TEMP exclusion, RAM disk),
   # then split or rebalance — raising the number is the last resort, not the first.
@@ -1050,13 +1097,14 @@ if build_server
   # store) — same confined-to-one-file precedent as every other tag in that
   # list, re-verified against this merge's actual case counts via --list-tests
   # on the built binary, not assumed from either side's pre-merge numbers.
-  # Partition preserved: N([pg]) == N(A) + N(B) + N(D) + N(E) + N(F) + N(G) +
-  # N(C) + N(H) (adversarial-review COD-P1-001/K5: an earlier version of this
-  # comment omitted F and G, which don't appear until further below in this
-  # file — the omission was prose-only, the filters and the verified sum at
-  # line ~1062 were always correct). (shard B split into B+D on 2026-08-16,
-  # shard C split further into C+E on 2026-08-17, shard A split into A+H on
-  # 2026-08-22 — see the blocks below.)
+  # Partition preserved: N([pg]) == N(A) + N(B) + N(D) + N(E) + N(I) + N(F) +
+  # N(G) + N(J) + N(C) + N(H) (adversarial-review COD-P1-001/K5: an earlier
+  # version of this comment omitted F and G, which don't appear until further
+  # below in this file — the omission was prose-only, the filters and the
+  # verified sum at line ~1062 were always correct). (shard B split into B+D
+  # on 2026-08-16, shard C split further into C+E on 2026-08-17, shard A
+  # split into A+H on 2026-08-22, shard E split into E+I and shard G split
+  # into G+J on 2026-08-25 — see the blocks below.)
   #
   # SPLIT INTO A+H on 2026-08-22 (#2185-adjacent — same "reddening dev,
   # unclassifiable TIMEOUT, no failing case on enumeration re-run" signature
@@ -1123,7 +1171,7 @@ if build_server
   # needs --allow-running-no-tests like shard D.
   test('server pg unit tests shard A', server_test_exe,
        args: ['[pg][routes]~[scim]~[dex]~[mfa],[pg][store],[pg][token]~[rotation]'],
-       suite: 'server', timeout: 600)
+       suite: ['server', 'server-pg'], timeout: 700)
   # H's four clauses each add `~[store]` (fable review, structural hardening):
   # A's own `[pg][store]` clause carries NO exclusions, so any [pg][store]
   # case is unconditionally claimed by A regardless of what else it carries —
@@ -1147,7 +1195,7 @@ if build_server
   test('server pg unit tests shard H', server_test_exe,
        args: ['[pg][routes][scim]~[store],[pg][routes][dex]~[store],[pg][routes][mfa]~[store],[pg][token][rotation]~[store]',
               '--allow-running-no-tests'],
-       suite: 'server', timeout: 600)
+       suite: ['server', 'server-pg'], timeout: 700)
   # shard B SPLIT into B+D on 2026-08-16 (#2092/#2093): the store-tag half had
   # reached 600/600s (100%) and flaked. BALANCED BY TIME, NOT COUNT — case count
   # is not proportional to wall-time (shard C carries ~1082 cases comfortably;
@@ -1165,10 +1213,11 @@ if build_server
   # 2026-08-17, see the shard-E block below).
   # When adding a new [pg] store tag: measure it, put it in whichever of B/D is
   # lighter by TIME, add it to shard C's exclusion list, AND add it to each of
-  # shard E's AND shard G's per-clause exclusion suffixes below (all of them or
-  # none — a tag added to D/C but not to every E and G clause double-runs any
-  # future case that also carries one of their category tags; E and G hold ten
-  # each since the 2026-08-19 split). If [rbac_store] itself
+  # shard E's, shard I's, shard G's AND shard J's per-clause exclusion suffixes
+  # below (all of them or none — a tag added to D/C but not to every E/I/G/J
+  # clause double-runs any future case that also carries one of their category
+  # tags; E and I between them hold E's original ten since the 2026-08-25
+  # split, G and J likewise hold G's original ten). If [rbac_store] itself
   # grows toward the ceiling, split IT next (it is already the single densest
   # tag).
   #
@@ -1181,7 +1230,7 @@ if build_server
   # list per the same instruction (both or neither).
   test('server pg unit tests shard B', server_test_exe,
        args: ['[pg][rbac_store]~[routes]~[store]~[token]'],
-       suite: 'server', timeout: 600)
+       suite: ['server', 'server-pg'], timeout: 700)
   # --allow-running-no-tests: shard D's tags are ALL DSN-gated store
   # behaviour tests, so on a DSN-less platform (macOS, ADR-0035) every case
   # SKIPs and Catch2 exits 4 on an all-skipped run — reddening the leg (#2092,
@@ -1198,7 +1247,7 @@ if build_server
   test('server pg unit tests shard D', server_test_exe,
        args: ['[pg][audit_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token],[pg][software_deployment]~[routes]~[store]~[token]',
               '--allow-running-no-tests'],
-       suite: 'server', timeout: 600)
+       suite: ['server', 'server-pg'], timeout: 700)
   # 2026-08-17 (PR #3174 CI, run 32004956605): shard C STILL TIMEOUT-ed at
   # 600.07/600s on the real contended Big Tam pool after the [software_deployment]
   # move above — the local-measurement projection (sre's own Gate 6 finding on
@@ -1251,9 +1300,6 @@ if build_server
   # already did (the non-DSN cases it carries aren't dex/mcp-tagged). Shard F
   # was verified the same way: no DSN set -> exit 0, 3 passed / 156 skipped —
   # it does NOT need --allow-running-no-tests (unlike shard D, #2092).
-  test('server pg unit tests shard E', server_test_exe,
-       args: ['[pg][engine_principal]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][scim]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][oidc]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][management_group]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][rbac]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][quarantine]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][custom_props]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][guaranteed_state]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][notification_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][software_inventory]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]'],
-       suite: 'server', timeout: 600)
   # 2026-08-19 (#3322): shard E timed out at its 600s ceiling on 10 of 14
   # consecutive Linux gcc-15 runs, reddening dev itself — Fail: 0 every time,
   # so nothing was failing, it simply did not finish. E held 608 of the 1876
@@ -1267,26 +1313,235 @@ if build_server
   # E=329, G=278, against the same 607 distinct cases as before, with ZERO
   # cases in both halves.
   #
-  # --allow-running-no-tests: unlike E, every one of G's ten tags is DSN-gated,
-  # so on a leg with no YUZU_TEST_POSTGRES_DSN the whole entry all-skips and
-  # Catch2 exits 4 — measured: E exits 0, G exits 4. Same flag and same reason as
-  # shard D (#2092). E keeps the non-DSN cases and so still does not need it.
+  # SPLIT AGAIN into E+I and G+J on 2026-08-25 (PR #3582), combined with a
+  # 600->700s timeout bump on all four. Trigger: PR #3582's own real CI run
+  # TIMEOUT'd E and G at 600.51s/600.54s with ZERO cross-job contention (the
+  # cross-job slot gate acquired in 0s) — a direct diagnostic run on Big Tam
+  # (--num-processes 1, no other job on the box) then measured shard E SOLO
+  # at ~353-363s, essentially unchanged whether the box was quiet or under
+  # deliberate concurrent load from 3 other PRs' full CI runs (within 3%) —
+  # so this was never contention, and E's own local-uncontended baseline had
+  # roughly DOUBLED since its 180.45s measurement at the 2026-08-19 split
+  # (case count grew 329->405, +23%, which alone does not explain a 2x wall-
+  # time increase — Big Tam's own per-op cost for this fsync-heavy DDL
+  # workload also drifted up over the same window; not further diagnosed
+  # here). G had grown 278->351 (+26%) over the same window.
   #
-  # G DEFERS TO E: every G clause additionally excludes each of E's ten
-  # remaining tags. Without that deferral 32 cases carrying a tag from each
-  # half would run in BOTH entries. If you move a tag between E and G, move
-  # it in the clause list AND in the other side's exclusion suffixes — the
-  # both-or-neither rule this file states for C/D/E applies here too.
-  test('server pg unit tests shard G', server_test_exe,
-       args: ['[pg][auth_routes]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][saml]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][access_review]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][audit]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][authz]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][secrets]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][agent_service]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][discovery]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][result_set]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][tar]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine]',
+  # Split by case count as a TIME proxy (no live-PG isolated per-tag timing
+  # taken this round — case count was treated as adequate given this
+  # workload's fairly uniform per-case CREATE DATABASE/DROP DATABASE cost;
+  # unlike the B/D split's [rbac_store] whale, no single tag here dominates).
+  # Greedy-balanced each ten-tag set into two five/five-ish groups by raw
+  # count: E keeps {scim, guaranteed_state, oidc, software_inventory} (193
+  # cases); I takes {engine_principal, rbac, custom_props, quarantine,
+  # management_group, notification_store} (212 cases) — I DEFERS TO E (each
+  # I clause additionally excludes E's four remaining tags; the first
+  # attempt without this deferral double-counted 12 cases carrying a tag
+  # from each side, caught by --list-tests before trusting it: 193+224=417
+  # raw vs 405 OR'd). G keeps {auth_routes, agent_service, authz, tar} (207
+  # cases); J takes {saml, result_set, audit, access_review, secrets,
+  # discovery} (144 cases) — J DEFERS TO G the same way (without it, 47
+  # cases double-counted: 207+191=398 raw vs 351 OR'd). Verified via
+  # --list-tests on the built binary: E 193 + I 212 = 405 (old E's total,
+  # exact), G 207 + J 144 = 351 (old G's total, exact), all four combined =
+  # 756 (old E+G total, exact) — zero cases lost, zero cases duplicated.
+  # These four figures (193/212/207/144, and the 405/351/756 sums) are
+  # SPLIT-TIME snapshots, not a maintained invariant — like the D/C counts
+  # noted elsewhere in this file, they drift as the case population changes
+  # and re-verifying them isn't this split's (or any single commit's)
+  # concern. Post-#3626-prune (2026-08-26) actuals, for reference only:
+  # I=181, E=188 — see the 2026-08-26 note below shard I's definition.
+  # E and I both survived a DSN-less all-skip without --allow-running-no-tests
+  # at split time (E: 6 non-DSN cases; I: 1) — G and J both needed it, same as
+  # old G did (every one of G's original ten tags is DSN-gated;
+  # subdividing a DSN-gated tag set keeps every piece DSN-gated). All four
+  # ran clean against a live Postgres database with zero failures: local
+  # (bigcolin, single container, quiet) wall time E 65.6s / I 34.4s / G(new)
+  # 55.6s / J 35.8s — each roughly half its parent's own last-measured local
+  # baseline, consistent with the case-count split ratio.
+  #
+  # The 600->700s timeout bump originally shipped E/I/G/J-only (PR #3582,
+  # 2026-08-25) as a DELIBERATE, TEMPORARY exception to this file's own
+  # "split, don't raise the timeout" house rule (the C->C+E and A->A+H
+  # precedents above never raised it). EXTENDED to all remaining shards
+  # (A/B/D/F/H/C) the same day, after dev's own CI (run 32833097478, merge of
+  # PR #3466 — no PR-specific pg-shard changes) TIMEOUT'd shard E at 600.51s
+  # AND landed shard G at 585-590/600s (97-98%) on all four Linux legs — live
+  # confirmation that the 600s ceiling was already tight fleet-wide, not just
+  # on the two shards #3582 happened to split. Justification, corrected after
+  # Gate 2 governance review (2026-08-25) caught the original wording
+  # overclaiming a settled near-term timeline: `docs/postgres-migration-ladder.md`
+  # explicitly disclaims one ("mutable state that drains over time, not a
+  # contract"), and completing that ladder is architecturally more likely to
+  # GROW this population than shrink it — every store that migrates onto
+  # Postgres adds its own [pg]-tagged CRUD/behaviour cases, while only each
+  # store's narrow, already-thin migrate_from_sqlite backfill suite becomes
+  # prunable. So this margin is NOT bought against an expected population
+  # shrink — it is a plain safety cushion on top of whatever headroom each
+  # shard's own split already earns. Revisit on a fixed cadence, not on an
+  # assumed completion date — tighten back to 600, or drop, per shard, once
+  # that shard is comfortably under budget. Tracked at issue #3443 (the
+  # existing linked home for the pg-shard-reliability lineage) — a prose-only
+  # "revisit later" with no dated/metric trigger has this file's own track
+  # record of being forgotten until the next stale-pin incident forces it.
+  test('server pg unit tests shard E', server_test_exe,
+       args: ['[pg][scim]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][guaranteed_state]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][oidc]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][software_inventory]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]'],
+       suite: ['server', 'server-pg'], timeout: 700)
+  # 2026-08-26 (#3626): shard I's one non-DSN survivor noted above --
+  # NotificationStore's "migrate_from_sqlite returns false on an unopened
+  # store" ([notification_store][pg], asserts against a deliberately
+  # unreachable PgPool so it needs no real DSN) -- was removed as part of
+  # this branch's backfill-test-suite pruning sweep (ADR-0009). That makes
+  # every one of shard I's tags fully DSN-gated, same as G/J: on a DSN-less
+  # leg (the GHA-hosted macOS runner, no live Postgres) all matching cases
+  # now skip, dropping the executed-case count to zero and tripping the
+  # same "no tests ran" exit(4) shard E/I were split off to avoid needing
+  # this flag for. Verified via --list-tests + a DSN-less local run before
+  # trusting it (0/181 cases execute without the flag; --allow-running-no-tests
+  # makes the identical filter exit 0). This branch's pruning sweep also
+  # dropped shard B's own "RbacStore: migrate_from_sqlite returns false on
+  # an unopened store" non-DSN case (its exact structural twin) -- B's
+  # survivor count fell 4->3 but didn't reach zero, so B needed no flag
+  # change. I was the only shard whose non-DSN survivor count reached zero;
+  # verified empirically for every currently-flagless shard (A/B/C/E/F), not
+  # just B, before trusting this claim.
+  test('server pg unit tests shard I', server_test_exe,
+       args: ['[pg][engine_principal]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[guaranteed_state]~[oidc]~[software_inventory],[pg][rbac]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[guaranteed_state]~[oidc]~[software_inventory],[pg][custom_props]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[guaranteed_state]~[oidc]~[software_inventory],[pg][quarantine]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[guaranteed_state]~[oidc]~[software_inventory],[pg][management_group]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[guaranteed_state]~[oidc]~[software_inventory],[pg][notification_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[guaranteed_state]~[oidc]~[software_inventory]',
               '--allow-running-no-tests'],
-       suite: 'server', timeout: 600)
+       suite: ['server', 'server-pg'], timeout: 700)
+  # G DEFERS TO E's original ten tags (unchanged from the 2026-08-19 split);
+  # J additionally DEFERS TO G — see the shard-E comment block above for the
+  # 2026-08-25 split rationale, measurements, and verification shared by all
+  # four of E/I/G/J.
+  test('server pg unit tests shard G', server_test_exe,
+       args: ['[pg][auth_routes]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][agent_service]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][authz]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][tar]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine]',
+              '--allow-running-no-tests'],
+       suite: ['server', 'server-pg'], timeout: 700)
+  test('server pg unit tests shard J', server_test_exe,
+       args: ['[pg][saml]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine]~[auth_routes]~[agent_service]~[authz]~[tar],[pg][result_set]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine]~[auth_routes]~[agent_service]~[authz]~[tar],[pg][audit]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine]~[auth_routes]~[agent_service]~[authz]~[tar],[pg][access_review]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine]~[auth_routes]~[agent_service]~[authz]~[tar],[pg][secrets]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine]~[auth_routes]~[agent_service]~[authz]~[tar],[pg][discovery]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine]~[auth_routes]~[agent_service]~[authz]~[tar]',
+              '--allow-running-no-tests'],
+       suite: ['server', 'server-pg'], timeout: 700)
   test('server pg unit tests shard F', server_test_exe,
        args: ['[pg][dex]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment],[pg][mcp]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]'],
-       suite: 'server', timeout: 600)
+       suite: ['server', 'server-pg'], timeout: 700)
   test('server pg unit tests shard C', server_test_exe,
        args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]'],
-       suite: 'server', timeout: 600)
+       suite: ['server', 'server-pg'], timeout: 700)
+
+  # #3443 Phase 2: PG portability smoke subset - runs INSTEAD of the 10 shards
+  # above on the 3 non-primary Linux push legs (ci.yml pg_mode=smoke); the
+  # gcc-15/debug leg (every PR, plus the primary push leg) keeps the full
+  # server-pg suite unchanged. Membership is the [pg-smoke] tag, hand-picked
+  # across 11 existing cases for libpq connection/RAII, migration, CRUD,
+  # NULL-vs-empty, pool exhaustion/reconnect, GUC hardening, transaction
+  # rollback, a real BYTEA+bigint wire round-trip, and UTF-8 truncation -
+  # enough to prove libpq linkage + basic runtime behavior without paying
+  # full PG-shard cost. Measured live (this box, warm cache): 280 assertions
+  # in 11 cases, ~2.8s.
+  #
+  # 'server pg shard partition invariant' below proves this is a nonzero,
+  # EXACT-count (SMOKE_EXACT_CASES in check-pg-shard-partition.py), correctly-
+  # named, correctly-flagged subset of [pg] - not a hand-maintained duplicate
+  # of the tag list, the exact defect class Phase 1 exists to cure.
+  #
+  # NOT in suite server-pg: the partition invariant above would see these 11
+  # cases as double-claimed (already owned by their real shards). suite:
+  # 'server-pg-smoke' is a dedicated suite so the smoke entry stays outside
+  # that partition while still being --suite-selectable on its own.
+  #
+  # --allow-running-no-tests is REQUIRED here (unlike Correction 1's original
+  # "no flag" wording): every [pg-smoke] case is all-DSN-gated, so a flagless
+  # entry would exit 4 (Catch2's AllTestsSkippedExitCode) on every DSN-less
+  # UNFILTERED `meson test` - local dev without Postgres, and any future
+  # sanitizer/nightly leg that runs the whole suite - breaking the documented
+  # skip contract in test_helpers.hpp. Loud-fail duty for a broken/missing DSN
+  # moves to ci.yml's own "Resolve pg_mode + assert Postgres DSN" step instead
+  # (checked BEFORE this or any other PG invocation runs) and to the checker's
+  # exact-count + flag-present assertions below.
+  #
+  # Invoked BY NAME from ci.yml, not by --suite: meson's positional test-name
+  # matching is an exact match (fnmatch with no glob characters in a literal
+  # name, mtest.py's tests_from_args) - a rename that doesn't update the
+  # ci.yml invocation errors loud ("test name does not match any test"), it
+  # does not silently keep matching on a substring. A --suite typo, by
+  # contrast, would exit 0 silently on a plain `meson test` RUN (mtest.py's
+  # get_tests/doit print "No suitable tests defined" and return success) -
+  # by-name selection is the one that fails safe on the real CI invocation.
+  # NOTE (adversarial review, both reviewers independently probed this):
+  # `meson test --list --suite <bad>` is a DIFFERENT code path and exits 1 -
+  # only the plain run (what ci.yml actually invokes, no --list) exits 0.
+  #
+  # Runs REDUNDANTLY (harmless, ~11 cases/seconds) under any unfiltered
+  # `meson test` - local dev, nightly.yml's 3 unfiltered legs,
+  # sanitizer-tests.yml's 2 unfiltered legs - since every test() entry runs
+  # once there regardless of suite; these 11 cases already run once via their
+  # owning shard too. Not worth special-casing for that cost.
+  #
+  # timeout: 60s is ~20x the measured solo cost (2.8s, 280 assertions) -
+  # generous margin for CI box contention (this step is deliberately UNGATED
+  # by with-test-slot.sh, see ci.yml) while still catching a genuine hang.
+  test('server pg smoke', server_test_exe,
+       args: ['[pg-smoke]', '--allow-running-no-tests'],
+       suite: ['server', 'server-pg-smoke'], timeout: 60)
+
+  # Structural partition-invariant check (Phase 1, #3443). Proves every
+  # [pg]-tagged case above lands in EXACTLY ONE 'server-pg'-suite shard --
+  # against the real compiled binary via --list-tests, not a hand-maintained
+  # pin of the filter strings above (the pin that replaced -- see
+  # scripts/ci/flake-retry.py's own selftest -- had to be updated by hand on
+  # every split/rebalance and was missed 3 times in as many weeks, each time
+  # reddening CI unconditionally). Discovery is via `meson introspect --tests`
+  # keyed on suite membership, so adding/splitting/rebalancing a shard needs
+  # no update here: give the new/changed test() entry the right suite: kwarg
+  # (['server', 'server-pg']) and this check verifies the rest on its own.
+  # depends: ensures ninja builds the binary before this runs; it needs no
+  # Postgres DSN (--list-tests only enumerates TEST_CASE macros, never runs
+  # one).
+  #
+  # EXTENDED Phase 2 (#3443) to also prove 'server pg smoke' above (suite:
+  # 'server-pg-smoke') is a genuine subset: exactly one entry, the expected
+  # name, the expected exact case count, --allow-running-no-tests present,
+  # and every matched case also carries [pg] (script's check_smoke()).
+  _pg_shard_python3 = find_program('python3', 'python')
+  test('server pg shard partition invariant',
+    _pg_shard_python3,
+    args: [files('../scripts/ci/check-pg-shard-partition.py'),
+           '--builddir', meson.project_build_root()],
+    suite: 'server',
+    depends: [server_test_exe],
+    timeout: 60,
+  )
+
+  # 2026-08-20 (ADR-0056, PolicyStore, batch-6): PolicyStore moved off SQLite
+  # onto Postgres, and test_policy_store.cpp / test_policy_evaluator.cpp went
+  # from carrying zero [pg]-tagged cases to 57 ([policy_store][pg], one
+  # holdout case tests an unreachable-pool failure path and stays untagged
+  # on purpose — 58 [policy_store] cases total) + 11 ([pg][policy][evaluator])
+  # = 68 new [pg] cases. Neither tag appears outside its one file (grep -rl
+  # checked). No shard's tag list names [policy_store]/[policy]/[evaluator],
+  # so — unlike every prior addition recorded above — this needed no
+  # meson.build edit to land correctly: the 68 cases fall into shard C by the
+  # catch-all's own exclusion list, automatically, same as any tag never
+  # added to A/B/D/E/F/G.
+  #
+  # Measured whether that default placement was SAFE rather than assuming it
+  # (per this file's own house rule) — isolated, live Postgres, this box:
+  # [policy_store] 58 cases (57 [pg] + the 1 untagged) 2.9s; [pg][policy]
+  # [evaluator] 11 cases 2.1s — cheap, ~0.07s/case, nothing like [rbac_store]'s
+  # per-case outlier rate. Shard C itself, before vs after (--list-tests
+  # case counts, then a full live-PG run of each): 336 cases/88.0s ->
+  # 404 cases/92.7s (meson test: 92.69s) — a ~4.7s/5% shift tracking the
+  # isolated measurement almost exactly. 92.69/600s is ~15% of budget, nowhere
+  # near the ceiling that drove the [license_store]/[software_deployment]
+  # dedicated-shard-D precedent (both of those reacted to a shard already AT
+  # or OVER 600s) — so a dedicated [policy_store] tag on D was considered and
+  # NOT taken; leaving both files' cases in shard C is correct as-is, no
+  # rebalance needed. Revisit if shard C's own growth later pushes it toward
+  # budget and this population no longer looks cheap in isolation.
+  #
+  # Partition reverified after the merge: A 559 / B 93 / D 410 / E 404 /
+  # F 193 / G 351 / C 404, summing to the current whole-binary [pg] total of
+  # 2414 exactly — zero double-counted, zero missing.
 
   # ── #2519 MCP bridge teardown allocation-budget probe (separate binary) ────
   # Same rationale as the #2270 spark probe above: a global operator new/delete
@@ -1500,6 +1755,20 @@ endif
 test('flake-retry integration selftest',
   _python3_test,
   args: [files('../scripts/ci/test_flake_retry.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# check-pg-shard-partition.py's own detection logic (#3443 Phase 1, governance
+# Gate 3/4: shipped with no permanent regression test, only ad-hoc uncommitted
+# manual mutation testing). Pure-function unit test against synthetic
+# `meson introspect`/Catch2-XML fixtures -- no real build needed, matching why
+# this lives in the cheap docs suite alongside flake-retry's own selftests
+# rather than needing a real yuzu_server_tests binary the way the checker's
+# OWN meson test() entry (search 'server pg shard partition invariant') does.
+test('check-pg-shard-partition selftest',
+  _python3_test,
+  args: [files('../scripts/ci/test_check_pg_shard_partition.py')],
   suite: 'docs',
   timeout: 30,
 )
