@@ -291,6 +291,10 @@ static int engine_store_error_status(const std::string& err) {
         return 409;
     case yuzu::server::detail::EngineStoreErrorClass::Transient:
         return 503;
+    case yuzu::server::detail::EngineStoreErrorClass::SecretMismatch:
+        // #3015: reachable only after the caller cleared every other
+        // admission gate — 403, distinct from the 400/409/503 above.
+        return 403;
     }
     return 503; // unreachable — all enum cases return above
 }
@@ -392,6 +396,31 @@ static int license_error_status(const std::string& err) {
     if (err.starts_with(yuzu::server::kLicenseDbErrorPrefix))
         return 503;
     return 400;
+}
+
+// DeviceTokenStore (docs/adr/0052-...md) error mapping — same three-way shape as
+// license_error_status: `not_found: ` (revoke_token's missing-id case) -> 404,
+// `kDeviceTokenDbErrorPrefix` (a genuine DB/lease failure) -> 503, anything else
+// (create_token's validation errors) -> 400. Preserves the pre-migration DELETE route's 404 for
+// a missing token_id, which a binary (prefix-only) classifier would have regressed to 400.
+static int device_token_error_status(const std::string& err) {
+    if (err.starts_with("not_found:"))
+        return 404;
+    if (err.starts_with(yuzu::server::kDeviceTokenDbErrorPrefix))
+        return 503;
+    return 400;
+}
+
+// Never echoes a genuine DB/lease failure's raw text to the client (mirrors
+// sw_deploy_client_message — see its comment for the full rationale: PQerrorMessage() fragments
+// are internal implementation detail, not caller-actionable feedback). A not_found/validation
+// error (never carries the prefix) is safe to echo verbatim.
+static std::string device_token_client_message(const char* op, const std::string& err) {
+    if (err.starts_with(yuzu::server::kDeviceTokenDbErrorPrefix)) {
+        spdlog::error("{}: {}", op, err);
+        return "service unavailable";
+    }
+    return err;
 }
 
 // A present-but-wrong-typed JSON body field (e.g. {"title": 5}) must degrade
@@ -792,7 +821,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Overlap-pair rotation of an engine principal's credential (design §7)", "tags": ["Security"], "description": "Mints a successor credential alongside the still-valid predecessor for the overlap window. A retry within the grace window by the SAME operator re-serves the identical raw secret (idempotent); step-up is re-validated on every call, including a re-serve.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token is the raw successor secret (Cache-Control: no-store)"}, "400": {"description": "overlap_secs outside the 24h-10y bounds, or more than 2 active credentials in an unrecognized shape"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, or no active credential to rotate (ambiguous with a transient store read failure — retry, or mint if genuinely absent)"}}}
     },
     "/engine-principals/{id}/credentials/confirm": {
-      "post": {"summary": "Confirm receipt of a rotated credential's successor secret (design §7 maker-checker)", "tags": ["Security"], "description": "The required token_id pins the confirm to the exact pending rotation — pass the successor token_id the rotate response returned; a stale or mismatched id is rejected with no state change.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["token_id"], "properties": {"token_id": {"type": "string", "maxLength": 64, "description": "Successor token_id returned by the rotate call (24 lowercase hex) — pins the exact rotation being confirmed"}}}}}}, "responses": {"200": {"description": "Confirmed; predecessor credential revoked"}, "400": {"description": "token_id missing, empty, or not a string; more than two active credentials; or a non-engine active credential"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "Replay or resolved-rotation conflict (do not blindly retry): token_id does not match the pending successor; the rotation was already confirmed or otherwise resolved by cutover/sweep/revoke; the sole active credential has unresolved rotation metadata; the grace window elapsed; or the rotation was initiated by a different operator"}, "503": {"description": "Retryable: store unavailable, advisory-lock contention, a confirm/revoke/clear persistence failure, or no in-flight rotation to confirm - the last covers zero active credentials (ambiguous with a transient read failure) and an unrecognized two-credential pair; rotate first if genuinely absent"}}}
+      "post": {"summary": "Confirm receipt of a rotated credential's successor secret (design §7 maker-checker)", "tags": ["Security"], "description": "Pass the successor token_id the rotate response returned (pins the confirm to that exact rotation; a stale or mismatched id is rejected with no state change) AND the raw successor secret (proof of possession, #3015). Confirm revokes the predecessor only after the presented secret verifies against the stored hash.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["token_id", "secret"], "properties": {"token_id": {"type": "string", "pattern": "^[0-9a-f]{24}$", "minLength": 24, "maxLength": 24, "description": "Successor token_id returned by the rotate call (24 lowercase hex) — pins the exact rotation being confirmed"}, "secret": {"type": "string", "minLength": 1, "maxLength": 512, "description": "The raw successor secret the rotate call returned — proof of possession (#3015), verified constant-time against the stored hash; checked only after every other admission gate. Missing/empty is 400; wrong is 403"}}}}}}, "responses": {"200": {"description": "Confirmed; predecessor credential revoked"}, "400": {"description": "token_id or secret missing, empty, or not a string; more than two active credentials; or a non-engine active credential"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write, or the presented secret does not verify against the pending successor (#3015)"}, "409": {"description": "Replay or resolved-rotation conflict (do not blindly retry): token_id does not match the pending successor; the rotation was already confirmed or otherwise resolved by cutover/sweep/revoke; the sole active credential has unresolved rotation metadata; the grace window elapsed; or the rotation was initiated by a different operator"}, "503": {"description": "Retryable: store unavailable, advisory-lock contention, a confirm/revoke/clear persistence failure, or no in-flight rotation to confirm - the last covers zero active credentials (ambiguous with a transient read failure) and an unrecognized two-credential pair; rotate first if genuinely absent"}}}
     },
     "/engine-principals/{id}/transfer-owner": {
       "post": {"summary": "Admin-forced ownership reassignment of an engine principal", "tags": ["Security"], "description": "Never depends on the outgoing owner's cooperation (design §3.1).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["new_owner"], "properties": {"new_owner": {"type": "string", "description": "Must reference an existing user"}}}}}}, "responses": {"200": {"description": "Transferred; {transferred:true}"}, "400": {"description": "Bad JSON, or new_owner missing/does not reference an existing user"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No engine principal with that id"}, "409": {"description": "Engine principal is not active"}, "503": {"description": "Store unavailable"}}}
@@ -816,7 +845,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6.3)", "tags": ["API Tokens"], "description": "Mints a successor token alongside the still-valid predecessor for the overlap window; requires ApiToken:Rotate and step-up on EVERY call (including an idempotent re-serve within the grace window). Self-service only — the caller must own the token; no admin override. The successor always inherits the predecessor's expires_at verbatim (rotation is lifetime-neutral).", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "The token_id of the token being rotated (the predecessor)"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token/token_id/expires_at describe the successor (found structurally, scoped to THIS predecessor's token_id); overlap_expires_at describes the PREDECESSOR (echoed for convenience — the epoch it is auto-revoked). token is the raw successor secret (Cache-Control: no-store)"}, "400": {"description": "overlap_secs present but not an integer, overlap_secs outside the 24h-10y bounds, or more than 2 active credentials in an unrecognized shape"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires ApiToken:Rotate"}, "404": {"description": "No such token, or the caller does not own it (identical body — not an enumeration oracle)"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, no active credential to rotate (ambiguous with a transient store read failure — retry, or mint a new token if genuinely absent), or the rotation succeeded but the successor could not be read back for the response (fails closed rather than return an uncorrelatable secret)"}}}
     },
     "/tokens/{token_id}/confirm": {
-      "post": {"summary": "Confirm receipt of a rotated API token's successor secret (P2 #11 maker-checker)", "tags": ["API Tokens"], "description": "token_id in the path is the SUCCESSOR token_id the rotate response returned — no request body. Requires ApiToken:Rotate and step-up. Self-service only.", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "The successor token_id returned by the rotate call"}], "responses": {"200": {"description": "Confirmed; predecessor token revoked"}, "400": {"description": "Terminal client-state conditions the store classifies ClientValidation: the caller's (mcp_tier, scope_service) does not equal the predecessor's, more than two active credentials share the rotation_group, or the token is not a human-owned credential"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires ApiToken:Rotate"}, "404": {"description": "No such token, or the caller does not own it (identical body — not an enumeration oracle)"}, "409": {"description": "Replay or resolved-rotation conflict (do not blindly retry)"}, "503": {"description": "Retryable: store unavailable, advisory-lock contention, or the deliberately-ambiguous no-in-flight-rotation read (a swallowed query failure and a genuinely empty active set are indistinguishable, so it stays retryable). A MALFORMED pair found after a positive two-row read is terminal 409, not this (#2943)."}}}
+      "post": {"summary": "Confirm receipt of a rotated API token's successor secret (P2 #11 maker-checker)", "tags": ["API Tokens"], "description": "token_id in the path is the SUCCESSOR token_id the rotate response returned. The request body MUST carry the raw successor secret (proof of possession, #3015), verified against the stored hash before the predecessor is revoked. Requires ApiToken:Rotate and step-up. Self-service only.", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "The successor token_id returned by the rotate call"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["secret"], "properties": {"secret": {"type": "string", "minLength": 1, "maxLength": 512, "description": "The raw successor secret the rotate call returned — proof of possession (#3015), verified constant-time against the stored hash; checked only after ownership/step-up. Missing/empty is 400; wrong is 403"}}}}}}, "responses": {"200": {"description": "Confirmed; predecessor token revoked"}, "400": {"description": "Missing or empty secret (#3015); or terminal client-state conditions the store classifies ClientValidation: the caller's (mcp_tier, scope_service) does not equal the predecessor's, more than two active credentials share the rotation_group, or the token is not a human-owned credential"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires ApiToken:Rotate, or the presented secret does not verify (#3015)"}, "404": {"description": "No such token, or the caller does not own it (identical body — not an enumeration oracle)"}, "409": {"description": "Replay or resolved-rotation conflict (do not blindly retry)"}, "503": {"description": "Retryable: store unavailable, advisory-lock contention, or the deliberately-ambiguous no-in-flight-rotation read (a swallowed query failure and a genuinely empty active set are indistinguishable, so it stays retryable). A MALFORMED pair found after a positive two-row read is terminal 409, not this (#2943)."}}}
     },
     "/ca/root": {
       "get": {"summary": "Internal CA root certificate (PEM, public)", "tags": ["Security"], "responses": {"200": {"description": "PEM CA certificate", "content": {"application/x-pem-file": {}}}, "404": {"description": "No CA root"}}}
@@ -1900,10 +1929,20 @@ void RestApiV1::register_routes(
                 // METRIC is a known small imprecision, and the path is only
                 // reachable at all if scoped_perm_fn and the derived set
                 // disagree about this device, which is itself a bug.
+                // #881: this can also mean the device is QUARANTINED — a
+                // permanent policy denial, not a transient reachability
+                // problem — or that the containment gate is failing closed
+                // fleet-wide. The dispatch closure returns only a sent count,
+                // so this route cannot yet tell them apart (#3424). Naming all
+                // three beats asserting the one that is most often wrong
+                // during an incident.
                 res.status = 404;
                 bump("agent_not_connected");
                 res.set_content(
-                    detail::error_json_a4(404, "device offline or not reachable", cid, 5000, ""),
+                    detail::error_json_a4(404,
+                                          "device offline, quarantined, or withheld because "
+                                          "containment state could not be read",
+                                          cid, 5000, ""),
                     "application/json");
                 return;
             }
@@ -3200,8 +3239,10 @@ void RestApiV1::register_routes(
     // confirmation that a rotation's successor secret has been received (P2
     // #11 / SOC 2 CC6.3). {id} is the SUCCESSOR token_id the rotate response
     // returned — ApiTokenStore::confirm_token_rotation resolves the
-    // principal and rotation group from that row, so no request body is
-    // needed at all.
+    // principal and rotation group from that row. #3015: the request body
+    // now MUST carry the raw successor secret ("secret") — proof of
+    // possession that the caller actually received the new credential
+    // before this call immediately revokes the predecessor.
     sink.Post(
         R"(/api/v1/tokens/([^/]+)/confirm)",
         [perm_fn, auth_fn, audit_fn, step_up_fn, token_store, metrics_registry](
@@ -3242,6 +3283,31 @@ void RestApiV1::register_routes(
 
             auto token_id = req.matches[1].str();
 
+            // #3015 proof-of-possession: the caller must supply the raw
+            // successor secret rotate returned, in the request body's
+            // "secret" field. Parsed AFTER the perm/auth/deny/step-up belt
+            // above so body validation can never become an unauthenticated
+            // oracle (same discipline the engine credentials/confirm route
+            // below already uses). Missing/empty is a pure 400 validation
+            // error — distinct from every auth/state outcome below, and
+            // NEVER echoed into an audit/error string (secret hygiene).
+            const auto body = nlohmann::json::parse(req.body, nullptr, false);
+            std::string presented_secret;
+            if (!body.is_discarded() && body.is_object() && body.contains("secret") &&
+                body["secret"].is_string())
+                presented_secret = body["secret"].get<std::string>();
+            if (presented_secret.empty()) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "secret required",
+                                                 {.remediation = "pass the raw successor secret "
+                                                                 "rotate returned in the request "
+                                                                 "body's \"secret\" field"}),
+                                "application/json");
+                (void)audit_fn(req, "api_token.confirm", "failure", "ApiToken", token_id,
+                               "secret required");
+                return;
+            }
+
             // Owner-vs-nonexistent 404 belt, same self-service-only posture
             // as rotate above — no admin bypass, identical body for both
             // missing-id and not-owner. NOT a store-reaching confirm call
@@ -3271,7 +3337,8 @@ void RestApiV1::register_routes(
             // reason as the rotate route above — defence-in-depth re-check
             // of the authority-inheritance guard (governance Gate 7).
             auto confirmed = token_store->confirm_token_rotation(
-                token_id, session->username, session->mcp_tier, session->token_scope_service);
+                token_id, presented_secret, session->username, session->mcp_tier,
+                session->token_scope_service);
             if (!confirmed) {
                 // Increment BEFORE the audit emission so an audit-store
                 // failure cannot suppress the operational counter (#2404).
@@ -3873,8 +3940,26 @@ void RestApiV1::register_routes(
                                "EnginePrincipal", principal_id, "token_id required");
                 return;
             }
-            auto confirmed =
-                token_store->confirm_rotation(principal_id, confirm_token_id, session->username);
+            // #3015 proof-of-possession: the caller must ALSO present the
+            // raw successor secret rotate returned — never echoed into an
+            // audit/error string (secret hygiene).
+            std::string presented_secret;
+            if (!body.is_discarded() && body.is_object() && body.contains("secret") &&
+                body["secret"].is_string())
+                presented_secret = body["secret"].get<std::string>();
+            if (presented_secret.empty()) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "secret required",
+                                                 {.remediation = "pass the raw successor secret "
+                                                                 "rotate returned in the request "
+                                                                 "body's \"secret\" field"}),
+                                "application/json");
+                (void)audit_fn(req, "engine_principal.credential.confirm", "failure",
+                               "EnginePrincipal", principal_id, "secret required");
+                return;
+            }
+            auto confirmed = token_store->confirm_rotation(principal_id, confirm_token_id,
+                                                            presented_secret, session->username);
             if (!confirmed) {
                 // Increment BEFORE the audit emission so an audit-store failure
                 // cannot suppress the operational counter (#2404).
@@ -4979,7 +5064,15 @@ void RestApiV1::register_routes(
                      return;
                  }
 
-                 auto defs = instruction_store->query_definitions();
+                 // ADR-0058: query_definitions now returns std::expected — a genuine
+                 // DB error 503s rather than silently rendering an empty list.
+                 auto defs_result = instruction_store->query_definitions();
+                 if (!defs_result) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                     return;
+                 }
+                 const auto& defs = *defs_result;
                  JArr arr;
                  for (size_t i = 0; i < defs.size(); ++i) {
                      const auto& d = defs[i];
@@ -5035,15 +5128,34 @@ void RestApiV1::register_routes(
         [instruction_store](
             const std::string& definition_id,
             const std::vector<ResponseTemplate>& templates) -> std::optional<std::string> {
-        auto def = instruction_store->get_definition(definition_id);
-        if (!def)
-            return std::string("definition not found");
+        // ADR-0058: get_definition now returns std::expected<optional<...>, string> —
+        // distinguish a genuine DB error from "no such definition". The returned string
+        // carries the store's own classification prefixes (kInstructionStoreDbErrorPrefix /
+        // "not_found: ") so callers can map to 503/404 the same way every sibling instruction
+        // route in this migration does (gov Gate 4/6 finding — this used to collapse both to a
+        // flat 500).
+        auto def_result = instruction_store->get_definition(definition_id);
+        if (!def_result)
+            return def_result.error();
+        if (!*def_result)
+            return std::string("not_found: definition not found");
+        auto def = **def_result;
         ResponseTemplatesEngine engine;
-        def->response_templates_spec = engine.serialise(templates);
-        auto upd = instruction_store->update_definition(*def);
+        def.response_templates_spec = engine.serialise(templates);
+        auto upd = instruction_store->update_definition(def);
         if (!upd)
             return upd.error();
         return std::nullopt;
+    };
+    // Classifies persist_templates' returned error the same way every sibling instruction
+    // route in this migration does: db_error -> 503, not_found -> 404, else -> 500 (gov Gate
+    // 4/6 finding — this used to collapse every case to a flat 500).
+    auto persist_status = [](const std::string& err) -> int {
+        if (err.rfind(kInstructionStoreDbErrorPrefix, 0) == 0)
+            return 503;
+        if (err.rfind("not_found:", 0) == 0)
+            return 404;
+        return 500;
     };
 
     // GET /api/v1/definitions/{id}/response-templates ─ list
@@ -5063,14 +5175,22 @@ void RestApiV1::register_routes(
                                      "application/json");
                      return;
                  }
-                 auto def = instruction_store->get_definition(def_id);
-                 if (!def) {
+                 // ADR-0058: get_definition now returns std::expected — distinguish a
+                 // genuine DB error (503) from "no such definition" (404, unchanged).
+                 auto def_result = instruction_store->get_definition(def_id);
+                 if (!def_result) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                     return;
+                 }
+                 if (!*def_result) {
                      res.status = 404;
                      res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                      return;
                  }
+                 const auto& def = **def_result;
                  ResponseTemplatesEngine engine;
-                 auto parsed = engine.parse(def->response_templates_spec);
+                 auto parsed = engine.parse(def.response_templates_spec);
                  std::vector<ResponseTemplate> templates;
                  if (parsed)
                      templates = std::move(*parsed);
@@ -5084,7 +5204,7 @@ void RestApiV1::register_routes(
                      }
                  JArr arr;
                  if (!operator_has_default) {
-                     auto synth = engine.synthesise_default(def->result_schema, def->plugin);
+                     auto synth = engine.synthesise_default(def.result_schema, def.plugin);
                      arr.add_raw(engine.to_json(synth).dump());
                  }
                  for (const auto& t : templates) {
@@ -5113,14 +5233,22 @@ void RestApiV1::register_routes(
                      res.set_content(detail::a4_error(res, "malformed id"), "application/json");
                      return;
                  }
-                 auto def = instruction_store->get_definition(def_id);
-                 if (!def) {
+                 // ADR-0058: get_definition now returns std::expected — distinguish a
+                 // genuine DB error (503) from "no such definition" (404, unchanged).
+                 auto def_result = instruction_store->get_definition(def_id);
+                 if (!def_result) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                     return;
+                 }
+                 if (!*def_result) {
                      res.status = 404;
                      res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                      return;
                  }
+                 const auto& def = **def_result;
                  ResponseTemplatesEngine engine;
-                 auto parsed = engine.parse(def->response_templates_spec);
+                 auto parsed = engine.parse(def.response_templates_spec);
                  std::vector<ResponseTemplate> templates;
                  if (parsed)
                      templates = std::move(*parsed);
@@ -5132,7 +5260,7 @@ void RestApiV1::register_routes(
                      // dashboard shows when nothing is configured", and
                      // operators introspecting it shouldn't have to know
                      // which path they're on.
-                     auto synth = engine.synthesise_default(def->result_schema, def->plugin);
+                     auto synth = engine.synthesise_default(def.result_schema, def.plugin);
                      res.set_content(ok_json(engine.to_json(synth).dump()), "application/json");
                      return;
                  }
@@ -5148,7 +5276,7 @@ void RestApiV1::register_routes(
 
     // POST /api/v1/definitions/{id}/response-templates ─ create
     sink.Post(R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates)",
-              [perm_fn, audit_fn, instruction_store, persist_templates](const httplib::Request& req,
+              [perm_fn, audit_fn, instruction_store, persist_templates, persist_status](const httplib::Request& req,
                                                                         httplib::Response& res) {
                   if (!perm_fn(req, res, "InstructionDefinition", "Write"))
                       return;
@@ -5182,16 +5310,28 @@ void RestApiV1::register_routes(
                                def_id, "reason=invalid_json");
                       return;
                   }
-                  auto def = instruction_store->get_definition(def_id);
-                  if (!def) {
+                  // ADR-0058: get_definition now returns std::expected — distinguish a
+                  // genuine DB error (503) from "no such definition" (404, unchanged).
+                  auto def_result = instruction_store->get_definition(def_id);
+                  if (!def_result) {
+                      res.status = 503;
+                      res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                      // "error", not "denied" (gov Gate 6 compliance-officer finding): an
+                      // infra degrade is not an operator denial.
+                      audit_fn(req, "response_template.create", "error", "InstructionDefinition",
+                               def_id, "reason=store_unavailable");
+                      return;
+                  }
+                  if (!*def_result) {
                       res.status = 404;
                       res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                       audit_fn(req, "response_template.create", "denied", "InstructionDefinition",
                                def_id, "reason=definition_not_found");
                       return;
                   }
+                  const auto& def = **def_result;
                   ResponseTemplatesEngine engine;
-                  auto parsed = engine.parse(def->response_templates_spec);
+                  auto parsed = engine.parse(def.response_templates_spec);
                   std::vector<ResponseTemplate> templates;
                   if (parsed)
                       templates = std::move(*parsed);
@@ -5209,8 +5349,10 @@ void RestApiV1::register_routes(
                   if (auto err = persist_templates(def_id, templates); err) {
                       spdlog::error("response_template.create persist failed: def={} err={}",
                                     def_id, *err);
-                      res.status = 500;
-                      res.set_content(detail::a4_error(res, "persist failure"), "application/json");
+                      res.status = persist_status(*err);
+                      res.set_content(detail::a4_error(res, res.status == 404 ? "definition not found"
+                                                                              : "persist failure"),
+                                      "application/json");
                       audit_fn(req, "response_template.create", "failure", "InstructionDefinition",
                                def_id, "reason=persist_failure");
                       return;
@@ -5223,7 +5365,7 @@ void RestApiV1::register_routes(
 
     // PUT /api/v1/definitions/{id}/response-templates/{tid} ─ replace
     sink.Put(R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates/([A-Za-z0-9_-]+))",
-             [perm_fn, audit_fn, instruction_store, persist_templates](const httplib::Request& req,
+             [perm_fn, audit_fn, instruction_store, persist_templates, persist_status](const httplib::Request& req,
                                                                        httplib::Response& res) {
                  if (!perm_fn(req, res, "InstructionDefinition", "Write"))
                      return;
@@ -5267,8 +5409,19 @@ void RestApiV1::register_routes(
                               def_id, "reason=invalid_json");
                      return;
                  }
-                 auto def = instruction_store->get_definition(def_id);
-                 if (!def) {
+                 // ADR-0058: get_definition now returns std::expected — distinguish a
+                 // genuine DB error (503) from "no such definition" (404, unchanged).
+                 auto def_result = instruction_store->get_definition(def_id);
+                 if (!def_result) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                     // "error", not "denied" (gov Gate 6 compliance-officer finding): an
+                     // infra degrade is not an operator denial.
+                     audit_fn(req, "response_template.update", "error", "InstructionDefinition",
+                              def_id, "reason=store_unavailable");
+                     return;
+                 }
+                 if (!*def_result) {
                      res.status = 404;
                      res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                      audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
@@ -5276,7 +5429,7 @@ void RestApiV1::register_routes(
                      return;
                  }
                  ResponseTemplatesEngine engine;
-                 auto parsed = engine.parse(def->response_templates_spec);
+                 auto parsed = engine.parse((*def_result)->response_templates_spec);
                  std::vector<ResponseTemplate> templates;
                  if (parsed)
                      templates = std::move(*parsed);
@@ -5312,8 +5465,10 @@ void RestApiV1::register_routes(
                  if (auto err = persist_templates(def_id, templates); err) {
                      spdlog::error("response_template.update persist failed: def={} tid={} err={}",
                                    def_id, tid, *err);
-                     res.status = 500;
-                     res.set_content(detail::a4_error(res, "persist failure"), "application/json");
+                     res.status = persist_status(*err);
+                     res.set_content(detail::a4_error(res, res.status == 404 ? "definition not found"
+                                                                             : "persist failure"),
+                                     "application/json");
                      audit_fn(req, "response_template.update", "failure", "InstructionDefinition",
                               def_id, "reason=persist_failure");
                      return;
@@ -5326,7 +5481,7 @@ void RestApiV1::register_routes(
     // DELETE /api/v1/definitions/{id}/response-templates/{tid}
     sink.Delete(
         R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates/([A-Za-z0-9_-]+))",
-        [perm_fn, audit_fn, instruction_store, persist_templates](const httplib::Request& req,
+        [perm_fn, audit_fn, instruction_store, persist_templates, persist_status](const httplib::Request& req,
                                                                   httplib::Response& res) {
             if (!perm_fn(req, res, "InstructionDefinition", "Write"))
                 return;
@@ -5354,8 +5509,19 @@ void RestApiV1::register_routes(
                          "reason=reserved_id");
                 return;
             }
-            auto def = instruction_store->get_definition(def_id);
-            if (!def) {
+            // ADR-0058: get_definition now returns std::expected — distinguish a genuine
+            // DB error (503) from "no such definition" (404, unchanged).
+            auto def_result = instruction_store->get_definition(def_id);
+            if (!def_result) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                // "error", not "denied" (gov Gate 6 compliance-officer finding): an infra
+                // degrade is not an operator denial.
+                audit_fn(req, "response_template.delete", "error", "InstructionDefinition", def_id,
+                         "reason=store_unavailable");
+                return;
+            }
+            if (!*def_result) {
                 res.status = 404;
                 res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                 audit_fn(req, "response_template.delete", "denied", "InstructionDefinition", def_id,
@@ -5363,7 +5529,7 @@ void RestApiV1::register_routes(
                 return;
             }
             ResponseTemplatesEngine engine;
-            auto parsed = engine.parse(def->response_templates_spec);
+            auto parsed = engine.parse((*def_result)->response_templates_spec);
             std::vector<ResponseTemplate> templates;
             if (parsed)
                 templates = std::move(*parsed);
@@ -5381,8 +5547,10 @@ void RestApiV1::register_routes(
             if (auto err = persist_templates(def_id, templates); err) {
                 spdlog::error("response_template.delete persist failed: def={} tid={} err={}",
                               def_id, tid, *err);
-                res.status = 500;
-                res.set_content(detail::a4_error(res, "persist failure"), "application/json");
+                res.status = persist_status(*err);
+                res.set_content(detail::a4_error(res, res.status == 404 ? "definition not found"
+                                                                        : "persist failure"),
+                                "application/json");
                 audit_fn(req, "response_template.delete", "failure", "InstructionDefinition",
                          def_id, "reason=persist_failure");
                 return;
@@ -6790,15 +6958,25 @@ void RestApiV1::register_routes(
                 }
             }
 
-            auto def = instruction_store->get_definition(definition_id);
-            if (!def) {
+            // ADR-0058: get_definition now returns std::expected — distinguish a genuine
+            // DB error (503) from "no such definition" (404, unchanged).
+            auto def_result = instruction_store->get_definition(definition_id);
+            if (!def_result) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
+                         definition_id + " reason=store_unavailable");
+                return;
+            }
+            if (!*def_result) {
                 res.status = 404;
                 res.set_content(detail::a4_error(res, "instruction definition not found"), "application/json");
                 audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
                          definition_id + " reason=definition_not_found");
                 return;
             }
-            int chart_count = VisualizationEngine::count(def->visualization_spec);
+            const auto& def = **def_result;
+            int chart_count = VisualizationEngine::count(def.visualization_spec);
             if (chart_count == 0) {
                 res.status = 404;
                 res.set_content(detail::a4_error(res, "no visualization configured for this definition"),
@@ -6875,7 +7053,7 @@ void RestApiV1::register_routes(
 
             VisualizationEngine engine;
             auto result =
-                engine.transform_at(def->visualization_spec, chart_index, def->plugin, responses);
+                engine.transform_at(def.visualization_spec, chart_index, def.plugin, responses);
             if (!result.ok) {
                 res.status = 500;
                 auto parsed = nlohmann::json::parse(result.json, nullptr, false);
@@ -7293,8 +7471,19 @@ void RestApiV1::register_routes(
                 // That indistinguishability is deliberate — a distinct "refused
                 // by confinement" status would disclose the existence of
                 // devices the caller is not allowed to see.
+                // #881 adds two more ways to reach zero that are NOT about
+                // device visibility: every target quarantined, and the gate
+                // failing closed because containment state is unreadable.
+                // Neither discloses anything about devices the caller cannot
+                // see — a fail-closed gate is a server condition, and
+                // quarantine state is already readable at GET
+                // /api/v1/quarantine — so naming them does not weaken the
+                // confinement rationale above.
                 execution_tracker->mark_cancelled(exec_id, owner);
-                rs_err(res, 503, "RESULT_SET_NO_AGENTS: no agents reached in the target scope");
+                rs_err(res, 503,
+                       "RESULT_SET_NO_AGENTS: no agents reached in the target scope — targets may "
+                       "be unreachable, quarantined, or withheld because containment state could "
+                       "not be read");
                 return;
             }
             execution_tracker->set_agents_targeted(exec_id, sent);
@@ -7731,11 +7920,18 @@ void RestApiV1::register_routes(
                           rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'instruction_id' is required");
                           return;
                       }
-                      auto def = instruction_store->get_definition(instruction_id);
-                      if (!def) {
+                      // ADR-0058: get_definition now returns std::expected — distinguish a
+                      // genuine DB error (503) from "no such instruction" (404, unchanged).
+                      auto def_result = instruction_store->get_definition(instruction_id);
+                      if (!def_result) {
+                          rs_err(res, 503, "instruction store not available");
+                          return;
+                      }
+                      if (!*def_result) {
                           rs_err(res, 404, "INSTRUCTION_NOT_FOUND: unknown instruction_id");
                           return;
                       }
+                      const auto& def = **def_result;
                       std::unordered_map<std::string, std::string> params;
                       if (body.contains("params") && body["params"].is_object())
                           for (auto& [k, v] : body["params"].items())
@@ -7752,7 +7948,7 @@ void RestApiV1::register_routes(
                           payload["matcher"] = body["matcher"];
                       if (body.contains("parent_id") && body["parent_id"].is_string())
                           payload["scope_input_id"] = body["parent_id"];
-                      run_async(req, res, *session, def->plugin, def->action, params,
+                      run_async(req, res, *session, def.plugin, def.action, params,
                                 source_kind::kInstructionResult, payload.dump(), matcher, body,
                                 body.value("name", ""));
                   });
@@ -7812,9 +8008,18 @@ void RestApiV1::register_routes(
                       } else if (orig->source_kind == source_kind::kInstructionResult) {
                           std::string instruction_id =
                               sp.is_object() ? sp.value("instruction_id", "") : "";
-                          auto def = instruction_store && instruction_store->is_open()
-                                         ? instruction_store->get_definition(instruction_id)
-                                         : std::nullopt;
+                          // ADR-0058: get_definition now returns std::expected — a genuine DB
+                          // error 503s distinctly; a not-found/store-unavailable/empty-id
+                          // condition keeps the pre-migration 400 collapse.
+                          std::optional<InstructionDefinition> def;
+                          if (instruction_store && instruction_store->is_open()) {
+                              auto def_result = instruction_store->get_definition(instruction_id);
+                              if (!def_result) {
+                                  rs_err(res, 503, "instruction store not available");
+                                  return;
+                              }
+                              def = *def_result;
+                          }
                           if (instruction_id.empty() || !def) {
                               rs_err(res, 400,
                                      "RESULT_SET_BAD_REQUEST: original instruction unavailable");
@@ -8032,8 +8237,20 @@ void RestApiV1::register_routes(
             if (!session)
                 return;
             auto tokens = device_token_store->list_tokens();
+            if (!tokens) {
+                res.status = device_token_error_status(tokens.error());
+                // gov Gate 4 (consistency-auditor, C2): sibling parity with
+                // api_token's GET-list 503, which sets Retry-After: 2.
+                if (res.status == 503)
+                    res.set_header("Retry-After", "2");
+                res.set_content(
+                    detail::a4_error(res, device_token_client_message(
+                                              "GET /api/v1/device-tokens", tokens.error())),
+                    "application/json");
+                return;
+            }
             JArr arr;
-            for (const auto& t : tokens) {
+            for (const auto& t : *tokens) {
                 arr.add(JObj()
                             .add("token_id", t.token_id)
                             .add("name", t.name)
@@ -8045,7 +8262,7 @@ void RestApiV1::register_routes(
                             .add("last_used_at", t.last_used_at)
                             .add("revoked", t.revoked));
             }
-            res.set_content(list_json(arr.str(), static_cast<int64_t>(tokens.size())),
+            res.set_content(list_json(arr.str(), static_cast<int64_t>(tokens->size())),
                             "application/json");
         });
 
@@ -8097,6 +8314,82 @@ void RestApiV1::register_routes(
             auto result = device_token_store->create_token(name, session->username, device_id,
                                                            definition_id, expires_at);
             if (!result) {
+                // ADR-0052: a genuine DB/lease failure (kDeviceTokenDbErrorPrefix) is not a
+                // CSPRNG failure — the pre-migration store could only fail this way, but the
+                // migrated store can also fail on a Postgres blip. Classify before assuming
+                // "entropy exhausted": mislabeling a DB fault as csprng_unavailable would both
+                // misinform SIEM and increment the wrong Prometheus counter.
+                //
+                // #3351: "internal_error: " (hash_token's checked-EVP failure path) joins this
+                // same non-CSPRNG arm — a hashing fault is exactly as much "not entropy
+                // exhaustion" as a DB fault is, and must not increment
+                // yuzu_secure_random_failure_total either.
+                if (result.error().starts_with(yuzu::server::kDeviceTokenDbErrorPrefix) ||
+                    result.error().starts_with("internal_error: ")) {
+                    bool audit_emitted = false;
+                    try {
+                        audit_emitted = audit_fn(req, "device_token.create", "failure",
+                                                 "DeviceToken", device_id,
+                                                 device_token_client_message(
+                                                     "POST /api/v1/device-tokens", result.error()));
+                    } catch (const std::exception& ex) {
+                        spdlog::error("device_token.create audit emission threw: {}", ex.what());
+                        audit_emitted = false;
+                    } catch (...) {
+                        spdlog::error("device_token.create audit emission threw unknown");
+                        audit_emitted = false;
+                    }
+                    res.status = 503;
+                    res.set_header("Retry-After", "5");
+                    if (!audit_emitted)
+                        res.set_header("Sec-Audit-Failed", "true");
+                    JObj envelope_err;
+                    envelope_err.add("code", 503).add("message", "service unavailable");
+                    JObj envelope;
+                    envelope.raw("error", envelope_err.str())
+                        .add("audit_emitted", audit_emitted)
+                        .raw("meta", R"({"api_version":"v1"})");
+                    res.set_content(envelope.str(), "application/json");
+                    return;
+                }
+                // gov Gate 4 (consistency-auditor, C-1): a store-level input-validation failure
+                // (`invalid_input_length:` or the pre-existing empty-principal_id guard) is a
+                // client error, not a service fault or CSPRNG exhaustion — the prior two-way
+                // classifier fell through to the CSPRNG arm below by elimination, which would
+                // have reported 503 + a misleading "CSPRNG unavailable" message/audit-reason and
+                // incremented yuzu_secure_random_failure_total for what is actually a 400.
+                // Unreachable via REST today (name/device_id/definition_id are pre-clamped at
+                // 256 chars above; principal_id is session->username, bounded by AuthDB's 64-char
+                // limit) — defence-in-depth for a future non-REST caller the store's own doc
+                // comment anticipates (e.g. an MCP twin).
+                //
+                // gov Gate 8 (consistency-auditor): uses the canonical detail::a4_error envelope
+                // (correlation_id, matches this endpoint's OWN pre-clamp 400s just above) rather
+                // than the hand-rolled shape the sibling 503 arms below use — two different 400s
+                // from the same endpoint should look the same. Sec-Audit-Failed header only (no
+                // audit_emitted body field), matching the same convention already used where an
+                // audited failure returns an A4-enveloped body elsewhere in this file (e.g.
+                // dex.device.view's audit fail-closed branch).
+                if (result.error().starts_with("invalid_input_length:") ||
+                    result.error() == "principal_id cannot be empty") {
+                    bool audit_emitted = false;
+                    try {
+                        audit_emitted = audit_fn(req, "device_token.create", "failure",
+                                                 "DeviceToken", device_id,
+                                                 "invalid_input: " + result.error());
+                    } catch (const std::exception& ex) {
+                        spdlog::error("device_token.create audit emission threw: {}", ex.what());
+                        audit_emitted = false;
+                    } catch (...) {
+                        spdlog::error("device_token.create audit emission threw unknown");
+                        audit_emitted = false;
+                    }
+                    if (!audit_emitted)
+                        res.set_header("Sec-Audit-Failed", "true");
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, result.error()), "application/json");
+                    return;
+                }
                 // sre-1: Prometheus signal for CSPRNG failure (see
                 // /api/v1/tokens comment for full rationale).
                 if (metrics_registry) {
@@ -8161,12 +8454,29 @@ void RestApiV1::register_routes(
                 if (!perm_fn(req, res, "DeviceToken", "Delete"))
                     return;
                 auto token_id = req.matches[1].str();
-                if (device_token_store->revoke_token(token_id)) {
+                auto result = device_token_store->revoke_token(token_id);
+                if (result) {
                     audit_fn(req, "device_token.revoke", "success", "DeviceToken", token_id, "");
                     res.set_content(ok_json(JObj().add("revoked", true).str()), "application/json");
                 } else {
-                    res.status = 404;
-                    res.set_content(detail::a4_error(res, "token not found"), "application/json");
+                    res.status = device_token_error_status(result.error());
+                    if (res.status == 503) {
+                        // gov Gate 4 (consistency-auditor, C1/C2): a genuine DB/lease
+                        // failure here is a failed revoke attempt, not a "not found" —
+                        // audit it like POST's db_error branch and api_token.revoke's
+                        // own 503 branch do; sibling parity on Retry-After too (api_token's
+                        // DELETE-revoke 503 sets 2s).
+                        audit_fn(req, "device_token.revoke", "failure", "DeviceToken", token_id,
+                                 device_token_client_message("DELETE /api/v1/device-tokens",
+                                                              result.error()));
+                        res.set_header("Retry-After", "2");
+                    }
+                    res.set_content(
+                        detail::a4_error(res, res.status == 404
+                                                  ? "token not found"
+                                                  : device_token_client_message(
+                                                        "DELETE /api/v1/device-tokens", result.error())),
+                        "application/json");
                 }
             });
     }
@@ -11435,7 +11745,21 @@ void RestApiV1::register_routes(
             }
 
             const bool deployed = (baseline->lifecycle == kBaselineDeployed);
-            const auto guard_ids = baseline_store->deployed_member_rule_ids(baseline->baseline_id);
+            // ADR-0055 catastrophic-read set: a degraded deployed_member_rule_ids
+            // read must 503, never render an empty guard_ids that would flow
+            // through rule_names_for/the compliance tally below as a false-clean
+            // "0 guards, fully compliant" report for this baseline.
+            auto guard_ids_result = baseline_store->deployed_member_rule_ids(baseline->baseline_id);
+            if (!guard_ids_result) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "baseline store degraded", cid),
+                                "application/json");
+                spdlog::warn("guardian.device.view baseline store degraded (503) cid={} "
+                             "agent_id={}",
+                             cid, agent_id);
+                return;
+            }
+            const auto& guard_ids = *guard_ids_result;
 
             // rule_id -> Guard name, resolved ONLY for this baseline's deployed
             // members (name-only read; never materializes the rule body blobs).

@@ -77,8 +77,8 @@ TEST_CASE("evaluate_scope: from_result_set is owner-scoped (no cross-operator ta
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    registry.register_agent(info("agent-win"));
-    registry.register_agent(info("agent-lin"));
+    (void)registry.register_agent(info("agent-win"));
+    (void)registry.register_agent(info("agent-lin"));
 
     // Alice curates a set containing only one of the two connected agents.
     CreateRequest cr;
@@ -252,8 +252,8 @@ TEST_CASE("evaluate_scope: a degraded result-set store ABORTS — never expands 
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    registry.register_agent(info("agent-win"));
-    registry.register_agent(info("agent-lin"));
+    (void)registry.register_agent(info("agent-win"));
+    (void)registry.register_agent(info("agent-lin"));
 
     CreateRequest cr;
     cr.owner_principal = "alice";
@@ -320,8 +320,8 @@ TEST_CASE("evaluate_scope: an empty principal ABORTS — never expands a NOT-inv
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    registry.register_agent(info("agent-win"));
-    registry.register_agent(info("agent-lin"));
+    (void)registry.register_agent(info("agent-win"));
+    (void)registry.register_agent(info("agent-lin"));
 
     CreateRequest cr;
     cr.owner_principal = "alice";
@@ -377,8 +377,8 @@ TEST_CASE("evaluate_scope: a NULL result-set store ABORTS a from_result_set scop
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    registry.register_agent(info("agent-win"));
-    registry.register_agent(info("agent-lin"));
+    (void)registry.register_agent(info("agent-win"));
+    (void)registry.register_agent(info("agent-lin"));
 
     SECTION("NOT from_result_set:<id> with a null store aborts rather than matching "
             "every agent") {

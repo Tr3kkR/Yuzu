@@ -294,14 +294,17 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 }
                 if (!template_id.empty() && !definition_id.empty() &&
                     instruction_store_ && instruction_store_->is_open()) {
-                    auto def = instruction_store_->get_definition(definition_id);
-                    if (def) {
+                    // ADR-0058: a DB-error outer result skips this best-effort template
+                    // resolution, same as a not-found inner optional did pre-migration.
+                    auto def_result = instruction_store_->get_definition(definition_id);
+                    if (def_result && *def_result) {
+                        const auto& def = **def_result;
                         ResponseTemplatesEngine engine;
                         std::vector<ResponseTemplate> templates;
-                        if (auto parsed = engine.parse(def->response_templates_spec); parsed)
+                        if (auto parsed = engine.parse(def.response_templates_spec); parsed)
                             templates = std::move(*parsed);
                         auto resolved = engine.resolve(templates, template_id,
-                                                      def->result_schema, def->plugin);
+                                                      def.result_schema, def.plugin);
                         // Sort default — only when URL didn't supply one.
                         if (!sort_explicit && !resolved.sort_column.empty()) {
                             // The dashboard sort param uses lowercased,
@@ -418,9 +421,11 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 // and canonical array shapes.
                 int chart_count = 0;
                 if (instruction_store_ && instruction_store_->is_open()) {
-                    auto def = instruction_store_->get_definition(definition_id);
-                    if (def)
-                        chart_count = VisualizationEngine::count(def->visualization_spec);
+                    // ADR-0058: a DB-error outer result leaves chart_count at 0 (deck
+                    // skipped below), same as a not-found inner optional did pre-migration.
+                    auto def_result = instruction_store_->get_definition(definition_id);
+                    if (def_result && *def_result)
+                        chart_count = VisualizationEngine::count((*def_result)->visualization_spec);
                 }
                 if (chart_count <= 0) {
                     res.set_content("", "text/html; charset=utf-8");
@@ -717,13 +722,18 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      q.plugin_filter = plugin;
                      q.enabled_only = true;
                      q.limit = 50;
-                     for (const auto& d : instruction_store_->query_definitions(q)) {
-                         if (d.action != action) continue;
-                         if (!VisualizationEngine::has_visualization(d.visualization_spec) &&
-                             d.result_schema.empty())
-                             continue;
-                         def_id = d.id;
-                         break;
+                     // ADR-0058: a DB-error result leaves def_id empty (enrichment
+                     // skipped below), same as an empty result did pre-migration.
+                     auto defs_result = instruction_store_->query_definitions(q);
+                     if (defs_result) {
+                         for (const auto& d : *defs_result) {
+                             if (d.action != action) continue;
+                             if (!VisualizationEngine::has_visualization(d.visualization_spec) &&
+                                 d.result_schema.empty())
+                                 continue;
+                             def_id = d.id;
+                             break;
+                         }
                      }
                  }
 
@@ -1633,10 +1643,12 @@ std::vector<FacetFilter> DashboardRoutes::parse_filters(const httplib::Request& 
 std::vector<std::string> DashboardRoutes::resolve_render_columns(
     const std::string& plugin, const std::string& definition_id) const {
     if (!definition_id.empty() && instruction_store_ && instruction_store_->is_open()) {
-        if (auto def = instruction_store_->get_definition(definition_id);
-            def && !def->result_schema.empty()) {
+        // ADR-0058: a DB-error outer result falls through to columns_for_plugin below,
+        // same as a not-found inner optional did pre-migration.
+        if (auto def_result = instruction_store_->get_definition(definition_id);
+            def_result && *def_result && !(*def_result)->result_schema.empty()) {
             ResponseTemplatesEngine engine;
-            auto tmpl = engine.synthesise_default(def->result_schema, plugin);
+            auto tmpl = engine.synthesise_default((*def_result)->result_schema, plugin);
             if (!tmpl.columns.empty()) {
                 std::vector<std::string> cols{"Agent"};
                 cols.insert(cols.end(), tmpl.columns.begin(), tmpl.columns.end());
@@ -1983,9 +1995,11 @@ std::string DashboardRoutes::render_results(
     // command is cleared.
     int chart_count = 0;
     if (!definition_id.empty() && instruction_store_ && instruction_store_->is_open()) {
-        auto def = instruction_store_->get_definition(definition_id);
-        if (def)
-            chart_count = VisualizationEngine::count(def->visualization_spec);
+        // ADR-0058: a DB-error outer result leaves chart_count at 0 (empty deck
+        // below), same as a not-found inner optional did pre-migration.
+        auto def_result = instruction_store_->get_definition(definition_id);
+        if (def_result && *def_result)
+            chart_count = VisualizationEngine::count((*def_result)->visualization_spec);
     }
     html += R"(<div id="chart-deck-host" hx-swap-oob="innerHTML">)";
     if (chart_count > 0) {
@@ -2033,11 +2047,14 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
     // /fragments/results with template_id=<chosen>; the route handler
     // resolves the template and applies sort/filter/columns defaults.
     if (!definition_id.empty() && instruction_store_ && instruction_store_->is_open()) {
-        auto def = instruction_store_->get_definition(definition_id);
-        if (def) {
+        // ADR-0058: a DB-error outer result skips this best-effort template
+        // selector, same as a not-found inner optional did pre-migration.
+        auto def_result = instruction_store_->get_definition(definition_id);
+        if (def_result && *def_result) {
+            const auto& def = **def_result;
             ResponseTemplatesEngine engine;
             std::vector<ResponseTemplate> templates;
-            if (auto parsed = engine.parse(def->response_templates_spec); parsed)
+            if (auto parsed = engine.parse(def.response_templates_spec); parsed)
                 templates = std::move(*parsed);
             // The dropdown lists the synthesised default first when no
             // operator template is marked default; otherwise it omits

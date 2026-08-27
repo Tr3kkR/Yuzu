@@ -157,12 +157,12 @@ The server stores its configuration in files located in the **same directory as 
 | `enrollment-tokens.cfg` | Legacy enrollment-token file (Tier 2). New deployments persist tokens inside `auth.db`; this file remains writable for backwards-compatibility on upgrades from pre-AuthDB releases. |
 | `pending-agents.cfg` | Queue of agents awaiting manual approval (Tier 1 enrollment). Contains agent ID, hostname, IP, and registration timestamp. |
 
-> **Backup recommendation:** Back up `auth.db` (use `sqlite3 auth.db ".backup ..."`, NEVER `cp` against a live WAL DB), `yuzu-server.cfg`, the rest of the `--data-dir` SQLite stores (including **`ca.db`** — the internal-CA inventory + CRL history), and **the entire CA/cert directory `--ca-dir`** (`default-ca.key` especially — the per-install CA private key) on the same schedule. Use the SQLite online-backup API for every `.db` file, not `cp`. **Losing `default-ca.key` forces a full fleet re-enrollment** (every agent's cert chains to that root, and the server refuses to silently re-root — see below). Losing `auth.db` AND `yuzu-server.cfg` requires re-running `--first-run-setup` to create a new admin. Losing `auth.db` alone is recoverable — see `docs/ops-runbooks/auth-db-recovery.md`. As server stores migrate to PostgreSQL (ADR-0006), a complete backup also covers the Postgres database — see [PostgreSQL Substrate](#postgresql-substrate) for the `pg_dump`/`pg_restore` procedure and the ADR-0010 restore-pairing invariant.
+> **Backup recommendation:** Back up `auth.db` (use `sqlite3 auth.db ".backup ..."`, NEVER `cp` against a live WAL DB), `yuzu-server.cfg`, the rest of the `--data-dir` SQLite stores, and **the entire CA/cert directory `--ca-dir`** (`default-ca.key` especially — the per-install CA private key) on the same schedule. Use the SQLite online-backup API for every `.db` file, not `cp`. **Losing `default-ca.key` forces a full fleet re-enrollment** (every agent's cert chains to that root, and the server refuses to silently re-root — see below). Losing `auth.db` AND `yuzu-server.cfg` requires re-running `--first-run-setup` to create a new admin. Losing `auth.db` alone is recoverable — see `docs/ops-runbooks/auth-db-recovery.md`. As server stores migrate to PostgreSQL (ADR-0006), a complete backup also covers the Postgres database — see [PostgreSQL Substrate](#postgresql-substrate) for the `pg_dump`/`pg_restore` procedure and the ADR-0010 restore-pairing invariant. **The internal-CA inventory + CRL history (`ca_store` schema, ADR-0053) is one of the migrated Postgres stores** — back it up with `pg_dump`/`pg_restore`, not as a separate local file.
 
 > **Built-in default certificates — convenience, not production.** With no `--cert`/`--key`/`--https-cert` supplied (and without `--no-default-certs`), the server generates a per-install ECDSA CA + server leaves on first boot so a fresh install is encrypted with zero config. Operational caveats:
 > - **10-year, no auto-renewal.** The server leaves do not auto-renew; the `yuzu_server_cert_expiry_timestamp_seconds{cert="default-ca"}` gauge + the `YuzuCertificateExpiringSoon`/`…Critical` alerts (`docs/prometheus/yuzu-alerts.yml`) warn ahead of expiry. **Replace defaults before production rollout** with operator-provided certs (`--cert`/`--key`, `--https-cert`/`--https-key`) or, to rotate the built-in set, clear `--ca-dir` (after backing it up) and restart.
 > - **SAN limitation.** Default leaf SANs cover `localhost`, `127.0.0.1`, `::1`, and the boot-time hostname only. Reaching the dashboard/agent listener by a LAN IP or a different FQDN needs operator-provided certs (or DNS that resolves to a covered name). A host rename invalidates the SAN — rotate the certs after renaming.
-> - **No silent re-root.** If `ca.db` already holds a CA root but the on-disk certs in `--ca-dir` are missing/corrupt (e.g. a wiped cert dir on a persistent data volume), the server **refuses to start** rather than mint a new CA that would orphan every enrolled agent. Restore `default-*.{pem,key}` from backup (matching the `ca.db` root), or remove `ca.db` too for a deliberate clean re-root.
+> - **No silent re-root.** If `ca_store` (the internal-CA Postgres store, ADR-0053) already holds a CA root but the on-disk certs in `--ca-dir` are missing/corrupt (e.g. a wiped cert dir on a persistent data volume, or ordinary later damage to an established install — a bad partial restore, a lost leaf file), the server **refuses to start** rather than mint a new CA that would orphan every enrolled agent — **unless this exact instance can prove it minted the still-incomplete root** (its local CA key file still resolves and cryptographically pairs with the stored root), in which case it resumes automatically and re-mints its own default leaves under the same root (ADR-0053). When that self-heal condition does not hold, restore `default-*.{pem,key}` from backup (matching the `ca_store` root), or perform a deliberate clean re-root by clearing `ca_store.ca_root`/`ca_issued`/`ca_crl_versions` directly against Postgres — see `docs/pki-architecture.md` "Operator runbook" for the full procedure.
 
 > **File permissions (Unix):** `auth.db` is created with mode `0600` (owner read/write only); `yuzu-server.cfg`, `enrollment-tokens.cfg`, and `pending-agents.cfg` are also `0600` after every write. No manual `chmod` is required.
 
@@ -195,6 +195,43 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 ---
 
 ## Upgrade Notes
+
+### vNEXT — `event_logs` acquires natively; Windows message text and `count` semantics change (breaking)
+
+The `event_logs` plugin now reads the event log **in-process** — wevtapi on
+Windows, `sd_journal` on Linux (falling back to a bounded `journalctl`
+invocation where libsystemd is unavailable) — replacing the previous PowerShell
+and shell-out legs. Automation that parses `event_logs` rows needs review before
+upgrading; the changes fail **silently** (fewer rows, or a rule that stops
+firing), not with an error.
+
+What changes for a row consumer:
+
+- **Windows message column** is now the event's `EventData` parameter values,
+  space-joined, instead of the provider-formatted message template. A rule
+  regex-matching template prose (for example `"The user account was locked
+  out"`) will stop matching; match on event ID and provider instead.
+- **Windows timestamps** are the event's UTC `SystemTime` at full precision,
+  where the previous leg emitted the PowerShell-rendered local time.
+- **Windows `count`** bounds the events **examined**, not the matches returned —
+  the filter is applied within the newest `count` events. Linux and macOS return
+  up to `count` matches. When the window fills without satisfying the query the
+  result now carries a `constrained` status rather than reporting an absence.
+- **Linux keyword filtering** is a case-insensitive substring match on both
+  rungs, where the shell-out leg used `journalctl --grep` regular expressions.
+- **`hours` and `count`** reject trailing or leading non-digits (`"12x"`,
+  `" 24"`, `"+8"`) and fall back to their defaults; the previous parse silently
+  accepted the leading digits.
+- **A failed, denied, or bounded read** now reports a typed status
+  (`permission_denied` / `unavailable` / `constrained`) instead of an empty
+  result. Consumers that treated "no rows" as "healthy" will now see the
+  difference — this is the point of the change, but it is a behaviour change.
+
+**Mixed-fleet blend during rollout.** Upgraded and non-upgraded agents emit
+*different message columns for the same Windows event*, and there is no per-row
+field identifying which leg produced it. Expect a blended view until the fleet
+is fully upgraded, and prefer event ID plus provider for any rule that must hold
+across both.
 
 ### vNEXT — a duplicate SCIM `externalId` now refuses to boot (ADR-2001, CC6.8) (breaking)
 
@@ -513,13 +550,15 @@ declared id).
 **What to do.** Before upgrading, check for affected content. Query the instruction database
 directly rather than the REST list route: `GET /api/v1/definitions` caps its result at 100
 definitions, and the shipped content alone exceeds that, so an API-based check can report a
-false all-clear. `GLOB` rather than `LIKE` because SQLite's `LIKE` is case-insensitive and
-the reservation is not — `MCP.foo` is a different id everywhere else in the system and is
-not reserved.
+false all-clear. Use a case-sensitive glob-style match — Postgres `LIKE` is case-sensitive by
+default, but `~` (POSIX regex) is used below for an explicit anchor — the reservation is
+case-sensitive: `MCP.foo` is a different id everywhere else in the system and is not reserved.
+(Superseded — `instruction_definitions` moved to PostgreSQL under ADR-0058; this is no longer
+a `sqlite3` query against `instructions.db`, see the PostgreSQL Substrate section below.)
 
 ```bash
-sqlite3 /var/lib/yuzu/instructions.db \
-  "SELECT id FROM instruction_definitions WHERE id GLOB 'mcp.*';"
+psql "$YUZU_POSTGRES_DSN" -c \
+  "SELECT id FROM instruction_store.instruction_definitions WHERE id ~ '^mcp\.';"
 ```
 
 Any id listed keeps executing after the upgrade and can still be edited through
@@ -746,6 +785,18 @@ Three operator-visible consequences:
   (the shipped systemd unit and every shipped compose file use **210 s**); 30 s
   — which suited GET alone — is the figure to move away from. Under-sizing
   SIGKILLs mid-drain and silently drops in-flight streams on deploy.
+  **Update (#3042):** the ~156 s figure above bounds a single streamed-POST
+  *call* during ordinary (non-shutdown) operation — it is not how long
+  `ServerImpl::stop()` itself waits on one. Since #3042, graceful shutdown
+  close-signals every live MCP session up front, so a streamed POST held open
+  across an ordinary `stop()` ends within about one pump tick (~3 s), not the
+  120 s cap; the underlying execution is unaffected and stays fetchable by
+  `execution_id`. What still bounds shutdown is a stream stuck mid-write to a
+  blackholed or drip-feeding peer (the 30 s write timeout) — see
+  `docs/mcp-server.md`'s Shutdown section for the current mechanism. The 210 s
+  `TimeoutStopSec` recommendation above remains a safe, comfortably
+  conservative choice; it is no longer the tight bound its original
+  derivation implied.
 - **Per-principal ceiling.** `--mcp-max-streams-per-principal` governs the GET
   channel. The streamed-POST allowance is a fixed 4 concurrent calls per
   principal — numerically the same as, but counted and enforced separately
@@ -1021,6 +1072,19 @@ same DSN. If you run single-replica, treat any sustained non-zero
 `yuzu_rotation_sweep_lock_skipped_total` as a fault to investigate, not
 background noise; see `docs/ops-runbooks/rotation-sweep-clock-guard.md`.
 
+### vNEXT — API-token rotation confirm now requires proof of possession (#3015) (breaking)
+
+**What changed.** `confirm` on a rotation — REST `POST /api/v1/tokens/{id}/confirm` and `POST /api/v1/engine-principals/{id}/credentials/confirm`, plus the MCP twins `confirm_api_token_rotation`/`confirm_engine_rotation` — previously admitted on caller identity plus the successor's `token_id` alone. A caller who recovered an unknown successor's `token_id` out-of-band (a support ticket, a log line) could confirm — and thereby revoke the predecessor for — a rotation whose secret they never received. All four confirm surfaces now additionally require the raw successor secret in the request body/args, verified with a constant-time hash comparison against the successor's stored hash, checked LAST — strictly after ownership, pair-state, the `token_id` pin, tier, scope, and the initiator binding have all already passed — before the predecessor is touched.
+
+**Who this affects.** Any caller confirming with only `token_id`: REST now returns `400` instead of succeeding; MCP returns `kInvalidParams`. A caller confirming with a *wrong* secret gets REST `403` / MCP `kPermissionDenied`. Correctly-installing automation is unaffected — the secret required here is the same raw value the `rotate` response already returns exactly once (REST `data.token`), so automation that installs the successor from that response and passes it straight to `confirm` sees no behavior change.
+
+**If you lose the rotate response before confirming,** you can no longer confirm — the secret cannot be manufactured from the `token_id` alone. Two recovery paths:
+
+1. **Wait for the automatic overlap-window sweep.** Proof of possession gates the immediate, explicit `confirm` call only — the 60-second background sweep is unaffected by this change and still auto-revokes the predecessor on its own schedule with no secret required, provided the successor secret was actually installed and presented (used) at least once.
+2. **Revoke the unknown successor and start a new rotation** (`DELETE /api/v1/tokens/{token_id}` or the engine-principal twin) — keeps the predecessor working immediately, at the cost of restarting the rotation.
+
+Full detail: [`authentication.md`](authentication.md#rotating-a-token) "Rotating a Token", [`engine-principals.md`](engine-principals.md) "Rotate the credential", and [`mcp.md`](mcp.md) rows 61/71.
+
 ### vNEXT — Guardian status routes gain real data, new denial/failure modes (#2298 item 6d) (breaking)
 
 **What changed.** `GET /api/v1/guaranteed-state/status` and
@@ -1279,11 +1343,11 @@ MFA CLI flags: `--mfa-enforcement` (default `optional`; `admin-only`/`required` 
 
 ### vNEXT — service-scoped API tokens can no longer read or mutate the confirmed fleet-wide Guardian/DEX/network/inventory/TAR/Schedule surfaces found as of this release (breaking)
 
-**What changed.** A pre-existing gap let a service-scoped API token read identity-linked, fleet-wide device data — and, for Guardian Baselines, MUTATE what every agent enforces — across every reporting agent, not just its own service's agents. **This note does not claim the underlying class is fully closed** — three tracked issues (#3123 device-discovery, #3124 response/execution data, #3125 inventory data) document further confirmed instances on surfaces this release does not touch, found by an independent adversarial review during this branch's own governance run; see those issues for the current list. The confinement check on these fleet-wide (no single `agent_id`) reads only ever verified the token's role, never its service scope, and several of the affected reads had no per-open audit trail at all. Fixed across REST, the dashboard, and MCP: `GET /api/v1/guaranteed-state/events` (no-`agent_id` shape), `GET /api/v1/dex/signals/{obs_type}`, `GET /api/v1/dex/perf/devices`, `GET /api/v1/network/devices` and their MCP twins now deny a service-scoped token outright and are access-audited (`dex.signal.view` / `dex.perf.device.view` / `network.device.view` — the latter two had no audit coverage at all before this release); the Guardian dashboard's fleet status, guards list, event timeline, per-Guard drilldown, baselines list, and per-Baseline fragments, plus the `/fragments/dex/perf/devices`, `/fragments/network/devices`, `/fragments/dex/overview`, `/fragments/dex/app`, and `/fragments/dex/catalogue/signal` dashboard fragments now deny a service-scoped token the same way. The same confinement-gap class extends beyond `GuaranteedState:Read`: `GET /fragments/devices/list` (`Infrastructure:Read`), `GET /fragments/inventory/devices` (`Inventory:Read` — GDPR-personal-data serial/system_uuid/primary_mac columns), and both TAR frame device pickers (`GET /fragments/tar/process-tree`, `GET /fragments/tar/capture-sources`) now deny a service-scoped token too. It also reached a MUTATING surface: `POST /fragments/auto/run` (the `/auto` Pre-flight dispatch) resolved its device cohort the same unconfined way before dispatching the configured checks — now denied the same way, before any dispatch occurs. A different shape of the same root cause also reached three more `/auto` Pre-flight routes: `GET /fragments/auto` (the saved-runs rail), `GET /fragments/auto/result` (the run result poll), and `POST /fragments/auto/delete` (run delete) scope by `session->username` alone, and a service-scoped API token shares its creating principal's username (`ApiToken::principal_id`) — so a token scoped to e.g. one IT service could read back, poll, or delete a fleet-wide pre-flight run its own principal created interactively. All three now deny a service-scoped token the same way. The same owner-scoping shape reached the `/auto` Deploy stage too: `GET /fragments/auto/deploy` (the deploy config form) and `POST /fragments/auto/deploy/delete` (deployment delete) now deny a service-scoped token for the same reason; `GET /fragments/auto/deploy/result` (the deployment result poll) now denies too, and — because it also re-invokes the deployment engine's mutating advance step on every call — this additionally narrows how far an already-in-flight deployment can progress for a service-scoped caller. The same owner-scoping shape reached the Schedule API too, and worse: `POST /api/schedules` (create) and `POST /api/schedules/{id}/enable` (re-enable) now deny a service-scoped token outright, even one holding both `Schedule:Write` and `Execution:Execute` — a recurring schedule dispatches fleet-wide through `ScheduleRunner` with no per-fire confinement at all, unattended, and reaching it needs no pre-existing state (unlike every route above). `DELETE /api/schedules/{id}` (delete) denies the same way as the ordinary owner-scoping class. Disabling a schedule (`enable=false`) is deliberately **not** denied — the kill switch must stay reachable even for a service-scoped token. A separate, worse-than-username-scoping gap in the same feature area: `GET /api/schedules` (REST) and the MCP `list_schedules` tool now also deny a service-scoped token, because `ITServiceOwner` grants full CRUD on `Schedule` and the underlying query had no owner/service filter of any kind, so `Schedule:Read` alone let a service-scoped token enumerate every schedule from every other service. `GET /fragments/schedules` (the dashboard twin) is fixed the same way, and separately gains an RBAC gate it never had — this fragment was previously reachable by **any authenticated session, regardless of role or grant**. Independently, `POST /api/schedules/{id}/enable` had a request-parsing bug that silently reinterpreted the standards-compliant JSON boolean `{"enabled": false}` as `enabled=true` — this is now fixed; see "What to do" below for who needs to check their integration. Two more instances were found and fixed during this branch's own governance review, both in files already touched above: the Guardian dashboard's six MUTATING fragments (guard create, guard enable/disable, baseline create/deploy/delete/update) never got the same deny their read-only siblings got in the same earlier commit — worst of all the fixes in this note, since a service-scoped token could deploy a Baseline (a fleet-wide, `full_sync` operation) outside its own service; and `GET /fragments/inventory/find/results`, `GET /api/v1/inventory/software`, and MCP `query_installed_software` (the software-search family) never got the deny their sibling `/fragments/inventory/devices` got. See `docs/user-manual/audit-log.md` for the full list of new/changed audit verbs and `docs/enterprise-readiness-soc2-first-customer.md` "The machine-health audit exemption" for the narrowed CC7.2 scope.
+**What changed.** A pre-existing gap let a service-scoped API token read identity-linked, fleet-wide device data — and, for Guardian Baselines, MUTATE what every agent enforces — across every reporting agent, not just its own service's agents. **This note does not claim the underlying class is fully closed** — three tracked issues (#3123 device-discovery, #3124 response/execution data, #3125 inventory data) document further confirmed instances on surfaces this release does not touch, found by an independent adversarial review during this branch's own governance run; see those issues for the current list. The confinement check on these fleet-wide (no single `agent_id`) reads only ever verified the token's role, never its service scope, and several of the affected reads had no per-open audit trail at all. Fixed across REST, the dashboard, and MCP: `GET /api/v1/guaranteed-state/events` (no-`agent_id` shape), `GET /api/v1/dex/signals/{obs_type}`, `GET /api/v1/dex/perf/devices`, `GET /api/v1/network/devices` and their MCP twins now deny a service-scoped token outright and are access-audited (`dex.signal.view` / `dex.perf.device.view` / `network.device.view` — the latter two had no audit coverage at all before this release); the Guardian dashboard's fleet status, guards list, event timeline, per-Guard drilldown, baselines list, and per-Baseline fragments, plus the `/fragments/dex/perf/devices`, `/fragments/network/devices`, `/fragments/dex/overview`, `/fragments/dex/app`, and `/fragments/dex/catalogue/signal` dashboard fragments now deny a service-scoped token the same way. The same confinement-gap class extends beyond `GuaranteedState:Read`: `GET /fragments/devices/list` (`Infrastructure:Read`), `GET /fragments/inventory/devices` (`Inventory:Read` — GDPR-personal-data serial/system_uuid/primary_mac columns), and both TAR frame device pickers (`GET /fragments/tar/process-tree`, `GET /fragments/tar/capture-sources`) now deny a service-scoped token too. It also reached a MUTATING surface: `POST /fragments/auto/run` (the `/auto` Pre-flight dispatch) resolved its device cohort the same unconfined way before dispatching the configured checks — now denied the same way, before any dispatch occurs. A different shape of the same root cause also reached three more `/auto` Pre-flight routes: `GET /fragments/auto` (the saved-runs rail), `GET /fragments/auto/result` (the run result poll), and `POST /fragments/auto/delete` (run delete) scope by `session->username` alone, and a service-scoped API token shares its creating principal's username (`ApiToken::principal_id`) — so a token scoped to e.g. one IT service could read back, poll, or delete a fleet-wide pre-flight run its own principal created interactively. All three now deny a service-scoped token the same way. The same owner-scoping shape reached the `/auto` Deploy stage too: `GET /fragments/auto/deploy` (the deploy config form) and `POST /fragments/auto/deploy/delete` (deployment delete) now deny a service-scoped token for the same reason; `GET /fragments/auto/deploy/result` (the deployment result poll) now denies too, and — because it also re-invokes the deployment engine's mutating advance step on every call — this additionally narrows how far an already-in-flight deployment can progress for a service-scoped caller. The same owner-scoping shape reached the Schedule API too, and worse: `POST /api/schedules` (create) and `POST /api/schedules/{id}/enable` (re-enable) now deny a service-scoped token outright, even one holding both `Schedule:Write` and `Execution:Execute` — a recurring schedule dispatches fleet-wide through `ScheduleRunner` with no per-fire confinement at all, unattended, and reaching it needs no pre-existing state (unlike every route above). `DELETE /api/schedules/{id}` (delete) denies the same way as the ordinary owner-scoping class. Disabling a schedule (`enable=false`) is deliberately **not** denied by this per-file check — the kill switch is intended to stay reachable even for a service-scoped token. **Caveat added 2026-08-21 (#3290 Phase 2 bucket 1a):** that guarantee does not currently hold in practice — `require_permission(Schedule,Write)` denies a service-scoped token unconditionally at the top of this handler, before `enabled` is even parsed, so a disable is denied the same as an enable. Pre-existing, not introduced by this note's own fixes; tracked as #3378. A separate, worse-than-username-scoping gap in the same feature area: `GET /api/schedules` (REST) and the MCP `list_schedules` tool now also deny a service-scoped token, because `ITServiceOwner` grants full CRUD on `Schedule` and the underlying query had no owner/service filter of any kind, so `Schedule:Read` alone let a service-scoped token enumerate every schedule from every other service. `GET /fragments/schedules` (the dashboard twin) is fixed the same way, and separately gains an RBAC gate it never had — this fragment was previously reachable by **any authenticated session, regardless of role or grant**. Independently, `POST /api/schedules/{id}/enable` had a request-parsing bug that silently reinterpreted the standards-compliant JSON boolean `{"enabled": false}` as `enabled=true` — this is now fixed; see "What to do" below for who needs to check their integration. Two more instances were found and fixed during this branch's own governance review, both in files already touched above: the Guardian dashboard's six MUTATING fragments (guard create, guard enable/disable, baseline create/deploy/delete/update) never got the same deny their read-only siblings got in the same earlier commit — worst of all the fixes in this note, since a service-scoped token could deploy a Baseline (a fleet-wide, `full_sync` operation) outside its own service; and `GET /fragments/inventory/find/results`, `GET /api/v1/inventory/software`, and MCP `query_installed_software` (the software-search family) never got the deny their sibling `/fragments/inventory/devices` got. See `docs/user-manual/audit-log.md` for the full list of new/changed audit verbs and `docs/enterprise-readiness-soc2-first-customer.md` "The machine-health audit exemption" for the narrowed CC7.2 scope.
 
 **Who this affects.** Any integration authenticating with a service-scoped API token (a token bound to one service's agents) that currently calls any of the routes/tools/fragments above will start receiving `403` instead of fleet-wide data on this upgrade — this is the intended fix, not a regression. Separately, any integration calling `POST /api/schedules/{id}/enable` with `enabled` as a native JSON boolean will see its `enabled: false` calls actually disable the schedule for the first time — see "What to do" below. Ordinary (non-service-scoped) operator sessions are unaffected by the confinement changes.
 
-**What to do.** An integration that needs this data should use a token scoped appropriately for the surface it reads: a global (non-service-scoped) credential for a fleet-wide aggregate view, or the existing per-device REST/MCP reads (`.../{agent_id}` shapes), which remain available and stay confined to the token's own service. For the `/auto` Pre-flight and Deploy rail/result/config/delete routes there is no per-device equivalent — a service-scoped token cannot manage its own principal's fleet-wide pre-flight runs or deployments at all; use a non-service-scoped credential for pre-flight and deployment workflows. The Schedule API has no per-device equivalent either — a service-scoped token cannot list, create, or arm a recurring schedule at all; use a non-service-scoped credential, or, if a service-scoped token is all that's reachable, it can still disable (never create, re-enable, or list) a runaway schedule. Guardian Guard/Baseline mutation and fleet-wide software search have no per-device equivalent either — use a non-service-scoped credential for those too. For the `enabled` parsing fix: if your integration sends `{"enabled": false}` as a real JSON boolean and has been relying on (or working around) it actually re-enabling the schedule, update it — that was always a bug, and the workaround is now unnecessary and will produce the opposite of the intended effect.
+**What to do.** An integration that needs this data should use a token scoped appropriately for the surface it reads: a global (non-service-scoped) credential for a fleet-wide aggregate view, or the existing per-device REST/MCP reads (`.../{agent_id}` shapes), which remain available and stay confined to the token's own service. For the `/auto` Pre-flight and Deploy rail/result/config/delete routes there is no per-device equivalent — a service-scoped token cannot manage its own principal's fleet-wide pre-flight runs or deployments at all; use a non-service-scoped credential for pre-flight and deployment workflows. The Schedule API has no per-device equivalent either — a service-scoped token cannot list, create, arm, **or (see the #3378 caveat above) disable** a runaway schedule; use a non-service-scoped credential for schedule management, including as the kill-switch for an incident involving a service-scoped-triggered schedule. Guardian Guard/Baseline mutation and fleet-wide software search have no per-device equivalent either — use a non-service-scoped credential for those too. For the `enabled` parsing fix: if your integration sends `{"enabled": false}` as a real JSON boolean and has been relying on (or working around) it actually re-enabling the schedule, update it — that was always a bug, and the workaround is now unnecessary and will produce the opposite of the intended effect.
 
 ### vNEXT — service-scoped API tokens are now denied by default everywhere, not just on the routes named above (guardian-confinement-2298 PR 3 — "the flip") (breaking)
 
@@ -1405,6 +1469,16 @@ Plugin signature verification ships in two parts: an agent-side CMS verifier and
 
 ### vNEXT — Response templates (#254, Phase 8.2)
 
+**Superseded (ADR-0058).** `instruction_definitions`/`instruction_sets` moved from
+per-replica SQLite to the shared PostgreSQL substrate — the `sqlite3 instructions.db`
+commands and the SQLite `schema_meta` v1→v3 probe-and-stamp mechanism described below **no
+longer apply**; that mechanism doesn't exist in the current codebase. For backup/restore and
+schema-version checks on this store today, use the PostgreSQL Substrate section's `pg_dump`/
+`pg_restore` procedure against the `instruction_store` schema, not the commands in this
+subsection. Left as-written below for historical reference (this is what the Phase 8.2
+migration looked like on SQLite, in case an operator is diagnosing an upgrade that predates
+the Postgres cutover).
+
 Phase 8.2 ships named response-view configurations attached to each `InstructionDefinition`: a column subset, sort order, and filter presets the dashboard's filter-bar **View** dropdown surfaces. The feature is purely additive — operators who never author a template see a synthesised `__default__` view that is byte-identical in behaviour to the prior "show all columns, sort by Agent" default.
 
 **Schema migration.** `instruction_definitions` gains one column: `response_templates_spec TEXT NOT NULL DEFAULT '[]'`. The migration ledger advances from v2 to v3. `ALTER TABLE ADD COLUMN` with a constant default is O(1) in SQLite (metadata-only, no table rewrite); the migration is non-destructive.
@@ -1444,6 +1518,27 @@ systemctl start yuzu-server
 **New audit actions.** `response_template.create`, `response_template.update`, `response_template.delete` — see `audit-log.md` for the failure-reason vocabulary. SIEM rules already filtering on `success`/`denied` will pick these up unchanged.
 
 **Authoring caveats.** The dashboard YAML editor's lightweight line-scanner does not extract `spec.responseTemplates` into the indexed column; author through `POST /api/v1/definitions/import` (JSON envelope) or the REST template endpoints. Imported templates with the reserved `id: __default__` are silently dropped during normalisation.
+
+### vNEXT — webhook store moves to Postgres; secrets now encrypted at rest (ADR-0057) (breaking)
+
+`WebhookStore` moves from SQLite (`webhooks.db`) to the PostgreSQL substrate, and the webhook
+HMAC signing secret is now envelope-encrypted at rest (`SecretCodec`, ADR-0010) instead of a
+plaintext column. A **mandatory, automatic backfill** re-encrypts every existing webhook's
+secret and carries over the delivery log on first boot; a failed backfill refuses to start the
+server (the boot log names the exact remediation). `POST /api/webhooks` now returns `400`
+for an invalid URL, distinct from a `503` for a genuine store/database error; both `POST` and
+`DELETE` return `503` (rather than a silently-empty/silently-failed result) on that latter
+case, previously ambiguous. The legacy `webhooks.db` is retained one release as a rollback
+reference (never deleted) and still holds every pre-cutover secret in plaintext during that
+window, restricted to the file owner where the platform supports it (POSIX only, see the ADR)
+— see [`rest-api.md`](rest-api.md#post-apiwebhooks) for the rotation guidance. Full
+detail: `docs/adr/0057-webhook-store-postgres-migration.md` and the
+`## ⚠️ Behaviour change: webhook store moves to Postgres (ADR-0057)` section in
+`docs/user-manual/upgrading.md`.
+
+### vNEXT — `initialize` can answer `503` during a graceful shutdown (#3042)
+
+With MCP streaming on, `initialize` now returns `HTTP 503` / JSON-RPC `-32015` ("Server is shutting down") for a narrow, transient window (seconds, not the deploy's whole grace period) if it lands after `ServerImpl::stop()` has begun draining live sessions. **Affected:** any MCP client integration — the reference clients and most SDKs already treat a non-2xx `initialize` as a transient failure and retry/reconnect; a client that specifically asserted "initialize never 503s" needs updating. No `retry_after_ms` is given (this process has no visibility into when a replacement instance will be reachable); reconnect and re-`initialize` once it is. A session that was already live when shutdown began instead receives a clean `notifications/yuzu.stream_closed` close frame (`reason: session_terminated`) rather than a bare connection drop — see [MCP — Troubleshooting](mcp.md#-32015-server-is-shutting-down-http-503) for the full symptom/cause/fix.
 
 ---
 
@@ -2070,6 +2165,8 @@ The server's storage substrate is **PostgreSQL** (ADR-0006/0007; the agent stays
 
 Held-open SSE streams also lease this pool: each re-validates its credential every ~3 s tick. Those reads are cached (60 s for API tokens, 15 s for the engine-principal liveness check), so steady-state cost is proportional to *distinct credentials* rather than to stream count — but the refreshes still land here alongside ordinary traffic, and a stream capacity far above the pool size is the shape that turns a brief pool blip into a correlated stall. The server warns at startup when effective SSE stream capacity exceeds 16x `--postgres-pool-size`. Treat that as a prompt to watch `yuzu_pg_acquire_wait_seconds` and `yuzu_pg_pool_in_use`, not as an instruction to enlarge the pool reflexively — adding connections against an already-struggling database makes matters worse, and lowering the stream capacity is often the better lever.
 
+**Bootstrap-time floor (default-cert generation, ADR-0053).** First-boot (or self-heal) default-cert generation takes the `yuzu:default_certs_bootstrap` Postgres advisory lock for the duration of its critical section, holding one pool lease for that whole window while the CA-store writes it performs inside the lock each draw their own nested per-call lease from the SAME pool — an N-way race at this one boot-time code path needs roughly N+1 simultaneous connections. At the allowed minimum `--postgres-pool-size=1` this is not merely "can self-contend under a race" — it fails **every** boot that needs to generate certs, deterministically, zero racers required, since the outer lease alone exhausts a pool of size 1. It fails closed and loudly (a nested-acquire timeout surfaces as an ordinary `record_issued` failure → refuse to start), never a hang or silent corruption, but a pool sized at the bare minimum for steady-state heartbeat/SSE traffic above can still be too small for this one-time bootstrap path — size for at least 2 even on the smallest deployments.
+
 **`endpoint_state` is reconstructible.** The `endpoint_state` schema (last-known offline-host display) is pure cache — the server repopulates it from heartbeats within one cycle (~30 s). A targeted restore may safely omit it; only the secret-bearing schemas and live operational data need the paired key-directory restore above.
 
 ### Provisioning a native (non-container) install
@@ -2141,7 +2238,7 @@ Schedule the dump alongside the existing SQLite/cert-dir backups; verify restore
 
 Secret columns in PostgreSQL are **envelope-encrypted app-side** (ADR-0010): each value is sealed under a fresh data-encryption key (DEK), and the DEK is wrapped by the install's key-encryption key (KEK). The KEK is a 32-byte key file generated on first boot (`secrets-kek-v1.key`, mode 0600, in the same key directory as the CA root key — `--ca-dir`, default `/etc/yuzu/certs` on Linux/macOS, `C:\ProgramData\Yuzu\certs` on Windows) and **never enters the database** — `kek_meta` in the `secrets` schema records only non-secret fingerprints (key-check values), which the server verifies against the key files at every boot.
 
-> The encryption machinery ships ahead of its consumers: as of this release **no store writes secret columns yet** — the gated stores (`auth` TOTP secrets, `webhooks`, `offload_targets`, the OIDC client secret) adopt it as each migrates to Postgres. Set your backup procedure up for the pairing below **now** so those migrations don't invalidate it.
+> Three of the four gated stores now write secret columns through this machinery: `auth` (TOTP secrets, since 2026-07-16), `webhooks` (the outbound HMAC signing secret, ADR-0057), and `runtime_config_store` (the OIDC client secret, ADR-0060). `offload_targets` adopts it once it migrates to Postgres (ADR-0059). Set your backup procedure up for the pairing below **now** — every additional migration widens the blast radius of a KEK/DB backup mismatch, never narrows it.
 
 **The restore-pairing invariant.** `pg_dump` output and volume snapshots contain **ciphertext and wrapped DEKs only** — a database backup alone recovers no secrets, and a database restore is unusable without the matching keys directory. DB backups and keys-dir backups are a *pair*: back them up on the same schedule, restore them **together**, and keep a separate offline copy of the KEK file exactly like the CA root key. The restore-verification drill must restore both halves and confirm a clean boot — the server checks every registered KEK fingerprint at startup and **fails closed** rather than serving with unreadable secrets. The failure classes below are stable error *prefixes* at the start of the fatal startup message (match the prefix in the message text when writing log-scraping alerts; they are not structured log fields):
 
@@ -2602,8 +2699,12 @@ Decrypt failures are counted per store and failure class as
 `yuzu_server_secret_decrypt_failures_total{store, failure_class}` (classes:
 `tag_mismatch`, `kek_unresolvable`, `malformed_blob`, `crypto_failure`).
 **This is live as of the auth store's Postgres migration** — the auth store
-(`auth.users.mfa_totp_secret`, TOTP secrets) is the first secret-bearing
-store to ship, so `store="auth"` is the only label value today. A sustained
+(`auth.users.mfa_totp_secret`, TOTP secrets) was the first secret-bearing
+store to ship; `webhook_store` (`webhooks.secret`, ADR-0057) joined it, so
+`store` already has more than one live value and gains a new one with each
+further secret-gated migration (`offload_targets`, then the OIDC client
+secret). Scope any dashboard/alert to the specific `store` you care about
+rather than assuming a single fixed value. A sustained
 non-zero `kek_unresolvable` rate after a deployment or restore is the
 primary backup-skew alert signal; a single-row `tag_mismatch` is the tamper
 signal and warrants investigation, not retry. Ready-made alert rules for

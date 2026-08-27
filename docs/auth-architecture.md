@@ -922,9 +922,12 @@ ADR-0041). Tests: `tests/unit/server/test_oidc_principal_key.cpp`.
 `/auth-and-authz` skill gap matrix P1 #6. Thin first slice: SP-initiated login
 against a single, statically-pinned IdP. Mirrors the OIDC SSO session seam
 (same cookie / `auth_source` / RBAC funnel) but uses the SAML 2.0 protocol.
-**Linux and macOS only — SAML is unsupported on Windows builds and fails closed
-there** (a Windows server logs an error at startup and does not enable SAML
-regardless of flag values).
+**Linux and macOS only — SAML is unsupported on Windows *server* builds and
+fails closed there** (a Windows server logs an error at startup and does not
+enable SAML regardless of flag values). This is a deliberate non-gap, not
+unfinished work: running the Yuzu **server** on Windows is out of scope, so a
+Windows-server SAML port is not planned. (The Yuzu **agent** on managed
+Windows endpoints is a separate binary and is unaffected.)
 
 ### Configuration
 
@@ -1162,9 +1165,13 @@ key. Design:
   assertion attributes are stored or surfaced.
 - **SP metadata endpoint.** No `GET /saml/metadata` endpoint is provided; IdP
   registration uses the manual flag values.
-- **Windows support.** SAML depends on an XML processing library whose Windows
-  build is not yet wired in the vcpkg manifest. The server detects Windows at
-  startup, logs an error, and does not enable the SAML routes.
+- **Windows server support — out of scope, not deferred.** Running the Yuzu
+  server on Windows is not a targeted deployment, so SAML on a Windows server
+  is intentionally not built: the server detects Windows at startup, logs an
+  error, and does not enable the SAML routes. (Correction: this was previously
+  documented as blocked on an XML processing library missing from the vcpkg
+  manifest — that is inaccurate; libxml2/xmlsec are already in the manifest.
+  The exclusion is a product-scope decision, not a dependency gap.)
 - **IdP-metadata auto-fetch.** The IdP cert and SSO URL are supplied statically
   via flags; SAML metadata XML auto-discovery is not implemented.
 - **Settings-UI runtime reconfigure.** SAML can only be configured via CLI
@@ -2443,6 +2450,16 @@ header, so these names stay rejected on client ingress permanently.
 - **API tokens** — Bearer token and `X-Yuzu-Token` header auth for automation. MCP tokens (see `docs/mcp-server.md`) use the same table with mandatory expiration (max 90 days).
 - **Ownership-scoped revocation** — `DELETE /api/v1/tokens/{id}` and `DELETE /api/settings/api-tokens/{id}` both require the caller to own the token; the global `admin` role is the sole bypass. Cross-user revoke returns `404 token not found` (identical to unknown-id, to prevent enumeration). Denied attempts are recorded with `result=denied`, `detail=owner=<principal>`. See #222 and `docs/user-manual/server-admin.md` "Upgrade Notes".
 
+### Device tokens (`DeviceTokenStore`, ADR-0052, capability 18.8) — currently dormant, docs/user-manual/rest-api.md "Device Tokens"
+
+Standing invariant: **token presenter MUST equal token subject** — a device token's `device_id`
+(the agent it is bound to) is the only identity `validate_token` checks a presenter against;
+`principal_id` (the operator who issued it) is never part of that check. #823's re-registration
+defence — every token bound to an agent's `device_id` is revoked when that agent re-registers,
+closing the window an mTLS-disabled impersonation (#779) could otherwise exploit to replay a
+stolen token — is keyed on this same `device_id` column (`revoke_by_device`, #3401). Fails closed
+on a genuine revoke failure (ADR-0012 §1): the registration is refused, not merely logged.
+
 ### Service-scoped token fleet-wide confinement — durable default-deny (guardian-confinement-2298 PR 3, "the flip")
 
 A **service-scoped API token** is bound to one IT service's agents (`session->token_scope_service` non-empty on the resolved session) — created so an integration's credential reaches only the devices tagged to its own service, not the whole fleet. A recurring gap closed across several earlier branches: a confinement check keyed on username, role, or resource ownership never actually consulted the token's *own* service-tag scope, so a service-scoped token could reach fleet-wide data or, on a few mutating surfaces, fleet-wide actions. Those earlier fixes (PR 1 role cap, PR 2 Phase 0 primitives, PR 2 gate renames) capped the blast radius and built the primitives; **this PR flips the underlying security posture from admit-by-default to deny-by-default**, closing the pattern structurally rather than instance-by-instance.
@@ -2459,11 +2476,11 @@ A **service-scoped API token** is bound to one IT service's agents (`session->to
 
 **Explicit denies for gate-less routes (§3e).** A route that never calls `require_permission`/`require_scoped_permission`/C8 at all is untouched by the flip regardless of how the flip itself is tuned — these needed their own deny. `AuthRoutes::deny_service_scoped_session` is `server.cpp`'s shared gate for this shape (health-summary fragment, the legacy `/events` SSE stream, the instructions-list fragment, and the six result-set HTMX fragments); `ComplianceRoutes` and `WorkflowRoutes` carry their own file-local equivalents for the same reason every other route-owner class in this list does (below). A residual grep sweep of every `auth_fn`/`perm_fn` call site in `rest_api_v1.cpp` (74 sites) and `mcp_server.cpp` (3 sites) found four more real instances — three sharing one shape (`management-groups/{id}/roles` GET/POST/DELETE, plus the `POST /api/v1/tokens` service-scope minting check, all bypassing `require_permission` via a **direct** `rbac_store->check_permission` call) and the eight-route `/api/v1/result-sets*` REST family (the twin of the HTMX fragments above) — plus one **distinct, more severe, not service-scope-specific** bug in the same pass: `POST /api/v1/result-sets/from-inventory-query` had no authorization check of any kind (CWE-862), missed by an earlier fix that gated its three dispatch siblings. Full inventory, including document-only dispositions and the sweep's own accounting: `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md`.
 
-**The per-file `deny_service_scoped_*`/`deny_fleet_wide_service_scoped` helpers are now a SECOND, largely-redundant layer, not the primary defense.** For any route that also calls `require_permission`/`require_scoped_permission` (the vast majority), the flip above already denies a service-scoped token structurally — six of the seven original in-handler deny sites (`list_schedules`, `get_dex_signal_detail`, `list_dex_perf_devices`, `get_dex_group_app_perf`, `compare_app_perf_versions`, `list_network_devices`) are still double-denies, kept for now and scheduled for Phase 2 retirement — `query_installed_software`'s was retired in the first Phase 2 migration (below) alongside the ~15 REST `deny_service_scoped_*` per-file helpers, once the routes migrate onto `require_fleet_read`/`confine_agent_target`. They remain load-bearing **only** for routes with no other RBAC gate call at all (the §3e class above) — `EXTEND the pattern, do not fork a new copy` still applies to *that* subset. Current call sites, including this PR's additions: `deny_service_scoped_`/`deny_service_scoped_mutation_` (`guardian_routes.{hpp,cpp}`), `deny_service_scoped_` (`dex_routes.{hpp,cpp}`, `deployment_routes.{hpp,cpp}`, `preflight_routes.{hpp,cpp}`, and the new `compliance_routes.{hpp,cpp}`), `deny_service_scoped_schedule` (`schedule_routes.{hpp,cpp}`), `deny_service_scoped_schedule_list` + the new `deny_service_scoped_scope_estimate` (both local lambdas in `workflow_routes.cpp`), the shared `deny_fleet_wide_service_scoped` lambda in `rest_api_v1.cpp` (now covering the result-set REST family too) and `mcp_server.cpp`, the new `AuthRoutes::deny_service_scoped_session` (`server.cpp`'s shared gate for its own gate-less routes), plus inline checks in `device_routes.cpp` / `network_routes.cpp` / `inventory_routes.cpp` / `tar_tree_routes.cpp`.
+**The per-file `deny_service_scoped_*`/`deny_fleet_wide_service_scoped` helpers are now a SECOND, largely-redundant layer, not the primary defense.** For any route that also calls `require_permission`/`require_scoped_permission` (the vast majority), the flip above already denies a service-scoped token structurally — five of the seven original in-handler deny sites (`list_schedules`, `get_dex_signal_detail`, `list_dex_perf_devices`, `compare_app_perf_versions`, `list_network_devices`) are still double-denies, kept for now and scheduled for Phase 2 retirement. Two are retired: `query_installed_software`'s in the first Phase 2 migration (below), and `get_dex_group_app_perf`'s in #3290 Phase 2 bucket 1a — both were provably dead (fired after their route's own `perm_fn`), unlike the five that remain, which are live-but-redundant (their deny fires BEFORE `perm_fn`, so retiring them changes the observable response, not just deletes unreachable code — a different, more cautious backlog item). Same bucket-1a pass also retired `deny_service_scoped_schedule` (`schedule_routes.{hpp,cpp}`) entirely — its four call sites (`schedule.create`/`.list`/`.delete`/`.enable`) all fired after their route's own `require_permission`. The remaining per-file helpers (below) stay in place; they remain load-bearing **only** for routes with no other RBAC gate call at all (the §3e class above) — `EXTEND the pattern, do not fork a new copy` still applies to *that* subset. Current call sites, including this PR's additions: `deny_service_scoped_`/`deny_service_scoped_mutation_` (`guardian_routes.{hpp,cpp}`), `deny_service_scoped_` (`dex_routes.{hpp,cpp}`, `deployment_routes.{hpp,cpp}`, `preflight_routes.{hpp,cpp}`, and the new `compliance_routes.{hpp,cpp}`), `deny_service_scoped_schedule_list` + the new `deny_service_scoped_scope_estimate` (both local lambdas in `workflow_routes.cpp`), the shared `deny_fleet_wide_service_scoped` lambda in `rest_api_v1.cpp` (now covering the result-set REST family too) and `mcp_server.cpp`, the new `AuthRoutes::deny_service_scoped_session` (`server.cpp`'s shared gate for its own gate-less routes), plus inline checks in `device_routes.cpp` / `network_routes.cpp` / `inventory_routes.cpp` / `tar_tree_routes.cpp`.
 
 **Phase 2 progress (#3290).** The first migration landed: `GET /api/v1/inventory/software` + its MCP twin `query_installed_software` are now on `require_fleet_read` — both surfaces' `deny_fleet_wide_service_scoped`/blanket-deny call sites are retired for this tool pair (the REST call was already provably dead, firing after `perm_fn`; the MCP call was live and is now gone). `require_fleet_read` itself gained the elevated/engine/mcp_tier caller-class branches it was missing at Phase 0 (mirroring `require_list_read`'s ladder — see its own doc comment). Prioritization for this and future migrations is **documented reasoning, not the metric** — no production fleet exists yet, so `yuzu_auth_service_scope_default_denied_total` has no real traffic to rank by; the criterion-1 substitute and the ranked backlog live in `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`. The §3d `authorize_list_read` supersede→intersect migration (below) is a separate, not-yet-started stream.
 
-**Consequences accepted for v1 (recorded, not oversights):** fleet-wide aggregates with no per-agent identity (e.g. `get_dex_perf_fleet`, `get_network_fleet`) stay `denied` at C8 — a `confined` label with no real downstream mechanism would be an unenforced claim; re-admission is a Phase 2 `kServiceScopeGlobalSafe` entry with security-guardian sign-off, not an inferred-safe classification during a routine change. Service-tag writes (whoever sets an agent's `service` tag moves scope) are hardened as of #3289 — a service-scoped session is denied, value-blind, before writing/deleting the `service` key at every REST/legacy-dashboard/MCP tag-mutation site, and the agent's own gRPC `Register` sync path no longer accepts an agent-claimed `service` value at all; plain `Tag:Write`/`Tag:Delete` remains sufficient for non-service-scoped (already fleet-scoped) holders. A related but distinct gap — a live agent's in-memory self-reported tags shadowing the store during scope-DSL evaluation — is tracked separately (#3295). No cached derived confinement sets. Dispatch's supersede→intersect migration (§3d, four `authorize_list_read` callers) is deferred, not part of this PR. **Bootstrap note:** an empty-cohort service token cannot bootstrap its own scope via any route — and since #3289, neither can an agent via its own Register sync; onboarding a brand-new service still needs an interactive/unscoped path; see `docs/user-manual/authentication.md`.
+**Consequences accepted for v1 (recorded, not oversights):** fleet-wide aggregates with no per-agent identity (e.g. `get_dex_perf_fleet`, `get_network_fleet`) stay `denied` at C8 — a `confined` label with no real downstream mechanism would be an unenforced claim; re-admission is a Phase 2 `kServiceScopeGlobalSafe` entry with security-guardian sign-off, not an inferred-safe classification during a routine change. Service-tag writes (whoever sets an agent's `service` tag moves scope) are hardened as of #3289 — a service-scoped session is denied, value-blind, before writing/deleting the `service` key at every REST/legacy-dashboard/MCP tag-mutation site, and the agent's own gRPC `Register` sync path no longer accepts an agent-claimed `service` value at all; plain `Tag:Write`/`Tag:Delete` remains sufficient for non-service-scoped (already fleet-scoped) holders. A related but distinct gap — a live agent's in-memory self-reported tags shadowing the store during scope-DSL evaluation — was tracked separately as #3295 and is now closed: `evaluate_scope`'s `tag:<key>` resolver is store-first (a TagStore row of any source wins over a connected agent's live claim; the session value answers only when the store has no row at all), and `register_agent` drops an agent-claimed `service` key from the session at ingest. No cached derived confinement sets. Dispatch's supersede→intersect migration (§3d, four `authorize_list_read` callers) is deferred, not part of this PR. **Bootstrap note:** an empty-cohort service token cannot bootstrap its own scope via any route — and since #3289, neither can an agent via its own Register sync; onboarding a brand-new service still needs an interactive/unscoped path; see `docs/user-manual/authentication.md`.
 
 **Known-but-unfixed instances predating this PR** were tracked as GitHub issues #3123 (device discovery), #3124 (response/execution data), #3125 (inventory data) — this PR proposes closing them as fixed-by-flip (every instance they list reaches `require_permission`/`require_scoped_permission`, which now denies by default), pending review; per the issue-standard, automation does not close a `security`-labelled issue unilaterally. Check each issue's current body before citing an instance count from it historically — issues were edited down as fixes landed elsewhere.
 
@@ -2971,7 +2988,7 @@ A fresh install no longer refuses to start without operator certs. On first boot
 the server generates a per-install internal CA (ECDSA P-384, 10-year) and P-256
 leaves for the HTTPS, agent-gRPC, and management-gRPC listeners under the cert
 directory (`auth::default_cert_dir()`; override with `--ca-dir`), recorded in
-`ca.db`. Implementation: `default_certs.{hpp,cpp}` on the
+`ca_store` (Postgres, ADR-0053). Implementation: `default_certs.{hpp,cpp}` on the
 `x509_ca`/`key_provider`/`ca_store` engine. Behaviour:
 
 - **Per-surface, partial-override.** Defaults fill only the surfaces the
@@ -3022,7 +3039,7 @@ cert on first boot, but the data plane requires one. Resolution:
    **and** the built-in CA is active, the server verifies the CSR's
    proof-of-possession, signs a client leaf — `CN=<agent_id>` + URI SAN
    `yuzu://<ca-fingerprint>/agent/<agent_id>` — sized to ≤ the CA's `notAfter`,
-   records it in `ca.db` (`purpose=agent`), and returns it in
+   records it in `ca_store` (`purpose=agent`), and returns it in
    `RegisterResponse.issued_certificate` + `issued_ca_chain`. **The CSR's own
    subject/SAN are ignored** — identity is set by the server from the
    authenticated enrollment, never from attacker-controlled CSR fields (this is
@@ -3070,7 +3087,7 @@ per-agent mTLS rolls out without breaking a heterogeneous or mid-upgrade fleet:
   non-PKI deployment stores nothing. PR4's operator-revoke handler calls the same
   sweep immediately so a dashboard/REST revoke tears the stream down promptly
   rather than waiting for the next tick. The revocation predicate runs off the
-  per-session lock (it reads `ca.db`), and teardown re-checks the cert is
+  per-session lock (it reads `ca_store`), and teardown re-checks the cert is
   unchanged so a reconnection mid-sweep is not cancelled by mistake.
 - `require_client_identity_` is recomputed *after* the default-cert bootstrap
   (`tls_enabled && !tls_ca_cert.empty()`), since it is baked at construction
@@ -3090,7 +3107,7 @@ follow-up (today they are enforced at `Register`, `Subscribe`, `Heartbeat`,
 **Custody & renewal.** The CA issuing key is loaded transiently per signature via
 `FileKeyProvider` and zeroed (RAII) so the crown jewel is not resident for the
 process lifetime. Server issuance is fail-closed: a cert that cannot be recorded
-in `ca.db` (so it could never be revoked) is not handed out, and per-agent
+in `ca_store` (so it could never be revoked) is not handed out, and per-agent
 issuance is rate-limited (one signature per `agent_id` per 30 s) so a holder of a
 valid enrollment credential cannot spam the signer. Agent leaves are ~1-year and
 auto-renew once two-thirds of their lifetime has elapsed (evaluated at agent
@@ -3132,13 +3149,13 @@ flow — e.g. when supplying an operator-minted client cert via `--client-cert` 
 (the issued leaf), and `agent-ca.pem` (the issuing CA chain the agent pins the
 server against). Deleting these files makes the agent **auto-re-provision** on
 its next enrollment: it generates a fresh keypair + CSR and the server signs a
-NEW leaf with a NEW serial. The previously-issued serial stays in `ca.db`
+NEW leaf with a NEW serial. The previously-issued serial stays in `ca_store`
 inventory as a now-orphaned `agent` row that no live agent holds — harmless, but
 operators reconciling the issued-cert inventory should expect one orphan row per
 key-loss event (revoke the orphan if a strict inventory is required).
 **Revocation-bypass guard (#1239 H-2):** auto-re-provision is refused when the
 agent's prior cert is *revoked* (not merely orphaned). `sign_agent_csr` scans
-`ca.db` for a revoked, non-expired cert with `subject==agent_id` and, if found,
+`ca_store` for a revoked, non-expired cert with `subject==agent_id` and, if found,
 returns `nullopt` (audit `ca.cert.reissue_blocked`, metric
 `yuzu_server_ca_reissue_blocked_total{reason=revoked_identity}`) — so a
 compromised endpoint cannot drop its key and re-enroll its way back onto the data
@@ -3158,7 +3175,7 @@ agent's leaf — so the server-side revocation gate and the open-stream sweep ab
 never see the proxied agent's serial, and a revoked agent behind a gateway stays
 functional on the data plane. PR5d closes the *issuance* half of this gap
 (gateway-proxied agents now obtain a per-agent leaf via `ProxyRegister`
-CSR-signing, so the identity exists and is recorded/revocable in `ca.db`), but
+CSR-signing, so the identity exists and is recorded/revocable in `ca_store`), but
 *enforcing* that revocation at the gateway edge is future work: durable
 cryptographic through-gateway identity (and therefore through-gateway revocation)
 arrives with the QUIC single-connection migration (#376). Until then, to revoke a

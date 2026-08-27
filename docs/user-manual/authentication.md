@@ -816,11 +816,15 @@ The raw successor secret is returned exactly once, the same as at creation.
 `overlap_secs` defaults to 7 days if omitted (24-hour floor, 10-year
 ceiling). Once the new secret is installed wherever it's consumed, close
 the loop explicitly instead of waiting on the auto-revoke sweep — `{token_id}`
-here is the **successor's** id, from the `rotate` response above:
+here is the **successor's** id, from the `rotate` response above, and the
+request body must now also carry the raw successor secret itself (`secret`,
+below) as proof you actually received it:
 
 ```bash
 curl -s -b cookies.txt -X POST \
-  http://localhost:8080/api/v1/tokens/f6e5d4c3b2a1/confirm
+  http://localhost:8080/api/v1/tokens/f6e5d4c3b2a1/confirm \
+  -H "Content-Type: application/json" \
+  -d '{ "secret": "yuzu_Nm7pQ2z..." }'
 ```
 
 `confirm` revokes the predecessor immediately and promotes the successor to
@@ -866,10 +870,21 @@ and the `YuzuRotationSweepNotRunning` alert exist to surface.
 **That safeguard covers the automatic sweep only — it does not cover an
 explicit `confirm`.** `confirm` is your attestation that you received and
 retained the successor secret, and it revokes the predecessor straight away.
-If the rotate response was lost, do NOT look the successor's `token_id` up
-and confirm it: that revokes the credential you still hold in favour of one
-you never received. Revoke the unknown successor instead — that keeps the
-predecessor working — and start a new rotation.
+Since #3015, `confirm` proves that attestation instead of merely asserting
+it: the request must carry the raw successor secret itself, verified
+server-side against the stored hash before the predecessor is touched. A
+lost rotate response can no longer be turned into a confirm by recovering
+the successor's `token_id` out-of-band — without the secret, `confirm`
+returns `403` and nothing is revoked. If the rotate response was lost, you
+have no way to satisfy that check, so the recovery path is the same as
+before: revoke the unknown successor (that keeps the predecessor working)
+and start a new rotation. Proof of possession gates this immediate,
+explicit `confirm` call only; it leaves the automatic sweep described above
+untouched. If the successor secret did actually reach wherever it's
+consumed (so it has been presented at least once, per the carve-out above),
+the sweep still auto-revokes the predecessor on its own schedule with no
+secret required, so waiting for it is also a valid recovery when you're
+unsure whether `confirm` would succeed.
 
 `confirm`'s check that you're the same operator who called `rotate` is
 stored durably, not just in memory, so a server restart no longer blocks

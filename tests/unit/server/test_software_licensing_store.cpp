@@ -493,7 +493,7 @@ TEST_CASE("SoftwareLicensingStore count_stale_agents keys on server-receipt last
 
 TEST_CASE("SoftwareLicensingStore reads are AUTHORITATIVE: degrade ≠ empty; writes fail soft",
           "[pg][software_licensing]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, sle_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     SoftwareLicensingStore store{pool};

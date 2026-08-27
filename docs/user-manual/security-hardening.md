@@ -12,8 +12,9 @@ This guide covers hardening Yuzu for production enterprise deployments.
 > or root the built-in CA in your enterprise CA (subordinate mode, roadmap). The
 > server warns loudly while on default certs (startup banner, audit
 > `server.default_certs_in_use`, the `yuzu_server_default_certs_active` gauge).
-> Back up `--ca-dir` (esp. `default-ca.key`) and `ca.db` — losing the CA key
-> forces a full fleet re-enrollment.
+> Back up `--ca-dir` (esp. `default-ca.key`) and the `ca_store` Postgres
+> schema (`pg_dump`/`pg_restore`, ADR-0053) — losing the CA key forces a full
+> fleet re-enrollment.
 
 All agent-to-server communication should use mutual TLS. Create a private CA, server certificate, and per-agent certificates.
 
@@ -298,16 +299,14 @@ Audit events include: `timestamp`, `principal`, `action`, `target_type`, `target
 
 ### Current encryption posture (interim, disclosed)
 
-Three secret classes are currently stored **plaintext inside 0600-mode server-side
-database files** (not encrypted at the column level): webhook signing secrets
-(`webhooks.db`), offload-target credentials (`offload_targets.db`), and the OIDC
-client secret (`runtime-config.db`). Protection today is file permissions + the
-host-level encryption above. ADR-0010
-(`docs/adr/0010-secrets-at-rest-envelope-encryption.md`) is the adopted roadmap:
-app-side AES-256-GCM envelope encryption lands with each store's PostgreSQL
-migration. Until then, treat server data-directory backups as secret-bearing.
+No secret class is now stored plaintext at the column level — the last remaining
+exception (offload-target credentials) closes with this migration (ADR-0059).
+ADR-0010 (`docs/adr/0010-secrets-at-rest-envelope-encryption.md`) is the completed
+roadmap: app-side AES-256-GCM envelope encryption landed with each store's
+PostgreSQL migration. Host-level encryption (above) remains defence-in-depth
+regardless.
 
-Two classes that used to appear on that list no longer belong on it:
+Five classes that used to appear on this list no longer belong on it:
 
 - **MFA TOTP secrets** (`auth.users.mfa_totp_secret`) are `SecretCodec`-encrypted
   as of 2026-07-16 — the first store to land the ADR-0010 seam. This changes the
@@ -317,11 +316,24 @@ Two classes that used to appear on that list no longer belong on it:
   keys directory and every MFA decrypt fails closed. Back the database and the
   keys directory up as a pair; see
   `docs/ops-runbooks/auth-db-recovery.md` § "Backup — the KEK pairing rule".
+- **Webhook signing secrets** (`webhook_store.webhooks.secret`) are
+  `SecretCodec`-encrypted as of the `WebhookStore` Postgres migration
+  (ADR-0057) — same KEK-pairing backup rule as MFA secrets above: back the
+  database and the `--ca-dir` keys directory up together.
+- **The OIDC client secret** (`runtime_config_store.runtime_config_secrets.sealed_value`)
+  is `SecretCodec`-encrypted as of the `RuntimeConfigStore` Postgres migration
+  (ADR-0060) — same KEK-pairing backup rule as MFA secrets above: back the
+  database and the `--ca-dir` keys directory up together.
 - **Session tokens** have no durable storage on any substrate. Sessions are
   in-memory-authoritative (`AuthManager::sessions_`); the Postgres cutover
   dropped the SQLite-era `sessions` table outright rather than migrating it, so
   there is no session-token column to encrypt — or to leak in a dump. A restart
   is itself a fleet-wide session revocation.
+- **Offload-target credentials** (`offload_target_store.offload_targets.auth_credential`)
+  are `SecretCodec`-encrypted as of 2026-08-25 (ADR-0059). Same backup-pairing
+  requirement as MFA TOTP secrets above: a Postgres dump alone cannot recover a
+  configured target's credential without the matching keys directory — the
+  target survives, but its credential must be re-entered.
 
 ## Plugin Allowlist
 
@@ -367,7 +379,89 @@ curl -s -X POST http://localhost:8080/api/v1/executions \
   }'
 ```
 
-The plugin blocks all network traffic except communication with the Yuzu server using platform-native firewalling: `netsh` on Windows, `iptables`/`nftables` on Linux, and `pfctl` on macOS.
+The plugin blocks all network traffic except communication with the Yuzu server using
+platform-native firewalling: `netsh` on Windows, `iptables` **and `ip6tables`** on Linux, and `pfctl` on macOS.
+
+### Whitelisting on a dual-stack host (read this before quarantining one)
+
+Containment covers **both address families**. On Linux the plugin installs the same
+`yuzu-quarantine` chain in `iptables` *and* `ip6tables`; each whitelist entry is routed to the
+chain matching its own family, so a **v4-only whitelist leaves IPv6 fully contained**.
+
+That is the correct posture — before this, an IPv6-capable host was never contained at all
+(#3282) — but it changes what a whitelist has to contain:
+
+- There is no blanket "keep existing connections alive" rule on either family — only a
+  whitelisted address's traffic survives, in any connection state (new, reconnecting, or
+  already established). The agent automatically whitelists its own configured server address
+  (`--server`) for this: an IP literal is used directly, and a hostname is resolved to its
+  address(es) **once, at agent startup** — never at quarantine time — covering whichever
+  families it resolves to at that point.
+- **Trust boundary: startup-time resolution uses the endpoint's own resolver.** This is a
+  deliberate improvement over resolving at quarantine time (which would let a host already
+  under active compromise steer its own containment exception via a poisoned `/etc/hosts` or
+  local resolver, right when quarantine is dispatched in response to that compromise) — but it
+  is not a trusted-channel guarantee against a resolver that was already compromised before or
+  at agent startup. For endpoints where containment integrity matters most, **configure `--server`
+  as an IP literal** rather than a hostname, removing DNS from the equation entirely.
+- If the agent's configured server address is a hostname that resolves to an IPv4 address but
+  the agent actually reaches the server over IPv6 through some other path (a split-horizon DNS
+  setup, a manually pinned route), or if the server's address changes after the agent last
+  started, the automatic whitelisting will not cover that path — **add the server's address to
+  the whitelist explicitly** in that case. The common case (the configured address resolves to
+  the address actually used, and doesn't change between agent restarts) needs no manual
+  whitelist entry for the server at all.
+- Whitelist entries that are neither valid IPv4 nor valid IPv6 (a hostname, a malformed literal)
+  are **skipped, and the skip is reported** — the plugin does not silently drop them and report a
+  clean success.
+- **On macOS, `whitelist` is a quarantine-time action.** It rebuilds and reloads the whole pf
+  ruleset, which includes the `block all` default-deny, and enables pf. Dispatching it at a device
+  that is *not* quarantined therefore isolates it. Use it to repair a contained device's
+  exceptions, which is what it is for; check `status` first if you are unsure of the device's
+  state.
+- If `ip6tables` is absent from the host, the v6 leg is reported as unavailable rather than
+  counted as applied.
+
+When in doubt, whitelist both families for the management server. An over-broad whitelist keeps
+the device manageable; a missing one requires physical or out-of-band access to recover.
+
+### Reading the result honestly
+
+The plugin reports on **two channels, and they carry different things**. `status|`/`state|` in the
+output line is the operator-readable detail; the ABI result status is what a generic
+success/failure consumer sees. Neither is allowed to say "clean" for a containment that is
+partial, unenforced, or unreadable.
+
+**Mutation actions** (`quarantine`, `unquarantine`, `whitelist`) emit `status|<token>`:
+
+| Token | Meaning | What to do |
+|---|---|---|
+| `quarantined` | Every rule the host's supported families need was applied | Nothing |
+| `quarantined_partial` | Some rules applied, some did not — e.g. IPv4 contained, IPv6 not | Treat the device as **not contained**; the `note\|` field names what is missing |
+| `failed` | Nothing applied | Not contained |
+| `released` | Rules removed | Nothing |
+| `release_uncertain` | The release ran but its result could not be confirmed | Verify with `status`; the device may still be contained |
+| `updated` | *(`whitelist`)* The exception list was changed | Nothing |
+| `update_uncertain` | *(`whitelist`)* The edit ran but its result could not be confirmed | Treat the repair as **not applied**; confirm with `status` before relying on it. This is the outcome to watch for on the stranded-device recovery path above |
+| `busy` | Another mutating quarantine action on this device held the serialization gate for longer than the wait budget | Nothing was changed by this call — retry. Waiters are served in arrival order, so a release queued behind a burst of quarantines is not starved |
+
+**`quarantine.status`** emits `state|<token>`:
+
+| Token | Meaning |
+|---|---|
+| `active` | Containment is in force |
+| `partial` | Some of the expected rules are present and some are not — a real containment gap |
+| `degraded` | *(macOS)* A blocking pf ruleset is loaded but pf is **disabled** — traffic is not actually being blocked |
+| `uncertain` | The firewall state could not be read, so the answer is unknown |
+| `inactive` | Not quarantined |
+
+`status` returns a **non-zero exit code** on `degraded` and `uncertain`, and sets the ABI result
+status to `UNAVAILABLE`/`PARTIAL`, so automation that only inspects the return code cannot read an
+unenforced or unreadable host as a clean status. `partial` returns 0 but is reported `PARTIAL` on
+the result-status channel. `active` and `inactive` are genuine answers and return 0.
+
+A quarantine result is a claim about firewall rules, not proof that traffic is blocked — for a
+device you believe is actively hostile, confirm with an independent probe.
 
 ### Checking Quarantine Status
 
@@ -384,7 +478,78 @@ curl -s -X POST http://localhost:8080/api/v1/executions \
 
 ### Releasing a Device
 
-Execute the `unquarantine` action to remove quarantine rules and restore normal network access. You can also use `whitelist` to add exceptions (IP or CIDR range) to the quarantine rules before releasing.
+Execute the `unquarantine` action to remove quarantine rules and restore normal network access. On
+Linux this tears down both the `iptables` and `ip6tables` chains; a release whose teardown does not
+fully succeed reports `release_uncertain`, not `released` — treat the device as possibly still
+contained and confirm with `status`.
+
+You can also use `whitelist` to add exceptions (IP or CIDR range) to the quarantine rules before
+releasing — the usual repair when a device has been contained without a reachable management
+address. `whitelist` is exempt from the dispatch gate below precisely so that repair stays possible.
+
+### Checking Quarantine Status
+
+```bash
+# Execute quarantine.status to check if an agent is isolated
+curl -s -X POST http://localhost:8080/api/v1/executions \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "definition_id": "quarantine.status",
+    "scope": "agent_id == \"agent-id\""
+  }'
+```
+
+### Releasing a Device
+
+Execute the `unquarantine` action to remove quarantine rules and restore normal network access. On
+Linux this tears down both the `iptables` and `ip6tables` chains; a release whose teardown does not
+fully succeed reports `release_uncertain`, not `released` — treat the device as possibly still
+contained and confirm with `status`.
+
+You can also use `whitelist` to add exceptions (IP or CIDR range) to the quarantine rules before
+releasing — the usual repair when a device has been contained without a reachable management
+address. `whitelist` is the repair path for a device whose exceptions are wrong.
+
+### Quarantine now blocks instruction dispatch (#881)
+
+A quarantined device is refused at the **server's dispatch chokepoint**, not only at its own
+firewall: any instruction targeting it — by id, by scope, by management group, or by broadcast —
+is dropped before it reaches the agent, and the refusal is audited as
+`quarantine.dispatch_denied`. Before this, quarantine isolated the network while the control
+plane carried on issuing commands to the device.
+
+Two consequences worth planning for:
+
+- **The quarantine plugin's own actions are exempt** — `quarantine`, `unquarantine`, `status` and
+  `whitelist` still reach a contained device, so release stays possible. The exemption is keyed on
+  the action, not the plugin, so a future fifth action would be gated until it is deliberately
+  added.
+- **Three server-internal pushes are also exempt, and you should know they exist.** The TAR
+  fleet-topology snapshot request (`tar.fleet_snapshot`), the Guardian rule push
+  (`__guard__.push_rules`) and the asset-tag sync (`asset_tags.sync`) continue to reach a
+  contained device. This is deliberate — gating the Guardian push would stop a quarantined device
+  receiving the enforcement rules that make containment meaningful — but it means the containment
+  boundary is not total, and a security review of the containment surface has to account for
+  those three channels. They are a closed set in code (`SystemReservedPush`) and are counted by
+  `yuzu_server_system_reserved_push_total{capability,result}`; a new one cannot be added without
+  appearing in that set. **They are counted, not audited** — there is no per-event row saying a
+  particular push reached a particular contained device, so this is a fleet-level signal rather
+  than per-device evidence. **Nothing outside that set and the plugin's own four actions reaches a
+  quarantined device.**
+
+  What that means for your threat model, channel by channel:
+
+  | Channel | What it can do on a contained device |
+  |---|---|
+  | `tar.fleet_snapshot` | Requests a read-only topology/process snapshot. No state change. |
+  | `asset_tags.sync` | Writes device tags. No code execution. |
+  | `__guard__.push_rules` | Delivers Guardian baseline rules, which the agent may *enforce*. Enforcement is **not arbitrary command execution**: the assertion vocabulary is a closed five-value set — file present/absent, file hash, registry value, service running, service stopped — and dangerous registry keys and service names are refused at the `dangerous_enforce_in_spec` chokepoint before a push is ever built. So an operator with Guardian deploy rights can still change *typed, bounded* state on a contained device while their `execute_instruction` is refused. That is deliberate — enforcing a security baseline on a compromised host is the point — but it is the one exempt channel that mutates the endpoint, so scope it accordingly. |
+- **If containment state becomes unreadable, dispatch fails closed** — the server refuses *every*
+  target rather than guess who is contained. A short store outage is absorbed by a 60-second
+  last-known-good snapshot; past that, instruction dispatch stops fleet-wide until the store
+  recovers. Alert on `yuzu_server_quarantine_gate_total{outcome="fail_closed"}` — see
+  [Metrics](metrics.md) — because that series is an outage signal, not a quarantine signal.
 
 ## IOC Checking
 

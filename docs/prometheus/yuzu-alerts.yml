@@ -782,11 +782,99 @@ groups:
             Denials are audited as mcp.<tool>|denied with detail
             "input bound exceeded: <reason>"; correlate there for the principal.
 
+      - alert: YuzuMcpEngineRevalidateStoreUnreachable
+        expr: |
+          increase(yuzu_server_engine_revalidate_backoff_suppressed_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Engine-principal liveness re-checks are being answered from the failure backoff - the principal store is unreachable and engine streams are riding their grace windows"
+          description: >-
+            This counter only moves on CONFIRMED unreachability (the store
+            closed, or a query actually ran and failed, or PgPool's own
+            connect-failure breaker is open) - a bare pool-lease-acquire
+            timeout under a healthy database does not arm this backoff, so
+            firing already rules out ordinary pool saturation. First rule out
+            real impact: a flat
+            yuzu_mcp_stream_closes_total{reason="auth_unavailable"} means the
+            backoff is absorbing the blip and no streams have ended. Then
+            correlate with yuzu_pg_acquire_wait_seconds and
+            yuzu_pg_pool_in_use for genuine connection exhaustion vs. a
+            connect-level failure.
+          runbook_url: "https://docs.yuzu.io/runbooks/engine-principal-store-recovery"
+
   - name: yuzu-dispatch
     rules:
+      - alert: YuzuQuarantineGateFailClosed
+        expr: |
+          increase(yuzu_server_quarantine_gate_total{outcome="fail_closed"}[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Instruction dispatch is refusing every target - containment state is unreadable"
+          description: >-
+            The #881 containment gate cannot read quarantine state and is
+            failing CLOSED, so instruction dispatch reaches NOBODY on every arm
+            including broadcast. This is a fleet-wide dispatch OUTAGE, not a
+            quarantine event - a quarantined device produces
+            outcome="fresh"/"stale" and the per-denial audit row, never this.
+            The gate absorbs a transient read failure for up to 60s from its
+            last-known-good snapshot (outcome="stale"), so a sustained
+            fail_closed means the quarantine store has been unreadable past
+            that budget: check yuzu_server_quarantine_read_degrade_total{reason}
+            and the Postgres pool (yuzu_pg_acquire_wait_seconds,
+            yuzu_pg_pool_in_use). reason="read_concurrency_cap" is NOT a store
+            fault - it means this dispatch waited for one of four
+            containment-read slots and did not get one, the bound that stops a
+            stalled backend pinning the pool every other store shares. A slot
+            timeout fails closed deliberately: serving stale containment state
+            when nobody asked the store would under-enforce against a healthy
+            one. The quarantine plugin's own control actions stay
+            reachable throughout - releasing a device does not depend on this
+            read - as do the three system-reserved internal pushes
+            (yuzu_server_system_reserved_push_total). BE PRECISE ABOUT for: 2m:
+            it delays the page by two minutes, it does NOT require a sustained
+            episode. increase()[5m] stays true for ~5 minutes after a single
+            increment, so one fail-closed evaluation still pages, two minutes
+            later. That is deliberate - a dispatch refused against the entire
+            fleet is not something to sit on, and the snapshot refresher means
+            a single fail_closed already implies the store was unreadable past
+            the whole 60s budget. The delay exists so a self-resolving blip
+            clears before anyone is woken, not so it is ignored.
+
+      - alert: YuzuQuarantineGateServingStaleState
+        expr: |
+          sum(increase(yuzu_server_quarantine_gate_total{outcome="stale"}[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Containment decisions are being made from a stale snapshot"
+          description: >-
+            The containment read is failing and the gate is serving its
+            last-known-good snapshot. Two reasons this is worth a page before
+            the critical fail-closed rule fires. First, it is the LEADING
+            INDICATOR: the snapshot is only trusted for 60s, so a read failure
+            that outlasts that becomes a fleet-wide dispatch outage. Second and
+            less obvious, stale is the one gate outcome in which containment
+            UNDER-enforces - a device quarantined after the snapshot was taken
+            is absent from it, so dispatch to that device is permitted. The
+            fail-closed rule pages on over-enforcement; nothing else pages on
+            this. A background refresher re-reads containment state every 20s,
+            so a sustained stale outcome means those refreshes are ALSO
+            failing, not merely that traffic is sparse. Correlate with
+            yuzu_server_quarantine_read_degrade_total{reason} - store_not_open,
+            pool_acquire_timeout and query_error are store faults;
+            read_concurrency_cap does NOT appear under this alert - a slot
+            timeout fails the dispatch closed, so it shows up on
+            YuzuQuarantineGateFailClosed instead.
+
       - alert: YuzuDispatchTargetRejected
         expr: |
-          sum by (route, reason) (increase(yuzu_server_dispatch_target_rejected_total[15m])) > 3
+          sum by (route, reason) (
+            increase(yuzu_server_dispatch_target_rejected_total{reason!="quarantined"}[15m])
+          ) > 3
         labels:
           severity: warning
         annotations:
@@ -807,7 +895,16 @@ groups:
             nothing. Denials are audited as
             command.dispatch|denied, instruction.execute|denied or
             result_set.create|denied with detail "reason=<reason>"; correlate
-            there for the principal.
+            there for the principal. reason="quarantined" (#881) is
+            EXCLUDED from the expression: a withheld dispatch to a contained
+            device is the control WORKING, not a caller naming nothing. Any
+            looping automation against a single quarantined host clears 3 in 15m,
+            and one fail-closed episode increments by the whole fleet at once, so
+            folding correct enforcement in here would fire this constantly, get
+            it silenced, and take the genuine near-miss signal with it - the
+            outcome the >3 threshold above was chosen to avoid. Quarantine
+            denials are observed on yuzu_server_quarantine_gate_total and audited
+            as quarantine.dispatch_denied.
 
   - name: yuzu-tls
     rules:
@@ -856,6 +953,68 @@ groups:
             minutes. The server is still using the previous valid certificate.
             Check that the new PEM files are valid, the cert and key match,
             and file permissions are correct (chmod 600 on Unix).
+
+  # ── yuzu-pki — internal CA (ca_store, ADR-0053) ─────────────────────────────
+  # All three counters below are bare/pre-seeded to 0 at boot (server.cpp), so
+  # increase(x[window]) > 0 catches even the FIRST occurrence — see the
+  # yuzu-scim group's header comment for why absent() would be the wrong shape
+  # here.
+  - name: yuzu-pki
+    rules:
+      - alert: YuzuCaCrlPublishFailing
+        expr: |
+          increase(yuzu_server_ca_crl_publish_failures_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Internal-CA CRL (re)publish is failing"
+          description: >-
+            yuzu_server_ca_crl_publish_failures_total moved: a CRL (re)publish
+            attempt failed (CA key load / build / record). Consumers keep
+            serving the last still-valid CRL, so this is not yet an outage, but
+            a revocation made since the last successful publish is NOT
+            reflected in the public CRL — server-side enforcement (is_revoked())
+            is unaffected and still blocks the revoked cert directly. Check
+            Postgres availability (ca_store schema) and CA key
+            loadability. See docs/pki-architecture.md "CRL distribution".
+          runbook_url: "https://docs.yuzu.io/runbooks/ca-crl-publish-failing"
+
+      - alert: YuzuCaRevocationSweepReadFailing
+        expr: |
+          increase(yuzu_server_ca_revocation_sweep_read_failures_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "The ~15s revocation-sweep tick cannot read the revoked-cert set"
+          description: >-
+            yuzu_server_ca_revocation_sweep_read_failures_total moved: the
+            periodic sweep that tears down live Subscribe streams for
+            already-revoked agents could not read ca_store's revoked set, so
+            that tick was skipped entirely (ADR-0053 UP-1 — the sweep aborts
+            rather than treating every live agent as revoked). A sustained
+            non-zero rate means an already-revoked agent's live stream may not
+            be torn down promptly; the per-request mTLS-accept gate
+            (is_peer_cert_revoked) still fails closed independently, so no NEW
+            access is granted in the meantime. Check Postgres availability.
+          runbook_url: "https://docs.yuzu.io/runbooks/ca-revocation-sweep-failing"
+
+      - alert: YuzuCaReissueBlocked
+        expr: |
+          increase(yuzu_server_ca_reissue_blocked_total[1h]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "An agent attempted to re-provision under a revoked identity"
+          description: >-
+            yuzu_server_ca_reissue_blocked_total{reason="revoked_identity"}
+            moved — sign_agent_csr refused to re-issue because a revoked,
+            non-expired cert already exists for that agent_id (the
+            revocation-bypass guard is working as intended; ADR-0036/ADR-0053).
+            This is not a failure to fix, but is worth an operator's attention:
+            a revoked device attempting to silently re-enroll may indicate a
+            still-active compromised endpoint. An operator must deliberately
+            clear the revocation before re-provisioning can succeed.
+          runbook_url: "https://docs.yuzu.io/runbooks/ca-reissue-blocked"
 
   # ── yuzu-response-store — LIVE as of the response store's Postgres migration
   # (ADR-0039) ──────────────────────────────────────────────────────────────
@@ -1044,7 +1203,10 @@ groups:
   # + failure class. These rules were parked "uncomment when live"; the auth
   # store (`auth.users.mfa_totp_secret`) is the first secret-bearing store to
   # ship, and its migration PR wired both the audit hook and the metric
-  # export, so they are now active. `store="auth"` is the only value today.
+  # export, so they are now active. Filtered only on `failure_class`, so both
+  # rules already cover every enrolled `store` label value with no new YAML
+  # needed as more land: `auth`, `plugin_config_store`, `webhook_store`,
+  # `runtime_config_store`, and (as of ADR-0059) `offload_target_store`.
   - name: yuzu-secrets
     rules:
       - alert: YuzuSecretDecryptKekUnresolvable
@@ -2702,6 +2864,48 @@ groups:
             fires (last_check_at stops advancing). Pair with yuzu_pg_pool_*
             saturation signals; /readyz does not reflect this state.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/tag-store-backfill-recovery.md"
+      - alert: YuzuRuntimeConfigReadDegraded
+        # A runtime_config_store read degraded (ADR-0060). Two DIFFERENT failure
+        # families under one metric, distinguished by `reason`:
+        #   store_not_open/pool_acquire_timeout/query_error — ordinary substrate
+        #   trouble (pool saturation, transient outage). Pair with
+        #   yuzu_pg_pool_waiters/yuzu_pg_acquire_* when triaging.
+        #   crypto_error — the OIDC client secret could not be decrypted
+        #   (KEK/DB pairing mismatch, e.g. a restore without its paired keys
+        #   directory, or corruption). This is the SAME fail-closed contract
+        #   AuthDB's TOTP secrets and WebhookStore's signing secret already
+        #   carry (docs/user-manual/server-admin.md's "Key management (secrets
+        #   KEK)" section). CORRECTION (docs-writer, Gate 8): `crypto_error`'s
+        #   ONLY production call site (`read_secret("oidc_client_secret")`
+        #   inside `apply_runtime_config_overrides()`) is boot-time, and a
+        #   failure there sets `startup_failed_`, which aborts `start_web_server()`
+        #   and exits the process BEFORE `/metrics` ever binds — so this
+        #   specific reason is NOT actually scrapeable: no Prometheus scrape
+        #   can observe a `crypto_error` increment from the boot that produced
+        #   it. The real, load-bearing operator signal for this failure is the
+        #   fatal `apply_runtime_config_overrides` log line and the process's
+        #   non-zero exit — check those, and server-admin.md's KEK recovery
+        #   procedure, not this alert. This `reason` value is retained on the
+        #   shared metric as defense-in-depth for a hypothetical future
+        #   non-boot call site, not as a live signal today.
+        # /readyz stays green under pure pool saturation (latched is_open), so
+        # this alert is the only signal for the read-side degradation itself.
+        expr: |
+          sum(rate(yuzu_server_runtime_config_read_degrade_total[5m])) by (reason) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Runtime-config reads degrading ({{ $labels.reason }})"
+          description: >-
+            yuzu_server_runtime_config_read_degrade_total{reason="{{ $labels.reason }}"}
+            is non-zero. store_not_open/pool_acquire_timeout/query_error is
+            ordinary substrate trouble — pair with yuzu_pg_pool_* saturation
+            signals. crypto_error means the OIDC client secret cannot be
+            decrypted (KEK/DB pairing mismatch) — the next server restart will
+            fail closed on this same secret; see "Key management (secrets
+            KEK)" in the server admin guide before it does.
+          runbook_url: "https://docs.yuzu.io/runbooks/runtime-config-read-degraded"
       - alert: YuzuTagStoreBackfillNotCompleted
         # Mirrors YuzuNotificationBackfillFailing's absent-success shape (NOT
         # the custom-properties result="failed" shape): the one-time legacy
@@ -2746,6 +2950,103 @@ groups:
             log for the specific refusal; the runbook maps each message to
             its recovery.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/tag-store-backfill-recovery.md"
+      - alert: YuzuProductPackReadDegraded
+        # A product_pack_store list()/get() read degraded and the caller failed
+        # CLOSED (503 via workflow_routes.cpp's product_pack_error_status),
+        # never a silently-empty pack list or a false "not found" (ADR-0054).
+        # /readyz stays green under pure pool saturation (latched is_open), so
+        # PAIR this with yuzu_pg_pool_waiters / yuzu_pg_acquire_* when triaging:
+        # pool_acquire_timeout/query_error correlate with substrate saturation
+        # or outage; store_not_open means the store failed at boot.
+        # reason = store_not_open | pool_acquire_timeout | query_error.
+        expr: |
+          sum(rate(yuzu_server_product_pack_read_degrade_total[5m])) by (reason) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Product-pack reads degrading ({{ $labels.reason }})"
+          description: >-
+            yuzu_server_product_pack_read_degrade_total{reason="{{ $labels.reason }}"}
+            is non-zero: GET /api/product-packs or GET /api/product-packs/{id}
+            degraded and answered 503 rather than a silently-wrong result.
+            Pair with yuzu_pg_pool_* saturation signals; /readyz does not
+            reflect this state.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#product-packs-migrate-to-postgres-mandatory-backfill-productpackstore-adr-0054"
+      - alert: YuzuProductPackBackfillNotCompleted
+        # Mirrors YuzuTagStoreBackfillNotCompleted's absent-success shape (NOT
+        # CustomPropertiesStore's result="failed" shape, which is accepted
+        # debt precisely because it cannot fire — see that alert's own
+        # comment): the one-time legacy product-packs.db -> product_pack_store
+        # backfill (ADR-0054) runs during server CONSTRUCTION, and a failure
+        # sets startup_failed_ so the HTTP listener never starts — /metrics is
+        # never served and a result="failed" sample is never scraped, making a
+        # failed-keyed expression unfireable. What IS observable is the
+        # ABSENCE of a success outcome. THIS RULE DEPENDS ON THE PRE-SEED in
+        # server.cpp's product-pack-store construction block (describe() +
+        # zero-loop over fresh/success/failed) — that is what makes "series
+        # absent" mean "no server is serving" rather than "metric not
+        # registered". THREE-WAY result split: fresh | success | failed; expr
+        # matches the two good outcomes. LIMITS: multi-replica — one wedged
+        # replica among healthy ones shows as up == 0, not this; a
+        # legitimately long first boot on a huge product-packs.db can trip it
+        # during the upgrade window (silence for the window). The BOOT LOG
+        # carries the actual remediation (which pack/item id conflicted). This
+        # is the outside-in backstop, not the primary signal.
+        expr: |
+          absent_over_time(yuzu_server_product_pack_backfill_total{result=~"success|fresh"}[15m])
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No server is reporting a completed product-pack backfill (possible boot refusal)"
+          description: >-
+            No scraped Yuzu server has reported a successful one-time legacy
+            product-packs.db -> PostgreSQL product_pack_store backfill
+            (ADR-0054) in the last 15 minutes. After an upgrade the usual
+            cause is a server that FAILED the backfill: it fails CLOSED,
+            refuses to serve, and retries on the next start — a restart loop
+            with the whole server down. A differently-valued pack/item
+            conflict across replicas means the currently-served pack catalog
+            may be the WRONG SIDE of an operator-authored-data race — treat
+            it as a data-integrity incident, not just an availability one.
+            Read the server BOOT log for the exact pack/item id and repair or
+            move the losing replica's legacy file aside before restarting.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#product-packs-migrate-to-postgres-mandatory-backfill-productpackstore-adr-0054"
+      - alert: YuzuInstructionBundledContentNotClean
+        # Same absent-success shape as YuzuProductPackBackfillNotCompleted above, adapted
+        # for an EVERY-BOOT (not one-time) outcome (gov Gate 4 UP-4/Gate 8 fix): the
+        # InstructionStore bundled-content reseed loop (232 definitions / 10 sets as of
+        # this writing) runs during server CONSTRUCTION, and a genuine DB error on any
+        # item sets startup_failed_ — the HTTP listener never starts, /metrics is never
+        # served, and a result="errored" sample is never scraped. What IS observable is
+        # the ABSENCE of a clean outcome. THIS RULE DEPENDS ON THE PRE-SEED in
+        # server.cpp's InstructionStore construction block (describe() + zero-loop over
+        # clean/errored). TWO-WAY result split: clean | errored; expr matches the good
+        # outcome only (unlike the ProductPack rule, there is no third "fresh" state —
+        # this store reseeds every boot, never skips as "nothing to migrate"). LIMITS:
+        # multi-replica — one wedged replica among healthy ones shows as up == 0, not
+        # this; a single-shot with_txn_for has no internal retry, so a transient
+        # Postgres blip during a rolling deploy is a real, not hypothetical, trigger —
+        # the existing crash-loop-backoff is the intended recovery. The BOOT LOG carries
+        # the per-item id/error. This is the outside-in backstop, not the primary signal.
+        expr: |
+          absent_over_time(yuzu_server_instruction_bundled_content_total{result="clean"}[15m])
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No server is reporting a clean InstructionStore bundled-content reseed (possible boot refusal)"
+          description: >-
+            No scraped Yuzu server has reported a clean bundled-content reseed
+            (ADR-0058) in the last 15 minutes. A server that hit a genuine DB
+            error importing any bundled definition/set fails CLOSED, refuses
+            to serve, and retries on the next start — a restart loop with the
+            whole server down. Read the server BOOT log for the exact
+            definition/set id and error before assuming Postgres itself is
+            down; a transient blip on one of ~240 sequential items is enough
+            to trigger this even when Postgres is otherwise healthy.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#behaviour-change-instructionstore-moves-to-postgresql--deleted-content-no-longer-resurrects-adr-0058"
       - alert: YuzuInventoryIngestSlow
         # Leading indicator for ingest transaction-hold saturation: full-payload
         # ingests taking >10s. Distinct from the yuzu_pg_acquire_* family, which

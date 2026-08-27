@@ -1,7 +1,7 @@
 # High Availability Architecture
 
 ---
-status: proposed
+status: accepted
 owner: Fraser Jarvis (@fjarvis)
 ---
 
@@ -397,7 +397,18 @@ Yuzu ships Postgres, so HA Postgres is a delivery artifact we own.
   **both** standbys are lost (quorum lost → fail-closed by design). This replaces the earlier
   unconditional 2-node RPO=0, which stalled all writes on a single standby blip — *below* the
   single-Postgres baseline. An **async/degrade profile** (lower latency, bounded loss window) is a
-  documented opt-out. **"3 nodes" means 3 distinct hosts / failure domains (finding 2).** Vanilla
+  documented opt-out.
+
+  > **Implementation note (WS-7, 2026-08).** The fail-closed-on-quorum-loss default above is realised
+  > in Patroni by `synchronous_mode_strict`. Kickoff measurement found strict mode **blocks writes for
+  > minutes after even a *single*-node failover** (the promoted primary waits for its surviving standby
+  > to re-establish sync) — empirically at odds with §13's ~10–30 s RTO target; the two cannot both be
+  > honoured today. WS-7 therefore **ships the async/degrade profile as the DEFAULT** (`YUZU_PG_SYNC_STRICT`
+  > default off: RPO=0 while ≥1 standby is available — the common single-failover case — degrading to
+  > async only on total standby loss), with strict fail-closed as a documented, operator-selectable
+  > opt-in. Reconciling strict-mode failover timing (and asserting both behaviours in the harness) is a
+  > **WS-9** item. Until then, the *shipped default* is the async profile, not the fail-closed one this
+  > section describes. **"3 nodes" means 3 distinct hosts / failure domains (finding 2).** Vanilla
   Docker Compose has **no cross-host placement primitive** — it cannot pin anti-affinity across
   physical hosts — so the **single-host Compose profile delivers container/process redundancy only,
   NOT host-level HA**, and co-locating all three would quietly void the §13 RPO=0-across-host-failure

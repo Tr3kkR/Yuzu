@@ -61,7 +61,7 @@ const GROUPS = [
     ['network_diag listening', 1],
     ['network_diag connections', 1],
     ['netstat netstat_list', 1],
-    ['sockwho sockwho_list', 1],
+    ['netstat attribution', 1],
   ]],
   ['Users & Sessions', [
     ['users logged_on', 1],
