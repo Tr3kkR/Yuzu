@@ -217,9 +217,11 @@ rule_assertion_from_rule(const yuzu::guardian::v1::GuaranteedStateRule& rule) {
         const auto it = rem.params().find(std::string(k));
         return it != rem.params().end() ? it->second : std::string{};
     };
-    // No `default:` label below, deliberately: that keeps -Wswitch as a compile-time
-    // net if SparkType ever gains an enumerator this switch doesn't handle. The
-    // std::optional (rather than a pre-seeded 1000ms literal) is the RUNTIME net for
+    // No `default:` label below, deliberately: that keeps -Wswitch live as a build-time
+    // SIGNAL if SparkType ever gains an enumerator this switch doesn't handle - not a
+    // guaranteed compile-time BLOCK, since this project builds with werror=false and
+    // MSVC's equivalent (C4062) is off even at /W4. The std::optional (rather than a
+    // pre-seeded 1000ms literal) is the RUNTIME net for
     // the same gap (#3531) - a future unhandled case must be caught and logged, not
     // silently fall back to the exact 1000ms default that reintroduces #3388's flood.
     std::optional<std::uint64_t> default_debounce_ms;
