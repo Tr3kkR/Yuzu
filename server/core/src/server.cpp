@@ -21374,6 +21374,14 @@ private:
         // version was active when it was written once rotation runs.
         if (webhook_secret_codec_)
             out.push_back(webhook_secret_codec_.get());
+        // RuntimeConfigStore's SecretCodec (ADR-0060) — same shape, same
+        // reason. Missing this entry was an external adversarial-review
+        // finding on the initial migration: KEK rotation/rewrap silently
+        // never re-wraps the OIDC client secret while /kek/status reports
+        // rotation_complete: true, and the secret becomes permanently
+        // undecryptable once the old KEK version is later retired.
+        if (runtime_config_secret_codec_)
+            out.push_back(runtime_config_secret_codec_.get());
         return out;
     }
 

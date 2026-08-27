@@ -183,6 +183,68 @@ TEST_CASE("warn_if_legacy_data_present warns defensively when the legacy file is
     CHECK(cap.text().find("legacy") != std::string::npos);
 }
 
+#ifndef _WIN32
+TEST_CASE("warn_if_legacy_data_present restricts the legacy file AND its WAL/SHM sidecars to "
+          "0600",
+          "[runtime_config][detect-and-warn]") {
+    // External adversarial-review finding: WebhookStore::migrate_from_sqlite_impl
+    // forces 0600 on a legacy plaintext-secret-bearing file AND its -wal/-shm
+    // sidecars before ever reading it (test_webhook_store.cpp's analogous test);
+    // this store's detect-and-warn path opened the legacy file read-only without
+    // ever doing either, leaving a real deployment's -wal sidecar (the
+    // pre-migration store ran journal_mode=WAL unconditionally) at whatever mode
+    // it already had -- exactly as sensitive as the main file it belongs to.
+    yuzu::test::TempDbFile legacy{"yuzu_test_rtcfg_wal_"};
+    {
+        yuzu::server::SqliteDb raw;
+        REQUIRE(sqlite3_open(legacy.path.string().c_str(), raw.addr()) == SQLITE_OK);
+        yuzu::server::SqliteErrMsg err;
+        REQUIRE(sqlite3_exec(raw.get(),
+                             "CREATE TABLE runtime_config (key TEXT PRIMARY KEY, value TEXT "
+                             "NOT NULL, updated_by TEXT NOT NULL DEFAULT '', updated_at "
+                             "INTEGER NOT NULL);",
+                             nullptr, nullptr, err.addr()) == SQLITE_OK);
+    }
+    // Simulate an unclean-shutdown leftover: dummy sidecars, group/world-readable,
+    // sitting beside the legacy db. Content is irrelevant -- the fix only needs
+    // to see them exist at the expected path.
+    std::vector<std::filesystem::path> sidecars;
+    for (const char* suffix : {"-wal", "-shm"}) {
+        auto side = legacy.path;
+        side += suffix;
+        std::ofstream(side) << "dummy-sidecar-content";
+        std::filesystem::permissions(side,
+                                     std::filesystem::perms::owner_read |
+                                         std::filesystem::perms::owner_write |
+                                         std::filesystem::perms::group_read |
+                                         std::filesystem::perms::others_read,
+                                     std::filesystem::perm_options::replace);
+        sidecars.push_back(side);
+    }
+    std::filesystem::permissions(legacy.path,
+                                 std::filesystem::perms::owner_read |
+                                     std::filesystem::perms::owner_write |
+                                     std::filesystem::perms::group_read |
+                                     std::filesystem::perms::others_read,
+                                 std::filesystem::perm_options::replace);
+
+    RuntimeConfigStore::warn_if_legacy_data_present(legacy.path);
+
+    const auto owner_only =
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write;
+    std::error_code st_ec;
+    CHECK((std::filesystem::status(legacy.path, st_ec).permissions() &
+           std::filesystem::perms::mask) == owner_only);
+    REQUIRE_FALSE(st_ec);
+    for (const auto& side : sidecars) {
+        std::error_code side_ec;
+        const auto perms = std::filesystem::status(side, side_ec).permissions();
+        REQUIRE_FALSE(side_ec);
+        CHECK((perms & std::filesystem::perms::mask) == owner_only);
+    }
+}
+#endif
+
 // No test exists for the sqlite3_step()-failure branch (distinct from the
 // prepare()-failure branch the corrupt-file test above covers) beyond the one
 // bounded attempt below (cpp-safety + advisor, Gate 8), which came back
@@ -414,6 +476,30 @@ TEST_CASE("RuntimeConfigStore: a secret value round-trips through the SecretCode
     REQUIRE(w.store.set("oidc_client_secret", "rotated", "bob").has_value());
     CHECK(decrypt_for_test(w.store, "oidc_client_secret") == "rotated");
     CHECK(count_rows(db.dsn(), "runtime_config_store.runtime_config_secrets") == 1);
+}
+
+TEST_CASE("RuntimeConfigStore: a secret containing an embedded NUL/invalid-UTF-8 byte round-trips "
+          "byte-for-byte, never sanitized before encrypting",
+          "[pg][runtime_config][store][secret]") {
+    // External adversarial-review finding: set()'s secret-key non-empty path
+    // encrypted sanitize_pg_text(value) instead of the raw value -- sealed_value
+    // is BYTEA, so there was no storage reason to touch the secret's bytes at
+    // all, and doing so silently replaced an embedded NUL (with U+FFFD's 3-byte
+    // encoding) or an invalid-UTF-8 sequence before it was ever sealed. A
+    // rotated credential containing such a byte would have reported success
+    // while silently storing the wrong value. WebhookStore/PluginConfigStore
+    // (this store's own cited precedent) both encrypt raw -- prove this store
+    // now does too, with a value sanitize_pg_text() would visibly alter.
+    YUZU_REQUIRE_PG_DB_TPL(db, rtcfg_store_tpl);
+    Wired w{db.dsn()};
+
+    // sanitize_pg_text() is file-local to runtime_config_store.cpp (not
+    // reachable from this test), but its documented behavior (scrub invalid
+    // UTF-8 to U+FFFD, then replace any embedded NUL) means both bytes below
+    // are exactly the ones it would visibly alter if applied.
+    const std::string secret_with_nul("a\0b\xFF" "c", 5); // embedded NUL + invalid UTF-8 byte
+    REQUIRE(w.store.set("oidc_client_secret", secret_with_nul, "alice").has_value());
+    CHECK(decrypt_for_test(w.store, "oidc_client_secret") == secret_with_nul);
 }
 
 TEST_CASE("RuntimeConfigStore: an empty secret clears ciphertext but keeps attribution",

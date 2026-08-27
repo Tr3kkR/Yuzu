@@ -578,7 +578,7 @@ std::expected<void, std::string> RuntimeConfigStore::set(const std::string& key,
         // chaos-confirmed finding — see header). Namespaced like
         // ResultSetStore::pin's per-owner lock; released automatically at
         // transaction end, never held past this function.
-        if (sanitized_value.empty()) {
+        if (value.empty()) {
             // Empty-stays-empty (see header): no ciphertext, ever. Clear any
             // stale ciphertext row and record the clear in the plain table so
             // updated_by/updated_at survive.
@@ -604,11 +604,19 @@ std::expected<void, std::string> RuntimeConfigStore::set(const std::string& key,
                                        "database write failed");
         } else {
             // ADR-0010 encrypt-failure semantics: encrypt OUTSIDE any lease,
-            // BEFORE any write. A failed encrypt touches nothing.
-            const auto* bytes = reinterpret_cast<const std::uint8_t*>(sanitized_value.data());
+            // BEFORE any write. A failed encrypt touches nothing. Encrypts
+            // the RAW value, never sanitize_pg_text()'d: that helper exists
+            // to make free-text safe for a PostgreSQL TEXT column, but
+            // `sealed_value` is BYTEA -- there is no storage reason to touch
+            // the secret's bytes at all, and doing so silently replaces any
+            // embedded NUL byte or invalid-UTF-8 sequence in the credential
+            // before it is ever sealed (external adversarial review finding;
+            // WebhookStore/PluginConfigStore, this store's own cited
+            // precedent for the secrets-table split, both encrypt raw).
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(value.data());
             auto enc = secret_codec_.encrypt(
                 pg::SecretCodec::SecretId{kStoreName, "runtime_config_secrets", "sealed_value", key},
-                std::span<const std::uint8_t>{bytes, sanitized_value.size()});
+                std::span<const std::uint8_t>{bytes, value.size()});
             if (!enc.has_value()) {
                 spdlog::error("RuntimeConfigStore::set: encrypt failed for key '{}'", key);
                 return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) +
@@ -711,6 +719,45 @@ void RuntimeConfigStore::warn_if_legacy_data_present(
     std::error_code ec;
     if (!std::filesystem::exists(legacy_db_path, ec) || ec)
         return; // genuine fresh install -- the unremarkable, silent case
+
+#ifndef _WIN32
+    // ADR-0010 §Consequences (a): a legacy file we are about to read may hold a
+    // PLAINTEXT oidc_client_secret row -- force 0600 defence-in-depth before
+    // touching it, same idiom as WebhookStore::migrate_from_sqlite_impl (external
+    // adversarial-review finding: this obligation was applied to WebhookStore for
+    // the identical scenario but missed here). POSIX-only: std::filesystem::
+    // permissions with owner-only POSIX bits is a silent no-op on Windows -- no
+    // compensating Windows ACL exists for this path today, tracked as issue #3593
+    // (WebhookStore's own tracked follow-up, same gap).
+    //
+    // Also force any pre-existing -wal/-shm sidecar, at read time: the
+    // pre-migration store ran `PRAGMA journal_mode=WAL` unconditionally, so an
+    // unclean prior shutdown can leave the pre-checkpoint plaintext secret
+    // pages sitting in the WAL sidecar, not the main file -- exactly as
+    // sensitive as the file it belongs to.
+    std::filesystem::permissions(legacy_db_path,
+                                 std::filesystem::perms::owner_read |
+                                     std::filesystem::perms::owner_write,
+                                 std::filesystem::perm_options::replace, ec);
+    if (ec)
+        spdlog::warn("RuntimeConfigStore: could not set 0600 on legacy {}: {}",
+                    legacy_db_path.string(), ec.message());
+    for (const char* suffix : {"-wal", "-shm"}) {
+        auto side = legacy_db_path;
+        side += suffix;
+        std::error_code side_exists_ec;
+        if (!std::filesystem::exists(side, side_exists_ec) || side_exists_ec)
+            continue;
+        std::error_code side_ec;
+        std::filesystem::permissions(side,
+                                     std::filesystem::perms::owner_read |
+                                         std::filesystem::perms::owner_write,
+                                     std::filesystem::perm_options::replace, side_ec);
+        if (side_ec)
+            spdlog::warn("RuntimeConfigStore: could not set 0600 on legacy sidecar {}: {}",
+                        side.string(), side_ec.message());
+    }
+#endif
 
     SqliteDb db;
     if (sqlite3_open_v2(legacy_db_path.string().c_str(), db.addr(), SQLITE_OPEN_READONLY,
