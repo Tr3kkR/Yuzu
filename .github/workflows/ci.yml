@@ -937,9 +937,9 @@ jobs:
         # measured A=227.86s H=214.19s B=90.35s D=227.48s E=353.32s G=317.04s
         # F=262.81s C=359.42s — E and G both already well past HALF the then-
         # 600s ceiling on their own, with no contention at all. --num-processes
-        # 2 stays at 2 here, not a higher number: this mirrors the Windows Test
-        # step's already-proven `--num-processes 2` rather than deriving a
-        # Linux-specific value.
+        # 2 stays at 2 here, not a higher number: this mirrors Windows' own
+        # `--num-processes 2` on its "Test (pg shards, full)" step (#3443)
+        # rather than deriving a Linux-specific value.
         #
         # with-test-slot.sh (#3443 AC4): --num-processes 2 alone fixed
         # WITHIN-job fan-out but left cross-job contention unmeasured. Now
@@ -948,8 +948,9 @@ jobs:
         # simultaneously, saturating all 4 Big Tam runners by itself, and a
         # concurrently-queued PR's Linux job was observed waiting 35 minutes for
         # a free runner while shard E timed out at exactly 600.01s under that
-        # same load. Mirrors the Windows Test step's already-proven pattern
-        # below: caps concurrent heavy test PHASES to 2 per box (crash-safe
+        # same load. Mirrors Windows' own already-proven pattern (#3443, its
+        # "Test (non-pg suites)" / "Test (pg shards, full)" steps): caps
+        # concurrent heavy test PHASES to 2 per box (crash-safe
         # flock; the build phase stays 4-wide, unaffected). YUZU_TEST_SLOT_DIR
         # is set explicitly because Big Tam's RUNNER_TOOL_CACHE is PER-AGENT
         # (docs/ci-architecture.md), unlike Wee Tam's box-wide one — the
@@ -1291,6 +1292,19 @@ jobs:
         build_type: [debug, release]
         exclude:
           - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
+        # pg_mode mirrors the Linux job's own matrix shape (#3443): an
+        # include:-derived key, never a real axis (would double this
+        # matrix and break the runner-pool arithmetic) and never in
+        # `name:` above (job names are required-check contexts,
+        # docs-required-checks). debug keeps full pg-shard coverage on
+        # every PR and push (PRs are debug-only via the exclude: above, so
+        # PR coverage is unchanged by this); release runs the pg smoke
+        # subset on a push instead (the only event that builds release on
+        # Windows).
+        include:
+          - pg_mode: smoke
+          - build_type: debug
+            pg_mode: full
 
     steps:
       # PR-5 of the CI overhaul plan: normal CI keeps clean:false on the persistent
@@ -1506,12 +1520,16 @@ jobs:
           echo "OK: libpq.dll import present — dynamic linkage as recorded in ADR-0008"
 
       # Postgres for server tests (ADR-0006 decision 8, #1318).
-      # Precondition on yuzu-local-windows: a native PostgreSQL 16+ service
-      # with role yuzu / password yuzu / db yuzu_test (one-time bootstrap,
-      # see docs/ci-architecture.md "Postgres for server tests"), or a
-      # runner-level YUZU_TEST_POSTGRES_DSN override. The script probes
-      # 127.0.0.1:5432 and exports the DSN; required since #1320 PR 1
-      # (SOFT_EXIT=1) — nothing listening fails the job at this step.
+      # Wee Tam (`yuzu-weetam-windows`) uses path 1, not path 4: each runner
+      # provides a native PostgreSQL 18 service — agent 0's
+      # `postgresql-x64-18-yuzu-ci` on :5433, agents 1-3 their own
+      # `postgresql-x64-18-yuzu-ci-<n>` on :5433+<n> (#2094) — and a
+      # machine-level YUZU_TEST_POSTGRES_DSN (the agent-0 DSN) that the
+      # script's path 1 derives the per-agent port from before exporting it;
+      # required since #1320 PR 1 (SOFT_EXIT=1) — nothing answering fails the
+      # job at this step. See docs/ci-architecture.md "Postgres for server
+      # tests" for the full path-1 mechanism and deploy/windows/ for
+      # provisioning.
       #
       # `source`, NOT `bash scripts/...`: inside the step's MSYS2 bash,
       # PATH puts C:\Windows\system32 before C:\msys64\usr\bin, so a bare
@@ -1521,7 +1539,70 @@ jobs:
       - name: Ensure Postgres (server tests)
         run: source scripts/ci/ensure-postgres.sh
 
-      - name: Test
+      # Mirrors the Linux job's own step of the same name (#3443) — see that
+      # step's comment for the full rationale (loud-fail backstop for a
+      # provisioning/matrix-include defect, checked BEFORE any test
+      # invocation runs, not just the PG ones). MATRIX_BUILD_TYPE only:
+      # Windows has no `compiler` axis, so the "primary leg" the Linux
+      # version pins to gcc-15/debug collapses to "debug" alone here.
+      - name: Resolve pg_mode + assert Postgres DSN
+        env:
+          PG_MODE: ${{ matrix.pg_mode }}
+          MATRIX_BUILD_TYPE: ${{ matrix.build_type }}
+        run: |
+          case "$PG_MODE" in
+            full|smoke) ;;
+            *)
+              echo "::error::pg_mode is '$PG_MODE', expected 'full' or 'smoke' — matrix include: may be misconfigured"
+              exit 1
+              ;;
+          esac
+          if [[ -z "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
+            echo "::error::YUZU_TEST_POSTGRES_DSN is unset after Ensure Postgres — refusing to proceed to any PG-tagged test invocation (pg_mode=$PG_MODE) rather than let it silently skip"
+            exit 1
+          fi
+          if [[ "$MATRIX_BUILD_TYPE" == "debug" && "$PG_MODE" != "full" ]]; then
+            echo "::error::Windows debug resolved to pg_mode=$PG_MODE, expected 'full' — the matrix include: mapping is broken; this leg must keep full PG-shard coverage on every PR and push"
+            exit 1
+          fi
+          # Symmetric guard (mirrors the Linux step's own): a push leg that
+          # is NOT debug (i.e. release, the only other Windows leg) must
+          # resolve to smoke, or a future include: edit could silently send
+          # every leg back to full and reintroduce full-PG-shard contention
+          # on every push.
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$MATRIX_BUILD_TYPE" != "debug" && "$PG_MODE" != "smoke" ]]; then
+            echo "::error::Windows $MATRIX_BUILD_TYPE on a push resolved to pg_mode=$PG_MODE, expected 'smoke' — the matrix include: mapping is broken; this reintroduces full-PG-shard contention on every Windows push"
+            exit 1
+          fi
+          echo "pg_mode=$PG_MODE"
+
+      # Windows CI test-phase restructuring (#3443, 2026-08-28): mirrors the
+      # Linux job's non-pg/pg-shards/pg-smoke split — see docs/ci-architecture.md
+      # "PG coverage by platform" for the full rationale and the measured
+      # numbers as the staged protocol produces them. Three differences from
+      # Linux, each with its own reason:
+      #   1. ONE gated non-pg invocation, not two uncapped ones — Wee Tam's
+      #      measured contention (docs/ci-architecture.md "Windows test-phase
+      #      concurrency gate") is DRAM/disk/Defender-minifilter, not
+      #      Postgres, so Big Tam's "cheap suites are never the contention
+      #      source, leave them uncapped" reasoning does not transfer; every
+      #      non-pg suite here shares the same box-wide gate.
+      #   2. --suite selection has no by-name fallback (Windows registers no
+      #      per-shard by-name list the way Linux's second invocation does),
+      #      and a bad --suite silently matches zero entries — so
+      #      assert-suite-cover.py runs FIRST, failing loud on a dropped or
+      #      misspelled suite before the real invocation could silently skip
+      #      a whole category.
+      #   3. YUZU_TEST_SLOT_TIMEOUT_MIN: "30" on both gated steps below —
+      #      Wee Tam's with-test-slot.sh default is 115 min; two acquisitions
+      #      per job (non-pg, then pg-shards-full) at that default could
+      #      together exceed this job's own 120-min budget, turning a slot
+      #      wait into an ambiguous job-level kill instead of an attributable
+      #      with-test-slot.sh failure (same reasoning as Big Tam's explicit
+      #      30-min override on its own pg-shards step).
+      - name: Test (non-pg suites)
+        env:
+          YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
         run: |
           if [[ "${{ matrix.build_type }}" == "debug" ]]; then
             bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/debug/bin"
@@ -1529,21 +1610,57 @@ jobs:
             bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/bin"
           fi
           export PATH="$bin_dir:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/protobuf:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/grpc:$PATH"
-          # Box-wide concurrency gate: Wee Tam runs 4 CCD-pinned runners on one
-          # host; affinity partitions cores but NOT DRAM bandwidth / the disk /
-          # the Defender minifilter, so >=3 concurrent Windows *test phases* drive
-          # the server/tar suites into their timeouts (measured server ~[pg]:
-          # c0 289s -> c4 603s). with-test-slot.sh caps concurrent heavy test
-          # phases to 2 per box (crash-safe flock; build stays 4-wide), and
-          # --num-processes 2 caps meson's own fan-out so the ~10 server pg
-          # shards don't pile onto one CCD+cluster. Linux's Test step now carries
-          # the same with-test-slot.sh + --num-processes 2 pair (#3443 AC4) — the
-          # two platforms differ in slot-dir/name/timeout tuning (Big Tam's
-          # RUNNER_TOOL_CACHE is per-agent, not box-wide like Wee Tam's, so its
-          # step sets these explicitly rather than using the script's Windows-
-          # tuned defaults; see that step's comment).
+          python scripts/ci/assert-suite-cover.py --builddir build-windows-${{ matrix.build_type }} \
+            --suite agent --suite docs --suite proto --suite tar --suite gateway \
+            --suite server-nonpg --suite server-checks \
+            --exclude-suite server-pg --exclude-suite server-pg-smoke
           bash scripts/ci/with-test-slot.sh 2 -- \
-            python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2
+            python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs --num-processes 4 \
+              --suite agent --suite docs --suite proto --suite tar --suite gateway --suite server-nonpg --suite server-checks
+
+      # if: matrix.pg_mode == 'full' — see the Resolve step above; PRs are
+      # debug-only (exclude: above), so PR coverage is unaffected. k=2 is the
+      # STARTING pool width (unchanged from before this split); the staged
+      # Windows measurement protocol (docs/ci-architecture.md) widens it in
+      # separate, individually-measured pushes — never bundled with a
+      # topology change in the same push, so a wall-time delta is
+      # attributable to one axis at a time.
+      - name: Test (pg shards, full)
+        if: matrix.pg_mode == 'full'
+        env:
+          YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
+        run: |
+          if [[ "${{ matrix.build_type }}" == "debug" ]]; then
+            bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/debug/bin"
+          else
+            bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/bin"
+          fi
+          export PATH="$bin_dir:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/protobuf:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/grpc:$PATH"
+          # Runs LAST (after the non-pg step above): flake-retry.py /
+          # ci-import-junit only import the LAST invocation's testlog.junit.xml
+          # into CI telemetry per job — ordering it last means the pg-shard
+          # numbers (the ones the staged measurement protocol reads) are what
+          # survives, not the non-pg step's. The non-pg step's own
+          # job-summary "Suite durations vs meson budgets" table (written on
+          # every invocation, not just the last) is where its numbers live.
+          bash scripts/ci/with-test-slot.sh 2 -- \
+            python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 --suite server-pg
+
+      # if: matrix.pg_mode == 'smoke' — only the release leg on a push (PRs
+      # are debug-only, so this step never runs on a PR; verified post-merge
+      # by the first dev push, not pre-merge). Deliberately UNGATED, mirroring
+      # the Linux smoke step: the smoke set costs seconds, far cheaper than
+      # the slot-wait it would otherwise pay.
+      - name: Test (pg smoke)
+        if: matrix.pg_mode == 'smoke'
+        run: |
+          if [[ "${{ matrix.build_type }}" == "debug" ]]; then
+            bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/debug/bin"
+          else
+            bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/bin"
+          fi
+          export PATH="$bin_dir:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/protobuf:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/grpc:$PATH"
+          python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs "server pg smoke"
 
       # meson+ninja truncate test stdout to the last 100 lines in the Actions
       # UI. testlog.txt in meson-logs/ contains the full Catch2 output for
