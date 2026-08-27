@@ -1203,7 +1203,10 @@ groups:
   # + failure class. These rules were parked "uncomment when live"; the auth
   # store (`auth.users.mfa_totp_secret`) is the first secret-bearing store to
   # ship, and its migration PR wired both the audit hook and the metric
-  # export, so they are now active. `store="auth"` is the only value today.
+  # export, so they are now active. Filtered only on `failure_class`, so both
+  # rules already cover every enrolled `store` label value with no new YAML
+  # needed as more land: `auth`, `plugin_config_store`, `webhook_store`,
+  # `runtime_config_store`, and (as of ADR-0059) `offload_target_store`.
   - name: yuzu-secrets
     rules:
       - alert: YuzuSecretDecryptKekUnresolvable
