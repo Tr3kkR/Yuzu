@@ -19,6 +19,7 @@
 
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
+#include "acquire_retry.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
@@ -165,6 +166,62 @@ constexpr const char* kStoreName = "auth";
 // unbounded `acquire()` is construction-only (used once, in the ctor).
 constexpr std::chrono::milliseconds kReadTimeout{1500};
 constexpr std::chrono::milliseconds kWriteTimeout{2000};
+
+// Bounded acquire-retry (issue #2396). The shared PG pool arms a short
+// connect-backoff breaker after a connectivity hiccup (pg_pool.cpp): for a
+// 200ms..5s window EVERY acquire returns an empty lease *immediately*, so a
+// single transient blip denies logins fleet-wide even after the database has
+// recovered. A first acquire can also come back empty under genuine pool
+// saturation. Both are TRANSIENT. `acquire_with_retry` rides one out by
+// retrying the acquire a few times within a tight total budget, so a
+// momentary blip does not turn into a total console lockout.
+//
+// This NEVER weakens the fail-closed guarantee: on budget exhaustion the
+// caller still returns a store-unavailable error (`StoreBusy`) ->
+// `is_store_unavailable()` -> 503, no session minted. Only the ACQUIRE is
+// retried; a query that RAN and errored (non-`PGRES_TUPLES_OK`) is not an empty
+// lease, will not self-heal in milliseconds, and is never retried.
+//
+// SCOPE (deliberately narrow — governance Gate 4, worker-pool starvation).
+// Applied ONLY to the login-DECISION reads `mfa_status` and `load_mfa_row`,
+// which run AFTER the /login handler releases its per-username stripe mutex
+// (and, on the elevate / enrollment paths, outside that mutex entirely). It is
+// deliberately NOT applied to the stripe-held lockout-section acquires
+// (`lockout_status`, `record_failed_login`, `clear_failed_logins`), which keep
+// their plain single `try_acquire_for`: sleeping under the stripe would extend
+// the per-username hold from ~PBKDF2-time to ~PBKDF2+budget during an outage,
+// so a same-username login pile-up would pin one httplib worker per attempt and
+// starve unrelated routes (/metrics, SSE). `mfa_status` is also the exact call
+// #2396 names as denying ALL logins — it 503s a legitimate, correct-password
+// login on a blip — whereas the lockout-section reads either fail OPEN
+// (`lockout_status` / `clear_failed_logins`) or only gate a wrong-password
+// attempt (`record_failed_login`), so they lose nothing by not retrying. NO
+// `acquire_with_retry` call therefore ever sleeps under the login stripe.
+// Worst-case added latency past the first attempt:
+// kAcquireRetries * (kAcquireRetryBackoff + kAcquireRetryTimeout) =
+// 2 * (150 + 150) = 600ms.
+constexpr int kAcquireRetries = 2; // extra attempts AFTER the first
+constexpr std::chrono::milliseconds kAcquireRetryBackoff{150};
+// >= the backoff so the retry acquire actually has time to catch a
+// just-freed connection once the breaker clears, rather than fast-failing a
+// too-narrow window into a false StoreBusy under mere contention (Gate 4 UP-3).
+constexpr std::chrono::milliseconds kAcquireRetryTimeout{150};
+
+// Acquire a pooled connection, retrying a bounded number of times on a
+// transient empty lease (see the block above). Returns an empty lease iff the
+// budget is exhausted — the caller maps that to `AuthDBError::StoreBusy`. The
+// retry loop itself lives in the header-only, pool-free
+// `detail::acquire_with_bounded_retry` so its ride-out-to-success behaviour is
+// deterministically unit-testable without a live pool (adv-review CDX-P1-02).
+[[nodiscard]] pg::PgPool::Lease acquire_with_retry(pg::PgPool& pool,
+                                                   std::chrono::milliseconds first_timeout) {
+    return detail::acquire_with_bounded_retry(
+        kAcquireRetries,
+        [&](bool first) {
+            return pool.try_acquire_for(first ? first_timeout : kAcquireRetryTimeout);
+        },
+        [] { std::this_thread::sleep_for(kAcquireRetryBackoff); });
+}
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets search_path to the store schema for
@@ -321,9 +378,9 @@ struct LoadedMfaRow {
 //                       enrolled-vs-absent distinction from every caller.
 [[nodiscard]] std::expected<LoadedMfaRow, AuthDBError> load_mfa_row(pg::PgPool& pool,
                                                                     const std::string& username) {
-    auto lease = pool.try_acquire_for(kReadTimeout);
+    auto lease = acquire_with_retry(pool, kReadTimeout); // #2396 transient-blip ride-out
     if (!lease)
-        return std::unexpected(AuthDBError::QueryFailed);
+        return std::unexpected(AuthDBError::StoreBusy);
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT id, encode(mfa_totp_secret, 'hex'), (mfa_enrolled_at IS NOT NULL), mfa_last_counter "
@@ -956,9 +1013,16 @@ AuthDB::lockout_status(const std::string& username) {
     if (!is_valid_username(username)) {
         return std::unexpected(AuthDBError::InvalidUsername);
     }
+    // Plain single acquire: #2396's bounded RETRY is deliberately NOT applied
+    // here (nor in record_failed_login / clear_failed_logins) — this read runs
+    // under the /login per-username stripe mutex, and retrying (sleeping) under
+    // it would amplify an outage into worker-pool starvation (see
+    // acquire_with_retry). An empty lease still reports StoreBusy (empty lease
+    // == StoreBusy, retry or not), so a pool-acquire timeout stays correctly
+    // labelled; lockout_status fails OPEN at the caller regardless.
     auto lease = impl_->pool.try_acquire_for(kReadTimeout);
     if (!lease)
-        return std::unexpected(AuthDBError::QueryFailed);
+        return std::unexpected(AuthDBError::StoreBusy);
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT failed_login_count, COALESCE((locked_until AT TIME ZONE 'UTC')::text, ''), "
@@ -993,9 +1057,14 @@ AuthDB::record_failed_login(const std::string& username, int threshold, int wind
     // correctly (a past `locked_until`). Production callers always pass a
     // positive operator-configured window; there is nothing to defend here.
 
+    // Plain single acquire: stripe-held write, no #2396 retry (see
+    // acquire_with_retry SCOPE). A blip here only 503s a wrong-password
+    // attempt, and retrying under the login stripe is the starvation vector.
+    // An empty lease reports StoreBusy so this fail-closed 503's degrade metric
+    // labels a pool-acquire timeout as pool_acquire_timeout, not query_error.
     auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
     if (!lease)
-        return std::unexpected(AuthDBError::WriteFailed);
+        return std::unexpected(AuthDBError::StoreBusy);
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "UPDATE auth.users "
@@ -1030,9 +1099,13 @@ std::expected<void, AuthDBError> AuthDB::clear_failed_logins(const std::string& 
     if (!is_valid_username(username)) {
         return std::unexpected(AuthDBError::InvalidUsername);
     }
+    // Plain single acquire: stripe-held write, no #2396 retry (see
+    // acquire_with_retry SCOPE). clear_failed_logins fails OPEN at the caller,
+    // so a blip here is logged and the login proceeds — nothing to ride out.
+    // An empty lease still reports StoreBusy (empty lease == StoreBusy).
     auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
     if (!lease)
-        return std::unexpected(AuthDBError::WriteFailed);
+        return std::unexpected(AuthDBError::StoreBusy);
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "UPDATE auth.users SET failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL "
@@ -1141,9 +1214,9 @@ std::expected<AuthDB::MfaStatus, AuthDBError> AuthDB::mfa_status(const std::stri
         return std::unexpected(AuthDBError::InvalidUsername);
     }
 
-    auto lease = impl_->pool.try_acquire_for(kReadTimeout);
+    auto lease = acquire_with_retry(impl_->pool, kReadTimeout); // #2396 transient-blip ride-out
     if (!lease)
-        return std::unexpected(AuthDBError::QueryFailed);
+        return std::unexpected(AuthDBError::StoreBusy);
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT id, encode(mfa_totp_secret, 'hex'), (mfa_enrolled_at IS NOT NULL), "
@@ -1219,15 +1292,24 @@ AuthDB::mfa_init_enrollment(const std::string& username, std::string_view issuer
     // is NOT "no provisional secret" — falling through to mint-fresh below
     // during a transient failure would silently invalidate an in-progress
     // enrollment the caller merely couldn't currently read. `load_mfa_row`
-    // now reports BOTH outage shapes (lease timeout AND non-TUPLES_OK result)
-    // as QueryFailed, where the old `acquire_failed` out-param caught only the
-    // first; either one fails closed here.
+    // reports BOTH outage shapes as store-unavailable — a lease-acquire timeout
+    // (now `StoreBusy` after the #2396 bounded retry is exhausted) and a
+    // non-TUPLES_OK result (`QueryFailed`) — so gate on `is_store_unavailable`,
+    // which covers both (plus `WriteFailed`/`SecretUnavailable`); matching only
+    // `== QueryFailed` here would let a #2396 acquire-timeout fall through to
+    // mint-fresh over a possibly-enrolled row. `UserNotFound` (impossible here —
+    // mfa_status above already proved an active row) still passes through.
     auto existing = load_mfa_row(impl_->pool, username);
-    if (!existing && existing.error() == AuthDBError::QueryFailed) {
+    if (!existing && is_store_unavailable(existing.error())) {
         spdlog::error("mfa_init_enrollment: reuse-load failed for '{}' (store outage) — refusing "
                       "to mint a fresh secret over a possibly-existing provisional one",
                       username);
-        return std::unexpected(AuthDBError::WriteFailed);
+        // Preserve the actual store-unavailable error (StoreBusy for an acquire
+        // timeout, QueryFailed for a failed statement) rather than flattening to
+        // WriteFailed — otherwise the enroll-init 503's degrade metric would
+        // mislabel a pool-acquire timeout as reason=query_error (#2396 adv-review
+        // CDX-P2-03/K1). Still fail-closed: is_store_unavailable() is true for both.
+        return std::unexpected(existing.error());
     }
     if (existing && !existing->secret_blob.empty()) {
         // TOCTOU re-check: load_mfa_row's SELECT is a separate statement from
