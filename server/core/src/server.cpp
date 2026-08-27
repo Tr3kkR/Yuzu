@@ -11062,31 +11062,37 @@ private:
         // The one secret this store carries. read_secret() returns the zeroizing
         // SecureBuffer type (ADR-0010 §1) -- copy into cfg_.oidc_client_secret (a
         // plain std::string by pre-existing design, populated identically from
-        // --oidc-client-secret at boot; see ADR-0060 "Zeroization fix") and let the
-        // buffer wipe itself the instant this scope ends, mirroring
-        // WebhookStore::deliver_one's signing-secret pattern.
-        auto secret_result = runtime_config_store_->read_secret("oidc_client_secret");
-        if (!secret_result.has_value()) {
-            // A KEK/decrypt failure here fails the boot closed (ADR-0006/ADR-0010
-            // fail-closed posture, same CONTRACT as AuthDB's TOTP secrets and
-            // WebhookStore's signing secret) -- but a WIDER blast radius: this
-            // denies the entire boot, not just one login or one delivery. See
-            // ADR-0060's "Decrypt-failure blast radius" section for why MEDIUM
-            // still stands despite that (fail-closed beats the fail-open
-            // alternative). Point at the recovery procedure rather than just the
-            // raw store error.
-            spdlog::error("apply_runtime_config_overrides: oidc_client_secret could not be "
-                          "decrypted ({}) -- see \"Key management (secrets KEK)\" in the server "
-                          "admin guide for recovery (a keys directory that does not match this "
-                          "database, e.g. after a restore without its paired backup, is the "
-                          "common cause)",
-                          secret_result.error());
-            return false;
-        }
-        if (secret_result->has_value() && !(*secret_result)->empty()) {
-            const auto& secret = **secret_result;
-            cfg_.oidc_client_secret.assign(reinterpret_cast<const char*>(secret.data()),
-                                           secret.size());
+        // --oidc-client-secret at boot; see ADR-0060 "Zeroization fix"). Block-
+        // scoped so the buffer wipes itself before apply_dex_alert_config() runs
+        // below, not merely before this function returns -- matching
+        // WebhookStore::deliver_one's signing-secret pattern as tightly as the
+        // header doc already claims (cpp-expert, governance Gate 3 finding: the
+        // prior function-scope placement kept the decrypted buffer alive longer
+        // than the header's own precedent citation implied).
+        {
+            auto secret_result = runtime_config_store_->read_secret("oidc_client_secret");
+            if (!secret_result.has_value()) {
+                // A KEK/decrypt failure here fails the boot closed (ADR-0006/ADR-0010
+                // fail-closed posture, same CONTRACT as AuthDB's TOTP secrets and
+                // WebhookStore's signing secret) -- but a WIDER blast radius: this
+                // denies the entire boot, not just one login or one delivery. See
+                // ADR-0060's "Decrypt-failure blast radius" section for why MEDIUM
+                // still stands despite that (fail-closed beats the fail-open
+                // alternative). Point at the recovery procedure rather than just the
+                // raw store error.
+                spdlog::error("apply_runtime_config_overrides: oidc_client_secret could not be "
+                              "decrypted ({}) -- see \"Key management (secrets KEK)\" in the server "
+                              "admin guide for recovery (a keys directory that does not match this "
+                              "database, e.g. after a restore without its paired backup, is the "
+                              "common cause)",
+                              secret_result.error());
+                return false;
+            }
+            if (secret_result->has_value() && !(*secret_result)->empty()) {
+                const auto& secret = **secret_result;
+                cfg_.oidc_client_secret.assign(reinterpret_cast<const char*>(secret.data()),
+                                               secret.size());
+            }
         }
 
         // F1 DEX alerting config — both consumers accept live updates, so the
@@ -12421,6 +12427,12 @@ private:
             // confinement CLOSED, so a "healthy" report over it would be
             // misleading.
             bool tag_ok = tag_store_ && tag_store_->is_open();
+            // ADR-0060: /readyz's StoreCheck vector already names this store; /healthz
+            // omitted it (governance Gate 3 finding, architect + sre independently) --
+            // /readyz is what actually gates traffic, so this was a monitoring-signal
+            // gap, not an availability one, but the two probes should agree on which
+            // stores exist.
+            bool runtime_config_ok = runtime_config_store_ && runtime_config_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
@@ -12429,7 +12441,8 @@ private:
                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
                 approval_ok && rbac_ok && result_set_ok && mgmt_group_ok && discovery_ok &&
-                deployment_ok && quarantine_ok && notification_ok && upload_grant_ok && tag_ok;
+                deployment_ok && quarantine_ok && notification_ok && upload_grant_ok && tag_ok &&
+                runtime_config_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -12471,7 +12484,8 @@ private:
                   {"quarantine_store", quarantine_ok ? "ok" : "error"},
                   {"notification_store", notification_ok ? "ok" : "error"},
                   {"upload_grant_store", upload_grant_ok ? "ok" : "error"},
-                  {"tag_store", tag_ok ? "ok" : "error"}}},
+                  {"tag_store", tag_ok ? "ok" : "error"},
+                  {"runtime_config_store", runtime_config_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -12952,7 +12966,7 @@ private:
             if (!runtime_config_store_ || !runtime_config_store_->is_open()) {
                 res.status = 503;
                 res.set_content(
-                    R"({"error":{"code":503,"message":"runtime configuration store unavailable"},)"
+                    R"({"error":{"code":503,"message":"runtime config store unavailable"},)"
                     R"("meta":{"api_version":"v1"}})",
                     "application/json");
                 return;
@@ -12962,7 +12976,7 @@ private:
                 spdlog::error("GET /api/config: read failed: {}", overrides_result.error());
                 res.status = 503;
                 res.set_content(
-                    R"({"error":{"code":503,"message":"runtime configuration store unavailable"},)"
+                    R"({"error":{"code":503,"message":"runtime config store unavailable"},)"
                     R"("meta":{"api_version":"v1"}})",
                     "application/json");
                 return;

@@ -234,6 +234,28 @@ as secret — deliberately asymmetric with `set()`, which locks only its secret-
 tables regardless of key classification, so there is no equivalent "which branch" question to
 answer the way `set()`'s does.
 
+### Post-merge hardening: `read_secret()`'s own two-SELECT race
+
+A later governance round on a follow-up change to this store re-derived, from three
+independent angles (unhappy-path, chaos-injector, enterprise-readiness), a race in
+`read_secret()` itself that the "Zeroization fix" section above did not close: unlike
+`get_all()`/`get()`, `read_secret()` still ran its becomes-secret-later plain-table
+fallback as a SECOND, separate, un-transacted `SELECT` after the first came back empty.
+A concurrent `set()` promoting the key from plain to secret could commit entirely between
+the two SELECTs, so `read_secret()` returned `nullopt` ("genuinely unset") while a real
+secret existed the whole time — the identical I3 (wrong-result-presented-as-correct)
+shape the `set()`-vs-`set()` advisory lock above exists to prevent, reached through the
+read side instead of the write side. Same fix as `get_all()`/`get()`: fold both tables
+into ONE `UNION ALL` statement (secrets-table row and plain-table row, in that
+precedence), so there is no window between two round trips for a concurrent writer to
+land in. No lock needed on the read side either, for the same reason `get_all()`/`get()`
+need none — a single statement is one MVCC snapshot, so there is nothing to serialize
+against. `read_secret()`'s nullopt returns for the genuinely-unset and explicitly-cleared
+cases are now logged at `info` ("no stored override found"), distinct from the `warn`-level
+read-degrade logging on an actual query/crypto failure, so an operator's boot log can tell
+"never configured" from "a read anomaly returned empty" (compliance-officer rider on this
+fix).
+
 ### Decrypt-failure blast radius: adjudicated MEDIUM, not HIGH — record kept, not silently resolved
 
 A separate chaos-confirmed finding: if `oidc_client_secret`'s stored ciphertext ever becomes
@@ -315,10 +337,14 @@ for anyone reading this ADR without also having read ADR-0009's amendment.
 
 ### `/readyz` / `/healthz`
 
-Already wired pre-migration (`server.cpp`'s health conjunction:
-`{"runtime_config_store", runtime_config_store_ && runtime_config_store_->is_open()}`) —
-unchanged by this migration; `is_open()` never flips post-construction, so this stays
-belt-and-braces, matching every other migrated store on the ladder.
+`/readyz`'s `StoreCheck` vector was already wired pre-migration and is unchanged by this
+migration; `is_open()` never flips post-construction, so this stays belt-and-braces,
+matching every other migrated store on the ladder. `/healthz` was NOT wired the same way
+at initial migration — a gap independently found by architect and sre in the post-merge
+governance hardening round (see "Post-merge hardening" above) and closed in that same
+round: `runtime_config_ok` now feeds both `/healthz`'s `all_stores_ok` conjunction and its
+`"stores"` JSON block (`{"runtime_config_store", runtime_config_ok ? "ok" : "error"}`),
+so the two probes now agree on which stores exist.
 
 ### `SecretCodec` instance model
 
@@ -423,6 +449,7 @@ startup error (`startup_failed_ = true`), never a serve-degraded config plane.
   `yuzu_server_runtime_config_read_degrade_total{reason}` counter
   (`store_not_open`/`pool_acquire_timeout`/`query_error`/`crypto_error`), matching
   `ProductPackStore`/`CustomPropertiesStore`'s #1675 observability convention.
-- `get_all()`/`get()` read the plain and secrets tables in ONE `UNION ALL` statement, not two
-  separate SELECTs — the two-SELECT atomicity race an earlier version of this migration recorded
-  as accepted is resolved by this shape, not left open (see "Zeroization fix" above).
+- `get_all()`, `get()`, and (as of the post-merge hardening round) `read_secret()` all read the
+  plain and secrets tables in ONE `UNION ALL` statement, not two separate SELECTs — the two-SELECT
+  atomicity race an earlier version of this migration recorded as accepted is resolved by this
+  shape, not left open (see "Zeroization fix" and "Post-merge hardening" above).

@@ -282,10 +282,11 @@ decrypt_sealed_value(pg::SecretCodec& codec, const std::string& key, const char*
 // True if the row at `i` in a `runtime_config UNION ALL runtime_config_secrets`-shaped
 // result is from the secrets side -- the literal `is_secret_row` column selected below.
 // Takes the column index explicitly: get_all()'s query carries `key` (5 columns, index
-// 4) but get()'s single-key query does not (4 columns, index 3) -- a shared hardcoded
-// index silently read past the end of the narrower shape (out-of-range column access,
-// caught by the resulting "column number N is out of range" libpq warning on every
-// get() call once this landed).
+// 4), get()'s single-key query does not (4 columns, index 3), and read_secret()'s
+// single-key query carries neither `key` nor `updated_by`/`updated_at` (3 columns, index
+// 2) -- a shared hardcoded index silently read past the end of a narrower shape
+// (out-of-range column access, caught by the resulting "column number N is out of
+// range" libpq warning on every get() call once this landed the first time).
 bool row_is_secret(PGresult* r, int i, int col_idx) {
     return std::string(col(r, i, col_idx)) == "t";
 }
@@ -446,63 +447,78 @@ RuntimeConfigStore::read_secret(const std::string& key) const {
                                "no database connection in time");
     }
 
+    // ONE statement, ONE MVCC snapshot -- same fix as get()/get_all()'s UNION ALL,
+    // applied here for the identical reason (governance Gate 4/5/6 finding,
+    // independently re-derived three times: unhappy-path, chaos-injector,
+    // enterprise-readiness). The prior shape ran two sequential un-transacted
+    // SELECTs; a concurrent set() promoting this key to secret could commit
+    // entirely between them, so this returned nullopt ("genuinely unset") while a
+    // real secret existed -- the same wrong-result-presented-as-correct shape the
+    // set()-vs-set() race fix (kSecretKeyLockSql) closed, reached a different way.
+    // No lock needed: a single statement cannot observe a torn state.
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "SELECT encode(sealed_value, 'hex') "
-        "FROM runtime_config_store.runtime_config_secrets WHERE key = $1",
+        "SELECT encode(sealed_value, 'hex') AS sealed_hex, ''::text AS plain_value, "
+        "true AS is_secret_row "
+        "FROM runtime_config_store.runtime_config_secrets WHERE key = $1 "
+        "UNION ALL "
+        "SELECT NULL::text, value, false "
+        "FROM runtime_config_store.runtime_config WHERE key = $1",
         std::vector<std::string>{key});
     if (res.status() != PGRES_TUPLES_OK) {
         if (note_read_degrade(metrics_, kReasonQueryError, g_read_secret_sampler))
             spdlog::warn("RuntimeConfigStore: read_secret degraded - query error");
         return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) + "database read failed");
     }
-    if (PQntuples(res.get()) == 0) {
-        // No secrets-table row. For a NON-secret key that's simply "not a secret" --
-        // nullopt, no fallback. For a secret key it's ambiguous by design: either
-        // genuinely unset/cleared, OR the becomes-secret-later transitional state (a
-        // stale PLAIN-table row from before this key was classified secret, or from
-        // an older release — see set()'s doc comment). Falling back here, not just in
-        // the redacted readers, matters: without it, get_all()/GET /api/config would
-        // report is_set=true (a plain-table row exists here per the redaction pass
-        // above) while this — the boot override pass's only source of the real value
-        // — silently applies nothing. That is the exact wrong-result-presented-as-
-        // correct shape the concurrent-set() race fix exists to prevent, reached a
-        // different way.
-        if (!is_secret_key(key))
-            return std::optional<SecureBuffer>(std::nullopt);
-        pg::PgResult plain = pg::exec_params(
-            lease.get(),
-            "SELECT value FROM runtime_config_store.runtime_config WHERE key = $1",
-            std::vector<std::string>{key});
-        if (plain.status() != PGRES_TUPLES_OK) {
-            if (note_read_degrade(metrics_, kReasonQueryError, g_read_secret_sampler))
-                spdlog::warn("RuntimeConfigStore: read_secret degraded - fallback query error");
-            return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) +
-                                   "database read failed");
-        }
-        if (PQntuples(plain.get()) == 0)
-            return std::optional<SecureBuffer>(std::nullopt); // genuinely unset
-        std::string value = col_str(plain.get(), 0, 0);
-        if (value.empty())
-            return std::optional<SecureBuffer>(std::nullopt); // explicitly cleared
-        spdlog::warn("RuntimeConfigStore: read_secret for '{}' used a stale PLAINTEXT row "
-                    "(becomes-secret-later transitional state) -- the next set() envelopes it",
-                    key);
-        SecureBuffer buf{std::span<const std::uint8_t>{
-            reinterpret_cast<const std::uint8_t*>(value.data()), value.size()}};
-        yuzu::secure_zero(value); // this copy already sat in cleartext in the plain
-                                  // table -- no less protected than before, but don't
-                                  // leave a second unwiped copy behind here too
-        return std::optional<SecureBuffer>(std::move(buf));
+
+    // Prefer the secrets-side row if (against the invariant) both somehow appear --
+    // same precedence as get()'s equivalent pass.
+    int secret_row = -1;
+    int plain_row_idx = -1;
+    for (int i = 0; i < PQntuples(res.get()); ++i) {
+        if (row_is_secret(res.get(), i, 2))
+            secret_row = i;
+        else
+            plain_row_idx = i;
     }
 
-    auto real = decrypt_sealed_value(secret_codec_, key, col(res.get(), 0, 0));
-    if (!real.has_value()) {
-        if (note_read_degrade(metrics_, kReasonCryptoError, g_read_secret_sampler))
-            spdlog::warn("RuntimeConfigStore: read_secret degraded - decrypt failed");
-        return std::unexpected(real.error());
+    if (secret_row >= 0) {
+        auto real = decrypt_sealed_value(secret_codec_, key, col(res.get(), secret_row, 0));
+        if (!real.has_value()) {
+            if (note_read_degrade(metrics_, kReasonCryptoError, g_read_secret_sampler))
+                spdlog::warn("RuntimeConfigStore: read_secret degraded - decrypt failed");
+            return std::unexpected(real.error());
+        }
+        return std::optional<SecureBuffer>(std::move(*real));
     }
-    return std::optional<SecureBuffer>(std::move(*real));
+
+    // No secrets-table row. For a NON-secret key that's simply "not a secret" --
+    // nullopt, no fallback: the plain row fetched above is an ordinary config value,
+    // never treated as a secret merely because this function was asked about it.
+    if (!is_secret_key(key))
+        return std::optional<SecureBuffer>(std::nullopt);
+
+    // Ambiguous by design for a secret-classified key with no secrets-table row:
+    // either genuinely unset/cleared, OR the becomes-secret-later transitional state
+    // (a stale PLAIN-table row from before this key was classified secret, or from an
+    // older release — see set()'s doc comment). Logged at info, distinctly from the
+    // warn-level read-degrade calls above: this is "never configured", not a read
+    // anomaly, and the two must stay distinguishable in the boot log (compliance-
+    // officer, governance Gate 6 rider on this fix).
+    std::string value = plain_row_idx < 0 ? std::string{} : col_str(res.get(), plain_row_idx, 1);
+    if (value.empty()) {
+        spdlog::info("RuntimeConfigStore: read_secret found no stored override for '{}'", key);
+        return std::optional<SecureBuffer>(std::nullopt); // genuinely unset or explicitly cleared
+    }
+    spdlog::warn("RuntimeConfigStore: read_secret for '{}' used a stale PLAINTEXT row "
+                "(becomes-secret-later transitional state) -- the next set() envelopes it",
+                key);
+    SecureBuffer buf{std::span<const std::uint8_t>{
+        reinterpret_cast<const std::uint8_t*>(value.data()), value.size()}};
+    yuzu::secure_zero(value); // this copy already sat in cleartext in the plain
+                              // table -- no less protected than before, but don't
+                              // leave a second unwiped copy behind here too
+    return std::optional<SecureBuffer>(std::move(buf));
 }
 
 // ── Mutations ────────────────────────────────────────────────────────────────
@@ -657,8 +673,14 @@ bool RuntimeConfigStore::remove(const std::string& key) {
         // always touches both tables regardless of key classification, and is
         // cold-path, so there is no hot-path cost to taking it every time.
         // Same lock id as set()'s secret-key branches -- this is what actually
-        // serializes a concurrent remove() against a concurrent set() on the
-        // same key.
+        // serializes a concurrent remove() against a concurrent set() when
+        // `key` classifies as secret. For a NON-secret key, set() never
+        // contests this lock (it's a single atomic INSERT ... ON CONFLICT, no
+        // lock at all) -- remove() still takes it, but there is nothing on
+        // the other side to serialize against for that case. Not a known
+        // live race (each side's own statement is independently atomic), but
+        // worth its own test as a follow-up rather than assumed safe on this
+        // comment's say-so alone.
         pg::PgResult lk = pg::exec_params(c, kSecretKeyLockSql, std::vector<std::string>{key});
         if (lk.status() != PGRES_TUPLES_OK)
             return false;

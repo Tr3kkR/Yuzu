@@ -41,13 +41,13 @@
 /// `configs`/`secrets` split, ADR-3005, the closest existing precedent for
 /// "some keys in this namespace are secret, most aren't"); every other
 /// value — including an EMPTY secret — lives in the plain `runtime_config`
-/// table. `get_all()`/`get()` read BOTH tables in one statement and let a
-/// `runtime_config_secrets` row win when present (see `set()`'s doc comment
-/// for the becomes-secret-later story); `read_secret()` — the only accessor
-/// that returns a real decrypted value — checks `runtime_config_secrets`
-/// first and falls back to a non-empty plain-table row for the SAME
-/// transitional state (never decrypting there, since there is nothing
-/// encrypted to decrypt). Presence in `runtime_config_secrets` is still a
+/// table. `get_all()`/`get()`/`read_secret()` ALL read both tables in ONE
+/// statement (`UNION ALL`) and let a `runtime_config_secrets` row win when
+/// present (see `set()`'s doc comment for the becomes-secret-later story);
+/// `read_secret()` — the only accessor that returns a real decrypted value —
+/// falls back to a non-empty plain-table row for the SAME transitional state
+/// (never decrypting there, since there is nothing encrypted to decrypt).
+/// Presence in `runtime_config_secrets` is still a
 /// HARD invariant that the row is never empty, so `set()` never encrypts an
 /// empty string — it
 /// deletes any stale ciphertext row instead and stores `value=''` in the
@@ -182,13 +182,18 @@ public:
     /// production callers today (the boot override pass, `GET
     /// /api/config`) both do.
     ///
-    /// Both `get_all()` and `get()` read the plain and secrets tables in
-    /// ONE statement (`UNION ALL`), not two separate round trips — a single
-    /// statement is one MVCC snapshot, so a concurrent `set()` moving a key
-    /// between tables (the becomes-secret / empty-secret transitions) can
-    /// never make that key transiently vanish from either read (governance
-    /// Gate 3/4 architect finding on the prior two-SELECT merge; resolved by
-    /// this redesign, not accepted as a residual race).
+    /// `get_all()`, `get()`, AND `read_secret()` all read the plain and
+    /// secrets tables in ONE statement (`UNION ALL`), not two separate round
+    /// trips — a single statement is one MVCC snapshot, so a concurrent
+    /// `set()` moving a key between tables (the becomes-secret /
+    /// empty-secret transitions) can never make that key transiently vanish
+    /// from any of the three reads. `get_all()`/`get()`: governance Gate 3/4
+    /// architect finding on the prior two-SELECT merge, resolved by this
+    /// redesign. `read_secret()`: governance Gate 4/5/6 finding (unhappy-
+    /// path, chaos-injector, enterprise-readiness — independently re-derived
+    /// three times) on its own prior two-sequential-SELECT shape, same
+    /// redesign applied. Neither needs a lock: one statement is one
+    /// snapshot, so there is no window left to serialize against.
 
     /// All entries, secrets redacted. Never decrypts — see above.
     [[nodiscard]] std::expected<std::vector<RuntimeConfigEntry>, std::string> get_all() const;
@@ -211,9 +216,13 @@ public:
     /// "Zeroization" — a plain-`std::string` return was a governance-
     /// blocking finding on this store's first version; see ADR-0060
     /// "Zeroization fix"). `nullopt` = genuinely nothing for this key (a
-    /// non-secret key, an unset secret, or an explicitly-cleared secret).
-    /// For a SECRET key with no `runtime_config_secrets` row, this also
-    /// checks the plain table for a non-empty becomes-secret-later
+    /// non-secret key, an unset secret, or an explicitly-cleared secret) —
+    /// logged at info ("no stored override"), distinct from the warn-level
+    /// read-degrade log on a genuine query/crypto failure, so an operator can
+    /// tell "never configured" from "read anomaly" in the boot log.
+    /// For a SECRET key with no `runtime_config_secrets` row, the same
+    /// single `UNION ALL` statement also carries the plain table's row (if
+    /// any), used as a non-empty becomes-secret-later
     /// transitional value (see the file header) and returns THAT — copied,
     /// not decrypted, since it was never encrypted — with a `spdlog::warn`
     /// naming the key. Skipping this fallback would silently apply nothing

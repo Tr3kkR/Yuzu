@@ -1,5 +1,5 @@
-- **`RuntimeConfigStore` migrated to PostgreSQL (ADR-0060) — `OffloadTargetStore` is now the only
-  server store remaining on the ladder.** Persistent runtime configuration overrides (retention
+- **Breaking —** `RuntimeConfigStore` migrated to PostgreSQL (ADR-0060) — `OffloadTargetStore` is now
+  the only server store remaining on the ladder. Persistent runtime configuration overrides (retention
   windows, log level, DEX alert-routing knobs, and the OIDC settings) now live in Postgres. The
   OIDC client secret is no longer stored plaintext at rest: it is SecretCodec-envelope-encrypted
   (AES-256-GCM), matching the treatment webhook signing secrets already receive (ADR-0057) —

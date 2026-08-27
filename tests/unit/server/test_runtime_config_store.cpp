@@ -536,11 +536,19 @@ TEST_CASE("set() on a secret key blocks on a held advisory lock for the SAME key
     });
     // Wait until the thread is genuinely queued on the lock (not a fixed sleep
     // gambling that scheduling was fast enough to reach it) before starting the
-    // deliberate hold below.
-    REQUIRE(wait_for_advisory_waiter(locker.get(), std::chrono::seconds(5)));
+    // deliberate hold below. Captured as a bool, NOT asserted yet -- a REQUIRE
+    // here, before `t` is joined, would unwind past a still-blocked-on-the-lock
+    // std::thread on the exact regression this test exists to catch (the lock
+    // silently not taken, so the wait times out) and call std::terminate on
+    // that still-joinable thread, aborting the whole shard instead of
+    // producing one clean red test (governance Gate 3 finding, cpp-safety +
+    // cpp-expert + quality-engineer independently).
+    const bool queued = wait_for_advisory_waiter(locker.get(), std::chrono::seconds(5));
     // This hold is what the timed assertion below measures -- it only starts
     // once the waiter above is confirmed queued, so it is not gambling on
-    // scheduling luck the way a bare pre-spawn sleep would.
+    // scheduling luck the way a bare pre-spawn sleep would. Held even if
+    // `queued` came back false: `t` is still running set() and still needs
+    // the ROLLBACK below to release it before it can be joined.
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     // Join BEFORE any assertion that could throw -- a REQUIRE between spawning
     // `t` and joining it would unwind past a still-joinable std::thread on
@@ -548,8 +556,12 @@ TEST_CASE("set() on a secret key blocks on a held advisory lock for the SAME key
     PgResult rollback_result{PQexec(locker.get(), "ROLLBACK")};
     const bool rollback_ok = rollback_result.ok();
     t.join();
-    REQUIRE(rollback_ok);
+    // Registered before the assertions below (not after) so it actually
+    // decorates whichever one fails -- Catch2's INFO only attaches to
+    // assertions that run after it in the same scope.
     INFO(set_error);
+    REQUIRE(rollback_ok);
+    REQUIRE(queued);
 
     // Self-verifying against a future regression that drops the lock silently:
     // if set() did not actually block on it, this would return almost
@@ -595,14 +607,41 @@ TEST_CASE("remove() on a secret key blocks on a held advisory lock for the SAME 
         remove_ok = w.store.remove("oidc_client_secret");
         call_duration = std::chrono::steady_clock::now() - call_start;
     });
-    REQUIRE(wait_for_advisory_waiter(locker.get(), std::chrono::seconds(5)));
+    // See the set()-side test above for why this is captured, not asserted,
+    // before `t` is joined.
+    const bool queued = wait_for_advisory_waiter(locker.get(), std::chrono::seconds(5));
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     PgResult rollback_result{PQexec(locker.get(), "ROLLBACK")};
     const bool rollback_ok = rollback_result.ok();
     t.join();
     REQUIRE(rollback_ok);
+    REQUIRE(queued);
 
     CHECK(call_duration >= std::chrono::milliseconds(150));
     REQUIRE(remove_ok);
     CHECK(count_rows(db.dsn(), "runtime_config_store.runtime_config_secrets") == 0);
+}
+
+TEST_CASE("read_secret() surfaces a genuine decrypt failure as unexpected, never as nullopt",
+          "[pg][runtime_config][store][secret]") {
+    // Regression coverage for a gap quality-engineer found in governance Gate 3: the
+    // crypto_error branch (decrypt_sealed_value() failing) had zero test coverage --
+    // every existing test only exercised the found-and-decryptable or not-found paths.
+    // Corrupt the stored ciphertext directly so decrypt() genuinely fails, rather than
+    // asserting the branch exists without ever executing it.
+    YUZU_REQUIRE_PG_DB_TPL(db, rtcfg_store_tpl);
+    Wired w{db.dsn()};
+    REQUIRE(w.store.set("oidc_client_secret", "real-secret", "alice").has_value());
+
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult corrupt{PQexec(
+        conn.get(),
+        "UPDATE runtime_config_store.runtime_config_secrets "
+        "SET sealed_value = '\\xdeadbeef'::bytea WHERE key = 'oidc_client_secret'")};
+    REQUIRE(corrupt.ok());
+
+    auto secret = w.store.read_secret("oidc_client_secret");
+    REQUIRE_FALSE(secret.has_value());
+    CHECK(secret.error().starts_with(kRuntimeConfigDbErrorPrefix));
 }
