@@ -1035,6 +1035,16 @@ runs — not just the PG-tagged ones.
 | Windows (release, push only) | smoke | **skipped** (2 of the 11 smoke cases) | never runs on a PR |
 | macOS | none (ADR-0035) | n/a | server is Linux-only |
 
+**#3508 (moving pg shards off Windows PRs entirely) is deliberately NOT
+adopted here** — Windows PR legs keep full `server-pg` coverage rather than
+dropping to `[pg-smoke]`. The Windows server still ships (ADR-0035 is
+`proposed`, not accepted, and `release.yml` signs `yuzu-server.exe` +
+builds `YuzuServerSetup`), and there is no agent<->server integration step
+in the Windows job that would make full pg coverage there redundant — the
+#3508 premise for narrowing Windows PR coverage does not hold today. This
+PR's non-pg/pg-shard split closes the time gap #3508 was trying to close
+by a different, more targeted route instead.
+
 44 migration-in-substance fresh-DB Postgres test sites (a real from-scratch
 migration, `!is_open`-on-failure, backfill/upgrade, drift detection) SKIP
 on Windows via `YUZU_REQUIRE_PG_MIGRATION_DB` in `tests/unit/test_helpers.hpp`
