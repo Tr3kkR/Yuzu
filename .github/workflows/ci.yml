@@ -902,7 +902,7 @@ jobs:
         # #3443 Phase 2) go through their own dedicated steps below.
         run: |
           python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --suite agent --suite docs --suite proto --suite tar --suite gateway
-          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs "server unit tests shard A" "server unit tests shard B" "mcp bridge teardown allocation budget" "server pg shard partition invariant"
+          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs "server unit tests shard A" "server unit tests shard B" "server unit tests shard C" "mcp bridge teardown allocation budget" "server pg shard partition invariant"
 
       - name: Test (pg shards, full)
         if: matrix.pg_mode == 'full'
