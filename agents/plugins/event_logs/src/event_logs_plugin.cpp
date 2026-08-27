@@ -637,7 +637,11 @@ const YuzuActionDescriptor kActionDescriptors[] = {
      {YUZU_SUPPORT_SUPPORTED, 1, "sd_journal (bounded local read, PRIORITY<=err)",
       "falls back to a bounded journalctl argv invocation (rung 2) when libsystemd is "
       "compiled out (-Dsystemd_guard) or the journal is unreachable"},
-     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 2, "log_show", nullptr},
+     /* macos   = */
+     {YUZU_SUPPORT_SUPPORTED, 2, "log_show",
+      "requires root or a real login session to open the local unified-log data store -- a "
+      "non-root headless process gets EX_NOPERM/77 regardless of Full Disk Access "
+      "(docs/darwin-compat.md); no gap in production, which runs as a root LaunchDaemon"},
      /* windows = */
      {YUZU_SUPPORT_SUPPORTED, 1, "wevtapi (EvtQuery/EvtRender, Level=2, bounded EvtNext)",
       nullptr}},
@@ -646,7 +650,11 @@ const YuzuActionDescriptor kActionDescriptors[] = {
      {YUZU_SUPPORT_SUPPORTED, 1, "sd_journal (bounded local read, keyword match)",
       "falls back to a bounded journalctl argv invocation (rung 2) when libsystemd is "
       "compiled out (-Dsystemd_guard) or the journal is unreachable"},
-     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 2, "log_show", nullptr},
+     /* macos   = */
+     {YUZU_SUPPORT_SUPPORTED, 2, "log_show",
+      "requires root or a real login session to open the local unified-log data store -- a "
+      "non-root headless process gets EX_NOPERM/77 regardless of Full Disk Access "
+      "(docs/darwin-compat.md); no gap in production, which runs as a root LaunchDaemon"},
      /* windows = */
      {YUZU_SUPPORT_SUPPORTED, 1, "wevtapi (EvtQuery/EvtRender, bounded EvtNext)", nullptr}},
 };
