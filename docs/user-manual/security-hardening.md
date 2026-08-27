@@ -299,16 +299,14 @@ Audit events include: `timestamp`, `principal`, `action`, `target_type`, `target
 
 ### Current encryption posture (interim, disclosed)
 
-Three secret classes are currently stored **plaintext inside 0600-mode server-side
-database files** (not encrypted at the column level): webhook signing secrets
-(`webhooks.db`), offload-target credentials (`offload_targets.db`), and the OIDC
-client secret (`runtime-config.db`). Protection today is file permissions + the
-host-level encryption above. ADR-0010
-(`docs/adr/0010-secrets-at-rest-envelope-encryption.md`) is the adopted roadmap:
-app-side AES-256-GCM envelope encryption lands with each store's PostgreSQL
-migration. Until then, treat server data-directory backups as secret-bearing.
+No secret class is now stored plaintext at the column level — the last remaining
+exception (offload-target credentials) closes with this migration (ADR-0059).
+ADR-0010 (`docs/adr/0010-secrets-at-rest-envelope-encryption.md`) is the completed
+roadmap: app-side AES-256-GCM envelope encryption landed with each store's
+PostgreSQL migration. Host-level encryption (above) remains defence-in-depth
+regardless.
 
-Two classes that used to appear on that list no longer belong on it:
+Five classes that used to appear on this list no longer belong on it:
 
 - **MFA TOTP secrets** (`auth.users.mfa_totp_secret`) are `SecretCodec`-encrypted
   as of 2026-07-16 — the first store to land the ADR-0010 seam. This changes the
@@ -318,11 +316,24 @@ Two classes that used to appear on that list no longer belong on it:
   keys directory and every MFA decrypt fails closed. Back the database and the
   keys directory up as a pair; see
   `docs/ops-runbooks/auth-db-recovery.md` § "Backup — the KEK pairing rule".
+- **Webhook signing secrets** (`webhook_store.webhooks.secret`) are
+  `SecretCodec`-encrypted as of the `WebhookStore` Postgres migration
+  (ADR-0057) — same KEK-pairing backup rule as MFA secrets above: back the
+  database and the `--ca-dir` keys directory up together.
+- **The OIDC client secret** (`runtime_config_store.runtime_config_secrets.sealed_value`)
+  is `SecretCodec`-encrypted as of the `RuntimeConfigStore` Postgres migration
+  (ADR-0060) — same KEK-pairing backup rule as MFA secrets above: back the
+  database and the `--ca-dir` keys directory up together.
 - **Session tokens** have no durable storage on any substrate. Sessions are
   in-memory-authoritative (`AuthManager::sessions_`); the Postgres cutover
   dropped the SQLite-era `sessions` table outright rather than migrating it, so
   there is no session-token column to encrypt — or to leak in a dump. A restart
   is itself a fleet-wide session revocation.
+- **Offload-target credentials** (`offload_target_store.offload_targets.auth_credential`)
+  are `SecretCodec`-encrypted as of 2026-08-25 (ADR-0059). Same backup-pairing
+  requirement as MFA TOTP secrets above: a Postgres dump alone cannot recover a
+  configured target's credential without the matching keys directory — the
+  target survives, but its credential must be re-entered.
 
 ## Plugin Allowlist
 

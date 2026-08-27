@@ -21,7 +21,9 @@
 #include <yuzu/agent/subprocess_runner.hpp>
 
 #include <cstddef>
+#include <format>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace yuzu::event_logs_macos;
@@ -153,6 +155,55 @@ TEST_CASE("classify_log_show_result: a nonzero exit is honest unavailable, never
     auto classification = classify_log_show_result(result);
     CHECK(classification.outcome == LogShowOutcome::unavailable);
     CHECK(classification.reason == "log show exited with an error");
+}
+
+TEST_CASE("classify_log_show_result: a line_limit stop is a clean bounded ok, not unavailable",
+         "[event_logs][macos]") {
+    // stop_after_max_lines fired: the runner killed the child DELIBERATELY
+    // after collecting exactly the requested cap, so exit_code stays the -1
+    // kill sentinel by SubprocessResult's contract ("NEVER fabricated to 0
+    // for a signal-killed child") while timed_out and output_truncated stay
+    // false. This is the runner's documented clean bound -- before the
+    // Wave-4 PR4.2 fix it fell through to the exit_code!=0 branch and every
+    // busy Mac (more matching lines than the cap) reported a false
+    // "unavailable" + rc 1. Found by the action-dispatch-level test driving
+    // the real plugin on real hardware.
+    SubprocessResult result;
+    result.tool_ran = true;
+    result.exit_code = -1;
+    result.timed_out = false;
+    result.output_truncated = false;
+    result.termination_reason = yuzu::agent::TerminationReason::line_limit;
+    result.lines = {"2026-07-20 12:00:00  kernel[0]  line 1 of the requested cap",
+                    "2026-07-20 12:00:01  kernel[0]  line 2 of the requested cap"};
+
+    auto classification = classify_log_show_result(result);
+    CHECK(classification.outcome == LogShowOutcome::ok);
+    CHECK(classification.reason.empty());
+}
+
+TEST_CASE("decide_log_show_output: a line_limit stop emits its capped lines, rc 0",
+         "[event_logs][macos]") {
+    SubprocessResult result;
+    result.tool_ran = true;
+    result.exit_code = -1;
+    result.timed_out = false;
+    result.output_truncated = false;
+    result.termination_reason = yuzu::agent::TerminationReason::line_limit;
+    result.lines = {"2026-07-20 12:00:00  kernel[0]  first capped line",
+                    "2026-07-20 12:00:01  syslogd[55]  second capped line"};
+
+    for (auto [prefix, empty_message] :
+         {std::pair{"error", "No error events found"},
+          std::pair{"event", "No matching events found"}}) {
+        auto decision = decide_log_show_output(result, prefix, empty_message);
+        CHECK(decision.rc == 0);
+        REQUIRE(decision.rows.size() == 2);
+        CHECK(decision.rows[0] ==
+              std::format("{}|2026-07-20 12:00:00|kernel[0]|first capped line", prefix));
+        CHECK(decision.rows[1] ==
+              std::format("{}|2026-07-20 12:00:01|syslogd[55]|second capped line", prefix));
+    }
 }
 
 TEST_CASE("classify_log_show_result: output_truncated is honest unavailable even with lines/exit 0",

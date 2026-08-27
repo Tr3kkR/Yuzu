@@ -68,7 +68,7 @@ duplicates.
 | **TAR — netconn** (connectivity-transition timeline) (`$NetConn`) · *opt-in* | ✅ wevtapi | 🔜 journald | 🔜 oslog | Win EvtQuery over NetworkProfile/NCSI/WLAN-AutoConfig channels (allow-listed fields); Linux NetworkManager/networkd journal and macOS configd/Wi-Fi OSLog **planned**. `netconn_enabled`. `tar_netconn_win.cpp` |
 | **TAR — mapdrive** (network-share mappings) (`$MapDrive`) · *opt-in* | ✅ wnet | 🟡 procfs | 🔜 getfsstat | Win WNet outbound + NetSessionEnum inbound (+ history); Linux `/proc/mounts` cifs/nfs (username unavailable) + `smbstatus`; macOS `getfsstat`/smbutil **planned** (empty today). `mapdrive_enabled`. `tar_mapdrive_collector.cpp` |
 | **━━ Inventory & daily-sync sources (→ central Postgres) ━━** | | | | Agent daily-sync framework `sync_scheduler.cpp` pushes per-source state over `ReportInventory` (hash-skip), reusing plugins via `LocalDispatcher`. ADR-0016 |
-| **Installed-software inventory** | ✅ | ✅ | ✅ | `sync_source_installed_software.cpp` reuses `installed_apps` `list_inventory` (Win registry; Linux dpkg/rpm/pacman/**apk**; macOS `system_profiler`). Blob contract v2 (kind/ecosystem/EVR/arch/packager + rpm signature_status + distro; honest-empty; Win/macOS rows = kind=app, name/version/publisher). Machine-scope only. Server `SoftwareInventoryStore` |
+| **Installed-software inventory** | ✅ | ✅ | ✅ | `sync_source_installed_software.cpp` reuses `installed_apps` `list_inventory` (Win registry; Linux dpkg/rpm/pacman/**apk**; macOS `system_profiler` apps + `pkgutil` receipts, kind=pkg/ecosystem=macos_pkgutil). Blob contract v2 (kind/ecosystem/EVR/arch/packager + rpm/macOS signature_status + distro; honest-empty; macOS app rows also carry a native CFBundle/SecStaticCode publisher + signed/unsigned read, #2273 — no `codesign` subprocess). Machine-scope only. Server `SoftwareInventoryStore` |
 | **Software-licence detection (SLE)** | ✅ (WMI `SoftwareLicensingProduct` + Office C2R + `ProbeSpec` + per-user hives/files) | 🟡 (rpm/dpkg declared-licence classification — no lapse detection; RHEL entitlement + FlexLM `.lic` expiry authoritative) | 🟡 (`_MASReceipt` + machine-scope vendor plists — `probable` confidence only) | Per-OS TUs `license_scan/src/licensing_{win,linux,macos}.cpp` (Windows WMI probe via the shared `agents/shared/wmi_bounded.hpp`); `sync_source_software_licensing.cpp` → `SoftwareLicensingStore` (ADR-0024). Detail: `docs/user-manual/software-licensing.md`. Java + SWID tags are the fast-follow (#2112) |
 | **Device-identity inventory** (serial, UUID, BIOS, CPU/RAM/disk, MAC, OS) | ✅ | ✅ | ✅ | `sync_source_device_ci.cpp` reuses `hardware`/`device_identity`/`os_info`/`network_config`. `hardware` `system`: Win WMI `Win32_BIOS`/`Win32_ComputerSystemProduct`; Linux `/sys/class/dmi/id/product_{serial,uuid}` (0400 → needs `cap_dac_read_search`; `unknown` without it); macOS native IOKit `IOPlatformExpertDevice` (`IOServiceGetMatchingService`/`IORegistryEntryCreateCFProperty`; `IOPlatformUUID` ≠ SMBIOS UUID). Machine-scope only. Server `DeviceInventoryStore` |
 | **━━ Live device snapshot ("Get live info") ━━** | | | | Device page dispatch-and-poll snapshot; each kind has its own `device.live.<kind>` audit verb. `docs/user-manual/device-management.md` |
@@ -99,7 +99,7 @@ duplicates.
 | diagnostics | ✅ | ✅ | ✅ | portable — `std::filesystem` checks |
 | discovery | ✅ | ✅ | ✅ | all three legs are native (`GetIpNetTable2` / `/proc/net/arp` / sysctl routing table), and the sweep uses a shared unprivileged ICMP socket, constrained on Linux by `net.ipv4.ping_group_range` |
 | disk_space | ✅ | ✅ | ✅ | linux/apple/win branches; `#else` unsupported only |
-| event_logs | ✅ | ✅ | ✅ | win/linux/apple branches. macOS `log show` now runs under the bounded `SubprocessRunner` with a hard wall-clock deadline (no built-in timeout in the tool), classified by pure `event_logs_macos.hpp` (`decide_log_show_output`) — a timed-out/degraded run surfaces a sentinel row + non-zero rc, never a silent empty result |
+| event_logs | ✅ | ✅ | ✅ | win/linux/apple branches, natively acquired on Windows and Linux (ADR-3002 rung-1 migration): Windows reads wevtapi `EvtQuery`/`EvtRender` in-process (bounded `EvtNext` wait, typed permission_denied/unavailable/constrained statuses); Linux reads a bounded `sd_journal` walk behind the `systemd_guard` feature, falling back to a bounded pre-split `journalctl` argv when compiled out or the journal is unreachable. macOS `log show` runs under the bounded `SubprocessRunner` with a hard wall-clock deadline (no built-in timeout in the tool), classified by pure `event_logs_macos.hpp` (`decide_log_show_output`) — a timed-out/degraded run surfaces a sentinel row + non-zero rc, never a silent empty result |
 | example | ✅ | ✅ | ✅ | portable — sample plugin |
 | filesystem | ✅ | ✅ | ✅ | `_WIN32` vs POSIX. `get_signature`/`get_version_info` now Win + macOS (Linux platform-unsupported) — depth in the **Security posture** section rows |
 | firewall | ✅ | ✅ | ✅ | win/linux/apple all implemented |
@@ -270,12 +270,12 @@ implementation is.
 | disk_space | free | linux | supported | 1 | statvfs(2) | - |
 | disk_space | free | macos | supported | 1 | statfs(2) | - |
 | disk_space | free | windows | supported | 1 | GetDiskFreeSpaceExW | - |
-| event_logs | errors | linux | supported | 3 | journalctl | - |
-| event_logs | errors | macos | supported | 2 | log_show | - |
-| event_logs | errors | windows | supported | 3 | powershell_getwinevent | - |
-| event_logs | query | linux | supported | 3 | journalctl | - |
-| event_logs | query | macos | supported | 2 | log_show | - |
-| event_logs | query | windows | supported | 3 | powershell_getwinevent | - |
+| event_logs | errors | linux | supported | 1 | sd_journal (bounded local read, PRIORITY<=err) | falls back to a bounded journalctl argv invocation (rung 2) when libsystemd is compiled out (-Dsystemd_guard) or the journal is unreachable |
+| event_logs | errors | macos | supported | 2 | log_show | requires root or a real login session to open the local unified-log data store -- a non-root headless process gets EX_NOPERM/77 regardless of Full Disk Access (docs/darwin-compat.md); no gap in production, which runs as a root LaunchDaemon |
+| event_logs | errors | windows | supported | 1 | wevtapi (EvtQuery/EvtRender, Level=2, bounded EvtNext) | - |
+| event_logs | query | linux | supported | 1 | sd_journal (bounded local read, keyword match) | falls back to a bounded journalctl argv invocation (rung 2) when libsystemd is compiled out (-Dsystemd_guard) or the journal is unreachable |
+| event_logs | query | macos | supported | 2 | log_show | requires root or a real login session to open the local unified-log data store -- a non-root headless process gets EX_NOPERM/77 regardless of Full Disk Access (docs/darwin-compat.md); no gap in production, which runs as a root LaunchDaemon |
+| event_logs | query | windows | supported | 1 | wevtapi (EvtQuery/EvtRender, bounded EvtNext) | - |
 | example | ping | linux | supported | 1 | in-process | - |
 | example | ping | macos | supported | 1 | in-process | - |
 | example | ping | windows | supported | 1 | in-process | - |
@@ -369,17 +369,17 @@ implementation is.
 | http_client | head | linux | supported | 1 | cpp-httplib (native sockets) | - |
 | http_client | head | macos | supported | 1 | cpp-httplib (native sockets) | - |
 | http_client | head | windows | supported | 1 | cpp-httplib (native sockets) | - |
-| installed_apps | list | linux | supported | 3 | popen(dpkg-query / rpm / pacman) | - |
-| installed_apps | list | macos | supported | 3 | popen(system_profiler SPApplicationsDataType) | - |
+| installed_apps | list | linux | supported | 2 | dpkg-query/rpm/pacman via bounded argv runner | - |
+| installed_apps | list | macos | supported | 2 | system_profiler via bounded argv runner | - |
 | installed_apps | list | windows | supported | 1 | Reg*W enumeration of the Uninstall key(s) | - |
-| installed_apps | query | linux | supported | 3 | popen(dpkg-query / rpm / pacman) | - |
-| installed_apps | query | macos | supported | 3 | popen(system_profiler SPApplicationsDataType) | - |
+| installed_apps | query | linux | supported | 2 | dpkg-query/rpm/pacman via bounded argv runner | - |
+| installed_apps | query | macos | supported | 2 | system_profiler via bounded argv runner | - |
 | installed_apps | query | windows | supported | 1 | Reg*W enumeration of the Uninstall key(s) | - |
-| installed_apps | list_per_user | linux | supported | 3 | popen(dpkg-query / rpm / pacman) | - |
-| installed_apps | list_per_user | macos | supported | 3 | popen(system_profiler SPApplicationsDataType) + popen(brew list --versions) | - |
+| installed_apps | list_per_user | linux | supported | 2 | dpkg-query/rpm/pacman via bounded argv runner | - |
+| installed_apps | list_per_user | macos | supported | 2 | system_profiler + brew via bounded argv runner | - |
 | installed_apps | list_per_user | windows | supported | 1 | Reg*W enumeration of HKU\\<SID>'s Uninstall key, mounting NTUSER.DAT via RegLoadKeyW when not already loaded | - |
-| installed_apps | list_inventory | linux | supported | 3 | popen(dpkg-query / rpm / pacman / apk) | - |
-| installed_apps | list_inventory | macos | supported | 3 | popen(system_profiler SPApplicationsDataType) | - |
+| installed_apps | list_inventory | linux | supported | 2 | dpkg-query/rpm/pacman/apk via bounded argv runner | - |
+| installed_apps | list_inventory | macos | supported | 2 | system_profiler + pkgutil via bounded argv runner + native SecCode/CFBundle enrichment | - |
 | installed_apps | list_inventory | windows | supported | 1 | Reg*W enumeration of the Uninstall key(s) | - |
 | interaction | notify | linux | supported | 2 | notify_send | - |
 | interaction | notify | macos | constrained | 3 | osascript | no reachable GUI session under a headless/root LaunchDaemon |
@@ -406,10 +406,10 @@ implementation is.
 | license_scan | surfaces | macos | constrained | 1 | filesystem_probe(glob+plist) | binary (bplist00) Info.plist files are not parsed; falls back to the bundle name with an empty version |
 | license_scan | surfaces | windows | supported | 1 | wmi+win32_registry | - |
 | msi_packages | list | linux | unsupported | - | - | - |
-| msi_packages | list | macos | supported | 3 | pkgutil | - |
+| msi_packages | list | macos | supported | 2 | pkgutil via bounded argv runner | - |
 | msi_packages | list | windows | supported | 1 | msi_api | - |
 | msi_packages | product_codes | linux | unsupported | - | - | - |
-| msi_packages | product_codes | macos | supported | 3 | pkgutil | - |
+| msi_packages | product_codes | macos | supported | 2 | pkgutil via bounded argv runner | - |
 | msi_packages | product_codes | windows | supported | 1 | msi_api | - |
 | netprobe | icmp | linux | constrained | 1 | SOCK_DGRAM ICMP ping socket | requires net.ipv4.ping_group_range to admit the process group; reports not-permitted otherwise |
 | netprobe | icmp | macos | supported | 1 | SOCK_DGRAM ICMP ping socket | - |

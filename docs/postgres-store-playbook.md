@@ -54,13 +54,18 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
    actually prescribes and the one `AuthDB` demonstrates. See ADR-0010's "Instance model" note
    for the full rationale.
 
-   **Two lessons from `WebhookStore` (ADR-0057, `SecretCodec`'s second production consumer)
+   **Five lessons from `WebhookStore` (ADR-0057, `SecretCodec`'s second production consumer)
    for `OffloadTargetStore`/`RuntimeConfigStore` — only the second still applies as written
    under ADR-0009's 2026-08-25 fresh-start-by-default amendment (see the Backfill bullet
    above): those two stores skip `migrate_from_sqlite()` by default, so the first lesson
    below — WebhookStore's backfill-fingerprint design — is not a template to copy unless you
    land in that bullet's documented-exception case. Kept here, not deleted, because it's still
-   the right answer IF that exception applies:**
+   the right answer IF that exception applies. The third, fourth, and fifth are checklist
+   items every new secret-bearing store MUST do, added after `RuntimeConfigStore`'s own
+   migration (ADR-0060) shipped without them and an external adversarial review caught all
+   three on PR #3632, after the identical pattern had already been correctly followed once
+   for `WebhookStore` — a demonstrated, not hypothetical, 1-of-2 miss rate on these steps when
+   they live only in sibling source rather than in this checklist:**
    - **(Only if you build a backfill under the documented-exception case.) A backfill
      idempotency fingerprint over a secret-bearing legacy table must hash only a has-secret
      bit, never the plaintext or a hash of it.** A stored hash of the secret would be a
@@ -76,6 +81,32 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
      `server.cpp`'s webhook teardown block. Copy that block's *shape*, not necessarily its
      literal position — a store with no worker-pool/background-delivery surface may not need
      this reordering at all.
+   - **Enroll your new `SecretCodec` instance in `server.cpp`'s `kek_enrolled_codecs()`.** Every
+     KEK rotate/rewrap/status route iterates this list; a codec missing from it silently never
+     gets re-wrapped on rotation while `/kek/status` reports `rotation_complete: true` — the
+     secret becomes permanently undecryptable once the pre-rotation KEK version is later
+     retired, and the same list also drives the `yuzu_server_secret_decrypt_failures_total`
+     metrics export loop, so an omission is invisible on that signal too. One line, appended
+     next to the existing entries, matching `webhook_secret_codec_`'s. `RuntimeConfigStore`'s
+     initial migration missed this; only an external adversarial review caught it (PR #3632).
+   - **If your store retains a legacy SQLite file post-migration (backfilled OR warn-only),
+     force it — and any `-wal`/`-shm` sidecar — to 0600 (POSIX-only) BEFORE the first open,
+     every time you touch it, not just once.** ADR-0010 §Consequences (a): a file you're about
+     to read that may hold a plaintext secret column needs this regardless of whether you then
+     backfill from it or only detect-and-warn over it. An unclean pre-migration shutdown under
+     `journal_mode=WAL` can leave the pre-checkpoint plaintext sitting in a sidecar the main
+     file's own hardening never touches. Copy `webhook_store.cpp`'s
+     `migrate_from_sqlite_impl` block (or, for a warn-only store, `runtime_config_store.cpp`'s
+     `warn_if_legacy_data_present`) verbatim in shape. `RuntimeConfigStore`'s initial migration
+     missed the warn-only variant of this; same PR #3632 catch.
+   - **Never sanitize a secret value before encrypting it.** `sanitize_pg_text()` (or any
+     TEXT-column sanitizer) exists to make free-text safe for a PostgreSQL TEXT column; your
+     secret's ciphertext column is BYTEA, so there is no storage reason to touch the plaintext's
+     bytes at all before sealing them — doing so silently corrupts an embedded NUL byte or
+     invalid-UTF-8 sequence in the credential, which then reports `set()` success while storing
+     the wrong value. Encrypt the raw value; sanitize only the non-secret metadata fields
+     (`updated_by`, free-text labels) that actually land in a TEXT column. `RuntimeConfigStore`'s
+     initial migration got this backwards on its secret-key path; same PR #3632 catch.
 4. **Authoritative reads must be type-distinguishable (2026-07-25 program policy, ADR-0036).**
    On an **authoritative** store, every read whose result can feed a grant/target/enforce/skip
    decision MUST make a runtime DB error TYPE-DISTINGUISHABLE from "no rows" at the call site —

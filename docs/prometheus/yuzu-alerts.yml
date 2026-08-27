@@ -1203,7 +1203,10 @@ groups:
   # + failure class. These rules were parked "uncomment when live"; the auth
   # store (`auth.users.mfa_totp_secret`) is the first secret-bearing store to
   # ship, and its migration PR wired both the audit hook and the metric
-  # export, so they are now active. `store="auth"` is the only value today.
+  # export, so they are now active. Filtered only on `failure_class`, so both
+  # rules already cover every enrolled `store` label value with no new YAML
+  # needed as more land: `auth`, `plugin_config_store`, `webhook_store`,
+  # `runtime_config_store`, and (as of ADR-0059) `offload_target_store`.
   - name: yuzu-secrets
     rules:
       - alert: YuzuSecretDecryptKekUnresolvable
@@ -2861,6 +2864,48 @@ groups:
             fires (last_check_at stops advancing). Pair with yuzu_pg_pool_*
             saturation signals; /readyz does not reflect this state.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/tag-store-backfill-recovery.md"
+      - alert: YuzuRuntimeConfigReadDegraded
+        # A runtime_config_store read degraded (ADR-0060). Two DIFFERENT failure
+        # families under one metric, distinguished by `reason`:
+        #   store_not_open/pool_acquire_timeout/query_error — ordinary substrate
+        #   trouble (pool saturation, transient outage). Pair with
+        #   yuzu_pg_pool_waiters/yuzu_pg_acquire_* when triaging.
+        #   crypto_error — the OIDC client secret could not be decrypted
+        #   (KEK/DB pairing mismatch, e.g. a restore without its paired keys
+        #   directory, or corruption). This is the SAME fail-closed contract
+        #   AuthDB's TOTP secrets and WebhookStore's signing secret already
+        #   carry (docs/user-manual/server-admin.md's "Key management (secrets
+        #   KEK)" section). CORRECTION (docs-writer, Gate 8): `crypto_error`'s
+        #   ONLY production call site (`read_secret("oidc_client_secret")`
+        #   inside `apply_runtime_config_overrides()`) is boot-time, and a
+        #   failure there sets `startup_failed_`, which aborts `start_web_server()`
+        #   and exits the process BEFORE `/metrics` ever binds — so this
+        #   specific reason is NOT actually scrapeable: no Prometheus scrape
+        #   can observe a `crypto_error` increment from the boot that produced
+        #   it. The real, load-bearing operator signal for this failure is the
+        #   fatal `apply_runtime_config_overrides` log line and the process's
+        #   non-zero exit — check those, and server-admin.md's KEK recovery
+        #   procedure, not this alert. This `reason` value is retained on the
+        #   shared metric as defense-in-depth for a hypothetical future
+        #   non-boot call site, not as a live signal today.
+        # /readyz stays green under pure pool saturation (latched is_open), so
+        # this alert is the only signal for the read-side degradation itself.
+        expr: |
+          sum(rate(yuzu_server_runtime_config_read_degrade_total[5m])) by (reason) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Runtime-config reads degrading ({{ $labels.reason }})"
+          description: >-
+            yuzu_server_runtime_config_read_degrade_total{reason="{{ $labels.reason }}"}
+            is non-zero. store_not_open/pool_acquire_timeout/query_error is
+            ordinary substrate trouble — pair with yuzu_pg_pool_* saturation
+            signals. crypto_error means the OIDC client secret cannot be
+            decrypted (KEK/DB pairing mismatch) — the next server restart will
+            fail closed on this same secret; see "Key management (secrets
+            KEK)" in the server admin guide before it does.
+          runbook_url: "https://docs.yuzu.io/runbooks/runtime-config-read-degraded"
       - alert: YuzuTagStoreBackfillNotCompleted
         # Mirrors YuzuNotificationBackfillFailing's absent-success shape (NOT
         # the custom-properties result="failed" shape): the one-time legacy

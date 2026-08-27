@@ -77,8 +77,20 @@ invalid_name_fixture_plugin = shared_library(
 # agents/core links no IOKit on darwin, so the test exe must pull the frameworks
 # itself. Darwin-only; empty elsewhere.
 agent_test_native_deps = []
+agent_test_native_args = []
 if host_machine.system() == 'darwin'
   agent_test_native_deps += dependency('appleframeworks', modules: ['IOKit', 'CoreFoundation'])
+  # Wave 4 PR4.3a: test_installed_apps_macos_enrich.cpp exercises
+  # installed_apps_macos_enrich.hpp's SecStaticCode path directly. Same
+  # required:false + -D shape as installed_apps/meson.build's own block, so a
+  # box without the Security framework compiles the header's honest no-op and
+  # the test self-skips rather than failing configure.
+  agent_test_security_dep = dependency('appleframeworks', modules: ['Security'],
+                                       required: false, include_type: 'system')
+  if agent_test_security_dep.found()
+    agent_test_native_deps += agent_test_security_dep
+    agent_test_native_args += ['-DYUZU_HAVE_SECURITY_FRAMEWORK']
+  endif
 elif host_machine.system() == 'windows'
   # test_icmp_probe.cpp (Wave 2 WP-0): ws2_32 for WSAStartup/getaddrinfo/
   # htons, iphlpapi for IcmpCreateFile/IcmpCloseHandle -- icmp_probe.hpp's
@@ -281,6 +293,14 @@ agent_test_exe = executable(
     'unit/test_capability_descriptor.cpp',    # PR1.1: ABI4 descriptor + plugin->host result seam + declared-vs-observable honesty
     'unit/test_filesystem_macos_sig.cpp',     # #2273/1.14: pure codesign/plutil classifiers
     'unit/test_event_logs_macos.cpp',         # BR-08: pure `log show` SubprocessResult classifier
+    'unit/test_event_logs_parsers.cpp',       # Wave 4 PR4.2: pure Windows event-XML / journal row parse+format helpers
+    'unit/test_event_logs_journalctl.cpp',    # Wave 4 PR4.2: pure Linux journalctl-fallback outcome classifier (runs on every host)
+    'unit/test_event_logs_posix_actions.cpp', # Wave 4 PR4.2 remediation: real event_logs.dylib/.so driven
+                                                # end to end via LocalDispatcher (POSIX-only; a no-op
+                                                # TU on Windows via the file's own #ifndef _WIN32 guard)
+    'unit/test_event_logs_win_actions.cpp',   # Wave 4 PR4.2 remediation: real event_logs.dll driven
+                                                # end to end via LocalDispatcher (Windows-only; a no-op
+                                                # TU elsewhere via the file's own #ifdef _WIN32 guard)
     'unit/test_users_macos_last.cpp',         # qe-M1: pure `last -y` timestamp/weekday parsers
     'unit/test_user_profile_model.cpp',       # PR1.7: pure ProfileList/HKU model (runs on every host)
     'unit/test_value_enumeration.cpp',        # Wave 3 gate-2 remediation: pure registry-enumeration
@@ -349,6 +369,15 @@ agent_test_exe = executable(
     'unit/test_bitlocker_local_dispatcher.cpp', # Wave 3 gate remediation: real bitlocker.dll driven
                                                 # end to end via LocalDispatcher (Windows-only; a no-op
                                                 # TU elsewhere via the file's own #ifdef _WIN32 guard)
+    'unit/test_installed_apps_parsers.cpp',   # Wave 4 PR4.3a: pure dpkg/rpm/pacman/system_profiler/
+                                                # brew/pkgutil parsers (installed_apps_parsers.hpp)
+    'unit/test_installed_apps_actions.cpp',   # Wave 4 PR4.3a remediation: real installed_apps.dylib/.so
+                                                # driven end to end via LocalDispatcher (POSIX-only; a
+                                                # no-op TU on Windows via the file's own #ifndef _WIN32 guard)
+    'unit/test_msi_packages_actions.cpp',     # Wave 4 PR4.3a remediation: real msi_packages.dylib driven
+                                                # end to end via LocalDispatcher (Darwin-only, self-gated)
+    'unit/test_installed_apps_macos_enrich.cpp', # Wave 4 PR4.3a gate-1 fix: SecStaticCode signed/unsigned
+                                                # discrimination (macOS-only; a no-op TU elsewhere)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -383,7 +412,10 @@ agent_test_exe = executable(
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
   # as agents/core/meson.build gates guard_systemd.cpp/spark_service.cpp.
-  cpp_args: test_partial_init_args + agent_platform_args,
+  # agent_test_native_args carries darwin's -DYUZU_HAVE_SECURITY_FRAMEWORK
+  # (Wave 4 PR4.3a) so test_installed_apps_macos_enrich.cpp compiles the real
+  # SecStaticCode path instead of the header's no-op.
+  cpp_args: test_partial_init_args + agent_platform_args + agent_test_native_args,
   # catch2_nomain_dep (#1648 diagnostic): yuzu_agent_tests supplies its own main()
   # via unit/test_runner_main.cpp, so it links Catch2 without Catch2Main.
   # spdlog_dep (brings fmt): test_thread_pool.cpp instantiates spdlog logging in
@@ -412,11 +444,18 @@ agent_test_exe = executable(
   # windows_updates_plugin_lib / sccm_plugin_lib: same reasoning for
   # test_windows_updates_{posix,win}_actions.cpp / test_sccm_win_actions.cpp
   # (Wave 3 PR33d code-review remediation).
+  # event_logs_plugin_lib: same reasoning for test_event_logs_{posix,win}_actions.cpp
+  # (Wave 4 PR4.2 native-acquisition migration remediation).
+  # installed_apps_plugin_lib / msi_packages_plugin_lib
+  # (agents/plugins/{installed_apps,msi_packages}/meson.build):
+  # test_installed_apps_actions.cpp / test_msi_packages_actions.cpp load both
+  # real plugins by path for the identical reason (Wave 4 PR4.3a remediation).
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin,
                 users_plugin_lib, os_info_plugin_lib, processes_plugin_lib,
                 network_diag_plugin_lib, ioc_plugin_lib,
                 hardware_plugin_lib, device_identity_plugin_lib, netstat_plugin_lib,
-                windows_updates_plugin_lib, sccm_plugin_lib],
+                windows_updates_plugin_lib, sccm_plugin_lib, event_logs_plugin_lib,
+                installed_apps_plugin_lib, msi_packages_plugin_lib],
 )
 # Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
 # threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it
@@ -603,6 +642,7 @@ if build_server
       'unit/server/test_auto_approve.cpp',
       'unit/server/test_cidr_match.cpp',
       'unit/server/test_runtime_config_secret_redaction.cpp',
+      'unit/server/test_runtime_config_store.cpp',
       'unit/server/test_nvd.cpp',
       'unit/server/test_cpe_identity_resolver.cpp',
       'unit/server/test_update_registry.cpp',
