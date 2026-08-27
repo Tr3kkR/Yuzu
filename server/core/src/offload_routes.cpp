@@ -245,11 +245,12 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                         // Same #3097 classification as create's 503 branch
                         // above — distinct in the audit record even though
                         // the HTTP status collapses to 503 for both.
-                        const char* detail = result.error() == OffloadWriteError::store_unavailable
-                                                ? "store_unavailable"
-                                                : "db_error";
+                        const char* write_err_detail =
+                            result.error() == OffloadWriteError::store_unavailable
+                                ? "store_unavailable"
+                                : "db_error";
                         audit_fn(req, "offload_target.delete", "denied", "offload_target",
-                                 std::to_string(*id_opt), detail);
+                                 std::to_string(*id_opt), write_err_detail);
                         send_unavailable(res);
                         return;
                     }
