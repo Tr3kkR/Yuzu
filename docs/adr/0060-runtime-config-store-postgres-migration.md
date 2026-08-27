@@ -316,14 +316,22 @@ to check whether its `runtime_config` table exists and holds any rows — silent
 (the unremarkable case: a genuine fresh install, or any boot after the first), a defensive
 `spdlog::warn` when the file exists but cannot be read as a database (corruption should never be
 silently waved through), and a loud `spdlog::warn` naming the exact row count when real overrides
-are found (the case this obligation exists for). It never migrates, mutates, or moves the file —
-detection only. Operators whose legacy file DID hold real overrides reapply them via Settings
-once after upgrading past this release; see `docs/user-manual/upgrading.md`.
+are found (the case this obligation exists for). It never migrates, moves, or deletes the file, and
+never reads its CONTENT for any purpose beyond the boot-time row count — detection only. It DOES
+force the file's permission bits (and any `-wal`/`-shm` sidecar's) to 0600 before ever opening it
+(external adversarial-review finding, post-merge hardening round: an unclean pre-migration shutdown
+under `PRAGMA journal_mode=WAL` can leave the pre-checkpoint plaintext secret pages sitting in a
+sidecar the main file's own hardening never touched — same idiom as `WebhookStore`'s identical
+obligation, `docs/postgres-migration-ladder.md`'s `WebhookStore` row). That is a permission-bits
+mutation, not a content one; the distinction matters because the file is otherwise genuinely
+inert. Operators whose legacy file DID hold real overrides reapply them via Settings once after
+upgrading past this release; see `docs/user-manual/upgrading.md`.
 
-**The legacy file itself is left in place, untouched, indefinitely** — nothing in this migration
-reads it for any purpose beyond the boot-time row count, moves it aside, or deletes it (contrast
-the dropped mandatory-backfill draft, which would have moved a successfully-backfilled file aside
-under ADR-0009's one-release rollback-window convention). A pre-migration install that set
+**The legacy file's CONTENT is left in place, untouched, indefinitely** (its permission bits are
+not — see above) — nothing in this migration reads its content for any purpose beyond the
+boot-time row count, moves it aside, or deletes it (contrast the dropped mandatory-backfill draft,
+which would have moved a successfully-backfilled file aside under ADR-0009's one-release
+rollback-window convention). A pre-migration install that set
 `oidc_client_secret` therefore has that plaintext secret sitting in `runtime-config.db`
 indefinitely post-upgrade, now surfaced to the operator by the row-count warning above rather than
 never mentioned at all. Not auto-remediated here (deleting an operator's file on their behalf is
@@ -349,13 +357,25 @@ so the two probes now agree on which stores exist.
 ### `SecretCodec` instance model
 
 Own instance (`runtime_config_secret_codec_`), constructed over the SHARED `auth_key_provider_`
-(the KEK material is install-wide, ADR-0010 §2 — this is the THIRD `SecretCodec` instance backing
-that one `FileKeyProvider`, after `auth_secret_codec_` and `plugin_config_secret_codec_`).
+(the KEK material is install-wide, ADR-0010 §2 — this is the FOURTH `SecretCodec` instance backing
+that one `FileKeyProvider`, after `auth_secret_codec_`, `plugin_config_secret_codec_`, and
+`webhook_secret_codec_` (ADR-0057, already merged when this migration was authored) — chronological
+count, not `server.cpp`'s construction-order line position, where this store's ctor call happens to
+sit above `webhook_secret_codec_`'s).
 Construction sequence in `server.cpp` mirrors `PluginConfigStore`'s exactly: construct the codec
 (ctor only) -> construct `RuntimeConfigStore` (registers `runtime_config_secrets.sealed_value`
 immediately after its own schema migration) -> `SecretCodec::init()` on a pinned lease ->
 `warn_if_legacy_data_present()` -> the boot override pass. Any failure at any step is a fatal
 startup error (`startup_failed_ = true`), never a serve-degraded config plane.
+
+`runtime_config_secret_codec_` joins `kek_enrolled_codecs()` (live KEK rotation surface) and,
+because that function also drives the `yuzu_server_secret_decrypt_failures_total` metrics export
+loop (ADR-0057's precedent — see its "SecretCodec instance model" section), the metrics export too
+— both in the same enrollment line. **Post-merge hardening**: the initial version of this migration
+omitted this enrollment (external adversarial-review finding, PR #3632) — a KEK rotation silently
+never re-wrapped the OIDC client secret while `/kek/status` reported `rotation_complete: true`, and
+the secret would have become permanently undecryptable once the pre-rotation KEK version was later
+retired. Fixed by adding the one enrollment line, matching `webhook_secret_codec_`'s.
 
 ## Considered and rejected
 

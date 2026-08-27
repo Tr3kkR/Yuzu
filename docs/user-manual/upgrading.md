@@ -2240,9 +2240,12 @@ after this upgrade means generating a new client secret with your identity provi
   read at every boot regardless of this store and is untouched by this migration.
 - **`oidc_client_secret` is now encrypted at rest** (SecretCodec envelope, AES-256-GCM)
   instead of plaintext, from the point you reapply it onward.
-- **The legacy `runtime-config.db` is left in place, untouched, and may still contain your
-  old OIDC client secret in plaintext.** Nothing in this release reads, moves, or deletes it.
-  If you previously configured `oidc_client_secret`, delete this file (or otherwise secure it)
+- **The legacy `runtime-config.db`'s CONTENT is left in place, and may still contain your
+  old OIDC client secret in plaintext.** This release never reads its content beyond a
+  boot-time row count, never moves it, never deletes it — but it DOES force the file's
+  permission bits (and any `-wal`/`-shm` sidecar's) to 0600 on every boot as a defence-in-depth
+  hardening step, so "untouched" applies to content only, not to permission bits. If you
+  previously configured `oidc_client_secret`, delete this file (or otherwise secure it)
   after confirming you no longer need it — it is not required for the server to run, and
   leaving it in place is a plaintext-credential-on-disk exposure this migration does not close
   on your behalf.
@@ -2250,9 +2253,10 @@ after this upgrade means generating a new client secret with your identity provi
   error, rather than a response indistinguishable from "nothing configured" (`GET`)
   or a `400` validation failure (`PUT`). No change to either route's success-path
   response shape.
-- **Rolling back:** because the legacy `runtime-config.db` is never touched or renamed,
-  reverting to a pre-cutover binary restores your pre-cutover overrides — including a
-  plaintext OIDC client secret, if one was there — exactly as they were. Anything you
+- **Rolling back:** because the legacy `runtime-config.db`'s content is never moved or renamed
+  (only its permission bits change, per above), reverting to a pre-cutover binary restores your
+  pre-cutover overrides — including a plaintext OIDC client secret, if one was there — exactly
+  as they were. Anything you
   set through Settings on the Postgres-backed binary lives only in Postgres and is
   lost on rollback (reapply it after rolling forward again).
 - No Settings UI or dashboard-visible change beyond the one-time reset. See
