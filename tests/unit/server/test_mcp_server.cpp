@@ -9510,6 +9510,18 @@ yuzu::server::AgentLicenseRow sle_pii_row() {
     r.collected_at = 1751000000;
     return r;
 }
+
+// Pre-migrated template for the four [pg] cases below that construct a
+// SoftwareLicensingStore AND an RbacStore on the SAME shared pool/db (the
+// RbacStore is only there to satisfy the #1717 fail-closed guard).
+yuzu::test::PgTestTemplate mcp_sle_rbac_tpl{
+    "mcpslerbac", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        yuzu::server::SoftwareLicensingStore sle{pool};
+        yuzu::server::RbacStore rbac{pool};
+        if (!sle.is_open() || !rbac.is_open())
+            throw std::runtime_error("mcp_sle_rbac template: a store failed to migrate");
+    }};
 } // namespace
 
 TEST_CASE("MCP query_software_licenses: scope gate unwired → fail closed (never legacy-open)",
@@ -9685,7 +9697,7 @@ TEST_CASE("MCP query_software_licenses: success shape + user_ref/user_scope OMIT
     // THE PII-omission guard: the store holds a per-user row WITH user_scope/user_ref,
     // but the MCP twin serves machine-scope FACTS only — that personal data is served
     // solely by the audited REST drill and must never appear in the twin's payload.
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_sle_rbac_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     yuzu::server::SoftwareLicensingStore store{pool};
@@ -9738,7 +9750,7 @@ TEST_CASE("MCP query_software_licenses: a degraded store errors, never success+[
     // store/pool/query failure (agent_licenses → nullopt) must surface a JSON-RPC error,
     // NOT success with an empty array — a licence query must never read a transient
     // outage as "nothing licensed" (authoritative reads, A4).
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_sle_rbac_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     yuzu::server::SoftwareLicensingStore store{pool};
@@ -9788,7 +9800,7 @@ TEST_CASE("MCP query_software_licenses: a degraded store errors, never success+[
 // throw into `false` rather than letting it escape as a 500).
 TEST_CASE("MCP query_software_licenses: dropped audit row surfaces audit_persisted:false (#1647)",
           "[mcp][pg][sle][audit]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_sle_rbac_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     yuzu::server::SoftwareLicensingStore store{pool};
@@ -9833,7 +9845,7 @@ TEST_CASE("MCP query_software_licenses: throwing audit_fn is caught → audit_pe
           "[mcp][pg][sle][audit]") {
     // try_persist_audit's catch arm: a bad_alloc-class throw from the audit sink must
     // become `false` (→ audit_persisted:false), never escape the handler as a 500.
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_sle_rbac_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     yuzu::server::SoftwareLicensingStore store{pool};

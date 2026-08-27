@@ -2207,6 +2207,63 @@ These are two SEPARATE failure/detection behaviors, not one — do not conflate 
 **Verify:** after the server reports ready, `GET /api/compliance` returns the expected
 policies and fleet compliance percentage.
 
+## Runtime configuration migrates to Postgres — OIDC client secret now encrypted at rest, config resets on cutover (RuntimeConfigStore, ADR-0060)
+
+`RuntimeConfigStore` — the Settings-configurable overrides behind `GET`/`PUT
+/api/config/:key` (retention windows, `log_level`, DEX alert-routing knobs, and the
+`oidc_*` OIDC parameters) — moves from the SQLite `runtime-config.db` file to the
+server's PostgreSQL substrate in this release, schema `runtime_config_store`.
+`WebhookStore` and `InstructionStore` have both since merged; `OffloadTargetStore` is
+now the only server store remaining on the Postgres migration ladder.
+
+**Before you upgrade, if you use OIDC/SSO configured through Settings (not
+`--oidc-client-secret`/the environment): record your IdP client secret now.** Yuzu
+cannot recover it for you — `GET /api/config` never returns a secret's real value — and
+this cutover does not carry it forward (see below). Without it on hand, restoring SSO
+after this upgrade means generating a new client secret with your identity provider.
+
+- **Your stored overrides do NOT carry over on this cutover.** Per ADR-0009's
+  fresh-start-by-default amendment, the legacy `runtime-config.db` is never copied — no
+  production fleet has ever run a pre-Postgres Yuzu build, so the mandate to preserve
+  real operator config across the cutover has nothing real to preserve for this
+  migration. If your `runtime-config.db` DID hold real overrides, the server checks for
+  this at boot and logs a warning naming the exact count found (e.g. "legacy
+  runtime-config.db holds 2 override(s) that will NOT be carried over"). **This check
+  only ever inspects the legacy SQLite file — it has no way to know whether you have
+  already reapplied the warned-about overrides, so it repeats on every boot for as
+  long as that file still holds rows, not just the first one after cutover.** Reapply
+  your overrides via Settings once, then either delete the legacy file (see below) or
+  ignore the repeated warning — it is expected until you do. Every key starts at its
+  CLI/env default until you do.
+- **This does NOT affect OIDC configured via `--oidc-client-secret`/the environment.**
+  Only Settings-configured values are reset; a secret supplied at the process level is
+  read at every boot regardless of this store and is untouched by this migration.
+- **`oidc_client_secret` is now encrypted at rest** (SecretCodec envelope, AES-256-GCM)
+  instead of plaintext, from the point you reapply it onward.
+- **The legacy `runtime-config.db`'s CONTENT is left in place, and may still contain your
+  old OIDC client secret in plaintext.** This release never reads its content beyond a
+  boot-time row count, never moves it, never deletes it — but it DOES force the file's
+  permission bits (and any `-wal`/`-shm` sidecar's) to 0600 on every boot as a defence-in-depth
+  hardening step, so "untouched" applies to content only, not to permission bits. If you
+  previously configured `oidc_client_secret`, delete this file (or otherwise secure it)
+  after confirming you no longer need it — it is not required for the server to run, and
+  leaving it in place is a plaintext-credential-on-disk exposure this migration does not close
+  on your behalf.
+- **`GET`/`PUT /api/config/:key` now return an honest 503** on a genuine database
+  error, rather than a response indistinguishable from "nothing configured" (`GET`)
+  or a `400` validation failure (`PUT`). No change to either route's success-path
+  response shape.
+- **Rolling back:** because the legacy `runtime-config.db`'s content is never moved or renamed
+  (only its permission bits change, per above), reverting to a pre-cutover binary restores your
+  pre-cutover overrides — including a plaintext OIDC client secret, if one was there — exactly
+  as they were. Anything you
+  set through Settings on the Postgres-backed binary lives only in Postgres and is
+  lost on rollback (reapply it after rolling forward again).
+- No Settings UI or dashboard-visible change beyond the one-time reset. See
+  [`security-hardening.md`](security-hardening.md) for the pre-existing OIDC secret
+  redaction behaviour (unchanged by this migration) and `docs/adr/0060-runtime-config-store-postgres-migration.md`
+  for the full design.
+
 ## ⚠️ Behaviour change: quarantine is now enforced at instruction dispatch (#881, #3127)
 
 Quarantine previously isolated a device's network without stopping the control plane from

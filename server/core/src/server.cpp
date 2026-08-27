@@ -174,6 +174,7 @@
 #include "workflow_routes.hpp"
 #include "runtime_config_store.hpp"
 #include "runtime_config_view.hpp"
+#include "secure_buffer.hpp"
 #include "schedule_engine.hpp"
 #include "scope_engine.hpp"
 #include "instruction_db_pool.hpp"
@@ -3244,6 +3245,22 @@ public:
             // trimmed value too.
             cfg_.oidc_admin_group = trim_ascii_whitespace(cfg_.oidc_admin_group);
 
+            // Pre-existing, migration-independent gap (governance enterprise-readiness
+            // finding on the RuntimeConfigStore/ADR-0060 PR, not caused by it): this
+            // provider is built HERE, before apply_runtime_config_overrides() runs
+            // (Phase 7, later in boot), and nothing rebuilds it afterward. A
+            // Settings-only-configured client secret is therefore never picked up by
+            // the live provider on any boot — only --oidc-client-secret/env do. Loudly
+            // flag it rather than let token exchange fail opaquely at the IdP later.
+            if (cfg_.oidc_client_secret.empty())
+                spdlog::warn(
+                    "OIDC configured (issuer/client_id set) but the client secret is empty at "
+                    "startup -- if you configured it via Settings rather than "
+                    "--oidc-client-secret/the environment, it will NOT take effect: this "
+                    "provider is built once at boot, before stored runtime config is applied, "
+                    "and is never rebuilt. Set the secret via --oidc-client-secret or the "
+                    "environment instead.");
+
             oidc::OidcConfig oidc_cfg;
             oidc_cfg.issuer = cfg_.oidc_issuer;
             oidc_cfg.client_id = cfg_.oidc_client_id;
@@ -5572,13 +5589,93 @@ public:
             }
         }
 
-        // Phase 7: Runtime Configuration + Custom Properties
-        {
-            auto rtcfg_db = cfg_.db_dir() / "runtime-config.db";
-            runtime_config_store_ = std::make_unique<RuntimeConfigStore>(rtcfg_db);
-            if (runtime_config_store_ && runtime_config_store_->is_open()) {
-                // Apply stored overrides on startup
-                apply_runtime_config_overrides();
+        // Phase 7: Runtime Configuration — Migrated Postgres store (ADR-0006/
+        // 0009/0060, schema `runtime_config_store`). Same fail-CLOSED
+        // construction posture as every other born-on-PG store (ADR-0012
+        // §1): a reachable database whose schema can't migrate/open is a
+        // fatal startup error, never a serve-degraded config plane — config
+        // reads feed auth/OIDC behaviour, so serving degraded here is a
+        // fail-open, not a benign default.
+        //
+        // NO backfill (ADR-0009's 2026-08-25 fresh-start-by-default
+        // amendment, ADR-0060): no production fleet has ever run a
+        // pre-Postgres Yuzu build, so the legacy runtime-config.db is never
+        // COPIED. Unlike ResponseStore (purely TTL'd telemetry), this store
+        // holds real operator config, so the playbook's detect-and-warn
+        // obligation applies: warn_if_legacy_data_present() opens the
+        // legacy file read-only to check for real rows and warns loudly
+        // (with a count) only when it finds them -- silence is the
+        // unremarkable case (a genuinely fresh install). This check ONLY
+        // ever inspects the legacy SQLite file -- it has no way to know
+        // whether the operator already reapplied a warned-about override,
+        // so a real-data warning repeats on EVERY boot the legacy file
+        // still holds rows, not just the first one after cutover (see
+        // docs/user-manual/upgrading.md's RuntimeConfigStore section).
+        //
+        // Own SecretCodec instance (ADR-0010 per-store model, mirrors
+        // plugin_config_store_'s construction sequence exactly, see that
+        // block above): construct the codec first (ctor only), THEN
+        // RuntimeConfigStore's own constructor registers its ONE secret
+        // column (runtime_config_store.runtime_config_secrets.sealed_value)
+        // immediately after its schema migration, THEN SecretCodec::init()
+        // runs on a pinned lease. Reuses auth_key_provider_ (constructed
+        // above; guaranteed non-null whenever this guard is reached) rather
+        // than minting a third FileKeyProvider — the KEK material is
+        // install-wide (ADR-0010 §2), so one KeyProvider instance backing
+        // three independent SecretCodec instances is the correct shape.
+        if (pg_pool_ && !startup_failed_) {
+            runtime_config_secret_codec_ = std::make_unique<pg::SecretCodec>(*auth_key_provider_);
+            runtime_config_store_ =
+                std::make_unique<RuntimeConfigStore>(*pg_pool_, *runtime_config_secret_codec_);
+            if (!runtime_config_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: runtime config store migration/open failed "
+                              "(database reachable but the runtime_config_store schema could not "
+                              "be created/opened)");
+                startup_failed_ = true;
+            } else {
+                auto lease = pg_pool_->acquire();
+                if (!lease) {
+                    spdlog::error("[PG] Refusing to start: could not acquire a connection to run "
+                                  "SecretCodec::init() for runtime_config_store ({})",
+                                  pg_pool_->last_error());
+                    startup_failed_ = true;
+                } else {
+                    auto init_res = runtime_config_secret_codec_->init(lease.get());
+                    lease.reset();
+                    if (!init_res) {
+                        spdlog::error(
+                            "[PG] Refusing to start: runtime_config_store SecretCodec::init() "
+                            "failed — {}: {}",
+                            pg::SecretCodec::to_string(init_res.error().kind),
+                            init_res.error().message);
+                        startup_failed_ = true;
+                    } else {
+                        runtime_config_store_->set_metrics(&metrics_);
+                        metrics_.describe("yuzu_server_runtime_config_read_degrade_total",
+                                          "RuntimeConfigStore reads that degraded instead of "
+                                          "answering, by reason",
+                                          "counter");
+                        for (auto reason : {"store_not_open", "pool_acquire_timeout",
+                                             "query_error", "crypto_error"}) {
+                            metrics_.counter("yuzu_server_runtime_config_read_degrade_total",
+                                             {{"reason", reason}});
+                        }
+                        // Detect-and-warn (docs/postgres-store-playbook.md's Backfill bullet):
+                        // silent unless the legacy file actually holds real overrides this
+                        // cutover will not carry over -- see the store's own doc comment.
+                        RuntimeConfigStore::warn_if_legacy_data_present(cfg_.db_dir() /
+                                                                        "runtime-config.db");
+                        if (!apply_runtime_config_overrides()) {
+                            spdlog::error(
+                                "[PG] Refusing to start: could not apply stored runtime config "
+                                "overrides at boot (see prior log lines) — a config read failure "
+                                "here would otherwise silently boot with defaults instead of the "
+                                "operator's stored overrides, including a possible OIDC client "
+                                "secret");
+                            startup_failed_ = true;
+                        }
+                    }
+                }
             }
         }
         // Migrated Postgres store (ADR-0006/ADR-0045, schema
@@ -8674,6 +8771,19 @@ public:
         if (webhook_secret_codec_)
             webhook_secret_codec_->set_audit_hook({});
         webhook_secret_codec_.reset();
+        // RuntimeConfigStore (ADR-0060) borrows both pg_pool_ and its own SecretCodec,
+        // which is itself constructed from *auth_key_provider_ — reset both HERE,
+        // before auth_key_provider_ below, not down near pg_pool_.reset() where an
+        // earlier revision of this teardown placed them (external adversarial-review
+        // finding: that placement left the codec holding a dangling KeyProvider&
+        // reference for the whole interval between auth_key_provider_.reset() and
+        // this store's own reset -- unreachable today only because kek_ops's
+        // rotate/rewrap/status handlers are already unreachable by the time this
+        // runs, per web_thread_'s join well above, not because the ordering was
+        // actually safe). pg_pool_ itself is still alive at this point (reset last,
+        // below), so moving these two lines earlier is safe.
+        runtime_config_store_.reset();
+        runtime_config_secret_codec_.reset();
         auth_key_provider_.reset();
         audit_store_.reset();
         // TagStore (ADR-0050) borrows pg_pool_ — unwire the borrowed raw
@@ -8749,6 +8859,8 @@ public:
         // (adversarial-review MEDIUM, 2026-08-20 — matches the sibling stores' own
         // explicit-reset discipline in this function).
         ca_store_.reset();
+        // RuntimeConfigStore/runtime_config_secret_codec_ already reset above,
+        // before auth_key_provider_ (the codec borrows it) — see that comment.
         pg_pool_.reset();
 
         // ONLY on full completion — a path above that escalates via std::_Exit(1)
@@ -10896,19 +11008,29 @@ private:
                           command_id, denied_count);
     }
 
-    // Apply stored runtime config overrides on startup
-    void apply_runtime_config_overrides() {
+    // Apply stored runtime config overrides on startup. Returns false on a
+    // genuine read failure (ADR-0036) — the caller treats that as a fatal
+    // boot error (startup_failed_), never as "nothing configured": a
+    // transient read blip here would otherwise silently boot with defaults
+    // instead of the operator's stored overrides, including a possible OIDC
+    // client secret (kickoff decision #1 / CH-2).
+    [[nodiscard]] bool apply_runtime_config_overrides() {
         if (!runtime_config_store_ || !runtime_config_store_->is_open())
-            return;
-        // The ONE caller entitled to plaintext: it must apply the real secret.
-        auto entries = runtime_config_store_->get_all_with_secrets();
-        for (const auto& e : entries) {
+            return true; // nothing to apply; not itself a failure
+        // Redacted read: never decrypts (ADR-0010 §1 / ADR-0060). The one real
+        // secret this store carries (oidc_client_secret) is applied separately
+        // below via read_secret(), the only accessor entitled to plaintext.
+        auto entries_result = runtime_config_store_->get_all();
+        if (!entries_result.has_value()) {
+            spdlog::error("apply_runtime_config_overrides: read failed: {}",
+                          entries_result.error());
+            return false;
+        }
+        for (const auto& e : *entries_result) {
             // Never log a credential. This line wrote the OIDC client secret verbatim
             // into yuzu-server.log on every boot once it had been set via Settings.
-            spdlog::info("Applying runtime config override: {} = {}", e.key,
-                         RuntimeConfigStore::is_secret_key(e.key)
-                             ? RuntimeConfigStore::redacted_placeholder()
-                             : e.value.c_str());
+            // get_all() already redacts, so e.value is never the real secret here.
+            spdlog::info("Applying runtime config override: {} = {}", e.key, e.value.c_str());
             if (e.key == "log_level") {
                 spdlog::set_level(spdlog::level::from_str(e.value));
             } else if (e.key == "heartbeat_timeout") {
@@ -10932,13 +11054,12 @@ private:
             // else reads it back from this store either. GET /api/config reports it
             // derived from whether any auto-approve rule exists, so a stored value
             // has no effect at all. See docs/user-manual/rest-api.md.
-            // OIDC settings — runtime-configurable via Settings UI
+            // OIDC settings — runtime-configurable via Settings UI. oidc_client_secret
+            // is handled below, never from this (redacted) loop.
             else if (e.key == "oidc_issuer" && !e.value.empty())
                 cfg_.oidc_issuer = e.value;
             else if (e.key == "oidc_client_id" && !e.value.empty())
                 cfg_.oidc_client_id = e.value;
-            else if (e.key == "oidc_client_secret" && !e.value.empty())
-                cfg_.oidc_client_secret = e.value;
             else if (e.key == "oidc_redirect_uri")
                 cfg_.oidc_redirect_uri = e.value;
             else if (e.key == "oidc_admin_group")
@@ -10946,9 +11067,47 @@ private:
             else if (e.key == "oidc_skip_tls_verify")
                 cfg_.oidc_skip_tls_verify = (e.value == "true");
         }
+
+        // The one secret this store carries. read_secret() returns the zeroizing
+        // SecureBuffer type (ADR-0010 §1) -- copy into cfg_.oidc_client_secret (a
+        // plain std::string by pre-existing design, populated identically from
+        // --oidc-client-secret at boot; see ADR-0060 "Zeroization fix"). Block-
+        // scoped so the buffer wipes itself before apply_dex_alert_config() runs
+        // below, not merely before this function returns -- matching
+        // WebhookStore::deliver_one's signing-secret pattern as tightly as the
+        // header doc already claims (cpp-expert, governance Gate 3 finding: the
+        // prior function-scope placement kept the decrypted buffer alive longer
+        // than the header's own precedent citation implied).
+        {
+            auto secret_result = runtime_config_store_->read_secret("oidc_client_secret");
+            if (!secret_result.has_value()) {
+                // A KEK/decrypt failure here fails the boot closed (ADR-0006/ADR-0010
+                // fail-closed posture, same CONTRACT as AuthDB's TOTP secrets and
+                // WebhookStore's signing secret) -- but a WIDER blast radius: this
+                // denies the entire boot, not just one login or one delivery. See
+                // ADR-0060's "Decrypt-failure blast radius" section for why MEDIUM
+                // still stands despite that (fail-closed beats the fail-open
+                // alternative). Point at the recovery procedure rather than just the
+                // raw store error.
+                spdlog::error("apply_runtime_config_overrides: oidc_client_secret could not be "
+                              "decrypted ({}) -- see \"Key management (secrets KEK)\" in the server "
+                              "admin guide for recovery (a keys directory that does not match this "
+                              "database, e.g. after a restore without its paired backup, is the "
+                              "common cause)",
+                              secret_result.error());
+                return false;
+            }
+            if (secret_result->has_value() && !(*secret_result)->empty()) {
+                const auto& secret = **secret_result;
+                cfg_.oidc_client_secret.assign(reinterpret_cast<const char*>(secret.data()),
+                                               secret.size());
+            }
+        }
+
         // F1 DEX alerting config — both consumers accept live updates, so the
         // same call applies at boot and from the settings POST handlers.
         apply_dex_alert_config();
+        return true;
     }
 
     /// F1: push the persisted DEX alerting config into the alert router and
@@ -12277,6 +12436,12 @@ private:
             // confinement CLOSED, so a "healthy" report over it would be
             // misleading.
             bool tag_ok = tag_store_ && tag_store_->is_open();
+            // ADR-0060: /readyz's StoreCheck vector already names this store; /healthz
+            // omitted it (governance Gate 3 finding, architect + sre independently) --
+            // /readyz is what actually gates traffic, so this was a monitoring-signal
+            // gap, not an availability one, but the two probes should agree on which
+            // stores exist.
+            bool runtime_config_ok = runtime_config_store_ && runtime_config_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
@@ -12285,7 +12450,8 @@ private:
                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
                 approval_ok && rbac_ok && result_set_ok && mgmt_group_ok && discovery_ok &&
-                deployment_ok && quarantine_ok && notification_ok && upload_grant_ok && tag_ok;
+                deployment_ok && quarantine_ok && notification_ok && upload_grant_ok && tag_ok &&
+                runtime_config_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -12327,7 +12493,8 @@ private:
                   {"quarantine_store", quarantine_ok ? "ok" : "error"},
                   {"notification_store", notification_ok ? "ok" : "error"},
                   {"upload_grant_store", upload_grant_ok ? "ok" : "error"},
-                  {"tag_store", tag_ok ? "ok" : "error"}}},
+                  {"tag_store", tag_ok ? "ok" : "error"},
+                  {"runtime_config_store", runtime_config_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -12808,12 +12975,22 @@ private:
             if (!runtime_config_store_ || !runtime_config_store_->is_open()) {
                 res.status = 503;
                 res.set_content(
-                    R"({"error":{"code":503,"message":"runtime configuration store unavailable"},)"
+                    R"({"error":{"code":503,"message":"runtime config store unavailable"},)"
                     R"("meta":{"api_version":"v1"}})",
                     "application/json");
                 return;
             }
-            nlohmann::json overrides = build_overrides_json(runtime_config_store_->get_all());
+            auto overrides_result = runtime_config_store_->get_all();
+            if (!overrides_result.has_value()) {
+                spdlog::error("GET /api/config: read failed: {}", overrides_result.error());
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"runtime config store unavailable"},)"
+                    R"("meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            nlohmann::json overrides = build_overrides_json(*overrides_result);
 
             nlohmann::json allowed = nlohmann::json::array();
             for (const auto& k : RuntimeConfigStore::allowed_keys())
@@ -12891,9 +13068,23 @@ private:
 
             auto result = runtime_config_store_->set(key, value, session->username);
             if (!result) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
-                                "application/json");
+                // A genuine DB/crypto failure (kRuntimeConfigDbErrorPrefix) is a
+                // 503 with a generic message -- never echo the internal detail
+                // to the caller; caller-input validation (unknown key, bad
+                // value shape, the redaction-placeholder guard) is a 400 with
+                // the store's own message, which is written for an operator.
+                if (result.error().starts_with(kRuntimeConfigDbErrorPrefix)) {
+                    spdlog::error("PUT /api/config/{}: write failed: {}", key, result.error());
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"runtime config store unavailable"},)"
+                        R"("meta":{"api_version":"v1"}})",
+                        "application/json");
+                } else {
+                    res.status = 400;
+                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
+                                    "application/json");
+                }
                 return;
             }
 
@@ -21192,6 +21383,14 @@ private:
         // version was active when it was written once rotation runs.
         if (webhook_secret_codec_)
             out.push_back(webhook_secret_codec_.get());
+        // RuntimeConfigStore's SecretCodec (ADR-0060) — same shape, same
+        // reason. Missing this entry was an external adversarial-review
+        // finding on the initial migration: KEK rotation/rewrap silently
+        // never re-wraps the OIDC client secret while /kek/status reports
+        // rotation_complete: true, and the secret becomes permanently
+        // undecryptable once the old KEK version is later retired.
+        if (runtime_config_secret_codec_)
+            out.push_back(runtime_config_secret_codec_.get());
         return out;
     }
 
@@ -21254,6 +21453,14 @@ private:
     std::atomic<bool> viz_disabled_{false};
 
     // Phase 7: Runtime config, custom properties, health monitoring, workflows, product packs
+    //
+    // ADR-0060: runtime_config_store_ borrows runtime_config_secret_codec_ by
+    // reference (ADR-0010 per-store codec model, same shape as
+    // plugin_config_store_ / plugin_config_secret_codec_ above), so it must
+    // destruct BEFORE the codec it borrows — true here because it is
+    // declared AFTER the codec. Both borrow pg_pool_ by reference too, and
+    // both destruct before it (declared above every member here).
+    std::unique_ptr<pg::SecretCodec> runtime_config_secret_codec_;
     std::unique_ptr<RuntimeConfigStore> runtime_config_store_;
     std::unique_ptr<CustomPropertiesStore> custom_properties_store_;
     std::unique_ptr<WorkflowEngine> workflow_engine_;
