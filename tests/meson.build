@@ -454,8 +454,7 @@ agent_test_exe = executable(
                 users_plugin_lib, os_info_plugin_lib, processes_plugin_lib,
                 network_diag_plugin_lib, ioc_plugin_lib,
                 hardware_plugin_lib, device_identity_plugin_lib, netstat_plugin_lib,
-                windows_updates_plugin_lib, sccm_plugin_lib, event_logs_plugin_lib],
-                windows_updates_plugin_lib, sccm_plugin_lib,
+                windows_updates_plugin_lib, sccm_plugin_lib, event_logs_plugin_lib,
                 installed_apps_plugin_lib, msi_packages_plugin_lib],
 )
 # Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
