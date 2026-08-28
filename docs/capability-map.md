@@ -44,7 +44,7 @@ Overall      [======================---------]   172/228 done (75%)
 | 5. Process & Service Mgmt | 5 | 4 | 0 | 1 |
 | 6. User & Session Mgmt | 5 | 5 | 0 | 0 |
 | 7. Software & App Mgmt | 6 | 6 | 0 | 0 |
-| 8. Patch & Update Mgmt | 9 | 8 | 0 | 1 |
+| 8. Patch & Update Mgmt | 9 | 5 | 2 | 2 |
 | 9. Security & Compliance | 10 | 9 | 0 | 1 |
 | 10. File System Operations | 15 | 14 | 0 | 1 |
 | 11. Script & Command Exec | 4 | 4 | 0 | 0 |
@@ -386,25 +386,44 @@ macOS (softwareupdate restart flag, bounded to a 60s deadline — replaces the p
 own prior unbounded `popen()` call, which could hang indefinitely on a headless/offline
 Mac). Reports per-source status and aggregate boolean.
 
-### 8.3 Patch Deployment :white_check_mark: `T2`
+### 8.3 Patch Deployment :large_orange_diamond: `T2`
 
-`PatchManager` (794 LOC) with `deploy_patch()` orchestration: scan → download → install → verify → optional reboot. Per-target status tracking (pending, scanning, downloading, installing, verifying, completed, failed, skipped). REST endpoints for deployment CRUD and cancellation.
+`PatchManager::deploy_patch()` (Postgres-backed, ADR-0062) creates a deployment record + a
+`pending` per-target row for a KB across one or more agents; `get_deployment()`/
+`list_deployments()`/`cancel_deployment()` and REST endpoints for the same. **The scan →
+download → install → verify → reboot orchestration workflow itself has no server-side
+implementation** — it existed as `PatchManager::execute_deployment()` but had zero production
+callers (nothing ever wired a dispatch/OS-lookup callback to it) and was deleted rather than
+ported in the store's Postgres migration; see #3669 for the removed tested-but-unwired
+implementation. A target's status only advances past `pending` via a direct
+`update_target_status()` call, which nothing in this codebase makes today.
 
-### 8.4 Patch Status Tracking :white_check_mark: `T2`
+### 8.4 Patch Status Tracking :large_orange_diamond: `T2`
 
-`PatchManager` tracks per-device deployment status via `PatchDeploymentTarget`. Per-agent status, error messages, start/complete timestamps. `recalculate_deployment_progress()` maintains aggregate counts. Queryable via REST API.
+`PatchManager` tracks per-device deployment status via `PatchDeploymentTarget` — per-agent
+status, error message, start/complete timestamps, settable via `update_target_status()` and
+queryable via `get_deployment()`/REST. **Deployment-level aggregate counters
+(`completed_targets`/`failed_targets`) are set once at creation and never recalculated
+afterward** — the only caller of the former `recalculate_deployment_progress()` was
+`execute_deployment()` (§8.3), deleted alongside it.
 
 ### 8.5 Patch Metadata Retrieval :white_check_mark: `T2`
 
 `PatchInfo` stores KB ID, title, severity (Critical/Important/Moderate/Low/Unspecified), release date, and scan timestamp. `get_fleet_patch_summary()` returns per-KB missing counts. `get_missing_patches()` and `get_installed_patches()` support severity and agent filtering.
 
-### 8.6 Reboot Management (Post-Patch) :white_check_mark: `T2`
+### 8.6 Reboot Management (Post-Patch) :x: `T2`
 
-Full reboot orchestration in `PatchManager::execute_deployment()`. Configurable `reboot_delay_seconds` (default 300, clamped [60, 86400]) and optional `reboot_at` epoch timestamp for maintenance windows. Pre-reboot user notification via `device.interaction.notify` (best-effort). Cross-platform reboot commands: Windows `shutdown /r /t N /c`, Linux/macOS `shutdown -r +N`. Target status lifecycle includes `"rebooting"` state. REST API accepts `reboot_delay_seconds` and `reboot_at` in `POST /api/patches/deploy`.
+Reboot orchestration (`PatchManager::execute_deployment()`: pre-reboot `device.interaction.notify`
+best-effort user notice, then a cross-platform reboot command — Windows `shutdown /r /t N /c`,
+Linux/macOS `shutdown -r +N`) existed but had zero production callers and was removed in the
+store's Postgres migration (ADR-0062); see #3669 for the removed tested-but-unwired
+implementation. `reboot_delay_seconds`/`reboot_at` are still accepted by
+`POST /api/patches/deploy`, clamped, and stored on `PatchDeployment`, but nothing currently acts
+on them.
 
 ### 8.7 Update Summary and Compliance Reporting :white_check_mark: `T2`
 
-`PatchManager::get_fleet_patch_summary()` returns fleet-wide patch compliance (per-KB missing agent counts). `get_missing_patches()` with `PatchQuery` filters by agent, severity, status. Deployment tracking with aggregate progress.
+`PatchManager::get_fleet_patch_summary()` returns fleet-wide patch compliance (per-KB missing agent counts). `get_missing_patches()` with `PatchQuery` filters by agent, severity, status. Deployment tracking reports `total_targets` (accurate as of creation); `completed_targets`/`failed_targets` do not auto-update post-creation (§8.4).
 
 ### 8.8 Patch Connectivity Testing :white_check_mark: `T2`
 

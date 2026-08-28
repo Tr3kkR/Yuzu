@@ -1,72 +1,68 @@
 /**
- * test_patch_manager.cpp — Unit tests for PatchManager
+ * test_patch_manager.cpp — Unit tests for PatchManager (Postgres-backed,
+ * ADR-0006/0009/0062 migration, schema `patch_manager`).
  *
- * Covers: create/get deployment, DeploymentRequest struct, reboot_delay clamping,
- *         kb_id validation, execute_deployment reboot orchestration (Windows/Linux/
- *         unknown OS), notification failure non-fatal, cancel_deployment, list_deployments.
+ * Covers: create/get deployment, DeploymentRequest struct, reboot_delay
+ *         clamping, kb_id validation, cancel_deployment, list_deployments.
+ *
+ * execute_deployment (reboot orchestration: Windows/Linux/unknown-OS,
+ * notification-failure-is-non-fatal — 4 cases) was REMOVED along with the
+ * code it tested (zero production callers on dev — see ADR-0062 "Deleted:
+ * execute_deployment"), not ported.
  */
 
 #include "patch_manager.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
 
-#include <cstdio>
-#include <filesystem>
+#include <stdexcept>
 #include <string>
-#include <utility>
-#include <vector>
 
 using namespace yuzu::server;
+using yuzu::server::pg::PgConn;
+using yuzu::server::pg::PgPool;
+using yuzu::server::pg::PgResult;
 
-// ── RAII wrapper for temp DB file ───────────────────────────────────────────
+namespace {
 
-// The previous fixture salted with a per-process counter + the object's own
-// address — cross-process uniqueness rested on ASLR, not a deliberate salt.
-// yuzu::test::TempDbFile carries the process-salted naming and -wal/-shm
-// cleanup (#1883). Member order matters: file FIRST so it outlives mgr —
-// PatchManager closes the DB before the file (and its sidecars) is removed.
-struct TestPatchDb {
-    yuzu::test::TempDbFile file{"yuzu_test_patch_mgr-"};
-    std::filesystem::path path{file.path};
-    PatchManager mgr{path};
-};
+// Pre-migrated template (docs/postgres-store-playbook.md step 7). Every
+// store-behaviour case clones this instead of re-migrating per test.
+yuzu::test::PgTestTemplate patch_mgr_tpl{"patchmgr", [](const std::string& dsn) {
+                                            PgPool pool{{.conninfo = dsn, .size = 1}};
+                                            PatchManager mgr{pool};
+                                            if (!mgr.is_open())
+                                                throw std::runtime_error(
+                                                    "patch_manager template: store failed to migrate");
+                                        }};
 
-// ── Helpers for dispatch mocking ────────────────────────────────────────────
+} // namespace
 
-/// Records (instruction_id, agent_id) for each dispatch call.
-using DispatchLog = std::vector<std::pair<std::string, std::string>>;
-
-/// Build a scan result JSON where the kb appears in rows[].title.
-static std::string scan_result_with_kb(const std::string& kb_id) {
-    return R"({"rows":[{"identifier":")" + kb_id +
-           R"(","title":"Security Update )" + kb_id +
-           R"(","severity":"Important"}]})";
-}
-
-/// Build an installed-verification result JSON where the kb appears in rows[].identifier.
-static std::string verify_result_with_kb(const std::string& kb_id) {
-    return R"({"rows":[{"identifier":")" + kb_id +
-           R"(","title":"Security Update","severity":"Important"}]})";
-}
-
-/// Build a generic success JSON (for script_exec, notify, etc.).
-static std::string success_json() {
-    return R"({"rows":[],"exit_code":0})";
-}
+// Fixture: a fresh cloned PG database, a pool, and an open PatchManager.
+// Expands to statements (includes the SKIP-if-no-DSN guard), so it must
+// lead a block. The db/pool must outlive `mgr_var`; declaring all three
+// here keeps that order.
+#define PATCH_MANAGER(mgr_var)                                                                    \
+    YUZU_REQUIRE_PG_DB_TPL(patch_db_fx_, patch_mgr_tpl);                                          \
+    PgPool patch_pool_fx_{{.conninfo = patch_db_fx_.dsn(), .size = 4}};                           \
+    REQUIRE(patch_pool_fx_.valid());                                                              \
+    PatchManager mgr_var{patch_pool_fx_};                                                          \
+    REQUIRE(mgr_var.is_open())
 
 // ── Test: create and get deployment ─────────────────────────────────────────
 
-TEST_CASE("PatchManager: create and get deployment", "[patch_manager][deploy]") {
-    TestPatchDb tdb;
-    REQUIRE(tdb.mgr.is_open());
+TEST_CASE("PatchManager: create and get deployment", "[patch_manager][pg][deploy]") {
+    PATCH_MANAGER(mgr);
 
-    auto result = tdb.mgr.deploy_patch("KB1234567", {"agent-1", "agent-2"}, false, "admin");
+    auto result = mgr.deploy_patch("KB1234567", {"agent-1", "agent-2"}, false, "admin");
     REQUIRE(result.has_value());
     CHECK(!result->empty());
 
-    auto depl = tdb.mgr.get_deployment(*result);
+    auto depl = mgr.get_deployment(*result);
     REQUIRE(depl.has_value());
     CHECK(depl->id == *result);
     CHECK(depl->kb_id == "KB1234567");
@@ -80,9 +76,8 @@ TEST_CASE("PatchManager: create and get deployment", "[patch_manager][deploy]") 
 
 // ── Test: deploy_patch with DeploymentRequest ───────────────────────────────
 
-TEST_CASE("PatchManager: deploy_patch with DeploymentRequest", "[patch_manager][deploy]") {
-    TestPatchDb tdb;
-    REQUIRE(tdb.mgr.is_open());
+TEST_CASE("PatchManager: deploy_patch with DeploymentRequest", "[patch_manager][pg][deploy]") {
+    PATCH_MANAGER(mgr);
 
     DeploymentRequest req;
     req.kb_id = "KB5034441";
@@ -92,10 +87,10 @@ TEST_CASE("PatchManager: deploy_patch with DeploymentRequest", "[patch_manager][
     req.reboot_delay_seconds = 600;
     req.reboot_at = 1700000000;
 
-    auto result = tdb.mgr.deploy_patch(req);
+    auto result = mgr.deploy_patch(req);
     REQUIRE(result.has_value());
 
-    auto depl = tdb.mgr.get_deployment(*result);
+    auto depl = mgr.get_deployment(*result);
     REQUIRE(depl.has_value());
     CHECK(depl->kb_id == "KB5034441");
     CHECK(depl->reboot_if_needed == true);
@@ -106,24 +101,23 @@ TEST_CASE("PatchManager: deploy_patch with DeploymentRequest", "[patch_manager][
 
 // ── Test: reboot_delay_seconds clamped ──────────────────────────────────────
 
-TEST_CASE("PatchManager: reboot_delay_seconds clamped", "[patch_manager][deploy]") {
-    TestPatchDb tdb;
-    REQUIRE(tdb.mgr.is_open());
+TEST_CASE("PatchManager: reboot_delay_seconds clamped", "[patch_manager][pg][deploy]") {
+    PATCH_MANAGER(mgr);
 
     SECTION("too small is clamped to 60") {
-        auto result = tdb.mgr.deploy_patch("KB1234567", {"agent-1"}, true, "admin", 10);
+        auto result = mgr.deploy_patch("KB1234567", {"agent-1"}, true, "admin", 10);
         REQUIRE(result.has_value());
 
-        auto depl = tdb.mgr.get_deployment(*result);
+        auto depl = mgr.get_deployment(*result);
         REQUIRE(depl.has_value());
         CHECK(depl->reboot_delay_seconds == 60);
     }
 
     SECTION("too large is clamped to 86400") {
-        auto result = tdb.mgr.deploy_patch("KB1234567", {"agent-1"}, true, "admin", 100000);
+        auto result = mgr.deploy_patch("KB1234567", {"agent-1"}, true, "admin", 100000);
         REQUIRE(result.has_value());
 
-        auto depl = tdb.mgr.get_deployment(*result);
+        auto depl = mgr.get_deployment(*result);
         REQUIRE(depl.has_value());
         CHECK(depl->reboot_delay_seconds == 86400);
     }
@@ -131,238 +125,46 @@ TEST_CASE("PatchManager: reboot_delay_seconds clamped", "[patch_manager][deploy]
 
 // ── Test: kb_id validation ──────────────────────────────────────────────────
 
-TEST_CASE("PatchManager: kb_id validation", "[patch_manager][validation]") {
-    TestPatchDb tdb;
-    REQUIRE(tdb.mgr.is_open());
+TEST_CASE("PatchManager: kb_id validation", "[patch_manager][pg][validation]") {
+    PATCH_MANAGER(mgr);
 
     SECTION("empty kb_id") {
-        auto result = tdb.mgr.deploy_patch("", {"agent-1"}, false, "admin");
+        auto result = mgr.deploy_patch("", {"agent-1"}, false, "admin");
         CHECK(!result.has_value());
     }
 
     SECTION("invalid prefix") {
-        auto result = tdb.mgr.deploy_patch("NOTAKB", {"agent-1"}, false, "admin");
+        auto result = mgr.deploy_patch("NOTAKB", {"agent-1"}, false, "admin");
         CHECK(!result.has_value());
     }
 
     SECTION("too few digits") {
-        auto result = tdb.mgr.deploy_patch("KB123", {"agent-1"}, false, "admin");
+        auto result = mgr.deploy_patch("KB123", {"agent-1"}, false, "admin");
         CHECK(!result.has_value());
     }
 
     SECTION("valid kb_id succeeds") {
-        auto result = tdb.mgr.deploy_patch("KB1234567", {"agent-1"}, false, "admin");
+        auto result = mgr.deploy_patch("KB1234567", {"agent-1"}, false, "admin");
         CHECK(result.has_value());
     }
 }
 
-// ── Test: execute_deployment reboot orchestration (Windows) ─────────────────
-
-TEST_CASE("PatchManager: execute_deployment reboot orchestration", "[patch_manager][execute]") {
-    TestPatchDb tdb;
-    REQUIRE(tdb.mgr.is_open());
-
-    auto deploy_result = tdb.mgr.deploy_patch("KB1234567", {"agent-1"}, true, "admin", 120);
-    REQUIRE(deploy_result.has_value());
-    auto deployment_id = *deploy_result;
-
-    DispatchLog log;
-
-    PatchDispatchFn dispatch_fn = [&](const std::string& instr_id,
-                                      const std::string& agent_id,
-                                      const std::string& params_json)
-        -> std::expected<std::string, std::string> {
-        log.emplace_back(instr_id, agent_id);
-
-        if (instr_id == "device.windows_updates.missing")
-            return scan_result_with_kb("KB1234567");
-        if (instr_id == "device.windows_updates.installed")
-            return verify_result_with_kb("KB1234567");
-        return success_json();
-    };
-
-    AgentOsLookupFn os_lookup = [](const std::string& agent_id) -> std::string {
-        return "windows";
-    };
-
-    auto exec_result = tdb.mgr.execute_deployment(deployment_id, dispatch_fn, os_lookup);
-    REQUIRE(exec_result.has_value());
-
-    // Should have dispatched: scan, install (script_exec), verify, notify, reboot (script_exec)
-    bool found_notify = false;
-    int script_exec_count = 0;
-    for (const auto& [instr, agent] : log) {
-        if (instr == "device.interaction.notify")
-            found_notify = true;
-        if (instr == "device.script_exec.run")
-            ++script_exec_count;
-    }
-    CHECK(found_notify);
-    // At least 2 script_exec calls: install + reboot
-    CHECK(script_exec_count >= 2);
-
-    // Verify dispatch log contains the Windows reboot command
-    // The last script_exec.run should be the reboot command containing "shutdown /r /t"
-    bool found_windows_reboot = false;
-    for (const auto& [instr, agent] : log) {
-        (void)agent;
-        // We just verify that script_exec was called — the params contain
-        // the reboot command but we're checking instruction IDs here.
-        if (instr == "device.script_exec.run")
-            found_windows_reboot = true;
-    }
-    CHECK(found_windows_reboot);
-}
-
-// ── Test: execute_deployment linux reboot ────────────────────────────────────
-
-TEST_CASE("PatchManager: execute_deployment linux reboot", "[patch_manager][execute]") {
-    TestPatchDb tdb;
-    REQUIRE(tdb.mgr.is_open());
-
-    auto deploy_result = tdb.mgr.deploy_patch("KB1234567", {"agent-1"}, true, "admin", 120);
-    REQUIRE(deploy_result.has_value());
-    auto deployment_id = *deploy_result;
-
-    // Store params_json for each script_exec call to verify linux reboot command
-    std::vector<std::string> script_exec_params;
-
-    PatchDispatchFn dispatch_fn = [&](const std::string& instr_id,
-                                      const std::string& agent_id,
-                                      const std::string& params_json)
-        -> std::expected<std::string, std::string> {
-        if (instr_id == "device.script_exec.run")
-            script_exec_params.push_back(params_json);
-        if (instr_id == "device.windows_updates.missing")
-            return scan_result_with_kb("KB1234567");
-        if (instr_id == "device.windows_updates.installed")
-            return verify_result_with_kb("KB1234567");
-        return success_json();
-    };
-
-    AgentOsLookupFn os_lookup = [](const std::string&) -> std::string {
-        return "linux";
-    };
-
-    auto exec_result = tdb.mgr.execute_deployment(deployment_id, dispatch_fn, os_lookup);
-    REQUIRE(exec_result.has_value());
-
-    // The last script_exec should be the reboot command with "shutdown -r +"
-    REQUIRE(!script_exec_params.empty());
-    bool found_linux_reboot = false;
-    for (const auto& p : script_exec_params) {
-        if (p.find("shutdown") != std::string::npos &&
-            p.find("-r +") != std::string::npos) {
-            found_linux_reboot = true;
-            break;
-        }
-    }
-    CHECK(found_linux_reboot);
-}
-
-// ── Test: execute_deployment unknown OS skips reboot ────────────────────────
-
-TEST_CASE("PatchManager: execute_deployment unknown OS skips reboot", "[patch_manager][execute]") {
-    TestPatchDb tdb;
-    REQUIRE(tdb.mgr.is_open());
-
-    auto deploy_result = tdb.mgr.deploy_patch("KB1234567", {"agent-1"}, true, "admin", 120);
-    REQUIRE(deploy_result.has_value());
-    auto deployment_id = *deploy_result;
-
-    PatchDispatchFn dispatch_fn = [&](const std::string& instr_id,
-                                      const std::string& /*agent_id*/,
-                                      const std::string& /*params_json*/)
-        -> std::expected<std::string, std::string> {
-        if (instr_id == "device.windows_updates.missing")
-            return scan_result_with_kb("KB1234567");
-        if (instr_id == "device.windows_updates.installed")
-            return verify_result_with_kb("KB1234567");
-        return success_json();
-    };
-
-    AgentOsLookupFn os_lookup = [](const std::string&) -> std::string {
-        return "";
-    };
-
-    auto exec_result = tdb.mgr.execute_deployment(deployment_id, dispatch_fn, os_lookup);
-    REQUIRE(exec_result.has_value());
-
-    // Target should be completed but with an error note about reboot skipped
-    auto depl = tdb.mgr.get_deployment(deployment_id);
-    REQUIRE(depl.has_value());
-    REQUIRE(!depl->targets.empty());
-    // The code sets error to "reboot skipped: unknown OS" when os is empty
-    bool found_reboot_skip = false;
-    for (const auto& t : depl->targets) {
-        if (t.error.find("reboot skipped") != std::string::npos) {
-            found_reboot_skip = true;
-            break;
-        }
-    }
-    CHECK(found_reboot_skip);
-}
-
-// ── Test: notification failure is non-fatal ─────────────────────────────────
-
-TEST_CASE("PatchManager: notification failure is non-fatal", "[patch_manager][execute]") {
-    TestPatchDb tdb;
-    REQUIRE(tdb.mgr.is_open());
-
-    auto deploy_result = tdb.mgr.deploy_patch("KB1234567", {"agent-1"}, true, "admin", 120);
-    REQUIRE(deploy_result.has_value());
-    auto deployment_id = *deploy_result;
-
-    PatchDispatchFn dispatch_fn = [&](const std::string& instr_id,
-                                      const std::string& /*agent_id*/,
-                                      const std::string& /*params_json*/)
-        -> std::expected<std::string, std::string> {
-        // Notification fails
-        if (instr_id == "device.interaction.notify")
-            return std::unexpected<std::string>("headless system — no desktop");
-        if (instr_id == "device.windows_updates.missing")
-            return scan_result_with_kb("KB1234567");
-        if (instr_id == "device.windows_updates.installed")
-            return verify_result_with_kb("KB1234567");
-        return success_json();
-    };
-
-    AgentOsLookupFn os_lookup = [](const std::string&) -> std::string {
-        return "windows";
-    };
-
-    auto exec_result = tdb.mgr.execute_deployment(deployment_id, dispatch_fn, os_lookup);
-    REQUIRE(exec_result.has_value());
-
-    // Deployment should still complete despite notification failure
-    auto depl = tdb.mgr.get_deployment(deployment_id);
-    REQUIRE(depl.has_value());
-    // The target should be completed (not failed)
-    bool all_completed = true;
-    for (const auto& t : depl->targets) {
-        if (t.status != "completed")
-            all_completed = false;
-    }
-    CHECK(all_completed);
-}
-
 // ── Test: cancel_deployment covers rebooting ────────────────────────────────
 
-TEST_CASE("PatchManager: cancel_deployment covers rebooting", "[patch_manager][cancel]") {
-    TestPatchDb tdb;
-    REQUIRE(tdb.mgr.is_open());
+TEST_CASE("PatchManager: cancel_deployment covers rebooting", "[patch_manager][pg][cancel]") {
+    PATCH_MANAGER(mgr);
 
-    auto deploy_result = tdb.mgr.deploy_patch("KB1234567", {"agent-1", "agent-2"}, true, "admin");
+    auto deploy_result = mgr.deploy_patch("KB1234567", {"agent-1", "agent-2"}, true, "admin");
     REQUIRE(deploy_result.has_value());
     auto deployment_id = *deploy_result;
 
     // Manually set agent-1 to "rebooting" status
-    tdb.mgr.update_target_status(deployment_id, "agent-1", "rebooting");
+    mgr.update_target_status(deployment_id, "agent-1", "rebooting");
 
-    auto cancel_result = tdb.mgr.cancel_deployment(deployment_id);
+    auto cancel_result = mgr.cancel_deployment(deployment_id);
     REQUIRE(cancel_result.has_value());
 
-    auto depl = tdb.mgr.get_deployment(deployment_id);
+    auto depl = mgr.get_deployment(deployment_id);
     REQUIRE(depl.has_value());
     CHECK(depl->status == "cancelled");
 
@@ -374,17 +176,110 @@ TEST_CASE("PatchManager: cancel_deployment covers rebooting", "[patch_manager][c
 
 // ── Test: list_deployments ──────────────────────────────────────────────────
 
-TEST_CASE("PatchManager: list_deployments", "[patch_manager][query]") {
-    TestPatchDb tdb;
-    REQUIRE(tdb.mgr.is_open());
+TEST_CASE("PatchManager: list_deployments", "[patch_manager][pg][query]") {
+    PATCH_MANAGER(mgr);
 
-    tdb.mgr.deploy_patch("KB1111111", {"agent-1"}, false, "admin");
-    tdb.mgr.deploy_patch("KB2222222", {"agent-1"}, false, "admin");
-    tdb.mgr.deploy_patch("KB3333333", {"agent-1"}, false, "admin");
+    mgr.deploy_patch("KB1111111", {"agent-1"}, false, "admin");
+    mgr.deploy_patch("KB2222222", {"agent-1"}, false, "admin");
+    mgr.deploy_patch("KB3333333", {"agent-1"}, false, "admin");
 
-    auto all = tdb.mgr.list_deployments(50);
+    auto all = mgr.list_deployments(50);
     REQUIRE(all.size() == 3);
 
-    auto limited = tdb.mgr.list_deployments(2);
+    auto limited = mgr.list_deployments(2);
     REQUIRE(limited.size() == 2);
+}
+
+// ── Test: deploy_patch de-duplicates caller-supplied agent_ids ─────────────
+// New coverage (ADR-0062): the SQLite era silently under-counted a duplicate
+// agent_id's target row (unchecked sqlite3_step, total_targets set from the
+// raw list size) — this store now de-dupes up front so total_targets always
+// matches the actual number of target rows created.
+
+TEST_CASE("PatchManager: deploy_patch de-duplicates agent_ids", "[patch_manager][pg][deploy]") {
+    PATCH_MANAGER(mgr);
+
+    auto result = mgr.deploy_patch("KB1234567", {"agent-1", "agent-2", "agent-1"}, false, "admin");
+    REQUIRE(result.has_value());
+
+    auto depl = mgr.get_deployment(*result);
+    REQUIRE(depl.has_value());
+    CHECK(depl->total_targets == 2);
+    CHECK(depl->targets.size() == 2);
+}
+
+// ── Test: record_patches upserts inventory ──────────────────────────────────
+// New coverage (ADR-0062): record_patches's batch upsert (unnest()-driven
+// INSERT ... ON CONFLICT DO UPDATE, replacing the SQLite-era per-row
+// prepared-statement loop) — insert then overwrite the same (agent_id,
+// kb_id) pair and confirm the update landed, plus a fleet-summary/
+// missing-vs-installed filter sanity check.
+
+TEST_CASE("PatchManager: record_patches upserts and queries", "[patch_manager][pg][inventory]") {
+    PATCH_MANAGER(mgr);
+
+    mgr.record_patches("agent-1", {
+        {.kb_id = "KB1111111", .title = "Update A", .severity = "Critical",
+         .status = "missing", .agent_id = "agent-1", .released_at = 100},
+        {.kb_id = "KB2222222", .title = "Update B", .severity = "Important",
+         .status = "installed", .agent_id = "agent-1", .released_at = 200},
+    });
+
+    auto missing = mgr.get_missing_patches({.agent_id = "agent-1"});
+    REQUIRE(missing.size() == 1);
+    CHECK(missing[0].kb_id == "KB1111111");
+    CHECK(missing[0].severity == "Critical");
+
+    auto installed = mgr.get_installed_patches({.agent_id = "agent-1"});
+    REQUIRE(installed.size() == 1);
+    CHECK(installed[0].kb_id == "KB2222222");
+
+    // Re-report KB1111111 as installed — ON CONFLICT DO UPDATE must overwrite
+    // the row rather than duplicate it.
+    mgr.record_patches("agent-1", {
+        {.kb_id = "KB1111111", .title = "Update A", .severity = "Critical",
+         .status = "installed", .agent_id = "agent-1", .released_at = 100},
+    });
+    CHECK(mgr.get_missing_patches({.agent_id = "agent-1"}).empty());
+    CHECK(mgr.get_installed_patches({.agent_id = "agent-1"}).size() == 2);
+
+    auto summary = mgr.get_fleet_patch_summary(10);
+    CHECK(summary.empty()); // nothing missing anymore
+}
+
+// gov fjarvis B1 precedent (test_offline_endpoint_store.cpp): a reachable
+// database whose schema migration FAILS must leave the store !is_open() —
+// which server.cpp wires to startup_failed_ (fail closed, not
+// serve-degraded; a posture upgrade from the SQLite era, where construction
+// was unconditional/best-effort). Force the failure by pre-seeding a table
+// in the store's schema with no schema_meta row: the migration runner's
+// schema-drift guard refuses (version 0 but tables exist), so run() returns
+// false. deploy_patch/cancel_deployment on the resulting closed store must
+// return their existing not-available std::expected error, never crash or
+// silently no-op.
+TEST_CASE("PatchManager reports !is_open on a migration failure and degrades writes",
+          "[patch_manager][pg]") {
+    YUZU_REQUIRE_PG_DB(db);
+
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult s{PQexec(conn.get(), "CREATE SCHEMA patch_manager")};
+        REQUIRE(s.ok());
+        PgResult t{PQexec(conn.get(), "CREATE TABLE patch_manager.bogus (x int)")};
+        REQUIRE(t.ok());
+    }
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    PatchManager mgr{pool};
+    CHECK_FALSE(mgr.is_open()); // → server.cpp sets startup_failed_ = true
+
+    auto deploy_result = mgr.deploy_patch("KB1234567", {"agent-1"}, false, "admin");
+    REQUIRE_FALSE(deploy_result.has_value());
+    CHECK(deploy_result.error() == "patch manager not available");
+
+    CHECK(mgr.get_missing_patches().empty());
+    CHECK(mgr.list_deployments().empty());
+    CHECK_FALSE(mgr.get_deployment("anything").has_value());
 }
