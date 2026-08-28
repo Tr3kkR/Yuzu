@@ -66,7 +66,26 @@ inline void warn_if_legacy_rows(const std::filesystem::path& legacy_db_path,
     // no writer (empirically confirmed: adversarial review, 2026-08-28). Same guard as
     // the established server.cpp::legacy_sqlite_row_count precedent this helper
     // generalizes -- "refuse a FIFO/symlink/device node -- never block on open()".
-    if (!std::filesystem::is_regular_file(legacy_db_path, ec) || ec)
+    const bool is_regular = std::filesystem::is_regular_file(legacy_db_path, ec);
+    // is_regular_file's error_code overload does NOT special-case "no such file" the
+    // way exists() does (empirically verified on this platform's libstdc++: exists()
+    // clears `ec` for ENOENT, is_regular_file does not) -- so a bare `if (ec)` here
+    // would misfire on the ordinary fresh-install case, which is exactly the silent
+    // path this function must not warn on. Only a REAL check failure (EACCES on the
+    // containing directory, not the file itself -- the case this branch exists for)
+    // should warn; genuine absence (ENOENT/ENOTDIR: the path itself, or a directory
+    // component of it, doesn't exist) stays silent same as exists()'s contract.
+    if (ec && ec != std::errc::no_such_file_or_directory && ec != std::errc::not_a_directory) {
+        // Real operator-authored legacy rows could exist behind this permission wall
+        // undetected; a silent return here is indistinguishable from the unremarkable
+        // fresh-install case. Warn instead (empirically found: adversarial review,
+        // 2026-08-28).
+        spdlog::warn("{}: legacy {} could not be checked ({}) -- verify manually whether "
+                    "it holds operator-authored rows that need reapplying",
+                    store_name, legacy_db_path.string(), ec.message());
+        return;
+    }
+    if (!is_regular)
         return; // genuine fresh install (or a non-regular path we refuse to open) -- silent
 
     SqliteDb db;

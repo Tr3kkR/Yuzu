@@ -8,6 +8,7 @@
 
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
+#include <yuzu/metrics.hpp>
 
 #include <chrono>
 #include <cstdlib>
@@ -64,7 +65,11 @@ bool col_bool(PGresult* res, int row, int c) {
 int col_int(PGresult* res, int row, int c) {
     if (PQgetisnull(res, row, c))
         return 0;
-    return std::atoi(PQgetvalue(res, row, c));
+    // strtol, not atoi, for consistency with col_i64 below (cpp-expert NICE,
+    // adversarial review 2026-08-28) — this file is the template for 2
+    // sibling migrations, so a lone atoi outlier is a copy-paste risk even
+    // though rollout_pct's int4 range makes it harmless here.
+    return static_cast<int>(std::strtol(PQgetvalue(res, row, c), nullptr, 10));
 }
 std::int64_t col_i64(PGresult* res, int row, int c) {
     if (PQgetisnull(res, row, c))
@@ -88,6 +93,28 @@ UpdatePackage row_to_pkg(PGresult* res, int row) {
 
 constexpr const char* kSelectCols = "platform, arch, version, sha256, filename, mandatory, "
                                     "rollout_pct, uploaded_at, file_size";
+
+// Read/write-degrade observability (gov sre finding, adversarial review
+// 2026-08-28): mirrors InstructionStore's `note_read_degrade`/
+// `note_write_degrade` convention (#1675) — plain counters, no rate-limited
+// DegradeSampler, since this store's call pattern (admin-driven writes,
+// per-heartbeat but not per-request reads) isn't the log-flood-prone hot
+// path RuntimeConfigStore's sampler exists for.
+constexpr const char* kReasonStoreNotOpen = "store_not_open";
+constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
+constexpr const char* kReasonQueryError = "query_error";
+
+void note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason) {
+    if (metrics)
+        metrics->counter("yuzu_server_update_registry_read_degrade_total", {{"reason", reason}})
+            .increment();
+}
+
+void note_write_degrade(yuzu::MetricsRegistry* metrics, const char* reason) {
+    if (metrics)
+        metrics->counter("yuzu_server_update_registry_write_degrade_total", {{"reason", reason}})
+            .increment();
+}
 
 } // namespace
 
@@ -131,10 +158,13 @@ UpdateRegistry::UpdateRegistry(pg::PgPool& pool, const std::filesystem::path& up
 UpdateRegistry::~UpdateRegistry() = default;
 
 void UpdateRegistry::upsert_package(const UpdatePackage& pkg) {
-    if (!open_)
+    if (!open_) {
+        note_write_degrade(metrics_, kReasonStoreNotOpen);
         return;
+    }
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
+        note_write_degrade(metrics_, kReasonPoolTimeout);
         spdlog::error("UpdateRegistry: upsert_package skipped, no connection in time ({})",
                       pool_.last_error());
         return;
@@ -155,6 +185,7 @@ void UpdateRegistry::upsert_package(const UpdatePackage& pkg) {
                                  std::to_string(pkg.rollout_pct), pkg.uploaded_at,
                                  std::to_string(pkg.file_size)});
     if (res.status() != PGRES_TUPLES_OK) {
+        note_write_degrade(metrics_, kReasonQueryError);
         spdlog::error("UpdateRegistry: upsert_package failed for {}/{}/{}: {}", pkg.platform,
                       pkg.arch, pkg.version, PQerrorMessage(lease.get()));
         return;
@@ -165,10 +196,13 @@ void UpdateRegistry::upsert_package(const UpdatePackage& pkg) {
 
 void UpdateRegistry::remove_package(const std::string& platform, const std::string& arch,
                                     const std::string& version) {
-    if (!open_)
+    if (!open_) {
+        note_write_degrade(metrics_, kReasonStoreNotOpen);
         return;
+    }
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
+        note_write_degrade(metrics_, kReasonPoolTimeout);
         spdlog::error("UpdateRegistry: remove_package skipped, no connection in time ({})",
                       pool_.last_error());
         return;
@@ -179,6 +213,7 @@ void UpdateRegistry::remove_package(const std::string& platform, const std::stri
         "WHERE platform = $1 AND arch = $2 AND version = $3",
         std::vector<std::string>{platform, arch, version});
     if (res.status() != PGRES_COMMAND_OK) {
+        note_write_degrade(metrics_, kReasonQueryError);
         spdlog::error("UpdateRegistry: remove_package failed for {}/{}/{}: {}", platform, arch,
                       version, PQerrorMessage(lease.get()));
         return;
@@ -188,10 +223,13 @@ void UpdateRegistry::remove_package(const std::string& platform, const std::stri
 
 std::vector<UpdatePackage> UpdateRegistry::list_packages() const {
     std::vector<UpdatePackage> packages;
-    if (!open_)
+    if (!open_) {
+        note_read_degrade(metrics_, kReasonStoreNotOpen);
         return packages;
+    }
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
+        note_read_degrade(metrics_, kReasonPoolTimeout);
         spdlog::error("UpdateRegistry: list_packages skipped, no connection in time ({})",
                       pool_.last_error());
         return packages;
@@ -201,6 +239,7 @@ std::vector<UpdatePackage> UpdateRegistry::list_packages() const {
                             "uploaded_at DESC";
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK) {
+        note_read_degrade(metrics_, kReasonQueryError);
         spdlog::error("UpdateRegistry: list_packages failed: {}", PQerrorMessage(lease.get()));
         return packages;
     }
@@ -213,10 +252,13 @@ std::vector<UpdatePackage> UpdateRegistry::list_packages() const {
 
 std::optional<UpdatePackage> UpdateRegistry::latest_for(const std::string& platform,
                                                         const std::string& arch) const {
-    if (!open_)
+    if (!open_) {
+        note_read_degrade(metrics_, kReasonStoreNotOpen);
         return std::nullopt;
+    }
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
+        note_read_degrade(metrics_, kReasonPoolTimeout);
         spdlog::error("UpdateRegistry: latest_for skipped, no connection in time ({})",
                       pool_.last_error());
         return std::nullopt;
@@ -227,6 +269,7 @@ std::optional<UpdatePackage> UpdateRegistry::latest_for(const std::string& platf
     pg::PgResult res =
         pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{platform, arch});
     if (res.status() != PGRES_TUPLES_OK) {
+        note_read_degrade(metrics_, kReasonQueryError);
         spdlog::error("UpdateRegistry: latest_for failed for {}/{}: {}", platform, arch,
                       PQerrorMessage(lease.get()));
         return std::nullopt;

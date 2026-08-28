@@ -17,6 +17,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
+#include <yuzu/metrics.hpp>
 
 #include <filesystem>
 #include <stdexcept>
@@ -328,6 +329,37 @@ TEST_CASE("UpdateRegistry: a store that fails to open degrades every method to a
     CHECK(reg.list_packages().empty());
 }
 
+// gov sre finding (Gate 8 re-review, adversarial review 2026-08-28), mirrors
+// test_instruction_store.cpp's "read and write degrade counters increment on
+// a store that failed to open" precedent exactly: a code-read confirmation
+// that note_read_degrade/note_write_degrade are called is not the same as
+// proof the counters actually move. Same malformed-conninfo store_not_open
+// path as the test above, but with a MetricsRegistry wired and inspected.
+TEST_CASE("UpdateRegistry: read and write degrade counters increment on a store "
+          "that failed to open",
+          "[update_registry][pg]") {
+    TempUpdateDir tmp;
+    PgPool broken_pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 1}};
+    REQUIRE_FALSE(broken_pool.valid());
+    UpdateRegistry reg(broken_pool, tmp.path());
+    REQUIRE_FALSE(reg.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    reg.set_metrics(&metrics); // wired after construction — construction's own
+                              // failed lease attempt must not touch the counter.
+
+    auto packages = reg.list_packages();
+    CHECK(packages.empty());
+    CHECK(metrics.counter("yuzu_server_update_registry_read_degrade_total",
+                          {{"reason", "store_not_open"}})
+              .value() == 1.0);
+
+    reg.upsert_package(make_pkg());
+    CHECK(metrics.counter("yuzu_server_update_registry_write_degrade_total",
+                          {{"reason", "store_not_open"}})
+              .value() == 1.0);
+}
+
 // gov fjarvis B1 precedent (OfflineEndpointStore): a reachable database whose
 // schema migration FAILS must leave the store !is_open() — which server.cpp
 // wires to startup_failed_ (fail closed, not serve-degraded). Force the
@@ -353,4 +385,71 @@ TEST_CASE("UpdateRegistry reports !is_open on a migration failure", "[update_reg
     REQUIRE(pool.valid());
     UpdateRegistry reg(pool, tmp.path());
     CHECK_FALSE(reg.is_open()); // → server.cpp sets startup_failed_ = true
+}
+
+// gov quality-engineer/cpp-safety (adversarial review, 2026-08-28, converged
+// independently across 2 reviewers), modelled directly on
+// test_api_token_store.cpp's "#2961 round-2" precedent: the migration-failure
+// test above exercises PgMigrationRunner's own schema-drift guard (version 0
+// but tables exist) — a DIFFERENT failure mode from the post-migration
+// projection smoke-read added in this PR's own hardening round. The runner's
+// guard can only see a version collision baked into THIS binary's own
+// migrations() vector; it cannot see a version already recorded by a
+// DIFFERENT binary whose schema doesn't match what THIS binary's runtime
+// queries select. Force exactly that: stamp schema_meta at v1 (a lie — no
+// real v1 migration ran against this schema) against a table that is
+// missing `file_size`, one of the columns list_packages()/latest_for()
+// actually select. Disabling the smoke-read would leave this green with
+// !is_open() never firing until the first runtime read hit `undefined
+// column` instead.
+TEST_CASE("UpdateRegistry reports !is_open when schema_meta claims v1 but update_packages "
+          "is missing a selected column (post-migration smoke-read guard)",
+          "[update_registry][pg]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    TempUpdateDir tmp;
+
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+
+        PgResult meta{PQexec(conn.get(),
+                             "CREATE TABLE public.schema_meta ("
+                             "  store       TEXT PRIMARY KEY,"
+                             "  version     INTEGER NOT NULL,"
+                             "  upgraded_at BIGINT NOT NULL)")};
+        REQUIRE(meta.ok());
+        PgResult schema{PQexec(conn.get(), "CREATE SCHEMA update_registry")};
+        REQUIRE(schema.ok());
+
+        // v1 DDL copied from migrations() in update_registry.cpp, deliberately
+        // missing the file_size column that list_packages()/latest_for()'s
+        // SELECT actually projects.
+        PgResult table{PQexec(conn.get(),
+                              "CREATE TABLE update_registry.update_packages ("
+                              "  platform    TEXT    NOT NULL,"
+                              "  arch        TEXT    NOT NULL,"
+                              "  version     TEXT    NOT NULL,"
+                              "  sha256      TEXT    NOT NULL,"
+                              "  filename    TEXT    NOT NULL,"
+                              "  mandatory   BOOLEAN NOT NULL DEFAULT FALSE,"
+                              "  rollout_pct INTEGER NOT NULL DEFAULT 100,"
+                              "  uploaded_at TEXT    NOT NULL DEFAULT '',"
+                              "  PRIMARY KEY (platform, arch, version))")};
+        REQUIRE(table.ok());
+
+        // Stamp schema_meta at v1 — a LIE: no real v1 migration ran against
+        // this schema, it's missing file_size. Models a database another
+        // binary's runner believed it already migrated (so
+        // PgMigrationRunner::run sees nothing pending and returns true),
+        // never a real migration run against this exact schema.
+        PgResult stamp{PQexec(conn.get(),
+                              "INSERT INTO public.schema_meta (store, version, upgraded_at) "
+                              "VALUES ('update_registry', 1, extract(epoch FROM now())::bigint)")};
+        REQUIRE(stamp.ok());
+    }
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    UpdateRegistry reg(pool, tmp.path());
+    CHECK_FALSE(reg.is_open()); // → smoke-read fails closed, not just the runner's own guard
 }

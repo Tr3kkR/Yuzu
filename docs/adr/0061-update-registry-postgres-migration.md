@@ -59,13 +59,20 @@ an internal representation change with no wire-visible effect, since the struct 
 
 ### Posture (ADR-0012 §1)
 
-**Construction is fail-closed**, whenever `--ota-enabled` is set — a posture upgrade. The SQLite
-constructor had **no `is_open()` check at all** at its `server.cpp` call site: an open/migration
-failure left `update_registry_` pointing at a store whose every method silently no-opped
-(`if (!db_) return;`), and the server served normally with OTA silently dead. Now, `!is_open()`
-sets `startup_failed_` — a reachable database whose `update_registry` schema can't be
-created/opened is a fatal startup error, same as every other migrated store. When
-`--ota-enabled` is unset, `update_registry_` stays null exactly as before — unchanged behaviour.
+**Construction is fail-closed** whenever OTA is enabled — a posture upgrade. `cfg_.ota_enabled`
+defaults **`true`** (opt-out via `--no-ota`, not an opt-in flag). `ca_store`/`scim_store`'s own
+fail-closed construction is already unconditional on every deployment with a live `pg_pool_`
+(only their `/readyz`/`/health` *checks* are flag-gated, on `using_default_certs`/`scim_enable`
+respectively — `using_default_certs` is itself typically true for an ordinary out-of-box
+self-signed deployment, not an "off by default" case) — `UpdateRegistry` is the only one of the
+three whose *construction itself* has an opt-out at all. So this now applies to the ordinary
+default deployment, not a minority who opted in. The SQLite constructor had **no `is_open()`
+check at all** at its `server.cpp` call
+site: an open/migration failure left `update_registry_` pointing at a store whose every method
+silently no-opped (`if (!db_) return;`), and the server served normally with OTA silently dead.
+Now, `!is_open()` sets `startup_failed_` — a reachable database whose `update_registry` schema
+can't be created/opened is a fatal startup error, same as every other migrated store. When
+`--no-ota` is passed, `update_registry_` stays null exactly as before — unchanged behaviour.
 
 **Runtime reads/writes deliberately keep their pre-migration fail-SOFT shape** — bare
 `bool`/`optional<UpdatePackage>`/`vector<UpdatePackage>`, no `std::expected` widening. This is a
@@ -123,9 +130,11 @@ attempts to solve.
 
 ### Public API — unchanged
 
-`upsert_package`/`remove_package`/`list_packages`/`latest_for`/`is_open`/`binary_path` keep their
-exact pre-migration signatures (see "Posture" above for why the read/write shapes are not
-widened). `is_eligible` (static, pure) and `binary_path` (pure) are untouched — no DB involved.
+`upsert_package`/`remove_package`/`list_packages`/`latest_for`/`is_open`/`binary_path` keep
+call-site-compatible pre-migration signatures (see "Posture" above for why the read/write shapes
+are not widened) — `is_open()` additionally gained `[[nodiscard]] noexcept` and moved header-inline,
+a source-compatible strengthening, not a byte-identical carry-over. `is_eligible` (static, pure)
+and `binary_path` (pure) are untouched — no DB involved.
 Both consumers (`agent_service_impl.cpp`'s gRPC OTA handlers, `settings_routes.cpp`'s Updates
 admin routes) needed zero changes beyond the constructor call site in `server.cpp` — verified by
 grep before this PR closed.
@@ -152,11 +161,17 @@ grep before this PR closed.
   re-uploads it via the Settings → Updates page (`POST /api/settings/updates/upload`). Package
   binaries already on disk under `update_dir_` are untouched by the cutover (only the metadata row
   is gone), so a re-upload of the same file reproduces the identical `sha256`/`file_size`.
-- **OTA silently going dark is now loud.** Pre-migration, a broken `update_packages.db` open
-  degraded every OTA check to "no update available" with no operator-visible signal beyond a log
-  line. Post-migration, the equivalent failure (a reachable Postgres whose `update_registry`
-  schema can't migrate) refuses to start the server at all — an intentional behaviour change,
-  consistent with every other migrated store's posture.
+- **OTA silently going dark at STARTUP is now loud — runtime degrade is unchanged.** Pre-migration,
+  a broken `update_packages.db` open degraded every OTA check to "no update available" with no
+  operator-visible signal beyond a log line. Post-migration, the equivalent failure AT
+  CONSTRUCTION (a reachable Postgres whose `update_registry` schema can't migrate) refuses to
+  start the server at all — an intentional behaviour change, consistent with every other migrated
+  store's posture. A *runtime* degrade after a clean boot (a transient lease timeout or query
+  error) is exactly as quiet as pre-migration by design (ADR-0036 deny-or-benign, see "Runtime
+  reads/writes" above) — the loud-at-boot change does not extend to it. Gate 6 sre's own review
+  round added `yuzu_server_update_registry_{read,write}_degrade_total{reason}` counters (mirroring
+  `InstructionStore`'s convention) precisely because this runtime gap was otherwise the sole
+  unalertable degrade path for this store — see `set_metrics` in `update_registry.hpp`.
 - `security-guardian` + `docs-writer` review is structural for this PR (routed-concern row: any
   auth/RBAC-adjacent surface change — none here beyond the standard PG construction pattern — plus
   the standing docs-writer Gate 2 requirement on every change).

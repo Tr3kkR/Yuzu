@@ -3689,9 +3689,10 @@ public:
         }
 
         // OTA update registry — Postgres store (ADR-0061, Wave 4 ladder blind
-        // spot). Only constructed when --ota-enabled is set, same gate as
-        // pre-migration; when off, update_registry_ stays null, unchanged
-        // behaviour. When on, construction is now FAIL-CLOSED per ADR-0012 §1
+        // spot). Only constructed when cfg_.ota_enabled is true (default —
+        // opt-out via --no-ota, not an opt-in flag), same gate as
+        // pre-migration; with --no-ota, update_registry_ stays null, unchanged
+        // behaviour. Otherwise, construction is now FAIL-CLOSED per ADR-0012 §1
         // — a posture upgrade: the pre-migration constructor had NO is_open()
         // check at this call site at all (silently served with a null db_ on
         // open failure). A reachable database whose update_registry schema
@@ -3714,6 +3715,25 @@ public:
                 // package rows this fresh-start cutover will not carry over.
                 legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "update_packages.db",
                                                          "UpdateRegistry", {"update_packages"});
+                // Read/write degrade-total counters (gov sre finding, adversarial
+                // review 2026-08-28) — mirrors InstructionStore's #1675 convention:
+                // pre-seed every {reason} series so a dashboard/alert never reads
+                // "no data" for a reason that simply hasn't fired yet.
+                update_registry_->set_metrics(&metrics_);
+                metrics_.describe("yuzu_server_update_registry_read_degrade_total",
+                                  "UpdateRegistry reads that degraded instead of answering, "
+                                  "by reason",
+                                  "counter");
+                metrics_.describe("yuzu_server_update_registry_write_degrade_total",
+                                  "UpdateRegistry writes that degraded instead of succeeding, "
+                                  "by reason",
+                                  "counter");
+                for (auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"}) {
+                    metrics_.counter("yuzu_server_update_registry_read_degrade_total",
+                                     {{"reason", reason}});
+                    metrics_.counter("yuzu_server_update_registry_write_degrade_total",
+                                     {{"reason", reason}});
+                }
             }
         }
 
@@ -12566,8 +12586,11 @@ private:
             // the /readyz conjunction; trivially true when not on default certs
             // (the operator brought their own, so ca_store isn't required).
             bool ca_ok = !cfg_.using_default_certs || (ca_store_ && ca_store_->is_open());
-            // ADR-0061: UpdateRegistry — only load-bearing when --ota-enabled is
-            // set; mirrors the ca_store row above and /readyz's own entry.
+            // ADR-0061: UpdateRegistry — only load-bearing when cfg_.ota_enabled
+            // is true (default ON, opt-out via --no-ota). Mirrors /readyz's own
+            // entry; NOT analogous to ca_ok just above (using_default_certs is
+            // itself true for the ordinary out-of-box self-signed deployment,
+            // not an "off by default" gate).
             bool update_registry_ok =
                 !cfg_.ota_enabled || (update_registry_ && update_registry_->is_open());
             // Born-on-Postgres stores (ADR-0012). They were wired into /readyz but
@@ -12952,10 +12975,15 @@ private:
                                    (scim_store_ && scim_store_->is_open() &&
                                     scim_store_->has_token())},
                 // ADR-0061: UpdateRegistry is only constructed when
-                // --ota-enabled is set (opt-in, mirrors the ca_store/scim_store
-                // pattern above); a failed migration/open would otherwise
-                // silently disable OTA (CheckForUpdate/DownloadUpdate always
-                // answering "no update") while /readyz reported "ready".
+                // cfg_.ota_enabled is true, which defaults ON (opt-out via
+                // --no-ota) — unlike ca_store/scim_store's construction
+                // (unconditional whenever pg_pool_ is up; only their /readyz
+                // CHECK above is flag-gated), this store's CONSTRUCTION itself
+                // has the opt-out. So the check below
+                // covers the ordinary default deployment, not an opt-in
+                // minority. A failed migration/open would otherwise silently
+                // disable OTA (CheckForUpdate/DownloadUpdate always answering
+                // "no update") while /readyz reported "ready".
                 {"update_registry", !cfg_.ota_enabled ||
                                         (update_registry_ && update_registry_->is_open())},
                 // Wave 2 migrated Postgres store (ADR-0006/0009/0044, schema

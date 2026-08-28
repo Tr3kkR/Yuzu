@@ -15,10 +15,17 @@
 #include <catch2/catch_test_macros.hpp>
 #include <sqlite3.h>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <string>
 #include <vector>
+
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 using yuzu::server::SqliteDb;
 using yuzu::server::SqliteErrMsg;
@@ -129,5 +136,119 @@ TEST_CASE("legacy_sqlite_probe: warns defensively when the legacy file is corrup
     yuzu::test::LogCapture cap;
     warn_if_legacy_rows(legacy.path, "TestStore", {"widgets"});
     cap.stop();
-    CHECK(cap.text().find("legacy") != std::string::npos);
+    // Specific substring, not just "legacy" -- pins THIS branch ("could not be
+    // read as a SQLite database") distinctly from the sibling "could not be
+    // opened" and "could not be checked" warn branches (quality-engineer NICE,
+    // adversarial review 2026-08-28: a bare "legacy" substring can't tell them
+    // apart, so a future regression that fired the wrong branch would still
+    // pass this assertion).
+    CHECK(cap.text().find("could not be read as a SQLite database") != std::string::npos);
 }
+
+#ifndef _WIN32
+// gov cpp-safety/architect/sre/quality-engineer (adversarial review, 2026-08-28,
+// converged independently across 4 reviewers): regression test for the FIFO/
+// non-regular-file startup-hang hazard this file's own is_regular_file() guard
+// exists to close. Without the guard, std::filesystem::exists() would return
+// true for a FIFO and sqlite3_open_v2(..., SQLITE_OPEN_READONLY, ...) would
+// block indefinitely waiting for a writer that never arrives -- reproduced
+// empirically by two independent adversarial-review models. Bounded via
+// std::async + wait_for rather than calling the function directly on this
+// thread: a REGRESSION back to exists() reports failure promptly (the
+// REQUIRE below fires at the 3s deadline) rather than never reporting at
+// all -- though on an actual hang, std::future's destructor still BLOCKS
+// joining the wedged async thread during unwind, so the PROCESS itself
+// doesn't exit fast; the external suite-level timeout (meson test /
+// nightly.yml) is the real backstop against an indefinite wall-clock hang
+// (security-guardian NICE, adversarial review 2026-08-28: an earlier
+// version of this comment overclaimed a clean fast failure).
+TEST_CASE("legacy_sqlite_probe: does not hang on a FIFO at the legacy path",
+          "[legacy_sqlite_probe]") {
+    auto path = yuzu::test::unique_temp_path("yuzu_test_legacyprobe_fifo_");
+    REQUIRE(::mkfifo(path.string().c_str(), 0600) == 0);
+    struct FifoCleanup {
+        std::filesystem::path path;
+        ~FifoCleanup() { ::unlink(path.string().c_str()); }
+    } fifo_cleanup{path};
+
+    yuzu::test::LogCapture cap;
+    // No writer ever opens the other end of the FIFO -- exactly the
+    // no-writer-arrives shape that makes SQLITE_OPEN_READONLY's open() block
+    // forever on this platform when the is_regular_file() guard is bypassed.
+    auto fut = std::async(std::launch::async, [&] {
+        warn_if_legacy_rows(path, "TestStore", {"widgets"});
+    });
+    // Generous safety-net bound (matches test_subprocess_runner.cpp's FIFO
+    // handshake precedent) -- the guarded call actually returns in low
+    // milliseconds; a regressed implementation reports failure at this
+    // deadline rather than never reporting (see the file header comment for
+    // why the process itself can still block past this point on unwind).
+    const auto status = fut.wait_for(std::chrono::seconds(3));
+    cap.stop();
+    REQUIRE(status == std::future_status::ready); // else: regressed to exists(), hung on open()
+    // Silent, matching every other non-regular/absent path this helper treats
+    // as "not this store's data" -- a FIFO is refused before any SQLite call.
+    CHECK(cap.text().find("legacy") == std::string::npos);
+}
+
+// gov cpp-safety/unhappy-path (adversarial review, 2026-08-28): regression test
+// for the permission-denied-on-the-CONTAINING-DIRECTORY case this file's
+// is_regular_file() error_code branch exists to distinguish from "genuinely
+// absent". Before this fix, a stat() failure on the parent directory (EACCES)
+// and a genuinely-missing file both fell through to the same silent return --
+// real operator-authored legacy rows behind a permission wall went undetected
+// with no warning.
+TEST_CASE("legacy_sqlite_probe: warns (does not silently skip) when the legacy path "
+          "cannot be stat'd due to a permission-denied parent directory",
+          "[legacy_sqlite_probe]") {
+    if (::geteuid() == 0) {
+        SKIP("root bypasses directory permissions; cannot make stat() fail");
+    }
+
+    auto dir = yuzu::test::unique_temp_path("yuzu_test_legacyprobe_denied_");
+    REQUIRE(std::filesystem::create_directory(dir));
+    // RAII: restore permissions before removal even if an assertion throws,
+    // so a permission-locked temp dir never leaks onto a CI box that reuses
+    // workspaces (test_tar_store.cpp's DirGuard precedent).
+    struct DirGuard {
+        std::filesystem::path dir;
+        ~DirGuard() {
+            std::error_code ec;
+            std::filesystem::permissions(dir, std::filesystem::perms::owner_all,
+                                         std::filesystem::perm_options::add, ec);
+            std::filesystem::remove_all(dir, ec);
+        }
+    } dir_guard{dir};
+
+    auto legacy_path = dir / "legacy.db";
+    {
+        SqliteDb raw;
+        REQUIRE(sqlite3_open(legacy_path.string().c_str(), raw.addr()) == SQLITE_OK);
+        SqliteErrMsg err;
+        REQUIRE(sqlite3_exec(raw.get(),
+                             "CREATE TABLE widgets (id INTEGER PRIMARY KEY); "
+                             "INSERT INTO widgets VALUES (1);",
+                             nullptr, nullptr, err.addr()) == SQLITE_OK);
+    }
+    // Strip execute (search) permission from the DIRECTORY -- not the file
+    // itself -- so stat() on the file inside it fails with EACCES.
+    std::error_code perm_ec;
+    std::filesystem::permissions(dir, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+                                 std::filesystem::perm_options::replace, perm_ec);
+    REQUIRE_FALSE(perm_ec);
+
+    yuzu::test::LogCapture cap;
+    warn_if_legacy_rows(legacy_path, "TestStore", {"widgets"});
+    cap.stop();
+    const std::string text = cap.text();
+    // Loud, not silent -- the whole point of the fix. Never claims a row
+    // count (it couldn't read one); just flags "could not be checked".
+    // "could not be checked" alone is NOT unique to this branch -- the
+    // per-table SQLITE_BUSY/IOERR branch shares the same phrase (quality-
+    // engineer NICE, adversarial review 2026-08-28) -- so also assert the
+    // absence of that branch's distinguishing "table '" fragment to pin
+    // THIS (whole-file stat() failure) branch specifically.
+    CHECK(text.find("could not be checked") != std::string::npos);
+    CHECK(text.find("table '") == std::string::npos);
+}
+#endif // _WIN32

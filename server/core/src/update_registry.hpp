@@ -17,7 +17,8 @@
 ///
 /// Posture (ADR-0012 §1): CONSTRUCTION is fail-closed — `is_open()` is false
 /// (and the server sets `startup_failed_`) if the lease was empty or the
-/// migration failed, whenever `--ota-enabled` is set. This is a posture
+/// migration failed, whenever OTA is enabled (`cfg_.ota_enabled` defaults
+/// `true` — opt-out via `--no-ota`, not an opt-in flag). This is a posture
 /// upgrade from the SQLite era, which had no `is_open()` check at the
 /// `server.cpp` call site at all. RUNTIME reads/writes deliberately keep
 /// their pre-migration fail-SOFT shape (bare `bool`/`optional`/`vector`, no
@@ -28,7 +29,9 @@
 /// Updates list re-checks rather than having anything silently granted,
 /// targeted, or enforced on their behalf. See the per-store ADR for the
 /// explicit statement this playbook rule requires when a store declines the
-/// typed-read widening.
+/// typed-read widening. A degrade is still counted (never silent to
+/// observability, only to the caller) via `set_metrics`' read/write
+/// degrade-total families below.
 ///
 /// Backfill: NONE (ADR-0009's 2026-08-25 fresh-start-by-default amendment —
 /// no production fleet has ever run a pre-Postgres build of any Yuzu store).
@@ -54,6 +57,10 @@
 
 namespace yuzu::server::pg {
 class PgPool;
+}
+
+namespace yuzu {
+class MetricsRegistry;
 }
 
 namespace yuzu::server {
@@ -86,6 +93,16 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
+    /// Wire a metrics sink for the read/write degrade-total counters below.
+    /// Set-before-traffic contract, same as every other migrated store's
+    /// `set_metrics` (e.g. `InstructionStore`, `RuntimeConfigStore`). Optional
+    /// — every method degrades silently-to-the-caller (per this class's
+    /// documented deny-or-benign posture) whether or not a sink is wired;
+    /// wiring one only adds the `yuzu_server_update_registry_{read,write}_
+    /// degrade_total{reason}` observability signal (gov sre finding,
+    /// adversarial review 2026-08-28).
+    void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
+
     void upsert_package(const UpdatePackage& pkg);
     void remove_package(const std::string& platform, const std::string& arch,
                         const std::string& version);
@@ -103,6 +120,7 @@ private:
     pg::PgPool& pool_;
     bool open_{false};
     std::filesystem::path update_dir_;
+    yuzu::MetricsRegistry* metrics_{nullptr};
 };
 
 } // namespace yuzu::server
