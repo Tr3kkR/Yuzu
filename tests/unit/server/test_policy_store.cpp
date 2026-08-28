@@ -137,7 +137,7 @@ yuzu::test::PgTestTemplate policy_store_tpl{
 // ============================================================================
 
 TEST_CASE("PolicyStore reports !is_open on a migration failure", "[policy_store][pg]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);

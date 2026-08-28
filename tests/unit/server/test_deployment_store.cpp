@@ -72,7 +72,7 @@ yuzu::test::PgTestTemplate deployment_store_tpl{
 // ── Construction fail-closed ────────────────────────────────────────────────
 
 TEST_CASE("DeploymentStore reports !is_open on a migration failure", "[deployment_store][pg]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);

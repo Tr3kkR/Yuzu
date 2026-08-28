@@ -262,7 +262,7 @@ TEST_CASE("DeploymentRunStore succeeded_agents_for_run (cross-deployment dedup)"
 // migrate leaves the store !is_open() (server.cpp → startup_failed_).
 TEST_CASE("DeploymentRunStore reports !is_open on a migration failure",
           "[pg][deployment][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
