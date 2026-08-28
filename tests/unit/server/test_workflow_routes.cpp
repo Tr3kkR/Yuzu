@@ -1711,10 +1711,13 @@ TEST_CASE("#1712: KPI strip is marked scope-reconciled so the live progress fram
     // the stamp in workflow_routes.cpp fails this; the client half is the
     // `data-scope-reconciled` early return in execApplyProgress.
     //
-    // Keyed on the filter being ACTIVE, not on "something was dropped":
-    // succeeded/failed are counted from the filtered roster and so are already
-    // scope-correct at zero drops, which is why the zero-drop case below must
-    // ALSO carry the marker.
+    // Keyed on `must_reconcile` (workflow_routes.cpp) — an observed drop OR
+    // an incomplete roster (some targeted agent has not yet reported a status
+    // row) while the scope machinery is active — NOT on the filter merely
+    // being wired. A complete, zero-drop roster (the section below) stays
+    // UNSTAMPED so the live progress frame keeps updating; only an actual
+    // drop or an as-yet-unresolved gap between the reported roster and the
+    // targeted count earns the marker.
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ExecHarness h(pool);
@@ -1736,6 +1739,29 @@ TEST_CASE("#1712: KPI strip is marked scope-reconciled so the live progress fram
         // fleet-wide one.
         CHECK(res->body.find("recon-out") == std::string::npos);
         CHECK(res->body.find("secret") == std::string::npos);
+    }
+
+    SECTION("stamped when an out-of-scope target has not yet reported (#1712 gate-8 fix)") {
+        // The blocker this section pins: `agents_targeted=2` but only the
+        // in-scope agent has reported. The out-of-scope target never created
+        // an `agent_exec_status` row (no `agent_status()` call for it below),
+        // so it is invisible to `filter_rows_in_scope` above and
+        // `roster_dropped` stays 0. Before the fix this fell through to the
+        // unfiltered `exec.agents_targeted`, disclosing that a second
+        // (out-of-scope) agent existed before it ever reported back.
+        auto eid = h.make_exec("def-recon", "running", 2, 0, 0);
+        h.agent_status(eid, "recon-in", "success", 0, "", 1735689601);
+        h.response_scope_predicate = [](const std::string&, const std::string& aid) {
+            return aid != "recon-out";
+        };
+        auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("data-scope-reconciled=\"1\"") != std::string::npos);
+        // Total must reconcile to the reported-and-visible roster (1), never
+        // the fleet-wide targeted count (2).
+        CHECK(res->body.find("<div class=\"exec-kpi-value\">1</div>") != std::string::npos);
+        CHECK(res->body.find("recon-out") == std::string::npos);
     }
 
     SECTION("NOT stamped when nothing was withheld from this viewer") {

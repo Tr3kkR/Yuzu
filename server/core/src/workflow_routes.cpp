@@ -314,6 +314,29 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     filter_rows_in_scope(agents, session->username, response_scope_fn)
                         .dropped_agents;
             }
+            // #1712 Gate-8 fix (FortitudeEtc review): `agents` only holds rows
+            // for targets that have ALREADY reported — `agent_exec_status`
+            // rows are created solely by `ExecutionTracker::update_agent_status`
+            // when an agent answers, never pre-populated at dispatch. So an
+            // out-of-scope target that simply hasn't reported yet is invisible
+            // to the filter above: it never enters `agents`, `roster_dropped`
+            // stays 0, and the fleet-wide `exec.agents_targeted` renders
+            // unfiltered below — the exact disclosure this feature exists to
+            // close, just delayed until the out-of-scope agent answers instead
+            // of avoided. Treat any gap between the (already scope-filtered)
+            // reported roster and the targeted count as suspect whenever the
+            // scope machinery is active: we cannot tell a pending in-scope
+            // agent from a pending out-of-scope one without a persisted target
+            // roster (tracked as the real fix), so the conservative default is
+            // to withhold the fleet-wide number rather than risk it. Mirrors
+            // `dashboard_routes.cpp`'s `/fragments/results` summary count,
+            // which recomputes from the loaded rows whenever
+            // `response_scope_fn_` is wired at all, not only on an observed
+            // drop, for the identical reason.
+            const bool roster_incomplete =
+                agents.size() < static_cast<std::size_t>(exec.agents_targeted);
+            const bool must_reconcile =
+                roster_dropped > 0 || (response_scope_fn && roster_incomplete);
             // CC7.2 evidence: ONE scope-drop row for this reader. Emitted here
             // rather than beside the response filter because the roster is the
             // superset (response rows are execution-bound, so every dropped
@@ -402,24 +425,20 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // replaced by the fleet counts for the rest of the execution, which
             // re-discloses exactly the cardinality this recompute withholds.
             //
-            // Keyed on `roster_dropped > 0` — on something having ACTUALLY
-            // been withheld from THIS viewer, not on the predicate merely
-            // being wired. `response_scope_fn` is wired UNCONDITIONALLY in
-            // `server.cpp`, so keying on it stamps every strip in every
-            // deployment, RBAC off (the default) included, and the live count
-            // update is then dead for everyone rather than suppressed for the
-            // confined. Wired-but-inert and actually-filtering are not the same
-            // state; conflating them is the shape ADR-0033 §2 names.
-            //
-            // Zero drops is safe to leave live, and that is a property of the
-            // data rather than an optimisation: an out-of-scope agent holding a
-            // status row would itself have been dropped, so at `roster_dropped
-            // == 0` every row in the roster is in scope and none of the three
-            // cells has a scope-driven divergence from the execution row. What
-            // remains at zero drops — targeted agents with no status row yet —
-            // is scope-independent staleness the static render already shows.
+            // Keyed on `must_reconcile`, not bare `roster_dropped > 0`: an
+            // observed drop is one way the strip's numbers can legitimately
+            // diverge from the execution row, but an incomplete roster while
+            // the scope machinery is active is another (see the
+            // `roster_incomplete` comment above) — the marker must cover both,
+            // or the live SSE channel clobbers the withheld number within
+            // under a second of it rendering. This does widen the marker's
+            // reach beyond a confirmed drop (the "wired vs actually filtering"
+            // distinction previously drawn here), but only for the pending
+            // window of an execution's own reporting — it self-clears to
+            // normal live updates once the roster completes or a drop is
+            // confirmed, not permanently for the deployment's lifetime.
             html += "<div class=\"exec-kpi-strip\" id=\"exec-kpi-" + html_escape(exec.id) + "\"";
-            if (roster_dropped > 0)
+            if (must_reconcile)
                 html += " data-scope-reconciled=\"1\"";
             html += ">";
             // #1712: `agents_targeted` is read off the EXECUTION row, not off
@@ -428,9 +447,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // confined operator how many agents outside their scope this
             // command targeted (the same cardinality disclosure the dashboard
             // results summary reconciles). Recompute from the surviving roster
-            // whenever something was dropped; when nothing was, the stored
-            // value renders byte-identically to before.
-            const int64_t displayed_targeted = roster_dropped > 0
+            // whenever `must_reconcile` — an observed drop OR an incomplete
+            // roster while the scope machinery is active; when neither holds,
+            // the stored value renders byte-identically to before.
+            const int64_t displayed_targeted = must_reconcile
                                                    ? static_cast<int64_t>(agents.size())
                                                    : static_cast<int64_t>(exec.agents_targeted);
             html += std::format("<div class=\"exec-kpi\"><div class=\"exec-kpi-value\">{}</div>"
