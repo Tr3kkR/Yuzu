@@ -217,6 +217,7 @@ agent_test_exe = executable(
     'unit/test_metrics.cpp',
     'unit/test_metrics_perf.cpp',
     'unit/test_kv_store.cpp',
+    'unit/test_command_dedup_store.cpp',
     'unit/test_trigger_engine.cpp',
     'unit/test_guardian_engine.cpp',
     'unit/test_guardian_journal_format.cpp',
