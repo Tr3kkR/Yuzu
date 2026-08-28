@@ -558,18 +558,31 @@ fi
 
 # --- 7. Manifest -------------------------------------------------------------
 
+# JSON string literal (quotes included) for the free-text fields below. Called
+# standalone between printfs, never inside a substitution, so set -e sees a
+# failure.
+jstr() { python3 -c 'import json, sys; sys.stdout.write(json.dumps(sys.argv[1]))' "$1"; }
+
 if [ -n "${MANIFEST}" ] && [ "$DRY_RUN" = 0 ]; then
   step "Writing provenance manifest to ${MANIFEST}"
   # shellcheck disable=SC1090
   . "${ENV_FILE}"
+  case "${ARCH}" in
+    x86_64)  VCPKG_TRIPLET="x64-linux" ;;
+    aarch64) VCPKG_TRIPLET="arm64-linux" ;;
+    *)       VCPKG_TRIPLET="unknown-${ARCH}" ;;
+  esac
+  # curl is required but no longer in PKGS (curl-minimal satisfies it); record
+  # whichever RPM actually provides the binary.
+  CURL_PKG="$(rpm -qf --qf '%{NAME}' "$(command -v curl)" 2>/dev/null)" || CURL_PKG=""
   {
     printf '{\n'
     printf '  "generated_by": "scripts/setup-rhel9.sh",\n'
-    printf '  "distro": "%s",\n' "${PRETTY_NAME:-${DISTRO_ID} ${VERSION_ID}}"
+    printf '  "distro": '; jstr "${PRETTY_NAME:-${DISTRO_ID} ${VERSION_ID}}"; printf ',\n'
     printf '  "distro_id": "%s",\n' "${DISTRO_ID}"
     printf '  "kernel": "%s",\n' "$(uname -r)"
     printf '  "arch": "%s",\n' "${ARCH}"
-    printf '  "vcpkg_triplet": "x64-linux",\n'
+    printf '  "vcpkg_triplet": "%s",\n' "${VCPKG_TRIPLET}"
     # Short SHA deliberately. This file is a historical record of what a given
     # run used, so it must NOT be rewritten when the baseline moves — unlike the
     # tracked copies in vcpkg.json/ci.yml/etc. A full 40-char SHA here would be
@@ -578,7 +591,7 @@ if [ -n "${MANIFEST}" ] && [ "$DRY_RUN" = 0 ]; then
     printf '  "vcpkg_baseline_short": "%s",\n' "${VCPKG_COMMIT:0:12}"
     printf '  "vcpkg_baseline_authority": "vcpkg.json builtin-baseline",\n'
     printf '  "vcpkg_tool": "%s",\n' "$("${VCPKG_ROOT_ARG}/vcpkg" version 2>/dev/null | head -1 | sed 's/.*version //;s/[^0-9a-z.-]//g')"
-    printf '  "compiler": "%s",\n' "$(g++ --version 2>/dev/null | head -1)"
+    printf '  "compiler": '; jstr "$(g++ --version 2>/dev/null | head -1)"; printf ',\n'
     printf '  "cmake": "%s",\n' "$(cmake --version 2>/dev/null | head -1 | awk '{print $3}')"
     printf '  "ninja": "%s",\n' "$(ninja --version 2>/dev/null)"
     printf '  "meson": "%s",\n' "$(meson --version 2>/dev/null)"
@@ -586,16 +599,17 @@ if [ -n "${MANIFEST}" ] && [ "$DRY_RUN" = 0 ]; then
     printf '  "pyyaml": "%s",\n' "$(python3 -c 'import yaml; print(yaml.__version__)')"
     printf '  "postgresql": "%s",\n' "$(/usr/bin/postgres --version 2>/dev/null | awk '{print $3}')"
     printf '  "packages": {\n'
-    local_first=1
-    for p in "${PKGS[@]}" "${CCACHE_PKG}"; do
+    first=1
+    for p in "${PKGS[@]}" "${CCACHE_PKG}" ${CURL_PKG:+"${CURL_PKG}"}; do
       rpm -q "$p" >/dev/null 2>&1 || continue
       evr="$(rpm -q --qf '%{VERSION}-%{RELEASE}' "$p")"
-      repo="$(dnf --quiet repoquery --installed --qf '%{from_repo}' "$p" 2>/dev/null | head -1)"
+      # sed, not head: head closes the pipe early and pipefail would abort this assignment.
+      repo="$(dnf --quiet repoquery --installed --qf '%{from_repo}' "$p" 2>/dev/null | sed -n 1p)"
       # Packages laid down by the installer carry an opaque hex repo id.
       case "$repo" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f]*[0-9a-f]) [ ${#repo} -eq 32 ] && repo="base-os-install" ;; esac
-      [ "$local_first" = 1 ] || printf ',\n'
-      printf '    "%s": {"version": "%s", "repo": "%s"}' "$p" "$evr" "${repo:-unknown}"
-      local_first=0
+      [ "$first" = 1 ] || printf ',\n'
+      printf '    "%s": {"version": "%s", "repo": ' "$p" "$evr"; jstr "${repo:-unknown}"; printf '}'
+      first=0
     done
     printf '\n  }\n}\n'
   } > "${MANIFEST}"
