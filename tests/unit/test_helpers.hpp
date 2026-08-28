@@ -1234,16 +1234,24 @@ inline PostgresTestDb::PostgresTestDb(PgTestTemplate& tpl) {
          << var.error());                                                                          \
     REQUIRE(var.available())
 
+/// The exact-"1" opt-in parsing rule for YUZU_TEST_PG_MIGRATION_DDL,
+/// extracted as a pure function so its contract is testable on every
+/// platform (not just Windows, where the caller below is the only live
+/// use) — nullptr, empty, "0", a typo, or any value other than the exact
+/// string "1" all opt IN to skipping (return false = "not opted in"),
+/// matching the fail-closed design: a shared, persistent runner (four CI
+/// agents share one OS identity on Wee Tam) must never silently un-skip
+/// an expensive fresh-migration test from a stale or malformed env value.
+inline bool is_migration_ddl_opt_in(const char* env_value) noexcept {
+    return env_value != nullptr && std::string_view(env_value) == "1";
+}
+
 /// FAIL-CLOSED runtime predicate for YUZU_REQUIRE_PG_MIGRATION_DB (below):
-/// skip on Windows unless the operator explicitly opted back in with the
-/// EXACT value "1". Any other set value (empty, "0", a typo, a stale value
-/// left in the runner's shared environment — four CI agents share one OS
-/// identity on Wee Tam) stays skipped rather than silently un-skipping an
-/// expensive fresh-migration test on a shared, persistent runner.
+/// skip on Windows unless the operator explicitly opted back in via
+/// is_migration_ddl_opt_in() above.
 inline bool pg_fresh_db_migration_skipped_here() noexcept {
 #ifdef _WIN32
-    const char* v = std::getenv("YUZU_TEST_PG_MIGRATION_DDL");
-    return !(v != nullptr && std::string_view(v) == "1");
+    return !is_migration_ddl_opt_in(std::getenv("YUZU_TEST_PG_MIGRATION_DDL"));
 #else
     return false;
 #endif
@@ -1262,7 +1270,8 @@ inline bool pg_fresh_db_migration_skipped_here() noexcept {
 /// debugging or a future dedicated leg.
 #define YUZU_REQUIRE_PG_MIGRATION_DB(var)                                                          \
     if (yuzu::test::pg_fresh_db_migration_skipped_here()) {                                        \
-        SKIP("fresh-DB migration DDL skipped on Windows (#2354; covered on Linux)");               \
+        SKIP("fresh-DB migration DDL skipped on Windows (#2354; covered on Linux; "                \
+             "set YUZU_TEST_PG_MIGRATION_DDL=1 to force it on locally)");                          \
     }                                                                                              \
     YUZU_REQUIRE_PG_DB(var)
 

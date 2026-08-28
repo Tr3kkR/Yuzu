@@ -191,10 +191,23 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
    (`CREATE DATABASE … TEMPLATE`) with every migration already applied, instead of re-running
    the store's migration DDL per test — per-test migrations were the dominant, worst-scaling
    cost of the `[pg]` set on the contended Windows runners (2026-07-12 server-suite timeout).
-   Keep plain `YUZU_REQUIRE_PG_DB` only for tests that exercise migration, fresh/empty-
-   database, or pg-substrate behaviour itself (pg_pool/pg_raii/pg_hardening need no
-   migrations, so a template buys them nothing). Full contract: the `PgTestTemplate` doc
-   comment in `tests/unit/test_helpers.hpp`.
+   Keep plain `YUZU_REQUIRE_PG_DB` only for tests that exercise fresh/empty-database or
+   pg-substrate behaviour itself (pg_pool/pg_raii/pg_hardening need no migrations, so a
+   template buys them nothing). Full contract: the `PgTestTemplate` doc comment in
+   `tests/unit/test_helpers.hpp`.
+
+   **Migration-in-substance tests use `YUZU_REQUIRE_PG_MIGRATION_DB(var)` instead**
+   (#2354, #3443) — a real from-scratch migrate, `!is_open()`-on-migration-failure,
+   backfill/upgrade, or drift-detection test genuinely needs to run the migration DDL
+   itself (a `PgTestTemplate` clone would hide the exact behaviour under test), but paying
+   that cost is Windows-specific EXEC_BACKEND overhead the same coverage on Linux already
+   proves. The macro is a drop-in `YUZU_REQUIRE_PG_DB` replacement — SKIPs on Windows by
+   default (fail-closed; `YUZU_TEST_PG_MIGRATION_DDL=1` forces it back on locally), runs
+   unconditionally everywhere else. A new store's own migration test belongs on this macro,
+   not plain `YUZU_REQUIRE_PG_DB` — using the plain macro re-adds the per-test Windows DDL
+   cost this mechanism exists to remove, one store at a time. Contract: the doc comment
+   immediately above `YUZU_REQUIRE_PG_MIGRATION_DB`'s definition in
+   `tests/unit/test_helpers.hpp`.
 
    High-volume store-behaviour files may instead keep one template clone and pool for the
    file, then completely reset its rows with `TRUNCATE … RESTART IDENTITY CASCADE` before

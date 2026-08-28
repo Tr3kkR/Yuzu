@@ -370,9 +370,13 @@ lower than Wee Tam's — but a prior revision of this section claimed Big Tam
 The `c0≈289 s → c2≈467 s → c4≈603 s` figures above predate the #3443 Windows
 test-phase restructuring (2026-08-28, below) — they describe the box-wide
 concurrency effect on the OLD single combined `Test` step and are not
-re-measured here; the restructuring changed the step SHAPE, not (yet) the
-slot count or `--num-processes` values, which stay unchanged pending the
-staged measurement protocol also described below.
+re-measured here; the restructuring changed the step SHAPE first, at the
+UNWIDENED starting values (slot count 2, pg-shards `--num-processes` 2),
+before any measurement existed to widen against. The staged measurement
+protocol below has since moved the pg-shards `--num-processes` value
+through two real widening rounds (k=4, then k=6 — see the Push 2 and
+Push 3 paragraphs below for the actual numbers); the slot count (2) has
+not moved.
 
 `ci.yml`'s Windows job now splits what used to be one combined `Test` step
 into `Test (non-pg suites)`, `Test (pg shards, full)`, and (release/push
@@ -383,7 +387,7 @@ shape. Each gated step still wraps the run in
 leaks a slot) that caps concurrent heavy test phases to **2 per box** (the
 **build** phase stays 4-wide). `Test (non-pg suites)` passes `--num-processes 4`
 (one consolidated invocation now covers what used to be five separate
-suites plus the two non-pg server shards).
+suites plus the three non-pg server shards).
 
 **Staged widening — the decision rule (stated once here; each push's
 paragraph below references it, doesn't restate it).** The pg-shards step
@@ -438,6 +442,26 @@ above are the actual empirical safety net for that gap, not this
 paragraph's arithmetic. The non-pg step's width (4) and the slot count
 (2) are unchanged this round; only the pg-shards width moved. Full
 diagnosis: the `tests/meson.build` server-shard comment.
+
+**Push 3, measured:** two samples at k=6 (one on this commit, one on the
+`dev`-merge commit that followed it with no test-relevant changes):
+4m29s (269s) and 4m25s (265s). Median: 267s, a **~25.5% improvement**
+over the k=4 median (358.3s) — clears rule (a). Worst-shard inflation:
+shard I, **~1.11x** its k=4 duration — clears rule (b) with the widest
+margin of any width so far (k=2→k=4's worst was shard F at 1.16x). No
+shard came within 80% of its 700s timeout (the slowest shard at k=6,
+C, runs ~184s median — about a quarter of the cap) — clears rule (c).
+Total job wall both samples: 7m54s and 8m02s, down from push 2's
+11m48s and 14m37s (push 2's own spread came entirely from the non-pg
+step's box-contention noise on an otherwise-stable pg-shards step — see
+push 2's paragraph above). This is the current head's width; no push 4
+(k=8) has been made. `docs/ci-architecture.md`'s own worst-case job-budget arithmetic
+(below, under "Worst-case job-budget arithmetic") and the round-count
+math (11 shards over 6 workers is already 2 scheduling rounds —
+identical to 11 over 8) are why k=6 is where the staged widening
+stopped rather than continuing to k=8; going wider buys no
+round-reduction here and only adds CCD-thread-contention risk on Wee
+Tam's fixed 16-thread envelope.
 
 ### Linux concurrency caps (within-job + cross-job)
 
@@ -669,7 +693,9 @@ structural contract: every pg shard's `test()` entry in `tests/meson.build`
 now carries `suite: ['server', 'server-pg']`, so `ci.yml` selects the whole
 group with `--suite server-pg` instead of enumerating names, and a new
 `scripts/ci/check-pg-shard-partition.py` runs as its own meson test
-(`'server pg shard partition invariant'`, `suite: 'server'`) that discovers
+(`'server pg shard partition invariant'`, `suite: ['server', 'server-checks']`
+— the second label is what lets the Windows non-pg step's
+`assert-suite-cover.py` select it) that discovers
 every `server-pg`-suite entry via `meson introspect --tests` and proves, via
 `--list-tests --reporter xml` against the real compiled binary, that every
 `[pg]`-tagged Catch2 case lands in exactly one shard — none lost, none
@@ -779,11 +805,16 @@ to any one platform — the same is true of a plain local `meson test` in any
 worktree. Not worth special-casing.
 
 **Telemetry note**: on a smoke leg, `'server pg smoke'` is the LAST
-PG-tagged invocation in the Test sequence, so (per the existing JUnit-
-overwrite behavior this section already documents for the full-shard case)
-it is what `ci-suite-stats` sees for that leg's PG timing — a full leg's
-`ci-suite-stats` entry still reflects the 11-shard run, not the smoke entry,
-since `pg_mode` fully separates which one actually executes per leg.
+PG-tagged invocation in the Test sequence, so (per the JUnit-overwrite
+behavior the "Persistent runner-local test history" section below
+documents for both platforms) it is what `ci-suite-stats` sees for that
+leg's PG timing — a full leg's `ci-suite-stats` entry still reflects the
+11-shard run, not the smoke entry, since `pg_mode` fully separates which
+one actually executes per leg. The same overwrite silently drops the
+non-pg step's own `flake-retry` recovery reporting from that job's
+queryable history too, not just its per-suite timing rows — the non-pg
+step's own job-summary "Suite durations" table is written on every
+invocation and is where its numbers actually live, same as Linux.
 
 **Cross-job — runner acquisition, a fourth layer (2026-08-25, same day as the
 split/timeout extension above):** the "Cross-job (fixed second, #3443 AC4)"
@@ -896,14 +927,21 @@ by `flake-retry`. A cancelled job normally finalizes as `cancelled`; a hard kill
 that prevents post-steps intentionally leaves an `in_progress` row, which is
 itself evidence of runner/job termination rather than a fabricated result.
 
-**Linux-specific gap, since the "Suite isolation" split above:** the finalizer
-imports one `meson-logs/testlog.junit.xml`, and Linux's Test step now runs 3
-separate `meson test` invocations against the same builddir, each overwriting
-that file. Only the last (pg-shard) invocation's per-suite `ci_test_suites`
-rows and any `flake-retry` recovery it reports survive — the two earlier, cheap
-invocations still gate the job (their own exit code), but produce no queryable
-history via `test-db-query.sh ci-suite-stats`/`ci-flakes` for this job. Windows
-and macOS are unaffected (still one invocation each).
+**Linux AND Windows gap, since the "Suite isolation" split above:** the
+finalizer imports one `meson-logs/testlog.junit.xml`, and both platforms'
+Test steps now run multiple separate `meson test` invocations against the
+same builddir (Linux: 3; Windows: always 2 — the non-pg step plus
+exactly one of pg-full/pg-smoke, `matrix.pg_mode` resolves to exactly
+one or the job fails loud earlier), each overwriting that file. Only
+the LAST invocation's per-suite `ci_test_suites` rows and any `flake-retry`
+recovery it reports survive — the earlier, cheaper invocation(s) still gate
+the job (their own exit code), but produce no queryable history via
+`test-db-query.sh ci-suite-stats`/`ci-flakes` for this job. This was true
+for Linux from the original #3443 restructuring and became true for
+Windows too once this PR mirrored that shape — see the "Telemetry note"
+above for the Windows-specific ordering detail (pg runs last on both
+platforms, for the same reason). macOS remains genuinely unaffected — it
+never runs a `[pg]`-tagged suite (ADR-0035) and still has one invocation.
 
 Provisioning is versioned in
 [`deploy/linux/Provision-BigTam-Runner-Telemetry.sh`](../deploy/linux/Provision-BigTam-Runner-Telemetry.sh)
@@ -1066,12 +1104,15 @@ get the authenticated gate instead). Locally the tests still skip when
 `YUZU_TEST_POSTGRES_DSN` is unset; when it is set but unreachable they
 fail rather than skip.
 
-On the Windows pool (path 1, #3443 restructuring): a machine-level DSN that
-fails to parse (`ci.yml`'s `Resolve pg_mode + assert Postgres DSN` step),
-`pg_mode` resolving to neither `full` nor `smoke`, or the two symmetric
-matrix-include guards catching a broken mapping are all separate,
-loud-fail `::error`+`exit 1` paths, checked before any test invocation
-runs — not just the PG-tagged ones.
+On the Windows pool (path 1, #3443 restructuring): `ci.yml`'s `Resolve
+pg_mode + assert Postgres DSN` step loud-fails (`::error`+`exit 1`,
+checked before any test invocation runs, not just the PG-tagged ones) on
+three separate conditions — `pg_mode` resolving to neither `full` nor
+`smoke`, `YUZU_TEST_POSTGRES_DSN` being unset/empty after Ensure Postgres,
+or the two symmetric matrix-include guards catching a broken mapping. It
+does NOT check DSN *parseability* — a syntactically malformed but
+non-empty DSN clears this step and only fails later, at the first actual
+libpq connection attempt inside a PG-tagged test.
 
 ## PG coverage by platform
 

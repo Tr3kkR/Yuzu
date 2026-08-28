@@ -795,8 +795,9 @@ def _selftest():
     #
     # The pg shards' partition identity is now proven STRUCTURALLY, against
     # the real compiled binary, by scripts/ci/check-pg-shard-partition.py --
-    # a dedicated meson test() entry (suite: 'server', needs yuzu_server_tests
-    # built, which this selftest deliberately does not depend on). It
+    # a dedicated meson test() entry (suite: ['server', 'server-checks'],
+    # needs yuzu_server_tests built, which this selftest deliberately does
+    # not depend on). It
     # discovers shard entries via `meson introspect --tests` keyed on suite
     # membership ('yuzu:server-pg'), not a hardcoded name/filter list, so a
     # pg-shard add/split/rebalance needs no update here at all -- only a
