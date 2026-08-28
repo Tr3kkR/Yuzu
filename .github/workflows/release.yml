@@ -933,6 +933,11 @@ jobs:
         env:
           CC: ccache cc
           CXX: ccache c++
+          # spdlog/fmt resolve via pkg-config, not cmake (CLAUDE.md Manual
+          # Configure). Set explicitly to match ci.yml's macOS job and the Linux
+          # release Configure step above — the brew `pkg-config` install is inert
+          # without this, and the earlier comment referenced a var no step set.
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/arm64-osx/lib/pkgconfig
         run: |
           # -Dbackend_max_links=1 serialises the link steps. `-j` bounds ninja's
           # job COUNT, not the per-process RSS of a monolithic full-LTO link of

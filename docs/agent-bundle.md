@@ -7,7 +7,7 @@ agent for three target triplets at one pinned version:
 |---|---|---|---|
 | `linux-x64` | Linux x86_64 (glibc) | GCC | — |
 | `windows-x64` | Windows x86_64 | MSVC | Authenticode |
-| `macos-arm64` | macOS Apple Silicon | Apple Clang | notarized |
+| `macos-arm64` | macOS Apple Silicon | Apple Clang | not signed / not notarized |
 
 It exists so a design partner who can only **`docker pull`** can still get the
 right agent onto every endpoint OS — the companion to the chiselled
@@ -24,8 +24,8 @@ Image: `ghcr.io/<owner>/yuzu-agent-bundle-chisel:<version>`
 
 The Windows (MSVC) and macOS (Apple Clang) agents **cannot be cross-built in a
 Linux Docker stage** — they require their native toolchains. So this image is
-not compiled: `scripts/build-agent-bundle.sh` downloads the signed/notarized
-per-platform archives **and** native installers from the matching GitHub
+not compiled: `scripts/build-agent-bundle.sh` downloads the Windows-signed /
+macOS-unsigned per-platform archives **and** native installers from the matching GitHub
 *release*, verifies them against the release `SHA256SUMS`, lays them out under
 `/opt/yuzu-agents`, and bakes that tree into the chiselled image. This is the
 same provenance customers get from the Releases page — just packaged for
