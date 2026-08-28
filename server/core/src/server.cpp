@@ -2508,9 +2508,11 @@ public:
         metrics_.describe("yuzu_auth_session_store_degrade_total",
                           "Durable session-store operations that hit a degraded PostgreSQL read/"
                           "write on the auth hot path (labelled by op: validate / create / touch / "
-                          "generation_refresh / reap); a validate degrade fails the request closed",
+                          "generation_refresh / reap / invalidate_user); a validate degrade fails "
+                          "the request closed",
                           "counter");
-        for (auto op : {"validate", "create", "touch", "generation_refresh", "reap"})
+        for (auto op :
+             {"validate", "create", "touch", "generation_refresh", "reap", "invalidate_user"})
             metrics_.counter("yuzu_auth_session_store_degrade_total", {{"op", op}});
         metrics_.describe("yuzu_auth_session_reap_total",
                           "Expired durable operator-session rows deleted by the clock-guarded "

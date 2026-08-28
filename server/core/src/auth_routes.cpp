@@ -81,8 +81,9 @@ constexpr std::size_t kMaxDetailValueLength = 128;
 // guardian_ingest.cpp's ts_to_iso8601 / rest_api_v1.cpp's iso_now pattern —
 // the established per-file idiom for this codebase (no shared formatter
 // header exists yet). Used for JIT elevation's `expires_at` (follow-up B,
-// security review 2026-06-30): the wall-clock projection of an internally
-// steady_clock-tracked window.
+// security review 2026-06-30): since HA WS-1/1a (ADR-2002 §4) the elevation
+// window is itself wall-clock (`system_clock`, durably persisted), so this
+// formats the absolute `elevated_until` directly — no steady→system projection.
 std::string iso8601_utc(std::chrono::system_clock::time_point tp) {
     std::time_t t = std::chrono::system_clock::to_time_t(tp);
     std::tm tm{};
@@ -2780,8 +2781,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
         }
 
-        // Success — stamp `mfa_verified_at = steady_clock::now()` on the
-        // existing session row. The cookie itself does NOT rotate — the
+        // Success — stamp `mfa_verified_at = system_clock::now()` on the
+        // existing session row (wall-clock since HA WS-1/1a). The cookie itself
+        // does NOT rotate — the
         // step-up refreshes a session attribute, it does not mint a new
         // session (which would break in-flight HTMX requests from the
         // same browser tab).

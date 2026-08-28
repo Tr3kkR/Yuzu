@@ -1,5 +1,13 @@
 # Security review — Inactivity (idle) session timeout (SOC 2 CC6.3)
 
+> ⚠️ **Superseded in part by HA WS-1/1a (ADR-2002 §4).** This review describes
+> `last_activity_at` as a monotonic `steady_clock` stamp held only in memory. As
+> of HA WS-1/1a it is wall-clock (`system_clock`) and durably mirrored to the
+> `SessionStore` row via `touch_activity` (which deliberately does not bump the
+> validate-cache generation), so the idle window survives a restart and ages a
+> session consistently on any replica. See `docs/auth-architecture.md` "Durable
+> operator sessions".
+
 **Date:** 2026-06-30
 **Change:** `--session-inactivity-secs` — a sliding idle-timeout for operator
 dashboard cookie sessions, under the absolute 8h session lifetime. Wires the

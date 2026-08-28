@@ -1,5 +1,13 @@
 # Security review — JIT admin elevation (SOC 2 CC6.3/CC6.6)
 
+> ⚠️ **Superseded in part by HA WS-1/1a (ADR-2002 §4).** This review describes
+> the elevation window as `steady_clock` (monotonic) and in-memory, dropped on
+> restart. As of HA WS-1/1a the window is wall-clock (`system_clock`) and
+> **durably persisted** to the `SessionStore` row (survives a restart, bounded
+> by a hard `kMaxElevationWindow` 24h ceiling + the session's absolute expiry);
+> the monotonic NTP-step resistance is replaced by that ceiling + a backward-step
+> guard. See `docs/auth-architecture.md` "Durable operator sessions".
+
 > ⚠️ **Superseded in part by #1837/#1857 (OIDC principal re-key).** The OIDC-amr
 > elevation portions of this review are **temporarily inactive**: an OIDC session
 > is now keyed on the immutable `oidc:<iss>#<sub>` principal, which has no local
