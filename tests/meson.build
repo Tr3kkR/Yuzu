@@ -1117,11 +1117,25 @@ if build_server
   # shard count moves from 10 to 11 as a direct consequence; see the
   # "Worst-case job-budget arithmetic" note in docs/ci-architecture.md for
   # what that does to the Linux degenerate-case timeout ceiling.
+  #
+  # NON-PG SHARD D (staged Windows measurement follow-up, same date range as
+  # PR #3677's own widening pushes): shard B's own [body_cap] tests carved
+  # out, sized this time by LOCAL Linux per-case TIME (--durations yes), not
+  # case count — the lesson from shard C above (case-count split "is the
+  # starting point, not a tuned result") applied. [body_cap] is 20 of B's
+  # 1969 cases (1%) but 16.58s of B's 39.60s measured total (42%): real
+  # httplib loopback round-trips (test_body_cap_policy.cpp,
+  # test_body_cap_route_inventory.cpp) cost ~40x an average case here.
+  # Filter repeats B's own exclusion suffix rather than bare [body_cap] (26
+  # cases repo-wide; 6 already belong to shard A, via [mcp], and must not
+  # be double-claimed — verified empirically, not shard C, which claims
+  # none) — verified 20 + 1949 = 1969, exact partition of B's pre-carve
+  # population.
   test('server unit tests shard A', server_test_exe,
        args: ['~[pg][auth],~[pg][mcp]'], suite: ['server', 'server-nonpg'], timeout: 600,
        priority: 20)
   test('server unit tests shard B', server_test_exe,
-       args: ['~[pg]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]'],
+       args: ['~[pg]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]~[body_cap]'],
        suite: ['server', 'server-nonpg'], timeout: 600, priority: 50)
   # server unit tests shard C — carved from shard B 2026-08-28 (Windows CI
   # test-phase restructuring, #3443): six tags whose combined case count
@@ -1135,6 +1149,33 @@ if build_server
   test('server unit tests shard C', server_test_exe,
        args: ['~[pg]~[auth]~[mcp][cel],~[pg]~[auth]~[mcp][viz],~[pg]~[auth]~[mcp][scope],~[pg]~[auth]~[mcp][dispatch],~[pg]~[auth]~[mcp][nvd],~[pg]~[auth]~[mcp][dex]'],
        suite: ['server', 'server-nonpg'], timeout: 600, priority: 45)
+  # server unit tests shard D — carved from shard B (staged Windows
+  # measurement follow-up, see the PR #3677 comment thread): [body_cap]
+  # alone, chosen by LOCAL Linux per-case TIME measurement (--durations
+  # yes), not case count — 20 cases, 16.58s of shard B's 39.60s measured
+  # total (41.9%), by far the single largest tag by time despite its small
+  # case count. These are real httplib loopback round-trips
+  # (test_body_cap_policy.cpp, test_body_cap_route_inventory.cpp), not
+  # pure in-process assertions, so their per-case cost (~0.83s average) is
+  # ~40x the shard's own overall per-case average (~0.02s) — exactly the
+  # kind of outlier case-count-based splitting misses. The filter repeats
+  # shard B's own exclusion suffix (not bare [body_cap], which matches 26
+  # cases repo-wide — 6 of them already belong to shard A via [mcp] and
+  # must not be double-claimed; none land via shard C's tags): verified
+  # locally, 20 + 1949 = 1969, exact partition of shard B's original
+  # population.
+  # A DSN-less run needs no --allow-running-no-tests: none of these are
+  # [pg]-tagged (confirmed: '[pg][body_cap]' matches zero cases).
+  # Priority 48 (between C's 45 and B's 50): even after this carve, B's
+  # REMAINING population still measures larger than D (23.02s vs 16.58s,
+  # both drawn from the same 39.60s baseline) — D isn't the new floor, B
+  # still is. Not ranked against C's own priority precisely: C's 45 predates
+  # any time measurement (case-count only, its own comment says so), and D's
+  # 16.58s isn't on the same measured baseline as C's unmeasured population,
+  # so this ordering is a reasonable placement, not a claimed comparison.
+  test('server unit tests shard D', server_test_exe,
+       args: ['[body_cap]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]'],
+       suite: ['server', 'server-nonpg'], timeout: 600, priority: 48)
   # [audit_store] is in shard A's OR-list because ADR-0040 moved that whole file
   # onto PG in one change: without it, every one of its cases lands in B, which
   # is the heavier half already. MEASURED on Linux at that change's head, same

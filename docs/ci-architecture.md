@@ -705,8 +705,9 @@ every `server-pg`-suite entry via `meson introspect --tests` and proves, via
 duplicated. A shard add/split/rebalance needs no update to this check at all,
 only a correct `suite:` kwarg on the changed `test()` entry.
 `flake-retry.py`'s own selftest keeps a small, genuinely-static verbatim pin
-for the non-pg server shards (three since the Windows restructuring split
-shard B → B+C, #3443 2026-08-28) plus a count-based sanity check that
+for the non-pg server shards (four: the Windows restructuring split shard
+B → B+C, #3443 2026-08-26, then a later measured-by-time follow-up carved
+shard D's `[body_cap]` tests out of B) plus a count-based sanity check that
 pg-shard extraction still finds a real population — a second, independent
 hollow-discovery signal, not a rebuild of what the structural check above
 already proves. The same structural check (`check_partition()`, parametrised
