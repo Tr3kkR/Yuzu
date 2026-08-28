@@ -30,7 +30,7 @@ Take the next free number in your block. Filename is `<number>-<kebab-slug>.md`.
 
 The `ls docs/adr/` grep above only sees numbers with a file on disk — it cannot see a number
 a doc has claimed in prose. `docs/postgres-migration-ladder.md`'s `## Wave 4` section (added
-2026-08-28) reserves **0061–0065** for its 5 in-flight migration PRs (`UpdateRegistry`,
+2026-08-27) reserves **0061–0065** for its 5 in-flight migration PRs (`UpdateRegistry`,
 `PatchManager`, `DirectorySync`, `WorkflowEngine`, and a shared cluster ADR for
 `ExecutionTracker`/`ApprovalManager`/`ScheduleEngine`) before any of those files exist. If
 you're picking a number in the `0xxx` block, check that doc's Wave 4 table too, not just this
