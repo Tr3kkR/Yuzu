@@ -340,9 +340,10 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   separate branch needed. The response reports the TRUE remaining time as
   `expires_in` (seconds, computed after any clamp — always `<=` the
   requested/capped duration) alongside an absolute `expires_at` (RFC3339 UTC —
-  a `system_clock` projection of the `steady_clock`-tracked remaining
-  duration, since `elevated_until` itself has no wall-clock meaning
-  off-process). The justification is sanitised (control bytes incl. DEL →
+  read directly off the `system_clock` `elevated_until`, which since HA WS-1/1a
+  (ADR-2002 §4) is a durably-persisted wall-clock instant, so it carries the
+  same meaning across a restart and off-process). The justification is
+  sanitised (control bytes incl. DEL →
   space) and capped (1 KiB) into the audit detail. The `role.elevation.granted`
   audit is **fail-closed**: if it can't persist, the elevation is rolled back
   (compensating `revoke_elevation`) and the call 500s with `Sec-Audit-Failed`
@@ -352,12 +353,17 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   analytics event); `role.elevation.denied` for an ineligible /
   failed-eligibility / not-MFA-enrolled caller.
 - **Effective role** — `auth::effective_role(session)` returns `admin` while
-  `steady_clock::now() < elevated_until`, else the base `role`. THE authorization
+  `system_clock::now() < elevated_until`, else the base `role`. THE authorization
   functions gate on it: `require_admin` checks `effective_role`, and
   `require_permission`/`require_scoped_permission` **short-circuit to allow** an
-  elevated session (full admin for the window). `elevated_until` is monotonic
-  `steady_clock` (an NTP step can't extend it) and **per-session in-memory** — a
-  restart or logout drops the elevation (fail-safe).
+  elevated session (full admin for the window). Since HA WS-1/1a (ADR-2002 §4)
+  `elevated_until` (with its `elevation_issued_at` anchor) is a wall-clock
+  `system_clock` instant **durably persisted** to `SessionStore`, so the
+  elevation **survives a server restart** — it is bounded by a hard
+  `kMaxElevationWindow` (24 h) wall-clock ceiling and by the session's own
+  absolute expiry, and auto-reverts when the window lapses or on explicit
+  revoke/logout, but **not** on restart. See `docs/auth-architecture.md` →
+  "Durable operator sessions (HA WS-1/1a, ADR-2002 §4)".
 - **Scope: interactive cookie sessions only.** `/api/v1/elevate` reads the
   session cookie and `elevate_session` keys on the cookie token; API and MCP
   tokens resolve through `synthesize_token_session` (no cookie, no
@@ -905,7 +911,9 @@ record.** Four fixes on top of the base restoration above:
   previously hit `InvalidUsername` at this inner call even though the REST
   layer had already accepted the principal — corrupting the audit trail with
   `result="partial"`/`db_error=true` for an action that fully succeeded (OIDC
-  sessions are never persisted to `sessions`, so 0 matched rows IS success).
+  sessions are never persisted to any AuthDB `sessions` table — durable sessions
+  live in the separate `SessionStore`, HA WS-1/1a — so 0 matched rows at this
+  AuthDB call IS success).
 - **Settings → Users "Revoke sessions" URL-encodes the principal.** The
   button previously built its `hx-delete` URL with `html_escape` alone, which
   does not touch `#` — a durable SSO principal's `#` was silently truncated
@@ -1062,9 +1070,13 @@ Browser           Yuzu Server               IdP
 
 ### Session
 
-The minted session is **in-memory and ephemeral** (lost on server restart,
-identical lifetime to OIDC sessions — 8-hour absolute, subject to
-`--session-inactivity-secs`). Session fields:
+The minted session is **durable** — since HA WS-1/1a (ADR-2002 §4)
+`AuthManager::create_saml_session` write-throughs to `SessionStore` exactly as
+OIDC does, so it **survives a server restart** (for Postgres-backed
+deployments; config-file-only deployments keep the old in-memory-only
+behavior). It has the identical lifetime to OIDC sessions — 8-hour absolute,
+subject to `--session-inactivity-secs`. See `docs/auth-architecture.md` →
+"Durable operator sessions (HA WS-1/1a, ADR-2002 §4)". Session fields:
 
 - `auth_source = "saml"`
 - `role = admin` when `--saml-admin-group` is configured and the assertion's
@@ -3349,8 +3361,11 @@ the replacement for the original in-memory + on-config-flush model that lost
 users on every restart, #618/#388/#527) in the ADR-0006 Wave 3 substrate
 migration. Tables: `users`, `enrollment_tokens`, `pending_agents`,
 `mfa_recovery_codes`. **Dropped, not migrated:** the SQLite-era `sessions`
-table (sessions are in-memory-authoritative in `AuthManager::sessions_` —
-the DB mirror was a permanent v1 dead-write, never read back) and `auth_kv`
+table (at the time of this cutover sessions were in-memory-authoritative in
+`AuthManager::sessions_`, and that SQLite `sessions` mirror had been a permanent
+v1 dead-write, never read back — since HA WS-1/1a (ADR-2002 §4) `sessions_` is a
+validate cache in front of the durable Postgres `SessionStore`; see "Durable
+operator sessions (HA WS-1/1a, ADR-2002 §4)") and `auth_kv`
 (unused scaffolding, superseded outright by `pg::SecretCodec`, ADR-0010).
 `ScimStore` migrated in lockstep to its own `scim_store` Postgres schema —
 see "Storage" under SCIM v2 provisioning above.

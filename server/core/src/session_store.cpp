@@ -17,6 +17,7 @@
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm> // std::max (reap anchor) — not transitively guaranteed on libc++
 #include <chrono>
 #include <cstdlib>
 
@@ -379,6 +380,18 @@ std::expected<int, SessionStore::Error> SessionStore::reap_expired(std::int64_t 
     // sanitised against a durable anchor in session_meta so a forward-skewed
     // reading (an already-wrong clock on the pass that matters) is DECLINED, not
     // acted on. Every accepted pass is unconditionally capped.
+    //
+    // Part-6 (missing-anchor) DECISION, recorded per the clock-guarded-retention
+    // rule: on the FIRST pass (no `reap_anchor_ms` yet) this store PROCEEDS to
+    // delete rather than declining — ResultSetStore's answer, not audit_store's.
+    // Rationale: a session is REGENERABLE via re-login, so the worst case of a
+    // from-boot forward-skewed clock on that first pass is a mass early logout
+    // (annoying, self-healing), never the loss of non-reproducible compliance
+    // evidence that makes audit_store/Guardian decline. Part-1 (would-wipe) is
+    // deliberately NOT probed for the same reason api_token_store omits it:
+    // sessions reach 100% expiry as routine drain, so a would-wipe verdict cannot
+    // separate a true from a false positive here. The magnitude guard
+    // (kMaxPlausibleSkewMs) still declines a later implausibly-forward reading.
     int deleted = 0;
     std::string err;
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {

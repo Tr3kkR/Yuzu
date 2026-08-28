@@ -432,6 +432,11 @@ std::string AuthManager::hash_token(const std::string& raw_token) {
     return sha256_hex(raw_token);
 }
 
+void AuthManager::note_session_store_degrade(const char* op) const {
+    if (metrics_)
+        metrics_->counter("yuzu_auth_session_store_degrade_total", {{"op", op}}).increment();
+}
+
 bool AuthManager::is_session_store_ok() const noexcept {
     return session_store_ == nullptr || session_store_->is_open();
 }
@@ -483,12 +488,16 @@ yuzu::server::SessionRow AuthManager::row_from_session(const std::string& raw_to
     return row;
 }
 
-void AuthManager::wipe_user_sessions_durable(const std::string& username) {
+bool AuthManager::wipe_user_sessions_durable(const std::string& username) {
     if (!session_store_)
-        return;
-    if (auto r = session_store_->invalidate_user(username); !r)
-        spdlog::error("durable session wipe for user '{}' failed ({})", username,
-                      r.error().message);
+        return true; // legacy in-memory path — nothing durable to fail
+    if (auto r = session_store_->invalidate_user(username); !r) {
+        spdlog::error("durable session wipe for user '{}' failed ({}) — role change NOT honored, "
+                      "retry (invalidate_user is idempotent)",
+                      username, r.error().message);
+        return false; // fail closed — caller must not report success (authdb-BLOCKING)
+    }
+    return true;
 }
 
 bool AuthManager::persist_new_session(const std::string& raw_token, const Session& s) {
@@ -499,6 +508,7 @@ bool AuthManager::persist_new_session(const std::string& raw_token, const Sessio
         if (auto r = session_store_->create(row); !r) {
             spdlog::error("AuthManager: durable session create failed for '{}': {}", s.username,
                           r.error().message);
+            note_session_store_degrade("create");
             return false; // fail closed — login not honored (ADR-0007)
         }
     }
@@ -531,6 +541,7 @@ void AuthManager::maybe_refresh_session_generation() const {
         // clear on failure (that would log out every locally-cached operator).
         spdlog::debug("AuthManager: durable session generation refresh failed: {}",
                       gen.error().message);
+        note_session_store_degrade("generation_refresh");
         return;
     }
     bool advanced = false;
@@ -945,17 +956,25 @@ std::optional<std::string> AuthManager::reap_expired_elevation(const std::string
 
 void AuthManager::expire_session_for_test(const std::string& token, std::chrono::seconds offset) {
     const std::string key = session_store_ ? hash_token(token) : token;
-    std::unique_lock lock(mu_);
-    auto it = sessions_.find(key);
-    if (it == sessions_.end())
-        return;
-    it->second.expires_at -= offset;
-    if (session_store_) {
+    // Snapshot the adjusted row UNDER the lock, then release mu_ BEFORE the
+    // durable upsert — never hold mu_ across PG I/O, matching every production
+    // write-through path (cpp-safety SHOULD; keeps this test helper from
+    // modelling a lock-discipline the rest of the class forbids).
+    std::optional<yuzu::server::SessionRow> row;
+    {
+        std::unique_lock lock(mu_);
+        auto it = sessions_.find(key);
+        if (it == sessions_.end())
+            return;
+        it->second.expires_at -= offset;
+        if (session_store_)
+            row = row_from_session(token, it->second);
+    }
+    if (row) {
         // Mirror the pushed-back expiry durably (test-only) via an upsert, so a
         // store-backed test observes the adjusted lifetime on a cache-cleared
-        // re-read too. No generation concern — the whole cache is coherent here.
-        auto row = row_from_session(token, it->second);
-        if (auto r = session_store_->create(row); !r)
+        // re-read too.
+        if (auto r = session_store_->create(*row); !r)
             spdlog::debug("expire_session_for_test: durable upsert failed ({})",
                           r.error().message);
     }
@@ -1132,6 +1151,7 @@ std::optional<Session> AuthManager::validate_session_durable(const std::string& 
             // on THIS replica is in the cache and never reaches here on a blip.
             spdlog::warn("validate_session: durable session lookup degraded ({})",
                          found.error().message);
+            note_session_store_degrade("validate");
             return std::nullopt;
         }
         if (!found->has_value())
@@ -1192,9 +1212,11 @@ std::optional<Session> AuthManager::validate_session_durable(const std::string& 
         // replica's cache — the whole point of a sliding update being cheap.
         if (now - session_copy->last_activity_persisted_at >= kActivityPersistGranularity) {
             session_copy->last_activity_persisted_at = now;
-            if (auto r = session_store_->touch_activity(key, ms_from_tp(now)); !r)
+            if (auto r = session_store_->touch_activity(key, ms_from_tp(now)); !r) {
                 spdlog::debug("validate_session: durable touch_activity failed ({})",
                               r.error().message);
+                note_session_store_degrade("touch");
+            }
         }
     }
     {
@@ -1342,9 +1364,11 @@ bool AuthManager::upsert_user(const std::string& username, const std::string& pa
     lock.unlock(); // release before durable I/O and save_config (both take their own locks)
 
     // Mirror the wipe durably so the stale-role session cannot survive on another
-    // replica or across a restart (no-op without a session store).
-    if (role_changed)
-        wipe_user_sessions_durable(username);
+    // replica or across a restart (no-op without a session store). Fail closed on
+    // a durable-wipe error — the local cache erase above is only eviction in store
+    // mode, so a failed durable delete would leave the old-role session live.
+    if (role_changed && !wipe_user_sessions_durable(username))
+        return false;
 
     // Only save config file if NOT using DB (backwards compat)
     if (!auth_db_)
@@ -1374,7 +1398,11 @@ bool AuthManager::remove_user(const std::string& username) {
         std::erase_if(sessions_,
                       [&](const auto& pair) { return pair.second.username == username; });
         lock.unlock();
-        wipe_user_sessions_durable(username); // durable + cross-replica
+        // Fail closed on a durable-wipe error (see wipe_user_sessions_durable):
+        // a removed user's sessions must not survive because the durable delete
+        // was lost — the operator retries (invalidate_user is idempotent).
+        if (!wipe_user_sessions_durable(username))
+            return false;
 
         return *result;
     }
@@ -1389,8 +1417,8 @@ bool AuthManager::remove_user(const std::string& username) {
     }
 
     lock.unlock();
-    if (erased)
-        wipe_user_sessions_durable(username); // durable + cross-replica (no-op w/o store)
+    if (erased && !wipe_user_sessions_durable(username)) // no-op (true) w/o store
+        return false;
     save_config();
 
     return erased;
@@ -1465,7 +1493,10 @@ bool AuthManager::update_role(const std::string& username, Role new_role) {
         std::erase_if(sessions_,
                       [&](const auto& pair) { return pair.second.username == username; });
         lock.unlock();
-        wipe_user_sessions_durable(username); // durable + cross-replica
+        // Fail closed on a durable-wipe error — a demoted user's higher-role
+        // session must not survive a lost durable delete (see the helper).
+        if (!wipe_user_sessions_durable(username))
+            return false;
 
         return true;
     }
@@ -1482,7 +1513,8 @@ bool AuthManager::update_role(const std::string& username, Role new_role) {
     std::erase_if(sessions_, [&](const auto& pair) { return pair.second.username == username; });
 
     lock.unlock();
-    wipe_user_sessions_durable(username); // durable + cross-replica (no-op w/o store)
+    if (!wipe_user_sessions_durable(username)) // no-op (true) w/o store
+        return false;
     save_config();
 
     return true;

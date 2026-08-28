@@ -270,6 +270,29 @@ TEST_CASE_METHOD(StepUpFixture, "require_mfa_step_up: stale proof beyond window 
 }
 
 TEST_CASE_METHOD(StepUpFixture,
+                 "require_mfa_step_up: a future-dated proof (backward clock step) fails CLOSED",
+                 "[pg][mfa][stepup]") {
+    // HA WS-1/1a wall-clock reversal: mfa_verified_at is now system_clock. A
+    // proof timestamped AFTER now — a backward step on the issuing/holding
+    // replica — must be treated as NO proof (never a spurious-fresh window a
+    // rewind would otherwise hold open), so the gate requires step-up (401).
+    httplib::Request req;
+    httplib::Response res;
+    res.status = 200;
+    auto session = make_session("alice", "local",
+                                std::chrono::system_clock::now() + std::chrono::seconds(600));
+
+    CHECK_FALSE(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
+                                    "POST /api/v1/tokens"));
+    CHECK(res.status == 401);
+    auto body = nlohmann::json::parse(res.body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["meta"]["mfa_step_up_required"] == true);
+    REQUIRE(audits.size() == 1);
+    CHECK(audits[0].action == "mfa.step_up.required");
+}
+
+TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: mfa_status store error fails CLOSED (UP-4)",
                  "[pg][mfa][stepup]") {
     // Tear down auth_db so mfa_status() returns an error → helper must

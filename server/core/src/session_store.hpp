@@ -20,10 +20,16 @@
  * compares against wall time. A backward clock step on the DB primary would
  * un-expire sessions and extend live JIT-elevation / MFA windows, so two
  * defences are layered (the store carries the data; AuthManager enforces):
- *   (1) elevation/MFA carry an `*_issued_ms` anchor and are additionally bounded
- *       by `now <= issued_ms + <authored max>` — a hard wall-clock ceiling that a
- *       steppable `elevated_until_ms` cannot exceed;
- *   (2) DB-primary clock integrity is a monitored security dependency (WS-11).
+ *   (1) elevation carries an `elevation_issued_ms` anchor: `is_elevated()`
+ *       rejects a grant whose window `elevated_until_ms - elevation_issued_ms`
+ *       exceeds the hard `kMaxElevationWindow` ceiling (bounds a forward-corrupted
+ *       or anchor-less `elevated_until_ms`), AND rejects a grant whose issued-at
+ *       is in the future relative to `now` (a backward step below the grant
+ *       instant). MFA uses the same future-dated-proof rejection (a
+ *       `mfa_verified_ms > now` proof is treated as absent — see mfa_step_up.cpp);
+ *   (2) DB-primary clock integrity is a monitored security dependency (WS-11) —
+ *       it covers the residual a smaller backward step (still above issued_at)
+ *       leaves, which the magnitude ceiling above does not bound.
  *
  * SECRET-AT-REST. The row key is a verify-only SHA-256 of the bearer session
  * token, never the raw token (a DB read must not yield a usable session cookie).

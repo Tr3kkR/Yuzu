@@ -172,7 +172,7 @@ struct Session {
     std::chrono::system_clock::time_point elevation_issued_at{};
 
     /// Inactivity (idle) timeout support (SOC 2 CC6.3). `last_activity_at` is
-    /// bumped toward `steady_clock::now()` on authenticated requests when the
+    /// bumped toward `system_clock::now()` on authenticated requests when the
     /// idle timeout is enabled (`AuthManager::session_inactivity_ > 0`),
     /// throttled to once per touch-granularity; `validate_session` rejects the
     /// session once `now - last_activity_at` exceeds the window — a sliding
@@ -211,7 +211,16 @@ inline constexpr auto kMaxElevationWindow = std::chrono::hours(24);
 inline bool is_elevated(const Session& s) {
     if (s.elevated_until.time_since_epoch().count() == 0)
         return false;
-    if (std::chrono::system_clock::now() >= s.elevated_until)
+    const auto now = std::chrono::system_clock::now();
+    if (now >= s.elevated_until)
+        return false;
+    // Backward-step guard, symmetric with mfa_step_up's future-dated-proof
+    // rejection: an issued-at in the future relative to `now` means the wall
+    // clock stepped backward below the grant instant — fail closed rather than
+    // honor a window a rewind would stretch. (A smaller rewind that stays above
+    // issued_at can still extend the live window; that residual is the
+    // WS-11-monitored DB-primary-clock dependency, ADR-2002 §4.)
+    if (now < s.elevation_issued_at)
         return false;
     // Reject a granted window wider than the hard ceiling (a forward-corrupted
     // `elevated_until`, or an elevated_until set without its issued-at anchor —
@@ -790,6 +799,12 @@ private:
     /// at rest: the store never sees the raw bearer token (session_store.hpp).
     static std::string hash_token(const std::string& raw_token);
 
+    /// Count a degraded durable-session operation on the auth hot path
+    /// (yuzu_auth_session_store_degrade_total{op}) so a PG blip/failover is
+    /// observable without log-grepping (mirrors the rbac/login degrade
+    /// counters). No-op when no MetricsRegistry is wired (tests/CLI).
+    void note_session_store_degrade(const char* op) const;
+
     /// Reconstruct a cache `Session` from a durable `SessionRow` (wall-clock).
     /// Stamps last_activity and both elevation fields so the ceiling and idle
     /// gates read a fully-formed session (auth.hpp Session invariant).
@@ -811,9 +826,20 @@ private:
     /// Durably delete every session for a username (bumps the generation so all
     /// replicas drop the cached copies). Called from the role-change / demote /
     /// delete paths ALONGSIDE the local-cache wipe, so a stale-role session
-    /// cannot survive on another replica or across a restart. No-op without a
-    /// store; best-effort (logs on failure). Caller must NOT hold `mu_`.
-    void wipe_user_sessions_durable(const std::string& username);
+    /// cannot survive on another replica or across a restart.
+    ///
+    /// Returns true when there is nothing durable to fail (no store configured)
+    /// OR the durable delete succeeded; FALSE on a durable-delete error. A false
+    /// return MUST fail the enclosing role-change/remove operation closed: in
+    /// store mode the local `sessions_` erase is only cache eviction — a
+    /// cache-missed token is re-served from the authoritative row — so if the
+    /// durable delete did not land, the stale-(higher-)role session survives and
+    /// the generation was NOT bumped (other replicas keep serving it). Reporting
+    /// success there would grant a demoted/removed operator their old privilege
+    /// past the change (governance authdb-BLOCKING). `invalidate_user` is
+    /// idempotent, so an operator retry after a false return is safe. No-op
+    /// (true) without a store. Caller must NOT hold `mu_`.
+    [[nodiscard]] bool wipe_user_sessions_durable(const std::string& username);
 
     /// Poll the durable write-generation on an interval; when it has advanced
     /// (a create/invalidate/elevate/mfa mutation landed, possibly on another

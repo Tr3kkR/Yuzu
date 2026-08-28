@@ -2498,6 +2498,25 @@ public:
             metrics_.counter("yuzu_auth_read_degrade_total",
                              {{"route", "login"}, {"reason", reason}});
         }
+        // HA WS-1/1a: durable SessionStore degradation on the auth hot path
+        // (validate/create/touch/generation-refresh/reap). Mirrors the
+        // yuzu_auth_read_degrade_total / yuzu_server_rbac_read_degrade_total
+        // pattern so an operator can see a PG blip/failover degrade session
+        // handling (stale-cache-or-401) without grepping logs. `op` labels the
+        // degrading operation. Wired from AuthManager (validate/create/touch/
+        // generation) + the maintenance-thread reap above.
+        metrics_.describe("yuzu_auth_session_store_degrade_total",
+                          "Durable session-store operations that hit a degraded PostgreSQL read/"
+                          "write on the auth hot path (labelled by op: validate / create / touch / "
+                          "generation_refresh / reap); a validate degrade fails the request closed",
+                          "counter");
+        for (auto op : {"validate", "create", "touch", "generation_refresh", "reap"})
+            metrics_.counter("yuzu_auth_session_store_degrade_total", {{"op", op}});
+        metrics_.describe("yuzu_auth_session_reap_total",
+                          "Expired durable operator-session rows deleted by the clock-guarded "
+                          "retention sweep",
+                          "counter");
+        metrics_.counter("yuzu_auth_session_reap_total");
         // First-boot seed observability (authdb MEDIUM). Incremented exactly
         // once, iff `seed_admin_if_empty` actually seeded the sole admin row
         // (an empty `auth.users` table) — a no-op (table already populated,
@@ -12730,6 +12749,12 @@ private:
             // start rather than shipping the gap. Construction is fail-closed,
             // so this is belt-and-braces against a runtime is_open() flip.
             bool patch_manager_ok = patch_manager_ && patch_manager_->is_open();
+            // HA WS-1/1a: durable operator sessions. /readyz's StoreCheck vector
+            // names this store; mirror it here so the two probes agree (same
+            // anti-drift rule as runtime_config above) and match the documented
+            // "reported at /readyz and /healthz" contract. is_session_store_ok()
+            // is true on legacy config-file-only deployments (no store wired).
+            bool session_store_ok = auth_mgr_.is_session_store_ok();
 
             // Determine overall status
             bool all_stores_ok =
@@ -12740,7 +12765,7 @@ private:
                 device_inventory_ok && inventory_ok && approval_ok && rbac_ok && result_set_ok &&
                 mgmt_group_ok && discovery_ok && deployment_ok && quarantine_ok &&
                 notification_ok && upload_grant_ok && tag_ok && runtime_config_ok &&
-                patch_manager_ok;
+                patch_manager_ok && session_store_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -12785,7 +12810,8 @@ private:
                   {"upload_grant_store", upload_grant_ok ? "ok" : "error"},
                   {"tag_store", tag_ok ? "ok" : "error"},
                   {"runtime_config_store", runtime_config_ok ? "ok" : "error"},
-                  {"patch_manager", patch_manager_ok ? "ok" : "error"}}},
+                  {"patch_manager", patch_manager_ok ? "ok" : "error"},
+                  {"session_store", session_store_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -18339,6 +18365,11 @@ private:
                 // is_open-gated (JC-6 decoupling — a response-store outage must
                 // not wedge the result-set GC/materialize work above).
                 constexpr int kResponseReapEveryNTicks = 1800; // ~60 minutes at 2s/tick
+                // HA WS-1/1a: durable session retention sweep. Tighter than the
+                // 60m stores above — expired session rows carry username /
+                // display_name / oidc_sub (identity/PII), so age them out on a
+                // ~15m cadence. reap_expired is clock-guarded + capped (5000/pass).
+                constexpr int kSessionReapEveryNTicks = 450; // ~15 minutes at 2s/tick
                 int tick = 0;
                 while (!stop_requested_.load(std::memory_order_acquire)) {
                     for (int i = 0; i < 2 && !stop_requested_.load(std::memory_order_acquire); ++i)
@@ -18440,6 +18471,31 @@ private:
                         if (guaranteed_state_store_ && guaranteed_state_store_->is_open() &&
                             tick % kGuardianReapEveryNTicks == 0) {
                             guaranteed_state_store_->reap_expired();
+                        }
+
+                        // 2d) Durable session retention reap (HA WS-1/1a, ADR-2002 §4).
+                        // Expired session rows carry identity/PII (username /
+                        // display_name / oidc_sub) and accrue one-per-login, so age
+                        // them out on a ~15m cadence. reap_expired is clock-guarded
+                        // (advisory-lock own-statement + persisted anchor +
+                        // implausible-skew decline + 5000/pass cap) and single-writer-
+                        // safe. now_ms is this server's wall clock; the guard sanitises
+                        // it. A returned count>0 is counted for retention auditability.
+                        if (session_store_ && session_store_->is_open() &&
+                            tick % kSessionReapEveryNTicks == 0) {
+                            const std::int64_t now_ms =
+                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+                            if (auto reaped = session_store_->reap_expired(now_ms)) {
+                                if (*reaped > 0)
+                                    metrics_.counter("yuzu_auth_session_reap_total")
+                                        .increment(static_cast<double>(*reaped));
+                            } else {
+                                metrics_.counter("yuzu_auth_session_store_degrade_total",
+                                                 {{"op", "reap"}})
+                                    .increment();
+                            }
                         }
 
                         // 3) Refresh alive gauges.

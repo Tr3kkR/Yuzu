@@ -21,6 +21,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <filesystem>
 #include <memory>
 #include <string>
 
@@ -45,6 +46,19 @@ yuzu::test::PgTestTemplate authsess_tpl{"authsess", [](const std::string& dsn) {
 // store, which is all the session lifecycle needs.
 std::unique_ptr<AuthManager> make_mgr(SessionStore& store) {
     auto mgr = std::make_unique<AuthManager>();
+    mgr->set_session_store(&store);
+    return mgr;
+}
+
+// A store-backed AuthManager with a config file behind it, so user-management
+// methods (upsert_user/update_role/remove_user) work in the config-file path.
+std::unique_ptr<AuthManager> make_mgr_with_config(SessionStore& store) {
+    auto mgr = std::make_unique<AuthManager>();
+    auto cfg = yuzu::test::unique_temp_path("yuzu_test_authsess_");
+    cfg += ".cfg";
+    std::filesystem::create_directories(cfg.parent_path());
+    std::filesystem::remove(cfg);
+    mgr->load_config(cfg);
     mgr->set_session_store(&store);
     return mgr;
 }
@@ -184,4 +198,24 @@ TEST_CASE("AuthManager+SessionStore: invalidate_user_sessions kills every device
     CHECK_FALSE(b->validate_session(t1).has_value());
     CHECK_FALSE(b->validate_session(t2).has_value());
     CHECK(b->validate_session(other).has_value()); // frank untouched
+}
+
+TEST_CASE("AuthManager+SessionStore: a role change durably wipes the user's sessions",
+          "[auth][session_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto a = make_mgr_with_config(store);
+    REQUIRE(a->upsert_user("gina", "secret123456", Role::user));
+    auto token = a->create_local_session("gina", Role::user, false);
+    REQUIRE(a->validate_session(token).has_value());
+
+    // Promote gina → the stale-role session must not survive on any replica:
+    // wipe_user_sessions_durable deletes the durable rows (fail-closed on error).
+    REQUIRE(a->update_role("gina", Role::admin));
+    CHECK_FALSE(a->validate_session(token).has_value());
+    auto b = make_mgr(store);
+    CHECK_FALSE(b->validate_session(token).has_value()); // gone fleet-wide
 }
