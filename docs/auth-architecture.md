@@ -21,10 +21,65 @@ Certificate setup instructions: `scripts/Certificate Instructions.txt`.
 - **Session revocation REST surface (CC6.3 revocation, CC6.7 disposition, CC6.8 termination).**
   - `DELETE /api/v1/sessions?username=<name>` — admin-only via `UserManagement:Write`. Cookie sessions only; API tokens deliberately not revoked.
   - `DELETE /api/v1/sessions/me` — any interactive authenticated principal. Wipes cookie sessions AND revokes the caller's API tokens (lost-laptop UX). MCP-tier and service-scoped tokens rejected with 403. Response sets `Set-Cookie: yuzu_session=; Max-Age=0` so the client side completes the disposition.
-  - Both wrap `AuthManager::invalidate_user_sessions`, which erases matching entries from the in-memory `sessions_` map under `mu_` and returns `RevokeResult { count, db_persisted }`. **Sessions have never had a durable row since the Postgres cutover** (ADR-0006 — the SQLite-era `sessions` table was dropped, not migrated; see "AuthDB — persistent authentication store" below), so `invalidate_user_sessions` no longer performs a companion AuthDB write — `db_persisted` is always `true` today. The field is kept on `RevokeResult` (rather than removed) so the REST handler's `result="partial"`/`db_error=true` audit path stays available without a wire-shape change, should a future durable session mirror return.
+  - Both wrap `AuthManager::invalidate_user_sessions`, which returns `RevokeResult { count, db_persisted }`. Since HA WS-1/1a (ADR-2002 §4) sessions ARE durable (`SessionStore`, see "Durable operator sessions" below): with a store wired it deletes every durable row for the user FIRST (bumping the write-generation so all replicas drop their cached copies), then wipes this replica's cache — `count` is the fleet-wide total killed and `db_persisted` reflects the durable-delete outcome (false on a store error, with the local wipe still done so the operator's "kill NOW" intent is honored — the REST handler's `result="partial"`/`db_error=true` audit path). On a legacy config-file-only deployment (no store) it stays an in-memory wipe with `db_persisted=true`.
   - Audit actions split for SIEM correlation: `session.revoke_all` (cross-user) vs `session.revoke_all.self` (self via either route, including admin self-target through the admin path). Both use `target_type=User` (project PascalCase convention). `result` ∈ {`success`, `partial`, `denied`}.
   - Prometheus counter `yuzu_auth_sessions_revoked_total{caller, result, scope}` for CC7.2 anomaly detection.
   - Self-target guard distinction (DO NOT CONFLATE WITH `#397/#403`): the existing `#397/#403` self-target guard on `DELETE /api/settings/users/<self>` and role demotion is a hard 403 to prevent admin-role self-lockout (an unrecoverable state). Session revocation self-target is recoverable (re-auth) and is permitted but audited as `.self`. Future refactors must not "fix" the session-revocation self-target into a hard 403.
+
+### Durable operator sessions (HA WS-1/1a, ADR-2002 §4)
+
+Operator sessions are durable Postgres rows so a session survives a core-replica
+restart/failover and validates identically on any replica — a prerequisite of
+the HA "safe-to-scale" gate. The design:
+
+- **Store.** `SessionStore` (`server/core/src/session_store.{hpp,cpp}`, schema
+  `session_store`) is a born-on-PG, fail-closed store (ADR-0012). The row key is
+  the **SHA-256 of the bearer token**, never the raw token (secret-at-rest); the
+  raw token is hashed at every store boundary. Rows carry the authz-relevant
+  `Session` fields in wall-clock epoch-millis.
+- **Write-through + validate cache.** `AuthManager` write-throughs every session
+  op to the store and validates against it, with the in-memory `sessions_` map
+  as a **generation-gated process-local cache**: a durable `write_generation`
+  counter is bumped in the same txn as every authz-affecting mutation (create,
+  invalidate, elevate, revoke-elevation, mfa-verify — but **not**
+  `touch_activity`, a sliding idle update). `validate_session` polls the
+  generation on a ~1s interval (single-flight); when it advances (a mutation
+  landed, possibly on another replica) the whole cache is cleared and the next
+  lookup re-reads authoritative state. A refresh failure keeps serving the cache
+  (every session's absolute `expires_at` is the backstop). Operator sessions
+  number in the tens, so a global generation whose bump clears the whole cache
+  is cheap. Cross-replica staleness is bounded by the refresh interval (~1s).
+- **Authoritative reads.** A `SessionStore::find` returns
+  `expected<optional<Row>>`: `nullopt` = definitively absent, `unexpected` = DB
+  degraded. `validate_session` never treats a degraded read as "no valid
+  session" in a way that grants — an uncached token whose lookup is degraded
+  **fails the request (401)**; a session minted on this replica is in the cache
+  and does not reach that path during a blip.
+- **Wall-clock (the reversal) + ceilings.** The `Session` lifetime fields
+  (`expires_at`, `mfa_verified_at`, `elevated_until`, `last_activity_at`) moved
+  from `steady_clock` (monotonic) to `system_clock` (wall-clock), because a
+  durable row is compared against absolute wall time on any replica. The
+  NTP-step resistance the monotonic clock gave is replaced by two
+  defense-in-depth wall-clock controls: (1) `is_elevated()` enforces a hard
+  `kMaxElevationWindow` (24 h) ceiling anchored by `Session::elevation_issued_at`
+  (stamped with `elevated_until` at every grant, cleared with it on revoke), so
+  a forward clock corruption or an anchor-less `elevated_until` cannot extend
+  admin past the ceiling; (2) the MFA step-up gate treats a **future-dated**
+  proof (`mfa_verified_at > now`, i.e. a backward step) as no proof — fail
+  closed. DB-primary clock integrity is a monitored security dependency (HA
+  WS-11).
+- **Retention.** `SessionStore::reap_expired` is a wall-clock bulk delete, so it
+  joins the clock-guarded-retention set (routed concern #2360/#2361): an
+  advisory lock taken as its own statement, a persisted `reap_anchor_ms`
+  sanitised against implausible skew (declined, not acted on), and an
+  unconditional per-pass cap. Single-writer today (one server); it becomes
+  PG-shared state under the ADR-0012 advisory lock when a second replica lands.
+- **Legacy path.** Config-file-only deployments (no `--postgres-dsn`, so no
+  pool) leave `AuthManager::session_store_` null and keep the pre-HA in-memory
+  sessions unchanged. The store is wired at boot only when the PG substrate is
+  up; a wired store that fails to migrate/open is a **fail-closed boot error**
+  (ADR-0007) and is surfaced at `/readyz` + `/healthz` via
+  `AuthManager::is_session_store_ok()`.
 
 ## Account lockout (SOC 2 CC6.3)
 
@@ -117,16 +172,20 @@ previously-reserved `sessions.last_activity_at` column end-to-end.
   user mid-coffee-break is a behaviour change, so it is off unless an operator
   turns it on (recommended `900` = 15 min). Boot posture is logged for CC6.3
   evidence. Enabling it satisfies the CC6.3 inactivity-timeout control.
-- **In-memory is authoritative — and, since the Postgres cutover, the ONLY
-  copy.** Sessions are validated from the in-memory `AuthManager::sessions_`
-  map. The SQLite-era `sessions` table (whose rows were always v1
-  dead-writes — never read back) was **dropped, not migrated**, when `AuthDB`
-  moved to Postgres (ADR-0006) — there is no `auth.sessions` table at all
-  today, durable or otherwise. So the idle state lives *only* on the
-  in-memory `Session`:
-  `last_activity_at` (a monotonic `steady_clock` stamp — an NTP step can neither
-  extend nor collapse the window). `AuthManager::session_inactivity_` holds the
-  configured window (set once at startup via `set_session_inactivity`).
+- **Durable since HA WS-1/1a (ADR-2002 §4).** Operator sessions are durable
+  Postgres rows in `SessionStore` (schema `session_store`); `AuthManager`
+  write-throughs every session and validates against it, with the in-memory
+  `AuthManager::sessions_` map serving as a generation-gated process-local
+  cache (see "Durable operator sessions" below). The idle state
+  (`last_activity_at`) is now a **wall-clock** (`system_clock`) row column
+  advanced via `SessionStore::touch_activity`, which deliberately does NOT bump
+  the write-generation (a slide is not an authz change, so it never invalidates
+  any replica's cache), and mirrored into the cache. It survives a replica
+  restart/failover and validates identically on any replica. (Before HA WS-1/1a
+  the idle state lived only in-memory on a monotonic `steady_clock`; the clock
+  is now wall-clock, with the JIT-elevation/MFA windows carrying hard wall-clock
+  ceilings — see below.) `AuthManager::session_inactivity_` holds the configured
+  window (set once at startup via `set_session_inactivity`).
 - **Enforcement is in `validate_session`** (the same place the absolute
   `expires_at` is checked, and which already conditionally upgrades its shared
   lock for the opportunistic reap). When the feature is on: a session idle
@@ -146,16 +205,15 @@ previously-reserved `sessions.last_activity_at` column end-to-end.
   `synthesize_token_session` (their own store), never `validate_session`, so a
   long-lived automation token is **never** idle-timed-out. OIDC sessions are
   subject to the same idle window but the user simply re-authenticates via SSO.
-- **No durable mirror since the Postgres cutover.** Before ADR-0006, a touch
-  best-effort-persisted the timestamp via `AuthDB::touch_session_activity`
-  (mirroring `mfa_mark_session_stepup`), throttled to at most once per session
-  per `kActivityPersistGranularity` (60 s). That method — and the `sessions`
-  table it wrote — was **removed**, not ported, when `AuthDB` moved to
-  Postgres: there is no session surface on the Postgres-backed `AuthDB` at all
-  (see "AuthDB — persistent authentication store" below), so `last_activity_at`
-  now lives purely in `AuthManager::sessions_` and does not survive a server
-  restart (idle-timeout state resets along with the rest of the in-memory
-  session table). Idle expiry is not separately audited (neither was absolute
+- **Durable mirror (HA WS-1/1a).** A throttled touch advances the durable
+  `last_activity_ms` column via `SessionStore::touch_activity`, at most once per
+  session per `kActivityPersistGranularity` (60 s), so the sliding update is not
+  a per-request SQL write and — because it does NOT bump the write-generation —
+  never invalidates any replica's validate cache. `last_activity_at` therefore
+  survives a restart (unlike the pre-HA in-memory state, which reset on
+  restart). The session surface lives on the dedicated `SessionStore`, never on
+  `AuthDB` (which has no session table — see "AuthDB — persistent authentication
+  store" below). Idle expiry is not separately audited (neither was absolute
   expiry) and emits **no Prometheus counter** — the observable signal is the
   `auth.login` audit row on re-authentication.
 

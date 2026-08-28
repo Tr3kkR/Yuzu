@@ -151,6 +151,7 @@
 #include "preflight_run_store.hpp"
 #include "vuln_finding_store.hpp"
 #include "access_review_store.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — campaign persistence
+#include "session_store.hpp"       // HA WS-1/1a — durable operator sessions (ADR-2002 §4)
 #include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
@@ -3916,6 +3917,26 @@ public:
                         auth_mgr_.set_auth_db(auth_db_.get());
                     }
                 }
+            }
+        }
+
+        // SessionStore — born-on-PG durable operator sessions (HA WS-1/1a,
+        // ADR-2002 §4). Same fail-CLOSED construction posture as the other
+        // born-on-PG stores (ADR-0012 §1): a reachable database whose schema
+        // can't migrate/open is a deploy error, not a serve-degraded state.
+        // Wired into AuthManager so sessions write-through to Postgres and
+        // survive a replica restart/failover; without it (config-file-only
+        // deployments never reach this block — pg_pool_ is null) AuthManager
+        // keeps its legacy in-memory sessions.
+        if (pg_pool_ && !startup_failed_) {
+            session_store_ = std::make_unique<SessionStore>(*pg_pool_);
+            if (!session_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: session store migration/open failed "
+                              "(database reachable but the session_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                auth_mgr_.set_session_store(session_store_.get());
             }
         }
 
@@ -8491,6 +8512,11 @@ public:
         // TrackerScope contract, auth_db_'s destruct-before-drop still holds
         // regardless — this only protects the OUTSIDE-owned raw pointer).
         auth_mgr_.set_auth_db(nullptr);
+        // Same contract for the durable SessionStore raw pointer (HA WS-1/1a):
+        // auth_mgr_ (main.cpp-owned) borrows session_store_ via
+        // set_session_store; null it before session_store_ destructs with the
+        // rest of this object's members.
+        auth_mgr_.set_session_store(nullptr);
 
         // Release Phase 2 components (RAII handles close).
         execution_tracker_.reset();
@@ -12881,6 +12907,13 @@ private:
                 // an operator can detect a corrupt auth.db without scraping
                 // spdlog; pairs with docs/ops-runbooks/auth-db-recovery.md.
                 {"auth_db", auth_mgr_.is_auth_db_ok()},
+                // HA WS-1/1a (ADR-2002 §4): durable operator sessions. Reports
+                // "ok" on legacy config-file-only deployments (no store wired in
+                // AuthManager) and false only when a wired SessionStore failed
+                // to migrate/open — a half-open store cannot mint or validate
+                // durable sessions, so the node is not ready to front the LB.
+                // Same is_*_ok() fail-closed shape as auth_db above.
+                {"session_store", auth_mgr_.is_session_store_ok()},
                 // Phase 8.3 #255 — load-bearing for /api/v1/offload-targets
                 // and the AgentService fan-out path. A migration failure
                 // would silently no-op all offload deliveries while the
@@ -21779,6 +21812,12 @@ private:
     std::unique_ptr<FileKeyProvider> auth_key_provider_;
     std::unique_ptr<pg::SecretCodec> auth_secret_codec_;
     std::unique_ptr<AuthDB> auth_db_;
+    // SessionStore — born-on-PG durable operator sessions (HA WS-1/1a,
+    // ADR-2002 §4). Borrows pg_pool_ by reference, so (like every member here)
+    // it destructs before pg_pool_. auth_mgr_ holds a raw pointer to it via
+    // set_session_store; that pointer is nulled at teardown before this
+    // destructs (see set_session_store(nullptr) beside set_auth_db(nullptr)).
+    std::unique_ptr<SessionStore> session_store_;
     // SCIM v2 provisioning (/scim/v2/*) — the store is constructed
     // unconditionally alongside AuthDB (born-on-PG, cheap to open); only
     // route registration + the configured bearer token are gated on
