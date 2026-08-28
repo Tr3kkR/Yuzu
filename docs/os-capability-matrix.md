@@ -557,10 +557,10 @@ implementation is.
 | services | set_start_mode | windows | supported | 1 | win32_service_api | - |
 | software_actions | list_upgradable | linux | supported | 2 | apt/yum check-update via bounded argv runner | - |
 | software_actions | list_upgradable | macos | supported | 2 | softwareupdate -l via bounded argv runner | - |
-| software_actions | list_upgradable | windows | constrained | 2 | winget via bounded argv runner | winget App-Execution-Alias may be unavailable to the agent service context; reports an honest empty/unavailable result |
+| software_actions | list_upgradable | windows | constrained | 2 | winget via bounded argv runner | winget is a PER-USER App Execution Alias under %LOCALAPPDATA%; under the shipped LocalSystem service account that path does not exist, so this leg resolves only when the agent runs in a user-session context. An unresolvable winget reports UNAVAILABLE, never a clean empty result |
 | software_actions | installed_count | linux | supported | 2 | dpkg-query/rpm via bounded argv runner | - |
 | software_actions | installed_count | macos | supported | 2 | pkgutil --pkgs via bounded argv runner | - |
-| software_actions | installed_count | windows | supported | 1 | native Reg*W subkey count of the Uninstall key | default (64-bit) registry view only; 32-bit apps under WOW6432Node are not counted |
+| software_actions | installed_count | windows | supported | 1 | native Reg*W subkey count of the Uninstall key | reads only the default (64-bit) registry view, matching the powershell payload it replaced; 32-bit applications registered under WOW6432Node are not counted |
 | status | version | linux | supported | 1 | in-process (compiled version constants) | - |
 | status | version | macos | supported | 1 | in-process (compiled version constants) | - |
 | status | version | windows | supported | 1 | in-process (compiled version constants) | - |
