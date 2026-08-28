@@ -65,9 +65,7 @@ UpdatePackage make_pkg(const std::string& platform = "windows", const std::strin
     return pkg;
 }
 
-// Pre-migrated template (see PgTestTemplate in test_helpers.hpp). The
-// migration-failure test stays on plain YUZU_REQUIRE_PG_DB — it pre-seeds a
-// conflicting schema and needs the store's schema to NOT exist yet.
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp).
 yuzu::test::PgTestTemplate update_registry_tpl{
     "update_registry", [](const std::string& dsn) {
         PgPool pool{{.conninfo = dsn, .size = 1}};
@@ -366,8 +364,16 @@ TEST_CASE("UpdateRegistry: read and write degrade counters increment on a store 
 // failure by pre-seeding a table in the store's schema with no schema_meta
 // row: the migration runner's schema-drift guard refuses (version 0 but
 // tables exist), so run() returns false.
+//
+// gov fjarvis C2 (PR #3695 review, 2026-08-28): this is exactly the
+// fresh-migrate/"!is_open on a migration failure" case
+// YUZU_REQUIRE_PG_MIGRATION_DB's own docstring names as its target — an
+// earlier version of this test stayed on plain YUZU_REQUIRE_PG_DB with a
+// comment claiming the two macros hand out different databases. They don't:
+// YUZU_REQUIRE_PG_MIGRATION_DB is YUZU_REQUIRE_PG_DB plus a Windows skip for
+// the #2354 EXEC_BACKEND fresh-DB cost, nothing else.
 TEST_CASE("UpdateRegistry reports !is_open on a migration failure", "[update_registry][pg]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     TempUpdateDir tmp;
 
     // Pre-seed: create the update_registry schema + a conflicting table, but
