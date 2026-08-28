@@ -35,7 +35,7 @@ Schema name = `snake_case(FullClassName)` incl. the `Store` suffix (ADR-0008 Upd
 > boundary of what this document tracked — it never enumerated the server's other `sqlite3*`
 > holders. A post-merge audit (2026-08-27, triggered by asking "is the ladder really done" after
 > `OffloadTargetStore` landed) found 7 production-wired components that were never tracked here
-> at all: see **`## Wave 4 — non-`*Store` SQLite owners`** below. The same fresh-start-by-default
+> at all: see **`## Wave 4` — non-`*Store` SQLite owners** below. The same fresh-start-by-default
 > rule applies to every row in it.
 
 ## Done
@@ -168,10 +168,11 @@ plain `snake_case(ClassName)` with nothing appended.
   `ScheduleEngine`, `InstructionDbPool`'s three consumers) holds a bare `sqlite3* db` with no
   distinguishing string, so it matches NEITHER pattern (#1325's finding — the old single-pattern
   grep silently missed them). `grep -rlE "sqlite3_open|instr_db_pool_|InstructionDbPool"
-  server/core/src` widens the match to the pool's own file and its `server.cpp` wiring site
-  (itself already caught by plain `sqlite3_open`) — it does NOT make the three consumer classes
-  grep-visible by name. Re-deriving the full list still needs a manual hop from
-  `instr_db_pool_`'s construction call sites in `server.cpp` to whatever it constructs.
+  server/core/src` widens the match by exactly three files — `instruction_db_pool.hpp`,
+  `migration_runner.cpp`, `pg/pg_pool.hpp` — none of which is one of the three consumer classes;
+  it does NOT make `ExecutionTracker`/`ApprovalManager`/`ScheduleEngine` grep-visible by name.
+  Re-deriving the full list still needs a manual hop from `instr_db_pool_`'s construction call
+  sites in `server.cpp` to whatever it constructs.
 - **`ConcurrencyManager` (`concurrency_manager.{hpp,cpp}`) is deliberately NOT a Wave 4 row.** It
   holds a real `sqlite3*` and a real migration ladder of its own, but has zero production callers
   anywhere in `server.cpp` (verified 2026-08-27 via `grep`) — compiled, unit-tested, and never
@@ -181,6 +182,13 @@ plain `snake_case(ClassName)` with nothing appended.
 - **Schema naming for a non-`*Store` class (Wave 4)** extends the ADR-0008 rule above: there is no
   `Store` suffix to append, so the schema name is plain `snake_case(ClassName)` —
   e.g. `WorkflowEngine` → `workflow_engine`, `ExecutionTracker` → `execution_tracker`.
+- **Merge hazard while Wave 4's 5 migration PRs are in flight concurrently:** each will delete
+  its own Wave 4 row and add a row to `## Done` when it lands — a flat, un-sectioned table with
+  no fragment mechanism (unlike `changelog.d/`), so two of the 5 landing close together risks
+  the same "second push voids the first PR's approval" conflict `changelog.d/README.md` exists
+  to avoid for changelog entries. Merge them **strictly one at a time**, rebasing each remaining
+  worktree onto the previous merge before it lands its own row — don't rely on git to
+  auto-resolve two near-simultaneous appends to this table.
 - A store may be **split** or **merged** during migration if its schema warrants it — record that
   in its per-store ADR.
 - When the last row clears, remove the `migration_runner.*` SQLite path from the server target and
