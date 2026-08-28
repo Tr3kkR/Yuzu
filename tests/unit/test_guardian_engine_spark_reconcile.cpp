@@ -2063,6 +2063,14 @@ TEST_CASE("#2233 item 3: a hung watch() wedges stop() until released",
 
     std::atomic<int> push_exit_code{-1};
     std::atomic<bool> push_done{false};
+    // stop_returned is declared here, BEFORE Cleanup, even though the stopper thread that
+    // writes it isn't started until after Cleanup exists (governance Gate 3 - cpp-expert
+    // and cpp-safety independently found this): C++ destroys locals in reverse declaration
+    // order, so an atomic declared AFTER Cleanup would be destroyed BEFORE ~Cleanup() joins
+    // the thread referencing it on some future unwind between the emplace below and the
+    // explicit join - the same defect class 13800f233 already fixed for the thread objects
+    // themselves, recurring for the atomic they write to.
+    std::atomic<bool> stop_returned{false};
 
     // Cleanup OWNS both worker threads as members (never a pointer to a separately-
     // declared local) - its destructor is then the ONLY thing that ever destroys them,
@@ -2099,7 +2107,6 @@ TEST_CASE("#2233 item 3: a hung watch() wedges stop() until released",
 
     REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(30)));
 
-    std::atomic<bool> stop_returned{false};
     cleanup.stopper_thread.emplace([&] {
         f.engine->stop();
         stop_returned.store(true, std::memory_order_release);
@@ -2137,6 +2144,16 @@ TEST_CASE("#2233 item 3: a hung watch() on one rule blocks an unrelated concurre
 
     std::atomic<int> push_a_exit_code{-1};
     std::atomic<bool> push_a_done{false};
+    // push_b_exit_code/push_b_done are declared here, BEFORE Cleanup, even though the
+    // pusher_b thread that writes them isn't started until after Cleanup exists and
+    // wait_entered_hang() has returned (governance Gate 3 - cpp-expert and cpp-safety
+    // independently found this class of gap): C++ destroys locals in reverse declaration
+    // order, so an atomic declared AFTER Cleanup would be destroyed BEFORE ~Cleanup() joins
+    // the thread referencing it on some future unwind between the emplace below and the
+    // explicit join - the same defect class 13800f233 already fixed for the thread objects
+    // themselves, recurring for the atomics they write to.
+    std::atomic<int> push_b_exit_code{-1};
+    std::atomic<bool> push_b_done{false};
 
     // See the "hung watch() wedges stop()" test above for why Cleanup must OWN both
     // threads as members rather than point to separately-declared locals.
@@ -2166,8 +2183,6 @@ TEST_CASE("#2233 item 3: a hung watch() on one rule blocks an unrelated concurre
     // r2 is a distinct spark key (different service name) and full_sync=false, so this
     // push does not also try to detach r1 - it exercises apply_rules() -> mtx_ contention
     // alone, independent of r1's own arm outcome.
-    std::atomic<int> push_b_exit_code{-1};
-    std::atomic<bool> push_b_done{false};
     cleanup.pusher_b_thread.emplace([&] {
         gpb::GuaranteedStatePush p;
         p.set_full_sync(false);
@@ -2201,8 +2216,18 @@ TEST_CASE("#2233 item 3: a hung unwatch() wedges stop() until released",
           "[spark][guardian][reconcile][liveness]") {
     SparkReconcileFixture f;
     // Arm r1 normally first (no hang yet), so the hang below is specifically on the
-    // detach path (reconcile_rule_locked's disabled-rule branch -> detach_rule ->
-    // detach_rule_locked -> backend_->disarm -> SparkEngine::disarm -> mech->unwatch).
+    // detach path. The second push below is full_sync=true, so the hang is actually
+    // entered via apply_rules()'s UNCONDITIONAL detach_all() sweep
+    // (guardian_engine.cpp, before the per-rule loop) -> detach_rule_locked ->
+    // backend_->disarm -> SparkEngine::disarm -> mech->unwatch - not via
+    // reconcile_rule_locked's disabled-rule branch, whose own detach_rule() call on
+    // r1 becomes a no-op once detach_all() has already erased it (governance Gate 3
+    // quality-engineer finding, this branch). Both routes end at the same
+    // detach_rule_locked/disarm/unwatch call, so the wedge this test proves is
+    // identical either way; a genuinely-untested adjacent case is a PARTIAL push
+    // (full_sync=false) disabling one of several armed rules, which is the only way
+    // to reach the disabled-rule branch directly - left as a follow-up, out of scope
+    // for this characterisation PR.
     f.apply(make_service_rule("r1"));
     REQUIRE(f.mechanism->watching_count() == 1);
 
@@ -2210,6 +2235,10 @@ TEST_CASE("#2233 item 3: a hung unwatch() wedges stop() until released",
 
     std::atomic<int> push_exit_code{-1};
     std::atomic<bool> push_done{false};
+    // stop_returned is declared here, BEFORE Cleanup - see the "hung watch() wedges
+    // stop()" test above for why (governance Gate 3 - cpp-expert and cpp-safety
+    // independently found this class of gap for the second thread's result atomics).
+    std::atomic<bool> stop_returned{false};
 
     struct Cleanup {
         FakeServiceMechanism* mech;
@@ -2234,7 +2263,6 @@ TEST_CASE("#2233 item 3: a hung unwatch() wedges stop() until released",
 
     REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(30)));
 
-    std::atomic<bool> stop_returned{false};
     cleanup.stopper_thread.emplace([&] {
         f.engine->stop();
         stop_returned.store(true, std::memory_order_release);
