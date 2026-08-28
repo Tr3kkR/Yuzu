@@ -231,8 +231,18 @@ TEST_CASE("render_results: no definition_id falls back to columns_for_plugin "
 // the out-of-scope agent's row NOR a fleet-wide count that reveals it exists.
 TEST_CASE("render_results: scope filter drops out-of-scope agents from both "
           "the rows and the agent count",
-          "[server][dashboard][render_results]") {
-    InstructionStore is{":memory:"};
+          "[pg][server][dashboard][render_results]") {
+    // Rebase hazard, found via /governance re-review (quality-engineer):
+    // this test was written when InstructionStore(":memory:") was still a
+    // valid SQLite-backed constructor; ADR-0058 (migrated to PostgreSQL)
+    // removed it upstream while this branch was rebasing, and since this
+    // test is a pure ADDITION (not a modification of pre-existing lines),
+    // git found no textual conflict to flag the break. Same
+    // dashboard_cols_instr_tpl pattern the sibling tests in this file
+    // already use.
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, dashboard_cols_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
     REQUIRE(is.is_open());
 
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);

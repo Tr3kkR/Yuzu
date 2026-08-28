@@ -77,6 +77,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 
 #include "../test_helpers.hpp"
 #include "pg/pg_pool.hpp"
@@ -5693,10 +5694,15 @@ TEST_CASE("MCP get_agent_details: out-of-scope agent collapses to not-found",
     // identical. Compare with each detail's own trailing agent_id stripped
     // rather than a fixed prefix length, so this stays correct if the
     // template wording ever changes.
+    // Gate 3 quality-engineer finding: comparing only the prefix before the
+    // id would false-green if a future template wording put the id
+    // mid-string with a distinguishing trailing suffix -- strip AND compare
+    // both sides of the id so the comparison stays sound across any
+    // template change, not just the current trailing-id shape.
     auto strip_agent_id = [](const std::string& detail, const std::string& agent_id) {
         auto pos = detail.rfind(agent_id);
         REQUIRE(pos != std::string::npos);
-        return detail.substr(0, pos);
+        return std::make_pair(detail.substr(0, pos), detail.substr(pos + agent_id.size()));
     };
     CHECK(strip_agent_id(denied_details[0], "agent-002") ==
           strip_agent_id(denied_details[1], "agent-999"));
