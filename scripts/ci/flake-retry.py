@@ -745,11 +745,13 @@ def _selftest():
     # surface.
     _entries = re.findall(r"test\(\s*'[^']*',\s*server_test_exe\b(.*?)\)", _src, re.S)
     # Windows CI test-phase restructuring (#3443, 2026-08-28): 11 pg shards
-    # (10 + new shard K) + 3 non-pg shards (A/B + new shard C) + the smoke
-    # entry (also server_test_exe) = 15. The floor stays a loose ">=", same
-    # spirit as the original "twelve" (itself a floor, not an exact pin) --
-    # exactness is check-pg-shard-partition.py's job, against the real binary.
-    check(len(_entries) >= 15, "meson.build: all fifteen server shard entries located")
+    # (10 + new shard K) + 4 non-pg shards (A/B + shard C, then a later
+    # measured-by-time follow-up added shard D, carved from B's [body_cap]
+    # tests) + the smoke entry (also server_test_exe) = 16. The floor stays
+    # a loose ">=", same spirit as the original "twelve" (itself a floor,
+    # not an exact pin) -- exactness is check-pg-shard-partition.py's job,
+    # against the real binary.
+    check(len(_entries) >= 16, "meson.build: all sixteen server shard entries located")
     _shard_specs = []
     for _body in _entries:
         # Quote-aware list match: a naive [(.*?)] truncates at the tag spec's
@@ -805,7 +807,8 @@ def _selftest():
     # check would itself catch getting dropped (hollow-discovery guard).
     #
     # What's left to pin here: the NON-pg shard filters (auth/mcp split, now
-    # three since the Windows restructuring split B -> B+C, #3443
+    # four since a later measured-by-time follow-up carved shard D's
+    # [body_cap] tests out of B, on top of the earlier B -> B+C split, #3443
     # 2026-08-28) -- comparatively stable, unlike the pg shards, which get
     # rebalanced -- so a small verbatim pin is proportionate for them
     # specifically. Plus a COUNT-based (not exact-string) sanity check that
@@ -816,13 +819,14 @@ def _selftest():
     # case the two checks are ever run without each other.
     _NONPG_SPECS = (
         ("~[pg][auth],~[pg][mcp]",),
-        ("~[pg]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]",),
+        ("~[pg]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]~[body_cap]",),
         ("~[pg]~[auth]~[mcp][cel],~[pg]~[auth]~[mcp][viz],~[pg]~[auth]~[mcp][scope],"
          "~[pg]~[auth]~[mcp][dispatch],~[pg]~[auth]~[mcp][nvd],~[pg]~[auth]~[mcp][dex]",),
+        ("[body_cap]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]",),
     )
     _pg_specs = [s for s in _shard_specs if s not in _NONPG_SPECS]
     check(all(spec in _shard_specs for spec in _NONPG_SPECS),
-          "meson.build: all three non-pg shard tag filters extracted verbatim")
+          "meson.build: all four non-pg shard tag filters extracted verbatim")
     # _pg_specs = 11 real pg shards (10 + K) + the smoke entry (also
     # server_test_exe, also not one of the three excluded non-pg tuples) =
     # 12. Not 11 -- the smoke entry's own spec ('[pg-smoke]',) has always
