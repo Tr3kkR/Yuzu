@@ -387,7 +387,7 @@ shape. Each gated step still wraps the run in
 leaks a slot) that caps concurrent heavy test phases to **2 per box** (the
 **build** phase stays 4-wide). `Test (non-pg suites)` passes `--num-processes 4`
 (one consolidated invocation now covers what used to be five separate
-suites plus the three non-pg server shards).
+suites plus the four non-pg server shards).
 
 **Staged widening — the decision rule (stated once here; each push's
 paragraph below references it, doesn't restate it).** The pg-shards step
@@ -706,7 +706,7 @@ duplicated. A shard add/split/rebalance needs no update to this check at all,
 only a correct `suite:` kwarg on the changed `test()` entry.
 `flake-retry.py`'s own selftest keeps a small, genuinely-static verbatim pin
 for the non-pg server shards (four: the Windows restructuring split shard
-B → B+C, #3443 2026-08-26, then a later measured-by-time follow-up carved
+B → B+C, #3443 2026-08-28, then a later measured-by-time follow-up carved
 shard D's `[body_cap]` tests out of B) plus a count-based sanity check that
 pg-shard extraction still finds a real population — a second, independent
 hollow-discovery signal, not a rebuild of what the structural check above
