@@ -1942,7 +1942,7 @@ TEST_CASE("SAML: a display-name attribute value is sanitised — control chars s
         CHECK(result->display_name.find("Alice") != std::string::npos);
     }
 
-    SECTION("an over-long value is clamped without splitting UTF-8") {
+    SECTION("an over-long ASCII value is clamped") {
         const std::string huge(5000, 'x');
         const auto attr_stmt = SamlTestFixture::make_attribute_statement("displayName", {huge});
         const auto response_b64 = f.make_response(request_id, "big-nameid", 3600, {}, {}, false,
@@ -1951,6 +1951,22 @@ TEST_CASE("SAML: a display-name attribute value is sanitised — control chars s
         REQUIRE(result.has_value());
         CHECK(result->display_name.size() <= 256);
         CHECK(result->display_name.size() > 0); // not emptied
+    }
+
+    SECTION("clamp lands on a UTF-8 codepoint boundary, never mid-sequence (adv-review K4)") {
+        // 100 × '€' (U+20AC = E2 82 AC, 3 bytes) = 300 bytes. A naive resize(256)
+        // would split the 86th char mid-sequence (byte 256 is a continuation
+        // byte); the back-up loop must retreat to byte 255 → 85 whole chars.
+        std::string euros;
+        for (int i = 0; i < 100; ++i) euros += "\xe2\x82\xac";
+        const auto attr_stmt = SamlTestFixture::make_attribute_statement("displayName", {euros});
+        const auto response_b64 = f.make_response(request_id, "euro-nameid", 3600, {}, {}, false,
+                                                  nullptr, false, false, attr_stmt);
+        const auto result = p.validate_response(response_b64, cookie_secret);
+        REQUIRE(result.has_value());
+        CHECK(result->display_name.size() <= 256);
+        CHECK(result->display_name.size() % 3 == 0);   // only whole 3-byte codepoints survive
+        CHECK(result->display_name.size() == 255);     // 85 × 3, not a mid-sequence 256
     }
 }
 

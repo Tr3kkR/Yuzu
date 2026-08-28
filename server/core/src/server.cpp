@@ -3368,7 +3368,8 @@ public:
 #ifdef _WIN32
         if (!cfg_.saml_idp_sso_url.empty() || !cfg_.saml_idp_cert.empty() ||
             !cfg_.saml_sp_entity_id.empty() || !cfg_.saml_sp_acs_url.empty() ||
-            !cfg_.saml_sp_key.empty()) {
+            !cfg_.saml_sp_key.empty() || !cfg_.saml_name_attribute.empty() ||
+            !cfg_.saml_email_attribute.empty()) {
             spdlog::error("SAML is not supported on Windows builds; SAML login disabled"
                           " — fail-closed");
         }

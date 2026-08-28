@@ -1417,9 +1417,15 @@ TEST_CASE("SAML ACS — display-name/email attributes set the session display (n
 
     const std::string name_id = "opaque-persistent-id"; // deliberately NOT a human name
 
+    // Construct the PG-backed fixture at TEST-BODY scope, NOT inside the
+    // value-returning lambda below. Its YUZU_REQUIRE_PG_DB skip must fire at
+    // test/section level; a SKIP() thrown from inside a CHECK(mint_display(...))
+    // expression instead surfaces as a FAILED "{ nested SKIP() called }" and
+    // breaks the no-Postgres Linux SAML test leg (adversarial-review CDX-C1).
+    SamlRoutesFixture fix(&provider);
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id;
+
     auto mint_display = [&](const std::string& attr_stmt) -> std::string {
-        SamlRoutesFixture fix(&provider);
-        fix.cfg.saml_idp_entity_id = f.idp_entity_id;
         auto start_res = fix.sink.Get("/auth/saml/start");
         REQUIRE(start_res != nullptr);
         REQUIRE(start_res->status == 302);
