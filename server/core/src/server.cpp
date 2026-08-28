@@ -21078,10 +21078,50 @@ private:
         // build_classified_command.
         auto classified = build_classified_command(caller, plugin, action, command_id);
         if (!classified) {
-            res.status = 403;
-            res.set_content(
-                R"({"error":{"code":403,"message":"command denied"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            // #1398 (governance Gate 6 sre finding, HIGH/BLOCKING): mirror
+            // the /api/command denial block exactly (server.cpp, ~line
+            // 14343) — this route was named explicitly in-scope by the
+            // design doc's Decision 7 ("REST (/api/command,
+            // forward_legacy_command): 403 ... with the specific denial
+            // reason in the audit detail") but was never actually touched
+            // by the diff. `chargen.chargen_start` (this route's live,
+            // dispatchable pair) is compiled ExecuteGate::AdminOrApproval,
+            // so an unaudited ApprovalRequired denial here was a real,
+            // reachable SOC 2 CC7.2 evidence-chain gap
+            // (docs/observability-conventions.md: "Denied operations MUST
+            // emit an audit event"), not a hypothetical one.
+            const auto& denial = classified.error();
+            const bool is_classification_error =
+                denial.reason == yuzu::server::detail::DispatchDenialReason::Unclassified ||
+                denial.reason == yuzu::server::detail::DispatchDenialReason::Ambiguous;
+            const bool is_approval_required =
+                denial.reason == yuzu::server::detail::DispatchDenialReason::ApprovalRequired;
+            const int status = is_classification_error ? 400 : 403;
+            const std::string message =
+                is_classification_error
+                    ? std::string{"unknown or ambiguous plugin.action"}
+                    : is_approval_required
+                          ? "approval required for " + plugin + "." + action +
+                                " — this action requires either an admin caller or an "
+                                "approved request; dispatch it via "
+                                "POST /api/instructions/{id}/execute instead, which "
+                                "supports the approval workflow"
+                          : "permission denied: " + denial.securable + ":" +
+                                std::string(yuzu::server::authz::to_string(denial.operation));
+            const bool audit_ok = audit_log(
+                req, "command.dispatch", "denied", "command", "",
+                std::string("reason=") +
+                    std::string(yuzu::server::detail::to_string(denial.reason)) + " " +
+                    onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                    onbehalf::sanitize_for_log(action, 128));
+            if (!audit_ok)
+                res.set_header("Sec-Audit-Failed", "true");
+            res.status = status;
+            nlohmann::json err{{"error", {{"code", status}, {"message", message}}},
+                               {"meta", {{"api_version", "v1"}}}};
+            if (audit_store_)
+                err["audit_emitted"] = audit_ok;
+            res.set_content(err.dump(), "application/json");
             return;
         }
 

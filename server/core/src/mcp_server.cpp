@@ -8113,23 +8113,37 @@ McpServer::HandlerFn McpServer::build_handler(
                             // this can be zero — a target that is QUARANTINED
                             // is withheld by the containment gate before
                             // dispatch, which is a permanent policy denial,
-                            // not transient unreachability. The dispatch
-                            // closure's return carries only (command_id,
-                            // sent), so this handler cannot yet tell the two
-                            // apart; saying so is better than asserting the
-                            // wrong one, because an agentic caller that reads
-                            // "unreachable" retries a denial forever. The
-                            // authoritative answer is the
-                            // quarantine.dispatch_denied audit row and
+                            // not transient unreachability. #1398 (governance
+                            // Gate 6 enterprise-readiness finding): a THIRD
+                            // cause collapses into this same envelope —
+                            // ExecuteGate::AdminOrApproval/AlwaysApproval
+                            // denying a non-admin, non-ticketed caller at the
+                            // dispatch chokepoint reaches this exact code
+                            // path too (mcp_server.cpp has no
+                            // classify_and_authorize_dispatch call of its own;
+                            // the shared dispatch_fn's internal chokepoint
+                            // denial surfaces as command_id/sent=0, same as
+                            // offline or quarantined). The dispatch closure's
+                            // return carries only (command_id, sent), so this
+                            // handler cannot yet tell any of the three apart;
+                            // naming all three is better than asserting one,
+                            // because an agentic caller that reads only
+                            // "unreachable" retries a permanent denial
+                            // forever. The authoritative answer is the
+                            // quarantine.dispatch_denied audit row,
                             // yuzu_server_dispatch_target_rejected_total
-                            // {reason="quarantined"}. A programmatic
+                            // {reason="quarantined"}, or
+                            // yuzu_server_dispatch_denied_total
+                            // {reason="approval_required"}. A programmatic
                             // discriminator needs a wider DispatchFn return —
-                            // tracked as a follow-up.
+                            // tracked as a follow-up (#1398 Rung 4 / #3687).
                             .add("message",
-                                 "No agents reached: every target was either unreachable or "
-                                 "withheld by the quarantine containment gate. If the device is "
-                                 "quarantined this is a policy denial and retrying will not "
-                                 "help — check quarantine status before retrying.")
+                                 "No agents reached: every target was either unreachable, "
+                                 "withheld by the quarantine containment gate, or denied "
+                                 "approval-required by the dispatch gate. A quarantine or "
+                                 "approval denial is a permanent policy refusal and retrying "
+                                 "will not help — check quarantine status, or dispatch via "
+                                 "POST /api/instructions/{id}/execute, before retrying.")
                             .str();
                     mcp_audit("failure",
                               std::string("no_agents_reached execution_id=") + execution_id);

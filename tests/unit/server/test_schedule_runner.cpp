@@ -707,3 +707,58 @@ TEST_CASE("ScheduleRunner: D7 a denied arming check audits the principal + targe
     }
     CHECK(found);
 }
+
+// #1398 (compliance-officer + sre governance findings): the
+// approval_content_mismatch audit event added alongside the content-swap
+// hardening test (above, in the SQLite-only harness section) had no test
+// verifying the audit row is actually written (compliance-officer) — a
+// future refactor of fire_with_approval could silently drop the audit()
+// call and nothing would catch it. This test wires a real AuditStore
+// (mirroring the D7 audit test just above) and checks two things: (1) the
+// row exists with the expected detail fields, and (2) it fires exactly
+// ONCE across two ticks that both re-detect the same stale mismatch — not
+// once per tick (sre finding: the stale approved ticket never changes
+// status, so an un-deduplicated audit call would re-fire on every tick for
+// as long as the fresh replacement ticket stays pending).
+TEST_CASE("ScheduleRunner: a content mismatch audits once, with the approved vs. current "
+          "target in the detail, not once per tick (#1398)",
+          "[schedule][runner][approval][1398][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, schedrunner_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+    Harness h(
+        [](const std::string&, const std::string&, const std::string&) { return true; }, &audit);
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+
+    h.runner.tick(); // submits a ticket for procs.list
+    auto pending = h.approvals.query({.status = "pending"});
+    REQUIRE(pending.size() == 1);
+    REQUIRE(h.approvals.approve(pending[0].id, "boss", "ok").has_value());
+
+    auto def_result = h.is.get_definition("test.def");
+    REQUIRE(def_result.has_value());
+    REQUIRE(def_result->has_value());
+    InstructionDefinition mutated = **def_result;
+    mutated.plugin = "script_exec";
+    mutated.action = "bash";
+    REQUIRE(h.is.update_definition(mutated).has_value());
+
+    h.runner.tick(); // detects the mismatch, audits once, submits a fresh ticket
+    h.runner.tick(); // re-detects the SAME stale mismatch — must NOT audit again
+
+    auto mismatch_rows_res = audit.query({.action = "instruction.schedule_fired"});
+    REQUIRE(mismatch_rows_res.has_value());
+    int mismatch_rows = 0;
+    for (const auto& e : *mismatch_rows_res) {
+        if (e.result == "denied" &&
+            e.detail.find("approval_content_mismatch") != std::string::npos) {
+            ++mismatch_rows;
+            CHECK(e.detail.find("approved_target=procs.list") != std::string::npos);
+            CHECK(e.detail.find("current_target=script_exec.bash") != std::string::npos);
+            CHECK(e.detail.find("schedule_id=" + id) != std::string::npos);
+        }
+    }
+    CHECK(mismatch_rows == 1);
+}
