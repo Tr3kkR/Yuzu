@@ -243,9 +243,10 @@ fi
 
 # --- 1. Repositories ---------------------------------------------------------
 #
-# ninja-build and ccache live in CRB (CodeReady Builder / PowerTools), which is
+# ninja-build lives in CRB (CodeReady Builder / PowerTools), which is
 # shipped-but-disabled on Rocky/Alma and subscription-gated on RHEL. This is the
-# single biggest RHEL-vs-Rocky divergence in the whole setup.
+# single biggest RHEL-vs-Rocky divergence in the whole setup. (ccache is one
+# repo further out - EPEL, not CRB; see CCACHE_PKG above.)
 
 step "Enabling repositories (CRB)"
 if dnf repolist --enabled 2>/dev/null | grep -qiE '^(crb|codeready-builder)'; then

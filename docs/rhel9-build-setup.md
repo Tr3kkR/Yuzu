@@ -114,9 +114,9 @@ sudo -u postgres psql -tAc \
 
 ## RHEL vs Rocky vs Alma
 
-The only material divergence is repository enablement. `ninja-build` and `ccache` live in **CRB**
+The only material divergence is repository enablement. `ninja-build` lives in **CRB**
 (CodeReady Builder, formerly PowerTools), which ships disabled on Rocky/Alma and is
-subscription-gated on RHEL.
+subscription-gated on RHEL. (`ccache` is one repo further out - EPEL, not CRB; see below.)
 
 | | Rocky 9 / Alma 9 | RHEL 9 |
 |---|---|---|
