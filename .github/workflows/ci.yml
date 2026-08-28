@@ -394,6 +394,16 @@ jobs:
           bash tests/shell/test_review_driver_substitution.sh  # patsub_replacement prompt corruption (#2644)
           bash tests/shell/test_trusted_inputs_validate.sh    # the step that picks the BUILD COMMIT (#2832)
 
+      # Prometheus HELP-text ASCII gate (#2128). Source-only, no build deps,
+      # so it belongs on the PR fast path beside the shell gate above rather
+      # than in a build job. Selftest first (fixture-level proof the gate
+      # still discriminates clean/seeded/comment-prose text), then the real
+      # scan over the tree.
+      - name: Metrics HELP ASCII gate (#2128)
+        run: |
+          bash scripts/ci/check-metrics-help-ascii.sh --selftest
+          bash scripts/ci/check-metrics-help-ascii.sh
+
   # ── Lint (disabled — clang-format reorders Windows headers and breaks MSVC builds) ──
   # lint:
   #   name: "Lint (clang-format)"
@@ -2230,7 +2240,23 @@ jobs:
       # Contrast the ccache save below, which stays on bare `always()` because a
       # partial ccache is simply a smaller ccache.
       - name: Save vcpkg installed packages (canary)
-        if: always() && steps.vcpkg-install-canary.outcome == 'success' && steps.cache-vcpkg-canary.outputs.cache-hit != 'true'
+        # CWE-349 (GHSA cache-poisoning query, #3543): a trusted-fork-ci
+        # dispatch runs untrusted fork content through this same job, but its
+        # workflow_call is invoked in the DEFAULT BRANCH's cache scope (the
+        # dispatch always targets dev/main), unlike a plain pull_request run,
+        # which the docs' "Cache access for low-trust workflow triggers"
+        # section confines to its own PR-scoped cache namespace. A save here
+        # would let a fork's build output be restored by a later, genuinely
+        # trusted push to dev/main. RESTORE above stays unconditional — reading
+        # a pre-existing entry cannot inject anything — only SAVE is gated.
+        # Mirrors the existing run-id-scoped `trusted_execution` ternary the
+        # self-hosted legs use for VCPKG_DEFAULT_BINARY_CACHE (this job has no
+        # such local-disk cache to isolate instead, since it's GHA-hosted).
+        if: >-
+          always()
+          && steps.vcpkg-install-canary.outcome == 'success'
+          && steps.cache-vcpkg-canary.outputs.cache-hit != 'true'
+          && needs.trusted_inputs.outputs.trusted_execution != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/vcpkg_installed
@@ -2252,10 +2278,14 @@ jobs:
       # superseded it has different sources and therefore a different key, so it
       # could only ever have reached that entry by prefix fallback anyway.
       - name: Save ccache (canary)
+        # Same CWE-349 gate as "Save vcpkg installed packages (canary)" above
+        # — a trusted-fork-ci dispatch must never write fork-built objects
+        # into the default branch's shared GitHub Actions cache scope.
         if: >-
           always()
           && (steps.build-canary.outcome == 'success' || steps.build-canary.outcome == 'failure')
           && steps.cache-ccache-canary.outputs.cache-hit != 'true'
+          && needs.trusted_inputs.outputs.trusted_execution != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ccache

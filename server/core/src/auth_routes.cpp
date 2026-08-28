@@ -44,6 +44,27 @@ namespace {
 // this before it reaches the audit detail.
 constexpr std::size_t kMaxJustificationLength = 1024;
 
+// Reason label for yuzu_auth_read_degrade_total (#2396 / #2401). Distinguishes
+// a transient pool-acquire outage (StoreBusy — the shared pool's
+// connect-backoff breaker fast-failing, or pool saturation; the class the
+// bounded acquire-retry rides out) from a query that RAN and errored
+// (QueryFailed / WriteFailed) and from an undecryptable/absent secret
+// (SecretUnavailable) — so SRE can tell a transient retry-storm apart from a
+// uniform outage instead of reading one flat counter. Closed label set,
+// pre-seeded in server.cpp. Any error that is not is_store_unavailable() must
+// never reach a 503 degrade site, so the default ("query_error") is a
+// belt-and-braces fallback, not an expected path.
+[[nodiscard]] const char* degrade_reason(AuthDBError e) noexcept {
+    switch (e) {
+    case AuthDBError::StoreBusy:
+        return "pool_acquire_timeout"; // matches the yuzu_*_read_degrade_total family
+    case AuthDBError::SecretUnavailable:
+        return "secret_unavailable";
+    default:
+        return "query_error";
+    }
+}
+
 // Max stored length of a single sanitised detail value (e.g. an OIDC
 // display name or email). These are short identity labels, not free-text
 // justifications, so the cap is much tighter than kMaxJustificationLength.
@@ -1765,9 +1786,30 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                             // password-spray brute-force unlimited tries while
                             // the store is degraded.
                             res.status = 503;
+                            // #2396: honest backoff hint on a transient
+                            // store-unavailable 503 (header + A4-style body
+                            // field), and a reason-labelled degrade counter so
+                            // a retry-storm is distinguishable from a uniform
+                            // outage. Does NOT change the fail-closed decision.
+                            res.set_header("Retry-After", "2");
                             res.set_content(
-                                R"({"error":{"code":503,"message":"authentication store is temporarily unavailable"},"meta":{"api_version":"v1"}})",
+                                R"({"error":{"code":503,"message":"authentication store is temporarily unavailable","retry_after_ms":2000},"meta":{"api_version":"v1"}})",
                                 "application/json");
+                            if (auto* m = auth_mgr_.metrics_registry()) {
+                                // Both counters, matching the mfa_status / mfa_init
+                                // sites: the coarse route-level total (every
+                                // store-unavailable login 503) AND the reason
+                                // split. #2396 adv-review CDX-P1-01 — the coarse
+                                // series must move at every login-path 503 so an
+                                // alert on it does not undercount an outage.
+                                m->counter("yuzu_auth_secret_unavailable_total",
+                                           {{"route", "login"}})
+                                    .increment();
+                                m->counter(
+                                     "yuzu_auth_read_degrade_total",
+                                     {{"route", "login"}, {"reason", degrade_reason(rec.error())}})
+                                    .increment();
+                            }
                         }
                     }
                 }
@@ -1833,13 +1875,25 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 mfa_enrolled = status->enrolled;
             } else {
                 res.status = 503;
+                res.set_header("Retry-After", "2"); // #2396 honest backoff hint
                 res.set_content(
                     R"({"error":{"code":503,"message":"authentication store is temporarily )"
-                    R"(unavailable"},"meta":{"api_version":"v1"}})",
+                    R"(unavailable","retry_after_ms":2000},"meta":{"api_version":"v1"}})",
                     "application/json");
                 if (auto* m = auth_mgr_.metrics_registry()) {
                     m->counter("yuzu_auth_secret_unavailable_total", {{"route", "login"}})
                         .increment();
+                    // #2396: reason-labelled sibling of the counter above so a
+                    // transient pool-acquire retry-storm is distinguishable
+                    // from a uniform secret/query outage (#2401). Gated on
+                    // is_store_unavailable so a non-store error reaching this
+                    // fail-closed else (e.g. a UserNotFound row-vanished race)
+                    // is never mislabelled with a store-degrade reason.
+                    if (is_store_unavailable(status.error())) {
+                        m->counter("yuzu_auth_read_degrade_total",
+                                   {{"route", "login"}, {"reason", degrade_reason(status.error())}})
+                            .increment();
+                    }
                 }
                 audit_log_for_principal(
                     req, "mfa.status.unavailable", "error", username,
@@ -1966,16 +2020,23 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 // harmless one-off. No session is minted either way.
                 const bool store_unavailable = is_store_unavailable(init.error());
                 res.status = store_unavailable ? 503 : 500;
+                if (store_unavailable)
+                    res.set_header("Retry-After", "2"); // #2396 honest backoff hint (503 only)
                 res.set_content(
                     store_unavailable
                         ? R"({"error":{"code":503,"message":"authentication store is temporarily )"
-                          R"(unavailable"},"meta":{"api_version":"v1"}})"
+                          R"(unavailable","retry_after_ms":2000},"meta":{"api_version":"v1"}})"
                         : R"({"error":{"code":500,"message":"Could not initiate MFA enrollment"},)"
                           R"("meta":{"api_version":"v1"}})",
                     "application/json");
                 if (store_unavailable) {
                     if (auto* m = auth_mgr_.metrics_registry()) {
                         m->counter("yuzu_auth_secret_unavailable_total", {{"route", "login"}})
+                            .increment();
+                        // #2396 reason-labelled sibling (#2401).
+                        m->counter(
+                             "yuzu_auth_read_degrade_total",
+                             {{"route", "login"}, {"reason", degrade_reason(init.error())}})
                             .increment();
                     }
                 }
