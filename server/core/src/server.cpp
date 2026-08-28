@@ -1796,7 +1796,7 @@ public:
         // the comment above this block already names for their siblings.
         metrics_.describe("yuzu_server_webhook_delivery_secret_unavailable_total",
                           "Webhook deliveries skipped because the signing secret could not be "
-                          "decrypted (tamper, KEK loss, or a malformed blob) — never fired "
+                          "decrypted (tamper, KEK loss, or a malformed blob) - never fired "
                           "unsigned or with an empty secret",
                           "counter");
         metrics_.describe("yuzu_server_webhook_fire_event_degraded_total",
@@ -1806,7 +1806,7 @@ public:
                           "counter");
         metrics_.describe("yuzu_server_webhook_delivery_log_failed_total",
                           "Delivery-log INSERTs (webhook_deliveries) that failed against an open "
-                          "store — the delivery itself still ran; only its record did not persist",
+                          "store - the delivery itself still ran; only its record did not persist",
                           "counter");
         metrics_.describe("yuzu_server_webhook_backfill_total",
                           "One-time legacy webhooks.db -> webhook_store PostgreSQL backfill "
@@ -4928,7 +4928,7 @@ public:
                 metrics_.describe("yuzu_server_instruction_bundled_content_total",
                                   "Bundled-content boot-time reseed outcome by result (clean = "
                                   "zero import errors; errored = at least one definition/set "
-                                  "failed to import against an open store — the boot refuses "
+                                  "failed to import against an open store - the boot refuses "
                                   "to serve, ADR-0058 Gate 8). Every-boot, not one-time, unlike "
                                   "sibling *_backfill_total counters.",
                                   "counter");
