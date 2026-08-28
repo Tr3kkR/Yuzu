@@ -152,10 +152,14 @@ sudo dnf install -y \
   bison flex autoconf automake libtool \
   perl perl-IPC-Cmd perl-FindBin perl-File-Compare perl-Pod-Html \
   systemd-devel glibc-devel kernel-headers \
-  python3-pip zip unzip tar curl git
+  python3-pip zip unzip tar git
 
 sudo dnf install -y ccache          # optional, EPEL only — see above
 ```
+
+`curl` is deliberately not in that list: stock RHEL-family images ship `curl-minimal`, which already
+provides the `curl` binary vcpkg needs, and installing the full `curl` package on top of it is a
+package conflict that aborts `dnf`. The script adds `curl` only when no `curl` binary exists at all.
 
 | Package(s) | Why |
 |---|---|
@@ -394,6 +398,7 @@ today this is a documented limitation rather than something the setup script can
 | `server pg unit tests shard B` TIMEOUT / SIGKILL after 600 s | Missing `pg_signal_backend`, trap 4. Check for leaked `yuzu_test_*` databases. |
 | `permission denied to terminate process` in test output | Same — trap 4. |
 | `near "RETURNING": syntax error` from a Python script | System SQLite is 3.34.1; `RETURNING` needs 3.35+. Known limitation, see above. |
+| `[fail] sudo is required` | Stock container images and minimal installs have no `sudo`. As root: `dnf install -y sudo`. |
 | vcpkg `openssl` port fails in `Configure` | Missing perl modules. Install `perl-IPC-Cmd perl-FindBin perl-File-Compare perl-Pod-Html`. |
 | vcpkg `libpq` port fails looking for `bison`/`flex` | Those two packages are not installed. |
 

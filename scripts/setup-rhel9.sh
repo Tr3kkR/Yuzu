@@ -63,8 +63,11 @@ PKGS=(
   perl perl-IPC-Cmd perl-FindBin perl-File-Compare perl-Pod-Html
   # headers the build links against
   systemd-devel glibc-devel kernel-headers
-  # python + archive/network tools vcpkg needs
-  python3-pip zip unzip tar curl git
+  # python + archive tools vcpkg needs. curl is deliberately NOT listed: stock
+  # images ship curl-minimal, which provides /usr/bin/curl but does not satisfy
+  # `rpm -q curl`, and asking dnf for the full package on top of it is a
+  # conflict that aborts the run. It is checked by capability below.
+  python3-pip zip unzip tar git
 )
 
 ENV_FILE="${HOME}/.config/yuzu/toolchain-env.sh"
@@ -164,6 +167,7 @@ if [ "$CHECK_ONLY" = 1 ]; then
   check "bison present"                    command -v bison
   check "flex present"                     command -v flex
   check "perl present"                     command -v perl
+  check "curl present"                     command -v curl
   check "python3 can import yaml"          python3 -c "import yaml"
   check "libsystemd headers present"       pkg-config --exists libsystemd
   check "VCPKG_ROOT set and bootstrapped"  test -x "${VCPKG_ROOT_ARG}/vcpkg"
@@ -188,6 +192,11 @@ fi
 # ============================================================================
 #  Provision
 # ============================================================================
+
+# Everything below escalates through sudo. A stock container image or a minimal
+# install has none, and the failure would otherwise be a bare "command not
+# found" several steps in. --dry-run never escalates, so it is exempt.
+[ "$DRY_RUN" = 1 ] || command -v sudo >/dev/null 2>&1 || die "sudo is required (as root: dnf install -y sudo)"
 
 # --- 1. Repositories ---------------------------------------------------------
 #
@@ -234,6 +243,8 @@ fi
 step "Installing system packages"
 MISSING=()
 for p in "${PKGS[@]}"; do rpm -q "$p" >/dev/null 2>&1 || MISSING+=("$p"); done
+# curl by capability, not RPM name (curl-minimal satisfies it; see PKGS).
+command -v curl >/dev/null 2>&1 || MISSING+=(curl)
 if [ ${#MISSING[@]} -eq 0 ]; then
   skip "all ${#PKGS[@]} packages already installed"
 else
