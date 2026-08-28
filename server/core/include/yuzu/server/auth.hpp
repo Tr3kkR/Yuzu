@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -16,7 +17,9 @@ class MetricsRegistry;
 }
 namespace yuzu::server {
 class AuthDB;
-}
+class SessionStore;  // HA WS-1/1a — durable operator sessions (Postgres, ADR-2002 §4)
+struct SessionRow;   // session_store.hpp — the durable row shape
+} // namespace yuzu::server
 
 namespace yuzu::server::auth {
 
@@ -427,6 +430,18 @@ public:
     /// Look up a session by cookie token.
     std::optional<Session> validate_session(const std::string& token) const;
 
+private:
+    /// Store-backed validate path (HA WS-1/1a): cache-first, then authoritative
+    /// `SessionStore::find`, with the same absolute-expiry + idle-timeout gates
+    /// as the legacy in-memory path. Only reached when `session_store_` is set;
+    /// the store-less deployment keeps the legacy body unchanged. A degraded
+    /// authoritative read for an uncached token fails the request (401), never a
+    /// silent grant.
+    std::optional<Session> validate_session_durable(const std::string& token,
+                                                    bool idle_enabled) const;
+
+public:
+
     /// Destroy a session (logout).
     void invalidate_session(const std::string& token);
 
@@ -493,6 +508,25 @@ public:
     /// If set, user operations go through the DB instead of config file.
     /// If not set, falls back to config file I/O (backwards compatible).
     void set_auth_db(yuzu::server::AuthDB* db) { auth_db_ = db; }
+
+    /// Set the durable session store (HA WS-1/1a, ADR-2002 §4). When set,
+    /// operator sessions are written-through to Postgres and validated
+    /// against it, with the in-memory `sessions_` map serving as a
+    /// generation-gated process-local cache; a session then survives a
+    /// core-replica restart/failover and validates on any replica. When
+    /// NULL (config-file-only deployments, and unit tests that do not wire
+    /// a pool) the legacy in-memory-only behavior is preserved unchanged —
+    /// the same optional-backing pattern as `set_auth_db`. Wired at startup
+    /// before any request is served.
+    void set_session_store(yuzu::server::SessionStore* s) { session_store_ = s; }
+
+    /// True iff a durable SessionStore is set AND reports open. Wired into
+    /// /readyz alongside `is_auth_db_ok()`: with sessions durable, a
+    /// half-open/failed session store is a readiness failure (the node cannot
+    /// mint or validate durable sessions). Returns true in the legacy
+    /// in-memory path (no store configured) so the signal only fires on an
+    /// actual store failure. Fail-closed like `is_auth_db_ok`.
+    bool is_session_store_ok() const noexcept;
 
     /// Configure the idle (inactivity) session timeout (SOC 2 CC6.3). When > 0,
     /// `validate_session` rejects a cookie session idle longer than `window` and
@@ -749,6 +783,53 @@ public:
 private:
     static std::string generate_session_token();
 
+    // ── Durable session store integration (HA WS-1/1a) ─────────────────────────
+    // These are all no-ops / pure-in-memory when `session_store_ == nullptr`.
+
+    /// SHA-256 (hex) of a raw session token — the SessionStore row key. Secrets
+    /// at rest: the store never sees the raw bearer token (session_store.hpp).
+    static std::string hash_token(const std::string& raw_token);
+
+    /// Reconstruct a cache `Session` from a durable `SessionRow` (wall-clock).
+    /// Stamps last_activity and both elevation fields so the ceiling and idle
+    /// gates read a fully-formed session (auth.hpp Session invariant).
+    static Session session_from_row(const yuzu::server::SessionRow& row);
+
+    /// Serialize a cache `Session` (+ its raw token) into a durable `SessionRow`.
+    yuzu::server::SessionRow row_from_session(const std::string& raw_token,
+                                              const Session& s) const;
+
+    /// Write-through a newly-created session: when a durable store is
+    /// configured, INSERT the row FIRST (outside `mu_`) and FAIL CLOSED on a
+    /// store error — a login whose session cannot be made durable is not
+    /// honored (ADR-0007 fail-closed; the server already refuses to run without
+    /// Postgres). Then cache it under `mu_`. Returns false on durable-write
+    /// failure; always true in the legacy in-memory path. Caller must NOT hold
+    /// `mu_`.
+    [[nodiscard]] bool persist_new_session(const std::string& raw_token, const Session& s);
+
+    /// Durably delete every session for a username (bumps the generation so all
+    /// replicas drop the cached copies). Called from the role-change / demote /
+    /// delete paths ALONGSIDE the local-cache wipe, so a stale-role session
+    /// cannot survive on another replica or across a restart. No-op without a
+    /// store; best-effort (logs on failure). Caller must NOT hold `mu_`.
+    void wipe_user_sessions_durable(const std::string& username);
+
+    /// Poll the durable write-generation on an interval; when it has advanced
+    /// (a create/invalidate/elevate/mfa mutation landed, possibly on another
+    /// replica), clear the process-local `sessions_` cache so the next lookup
+    /// re-reads authoritative state. Interval-gated + single-flight (mirrors
+    /// RbacStore::maybe_refresh_generation); a refresh FAILURE keeps serving the
+    /// existing cache (the absolute `expires_at` on every session is the
+    /// backstop). No-op without a store. Caller must NOT hold `mu_`.
+    ///
+    /// Coherence does NOT depend on anchoring a locally-committed write: a
+    /// mutation bumps the durable generation, so within one refresh interval
+    /// this same poll observes the advance and clears the cache, re-reading
+    /// authoritative state — write-through to the local cache only covers the
+    /// sub-interval window until then.
+    void maybe_refresh_session_generation() const;
+
     /// Persist enrollment tokens to disk.
     bool save_tokens() const;
     /// Load enrollment tokens from disk.
@@ -768,10 +849,28 @@ private:
     std::filesystem::path cfg_path_;
     std::filesystem::path data_dir_;
     std::unordered_map<std::string, UserEntry> users_;
+    // Keyed by the token HASH when a durable store is configured (it is the
+    // store row key too), by the raw token in the legacy in-memory-only mode.
+    // Serves as the generation-gated validate cache when `session_store_` is set.
     mutable std::unordered_map<std::string, Session> sessions_;
 
     // Non-owning pointer to AuthDB; if set, persistence goes through DB.
     yuzu::server::AuthDB* auth_db_ = nullptr;
+
+    // Non-owning pointer to the durable SessionStore (HA WS-1/1a). Null =
+    // legacy in-memory-only sessions. Set once at startup before serving.
+    yuzu::server::SessionStore* session_store_ = nullptr;
+
+    // Validate-cache generation state (guarded by `session_gen_mtx_`, a
+    // dedicated mutex so a generation poll never contends on the session-map
+    // `mu_`). `cached_session_gen_` is the durable write-generation this
+    // replica's `sessions_` cache is coherent with; `session_gen_valid_` is
+    // false until the first successful anchor. `last_session_gen_refresh_ms_`
+    // interval-gates the poll (single-flight claim, like RbacStore).
+    mutable std::mutex session_gen_mtx_;
+    mutable std::uint64_t cached_session_gen_ = 0;
+    mutable bool session_gen_valid_ = false;
+    mutable std::int64_t last_session_gen_refresh_ms_ = 0;
 
     /// Idle-timeout window (SOC 2 CC6.3). 0 = disabled (absolute expiry only).
     /// Read on the validate_session hot path; set once at startup before any
