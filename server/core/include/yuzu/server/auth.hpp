@@ -537,9 +537,17 @@ public:
     /// `SamlProvider::validate_response` to equal the assertion's signed
     /// `<saml:Issuer>` before this is called (see the ACS handler,
     /// auth_routes.cpp).
+    /// `saml_display_name` / `saml_email` are the session-enrichment attribute
+    /// values parsed from the same XSW-verified assertion (empty when the
+    /// `--saml-name-attribute`/`--saml-email-attribute` flags are unset). They
+    /// only derive `Session::display_name` (name -> email -> raw NameID,
+    /// mirroring `create_oidc_session`); email is never stored durably, and
+    /// neither is ever an identity/authz/SCIM-linkage input.
     std::string create_saml_session(const std::string& name_id, const std::string& entity_id,
                                     const std::vector<std::string>& groups = {},
-                                    const std::string& admin_group = {});
+                                    const std::string& admin_group = {},
+                                    const std::string& saml_display_name = {},
+                                    const std::string& saml_email = {});
 
     /// #1852 — auto-provision (or refresh) a durable `users` row for an
     /// OIDC-authenticated principal, so JIT admin elevation (which reads

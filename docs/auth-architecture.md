@@ -947,6 +947,8 @@ mapping below).
 | `--saml-sp-acs-url` | `YUZU_SAML_SP_ACS_URL` | Full URL of this server's Assertion Consumer Service (`POST /saml/acs`) |
 | `--saml-group-attribute` *(optional)* | `YUZU_SAML_GROUP_ATTRIBUTE` | `<Attribute Name="...">` in the assertion's `<AttributeStatement>` whose `<AttributeValue>`s are group identifiers (e.g. Entra's `http://schemas.microsoft.com/ws/2008/06/identity/claims/groups`) |
 | `--saml-admin-group` *(optional)* | `YUZU_SAML_ADMIN_GROUP` | Group value (from `--saml-group-attribute`) that grants `role=admin` |
+| `--saml-name-attribute` *(optional)* | `YUZU_SAML_NAME_ATTRIBUTE` | `<Attribute Name="...">` whose first `<AttributeValue>` is the user's human display name (e.g. Entra's `http://schemas.microsoft.com/identity/claims/displayname`). Empty leaves the display as the raw NameID. See "Attribute-based display" below |
+| `--saml-email-attribute` *(optional)* | `YUZU_SAML_EMAIL_ATTRIBUTE` | `<Attribute Name="...">` whose first `<AttributeValue>` is the user's email (e.g. Entra's `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress`). Used only as a display fallback and logged |
 | `--saml-sp-key` *(optional)* | `YUZU_SAML_SP_KEY` | Filesystem path to an SP AuthnRequest signing private key (PEM, **RSA only**); when set, AuthnRequests are signed (see AuthnRequest signing below) |
 
 Example startup:
@@ -1041,6 +1043,42 @@ groups the IdP didn't attest to. Parsing is capped at 64 `<AttributeValue>`
 entries (across however many `<Attribute>` elements carry the configured
 Name) as a DoS guard; values beyond the cap are silently ignored rather than
 rejecting the assertion.
+
+### Attribute-based display (name / email)
+
+By default a SAML session's `display_name` is the raw `NameID` — often an
+opaque `persistent` identifier. `--saml-name-attribute` and
+`--saml-email-attribute` let the operator name the `<Attribute>` elements that
+carry the user's display name and email, so the dashboard and audit rows show
+a human name instead. The session display is derived exactly like OIDC's
+(`create_oidc_session`): **name attribute → email attribute → raw NameID**.
+
+- Both values are read from the **same XSW-verified assertion node** as the
+  `NameID` and groups (never a second document-wide search), via the same
+  namespace-checked walk — a signature-wrapping attack cannot inject a display
+  name or email the IdP didn't attest to. The first non-empty `<AttributeValue>`
+  wins; empty values are skipped.
+- They are **session-enrichment only**. Email is used as a display fallback and
+  logged; it is **not** stored as a durable session field (mirroring OIDC,
+  which has no session email field either). Neither value is ever an identity,
+  authz, or SCIM-linkage input — the SAML identity key stays `NameID`-only
+  (`saml_principal_id`), and admin is still granted **only** from the group
+  attribute, never from the name/email attributes (the security note above
+  continues to hold — these attributes are attacker-controlled labels).
+- Both flags empty (the default) reproduces the raw-`NameID` display exactly —
+  a fully backward-compatible addition.
+
+> **PII in operational logs (data-handling note, CC6.7).** When configured, the
+> parsed display name and email appear in the **operational** log (`spdlog`) at
+> `info` on session creation — the same posture OIDC already has (its
+> `create_oidc_session` logs the resolved display + email identically). These
+> are IdP-attested values, are **not** written to the audit store (the SAML
+> audit row keys on the stable NameID-derived principal only), and are not
+> otherwise persisted. Operational logs inherit the deployment's general
+> log-access and retention controls; a first-customer questionnaire asking
+> "where does user PII appear in logs" is answered here for both SSO paths.
+> Tightening this to a hashed/omitted form across OIDC and SAML consistently is
+> tracked as a follow-up.
 
 Because role is computed fresh at every session mint (no persisted mapping),
 there is no schema or migration involved, and changing `--saml-admin-group`
@@ -1160,9 +1198,11 @@ key. Design:
 - **`--auth-mode=sso-only` for SAML.** A SAML-only deployment cannot disable
   local-password login. Compliance impact: CC6.3 (local-password fallback
   remains active). OIDC is the path to `sso-only`.
-- **AttributeStatement parsing beyond the group attribute.** Only the single
-  configured `--saml-group-attribute` is read for group→role mapping; no other
-  assertion attributes are stored or surfaced.
+- **AttributeStatement parsing beyond group/name/email.** Group→role mapping
+  (`--saml-group-attribute`) plus the display-name/email session-enrichment
+  attributes (`--saml-name-attribute`/`--saml-email-attribute`, see
+  "Attribute-based display" above) are read; no *other* assertion attributes
+  (department, title, custom claims, …) are stored or surfaced.
 - **SP metadata endpoint.** No `GET /saml/metadata` endpoint is provided; IdP
   registration uses the manual flag values.
 - **Windows server support — out of scope, not deferred.** Running the Yuzu

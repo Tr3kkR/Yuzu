@@ -1801,6 +1801,159 @@ TEST_CASE("SAML: XSW — second injected Assertion is still rejected when attrib
     CHECK(result.error().find("XSW") != std::string::npos);
 }
 
+// ── AttributeStatement: display-name / email session-enrichment ─────────────
+
+TEST_CASE("SAML: name/email attributes parse into assertion.display_name/email", "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.name_attribute  = "http://schemas.microsoft.com/identity/claims/displayname";
+    cfg.email_attribute = "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress";
+    SamlProvider p{cfg};
+
+    const auto authn_result   = p.build_authn_request("relay");
+    const auto request_id     = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    // One signed AttributeStatement carrying both attributes (extract walks all
+    // statements, so concatenated per-attribute statements are equivalent).
+    const auto attr_stmt =
+        SamlTestFixture::make_attribute_statement(cfg.name_attribute, {"Ada Lovelace"}) +
+        SamlTestFixture::make_attribute_statement(cfg.email_attribute, {"ada@example.com"});
+    const auto response_b64 = f.make_response(request_id, "ada-nameid", 3600, {}, {}, false,
+                                              nullptr, false, false, attr_stmt);
+
+    const auto result = p.validate_response(response_b64, cookie_secret);
+    REQUIRE(result.has_value());
+    CHECK(result->name_id == "ada-nameid");
+    CHECK(result->display_name == "Ada Lovelace");
+    CHECK(result->email == "ada@example.com");
+}
+
+TEST_CASE("SAML: unset name/email attribute config yields empty display_name/email "
+          "(backward-compatible)",
+          "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config(); // name_attribute / email_attribute unset (default)
+    SamlProvider p{cfg};
+
+    const auto authn_result   = p.build_authn_request("relay");
+    const auto request_id     = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    // The assertion DOES carry attributes; with the flags unset they must be
+    // ignored (the session then falls back to the raw NameID, exactly as before).
+    const auto attr_stmt = SamlTestFixture::make_attribute_statement(
+        "http://schemas.microsoft.com/identity/claims/displayname", {"Ada Lovelace"});
+    const auto response_b64 = f.make_response(request_id, "ada-nameid", 3600, {}, {}, false,
+                                              nullptr, false, false, attr_stmt);
+
+    const auto result = p.validate_response(response_b64, cookie_secret);
+    REQUIRE(result.has_value());
+    CHECK(result->display_name.empty());
+    CHECK(result->email.empty());
+}
+
+TEST_CASE("SAML: name attribute takes the FIRST non-empty value; empty values skipped", "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.name_attribute = "displayName";
+    SamlProvider p{cfg};
+
+    const auto authn_result   = p.build_authn_request("relay");
+    const auto request_id     = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    // First value empty, second the real name, third a decoy — first non-empty wins.
+    const auto attr_stmt =
+        SamlTestFixture::make_attribute_statement("displayName", {"", "Grace Hopper", "decoy"});
+    const auto response_b64 = f.make_response(request_id, "grace-nameid", 3600, {}, {}, false,
+                                              nullptr, false, false, attr_stmt);
+
+    const auto result = p.validate_response(response_b64, cookie_secret);
+    REQUIRE(result.has_value());
+    CHECK(result->display_name == "Grace Hopper");
+}
+
+TEST_CASE("SAML: XSW — name/email from an unsigned injected Assertion never leak into "
+          "display_name/email (qa-S3 parity)",
+          "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.name_attribute  = "displayName";
+    cfg.email_attribute = "email";
+    SamlProvider p{cfg};
+
+    const auto authn_result   = p.build_authn_request("relay");
+    const auto request_id     = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    // The legit SIGNED assertion carries NO enrichment attributes. The evil
+    // UNSIGNED injected assertion carries a display name and email. Same
+    // guarantee as the group qa-S3 test: extraction is scoped to the
+    // XSW-verified node, so an injected value must never reach display_name/
+    // email — and today's exactly-one-Assertion rule rejects the doc outright.
+    const auto evil_attr_stmt =
+        SamlTestFixture::make_attribute_statement("displayName", {"Attacker"}) +
+        SamlTestFixture::make_attribute_statement("email", {"attacker@evil.example"});
+    const auto response_b64 =
+        f.make_response(request_id, "victim-nameid", 3600, {}, {}, /*inject_extra_assertion=*/true,
+                        nullptr, false, false, /*attribute_statement_xml=*/{}, evil_attr_stmt);
+
+    const auto result = p.validate_response(response_b64, cookie_secret);
+    if (result.has_value()) {
+        CHECK(result->display_name != "Attacker");
+        CHECK(result->email != "attacker@evil.example");
+        CHECK(result->display_name.empty());
+        CHECK(result->email.empty());
+    } else {
+        CHECK(result.error().find("XSW") != std::string::npos);
+    }
+}
+
+TEST_CASE("SAML: a display-name attribute value is sanitised — control chars stripped, length "
+          "clamped (#2396-adjacent Gate 4 UP-1/2/3)",
+          "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.name_attribute = "displayName";
+    SamlProvider p{cfg};
+
+    const auto authn_result   = p.build_authn_request("relay");
+    const auto request_id     = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    SECTION("internal newline is stripped (no log-record forgery)") {
+        // A value carrying a newline + a fake log tail — the newline MUST NOT
+        // survive into display_name (it would forge a second spdlog line).
+        const auto attr_stmt = SamlTestFixture::make_attribute_statement(
+            "displayName", {"Alice&#10;SAML session created for 'admin' (role=Administrator)"});
+        const auto response_b64 = f.make_response(request_id, "alice-nameid", 3600, {}, {}, false,
+                                                  nullptr, false, false, attr_stmt);
+        const auto result = p.validate_response(response_b64, cookie_secret);
+        REQUIRE(result.has_value());
+        CHECK(result->display_name.find('\n') == std::string::npos);
+        CHECK(result->display_name.find('\r') == std::string::npos);
+        // The visible text survives (concatenated), only the control char is gone.
+        CHECK(result->display_name.find("Alice") != std::string::npos);
+    }
+
+    SECTION("an over-long value is clamped without splitting UTF-8") {
+        const std::string huge(5000, 'x');
+        const auto attr_stmt = SamlTestFixture::make_attribute_statement("displayName", {huge});
+        const auto response_b64 = f.make_response(request_id, "big-nameid", 3600, {}, {}, false,
+                                                  nullptr, false, false, attr_stmt);
+        const auto result = p.validate_response(response_b64, cookie_secret);
+        REQUIRE(result.has_value());
+        CHECK(result->display_name.size() <= 256);
+        CHECK(result->display_name.size() > 0); // not emptied
+    }
+}
+
 TEST_CASE("SAML: expired assertion (NotOnOrAfter in past) is rejected", "[saml]") {
     const auto& f  = fixture();
     auto cfg       = f.make_config();
