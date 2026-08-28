@@ -83,6 +83,8 @@ inline std::string kind_mismatch_error(std::string_view expected, std::string_vi
 inline std::string kind_missing_error() {
     return "kind is required. yaml_source must be a complete YAML document "
            "including 'apiVersion: yuzu.io/v1alpha1' and a 'kind:' field.";
+}
+
 // Shared error-message prefix that migrated-store methods use to signal a genuine DB/lease
 // failure, distinct from not-found/validation (ADR-0036 typed-read policy; governance Gate 3
 // architect finding). Each store previously defined its own independent
