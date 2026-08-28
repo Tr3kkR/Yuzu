@@ -426,9 +426,9 @@ Plugins for antivirus, firewall, disk encryption, event logs, vulnerability scan
 
 | | |
 |---|---|
-| **Version** | v1.0.0 |
+| **Version** | v1.1.0 |
 | **Platforms** | W L M |
-| **Description** | Query OS event logs. Uses Windows Event Log API, `journalctl` on Linux, and macOS unified log. |
+| **Description** | Query OS event logs. Reads in-process via the Windows Event Log API (wevtapi) on Windows and `sd_journal` on Linux — falling back to a bounded `journalctl` invocation where libsystemd is unavailable or the journal cannot be read — and the unified log (`log show`) on macOS. A read that fails, is denied, or is cut short by its bound reports a typed status rather than an empty result. |
 
 | Action | Description |
 |---|---|

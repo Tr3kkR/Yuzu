@@ -2264,6 +2264,48 @@ after this upgrade means generating a new client secret with your identity provi
   redaction behaviour (unchanged by this migration) and `docs/adr/0060-runtime-config-store-postgres-migration.md`
   for the full design.
 
+## ⚠️ Behaviour change: offload targets reset on Postgres cutover (ADR-0059)
+
+`OffloadTargetStore` — the response-offload control plane behind
+`/api/v1/offload-targets` — moves from the SQLite `offload_targets.db` file to the
+server's PostgreSQL substrate in this release, schema `offload_target_store`, on the
+existing shared pool. Like `ResponseStore`/`AnalyticsEventStore`, this is a
+**fresh-start cutover with no data migration** (ADR-0009's 2026-08-25
+fresh-start-by-default amendment — no production fleet has ever run a pre-Postgres
+build of this store, so there is no legacy backfill to protect), so the legacy
+`offload_targets.db` is **never read** on upgrade.
+
+**Before you upgrade, if you have offload targets configured:** the non-secret fields
+(`name`, `url`, `auth_type`, `event_types`, `batch_size`, `enabled`) are recoverable via
+`GET /api/v1/offload-targets` — list them now to speed up re-registration after the
+cutover. Credential values themselves were never GET-recoverable even before this
+migration (`auth_credential` has always been redacted from every response), so there
+is nothing new to lose there — only the non-secret configuration is worth capturing.
+
+**What happens on first PG boot:**
+- The server logs a one-time `OffloadTargetStore initialized (schema
+  offload_target_store) — fresh start, no legacy backfill` line.
+- Every previously-configured offload target and its delivery history is gone; targets
+  must be re-registered via `POST /api/v1/offload-targets` (including credentials —
+  they were never durably exportable in plaintext form to begin with).
+- No operator action required beyond re-registering targets.
+
+**Also in this release:** `auth_credential` is now encrypted at rest app-side
+(ADR-0010) rather than a plaintext column; `GET`/`list()` responses gain a
+`has_credential` boolean alongside the already-redacted `auth_credential`. A delivery
+whose target's credential fails to decrypt (KEK unavailable, a tampered/corrupted
+stored blob) is skipped entirely and logged with `error=credential_unavailable` — it is
+never fired unsigned. A degraded read on `GET /api/v1/offload-targets` or
+`GET /api/v1/offload-targets/{id}` now returns **503**, distinguishable from a genuine
+"no targets configured" (empty list) or "no such id" (404).
+
+**Rolling back:** because the legacy `offload_targets.db` is never touched by the
+Postgres-backed binary (not read, not moved, not deleted), reverting to a pre-cutover
+binary restores whatever was in that file **before** the cutover, exactly as it was.
+Any target registered through `POST /api/v1/offload-targets` on the Postgres-backed
+binary lives only in Postgres and is lost on rollback (re-register it after rolling
+forward again).
+
 ## ⚠️ Behaviour change: quarantine is now enforced at instruction dispatch (#881, #3127)
 
 Quarantine previously isolated a device's network without stopping the control plane from

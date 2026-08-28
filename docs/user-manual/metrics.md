@@ -282,7 +282,7 @@ so `absent()`/`rate()` alerting is meaningful on a healthy server.
 
 ## Webhook / offload delivery metrics (#3261, extended ADR-0057)
 
-`WebhookStore` and `OffloadTargetStore` (see [REST API §Webhooks / §Offload Targets](rest-api.md)) dispatch deliveries through a bounded worker pool; these counters cover delivery outcomes and pool backpressure. Every no-label counter below is pre-seeded to `0` at boot, so `absent()`-based alerting stays meaningful on a fresh server before the first delivery ever fires; `yuzu_server_webhook_backfill_total` is pre-seeded per `result` label value for the same reason.
+`WebhookStore` and `OffloadTargetStore` (see [REST API §Webhooks / §Offload Targets](rest-api.md)) dispatch deliveries through a bounded worker pool; these counters cover delivery outcomes and pool backpressure. Every no-label counter below is pre-seeded to `0` at boot, so `absent()`-based alerting stays meaningful on a fresh server before the first delivery ever fires; `yuzu_server_webhook_backfill_total` is pre-seeded per `result` label value for the same reason. `OffloadTargetStore` has no equivalent backfill metric — it fresh-starts unconditionally per ADR-0009's amendment, with no `migrate_from_sqlite()` to report an outcome for.
 
 | Metric | Type | Meaning |
 |---|---|---|
@@ -294,8 +294,15 @@ so `absent()`/`rate()` alerting is meaningful on a healthy server.
 | `yuzu_server_webhook_delivery_log_failed_total` | counter | Delivery-log `INSERT`s (`webhook_deliveries`) that failed against an open store — the delivery itself still ran; only its record did not persist. |
 | `yuzu_server_webhook_backfill_total{result}` | counter | One-time legacy `webhooks.db` → `webhook_store` Postgres backfill outcome on every boot, `result` ∈ `{success, failed}` (`success` covers a fresh install, an already-migrated skip, and a completed migration alike). ADR-0057. |
 | `yuzu_server_offload_delivery_success_total` | counter | Offload-target deliveries that completed with a 2xx response. |
-| `yuzu_server_offload_delivery_failed_total` | counter | Offload-target deliveries that failed (connection error, non-2xx, exception, or a tampered non-http(s) URL). |
+| `yuzu_server_offload_delivery_failed_total` | counter | Offload-target deliveries that failed (connection error, non-2xx, exception, a tampered non-http(s) URL, or a stored `auth_type` that doesn't resolve to a recognized value — a tampered/legacy row, refused rather than dispatched unauthenticated). |
 | `yuzu_server_offload_delivery_dropped_total` | counter | Offload-target deliveries dropped because the delivery worker pool's bounded queue was full, or the store was quiescing. |
+
+Two more, added with the ADR-0059 Postgres migration (also pre-seeded to `0` at boot; this store has no backfill metric — ADR-0009's fresh-start-by-default amendment means there is no legacy migration to report an outcome for):
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `yuzu_server_offload_delivery_credential_unavailable_total` | counter | Offload-target deliveries skipped because the target's credential (ADR-0010) failed to decrypt — the delivery is never fired unsigned. A nonzero rate points at KEK/keys-directory health, not the target's own configuration; cross-check against `yuzu_server_secret_decrypt_failures_total{store="offload_target_store"}` for the specific failure class. |
+| `yuzu_server_offload_fire_event_degraded_total` | counter | `fire_event`'s enabled-target scan could not acquire a database connection within its 300ms bound, or the query itself failed — that tick's events were not delivered to any target. A rising rate under normal load indicates pool exhaustion on the hot dispatch path. |
 
 ## Fleet visualization metrics
 

@@ -112,7 +112,7 @@ playbook's Backfill bullet for the detect-and-warn obligation this doesn't remov
 
 | Store | Schema | Secret handling | Notes |
 |---|---|---|---|
-| `OffloadTargetStore` | `offload_target_store` | `SecretCodec` | target credentials. **Do NOT build `migrate_from_sqlite()`** — see Wave 3 note above. |
+| `OffloadTargetStore` | `offload_target_store` | `SecretCodec` | **Implemented (ADR-0059), local/unpushed as of 2026-08-27 — the only server store remaining on this ladder** (`RuntimeConfigStore`/ADR-0060 has since merged; see its own row above). `has_credential` BOOLEAN + `auth_credential` BYTEA, XNOR CHECK constraint (WebhookStore/ADR-0057's pattern, adopted verbatim — both now merged). Own `SecretCodec` instance sharing `auth_key_provider_`; enrolled in `kek_enrolled_codecs()` (rotate/rewrap/status), the `yuzu_server_secret_decrypt_failures_total` fan-in, and — mirroring WebhookStore's own pattern — the ADR-0010 `secret.decrypt_failure` AuditStore hook (construction-time `set_audit_hook`, cleared+reset only after this store's own delivery-pool quiesce). Decrypt-on-use per delivery (never batch-cached), fail-closed on decrypt failure. No `migrate_from_sqlite()` — ADR-0009's fresh-start-by-default amendment, see Wave 3 note above; fresh start, one-time boot log line. The SQLite-era partial index on `enabled` (perf-S2, `fire_event`'s hot-path scan) is carried across as `CREATE INDEX ... WHERE enabled`. `stop()`'s `auth_key_provider_.reset()` runs after the webhook/offload delivery-pool quiesce, closing a UAF the shared FileKeyProvider would otherwise have against a still-draining delivery. |
 
 ## Notes
 

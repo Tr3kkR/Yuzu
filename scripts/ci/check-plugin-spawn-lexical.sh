@@ -478,7 +478,6 @@ RUNNER_ALLOWLIST = {
 # C/C++ source file and is excluded by SCAN_EXT below, not by this list.
 GRANDFATHERED = {
     "agents/plugins/content_dist/src/content_dist_plugin.cpp",
-    "agents/plugins/event_logs/src/event_logs_plugin.cpp",
     "agents/plugins/firewall/src/firewall_plugin.cpp",
     "agents/plugins/license_scan/src/licensing_linux.cpp",
     # installed_apps AND msi_packages both removed here (#3405): this PR

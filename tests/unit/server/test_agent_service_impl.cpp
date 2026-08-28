@@ -44,6 +44,7 @@
 #include "peer_ip.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
+#include "test_offload_target_store_pg_helper.hpp"
 #include "test_webhook_store_pg_helper.hpp"
 #include "webhook_store.hpp"
 #include <yuzu/metrics.hpp>
@@ -2191,18 +2192,17 @@ struct BareServiceHarness {
 /// the whole story before the pool existed, and left a narrow gap if a
 /// REQUIRE failed mid-poll and unwound straight into this destructor).
 struct EventSinkScope {
-    // Self-contained (skip-if-no-PG, owns its own ephemeral DB/keys dir) —
-    // see test_webhook_store_pg_helper.hpp. Declared FIRST so it destructs
-    // LAST (reverse declaration order): harmless either way since webhooks
-    // and offloads share no state, but matches the shared helper's own
-    // "declare before what borrows it" convention.
+    // Both self-contained (skip-if-no-PG, own their own ephemeral DB/keys
+    // dir) — see test_webhook_store_pg_helper.hpp /
+    // test_offload_target_store_pg_helper.hpp. Declared FIRST so they
+    // destruct LAST (reverse declaration order): harmless either way since
+    // webhooks and offloads share no state, but matches each shared
+    // helper's own "declare before what borrows it" convention.
     yuzu::test::WebhookStorePg webhooks;
-    std::unique_ptr<OffloadTargetStore> offloads;
+    yuzu::test::OffloadTargetStorePg offloads;
     AgentServiceImpl* svc{nullptr};
 
     explicit EventSinkScope(AgentServiceImpl& s) : svc(&s) {
-        offloads = std::make_unique<OffloadTargetStore>(":memory:");
-        REQUIRE(offloads->is_open());
         svc->set_webhook_store(webhooks.get());
         svc->set_offload_target_store(offloads.get());
     }
@@ -2222,12 +2222,11 @@ struct EventSinkScope {
         // delivery on the pool has actually finished, so reset() below is
         // always safe regardless of how this scope exits.
         webhooks->quiesce(std::chrono::seconds(5));
-        if (offloads)
-            offloads->quiesce(std::chrono::seconds(5));
-        offloads.reset();
-        // webhooks (WebhookStorePg) destructs after this body returns,
-        // via its own member order — no explicit .reset() available/needed
-        // (it is a value member, not a unique_ptr).
+        offloads->quiesce(std::chrono::seconds(5));
+        // webhooks (WebhookStorePg) and offloads (OffloadTargetStorePg)
+        // both destruct after this body returns, via their own member
+        // order — no explicit .reset() available/needed (they are value
+        // members, not unique_ptr).
     }
 
     EventSinkScope(const EventSinkScope&) = delete;
@@ -2273,9 +2272,11 @@ TEST_CASE("process_gateway_response: wired webhook + offload sinks receive "
     // instead of dispatching immediately (test_offload_target_store.cpp's
     // batch_size>1 idiom) — proves fire_event ran without racing a
     // detached-thread dispatch.
-    auto off_id = sinks.offloads->create_target("t1", "http://127.0.0.1:1/off", OffloadAuthType::None,
-                                                "", "execution.completed", /*batch_size=*/2);
-    REQUIRE(off_id > 0);
+    auto off_result = sinks.offloads->create_target(
+        "t1", "http://127.0.0.1:1/off", OffloadAuthType::None, "", "execution.completed",
+        /*batch_size=*/2);
+    REQUIRE(off_result.has_value());
+    auto off_id = *off_result;
 
     auto resp = GatewayResponseHarness::make_response("cmd-hook-1", apb::CommandResponse::SUCCESS,
                                                         /*output=*/"done", /*exit_code=*/0);
@@ -2400,10 +2401,11 @@ TEST_CASE("Register: notification fires once on first enrollment; webhook/offloa
     REQUIRE(wh_id_result.has_value());
     auto wh_id = *wh_id_result;
     REQUIRE(wh_id > 0);
-    auto off_id = sinks.offloads->create_target("t1", "http://127.0.0.1:1/off",
-                                                OffloadAuthType::None, "", "agent.registered",
-                                                /*batch_size=*/1);
-    REQUIRE(off_id > 0);
+    auto off_result = sinks.offloads->create_target("t1", "http://127.0.0.1:1/off",
+                                                    OffloadAuthType::None, "", "agent.registered",
+                                                    /*batch_size=*/1);
+    REQUIRE(off_result.has_value());
+    auto off_id = *off_result;
 
     auto req = make_register("reauth-test-agent");
 

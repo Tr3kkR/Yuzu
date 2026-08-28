@@ -99,7 +99,7 @@ duplicates.
 | diagnostics | ✅ | ✅ | ✅ | portable — `std::filesystem` checks |
 | discovery | ✅ | ✅ | ✅ | all three legs are native (`GetIpNetTable2` / `/proc/net/arp` / sysctl routing table), and the sweep uses a shared unprivileged ICMP socket, constrained on Linux by `net.ipv4.ping_group_range` |
 | disk_space | ✅ | ✅ | ✅ | linux/apple/win branches; `#else` unsupported only |
-| event_logs | ✅ | ✅ | ✅ | win/linux/apple branches. macOS `log show` now runs under the bounded `SubprocessRunner` with a hard wall-clock deadline (no built-in timeout in the tool), classified by pure `event_logs_macos.hpp` (`decide_log_show_output`) — a timed-out/degraded run surfaces a sentinel row + non-zero rc, never a silent empty result |
+| event_logs | ✅ | ✅ | ✅ | win/linux/apple branches, natively acquired on Windows and Linux (ADR-3002 rung-1 migration): Windows reads wevtapi `EvtQuery`/`EvtRender` in-process (bounded `EvtNext` wait, typed permission_denied/unavailable/constrained statuses); Linux reads a bounded `sd_journal` walk behind the `systemd_guard` feature, falling back to a bounded pre-split `journalctl` argv when compiled out or the journal is unreachable. macOS `log show` runs under the bounded `SubprocessRunner` with a hard wall-clock deadline (no built-in timeout in the tool), classified by pure `event_logs_macos.hpp` (`decide_log_show_output`) — a timed-out/degraded run surfaces a sentinel row + non-zero rc, never a silent empty result |
 | example | ✅ | ✅ | ✅ | portable — sample plugin |
 | filesystem | ✅ | ✅ | ✅ | `_WIN32` vs POSIX. `get_signature`/`get_version_info` now Win + macOS (Linux platform-unsupported) — depth in the **Security posture** section rows |
 | firewall | ✅ | ✅ | ✅ | win/linux/apple all implemented |
@@ -270,12 +270,12 @@ implementation is.
 | disk_space | free | linux | supported | 1 | statvfs(2) | - |
 | disk_space | free | macos | supported | 1 | statfs(2) | - |
 | disk_space | free | windows | supported | 1 | GetDiskFreeSpaceExW | - |
-| event_logs | errors | linux | supported | 3 | journalctl | - |
-| event_logs | errors | macos | supported | 2 | log_show | - |
-| event_logs | errors | windows | supported | 3 | powershell_getwinevent | - |
-| event_logs | query | linux | supported | 3 | journalctl | - |
-| event_logs | query | macos | supported | 2 | log_show | - |
-| event_logs | query | windows | supported | 3 | powershell_getwinevent | - |
+| event_logs | errors | linux | supported | 1 | sd_journal (bounded local read, PRIORITY<=err) | falls back to a bounded journalctl argv invocation (rung 2) when libsystemd is compiled out (-Dsystemd_guard) or the journal is unreachable |
+| event_logs | errors | macos | supported | 2 | log_show | requires root or a real login session to open the local unified-log data store -- a non-root headless process gets EX_NOPERM/77 regardless of Full Disk Access (docs/darwin-compat.md); no gap in production, which runs as a root LaunchDaemon |
+| event_logs | errors | windows | supported | 1 | wevtapi (EvtQuery/EvtRender, Level=2, bounded EvtNext) | - |
+| event_logs | query | linux | supported | 1 | sd_journal (bounded local read, keyword match) | falls back to a bounded journalctl argv invocation (rung 2) when libsystemd is compiled out (-Dsystemd_guard) or the journal is unreachable |
+| event_logs | query | macos | supported | 2 | log_show | requires root or a real login session to open the local unified-log data store -- a non-root headless process gets EX_NOPERM/77 regardless of Full Disk Access (docs/darwin-compat.md); no gap in production, which runs as a root LaunchDaemon |
+| event_logs | query | windows | supported | 1 | wevtapi (EvtQuery/EvtRender, bounded EvtNext) | - |
 | example | ping | linux | supported | 1 | in-process | - |
 | example | ping | macos | supported | 1 | in-process | - |
 | example | ping | windows | supported | 1 | in-process | - |
