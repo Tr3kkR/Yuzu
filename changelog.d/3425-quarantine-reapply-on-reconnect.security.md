@@ -37,10 +37,11 @@
   while a dispatched command's response is being polled now escalates backoff like every
   other repeated-failure path in the reconciler's state machine, instead of retrying at a
   flat ~60s cadence for as long as the outage lasts. `yuzu_server_quarantine_reconciler_tick_healthy`
-  is a new gauge distinguishing "the reconciler's last periodic tick genuinely found nothing
-  unconfirmed" from "the last tick couldn't check" — `yuzu_server_quarantine_endpoint_unconfirmed`
-  silently freezes at its last value during a sustained `quarantine_store` outage, and this
-  is the freshness signal that catches it.
+  is a new gauge distinguishing "the reconciler's last periodic tick reached its normal
+  publish" (however many or few records it found — including zero) from "the last tick
+  couldn't check" — `yuzu_server_quarantine_endpoint_unconfirmed` silently freezes at its last
+  value during a sustained `quarantine_store` outage, and this is the freshness signal that
+  catches it.
 
 - **BREAKING — `POST /api/v1/quarantine` now validates `whitelist` at write time (#3425).**
   Previously this route wrote the field unchecked, regardless of shape — a malformed value
@@ -50,4 +51,10 @@
   MCP's `quarantine_device` already enforced (≤512 characters total, each comma-separated
   token ≤45 characters, `[0-9A-Fa-f.:]` only) and rejected with `400` instead of written. Any
   caller relying on this route's historical permissiveness for CIDR or hostname whitelist
-  entries will now receive `400` on a call that previously returned `201`.
+  entries will now receive `400` on a call that previously returned `201` — and, because this
+  route only ever creates a NEW record (rejected with 400 if the device is already
+  quarantined), a caller that ignores the `400` gets no containment at all for that device,
+  where previously a malformed-but-persisted record still left it denied at the #881
+  control-plane dispatch gate even though its endpoint firewall could never be enforced. An
+  already-quarantined device is unaffected either way — this route can't mutate an existing
+  record's whitelist, so no in-place containment is ever lost by this change.

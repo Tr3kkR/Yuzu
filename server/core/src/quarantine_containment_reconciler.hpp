@@ -204,6 +204,23 @@ public:
     /// rate-limit claim as `tick()` so a racing tick cannot double-dispatch.
     void notify_agent_heartbeat(std::string_view agent_id);
 
+    /// #3425 governance correction round (cpp-safety SHOULD + unhappy-path
+    /// UP-1, independently converged): call from the tick-thread's outer
+    /// catch (`server.cpp`) on ANY exception `tick()` propagates — whether
+    /// before the read (never wired, degraded), or after the success-path
+    /// publish, from the per-record `reconcile_one` dispatch loop (Gate 8
+    /// re-review, docs-writer + security-guardian, independently converged:
+    /// an earlier draft of this comment overclaimed "before reaching any
+    /// publish_tick_health() call site", which the dispatch-loop case
+    /// disproves — the gauge correctly reads unhealthy either way, this was
+    /// a wording-only imprecision). Without this, an exception mid-tick (a
+    /// PG/gRPC boundary throw) leaves the freshness gauge frozen at its last
+    /// value — exactly the outage class it exists to expose, and silently,
+    /// since the outer catch only logs. Its own body must not itself throw
+    /// (Gate 8, cpp-safety SHOULD + cpp-expert INFO, independently
+    /// converged): it runs from inside a catch block nothing else catches.
+    void on_tick_exception() const;
+
 private:
     enum class Pending { none, apply, status };
 

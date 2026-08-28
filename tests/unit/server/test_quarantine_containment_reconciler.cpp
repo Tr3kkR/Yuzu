@@ -26,6 +26,7 @@
 #include "agent_registry.hpp"
 #include "audit_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "quarantine_store.hpp"
 #include "response_store.hpp"
 
@@ -34,6 +35,8 @@
 #include "agent.pb.h"
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <libpq-fe.h>
 
 #include <yuzu/metrics.hpp>
 
@@ -48,7 +51,9 @@
 using namespace yuzu::server;
 using yuzu::server::detail::AgentRegistry;
 using yuzu::server::detail::EventBus;
+using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
+using yuzu::server::pg::PgResult;
 
 namespace {
 
@@ -947,6 +952,93 @@ TEST_CASE("QuarantineContainmentReconciler: a successful tick publishes tick_hea
 
     reconciler.tick();
     CHECK(metrics.gauge("yuzu_server_quarantine_reconciler_tick_healthy").value() == 1);
+}
+
+TEST_CASE("QuarantineContainmentReconciler: a degraded list_quarantined() read on an OPEN "
+          "store also publishes tick_healthy=0, not only the never-wired branch",
+          "[pg][quarantine][reconciler]") {
+    // #3425 governance correction round (cpp-expert LOW + security-guardian
+    // INFO + quality-engineer MEDIUM, independently converged three ways):
+    // the two early returns in tick() publish identical `false`, but only
+    // the `!quarantine_store` branch (above) had a dedicated assertion —
+    // and that branch is production-UNREACHABLE (server.cpp fails closed at
+    // boot, before quarantine_reconciler_ is ever constructed, on a store
+    // that fails to open). The branch this gauge actually exists for — a
+    // previously-open store whose read degrades mid-flight — had zero
+    // coverage. Force a genuine read failure (not a mock) by dropping the
+    // table out from under the still-open store.
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_recon_tpl);
+    PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineStore qstore{qpool};
+    REQUIRE(qstore.is_open());
+
+    {
+        PgConn conn{PQconnectdb(qdb.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult drop{PQexec(conn.get(), "DROP TABLE quarantine_store.quarantine_records CASCADE")};
+        REQUIRE(drop.ok());
+    }
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry{bus, metrics};
+
+    MockDispatch dispatch;
+    QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
+        .quarantine_store = &qstore,
+        .response_store = nullptr,
+        .registry = &registry,
+        .metrics = &metrics,
+        .audit_store = nullptr,
+        .dispatch_fn = dispatch.fn(),
+        .now_fn = {},
+    });
+
+    // Same pre-seed rationale as the sibling test above: Gauge::value()
+    // defaults to 0.0, so asserting == 0 without ever setting it first
+    // cannot distinguish the fix running from the fix being silently
+    // removed.
+    metrics.gauge("yuzu_server_quarantine_reconciler_tick_healthy").set(1);
+
+    reconciler.tick();
+    CHECK(dispatch.calls.empty());
+    CHECK(metrics.gauge("yuzu_server_quarantine_reconciler_tick_healthy").value() == 0);
+}
+
+TEST_CASE("QuarantineContainmentReconciler: on_tick_exception publishes tick_healthy=0 and "
+          "counts degraded",
+          "[quarantine][reconciler]") {
+    // Gate 8 re-review (cpp-safety SHOULD + quality-engineer NICE,
+    // independently converged): the fourth publish_tick_health(false) call
+    // site — server.cpp's tick-thread outer catch, wired to this method —
+    // had no direct test; the other three (null store, degraded read,
+    // success path) all do. Called directly rather than via a real thrown
+    // exception since there is no fault-injection seam on the dispatch/PG
+    // path yet (chaos-injector CH-1, deferred).
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry{bus, metrics};
+
+    MockDispatch dispatch;
+    QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
+        .quarantine_store = nullptr,
+        .response_store = nullptr,
+        .registry = &registry,
+        .metrics = &metrics,
+        .audit_store = nullptr,
+        .dispatch_fn = dispatch.fn(),
+        .now_fn = {},
+    });
+
+    metrics.gauge("yuzu_server_quarantine_reconciler_tick_healthy").set(1);
+    const double before =
+        metrics.counter("yuzu_server_quarantine_reapply_total", {{"result", "degraded"}}).value();
+
+    reconciler.on_tick_exception();
+
+    CHECK(metrics.gauge("yuzu_server_quarantine_reconciler_tick_healthy").value() == 0);
+    CHECK(metrics.counter("yuzu_server_quarantine_reapply_total", {{"result", "degraded"}})
+              .value() == before + 1);
 }
 
 // ── Adversarial-review regression tests (2026-08-24) ───────────────────────

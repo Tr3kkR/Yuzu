@@ -269,6 +269,21 @@ void QuarantineContainmentReconciler::tick() {
     }
 }
 
+void QuarantineContainmentReconciler::on_tick_exception() const {
+    // Gate 8 re-review (cpp-safety SHOULD + cpp-expert INFO, independently
+    // converged): this runs from inside server.cpp's outer catch, where
+    // nothing else catches — publish_tick_health()/count() are not noexcept
+    // (both take a lock and touch an unordered_map), so a genuinely
+    // pathological failure here (OOM, lock corruption) must not itself
+    // escape and terminate the process on top of the tick() exception
+    // already being handled.
+    try {
+        publish_tick_health(false);
+        count("degraded");
+    } catch (...) {
+    }
+}
+
 void QuarantineContainmentReconciler::notify_agent_heartbeat(std::string_view agent_id_sv) {
     const std::string agent_id(agent_id_sv);
     {

@@ -18005,9 +18005,18 @@ private:
                     } catch (const std::exception& e) {
                         spdlog::error("quarantine_reconciler: tick threw ({}) — thread continuing",
                                       e.what());
+                        // #3425 governance correction round (cpp-safety
+                        // SHOULD + unhappy-path UP-1): an exception here
+                        // means this tick did not reach ITS OWN successful
+                        // completion (whether it never reached the read, or
+                        // threw later during dispatch) — without this, the
+                        // freshness gauge freezes at its last value instead
+                        // of exposing the outage.
+                        quarantine_reconciler_->on_tick_exception();
                     } catch (...) {
                         spdlog::error(
                             "quarantine_reconciler: tick threw unknown exception — continuing");
+                        quarantine_reconciler_->on_tick_exception();
                     }
                 }
             }

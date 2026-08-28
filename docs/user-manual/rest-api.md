@@ -1576,10 +1576,16 @@ Quarantine a device.
 >   the next periodic tick populates it, so a heartbeat arriving in that
 >   narrow window doesn't shortcut the wait. A record created here for a
 >   reachable device does not stay dormant — the one exception is a stored
->   `whitelist` the re-dispatch validator refuses (this route does no
->   charset/length validation of its own): every reconcile attempt then
->   counts `validation_failed` and nothing is ever dispatched. That failure
->   is loud, not silent — the device stays in
+>   `whitelist` the re-dispatch validator refuses. As of #3425 (`d1f71c58f`)
+>   this route validates `whitelist` at write time (`400` instead of `201`
+>   for a malformed value), the same rule MCP's `quarantine_device` already
+>   enforced — so a fresh write here can no longer land in this state. A
+>   `validation_failed` reconcile now points at a record migrated from the
+>   legacy `quarantine.db` (ADR-0047 backfill, which copies `whitelist`
+>   verbatim with no validation) or one written via this route before
+>   `d1f71c58f` shipped, not a fresh call. Either way, every reconcile
+>   attempt then counts `validation_failed` and nothing is ever dispatched.
+>   That failure is loud, not silent — the device stays in
 >   `yuzu_server_quarantine_endpoint_unconfirmed{reachability="connected"}`
 >   and trips `YuzuQuarantineEndpointUnconfirmed` after 15 minutes — but it
 >   is a real way for a record to go permanently unenforced through this

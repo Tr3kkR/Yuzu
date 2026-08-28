@@ -893,18 +893,28 @@ groups:
             on correct behaviour (the #2553/observability-conventions.md
             lesson already applied to reason="quarantined" dispatch
             denials) - that population is dashboard material, not an
-            alert. Correlate with yuzu_server_quarantine_reapply_total{result}
-            for WHY: "validation_failed" means the stored whitelist itself is
-            undispatchable (likely written via the record-only REST twin,
-            POST /api/v1/quarantine, with no server-edge validation);
-            "busy"/"unconfirmed" mean a dispatch landed but did not (yet)
-            confirm; "degraded" means the reconciler's own reads are
-            failing - check yuzu_server_quarantine_read_degrade_total and
-            the Postgres pool, same triage as YuzuQuarantineGateFailClosed.
-            The audited evidence trail is the quarantine.reapply verb
-            (system principal, detail carries record_id + command_id +
-            trigger=tick|heartbeat, or "CONFIRMED record_id=... command_id=..."
-            on success).
+            alert. Check yuzu_server_quarantine_reconciler_tick_healthy first
+            - if 0, the reconciler's own reads are currently failing and this
+            alert's source gauge is frozen at a stale value, not necessarily
+            an accurate one; triage the reconciler itself before this alert's
+            population. If tick_healthy=1, correlate with
+            yuzu_server_quarantine_reapply_total{result} for WHY:
+            "validation_failed" means the stored whitelist itself is
+            undispatchable - as of #3425 (d1f71c58f) POST /api/v1/quarantine
+            validates whitelist at write time, so this now points at a record
+            migrated from the legacy quarantine.db (ADR-0047 backfill, no
+            validation) or one written before d1f71c58f shipped, not a fresh
+            REST write; "busy"/"unconfirmed" mean a dispatch landed but did
+            not (yet) confirm; "degraded" means either a per-agent
+            apply/confirm/status call is failing, OR the tick itself is
+            failing (check tick_healthy above first to tell which) - NOT
+            reliably correlated against yuzu_server_quarantine_read_degrade_total
+            (see that counter's row in metrics.md) - check the Postgres
+            pool, same triage as
+            YuzuQuarantineGateFailClosed. The audited evidence trail is the
+            quarantine.reapply verb (system principal, detail carries
+            record_id + command_id + trigger=tick|heartbeat, or "CONFIRMED
+            record_id=... command_id=..." on success).
 
       - alert: YuzuDispatchTargetRejected
         expr: |

@@ -624,6 +624,10 @@ quarantine record whose endpoint containment is not yet confirmed:
   `YuzuQuarantineEndpointUnconfirmed` in [Metrics](metrics.md). `yuzu_server_quarantine_reapply_total{result}`
   breaks down every outcome (`reapplied`, `confirmed`, `unconfirmed`, `busy`, `offline`,
   `not_reached`, `rate_limited`, `pending`, `degraded`, `validation_failed`, `dispatch_error`).
+  `yuzu_server_quarantine_reconciler_tick_healthy` (0/1) distinguishes a genuinely-empty confirm
+  queue from a tick that couldn't read at all — check it first when
+  `yuzu_server_quarantine_endpoint_unconfirmed` looks suspiciously static, since that gauge
+  freezes rather than reflecting an outage.
 
 A manual re-issue of `quarantine_device` (MCP) still works and re-drives the same stored intent —
 it is redundant with the automatic reconciler, never required, and never harmful.

@@ -1034,7 +1034,7 @@ you see this on a rolling upgrade, retry once traffic quiesces (a load
 balancer draining the outgoing replica is usually enough); it is not a data
 integrity concern either way.
 
-### vNEXT — a device quarantined while offline now re-contains itself automatically on reconnect (#3425)
+### vNEXT — a device quarantined while offline now re-contains itself automatically on reconnect (#3425) (breaking)
 
 `QuarantineStore` gains schema v2: two columns on `quarantine_records`
 (`last_applied_at`, `last_confirmed_at`, both `BIGINT NOT NULL DEFAULT 0`) tracking whether a new
@@ -1043,16 +1043,28 @@ endpoint firewall since it last reconnected. Same `ACCESS EXCLUSIVE` migration-l
 API-token entry above applies here too — negligible in practice, since `quarantine_records` is a
 small, manually-curated security-event table, not a hot path.
 
-No operator action needed. Previously, a device quarantined while offline stayed contained at the
-control plane (the #881 dispatch gate) indefinitely, but its own firewall was never (re-)applied
-until someone noticed and manually re-issued the `quarantine_device` MCP call. On upgrade, every
-pre-existing active quarantine record starts unconfirmed, so expect one automatic re-application
-attempt per connected contained device shortly after the new binary starts serving — this is
-idempotent and is the correct, intended behaviour (those are exactly the devices whose endpoint
-containment was never independently confirmed). See `docs/user-manual/security-hardening.md`
-"Reconnect re-application (#3425)" for the mechanism and the new
-`yuzu_server_quarantine_endpoint_unconfirmed{reachability}` / `yuzu_server_quarantine_reapply_total{result}`
+No operator action needed for the reconciler itself. Previously, a device quarantined while
+offline stayed contained at the control plane (the #881 dispatch gate) indefinitely, but its own
+firewall was never (re-)applied until someone noticed and manually re-issued the
+`quarantine_device` MCP call. On upgrade, every pre-existing active quarantine record starts
+unconfirmed, so expect one automatic re-application attempt per connected contained device shortly
+after the new binary starts serving — this is idempotent and is the correct, intended behaviour
+(those are exactly the devices whose endpoint containment was never independently confirmed). See
+`docs/user-manual/security-hardening.md` "Reconnect re-application (#3425)" for the mechanism and
+the new `yuzu_server_quarantine_endpoint_unconfirmed{reachability}` /
+`yuzu_server_quarantine_reapply_total{result}` / `yuzu_server_quarantine_reconciler_tick_healthy`
 metrics.
+
+**BREAKING for callers of `POST /api/v1/quarantine`.** This route now validates `whitelist` at
+write time (≤512 chars, `[0-9A-Fa-f.:]` tokens only) and rejects a malformed value with `400`
+instead of persisting it — a caller relying on the old permissiveness for a CIDR range or hostname
+entry now gets `400` where it previously got `201`. This route only ever creates a NEW record (it
+already refuses with `400` if the device is already quarantined), so no *existing* containment is
+ever lost by this change — but a caller that fires a quarantine request and ignores a `400`
+response now gets zero protection for that device, where before a malformed-but-persisted record
+still left it denied at the #881 control-plane dispatch gate (its endpoint firewall was never
+actually enforceable either way, since the same malformed value could never be dispatched). Check
+the response status; do not assume success.
 
 `QuarantineContainmentReconciler` is **always on, with no configuration surface** — no CLI flag or
 env var disables or tunes it (matching the #881 dispatch gate it complements, which is the same

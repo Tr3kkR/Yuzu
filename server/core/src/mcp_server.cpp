@@ -9073,7 +9073,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         // that turned out not to be there.
                         mcp_audit("failure", "agent_id=" + agent_id + ", " + err.detail);
                         res.set_content(a4_error(kInternalError, err.detail, "retry the request",
-                                                 /*retry_after_ms=*/5000),
+                                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                         "application/json");
                         return;
                     }
@@ -9200,7 +9200,18 @@ McpServer::HandlerFn McpServer::build_handler(
                                        "containment is re-applied automatically on reconnect; "
                                        "re-issuing this call is optional, not required"
                                      : "retry the request",
-                                 /*retry_after_ms=*/device_durably_unreachable ? 60000 : 5000),
+                                 // 60000 (not a named constant — a one-site,
+                                 // deliberately longer wait for the durably-
+                                 // unreachable case, distinct from the
+                                 // ordinary store-fault retry below) vs
+                                 // kMcpStoreFaultRetryMs (#3425 governance
+                                 // correction round, architect LOW: this
+                                 // site's own retryable branch had drifted to
+                                 // a bare 5000 literal after #3344 named the
+                                 // sibling sites in this same handler).
+                                 /*retry_after_ms=*/device_durably_unreachable
+                                     ? 60000
+                                     : mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
