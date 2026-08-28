@@ -453,9 +453,9 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     s.username = username;
     s.display_name = username; // local auth: username IS the human label
     s.role = it->second.role;
-    s.expires_at = std::chrono::steady_clock::now() + kSessionDuration;
+    s.expires_at = std::chrono::system_clock::now() + kSessionDuration;
     s.auth_source = "local";
-    s.last_activity_at = std::chrono::steady_clock::now();
+    s.last_activity_at = std::chrono::system_clock::now();
     s.last_activity_persisted_at = s.last_activity_at;
     sessions_[token] = std::move(s);
 
@@ -532,12 +532,12 @@ std::string AuthManager::create_local_session(const std::string& username, Role 
     s.username = username;
     s.display_name = username; // local auth: username IS the human label
     s.role = role;
-    s.expires_at = std::chrono::steady_clock::now() + kSessionDuration;
+    s.expires_at = std::chrono::system_clock::now() + kSessionDuration;
     s.auth_source = "local";
-    s.last_activity_at = std::chrono::steady_clock::now();
+    s.last_activity_at = std::chrono::system_clock::now();
     s.last_activity_persisted_at = s.last_activity_at;
     if (mfa_verified) {
-        s.mfa_verified_at = std::chrono::steady_clock::now();
+        s.mfa_verified_at = std::chrono::system_clock::now();
     }
     {
         std::unique_lock lock(mu_);
@@ -564,11 +564,11 @@ bool AuthManager::mark_session_mfa_verified(const std::string& token) {
     auto it = sessions_.find(token);
     if (it == sessions_.end())
         return false;
-    it->second.mfa_verified_at = std::chrono::steady_clock::now();
+    it->second.mfa_verified_at = std::chrono::system_clock::now();
     return true;
 }
 
-std::optional<std::chrono::steady_clock::time_point>
+std::optional<std::chrono::system_clock::time_point>
 AuthManager::elevate_session(const std::string& token, std::chrono::seconds duration) {
     if (token.size() > auth::kMaxSessionTokenLength)
         return std::nullopt;
@@ -580,7 +580,7 @@ AuthManager::elevate_session(const std::string& token, std::chrono::seconds dura
     // outlive the cookie session that carries it (follow-up B, security review
     // 2026-06-30). (std::min) parenthesised to dodge the <windows.h> `min`
     // function-like macro on MSVC (see the note at validate_session below).
-    const auto now = std::chrono::steady_clock::now();
+    const auto now = std::chrono::system_clock::now();
     const auto until = (std::min)(now + duration, it->second.expires_at);
     // Dead-window guard (governance hardening round, UP-1/UP-4): a session
     // that crosses its own absolute expires_at between validate_session and
@@ -594,6 +594,12 @@ AuthManager::elevate_session(const std::string& token, std::chrono::seconds dura
     if (until <= now)
         return std::nullopt;
     it->second.elevated_until = until;
+    // Stamp the max-delta anchor together with elevated_until (auth.hpp
+    // is_elevated ceiling, ADR-2002 §4): the granted window `until - now` is
+    // already ≤ the caller-clamped duration, so it passes kMaxElevationWindow;
+    // the anchor lets that ceiling re-check the invariant on every read,
+    // including after a durable round-trip on another replica.
+    it->second.elevation_issued_at = now;
     return until;
 }
 
@@ -605,7 +611,8 @@ bool AuthManager::revoke_elevation(const std::string& token) {
     if (it == sessions_.end())
         return false;
     const bool was_elevated = is_elevated(it->second);
-    it->second.elevated_until = {}; // clear → effective role reverts to base
+    it->second.elevated_until = {};     // clear → effective role reverts to base
+    it->second.elevation_issued_at = {}; // clear the anchor together (auth.hpp)
     return was_elevated;
 }
 
@@ -628,7 +635,7 @@ std::optional<std::string> AuthManager::reap_expired_elevation(const std::string
         // Sentinel (epoch) means "never elevated" OR "already reaped/revoked"
         // — nothing to report. Still-live means nothing to report yet either.
         if (it->second.elevated_until.time_since_epoch().count() == 0 ||
-            std::chrono::steady_clock::now() < it->second.elevated_until)
+            std::chrono::system_clock::now() < it->second.elevated_until)
             return std::nullopt;
     }
 
@@ -643,8 +650,9 @@ std::optional<std::string> AuthManager::reap_expired_elevation(const std::string
     if (it == sessions_.end())
         return std::nullopt;
     if (it->second.elevated_until.time_since_epoch().count() != 0 &&
-        std::chrono::steady_clock::now() >= it->second.elevated_until) {
+        std::chrono::system_clock::now() >= it->second.elevated_until) {
         it->second.elevated_until = {};
+        it->second.elevation_issued_at = {}; // clear the anchor together (auth.hpp)
         return it->second.username;
     }
     return std::nullopt;
@@ -662,6 +670,7 @@ int AuthManager::revoke_user_elevations(const std::string& username) {
     for (auto& [token, s] : sessions_) {
         if (s.username == username && is_elevated(s)) {
             s.elevated_until = {};
+            s.elevation_issued_at = {}; // clear the anchor together (auth.hpp)
             ++cleared;
         }
     }
@@ -684,7 +693,7 @@ std::optional<Session> AuthManager::validate_session(const std::string& token) c
     if (it == sessions_.end())
         return std::nullopt;
 
-    auto now = std::chrono::steady_clock::now();
+    auto now = std::chrono::system_clock::now();
     if (now > it->second.expires_at) // absolute lifetime — always enforced
         return std::nullopt;
 
@@ -727,7 +736,7 @@ std::optional<Session> AuthManager::validate_session(const std::string& token) c
     if (need_write) {
         lock.unlock();
         std::unique_lock wlock(mu_);
-        auto wnow = std::chrono::steady_clock::now();
+        auto wnow = std::chrono::system_clock::now();
 
         // Opportunistic reap (G2-SEC-A1-004), extended to drop idle sessions
         // when the feature is on. Runs on the large map (pre-existing cadence)
@@ -1041,7 +1050,7 @@ std::string AuthManager::create_oidc_session(const std::string& display_name,
                                              const std::string& iss,
                                              const std::vector<std::string>& groups,
                                              const std::string& admin_group_id,
-                                             std::chrono::steady_clock::time_point mfa_verified_at) {
+                                             std::chrono::system_clock::time_point mfa_verified_at) {
     std::unique_lock lock(mu_);
 
     Role role = resolve_role_from_groups(groups, admin_group_id);
@@ -1063,10 +1072,10 @@ std::string AuthManager::create_oidc_session(const std::string& display_name,
     s.username = stable_username;
     s.display_name = resolved_display;
     s.role = role;
-    s.expires_at = std::chrono::steady_clock::now() + kSessionDuration;
+    s.expires_at = std::chrono::system_clock::now() + kSessionDuration;
     s.auth_source = "oidc";
     s.oidc_sub = oidc_sub;
-    s.last_activity_at = std::chrono::steady_clock::now();
+    s.last_activity_at = std::chrono::system_clock::now();
     s.last_activity_persisted_at = s.last_activity_at;
     s.mfa_verified_at = mfa_verified_at;
     sessions_[token] = std::move(s);
@@ -1149,9 +1158,9 @@ std::string AuthManager::create_saml_session(const std::string& name_id,
     s.username                   = stable_username;
     s.display_name               = resolved_display;
     s.role                       = role;
-    s.expires_at                 = std::chrono::steady_clock::now() + kSessionDuration;
+    s.expires_at                 = std::chrono::system_clock::now() + kSessionDuration;
     s.auth_source                = "saml";
-    s.last_activity_at           = std::chrono::steady_clock::now();
+    s.last_activity_at           = std::chrono::system_clock::now();
     s.last_activity_persisted_at = s.last_activity_at;
     sessions_[token]             = std::move(s);
 

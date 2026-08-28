@@ -104,7 +104,14 @@ struct Session {
     /// display-name changes without perturbing the stable `username` above.
     std::string display_name;
     Role role;
-    std::chrono::steady_clock::time_point expires_at;
+    /// Absolute session-lifetime ceiling. WALL-CLOCK (`system_clock`) since
+    /// HA WS-1/1a (ADR-2002 §4): sessions are durable Postgres rows, so their
+    /// lifetime is an absolute wall-clock instant that any replica compares
+    /// against, not a per-process monotonic point. The NTP-step resistance the
+    /// former `steady_clock` gave is replaced by (a) the DB-primary clock being
+    /// a monitored security dependency (WS-11) and (b) the hard wall-clock
+    /// ceilings on the elevation/MFA windows below.
+    std::chrono::system_clock::time_point expires_at;
     // "local", "oidc", "saml", "api_token", "mcp_token", or "engine_token" (six values —
     // docs/auth-engine-principals-design.md §6; the sixth is minted only by
     // AuthRoutes::synthesize_token_session for a principal_kind="engine" ApiToken).
@@ -131,48 +138,82 @@ struct Session {
 
     /// Timestamp of the most recent successful MFA proof on this session
     /// (login completion or step-up). Default-constructed sentinel means
-    /// "no MFA proof yet". Compared against
-    /// `steady_clock::now() - cfg.mfa_step_up_window_secs` by high-risk
-    /// route handlers. SOC 2 CC6.6 — see docs/auth-mfa-design.md.
-    std::chrono::steady_clock::time_point mfa_verified_at{};
+    /// "no MFA proof yet". WALL-CLOCK (`system_clock`) since HA WS-1/1a
+    /// (durable rows). Compared against
+    /// `system_clock::now() - cfg.mfa_step_up_window_secs` by high-risk route
+    /// handlers, which fail CLOSED on a backward step (a proof timestamped
+    /// AFTER `now` is treated as no proof — see mfa_step_up.cpp). SOC 2 CC6.6 —
+    /// see docs/auth-mfa-design.md.
+    std::chrono::system_clock::time_point mfa_verified_at{};
 
-    /// JIT admin elevation (SOC 2 CC6.3/CC6.6). When `steady_clock::now() <
-    /// elevated_until`, this session's EFFECTIVE role is `admin` regardless of
-    /// the base `role` — a time-boxed, justified, MFA-gated activation set by
-    /// `POST /api/v1/elevate` (eligibility = `users.elevation_eligible`). The
-    /// default-constructed sentinel (epoch) means "not elevated" — fail-closed,
-    /// monotonic (an NTP step can't extend it). Per-session + in-memory: a
-    /// restart or logout drops the elevation. See `effective_role()` and
-    /// docs/auth-architecture.md "JIT admin elevation".
-    std::chrono::steady_clock::time_point elevated_until{};
+    /// JIT admin elevation (SOC 2 CC6.3/CC6.6). When `system_clock::now() <
+    /// elevated_until` (AND the window is within the `kMaxElevationWindow` hard
+    /// ceiling — see `is_elevated()`), this session's EFFECTIVE role is `admin`
+    /// regardless of the base `role` — a time-boxed, justified, MFA-gated
+    /// activation set by `POST /api/v1/elevate` (eligibility =
+    /// `users.elevation_eligible`). The default-constructed sentinel (epoch)
+    /// means "not elevated". WALL-CLOCK since HA WS-1/1a (durable rows); the
+    /// former monotonic NTP-step resistance is replaced by the paired
+    /// `elevation_issued_at` anchor + `kMaxElevationWindow` ceiling below. See
+    /// `effective_role()` and docs/auth-architecture.md "JIT admin elevation".
+    std::chrono::system_clock::time_point elevated_until{};
+
+    /// Wall-clock instant the current elevation was GRANTED (the max-delta
+    /// anchor, ADR-2002 §4). Paired with `elevated_until`: `is_elevated()`
+    /// rejects any elevation whose granted window `elevated_until -
+    /// elevation_issued_at` exceeds `kMaxElevationWindow`, so a forward clock
+    /// corruption (at grant, or a tampered durable row) cannot push admin
+    /// beyond the hard ceiling independent of what `elevated_until` holds. Epoch
+    /// sentinel when not elevated; set together with `elevated_until` at every
+    /// grant site and cleared together on revoke.
+    std::chrono::system_clock::time_point elevation_issued_at{};
 
     /// Inactivity (idle) timeout support (SOC 2 CC6.3). `last_activity_at` is
     /// bumped toward `steady_clock::now()` on authenticated requests when the
     /// idle timeout is enabled (`AuthManager::session_inactivity_ > 0`),
     /// throttled to once per touch-granularity; `validate_session` rejects the
     /// session once `now - last_activity_at` exceeds the window — a sliding
-    /// window UNDER the absolute `expires_at`. steady_clock (monotonic) so an
-    /// NTP step can neither extend nor collapse it. `last_activity_persisted_at`
-    /// throttles the best-effort AuthDB mirror (`touch_session_activity`) to at
-    /// most one write per session per kActivityPersistGranularity, keeping the
-    /// hot path off a per-request SQL write.
+    /// window UNDER the absolute `expires_at`. WALL-CLOCK (`system_clock`) since
+    /// HA WS-1/1a: the sliding anchor is a durable row column advanced via
+    /// `SessionStore::touch_activity` (which deliberately does NOT bump the
+    /// write-generation), so any replica ages the session from the same
+    /// absolute instant. `last_activity_persisted_at` throttles the durable
+    /// mirror to at most one write per session per kActivityPersistGranularity,
+    /// keeping the hot path off a per-request SQL write.
     ///
-    /// Both are STAMPED at each of the three session-creation sites
-    /// (authenticate / create_local_session / create_oidc_session). The `{}`
-    /// member-init is the steady_clock EPOCH, which is fail-closed: an unstamped
-    /// session reads as instantly-idle (rejected), never a spurious keep-alive.
-    /// **Invariant:** any future path that inserts a Session into
-    /// `AuthManager::sessions_` (e.g. the v2 session-rehydration-from-auth.db
-    /// work) MUST stamp `last_activity_at`, or the restored session is
-    /// idle-evicted on its first validate when the feature is on.
-    std::chrono::steady_clock::time_point last_activity_at{};
-    std::chrono::steady_clock::time_point last_activity_persisted_at{};
+    /// Both are STAMPED at every session-creation and rehydration site. The `{}`
+    /// member-init is the EPOCH, which is fail-closed: an unstamped session
+    /// reads as instantly-idle (rejected), never a spurious keep-alive.
+    /// **Invariant:** any path that inserts a Session into the validate-cache
+    /// (creation OR rehydration from a `SessionRow`) MUST stamp
+    /// `last_activity_at`, or the restored session is idle-evicted on its first
+    /// validate when the feature is on.
+    std::chrono::system_clock::time_point last_activity_at{};
+    std::chrono::system_clock::time_point last_activity_persisted_at{};
 };
 
-/// True iff `s` currently holds an unexpired JIT admin elevation.
+/// Defense-in-depth hard ceiling on any JIT elevation window (ADR-2002 §4).
+/// With sessions on wall-clock (durable rows), `is_elevated()` additionally
+/// rejects any elevation whose granted window (`elevated_until -
+/// elevation_issued_at`) exceeds this bound — so a forward clock corruption at
+/// grant time, or a tampered durable row, cannot extend admin beyond it,
+/// INDEPENDENT of the per-deployment `--jit-max-elevation-secs` clamp the caller
+/// applies at grant. Chosen generously so every legitimate grant (default 1h,
+/// config-capped) passes while an implausible far-future value is refused.
+inline constexpr auto kMaxElevationWindow = std::chrono::hours(24);
+
+/// True iff `s` currently holds an unexpired, in-ceiling JIT admin elevation.
+/// Wall-clock (`system_clock`) since HA WS-1/1a; the ceiling below is the
+/// defense-in-depth replacement for the former monotonic NTP-step resistance.
 inline bool is_elevated(const Session& s) {
-    return s.elevated_until.time_since_epoch().count() != 0 &&
-           std::chrono::steady_clock::now() < s.elevated_until;
+    if (s.elevated_until.time_since_epoch().count() == 0)
+        return false;
+    if (std::chrono::system_clock::now() >= s.elevated_until)
+        return false;
+    // Reject a granted window wider than the hard ceiling (a forward-corrupted
+    // `elevated_until`, or an elevated_until set without its issued-at anchor —
+    // which reads as an epoch-anchored, thus enormous, window and is refused).
+    return (s.elevated_until - s.elevation_issued_at) <= kMaxElevationWindow;
 }
 
 /// The session's EFFECTIVE legacy role: `admin` while a JIT elevation is active,
@@ -314,11 +355,11 @@ public:
     /// Create a session for a user who has already cleared the password
     /// and any required MFA checks. Mirrors create_oidc_session but with
     /// `auth_source="local"`. If `mfa_verified` is true, stamps
-    /// `mfa_verified_at = steady_clock::now()` so the step-up window
+    /// `mfa_verified_at = system_clock::now()` so the step-up window
     /// covers immediate high-risk actions taken right after login.
     std::string create_local_session(const std::string& username, Role role, bool mfa_verified);
 
-    /// Stamp `mfa_verified_at = steady_clock::now()` on the named session.
+    /// Stamp `mfa_verified_at = system_clock::now()` on the named session.
     /// Returns true if the session existed and was updated. Used by the
     /// /login/mfa/stepup route (PR 2) to mark an already-issued session
     /// as freshly MFA-verified.
@@ -331,7 +372,7 @@ public:
     /// cookie session that carries it (residual-risk follow-up B, security
     /// review 2026-06-30). The CALLER is responsible for the eligibility +
     /// MFA-step-up gates; this only mutates the in-memory session. Returns the
-    /// absolute (possibly-clamped) expiry `steady_clock::time_point` on success
+    /// absolute (possibly-clamped) expiry `system_clock::time_point` on success
     /// (so the route can report it), nullopt if the session does not exist OR
     /// is already at/past its own `expires_at` (a dead-window guard, governance
     /// hardening round UP-1/UP-4: a session that crosses its absolute lifetime
@@ -340,8 +381,9 @@ public:
     /// spurious `role.elevation.granted`/`role.elevation.expired` pair). The
     /// caller's nullopt→401 path already covers this. `duration` is assumed
     /// already clamped to the configured `--jit-max-elevation-secs` cap by the
-    /// caller.
-    std::optional<std::chrono::steady_clock::time_point>
+    /// caller; the durable grant additionally stamps `elevation_issued_at` so
+    /// the `kMaxElevationWindow` ceiling (auth.hpp) can bound it wall-clock.
+    std::optional<std::chrono::system_clock::time_point>
     elevate_session(const std::string& token, std::chrono::seconds duration);
 
     /// Revoke an active JIT elevation (manual step-down): clear `elevated_until`
@@ -488,13 +530,13 @@ public:
     /// Role: admin if user is in the admin group, or email/name matches a local admin.
     ///
     /// `mfa_verified_at` seeds the new session's MFA-proof timestamp. The
-    /// caller passes a non-default `steady_clock` value only when the IdP
+    /// caller passes a non-default `system_clock` value only when the IdP
     /// attested a multi-factor login via the `amr` claim (PR3 / SOC 2
     /// CC6.6). A default-constructed value leaves the session un-stepped-up,
     /// so the local step-up gate prompts for a TOTP code on the first
-    /// high-risk action. Must be `steady_clock` (not the wall-clock `iat`)
-    /// so an NTP step cannot extend the step-up window — see
-    /// docs/auth-mfa-design.md hard invariant #5.
+    /// high-risk action. Wall-clock (`system_clock`) since HA WS-1/1a (durable
+    /// rows); the step-up window is short and fails CLOSED on a backward clock
+    /// step (see mfa_step_up.cpp) — docs/auth-mfa-design.md hard invariant #5.
     ///
     /// #1837 — the session's STABLE `username` (authorization principal) is
     /// derived from `"oidc:" + iss + "#" + oidc_sub`, NOT `display_name`: a
@@ -513,7 +555,7 @@ public:
                                     const std::string& oidc_sub, const std::string& iss,
                                     const std::vector<std::string>& groups = {},
                                     const std::string& admin_group_id = {},
-                                    std::chrono::steady_clock::time_point mfa_verified_at = {});
+                                    std::chrono::system_clock::time_point mfa_verified_at = {});
 
     /// Create an ephemeral session for a verified SAML assertion's NameID.
     /// Role: admin if `groups` contains `admin_group` (exact match), user

@@ -3122,36 +3122,27 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // step-up gate (mfa_step_up.cpp) consumes this so an MFA'd SSO
         // session clears high-risk endpoints without a redundant local
         // prompt, while a single-factor SSO login is gated. Anchor the
-        // steady-clock timestamp to the IdP-asserted `iat` so a stale
-        // assertion still re-prompts: a token issued `age` ago is treated
-        // as proven `age` ago. `iat` is wall-clock; convert the age into
-        // the steady-clock domain (never store `iat` directly — an NTP
-        // step must not be able to extend the step-up window, hard
-        // invariant #5). Negative ages (IdP clock ahead of ours) clamp to
-        // "just now".
+        // proof to the IdP-asserted `iat` so a stale assertion still
+        // re-prompts: a token issued `age` ago is treated as proven `age`
+        // ago. Since HA WS-1/1a the proof timestamp IS wall-clock
+        // (`system_clock`, durable rows, ADR-2002 §4), so `iat` seeds it
+        // directly — the former steady-clock age-projection is gone. The
+        // NTP-step resistance hard-invariant #5 asked for is now provided by
+        // the short step-up window plus mfa_step_up.cpp's fail-closed guard
+        // on a future-dated proof. A future `iat` (IdP clock ahead of ours)
+        // is clamped to "now" so it can only ever shorten the window, never
+        // extend it. `iat<=0` (missing/0) is NOT seeded — fabricating a fresh
+        // window from a timestampless assertion would let a replayed
+        // amr-without-iat token look fresh (governance UP-9); an un-seeded
+        // OIDC session simply passes the step-up gate like any non-MFA SSO
+        // identity.
         const bool amr_mfa_asserted = amr_asserts_mfa(claims.amr);
-        std::chrono::steady_clock::time_point mfa_at{};
+        std::chrono::system_clock::time_point mfa_at{};
         if (amr_mfa_asserted && claims.iat > 0) {
-            // Anchor the steady-clock proof to the IdP-asserted `iat` so a
-            // stale assertion still re-prompts: a token issued `age` ago is
-            // treated as proven `age` ago. Clamp the system-clock domain
-            // BEFORE the cast to steady_clock::duration (a future editor
-            // casting first then clamping against steady_clock::zero risks
-            // truncation skew; cpp-expert SHOULD). Negative age (IdP clock
-            // ahead of ours) clamps to "just now"; it can only ever shorten
-            // the window, never extend it. `iat<=0` (missing/0) is NOT
-            // seeded — fabricating a fresh window from a timestampless
-            // assertion would let a replayed amr-without-iat token look
-            // fresh (governance UP-9). An un-seeded OIDC session simply
-            // passes the step-up gate like any non-MFA SSO identity.
-            auto asserted =
+            const auto asserted =
                 std::chrono::system_clock::from_time_t(static_cast<std::time_t>(claims.iat));
-            auto age = std::chrono::system_clock::now() - asserted;
-            if (age < std::chrono::system_clock::duration::zero()) {
-                age = std::chrono::system_clock::duration::zero();
-            }
-            mfa_at = std::chrono::steady_clock::now() -
-                     std::chrono::duration_cast<std::chrono::steady_clock::duration>(age);
+            const auto now = std::chrono::system_clock::now();
+            mfa_at = (asserted > now) ? now : asserted; // clamp a future iat to "now"
         }
 
         auto session_token = auth_mgr_.create_oidc_session(display, email, claims.sub, claims.iss,
@@ -4421,15 +4412,14 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // re-sampled a moment later) would falsely report 0 across all three
         // channels (HIGH, adversarial review). Only a non-live/edge window
         // (until <= now) floors to 0.
-        const auto elevate_now = std::chrono::steady_clock::now();
+        const auto elevate_now = std::chrono::system_clock::now();
         auto remaining = (*until > elevate_now)
                               ? std::chrono::ceil<std::chrono::seconds>(*until - elevate_now)
                               : std::chrono::seconds(0);
-        // steady_clock has no wall-clock meaning across a restart/off-process,
-        // so the absolute `expires_at` is a system_clock projection of the
-        // steady remaining duration, taken at essentially the same instant.
-        const std::string expires_at_str =
-            iso8601_utc(std::chrono::system_clock::now() + remaining);
+        // `*until` is an absolute wall-clock instant since HA WS-1/1a (durable
+        // session, ADR-2002 §4), so it reports directly — no steady→system
+        // projection needed. iso8601_utc formats the true (post-clamp) expiry.
+        const std::string expires_at_str = iso8601_utc(*until);
         // FAIL-CLOSED on the mandatory grant audit (review UP-3): a privileged
         // activation must never stand without a durable record. If the audit row
         // can't persist, ROLL BACK the elevation (compensating revoke, mirrors

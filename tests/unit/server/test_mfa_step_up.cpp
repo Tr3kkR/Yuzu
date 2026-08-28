@@ -89,11 +89,11 @@ struct StepUpFixture {
     }
 
     auth::Session make_session(const std::string& user, const std::string& source,
-                               std::chrono::steady_clock::time_point verified_at = {}) {
+                               std::chrono::system_clock::time_point verified_at = {}) {
         auth::Session s;
         s.username = user;
         s.role = (user == "alice") ? Role::admin : Role::user;
-        s.expires_at = std::chrono::steady_clock::now() + std::chrono::hours(1);
+        s.expires_at = std::chrono::system_clock::now() + std::chrono::hours(1);
         s.auth_source = source;
         s.mfa_verified_at = verified_at;
         return s;
@@ -233,7 +233,7 @@ TEST_CASE_METHOD(StepUpFixture,
     httplib::Request req;
     httplib::Response res;
     res.status = 200;
-    auto session = make_session("alice", "local", std::chrono::steady_clock::now());
+    auto session = make_session("alice", "local", std::chrono::system_clock::now());
 
     CHECK(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
                               "POST /api/v1/tokens"));
@@ -249,7 +249,7 @@ TEST_CASE_METHOD(StepUpFixture, "require_mfa_step_up: stale proof beyond window 
     res.status = 200;
     // 600 s old; window is 300 s → stale.
     auto session = make_session("alice", "local",
-                                std::chrono::steady_clock::now() - std::chrono::seconds(600));
+                                std::chrono::system_clock::now() - std::chrono::seconds(600));
 
     CHECK_FALSE(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
                                     "POST /api/v1/tokens"));
@@ -282,7 +282,7 @@ TEST_CASE_METHOD(StepUpFixture,
     // alice was enrolled in the fixture; we now drop her row to simulate
     // a deleted-mid-request user. mfa_status() returns an error.
     REQUIRE(db->remove_user("alice").has_value());
-    auto session = make_session("alice", "local", std::chrono::steady_clock::now());
+    auto session = make_session("alice", "local", std::chrono::system_clock::now());
 
     CHECK_FALSE(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
                                     "POST /api/v1/tokens"));
@@ -329,7 +329,7 @@ TEST_CASE_METHOD(StepUpFixture,
     httplib::Response res;
     res.status = 200;
     REQUIRE_FALSE(db->mfa_status("carol").has_value()); // no local row
-    auto session = make_session("carol", "oidc", std::chrono::steady_clock::now());
+    auto session = make_session("carol", "oidc", std::chrono::system_clock::now());
 
     CHECK(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
                               "POST /api/v1/tokens"));
@@ -409,7 +409,7 @@ TEST_CASE_METHOD(StepUpFixture,
     {
         httplib::Response res;
         res.status = 200;
-        auto s = make_session("carol", "oidc", std::chrono::steady_clock::now());
+        auto s = make_session("carol", "oidc", std::chrono::system_clock::now());
         CHECK(require_mfa_step_up(req, res, s, *db, 300, audit_fn, "X", "required"));
         CHECK(res.status == 200);
     }
@@ -422,7 +422,7 @@ TEST_CASE_METHOD(StepUpFixture,
     // session proven exactly `window_secs` ago passes; one second past
     // fails. Guards the boundary against an off-by-one regression.
     httplib::Request req;
-    const auto now = std::chrono::steady_clock::now();
+    const auto now = std::chrono::system_clock::now();
 
     httplib::Response res_at;
     res_at.status = 200;
@@ -445,7 +445,7 @@ TEST_CASE_METHOD(StepUpFixture,
     res.status = 200;
     // amr attested MFA, but 600s ago; window is 300s → stale.
     auto session = make_session("carol", "oidc",
-                                std::chrono::steady_clock::now() - std::chrono::seconds(600));
+                                std::chrono::system_clock::now() - std::chrono::seconds(600));
 
     CHECK_FALSE(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
                                     "POST /api/v1/tokens"));

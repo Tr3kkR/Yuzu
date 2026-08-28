@@ -182,8 +182,15 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
     // Compute proof age. A default-constructed `mfa_verified_at`
     // (time_since_epoch() == 0) signals "no MFA proof on this
     // session yet" — treat as infinitely stale.
-    const auto now = std::chrono::steady_clock::now();
-    const bool no_proof = session.mfa_verified_at.time_since_epoch().count() == 0;
+    const auto now = std::chrono::system_clock::now();
+    // Wall-clock (system_clock) since HA WS-1/1a (durable sessions, ADR-2002
+    // §4). A proof timestamped AFTER `now` — a backward clock step on the DB
+    // primary / issuing replica — is treated as NO proof: fail CLOSED, never a
+    // spurious-fresh window a backward step would otherwise hold open. This is
+    // the wall-clock replacement for the monotonic-clock resistance the former
+    // steady_clock gave.
+    const bool no_proof = session.mfa_verified_at.time_since_epoch().count() == 0 ||
+                          session.mfa_verified_at > now;
 
     // OIDC sessions whose IdP did not attest MFA carry no seeded proof
     // (no `amr` → `/auth/callback` never set `mfa_verified_at`). Whether

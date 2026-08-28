@@ -69,19 +69,35 @@ TEST_CASE("effective_role: a session is admin only while elevated", "[jit][auth]
     CHECK_FALSE(auth::is_elevated(s));
     CHECK(auth::effective_role(s) == Role::user);
 
-    // Elevated into the future → effective admin.
-    s.elevated_until = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    // Elevated into the future → effective admin. The issued-at anchor must be
+    // stamped alongside elevated_until (HA WS-1/1a, ADR-2002 §4): is_elevated
+    // rejects an elevation whose window exceeds kMaxElevationWindow, and an
+    // absent anchor reads as an epoch-anchored (enormous) window.
+    const auto now = std::chrono::system_clock::now();
+    s.elevated_until = now + std::chrono::seconds(60);
+    s.elevation_issued_at = now;
     CHECK(auth::is_elevated(s));
     CHECK(auth::effective_role(s) == Role::admin);
 
-    // An elapsed window → reverts to base (monotonic, no wall-clock).
-    s.elevated_until = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    // Ceiling: elevated_until far in the future WITHOUT a matching anchor (or
+    // with a window wider than kMaxElevationWindow) is NOT honored — the
+    // defense-in-depth wall-clock bound against a forward clock corruption.
+    s.elevation_issued_at = {}; // epoch anchor → window == elevated_until - epoch
+    CHECK_FALSE(auth::is_elevated(s));
+    s.elevation_issued_at = now;
+    s.elevated_until = now + auth::kMaxElevationWindow + std::chrono::hours(1);
+    CHECK_FALSE(auth::is_elevated(s));
+
+    // An elapsed window → reverts to base (checked before the ceiling).
+    s.elevated_until = now - std::chrono::seconds(1);
+    s.elevation_issued_at = now - std::chrono::seconds(61);
     CHECK_FALSE(auth::is_elevated(s));
     CHECK(auth::effective_role(s) == Role::user);
 
     // A base-admin is admin regardless of elevation.
     s.role = Role::admin;
     s.elevated_until = {};
+    s.elevation_issued_at = {};
     CHECK(auth::effective_role(s) == Role::admin);
 }
 
@@ -149,12 +165,12 @@ TEST_CASE("AuthManager::elevate_session clamps the window to the session's own "
     CHECK(*until <= session_before->expires_at);
     // And meaningfully clamped, not merely coincidentally equal — the naive
     // (unclamped) now+48h would be far beyond the session's ~8h expiry.
-    CHECK(*until < std::chrono::steady_clock::now() + std::chrono::hours(47));
+    CHECK(*until < std::chrono::system_clock::now() + std::chrono::hours(47));
 
     // A short, well-inside-the-session-lifetime window is NOT clamped.
     auto token2 = mgr->authenticate("carol", "secret123456");
     REQUIRE(token2.has_value());
-    auto before2 = std::chrono::steady_clock::now();
+    auto before2 = std::chrono::system_clock::now();
     auto until2 = mgr->elevate_session(*token2, std::chrono::seconds(60));
     REQUIRE(until2.has_value());
     CHECK(*until2 >= before2 + std::chrono::seconds(58));
@@ -415,11 +431,11 @@ struct JitHarness {
     //   proof=stale   -> mfa_verified_at older than the elevation step-up window
     enum class OidcProof { absent, fresh, stale };
     std::string oidc_session_for(const std::string& u, OidcProof proof) {
-        std::chrono::steady_clock::time_point mfa_at{};
+        std::chrono::system_clock::time_point mfa_at{};
         if (proof == OidcProof::fresh) {
-            mfa_at = std::chrono::steady_clock::now();
+            mfa_at = std::chrono::system_clock::now();
         } else if (proof == OidcProof::stale) {
-            mfa_at = std::chrono::steady_clock::now() - std::chrono::seconds(400);
+            mfa_at = std::chrono::system_clock::now() - std::chrono::seconds(400);
         }
         return auth_mgr.create_oidc_session(u, u + "@example.com", "sub-" + u,
                                             "https://idp.example", {}, "", mfa_at);
