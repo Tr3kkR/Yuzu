@@ -12677,11 +12677,13 @@ TEST_CASE("MCP quarantine_device records-only (agents_reached=0) returns a RETRY
     CHECK(body3["error"]["data"]["retry_after_ms"] == 60000);
     CHECK(body3["error"]["message"].get<std::string>().find(
               "already denying dispatch to this device") != std::string::npos);
-    // And it must say what does NOT happen. An earlier wording promised the
-    // endpoint firewall would apply on reconnect; nothing does that, and a SOC
-    // analyst who believes it closes the ticket on an uncontained device.
+    // And it must say what DOES happen now (#3425 closed the reconnect gap
+    // this comment used to warn about — an earlier wording here promised
+    // exactly this and nothing backed it; the message must not repeat that
+    // mistake in the OPPOSITE direction by omitting it now that it is true).
     CHECK(body3["error"]["message"].get<std::string>().find(
-              "nothing re-applies it automatically on reconnect") != std::string::npos);
+              "the server automatically re-applies it once the device reconnects") !=
+          std::string::npos);
 }
 
 TEST_CASE("MCP write tools are advertised in tools/list", "[mcp][integration][tag]") {

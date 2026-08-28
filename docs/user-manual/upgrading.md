@@ -1798,8 +1798,8 @@ distinguishes them, since only one is covered by the existing metric:
 (`completed` / `fresh` / `failed`).
 
 **Verify:** after the server reports ready, confirm the migration actually moved
-your data — `GET /api/v1/quarantine` (or the dashboard Guardian → Quarantine view)
-should show the same active quarantine records you had before upgrading, and
+your data — `GET /api/v1/quarantine` (quarantine has no dashboard surface — REST/MCP
+only) should show the same active quarantine records you had before upgrading, and
 `SELECT value FROM quarantine_store.quarantine_meta WHERE key = 'backfill_row_count';`
 against the Postgres database should match the row count you'd have gotten from
 `sqlite3 quarantine.db.migrated-<epoch> "SELECT count(*) FROM quarantine_records;"`
@@ -2382,12 +2382,15 @@ both are **wire-visible to an MCP client**:
 - `agents_reached=0` (the agent was offline) or a dispatch that threw previously returned a
   success envelope. It now answers `-32603` — *"quarantine recorded but isolation was not
   confirmed"* — with `retry_after_ms: 5000` on a first failure. A **repeat** failure against a device that already
-  has a record backs off to `60000`: the device is offline rather than busy, and nothing changes
-  until it reconnects. Note what the server does *not* do — there is no hook that re-applies the
-  endpoint firewall on reconnect, so a device quarantined while offline is contained at the control
-  plane (dispatch to it is refused) but **not** at its own firewall until a quarantine dispatch
-  actually reaches it. Re-issue once it is back. **The record still persists**; retry the same call to
-  re-drive dispatch.
+  has a record backs off to `60000`: the device is offline rather than busy, and (**at the time
+  #3127 shipped**) nothing changed until an operator re-issued the call once the device
+  reconnected — a device quarantined while offline was contained at the control plane
+  (dispatch to it was refused) but **not** at its own firewall until a quarantine dispatch
+  actually reached it. **#3425 closed that gap**: `QuarantineContainmentReconciler` now
+  re-applies the stored whitelist automatically on reconnect (heartbeat-triggered, with a
+  periodic tick backstop), so a manual re-issue is no longer required — it remains
+  harmless if issued anyway. **The record still persists**; retry the same call to
+  re-drive dispatch if you prefer not to wait for the automatic reconciler.
 - An **already-quarantined** device was a terminal error. It is now a retryable re-dispatch
   against the **stored** `reason`/`whitelist`, not the retry's own arguments — a retry cannot
   silently rewrite a contained device's allow-list with no store update and no audit trail.

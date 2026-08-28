@@ -1485,13 +1485,26 @@ list entirely, not merely hidden from write access.
       "quarantined_by": "admin",
       "quarantined_at": 1710849600,
       "whitelist": "10.0.1.50,10.0.1.51",
-      "reason": "Suspicious network activity detected"
+      "reason": "Suspicious network activity detected",
+      "last_applied_at": 1710849660,
+      "last_confirmed_at": 1710849675
     }
   ],
   "pagination": { "total": 1, "start": 0, "page_size": 50 },
   "meta": { "api_version": "v1" }
 }
 ```
+
+> **`last_applied_at`/`last_confirmed_at` (#3425), both `0` = never.** Endpoint-containment
+> confirmation state written by `QuarantineContainmentReconciler`, the background component that
+> re-applies a device's own firewall on reconnect. `last_applied_at` means a system re-dispatch of
+> the stored whitelist was accepted (`agents_reached > 0`) — NOT proof of containment (a
+> gateway-attached agent's `send_to` only queues the frame). `last_confirmed_at` is set only after
+> a follow-up `quarantine.status` read reports `state|active` — but that read is the target
+> agent's own self-report (cert-bound to its identity, not independently corroborated by any
+> network-side signal), so treat it as strong operational evidence of containment, not proof. See
+> `docs/user-manual/security-hardening.md` "Reconnect re-application (#3425)" for the full trust
+> boundary.
 
 ---
 
@@ -1521,7 +1534,7 @@ Quarantine a device.
 |---|---|---|---|
 | `agent_id` | string | Yes | Target device ID |
 | `reason` | string | No | Human-readable reason for quarantine |
-| `whitelist` | string | No | Comma-separated IPs still allowed to communicate |
+| `whitelist` | string | No | Comma-separated IPs still allowed to communicate. Validated server-side (#3425): ≤512 characters total, each token ≤45 characters and drawn from `[0-9A-Fa-f.:]` — the same charset the reconciler and MCP's `quarantine_device` retry path require before ever dispatching a stored whitelist. Rejected with `400`, not written. |
 
 **Response (201):**
 
@@ -1533,25 +1546,52 @@ Quarantine a device.
 ```
 
 > **`400` vs `503` (ADR-0047).** A `400` means a business/state error (a
-> missing `agent_id`, or the device is already quarantined) — retrying the
-> identical request will not succeed, and `error.retry_after_ms` is
+> missing `agent_id`, the device is already quarantined, or `whitelist` fails
+> server-edge validation) — retrying the identical request will not succeed,
+> and `error.retry_after_ms` is
 > `null`. A `503` means a genuine store/pool failure — retrying is
 > reasonable, and `error.retry_after_ms` carries a concrete `5000`
 > hint (REST's envelope has no nested `data` object — that's MCP's JSON-RPC
 > shape; REST matches the MCP `quarantine_device` twin's A5 behavior, not
 > its exact field path).
 
-> **This route records; it does NOT dispatch — and the twins have diverged
-> on the already-quarantined case (#3127).** `POST /api/v1/quarantine`
-> writes the quarantine record only. The live plugin isolation is dispatched
-> by the MCP `quarantine_device` tool, which has no REST twin. Two
-> consequences for a client that treats the two transports as
+> **This route records; it does NOT itself dispatch — and the twins have
+> diverged on the already-quarantined case (#3127).** `POST /api/v1/quarantine`
+> writes the quarantine record only, synchronously. The live plugin isolation
+> is dispatched by the MCP `quarantine_device` tool, which has no REST twin.
+> Two consequences for a client that treats the two transports as
 > interchangeable:
 >
 > - A `201` here means **the record was written**, not that the device's
->   firewall is enforcing anything. To isolate a device over REST, dispatch
->   `quarantine.quarantine` through the normal execution routes as well —
->   see [Security Hardening](security-hardening.md#device-quarantine).
+>   firewall is enforcing anything **yet**. To isolate a device immediately,
+>   dispatch `quarantine.quarantine` through the normal execution routes as
+>   well — see [Security Hardening](security-hardening.md#device-quarantine).
+>   **As of #3425, "yet" is load-bearing: this route no longer leaves a
+>   record permanently unenforced.** `QuarantineContainmentReconciler`
+>   reconciles every active record regardless of which surface created it —
+>   a record written here for a device that is (or later becomes) connected
+>   is automatically dispatched the stored whitelist typically within one
+>   reconciler tick (~20s) of the device being connected, without a second
+>   call — a brand-new record isn't in the heartbeat fast path's cache until
+>   the next periodic tick populates it, so a heartbeat arriving in that
+>   narrow window doesn't shortcut the wait. A record created here for a
+>   reachable device does not stay dormant — the one exception is a stored
+>   `whitelist` the re-dispatch validator refuses. As of #3425 (`d1f71c58f`)
+>   this route validates `whitelist` at write time (`400` instead of `201`
+>   for a malformed value), the same rule MCP's `quarantine_device` already
+>   enforced — so a fresh write here can no longer land in this state. A
+>   `validation_failed` reconcile now points at a record migrated from the
+>   legacy `quarantine.db` (ADR-0047 backfill, which copies `whitelist`
+>   verbatim with no validation) or one written via this route before
+>   `d1f71c58f` shipped, not a fresh call. Either way, every reconcile
+>   attempt then counts `validation_failed` and nothing is ever dispatched.
+>   That failure is loud, not silent — the device stays in
+>   `yuzu_server_quarantine_endpoint_unconfirmed{reachability="connected"}`
+>   and trips `YuzuQuarantineEndpointUnconfirmed` after 15 minutes — but it
+>   is a real way for a record to go permanently unenforced through this
+>   route. If record-only-without-live-isolation is the intent (e.g.
+>   flagging for review), enforce it at the caller/workflow level; do not
+>   rely on this route's absence of its own dispatch.
 > - The MCP tool now treats an already-active record as a **retryable
 >   re-dispatch**, not a terminal error; this route still answers `400`,
 >   because with no dispatch of its own there is nothing for it to re-drive.
