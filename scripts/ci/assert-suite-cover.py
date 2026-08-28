@@ -35,11 +35,20 @@ def gh(kind, msg):
 
 
 def introspect_tests(builddir):
-    out = subprocess.run(
-        ["meson", "introspect", builddir, "--tests"],
-        capture_output=True, text=True, check=True,
-    )
-    return json.loads(out.stdout)
+    try:
+        out = subprocess.run(
+            ["meson", "introspect", builddir, "--tests"],
+            capture_output=True, text=True, check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        gh("error", f"assert-suite-cover: meson introspect failed (exit {e.returncode}): "
+                     f"{e.stderr.strip()}")
+        raise
+    try:
+        return json.loads(out.stdout)
+    except json.JSONDecodeError as e:
+        gh("error", f"assert-suite-cover: meson introspect returned unparseable JSON: {e}")
+        raise
 
 
 def _bare_suites(entry_suites):

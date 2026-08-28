@@ -1054,8 +1054,14 @@ The predicate is fail-closed: set `YUZU_TEST_PG_MIGRATION_DDL=1` (exact
 value) to force them back on locally. `--list-tests` still enumerates a
 skipped case (Catch2 SKIP is a runtime throw, not a compile-time
 exclusion), so the pg-shard partition checker and `SMOKE_EXACT_CASES` are
-unaffected; the 29 pure pg-substrate tests (`test_pg_pool.cpp` etc.) and
-the 29 SQLite/pure `[migration]`-tagged tests run everywhere unconditionally.
+unaffected; the 28 pure pg-substrate tests (`test_pg_pool.cpp` etc. —
+`test_secret_column_registration_tripwire.cpp` moved to the migration-skip
+bucket above, governance 2026-08-28: it constructs a real `AuthDB` against a
+fresh, non-templated DB, running actual migration DDL, not pure substrate)
+and the 28 SQLite/pure `[migration]`-tagged tests (`test_offload_target_store.cpp`
+no longer belongs in this count — it migrated to Postgres on 2026-08-25,
+before this branch's own base commit, and was never SQLite or
+`[migration]`-tagged to begin with) run everywhere unconditionally.
 
 Local-dev note: to run the non-pg server tests on a machine with no
 Docker and no Postgres, invoke the test binary directly
