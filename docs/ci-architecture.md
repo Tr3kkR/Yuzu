@@ -385,19 +385,59 @@ leaks a slot) that caps concurrent heavy test phases to **2 per box** (the
 (one consolidated invocation now covers what used to be five separate
 suites plus the two non-pg server shards).
 
-**Staged widening, measured (PR #3677):** push 1 shipped `Test (pg shards,
-full)` at the unwidened starting point, `--num-processes 2` — deliberately,
-per this section's own prior text, rather than guessing ahead of data. That
-push measured (cold cache, first run of the branch on Wee Tam):
-`Test (non-pg suites)` 4m30s, `Test (pg shards, full)` 10m02s — the pg step
-alone is 61% of the 16m32s total job, confirming the plan's own diagnosis
-that 11 shards through 2 workers leaves real serialization on the table.
-Push 2 widens to `--num-processes 4` on that same step, still per the plan's
-own median-of-2+-pushes protocol — this single measured data point informs
-the widening, it does not by itself justify stopping there. The non-pg
-step's width (4) and the slot count (2) are unchanged this round; only the
-pg-shards width moved. Full diagnosis: the `tests/meson.build` server-shard
-comment.
+**Staged widening — the decision rule (stated once here; each push's
+paragraph below references it, doesn't restate it).** The pg-shards step
+widens `2 → 4 → 6 → 8` in separate, individually-measured pushes, never
+bundled with a topology change, so a wall-time delta stays attributable
+to one axis at a time. At each width: take **≥2 same-SHA samples**
+(one sample is noise, not a measurement) and use the median. **Continue**
+widening only while (a) the median step wall improves ≥10% over the
+previous width, AND (b) no shard's own duration inflates past **1.5x**
+its value at the previous width, AND (c) no shard comes within 80% of
+its 700s per-shard timeout (≥560s). **If either safety check (b) or (c)
+fails, or the improvement check (a) comes back <10%, revert to the
+previous width and stop** — a failed safety check is not "try one more
+sample," it's "this width is unsafe, back off."
+
+**Push 1** shipped `Test (pg shards, full)` at the unwidened starting
+point, `--num-processes 2` — deliberately, rather than guessing ahead of
+data. One sample (cold cache, first run of the branch on Wee Tam):
+`Test (non-pg suites)` 4m30s, `Test (pg shards, full)` 10m02s (602s) —
+the pg step alone was 61% of the 16m32s total job, confirming the plan's
+own diagnosis that 11 shards through 2 workers leaves real serialization
+on the table. (This baseline is itself only one sample — the huge margin
+in every subsequent push's improvement makes that imprecision moot, but
+it's not a second-sampled median the way k=4 and later are.)
+
+**Push 2** widened to `--num-processes 4`, two same-SHA samples: 5m59s
+(359s) and 5m57s (358s) — a strikingly stable pair (0.4% apart) despite
+the *unrelated, untouched* non-pg step swinging 2m42s to 7m55s on the
+exact same commit in the exact same two runs. That swing is real
+box-contention noise on shared Wee Tam (already named as an unmeasured
+risk in this branch's own chaos-injector pass) — it says the pg step's
+own stability is real signal, not luck, precisely because the box was
+demonstrably NOT quiet during at least one of the two runs. Median:
+358.3s, a **40.5% improvement** over k=2 — clears rule (a). Worst-shard
+inflation: shard F, 125s → 145s = **1.16x** — clears rule (b) (1.5x cap)
+with margin. No shard within 500s of the 700s timeout — clears rule (c).
+`Test (non-pg suites)`'s own width (4) had a working precedent for the
+"N-wide fan-out inside the 2-slot box-wide gate" shape before push 2 ever
+ran; push 2 confirmed the pg step tolerates it too, at least at k=4.
+
+**Push 3** widens to `--num-processes 6` on that basis — genuinely novel
+territory, though: unlike k=4, **no CI job anywhere in this repo has run
+at `--num-processes 6` before**, so push 3 has no existing-precedent
+shortcut the way push 2 did. Wee Tam's per-runner-agent CCD pinning is a
+**fixed 16-thread envelope** (`deploy/windows/README.md`,
+`YUZU_BUILD_JOBS=16`) — 6 meson-level worker processes is a modest
+fraction of that on a raw process-count basis, but neither this doc nor
+push 2's data quantifies how many threads or Postgres connections each
+`yuzu_server_tests.exe` shard itself spawns, so "headroom" here is
+bounded loosely, not measured precisely. The per-shard 1.5x/700s checks
+above are the actual empirical safety net for that gap, not this
+paragraph's arithmetic. The non-pg step's width (4) and the slot count
+(2) are unchanged this round; only the pg-shards width moved. Full
+diagnosis: the `tests/meson.build` server-shard comment.
 
 ### Linux concurrency caps (within-job + cross-job)
 

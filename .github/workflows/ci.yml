@@ -941,10 +941,12 @@ jobs:
         # 2 stays at 2 here, not a higher number: this mirrored Windows' own
         # starting `--num-processes 2` on its "Test (pg shards, full)" step
         # (#3443) rather than deriving a Linux-specific value — the two
-        # platforms have since DIVERGED (PR #3677 push 2 widened Windows to
-        # k=4 per its own staged measurement protocol; Linux stays at 2,
-        # unmeasured-and-unwidened, since nothing here has re-derived a
-        # Linux-specific value from real contention data either).
+        # platforms have since DIVERGED: PR #3677's staged Windows
+        # measurement protocol (docs/ci-architecture.md, current value
+        # there, not restated here to avoid this comment going stale every
+        # widening round) has moved Windows past 2 on real per-shard
+        # contention data; Linux stays at 2, unmeasured-and-unwidened,
+        # since nothing here has re-derived a Linux-specific value either.
         #
         # with-test-slot.sh (#3443 AC4): --num-processes 2 alone fixed
         # WITHIN-job fan-out but left cross-job contention unmeasured. Now
@@ -1630,12 +1632,17 @@ jobs:
 
       # if: matrix.pg_mode == 'full' — see the Resolve step above; PRs are
       # debug-only (exclude: above), so PR coverage is unaffected. k=2 was
-      # the STARTING pool width; push 1 (PR #3677) measured it at 10m02s
-      # (61% of a 16m32s total job), and push 2 widened to k=4 per the
-      # staged Windows measurement protocol (docs/ci-architecture.md) —
-      # each width change lands in its own, individually-measured push,
-      # never bundled with a topology change in the same push, so a
-      # wall-time delta is attributable to one axis at a time.
+      # the STARTING pool width (measured 602s, one sample); push 2 widened
+      # to k=4 and took 2 same-SHA samples per the protocol's own median
+      # rule (358s / 359s — remarkably stable run-to-run despite the
+      # non-pg step swinging 3x on the SAME commit, confirming the pg step
+      # itself isn't the noisy part): a real 40.5% improvement, no shard's
+      # own duration inflated past 1.16x its k=2 value (well under the
+      # 1.5x stop-rule), nowhere near the 700s per-shard timeout. Push 3
+      # widens to k=6 on that same basis — each width change lands in its
+      # own, individually-measured push (docs/ci-architecture.md), never
+      # bundled with a topology change, so a wall-time delta stays
+      # attributable to one axis at a time.
       - name: Test (pg shards, full)
         if: matrix.pg_mode == 'full'
         env:
@@ -1655,7 +1662,7 @@ jobs:
           # job-summary "Suite durations vs meson budgets" table (written on
           # every invocation, not just the last) is where its numbers live.
           bash scripts/ci/with-test-slot.sh 2 -- \
-            python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs --num-processes 4 --suite server-pg
+            python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs --num-processes 6 --suite server-pg
 
       # if: matrix.pg_mode == 'smoke' — only the release leg on a push (PRs
       # are debug-only, so this step never runs on a PR; verified post-merge
