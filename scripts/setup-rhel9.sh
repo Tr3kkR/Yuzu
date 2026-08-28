@@ -81,6 +81,7 @@ CHECK_ONLY=0
 DRY_RUN=0
 MANIFEST=""
 VCPKG_ROOT_ARG="${VCPKG_ROOT:-${HOME}/vcpkg}"
+VCPKG_ROOT_EXPLICIT=0
 
 usage() {
   sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
@@ -94,7 +95,7 @@ while [ $# -gt 0 ]; do
     --skip-vcpkg)    SKIP_VCPKG=1 ;;
     --check)         CHECK_ONLY=1 ;;
     --dry-run)       DRY_RUN=1 ;;
-    --vcpkg-root)    VCPKG_ROOT_ARG="${2:?--vcpkg-root needs a path}"; shift ;;
+    --vcpkg-root)    VCPKG_ROOT_ARG="${2:?--vcpkg-root needs a path}"; VCPKG_ROOT_EXPLICIT=1; shift ;;
     --manifest)      MANIFEST="${2:?--manifest needs a path}"; shift ;;
     -h|--help)       usage ;;
     *) echo "Unknown option: $1 (try --help)" >&2; exit 2 ;;
@@ -127,6 +128,17 @@ check() { # check <label> <condition-cmd...>
   fi
 }
 
+# The one check that proves libstdc++ 14 is in play: <print> does not exist in
+# the system libstdc++ 11. Subshell body so the EXIT trap is scoped to this
+# call; the status is the compile+run chain's, never the cleanup's.
+cxx23_probe() (
+  d="$(mktemp -d)" || exit 1
+  trap 'rc=$?; rm -rf -- "$d"; exit "$rc"' EXIT
+  printf '#include <print>\n#include <expected>\nint main(){std::println("{}", std::expected<int,int>{1}.value());}\n' > "$d/c23.cpp" \
+    && g++ -std=c++23 "$d/c23.cpp" -o "$d/c23" \
+    && "$d/c23"
+)
+
 # --- Distro gate -------------------------------------------------------------
 
 [ -r /etc/os-release ] || die "no /etc/os-release — unsupported system"
@@ -156,10 +168,13 @@ if [ "$CHECK_ONLY" = 1 ]; then
 
   # shellcheck disable=SC1090
   [ -f "$ENV_FILE" ] && . "$ENV_FILE"
+  # A custom root recorded in the env file beats the $HOME default; an explicit
+  # --vcpkg-root beats both. Without this, --check silently verified ~/vcpkg.
+  [ "$VCPKG_ROOT_EXPLICIT" = 1 ] || VCPKG_ROOT_ARG="${VCPKG_ROOT:-${HOME}/vcpkg}"
 
   check "${GCC_TOOLSET} present"           test -f "/opt/rh/${GCC_TOOLSET}/enable"
   check "g++ is GCC 13+"                   bash -c 'v=$(g++ -dumpfullversion -dumpversion 2>/dev/null | cut -d. -f1); [ -n "$v" ] && [ "$v" -ge 13 ]'
-  check "C++23 <print>/<expected> compile" bash -c 'printf "#include <print>\n#include <expected>\nint main(){std::println(\"{}\", std::expected<int,int>{1}.value());}\n" > /tmp/.yuzu_c23_$$.cpp && g++ -std=c++23 /tmp/.yuzu_c23_$$.cpp -o /tmp/.yuzu_c23_$$ && /tmp/.yuzu_c23_$$; rm -f /tmp/.yuzu_c23_$$ /tmp/.yuzu_c23_$$.cpp'
+  check "C++23 <print>/<expected> compile" cxx23_probe
   check "meson ${MESON_VERSION}"           bash -c "meson --version | grep -qx '${MESON_VERSION}'"
   check "ninja present"                    command -v ninja
   check "cmake present"                    command -v cmake
@@ -168,7 +183,7 @@ if [ "$CHECK_ONLY" = 1 ]; then
   check "flex present"                     command -v flex
   check "perl present"                     command -v perl
   check "curl present"                     command -v curl
-  check "python3 can import yaml"          python3 -c "import yaml"
+  check "pyyaml ${PYYAML_VERSION}"           python3 -c "import yaml, sys; sys.exit(yaml.__version__ != '${PYYAML_VERSION}')"
   check "libsystemd headers present"       pkg-config --exists libsystemd
   check "VCPKG_ROOT set and bootstrapped"  test -x "${VCPKG_ROOT_ARG}/vcpkg"
   check "vcpkg pinned to baseline"         bash -c "[ \"\$(git -C '${VCPKG_ROOT_ARG}' rev-parse HEAD 2>/dev/null)\" = '${VCPKG_COMMIT}' ]"
@@ -279,8 +294,9 @@ try:
     import mesonbuild, yaml
 except ImportError:
     sys.exit(1)
+sys.exit(yaml.__version__ != '${PYYAML_VERSION}')
 " 2>/dev/null && "${HOME}/.local/bin/meson" --version 2>/dev/null | grep -qx "${MESON_VERSION}"; then
-  skip "meson ${MESON_VERSION} and pyyaml already present"
+  skip "meson ${MESON_VERSION} and pyyaml ${PYYAML_VERSION} already present"
 else
   run python3 -m pip install --user --upgrade pip
   run python3 -m pip install --user "meson==${MESON_VERSION}" "pyyaml==${PYYAML_VERSION}"
