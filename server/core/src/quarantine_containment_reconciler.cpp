@@ -70,7 +70,8 @@ void QuarantineContainmentReconciler::count(const char* result) const {
 void QuarantineContainmentReconciler::publish_tick_health(bool healthy) const {
     // #3425 review (Doomgoose, #3567): the freshness signal for
     // `yuzu_server_quarantine_endpoint_unconfirmed`, which otherwise
-    // silently freezes at its last value on either early-return path above.
+    // silently freezes at its last value on either early-return path in
+    // tick() below.
     // 1 only on a tick that reached the real publish; 0 on either early
     // return. Not per-label — one series, tick()-only (notify_agent_heartbeat's
     // fast path never calls this: a cache-hit heartbeat says nothing about

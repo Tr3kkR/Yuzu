@@ -900,6 +900,15 @@ TEST_CASE("QuarantineContainmentReconciler: a degraded quarantine-store read abo
         .now_fn = {},
     });
 
+    // #3425 review (security-guardian + cpp-expert, gate11 focused re-review):
+    // Gauge::value() defaults to 0.0, same as the value this test expects —
+    // asserting == 0 without ever setting it first cannot distinguish
+    // publish_tick_health(false) actually running from that call being
+    // silently removed. Pre-seed to 1 (mirrors the real boot-time seed in
+    // server.cpp) so the post-tick assertion below is load-bearing: it can
+    // only read 0 if the degraded branch genuinely published it.
+    metrics.gauge("yuzu_server_quarantine_reconciler_tick_healthy").set(1);
+
     // Must not crash and must not fabricate any dispatch.
     reconciler.tick();
     CHECK(dispatch.calls.empty());
@@ -911,7 +920,7 @@ TEST_CASE("QuarantineContainmentReconciler: a degraded quarantine-store read abo
 }
 
 TEST_CASE("QuarantineContainmentReconciler: a successful tick publishes tick_healthy=1 "
-          "(#3425 gate10-review #3567)",
+          "(#3425 review (Doomgoose, #3567))",
           "[pg][quarantine][reconciler]") {
     YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_recon_tpl);
     PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
