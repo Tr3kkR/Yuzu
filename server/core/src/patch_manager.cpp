@@ -250,11 +250,11 @@ void PatchManager::record_patches(const std::string& agent_id,
         spdlog::warn("PatchManager::record_patches: failed to record {} patches for agent {} "
                     "(pool degraded or transaction failed)",
                     patches.size(), agent_id);
-        if (metrics_)
-            metrics_->counter("yuzu_server_patch_manager_write_failed_total",
-                              {{"op", "record_patches"}})
-                .increment();
     }
+    if (metrics_)
+        metrics_->counter("yuzu_server_patch_manager_writes_total",
+                          {{"op", "record_patches"}, {"result", ok ? "success" : "failed"}})
+            .increment();
 }
 
 std::vector<PatchInfo> PatchManager::query_patches(const PatchQuery& query,
@@ -448,13 +448,12 @@ PatchManager::deploy_patch(const DeploymentRequest& req) {
         return true;
     });
 
-    if (!ok) {
-        if (metrics_)
-            metrics_->counter("yuzu_server_patch_manager_write_failed_total",
-                              {{"op", "deploy_patch"}})
-                .increment();
+    if (metrics_)
+        metrics_->counter("yuzu_server_patch_manager_writes_total",
+                          {{"op", "deploy_patch"}, {"result", ok ? "success" : "failed"}})
+            .increment();
+    if (!ok)
         return std::unexpected("failed to create deployment");
-    }
 
     spdlog::info("PatchManager: created deployment {} for {} targeting {} agents",
                  id, kb_id, agent_ids.size());
@@ -579,13 +578,12 @@ PatchManager::cancel_deployment(const std::string& id) {
         return true;
     });
 
-    if (!ok) {
-        if (metrics_)
-            metrics_->counter("yuzu_server_patch_manager_write_failed_total",
-                              {{"op", "cancel_deployment"}})
-                .increment();
+    if (metrics_)
+        metrics_->counter("yuzu_server_patch_manager_writes_total",
+                          {{"op", "cancel_deployment"}, {"result", ok ? "success" : "failed"}})
+            .increment();
+    if (!ok)
         return std::unexpected("failed to cancel deployment");
-    }
 
     spdlog::info("PatchManager: cancelled deployment {}", id);
     return {};

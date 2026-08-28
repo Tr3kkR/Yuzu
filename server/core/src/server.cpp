@@ -6341,6 +6341,14 @@ public:
                 startup_failed_ = true;
             } else {
                 patch_manager_->set_metrics(&metrics_);
+                metrics_.describe("yuzu_server_patch_manager_writes_total",
+                                  "PatchManager record_patches/deploy_patch/cancel_deployment "
+                                  "outcomes, by op and result. ADR-0062.",
+                                  "counter");
+                for (const auto op : {"record_patches", "deploy_patch", "cancel_deployment"})
+                    for (const auto result : {"success", "failed"})
+                        metrics_.counter("yuzu_server_patch_manager_writes_total",
+                                         {{"op", op}, {"result", result}});
                 legacy_sqlite_probe::warn_if_legacy_rows(
                     cfg_.db_dir() / "patches.db", "PatchManager",
                     {"patch_inventory", "patch_deployments", "patch_deployment_targets"});

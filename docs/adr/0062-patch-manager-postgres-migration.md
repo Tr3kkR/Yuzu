@@ -236,11 +236,12 @@ probe, since no caller ever checked `is_open()`).
 
 ## Consequences
 
-- **Any in-flight patch deployment or inventory scan recorded against a pre-Postgres build is
-  lost on upgrade** — patch inventory is agent-reported and self-heals on the next scan;
-  in-flight deployments must be re-created via `POST /api/patches/deploy`. Documented in
+- **Any in-flight patch deployment recorded against a pre-Postgres build is lost on upgrade** —
+  must be re-created via `POST /api/patches/deploy`. Documented in
   `docs/user-manual/upgrading.md`, same treatment as every other fresh-start cutover on this
-  ladder.
+  ladder. (Patch inventory itself does NOT self-heal on the next scan — `record_patches()`, its
+  only writer, has no production caller on any build, pre- or post-migration; see "Follow-ups"
+  below and #3676.)
 - **`execute_deployment`'s reboot-orchestration behavior is no longer available at all** (it was
   never reachable from a production caller, so this is a documentation/tracking change, not a
   behavior change for any real deployment). See the tracking issue for the deliberate de-scope.

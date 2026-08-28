@@ -126,9 +126,12 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
-    /// Wire a metrics sink for write-failure counters
-    /// (`yuzu_server_patch_manager_write_failed_total{op}`). Set-before-
-    /// traffic contract, same as every other metrics-emitting store.
+    /// Wire a metrics sink for write-outcome counters
+    /// (`yuzu_server_patch_manager_writes_total{op,result}` — `op` one of
+    /// `record_patches`/`deploy_patch`/`cancel_deployment`, `result` one of
+    /// `success`/`failed`; pre-seeded at boot so a rate can be computed
+    /// from the first request, not just from the first failure). Set-
+    /// before-traffic contract, same as every other metrics-emitting store.
     void set_metrics(yuzu::MetricsRegistry* metrics) noexcept { metrics_ = metrics; }
 
     // ── Patch inventory ─────────────────────────────────────────────────

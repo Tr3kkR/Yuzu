@@ -178,6 +178,32 @@ TEST_CASE("PatchManager: cancel_deployment covers rebooting", "[patch_manager][p
     }
 }
 
+// New coverage (governance Gate 8 quality-engineer finding): cancel_deployment's
+// two guard branches were only reachable via the happy path above, never
+// exercised directly.
+
+TEST_CASE("PatchManager: cancel_deployment rejects an unknown id", "[patch_manager][pg][cancel]") {
+    PATCH_MANAGER(mgr);
+
+    auto result = mgr.cancel_deployment("no-such-deployment-id");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == "deployment not found");
+}
+
+TEST_CASE("PatchManager: cancel_deployment rejects a double-cancel", "[patch_manager][pg][cancel]") {
+    PATCH_MANAGER(mgr);
+
+    auto deploy_result = mgr.deploy_patch("KB1234567", {"agent-1"}, false, "admin");
+    REQUIRE(deploy_result.has_value());
+    auto deployment_id = *deploy_result;
+
+    REQUIRE(mgr.cancel_deployment(deployment_id).has_value());
+
+    auto second = mgr.cancel_deployment(deployment_id);
+    REQUIRE_FALSE(second.has_value());
+    CHECK(second.error() == "deployment already cancelled");
+}
+
 // ── Test: list_deployments ──────────────────────────────────────────────────
 
 TEST_CASE("PatchManager: list_deployments", "[patch_manager][pg][query]") {
