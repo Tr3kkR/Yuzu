@@ -60,6 +60,8 @@
 #include "guardian_rule_eval.hpp" // RuleAssertion, AssertionKind
 #include "guaranteed_state.pb.h"
 
+#include <spdlog/spdlog.h>
+
 #include <charconv>
 #include <cstdint>
 #include <expected>
@@ -215,7 +217,14 @@ rule_assertion_from_rule(const yuzu::guardian::v1::GuaranteedStateRule& rule) {
         const auto it = rem.params().find(std::string(k));
         return it != rem.params().end() ? it->second : std::string{};
     };
-    std::uint64_t default_debounce_ms = 1000; // unreachable: *spark_type is always File/Service/Registry
+    // No `default:` label below, deliberately: that keeps -Wswitch live as a build-time
+    // SIGNAL if SparkType ever gains an enumerator this switch doesn't handle - not a
+    // guaranteed compile-time BLOCK, since this project builds with werror=false and
+    // MSVC's equivalent (C4062) is off even at /W4. The std::optional (rather than a
+    // pre-seeded 1000ms literal) is the RUNTIME net for
+    // the same gap (#3531) - a future unhandled case must be caught and logged, not
+    // silently fall back to the exact 1000ms default that reintroduces #3388's flood.
+    std::optional<std::uint64_t> default_debounce_ms;
     switch (*spark_type) {
     case SparkType::File:
         default_debounce_ms =
@@ -237,7 +246,22 @@ rule_assertion_from_rule(const yuzu::guardian::v1::GuaranteedStateRule& rule) {
     case SparkType::Disk:
         break; // unreachable here (spark_type_from_token already rejected these above)
     }
-    (void)parse_resilience_params(get, out.debounce_ms, default_debounce_ms);
+    if (!default_debounce_ms) {
+        // Unreachable today - kept as a loud, logged degrade rather than a silent one
+        // (#3531). No assert: this project leaves b_ndebug unset, so asserts are LIVE
+        // in release builds, and aborting here is exactly what the #3388 ledger ruled
+        // out in favor of safe degrade. Falling back to the legacy default is safe (it
+        // just re-admits the per-sweep flood for this one rule until the switch above
+        // is updated for the new SparkType), but it must never be silent. Reuses
+        // parse_resilience_params' own kGuardianLegacyDebounceMs rather than repeating
+        // the literal, so a future change to the legacy default can't leave this
+        // fallback silently stale.
+        default_debounce_ms = kGuardianLegacyDebounceMs;
+        spdlog::error("Guardian: rule '{}' has spark type '{}' unhandled by the debounce-"
+                      "default switch - falling back to the legacy {}ms default (#3531)",
+                      out.rule_id, spark_type_token(*spark_type), *default_debounce_ms);
+    }
+    (void)parse_resilience_params(get, out.debounce_ms, *default_debounce_ms);
 
     const std::string& atype = assertion.type();
     switch (*spark_type) {
