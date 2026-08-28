@@ -131,6 +131,8 @@ TEST_CASE("kind_mismatch_error wording agrees across stores modulo the "
     // check above would be vacuous).
     CHECK(fragment_msg != policy_msg);
     CHECK(policy_msg != workflow_msg);
+}
+
 // Governance Gate 2/3/4/6 (SEC-1/ARCH-1/Finding-B/CO-1, InstructionStore PG migration):
 // three independent call sites let a kDbErrorPrefix error reach a client response or a
 // persisted audit row verbatim before genericize_db_error()/is_generic_db_error() existed —
