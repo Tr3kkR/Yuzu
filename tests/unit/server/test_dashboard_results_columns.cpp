@@ -311,11 +311,14 @@ TEST_CASE("render_filter_bar: a degraded facet read disables the dropdown "
 TEST_CASE("render_results #1712: a deny-all response scope (corrupt-rbac "
           "simulation) yields zero rows, not the agent's output",
           "[pg][server][dashboard][render_results][1712]") {
-    InstructionStore is{":memory:"};
-    REQUIRE(is.is_open());
-
+    // #1712 gate-8 fix: InstructionStore migrated to Postgres (ADR-0058)
+    // after this branch's own #1712 tests were authored -- shares the
+    // ResponseStore's pool rather than opening a second PG instance,
+    // since each store schema-qualifies its own tables.
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    InstructionStore is{pool};
+    REQUIRE(is.is_open());
     ResponseStore rs{pool};
     const std::string command_id = "cmd-scope-deny";
     StoredResponse r;
@@ -339,11 +342,14 @@ TEST_CASE("render_results #1712: a deny-all response scope (corrupt-rbac "
 TEST_CASE("render_results #1712: out-of-scope agent's row is dropped while an "
           "in-scope agent's row is kept",
           "[pg][server][dashboard][render_results][1712]") {
-    InstructionStore is{":memory:"};
-    REQUIRE(is.is_open());
-
+    // #1712 gate-8 fix: InstructionStore migrated to Postgres (ADR-0058)
+    // after this branch's own #1712 tests were authored -- shares the
+    // ResponseStore's pool rather than opening a second PG instance,
+    // since each store schema-qualifies its own tables.
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    InstructionStore is{pool};
+    REQUIRE(is.is_open());
     ResponseStore rs{pool};
     const std::string command_id = "cmd-scope-mix";
     StoredResponse in_scope;
@@ -380,11 +386,14 @@ TEST_CASE("render_results #1712: a scope drop emits the CC7.2 denied audit row",
     // scope_dropped audit row. Without this the dashboard's audit branch was
     // unreachable from any test: the seam always passed a null request, so
     // `dropped > 0 && req && audit_fn_` could never be true.
-    InstructionStore is{":memory:"};
-    REQUIRE(is.is_open());
-
+    // #1712 gate-8 fix: InstructionStore migrated to Postgres (ADR-0058)
+    // after this branch's own #1712 tests were authored -- shares the
+    // ResponseStore's pool rather than opening a second PG instance,
+    // since each store schema-qualifies its own tables.
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    InstructionStore is{pool};
+    REQUIRE(is.is_open());
     ResponseStore rs{pool};
     const std::string command_id = "cmd-scope-audit";
     for (const auto& [agent, out] : std::vector<std::pair<std::string, std::string>>{
@@ -434,11 +443,14 @@ TEST_CASE("render_results #1712: the summary agent count describes only in-scope
     // answered the command. The full deny-all case hid this incidentally
     // (an empty result set skips the summary block entirely), so only the
     // MIXED case exposes it — which is why this test is mixed-scope.
-    InstructionStore is{":memory:"};
-    REQUIRE(is.is_open());
-
+    // #1712 gate-8 fix: InstructionStore migrated to Postgres (ADR-0058)
+    // after this branch's own #1712 tests were authored -- shares the
+    // ResponseStore's pool rather than opening a second PG instance,
+    // since each store schema-qualifies its own tables.
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    InstructionStore is{pool};
+    REQUIRE(is.is_open());
     ResponseStore rs{pool};
     const std::string command_id = "cmd-scope-count";
     // One in-scope agent, four out-of-scope: an unreconciled count renders
