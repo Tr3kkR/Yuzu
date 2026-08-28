@@ -90,6 +90,12 @@ public:
     /// synchronously on the caller's thread.
     void sweep_lane(SparkType type);
     void sweep_pending_initial();
+    /// Deterministic test seam (also lane_loop's own wait-duration source, #3531):
+    /// apply cfg_'s jitter_pct to base_ms using the given RNG. Single-sourced with
+    /// guardian_spark_bridge.hpp's debounce-default computation via
+    /// guardian_jitter_span_ms (spark.hpp) - not just the same input constants, the
+    /// same arithmetic, so the two can't silently desync.
+    [[nodiscard]] std::chrono::milliseconds jittered(std::uint64_t base_ms, std::mt19937& rng) const;
 
 private:
     /// Heap sync state shared by the lane threads AND the pending-initial waker. The
@@ -113,7 +119,6 @@ private:
     /// terminates the whole agent daemon - the #2037 class of defect the drain worker was
     /// firewalled against and these lanes, identically exposed, were not (#2298 Gate 4).
     void firewalled_sweep(const std::function<void()>& fn);
-    [[nodiscard]] std::chrono::milliseconds jittered(std::uint64_t base_ms, std::mt19937& rng) const;
 
     GuardianSparkRuntime& rt_;
     Config cfg_;
