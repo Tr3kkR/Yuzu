@@ -443,10 +443,13 @@ paragraph's arithmetic. The non-pg step's width (4) and the slot count
 (2) are unchanged this round; only the pg-shards width moved. Full
 diagnosis: the `tests/meson.build` server-shard comment.
 
-**Push 3, measured:** two samples at k=6 (one on this commit, one on the
-`dev`-merge commit that followed it with no test-relevant changes):
-4m29s (269s) and 4m25s (265s). Median: 267s, a **~25.5% improvement**
-over the k=4 median (358.3s) — clears rule (a). Worst-shard inflation:
+**Push 3, measured:** two samples at k=6 (one on the push-3 commit
+itself, one on the `dev`-merge commit that followed it — `git diff
+--stat` between the two confirms no changes under `tests/`,
+`scripts/ci/`, or `.github/workflows/`, so both samples are effectively
+same-SHA for width purposes): 4m29s (269s) and 4m25s (265s). Median:
+267s, a **~25.5% improvement** over the k=4 median (358.3s) — clears
+rule (a). Worst-shard inflation:
 shard I, **~1.11x** its k=4 duration — clears rule (b) with the widest
 margin of any width so far (k=2→k=4's worst was shard F at 1.16x). No
 shard came within 80% of its 700s timeout (the slowest shard at k=6,
