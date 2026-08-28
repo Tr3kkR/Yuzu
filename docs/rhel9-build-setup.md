@@ -251,14 +251,22 @@ source /opt/rh/gcc-toolset-14/enable   # guarded: no stacked PATH entries
 PATH="$HOME/.local/bin:$PATH"          # meson
 export VCPKG_ROOT="$HOME/vcpkg"
 export CC="ccache gcc" CXX="ccache g++"
-export YUZU_TEST_ENABLE_PG=1
-export YUZU_TEST_POSTGRES_DSN="postgresql://yuzu:yuzu@127.0.0.1:5432/yuzu_test"
+export YUZU_TEST_POSTGRES_DSN="postgresql://yuzu:yuzu@127.0.0.1:5432/yuzu_test"   # --with-postgres only, once verified
 ```
+
+The DSN line is written only by a `--with-postgres` run, and only after the cluster has answered on
+that exact DSN - the skip-vs-fail contract above means an exported-but-unreachable DSN would turn
+every `[pg]` test from a clean skip into a hard failure. The file is regenerated from the flags of
+the *most recent* run, so a later run without `--with-postgres` drops the DSN again (the tests then
+skip - the safe direction); keep passing the flag. `YUZU_TEST_ENABLE_PG` is a compile-time define in
+`tests/meson.build`, not an environment variable, so the file does not export it.
 
 The DSN address/role/database match the native-cluster branch of `scripts/ci/ensure-postgres.sh`, so
 that script is a no-op on a box provisioned this way. The `yuzu` role needs **`CREATEDB`** —
 `PostgresTestDb` (`tests/unit/test_helpers.hpp`) creates and drops an ephemeral
-`yuzu_test_<salt>_<n>` database per test.
+`yuzu_test_<salt>_<n>` database per test. The script logs in with the DSN's own credentials before
+deciding: a pre-existing `yuzu` role that lacks `LOGIN`, `CREATEDB`, or the `yuzu` password is
+repaired with `ALTER ROLE` rather than accepted on its name.
 
 ---
 

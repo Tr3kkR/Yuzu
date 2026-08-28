@@ -47,6 +47,8 @@ PYYAML_VERSION="6.0.3"
 
 # AppStream module stream. 18 matches the server substrate (ADR-0006).
 PG_STREAM="18"
+# Address/role/db match the native-cluster branch of scripts/ci/ensure-postgres.sh.
+PG_DSN="postgresql://yuzu:yuzu@127.0.0.1:5432/yuzu_test"
 
 # ccache is deliberately NOT in PKGS: on the RHEL 9 family it exists only in
 # EPEL (verified — it is in neither BaseOS, AppStream nor CRB), and enabling
@@ -136,6 +138,13 @@ probe() { # probe [--assume-true] <predicate-cmd...>
   "$@" 2>/dev/null
 }
 
+# True when the cluster answers on the DSN this script exports. It is the ONLY
+# thing that puts YUZU_TEST_POSTGRES_DSN into the env file (via PG_VERIFIED):
+# an exported-but-unreachable DSN turns every [pg] test from a clean skip into
+# a hard failure (CLAUDE.md skip-vs-fail contract).
+pg_answers() { psql "${PG_DSN}" -v ON_ERROR_STOP=1 -tAc 'SELECT 1' 2>/dev/null | grep -qx 1; }
+PG_VERIFIED=0
+
 FAILURES=0
 check() { # check <label> <condition-cmd...>
   local label="$1"; shift
@@ -205,7 +214,9 @@ if [ "$CHECK_ONLY" = 1 ]; then
   check "VCPKG_ROOT set and bootstrapped"  test -x "${VCPKG_ROOT_ARG}/vcpkg"
   check "vcpkg pinned to baseline"         test "$(git -C "${VCPKG_ROOT_ARG}" rev-parse HEAD 2>/dev/null)" = "${VCPKG_COMMIT}"
 
-  if [ "$WITH_POSTGRES" = 1 ] || [ -n "${YUZU_TEST_POSTGRES_DSN:-}" ]; then
+  if [ "$WITH_POSTGRES" = 1 ]; then
+    check "env file exports the DSN"       grep -qxF "export YUZU_TEST_POSTGRES_DSN=\"${PG_DSN}\"" "${ENV_FILE}"
+    export YUZU_TEST_POSTGRES_DSN="${PG_DSN}"   # the checks below target the canonical DSN
     check "postgresql service active"      systemctl is-active --quiet postgresql
     check "DSN connects"                   bash -c 'psql "$YUZU_TEST_POSTGRES_DSN" -tAc "SELECT 1" | grep -qx 1'
     check "test role has CREATEDB"         bash -c 'psql "$YUZU_TEST_POSTGRES_DSN" -tAc "SELECT rolcreatedb FROM pg_roles WHERE rolname = current_user" | grep -qx t'
@@ -360,12 +371,23 @@ else
   export CC="gcc"
   export CXX="g++"
 fi
-
-# PostgreSQL-backed server tests. Unset DSN => those tests skip cleanly;
-# set-but-broken => hard FAIL (CLAUDE.md contract).
-export YUZU_TEST_ENABLE_PG=1
-export YUZU_TEST_POSTGRES_DSN="postgresql://yuzu:yuzu@127.0.0.1:5432/yuzu_test"
 EOF
+  if [ "$PG_VERIFIED" = 1 ]; then
+    cat <<EOF
+
+# PostgreSQL-backed server tests (--with-postgres). Unset DSN => those tests
+# skip cleanly; set-but-broken => hard FAIL (CLAUDE.md contract). Written only
+# after the cluster answered on this DSN; dropped again by a run without
+# --with-postgres.
+export YUZU_TEST_POSTGRES_DSN="${PG_DSN}"
+EOF
+  else
+    cat <<EOF
+
+# PostgreSQL: not configured by this run. --with-postgres provisions a local
+# cluster and exports YUZU_TEST_POSTGRES_DSN here once it is verified reachable.
+EOF
+  fi
 }
 
 # Installs the rendered file only when its content changed (temp + cmp + mv):
@@ -386,6 +408,9 @@ write_env_file() {
 }
 
 if [ "$DRY_RUN" = 0 ]; then
+  # Under --with-postgres the DSN line survives only if the cluster answers on
+  # it right now; otherwise it is withheld until step 6 has verified it.
+  if [ "$WITH_POSTGRES" = 1 ] && pg_answers; then PG_VERIFIED=1; fi
   write_env_file
 
   if grep -q 'yuzu/toolchain-env.sh' "${HOME}/.bashrc" 2>/dev/null; then
@@ -438,7 +463,12 @@ if [ "$WITH_POSTGRES" = 1 ]; then
   step "Provisioning PostgreSQL ${PG_STREAM} for the server test suite"
 
   if rpm -q postgresql-server >/dev/null 2>&1; then
-    skip "postgresql-server already installed ($(rpm -q --qf '%{VERSION}' postgresql-server))"
+    PG_INSTALLED="$(rpm -q --qf '%{VERSION}' postgresql-server)"
+    # A server of another major (RHEL 9's AppStream default is 13) would
+    # otherwise be accepted silently, breaking the "PostgreSQL 18" promise.
+    [ "${PG_INSTALLED%%.*}" = "${PG_STREAM}" ] \
+      || die "postgresql-server ${PG_INSTALLED} is installed; this recipe needs the postgresql:${PG_STREAM} stream (ADR-0006). Remove it, or enable the ${PG_STREAM} stream and upgrade, then re-run."
+    skip "postgresql-server ${PG_INSTALLED} already installed"
   else
     run sudo dnf -qy module enable "postgresql:${PG_STREAM}"
     run sudo dnf install -y postgresql-server postgresql-contrib
@@ -472,13 +502,21 @@ if [ "$WITH_POSTGRES" = 1 ]; then
     run sudo systemctl reload postgresql
     ok "host auth set to scram-sha-256"
   else
-    skip "pg_hba.conf host auth already password-based"
+    skip "no default ident rule in pg_hba.conf; left unchanged (the DSN check below decides)"
   fi
 
   # CREATEDB is REQUIRED: PostgresTestDb (tests/unit/test_helpers.hpp) creates
-  # and drops an ephemeral yuzu_test_<salt>_<n> database per test.
-  if probe sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='yuzu'" | grep -qx 1; then
-    skip "role 'yuzu' exists"
+  # and drops an ephemeral yuzu_test_<salt>_<n> database per test. The first
+  # probe logs in with exactly the credentials the env file will export
+  # (against the always-present `postgres` db: yuzu_test may not exist yet), so
+  # an existing role that lost LOGIN, CREATEDB or the password is repaired, not
+  # accepted on its name. The password reset is deliberate: the DSN this script
+  # writes hardcodes it.
+  if probe psql "${PG_DSN%/*}/postgres" -tAc "SELECT rolcreatedb FROM pg_roles WHERE rolname = current_user" | grep -qx t; then
+    skip "role 'yuzu' logs in with CREATEDB"
+  elif probe sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='yuzu'" | grep -qx 1; then
+    run sudo -u postgres psql -c "ALTER ROLE yuzu WITH LOGIN CREATEDB PASSWORD 'yuzu';"
+    ok "role 'yuzu' repaired (LOGIN CREATEDB, password reset to match the DSN)"
   else
     run sudo -u postgres psql -c "CREATE ROLE yuzu LOGIN CREATEDB PASSWORD 'yuzu';"
     ok "role 'yuzu' created"
@@ -502,6 +540,18 @@ if [ "$WITH_POSTGRES" = 1 ]; then
   else
     run sudo -u postgres psql -c "CREATE DATABASE yuzu_test OWNER yuzu;"
     ok "database 'yuzu_test' created"
+  fi
+
+  # Last word: the DSN goes into the env file only once the cluster answers on
+  # it. Everything above already aborted under set -e if it failed.
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '  (dry-run) verify %s answers, then add YUZU_TEST_POSTGRES_DSN to %s\n' "${PG_DSN}" "${ENV_FILE}"
+  elif pg_answers; then
+    ok "cluster answers on ${PG_DSN}"
+    PG_VERIFIED=1
+    write_env_file
+  else
+    die "PostgreSQL is provisioned but ${PG_DSN} does not answer, so YUZU_TEST_POSTGRES_DSN was NOT exported (exported-but-broken fails the [pg] tests instead of skipping them). Check 'systemctl status postgresql' and pg_hba.conf, then re-run."
   fi
 fi
 
