@@ -131,4 +131,43 @@ TEST_CASE("kind_mismatch_error wording agrees across stores modulo the "
     // check above would be vacuous).
     CHECK(fragment_msg != policy_msg);
     CHECK(policy_msg != workflow_msg);
+// Governance Gate 2/3/4/6 (SEC-1/ARCH-1/Finding-B/CO-1, InstructionStore PG migration):
+// three independent call sites let a kDbErrorPrefix error reach a client response or a
+// persisted audit row verbatim before genericize_db_error()/is_generic_db_error() existed —
+// each had re-derived its own ad hoc prefix check. These tests lock in the shared contract
+// so a future call site can trust the helper instead of re-deriving a fourth check, the same
+// way the kConflictPrefix tests above protect create_definition's 409 path.
+
+TEST_CASE("kDbErrorPrefix is the canonical 'db_error: ' string", "[store_errors]") {
+    CHECK(std::string(kDbErrorPrefix) == "db_error: ");
+}
+
+TEST_CASE("is_generic_db_error matches only the canonical prefix", "[store_errors]") {
+    CHECK(is_generic_db_error("db_error: connection refused"));
+    CHECK(is_generic_db_error("db_error: "));
+
+    CHECK_FALSE(is_generic_db_error(""));
+    CHECK_FALSE(is_generic_db_error("db_error:no space, wrong form"));
+    CHECK_FALSE(is_generic_db_error("Db_Error: capitalized"));
+    CHECK_FALSE(is_generic_db_error("conflict: instruction set 'x' already exists"));
+    CHECK_FALSE(is_generic_db_error("not_found: no such instruction"));
+}
+
+TEST_CASE("genericize_db_error hides driver text and passes everything else through",
+          "[store_errors]") {
+    // The exact defect this closes: a raw PQerrorMessage() fragment — connection detail,
+    // occasionally host:port — must never reach the caller verbatim.
+    CHECK(genericize_db_error("test-op", "db_error: connection to server at "
+                                         "\"10.0.4.7\", port 5432 failed") ==
+          "service unavailable");
+    CHECK(genericize_db_error("test-op", "db_error: ") == "service unavailable");
+
+    // not_found/conflict/validation text is operator-facing feedback, not database
+    // internals — must pass through unchanged (this is what create_set's 409 fix and
+    // dispatch_fn's "unknown instruction" message both rely on).
+    CHECK(genericize_db_error("test-op", "conflict: instruction set 'x' already exists") ==
+          "conflict: instruction set 'x' already exists");
+    CHECK(genericize_db_error("test-op", "unknown instruction: foo") ==
+          "unknown instruction: foo");
+    CHECK(genericize_db_error("test-op", "") == "");
 }

@@ -836,7 +836,7 @@ spec:
 
 ### 11.1 Storage
 
-Instruction definitions are stored in the `InstructionStore` SQLite database with:
+Instruction definitions are stored in the `InstructionStore` PostgreSQL schema (ADR-0058) with:
 - `yaml_source` — `TEXT` column containing the original YAML document (source of truth)
 - Denormalized columns (`name`, `version`, `type`, `plugin`, `action`, `enabled`, etc.) parsed from YAML for efficient queries
 
@@ -1454,6 +1454,6 @@ This document is grounded in the following implementation files:
 
 ## Build-time content embedding — there is no filesystem load path
 
-`content/definitions/*.yaml` and `content/packs/*.yaml` are converted to JSON envelopes by `server/core/scripts/embed_content.py` at build time, written into `bundled_content.cpp` as the `kBundledDefinitions` / `kBundledSets` vectors, linked into `yuzu-server`, and seeded into `instructions.db` on first boot via `import_definition_json` (conflict-skip on subsequent boots so operator REST/dashboard edits win). The runtime never reads YAML from disk — there is no `--content-dir` flag and none of the install packages ship the YAMLs separately. This is identical on Linux, macOS, and Windows.
+`content/definitions/*.yaml` and `content/packs/*.yaml` are converted to JSON envelopes by `server/core/scripts/embed_content.py` at build time, written into `bundled_content.cpp` as the `kBundledDefinitions` / `kBundledSets` vectors, linked into `yuzu-server`, and reseeded into the shared Postgres `instruction_store` schema on **every** boot via the build-time-trusted import path (ADR-0058; conflict-skip on id existence so operator REST/dashboard edits win — an operator-deleted bundled id stays deleted via a tombstone, never resurrected). The runtime never reads YAML from disk — there is no `--content-dir` flag and none of the install packages ship the YAMLs separately. This is identical on Linux, macOS, and Windows.
 
 **PyYAML is a hard build dependency.** `meson setup` probes `python -c "import yaml"` and fails the configure step if it's missing; `embed_content.py` itself fails the build (non-zero exit) on missing PyYAML, missing `content/` directory, missing required fields in any `InstructionDefinition`, or zero parsed defs. The historical "warn and emit empty bundle" fallback (which silently produced binaries with empty Instructions tabs) was removed. Provision PyYAML with `pip install pyyaml` (Linux/macOS) or `pacman -S python-yaml` (MSYS2).

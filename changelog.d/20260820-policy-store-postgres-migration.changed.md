@@ -4,12 +4,11 @@
   evaluation pipeline. Policy dispatch is now coordinated across replicas via a
   durable, single-sweeper claim (`claim_due_policies`) instead of per-process
   memory, so running the server with multiple replicas no longer risks duplicate
-  or missed policy dispatch. Existing `policies.db` files are backfilled
-  automatically on first boot in the common case; the backfill refuses to
-  boot (and logs why) if it finds two divergent legacy files or a status row
-  Postgres has already advanced past — both require operator reconciliation,
-  by design, rather than a silent merge. See `docs/user-manual/upgrading.md`
-  ("Compliance policy engine migrates to Postgres") for the pre-upgrade check
-  and operator-visible behaviour changes, and
-  `docs/ops-runbooks/policy-store-backfill-recovery.md` for backfill-refusal
-  recovery.
+  or missed policy dispatch. No legacy-SQLite migration path: no production
+  fleet ever ran a pre-Postgres build of this store, so there was no real
+  `policies.db` data to carry over — the one-time backfill mechanism this store
+  originally shipped with was retired shortly after, under ADR-0009's
+  fresh-start-by-default amendment, since this migration had not yet reached a
+  release. See `docs/user-manual/upgrading.md`
+  ("Compliance policy engine moves to Postgres") for the operator-visible
+  behaviour changes.

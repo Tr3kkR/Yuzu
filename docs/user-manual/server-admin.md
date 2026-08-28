@@ -196,6 +196,43 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — `event_logs` acquires natively; Windows message text and `count` semantics change (breaking)
+
+The `event_logs` plugin now reads the event log **in-process** — wevtapi on
+Windows, `sd_journal` on Linux (falling back to a bounded `journalctl`
+invocation where libsystemd is unavailable) — replacing the previous PowerShell
+and shell-out legs. Automation that parses `event_logs` rows needs review before
+upgrading; the changes fail **silently** (fewer rows, or a rule that stops
+firing), not with an error.
+
+What changes for a row consumer:
+
+- **Windows message column** is now the event's `EventData` parameter values,
+  space-joined, instead of the provider-formatted message template. A rule
+  regex-matching template prose (for example `"The user account was locked
+  out"`) will stop matching; match on event ID and provider instead.
+- **Windows timestamps** are the event's UTC `SystemTime` at full precision,
+  where the previous leg emitted the PowerShell-rendered local time.
+- **Windows `count`** bounds the events **examined**, not the matches returned —
+  the filter is applied within the newest `count` events. Linux and macOS return
+  up to `count` matches. When the window fills without satisfying the query the
+  result now carries a `constrained` status rather than reporting an absence.
+- **Linux keyword filtering** is a case-insensitive substring match on both
+  rungs, where the shell-out leg used `journalctl --grep` regular expressions.
+- **`hours` and `count`** reject trailing or leading non-digits (`"12x"`,
+  `" 24"`, `"+8"`) and fall back to their defaults; the previous parse silently
+  accepted the leading digits.
+- **A failed, denied, or bounded read** now reports a typed status
+  (`permission_denied` / `unavailable` / `constrained`) instead of an empty
+  result. Consumers that treated "no rows" as "healthy" will now see the
+  difference — this is the point of the change, but it is a behaviour change.
+
+**Mixed-fleet blend during rollout.** Upgraded and non-upgraded agents emit
+*different message columns for the same Windows event*, and there is no per-row
+field identifying which leg produced it. Expect a blended view until the fleet
+is fully upgraded, and prefer event ID plus provider for any rule that must hold
+across both.
+
 ### vNEXT — a duplicate SCIM `externalId` now refuses to boot (ADR-2001, CC6.8) (breaking)
 
 **What changed.** This release adds a partial unique index, `scim_resources_external_id_uniq ON scim_resources (external_id) WHERE external_id IS NOT NULL`, applied by the `ScimStore` migration that runs at construction — **unconditionally, regardless of whether `--scim-enable` is set**. Postgres itself detects any pre-existing duplicate non-empty `external_id` and raises a `unique_violation`, which fails the migration; `ScimStore` then reports `!is_open()` and the server refuses to start, the same fail-closed posture every born-on-PG store uses on a failed migration. This is deliberate, not a bug to work around: a duplicate `externalId` is exactly the mis-link hazard ADR-2001's SCIM↔OIDC token-revoke linkage exists to prevent (a duplicate would let link formation pick a SCIM resource arbitrarily and revoke — or fail to revoke — the wrong principal's tokens), so the index is a **stronger** posture than what shipped before, not a regression to relax.
@@ -513,13 +550,15 @@ declared id).
 **What to do.** Before upgrading, check for affected content. Query the instruction database
 directly rather than the REST list route: `GET /api/v1/definitions` caps its result at 100
 definitions, and the shipped content alone exceeds that, so an API-based check can report a
-false all-clear. `GLOB` rather than `LIKE` because SQLite's `LIKE` is case-insensitive and
-the reservation is not — `MCP.foo` is a different id everywhere else in the system and is
-not reserved.
+false all-clear. Use a case-sensitive glob-style match — Postgres `LIKE` is case-sensitive by
+default, but `~` (POSIX regex) is used below for an explicit anchor — the reservation is
+case-sensitive: `MCP.foo` is a different id everywhere else in the system and is not reserved.
+(Superseded — `instruction_definitions` moved to PostgreSQL under ADR-0058; this is no longer
+a `sqlite3` query against `instructions.db`, see the PostgreSQL Substrate section below.)
 
 ```bash
-sqlite3 /var/lib/yuzu/instructions.db \
-  "SELECT id FROM instruction_definitions WHERE id GLOB 'mcp.*';"
+psql "$YUZU_POSTGRES_DSN" -c \
+  "SELECT id FROM instruction_store.instruction_definitions WHERE id ~ '^mcp\.';"
 ```
 
 Any id listed keeps executing after the upgrade and can still be edited through
@@ -1430,6 +1469,16 @@ Plugin signature verification ships in two parts: an agent-side CMS verifier and
 
 ### vNEXT — Response templates (#254, Phase 8.2)
 
+**Superseded (ADR-0058).** `instruction_definitions`/`instruction_sets` moved from
+per-replica SQLite to the shared PostgreSQL substrate — the `sqlite3 instructions.db`
+commands and the SQLite `schema_meta` v1→v3 probe-and-stamp mechanism described below **no
+longer apply**; that mechanism doesn't exist in the current codebase. For backup/restore and
+schema-version checks on this store today, use the PostgreSQL Substrate section's `pg_dump`/
+`pg_restore` procedure against the `instruction_store` schema, not the commands in this
+subsection. Left as-written below for historical reference (this is what the Phase 8.2
+migration looked like on SQLite, in case an operator is diagnosing an upgrade that predates
+the Postgres cutover).
+
 Phase 8.2 ships named response-view configurations attached to each `InstructionDefinition`: a column subset, sort order, and filter presets the dashboard's filter-bar **View** dropdown surfaces. The feature is purely additive — operators who never author a template see a synthesised `__default__` view that is byte-identical in behaviour to the prior "show all columns, sort by Agent" default.
 
 **Schema migration.** `instruction_definitions` gains one column: `response_templates_spec TEXT NOT NULL DEFAULT '[]'`. The migration ledger advances from v2 to v3. `ALTER TABLE ADD COLUMN` with a constant default is O(1) in SQLite (metadata-only, no table rewrite); the migration is non-destructive.
@@ -1469,6 +1518,23 @@ systemctl start yuzu-server
 **New audit actions.** `response_template.create`, `response_template.update`, `response_template.delete` — see `audit-log.md` for the failure-reason vocabulary. SIEM rules already filtering on `success`/`denied` will pick these up unchanged.
 
 **Authoring caveats.** The dashboard YAML editor's lightweight line-scanner does not extract `spec.responseTemplates` into the indexed column; author through `POST /api/v1/definitions/import` (JSON envelope) or the REST template endpoints. Imported templates with the reserved `id: __default__` are silently dropped during normalisation.
+
+### vNEXT — webhook store moves to Postgres; secrets now encrypted at rest (ADR-0057) (breaking)
+
+`WebhookStore` moves from SQLite (`webhooks.db`) to the PostgreSQL substrate, and the webhook
+HMAC signing secret is now envelope-encrypted at rest (`SecretCodec`, ADR-0010) instead of a
+plaintext column. A **mandatory, automatic backfill** re-encrypts every existing webhook's
+secret and carries over the delivery log on first boot; a failed backfill refuses to start the
+server (the boot log names the exact remediation). `POST /api/webhooks` now returns `400`
+for an invalid URL, distinct from a `503` for a genuine store/database error; both `POST` and
+`DELETE` return `503` (rather than a silently-empty/silently-failed result) on that latter
+case, previously ambiguous. The legacy `webhooks.db` is retained one release as a rollback
+reference (never deleted) and still holds every pre-cutover secret in plaintext during that
+window, restricted to the file owner where the platform supports it (POSIX only, see the ADR)
+— see [`rest-api.md`](rest-api.md#post-apiwebhooks) for the rotation guidance. Full
+detail: `docs/adr/0057-webhook-store-postgres-migration.md` and the
+`## ⚠️ Behaviour change: webhook store moves to Postgres (ADR-0057)` section in
+`docs/user-manual/upgrading.md`.
 
 ### vNEXT — `initialize` can answer `503` during a graceful shutdown (#3042)
 
@@ -2172,7 +2238,7 @@ Schedule the dump alongside the existing SQLite/cert-dir backups; verify restore
 
 Secret columns in PostgreSQL are **envelope-encrypted app-side** (ADR-0010): each value is sealed under a fresh data-encryption key (DEK), and the DEK is wrapped by the install's key-encryption key (KEK). The KEK is a 32-byte key file generated on first boot (`secrets-kek-v1.key`, mode 0600, in the same key directory as the CA root key — `--ca-dir`, default `/etc/yuzu/certs` on Linux/macOS, `C:\ProgramData\Yuzu\certs` on Windows) and **never enters the database** — `kek_meta` in the `secrets` schema records only non-secret fingerprints (key-check values), which the server verifies against the key files at every boot.
 
-> The encryption machinery ships ahead of its consumers: as of this release **no store writes secret columns yet** — the gated stores (`auth` TOTP secrets, `webhooks`, `offload_targets`, the OIDC client secret) adopt it as each migrates to Postgres. Set your backup procedure up for the pairing below **now** so those migrations don't invalidate it.
+> Three of the four gated stores now write secret columns through this machinery: `auth` (TOTP secrets, since 2026-07-16), `webhooks` (the outbound HMAC signing secret, ADR-0057), and `runtime_config_store` (the OIDC client secret, ADR-0060). `offload_targets` adopts it once it migrates to Postgres (ADR-0059). Set your backup procedure up for the pairing below **now** — every additional migration widens the blast radius of a KEK/DB backup mismatch, never narrows it.
 
 **The restore-pairing invariant.** `pg_dump` output and volume snapshots contain **ciphertext and wrapped DEKs only** — a database backup alone recovers no secrets, and a database restore is unusable without the matching keys directory. DB backups and keys-dir backups are a *pair*: back them up on the same schedule, restore them **together**, and keep a separate offline copy of the KEK file exactly like the CA root key. The restore-verification drill must restore both halves and confirm a clean boot — the server checks every registered KEK fingerprint at startup and **fails closed** rather than serving with unreadable secrets. The failure classes below are stable error *prefixes* at the start of the fatal startup message (match the prefix in the message text when writing log-scraping alerts; they are not structured log fields):
 
@@ -2633,8 +2699,12 @@ Decrypt failures are counted per store and failure class as
 `yuzu_server_secret_decrypt_failures_total{store, failure_class}` (classes:
 `tag_mismatch`, `kek_unresolvable`, `malformed_blob`, `crypto_failure`).
 **This is live as of the auth store's Postgres migration** — the auth store
-(`auth.users.mfa_totp_secret`, TOTP secrets) is the first secret-bearing
-store to ship, so `store="auth"` is the only label value today. A sustained
+(`auth.users.mfa_totp_secret`, TOTP secrets) was the first secret-bearing
+store to ship; `webhook_store` (`webhooks.secret`, ADR-0057) joined it, so
+`store` already has more than one live value and gains a new one with each
+further secret-gated migration (`offload_targets`, then the OIDC client
+secret). Scope any dashboard/alert to the specific `store` you care about
+rather than assuming a single fixed value. A sustained
 non-zero `kek_unresolvable` rate after a deployment or restore is the
 primary backup-skew alert signal; a single-row `tag_mismatch` is the tamper
 signal and warrants investigation, not retry. Ready-made alert rules for

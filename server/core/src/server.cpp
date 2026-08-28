@@ -94,6 +94,8 @@
 #include "notification_store.hpp"
 #include "nvd_db.hpp"
 #include "policy_store.hpp"
+#include "sqlite_raii.hpp" // read-only legacy-file row count, PolicyStore boot detect-and-warn
+#include <sqlite3.h> // direct include per house IWYU convention (baseline_store.cpp, ca_store.cpp, etc.), not relied on transitively via sqlite_raii.hpp
 #include "guaranteed_state_store.hpp"
 #include "baseline_store.hpp"
 #include "guardian_push_builder.hpp"
@@ -172,6 +174,7 @@
 #include "workflow_routes.hpp"
 #include "runtime_config_store.hpp"
 #include "runtime_config_view.hpp"
+#include "secure_buffer.hpp"
 #include "schedule_engine.hpp"
 #include "scope_engine.hpp"
 #include "instruction_db_pool.hpp"
@@ -325,6 +328,43 @@ namespace {
 // independently, same round).
 bool is_custom_properties_db_error(const std::string& err) {
     return err.starts_with(kCustomPropertiesDbErrorPrefix);
+}
+
+// Best-effort row count for a legacy-file detect-and-warn check (currently
+// PolicyStore's boot path; postgres-store-playbook.md's Backfill bullet
+// mandates a count, not just file-existence, so a schema-only legacy file
+// left by a dev/UAT box that never wrote a real row doesn't read as data
+// loss — gov Gate 6 sre + enterprise-readiness, independently). Read-only,
+// diagnostic-only: any failure (missing table, corrupt file, wrong schema
+// version) returns nullopt and the caller falls back to a countless warning
+// rather than treating this as fatal — it must never affect boot outcome.
+// `table` MUST be a compile-time literal, never request/config-derived —
+// there is no bind placeholder for a table name (gov Gate 8 security-guardian).
+// Known accepted limitation (gov Gate 8 security-guardian, LOW): if the
+// legacy file was left mid-lifecycle in WAL mode with an unchecked-out
+// -wal/-shm pair, SQLite's reader can create a -shm index sidecar even
+// under SQLITE_OPEN_READONLY (the main file's bytes are never written —
+// READONLY guarantees that — only a transient sibling file can appear).
+// Avoiding this needs SQLITE_OPEN_URI + `immutable=1`, which requires
+// correctly percent-encoding `path` for the file: URI form; not done here
+// to avoid introducing a path-escaping bug for a narrow, low-severity gap
+// on a diagnostic-only path — revisit if this pattern gets a second caller.
+std::optional<std::int64_t> legacy_sqlite_row_count(const std::filesystem::path& path,
+                                                     const char* table) {
+    std::error_code reg_ec;
+    if (!std::filesystem::is_regular_file(path, reg_ec) || reg_ec)
+        return std::nullopt; // refuse a FIFO/symlink/device node — never block on open()
+    yuzu::server::SqliteDb db;
+    if (sqlite3_open_v2(path.string().c_str(), db.addr(), SQLITE_OPEN_READONLY, nullptr) !=
+        SQLITE_OK)
+        return std::nullopt;
+    yuzu::server::SqliteStmt stmt;
+    const std::string sql = std::string("SELECT count(*) FROM ") + table;
+    if (sqlite3_prepare_v2(db.get(), sql.c_str(), -1, stmt.addr(), nullptr) != SQLITE_OK)
+        return std::nullopt;
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW)
+        return std::nullopt;
+    return sqlite3_column_int64(stmt.get(), 0);
 }
 } // namespace
 } // namespace yuzu::server
@@ -1751,6 +1791,31 @@ public:
                           "Webhook deliveries dropped because the delivery worker pool's queue "
                           "was full or the store was quiescing",
                           "counter");
+        // ADR-0057 (gov Gate 3 sre): these three joined the family above but
+        // were missing describe()/pre-seed, the same HC-1-class parity gap
+        // the comment above this block already names for their siblings.
+        metrics_.describe("yuzu_server_webhook_delivery_secret_unavailable_total",
+                          "Webhook deliveries skipped because the signing secret could not be "
+                          "decrypted (tamper, KEK loss, or a malformed blob) — never fired "
+                          "unsigned or with an empty secret",
+                          "counter");
+        metrics_.describe("yuzu_server_webhook_fire_event_degraded_total",
+                          "fire_event ticks that skipped their enabled-webhook scan because the "
+                          "Postgres pool did not yield a connection within the bounded acquire, "
+                          "or the enabled-webhook query failed after a connection was acquired",
+                          "counter");
+        metrics_.describe("yuzu_server_webhook_delivery_log_failed_total",
+                          "Delivery-log INSERTs (webhook_deliveries) that failed against an open "
+                          "store — the delivery itself still ran; only its record did not persist",
+                          "counter");
+        metrics_.describe("yuzu_server_webhook_backfill_total",
+                          "One-time legacy webhooks.db -> webhook_store PostgreSQL backfill "
+                          "outcome on every boot, by result (success = fresh install, "
+                          "already-migrated skip, or a completed migration; failed = fail-closed, "
+                          "boot refused, next start retries). ADR-0057.",
+                          "counter");
+        for (const auto result : {"success", "failed"})
+            metrics_.counter("yuzu_server_webhook_backfill_total", {{"result", result}});
         metrics_.describe("yuzu_server_offload_delivery_success_total",
                           "Offload-target deliveries that completed with a 2xx response", "counter");
         metrics_.describe("yuzu_server_offload_delivery_failed_total",
@@ -1780,11 +1845,26 @@ public:
         for (const char* name : {"yuzu_server_webhook_delivery_success_total",
                                  "yuzu_server_webhook_delivery_failed_total",
                                  "yuzu_server_webhook_delivery_dropped_total",
+                                 "yuzu_server_webhook_delivery_secret_unavailable_total",
+                                 "yuzu_server_webhook_fire_event_degraded_total",
+                                 "yuzu_server_webhook_delivery_log_failed_total",
                                  "yuzu_server_offload_delivery_success_total",
                                  "yuzu_server_offload_delivery_failed_total",
                                  "yuzu_server_offload_delivery_dropped_total"}) {
             metrics_.counter(name);
         }
+        // ADR-0059 (OffloadTargetStore Postgres migration) — two new counters
+        // this migration adds, same pre-seed rule as the six above.
+        metrics_.describe("yuzu_server_offload_delivery_credential_unavailable_total",
+                          "Offload-target deliveries skipped because the target's credential "
+                          "failed to decrypt (ADR-0010 fail-closed - never fired unsigned)",
+                          "counter");
+        metrics_.counter("yuzu_server_offload_delivery_credential_unavailable_total");
+        metrics_.describe("yuzu_server_offload_fire_event_degraded_total",
+                          "fire_event's enabled-target scan degraded (lease timeout or query "
+                          "failure) and skipped this tick's dispatch entirely",
+                          "counter");
+        metrics_.counter("yuzu_server_offload_fire_event_degraded_total");
         // ADR-0010 §Decision 3. Carried in the gauge family because the
         // authoritative cumulative count lives in SecretCodec and is exported
         // pull-model at scrape time, but it IS a monotonic counter — declared
@@ -3176,6 +3256,22 @@ public:
             // admin_gid lookup, the startup config-audit line) sees the
             // trimmed value too.
             cfg_.oidc_admin_group = trim_ascii_whitespace(cfg_.oidc_admin_group);
+
+            // Pre-existing, migration-independent gap (governance enterprise-readiness
+            // finding on the RuntimeConfigStore/ADR-0060 PR, not caused by it): this
+            // provider is built HERE, before apply_runtime_config_overrides() runs
+            // (Phase 7, later in boot), and nothing rebuilds it afterward. A
+            // Settings-only-configured client secret is therefore never picked up by
+            // the live provider on any boot — only --oidc-client-secret/env do. Loudly
+            // flag it rather than let token exchange fail opaquely at the IdP later.
+            if (cfg_.oidc_client_secret.empty())
+                spdlog::warn(
+                    "OIDC configured (issuer/client_id set) but the client secret is empty at "
+                    "startup -- if you configured it via Settings rather than "
+                    "--oidc-client-secret/the environment, it will NOT take effect: this "
+                    "provider is built once at boot, before stored runtime config is applied, "
+                    "and is never rebuilt. Set the secret via --oidc-client-secret or the "
+                    "environment instead.");
 
             oidc::OidcConfig oidc_cfg;
             oidc_cfg.issuer = cfg_.oidc_issuer;
@@ -4776,16 +4872,29 @@ public:
             gateway_service_->set_analytics_store(analytics_store_);
         }
 
-        // Initialize instruction store (Phase 2)
-        {
-            auto instr_db = cfg_.db_dir() / "instructions.db";
-            instruction_store_ = std::make_unique<InstructionStore>(instr_db);
-            // #1073 / W7.4 sibling-gap: InstructionStore ctor sets
-            // require_signed_definitions_=true. Wire the operator opt-out
-            // immediately after construction, before any import path can
-            // execute, so legacy unsigned imports are accepted iff the
-            // operator explicitly enabled --allow-unsigned-definitions.
-            if (instruction_store_) {
+        // Initialize instruction store (Phase 2) — Migrated Postgres store
+        // (ADR-0006/0009/0058, schema `instruction_store`). Construction fail-CLOSED per
+        // ADR-0012 §1 (ProductPackStore template): a reachable database whose schema can't
+        // migrate/open is a fatal startup error, never a serve-degraded instruction catalog —
+        // execute_instruction resolves definitions here, so a silent-empty read would break
+        // dispatch. No legacy-SQLite backfill (ADR-0009's fresh-start-by-default class,
+        // ResponseStore precedent): no production fleet has ever run a pre-Postgres build of
+        // any Yuzu store, so there is no legacy `instructions.db` content to protect.
+        if (pg_pool_ && !startup_failed_) {
+            instruction_store_ = std::make_unique<InstructionStore>(*pg_pool_);
+            if (!instruction_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: instruction store migration/open failed "
+                              "(database reachable but the instruction_store schema could not "
+                              "be created/opened)");
+                startup_failed_ = true;
+            } else {
+                spdlog::info("InstructionStore initialized (schema instruction_store) — fresh "
+                             "start, no legacy backfill");
+                // #1073 / W7.4 sibling-gap: InstructionStore ctor sets
+                // require_signed_definitions_=true. Wire the operator opt-out
+                // immediately after construction, before any import path can
+                // execute, so legacy unsigned imports are accepted iff the
+                // operator explicitly enabled --allow-unsigned-definitions.
                 instruction_store_->set_require_signed_definitions(
                     !cfg_.allow_unsigned_definitions);
                 if (cfg_.allow_unsigned_definitions) {
@@ -4794,145 +4903,228 @@ public:
                                  "YUZU_ALLOW_UNSIGNED_DEFINITIONS) — unsigned "
                                  "instruction imports will be accepted");
                 }
+                instruction_store_->set_metrics(&metrics_);
+                metrics_.describe("yuzu_server_instruction_read_degrade_total",
+                                  "InstructionStore reads that degraded instead of answering, "
+                                  "by reason",
+                                  "counter");
+                for (auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"}) {
+                    metrics_.counter("yuzu_server_instruction_read_degrade_total",
+                                     {{"reason", reason}});
+                }
+                metrics_.describe("yuzu_server_instruction_write_degrade_total",
+                                  "InstructionStore writes that degraded instead of succeeding, "
+                                  "by call site",
+                                  "counter");
+                for (auto reason : {"insert_definition_row", "update_definition",
+                                    "delete_definition", "insert_set_row", "delete_set"}) {
+                    metrics_.counter("yuzu_server_instruction_write_degrade_total",
+                                     {{"reason", reason}});
+                }
+                // Gate 4 UP-4: distinct from the runtime write-degrade counter above — this
+                // is the ONE-BOOT reseed-loop outcome, alertable on its own so "reseed lost
+                // N/232 items at boot" is distinguishable from an ordinary operator-write
+                // blip sharing the same reason labels.
+                metrics_.describe("yuzu_server_instruction_bundled_content_total",
+                                  "Bundled-content boot-time reseed outcome by result (clean = "
+                                  "zero import errors; errored = at least one definition/set "
+                                  "failed to import against an open store — the boot refuses "
+                                  "to serve, ADR-0058 Gate 8). Every-boot, not one-time, unlike "
+                                  "sibling *_backfill_total counters.",
+                                  "counter");
+                for (auto result : {"clean", "errored"}) {
+                    metrics_.counter("yuzu_server_instruction_bundled_content_total",
+                                     {{"result", result}});
+                }
             }
-            if (instruction_store_ && instruction_store_->is_open()) {
-                // RAII pool owns the shared connection (fixes G3-ARCH-T2-002).
-                // Declare instr_db_pool_ before the consumers in the member list
-                // so that consumers are destroyed before the pool closes the DB.
-                instr_db_pool_ = std::make_unique<InstructionDbPool>(instr_db);
-                if (instr_db_pool_->is_open()) {
-                    // PR 3 — per-execution SSE event bus. Constructed
-                    // before the tracker so the tracker can attach
-                    // immediately and we keep the "bus outlives tracker"
-                    // invariant that the member-order comment encodes.
-                    execution_event_bus_ = std::make_unique<ExecutionEventBus>();
-                    execution_tracker_ = std::make_unique<ExecutionTracker>(instr_db_pool_->get());
-                    execution_tracker_->create_tables();
-                    execution_tracker_->set_event_bus(execution_event_bus_.get());
-                    // UAT 2026-05-06 #8: AgentServiceImpl notifies the
-                    // tracker on every response so the per-agent KPI
-                    // table populates and SSE agent-transition fires
-                    // for live drawer updates.
-                    agent_service_.set_execution_tracker(execution_tracker_.get());
+        }
 
-                    approval_manager_ = std::make_unique<ApprovalManager>(instr_db_pool_->get());
-                    approval_manager_->create_tables();
+        // InstructionDbPool — a SEPARATE SQLite pool onto the SAME instructions.db file,
+        // backing the still-unmigrated ExecutionTracker/ApprovalManager/ScheduleEngine
+        // (ADR-0058: only instruction_definitions/instruction_sets moved to Postgres; these
+        // three siblings are unaffected and keep reading/writing the physical file directly —
+        // it is not retired by this migration). Deliberately NOT gated on instruction_store_'s
+        // (now Postgres) is_open() — the two are independent post-migration, unlike
+        // pre-migration where they happened to share one SQLite-open check. RAII pool owns the
+        // shared connection (fixes G3-ARCH-T2-002); declared before the consumers in the member
+        // list so that consumers are destroyed before the pool closes the DB.
+        if (!startup_failed_) {
+            auto instr_db = cfg_.db_dir() / "instructions.db";
+            instr_db_pool_ = std::make_unique<InstructionDbPool>(instr_db);
+            if (instr_db_pool_->is_open()) {
+                // PR 3 — per-execution SSE event bus. Constructed
+                // before the tracker so the tracker can attach
+                // immediately and we keep the "bus outlives tracker"
+                // invariant that the member-order comment encodes.
+                execution_event_bus_ = std::make_unique<ExecutionEventBus>();
+                execution_tracker_ = std::make_unique<ExecutionTracker>(instr_db_pool_->get());
+                execution_tracker_->create_tables();
+                execution_tracker_->set_event_bus(execution_event_bus_.get());
+                // UAT 2026-05-06 #8: AgentServiceImpl notifies the
+                // tracker on every response so the per-agent KPI
+                // table populates and SSE agent-transition fires
+                // for live drawer updates.
+                agent_service_.set_execution_tracker(execution_tracker_.get());
 
-                    schedule_engine_ = std::make_unique<ScheduleEngine>(instr_db_pool_->get());
-                    schedule_engine_->create_tables();
+                approval_manager_ = std::make_unique<ApprovalManager>(instr_db_pool_->get());
+                approval_manager_->create_tables();
+
+                schedule_engine_ = std::make_unique<ScheduleEngine>(instr_db_pool_->get());
+                schedule_engine_->create_tables();
+            }
+        }
+
+        // Auto-import shipped content from content/definitions/ and content/packs/ — the
+        // every-boot bundled-content reseed loop (ADR-0058). The build-time embed_content.py
+        // script converts each YAML doc to a JSON envelope; we walk the arrays and upsert.
+        // Conflicts on already-existing ids are expected on second-and-later startups and
+        // silently skipped — content is the source of truth at boot, not override of in-place
+        // operator edits. Requires the Postgres instruction_store to be open; the
+        // `!startup_failed_` guard skips this on a construction failure that is about to refuse
+        // boot anyway.
+        //
+        // Conflict detection uses is_conflict_error() against the
+        // shared kConflictPrefix (Gate 4 C-B1 / arch-B1). Substring
+        // matching on "already exists" was fragile to localization
+        // and to error-string drift in the store layer.
+        //
+        // Audit emission: each successful import or skip writes one
+        // audit_store entry with principal="system" — closes Gate 6
+        // COMP-1 / sec-M2. Errors include the JSON envelope's `id`
+        // field in both the audit detail and the spdlog warning so
+        // operators can triage without reading 200+ envelopes by
+        // hand (Gate 6 SRE-O2).
+        //
+        // Gate 4 UP-4 (BLOCKING, HIGH-derived): a genuine DB error on any item was
+        // previously only counted (defs_errored/sets_errored) and logged at INFO — never
+        // checked against startup_failed_, unlike every OTHER store construction in this
+        // function. The server would boot and serve a silently partial catalog with no
+        // readiness signal. This loop is entirely synchronous inside the constructor —
+        // web_server_->listen() runs strictly after it returns — so there is no window
+        // where a partially-reseeded server is already accepting traffic; failing closed
+        // here means refusing to ever start serving, not interrupting an in-progress
+        // serve. A single-shot with_txn_for has no internal retry, so a transient blip on
+        // one of ~232 sequential items is a real, not hypothetical, trigger; the existing
+        // orchestrator crash-loop-backoff is the intended recovery (a failed item was
+        // never inserted, so a clean restart against a healthy Postgres re-imports it —
+        // ADR-0058's every-boot reseed already makes this self-healing).
+        if (instruction_store_ && instruction_store_->is_open() && !startup_failed_) {
+            auto audit_bundle = [this](std::string_view target_type, const std::string& target_id,
+                                       std::string_view result, const std::string& detail) {
+                // Hardening round 1 INFO — audit_store_ is
+                // initialized at server.cpp:394, before this
+                // block at :441; the null branch is unreachable
+                // today. Guard with an error log so a future
+                // re-ordering surfaces immediately rather than
+                // silently dropping boot-content audit events.
+                if (!audit_store_) {
+                    spdlog::error("bundled_content audit dropped: "
+                                  "audit_store_ not initialized "
+                                  "(target_type={} target_id={})",
+                                  target_type, target_id);
+                    return;
                 }
-
-                // Auto-import shipped content from content/definitions/ and
-                // content/packs/. The build-time embed_content.py script
-                // converts each YAML doc to a JSON envelope; we walk the
-                // arrays and upsert. Conflicts on already-existing ids are
-                // expected on second-and-later startups and silently
-                // skipped — content is the source of truth at boot, not
-                // override of in-place operator edits.
-                //
-                // Conflict detection uses is_conflict_error() against the
-                // shared kConflictPrefix (Gate 4 C-B1 / arch-B1). Substring
-                // matching on "already exists" was fragile to localization
-                // and to error-string drift in the store layer.
-                //
-                // Audit emission: each successful import or skip writes one
-                // audit_store entry with principal="system" — closes Gate 6
-                // COMP-1 / sec-M2. Errors include the JSON envelope's `id`
-                // field in both the audit detail and the spdlog warning so
-                // operators can triage without reading 200+ envelopes by
-                // hand (Gate 6 SRE-O2).
-                {
-                    auto audit_bundle = [this](std::string_view target_type,
-                                               const std::string& target_id,
-                                               std::string_view result, const std::string& detail) {
-                        // Hardening round 1 INFO — audit_store_ is
-                        // initialized at server.cpp:394, before this
-                        // block at :441; the null branch is unreachable
-                        // today. Guard with an error log so a future
-                        // re-ordering surfaces immediately rather than
-                        // silently dropping boot-content audit events.
-                        if (!audit_store_) {
-                            spdlog::error("bundled_content audit dropped: "
-                                          "audit_store_ not initialized "
-                                          "(target_type={} target_id={})",
-                                          target_type, target_id);
-                            return;
-                        }
-                        AuditEvent ev{};
-                        ev.timestamp = std::time(nullptr);
-                        ev.principal = "system";
-                        ev.principal_role = "system";
-                        ev.action = "content.bundled_import";
-                        ev.target_type = std::string(target_type);
-                        ev.target_id = target_id;
-                        ev.detail = detail;
-                        ev.result = std::string(result);
-                        (void)audit_store_->log(ev);
-                    };
-                    auto envelope_id = [](const std::string& env) -> std::string {
-                        auto p = nlohmann::json::parse(env, nullptr, false);
-                        return p.is_discarded() ? std::string{} : p.value("id", std::string{});
-                    };
-                    int defs_imported = 0, defs_skipped = 0, defs_errored = 0;
-                    for (const auto& env : kBundledDefinitions) {
-                        auto id = envelope_id(env);
-                        // #1073 / W7.4 sibling-gap: bundled content is
-                        // authenticated by build-time binary linkage; route
-                        // through the trusted variant so the runtime
-                        // signature gate doesn't reject definitions baked
-                        // into yuzu-server at compile time. The public
-                        // `import_definition_json` is reserved for
-                        // operator/network-supplied input.
-                        auto r = instruction_store_->import_definition_json_trusted(env);
-                        if (r) {
-                            ++defs_imported;
-                            audit_bundle("InstructionDefinition", *r, "success",
-                                         "boot-time content embed");
-                        } else if (is_conflict_error(r.error())) {
-                            ++defs_skipped;
-                        } else {
-                            ++defs_errored;
-                            spdlog::warn("bundled definition import failed: id={} error={}", id,
-                                         r.error());
-                            audit_bundle("InstructionDefinition", id, "error", r.error());
-                        }
-                    }
-                    int sets_imported = 0, sets_skipped = 0, sets_errored = 0;
-                    for (const auto& env : kBundledSets) {
-                        auto parsed = nlohmann::json::parse(env, nullptr, false);
-                        if (parsed.is_discarded()) {
-                            ++sets_errored;
-                            continue;
-                        }
-                        InstructionSet s;
-                        s.id = parsed.value("id", "");
-                        s.name = parsed.value("name", s.id);
-                        s.description = parsed.value("description", "");
-                        s.created_by = parsed.value("created_by", "system");
-                        if (s.id.empty()) {
-                            ++sets_errored;
-                            continue;
-                        }
-                        auto r = instruction_store_->create_set(s);
-                        if (r) {
-                            ++sets_imported;
-                            audit_bundle("InstructionSet", *r, "success",
-                                         "boot-time content embed");
-                        } else if (is_conflict_error(r.error())) {
-                            ++sets_skipped;
-                        } else {
-                            ++sets_errored;
-                            spdlog::warn("bundled set import failed: id={} error={}", s.id,
-                                         r.error());
-                            audit_bundle("InstructionSet", s.id, "error", r.error());
-                        }
-                    }
-                    spdlog::info(
-                        "bundled content: {} definitions imported / {} skipped / {} errored; "
-                        "{} sets imported / {} skipped / {} errored",
-                        defs_imported, defs_skipped, defs_errored, sets_imported, sets_skipped,
-                        sets_errored);
+                AuditEvent ev{};
+                ev.timestamp = std::time(nullptr);
+                ev.principal = "system";
+                ev.principal_role = "system";
+                ev.action = "content.bundled_import";
+                ev.target_type = std::string(target_type);
+                ev.target_id = target_id;
+                ev.detail = detail;
+                ev.result = std::string(result);
+                (void)audit_store_->log(ev);
+            };
+            auto envelope_id = [](const std::string& env) -> std::string {
+                auto p = nlohmann::json::parse(env, nullptr, false);
+                return p.is_discarded() ? std::string{} : p.value("id", std::string{});
+            };
+            int defs_imported = 0, defs_skipped = 0, defs_errored = 0;
+            for (const auto& env : kBundledDefinitions) {
+                auto id = envelope_id(env);
+                // #1073 / W7.4 sibling-gap: bundled content is
+                // authenticated by build-time binary linkage; route
+                // through the trusted variant so the runtime
+                // signature gate doesn't reject definitions baked
+                // into yuzu-server at compile time. The public
+                // `import_definition_json` is reserved for
+                // operator/network-supplied input. ADR-0058: this variant ALSO routes through
+                // the seed-aware insert path (deleted_seed_content-consulting) internally.
+                auto r = instruction_store_->import_definition_json_trusted(env);
+                if (r) {
+                    ++defs_imported;
+                    audit_bundle("InstructionDefinition", *r, "success",
+                                 "boot-time content embed");
+                } else if (is_conflict_error(r.error())) {
+                    ++defs_skipped;
+                } else {
+                    ++defs_errored;
+                    spdlog::warn("bundled definition import failed: id={} error={}", id,
+                                 r.error());
+                    // Gate 8 re-review (security-guardian): the boot log line above already
+                    // carries the raw driver text for operators — the persisted audit row
+                    // gets the genericized form, same shape as the other 3 sites this round
+                    // fixed (r.error() can carry a genuine kDbErrorPrefix failure, not just
+                    // an is_conflict_error, since that branch is handled above).
+                    audit_bundle("InstructionDefinition", id, "error",
+                                 genericize_db_error("bundled_content reseed", r.error()));
                 }
+            }
+            int sets_imported = 0, sets_skipped = 0, sets_errored = 0;
+            for (const auto& env : kBundledSets) {
+                auto parsed = nlohmann::json::parse(env, nullptr, false);
+                if (parsed.is_discarded()) {
+                    ++sets_errored;
+                    continue;
+                }
+                InstructionSet s;
+                s.id = parsed.value("id", "");
+                s.name = parsed.value("name", s.id);
+                s.description = parsed.value("description", "");
+                s.created_by = parsed.value("created_by", "system");
+                if (s.id.empty()) {
+                    ++sets_errored;
+                    continue;
+                }
+                // ADR-0058: the seed-aware entry point (consults deleted_seed_content so an
+                // operator-deleted bundled set is never resurrected) — NOT plain create_set,
+                // which is the REST-facing "create a custom set" path.
+                auto r = instruction_store_->create_set_seed(s);
+                if (r) {
+                    ++sets_imported;
+                    audit_bundle("InstructionSet", *r, "success",
+                                 "boot-time content embed");
+                } else if (is_conflict_error(r.error())) {
+                    ++sets_skipped;
+                } else {
+                    ++sets_errored;
+                    spdlog::warn("bundled set import failed: id={} error={}", s.id, r.error());
+                    // Gate 8 re-review (security-guardian): see the matching comment on the
+                    // definitions loop above.
+                    audit_bundle("InstructionSet", s.id, "error",
+                                 genericize_db_error("bundled_content reseed", r.error()));
+                }
+            }
+            if (defs_errored > 0 || sets_errored > 0) {
+                spdlog::error(
+                    "bundled content: {} definitions imported / {} skipped / {} errored; "
+                    "{} sets imported / {} skipped / {} errored — refusing to start "
+                    "(ADR-0058 Gate 8: a partial catalog is never served silently)",
+                    defs_imported, defs_skipped, defs_errored, sets_imported, sets_skipped,
+                    sets_errored);
+                metrics_.counter("yuzu_server_instruction_bundled_content_total",
+                                 {{"result", "errored"}})
+                    .increment();
+                startup_failed_ = true;
+            } else {
+                spdlog::info(
+                    "bundled content: {} definitions imported / {} skipped / {} errored; "
+                    "{} sets imported / {} skipped / {} errored",
+                    defs_imported, defs_skipped, defs_errored, sets_imported, sets_skipped,
+                    sets_errored);
+                metrics_.counter("yuzu_server_instruction_bundled_content_total",
+                                 {{"result", "clean"}})
+                    .increment();
             }
         }
 
@@ -5180,13 +5372,65 @@ public:
         // Phase 5: Policy Engine. Migrated Postgres store (ADR-0006/ADR-0056,
         // schema `policy_store`) — construction fail-CLOSED per ADR-0012 §1
         // (same template as ResultSetStore above): a reachable database whose
-        // schema can't migrate/open is a fatal startup error. This store had
-        // NO fail-closed guard on SQLite (a pre-existing gap the ladder's
-        // Wave 2 "authoritative" posture already called for — ADR-0056
-        // closes it, not a new decision). `migrate_from_sqlite` runs the
-        // one-time, idempotent legacy-`policies.db` backfill (ADR-0009);
-        // AUTHORITATIVE posture means a backfill failure is ALSO fatal.
+        // schema can't migrate/open is a fatal startup error. No legacy-SQLite
+        // backfill (retired: no production fleet ever ran the pre-Postgres
+        // build, so there was never real data to carry over) — but per
+        // postgres-store-playbook.md's detect-and-warn requirement for a
+        // skip-by-default store that holds real operator-authored data,
+        // still check whether a legacy file exists and warn loudly rather
+        // than silently proceeding fresh-started if the "no production
+        // fleet" premise ever turns out to be locally wrong.
         if (pg_pool_ && !startup_failed_) {
+            std::error_code legacy_ec;
+            auto legacy_policy_db = cfg_.db_dir() / "policies.db";
+            if (std::filesystem::exists(legacy_policy_db, legacy_ec) && !legacy_ec) {
+                // A schema-only file (created but never written to — any dev/UAT box
+                // that booted the pre-Postgres build once, even with zero real
+                // policies) must not trip this warning: count rows, don't just check
+                // existence, per postgres-store-playbook.md's own requirement. Check
+                // BOTH `policies` and `policy_fragments` — the dependency runs
+                // policies.fragment_id -> policy_fragments(id), not the reverse, so
+                // an operator could have authored real fragments with zero policies
+                // created from them yet; counting `policies` alone would silently
+                // call that "nothing lost" (gov Gate 8 architect finding).
+                auto policy_count = legacy_sqlite_row_count(legacy_policy_db, "policies");
+                auto fragment_count = legacy_sqlite_row_count(legacy_policy_db, "policy_fragments");
+                // The two tables are read independently, so their outcomes are
+                // independent too: one can be a genuine 0 while the other failed
+                // to read (single-table corruption, not just whole-file/whole-
+                // schema failure). Branch on has_value(), never value_or(0) alone,
+                // or a real-0/unreadable mix silently falls through neither branch
+                // and claims (via the trailing no-warning comment) that both were
+                // confirmed empty when one genuinely wasn't (gov round-5 cpp-safety
+                // finding).
+                auto count_str = [](std::optional<std::int64_t> c) -> std::string {
+                    return c.has_value() ? std::to_string(*c) : std::string("unknown");
+                };
+                if (policy_count.value_or(0) > 0 || fragment_count.value_or(0) > 0) {
+                    spdlog::warn(
+                        "[PG] A legacy policies.db ({}) has {} policy row(s) and {} fragment "
+                        "row(s) but PolicyStore no longer backfills it (retired 2026-08-25 — no "
+                        "production fleet has ever run a pre-Postgres build). This content will "
+                        "NOT be carried over. To reconcile manually, re-author the equivalent "
+                        "fragments/policies via POST /api/policy-fragments and POST /api/policies "
+                        "before relying on this Postgres instance.",
+                        legacy_policy_db.string(), count_str(policy_count),
+                        count_str(fragment_count));
+                } else if (!policy_count.has_value() || !fragment_count.has_value()) {
+                    // Couldn't read at least one count (corrupt file, unreadable,
+                    // unexpected schema) — still worth a heads-up, but don't claim
+                    // a confirmed-empty result for the table that failed to read.
+                    spdlog::warn("[PG] A legacy policies.db ({}) exists but its row counts "
+                                 "couldn't be fully read (policies={}, policy_fragments={}) — "
+                                 "PolicyStore no longer backfills it regardless; if this "
+                                 "environment has real compliance-policy data, inspect the file "
+                                 "manually before relying on this Postgres instance.",
+                                 legacy_policy_db.string(), count_str(policy_count),
+                                 count_str(fragment_count));
+                }
+                // Both tables read successfully and both are empty: schema-only
+                // file, nothing lost — no warning.
+            }
             policy_store_ = std::make_unique<PolicyStore>(*pg_pool_);
             if (!policy_store_->is_open()) {
                 spdlog::error("[PG] Refusing to start: policy store migration/open failed "
@@ -5194,25 +5438,7 @@ public:
                               "created/opened)");
                 startup_failed_ = true;
             } else {
-                auto policy_db = cfg_.db_dir() / "policies.db";
-                if (!policy_store_->migrate_from_sqlite(policy_db)) {
-                    // Recovery procedure for every refusal shape (divergent
-                    // legacy file, legacy-ahead status row, unreadable file):
-                    // docs/ops-runbooks/policy-store-backfill-recovery.md.
-                    spdlog::error("[PG] Refusing to start: policy legacy-SQLite backfill failed "
-                                  "(see prior log lines) — policy_store is authoritative and "
-                                  "must not serve partially-migrated compliance data. Operator "
-                                  "remediation: repair {} or move it aside to skip the backfill "
-                                  "(policy definitions AND per-agent status history in it will "
-                                  "NOT carry over — see "
-                                  "docs/ops-runbooks/policy-store-backfill-recovery.md)",
-                                  policy_db.string());
-                    startup_failed_ = true;
-                } else {
-                    spdlog::info("PolicyStore initialized (schema policy_store; legacy backfill "
-                                 "source {})",
-                                 policy_db.string());
-                }
+                spdlog::info("PolicyStore initialized (schema policy_store)");
             }
         }
 
@@ -5375,13 +5601,93 @@ public:
             }
         }
 
-        // Phase 7: Runtime Configuration + Custom Properties
-        {
-            auto rtcfg_db = cfg_.db_dir() / "runtime-config.db";
-            runtime_config_store_ = std::make_unique<RuntimeConfigStore>(rtcfg_db);
-            if (runtime_config_store_ && runtime_config_store_->is_open()) {
-                // Apply stored overrides on startup
-                apply_runtime_config_overrides();
+        // Phase 7: Runtime Configuration — Migrated Postgres store (ADR-0006/
+        // 0009/0060, schema `runtime_config_store`). Same fail-CLOSED
+        // construction posture as every other born-on-PG store (ADR-0012
+        // §1): a reachable database whose schema can't migrate/open is a
+        // fatal startup error, never a serve-degraded config plane — config
+        // reads feed auth/OIDC behaviour, so serving degraded here is a
+        // fail-open, not a benign default.
+        //
+        // NO backfill (ADR-0009's 2026-08-25 fresh-start-by-default
+        // amendment, ADR-0060): no production fleet has ever run a
+        // pre-Postgres Yuzu build, so the legacy runtime-config.db is never
+        // COPIED. Unlike ResponseStore (purely TTL'd telemetry), this store
+        // holds real operator config, so the playbook's detect-and-warn
+        // obligation applies: warn_if_legacy_data_present() opens the
+        // legacy file read-only to check for real rows and warns loudly
+        // (with a count) only when it finds them -- silence is the
+        // unremarkable case (a genuinely fresh install). This check ONLY
+        // ever inspects the legacy SQLite file -- it has no way to know
+        // whether the operator already reapplied a warned-about override,
+        // so a real-data warning repeats on EVERY boot the legacy file
+        // still holds rows, not just the first one after cutover (see
+        // docs/user-manual/upgrading.md's RuntimeConfigStore section).
+        //
+        // Own SecretCodec instance (ADR-0010 per-store model, mirrors
+        // plugin_config_store_'s construction sequence exactly, see that
+        // block above): construct the codec first (ctor only), THEN
+        // RuntimeConfigStore's own constructor registers its ONE secret
+        // column (runtime_config_store.runtime_config_secrets.sealed_value)
+        // immediately after its schema migration, THEN SecretCodec::init()
+        // runs on a pinned lease. Reuses auth_key_provider_ (constructed
+        // above; guaranteed non-null whenever this guard is reached) rather
+        // than minting a third FileKeyProvider — the KEK material is
+        // install-wide (ADR-0010 §2), so one KeyProvider instance backing
+        // three independent SecretCodec instances is the correct shape.
+        if (pg_pool_ && !startup_failed_) {
+            runtime_config_secret_codec_ = std::make_unique<pg::SecretCodec>(*auth_key_provider_);
+            runtime_config_store_ =
+                std::make_unique<RuntimeConfigStore>(*pg_pool_, *runtime_config_secret_codec_);
+            if (!runtime_config_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: runtime config store migration/open failed "
+                              "(database reachable but the runtime_config_store schema could not "
+                              "be created/opened)");
+                startup_failed_ = true;
+            } else {
+                auto lease = pg_pool_->acquire();
+                if (!lease) {
+                    spdlog::error("[PG] Refusing to start: could not acquire a connection to run "
+                                  "SecretCodec::init() for runtime_config_store ({})",
+                                  pg_pool_->last_error());
+                    startup_failed_ = true;
+                } else {
+                    auto init_res = runtime_config_secret_codec_->init(lease.get());
+                    lease.reset();
+                    if (!init_res) {
+                        spdlog::error(
+                            "[PG] Refusing to start: runtime_config_store SecretCodec::init() "
+                            "failed — {}: {}",
+                            pg::SecretCodec::to_string(init_res.error().kind),
+                            init_res.error().message);
+                        startup_failed_ = true;
+                    } else {
+                        runtime_config_store_->set_metrics(&metrics_);
+                        metrics_.describe("yuzu_server_runtime_config_read_degrade_total",
+                                          "RuntimeConfigStore reads that degraded instead of "
+                                          "answering, by reason",
+                                          "counter");
+                        for (auto reason : {"store_not_open", "pool_acquire_timeout",
+                                             "query_error", "crypto_error"}) {
+                            metrics_.counter("yuzu_server_runtime_config_read_degrade_total",
+                                             {{"reason", reason}});
+                        }
+                        // Detect-and-warn (docs/postgres-store-playbook.md's Backfill bullet):
+                        // silent unless the legacy file actually holds real overrides this
+                        // cutover will not carry over -- see the store's own doc comment.
+                        RuntimeConfigStore::warn_if_legacy_data_present(cfg_.db_dir() /
+                                                                        "runtime-config.db");
+                        if (!apply_runtime_config_overrides()) {
+                            spdlog::error(
+                                "[PG] Refusing to start: could not apply stored runtime config "
+                                "overrides at boot (see prior log lines) — a config read failure "
+                                "here would otherwise silently boot with defaults instead of the "
+                                "operator's stored overrides, including a possible OIDC client "
+                                "secret");
+                            startup_failed_ = true;
+                        }
+                    }
+                }
             }
         }
         // Migrated Postgres store (ADR-0006/ADR-0045, schema
@@ -5539,18 +5845,194 @@ public:
                 }
             }
         }
-        // Webhook store
-        {
-            auto webhook_db = cfg_.db_dir() / "webhooks.db";
-            webhook_store_ = std::make_unique<WebhookStore>(webhook_db);
-            webhook_store_->set_metrics(&metrics_);
-            agent_service_.set_webhook_store(webhook_store_.get());
+        // WebhookStore (ADR-0057, Wave 3) — Postgres-backed, construction
+        // fail-closed (ADR-0012 §1). First store past AuthDB to carry a
+        // real SecretCodec migration (`webhooks.secret`, the webhook HMAC
+        // signing secret) — the ADR-0057 template for OffloadTargetStore/
+        // RuntimeConfigStore. Construction order mirrors AuthDB's block
+        // above EXACTLY (docs/postgres-store-playbook.md step 3,
+        // "Instance model" — one codec per secret-bearing store, reusing
+        // auth_key_provider_ rather than minting a second KeyProvider over
+        // the same install-wide KEK): SecretCodec (ctor only) -> WebhookStore
+        // (this ctor registers `secret` as the secret column) ->
+        // SecretCodec::init() -> migrate_from_sqlite (MANDATORY backfill,
+        // ADR-0009 — webhook configs+secrets are unconditionally mandatory,
+        // and ADR-0057 also treats the delivery log as mandatory: it is
+        // not TTL'd, so ResponseStore's "ages out" skip-justification does
+        // not hold, and one transaction already covers both tables at this
+        // scale). auth_key_provider_ is guaranteed non-null whenever this
+        // guard is reached — same reasoning as the plugin_config_store_
+        // block above.
+        if (pg_pool_ && !startup_failed_) {
+            webhook_secret_codec_ = std::make_unique<pg::SecretCodec>(*auth_key_provider_);
+            webhook_store_ = std::make_unique<WebhookStore>(*pg_pool_, *webhook_secret_codec_);
+            if (!webhook_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: webhook store migration/open failed "
+                              "(database reachable but the webhook_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                auto lease = pg_pool_->acquire();
+                if (!lease) {
+                    spdlog::error("[PG] Refusing to start: could not acquire a connection to run "
+                                  "SecretCodec::init() for webhook_store ({})",
+                                  pg_pool_->last_error());
+                    startup_failed_ = true;
+                } else {
+                    auto init_res = webhook_secret_codec_->init(lease.get());
+                    lease.reset();
+                    if (!init_res) {
+                        spdlog::error(
+                            "[PG] Refusing to start: webhook_store SecretCodec::init() failed — "
+                            "{}: {}",
+                            pg::SecretCodec::to_string(init_res.error().kind),
+                            init_res.error().message);
+                        startup_failed_ = true;
+                    } else {
+                        // set_metrics() BEFORE migrate_from_sqlite() — gov
+                        // Gate 3 sre: the old ordering left
+                        // yuzu_server_webhook_backfill_total{result} dead on
+                        // every production boot (metrics_ was still null at
+                        // the sole call site inside migrate_from_sqlite).
+                        // NotificationStore's equivalent block (above) is
+                        // the reference ordering this now matches.
+                        webhook_store_->set_metrics(&metrics_);
+                        auto webhook_db = cfg_.db_dir() / "webhooks.db";
+                        if (!webhook_store_->migrate_from_sqlite(webhook_db)) {
+                            spdlog::error(
+                                "[PG] Refusing to start: webhook legacy-SQLite backfill failed "
+                                "(see prior log lines) — webhook_store is authoritative and must "
+                                "not serve partially-migrated secret-bearing data. Operator "
+                                "remediation: repair {} or move it aside to skip the backfill "
+                                "(existing webhooks/signing secrets in it will NOT carry over)",
+                                webhook_db.string());
+                            startup_failed_ = true;
+                        } else {
+                            spdlog::info("WebhookStore initialized (schema webhook_store; legacy "
+                                         "backfill source {})",
+                                         webhook_db.string());
+                            // #3261/#3294 lesson 10: wire the consumer only
+                            // inside the full-success branch — a top-of-ctor
+                            // wiring block that ran before this store
+                            // existed silently never fired.
+                            agent_service_.set_webhook_store(webhook_store_.get());
+                            // ADR-0010 §Decision 3 evidence surface (gov Gate
+                            // 6 compliance-officer, contract floor — the
+                            // decrypt-failure metric alone does not satisfy
+                            // ADR-0010's "emit an audit event + metric" rule).
+                            // Mirrors auth_secret_codec_'s hook exactly
+                            // (server.cpp:4176) — audit_store_ already exists
+                            // by this point (constructed above at :4093), so
+                            // no deferred-wiring step is needed here the way
+                            // AuthDB's block needed one. Lifetime: the lambda
+                            // captures `this` and reads `audit_store_` at
+                            // call time, never the pointer, so a later reset
+                            // store cannot dangle; stop() clears the hook
+                            // before destroying the codec (below).
+                            webhook_secret_codec_->set_audit_hook(
+                                [this](std::string_view verb, const std::string& detail_json) {
+                                    if (!audit_store_ || !audit_store_->is_open())
+                                        return;
+                                    const bool failure = (verb == "secret.decrypt_failure");
+                                    (void)audit_store_->log(
+                                        {.timestamp = std::time(nullptr),
+                                         .principal = "system:secret-codec",
+                                         .principal_role = "system",
+                                         .action = std::string(verb),
+                                         .target_type = "Secret",
+                                         .target_id = "webhook_store",
+                                         // detail_json carries AAD
+                                         // coordinates, kek_version and the
+                                         // failure class ONLY — never
+                                         // ciphertext, plaintext, DEK or key
+                                         // bytes (secret_codec.hpp).
+                                         .detail = detail_json,
+                                         .result = failure ? "failure" : "success"});
+                                });
+                        }
+                    }
+                }
+            }
         }
-        {
-            auto offload_db = cfg_.db_dir() / "offload_targets.db";
-            offload_target_store_ = std::make_unique<OffloadTargetStore>(offload_db);
-            offload_target_store_->set_metrics(&metrics_);
-            agent_service_.set_offload_target_store(offload_target_store_.get());
+        // OffloadTargetStore — Postgres substrate migration (ADR-0059, Wave 3
+        // secret-gated store, mirrors WebhookStore/ADR-0057's conventions).
+        // Deliberate posture upgrade from the prior unconditional SQLite
+        // construction (no startup_failed_ gate) to the same fail-CLOSED
+        // posture as every other born-on-PG store (ADR-0012 §1): these are
+        // operator-authored target configs + credentials, not best-effort
+        // telemetry. Construction order mirrors the PluginConfigStore block
+        // above exactly: FileKeyProvider (shared, already constructed by the
+        // AuthDB block) → SecretCodec (constructed only) → OffloadTargetStore
+        // (migrates the schema AND registers auth_credential as a secret
+        // column) → SecretCodec::init() (runs AFTER the store so the column
+        // it validates already exists). NO backfill (ADR-0009's 2026-08-25
+        // fresh-start-by-default amendment, ResponseStore precedent): no
+        // production fleet has ever run a pre-Postgres build of this store,
+        // so there is no legacy `offload_targets.db` content to protect —
+        // the store's own constructor logs the one-time "fresh start, no
+        // legacy backfill" line.
+        if (pg_pool_ && !startup_failed_) {
+            offload_secret_codec_ = std::make_unique<pg::SecretCodec>(*auth_key_provider_);
+            offload_target_store_ =
+                std::make_unique<OffloadTargetStore>(*pg_pool_, *offload_secret_codec_);
+            if (!offload_target_store_->is_open()) {
+                spdlog::error(
+                    "[PG] Refusing to start: offload target store migration/open failed");
+                startup_failed_ = true;
+            } else {
+                auto lease = pg_pool_->acquire();
+                if (!lease) {
+                    spdlog::error(
+                        "[PG] Refusing to start: could not acquire a connection to run "
+                        "SecretCodec::init() for offload_target_store ({})",
+                        pg_pool_->last_error());
+                    startup_failed_ = true;
+                } else {
+                    auto init_res = offload_secret_codec_->init(lease.get());
+                    lease.reset();
+                    if (!init_res) {
+                        spdlog::error(
+                            "[PG] Refusing to start: offload_target_store SecretCodec::init() "
+                            "failed — {}: {}",
+                            pg::SecretCodec::to_string(init_res.error().kind),
+                            init_res.error().message);
+                        startup_failed_ = true;
+                    } else {
+                        offload_target_store_->set_metrics(&metrics_);
+                        agent_service_.set_offload_target_store(offload_target_store_.get());
+                        // ADR-0010 §Decision 3 evidence surface (gov Gate 6
+                        // compliance-officer, contract floor — the
+                        // decrypt-failure metric alone does not satisfy
+                        // ADR-0010's "emit an audit event + metric" rule).
+                        // Mirrors webhook_secret_codec_'s hook exactly
+                        // (server.cpp:5932) — audit_store_ already exists by
+                        // this point, so no deferred-wiring step is needed.
+                        // Lifetime: the lambda captures `this` and reads
+                        // `audit_store_` at call time, never the pointer, so
+                        // a later reset store cannot dangle; stop() clears
+                        // the hook before destroying the codec (below).
+                        offload_secret_codec_->set_audit_hook(
+                            [this](std::string_view verb, const std::string& detail_json) {
+                                if (!audit_store_ || !audit_store_->is_open())
+                                    return;
+                                const bool failure = (verb == "secret.decrypt_failure");
+                                (void)audit_store_->log(
+                                    {.timestamp = std::time(nullptr),
+                                     .principal = "system:secret-codec",
+                                     .principal_role = "system",
+                                     .action = std::string(verb),
+                                     .target_type = "Secret",
+                                     .target_id = "offload_target_store",
+                                     // detail_json carries AAD coordinates,
+                                     // kek_version and the failure class
+                                     // ONLY — never ciphertext, plaintext,
+                                     // DEK or key bytes (secret_codec.hpp).
+                                     .detail = detail_json,
+                                     .result = failure ? "failure" : "success"});
+                            });
+                    }
+                }
+            }
         }
 
         // Phase 7: Inventory Store (Issue 7.17) — generic per-source blob store,
@@ -6979,16 +7461,24 @@ public:
                         .set(static_cast<double>(baseline_store_->baseline_count()));
                 }
                 // ADR-0010 §Decision 3 — `yuzu_server_secret_decrypt_failures_total`
-                // {store, failure_class}. The codec accumulates these
-                // internally; before the 2026-07-25 review (HIGH #4) nothing
-                // read them, so the metric existed only as a comment in
-                // secret_codec.hpp. Exported pull-model at scrape time (#1909
-                // pattern) — the codec keeps the authoritative cumulative
-                // count, so this is a `set()` of a monotonic total, not an
-                // increment, and a scrape that races a failure simply reports
-                // it on the next one.
-                if (auth_secret_codec_) {
-                    for (const auto& [key, count] : auth_secret_codec_->decrypt_failure_counts()) {
+                // {store, failure_class}. Each codec accumulates its own
+                // counts internally; before the 2026-07-25 review (HIGH #4)
+                // nothing read them, so the metric existed only as a comment
+                // in secret_codec.hpp. Exported pull-model at scrape time
+                // (#1909 pattern) — each codec keeps its own authoritative
+                // cumulative count, so this is a `set()` of a monotonic
+                // total, not an increment, and a scrape that races a
+                // failure simply reports it on the next one. Fanned out
+                // across EVERY kek_enrolled_codecs() instance — was
+                // auth_secret_codec_-only, which silently missed
+                // plugin_config_secret_codec_'s decrypt failures;
+                // webhook_secret_codec_ (ADR-0057) and offload_secret_codec_
+                // (ADR-0059) both join the same enrolled set — the `store`
+                // label already disambiguates which secret-bearing store
+                // each entry belongs to, so merging counts from multiple
+                // codec instances into one metric family is safe.
+                for (auto* codec : kek_enrolled_codecs()) {
+                    for (const auto& [key, count] : codec->decrypt_failure_counts()) {
                         const auto& [store, cls] = key;
                         metrics_
                             .gauge("yuzu_server_secret_decrypt_failures_total",
@@ -8075,9 +8565,9 @@ public:
         // plugin_config_secret_codec_, which borrows the SAME
         // auth_key_provider_ auth_secret_codec_ above borrows — so both
         // stores/codecs must be gone before auth_key_provider_.reset()
-        // below (docs/postgres-store-playbook.md:112 destruct-before-pool,
-        // applied transitively to the shared key provider too). No audit
-        // hook to clear: PluginConfigStore's SecretCodec is never wired to
+        // (docs/postgres-store-playbook.md:112 destruct-before-pool, applied
+        // transitively to the shared key provider too). No audit hook to
+        // clear: PluginConfigStore's SecretCodec is never wired to
         // audit_store_ (its own audit trail runs through
         // plugin_config_routes.cpp's rest_audit.hpp calls, not the codec's
         // ADR-0010 audit hook).
@@ -8087,19 +8577,31 @@ public:
         // the pool. Every HTTP handler holding the raw pointer is quiesced
         // by the drains above.
         upload_grant_store_.reset();
-        auth_key_provider_.reset();
+        // auth_key_provider_.reset() does NOT happen here — see the call
+        // site right after webhook_store_/offload_target_store_.reset()
+        // below. Unlike auth_db_/plugin_config_store_ above (no async
+        // worker touching their codec past their own .reset()),
+        // WebhookStore (ADR-0057) and OffloadTargetStore (ADR-0059) both
+        // dispatch deliveries onto a bounded worker pool that can still be
+        // decrypting through webhook_secret_codec_/offload_secret_codec_ —
+        // which borrow THIS SAME auth_key_provider_ — right up until each
+        // store's own quiesce() (a few hundred lines below, after the gRPC
+        // drain) proves it drained. Resetting the shared provider here,
+        // before those quiesce() calls run, would be a UAF against a live
+        // delivery's KeyProvider::unwrap_dek call.
         // AuditStore (ADR-0040) borrows pg_pool_ via its retention thread — that
-        // thread is joined at stop_cleanup() above; drop the store before the
-        // pool so no late lease touches a destroyed pool. Unwire the borrowed
-        // pointer from every writer FIRST (belt-and-braces, matching the sibling
+        // thread is joined at stop_cleanup() above. Unwire the borrowed pointer
+        // from every OTHER writer HERE (belt-and-braces, matching the sibling
         // stores above + ADR-0040 §Lifecycle) rather than relying on RPC/HTTP
-        // drain ordering — a late log() must not touch a reset store.
+        // drain ordering — a late log() from THESE consumers must not touch a
+        // reset store. The actual `audit_store_.reset()` call, though, does
+        // NOT happen here — see its new position below, after the webhook
+        // delivery-pool drain, and that comment for why.
         agent_service_.set_audit_store(nullptr);
         if (gateway_service_)
             gateway_service_->set_audit_store(nullptr);
         if (fleet_topology_store_)
             fleet_topology_store_->set_audit_store(nullptr);
-        audit_store_.reset();
         // NotificationStore (ADR-0046) borrows pg_pool_ — unwire the borrowed
         // raw pointer from agent_service_ (enrollment/execution-failure toast
         // events), then drop the store, BEFORE the pool. No background
@@ -8324,6 +8826,65 @@ public:
         agent_service_.set_offload_target_store(nullptr);
         webhook_store_.reset();
         offload_target_store_.reset();
+        // ADR-0057/ADR-0059: webhook_secret_codec_ and offload_secret_codec_
+        // both borrow auth_key_provider_ — same contract as
+        // auth_secret_codec_/plugin_config_secret_codec_ above (clear the
+        // audit hook before the codec dies, then drop it) — except this
+        // pair sits HERE, after both stores' delivery-pool quiesce() just
+        // above, not up with the other codecs: an in-flight delivery
+        // decrypts (touches its codec, transitively auth_key_provider_)
+        // right up until quiesce() proves it drained, so resetting either
+        // any earlier would UAF a still-draining delivery.
+        // auth_key_provider_.reset() ALSO moved here from its former
+        // position up with the other codecs, for the identical reason —
+        // see that block's comment.
+        //
+        // audit_store_.reset() ALSO moved here (gov Gate 8 cpp-safety,
+        // hardening round) — for a THIRD, distinct reason from the two
+        // above, not merely "matches the pattern": each codec's audit hook
+        // (registered near its construction site) is a LIVE CALLBACK into
+        // audit_store_ for as long as a delivery can still decrypt through
+        // it, i.e. right up until that store's own quiesce() above proves
+        // it drained. The earlier position (up with set_audit_store(nullptr)
+        // et al., before this drain) let audit_store_ die while that
+        // callback was still reachable; the hook's own
+        // `if (!audit_store_ || !audit_store_->is_open()) return;` guard
+        // made this memory-safe, never a UAF, but it SILENTLY DROPPED every
+        // decrypt-failure audit event fired during that window — exactly
+        // the ADR-0010 §Decision-3 evidence ("emit an audit event + metric"
+        // on every decrypt failure) this codec exists to guarantee. This is
+        // NOT symmetric with auth_secret_codec_'s own hook-clear position
+        // (still correctly up near set_audit_store, unmoved): auth_db_'s
+        // reaper thread — the only thing that could still call
+        // auth_secret_codec_->decrypt() — is already joined by ~AuthDB
+        // before auth_db_.reset() runs a few lines above that block, so
+        // auth_secret_codec_'s caller is provably dead before its hook is
+        // cleared; webhook_secret_codec_'s and offload_secret_codec_'s
+        // callers (each a StoreWorkerPool delivery thread) are deliberately
+        // kept alive past that point by their own quiesce(), so their
+        // hooks — and the audit_store_ they read — must stay live until
+        // that quiesce proves the caller is gone too.
+        if (webhook_secret_codec_)
+            webhook_secret_codec_->set_audit_hook({});
+        webhook_secret_codec_.reset();
+        // RuntimeConfigStore (ADR-0060) borrows both pg_pool_ and its own SecretCodec,
+        // which is itself constructed from *auth_key_provider_ — reset both HERE,
+        // before auth_key_provider_ below, not down near pg_pool_.reset() where an
+        // earlier revision of this teardown placed them (external adversarial-review
+        // finding: that placement left the codec holding a dangling KeyProvider&
+        // reference for the whole interval between auth_key_provider_.reset() and
+        // this store's own reset -- unreachable today only because kek_ops's
+        // rotate/rewrap/status handlers are already unreachable by the time this
+        // runs, per web_thread_'s join well above, not because the ordering was
+        // actually safe). pg_pool_ itself is still alive at this point (reset last,
+        // below), so moving these two lines earlier is safe.
+        runtime_config_store_.reset();
+        runtime_config_secret_codec_.reset();
+        if (offload_secret_codec_)
+            offload_secret_codec_->set_audit_hook({});
+        offload_secret_codec_.reset();
+        auth_key_provider_.reset();
+        audit_store_.reset();
         // TagStore (ADR-0050) borrows pg_pool_ — unwire the borrowed raw
         // pointer from agent_service_ (the Register sync_agent_tags ingest —
         // Register-only, heartbeats do not sync tags; governance perf-F8),
@@ -8397,6 +8958,8 @@ public:
         // (adversarial-review MEDIUM, 2026-08-20 — matches the sibling stores' own
         // explicit-reset discipline in this function).
         ca_store_.reset();
+        // RuntimeConfigStore/runtime_config_secret_codec_ already reset above,
+        // before auth_key_provider_ (the codec borrows it) — see that comment.
         pg_pool_.reset();
 
         // ONLY on full completion — a path above that escalates via std::_Exit(1)
@@ -10544,19 +11107,29 @@ private:
                           command_id, denied_count);
     }
 
-    // Apply stored runtime config overrides on startup
-    void apply_runtime_config_overrides() {
+    // Apply stored runtime config overrides on startup. Returns false on a
+    // genuine read failure (ADR-0036) — the caller treats that as a fatal
+    // boot error (startup_failed_), never as "nothing configured": a
+    // transient read blip here would otherwise silently boot with defaults
+    // instead of the operator's stored overrides, including a possible OIDC
+    // client secret (kickoff decision #1 / CH-2).
+    [[nodiscard]] bool apply_runtime_config_overrides() {
         if (!runtime_config_store_ || !runtime_config_store_->is_open())
-            return;
-        // The ONE caller entitled to plaintext: it must apply the real secret.
-        auto entries = runtime_config_store_->get_all_with_secrets();
-        for (const auto& e : entries) {
+            return true; // nothing to apply; not itself a failure
+        // Redacted read: never decrypts (ADR-0010 §1 / ADR-0060). The one real
+        // secret this store carries (oidc_client_secret) is applied separately
+        // below via read_secret(), the only accessor entitled to plaintext.
+        auto entries_result = runtime_config_store_->get_all();
+        if (!entries_result.has_value()) {
+            spdlog::error("apply_runtime_config_overrides: read failed: {}",
+                          entries_result.error());
+            return false;
+        }
+        for (const auto& e : *entries_result) {
             // Never log a credential. This line wrote the OIDC client secret verbatim
             // into yuzu-server.log on every boot once it had been set via Settings.
-            spdlog::info("Applying runtime config override: {} = {}", e.key,
-                         RuntimeConfigStore::is_secret_key(e.key)
-                             ? RuntimeConfigStore::redacted_placeholder()
-                             : e.value.c_str());
+            // get_all() already redacts, so e.value is never the real secret here.
+            spdlog::info("Applying runtime config override: {} = {}", e.key, e.value.c_str());
             if (e.key == "log_level") {
                 spdlog::set_level(spdlog::level::from_str(e.value));
             } else if (e.key == "heartbeat_timeout") {
@@ -10580,13 +11153,12 @@ private:
             // else reads it back from this store either. GET /api/config reports it
             // derived from whether any auto-approve rule exists, so a stored value
             // has no effect at all. See docs/user-manual/rest-api.md.
-            // OIDC settings — runtime-configurable via Settings UI
+            // OIDC settings — runtime-configurable via Settings UI. oidc_client_secret
+            // is handled below, never from this (redacted) loop.
             else if (e.key == "oidc_issuer" && !e.value.empty())
                 cfg_.oidc_issuer = e.value;
             else if (e.key == "oidc_client_id" && !e.value.empty())
                 cfg_.oidc_client_id = e.value;
-            else if (e.key == "oidc_client_secret" && !e.value.empty())
-                cfg_.oidc_client_secret = e.value;
             else if (e.key == "oidc_redirect_uri")
                 cfg_.oidc_redirect_uri = e.value;
             else if (e.key == "oidc_admin_group")
@@ -10594,9 +11166,47 @@ private:
             else if (e.key == "oidc_skip_tls_verify")
                 cfg_.oidc_skip_tls_verify = (e.value == "true");
         }
+
+        // The one secret this store carries. read_secret() returns the zeroizing
+        // SecureBuffer type (ADR-0010 §1) -- copy into cfg_.oidc_client_secret (a
+        // plain std::string by pre-existing design, populated identically from
+        // --oidc-client-secret at boot; see ADR-0060 "Zeroization fix"). Block-
+        // scoped so the buffer wipes itself before apply_dex_alert_config() runs
+        // below, not merely before this function returns -- matching
+        // WebhookStore::deliver_one's signing-secret pattern as tightly as the
+        // header doc already claims (cpp-expert, governance Gate 3 finding: the
+        // prior function-scope placement kept the decrypted buffer alive longer
+        // than the header's own precedent citation implied).
+        {
+            auto secret_result = runtime_config_store_->read_secret("oidc_client_secret");
+            if (!secret_result.has_value()) {
+                // A KEK/decrypt failure here fails the boot closed (ADR-0006/ADR-0010
+                // fail-closed posture, same CONTRACT as AuthDB's TOTP secrets and
+                // WebhookStore's signing secret) -- but a WIDER blast radius: this
+                // denies the entire boot, not just one login or one delivery. See
+                // ADR-0060's "Decrypt-failure blast radius" section for why MEDIUM
+                // still stands despite that (fail-closed beats the fail-open
+                // alternative). Point at the recovery procedure rather than just the
+                // raw store error.
+                spdlog::error("apply_runtime_config_overrides: oidc_client_secret could not be "
+                              "decrypted ({}) -- see \"Key management (secrets KEK)\" in the server "
+                              "admin guide for recovery (a keys directory that does not match this "
+                              "database, e.g. after a restore without its paired backup, is the "
+                              "common cause)",
+                              secret_result.error());
+                return false;
+            }
+            if (secret_result->has_value() && !(*secret_result)->empty()) {
+                const auto& secret = **secret_result;
+                cfg_.oidc_client_secret.assign(reinterpret_cast<const char*>(secret.data()),
+                                               secret.size());
+            }
+        }
+
         // F1 DEX alerting config — both consumers accept live updates, so the
         // same call applies at boot and from the settings POST handlers.
         apply_dex_alert_config();
+        return true;
     }
 
     /// F1: push the persisted DEX alerting config into the alert router and
@@ -11925,6 +12535,12 @@ private:
             // confinement CLOSED, so a "healthy" report over it would be
             // misleading.
             bool tag_ok = tag_store_ && tag_store_->is_open();
+            // ADR-0060: /readyz's StoreCheck vector already names this store; /healthz
+            // omitted it (governance Gate 3 finding, architect + sre independently) --
+            // /readyz is what actually gates traffic, so this was a monitoring-signal
+            // gap, not an availability one, but the two probes should agree on which
+            // stores exist.
+            bool runtime_config_ok = runtime_config_store_ && runtime_config_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
@@ -11933,7 +12549,8 @@ private:
                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
                 approval_ok && rbac_ok && result_set_ok && mgmt_group_ok && discovery_ok &&
-                deployment_ok && quarantine_ok && notification_ok && upload_grant_ok && tag_ok;
+                deployment_ok && quarantine_ok && notification_ok && upload_grant_ok && tag_ok &&
+                runtime_config_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -11975,7 +12592,8 @@ private:
                   {"quarantine_store", quarantine_ok ? "ok" : "error"},
                   {"notification_store", notification_ok ? "ok" : "error"},
                   {"upload_grant_store", upload_grant_ok ? "ok" : "error"},
-                  {"tag_store", tag_ok ? "ok" : "error"}}},
+                  {"tag_store", tag_ok ? "ok" : "error"},
+                  {"runtime_config_store", runtime_config_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -12456,12 +13074,22 @@ private:
             if (!runtime_config_store_ || !runtime_config_store_->is_open()) {
                 res.status = 503;
                 res.set_content(
-                    R"({"error":{"code":503,"message":"runtime configuration store unavailable"},)"
+                    R"({"error":{"code":503,"message":"runtime config store unavailable"},)"
                     R"("meta":{"api_version":"v1"}})",
                     "application/json");
                 return;
             }
-            nlohmann::json overrides = build_overrides_json(runtime_config_store_->get_all());
+            auto overrides_result = runtime_config_store_->get_all();
+            if (!overrides_result.has_value()) {
+                spdlog::error("GET /api/config: read failed: {}", overrides_result.error());
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"runtime config store unavailable"},)"
+                    R"("meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            nlohmann::json overrides = build_overrides_json(*overrides_result);
 
             nlohmann::json allowed = nlohmann::json::array();
             for (const auto& k : RuntimeConfigStore::allowed_keys())
@@ -12539,9 +13167,23 @@ private:
 
             auto result = runtime_config_store_->set(key, value, session->username);
             if (!result) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
-                                "application/json");
+                // A genuine DB/crypto failure (kRuntimeConfigDbErrorPrefix) is a
+                // 503 with a generic message -- never echo the internal detail
+                // to the caller; caller-input validation (unknown key, bad
+                // value shape, the redaction-placeholder guard) is a 400 with
+                // the store's own message, which is written for an operator.
+                if (result.error().starts_with(kRuntimeConfigDbErrorPrefix)) {
+                    spdlog::error("PUT /api/config/{}: write failed: {}", key, result.error());
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"runtime config store unavailable"},)"
+                        R"("meta":{"api_version":"v1"}})",
+                        "application/json");
+                } else {
+                    res.status = 400;
+                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
+                                    "application/json");
+                }
                 return;
             }
 
@@ -15186,7 +15828,17 @@ private:
                 return;
             }
 
-            auto defs = instruction_store_->query_definitions(q);
+            // ADR-0058: query_definitions now returns std::expected — a genuine DB
+            // error 503s rather than silently rendering an empty list.
+            auto defs_result = instruction_store_->query_definitions(q);
+            if (!defs_result) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"instruction store read failed"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            const auto& defs = *defs_result;
             nlohmann::json arr = nlohmann::json::array();
             for (const auto& d : defs) {
                 arr.push_back({{"id", d.id},
@@ -15256,6 +15908,26 @@ private:
 
                 auto result = instruction_store_->create_definition(def);
                 if (!result) {
+                    // ADR-0058: a genuine DB/lease failure 503s — never falls through to
+                    // the conflict/validation split below (see delete routes for the
+                    // same check).
+                    if (result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0) {
+                        // R2: checked, not discarded — a create denial is a security-relevant
+                        // evidence-chain audit (see audit_log's [[nodiscard]] comment).
+                        // "error", not "denied" (gov Gate 6 compliance-officer finding): an
+                        // infra degrade is not an operator denial — matches policy.evaluate's
+                        // own error-vs-denied convention (rest-api.md's classification rule).
+                        const bool audit_ok = audit_log(req, "instruction.create", "error",
+                                                        "InstructionDefinition", def.id,
+                                                        "db_error");
+                        if (!audit_ok)
+                            res.set_header("Sec-Audit-Failed", "true");
+                        res.status = 503;
+                        res.set_content(
+                            R"({"error":{"code":503,"message":"instruction store unavailable"},"meta":{"api_version":"v1"}})",
+                            "application/json");
+                        return;
+                    }
                     // #402: store-level kConflictPrefix maps to HTTP 409. The
                     // prefix is an internal store↔route contract — strip it
                     // before placing the message in the operator-facing JSON
@@ -15305,29 +15977,39 @@ private:
             }
 
             auto id = req.matches[1].str();
-            auto def = instruction_store_->get_definition(id);
-            if (!def) {
+            // ADR-0058: get_definition now returns std::expected — distinguish a genuine
+            // DB error (503) from "no such definition" (404, unchanged).
+            auto def_result = instruction_store_->get_definition(id);
+            if (!def_result) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"instruction store read failed"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            if (!*def_result) {
                 res.status = 404;
                 res.set_content(
                     R"({"error":{"code":404,"message":"not found"},"meta":{"api_version":"v1"}})",
                     "application/json");
                 return;
             }
+            const auto& def = **def_result;
 
-            res.set_content(nlohmann::json({{"id", def->id},
-                                            {"name", def->name},
-                                            {"version", def->version},
-                                            {"type", def->type},
-                                            {"plugin", def->plugin},
-                                            {"action", def->action},
-                                            {"description", def->description},
-                                            {"enabled", def->enabled},
-                                            {"instruction_set_id", def->instruction_set_id},
-                                            {"gather_ttl_seconds", def->gather_ttl_seconds},
-                                            {"response_ttl_days", def->response_ttl_days},
-                                            {"created_by", def->created_by},
-                                            {"created_at", def->created_at},
-                                            {"updated_at", def->updated_at}})
+            res.set_content(nlohmann::json({{"id", def.id},
+                                            {"name", def.name},
+                                            {"version", def.version},
+                                            {"type", def.type},
+                                            {"plugin", def.plugin},
+                                            {"action", def.action},
+                                            {"description", def.description},
+                                            {"enabled", def.enabled},
+                                            {"instruction_set_id", def.instruction_set_id},
+                                            {"gather_ttl_seconds", def.gather_ttl_seconds},
+                                            {"response_ttl_days", def.response_ttl_days},
+                                            {"created_by", def.created_by},
+                                            {"created_at", def.created_at},
+                                            {"updated_at", def.updated_at}})
                                 .dump(),
                             "application/json");
         });
@@ -15348,9 +16030,18 @@ private:
             try {
                 auto j = nlohmann::json::parse(req.body);
 
-                // Read existing definition to preserve fields not in the update
-                auto existing = instruction_store_->get_definition(id);
-                if (!existing) {
+                // Read existing definition to preserve fields not in the update.
+                // ADR-0058: get_definition now returns std::expected — distinguish a
+                // genuine DB error (503) from "no such definition" (404, unchanged).
+                auto existing_result = instruction_store_->get_definition(id);
+                if (!existing_result) {
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"instruction store read failed"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
+                if (!*existing_result) {
                     res.status = 404;
                     res.set_content(
                         R"({"error":{"code":404,"message":"instruction definition not found"},"meta":{"api_version":"v1"}})",
@@ -15358,7 +16049,7 @@ private:
                     return;
                 }
 
-                InstructionDefinition def = *existing;
+                InstructionDefinition def = **existing_result;
                 if (j.contains("name"))
                     def.name = j["name"].get<std::string>();
                 if (j.contains("version"))
@@ -15396,8 +16087,33 @@ private:
 
                 auto result = instruction_store_->update_definition(def);
                 if (!result) {
-                    res.status = 400;
-                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
+                    // ADR-0058: a genuine DB/lease failure 503s; "not_found: " -> 404 (mirrors
+                    // the DELETE route immediately below); everything else is a 400 validation
+                    // error. Previously not_found fell through to the 400 branch, indistinguishable
+                    // from a validation failure (consistency-auditor Gate 8 finding).
+                    bool db_error = result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0;
+                    bool not_found = !db_error && result.error().rfind("not_found: ", 0) == 0;
+                    // Audited on db_error (existing convention) and not_found (matches the
+                    // DELETE route's audited not_found branch just below); a plain validation
+                    // 400 stays unaudited, matching create_definition's equivalent branch.
+                    // R2: checked, not discarded — an update denial is a security-relevant
+                    // evidence-chain audit (see audit_log's [[nodiscard]] comment).
+                    bool audit_ok = true;
+                    if (db_error)
+                        // "error", not "denied" (gov Gate 6 compliance-officer finding): an
+                        // infra degrade is not an operator denial.
+                        audit_ok = audit_log(req, "instruction.update", "error",
+                                             "InstructionDefinition", id, "db_error");
+                    else if (not_found)
+                        audit_ok = audit_log(req, "instruction.update", "denied",
+                                             "InstructionDefinition", id, "not_found");
+                    if ((db_error || not_found) && !audit_ok)
+                        res.set_header("Sec-Audit-Failed", "true");
+                    res.status = db_error ? 503 : (not_found ? 404 : 400);
+                    res.set_content(nlohmann::json({{"error", db_error
+                                                                   ? "instruction store unavailable"
+                                                                   : result.error()}})
+                                        .dump(),
                                     "application/json");
                     return;
                 }
@@ -15426,15 +16142,41 @@ private:
             }
 
             auto id = req.matches[1].str();
-            bool deleted = instruction_store_->delete_definition(id);
-            if (deleted) {
-                (void)audit_log(req, "instruction.delete", "success", "InstructionDefinition", id);
-                emit_event("instruction.deleted", req, {}, {{"instruction_id", id}});
-                res.set_header(
-                    "HX-Trigger",
-                    R"({"showToast":{"message":"Instruction definition deleted","level":"success"}})");
+            // ADR-0058: delete_definition now returns std::expected<void, std::string> —
+            // a genuine DB error 503s distinctly; "not_found: " -> 404 (mirrors
+            // ProductPackStore::uninstall's identical REST contract change,
+            // workflow_routes.cpp product_pack_error_status).
+            auto del_result = instruction_store_->delete_definition(id);
+            // R2: checked, not discarded — a delete denial is a security-relevant
+            // evidence-chain audit (see audit_log's [[nodiscard]] comment).
+            if (!del_result && del_result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0) {
+                // "error", not "denied" (gov Gate 6 compliance-officer finding): an infra
+                // degrade is not an operator denial.
+                if (!audit_log(req, "instruction.delete", "error", "InstructionDefinition", id,
+                               "db_error"))
+                    res.set_header("Sec-Audit-Failed", "true");
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"instruction store delete failed"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
             }
-            res.set_content(nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
+            if (!del_result) {
+                if (!audit_log(req, "instruction.delete", "denied", "InstructionDefinition", id,
+                               "not_found"))
+                    res.set_header("Sec-Audit-Failed", "true");
+                res.status = 404;
+                res.set_content(
+                    R"({"error":{"code":404,"message":"instruction definition not found"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            (void)audit_log(req, "instruction.delete", "success", "InstructionDefinition", id);
+            emit_event("instruction.deleted", req, {}, {{"instruction_id", id}});
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Instruction definition deleted","level":"success"}})");
+            res.set_content(nlohmann::json({{"deleted", true}}).dump(), "application/json");
         });
 
         web_server_->Get(R"(/api/instructions/([^/]+)/export)", [this](const httplib::Request& req,
@@ -15450,8 +16192,17 @@ private:
             }
 
             auto id = req.matches[1].str();
-            auto json = instruction_store_->export_definition_json(id);
-            res.set_content(json, "application/json");
+            // ADR-0058: export_definition_json now returns std::expected — a genuine
+            // DB error 503s rather than silently rendering an empty/malformed body.
+            auto json_result = instruction_store_->export_definition_json(id);
+            if (!json_result) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"instruction store read failed"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            res.set_content(*json_result, "application/json");
         });
 
         web_server_->Post("/api/instructions/import", [this](const httplib::Request& req,
@@ -15468,6 +16219,22 @@ private:
 
             auto result = instruction_store_->import_definition_json(req.body);
             if (!result) {
+                // ADR-0058: a genuine DB/lease failure 503s — never falls through to the
+                // conflict/validation split below. R4: audited the same as every other
+                // rejection branch below (gov Gate 6 compliance-officer finding).
+                if (result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0) {
+                    // "error", not "denied" (gov Gate 6 compliance-officer finding, second
+                    // round): an infra degrade is not an operator denial.
+                    const bool audit_ok = audit_log(req, "instruction.import", "error",
+                                                    "InstructionDefinition", "", "db_error");
+                    if (!audit_ok)
+                        res.set_header("Sec-Audit-Failed", "true");
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"instruction store unavailable"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
                 // iter-H2: /import shares the create_definition_impl path,
                 // so it inherits the kConflictPrefix → 409 mapping that the
                 // POST handler does. Without this mapping the import path
@@ -15543,7 +16310,17 @@ private:
                 return;
             }
 
-            auto sets = instruction_store_->list_sets();
+            // ADR-0058: list_sets now returns std::expected — a genuine DB error 503s
+            // rather than silently rendering an empty list.
+            auto sets_result = instruction_store_->list_sets();
+            if (!sets_result) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"instruction store read failed"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            const auto& sets = *sets_result;
             nlohmann::json arr = nlohmann::json::array();
             for (const auto& s : sets) {
                 arr.push_back({{"id", s.id},
@@ -15574,9 +16351,31 @@ private:
             s.description = desc;
             auto result = instruction_store_->create_set(s);
             if (!result) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
-                                "application/json");
+                // ADR-0058: a genuine DB/lease failure 503s, never falls through to
+                // the conflict/validation split below.
+                // Not audited: this route has no audit logging at all (success or failure),
+                // pre-existing and unrelated to this migration — tracked separately, not
+                // asymmetrically half-fixed here (see the instruction-sets audit-gap issue).
+                bool db_error = result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0;
+                if (db_error) {
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":"instruction store unavailable"})",
+                        "application/json");
+                    return;
+                }
+                // Gate 4 Finding A / Gate 6 enterprise-readiness: this route was the one
+                // sibling of instruction.create/update/delete that never added the
+                // is_conflict_error branch store_errors.hpp's kConflictPrefix comment says
+                // every duplicate-class error site must handle — a duplicate id fell
+                // through to plain 400 with the raw unstripped "conflict:" prefix in the
+                // body. Matches instruction.create's pattern (this route still has no audit
+                // logging at all, pre-existing gap, not fixed here).
+                bool is_conflict = is_conflict_error(result.error());
+                res.status = is_conflict ? 409 : 400;
+                auto body_msg = is_conflict ? std::string(strip_conflict_prefix(result.error()))
+                                            : result.error();
+                res.set_content(nlohmann::json({{"error", body_msg}}).dump(), "application/json");
                 return;
             }
             res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
@@ -15595,8 +16394,37 @@ private:
             }
 
             auto id = req.matches[1].str();
-            bool deleted = instruction_store_->delete_set(id);
-            res.set_content(nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
+            // ADR-0058: delete_set now returns std::expected<void, std::string> — a
+            // genuine DB error 503s distinctly; "not_found: " -> 404 (mirrors
+            // ProductPackStore::uninstall's identical REST contract change).
+            auto del_result = instruction_store_->delete_set(id);
+            // R2 / gov Gate 4 consistency-auditor finding: these 404/503 denial branches are
+            // new in this migration (pre-migration delete_set was an undifferentiated
+            // 200 {"deleted": bool} with no distinguishable denial to audit) — unlike
+            // create_set (still undifferentiated 400/503 today, tracked separately, see the
+            // instruction-sets audit-gap issue), these are new-in-this-diff and must not ship
+            // unaudited from birth.
+            if (!del_result && del_result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0) {
+                if (!audit_log(req, "instruction_set.delete", "error", "InstructionSet", id,
+                               "db_error"))
+                    res.set_header("Sec-Audit-Failed", "true");
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"instruction store delete failed"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            if (!del_result) {
+                if (!audit_log(req, "instruction_set.delete", "denied", "InstructionSet", id,
+                               "not_found"))
+                    res.set_header("Sec-Audit-Failed", "true");
+                res.status = 404;
+                res.set_content(
+                    R"({"error":{"code":404,"message":"instruction set not found"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            res.set_content(nlohmann::json({{"deleted", true}}).dump(), "application/json");
         });
 
         // -- Execution API ----------------------------------------------------
@@ -16213,7 +17041,14 @@ private:
                     return;
                 }
 
-                auto defs = instruction_store_->query_definitions();
+                // ADR-0058: query_definitions now returns std::expected — a genuine DB
+                // error degrades to the same "Not available" fragment as a null store.
+                auto defs_result = instruction_store_->query_definitions();
+                if (!defs_result) {
+                    res.set_content("<div class=\"empty-state\">Not available</div>", "text/html");
+                    return;
+                }
+                const auto& defs = *defs_result;
 
                 // Check if user has PlatformEngineer or Administrator role
                 // PlatformEngineer or Administrator can author definitions.
@@ -16315,37 +17150,41 @@ private:
             std::string tmpl(kInstructionEditorHtml);
             auto def_id = req.get_param_value("id");
             if (!def_id.empty() && instruction_store_) {
-                auto def = instruction_store_->get_definition(def_id);
-                if (def) {
+                // ADR-0058: a DB-error outer result skips this best-effort pre-fill (the
+                // form falls back to unreplaced placeholders), same as a not-found inner
+                // optional did pre-migration.
+                auto def_result = instruction_store_->get_definition(def_id);
+                if (def_result && *def_result) {
+                    const auto& def = **def_result;
                     auto replace = [&](const std::string& key, const std::string& val) {
                         for (auto pos = tmpl.find(key); pos != std::string::npos;
                              pos = tmpl.find(key))
                             tmpl.replace(pos, key.size(), html_escape(val));
                     };
                     replace("{{TITLE}}", "Edit Definition");
-                    replace("{{DEF_ID}}", def->id);
-                    replace("{{DEF_NAME}}", def->name);
-                    replace("{{DEF_VERSION}}", def->version);
-                    replace("{{DEF_PLUGIN}}", def->plugin);
-                    replace("{{DEF_ACTION}}", def->action);
-                    replace("{{DEF_DESCRIPTION}}", def->description);
-                    replace("{{DEF_PLATFORMS}}", def->platforms);
-                    replace("{{YAML_SOURCE}}", def->yaml_source);
+                    replace("{{DEF_ID}}", def.id);
+                    replace("{{DEF_NAME}}", def.name);
+                    replace("{{DEF_VERSION}}", def.version);
+                    replace("{{DEF_PLUGIN}}", def.plugin);
+                    replace("{{DEF_ACTION}}", def.action);
+                    replace("{{DEF_DESCRIPTION}}", def.description);
+                    replace("{{DEF_PLATFORMS}}", def.platforms);
+                    replace("{{YAML_SOURCE}}", def.yaml_source);
                     // Set dropdowns
-                    replace("{{SEL_QUESTION}}", def->type == "question" ? "selected" : "");
-                    replace("{{SEL_ACTION}}", def->type == "action" ? "selected" : "");
-                    replace("{{SEL_APPR_AUTO}}", def->approval_mode == "auto" ? "selected" : "");
+                    replace("{{SEL_QUESTION}}", def.type == "question" ? "selected" : "");
+                    replace("{{SEL_ACTION}}", def.type == "action" ? "selected" : "");
+                    replace("{{SEL_APPR_AUTO}}", def.approval_mode == "auto" ? "selected" : "");
                     replace("{{SEL_APPR_ROLE}}",
-                            def->approval_mode == "role-gated" ? "selected" : "");
+                            def.approval_mode == "role-gated" ? "selected" : "");
                     replace("{{SEL_APPR_ALWAYS}}",
-                            def->approval_mode == "always" ? "selected" : "");
+                            def.approval_mode == "always" ? "selected" : "");
                     replace("{{SEL_CC_UNLIM}}",
-                            def->concurrency_mode == "unlimited" ? "selected" : "");
+                            def.concurrency_mode == "unlimited" ? "selected" : "");
                     replace("{{SEL_CC_DEV}}",
-                            def->concurrency_mode == "per-device" ? "selected" : "");
+                            def.concurrency_mode == "per-device" ? "selected" : "");
                     replace("{{SEL_CC_DEF}}",
-                            def->concurrency_mode == "per-definition" ? "selected" : "");
-                    replace("{{SEL_CC_SET}}", def->concurrency_mode == "per-set" ? "selected" : "");
+                            def.concurrency_mode == "per-definition" ? "selected" : "");
+                    replace("{{SEL_CC_SET}}", def.concurrency_mode == "per-set" ? "selected" : "");
                 }
             } else {
                 // New definition — clear all placeholders
@@ -16476,7 +17315,14 @@ private:
                 if (!result) {
                     spdlog::warn("instruction yaml update failed: id={} error={}",
                                  log_safe(def_id), result.error());
-                    respond("Update failed: " + result.error(), false);
+                    // A db_error-prefixed message can carry libpq internals (PQerrorMessage
+                    // fragments) — generic-ize it before it reaches the operator, matching
+                    // workflow_routes.cpp's product_pack_client_message convention (gov Gate 4
+                    // consistency finding).
+                    bool db_error = result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0;
+                    respond("Update failed: " +
+                                (db_error ? "instruction store unavailable" : result.error()),
+                            false);
                     return;
                 }
                 (void)audit_log(req, "instruction.update", "success", "InstructionDefinition",
@@ -16506,7 +17352,11 @@ private:
                                     std::string(strip_conflict_prefix(result.error())),
                                 false);
                     } else {
-                        respond("Create failed: " + result.error(), false);
+                        // See the update-branch comment above (gov Gate 4 consistency finding).
+                        bool db_error = result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0;
+                        respond("Create failed: " +
+                                    (db_error ? "instruction store unavailable" : result.error()),
+                                false);
                     }
                     return;
                 }
@@ -20625,6 +21475,24 @@ private:
             out.push_back(auth_secret_codec_.get());
         if (plugin_config_secret_codec_)
             out.push_back(plugin_config_secret_codec_.get());
+        // WebhookStore's SecretCodec (ADR-0057) and OffloadTargetStore's
+        // (ADR-0059) — both reuse auth_key_provider_ (same "one KeyProvider
+        // instance backing multiple independent SecretCodec instances"
+        // shape as plugin_config_secret_codec_ above), enrolled so their
+        // secrets never stay pinned to whatever KEK version was active when
+        // they were written once rotation runs.
+        if (webhook_secret_codec_)
+            out.push_back(webhook_secret_codec_.get());
+        // RuntimeConfigStore's SecretCodec (ADR-0060) — same shape, same
+        // reason. Missing this entry was an external adversarial-review
+        // finding on the initial migration: KEK rotation/rewrap silently
+        // never re-wraps the OIDC client secret while /kek/status reports
+        // rotation_complete: true, and the secret becomes permanently
+        // undecryptable once the old KEK version is later retired.
+        if (runtime_config_secret_codec_)
+            out.push_back(runtime_config_secret_codec_.get());
+        if (offload_secret_codec_)
+            out.push_back(offload_secret_codec_.get());
         return out;
     }
 
@@ -20687,6 +21555,14 @@ private:
     std::atomic<bool> viz_disabled_{false};
 
     // Phase 7: Runtime config, custom properties, health monitoring, workflows, product packs
+    //
+    // ADR-0060: runtime_config_store_ borrows runtime_config_secret_codec_ by
+    // reference (ADR-0010 per-store codec model, same shape as
+    // plugin_config_store_ / plugin_config_secret_codec_ above), so it must
+    // destruct BEFORE the codec it borrows — true here because it is
+    // declared AFTER the codec. Both borrow pg_pool_ by reference too, and
+    // both destruct before it (declared above every member here).
+    std::unique_ptr<pg::SecretCodec> runtime_config_secret_codec_;
     std::unique_ptr<RuntimeConfigStore> runtime_config_store_;
     std::unique_ptr<CustomPropertiesStore> custom_properties_store_;
     std::unique_ptr<WorkflowEngine> workflow_engine_;
@@ -20696,7 +21572,27 @@ private:
 
     // Notification & Webhook stores
     std::unique_ptr<NotificationStore> notification_store_;
+    // WebhookStore's own SecretCodec (ADR-0057/ADR-0010) — declared BEFORE
+    // webhook_store_ (borrows it by reference) so normal ~ServerImpl
+    // (reverse declaration order) tears the store down first. stop()
+    // additionally moves auth_key_provider_.reset() to AFTER this store's
+    // drain+reset (see that block's comment) — declaration order alone is
+    // NOT sufficient there, because webhook_store_ only resets after the
+    // up-to-60s delivery-pool quiesce(), well past auth_key_provider_'s old
+    // reset point, and an in-flight delivery decrypts (touches the
+    // KeyProvider transitively) right up until it drains.
+    std::unique_ptr<pg::SecretCodec> webhook_secret_codec_;
     std::unique_ptr<WebhookStore> webhook_store_;
+    // OffloadTargetStore's own SecretCodec (ADR-0010 per-store instance
+    // model), backed by the SHARED auth_key_provider_ FileKeyProvider (one
+    // KEK per database is install-wide custody — see the PluginConfigStore
+    // block's identical reasoning above). Declared BEFORE
+    // offload_target_store_ so reverse-declaration-order destruction tears
+    // the store down first (a still-draining delivery decrypts through this
+    // codec right up until OffloadTargetStore::quiesce() proves it drained —
+    // see stop()'s teardown-ordering comment, which moves
+    // auth_key_provider_.reset() to after that quiesce for the same reason).
+    std::unique_ptr<pg::SecretCodec> offload_secret_codec_;
     std::unique_ptr<OffloadTargetStore> offload_target_store_;
 
     // Phase 7: Inventory Store (Issue 7.17)

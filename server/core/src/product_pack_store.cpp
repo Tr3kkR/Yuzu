@@ -1348,14 +1348,23 @@ std::expected<void, std::string> ProductPackStore::uninstall(const std::string& 
     ProductPack pack = std::move(**pack_result);
 
     // Remove each contained item from its origin store. No pool_ lease of ours held here — same
-    // rationale as install() (see file header).
+    // rationale as install() (see file header). A genuine origin-store DB error aborts the whole
+    // uninstall (never delete/tombstone the pack while a contained item may still be live) —
+    // not-found/unsupported-kind failures from origin stores that don't yet distinguish the two
+    // stay tolerated+logged, matching pre-ADR-0058 behaviour.
     int removed = 0;
     for (const auto& item : pack.items) {
-        if (uninstall_fn(item.kind, item.item_id))
+        auto item_result = uninstall_fn(item.kind, item.item_id);
+        if (item_result) {
             ++removed;
-        else
-            spdlog::warn("ProductPackStore: failed to remove {} item '{}'", item.kind,
-                         item.item_id);
+        } else if (item_result.error().starts_with(kProductPackDbErrorPrefix)) {
+            return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                                    "failed to remove " + item.kind + " item '" + item.item_id +
+                                    "': " + item_result.error());
+        } else {
+            spdlog::warn("ProductPackStore: failed to remove {} item '{}': {}", item.kind,
+                         item.item_id, item_result.error());
+        }
     }
 
     bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {

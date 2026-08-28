@@ -280,18 +280,29 @@ so `absent()`/`rate()` alerting is meaningful on a healthy server.
 |---|---|---|
 | `yuzu_preflight_tick_errors_total` | counter | Exceptions caught by the background `PreflightRunner`'s per-tick try/catch (60 s cadence). A rising rate means pre-flight runs are not being re-dispatched/settled — check the server log. |
 
-## Webhook / offload delivery metrics (#3261)
+## Webhook / offload delivery metrics (#3261, extended ADR-0057)
 
-`WebhookStore` and `OffloadTargetStore` (see [REST API §Webhooks / §Offload Targets](rest-api.md)) dispatch deliveries through a bounded worker pool; these counters cover delivery outcomes and pool backpressure. All six are pre-seeded to `0` at boot, so `absent()`-based alerting stays meaningful on a fresh server before the first delivery ever fires.
+`WebhookStore` and `OffloadTargetStore` (see [REST API §Webhooks / §Offload Targets](rest-api.md)) dispatch deliveries through a bounded worker pool; these counters cover delivery outcomes and pool backpressure. Every no-label counter below is pre-seeded to `0` at boot, so `absent()`-based alerting stays meaningful on a fresh server before the first delivery ever fires; `yuzu_server_webhook_backfill_total` is pre-seeded per `result` label value for the same reason. `OffloadTargetStore` has no equivalent backfill metric — it fresh-starts unconditionally per ADR-0009's amendment, with no `migrate_from_sqlite()` to report an outcome for.
 
 | Metric | Type | Meaning |
 |---|---|---|
 | `yuzu_server_webhook_delivery_success_total` | counter | Webhook deliveries that completed with a 2xx response. |
 | `yuzu_server_webhook_delivery_failed_total` | counter | Webhook deliveries that failed (connection error, non-2xx, exception). |
 | `yuzu_server_webhook_delivery_dropped_total` | counter | Webhook deliveries dropped because the delivery worker pool's bounded queue was full, or the store was quiescing (shutdown in progress). A rising rate under normal operation indicates a persistently slow/unreachable endpoint saturating the pool — check `GET /api/webhooks/{id}/deliveries` for the failing target. |
+| `yuzu_server_webhook_delivery_secret_unavailable_total` | counter | Webhook deliveries skipped because the signing secret could not be decrypted (tamper, KEK loss, or a malformed blob) — never fired unsigned or with an empty secret. A sustained rate indicates a KEK-availability incident; cross-reference `yuzu_server_secret_decrypt_failures_total{store="webhook_store"}` for the specific failure class. |
+| `yuzu_server_webhook_fire_event_degraded_total` | counter | `fire_event` ticks that skipped their enabled-webhook scan because the Postgres pool did not yield a connection within its bounded (300ms) acquire, or the enabled-webhook query failed after a connection was acquired — either way, that tick's events are not delivered to any webhook. |
+| `yuzu_server_webhook_delivery_log_failed_total` | counter | Delivery-log `INSERT`s (`webhook_deliveries`) that failed against an open store — the delivery itself still ran; only its record did not persist. |
+| `yuzu_server_webhook_backfill_total{result}` | counter | One-time legacy `webhooks.db` → `webhook_store` Postgres backfill outcome on every boot, `result` ∈ `{success, failed}` (`success` covers a fresh install, an already-migrated skip, and a completed migration alike). ADR-0057. |
 | `yuzu_server_offload_delivery_success_total` | counter | Offload-target deliveries that completed with a 2xx response. |
-| `yuzu_server_offload_delivery_failed_total` | counter | Offload-target deliveries that failed (connection error, non-2xx, exception, or a tampered non-http(s) URL). |
+| `yuzu_server_offload_delivery_failed_total` | counter | Offload-target deliveries that failed (connection error, non-2xx, exception, a tampered non-http(s) URL, or a stored `auth_type` that doesn't resolve to a recognized value — a tampered/legacy row, refused rather than dispatched unauthenticated). |
 | `yuzu_server_offload_delivery_dropped_total` | counter | Offload-target deliveries dropped because the delivery worker pool's bounded queue was full, or the store was quiescing. |
+
+Two more, added with the ADR-0059 Postgres migration (also pre-seeded to `0` at boot; this store has no backfill metric — ADR-0009's fresh-start-by-default amendment means there is no legacy migration to report an outcome for):
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `yuzu_server_offload_delivery_credential_unavailable_total` | counter | Offload-target deliveries skipped because the target's credential (ADR-0010) failed to decrypt — the delivery is never fired unsigned. A nonzero rate points at KEK/keys-directory health, not the target's own configuration; cross-check against `yuzu_server_secret_decrypt_failures_total{store="offload_target_store"}` for the specific failure class. |
+| `yuzu_server_offload_fire_event_degraded_total` | counter | `fire_event`'s enabled-target scan could not acquire a database connection within its 300ms bound, or the query itself failed — that tick's events were not delivered to any target. A rising rate under normal load indicates pool exhaustion on the hot dispatch path. |
 
 ## Fleet visualization metrics
 
@@ -1384,6 +1395,31 @@ sum(rate(yuzu_server_product_pack_read_degrade_total[5m])) by (reason) > 0
 # absent-success shape, NOT result="failed" — a refused boot never serves
 # /metrics.)
 absent_over_time(yuzu_server_product_pack_backfill_total{result=~"success|fresh"}[15m])
+```
+
+## Instruction store metrics (content-plane catalog, ADR-0058)
+
+The `InstructionStore` (`InstructionDefinition -> InstructionSet -> ProductPack`, schema
+`instruction_store`) is a migrated PostgreSQL store (authoritative posture). It has **no
+legacy-SQLite backfill** (ADR-0009's fresh-start-by-default class) — there is no
+`*_backfill_total` family for it, unlike most stores on this page.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_instruction_read_degrade_total{reason}` | counter | An `InstructionStore` read degraded instead of answering, and the caller FAILED CLOSED — the REST/MCP surfaces answer `503`, never a silently-empty or silently-truncated catalog. `reason` ∈ `store_not_open`, `pool_acquire_timeout`, `query_error`. Pre-seeded to 0 for all three. |
+| `yuzu_server_instruction_write_degrade_total{reason}` | counter | An `InstructionStore` write degraded instead of succeeding. `reason` ∈ `insert_definition_row`, `update_definition`, `delete_definition`, `insert_set_row`, `delete_set`. Pre-seeded to 0 for all five. Shared with the boot-time reseed loop's own inserts (`insert_definition_row`/`insert_set_row`) — a spike here during a boot window overlaps with `yuzu_server_instruction_bundled_content_total{result="errored"}` below; outside a boot window it's an ordinary operator-write failure. |
+| `yuzu_server_instruction_bundled_content_total{result}` | counter | Outcome of the **every-boot** bundled-content reseed loop (`kBundledDefinitions`/`kBundledSets`, 232 definitions / 10 sets as of this writing) — distinct from the `*_backfill_total` one-time-at-boot shape used elsewhere on this page, since this store reseeds on **every** boot, not once. `result` ∈ `clean` (zero import errors) or `errored` (at least one definition/set failed to import against an open store). Pre-seeded to 0 for both. **`errored` means the boot refused to start** (gov Gate 4 UP-4/Gate 8 fix): a genuine DB error during the reseed loop sets `startup_failed_`, so — same caveat as the `*_backfill_total{result="failed"}` families elsewhere on this page — a refused boot never serves `/metrics`, making `errored` itself effectively unscrapeable; alert on the ABSENCE of `clean` instead, the same shape `YuzuProductPackBackfillNotCompleted` uses. |
+
+**Useful PromQL queries:**
+
+```promql
+# InstructionStore reads degrading → REST/MCP catalog reads failing closed to 503.
+sum(rate(yuzu_server_instruction_read_degrade_total[5m])) by (reason) > 0
+
+# No server reporting a clean bundled-content reseed this boot → the reseed loop hit a
+# genuine DB error and the boot refused to start (absent-clean shape, not
+# result="errored" — a refused boot never serves /metrics).
+absent_over_time(yuzu_server_instruction_bundled_content_total{result="clean"}[15m])
 ```
 
 ## Quarantine store metrics (Guardian device-quarantine bookkeeping, ADR-0047)

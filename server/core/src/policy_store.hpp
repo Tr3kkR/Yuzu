@@ -36,7 +36,6 @@
 #include <chrono>
 #include <cstdint>
 #include <expected>
-#include <filesystem>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -177,20 +176,6 @@ public:
     PolicyStore& operator=(const PolicyStore&) = delete;
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
-
-    /// One-time idempotent first-boot backfill from a legacy SQLite
-    /// `policies.db` (ADR-0009). Mandatory for the five operator-intent tables;
-    /// `policy_status` is copied (not fresh-started, see ADR-0056); the new
-    /// `policy_dispatch_state` table is deliberately excluded — it is pure
-    /// claim-tracking state invented by this migration, not legacy data.
-    /// Fails closed on any error EXCEPT one: a `policy_status` row whose
-    /// policy_id has no match in the legacy file's own `policies` table
-    /// (orphan debris, unrepresentable under the new FK) is skipped and
-    /// counted, not treated as a backfill failure — see the deliberate-
-    /// exception note in the .cpp. Idempotent: a fingerprint marker makes a
-    /// repeat call (or a second replica racing the same legacy file) a
-    /// cheap no-op.
-    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
     // ── Fragments ────────────────────────────────────────────────────────
     [[nodiscard]] std::expected<std::string, std::string>

@@ -204,7 +204,12 @@ struct ExecHarness {
             tracker->set_event_bus(event_bus.get());
         }
 
-        instructions = std::make_unique<InstructionStore>(instr_db);
+        // ADR-0058: InstructionStore is now a migrated Postgres store — shares
+        // the same pool/database as ResponseStore below (schema-per-store,
+        // ADR-0008). instr_db (the old SQLite path) is now unused dead weight
+        // in the fs::remove cleanup loops below, harmless (removing a path
+        // nothing ever creates is a silent no-op).
+        instructions = std::make_unique<InstructionStore>(pool);
         REQUIRE(instructions->is_open());
         responses = std::make_unique<ResponseStore>(pool, /*retention_days=*/0);
         REQUIRE(responses->is_open());

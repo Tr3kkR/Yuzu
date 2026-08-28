@@ -66,11 +66,11 @@ namespace yuzu::agent {
 class YUZU_EXPORT ConvergenceScheduler {
 public:
     struct Config {
-        std::uint64_t service_cadence_ms{60'000};
-        std::uint64_t registry_cadence_ms{60'000};
-        std::uint64_t file_cadence_ms{600'000}; ///< ~10 min (the 5-15 min band)
+        std::uint64_t service_cadence_ms{kGuardianServiceLaneCadenceMs};
+        std::uint64_t registry_cadence_ms{kGuardianRegistryLaneCadenceMs};
+        std::uint64_t file_cadence_ms{kGuardianFileLaneCadenceMs}; ///< ~10 min (the 5-15 min band)
         std::uint64_t priority_poll_ms{5'000};  ///< pending-initial backstop poll (also CV-woken)
-        std::uint32_t jitter_pct{20};            ///< +/- this % of the cadence, per lane
+        std::uint32_t jitter_pct{kGuardianLaneJitterPct}; ///< +/- this % of the cadence, per lane
         std::uint64_t rng_seed{0x5eed};          ///< deterministic jitter source (per-lane offset)
     };
 
