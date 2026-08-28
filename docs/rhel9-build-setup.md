@@ -174,7 +174,10 @@ package conflict that aborts `dnf`. The script adds `curl` only when no `curl` b
 | `ccache` | **Optional, EPEL-only.** `CC`/`CXX` are set to `ccache gcc` / `ccache g++` when present (matching CI), plain `gcc`/`g++` otherwise. |
 
 **Do not install `meson` from dnf** — Rocky/RHEL 9 ship 0.63.3, below the `meson_version: '>=1.3.0'`
-floor in `meson.build`. Meson comes from pip, pinned to the CI version:
+floor in `meson.build`. Meson comes from pip - but **not at the CI pin**: `requirements-ci.txt` pins
+meson 1.12.0, whose `Requires-Python` is `>=3.10`, and RHEL 9's `python3` is 3.9. The recipe installs
+1.11.2, the last meson that installs under 3.9; the build is unaffected (the floor is 1.3.0), and the
+script warns at step 3 whenever its pin and CI's differ:
 
 ```bash
 python3 -m pip install --user meson==1.11.2 pyyaml==6.0.3
@@ -186,11 +189,11 @@ hard-errors if it fails, because content embedding (`embed_content.py`) needs it
 `python3-pyyaml` (5.4.1) would work; the pinned 6.0.3 in `~/.local` shadows it and matches
 `requirements-ci.in`.
 
-> Do not install the hash-pinned `requirements-ci.txt` here — it was `pip-compile`d under Python
-> 3.12, so `--require-hashes` under Python 3.9 is a needless wheel-selection risk. Install the two
-> packages that matter explicitly. (`gcovr` from that file is only for the nightly coverage job.)
+> Do not install the hash-pinned `requirements-ci.txt` here: its meson pin needs Python 3.10+, so
+> under Python 3.9 pip refuses it outright. Install the two packages that matter explicitly.
+> (`gcovr` from that file is only for the nightly coverage job.)
 
-### Python 3.9 has a shelf life here
+### The Python 3.9 ceiling
 
 `meson setup` emits:
 
@@ -198,9 +201,11 @@ hard-errors if it fails, because content embedding (`embed_content.py`) needs it
 NOTICE: You are using Python 3.9 which is EOL. Starting with v1.12.0, Meson will require Python 3.10 or newer
 ```
 
-Meson 1.11.2 works fine on 3.9 today, so this recipe stays on the system interpreter. When the
-project moves past meson 1.11.x, RHEL 9 boxes will need a newer interpreter from AppStream
-(`python3.12` is packaged). Two things to get right at that point:
+That day has come: CI moved to meson 1.12.0 on 2026-08-21. This recipe stays on 1.11.2 under the
+system interpreter on purpose - the alternative changes which interpreter runs the build scripts and
+needs the reference run redone - and `setup-rhel9.sh` warns at step 3 while the two pins differ.
+Following the CI pin means a newer interpreter from AppStream (`python3.12` is packaged); that
+migration is tracked in #3696. Two things to get right at that point:
 
 1. Install meson under the new interpreter — `python3.12 -m pip install --user meson==<ver>`.
 2. **PyYAML must be importable by whatever `python3` *meson* resolves**, which is a separate
@@ -406,6 +411,7 @@ today this is a documented limitation rather than something the setup script can
 | `server pg unit tests shard B` TIMEOUT / SIGKILL after 600 s | Missing `pg_signal_backend`, trap 4. Check for leaked `yuzu_test_*` databases. |
 | `permission denied to terminate process` in test output | Same — trap 4. |
 | `near "RETURNING": syntax error` from a Python script | System SQLite is 3.34.1; `RETURNING` needs 3.35+. Known limitation, see above. |
+| pip: `Could not find a version that satisfies the requirement meson==1.12.0` (with `Ignored the following versions that require a different python version`) | You asked the 3.9 `python3` for the CI pin. This recipe installs `meson==1.11.2`; the python3.12 route is #3696. |
 | `[fail] sudo is required` | Stock container images and minimal installs have no `sudo`. As root: `dnf install -y sudo`. |
 | vcpkg `openssl` port fails in `Configure` | Missing perl modules. Install `perl-IPC-Cmd perl-FindBin perl-File-Compare perl-Pod-Html`. |
 | vcpkg `libpq` port fails looking for `bison`/`flex` | Those two packages are not installed. |

@@ -40,8 +40,13 @@ except Exception as exc:
 # is 11, so the compiler must come from a gcc-toolset Software Collection.
 GCC_TOOLSET="gcc-toolset-14"
 
-# Pinned to requirements-ci.in. Rocky's dnf meson is 0.63.3 — below the
-# meson_version '>=1.3.0' floor in meson.build — so meson comes from pip.
+# Rocky's dnf meson is 0.63.3, below the meson_version '>=1.3.0' floor in
+# meson.build, so meson comes from pip. CI pins meson in requirements-ci.txt;
+# from 1.12.0 meson's Requires-Python is >=3.10 and RHEL 9's python3 is 3.9,
+# so this recipe deliberately trails on the last release that installs under
+# 3.9. The build is unaffected (the floor is 1.3.0). Step 3 warns while the
+# two differ; following the CI pin via AppStream's python3.12 is issue #3696.
+# PyYAML matches the CI pin.
 MESON_VERSION="1.11.2"
 PYYAML_VERSION="6.0.3"
 
@@ -317,6 +322,14 @@ fi
 # `python3 -c 'import yaml'` and hard-errors if it fails (content embedding).
 
 step "Installing Python build tooling (meson ${MESON_VERSION}, pyyaml ${PYYAML_VERSION})"
+# Make the deviation from CI visible instead of silent (same awk as ci.yml).
+CI_MESON=""
+if [ -r "${REPO_ROOT}/requirements-ci.txt" ]; then
+  CI_MESON="$(awk '/^meson==/ {print $1}' "${REPO_ROOT}/requirements-ci.txt")" || CI_MESON=""
+  CI_MESON="${CI_MESON#meson==}"
+fi
+[ -z "${CI_MESON}" ] || [ "${CI_MESON}" = "${MESON_VERSION}" ] \
+  || warn "CI pins meson ${CI_MESON}; this recipe installs ${MESON_VERSION} (RHEL 9 python3 is 3.9, see #3696)"
 if python3 -c "
 import sys
 try:
