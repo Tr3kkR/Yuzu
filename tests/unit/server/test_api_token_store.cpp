@@ -56,7 +56,7 @@ using yuzu::server::pg::PgResult;
 // schema_meta row: the migration runner's drift guard refuses. Mirrors
 // test_preflight_run_store.cpp's "reports !is_open on a migration failure".
 TEST_CASE("ApiTokenStore reports !is_open on a migration failure", "[pg][token][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
@@ -81,7 +81,7 @@ TEST_CASE("ApiTokenStore reports !is_open on a migration failure", "[pg][token][
 TEST_CASE("ApiTokenStore reports !is_open when schema_meta claims v3 but the schema is only "
           "at v2 (post-migration smoke-read guard, #2961 round-2)",
           "[pg][token][store][migration]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
@@ -169,7 +169,7 @@ TEST_CASE("ApiTokenStore reports !is_open when schema_meta claims v3 but the sch
 TEST_CASE("ApiTokenStore: a genuine v2->v3 upgrade (real ALTER against a populated table) "
           "opens cleanly and the new column is usable end-to-end (#2961 UP-7)",
           "[pg][token][store][migration]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     std::string preexisting_token_id;
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
@@ -276,7 +276,7 @@ TEST_CASE("ApiTokenStore: a genuine v2->v3 upgrade (real ALTER against a populat
 TEST_CASE("ApiTokenStore fails closed at construction when rotation_retention_meta is missing "
           "despite schema_meta already claiming v4 (#3013 migration-numbering collision)",
           "[pg][token][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);

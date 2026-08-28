@@ -413,7 +413,7 @@ TEST_CASE("migration v5 backfills '' into v2 columns for pre-existing rows and r
     // v2 columns after the first construction, seeds the row into that
     // genuinely-4-column table, then rewinds schema_meta and reconstructs so v5
     // re-adds the columns over live pre-existing data.
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     { // first construction applies v1..v5
@@ -886,7 +886,7 @@ TEST_CASE("migration v3 backfill clamps pre-fix future last_seen/first_seen at r
     // row, roll the recorded schema version back to 2 so a fresh construction
     // re-runs ONLY v3 (a DML, re-run-safe), and prove the clamp moved it back into
     // the freshness window.
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(

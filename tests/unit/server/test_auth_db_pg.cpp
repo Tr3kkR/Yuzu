@@ -226,7 +226,7 @@ TEST_CASE("AuthDB constructs, migrates, and opens", "[pg][auth_db]") {
 }
 
 TEST_CASE("AuthDB reports !is_open on a migration failure", "[pg][auth_db]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);

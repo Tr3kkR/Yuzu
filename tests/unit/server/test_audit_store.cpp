@@ -620,7 +620,7 @@ TEST_CASE("AuditStore #2854: the liveness gauge is seeded from a legacy anchor w
     // forever. `migrate_from_sqlite`'s success chokepoint (`backfill_ok`) must
     // re-seed after copying the legacy anchor, on the SAME store instance,
     // with no restart in between.
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     yuzu::test::TempDir dir{std::string_view{"yuzu_test_audit_seed_"}};
     auto legacy = dir.path / "audit.db";
     build_legacy_audit_db(legacy, /*count=*/5); // seeds legacy last_pass_now=1699000000
