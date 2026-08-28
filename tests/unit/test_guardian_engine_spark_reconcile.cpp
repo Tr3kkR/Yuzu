@@ -86,8 +86,11 @@ fs::path unique_kv_path() {
 
 /// A minimal cross-platform stand-in for the real service mechanism (mirrors
 /// test_spark_mechanism.cpp's FakeMechanism, trimmed to what these tests
-/// need): records watch()/unwatch() calls and can be told to fail its NEXT
-/// watch() (for the arm-failure test).
+/// need): records watch()/unwatch() calls, can be told to fail its NEXT
+/// watch() (for the arm-failure test), and can be told to HANG its next
+/// watch()/unwatch() until released (#2233 item 3 liveness repro, governance
+/// Gate 3/4 consistency-auditor: this doc comment previously predated that
+/// capability).
 class FakeServiceMechanism final : public ISparkMechanism {
 public:
     void start(SparkEmitFn, SparkFaultFn) override {}
@@ -2107,6 +2110,13 @@ TEST_CASE("#2233 item 3: a hung watch() wedges stop() until released",
 
     REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(30)));
 
+    // f.engine->stop() runs unguarded on a non-main thread here - relies on the same
+    // implicitly-noexcept treatment ~GuardianEngine() itself gives stop()
+    // (guardian_engine.cpp:379's "(implicitly noexcept) ~GuardianEngine destructor"
+    // comment). An uncaught throw here would std::terminate the whole test binary
+    // rather than fail one Catch2 case (governance Gate 4 unhappy-path UP-1) - not a
+    // new risk this test introduces, just the first place that reliance is exercised
+    // off the main thread.
     cleanup.stopper_thread.emplace([&] {
         f.engine->stop();
         stop_returned.store(true, std::memory_order_release);
@@ -2207,6 +2217,7 @@ TEST_CASE("#2233 item 3: a hung watch() on one rule blocks an unrelated concurre
     cleanup.pusher_b_thread->join();
 
     CHECK(b_blocked_before_release);
+    CHECK(push_a_done.load(std::memory_order_acquire));
     CHECK(push_b_done.load(std::memory_order_acquire));
     CHECK(push_a_exit_code.load(std::memory_order_acquire) == 0);
     CHECK(push_b_exit_code.load(std::memory_order_acquire) == 0);
@@ -2263,6 +2274,9 @@ TEST_CASE("#2233 item 3: a hung unwatch() wedges stop() until released",
 
     REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(30)));
 
+    // f.engine->stop() runs unguarded on a non-main thread here - see the "hung
+    // watch() wedges stop()" test above for the implicitly-noexcept reliance this
+    // shares with ~GuardianEngine() itself (governance Gate 4 unhappy-path UP-1).
     cleanup.stopper_thread.emplace([&] {
         f.engine->stop();
         stop_returned.store(true, std::memory_order_release);
