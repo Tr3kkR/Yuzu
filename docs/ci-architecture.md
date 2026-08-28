@@ -383,13 +383,21 @@ shape. Each gated step still wraps the run in
 leaks a slot) that caps concurrent heavy test phases to **2 per box** (the
 **build** phase stays 4-wide). `Test (non-pg suites)` passes `--num-processes 4`
 (one consolidated invocation now covers what used to be five separate
-suites plus the two non-pg server shards); `Test (pg shards, full)` keeps
-`--num-processes 2` so meson's own fan-out can't pile the 11 server pg
-shards onto one CCD+cluster. Both values are the STARTING point, unchanged
-by the restructuring itself — the slot count and `--num-processes` are the
-next knobs to revisit, once the staged Windows measurement protocol
-(below) has actual per-shard wall-clock numbers to widen against, not
-before. Full diagnosis: the `tests/meson.build` server-shard comment.
+suites plus the two non-pg server shards).
+
+**Staged widening, measured (PR #3677):** push 1 shipped `Test (pg shards,
+full)` at the unwidened starting point, `--num-processes 2` — deliberately,
+per this section's own prior text, rather than guessing ahead of data. That
+push measured (cold cache, first run of the branch on Wee Tam):
+`Test (non-pg suites)` 4m30s, `Test (pg shards, full)` 10m02s — the pg step
+alone is 61% of the 16m32s total job, confirming the plan's own diagnosis
+that 11 shards through 2 workers leaves real serialization on the table.
+Push 2 widens to `--num-processes 4` on that same step, still per the plan's
+own median-of-2+-pushes protocol — this single measured data point informs
+the widening, it does not by itself justify stopping there. The non-pg
+step's width (4) and the slot count (2) are unchanged this round; only the
+pg-shards width moved. Full diagnosis: the `tests/meson.build` server-shard
+comment.
 
 ### Linux concurrency caps (within-job + cross-job)
 
