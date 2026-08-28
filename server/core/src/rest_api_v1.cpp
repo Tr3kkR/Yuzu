@@ -1596,6 +1596,9 @@ void RestApiV1::register_routes(
         if (sess) {
             caller.principal = sess->username;
             caller.principal_role = auth::role_to_string(sess->role);
+            // #1398: JIT-elevation-aware, matching every other session-derived
+            // caller.
+            caller.principal_is_admin = auth::effective_role(*sess) == auth::Role::admin;
         }
         caller.exec_visible = (exec_visible_fn && sess) ? exec_visible_fn(*sess)
                                                         : yuzu::server::authz::deny_all();
@@ -1750,6 +1753,13 @@ void RestApiV1::register_routes(
                   }
                   auto session = auth_fn(req, res);
                   const std::string principal = session ? session->username : std::string{};
+                  // #1398: JIT-elevation-aware, matching every other session-derived
+                  // caller — threaded into bundle_orch->dispatch() below so an
+                  // admin's bundle step on an AdminOrApproval-gated pair is not
+                  // unconditionally denied (adversarial-review finding: this value
+                  // used to be dropped entirely between here and the orchestrator).
+                  const bool principal_is_admin =
+                      session && auth::effective_role(*session) == auth::Role::admin;
                   // A bundle is owned by its dispatcher (collate gates on it). An
                   // empty principal would be un-attributable and collatable by any
                   // other empty-principal caller — refuse it, matching the
@@ -1809,7 +1819,15 @@ void RestApiV1::register_routes(
                           exec_visible_fn && session
                               ? exec_visible_fn(*session)
                               : yuzu::server::authz::deny_all();
-                      r = bundle_orch->dispatch(agent_id, *specs, principal, audit, exec_visible);
+                      // #1398: thread principal_is_admin (derived above) so an
+                      // admin's bundle step on a gated pair is not unconditionally
+                      // denied. approval_provenance stays the default None — REST
+                      // execute_bundle has no ticket-consumption flow (that is an
+                      // MCP-tier-specific mechanism); a non-admin REST caller
+                      // reaches a gated pair only via the governed instruction-
+                      // execute path, same as before this diff.
+                      r = bundle_orch->dispatch(agent_id, *specs, principal, audit, exec_visible,
+                                                principal_is_admin);
                   } catch (const std::exception& e) {
                       audit_fn(req, "bundle.dispatch", "failure", "Execution", "",
                                std::string("agent=") + agent_id + " error=" + e.what());

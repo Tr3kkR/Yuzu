@@ -271,7 +271,14 @@ int ScheduleRunner::dispatch_tracked(const InstructionSchedule& s, const std::st
         // dispatch goes through, not silently bypass it. `parameters` is
         // this package's typed-schedule-params payload — the two are
         // independent: WHAT is dispatched vs WHO it is dispatched as.
-        const auto caller = d_.resolve_caller(s.created_by);
+        auto caller = d_.resolve_caller(s.created_by);
+        // #1398: `approval_id` is empty on a direct auto-mode fire and a
+        // real ApprovalManager ticket id on the approved-ticket branch
+        // (fire_with_approval, above) — the same signal dispatch_tracked's
+        // own audit detail already keys on (see `detail += " approval_id="`
+        // below), reused here rather than re-derived.
+        caller.approval_provenance =
+            approval_id.empty() ? ApprovalProvenance::None : ApprovalProvenance::Ticket;
         std::tie(command_id, sent) = d_.dispatch_fn(plugin, action, /*agent_ids=*/{},
                                                     dispatch_scope, parameters, exec_id, caller);
     } catch (const std::exception& e) {

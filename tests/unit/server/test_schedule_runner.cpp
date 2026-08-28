@@ -226,6 +226,10 @@ TEST_CASE("ScheduleRunner: due interval schedule fires once and advances", "[sch
     // silently, since none of them inspect the caller at all.
     CHECK_FALSE(h.calls[0].caller.system);
     CHECK(h.calls[0].caller.principal == "admin");
+    // #1398: a direct auto-mode fire carries no approval provenance — the
+    // gate at the dispatch chokepoint relies on principal_is_admin alone
+    // for a role-gated pair reached this way, never a fabricated ticket.
+    CHECK(h.calls[0].caller.approval_provenance == ApprovalProvenance::None);
 
     // Tracked execution row, targeted count recorded.
     auto exec = h.tracker.get_execution(h.calls[0].execution_id);
@@ -378,6 +382,11 @@ TEST_CASE("ScheduleRunner: approving the ticket fires the held occurrence exactl
 
     REQUIRE(h.calls.size() == 1);
     CHECK(h.get(id).execution_count == 1);
+    // #1398: firing on an approved ticket stamps Ticket provenance — the
+    // ONE non-MCP redemption loop this ladder's gate relies on for a
+    // role-gated/always-gated definition's schedule to ever fire for a
+    // non-admin creator.
+    CHECK(h.calls[0].caller.approval_provenance == ApprovalProvenance::Ticket);
 
     // One-approval == one-run: force the next occurrence due — the spent
     // (still 'approved') ticket must be stale under the occurrence anchor,

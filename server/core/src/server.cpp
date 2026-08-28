@@ -1308,7 +1308,7 @@ public:
                           "distinct from the `forbidden` authorization verdict.",
                           "counter");
         for (auto reason : {"unclassified", "ambiguous", "anonymous_operator", "forbidden",
-                            "kill_switched"}) {
+                            "approval_required", "kill_switched"}) {
             metrics_.counter("yuzu_server_dispatch_denied_total", {{"reason", reason}});
         }
         metrics_.describe("yuzu_server_dispatch_tag_invalid_total",
@@ -10094,6 +10094,10 @@ private:
             .principal_role = auth::role_to_string(sess.role),
             .exec_visible = derive_exec_visible(sess),
             .system = false,
+            // #1398: JIT-elevation-aware, matching the governed
+            // POST /api/instructions/:id/execute path's own role-gated
+            // bypass (workflow_routes.cpp).
+            .principal_is_admin = auth::effective_role(sess) == auth::Role::admin,
         };
     }
 
@@ -10128,10 +10132,16 @@ private:
     yuzu::server::DispatchCaller derive_dispatch_caller_for_username(const std::string& username) {
         bool principal_resolves = false;
         std::string role_label;
+        // #1398: resolved from the SAME auth-store read as role_label, at
+        // fire time — never cached from schedule-creation time — and fails
+        // closed (stays false) on any resolution failure below, matching
+        // principal_resolves's own fail-closed contract.
+        bool principal_is_admin = false;
         if (auth_db_ && !username.empty()) {
             if (auto user = auth_db_->get_user(username)) {
                 principal_resolves = true;
                 role_label = auth::role_to_string(user->role);
+                principal_is_admin = user->role == auth::Role::admin;
             } else {
                 spdlog::warn("schedule fire: creator '{}' no longer resolves ({}); denying "
                              "fail-closed rather than firing on a stale identity",
@@ -10160,7 +10170,7 @@ private:
         }
         return yuzu::server::caller_for_stored_username(
             username, true, std::move(role_label),
-            yuzu::server::authz::compose_exec_visible(facts));
+            yuzu::server::authz::compose_exec_visible(facts), principal_is_admin);
     }
 
     /// PR1.9c: a stable string label for `DispatchArm`, fed into
@@ -10262,24 +10272,10 @@ private:
 
         if (!decision) {
             const auto& denial = decision.error();
-            std::string_view reason_label;
-            switch (denial.reason) {
-            case yuzu::server::detail::DispatchDenialReason::Unclassified:
-                reason_label = "unclassified";
-                break;
-            case yuzu::server::detail::DispatchDenialReason::Ambiguous:
-                reason_label = "ambiguous";
-                break;
-            case yuzu::server::detail::DispatchDenialReason::AnonymousOperator:
-                reason_label = "anonymous_operator";
-                break;
-            case yuzu::server::detail::DispatchDenialReason::Forbidden:
-                reason_label = "forbidden";
-                break;
-            case yuzu::server::detail::DispatchDenialReason::KillSwitched:
-                reason_label = "kill_switched";
-                break;
-            }
+            // #1398: the ONE label mapping — see to_string(DispatchDenialReason)'s
+            // doc comment (agent_registry.hpp) for why this is no longer a
+            // hand-duplicated switch here.
+            const std::string_view reason_label = yuzu::server::detail::to_string(denial.reason);
             metrics_
                 .counter("yuzu_server_dispatch_denied_total",
                          {{"reason", std::string(reason_label)}})
@@ -10535,14 +10531,18 @@ private:
     /// WorkflowRoutes::CommandDispatchFn); every fake dispatch lambda in
     /// test_mcp_server.cpp / test_dashboard_tar_fragments.cpp /
     /// test_workflow_routes.cpp was updated for the signature-only change.
-    /// `BundleOrchestrator::DispatchFn` (execute_bundle) is left as the
-    /// original CDX-P1-03/K-3 comment found it — a SEPARATE, REST-shared
-    /// typedef with no role concept on its REST side; mcp_server.cpp now
-    /// adapts the widened DispatchFn down to it at construction rather than
-    /// touch that shared type. `principal`/`principal_role` are empty for a
-    /// caller not yet wired to identify itself (present-empty `exec_visible`
-    /// still denies); `DispatchCaller::system` marks a genuine
-    /// background/system dispatcher (no Session at all) explicitly.
+    /// `BundleOrchestrator::DispatchFn` (execute_bundle) is signature-identical
+    /// to `McpServer::DispatchFn` — PR1.9c removed the old adapter, and its
+    /// `dispatch()` (bundle_orchestrator.hpp/.cpp) accepts and threads the
+    /// caller's `principal_is_admin`/`approval_provenance` too (#1398,
+    /// adversarial-review finding: those two fields used to be dropped
+    /// between the wrapper's already-correct caller derivation and the
+    /// per-step `DispatchCaller` this orchestrator reconstructs — fixed by
+    /// widening `dispatch()`'s own signature, not by touching this shared
+    /// typedef). `principal`/`principal_role` are empty for a caller not yet
+    /// wired to identify itself (present-empty `exec_visible` still denies);
+    /// `DispatchCaller::system` marks a genuine background/system dispatcher
+    /// (no Session at all) explicitly.
     ///
     /// Original CDX-P1-03/K-3 (adv-fix11) rationale, preserved for context: a
     /// prior wave attempted widening McpServer::DispatchFn by one param for
@@ -14343,17 +14343,37 @@ private:
                 const bool is_classification_error =
                     denial.reason == yuzu::server::detail::DispatchDenialReason::Unclassified ||
                     denial.reason == yuzu::server::detail::DispatchDenialReason::Ambiguous;
+                // #1398: a gated-but-unapproved pair gets its own message,
+                // naming the gate and pointing at the governed alternative —
+                // distinct from a bare RBAC "permission denied" (Decision 7,
+                // deny+redirect, no new ticket-mint surface on this route).
+                const bool is_approval_required =
+                    denial.reason ==
+                    yuzu::server::detail::DispatchDenialReason::ApprovalRequired;
                 const int status = is_classification_error ? 400 : 403;
                 const std::string message =
                     is_classification_error
                         ? std::string{"unknown or ambiguous plugin.action"}
-                        : "permission denied: " + denial.securable + ":" +
-                              std::string(yuzu::server::authz::to_string(denial.operation));
-                const bool audit_ok =
-                    audit_log(req, "command.dispatch", "denied", "command", "",
-                             std::string("reason=dispatch_denied ") +
-                                 onbehalf::sanitize_for_log(plugin, 128) + ":" +
-                                 onbehalf::sanitize_for_log(action, 128));
+                        : is_approval_required
+                              ? "approval required for " + plugin + "." + action +
+                                    " — this action requires either an admin caller or an "
+                                    "approved request; dispatch it via "
+                                    "POST /api/instructions/{id}/execute instead, which "
+                                    "supports the approval workflow"
+                              : "permission denied: " + denial.securable + ":" +
+                                    std::string(yuzu::server::authz::to_string(denial.operation));
+                // #1398 (governance security-guardian F3): the SPECIFIC denial
+                // reason, not a flat "dispatch_denied" — an incident review
+                // needs to tell `forbidden` apart from `approval_required`
+                // from the audit trail alone, the same way the metric label
+                // already does (yuzu::server::detail::to_string, shared with
+                // build_classified_command's metric emission above).
+                const bool audit_ok = audit_log(
+                    req, "command.dispatch", "denied", "command", "",
+                    std::string("reason=") +
+                        std::string(yuzu::server::detail::to_string(denial.reason)) + " " +
+                        onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                        onbehalf::sanitize_for_log(action, 128));
                 if (!audit_ok)
                     res.set_header("Sec-Audit-Failed", "true");
                 res.status = status;

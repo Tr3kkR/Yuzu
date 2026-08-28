@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""test_capability_gate_consistency.py — #1398's content<->catalogue drift gate.
+
+Issue #1398: an `InstructionDefinition`'s `approval.mode` was enforced only
+on the governed `POST /api/instructions/:id/execute` path, never on raw
+dispatch (`POST /api/command`, MCP `execute_instruction`). The fix adds an
+`ExecuteGate` dimension to `CommandCapability` (`command_capability.hpp`),
+authored per `plugin.action` row across the six `capability_decls/*.hpp`
+fragments, derived STRICTEST-WINS from every shipped definition targeting
+that pair (`auto` -> `None`, `role-gated` -> `AdminOrApproval`, `always` ->
+`AlwaysApproval`). This script is the mechanical guarantee that the
+authored catalogue value and the derived content value never drift apart —
+a content author tightening a definition's `approval.mode` without a
+matching catalogue change is exactly the shape of gap #1398 was filed for,
+just at the pair level instead of the platform level.
+
+Three things checked against the real, integrated tree:
+
+  1. GATE CONSISTENCY: for every `plugin.action` pair that both (a) has a
+     shipped `InstructionDefinition` and (b) has a catalogue row, the
+     catalogue's authored `.execute_gate` must equal the strictest
+     `approval.mode` among every definition targeting that pair. Mismatches
+     are named exactly (`plugin.action`: catalogue says X, content demands
+     Y).
+  2. NON-CATALOGUE EXEMPTION RULE (Decision 1, #1398 design doc): a content
+     pair with NO catalogue row is exempt from gating BY CONSTRUCTION only
+     when it is server-side (`server`/`server_internal`/`_server`-prefixed)
+     — such a pair can never reach `CommandCapabilityRegistry::classify`
+     because nothing dispatches it to an agent. A future catalogue-eligible
+     plugin action that ships content but never gets a catalogue row would
+     otherwise silently inherit this exemption; this check makes that a
+     named failure instead.
+  3. PARSE INTEGRITY: the number of fragment rows this script's regex finds
+     an `.execute_gate` for must equal the number of rows it finds a
+     `.plugin`/`.action` pair for, and both must equal 184 (45+55+34+42+5+3
+     across the six fragments) — architect review requirement: a regex that
+     silently fails to associate a gate with its row must read as a hard
+     failure, never as an absent gate.
+
+Mode-defaulting semantics are replicated EXACTLY from
+`server/core/scripts/embed_content.py`'s `def_envelope`
+(`approval.get("mode") or "auto"`) so a definition with no `approval:`
+block, or an empty one, derives `auto` identically in both places —
+otherwise this gate and the build-time embed step could disagree about
+what a defaulted definition means.
+
+Runnable standalone: `python3 tests/test_capability_gate_consistency.py`.
+Hermetic — reads only source files already on disk under this repository
+(content/definitions/*.yaml, the six capability_decls fragments); no
+subprocess, no network, no clock. Requires PyYAML, an existing hard build
+dependency (see embed_content.py) — not a new one for this repo.
+
+Demonstrating the failure modes is done on fabricated data only, per this
+package's boundary against editing real fragment/content files —
+`TestFailureModesOnSyntheticData` feeds synthetic pair/mode/gate maps
+straight into the same `diff_gates` analysis function the real-tree check
+uses.
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+import unittest
+from pathlib import Path
+
+try:
+    import yaml  # type: ignore[import-not-found]
+except ImportError:
+    print(
+        "ERROR: test_capability_gate_consistency.py requires PyYAML "
+        "(already a hard build dependency — see embed_content.py). "
+        "Install with `pip install pyyaml`.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+CONTENT_GLOB = "content/definitions/*.yaml"
+
+FRAGMENT_FILES = [
+    "server/core/src/capability_decls/core_dispatch_capabilities.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_content_dist.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_a.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_b.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_c.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_d.hpp",
+]
+# 3 + 5 + 45 + 55 + 34 + 42 — see command_capability.hpp's fragment doc
+# comments and the #1398 design doc's verified row-count audit.
+EXPECTED_TOTAL_ROWS = 184
+
+# Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
+# with no catalogue row may carry — server-side handlers with no
+# agent-dispatch surface, so ExecuteGate is meaningless for them.
+NON_CATALOGUE_EXEMPT_PREFIXES = ("server", "server_internal", "_server")
+
+RANK = {"auto": 0, "role-gated": 1, "always": 2}
+MODE_TO_GATE = {"auto": "None", "role-gated": "AdminOrApproval", "always": "AlwaysApproval"}
+
+_ROW_RE = re.compile(
+    r'\.plugin\s*=\s*"([^"]+)"\s*,\s*'
+    r'\.action\s*=\s*"([^"]+)"'
+    r'(?:.*?)'
+    r'\.execute_gate\s*=\s*ExecuteGate::(\w+)\s*,',
+    re.DOTALL,
+)
+_PAIR_ONLY_RE = re.compile(r'\.plugin\s*=\s*"([^"]+)"\s*,\s*\.action\s*=\s*"([^"]+)"')
+
+
+def parse_content_pair_modes(content_root: Path) -> dict[tuple[str, str], list[str]]:
+    """Every `(plugin, action) -> [approval.mode, ...]` across every
+    definition in every multi-document `content/definitions/*.yaml` file.
+    Mode-defaulting matches `embed_content.py`'s `def_envelope` exactly:
+    `approval.get("mode") or "auto"`.
+    """
+    pair_modes: dict[tuple[str, str], list[str]] = {}
+    for path in sorted(content_root.glob(CONTENT_GLOB)):
+        with path.open(encoding="utf-8") as f:
+            docs = list(yaml.safe_load_all(f))
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            spec = doc.get("spec")
+            if not isinstance(spec, dict):
+                continue
+            exec_ = spec.get("execution") or {}
+            plugin = exec_.get("plugin") or spec.get("plugin") or ""
+            action = exec_.get("action") or spec.get("action") or ""
+            if not plugin or not action:
+                continue
+            approval = spec.get("approval") or {}
+            mode = approval.get("mode") or "auto"
+            pair_modes.setdefault((plugin, str(action).lower()), []).append(mode)
+    return pair_modes
+
+
+def parse_fragment_gate_rows(path: Path) -> list[tuple[str, str, str]]:
+    """Every `(plugin, action, execute_gate)` triple a fragment declares, in
+    file order. Pairs on `.plugin =` immediately followed by `.action =`
+    (same adjacency `test_capability_catalogue_complete.py` relies on),
+    extended to also capture the `.execute_gate = ExecuteGate::<Value>`
+    that must follow somewhere later in the same row.
+    """
+    text = path.read_text(encoding="utf-8")
+    return [(p, a, g) for p, a, g in _ROW_RE.findall(text)]
+
+
+def parse_fragment_pair_count(path: Path) -> int:
+    """Count of `.plugin =`/`.action =` adjacent pairs only, independent of
+    whether a gate was found for them — the parse-integrity comparison
+    baseline (check 3 in the module docstring).
+    """
+    text = path.read_text(encoding="utf-8")
+    return len(_PAIR_ONLY_RE.findall(text))
+
+
+def diff_gates(
+    pair_modes: dict[tuple[str, str], list[str]],
+    fragment_rows: list[tuple[str, str, str]],
+) -> tuple[dict[tuple[str, str], tuple[str, str]], set[tuple[str, str]]]:
+    """The pure analysis this gate's checks 1 and 2 run — no file I/O, so
+    the synthetic failure-mode tests below can drive it directly.
+
+    Returns `(mismatches, unexempt_missing)`:
+      - `mismatches`: pair -> (catalogue_gate, derived_gate) for every
+        catalogue-backed pair where the authored gate disagrees with the
+        strictest mode any shipped definition declares for it.
+      - `unexempt_missing`: content pairs with NO catalogue row whose
+        plugin is NOT one of the exempt server-side prefixes — a
+        catalogue-eligible action that content declares but the catalogue
+        never classifies.
+    """
+    catalogue_gate_by_pair = {(p, a): g for p, a, g in fragment_rows}
+
+    mismatches: dict[tuple[str, str], tuple[str, str]] = {}
+    unexempt_missing: set[tuple[str, str]] = set()
+
+    for pair, modes in pair_modes.items():
+        strictest_mode = max(modes, key=lambda m: RANK.get(m, -1))
+        if strictest_mode not in RANK:
+            # An unvalidated mode is a separate gate's problem (rung 1's
+            # embed_content.py / instruction_store.cpp vocabulary check) —
+            # this script only compares gates for validly-moded pairs so
+            # the two checks stay independent and don't double-report the
+            # same underlying defect.
+            continue
+        derived_gate = MODE_TO_GATE[strictest_mode]
+
+        plugin = pair[0]
+        catalogue_gate = catalogue_gate_by_pair.get(pair)
+        if catalogue_gate is None:
+            if not plugin.startswith(NON_CATALOGUE_EXEMPT_PREFIXES):
+                unexempt_missing.add(pair)
+            continue
+
+        if catalogue_gate != derived_gate:
+            mismatches[pair] = (catalogue_gate, derived_gate)
+
+    return mismatches, unexempt_missing
+
+
+def format_gaps(
+    mismatches: dict[tuple[str, str], tuple[str, str]],
+    unexempt_missing: set[tuple[str, str]],
+) -> str:
+    lines: list[str] = []
+    for (plugin, action), (catalogue_gate, derived_gate) in sorted(mismatches.items()):
+        lines.append(
+            f"GATE MISMATCH for {plugin}.{action}: catalogue authors "
+            f"ExecuteGate::{catalogue_gate}, but shipped content demands "
+            f"ExecuteGate::{derived_gate} — update the catalogue row (or "
+            "the content, if the catalogue is the intended source of truth "
+            "for this change)"
+        )
+    for plugin, action in sorted(unexempt_missing):
+        lines.append(
+            f"UNCLASSIFIED GATE-ELIGIBLE PAIR {plugin}.{action}: content declares "
+            "this pair but no capability_decls/*.hpp row exists for it, and its "
+            f"plugin prefix is not in the exempt server-side set "
+            f"{NON_CATALOGUE_EXEMPT_PREFIXES} — this pair CAN reach "
+            "CommandCapabilityRegistry::classify, so it needs an authored "
+            ".execute_gate row"
+        )
+    return "\n".join(lines)
+
+
+class TestGateConsistencyOnRealTree(unittest.TestCase):
+    """The actual drift gate: parses the live repository and fails, naming
+    every gap, if content's approval.mode and the six capability-catalogue
+    fragments' execute_gate have drifted apart.
+    """
+
+    def test_no_gate_gaps_between_content_and_catalogue(self) -> None:
+        pair_modes = parse_content_pair_modes(REPO_ROOT)
+        self.assertTrue(pair_modes, "parsed zero content definitions — the glob is broken")
+
+        fragment_rows: list[tuple[str, str, str]] = []
+        pair_only_count = 0
+        for rel in FRAGMENT_FILES:
+            path = REPO_ROOT / rel
+            fragment_rows.extend(parse_fragment_gate_rows(path))
+            pair_only_count += parse_fragment_pair_count(path)
+
+        # Check 3: parse-integrity. A regex that finds the plugin/action
+        # pair but silently fails to associate an execute_gate with it
+        # (e.g. a future field reordering this script's regex doesn't
+        # anticipate) must fail loud here, not read as "no gate = fine".
+        self.assertEqual(
+            len(fragment_rows), pair_only_count,
+            f"parsed {pair_only_count} plugin/action pairs across the six fragments but "
+            f"only {len(fragment_rows)} had an associated .execute_gate — the row/gate "
+            "regex has drifted apart from the fragment file format (or a row is missing "
+            "its .execute_gate field, which should be a COMPILE failure via each "
+            "fragment's static_assert(all_gates_specified(...)) — if it isn't, that "
+            "sweep itself has a bug)",
+        )
+        self.assertEqual(
+            len(fragment_rows), EXPECTED_TOTAL_ROWS,
+            f"expected exactly {EXPECTED_TOTAL_ROWS} total capability rows across the six "
+            f"fragments, found {len(fragment_rows)} — update EXPECTED_TOTAL_ROWS if a row "
+            "was deliberately added or removed, after confirming the six per-file counts "
+            "in the #1398 design doc's row-count audit are updated too",
+        )
+        self.assertNotIn(
+            "Unspecified", {g for _, _, g in fragment_rows},
+            "a fragment row's execute_gate parsed as ExecuteGate::Unspecified — this "
+            "should be IMPOSSIBLE (every fragment's static_assert(all_gates_specified(...)) "
+            "makes an omitted .execute_gate a compile failure), so either that sweep is "
+            "broken or a row was authored with the sentinel value explicitly",
+        )
+
+        mismatches, unexempt_missing = diff_gates(pair_modes, fragment_rows)
+
+        if mismatches or unexempt_missing:
+            self.fail("\n" + format_gaps(mismatches, unexempt_missing))
+
+
+class TestFailureModesOnSyntheticData(unittest.TestCase):
+    """Proves `diff_gates` actually catches both drift shapes, using
+    fabricated data only — never a real fragment or content file.
+    """
+
+    def test_stricter_content_than_catalogue_is_named(self) -> None:
+        pair_modes = {("widget", "explode"): ["role-gated"]}
+        fragment_rows = [("widget", "explode", "None")]
+        mismatches, unexempt_missing = diff_gates(pair_modes, fragment_rows)
+        self.assertEqual(mismatches, {("widget", "explode"): ("None", "AdminOrApproval")})
+        self.assertFalse(unexempt_missing)
+
+    def test_looser_content_than_catalogue_is_also_named(self) -> None:
+        # A catalogue gate stricter than content demands is still a drift —
+        # #1398's fix ships an accurate reflection of content, not a
+        # ratchet that only tightens.
+        pair_modes = {("widget", "spin"): ["auto"]}
+        fragment_rows = [("widget", "spin", "AlwaysApproval")]
+        mismatches, unexempt_missing = diff_gates(pair_modes, fragment_rows)
+        self.assertEqual(mismatches, {("widget", "spin"): ("AlwaysApproval", "None")})
+        self.assertFalse(unexempt_missing)
+
+    def test_strictest_wins_across_multiple_definitions(self) -> None:
+        pair_modes = {("tar", "sql"): ["auto", "auto", "role-gated", "auto"]}
+        fragment_rows = [("tar", "sql", "None")]
+        mismatches, unexempt_missing = diff_gates(pair_modes, fragment_rows)
+        self.assertEqual(mismatches, {("tar", "sql"): ("None", "AdminOrApproval")})
+
+    def test_matching_gate_is_not_reported(self) -> None:
+        pair_modes = {("rdp_control", "set_state"): ["role-gated"]}
+        fragment_rows = [("rdp_control", "set_state", "AdminOrApproval")]
+        mismatches, unexempt_missing = diff_gates(pair_modes, fragment_rows)
+        self.assertFalse(mismatches)
+        self.assertFalse(unexempt_missing)
+
+    def test_exempt_server_prefix_missing_row_is_not_reported(self) -> None:
+        pair_modes = {("server", "policy.delete"): ["always"]}
+        mismatches, unexempt_missing = diff_gates(pair_modes, [])
+        self.assertFalse(mismatches)
+        self.assertFalse(unexempt_missing)
+
+    def test_unexempt_missing_catalogue_row_is_named(self) -> None:
+        pair_modes = {("widget", "ghost"): ["role-gated"]}
+        mismatches, unexempt_missing = diff_gates(pair_modes, [])
+        self.assertFalse(mismatches)
+        self.assertEqual(unexempt_missing, {("widget", "ghost")})
+
+    def test_invalid_mode_is_skipped_not_crashed_on(self) -> None:
+        # An invalid approval.mode is rung 1's vocabulary check's problem
+        # (embed_content.py / instruction_store.cpp), not this script's —
+        # it must not crash comparing an unranked mode.
+        pair_modes = {("widget", "spin"): ["manual"]}
+        fragment_rows = [("widget", "spin", "None")]
+        mismatches, unexempt_missing = diff_gates(pair_modes, fragment_rows)
+        self.assertFalse(mismatches)
+        self.assertFalse(unexempt_missing)
+
+
+if __name__ == "__main__":
+    unittest.main()
