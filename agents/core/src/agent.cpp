@@ -2171,24 +2171,31 @@ public:
                             // HA WS-0 dedup safety-net signals, emitted every
                             // heartbeat (the agent has no /metrics; the server-side
                             // yuzu_fleet_* derivation + alert land with WS-11).
-                            // "degraded"=1 means the durable store never OPENED, so
-                            // this agent runs commands undeduplicated (fail-open) — a
-                            // real 0/1 reading, never absent-reads-as-zero. "misses"
-                            // counts terminal outcomes that matched no in-flight row
-                            // (a command that ran undeduplicated, or a duplicate
-                            // terminal) — NOT the eviction double-execute, which is not
-                            // separately detectable. "record_errors" counts durable
-                            // WRITE failures after a healthy open (the write-side of
-                            // fail-open). "replays" counts served terminal replays.
+                            // "degraded"=1 means the durable store never OPENED (a
+                            // real 0/1 reading, never absent-reads-as-zero). It is
+                            // the OPEN-failure signal ONLY; a store that opened then
+                            // fails to WRITE (post-boot disk-full) is surfaced by the
+                            // "claim_errors"/"record_errors"/"release_errors"
+                            // counters below — each a command that ran undeduplicated
+                            // or a possibly-leaked claim, so a post-boot degradation
+                            // is not invisible. "misses" counts terminal outcomes
+                            // that matched no in-flight row (ran undeduplicated, or a
+                            // duplicate terminal) — NOT the eviction double-execute,
+                            // which is not separately detectable. "replays" counts
+                            // served terminal replays.
                             tags["yuzu.dedup_degraded"] = command_dedup_ ? "0" : "1";
                             tags["yuzu.dedup_replays"] = std::to_string(static_cast<int64_t>(
                                 metrics_.counter("yuzu_agent_dedup_replays_total").value()));
+                            tags["yuzu.dedup_claim_errors"] = std::to_string(static_cast<int64_t>(
+                                metrics_.counter("yuzu_agent_dedup_claim_errors_total").value()));
                             tags["yuzu.dedup_record_terminal_misses"] =
                                 std::to_string(static_cast<int64_t>(
                                     metrics_.counter("yuzu_agent_dedup_record_terminal_miss_total")
                                         .value()));
                             tags["yuzu.dedup_record_errors"] = std::to_string(static_cast<int64_t>(
                                 metrics_.counter("yuzu_agent_dedup_record_errors_total").value()));
+                            tags["yuzu.dedup_release_errors"] = std::to_string(static_cast<int64_t>(
+                                metrics_.counter("yuzu_agent_dedup_release_errors_total").value()));
                             tags["yuzu.os"] = kAgentOs;
                             tags["yuzu.arch"] = kAgentArch;
                             tags["yuzu.agent_version"] = std::string{yuzu::kFullVersionString};
@@ -2564,6 +2571,10 @@ public:
                     if (stop_requested_.load(std::memory_order_acquire))
                         break;
 
+                    // True only when THIS delivery's claim() succeeded — gates the
+                    // queue-full release so it never deletes a concurrent owner's row.
+                    bool claimed_here = false;
+
                     // Command replay protection (HA WS-0, ADR-2002). claim() is the
                     // atomic first-writer-wins gate: on a duplicate we REPLAY the
                     // original terminal outcome (never a bare REJECTED that would
@@ -2588,6 +2599,10 @@ public:
                                      "protection cannot apply");
                     } else if (command_dedup_ && cmd.plugin() != "__guard__") {
                         auto claim = command_dedup_->claim(cmd.command_id());
+                        // Own the in-flight record ONLY when WE claimed it — a
+                        // fall-through on Error (fail-open) must NOT later release a
+                        // row a concurrent first delivery owns.
+                        claimed_here = (claim.status == ClaimStatus::Claimed);
                         if (claim.status == ClaimStatus::Error)
                             metrics_.counter("yuzu_agent_dedup_claim_errors_total").increment();
                         if (claim.status == ClaimStatus::Duplicate) {
@@ -2759,10 +2774,14 @@ public:
                         reject_resp.set_status(pb::CommandResponse::REJECTED);
                         reject_resp.set_output("agent overloaded: command queue full");
                         // Queue-full is TRANSIENT and the command never executed —
-                        // release the claim so a redelivery can be attempted, never
-                        // memoise it as a terminal outcome.
-                        if (command_dedup_)
-                            command_dedup_->release(cmd.command_id());
+                        // release OUR claim so a redelivery can be attempted (never
+                        // memoise a terminal outcome). Only when we actually claimed
+                        // here: releasing otherwise could delete a concurrent first
+                        // delivery's in-flight row. A failed release leaks the claim
+                        // (RUNNING-forever), so count it.
+                        if (command_dedup_ && claimed_here &&
+                            command_dedup_->release(cmd.command_id()) == ReleaseOutcome::Error)
+                            metrics_.counter("yuzu_agent_dedup_release_errors_total").increment();
                         std::lock_guard lock(stream_write_mu_);
                         stream->Write(reject_resp, grpc::WriteOptions());
                     }
@@ -3247,8 +3266,14 @@ private:
             return;
         try {
             static constexpr size_t kMaxDedupResponseBytes = 64 * 1024;
+            static constexpr int kMaxDedupErrorMessageBytes = 1024;
             std::string blob;
             if (resp.ByteSizeLong() > kMaxDedupResponseBytes) {
+                // Store a slim form: keep the terminal SIGNAL (status/exit_code/
+                // result-status/error) that effectively-once needs; replace only
+                // the large `output` field with a fixed sentinel. `error.code` +
+                // a bounded `error.message` are preserved so a replayed failure
+                // still carries its reason.
                 pb::CommandResponse slim;
                 slim.set_command_id(resp.command_id());
                 slim.set_status(resp.status());
@@ -3256,7 +3281,12 @@ private:
                 slim.set_plugin_result_status(resp.plugin_result_status());
                 if (resp.has_sent_at())
                     *slim.mutable_sent_at() = resp.sent_at();
-                slim.set_output("[output omitted from dedup store: exceeded size cap; "
+                if (resp.has_error()) {
+                    slim.mutable_error()->set_code(resp.error().code());
+                    slim.mutable_error()->set_message(
+                        resp.error().message().substr(0, kMaxDedupErrorMessageBytes));
+                }
+                slim.set_output("[output replaced in dedup store: response exceeded size cap; "
                                 "command completed]");
                 blob = slim.SerializeAsString();
             } else {
@@ -3281,8 +3311,17 @@ private:
                 break;
             }
         } catch (...) {
-            // best-effort: an allocation/serialization failure only degrades
-            // durability (a redelivery may re-execute); never terminate.
+            // Best-effort + noexcept: an allocation/serialization failure here
+            // leaves the row IN-FLIGHT (the terminal was never recorded), so a
+            // redelivery answers RUNNING and the command does NOT re-execute —
+            // durability degraded, not a double-run. Count + log so it is not
+            // silent; the log is itself guarded (spdlog can throw under OOM).
+            metrics_.counter("yuzu_agent_dedup_record_errors_total").increment();
+            try {
+                spdlog::error("record_command_terminal failed to persist outcome for {}",
+                              command_id);
+            } catch (...) {
+            }
         }
     }
 

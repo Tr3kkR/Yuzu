@@ -20,6 +20,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <string>
 
 #ifndef _WIN32
@@ -277,4 +278,40 @@ TEST_CASE("CommandDedupStore: a live in-flight row is NEVER evicted by retention
     auto dup = t.store.claim("cmd-live");
     CHECK(dup.status == ClaimStatus::Duplicate);
     CHECK(dup.state == DedupState::InFlight);
+}
+
+// ── release outcome + open() failure branches ──────────────────────────────────
+
+TEST_CASE("CommandDedupStore: release reports Released on a healthy store",
+          "[command_dedup][release]") {
+    auto t = make_store();
+    REQUIRE(t.store.claim("cmd-1").status == ClaimStatus::Claimed);
+    CHECK(t.store.release("cmd-1") == ReleaseOutcome::Released);
+    // An empty id / no-op release is Released (nothing to leak), not Error.
+    CHECK(t.store.release("") == ReleaseOutcome::Released);
+    CHECK(t.store.release("never-claimed") == ReleaseOutcome::Released);
+}
+
+TEST_CASE("CommandDedupStore: open fails on an unusable path (a directory)",
+          "[command_dedup][lifecycle]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_dir_"};
+    std::error_code ec;
+    std::filesystem::create_directories(dir.path, ec);
+    REQUIRE_FALSE(ec);
+    // The path is a directory, not a valid database file — open must fail.
+    auto result = CommandDedupStore::open(dir.path);
+    CHECK_FALSE(result.has_value());
+}
+
+TEST_CASE("CommandDedupStore: open fails on a non-database file",
+          "[command_dedup][lifecycle]") {
+    const auto path = fresh_db_path();
+    yuzu::test::TempDbFile guard{path};
+    {
+        std::ofstream f(path);
+        f << "this is not a sqlite database";
+    }
+    // journal_mode/synchronous read-back or the schema DDL rejects a garbage file.
+    auto result = CommandDedupStore::open(path);
+    CHECK_FALSE(result.has_value());
 }

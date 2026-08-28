@@ -13,6 +13,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <cctype>
 #include <chrono>
 #include <format>
 
@@ -30,6 +31,36 @@ struct StmtDeleter {
     void operator()(sqlite3_stmt* s) const { sqlite3_finalize(s); }
 };
 using StmtPtr = std::unique_ptr<sqlite3_stmt, StmtDeleter>;
+
+// RAII for the interim raw connection during open(): manual sqlite3_close on
+// every early-return error path is exactly the "undocumented manual cleanup in
+// new code" cpp-conventions flags, so the handle is owned by a guard and only
+// released to the store on success.
+struct DbCloser {
+    void operator()(sqlite3* d) const {
+        if (d)
+            sqlite3_close(d);
+    }
+};
+using DbGuard = std::unique_ptr<sqlite3, DbCloser>;
+
+// Read a single-value PRAGMA back as lower-cased text. A REFUSED durability
+// pragma (e.g. journal_mode=WAL on a filesystem that cannot support it) is
+// reported by SQLite as SQLITE_OK with the *actual* mode in the result row, so
+// setting a pragma is not proof it took — invariant (6) requires reading it back.
+std::string query_pragma(sqlite3* db, const char* pragma_sql) {
+    sqlite3_stmt* raw = nullptr;
+    if (sqlite3_prepare_v2(db, pragma_sql, -1, &raw, nullptr) != SQLITE_OK)
+        return {};
+    StmtPtr stmt(raw);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW)
+        return {};
+    const auto* txt = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+    std::string v = txt ? txt : "";
+    for (auto& c : v)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return v;
+}
 
 // Persisted state values. Stored as INTEGER, never the enum's ABI value.
 constexpr int kStateInFlight = 0;
@@ -79,26 +110,28 @@ CommandDedupStore::open(const std::filesystem::path& db_path) {
     if (rc != SQLITE_OK) {
         std::string err = raw_db ? sqlite3_errmsg(raw_db) : "unknown error";
         if (raw_db)
-            sqlite3_close(raw_db);
+            sqlite3_close(raw_db); // open_v2 may hand back a handle even on failure
         return std::unexpected(
             CommandDedupError{std::format("failed to open command_dedup.db: {}", err)});
     }
+    DbGuard db_guard(raw_db); // owns the handle across every early return below
 
-    char* err_msg = nullptr;
-    rc = sqlite3_exec(raw_db, "PRAGMA journal_mode=WAL", nullptr, nullptr, &err_msg);
-    if (rc != SQLITE_OK) {
-        spdlog::warn("CommandDedupStore: WAL mode failed: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
+    // WAL + synchronous=FULL are load-bearing durability guarantees (invariant 6),
+    // so SET then READ BACK: a *refused* pragma returns SQLITE_OK with the actual
+    // mode in the result row, so a mismatch (WAL not "wal", synchronous not "2"=
+    // FULL) means the guarantee is silently void — treat that as an open failure,
+    // which takes the caller's observable fail-open path (degraded, not silent).
+    sqlite3_exec(raw_db, "PRAGMA journal_mode=WAL", nullptr, nullptr, nullptr);
+    if (auto jm = query_pragma(raw_db, "PRAGMA journal_mode"); jm != "wal") {
+        return std::unexpected(CommandDedupError{
+            std::format("journal_mode=WAL not in effect (got '{}')", jm)});
     }
-    // synchronous=FULL (not the WAL default NORMAL): fsync every commit so a
-    // claim/terminal record survives a HOST power-loss, not just a process crash
-    // — the durability the effectively-once-across-host-failure guarantee needs.
-    // One write per command (not a hot path), so the cost is negligible.
-    err_msg = nullptr;
-    rc = sqlite3_exec(raw_db, "PRAGMA synchronous=FULL", nullptr, nullptr, &err_msg);
-    if (rc != SQLITE_OK) {
-        spdlog::warn("CommandDedupStore: synchronous=FULL failed: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
+    // fsync every commit so a claim/terminal record survives a HOST power-loss,
+    // not just a process crash. One write per command (not a hot path).
+    sqlite3_exec(raw_db, "PRAGMA synchronous=FULL", nullptr, nullptr, nullptr);
+    if (auto sy = query_pragma(raw_db, "PRAGMA synchronous"); sy != "2") {
+        return std::unexpected(CommandDedupError{
+            std::format("synchronous=FULL not in effect (got '{}')", sy)});
     }
     sqlite3_busy_timeout(raw_db, 5000);
 
@@ -125,18 +158,28 @@ CommandDedupStore::open(const std::filesystem::path& db_path) {
         INSERT INTO meta(key, value) VALUES('schema_version', '1')
             ON CONFLICT(key) DO NOTHING;
     )";
-    err_msg = nullptr;
+    char* err_msg = nullptr;
     rc = sqlite3_exec(raw_db, create_sql, nullptr, nullptr, &err_msg);
     if (rc != SQLITE_OK) {
         std::string err = err_msg ? err_msg : "unknown error";
         sqlite3_free(err_msg);
-        sqlite3_close(raw_db);
         return std::unexpected(
             CommandDedupError{std::format("failed to create command_dedup schema: {}", err)});
     }
 
+    // Owner-only (0600), matching the security-hardening.md "chmod 600 *.db" rule
+    // and the agent's cert-key posture. Best-effort per file: -wal/-shm may not
+    // exist yet, and a chmod failure must not fail an otherwise-healthy open.
+    const auto owner_only =
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write;
+    for (const auto& suffix : {"", "-wal", "-shm"}) {
+        std::error_code pec;
+        std::filesystem::permissions(db_path.string() + suffix, owner_only,
+                                     std::filesystem::perm_options::replace, pec);
+    }
+
     spdlog::info("CommandDedupStore opened: {}", db_path.string());
-    return CommandDedupStore{raw_db};
+    return CommandDedupStore{db_guard.release()};
 }
 
 ClaimResult CommandDedupStore::claim(std::string_view command_id) noexcept {
@@ -177,10 +220,9 @@ ClaimResult CommandDedupStore::claim(std::string_view command_id) noexcept {
             spdlog::error("CommandDedupStore::claim commit failed: {}", sqlite3_errmsg(db_));
             return ClaimResult{.status = ClaimStatus::Error};
         }
-        if (++claims_since_prune_ >= kPruneInterval) {
-            prune_locked();
-            claims_since_prune_ = 0;
-        }
+        // NB: prune is NOT triggered here — it runs from record_terminal() (a
+        // worker thread), off the latency-critical reader, since the ring evicts
+        // terminal rows.
         return ClaimResult{.status = ClaimStatus::Claimed};
     }
     if (rc != SQLITE_DONE) {
@@ -275,10 +317,18 @@ RecordOutcome CommandDedupStore::record_terminal(std::string_view command_id,
     if (rc == SQLITE_ROW) {
         // Drain to DONE so the WAL-fsync commit failure surfaces as Error.
         rc = sqlite3_step(stmt.get());
-        if (rc == SQLITE_DONE)
-            return RecordOutcome::Recorded;
-        spdlog::error("CommandDedupStore::record_terminal commit failed: {}", sqlite3_errmsg(db_));
-        return RecordOutcome::Error;
+        if (rc != SQLITE_DONE) {
+            spdlog::error("CommandDedupStore::record_terminal commit failed: {}",
+                          sqlite3_errmsg(db_));
+            return RecordOutcome::Error;
+        }
+        // A new terminal row was created — amortised prune of the terminal ring,
+        // on this (worker) thread, keeping the reader off the DELETE.
+        if (++records_since_prune_ >= kPruneInterval) {
+            prune_locked();
+            records_since_prune_ = 0;
+        }
+        return RecordOutcome::Recorded;
     }
     if (rc == SQLITE_DONE)
         return RecordOutcome::Miss; // no in-flight row matched (evicted / never claimed / already terminal)
@@ -286,12 +336,12 @@ RecordOutcome CommandDedupStore::record_terminal(std::string_view command_id,
     return RecordOutcome::Error;
 }
 
-void CommandDedupStore::release(std::string_view command_id) noexcept {
+ReleaseOutcome CommandDedupStore::release(std::string_view command_id) noexcept {
     if (command_id.empty())
-        return;
+        return ReleaseOutcome::Released; // nothing to leak
     std::lock_guard lock(mu_);
     if (!db_)
-        return;
+        return ReleaseOutcome::Released; // no store: the caller never claimed here
 
     // Only an in-flight row is releasable — never delete a terminal outcome (a
     // concurrent worker may have just recorded one for a redelivery).
@@ -299,8 +349,9 @@ void CommandDedupStore::release(std::string_view command_id) noexcept {
     sqlite3_stmt* raw_stmt = nullptr;
     int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
     if (rc != SQLITE_OK) {
-        spdlog::error("CommandDedupStore::release prepare failed: {}", sqlite3_errmsg(db_));
-        return;
+        spdlog::error("CommandDedupStore::release prepare failed for {}: {}", command_id,
+                      sqlite3_errmsg(db_));
+        return ReleaseOutcome::Error;
     }
     StmtPtr stmt(raw_stmt);
     sqlite3_bind_text(stmt.get(), 1, command_id.data(), static_cast<int>(command_id.size()),
@@ -308,8 +359,14 @@ void CommandDedupStore::release(std::string_view command_id) noexcept {
     sqlite3_bind_int(stmt.get(), 2, kStateInFlight);
 
     rc = sqlite3_step(stmt.get());
-    if (rc != SQLITE_DONE)
-        spdlog::error("CommandDedupStore::release step failed: {}", sqlite3_errmsg(db_));
+    if (rc != SQLITE_DONE) {
+        // The in-flight row was NOT deleted — the claim leaks: the command answers
+        // RUNNING to every redelivery and never re-runs. The caller counts this.
+        spdlog::error("CommandDedupStore::release failed for {} — claim may be leaked: {}",
+                      command_id, sqlite3_errmsg(db_));
+        return ReleaseOutcome::Error;
+    }
+    return ReleaseOutcome::Released;
 }
 
 void CommandDedupStore::prune_locked() noexcept {
@@ -344,7 +401,7 @@ void CommandDedupStore::prune_locked() noexcept {
 
 void CommandDedupStore::set_max_dedup_rows_for_test(std::int64_t n) {
     std::lock_guard lock(mu_);
-    max_dedup_rows_ = n;
+    max_dedup_rows_ = n < 1 ? 1 : n; // a non-positive LIMIT would delete everything
 }
 
 std::optional<std::int64_t> CommandDedupStore::count() const {

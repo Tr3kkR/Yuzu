@@ -37,14 +37,15 @@
  *                             RUNNING (indeterminate).
  *              -> Error     : store write failed; the caller proceeds WITHOUT
  *                             dedup for this one command — a DELIBERATE fail-OPEN
- *                             to availability (ADR-2002): when the durable store
- *                             cannot function no dedup mechanism can, and the
- *                             chosen degradation is at-least-once (a redelivery
- *                             may re-execute) rather than refusing the command
- *                             and dropping the endpoint out of remote-control
- *                             reach. This is degraded, not wrong, and the caller
- *                             is expected to make it OBSERVABLE (a counter/tag),
- *                             never silent.
+ *                             to availability (ADR-2002): the chosen degradation
+ *                             is at-least-once (a redelivery may re-execute)
+ *                             rather than refusing the command and dropping the
+ *                             endpoint out of remote-control reach. Fail-open is a
+ *                             POLICY CHOICE, not a necessity (the old in-memory
+ *                             sets needed no disk); a per-instruction-class fail-
+ *                             closed option is a tracked follow-up. This is
+ *                             degraded, not wrong, and the caller MUST make it
+ *                             OBSERVABLE (a counter/tag), never silent.
  *
  * Retention is a clock-free rowid ring over TERMINAL rows only (keep the most
  * recent kMaxDedupRows). Deliberately NOT a wall-clock delete, so it sidesteps
@@ -105,6 +106,14 @@ enum class RecordOutcome {
     Error,    ///< store write failed
 };
 
+/// Outcome of release() — a failed DELETE leaks a claim (the command answers
+/// RUNNING to every redelivery, never re-runs), so it MUST be observable, not a
+/// void that swallows the error (invariant 1).
+enum class ReleaseOutcome {
+    Released, ///< the in-flight row was deleted (or was already gone)
+    Error,    ///< store write failed — the claim may be leaked; count it
+};
+
 struct ClaimResult {
     ClaimStatus status = ClaimStatus::Error;
     DedupState state = DedupState::InFlight; ///< meaningful only when status==Duplicate
@@ -162,10 +171,12 @@ public:
     /**
      * Drop a claimed in-flight record that produced NO memoizable outcome (the
      * dispatch queue was full — transient), so a redelivery can be executed.
-     * Only deletes a still-in-flight row — never a terminal one. Best-effort +
-     * noexcept. No-op on an empty id / closed store.
+     * Only deletes a still-in-flight row — never a terminal one. Returns Error
+     * on a store-write failure so the caller can count a possibly-leaked claim
+     * (invariant 1); noexcept. Released on an empty id / closed store (nothing to
+     * leak), Error only on an actual failed DELETE.
      */
-    void release(std::string_view command_id) noexcept;
+    ReleaseOutcome release(std::string_view command_id) noexcept;
 
     /** Row count (TEST/observability). nullopt on error/closed store. */
     [[nodiscard]] std::optional<std::int64_t> count() const;
@@ -173,7 +184,8 @@ public:
     /**
      * TEST-ONLY: lower the terminal-ring bound so retention tests exercise the
      * real prune path without driving kMaxDedupRows (20000) fsync'd commits.
-     * Production never calls this; the default is kMaxDedupRows.
+     * Production never calls this; the default is kMaxDedupRows. Clamped to >= 1
+     * (a non-positive bound would make the ring's LIMIT delete everything).
      */
     void set_max_dedup_rows_for_test(std::int64_t n);
 
@@ -202,7 +214,10 @@ private:
 
     sqlite3* db_{nullptr};
     mutable std::mutex mu_;
-    std::uint64_t claims_since_prune_{0};
+    /// Prune is triggered from record_terminal() (a worker thread), NOT claim()
+    /// (the latency-critical reader): the ring evicts TERMINAL rows, which only
+    /// record_terminal creates, and this keeps the reader off the prune DELETE.
+    std::uint64_t records_since_prune_{0};
     std::int64_t max_dedup_rows_{kMaxDedupRows}; ///< effective ring bound (test-lowerable)
 };
 
