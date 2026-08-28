@@ -216,7 +216,13 @@ probe, since no caller ever checked `is_open()`).
   decision), and the task scope is the store + its own test file — widening the consumer-facing
   contract would touch `discovery_routes.cpp` for no closed gap. Tracked as a follow-up if a
   future consumer (a dashboard summary tile, a compliance report) starts treating an empty result
-  as a decision input.
+  as a decision input. **Distinguished from `DiscoveryStore`'s opposite call for a structurally
+  similar read** (governance Gate 3 architect finding): `DiscoveryStore` 503s on a degraded read
+  because "an operator scanning for rogue devices must not be told 'nothing found' when the real
+  answer is 'could not ask'" — patch compliance is not itself a security-gating decision the way
+  "is this device managed" is, so the deny-or-benign classification stands, but the next Wave-4
+  author reusing this reasoning should weigh their own store against BOTH precedents, not just
+  `OffloadTargetStore`'s.
 - **Porting `execute_deployment` as-is.** Rejected — zero production callers, and the reboot
   orchestration it implements (PowerShell `-match` on a live Windows Update search, cross-platform
   shutdown commands) is real, security-sensitive shell-construction logic that would need its own
@@ -247,5 +253,13 @@ probe, since no caller ever checked `is_open()`).
 - **#3669** — decision issue tracking whether `execute_deployment`'s scan/install/verify/reboot
   orchestration should be revived (wired to a real dispatch path) or the de-scope confirmed
   permanent (filed alongside this PR).
+- **#3676** — governance Gate 3 `sre` finding, independently confirmed by grep during this PR's
+  own review: `record_patches()`, the only method that writes `patch_inventory`, has **zero
+  production callers anywhere in this codebase** — pre-existing, predates this migration. Every
+  read this store exposes (`get_missing_patches`/`get_installed_patches`/
+  `get_fleet_patch_summary`) is correctly implemented over a table nothing currently populates, so
+  `GET /api/patches` returns empty in any real deployment today. `docs/capability-map.md` §8.5/§8.7
+  are downgraded (Done → Partial) in this same PR to reflect that; see #3676 for the wire-it-vs-
+  confirm-out-of-scope decision.
 - Widening `PatchManager`'s reads to a typed degrade channel, if a future consumer needs to
   distinguish "no patches" from "degraded read" (see "Considered and rejected" above).

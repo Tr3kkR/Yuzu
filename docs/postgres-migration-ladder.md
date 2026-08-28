@@ -10,7 +10,10 @@ priorities: cross-store-join + durable + high-write stores first; security/authz
 stores next; trivial config and secret-gated stores last. **Posture and secret columns below are
 provisional** — each is finalized in that store's per-store ADR after reading the code.
 
-Schema name = `snake_case(FullClassName)` incl. the `Store` suffix (ADR-0008 Update).
+Schema name = `snake_case(FullClassName)` incl. the `Store` suffix (ADR-0008 Update). **Exception**
+for a non-`*Store`-suffixed class (the Wave-4 ladder-blind-spot components below, e.g.
+`PatchManager`): no suffix to append because none exists on the class — the schema is that name's
+`snake_case(FullClassName)`, literally (ADR-0008's 2026-08-28 extension, recorded at ADR-0062).
 
 > **Every `*Store` class + the auth DB is migrated (2026-08-27 — `OffloadTargetStore`/ADR-0059
 > merged PR #3652, moved to `## Done` below).** `InstructionStore` (ADR-0058),

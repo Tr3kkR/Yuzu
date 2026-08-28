@@ -8,13 +8,16 @@
 
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
+#include <yuzu/metrics.hpp>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <random>
 #include <regex>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace yuzu::server {
 
@@ -237,8 +240,21 @@ void PatchManager::record_patches(const std::string& agent_id,
         return true;
     });
 
-    if (ok)
+    if (ok) {
         spdlog::info("PatchManager: recorded {} patches for agent {}", patches.size(), agent_id);
+    } else {
+        // with_txn_for returns false silently on a lease-acquire/BEGIN
+        // failure too (not just an INSERT failure, which already logs its
+        // own line above) — log here so a degraded pool doesn't drop an
+        // agent's whole inventory report with zero trace.
+        spdlog::warn("PatchManager::record_patches: failed to record {} patches for agent {} "
+                    "(pool degraded or transaction failed)",
+                    patches.size(), agent_id);
+        if (metrics_)
+            metrics_->counter("yuzu_server_patch_manager_write_failed_total",
+                              {{"op", "record_patches"}})
+                .increment();
+    }
 }
 
 std::vector<PatchInfo> PatchManager::query_patches(const PatchQuery& query,
@@ -372,8 +388,10 @@ PatchManager::deploy_patch(const DeploymentRequest& req) {
     // total_targets accurate.
     std::vector<std::string> agent_ids;
     agent_ids.reserve(req.agent_ids.size());
+    std::unordered_set<std::string_view> seen;
+    seen.reserve(req.agent_ids.size());
     for (const auto& id : req.agent_ids) {
-        if (std::find(agent_ids.begin(), agent_ids.end(), id) == agent_ids.end())
+        if (seen.insert(id).second)
             agent_ids.push_back(id);
     }
 
@@ -430,8 +448,13 @@ PatchManager::deploy_patch(const DeploymentRequest& req) {
         return true;
     });
 
-    if (!ok)
+    if (!ok) {
+        if (metrics_)
+            metrics_->counter("yuzu_server_patch_manager_write_failed_total",
+                              {{"op", "deploy_patch"}})
+                .increment();
         return std::unexpected("failed to create deployment");
+    }
 
     spdlog::info("PatchManager: created deployment {} for {} targeting {} agents",
                  id, kb_id, agent_ids.size());
@@ -515,24 +538,53 @@ PatchManager::cancel_deployment(const std::string& id) {
     if (depl->status == "completed" || depl->status == "cancelled")
         return std::unexpected("deployment already " + depl->status);
 
-    update_deployment_status(id, "cancelled");
-
     if (!open_)
         return std::unexpected("database not available");
-    auto lease = pool_.try_acquire_for(kWriteTimeout);
-    if (!lease)
-        return std::unexpected("failed to cancel targets");
 
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "UPDATE patch_manager.patch_deployment_targets SET status = 'cancelled', completed_at = $1 "
-        "WHERE deployment_id = $2 AND status IN "
-        "('pending', 'scanning', 'downloading', 'installing', 'verifying', 'rebooting')",
-        std::vector<std::string>{std::to_string(now_epoch()), id});
-    if (res.status() != PGRES_COMMAND_OK) {
-        spdlog::error("PatchManager::cancel_deployment: target update failed: {}",
-                      PQresultErrorMessage(res.get()));
-        return std::unexpected("failed to cancel targets");
+    // Both writes in ONE transaction — governance Gate 4 unhappy-path fix.
+    // The SQLite-era shape (and this migration's own first draft) issued the
+    // deployment-status UPDATE and the target-rows UPDATE as two SEPARATE
+    // lease acquisitions. A lease failure on the FIRST (silently returning,
+    // no error surfaced) while the SECOND still succeeded reported overall
+    // SUCCESS to the caller with the deployment's own `status` column never
+    // actually changed — a false-success report with no reconciler left to
+    // ever correct it (execute_deployment/recalculate_deployment_progress,
+    // the only code that ever revisited a deployment's state, are both
+    // deleted in this same migration). One transaction makes this
+    // all-or-nothing instead.
+    const auto now = std::to_string(now_epoch());
+    bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult dres = pg::exec_params(
+            conn,
+            "UPDATE patch_manager.patch_deployments SET status = 'cancelled', completed_at = $1 "
+            "WHERE id = $2",
+            std::vector<std::string>{now, id});
+        if (dres.status() != PGRES_COMMAND_OK) {
+            spdlog::error("PatchManager::cancel_deployment: deployment status update failed: {}",
+                          PQresultErrorMessage(dres.get()));
+            return false;
+        }
+
+        pg::PgResult tres = pg::exec_params(
+            conn,
+            "UPDATE patch_manager.patch_deployment_targets SET status = 'cancelled', "
+            "completed_at = $1 WHERE deployment_id = $2 AND status IN "
+            "('pending', 'scanning', 'downloading', 'installing', 'verifying', 'rebooting')",
+            std::vector<std::string>{now, id});
+        if (tres.status() != PGRES_COMMAND_OK) {
+            spdlog::error("PatchManager::cancel_deployment: target update failed: {}",
+                          PQresultErrorMessage(tres.get()));
+            return false;
+        }
+        return true;
+    });
+
+    if (!ok) {
+        if (metrics_)
+            metrics_->counter("yuzu_server_patch_manager_write_failed_total",
+                              {{"op", "cancel_deployment"}})
+                .increment();
+        return std::unexpected("failed to cancel deployment");
     }
 
     spdlog::info("PatchManager: cancelled deployment {}", id);
@@ -562,32 +614,6 @@ void PatchManager::update_target_status(const std::string& deployment_id,
     if (res.status() != PGRES_COMMAND_OK)
         spdlog::warn("PatchManager::update_target_status: update failed for {}/{}: {}",
                     deployment_id, agent_id, PQresultErrorMessage(res.get()));
-}
-
-// ── Internal helpers ─────────────────────────────────────────────────────────
-
-void PatchManager::update_deployment_status(const std::string& id,
-                                            const std::string& status) {
-    if (!open_)
-        return;
-    auto lease = pool_.try_acquire_for(kWriteTimeout);
-    if (!lease)
-        return;
-
-    const bool is_terminal = (status == "completed" || status == "failed" || status == "cancelled");
-    pg::PgResult res =
-        is_terminal
-            ? pg::exec_params(
-                  lease.get(),
-                  "UPDATE patch_manager.patch_deployments SET status = $1, completed_at = $2 "
-                  "WHERE id = $3",
-                  std::vector<std::string>{status, std::to_string(now_epoch()), id})
-            : pg::exec_params(lease.get(),
-                              "UPDATE patch_manager.patch_deployments SET status = $1 WHERE id = $2",
-                              std::vector<std::string>{status, id});
-    if (res.status() != PGRES_COMMAND_OK)
-        spdlog::warn("PatchManager::update_deployment_status: update failed for {}: {}", id,
-                    PQresultErrorMessage(res.get()));
 }
 
 } // namespace yuzu::server

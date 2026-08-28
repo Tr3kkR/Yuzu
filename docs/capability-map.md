@@ -28,11 +28,11 @@ Each capability is rated on two axes:
 
 ```
 Foundation   [================================]  33/33 done  (100%)
-Advanced     [================================]  101/101 done (100%)
+Advanced     [==============================--]  96/101 done (95%)
 Future       [=====================-----------]  33/50 done  (66%)
 New (Ph 8-16)[=---------------------------]     2/44 done   (5%) (5 partial — Guardian PRs 1-2 + Guardian pre-login activation done; 15.A + 28.4 + 28.6 + 28.7 fleet-viz in flight)
 ─────────────────────────────────────────────────────────────────
-Overall      [======================---------]   172/228 done (75%)
+Overall      [=======================--------]   167/228 done (73%)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -44,7 +44,7 @@ Overall      [======================---------]   172/228 done (75%)
 | 5. Process & Service Mgmt | 5 | 4 | 0 | 1 |
 | 6. User & Session Mgmt | 5 | 5 | 0 | 0 |
 | 7. Software & App Mgmt | 6 | 6 | 0 | 0 |
-| 8. Patch & Update Mgmt | 9 | 5 | 2 | 2 |
+| 8. Patch & Update Mgmt | 9 | 3 | 4 | 2 |
 | 9. Security & Compliance | 10 | 9 | 0 | 1 |
 | 10. File System Operations | 15 | 14 | 0 | 1 |
 | 11. Script & Command Exec | 4 | 4 | 0 | 0 |
@@ -407,9 +407,14 @@ queryable via `get_deployment()`/REST. **Deployment-level aggregate counters
 afterward** — the only caller of the former `recalculate_deployment_progress()` was
 `execute_deployment()` (§8.3), deleted alongside it.
 
-### 8.5 Patch Metadata Retrieval :white_check_mark: `T2`
+### 8.5 Patch Metadata Retrieval :large_orange_diamond: `T2`
 
-`PatchInfo` stores KB ID, title, severity (Critical/Important/Moderate/Low/Unspecified), release date, and scan timestamp. `get_fleet_patch_summary()` returns per-KB missing counts. `get_missing_patches()` and `get_installed_patches()` support severity and agent filtering.
+`PatchInfo` stores KB ID, title, severity (Critical/Important/Moderate/Low/Unspecified), release
+date, and scan timestamp. `get_fleet_patch_summary()` returns per-KB missing counts.
+`get_missing_patches()` and `get_installed_patches()` support severity and agent filtering — all
+correctly implemented, but **`record_patches()`, the only method that writes `patch_inventory`,
+has no production caller** (verified by grep — pre-existing, predates the Postgres migration),
+so every one of these reads returns empty in any real deployment today. See #3676.
 
 ### 8.6 Reboot Management (Post-Patch) :x: `T2`
 
@@ -421,9 +426,13 @@ implementation. `reboot_delay_seconds`/`reboot_at` are still accepted by
 `POST /api/patches/deploy`, clamped, and stored on `PatchDeployment`, but nothing currently acts
 on them.
 
-### 8.7 Update Summary and Compliance Reporting :white_check_mark: `T2`
+### 8.7 Update Summary and Compliance Reporting :large_orange_diamond: `T2`
 
-`PatchManager::get_fleet_patch_summary()` returns fleet-wide patch compliance (per-KB missing agent counts). `get_missing_patches()` with `PatchQuery` filters by agent, severity, status. Deployment tracking reports `total_targets` (accurate as of creation); `completed_targets`/`failed_targets` do not auto-update post-creation (§8.4).
+`PatchManager::get_fleet_patch_summary()` returns fleet-wide patch compliance (per-KB missing
+agent counts). `get_missing_patches()` with `PatchQuery` filters by agent, severity, status.
+Deployment tracking reports `total_targets` (accurate as of creation); `completed_targets`/
+`failed_targets` do not auto-update post-creation (§8.4). **Fleet compliance reporting reads the
+same never-populated `patch_inventory` table as §8.5** — see that section and #3676.
 
 ### 8.8 Patch Connectivity Testing :white_check_mark: `T2`
 

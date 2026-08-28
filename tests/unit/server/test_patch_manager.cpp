@@ -168,7 +168,11 @@ TEST_CASE("PatchManager: cancel_deployment covers rebooting", "[patch_manager][p
     REQUIRE(depl.has_value());
     CHECK(depl->status == "cancelled");
 
-    // Both targets should now be cancelled (rebooting + pending are both in the cancel set)
+    // Both targets should now be cancelled (rebooting + pending are both in the cancel set).
+    // REQUIRE the count first — quality-engineer governance finding: a
+    // loop-only assertion with no size check passes vacuously if the
+    // target sub-query ever silently returns an empty vector.
+    REQUIRE(depl->targets.size() == 2);
     for (const auto& t : depl->targets) {
         CHECK(t.status == "cancelled");
     }
@@ -245,6 +249,69 @@ TEST_CASE("PatchManager: record_patches upserts and queries", "[patch_manager][p
 
     auto summary = mgr.get_fleet_patch_summary(10);
     CHECK(summary.empty()); // nothing missing anymore
+}
+
+// New coverage (governance Gate 3 quality-engineer finding): the rewritten
+// GROUP BY/ORDER BY/LIMIT query had only ever been exercised by
+// `summary.empty()` — this exercises real grouping, descending-count
+// ordering, and LIMIT truncation across multiple kb_ids/agents.
+TEST_CASE("PatchManager: get_fleet_patch_summary groups, orders, and truncates",
+          "[patch_manager][pg][inventory]") {
+    PATCH_MANAGER(mgr);
+
+    // KB1111111 missing on 3 agents, KB2222222 on 2, KB3333333 on 1.
+    mgr.record_patches("agent-1", {
+        {.kb_id = "KB1111111", .status = "missing"},
+        {.kb_id = "KB2222222", .status = "missing"},
+        {.kb_id = "KB3333333", .status = "missing"},
+    });
+    mgr.record_patches("agent-2", {
+        {.kb_id = "KB1111111", .status = "missing"},
+        {.kb_id = "KB2222222", .status = "missing"},
+    });
+    mgr.record_patches("agent-3", {
+        {.kb_id = "KB1111111", .status = "missing"},
+    });
+
+    auto summary = mgr.get_fleet_patch_summary(50);
+    REQUIRE(summary.size() == 3);
+    CHECK(summary[0] == std::pair<std::string, int>{"KB1111111", 3});
+    CHECK(summary[1] == std::pair<std::string, int>{"KB2222222", 2});
+    CHECK(summary[2] == std::pair<std::string, int>{"KB3333333", 1});
+
+    auto limited = mgr.get_fleet_patch_summary(2);
+    REQUIRE(limited.size() == 2);
+    CHECK(limited[0].first == "KB1111111");
+    CHECK(limited[1].first == "KB2222222");
+}
+
+// New coverage (governance Gate 3 quality-engineer finding): deploy_patch's
+// same-transaction title-enrichment read was never asserted, either found
+// or not-found.
+TEST_CASE("PatchManager: deploy_patch enriches title from inventory when present",
+          "[patch_manager][pg][deploy]") {
+    PATCH_MANAGER(mgr);
+
+    mgr.record_patches("agent-1", {
+        {.kb_id = "KB1234567", .title = "Security Update for Widgets", .status = "missing"},
+    });
+
+    auto result = mgr.deploy_patch("KB1234567", {"agent-1"}, false, "admin");
+    REQUIRE(result.has_value());
+    auto depl = mgr.get_deployment(*result);
+    REQUIRE(depl.has_value());
+    CHECK(depl->title == "Security Update for Widgets");
+}
+
+TEST_CASE("PatchManager: deploy_patch leaves title empty when kb_id is not in inventory",
+          "[patch_manager][pg][deploy]") {
+    PATCH_MANAGER(mgr);
+
+    auto result = mgr.deploy_patch("KB9999999", {"agent-1"}, false, "admin");
+    REQUIRE(result.has_value());
+    auto depl = mgr.get_deployment(*result);
+    REQUIRE(depl.has_value());
+    CHECK(depl->title.empty());
 }
 
 // Regression test (governance Gate 2, empirically reproduced): a single

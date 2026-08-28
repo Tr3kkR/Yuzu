@@ -6340,6 +6340,7 @@ public:
                               "created/opened)");
                 startup_failed_ = true;
             } else {
+                patch_manager_->set_metrics(&metrics_);
                 legacy_sqlite_probe::warn_if_legacy_rows(
                     cfg_.db_dir() / "patches.db", "PatchManager",
                     {"patch_inventory", "patch_deployments", "patch_deployment_targets"});

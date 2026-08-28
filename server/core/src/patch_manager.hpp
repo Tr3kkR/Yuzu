@@ -31,7 +31,6 @@
 /// tracking issue for its tested-but-unwired reboot-orchestration
 /// behaviour.
 
-#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <optional>
@@ -41,6 +40,10 @@
 namespace yuzu::server::pg {
 class PgPool;
 } // namespace yuzu::server::pg
+
+namespace yuzu {
+class MetricsRegistry;
+} // namespace yuzu
 
 namespace yuzu::server {
 
@@ -123,6 +126,11 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
+    /// Wire a metrics sink for write-failure counters
+    /// (`yuzu_server_patch_manager_write_failed_total{op}`). Set-before-
+    /// traffic contract, same as every other metrics-emitting store.
+    void set_metrics(yuzu::MetricsRegistry* metrics) noexcept { metrics_ = metrics; }
+
     // ── Patch inventory ─────────────────────────────────────────────────
 
     /// Record patches reported by an agent (called when scan results come in).
@@ -178,11 +186,10 @@ public:
 private:
     pg::PgPool& pool_;
     bool open_{false};
+    yuzu::MetricsRegistry* metrics_{nullptr};
 
     std::string generate_id() const;
 
-    // Internal helpers
-    void update_deployment_status(const std::string& id, const std::string& status);
     std::vector<PatchInfo> query_patches(const PatchQuery& query,
                                           const std::string& status_filter) const;
 };

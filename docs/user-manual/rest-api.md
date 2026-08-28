@@ -6223,6 +6223,10 @@ The one device list behind every network-quality drill: worst devices by a metri
 - **Permission:** `Patch:Read`
 - **Query params:** `agent_id`, `severity`, `status`, `limit` (default 100)
 
+> **Note:** patch inventory is populated only by `PatchManager::record_patches()`, which has no
+> production caller today — this endpoint returns an empty result in every real deployment, not
+> because the fleet has no missing patches. See `docs/capability-map.md` §8.5/§8.7 and #3676.
+
 **`POST /api/patches/deploy`** — Create a patch deployment targeting specific agents.
 
 - **Permission:** `Patch:Write`
