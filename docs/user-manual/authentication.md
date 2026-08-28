@@ -416,17 +416,84 @@ element cannot inject group membership that the IdP didn't attest to.
 >   regardless of actual group membership. Either keep the target admin's
 >   group count under the overage threshold or use a dedicated,
 >   low-membership group for the admin mapping.
-> - At most **64 group values** from the configured attribute are considered
->   (a DoS guard); a value beyond the 64th is never evaluated.
+> - At most **200 group values** from the configured attribute are considered
+>   (a DoS guard, aligned with the RBAC reconcile cap below); an assertion
+>   carrying more than 200 values is **rejected outright** when
+>   `--saml-group-attribute` is configured and RBAC is enabled — see
+>   [SAML Fine-Grained RBAC](#saml-fine-grained-rbac) below. The coarse
+>   `--saml-admin-group` mapping on its own (RBAC disabled, or no RBAC store)
+>   still just silently ignores a value beyond the 200th, same as before.
 
 Changing either flag requires a server restart to take effect (no hot-reload,
 same as the other SAML flags).
 
-> **Unlike OIDC, SAML group values are not synced into `rbac_store`:**
-> SAML group values feed the admin/user role decision only; they are NOT
-> synced into `rbac_store` (group-scoped RBAC role assignments do not apply
-> to SAML principals) — deferred pending source-aware group resolution, see
-> issue #1832.
+### SAML Fine-Grained RBAC
+
+Beyond the coarse admin/user mapping above, SAML now reaches parity with
+OIDC's group-to-role reconciliation: when RBAC is enabled and
+`--saml-group-attribute` is configured, every value in the configured group
+attribute is reconciled into the RBAC store as `saml:<value>` group
+principals (source `"saml"`) on every login — the same
+`RbacStore::reconcile_idp_memberships` mechanism OIDC's fixed `groups` ID
+token claim uses for source `"entra"`. There is no dedicated group-membership
+UI — a group-scoped role grant is made via the management-group
+role-delegation API, `POST /api/v1/management-groups/{id}/roles`, whose
+`principal_id` field is free text: set `"principal_type": "group"` and
+`"principal_id": "saml:<value>"` to delegate `Operator` or `Viewer` (the only
+two roles this route delegates) to everyone the IdP asserts is in that group;
+no new configuration flag is needed —
+reconciliation is driven entirely by `--saml-group-attribute`, which you
+likely already have configured for the coarse admin mapping above.
+
+Both mechanisms coexist: `--saml-admin-group` still grants the coarse
+`role=admin`/`role=user` session role exactly as documented above,
+independently of any RBAC-assigned fine-grained permissions.
+
+Reconciliation happens **before** the session is minted, so a provisioning
+failure denies the login outright (fail-closed) rather than granting a
+session under stale or partially-reconciled roles. Three cases worth
+knowing:
+
+- **More than 200 asserted group values DENIES the login.** The verifier
+  already truncates its parsed `groups` list to 200 entries (the DoS guard
+  above) — reconciling that truncated, incomplete view would silently
+  deprovision every membership beyond the 200th on the next login, so the
+  login is refused instead (redirects to the login page with an error,
+  same as any other SAML failure). This matches OIDC's
+  `group_count_exceeded` behaviour exactly.
+- **An empty or absent group attribute does NOT deprovision.** SAML cannot
+  distinguish "the attribute was never asserted" from "the attribute was
+  asserted with zero values" — both produce an empty group list. Unlike
+  OIDC (which has an explicit `groups` claim presence signal from the
+  token), reconciling an empty SAML group list would delete every one of
+  the user's `saml:`-sourced memberships. Reconciliation is skipped
+  entirely in this case — existing memberships are left untouched, and the
+  login still proceeds normally. **SCIM deprovisioning remains the only
+  full deprovisioning path** for a SAML-linked identity — see
+  [SCIM ↔ SAML identity linkage](scim-provisioning.md#scim--saml-identity-linkage-federated-session-revocation).
+- **A store error also denies the login** (fail-closed) — a reconcile call
+  that cannot be answered (e.g. the RBAC store is unavailable) refuses the
+  login rather than proceeding under an unknown authorization state.
+
+> **Practical reach of the >200-group deny path.** `/saml/acs` receives the
+> IdP's response as an `application/x-www-form-urlencoded` POST, and
+> httplib's own form-parsing layer caps that body at 8 KiB
+> (`CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH`) — enforced **before**
+> the `/saml/acs` handler (and therefore this reconciliation logic) ever
+> runs. A base64-encoded SAML response carrying more than roughly 180 group
+> values typically exceeds that 8 KiB cap on its own, so in practice a real
+> assertion this large is rejected with a bare `413` at the HTTP layer, not
+> the SAML-specific deny-and-redirect-to-`/login?error=saml` path described
+> above. Deployments whose IdP can assert that many groups see a generic
+> `413`, not this section's denial. A follow-up tracks raising the cap for
+> `/saml/acs` so the documented >200-group deny path is reachable at its
+> full documented range.
+
+Reconciliation only runs when a live RBAC store is wired in **and**
+`--saml-group-attribute` is non-empty; with either condition unmet (RBAC
+disabled, or the attribute unconfigured), this section is a no-op and only
+the coarse `--saml-admin-group` mapping applies — group-scoped RBAC role
+assignments do not reach SAML principals in that configuration.
 
 ### AuthnRequest Signing
 
@@ -512,6 +579,7 @@ The resulting session behaves identically to an OIDC session — it is subject t
 | Audience / recipient / expiry validation | Supported |
 | Replay protection (`InResponseTo` single-use) | Supported |
 | Group-to-role mapping | Supported — `--saml-group-attribute` + `--saml-admin-group`, exact-match only; both unset ⇒ all SAML users are `role=user` (see [SAML Group-to-Role Mapping](#saml-group-to-role-mapping)) |
+| Fine-grained RBAC group provisioning | Supported — parity with OIDC; requires RBAC enabled + `--saml-group-attribute`, reconciles asserted groups into `saml:<value>` RBAC group principals (see [SAML Fine-Grained RBAC](#saml-fine-grained-rbac)) |
 | Admin access for SAML users | Supported via group mapping above; JIT elevation itself is still non-functional for SAML users (no local `users` row) — an admin session is granted directly at login, not via the elevation endpoint |
 | Login-page SSO button | Not in this release — navigate directly to `GET /auth/saml/start` |
 | MFA step-up at high-risk endpoints | Not supported — SAML sessions receive 403 at all step-up-gated endpoints regardless of `--mfa-enforcement`; rely on IdP MFA |
@@ -574,7 +642,12 @@ curl -s -H "X-Yuzu-Token: yuzu_Ab3xK9m2..." \
   http://localhost:8080/api/v1/me
 ```
 
-API tokens are always granted full admin-level access. RBAC scoping for API tokens is planned for a future release.
+A plain, untiered, unscoped API token carries the creating user's own RBAC role and grants — it is
+not automatically admin unless its creator is. Two mechanisms narrow a token below that: an
+`mcp_tier` bounds what it can do through the MCP endpoint (see [MCP Token
+Restrictions](#mcp-token-restrictions) below), and a `scope_service` floors its session role to
+`user` regardless of the creator's role, so an `ITServiceOwner` RBAC grant becomes its sole
+authority ceiling (see [Service-Scoped Tokens](#service-scoped-tokens) below).
 
 ### Listing Tokens
 
@@ -639,8 +712,48 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
 Service-scoped tokens:
 - Cannot access any `/api/v1/admin/*` routes (403 Forbidden)
 - Require RBAC to be enabled; rejected if RBAC is disabled (403 Forbidden)
-- Must have `ITServiceOwner` role permission for the target operation
-- Are scoped to agents tagged with the matching `service` tag
+- Carry a session role floored to the base `user` level regardless of the
+  minting principal's own role — an `ITServiceOwner` RBAC grant is the sole
+  authority ceiling for a service-scoped token, never the minter's role
+
+**Default-deny (guardian-confinement-2298 PR 3 — "the flip").** Holding
+`ITServiceOwner` for a given `securable:operation` is necessary but no
+longer sufficient. A service-scoped token is denied fleet-wide access by
+default — the operation must also appear on a server-side allow-list that
+ships **empty**, so today a fresh install denies every fleet-wide
+operation to every service-scoped token, full stop. This is the deliberate
+opposite of the token's `service` tag acting as an automatic per-service
+filter: there is no such filter today. A small, explicitly-reviewed set of
+routes have their own real per-request confinement instead (checked
+against a matching `service` tag on the target device) — the response
+body's `error.permission` field, when present, names the missing grant;
+its absence on a `403` means the route has no grant that would help at
+all, and reaching it as a service-scoped token is not currently possible
+by design. Widening what a service-scoped token can reach is a
+security-reviewed change to the server, not a per-token configuration
+option.
+
+**A service-scoped token may never write or delete the `service` tag
+itself (#3289)**, on any target device — in or out of its own scope. The
+`service` tag is the confinement boundary the token is checked against, so
+without this restriction a token could rewrite or delete its own cohort's
+`service` tag and move a device out of (or a different device into) its
+own confinement. Writing or deleting any OTHER tag key on an in-scope
+device is unaffected — only the `service` key is restricted, and the
+restriction applies regardless of the value being written (even
+re-asserting the token's own current value is denied). This does not
+affect a plain, non-service-scoped session's `Tag:Write`/`Tag:Delete`
+grant, which remains sufficient to set or move any device's `service` tag.
+
+**Bootstrap note.** A brand-new service token, on a brand-new install, has
+no other credential to fall back on — it cannot use itself to discover or
+claim a `service` tag for its own agents, or to widen its own reach. As of
+#3289, an agent cannot self-claim a `service` tag on its own behalf either
+(its gRPC `Register` sync silently drops any `service` value it reports).
+Stand up a new service's automation using an interactive session (or a
+plain, unscoped API token) for the one-time setup, and mint the
+service-scoped token only once the agents it should reach already carry
+the matching, operator-or-API-assigned `service` tag.
 
 ### Revoking a Token
 
@@ -703,11 +816,15 @@ The raw successor secret is returned exactly once, the same as at creation.
 `overlap_secs` defaults to 7 days if omitted (24-hour floor, 10-year
 ceiling). Once the new secret is installed wherever it's consumed, close
 the loop explicitly instead of waiting on the auto-revoke sweep — `{token_id}`
-here is the **successor's** id, from the `rotate` response above:
+here is the **successor's** id, from the `rotate` response above, and the
+request body must now also carry the raw successor secret itself (`secret`,
+below) as proof you actually received it:
 
 ```bash
 curl -s -b cookies.txt -X POST \
-  http://localhost:8080/api/v1/tokens/f6e5d4c3b2a1/confirm
+  http://localhost:8080/api/v1/tokens/f6e5d4c3b2a1/confirm \
+  -H "Content-Type: application/json" \
+  -d '{ "secret": "yuzu_Nm7pQ2z..." }'
 ```
 
 `confirm` revokes the predecessor immediately and promotes the successor to
@@ -753,10 +870,21 @@ and the `YuzuRotationSweepNotRunning` alert exist to surface.
 **That safeguard covers the automatic sweep only — it does not cover an
 explicit `confirm`.** `confirm` is your attestation that you received and
 retained the successor secret, and it revokes the predecessor straight away.
-If the rotate response was lost, do NOT look the successor's `token_id` up
-and confirm it: that revokes the credential you still hold in favour of one
-you never received. Revoke the unknown successor instead — that keeps the
-predecessor working — and start a new rotation.
+Since #3015, `confirm` proves that attestation instead of merely asserting
+it: the request must carry the raw successor secret itself, verified
+server-side against the stored hash before the predecessor is touched. A
+lost rotate response can no longer be turned into a confirm by recovering
+the successor's `token_id` out-of-band — without the secret, `confirm`
+returns `403` and nothing is revoked. If the rotate response was lost, you
+have no way to satisfy that check, so the recovery path is the same as
+before: revoke the unknown successor (that keeps the predecessor working)
+and start a new rotation. Proof of possession gates this immediate,
+explicit `confirm` call only; it leaves the automatic sweep described above
+untouched. If the successor secret did actually reach wherever it's
+consumed (so it has been presented at least once, per the carve-out above),
+the sweep still auto-revokes the predecessor on its own schedule with no
+secret required, so waiting for it is also a valid recovery when you're
+unsure whether `confirm` would succeed.
 
 `confirm`'s check that you're the same operator who called `rotate` is
 stored durably, not just in memory, so a server restart no longer blocks
@@ -1041,7 +1169,7 @@ All authentication and authorization errors use the standard JSON envelope:
 {
   "error": {
     "code": 403,
-    "message": "service-scoped token does not grant Agent:Execute (ITServiceOwner permission required)"
+    "message": "service-scoped token does not grant Agent:Execute (requires ITServiceOwner AND an explicit service-scope allow-list entry)"
   },
   "meta": {
     "api_version": "v1"

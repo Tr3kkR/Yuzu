@@ -5,9 +5,17 @@
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
+#include "authz_gates.hpp" // #3290 Phase 2: authz::FleetReadGate — query_installed_software's real confinement seam
 #include "authz_model.hpp" // #1788: VisibleSet — MCP dispatch confinement (in_scope/filter_to_scope)
 #include "ca_store.hpp"
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
+// ADR-0031 operator surface (PR1.6c) — MCP twins of the operator
+// mint/list/revoke upload-grant routes. Reuses UploadGrantListAuthorization/
+// UploadGrantListDecision verbatim (not redefined) so the REST list-admit
+// gate (GET /api/v1/upload-grants) and this MCP twin cannot drift — same
+// reuse discipline as kek_routes.hpp above. Also brings in UploadGrantStore
+// fully defined, so no separate include is needed for that.
+#include "file_retrieval_routes.hpp"
 #include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
 #include "network_perf_model.hpp"
@@ -16,7 +24,14 @@
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
 #include "kek_routes.hpp" // KekOps / KekOpResult (#2395 track C): reused, not redefined
+// ADR-0031 operator surface (PR1.5c/1.6c, p14): reuses
+// UploadGrantListAuthorization/UploadGrantListDecision verbatim (not
+// redefined) so the REST list-admit gate (GET /api/v1/upload-grants) and its
+// MCP twin (list_upload_grants) cannot drift — same reuse discipline as
+// kek_routes.hpp above.
+#include "file_retrieval_routes.hpp"
 #include "management_group_store.hpp"
+#include "mcp_retry.hpp"  // named retry_after_ms floors + poll counter name (#3344)
 #include "mcp_session.hpp"
 #include "mcp_stream.hpp" // GET SSE channel: StreamRevalidateFn, handle_get_tail (2f PR 2)
 #include "policy_store.hpp"
@@ -54,6 +69,12 @@ class EnginePrincipalStore;
 // directory_sync.hpp. AuthDB is already forward-declared via <yuzu/server/auth.hpp>.
 class AccessReviewStore;
 class DirectorySync;
+// ADR-0031 operator surface (PR1.5c, p14) — backs the plugin config/secret/
+// kill-switch MCP twins. Forward-declared (pointer-only in the setter
+// below); the .cpp includes plugin_config_store.hpp for the definition.
+// UploadGrantStore itself is NOT forward-declared here — it arrives fully
+// defined via file_retrieval_routes.hpp's own include above.
+class PluginConfigStore;
 }
 
 namespace yuzu::server::detail {
@@ -171,22 +192,6 @@ public:
     using ResponseScopeFn =
         std::function<bool(const std::string& username, const std::string& agent_id)>;
 
-    /// Per-agent INVENTORY-scope predicate — same shape as ResponseScopeFn but
-    /// bound to ("Inventory","Read"), so `query_installed_software` filters its
-    /// fleet rows to the caller's management groups (INTENDED cross-operator
-    /// isolation, mirrors the #1550 query_responses filter — same inert-under-the-
-    /// global-gate class, NOT achieved isolation). NOTE (ADR-0017): this
-    /// filter is INERT under the global Inventory:Read gate — a confined operator
-    /// is denied at the gate before it runs, a global operator's filter is a no-op —
-    /// so it does not yet narrow list reads; it is the foundation the ADR-0017
-    /// admit-then-filter list gate builds on (#1716). Same fail-open-when-unwired
-    /// contract: an unset predicate (`= {}`) applies NO filter (legacy-open /
-    /// RBAC-off). The SOLE production caller (server.cpp) MUST wire it to
-    /// rbac_store->check_scoped_permission(username,"Inventory","Read",agent_id,
-    /// mgmt_store). Do NOT add a new production registration without wiring it.
-    using InventoryScopeFn =
-        std::function<bool(const std::string& username, const std::string& agent_id)>;
-
     /// Send command callback — dispatches a command and returns (command_id, agents_reached).
     ///
     /// `execution_id` is the pre-created `ExecutionTracker` row id, threaded
@@ -241,8 +246,8 @@ public:
     /// unavailable"), never silently admitted — mirrors
     /// `ApiTokenStore::set_engine_referent_check`'s fail-closed-when-unwired
     /// posture, not the FAIL-OPEN-WHEN-UNWIRED contract used by
-    /// ResponseScopeFn/InventoryScopeFn above (those are defense-in-depth
-    /// filters over an already-gated read; this is the sole check standing
+    /// ResponseScopeFn above (a defense-in-depth filter over an already-gated
+    /// read; this is the sole check standing
     /// between an MCP write and a dangling owner reference).
     using OwnerExistsFn = std::function<bool(const std::string& username)>;
 
@@ -288,6 +293,55 @@ public:
     /// to KekRoutes::register_routes.
     void set_kek_ops(KekOps ops) { kek_ops_ = std::move(ops); }
 
+    /// ADR-0031 operator surface (PR1.5c) — plugin config/secret/kill-switch
+    /// store, backing get/set/delete_plugin_config, set/delete_plugin_secret,
+    /// get/set_plugin_kill_switch. Same setter idiom as
+    /// set_engine_principal_store above (the handler's `[=]` lambda captures
+    /// `this`, so the injection is a live read on the next request). Unset
+    /// (`nullptr`, the default) ⇒ every one of those tools answers
+    /// "unavailable" rather than crashing or silently no-op'ing.
+    void set_plugin_config_store(PluginConfigStore* store) { plugin_config_store_ = store; }
+
+    /// ADR-0031 operator surface (PR1.6c) — upload-grant store + the
+    /// ADR-0017 list-admit resolver for list_upload_grants, backing
+    /// mint/list/revoke_upload_grant. `list_read_fn` is the SAME shape as
+    /// `yuzu::server::Deps::ListReadFn` (file_retrieval_routes.hpp) reused
+    /// verbatim, not redefined, so the REST GET /api/v1/upload-grants list
+    /// gate and this MCP twin cannot drift — server.cpp wires both from the
+    /// identical `RbacStore::authorize_list_read` call. Unset store ⇒ every
+    /// upload-grant tool answers "unavailable"; unset (default-constructed)
+    /// `list_read_fn` fails CLOSED (kDenyAll), matching the REST twin's own
+    /// unwired default (file_retrieval_routes.hpp's Deps doc comment) — NOT
+    /// the fail-open-when-unwired contract ResponseScopeFn above uses,
+    /// because this is the sole admit decision for the route, not
+    /// a defense-in-depth filter over an already-gated read.
+    using UploadGrantListReadFn =
+        std::function<UploadGrantListAuthorization(const std::string& username)>;
+    void set_upload_grant_ops(UploadGrantStore* store, UploadGrantListReadFn list_read_fn) {
+        upload_grant_store_ = store;
+        upload_grant_list_read_fn_ = std::move(list_read_fn);
+    }
+
+    /// #3290 Phase 2 — the injected-callback twin of
+    /// `AuthRoutes::require_fleet_read`, backing `query_installed_software`'s
+    /// real per-agent/service confinement (see `authz::FleetReadGate`'s doc
+    /// comment, authz_gates.hpp, and `RestApiV1::FleetReadFn`,
+    /// rest_api_v1.hpp, for the shared shape — server.cpp wires the SAME
+    /// conversion lambda into both surfaces so REST and MCP cannot drift).
+    /// Same setter idiom as `set_upload_grant_ops` above (the handler's
+    /// `[=]` lambda captures `this`, so the injection is a live read on the
+    /// next request). MUST be this tool's SOLE authorization gate — never
+    /// stacked with `perm_fn` for the same `(securable_type, operation)`
+    /// (the identical BLOCKING defect `require_fleet_read`'s own doc
+    /// comment warns against). Unset (default-constructed) ⇒ the tool fails
+    /// CLOSED (503 "unwired"), mirroring `RestApiV1`'s own unwired contract
+    /// for the identical seam.
+    using FleetReadFn =
+        std::function<authz::FleetReadGate(const httplib::Request&, httplib::Response&,
+                                           const std::string& securable_type,
+                                           const std::string& operation)>;
+    void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
+
     /// Republish-CRL callback (PR4 B-2): mirrors `CaRoutes::PublishCrlFn` so the
     /// MCP `revoke_certificate` tool republishes the CRL after a revoke exactly as
     /// the REST `/api/v1/ca/revoke` handler does. Returns the new CRL DER, or
@@ -322,7 +376,6 @@ public:
                             DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
                             ResponseScopeFn response_scope_fn = {},
                             SoftwareInventoryStore* software_inventory_store = nullptr,
-                            InventoryScopeFn inventory_scope_fn = {},
                             yuzu::MetricsRegistry* metrics = nullptr,
                             AppPerfProviders app_perf_providers = {},
                             QuarantineStore* quarantine_store = nullptr,
@@ -439,7 +492,6 @@ public:
                          DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
                          ResponseScopeFn response_scope_fn = {},
                          SoftwareInventoryStore* software_inventory_store = nullptr,
-                         InventoryScopeFn inventory_scope_fn = {},
                          yuzu::MetricsRegistry* metrics = nullptr,
                          AppPerfProviders app_perf_providers = {},
                          QuarantineStore* quarantine_store = nullptr,
@@ -499,6 +551,15 @@ private:
     // KEK rotation seam (#2395 track C) - see set_kek_ops above. Default-
     // constructed (all three std::functions empty) until server.cpp wires it.
     KekOps kek_ops_;
+    // ADR-0031 operator surface (PR1.5c/1.6c, p14) - see set_plugin_config_store
+    // / set_upload_grant_ops above. Nullable; every backed tool checks before
+    // use and answers a clean "unavailable" error, matching
+    // engine_principal_store_'s contract above.
+    PluginConfigStore* plugin_config_store_{nullptr};
+    UploadGrantStore* upload_grant_store_{nullptr};
+    UploadGrantListReadFn upload_grant_list_read_fn_;
+    // #3290 Phase 2 — see set_fleet_read_fn above.
+    FleetReadFn fleet_read_fn_;
 };
 
 // The (tool, securable, operation) test-only accessors that formerly lived here

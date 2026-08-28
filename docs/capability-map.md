@@ -230,7 +230,7 @@ Not implemented. Enumerate connected printers for asset tracking.
 
 ### 3.10 Device Tagging (Key-Value Metadata) :white_check_mark: `T2`
 
-`TagStore` with SQLite backend. Full CRUD: set, get, get_all, delete, check, clear, count. Agent-side `tags` plugin with server-side sync via heartbeat. Validation: key max 64 chars, value max 448 bytes. `agents_with_tag()` for scope queries.
+`TagStore` on the PostgreSQL substrate (ADR-0050, schema `tag_store`). Full CRUD: set, get, get_all, delete, check, clear, count. Agent-side `tags` plugin with server-side sync on Register. Validation: key max 64 chars, value max 448 bytes. `agents_with_tag()` for scope queries; typed degrade-distinguishable reads (a store failure never reads as "no tags").
 
 ---
 
@@ -248,7 +248,8 @@ Not implemented. Enumerate connected printers for asset tracking.
 
 ### 4.3 Listening Endpoint Enumeration :white_check_mark: `T1`
 
-`netstat` and `sockwho` plugins.
+`netstat` plugin (`netstat_list` action; `attribution` adds owning-process
+resolution -- folded from the retired sockwho plugin, #3403).
 
 ### 4.4 ARP Table :white_check_mark: `T1`
 
@@ -264,7 +265,7 @@ Not implemented. Enumerate connected printers for asset tracking.
 
 ### 4.7 Wake-on-LAN :white_check_mark: `T2`
 
-`wol` plugin (cross-platform). `wake` sends magic packet (UDP broadcast, 6×0xFF + 16×MAC) to a target MAC address. `check` pings the host to verify wake. Windows: Winsock2, Linux/macOS: POSIX sockets.
+`wol` plugin (cross-platform). `wake` sends magic packet (UDP broadcast, 6×0xFF + 16×MAC) to a target MAC address. `check` verifies reachability natively — unprivileged ICMP echo (`IcmpSendEcho` on Windows, an unprivileged ICMP socket on Linux/macOS) with a TCP-connect fallback on port 443 for hosts/kernels that drop or deny ICMP (Wave 2, ADR-3002) — no subprocess spawn on any platform.
 
 ### 4.8 Network Diagnostics :white_check_mark: `T1`
 
@@ -276,7 +277,7 @@ Not implemented. Legacy reverse lookup on IP addresses.
 
 ### 4.10 ARP Scanning (Subnet Discovery) :white_check_mark: `T3`
 
-`discovery` plugin with `scan_subnet` action. ARP scan + ping sweep of a CIDR subnet to find hosts. Returns IP, MAC address, hostname, and managed/unmanaged status. Cross-platform: arp table parsing + ping sweep via subprocess. Input validation prevents command injection on CIDR parameter.
+`discovery` plugin with `scan_subnet` action. ARP scan + ping sweep of a CIDR subnet to find hosts. Returns IP, MAC address, hostname, and managed/unmanaged status. Cross-platform: native ARP-table acquisition (`GetIpNetTable2` on Windows, `/proc/net/arp` on Linux, the routing-socket `sysctl` on macOS) + an unprivileged ICMP ping sweep — no subprocess spawn on any platform (Wave 2, ADR-3002). Input validation prevents command injection on CIDR parameter.
 
 ### 4.11 Port Scanning :x: `T3`
 
@@ -360,11 +361,11 @@ Not implemented. Desktop interaction to enumerate visible application windows.
 
 ### 7.5 Per-User Application Inventory :white_check_mark: `T2`
 
-`installed_apps` plugin extended with per-user hive enumeration (HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall for each user profile). Distinguishes system-wide from user-specific installs in output.
+`installed_apps` plugin extended with per-user hive enumeration (`list_per_user`): each local profile's `Software\Microsoft\Windows\CurrentVersion\Uninstall` is read from the live `HKEY_USERS\<SID>` hive when the user is logged in, falling back to an offline `NTUSER.DAT` mount otherwise — via the shared ladder in `agents/shared/win_profiles.hpp` (#2771), not a literal `HKCU` read (which under the agent's system-context identity resolves to the service account's own profile, not an end user's — see §12.7). Distinguishes system-wide from user-specific installs in output; on Linux/macOS `list_per_user` reports system-scope packages/apps plus (macOS) the calling account's own Homebrew formulae, not a per-profile walk.
 
 ### 7.6 Software Deployment (Install/Upgrade) :white_check_mark: `T2`
 
-`SoftwareDeploymentStore` (SQLite) with package registration, deployment lifecycle (staged/deploying/verifying/completed/rolled_back/failed), per-agent status tracking. REST endpoints: `GET/POST /api/v1/software-packages`, `GET/POST /api/v1/software-deployments`, `/start`, `/rollback`, `/cancel`.
+`SoftwareDeploymentStore` (PostgreSQL, ADR-0051) with package registration, deployment lifecycle (staged/deploying/verifying/completed/cancelled/rolled_back/failed), per-agent status tracking. REST endpoints: `GET/POST /api/v1/software-packages`, `GET/POST /api/v1/software-deployments`, `/start`, `/rollback`, `/cancel`. **Dormant** (same family as `LicenseStore`/ADR-0048) — the store is migrated and tested but not constructed by the server, so these routes do not register today.
 
 ---
 
@@ -374,14 +375,16 @@ Not implemented. Desktop interaction to enumerate visible application windows.
 
 ### 8.1 Installed Update Enumeration :white_check_mark: `T1`
 
-`windows_updates` plugin with `installed` action. Cross-platform: Windows (Get-HotFix), Linux (rpm/apt), macOS (system_profiler).
+`windows_updates` plugin with `installed` action. Cross-platform: Windows (bounded WMI `Win32_QuickFixEngineering` query, capped at 512 rows, unsorted — WQL has no `ORDER BY` for a data-class query, a disclosed behaviour change from the retired PowerShell path's 50-most-recent-sorted output), Linux (rpm/apt), macOS (system_profiler).
 
 ### 8.2 Pending Reboot Detection :white_check_mark: `T1`
 
 `windows_updates` plugin `pending_reboot` action. Cross-platform reboot-pending detection:
 Windows (3 registry keys: WindowsUpdate RebootRequired, CBS RebootPending, Session Manager PendingFileRenameOperations),
 Linux (reboot-required file + kernel version comparison + needs-restarting fallback),
-macOS (softwareupdate restart flag). Reports per-source status and aggregate boolean.
+macOS (softwareupdate restart flag, bounded to a 60s deadline — replaces the plugin's
+own prior unbounded `popen()` call, which could hang indefinitely on a headless/offline
+Mac). Reports per-source status and aggregate boolean.
 
 ### 8.3 Patch Deployment :white_check_mark: `T2`
 
@@ -433,9 +436,13 @@ pf packet filter demoted to a secondary row; `rules` lists pf rules.
 
 ### 9.3 Disk Encryption Status :white_check_mark: `T1`
 
-`bitlocker` plugin (cross-platform): Windows BitLocker (`manage-bde`), Linux
-LUKS (`list_luks_volumes`), and macOS FileVault (`fdesetup` + per-APFS-volume
-`diskutil apfs list`) — all three dispatched from the plugin's `state` action.
+`bitlocker` plugin (cross-platform): Windows BitLocker via an in-process
+Win32_EncryptableVolume WMI query + per-volume `GetConversionStatus()`
+method call (rung 1, no subprocess), Linux LUKS via in-process libblkid
+enumeration + plain `/sys/class/block/dm-*/dm/uuid` reads (`list_luks_volumes`,
+rung 1, no subprocess), and macOS FileVault (`fdesetup` + per-APFS-volume
+`diskutil apfs list`, direct argv through the bounded subprocess runner,
+rung 2) — all three dispatched from the plugin's `state` action.
 
 ### 9.4 Vulnerability Scanning :large_orange_diamond: `T1`
 
@@ -473,7 +480,7 @@ collisions possible; vendor precision pending ADR-0018). See
 
 ### 9.8 Certificate Inventory (Get/Delete) :white_check_mark: `T2`
 
-`certificates` plugin with `list`, `details`, and `delete` actions. Enumerates certificates in system stores with thumbprint, subject, issuer, expiry, and key usage. Windows: CryptoAPI (CertOpenStore, CertEnumCertificatesInStore). Linux: PEM files in /etc/ssl/certs/. macOS: `security find-certificate` over System.keychain and SystemRootCertificates.keychain, plus the current console user's login keychain via a `launchctl asuser <uid> sudo -n -u <user> security` hop (selectable per query with the `store` param: `System`/`root`/`login`/`all`; the LaunchDaemon has no login keychain of its own). Delete on macOS verifies the certificate is actually absent from the target keychain afterward before reporting success (a tri-state safe delete — command failure, still-present, and an unreadable re-enumeration each block a false "deleted"); `store=root` is rejected as unsupported because SystemRootCertificates.keychain is sealed by System Integrity Protection and cannot be modified.
+`certificates` plugin with `list`, `details`, and `delete` actions. Enumerates certificates in system stores with thumbprint, subject, issuer, expiry, and key usage. Windows: CryptoAPI (CertOpenStore, CertEnumCertificatesInStore). Linux: PEM files in /etc/ssl/certs/, parsed in-process via libcrypto (no `openssl` shell-out). macOS: System.keychain and SystemRootCertificates.keychain are read natively via SecItem (`SecItemCopyMatching`, no shell-out); the current console user's login keychain still goes through the `launchctl asuser <uid> sudo -n -u <user> security` hop (selectable per query with the `store` param: `System`/`root`/`login`/`all`; the LaunchDaemon has no login keychain of its own). Delete on macOS verifies the certificate is actually absent from the target keychain afterward before reporting success (a tri-state safe delete — command failure, still-present, and an unreadable re-enumeration each block a false "deleted"); `store=root` is rejected as unsupported because SystemRootCertificates.keychain is sealed by System Integrity Protection and cannot be modified.
 
 ### 9.9 Quarantine Status Tracking :white_check_mark: `T2`
 
@@ -539,7 +546,7 @@ Not implemented. Integrity verification of directory trees.
 
 ### 10.13 File Retrieval (Upload to Server) :white_check_mark: `T2`
 
-`upload_file` action in `content_dist` plugin. Agent-side: SHA-256 hash, multipart POST to server. Server-side: `POST /api/v1/file-retrieval` endpoint. File stored in `{data_dir}/file-retrieval/`. `GET/DELETE` endpoints for management.
+`upload_file` action in `content_dist` plugin, via the PR1.6 one-time upload-grant + authenticated chunked-receive protocol (`docs/adr/3004-artifact-blob-storage.md`) — the legacy unauthenticated `POST /api/v1/file-retrieval` endpoint was removed. Operator mints a grant (`POST /api/v1/upload-grants`); the agent redeems it, streams the file in bounded chunks with per-chunk offset CAS, and commits with a SHA-256 computed from the exact bytes acknowledged. File stored in `{data_dir}/upload-blobs/{retention_class}/{grant_id}`. `GET /api/v1/upload-grants` (list) / `DELETE /api/v1/upload-grants/{id}` (revoke) for management.
 
 ### 10.14 Find File by Size and Hash :white_check_mark: `T2`
 
@@ -603,7 +610,9 @@ gRPC streaming delivers output in real time.
 
 ### 12.7 Per-User Registry Operations :white_check_mark: `T2`
 
-`registry` plugin with `list_profiles` (enumerate local profiles: SID, resolved name, profile path, live hive-load state) and `get_user_value` (read a value from a resolved profile's hive) actions. Both resolve the target profile via `HKLM\...\ProfileList`; `get_user_value` reads the live `HKEY_USERS\<SID>` hive when the user is logged in, or loads that profile's NTUSER.DAT via `RegLoadKey` as a fallback (unloaded via RAII on every exit path). SE_RESTORE_NAME and SE_BACKUP_NAME privileges are required only for that offline fallback, which the agent account already holds — no new privilege grant; reading an already-loaded live hive needs no elevated privilege.
+`registry` plugin with `list_profiles` (enumerate local profiles: SID, resolved name, profile path, live hive-load state) and `get_user_value` (read a value from a resolved profile's hive) actions. Both resolve the target profile via `HKLM\...\ProfileList`; `get_user_value` reads the live `HKEY_USERS\<SID>` hive when the user is logged in, or loads that profile's NTUSER.DAT via `RegLoadKey` as a fallback (unloaded via RAII on every exit path, under a per-call salted mount name). SE_RESTORE_NAME and SE_BACKUP_NAME privileges are required only for that offline fallback, which the agent account already holds — no new privilege grant; reading an already-loaded live hive needs no elevated privilege.
+
+The ladder itself lives in `agents/shared/win_profiles.hpp` and is the single implementation for every per-user consumer: `registry`, `installed_apps.list_per_user`, `license_scan`'s per-user surfaces, and `tar`'s outbound mapdrive history. Its offline arm is serialised process-wide, because privilege enabling acts on the process token and all four plugins load into one agent process.
 
 ---
 
@@ -797,7 +806,7 @@ Session-cookie auth with PBKDF2-hashed passwords.
 
 ### 18.8 Device Authorization Tokens :white_check_mark: `T2`
 
-`DeviceTokenStore` (SQLite) with SHA-256 hashed tokens, device_id and definition_id scoping. REST: `GET/POST/DELETE /api/v1/device-tokens`. Integrated into auth chain.
+`DeviceTokenStore` (PostgreSQL, ADR-0052) with SHA-256 hashed tokens, device_id and definition_id scoping. REST: `GET/POST/DELETE /api/v1/device-tokens`. **Dormant** (same family as `LicenseStore`/ADR-0048 and `SoftwareDeploymentStore`/ADR-0051) — the store is migrated and tested but not constructed by the server, so these routes do not register today.
 
 ### 18.9 HTTPS for Web Dashboard :white_check_mark: `T1`
 
@@ -873,7 +882,7 @@ Named response-view configurations (column subset, sort order, filter presets) a
 
 ### 20.7 Response Offloading :white_check_mark: `T3`
 
-Operator-registered external HTTP endpoints (*offload targets*) that receive a copy of `agent.registered` and `execution.completed` events as they fire. Sibling `OffloadTargetStore` (`offload_targets.db`, migration v1) wired into `AgentServiceImpl` next to the existing webhook fan-out — every event that fires a webhook also fans out to every enabled offload target whose `event_types` filter matches. Typed auth: none / bearer / basic / hmac (Authorization headers are CRLF-guarded against header injection). Server-side batching: `batch_size > 1` accumulates events into a per-target buffer and flushes on threshold; flush body is JSON of shape `{"events":[…]}`. REST CRUD at `/api/v1/offload-targets` gated on `Infrastructure:Read`/`Write`. `auth_credential` is persisted but never returned by any read endpoint (paranoia-double-check assertion in REST tests). YAML authoring via `spec.offload.targets` is documented; dispatcher-side correlation (per-instruction filter honouring) deferred to a follow-up. Phase 8.3, issue #255.
+Operator-registered external HTTP endpoints (*offload targets*) that receive a copy of `agent.registered` and `execution.completed` events as they fire. Sibling `OffloadTargetStore` (Postgres schema `offload_target_store`, ADR-0059) wired into `AgentServiceImpl` next to the existing webhook fan-out — every event that fires a webhook also fans out to every enabled offload target whose `event_types` filter matches. Typed auth: none / bearer / basic / hmac (Authorization headers are CRLF-guarded against header injection). Server-side batching: `batch_size > 1` accumulates events into a per-target buffer and flushes on threshold; flush body is JSON of shape `{"events":[…]}`. REST CRUD at `/api/v1/offload-targets` gated on `Infrastructure:Read`/`Write`. `auth_credential` is `SecretCodec`-encrypted at rest (ADR-0010) and never returned by any read endpoint (a `has_credential` flag reports whether one is configured; paranoia-double-check assertion in REST tests). YAML authoring via `spec.offload.targets` is documented; dispatcher-side correlation (per-instruction filter honouring) deferred to a follow-up. Phase 8.3, issue #255.
 
 ---
 
@@ -917,11 +926,11 @@ Kubernetes-style health probes: `/livez` (always 200) and `/readyz` (checks stor
 
 ### 22.3 License Management :white_check_mark: `T2`
 
-`LicenseStore` (SQLite) with seat-based licensing, expiry, edition, feature flags. Soft enforcement with alerts at 90% seats / 30 days to expiry. REST: `GET/POST/DELETE /api/v1/license`, `GET /api/v1/license/alerts`.
+`LicenseStore` with seat-based licensing, expiry, edition, feature flags. Soft enforcement with alerts at 90% seats / 30 days to expiry. REST: `GET/POST/DELETE /api/v1/license`, `GET /api/v1/license/alerts`. **Dormant** (ADR-0048) — the store is migrated and tested but not constructed by the server, so these routes do not register today.
 
 ### 22.4 Platform Configuration (TTLs, Limits) :white_check_mark: `T2`
 
-`RuntimeConfigStore`. Persistent runtime configuration overrides in SQLite. Allow-listed keys only, **including one credential** (`oidc_client_secret`, plaintext at rest until ADR-0010 envelope encryption reaches this store) - `is_secret_key` gates every emitter (startup log, `GET /api/config`, the `config.update` audit detail, and the `PUT` response echo) so the value is not returned or logged; pre-existing audit rows are redacted when read. Set/get/remove with `updated_by` attribution. **Only some keys take effect without a restart**: the three retention keys are stored-only until a restart, DEX-alert keys until a restart or a Settings-UI save, OIDC keys apply ONLY via a Settings-UI save (a restart does not apply them), and `auto_approve_enabled` is never read back from this store - see `docs/user-manual/rest-api.md` "Runtime Configuration". REST API for configuration CRUD. Startup defaults overridden by stored values.
+`RuntimeConfigStore`. Persistent runtime configuration overrides in PostgreSQL (ADR-0060). Allow-listed keys only, **including one credential** (`oidc_client_secret`, SecretCodec-envelope-encrypted at rest, ADR-0010) - `is_secret_key` gates every emitter (startup log, `GET /api/config`, the `config.update` audit detail, and the `PUT` response echo) so the value is not returned or logged; pre-existing audit rows are redacted when read. Set/get/remove with `updated_by` attribution. **Only some keys take effect without a restart**: the three retention keys are stored-only until a restart, DEX-alert keys until a restart or a Settings-UI save, OIDC keys apply ONLY via a Settings-UI save (a restart does not apply them), and `auto_approve_enabled` is never read back from this store - see `docs/user-manual/rest-api.md` "Runtime Configuration". REST API for configuration CRUD. Startup defaults overridden by stored values.
 
 ### 22.5 Gateway / Scale-Out Architecture :white_check_mark: `T2`
 
@@ -1251,7 +1260,6 @@ Not implemented (PRs 12, 15). HMAC rule signing (HKDF per design §11.2) with pe
 | users | Y | Y | Y | User |
 | network_config | Y | Y | Y | Network |
 | netstat | Y | Y | Y | Network |
-| sockwho | Y | Y | Y | Network |
 | network_diag | Y | Y | Y | Network |
 | network_actions | Y | Y | Y | Network |
 | wifi | Y | Y | Y | Network |

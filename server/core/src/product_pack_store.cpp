@@ -1,14 +1,26 @@
 #include "product_pack_store.hpp"
-#include "migration_runner.hpp"
+#include "store_errors.hpp"
 
-#include <nlohmann/json.hpp>
+#include "pg/pg_exec.hpp"
+#include "pg/pg_migration_runner.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
+#include "sqlite_raii.hpp"
+#include "utf8_sanitize.hpp"
+
+#include <yuzu/metrics.hpp>
+
+#include <libpq-fe.h>
 #include <spdlog/spdlog.h>
+#include <sqlite3.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <format>
 #include <random>
-#include <shared_mutex>
-#include <stdexcept>
+#include <unordered_set>
 
 // Ed25519 signature verification — OpenSSL EVP on every platform.
 // Pre-#802 / W7.4 R3, the Windows branch used BCrypt
@@ -30,9 +42,43 @@
 
 namespace yuzu::server {
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Small helpers ────────────────────────────────────────────────────────────
 
 namespace {
+
+constexpr const char* kStoreName = "product_pack_store";
+
+// Bounded acquires (ADR-0012 §2(a)): authoritative store, so reads/writes wait a little longer
+// than a fail-soft store's hot-path budget, but every runtime acquire is still bounded.
+constexpr std::chrono::milliseconds kReadTimeout{2000};
+constexpr std::chrono::milliseconds kWriteTimeout{4000};
+
+// Gate 8 review of F035 (security-guardian/architect, both BLOCKING; same race RbacStore hit
+// and fixed as HIGH — CHAOS-1, see rbac_store.cpp's kRevokeCoordLockSql comment for the full
+// mechanism): without this, migrate_from_sqlite's tombstone check
+// (SELECT ... deleted_pack_ids) and its subsequent pack INSERT are two separate READ COMMITTED
+// statement snapshots — a concurrent uninstall() that commits its DELETE + tombstone INSERT in
+// the window between them is invisible to the already-taken SELECT snapshot, so the pack
+// resurrects despite the tombstone existing right next to it. Serializes every writer of the
+// erasure/backfill pair (uninstall()'s delete+tombstone, migrate_from_sqlite's
+// check-then-insert) against each other. MUST be acquired in its own statement, strictly
+// BEFORE the statement that checks-and-mutates — embedding it in the same statement does NOT
+// work (a single statement's snapshot is fixed before any of its own function calls run, incl.
+// a blocking pg_advisory_xact_lock). Coarse-grained (one fixed key, not per-pack-id): product
+// pack install/uninstall is operator-driven content-catalog management, never a hot path, so
+// store-wide serialization is cheap — same reasoning as RbacStore's coordination lock. Two-int32
+// form + the "yuzu" namespace constant matches house convention (pg_migration_runner.cpp,
+// auth_db.cpp, secret_codec.cpp, kek_op_lock.hpp, rbac_store.cpp).
+constexpr const char* kErasureCoordLockSql =
+    "SELECT pg_advisory_xact_lock(2037545589, hashtext('product_pack_store:erasure_coordination'))";
+
+// Preserves the pre-migration SQLite behavior ("generous default, effectively no hard cap") in
+// a form Postgres accepts — SQLite treats a non-positive LIMIT as "no limit"; Postgres errors on
+// a negative LIMIT. A hostile `?limit=-1` must clamp to the default, never surface as a 503.
+constexpr int kDefaultListLimit = 100;
+constexpr int kMaxListLimit = 10000;
+
+constexpr const char* kSourcelessFingerprint = "sourceless";
 
 int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -40,9 +86,37 @@ int64_t now_epoch() {
         .count();
 }
 
-std::string col_text(sqlite3_stmt* stmt, int col) {
-    auto p = sqlite3_column_text(stmt, col);
-    return p ? std::string(reinterpret_cast<const char*>(p)) : std::string{};
+// ── Read-degrade observability (#1675 convention, mirrors CustomPropertiesStore) ──
+constexpr const char* kReasonStoreNotOpen = "store_not_open";
+constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
+constexpr const char* kReasonQueryError = "query_error";
+constexpr std::uint64_t kReadDegradeLogSample = 100;
+constexpr std::int64_t kDegradeEpisodeGapSecs = 60;
+
+struct DegradeSampler {
+    std::atomic<std::uint64_t> count{0};
+    std::atomic<std::int64_t> last_ts{0};
+};
+
+bool note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason, DegradeSampler& s) {
+    if (metrics)
+        metrics->counter("yuzu_server_product_pack_read_degrade_total", {{"reason", reason}})
+            .increment();
+    const std::int64_t now = now_epoch();
+    const std::int64_t prev = s.last_ts.exchange(now, std::memory_order_relaxed);
+    const std::uint64_t n = s.count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool new_episode = prev == 0 || (now - prev) > kDegradeEpisodeGapSecs;
+    return new_episode || (n % kReadDegradeLogSample) == 0;
+}
+
+// One sampler per distinct read call site (a shared sampler would let a hot `list()` degrade
+// mask a cold `get()` one from ever logging).
+DegradeSampler g_list_sampler;
+DegradeSampler g_get_sampler;
+
+// Only used against legacy SQLite text columns (may be nullptr).
+const char* safe(const char* p) {
+    return p ? p : "";
 }
 
 std::string gen_id() {
@@ -64,7 +138,7 @@ std::string gen_id() {
 /// W7.4 Gate 4). Replaces any byte < 0x20 or == 0x7F with `?`. The result
 /// is for human-readable logging only; the verbatim name is preserved in
 /// the error envelope returned to REST (where nlohmann::json::dump escapes
-/// it safely) and in the stored `pack_name` column.
+/// it safely) and in the stored `name` column.
 std::string sanitize_for_log(std::string_view s) {
     std::string out;
     out.reserve(s.size());
@@ -83,6 +157,273 @@ std::string sanitize_for_log(std::string_view s) {
         out.append("...");
     }
     return out;
+}
+
+// Applied to every free-text column reaching Postgres (name/version/description/yaml_source and
+// the item equivalents), mirroring license_store.cpp/discovery_store.cpp's sanitize_pg_text — a
+// bad byte in a legacy file must not brick the mandatory backfill, and an install()'d pack's YAML
+// (attacker-controlled: operator-supplied or network-fetched) is equally untrusted. libpq binds
+// text parameters as C-strings, so an embedded NUL would otherwise silently TRUNCATE the stored
+// value at that point — the pre-migration `sqlite3_bind_text(..., -1, ...)` had this exact
+// truncation behavior too, so U+FFFD replacement here is a strict improvement, not a new risk
+// (see product_pack_store.hpp file header).
+std::string sanitize_pg_text(std::string_view s) {
+    std::string out = sanitize_utf8_strict(s);
+    std::size_t pos = 0;
+    while ((pos = out.find('\0', pos)) != std::string::npos) {
+        out.replace(pos, 1, "\xEF\xBF\xBD");
+        pos += 3;
+    }
+    return out;
+}
+
+std::int64_t to_i64(const char* s) {
+    if (s == nullptr || s[0] == '\0')
+        return 0;
+    return static_cast<std::int64_t>(std::strtoll(s, nullptr, 10));
+}
+bool to_bool(const char* s) {
+    return s != nullptr && s[0] == 't';
+}
+std::string text_col(PGresult* res, int row, int col) {
+    return PQgetisnull(res, row, col) ? std::string{} : std::string(PQgetvalue(res, row, col));
+}
+
+// Whether sqlite_master lists a table named `table_name`; `nullopt` on a schema-probe DB error
+// (never conflated with "table absent"). Mirrors license_store.cpp's sqlite_table_exists.
+std::optional<bool> sqlite_table_exists(sqlite3* db, const char* table_name) {
+    SqliteStmt probe;
+    if (sqlite3_prepare_v2(db, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?;",
+                           -1, probe.addr(), nullptr) != SQLITE_OK)
+        return std::nullopt;
+    sqlite3_bind_text(probe.get(), 1, table_name, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(probe.get()) != SQLITE_ROW)
+        return std::nullopt;
+    return sqlite3_column_int64(probe.get(), 0) > 0;
+}
+
+// Whether `table_name` has a column named `column_name` — the pre-7.13 vintage check. A legacy
+// file last written by a pre-7.13 binary predates the `verified` column (it was patched in by a
+// raw `ALTER TABLE` the pre-migration constructor ran outside the migration list; this migration
+// retires that shim and folds `verified` into schema v1 instead). `nullopt` on a probe DB error.
+std::optional<bool> sqlite_column_exists(sqlite3* db, const char* table_name,
+                                         const char* column_name) {
+    SqliteStmt probe;
+    std::string sql = std::string("SELECT 1 FROM pragma_table_info('") + table_name +
+                      "') WHERE name=? LIMIT 1";
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, probe.addr(), nullptr) != SQLITE_OK)
+        return std::nullopt;
+    sqlite3_bind_text(probe.get(), 1, column_name, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(probe.get());
+    if (rc != SQLITE_ROW && rc != SQLITE_DONE)
+        return std::nullopt;
+    return rc == SQLITE_ROW;
+}
+
+// ── Legacy row shapes (backfill only) ───────────────────────────────────────
+
+struct LegacyPackRow {
+    std::string id, name, version, description, yaml_source;
+    std::int64_t installed_at{0};
+    bool verified{false};
+};
+
+struct LegacyItemRow {
+    std::string pack_id, kind, item_id, name, yaml_source;
+};
+
+std::string sha256_hex(const std::string& in) {
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int len = 0;
+    if (EVP_Digest(in.data(), in.size(), md, &len, EVP_sha256(), nullptr) != 1)
+        return {};
+    static const char* kHex = "0123456789abcdef";
+    std::string out;
+    out.reserve(static_cast<std::size_t>(len) * 2);
+    for (unsigned int i = 0; i < len; ++i) {
+        out.push_back(kHex[md[i] >> 4]);
+        out.push_back(kHex[md[i] & 0x0f]);
+    }
+    return out;
+}
+
+// Length-prefixed (`<byte-length>:<bytes>`, the netstring/bencode technique — see
+// LicenseStore/DeploymentStore's canonicalize_legacy for the injectivity rationale): a raw
+// delimiter byte embedded in a field can't be confused with a real field boundary.
+void append_field(std::string& out, std::string_view field) {
+    out += std::to_string(field.size());
+    out += ':';
+    out += field;
+}
+
+// Canonicalizes BOTH legacy tables into one stable, order-independent, injective fingerprint
+// input. Each table's section is prefixed with its own row count (LicenseStore's two-section
+// extension) — without that, a section boundary could be ambiguous even though every row within
+// a section is unambiguous.
+std::string canonicalize_legacy(const std::vector<LegacyPackRow>& packs,
+                                const std::vector<LegacyItemRow>& items) {
+    std::vector<std::string> pack_rows;
+    pack_rows.reserve(packs.size());
+    for (const auto& p : packs) {
+        std::string r;
+        append_field(r, p.id);
+        append_field(r, p.name);
+        append_field(r, p.version);
+        append_field(r, p.description);
+        append_field(r, p.yaml_source);
+        append_field(r, std::to_string(p.installed_at));
+        append_field(r, p.verified ? "1" : "0");
+        pack_rows.push_back(std::move(r));
+    }
+    std::sort(pack_rows.begin(), pack_rows.end());
+
+    std::vector<std::string> item_rows;
+    item_rows.reserve(items.size());
+    for (const auto& it : items) {
+        std::string r;
+        append_field(r, it.pack_id);
+        append_field(r, it.kind);
+        append_field(r, it.item_id);
+        append_field(r, it.name);
+        append_field(r, it.yaml_source);
+        item_rows.push_back(std::move(r));
+    }
+    std::sort(item_rows.begin(), item_rows.end());
+
+    std::string canon = "product-pack-legacy-fingerprint-v1\n";
+    append_field(canon, std::to_string(pack_rows.size()));
+    for (const auto& r : pack_rows)
+        canon += r;
+    append_field(canon, std::to_string(item_rows.size()));
+    for (const auto& r : item_rows)
+        canon += r;
+    return canon;
+}
+
+// ── Migration DDL ────────────────────────────────────────────────────────────
+
+const std::vector<pg::PgMigration>& migrations() {
+    // Unqualified DDL: the runner sets search_path to the store schema for the migration txn.
+    // Runtime statements below schema-qualify explicitly. `verified` is folded into v1 here —
+    // the pre-migration SQLite store patched it in via a raw ALTER TABLE run outside the
+    // migration list on every construction (a pre-7.13 compat shim); on Postgres the schema is
+    // born fresh, so that shim has no reason to exist. `migrate_from_sqlite` still reads a
+    // pre-7.13 legacy file correctly (see the column-probe helper above).
+    static const std::vector<pg::PgMigration> kMigrations = {
+        {1,
+         "CREATE TABLE product_packs ("
+         "  id           TEXT PRIMARY KEY,"
+         "  name         TEXT NOT NULL,"
+         "  version      TEXT NOT NULL DEFAULT '1.0.0',"
+         "  description  TEXT NOT NULL DEFAULT '',"
+         "  yaml_source  TEXT NOT NULL,"
+         "  installed_at BIGINT NOT NULL DEFAULT 0,"
+         "  verified     BOOLEAN NOT NULL DEFAULT FALSE);"
+         "CREATE INDEX idx_product_packs_installed ON product_packs(installed_at DESC);"
+         "CREATE TABLE product_pack_items ("
+         "  pack_id      TEXT NOT NULL REFERENCES product_packs(id) ON DELETE CASCADE,"
+         "  kind         TEXT NOT NULL,"
+         "  item_id      TEXT NOT NULL,"
+         "  name         TEXT NOT NULL DEFAULT '',"
+         "  yaml_source  TEXT NOT NULL DEFAULT '',"
+         "  PRIMARY KEY (pack_id, item_id));"
+         "CREATE INDEX idx_pack_items_pack ON product_pack_items(pack_id);"
+         // ADR-0009 backfill idempotency — content-fingerprinted, not a single fleet-wide
+         // completion flag (see migrate_from_sqlite's doc comment).
+         "CREATE TABLE sqlite_backfill_source ("
+         "  fingerprint  TEXT PRIMARY KEY,"
+         "  completed_at BIGINT NOT NULL);"
+         // ADR-0009 erasure-consistency (RbacStore's `revoked_seed_defaults` is the precedent
+         // for this shape — a dedicated suppression table, never a plain DELETE an idempotent
+         // reseed/backfill would silently undo). `uninstall()` stamps a row here in the SAME
+         // transaction as its DELETEs; `migrate_from_sqlite` consults it before treating an
+         // unmatched legacy pack id as fresh content, so a stale/redeployed replica's legacy
+         // file can never resurrect a pack this store has already reported erased. See
+         // migrate_from_sqlite's doc comment for the full hazard this closes.
+         "CREATE TABLE deleted_pack_ids ("
+         "  pack_id    TEXT PRIMARY KEY,"
+         "  deleted_at BIGINT NOT NULL);"},
+    };
+    return kMigrations;
+}
+
+// ── Row readers ──────────────────────────────────────────────────────────────
+
+constexpr const char* kPackCols =
+    "id, name, version, description, yaml_source, installed_at, verified";
+
+ProductPack read_pack_row(PGresult* res, int row) {
+    ProductPack p;
+    int c = 0;
+    p.id = text_col(res, row, c++);
+    p.name = text_col(res, row, c++);
+    p.version = text_col(res, row, c++);
+    p.description = text_col(res, row, c++);
+    p.yaml_source = text_col(res, row, c++);
+    p.installed_at = to_i64(PQgetvalue(res, row, c++));
+    p.verified = to_bool(PQgetvalue(res, row, c++));
+    return p;
+}
+
+ProductPackItem read_item_row(PGresult* res, int row) {
+    ProductPackItem it;
+    int c = 0;
+    it.kind = text_col(res, row, c++);
+    it.item_id = text_col(res, row, c++);
+    it.name = text_col(res, row, c++);
+    it.yaml_source = text_col(res, row, c++);
+    return it;
+}
+
+// Shared by list()/get() — reads a pack's items on the SAME connection the caller already holds
+// (no extra pool acquisition per pack; ADR-0012 §2 "one lease per logical operation").
+std::expected<std::vector<ProductPackItem>, std::string> read_items_for_pack(
+    PGconn* conn, const std::string& pack_id) {
+    pg::PgResult res = pg::exec_params(
+        conn,
+        "SELECT kind, item_id, name, yaml_source FROM product_pack_store.product_pack_items "
+        "WHERE pack_id = $1",
+        std::vector<std::string>{pack_id});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                               "load items failed: " + PQerrorMessage(conn));
+    const int rows = PQntuples(res.get());
+    std::vector<ProductPackItem> items;
+    items.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        items.push_back(read_item_row(res.get(), i));
+    return items;
+}
+
+// ── Hex decode helper ───────────────────────────────────────────────────────
+
+bool hex_decode(const std::string& hex, std::vector<uint8_t>& out) {
+    if (hex.size() % 2 != 0)
+        return false;
+    out.resize(hex.size() / 2);
+    for (size_t i = 0; i < hex.size(); i += 2) {
+        unsigned int byte = 0;
+        auto hi = hex[i];
+        auto lo = hex[i + 1];
+
+        auto hex_val = [](char c) -> int {
+            if (c >= '0' && c <= '9')
+                return c - '0';
+            if (c >= 'a' && c <= 'f')
+                return 10 + (c - 'a');
+            if (c >= 'A' && c <= 'F')
+                return 10 + (c - 'A');
+            return -1;
+        };
+
+        int h = hex_val(hi);
+        int l = hex_val(lo);
+        if (h < 0 || l < 0)
+            return false;
+        byte = static_cast<unsigned int>((h << 4) | l);
+        out[i / 2] = static_cast<uint8_t>(byte);
+    }
+    return true;
 }
 
 } // namespace
@@ -169,41 +510,6 @@ std::vector<std::string> ProductPackStore::split_yaml_documents(const std::strin
     return docs;
 }
 
-// ── Hex decode helper ───────────────────────────────────────────────────────
-
-namespace {
-
-bool hex_decode(const std::string& hex, std::vector<uint8_t>& out) {
-    if (hex.size() % 2 != 0)
-        return false;
-    out.resize(hex.size() / 2);
-    for (size_t i = 0; i < hex.size(); i += 2) {
-        unsigned int byte = 0;
-        auto hi = hex[i];
-        auto lo = hex[i + 1];
-
-        auto hex_val = [](char c) -> int {
-            if (c >= '0' && c <= '9')
-                return c - '0';
-            if (c >= 'a' && c <= 'f')
-                return 10 + (c - 'a');
-            if (c >= 'A' && c <= 'F')
-                return 10 + (c - 'A');
-            return -1;
-        };
-
-        int h = hex_val(hi);
-        int l = hex_val(lo);
-        if (h < 0 || l < 0)
-            return false;
-        byte = static_cast<unsigned int>((h << 4) | l);
-        out[i / 2] = static_cast<uint8_t>(byte);
-    }
-    return true;
-}
-
-} // namespace
-
 // ── Ed25519 signature verification ──────────────────────────────────────────
 
 bool ProductPackStore::verify_signature(const std::string& content,
@@ -252,88 +558,468 @@ bool ProductPackStore::verify_signature(const std::string& content,
     return valid;
 }
 
-// ── Construction / destruction ──────────────────────────────────────────────
+// ── Construction ─────────────────────────────────────────────────────────────
 
-ProductPackStore::ProductPackStore(const std::filesystem::path& db_path) {
-    int rc = sqlite3_open_v2(db_path.string().c_str(), &db_,
-                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-                             nullptr);
-    if (rc != SQLITE_OK) {
-        spdlog::error("ProductPackStore: failed to open DB {}: {}", db_path.string(),
-                      sqlite3_errmsg(db_));
-        if (db_) {
-            sqlite3_close(db_);
-            db_ = nullptr;
-        }
+ProductPackStore::ProductPackStore(pg::PgPool& pool) : pool_(pool) {
+    auto lease = pool_.acquire();
+    if (!lease) {
+        spdlog::error("ProductPackStore: no database connection at construction ({}) — product "
+                      "pack persistence disabled",
+                      pool_.last_error());
         return;
     }
-    sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
-    sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
-
-    create_tables();
-    if (db_)
-        spdlog::info("ProductPackStore: opened {}", db_path.string());
-}
-
-ProductPackStore::~ProductPackStore() {
-    if (db_) {
-        sqlite3_close(db_);
-        db_ = nullptr;
+    if (!pg::PgMigrationRunner::run(lease.get(), kStoreName, migrations())) {
+        spdlog::error("ProductPackStore: schema migration failed — product pack persistence "
+                      "disabled");
+        return;
     }
+    // Gate 8 review of F035 (cpp-expert/sre, both MEDIUM): a second, independent line of
+    // defence behind the migration runner's own version guard (ApiTokenStore's #3013/#2964
+    // precedent — see its constructor comment for the full mechanism). `deleted_pack_ids` was
+    // folded into migration v1 rather than shipped as v2 (this store is unshipped — no v1 has
+    // ever been recorded against a live database by an earlier binary). If that assumption is
+    // ever wrong for a given database (e.g. a persistent dev/CI Postgres instance that already
+    // ran a pre-fix build of this branch's v1), the runner sees version 1 already applied and
+    // silently skips it, leaving `deleted_pack_ids` missing — this table-presence smoke-read
+    // catches that and fails CLOSED (ADR-0012 §1) rather than surfacing as a raw "relation does
+    // not exist" on the first uninstall()/migrate_from_sqlite call.
+    pg::PgResult smoke = pg::exec_params(
+        lease.get(), "SELECT 1 FROM product_pack_store.deleted_pack_ids LIMIT 0",
+        std::vector<std::string>{});
+    if (smoke.status() != PGRES_TUPLES_OK) {
+        spdlog::error(
+            "ProductPackStore: post-migration smoke-read of deleted_pack_ids failed ({}) — the "
+            "migration runner reported success but the schema this code expects is not "
+            "actually present — refusing to open (ADR-0012 §1 fail-closed)",
+            PQerrorMessage(lease.get()));
+        return;
+    }
+    open_ = true;
 }
 
-bool ProductPackStore::is_open() const {
-    return db_ != nullptr;
-}
+// ── Backfill (ADR-0009/0054) ─────────────────────────────────────────────────
 
-void ProductPackStore::create_tables() {
-    // Legacy compat: bring pre-v0.10 databases up to v1's schema before stamping.
-    // v1's CREATE TABLE IF NOT EXISTS is a no-op on existing tables, so the
-    // `verified` column (added in 7.13) must still be applied here.
-    sqlite3_exec(db_, "ALTER TABLE product_packs ADD COLUMN verified INTEGER NOT NULL DEFAULT 0;",
-                 nullptr, nullptr, nullptr);
+bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path) {
+    if (!open_)
+        return false;
 
-    static const std::vector<Migration> kMigrations = {
-        {1, R"(
-            CREATE TABLE IF NOT EXISTS product_packs (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                version TEXT NOT NULL DEFAULT '1.0.0',
-                description TEXT NOT NULL DEFAULT '',
-                yaml_source TEXT NOT NULL,
-                installed_at INTEGER NOT NULL DEFAULT 0,
-                verified INTEGER NOT NULL DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS product_pack_items (
-                pack_id TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                item_id TEXT NOT NULL,
-                name TEXT NOT NULL DEFAULT '',
-                yaml_source TEXT NOT NULL DEFAULT '',
-                PRIMARY KEY (pack_id, item_id),
-                FOREIGN KEY (pack_id) REFERENCES product_packs(id) ON DELETE CASCADE
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_pack_items_pack ON product_pack_items(pack_id);
-        )"},
+    // Mirrors CustomPropertiesStore's #1675 convention: "failed"/"fresh"/"success" only — the
+    // already-processed fast-skip path (below) emits no metric at all, matching that precedent
+    // exactly (a boot that does nothing new to the backfill state has nothing to count).
+    const auto backfill_metric = [this](const char* result) {
+        if (metrics_)
+            metrics_->counter("yuzu_server_product_pack_backfill_total", {{"result", result}})
+                .increment();
     };
-    if (!MigrationRunner::run(db_, "product_pack_store", kMigrations)) {
-        spdlog::error("ProductPackStore: schema migration failed, closing database");
-        sqlite3_close(db_);
-        db_ = nullptr;
-    }
-}
 
-std::string ProductPackStore::generate_id() const {
-    return gen_id();
+    std::error_code ec;
+    const bool legacy_exists = std::filesystem::exists(legacy_db_path, ec);
+    if (ec) {
+        spdlog::error("ProductPackStore::migrate_from_sqlite: cannot stat legacy path {}: {}",
+                      legacy_db_path.string(), ec.message());
+        backfill_metric("failed");
+        return false;
+    }
+
+    std::string fingerprint;
+    std::vector<LegacyPackRow> legacy_packs;
+    std::vector<LegacyItemRow> legacy_items;
+
+    if (!legacy_exists) {
+        fingerprint = kSourcelessFingerprint;
+    } else {
+        // SqliteDb/SqliteStmt (gov cpp-safety): close/finalize on every path, including an
+        // exception thrown mid read-loop.
+        SqliteDb legacy;
+        if (sqlite3_open_v2(legacy_db_path.string().c_str(), legacy.addr(), SQLITE_OPEN_READONLY,
+                            nullptr) != SQLITE_OK) {
+            spdlog::error("ProductPackStore::migrate_from_sqlite: failed to open legacy {}: {}",
+                          legacy_db_path.string(),
+                          legacy ? sqlite3_errmsg(legacy.get()) : "open failed");
+            backfill_metric("failed");
+            return false;
+        }
+
+        auto packs_probe = sqlite_table_exists(legacy.get(), "product_packs");
+        auto items_probe = sqlite_table_exists(legacy.get(), "product_pack_items");
+        if (!packs_probe || !items_probe) {
+            spdlog::error("ProductPackStore::migrate_from_sqlite: schema probe failed on legacy "
+                          "{}: {}",
+                          legacy_db_path.string(), sqlite3_errmsg(legacy.get()));
+            backfill_metric("failed");
+            return false;
+        }
+        const bool has_packs = *packs_probe;
+        const bool has_items = *items_probe;
+
+        if (!has_packs && !has_items) {
+            // Present-but-schema-less file — same "nothing to protect" class as no file at all.
+            fingerprint = kSourcelessFingerprint;
+        } else if (has_packs != has_items) {
+            // The shipped binary always creates both tables together (schema v1) — this shape
+            // is not producible by any released version, so treat it as corrupt/hand-edited and
+            // fail closed rather than guess.
+            spdlog::error(
+                "ProductPackStore::migrate_from_sqlite: legacy {} has exactly one of "
+                "{{product_packs, product_pack_items}} present (product_packs={}, "
+                "product_pack_items={}) — refusing (fail-closed): the shipped binary always "
+                "creates both together, this looks like a corrupt or hand-edited file",
+                legacy_db_path.string(), has_packs, has_items);
+            backfill_metric("failed");
+            return false;
+        } else {
+            // Pre-7.13 vintage check: a legacy file written before 7.13 has no `verified`
+            // column (it was patched in by a raw ALTER TABLE the pre-migration constructor ran
+            // on every boot, outside the migration list). Default verified=0 for that vintage —
+            // matches the pre-migration shim's own DEFAULT 0.
+            auto verified_col_probe = sqlite_column_exists(legacy.get(), "product_packs",
+                                                            "verified");
+            if (!verified_col_probe) {
+                spdlog::error("ProductPackStore::migrate_from_sqlite: column probe failed on "
+                              "legacy {}: {}",
+                              legacy_db_path.string(), sqlite3_errmsg(legacy.get()));
+                backfill_metric("failed");
+                return false;
+            }
+            const bool has_verified_col = *verified_col_probe;
+
+            {
+                SqliteStmt s;
+                const char* sql =
+                    has_verified_col
+                        ? "SELECT id, name, version, description, yaml_source, installed_at, "
+                          "verified FROM product_packs ORDER BY id ASC;"
+                        : "SELECT id, name, version, description, yaml_source, installed_at "
+                          "FROM product_packs ORDER BY id ASC;";
+                if (sqlite3_prepare_v2(legacy.get(), sql, -1, s.addr(), nullptr) != SQLITE_OK) {
+                    spdlog::error("ProductPackStore::migrate_from_sqlite: legacy product_packs "
+                                  "query failed: {}",
+                                  sqlite3_errmsg(legacy.get()));
+                    backfill_metric("failed");
+                    return false;
+                }
+                int step_rc = SQLITE_OK;
+                while ((step_rc = sqlite3_step(s.get())) == SQLITE_ROW) {
+                    LegacyPackRow p;
+                    p.id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0)));
+                    p.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1)));
+                    p.version =
+                        safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 2)));
+                    p.description =
+                        safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 3)));
+                    p.yaml_source =
+                        safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 4)));
+                    p.installed_at = sqlite3_column_int64(s.get(), 5);
+                    p.verified = has_verified_col && sqlite3_column_int64(s.get(), 6) != 0;
+                    legacy_packs.push_back(std::move(p));
+                }
+                // H2 (governance): require the terminal code to be SQLITE_DONE — a corrupt page
+                // or I/O error mid-scan otherwise truncates the legacy set silently, and the
+                // marker below would stamp the backfill complete over a partial copy,
+                // permanently.
+                if (step_rc != SQLITE_DONE) {
+                    spdlog::error("ProductPackStore::migrate_from_sqlite: legacy product_packs "
+                                  "scan aborted mid-read (rc={} {}): refusing to stamp a "
+                                  "partial backfill",
+                                  step_rc, sqlite3_errmsg(legacy.get()));
+                    backfill_metric("failed");
+                    return false;
+                }
+            }
+            {
+                SqliteStmt s;
+                const char* sql = "SELECT pack_id, kind, item_id, name, yaml_source FROM "
+                                  "product_pack_items ORDER BY pack_id ASC, item_id ASC;";
+                if (sqlite3_prepare_v2(legacy.get(), sql, -1, s.addr(), nullptr) != SQLITE_OK) {
+                    spdlog::error("ProductPackStore::migrate_from_sqlite: legacy "
+                                  "product_pack_items query failed: {}",
+                                  sqlite3_errmsg(legacy.get()));
+                    backfill_metric("failed");
+                    return false;
+                }
+                int step_rc = SQLITE_OK;
+                while ((step_rc = sqlite3_step(s.get())) == SQLITE_ROW) {
+                    LegacyItemRow it;
+                    it.pack_id =
+                        safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0)));
+                    it.kind = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1)));
+                    it.item_id =
+                        safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 2)));
+                    it.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 3)));
+                    it.yaml_source =
+                        safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 4)));
+                    legacy_items.push_back(std::move(it));
+                }
+                if (step_rc != SQLITE_DONE) {
+                    spdlog::error("ProductPackStore::migrate_from_sqlite: legacy "
+                                  "product_pack_items scan aborted mid-read (rc={} {}): "
+                                  "refusing to stamp a partial backfill",
+                                  step_rc, sqlite3_errmsg(legacy.get()));
+                    backfill_metric("failed");
+                    return false;
+                }
+            }
+
+            if (legacy_packs.empty() && legacy_items.empty()) {
+                fingerprint = kSourcelessFingerprint;
+            } else {
+                fingerprint = sha256_hex(canonicalize_legacy(legacy_packs, legacy_items));
+                if (fingerprint.empty()) {
+                    spdlog::error("ProductPackStore::migrate_from_sqlite: SHA-256 hashing "
+                                  "failed for legacy content at {} — refusing (fail-closed)",
+                                  legacy_db_path.string());
+                    backfill_metric("failed");
+                    return false;
+                }
+            }
+        }
+    }
+    // `legacy` (if opened) closed here via SqliteDb's destructor.
+
+    // Has THIS specific fingerprint already been processed? Unbounded acquire() here is
+    // construction-time discipline (ADR-0012 §2(a)) — this runs once at boot, before serving.
+    {
+        auto lease = pool_.acquire();
+        if (!lease) {
+            spdlog::error("ProductPackStore::migrate_from_sqlite: no database connection");
+            backfill_metric("failed");
+            return false;
+        }
+        pg::PgResult marker = pg::exec_params(
+            lease.get(),
+            "SELECT 1 FROM product_pack_store.sqlite_backfill_source WHERE fingerprint=$1",
+            std::vector<std::string>{fingerprint});
+        if (marker.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ProductPackStore::migrate_from_sqlite: backfill-marker check failed: "
+                          "{}",
+                          PQerrorMessage(lease.get()));
+            backfill_metric("failed");
+            return false;
+        }
+        if (PQntuples(marker.get()) > 0) {
+            spdlog::debug("ProductPackStore::migrate_from_sqlite: fingerprint already "
+                          "processed, skipping");
+            return true;
+        }
+    }
+
+    if (fingerprint == kSourcelessFingerprint) {
+        auto lease = pool_.acquire();
+        if (!lease) {
+            spdlog::error("ProductPackStore::migrate_from_sqlite: no connection to stamp marker");
+            backfill_metric("failed");
+            return false;
+        }
+        pg::PgResult r = pg::exec_params(
+            lease.get(),
+            "INSERT INTO product_pack_store.sqlite_backfill_source (fingerprint, completed_at) "
+            "VALUES ($1, $2::bigint) ON CONFLICT (fingerprint) DO NOTHING",
+            std::vector<std::string>{fingerprint, std::to_string(now_epoch())});
+        if (r.status() != PGRES_COMMAND_OK) {
+            spdlog::error("ProductPackStore::migrate_from_sqlite: failed to stamp marker: {}",
+                          PQerrorMessage(lease.get()));
+            backfill_metric("failed");
+            return false;
+        }
+        spdlog::info("ProductPackStore::migrate_from_sqlite: no legacy product pack data at {} "
+                     "— nothing to backfill",
+                     legacy_db_path.string());
+        backfill_metric("fresh");
+        return true;
+    }
+
+    spdlog::info("ProductPackStore::migrate_from_sqlite: backfilling {} pack(s), {} item(s) "
+                 "from {}",
+                 legacy_packs.size(), legacy_items.size(), legacy_db_path.string());
+
+    // ONE transaction, parent-before-child (packs table fully inserted before any item row —
+    // satisfies the product_pack_items -> product_packs FK trivially, since the two are
+    // different tables rather than ResultSetStore's self-referencing case). Fail closed on any
+    // error (ADR-0009): nothing partially committed.
+    std::string failure_detail;
+    // ADR-0009 erasure consistency: pack ids this store has already reported erased via
+    // uninstall() (see deleted_pack_ids' schema comment). A legacy row naming one of these is
+    // NOT a conflict to compare against an existing row — there is no existing row, it was
+    // legitimately deleted — it is a resurrection attempt and must be silently skipped, along
+    // with every item row that belongs to it (an attempted item insert would otherwise hit the
+    // product_pack_items -> product_packs FK with no parent row and fail the whole backfill
+    // closed).
+    std::unordered_set<std::string> tombstoned_ids;
+    bool ok = pool_.with_txn([&](PGconn* conn) -> bool {
+        // MUST be the first statement in this transaction — see kErasureCoordLockSql's comment.
+        // Without this, a concurrent uninstall() committing between one pack's tombstone check
+        // (below) and its INSERT is invisible to the check's already-taken snapshot.
+        pg::PgResult lk = pg::exec_params(conn, kErasureCoordLockSql, std::vector<std::string>{});
+        if (lk.status() != PGRES_TUPLES_OK) {
+            failure_detail = std::format("erasure-coordination lock: {}", PQerrorMessage(conn));
+            spdlog::error("ProductPackStore::migrate_from_sqlite: {}", failure_detail);
+            return false;
+        }
+        for (const auto& p : legacy_packs) {
+            pg::PgResult tomb = pg::exec_params(
+                conn, "SELECT 1 FROM product_pack_store.deleted_pack_ids WHERE pack_id = $1",
+                std::vector<std::string>{p.id});
+            if (tomb.status() != PGRES_TUPLES_OK) {
+                failure_detail = std::format("legacy product_packs row id='{}': tombstone check "
+                                             "failed: {}",
+                                             p.id, PQerrorMessage(conn));
+                spdlog::error("ProductPackStore::migrate_from_sqlite: {}", failure_detail);
+                return false;
+            }
+            if (PQntuples(tomb.get()) > 0) {
+                spdlog::info("ProductPackStore::migrate_from_sqlite: legacy pack id='{}' was "
+                             "already uninstalled — skipping (not a conflict, a resurrection "
+                             "attempt from a stale legacy file)",
+                             p.id);
+                tombstoned_ids.insert(p.id);
+                continue;
+            }
+            pg::PgResult res = pg::exec_params(
+                conn,
+                "INSERT INTO product_pack_store.product_packs "
+                "(id, name, version, description, yaml_source, installed_at, verified) "
+                "VALUES ($1,$2,$3,$4,$5,$6::bigint,$7::boolean) ON CONFLICT (id) DO NOTHING "
+                "RETURNING id",
+                std::vector<std::string>{
+                    p.id, sanitize_pg_text(p.name), sanitize_pg_text(p.version),
+                    sanitize_pg_text(p.description), sanitize_pg_text(p.yaml_source),
+                    std::to_string(p.installed_at), p.verified ? "true" : "false"});
+            if (res.status() != PGRES_TUPLES_OK) {
+                failure_detail =
+                    std::format("legacy product_packs row id='{}': {}", p.id, PQerrorMessage(conn));
+                spdlog::error("ProductPackStore::migrate_from_sqlite: insert of {} failed: {}",
+                              p.id, PQerrorMessage(conn));
+                return false;
+            }
+            if (PQntuples(res.get()) > 0)
+                continue; // inserted cleanly — no conflict
+
+            // Conflict: a row with this id already exists (only plausible source: a
+            // cloned/restored legacy file backfilled on more than one replica — see
+            // product_pack_store.hpp, `id` is a 128-bit random surrogate, not a human-chosen
+            // key). Every product_packs column is write-once — no runtime method ever UPDATEs a
+            // pack row after install() inserts it — so there is no IDENTITY/LIFECYCLE partition
+            // to make here (unlike LicenseStore); read back and require full equality, fail
+            // closed on any mismatch.
+            std::string existing_sql =
+                std::string("SELECT ") + kPackCols + " FROM product_pack_store.product_packs "
+                "WHERE id=$1";
+            pg::PgResult existing =
+                pg::exec_params(conn, existing_sql.c_str(), std::vector<std::string>{p.id});
+            if (existing.status() != PGRES_TUPLES_OK || PQntuples(existing.get()) == 0) {
+                failure_detail = std::format(
+                    "legacy product_packs row id='{}': conflicted on insert but the existing "
+                    "row could not be read back for comparison: {}",
+                    p.id, PQerrorMessage(conn));
+                spdlog::error("ProductPackStore::migrate_from_sqlite: {}", failure_detail);
+                return false;
+            }
+            const ProductPack stored = read_pack_row(existing.get(), 0);
+            const bool identical =
+                stored.name == sanitize_pg_text(p.name) &&
+                stored.version == sanitize_pg_text(p.version) &&
+                stored.description == sanitize_pg_text(p.description) &&
+                stored.yaml_source == sanitize_pg_text(p.yaml_source) &&
+                stored.installed_at == p.installed_at && stored.verified == p.verified;
+            if (!identical) {
+                failure_detail = std::format(
+                    "legacy product_packs row id='{}': conflicts with a differently-valued "
+                    "existing row (every column is write-once for this store — see "
+                    "product_pack_store.hpp file header)",
+                    p.id);
+                spdlog::error("ProductPackStore::migrate_from_sqlite: {}", failure_detail);
+                return false;
+            }
+            // Identical content — a benign replay from a shared/cloned legacy file.
+        }
+        for (const auto& it : legacy_items) {
+            if (tombstoned_ids.contains(it.pack_id))
+                continue; // parent pack was skipped above — see the tombstone check comment
+            pg::PgResult res = pg::exec_params(
+                conn,
+                "INSERT INTO product_pack_store.product_pack_items "
+                "(pack_id, kind, item_id, name, yaml_source) VALUES ($1,$2,$3,$4,$5) "
+                "ON CONFLICT (pack_id, item_id) DO NOTHING RETURNING pack_id",
+                std::vector<std::string>{it.pack_id, sanitize_pg_text(it.kind),
+                                         sanitize_pg_text(it.item_id), sanitize_pg_text(it.name),
+                                         sanitize_pg_text(it.yaml_source)});
+            if (res.status() != PGRES_TUPLES_OK) {
+                failure_detail = std::format("legacy product_pack_items row (pack_id='{}', "
+                                             "item_id='{}'): {}",
+                                             it.pack_id, it.item_id, PQerrorMessage(conn));
+                spdlog::error("ProductPackStore::migrate_from_sqlite: item insert ({}, {}) "
+                              "failed: {}",
+                              it.pack_id, it.item_id, PQerrorMessage(conn));
+                return false;
+            }
+            if (PQntuples(res.get()) > 0)
+                continue; // inserted cleanly
+
+            // Same reasoning as the packs loop above: item rows are also write-once (no
+            // runtime method ever UPDATEs one), so a conflict is only benign if identical.
+            pg::PgResult existing = pg::exec_params(
+                conn,
+                "SELECT kind, item_id, name, yaml_source FROM product_pack_store."
+                "product_pack_items WHERE pack_id=$1 AND item_id=$2",
+                std::vector<std::string>{it.pack_id, sanitize_pg_text(it.item_id)});
+            if (existing.status() != PGRES_TUPLES_OK || PQntuples(existing.get()) == 0) {
+                failure_detail = std::format(
+                    "legacy product_pack_items row (pack_id='{}', item_id='{}'): conflicted on "
+                    "insert but the existing row could not be read back for comparison: {}",
+                    it.pack_id, it.item_id, PQerrorMessage(conn));
+                spdlog::error("ProductPackStore::migrate_from_sqlite: {}", failure_detail);
+                return false;
+            }
+            const ProductPackItem stored = read_item_row(existing.get(), 0);
+            const bool identical = stored.kind == sanitize_pg_text(it.kind) &&
+                                   stored.name == sanitize_pg_text(it.name) &&
+                                   stored.yaml_source == sanitize_pg_text(it.yaml_source);
+            if (!identical) {
+                failure_detail = std::format(
+                    "legacy product_pack_items row (pack_id='{}', item_id='{}'): conflicts "
+                    "with a differently-valued existing row",
+                    it.pack_id, it.item_id);
+                spdlog::error("ProductPackStore::migrate_from_sqlite: {}", failure_detail);
+                return false;
+            }
+        }
+        pg::PgResult marker = pg::exec_params(
+            conn,
+            "INSERT INTO product_pack_store.sqlite_backfill_source (fingerprint, completed_at) "
+            "VALUES ($1, $2::bigint) ON CONFLICT (fingerprint) DO NOTHING",
+            std::vector<std::string>{fingerprint, std::to_string(now_epoch())});
+        if (marker.status() != PGRES_COMMAND_OK) {
+            failure_detail = std::format("backfill marker stamp: {}", PQerrorMessage(conn));
+            spdlog::error("ProductPackStore::migrate_from_sqlite: failed to stamp backfill "
+                          "marker: {}",
+                          PQerrorMessage(conn));
+            return false;
+        }
+        return true;
+    });
+    if (!ok) {
+        spdlog::error(
+            "ProductPackStore::migrate_from_sqlite: backfill transaction failed and was rolled "
+            "back — product pack data NOT migrated. Offending: {}. Remediation: inspect/fix the "
+            "referenced row in the retained read-only legacy file ({}) — e.g. `sqlite3 {} "
+            "\"SELECT * FROM product_packs WHERE id='<id>'\"` — then restart the server; the "
+            "backfill marker was NOT stamped, so the next boot retries the whole backfill.",
+            failure_detail.empty() ? "unknown (see the specific-row error above)" : failure_detail,
+            legacy_db_path.string(), legacy_db_path.string());
+        backfill_metric("failed");
+        return false;
+    }
+    spdlog::info("ProductPackStore::migrate_from_sqlite: backfill complete");
+    backfill_metric("success");
+    return true;
 }
 
 // ── Install ─────────────────────────────────────────────────────────────────
 
 std::expected<std::string, std::string> ProductPackStore::install(const std::string& yaml_bundle,
                                                                   ItemInstallFn install_fn) {
-
+    if (!open_)
+        return std::unexpected(std::string(kProductPackDbErrorPrefix) + "database not open");
     if (!install_fn)
         return std::unexpected("install callback is required");
 
@@ -423,10 +1109,6 @@ std::expected<std::string, std::string> ProductPackStore::install(const std::str
             spdlog::error("ProductPackStore: pack '{}' is unsigned but signature "
                           "enforcement is enabled — rejecting",
                           sanitize_for_log(pack_name));
-            // gov W7.4 R1 CONS-BLOCKING-2: error message names the operator-
-            // facing CLI flag (--allow-unsigned-packs) rather than the
-            // internal field name (require_signed_packs). Operators reading
-            // the rejection see a knob that actually exists on the CLI.
             return std::unexpected(
                 "pack '" + pack_name +
                 "' is unsigned and signature enforcement is enabled "
@@ -436,39 +1118,17 @@ std::expected<std::string, std::string> ProductPackStore::install(const std::str
                      sanitize_for_log(pack_name));
     }
 
-    auto pack_id = generate_id();
+    auto pack_id = gen_id();
     auto now = now_epoch();
 
-    std::unique_lock lock(mtx_);
-
-    // M5: Wrap entire install in a transaction so partial failures are rolled back
-    sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr);
-
-    // Insert pack record
-    {
-        const char* sql = "INSERT INTO product_packs "
-                          "(id, name, version, description, yaml_source, installed_at, verified) "
-                          "VALUES (?, ?, ?, ?, ?, ?, ?)";
-        sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-            return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-
-        sqlite3_bind_text(stmt, 1, pack_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 2, pack_name.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 3, pack_version.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 4, pack_description.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 5, yaml_bundle.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt, 6, now);
-        sqlite3_bind_int(stmt, 7, pack_verified ? 1 : 0);
-        int rc = sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
-        if (rc != SQLITE_DONE)
-            return std::unexpected(std::string("insert failed: ") + sqlite3_errmsg(db_));
-    }
-
-    // Install each content document (skip the ProductPack metadata doc)
+    // Install each content document (skip the ProductPack metadata doc). Deliberately NO pool_
+    // lease held across this loop — install_fn's callees (InstructionStore/PolicyStore/
+    // WorkflowEngine) draw from the SAME shared pool; holding our own lease here would risk
+    // starving theirs (docs/postgres-store-playbook.md "never call another store while holding
+    // a lease"). See product_pack_store.hpp file header for the full rationale.
     int installed_count = 0;
     std::vector<std::string> errors;
+    std::vector<ProductPackItem> items_to_store;
 
     for (int i = 0; i < static_cast<int>(documents.size()); ++i) {
         if (i == pack_doc_idx)
@@ -481,7 +1141,7 @@ std::expected<std::string, std::string> ProductPackStore::install(const std::str
                 documents[i].find("plugin:") != std::string::npos) {
                 kind = "InstructionDefinition";
             } else {
-                errors.push_back("document " + std::to_string(i) + " has no kind");
+                errors.push_back("document " + std::to_string(i) + ": " + kind_missing_error());
                 continue;
             }
         }
@@ -498,7 +1158,7 @@ std::expected<std::string, std::string> ProductPackStore::install(const std::str
             item.item_id = *result;
             item.name = item_name;
             item.yaml_source = documents[i];
-            store_item(pack_id, item);
+            items_to_store.push_back(std::move(item));
             ++installed_count;
         } else {
             errors.push_back(kind + ": " + result.error());
@@ -506,175 +1166,241 @@ std::expected<std::string, std::string> ProductPackStore::install(const std::str
     }
 
     if (installed_count == 0 && !errors.empty()) {
-        // Rollback the entire transaction — nothing was installed
-        sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+        // Nothing was ever written to Postgres — no rollback needed.
         return std::unexpected("no items installed: " + errors[0]);
     }
 
-    // Commit the transaction — all items installed successfully (or partial with warnings)
-    sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr);
+    // Gate 8 review (Fable, external): a bundle whose documents assign the same item id
+    // twice would otherwise reach the persist transaction below, violate
+    // product_pack_items' (pack_id, item_id) PK, and fail with kProductPackDbErrorPrefix —
+    // classified as a genuine DB error, hence a RETRYABLE 503 at the REST layer. This
+    // condition is deterministic (the same bundle always duplicates the same id), so a
+    // client retry never succeeds and instead re-runs install_fn against every sibling
+    // store again on each attempt (no lease held across that loop, see the file header),
+    // compounding the F031/F033-tracked orphan risk. Detected here, before any Postgres
+    // interaction, and classified as a plain validation error (400, not 503) so a client
+    // knows not to retry — this does not change the "fails the whole install" outcome
+    // (already the case, see the changelog fragment), only its retryability.
+    {
+        std::unordered_set<std::string> seen_item_ids;
+        for (const auto& item : items_to_store) {
+            if (!seen_item_ids.insert(item.item_id).second)
+                return std::unexpected("duplicate item id in bundle: '" + item.item_id + "'");
+        }
+    }
 
-    spdlog::info("ProductPackStore: installed '{}' v{} ({}), {} items, {} errors", pack_name,
-                 pack_version, pack_id, installed_count, errors.size());
+    // Now persist the pack row + its successfully-installed item rows in ONE transaction
+    // (parent-before-child for the product_pack_items -> product_packs FK).
+    bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult pres = pg::exec_params(
+            conn,
+            "INSERT INTO product_pack_store.product_packs "
+            "(id, name, version, description, yaml_source, installed_at, verified) "
+            "VALUES ($1,$2,$3,$4,$5,$6::bigint,$7::boolean)",
+            std::vector<std::string>{
+                pack_id, sanitize_pg_text(pack_name), sanitize_pg_text(pack_version),
+                sanitize_pg_text(pack_description), sanitize_pg_text(yaml_bundle),
+                std::to_string(now), pack_verified ? "true" : "false"});
+        if (pres.status() != PGRES_COMMAND_OK)
+            return false;
+
+        for (const auto& item : items_to_store) {
+            pg::PgResult ires = pg::exec_params(
+                conn,
+                "INSERT INTO product_pack_store.product_pack_items "
+                "(pack_id, kind, item_id, name, yaml_source) VALUES ($1,$2,$3,$4,$5)",
+                std::vector<std::string>{pack_id, sanitize_pg_text(item.kind),
+                                         sanitize_pg_text(item.item_id),
+                                         sanitize_pg_text(item.name),
+                                         sanitize_pg_text(item.yaml_source)});
+            if (ires.status() != PGRES_COMMAND_OK)
+                return false;
+        }
+        return true;
+    });
+    if (!ok) {
+        return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                               "failed to persist pack '" + pack_name + "'");
+    }
+
+    spdlog::info("ProductPackStore: installed '{}' v{} ({}), {} items, {} errors",
+                 sanitize_for_log(pack_name), pack_version, pack_id, installed_count,
+                 errors.size());
     return pack_id;
 }
 
 // ── List / Get ──────────────────────────────────────────────────────────────
 
-std::vector<ProductPack> ProductPackStore::list(const ProductPackQuery& q) const {
-    std::shared_lock lock(mtx_);
-    std::vector<ProductPack> result;
+std::expected<std::vector<ProductPack>, std::string> ProductPackStore::list(
+    const ProductPackQuery& q) {
+    if (!open_) {
+        if (note_read_degrade(metrics_, kReasonStoreNotOpen, g_list_sampler))
+            spdlog::warn("ProductPackStore::list: store not open");
+        return std::unexpected(std::string(kProductPackDbErrorPrefix) + "database not open");
+    }
 
-    std::string sql = "SELECT id, name, version, description, yaml_source, installed_at, verified "
-                      "FROM product_packs";
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, g_list_sampler))
+            spdlog::warn("ProductPackStore::list: no connection in time ({})",
+                        pool_.last_error());
+        return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                               "database unavailable — try again");
+    }
+
+    int limit = q.limit;
+    if (limit <= 0)
+        limit = kDefaultListLimit;
+    if (limit > kMaxListLimit)
+        limit = kMaxListLimit;
+
+    std::string sql =
+        std::string("SELECT ") + kPackCols + " FROM product_pack_store.product_packs";
     std::vector<std::string> binds;
     if (!q.name_filter.empty()) {
-        sql += " WHERE name LIKE ?";
-        binds.push_back("%" + q.name_filter + "%");
+        sql += " WHERE name LIKE $1";
+        binds.push_back("%" + sanitize_pg_text(q.name_filter) + "%");
     }
-    sql += " ORDER BY installed_at DESC LIMIT ?";
+    sql += " ORDER BY installed_at DESC LIMIT $" + std::to_string(binds.size() + 1);
+    binds.push_back(std::to_string(limit));
 
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
-        return result;
-
-    int idx = 1;
-    for (auto& b : binds)
-        sqlite3_bind_text(stmt, idx++, b.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, idx, q.limit);
-
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        ProductPack p;
-        p.id = col_text(stmt, 0);
-        p.name = col_text(stmt, 1);
-        p.version = col_text(stmt, 2);
-        p.description = col_text(stmt, 3);
-        p.yaml_source = col_text(stmt, 4);
-        p.installed_at = sqlite3_column_int64(stmt, 5);
-        p.verified = (sqlite3_column_int(stmt, 6) != 0);
-        p.items = load_items(p.id);
-        result.push_back(std::move(p));
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), binds);
+    if (res.status() != PGRES_TUPLES_OK) {
+        if (note_read_degrade(metrics_, kReasonQueryError, g_list_sampler))
+            spdlog::warn("ProductPackStore::list: query failed: {}", PQerrorMessage(lease.get()));
+        return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                               "list failed: " + PQerrorMessage(lease.get()));
     }
-    sqlite3_finalize(stmt);
-    return result;
+
+    const int rows = PQntuples(res.get());
+    std::vector<ProductPack> out;
+    out.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i) {
+        auto p = read_pack_row(res.get(), i);
+        auto items = read_items_for_pack(lease.get(), p.id);
+        if (!items) {
+            if (note_read_degrade(metrics_, kReasonQueryError, g_list_sampler))
+                spdlog::warn("ProductPackStore::list: item read failed for pack '{}': {}", p.id,
+                             items.error());
+            return std::unexpected(items.error());
+        }
+        p.items = std::move(*items);
+        out.push_back(std::move(p));
+    }
+    return out;
 }
 
-std::optional<ProductPack> ProductPackStore::get(const std::string& id) const {
-    std::shared_lock lock(mtx_);
-
-    const char* sql = "SELECT id, name, version, description, yaml_source, installed_at, verified "
-                      "FROM product_packs WHERE id = ?";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return std::nullopt;
-
-    sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(stmt) != SQLITE_ROW) {
-        sqlite3_finalize(stmt);
-        return std::nullopt;
+std::expected<std::optional<ProductPack>, std::string> ProductPackStore::get(
+    const std::string& id) {
+    if (!open_) {
+        if (note_read_degrade(metrics_, kReasonStoreNotOpen, g_get_sampler))
+            spdlog::warn("ProductPackStore::get: store not open");
+        return std::unexpected(std::string(kProductPackDbErrorPrefix) + "database not open");
     }
 
-    ProductPack p;
-    p.id = col_text(stmt, 0);
-    p.name = col_text(stmt, 1);
-    p.version = col_text(stmt, 2);
-    p.description = col_text(stmt, 3);
-    p.yaml_source = col_text(stmt, 4);
-    p.installed_at = sqlite3_column_int64(stmt, 5);
-    p.verified = (sqlite3_column_int(stmt, 6) != 0);
-    sqlite3_finalize(stmt);
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, g_get_sampler))
+            spdlog::warn("ProductPackStore::get: no connection in time ({})",
+                        pool_.last_error());
+        return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                               "database unavailable — try again");
+    }
 
-    p.items = load_items(p.id);
-    return p;
+    std::string sql =
+        std::string("SELECT ") + kPackCols + " FROM product_pack_store.product_packs WHERE id=$1";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{id});
+    if (res.status() != PGRES_TUPLES_OK) {
+        if (note_read_degrade(metrics_, kReasonQueryError, g_get_sampler))
+            spdlog::warn("ProductPackStore::get: query failed: {}", PQerrorMessage(lease.get()));
+        return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                               "get failed: " + PQerrorMessage(lease.get()));
+    }
+    if (PQntuples(res.get()) == 0)
+        return std::optional<ProductPack>{std::nullopt};
+
+    auto p = read_pack_row(res.get(), 0);
+    auto items = read_items_for_pack(lease.get(), p.id);
+    if (!items) {
+        if (note_read_degrade(metrics_, kReasonQueryError, g_get_sampler))
+            spdlog::warn("ProductPackStore::get: item read failed for pack '{}': {}", p.id,
+                         items.error());
+        return std::unexpected(items.error());
+    }
+    p.items = std::move(*items);
+    return std::optional<ProductPack>{std::move(p)};
 }
 
 // ── Uninstall ───────────────────────────────────────────────────────────────
 
 std::expected<void, std::string> ProductPackStore::uninstall(const std::string& id,
                                                              ItemUninstallFn uninstall_fn) {
-
+    if (!open_)
+        return std::unexpected(std::string(kProductPackDbErrorPrefix) + "database not open");
     if (!uninstall_fn)
         return std::unexpected("uninstall callback is required");
 
-    auto pack = get(id);
-    if (!pack)
-        return std::unexpected("product pack not found: " + id);
+    auto pack_result = get(id);
+    if (!pack_result)
+        return std::unexpected(pack_result.error());
+    if (!*pack_result)
+        return std::unexpected("not_found: product pack not found: " + id);
+    ProductPack pack = std::move(**pack_result);
 
-    std::unique_lock lock(mtx_);
-
-    // Remove each contained item from its origin store
+    // Remove each contained item from its origin store. No pool_ lease of ours held here — same
+    // rationale as install() (see file header). A genuine origin-store DB error aborts the whole
+    // uninstall (never delete/tombstone the pack while a contained item may still be live) —
+    // not-found/unsupported-kind failures from origin stores that don't yet distinguish the two
+    // stay tolerated+logged, matching pre-ADR-0058 behaviour.
     int removed = 0;
-    for (const auto& item : pack->items) {
-        if (uninstall_fn(item.kind, item.item_id))
+    for (const auto& item : pack.items) {
+        auto item_result = uninstall_fn(item.kind, item.item_id);
+        if (item_result) {
             ++removed;
-        else
-            spdlog::warn("ProductPackStore: failed to remove {} item '{}'", item.kind,
-                         item.item_id);
-    }
-
-    // Delete pack items
-    {
-        const char* sql = "DELETE FROM product_pack_items WHERE pack_id = ?";
-        sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_step(stmt);
-            sqlite3_finalize(stmt);
+        } else if (item_result.error().starts_with(kProductPackDbErrorPrefix)) {
+            return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                                    "failed to remove " + item.kind + " item '" + item.item_id +
+                                    "': " + item_result.error());
+        } else {
+            spdlog::warn("ProductPackStore: failed to remove {} item '{}': {}", item.kind,
+                         item.item_id, item_result.error());
         }
     }
 
-    // Delete pack record
-    {
-        const char* sql = "DELETE FROM product_packs WHERE id = ?";
-        sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_step(stmt);
-            sqlite3_finalize(stmt);
-        }
-    }
+    bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        // MUST be the first statement in this transaction — see kErasureCoordLockSql's comment.
+        pg::PgResult lk = pg::exec_params(conn, kErasureCoordLockSql, std::vector<std::string>{});
+        if (lk.status() != PGRES_TUPLES_OK)
+            return false;
+        pg::PgResult di = pg::exec_params(
+            conn, "DELETE FROM product_pack_store.product_pack_items WHERE pack_id = $1",
+            std::vector<std::string>{id});
+        if (di.status() != PGRES_COMMAND_OK)
+            return false;
+        pg::PgResult dp = pg::exec_params(
+            conn, "DELETE FROM product_pack_store.product_packs WHERE id = $1",
+            std::vector<std::string>{id});
+        if (dp.status() != PGRES_COMMAND_OK)
+            return false;
+        // ADR-0009 erasure consistency: stamp the tombstone in the SAME transaction as the
+        // deletes, so migrate_from_sqlite can never observe a deletion without also observing
+        // its suppression marker (see the deleted_pack_ids schema comment / this store's
+        // migrate_from_sqlite doc comment).
+        pg::PgResult tomb = pg::exec_params(
+            conn,
+            "INSERT INTO product_pack_store.deleted_pack_ids (pack_id, deleted_at) "
+            "VALUES ($1, $2::bigint) ON CONFLICT (pack_id) DO NOTHING",
+            std::vector<std::string>{id, std::to_string(now_epoch())});
+        if (tomb.status() != PGRES_COMMAND_OK)
+            return false;
+        return true;
+    });
+    if (!ok)
+        return std::unexpected(std::string(kProductPackDbErrorPrefix) + "uninstall failed");
 
-    spdlog::info("ProductPackStore: uninstalled '{}', removed {} items", pack->name, removed);
+    spdlog::info("ProductPackStore: uninstalled '{}', removed {} items",
+                 sanitize_for_log(pack.name), removed);
     return {};
-}
-
-// ── Item storage helpers ────────────────────────────────────────────────────
-
-void ProductPackStore::store_item(const std::string& pack_id, const ProductPackItem& item) {
-    const char* sql = "INSERT INTO product_pack_items (pack_id, kind, item_id, name, yaml_source) "
-                      "VALUES (?, ?, ?, ?, ?)";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return;
-
-    sqlite3_bind_text(stmt, 1, pack_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, item.kind.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, item.item_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 4, item.name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 5, item.yaml_source.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-}
-
-std::vector<ProductPackItem> ProductPackStore::load_items(const std::string& pack_id) const {
-    std::vector<ProductPackItem> items;
-    const char* sql = "SELECT kind, item_id, name, yaml_source "
-                      "FROM product_pack_items WHERE pack_id = ?";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return items;
-
-    sqlite3_bind_text(stmt, 1, pack_id.c_str(), -1, SQLITE_TRANSIENT);
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        ProductPackItem item;
-        item.kind = col_text(stmt, 0);
-        item.item_id = col_text(stmt, 1);
-        item.name = col_text(stmt, 2);
-        item.yaml_source = col_text(stmt, 3);
-        items.push_back(std::move(item));
-    }
-    sqlite3_finalize(stmt);
-    return items;
 }
 
 } // namespace yuzu::server

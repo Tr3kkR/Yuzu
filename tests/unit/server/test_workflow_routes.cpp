@@ -106,6 +106,10 @@ struct ExecHarness {
     std::unique_ptr<ExecutionEventBus> event_bus;
 
     bool perm_grant{true};
+    /// guardian-confinement-2298: empty by default (an ordinary session);
+    /// a test sets this to prove the /fragments/schedules service-scoped
+    /// deny fires independently of perm_grant.
+    std::string mock_token_scope_service;
     /// PR 2 hardening regression net: captures the execution_id passed to
     /// cmd_dispatch so a test can prove the FAST-agent race fix (mapping
     /// registered BEFORE dispatch). Empty when the dispatch path has no
@@ -139,6 +143,11 @@ struct ExecHarness {
     /// into the dispatch stub (the confinement the production dispatch_confined
     /// seam then applies). Mirrors test_mcp_server.cpp's last_dispatch_exec_visible.
     yuzu::server::authz::VisibleSet last_dispatch_exec_visible;
+    /// #3136 blocker regression net: the RAW params map cmd_dispatch actually
+    /// received, so a test can assert it still carries a sensitive value
+    /// (e.g. grant_secret) even though the PERSISTED execution row's
+    /// parameter_values must not.
+    std::unordered_map<std::string, std::string> last_dispatch_params;
     /// PLAN-006: the full DispatchCaller (identity + exec_visible) the execute
     /// handler threaded into the dispatch stub, so a test can assert the
     /// principal half independently of last_dispatch_exec_visible above.
@@ -195,7 +204,12 @@ struct ExecHarness {
             tracker->set_event_bus(event_bus.get());
         }
 
-        instructions = std::make_unique<InstructionStore>(instr_db);
+        // ADR-0058: InstructionStore is now a migrated Postgres store — shares
+        // the same pool/database as ResponseStore below (schema-per-store,
+        // ADR-0008). instr_db (the old SQLite path) is now unused dead weight
+        // in the fs::remove cleanup loops below, harmless (removing a path
+        // nothing ever creates is a silent no-op).
+        instructions = std::make_unique<InstructionStore>(pool);
         REQUIRE(instructions->is_open());
         responses = std::make_unique<ResponseStore>(pool, /*retention_days=*/0);
         REQUIRE(responses->is_open());
@@ -208,11 +222,12 @@ struct ExecHarness {
             REQUIRE(workflows->is_open());
         }
 
-        auto auth_fn = [](const httplib::Request&,
-                          httplib::Response&) -> std::optional<auth::Session> {
+        auto auth_fn = [this](const httplib::Request&,
+                              httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
             s.username = "tester";
             s.role = auth::Role::admin;
+            s.token_scope_service = mock_token_scope_service;
             return s;
         };
         auto perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
@@ -243,7 +258,7 @@ struct ExecHarness {
         auto cmd_dispatch = [this](const std::string&, const std::string&,
                                    const std::vector<std::string>& agent_ids,
                                    const std::string& scope_expr,
-                                   const std::unordered_map<std::string, std::string>&,
+                                   const std::unordered_map<std::string, std::string>& params,
                                    const std::string& execution_id,
                                    const yuzu::server::DispatchCaller& caller)
             -> std::pair<std::string, int> {
@@ -252,6 +267,7 @@ struct ExecHarness {
             ++dispatch_calls;
             last_dispatch_agent_ids = agent_ids;
             last_dispatch_scope = scope_expr;
+            last_dispatch_params = params;
             // K-R7-02 / PLAN-006: capture the confinement + identity threaded
             // into dispatch.
             last_dispatch_exec_visible = caller.exec_visible;
@@ -994,6 +1010,47 @@ TEST_CASE("#1088 — POST /api/instructions/:id/execute response includes execut
     CHECK(body["command_id"] == "cmd-agentic-abc");
     CHECK(body["agents_reached"] == 3);
     CHECK(body["definition_id"] == "def-AGENTIC");
+}
+
+TEST_CASE("#3136 blocker: grant_secret reaches cmd_dispatch but is redacted from the "
+         "persisted execution row",
+         "[pg][workflow][executions][security]") {
+    // The concrete attack this closes: an execution row created BEFORE
+    // dispatch (create-before-dispatch, UP2-4) used to carry the FULL
+    // caller-supplied params JSON — including a one-time upload-grant
+    // secret — into executions.parameter_values, readable by any principal
+    // holding the broadly-granted Execution:Read permission within the
+    // grant's TTL. See sensitive_instruction_params.hpp.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-UPLOAD", "Upload File");
+    h.dispatch_cmd_override = "cmd-upload-abc";
+    h.dispatch_sent_override = 1;
+
+    auto res = h.sink.Post(
+        "/api/instructions/def-UPLOAD/execute",
+        R"({"params":{"grant_id":"deadbeef","grant_secret":"topsecret","path":"/tmp/x"},)"
+        R"("agent_ids":["agent-1"]})");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+
+    // The LIVE dispatch still got the raw secret — otherwise the upload
+    // could never actually authenticate against the server.
+    REQUIRE(h.dispatch_calls == 1);
+    CHECK(h.last_dispatch_params.at("grant_secret") == "topsecret");
+    CHECK(h.last_dispatch_params.at("grant_id") == "deadbeef");
+
+    // The PERSISTED row must not carry either sensitive key.
+    auto body = nlohmann::json::parse(res->body);
+    auto exec = h.tracker->get_execution(body["execution_id"].get<std::string>());
+    REQUIRE(exec.has_value());
+    auto stored = nlohmann::json::parse(exec->parameter_values);
+    CHECK_FALSE(stored.contains("grant_secret"));
+    CHECK_FALSE(stored.contains("grant_id"));
+    // Ordinary, non-sensitive parameters survive untouched.
+    REQUIRE(stored.contains("path"));
+    CHECK(stored["path"] == "/tmp/x");
 }
 
 TEST_CASE("PR2 hardening — query_by_execution includes the partial-index "
@@ -1993,4 +2050,140 @@ TEST_CASE("CDX-FV-03 — workflow execute FAILS CLOSED when the exec-visible der
     CHECK(h.dispatch_calls == 1);
     REQUIRE(h.last_dispatch_exec_visible.has_value()); // PRESENT (deny), not nullopt
     CHECK(h.last_dispatch_exec_visible->empty());      // EMPTY → production sink reaches no one
+}
+
+// ── /fragments/schedules confinement (guardian-confinement-2298) ──────────
+//
+// Previously reachable by ANY authenticated session with no RBAC check at
+// all, and — even with a Schedule:Read gate — ITServiceOwner grants full
+// CRUD on Schedule with no owner/service filter anywhere in the query, so a
+// service-scoped token could enumerate every schedule from every other
+// service. schedule_engine stays nullptr in ExecHarness (never wired) —
+// the deny fires before the null-check, so these tests need no real store.
+
+TEST_CASE("/fragments/schedules: an ordinary session is now gated on Schedule:Read",
+          "[pg][workflow][schedules][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.perm_grant = false; // simulates a session lacking Schedule:Read
+
+    auto res = h.sink.Get("/fragments/schedules");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+TEST_CASE("/fragments/schedules: a service-scoped token is denied even holding Schedule:Read",
+          "[pg][workflow][schedules][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.perm_grant = true; // the stub perm_fn would otherwise let this through
+    h.mock_token_scope_service = "printers";
+
+    auto res = h.sink.Get("/fragments/schedules");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("service-scoped") != std::string::npos);
+
+    bool saw_denied = false;
+    for (const auto& c : h.audit_calls) {
+        if (c.action == "schedule.list.access_denied" && c.result == "denied")
+            saw_denied = true;
+    }
+    CHECK(saw_denied);
+}
+
+TEST_CASE("/fragments/schedules: an ordinary session with Schedule:Read reaches the list",
+          "[pg][workflow][schedules][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.perm_grant = true;
+
+    auto res = h.sink.Get("/fragments/schedules");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // schedule_engine is nullptr in this harness — the "Not available" branch,
+    // not a denial. Confirms the deny/gate above didn't also block the
+    // legitimate path.
+    CHECK(res->body.find("Not available") != std::string::npos);
+}
+
+// guardian-confinement-2298 PR3 §3e: POST /api/scope/estimate is auth_fn-only
+// (no perm_fn at all) and probes scope_fn(expression, session->username) —
+// the caller's own visible fleet, which for a service-scoped token is still
+// the minter's full-CRUD-visible set. Same test shape as the schedule-list
+// pair above.
+
+TEST_CASE("POST /api/scope/estimate: a service-scoped token is denied",
+          "[pg][workflow][scope][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.mock_token_scope_service = "printers";
+
+    auto res = h.sink.Post("/api/scope/estimate", R"({"expression":"ostype == \"Windows\""})",
+                           "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("service-scoped") != std::string::npos);
+    // Header/body correlation-id parity (consistency-auditor, Gate 4): a
+    // hand-built id used to land in the body only, never the header.
+    auto j = nlohmann::json::parse(res->body);
+    CHECK_FALSE(j["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(res->get_header_value("X-Correlation-Id") ==
+          j["error"]["correlation_id"].get<std::string>());
+
+    bool saw_denied = false;
+    for (const auto& c : h.audit_calls) {
+        if (c.action == "scope.estimate.access_denied" && c.result == "denied") {
+            saw_denied = true;
+            // PascalCase convention (consistency-auditor, Gate 4): was
+            // "scope_expression".
+            CHECK(c.target_type == "ScopeExpression");
+        }
+    }
+    CHECK(saw_denied);
+}
+
+TEST_CASE("POST /api/scope/estimate: an ordinary session reaches the estimator",
+          "[pg][workflow][scope][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+
+    auto res = h.sink.Post("/api/scope/estimate", R"({"expression":"ostype == \"Windows\""})",
+                           "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body.contains("matched"));
+    CHECK(body.contains("total"));
+
+    for (const auto& c : h.audit_calls) {
+        CHECK(c.action != "scope.estimate.access_denied");
+    }
+}
+
+// #3503 review finding: WorkflowEngine::create_workflow()'s wrong-kind path
+// routes through the shared kind_mismatch_error() helper (workflow_engine.cpp
+// :300), but until now was only pinned at the helper's own raw two-argument
+// level (test_store_errors.cpp) -- never exercised through the real
+// create_workflow() call site the way PolicyStore's equivalent path is
+// (test_policy_store.cpp's "create fragment with wrong kind"). A future edit
+// that stops WorkflowEngine routing through the shared helper would go
+// undetected without this. No PG/ExecHarness needed -- WorkflowEngine's
+// whole ctor is sqlite3_open_v2 + CREATE TABLE (CDX-FV-03).
+TEST_CASE("WorkflowEngine::create_workflow rejects a wrong kind via the shared "
+         "kind-mismatch helper", "[workflow][workflow_engine]") {
+    WorkflowEngine engine(uniq("wf-engine-kind-mismatch"));
+    REQUIRE(engine.is_open());
+
+    auto result = engine.create_workflow("kind: Policy\nmetadata:\n  displayName: oops\n");
+    REQUIRE(!result.has_value());
+    CHECK(result.error() ==
+          "kind must be 'Workflow', got 'Policy'. yaml_source must be a "
+          "complete YAML document including 'apiVersion: yuzu.io/v1alpha1' "
+          "and 'kind: Workflow'.");
 }

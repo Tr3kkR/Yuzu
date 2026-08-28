@@ -59,7 +59,11 @@ jobs:
       # input on `actions/cache`. The cache maintainers documented it as
       # "does not work as intended" and recommend a split
       # `actions/cache/restore` + `actions/cache/save` (gated on
-      # `if: always() && cache-hit != 'true'`) instead. This step fails
+      # `if: always() && cache-hit != 'true'`) instead. That gate is right
+      # for an ADDITIVE cache (ccache); a coherent-artifact tree such as
+      # `vcpkg_installed` must ALSO gate on the producing step's outcome,
+      # or a cancelled run saves a partial tree under an immutable key —
+      # see `.claude/skills/ci-cache/SKILL.md`. This step fails
       # the workflow if `save-always` reappears in any workflow YAML so
       # the non-use becomes structural rather than convention.
       # Reference: https://github.com/actions/cache/tree/main/save#always-save-cache
@@ -115,7 +119,7 @@ jobs:
           echo "close-linked-issues control-plane check: clean"
 
       - name: Run zizmor
-        uses: zizmorcore/zizmor-action@6fc4b006235f201fdab3722e17240ab420d580e5 # v0.6.1
+        uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 # v0.6.2
         with:
           # Audit everything under .github/workflows/ and reusable
           # composite actions. The action uploads SARIF itself.

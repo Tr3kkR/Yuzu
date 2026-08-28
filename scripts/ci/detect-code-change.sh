@@ -57,6 +57,7 @@ usage() {
 usage:
   detect-code-change.sh [--class code] [TOTAL] < changed-paths
   detect-code-change.sh --class ci-infrastructure --git-diff BASE [HEAD]
+  detect-code-change.sh --class ci-infrastructure --git-diff-merge-base BASE HEAD
 EOF
   exit 2
 }
@@ -78,10 +79,39 @@ case "$path_class" in
     mapfile -t files || true
     ;;
   ci-infrastructure)
-    [[ "${1:-}" == "--git-diff" ]] || usage
+    # Two diff modes, deliberately distinct spellings rather than one flag with
+    # a switch, so the caller's choice is visible at the call site and testable.
+    #
+    #   --git-diff             two-dot `A B`. Correct for a PUSH, where the
+    #                          question is "what did this push move" and BASE is
+    #                          `github.event.before`.
+    #   --git-diff-merge-base  three-dot. Correct for a PULL REQUEST, where BASE
+    #                          is a live branch tip that may have advanced past
+    #                          the fork point; two-dot there reports the base
+    #                          branch's own commits as if the PR contained them.
+    #
+    # CRITICAL for callers: pass the PR **head** as HEAD, never the checked-out
+    # `refs/pull/N/merge` commit. `base.sha` is always an ancestor of that merge
+    # commit, so `merge-base(base.sha, merge_commit) == base.sha` and three-dot
+    # silently collapses back to two-dot — a byte-identical no-op that leaves
+    # this whole mode inert while every test still passes.
+    case "${1:-}" in
+      --git-diff)            diff_mode=two-dot ;;
+      --git-diff-merge-base) diff_mode=merge-base ;;
+      *)                     usage ;;
+    esac
     (( $# >= 2 && $# <= 3 )) || usage
+    # merge-base mode must be given an explicit HEAD. Falling through to the
+    # `${3:-HEAD}` default below would hand it the checked-out ref, which for a
+    # PR is the merge commit — the very object the comment above forbids.
+    # `${3:-HEAD}` below substitutes on EMPTY as well as unset, so an explicitly
+    # empty head would pass an arity check and silently become HEAD — the merge
+    # commit, i.e. the no-op this mode exists to prevent. Reject both.
+    if [[ "$diff_mode" == "merge-base" ]] && { (( $# != 3 )) || [[ -z "$3" ]]; }; then usage; fi
     diff_base="$2"
-    diff_head="${3:-HEAD}"
+    diff_head="${3-HEAD}"
+    diff_range_args=()
+    [[ "$diff_mode" == "merge-base" ]] && diff_range_args+=(--merge-base)
     # Keep diff acquisition inside this module. In particular, do not pipe
     # `git diff` into a matcher: without explicit pipefail handling, git's
     # error becomes the matcher's ordinary "no paths matched" result (the old
@@ -90,9 +120,13 @@ case "$path_class" in
     # Disable rename folding too. A rename out of an owned path must expose
     # both its source and destination; the default rename display can report
     # only the non-CI destination and incorrectly classify the change as safe.
+    # git exits non-zero — into the same fail-closed branch as any other diff
+    # failure — when there is NO merge base (unrelated histories) and also when
+    # there are SEVERAL (criss-cross history). Two-dot has neither case.
     if ! diff_output=$(git --no-pager -c core.quotePath=false diff \
-          --no-ext-diff --no-renames --name-only "$diff_base" "$diff_head" --); then
-      echo "detect-code-change: unable to establish git diff '$diff_base'..'$diff_head' -> matched (fail-closed)" >&2
+          --no-ext-diff --no-renames --name-only \
+          "${diff_range_args[@]}" "$diff_base" "$diff_head" --); then
+      echo "detect-code-change: unable to establish git diff ($diff_mode) '$diff_base'..'$diff_head' -> matched (fail-closed)" >&2
       emit true
     fi
     diff_established=true

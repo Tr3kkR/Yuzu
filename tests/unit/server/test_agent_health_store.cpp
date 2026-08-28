@@ -879,6 +879,136 @@ TEST_CASE("REAL AgentHealthStore: a garbage spark_disabled value pages on neithe
     CHECK(out.find("yuzu_fleet_spark_disabled{os=\"windows\"}") == std::string::npos);
 }
 
+// F7 (#2298 rung 2): the yuzu_fleet_spark_unsupported gauge, driven through the REAL
+// shipped AgentHealthStore (not the TestAgentHealthStore reproduction above), so this
+// case would fail if the 4th-token parse/accumulate/publish were deleted from
+// agent_registry.cpp - the exact coverage gap this file's header warns a mirror-based
+// case cannot catch.
+TEST_CASE("REAL AgentHealthStore: yuzu_fleet_spark_unsupported sums across agents and "
+          "goes absent after staleness",
+          "[spark][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    auto beat = [&](const std::string& id,
+                    const std::vector<std::pair<std::string, std::string>>& kv) {
+        google::protobuf::Map<std::string, std::string> tags;
+        tags["yuzu.os"] = "linux";
+        tags["yuzu.spark_running"] = "1";
+        tags["yuzu.spark_mechs"] = "file,registry";
+        for (const auto& [k, v] : kv)
+            tags[k] = v;
+        store.upsert(id, tags);
+    };
+
+    // Two agents, both reporting File as unsupported - the fleet gauge is their SUM,
+    // not either one alone.
+    beat("a1", {{"yuzu.spark_file_unsupported", "1"}});
+    beat("a2", {{"yuzu.spark_file_unsupported", "2"}, {"yuzu.spark_registry_unsupported", "5"}});
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    std::string out = metrics.serialize();
+
+    auto val = [&](const std::string& series) -> double {
+        const auto pos = out.find(series);
+        REQUIRE(pos != std::string::npos);
+        return std::stod(out.substr(pos + series.size()));
+    };
+    CHECK(val("yuzu_fleet_spark_unsupported{os=\"linux\",mechanism=\"file\"} ") == 3.0);
+    CHECK(val("yuzu_fleet_spark_unsupported{os=\"linux\",mechanism=\"registry\"} ") == 5.0);
+    // A mechanism nobody reported must not be seeded at 0 (absent-not-zero, same
+    // convention as every other spark gauge in this file).
+    CHECK(out.find("yuzu_fleet_spark_unsupported{os=\"linux\",mechanism=\"service\"}") ==
+          std::string::npos);
+
+    // CURRENT gauge, not cumulative: a2 dropping to 0 must bring the fleet sum down to
+    // exactly a1's contribution, never stay latched at the old total. Governance
+    // finding (consistency-auditor C2, F7/#2298): production's sparse-emit contract
+    // OMITS the key at zero-count (guardian_unsupported_heartbeat.hpp), it never
+    // sends an explicit "0" - so this drives the shrink the same way, via an empty
+    // kv (upsert() REPLACES the whole per-agent tag snapshot, never merges), rather
+    // than an explicit "0" tag production never actually emits. This also drops a2's
+    // registry=5 report, not just file - a2 was registry's ONLY reporter.
+    beat("a2", {});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    out = metrics.serialize();
+    CHECK(val("yuzu_fleet_spark_unsupported{os=\"linux\",mechanism=\"file\"} ") == 1.0);
+    // Registry now has no reporter at all - fully ABSENT, not a present 0 (the
+    // series line does not exist; find() must fail). Contrast with the explicit-"0"
+    // case immediately below.
+    CHECK(out.find("yuzu_fleet_spark_unsupported{os=\"linux\",mechanism=\"registry\"}") ==
+          std::string::npos);
+
+    // A THIRD agent, sent an explicit "0" for registry, keeps this integration path
+    // exercising parse_spark_count's explicit-zero branch too (governance finding,
+    // F7/#2298 Gate 8: fixing the shrink above to use omission silently dropped this
+    // file's only integration-level coverage of that branch - the raw parser's
+    // unit-level "0" case is separately covered in test_spark_fleet_tags.cpp, but a
+    // real explicit "0" arriving through the real AgentHealthStore was untested
+    // anywhere after that fix). This also proves explicit-zero and omission are NOT
+    // the same wire shape even though they parse to the same value: an explicit "0"
+    // creates a PRESENT series reading 0 (parse_spark_count succeeds and the map
+    // entry is created), where the full omission just above left the series fully
+    // ABSENT - the exact absent-not-zero distinction this file's other rollups
+    // already rely on.
+    beat("a3", {{"yuzu.spark_registry_unsupported", "0"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    out = metrics.serialize();
+    CHECK(val("yuzu_fleet_spark_unsupported{os=\"linux\",mechanism=\"file\"} ") == 1.0);
+    CHECK(val("yuzu_fleet_spark_unsupported{os=\"linux\",mechanism=\"registry\"} ") == 0.0);
+
+    // Staleness: an agent that stops reporting entirely (aged past the window) must
+    // vanish from the fleet sum, same absent-not-zero contract the other rollups here
+    // already have tests for. A short sleep first (matching this file's other
+    // staleness case) makes the strict "(now - last_seen) > staleness" comparison
+    // unambiguous rather than relying on sub-millisecond clock resolution alone.
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    store.recompute_metrics(metrics, std::chrono::seconds{0}); // everything now "stale"
+    out = metrics.serialize();
+    CHECK(out.find("yuzu_fleet_spark_unsupported{os=\"linux\",mechanism=\"file\"}") ==
+          std::string::npos);
+}
+
+// Governance finding (consistency-auditor C1 / architect, F7 #2298): the reader loop
+// in agent_registry.cpp used to index kSparkMetricTokens by bare literal (0/1/2/3),
+// bound to its declared order only by a comment. A future reorder would still
+// compile (the writer composes keys by NAME) but silently misattribute one health
+// signal's fleet sum into another gauge family - e.g. quarantined counts reported
+// under watch_rejected, corrupting the family backing the CRITICAL
+// YuzuSparkMechanismQuarantined alert. Fixed with named indices + static_asserts in
+// spark_fleet_tags.hpp; this test is the regression proof - all four metrics set to
+// DISTINCT non-zero values on one mechanism, each asserted to land in its own gauge,
+// none of the others.
+TEST_CASE("REAL AgentHealthStore: the four per-mechanism spark metrics never "
+          "cross-attribute",
+          "[spark][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> tags;
+    tags["yuzu.os"] = "linux";
+    tags["yuzu.spark_running"] = "1";
+    tags["yuzu.spark_mechs"] = "service";
+    tags["yuzu.spark_service_watch_rejected"] = "11";
+    tags["yuzu.spark_service_quarantined"] = "22";
+    tags["yuzu.spark_service_slow_op"] = "33";
+    tags["yuzu.spark_service_unsupported"] = "44";
+    store.upsert("a1", tags);
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const std::string out = metrics.serialize();
+
+    auto val = [&](const std::string& series) -> double {
+        const auto pos = out.find(series);
+        REQUIRE(pos != std::string::npos);
+        return std::stod(out.substr(pos + series.size()));
+    };
+    CHECK(val("yuzu_fleet_spark_watch_rejected{os=\"linux\",mechanism=\"service\"} ") == 11.0);
+    CHECK(val("yuzu_fleet_spark_quarantined{os=\"linux\",mechanism=\"service\"} ") == 22.0);
+    CHECK(val("yuzu_fleet_spark_slow_op{os=\"linux\",mechanism=\"service\"} ") == 33.0);
+    CHECK(val("yuzu_fleet_spark_unsupported{os=\"linux\",mechanism=\"service\"} ") == 44.0);
+}
+
 // ── Guardian durable lifecycle-journal fleet rollup (#2298 gate 3) ────────────
 //
 // Driven through the REAL AgentHealthStore, never the reproduction at the top of this
@@ -1282,4 +1412,202 @@ TEST_CASE("REAL AgentHealthStore: one agent mixing parseable and rejected journa
     // One agent, and it DID report something parseable, so it counts once toward
     // coverage even though three of its five journal tags were refused.
     CHECK(unlabelled_series(out, "yuzu_fleet_guardian_journal_reporting") == 1.0);
+}
+
+// ── Guardian M1 health-stream rollup (#2298 gate 3, item 6d) ──────────────────────
+// Same coverage set as the journal family above, scoped to the 3-counter table.
+
+TEST_CASE("REAL AgentHealthStore: guardian health tags sum into unlabelled fleet gauges",
+          "[guardian][health][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    auto beat = [&](const std::string& id,
+                    const std::vector<std::pair<std::string, std::string>>& kv) {
+        google::protobuf::Map<std::string, std::string> tags;
+        tags["yuzu.os"] = "windows";
+        for (const auto& [k, v] : kv)
+            tags[k] = v;
+        store.upsert(id, tags);
+    };
+
+    beat("h1", {{"yuzu.guardian_unhealthy_suppressed", "1"},
+                {"yuzu.guardian_unhealthy_refreshed", "3"}});
+    beat("h2", {{"yuzu.guardian_unhealthy_suppressed", "4"},
+                {"yuzu.guardian_priority_demoted", "2"}});
+    // A quiescent or inert (prefer_spark off) agent: the writer is sparse, ships no
+    // health tag, contributes nothing - not a fabricated 0.
+    beat("quiet", {});
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const std::string out = metrics.serialize();
+
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_unhealthy_suppressed") == 5.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_unhealthy_refreshed") == 3.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_priority_demoted") == 2.0);
+
+    // No agent-controlled label anywhere in this family (flat by design).
+    CHECK(out.find("yuzu_fleet_guardian_unhealthy_suppressed{") == std::string::npos);
+}
+
+TEST_CASE("REAL AgentHealthStore: guardian health gauges go absent (not zero) when nobody "
+          "reports",
+          "[guardian][health][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> reporting;
+    reporting["yuzu.os"] = "linux";
+    reporting["yuzu.guardian_unhealthy_suppressed"] = "7";
+    store.upsert("h1", reporting);
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    REQUIRE(unlabelled_series(metrics.serialize(), "yuzu_fleet_guardian_unhealthy_suppressed") ==
+            7.0);
+
+    // The rule recovers (or prefer_spark turned off), so the sparse writer stops
+    // emitting the tag. A stale 7 and a fabricated 0 are BOTH lies - the family must
+    // clear.
+    google::protobuf::Map<std::string, std::string> quiet;
+    quiet["yuzu.os"] = "linux";
+    store.upsert("h1", quiet);
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+
+    const std::string out = metrics.serialize();
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_unhealthy_suppressed"));
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_unhealthy_refreshed"));
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_priority_demoted"));
+}
+
+TEST_CASE("REAL AgentHealthStore: a rogue agent cannot poison a guardian health fleet gauge",
+          "[guardian][health][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    auto beat = [&](const std::string& id, const std::string& value) {
+        google::protobuf::Map<std::string, std::string> tags;
+        tags["yuzu.os"] = "linux";
+        tags["yuzu.guardian_unhealthy_suppressed"] = value;
+        store.upsert(id, tags);
+    };
+
+    beat("honest", "5");
+    beat("inf", "inf");
+    beat("nan", "nan");
+    beat("neg", "-1");
+    beat("frac", "1.5");
+    beat("junk", "garbage");
+    beat("huge", "18446744073709551615"); // UINT64_MAX
+    beat("over", "1000000001");           // one past the implausibility ceiling
+    beat("long", std::string(4096, '9'));
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const std::string out = metrics.serialize();
+
+    const double sum = unlabelled_series(out, "yuzu_fleet_guardian_unhealthy_suppressed");
+    CHECK(sum == 5.0); // only the honest agent contributed
+    CHECK(std::isfinite(sum));
+}
+
+TEST_CASE("REAL AgentHealthStore: guardian health meta-signals publish even at zero",
+          "[guardian][health][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> quiet;
+    quiet["yuzu.os"] = "linux";
+    store.upsert("no-health-tags", quiet);
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+
+    const std::string out = metrics.serialize();
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_reporting") == 0.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_tag_rejected") == 0.0);
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_unhealthy_suppressed"));
+}
+
+TEST_CASE("REAL AgentHealthStore: guardian health reporting counts agents, not tags",
+          "[guardian][health][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    auto beat = [&](const std::string& id,
+                    const std::vector<std::pair<std::string, std::string>>& kv) {
+        google::protobuf::Map<std::string, std::string> tags;
+        tags["yuzu.os"] = "linux";
+        for (const auto& [k, v] : kv)
+            tags[k] = v;
+        store.upsert(id, tags);
+    };
+
+    // Two reporters (one with all three tags, one with one) and two non-reporters.
+    beat("h1", {{"yuzu.guardian_unhealthy_suppressed", "10"},
+                {"yuzu.guardian_unhealthy_refreshed", "3"},
+                {"yuzu.guardian_priority_demoted", "1"}});
+    beat("h2", {{"yuzu.guardian_unhealthy_suppressed", "5"}});
+    beat("quiet-1", {});
+    beat("quiet-2", {});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+
+    const std::string out = metrics.serialize();
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_reporting") == 2.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_unhealthy_suppressed") == 15.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: a rejected health tag is counted, not silently dropped",
+          "[guardian][health][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> rogue;
+    rogue["yuzu.os"] = "linux";
+    rogue["yuzu.guardian_unhealthy_suppressed"] = "1000000001"; // past the ceiling
+    rogue["yuzu.guardian_priority_demoted"] = "garbage";
+    store.upsert("rogue", rogue);
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+
+    const std::string out = metrics.serialize();
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_tag_rejected") == 2.0);
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_unhealthy_suppressed"));
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_priority_demoted"));
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_reporting") == 0.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: an explicit health zero publishes as zero",
+          "[guardian][health][rollup][real]") {
+    // The real writer is sparse and never emits "0", but a non-conforming build can -
+    // an explicit "0" IS a report of zero, so it publishes as 0 rather than being
+    // suppressed into absence.
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> tags;
+    tags["yuzu.os"] = "linux";
+    tags["yuzu.guardian_unhealthy_suppressed"] = "0";
+    store.upsert("nonconforming", tags);
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+
+    const std::string out = metrics.serialize();
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_unhealthy_suppressed") == 0.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_reporting") == 1.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_tag_rejected") == 0.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: a stale agent's health counters leave the fleet sum",
+          "[guardian][health][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> tags;
+    tags["yuzu.os"] = "linux";
+    tags["yuzu.guardian_priority_demoted"] = "9";
+    store.upsert("doomed", tags);
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    REQUIRE(unlabelled_series(metrics.serialize(), "yuzu_fleet_guardian_priority_demoted") ==
+            9.0);
+
+    // Zero window: every snapshot is stale, so the agent is pruned before accumulation.
+    store.recompute_metrics(metrics, std::chrono::seconds{0});
+    const std::string out = metrics.serialize();
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_priority_demoted"));
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_reporting") == 0.0);
 }

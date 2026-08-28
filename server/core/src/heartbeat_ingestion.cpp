@@ -73,6 +73,31 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
         }
     }
 
+    // #3425: quarantine reconnect reconciler. Unconditional — reconnect
+    // itself is the signal, no tag to gate on (unlike the guardian hook
+    // above). Defensive: never let a reconcile hook take down the rest of
+    // ingestion.
+    //
+    // Held for the ENTIRE call, not just the fn copy (governance Gate 3,
+    // cpp-safety, 2026-08-24) — the shared lock IS the liveness proof
+    // `set_quarantine_reconcile_fn(nullptr)`'s exclusive lock waits on; a
+    // copy-then-call-outside-the-lock idiom would let set(nullptr) return
+    // while a copied fn is still running, which reopens the same
+    // use-after-free window this lock exists to close. Concurrent ingest()
+    // calls from other heartbeats are unaffected (shared/shared never
+    // blocks).
+    {
+        std::shared_lock lock(quarantine_reconcile_mu_);
+        if (quarantine_reconcile_fn_) {
+            try {
+                quarantine_reconcile_fn_(agent_id_str);
+            } catch (const std::exception& e) {
+                spdlog::warn("[{}] Heartbeat quarantine reconcile threw for agent={}: {}", via_str,
+                            agent_id_str, e.what());
+            }
+        }
+    }
+
     // PR 10 / UAT 2026-05-12 — fleet_snapshot.v1 ingestion. Parse failures
     // are non-fatal: a malformed payload from a buggy agent must not knock
     // the heartbeat path offline for the rest of the fleet.

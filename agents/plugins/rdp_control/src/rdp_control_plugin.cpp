@@ -43,6 +43,8 @@
 
 #include <netfw.h>
 #include <oleauto.h> // SysAllocString / SysFreeString
+
+#include <win_com.hpp> // shared yuzu::shared::win ComInit / ComPtr<T> / BStr
 #endif
 
 namespace {
@@ -75,26 +77,9 @@ bool is_valid_rdp_state(std::string_view state) {
     return state == "enable" || state == "disable";
 }
 
-class ComInit {
-public:
-    ComInit() { hr_ = CoInitializeEx(nullptr, COINIT_MULTITHREADED); }
-    ~ComInit() {
-        if (SUCCEEDED(hr_)) CoUninitialize();
-    }
-    // Non-copyable: a copy would duplicate hr_ and both destructors would call
-    // CoUninitialize (unbalanced). Parity with ScHandle below.
-    ComInit(const ComInit&) = delete;
-    ComInit& operator=(const ComInit&) = delete;
-    // RPC_E_CHANGED_MODE means COM was already initialised on this thread in a
-    // different apartment (e.g. an STA from a prior plugin on the pool thread).
-    // That is usable — in-proc COM works regardless of apartment — so treat it as
-    // ok. The dtor still only CoUninitialize()s when WE initialised (SUCCEEDED),
-    // which excludes RPC_E_CHANGED_MODE, so the ref count stays balanced.
-    bool ok() const { return SUCCEEDED(hr_) || hr_ == RPC_E_CHANGED_MODE; }
-
-private:
-    HRESULT hr_;
-};
+using yuzu::shared::win::BStr;
+using yuzu::shared::win::ComInit;
+using yuzu::shared::win::ComPtr;
 
 /// RAII owner for SC_HANDLE (service control manager / service handles).
 class ScHandle {
@@ -128,41 +113,6 @@ public:
 
 private:
     HKEY h_ = nullptr;
-};
-
-/// RAII owner for a COM interface pointer (Release on scope exit). `put()`
-/// yields the out-param for CoCreateInstance.
-template <class T>
-class ComPtr {
-public:
-    ComPtr() = default;
-    ~ComPtr() {
-        if (p_) p_->Release();
-    }
-    ComPtr(const ComPtr&) = delete;
-    ComPtr& operator=(const ComPtr&) = delete;
-    T** put() { return &p_; }
-    T* operator->() const { return p_; }
-    explicit operator bool() const { return p_ != nullptr; }
-
-private:
-    T* p_ = nullptr;
-};
-
-/// RAII owner for a BSTR (SysFreeString on scope exit).
-class BStr {
-public:
-    explicit BStr(const wchar_t* s) : b_(SysAllocString(s)) {}
-    ~BStr() {
-        if (b_) SysFreeString(b_);
-    }
-    BStr(const BStr&) = delete;
-    BStr& operator=(const BStr&) = delete;
-    BSTR get() const { return b_; }
-    explicit operator bool() const { return b_ != nullptr; }
-
-private:
-    BSTR b_;
 };
 
 /// Write fDenyTSConnections. Returns ERROR_SUCCESS or the Win32 error.
@@ -310,6 +260,32 @@ const char* derive_rdp_verdict(bool deny_known, bool deny_allows, bool fw_known,
 }
 #endif
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// Windows-only, entirely native: the registry (RegSetValueExW/
+// RegGetValueW), the Windows Firewall via INetFwPolicy2 COM, and the
+// Service Control Manager (StartServiceW/QueryServiceStatusEx) — zero
+// subprocesses (rung 1). Linux/macOS have no implementation at all: both
+// actions on both platforms return the honest "rdp_control|unsupported|..."
+// sentinel without attempting anything (there is no macOS/Linux equivalent
+// surface this plugin targets — see the file header comment).
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "set_state",
+        /* .linux_leg   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "Win32 registry + INetFwPolicy2 COM + SCM", nullptr},
+    },
+    {
+        /* .action      = */ "status",
+        /* .linux_leg   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "Win32 registry + INetFwPolicy2 COM + SCM", nullptr},
+    },
+};
+
 } // namespace
 
 class RdpControlPlugin final : public yuzu::Plugin {
@@ -323,6 +299,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"set_state", "status", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext&) override { return {}; }

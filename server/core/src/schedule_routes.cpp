@@ -17,6 +17,14 @@ void handle_create_schedule(AuthRoutes& auth_routes, ScheduleEngine* schedule_en
     // Execution:Execute; schedule creation must too.
     if (!auth_routes.require_permission(req, res, "Execution", "Execute"))
         return;
+    // The interim deny_service_scoped_schedule() call that used to sit here
+    // was retired (#3290 Phase 2, bucket 1a): guardian-confinement-2298 PR 3
+    // ("the flip") made it provably dead — require_permission's own
+    // service-scoped branch above already denies any service-scoped token
+    // outright for (Schedule, Write) (kServiceScopeGlobalSafe is
+    // compile-time-empty), so a service-scoped session can never reach this
+    // point at all. See docs/security-reviews/service-scope-phase2-migrations-2026-08.md's
+    // "Bucket 1a" section.
     if (!schedule_engine) {
         res.status = 503;
         res.set_content(
@@ -75,6 +83,20 @@ void handle_create_schedule(AuthRoutes& auth_routes, ScheduleEngine* schedule_en
         res.status = 400;
         res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
     }
+}
+
+bool parse_schedule_enabled(const std::string& body) {
+    try {
+        auto j = nlohmann::json::parse(body);
+        if (j.contains("enabled")) {
+            if (j["enabled"].is_boolean())
+                return j["enabled"].get<bool>();
+            if (j["enabled"].is_string())
+                return j["enabled"].get<std::string>() != "false";
+        }
+    } catch (...) {
+    }
+    return true; // missing key / malformed body — pre-existing default
 }
 
 } // namespace yuzu::server

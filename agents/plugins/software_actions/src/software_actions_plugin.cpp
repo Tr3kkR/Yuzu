@@ -292,6 +292,22 @@ int do_installed_count(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// Both actions shell out via popen/_popen (never the governed runner) on
+// every OS -- winget on Windows, apt/yum on Linux, softwareupdate/pkgutil on
+// macOS -- rung 3 throughout.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {"list_upgradable",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "apt+yum", nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 3, "softwareupdate", nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 3, "winget", nullptr}},
+    {"installed_count",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "dpkg+rpm", nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 3, "pkgutil", nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 3, "powershell_registry_count", nullptr}},
+};
+
 } // namespace
 
 class SoftwareActionsPlugin final : public yuzu::Plugin {
@@ -305,6 +321,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"list_upgradable", "installed_count", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

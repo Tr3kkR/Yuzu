@@ -13,6 +13,7 @@
 #include <string_view>
 
 #include "authz_topology_floor.hpp"
+#include "body_cap_policy.hpp" // resolve_body_cap — path_class label for the service-scope deny metric (#2298 PR 3)
 #include "deprovision_deny_split.hpp" // record_deprovision_deny_split — ADR-2001 #3069 shared split
 #include "engine_principal_store.hpp"
 #include "http_route_sink.hpp"
@@ -25,6 +26,7 @@
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial — the unified A4 denial wrapper (#1470)
 #include "saml_principal.hpp"  // saml_principal_id / is_valid_saml_component — ADR-2001 PR4a
 #include "saml_scim_link.hpp"  // link_saml_login_to_scim — ADR-2001 PR4a login-site orchestration
+#include "service_scope_policy.hpp" // authz::service_scope_global_safe — #2298 PR 3 default-deny table
 
 #include <ctime>
 
@@ -41,6 +43,27 @@ namespace {
 // operator-supplied reason is sanitised (control bytes → space) and truncated to
 // this before it reaches the audit detail.
 constexpr std::size_t kMaxJustificationLength = 1024;
+
+// Reason label for yuzu_auth_read_degrade_total (#2396 / #2401). Distinguishes
+// a transient pool-acquire outage (StoreBusy — the shared pool's
+// connect-backoff breaker fast-failing, or pool saturation; the class the
+// bounded acquire-retry rides out) from a query that RAN and errored
+// (QueryFailed / WriteFailed) and from an undecryptable/absent secret
+// (SecretUnavailable) — so SRE can tell a transient retry-storm apart from a
+// uniform outage instead of reading one flat counter. Closed label set,
+// pre-seeded in server.cpp. Any error that is not is_store_unavailable() must
+// never reach a 503 degrade site, so the default ("query_error") is a
+// belt-and-braces fallback, not an expected path.
+[[nodiscard]] const char* degrade_reason(AuthDBError e) noexcept {
+    switch (e) {
+    case AuthDBError::StoreBusy:
+        return "pool_acquire_timeout"; // matches the yuzu_*_read_degrade_total family
+    case AuthDBError::SecretUnavailable:
+        return "secret_unavailable";
+    default:
+        return "query_error";
+    }
+}
 
 // Max stored length of a single sanitised detail value (e.g. an OIDC
 // display name or email). These are short identity labels, not free-text
@@ -253,7 +276,10 @@ std::optional<auth::Session> AuthRoutes::synthesize_token_session(const ApiToken
     }
 
     if (api_token.principal_kind == "human") {
-        // ---- human branch — byte-identical to pre-#2021 behavior ----------
+        // ---- human branch ---------------------------------------------
+        // No longer byte-identical to pre-#2021 behavior: a service-scoped
+        // token's role is now floored below, rather than always resolved
+        // from the creator's live role (see the scope_service branch).
         auth::Session synth;
         synth.username = api_token.principal_id;
         // #1837: no separate display label is stored for a token; fall back to
@@ -267,11 +293,39 @@ std::optional<auth::Session> AuthRoutes::synthesize_token_session(const ApiToken
         synth.mcp_tier = api_token.mcp_tier;
         synth.principal_kind = "human";
 
-        // Resolve the creator's actual legacy role fresh (not unconditional admin).
-        // get_user_role() queries the current role on every call, so a creator who's
-        // been demoted since the token was issued will produce a user-role session.
-        auto legacy_role = auth_mgr_.get_user_role(api_token.principal_id);
-        synth.role = legacy_role.value_or(auth::Role::user);
+        if (!api_token.scope_service.empty()) {
+            // A service-scoped token is capped at the user floor regardless of
+            // the minter's live role — ITServiceOwner (an RBAC grant, resolved
+            // elsewhere) is the sole authority ceiling for such a token, never
+            // the minter's legacy role. require_admin() already denies every
+            // service-scoped token outright on token_scope_service alone
+            // (below, pre-dating this cap) — the exposure this closes is the
+            // OTHER consumers of role/effective_role() that have no such
+            // independent guard: a service-scoped token minted by a
+            // currently-admin user inherited `role == admin` and satisfied
+            // the workflow/instruction step-approval gates' inline
+            // `effective_role(*session) == admin` check (workflow_routes.cpp,
+            // meant to require a human decision) and MCP bundle-ownership's
+            // raw `session->role == admin` check (mcp_server.cpp).
+            synth.role = auth::Role::user;
+            // Fires on every service-scoped session, not just when the cap
+            // changed the outcome — proving "changed the outcome" needs the
+            // creator's live role, i.e. the very get_user_role() lookup this
+            // branch deliberately skips (see the else branch's comment).
+            // This is a debuggability signal ("the cap is active for this
+            // token"), not an anomaly counter — there is no expected-vs-
+            // unexpected split to alert on here.
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_service_token_role_capped_total").increment();
+            }
+        } else {
+            // Resolve the creator's actual legacy role fresh (not unconditional
+            // admin). get_user_role() queries the current role on every call, so
+            // a creator who's been demoted since the token was issued will
+            // produce a user-role session.
+            auto legacy_role = auth_mgr_.get_user_role(api_token.principal_id);
+            synth.role = legacy_role.value_or(auth::Role::user);
+        }
 
         return synth;
     }
@@ -568,6 +622,18 @@ bool AuthRoutes::require_admin(const httplib::Request& req, httplib::Response& r
     return true;
 }
 
+bool AuthRoutes::service_scope_admits(std::string_view securable_type,
+                                      std::string_view operation) const {
+    if (service_scope_global_safe_override_for_test_) {
+        for (const auto& pair : *service_scope_global_safe_override_for_test_) {
+            if (pair.securable_type == securable_type && pair.operation == operation)
+                return true;
+        }
+        return false;
+    }
+    return authz::service_scope_global_safe(securable_type, operation);
+}
+
 bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Response& res,
                                     const std::string& securable_type,
                                     const std::string& operation) {
@@ -580,9 +646,16 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
     // effective_role). Only interactive cookie sessions can be elevated —
     // elevate_session never runs for MCP/service-scoped tokens (which are
     // synthesized per-request and carry no elevated_until), so this short-circuit
-    // cannot be reached by them. Auditing is on the elevation lifecycle
+    // cannot be reached by them today. Auditing is on the elevation lifecycle
     // (role.elevation.granted/expired), not per privileged action.
-    if (auth::is_elevated(*session))
+    //
+    // Defense-in-depth (#2298 PR 3): the `token_scope_service.empty()` guard
+    // is currently redundant with the invariant above, not load-bearing — kept
+    // so this short-circuit can never be the thing that lets a service-scoped
+    // token bypass the default-deny flip below, if that invariant ever
+    // changes. Do NOT read its presence as evidence elevation is reachable
+    // for service tokens today; it is not.
+    if (auth::is_elevated(*session) && session->token_scope_service.empty())
         return true;
 
     // Engine principals have NO legacy or service-scoped authority — their only
@@ -610,6 +683,28 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
             const std::string perm = securable_type + ":" + operation;
             res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
                                               detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
+            return false;
+        }
+        // Belt-and-braces (#2298 PR 3): engine-token mint already rejects a
+        // non-empty `scope_service` (`api_token_store.cpp::validate_engine_mint`),
+        // so this guards a corrupted/constraint-bypassed row only, not a live
+        // path. An engine session's own direct RBAC grant is a DIFFERENT
+        // authority than ITServiceOwner and is not exempt from the same
+        // default-deny consult the service branch applies below — a
+        // corrupted row must not use the engine branch as a side door around
+        // the seeded-empty allow-list.
+        if (!session->token_scope_service.empty() &&
+            !service_scope_admits(securable_type, operation)) {
+            audit_log(req, "auth.permission_required", "denied", "", "",
+                      "engine principal denied: corrupted scope_service on engine session "
+                      "blocked by service-scope default-deny");
+            res.status = 403;
+            const std::string perm = securable_type + ":" + operation;
+            // No `.permission` field: holding `perm` alone would not admit
+            // this session (compile-time-empty allow-list — routed-concern
+            // "MUST NOT name a permission that wouldn't actually admit").
+            res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm),
                             "application/json");
             return false;
         }
@@ -664,17 +759,34 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
         }
     }
 
-    // Service-scoped tokens: check if the ITServiceOwner role grants this permission.
-    // Scoped tokens cannot be used when RBAC is disabled.
+    // Service-scoped tokens (PR 3 — the flip, #2298 durable fix): ITServiceOwner
+    // remains the AUTHORITY CEILING (a service token can never exceed what that
+    // role grants), but no longer the sole gate. A pair also has to clear the
+    // seeded-EMPTY `kServiceScopeGlobalSafe` allow-list to be exercised
+    // fleet-wide/unconfined — everything else 403s by default now, inverting
+    // the old "ITServiceOwner holds it -> admit" shape. This closes the ~100
+    // instances where that admit reached fleet-wide data with no per-agent
+    // narrowing at all (`docs/adr/1006-service-scope-default-deny.md`). A
+    // route that legitimately needs to serve service tokens migrates onto
+    // `require_fleet_read`/`confine_agent_target` (Phase 2, metric-prioritized
+    // below) instead of growing this allow-list.
     if (!session->token_scope_service.empty()) {
         const std::string perm = securable_type + ":" + operation;
-        if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {
+        // #1717: gate on `rbac_enforcement_in_effect`, not raw
+        // `is_rbac_enabled()` (same standardization as the legacy branch
+        // below and `require_scoped_permission`'s service branch). A null
+        // store or a genuinely-disabled one still denies here; a degraded
+        // view (open, but a stale cached "disabled" that never observed a
+        // real toggle) is treated as still-enforced and falls through to
+        // fail closed via `check_role_has_permission` on that same handle
+        // instead — deny-on-degrade either way, just a more accurate reason.
+        if (!rbac_store_ || !rbac_enforcement_in_effect(rbac_store_)) {
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "service-scoped token blocked: RBAC not enabled");
             res.status = 403;
+            // No `.permission`: granting `perm` does not fix "RBAC disabled".
             res.set_content(detail::a4_denial(res, 403,
-                                              "service-scoped tokens require RBAC to be enabled",
-                                              detail::A4ErrorOpts{.permission = perm}),
+                                              "service-scoped tokens require RBAC to be enabled"),
                             "application/json");
             return false;
         }
@@ -682,10 +794,36 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "service-scoped token blocked: lacks ITServiceOwner permission");
             res.status = 403;
+            // Post-flip, an ITServiceOwner grant is necessary but no longer
+            // sufficient (the allow-list check below still applies) — the
+            // message says so and `.permission` is omitted rather than
+            // implying this single grant would admit the caller.
             std::string msg = "service-scoped token does not grant " + perm +
-                              " (ITServiceOwner permission required)";
-            res.set_content(detail::a4_denial(res, 403, msg, detail::A4ErrorOpts{.permission = perm}),
-                            "application/json");
+                              " (requires ITServiceOwner AND an explicit service-scope "
+                              "allow-list entry)";
+            res.set_content(detail::a4_denial(res, 403, msg), "application/json");
+            return false;
+        }
+        if (!service_scope_admits(securable_type, operation)) {
+            audit_log(req, "auth.permission_required", "denied", "", "",
+                      "service-scoped token blocked: default-deny (" + perm +
+                          " not on the service-scope global-safe allow-list)");
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_service_scope_default_denied_total",
+                           {{"permission", perm},
+                            {"path_class", std::string(resolve_body_cap(req.method, req.path)
+                                                            .path_class)}})
+                    .increment();
+            }
+            res.status = 403;
+            // No `.permission`: the allow-list is compile-time-empty, so no
+            // RBAC grant admits this caller (routed-concern MUST — a blanket
+            // deny must not name a permission that wouldn't actually admit).
+            std::string msg = "service-scoped token does not grant " + perm +
+                              " (not on the service-scope global-safe allow-list; this route "
+                              "needs an explicit confined path via require_fleet_read/"
+                              "confine_agent_target)";
+            res.set_content(detail::a4_denial(res, 403, msg), "application/json");
             return false;
         }
         return true;
@@ -763,7 +901,15 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
 
     // JIT admin elevation grants full admin (across all management groups) for
     // its window — cookie-session-only, so unreachable by MCP/service tokens.
-    if (auth::is_elevated(*session))
+    //
+    // Defense-in-depth (#2298 PR 3, mirrors require_permission's identical
+    // guard above): the `token_scope_service.empty()` check is currently
+    // redundant with that same cookie-session-only invariant, not
+    // load-bearing — kept so this short-circuit can never be the thing that
+    // lets a service-scoped token bypass the default-deny flip below, if
+    // that invariant ever changes. Do NOT read its presence as evidence
+    // elevation is reachable for service tokens today; it is not.
+    if (auth::is_elevated(*session) && session->token_scope_service.empty())
         return true;
 
     // Engine principals have NO legacy or service-scoped authority — their only
@@ -792,6 +938,28 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             const std::string perm = securable_type + ":" + operation;
             res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
                                               detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
+            return false;
+        }
+        // Belt-and-braces (#2298 PR 3, mirrors require_permission's identical
+        // guard): engine-token mint already rejects a non-empty
+        // `scope_service` (`api_token_store.cpp::validate_engine_mint`), so
+        // this guards a corrupted/constraint-bypassed row only, not a live
+        // path — fjarvis (PR review) found this sibling function had the
+        // guard applied to only one of the two engine branches. A corrupted
+        // row must not use the engine branch as a side door around the
+        // seeded-empty allow-list.
+        if (!session->token_scope_service.empty() &&
+            !service_scope_admits(securable_type, operation)) {
+            audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
+                      "engine principal denied: corrupted scope_service on engine session "
+                      "blocked by service-scope default-deny");
+            res.status = 403;
+            const std::string perm = securable_type + ":" + operation;
+            // No `.permission` field: holding `perm` alone would not admit
+            // this session (compile-time-empty allow-list — routed-concern
+            // "MUST NOT name a permission that wouldn't actually admit").
+            res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm),
                             "application/json");
             return false;
         }
@@ -849,13 +1017,17 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
     // and that the ITServiceOwner role grants the required permission.
     if (!session->token_scope_service.empty()) {
         const std::string perm = securable_type + ":" + operation;
-        if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {
+        // #1717: gate on `rbac_enforcement_in_effect`, not raw
+        // `is_rbac_enabled()` — same standardization as `require_permission`'s
+        // service branch (#2298 PR 3), so a degraded/stale-cached store
+        // reads identically on both functions instead of diverging.
+        if (!rbac_store_ || !rbac_enforcement_in_effect(rbac_store_)) {
             audit_log(req, "auth.scoped_permission_required", "denied", "", "",
                       "service-scoped token blocked: RBAC not enabled");
             res.status = 403;
+            // No `.permission`: granting `perm` does not fix "RBAC disabled".
             res.set_content(detail::a4_denial(res, 403,
-                                              "service-scoped tokens require RBAC to be enabled",
-                                              detail::A4ErrorOpts{.permission = perm}),
+                                              "service-scoped tokens require RBAC to be enabled"),
                             "application/json");
             return false;
         }
@@ -864,10 +1036,14 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             audit_log(req, "auth.scoped_permission_required", "denied", "", "",
                       "service-scoped token blocked: lacks ITServiceOwner permission");
             res.status = 403;
-            std::string msg =
-                "service-scoped token does not grant " + perm + " (ITServiceOwner permission required)";
-            res.set_content(detail::a4_denial(res, 403, msg, detail::A4ErrorOpts{.permission = perm}),
-                            "application/json");
+            // Post-flip, an ITServiceOwner grant is necessary but no longer
+            // sufficient (the target agent's service tag must still match
+            // below) — omit `.permission` rather than imply this single
+            // grant would admit the caller.
+            std::string msg = "service-scoped token does not grant " + perm +
+                              " (requires ITServiceOwner AND the target agent's service tag "
+                              "to match the token's scope)";
+            res.set_content(detail::a4_denial(res, 403, msg), "application/json");
             return false;
         }
         // Verify the target agent's service tag matches the token's scope
@@ -881,22 +1057,57 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                             "application/json");
             return false;
         }
-        if (!agent_id.empty()) {
-            auto agent_service = tag_store_->get_tag(agent_id, "service");
-            if (agent_service != session->token_scope_service) {
-                audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
-                          "agent service '" + agent_service + "' does not match token scope '" +
-                              session->token_scope_service + "'");
-                res.status = 403;
-                // Was the third denial shape ({"error":"forbidden","detail":...});
-                // now the unified A4 envelope like every other gate (#1470).
-                res.set_content(detail::a4_denial(res, 403,
-                                                  "agent is not in service '" +
-                                                      session->token_scope_service + "'",
-                                                  detail::A4ErrorOpts{.permission = perm}),
-                                "application/json");
-                return false;
-            }
+        // #2298 PR 3 (§3b): an empty agent_id used to skip the ONLY
+        // comparison that could deny and fall through to an unconditional
+        // `return true` below — the exact "allow everything" degenerate
+        // `confine_agent_target` (authz_gates.cpp) was built to not repeat
+        // (#2437/#2500 omitted-vs-empty rule: an empty agent_id is a caller
+        // bug, never "no target to check"). Verified during planning: every
+        // one of this function's ~18 call sites already guards
+        // `agent_id.empty()` before reaching it, so this bug was latent, not
+        // live — this 400 closes the function's own degenerate shape without
+        // an admit->deny regression on any real caller. Checked FIRST, before
+        // any tag-store access, so a caller bug never reaches the (unrelated)
+        // degraded-store handling below.
+        if (agent_id.empty()) {
+            audit_log(req, "auth.scoped_permission_required", "denied", "", "",
+                      "service-scoped token blocked: empty agent_id");
+            res.status = 400;
+            res.set_content(detail::a4_denial(res, 400, "agent_id is required",
+                                              detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
+            return false;
+        }
+        // ADR-0050 typed read: a degraded store is a 503 (retryable),
+        // never conflated with "agent has no service tag" — the
+        // pre-migration read collapsed both to "", which happened to
+        // deny (fail-closed) but audited the outage as a scope MISMATCH,
+        // hiding the real cause from the operator.
+        auto service_tag = tag_store_->get_tag(agent_id, std::string(authz::kServiceTagKey));
+        if (!service_tag) {
+            audit_log(req, "auth.scoped_permission_required", "denied", agent_id, "",
+                      "service-scoped token blocked: tag store degraded");
+            res.status = 503;
+            res.set_content(detail::a4_denial(res, 503,
+                                              "tag store unavailable, cannot verify scope",
+                                              detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                            "application/json");
+            return false;
+        }
+        const std::string agent_service = service_tag->value_or(std::string{});
+        if (agent_service != session->token_scope_service) {
+            audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
+                      "agent service '" + agent_service + "' does not match token scope '" +
+                          session->token_scope_service + "'");
+            res.status = 403;
+            // Was the third denial shape ({"error":"forbidden","detail":...});
+            // now the unified A4 envelope like every other gate (#1470).
+            res.set_content(detail::a4_denial(res, 403,
+                                              "agent is not in service '" +
+                                                  session->token_scope_service + "'",
+                                              detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
+            return false;
         }
         return true;
     }
@@ -953,6 +1164,135 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
         return false;
     }
     return true;
+}
+
+ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib::Response& res,
+                                           const std::string& securable_type,
+                                           const std::string& operation) {
+    ListReadGate gate;
+    const std::string perm = securable_type + ":" + operation;
+
+    auto session = require_auth(req, res);
+    if (!session)
+        return gate;
+    gate.session = *session;
+
+    // Structurally Read-only: the MCP approval-ticket branch never applies to
+    // this gate (mcp::requires_approval only fires for Write/Delete/Execute,
+    // mcp_policy.hpp), and this prevents a future caller from accidentally
+    // routing a mutation through a primitive whose legacy-open branch can
+    // return an unfiltered admit.
+    if (operation != "Read") {
+        audit_log(req, "auth.permission_required", "denied", "", "",
+                  "list-read gate accepts Read operations only: " + perm);
+        res.status = 403;
+        res.set_content(detail::a4_denial(res, 403, "list-read gate accepts Read operations only",
+                                          detail::A4ErrorOpts{.permission = perm}),
+                        "application/json");
+        return gate;
+    }
+
+    // JIT admin elevation: same semantics as require_permission — full admin
+    // for the elevation window, no underlying grant needed. Do NOT call
+    // authorize_list_read here: it has no elevation concept, so an elevated
+    // session with zero RBAC grants would otherwise be denied (the
+    // regression the first #3038 fix attempt shipped, closed here).
+    if (auth::is_elevated(*session)) {
+        gate.admitted = true;
+        return gate; // scope stays nullopt: unfiltered
+    }
+
+    // Engine principals have NO legacy or service-scoped authority — their
+    // only authority is an explicit RBAC assignment (design §4.2
+    // default-deny). authorize_list_read's own legacy-open branch would
+    // otherwise hand an engine credential fleet-wide read the moment RBAC is
+    // disabled; resolve engine sessions here, RBAC-only, or deny.
+    if (session->principal_kind == "engine") {
+        if (!rbac_store_ || !rbac_store_->is_open()) {
+            audit_log(req, "auth.permission_required", "denied", "", "",
+                      "engine principal denied: RBAC store unavailable");
+            res.status = 503;
+            res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
+                                              detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
+            return gate;
+        }
+        if (!rbac_store_->is_rbac_enabled() ||
+            !rbac_store_->check_permission(session->username, securable_type, operation)) {
+            audit_log(req, "auth.permission_required", "denied", "", "",
+                      "engine principal denied " + perm);
+            res.status = 403;
+            res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
+                                              detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
+            return gate;
+        }
+        gate.admitted = true; // current engine grants are fleet-wide only
+        return gate;
+    }
+
+    // MCP-tier tokens: tier policy precedes RBAC (matches require_permission).
+    // Falls through on allow — an allowed MCP token continues below with its
+    // creator's role/authority.
+    if (!session->mcp_tier.empty() &&
+        !mcp::tier_allows(session->mcp_tier, securable_type, operation)) {
+        audit_log(req, "auth.permission_required", "denied", "", "",
+                  "MCP token tier '" + session->mcp_tier + "' does not allow " + perm);
+        res.status = 403;
+        res.set_content(detail::a4_denial(res, 403, "MCP token tier does not allow " + perm,
+                                          detail::A4ErrorOpts{.permission = perm}),
+                        "application/json");
+        return gate;
+    }
+
+    // This fleet-wide list-read aggregate deliberately refuses service-scoped
+    // credentials outright — unlike require_permission's service-scoped
+    // branch (which checks the ITServiceOwner role and, for
+    // require_scoped_permission, the target agent's own service tag), a
+    // flat list-read gate has no single agent_id to scope the token's
+    // service against, so admitting it would hand a service-scoped token the
+    // WHOLE fleet's data.
+    if (!session->token_scope_service.empty()) {
+        audit_log(req, "auth.permission_required", "denied", "", "",
+                  "service-scoped token '" + session->token_scope_service +
+                      "' cannot read the fleet-wide list-read aggregate: " + perm);
+        res.status = 403;
+        res.set_content(
+            detail::a4_denial(res, 403,
+                              "service-scoped tokens cannot read the fleet-wide status rollup",
+                              detail::A4ErrorOpts{.permission = perm}),
+            "application/json");
+        return gate;
+    }
+
+    // Wholly unwired RBAC subsystem: exact current legacy semantics (mirrors
+    // require_permission's rbac_store_==nullptr short-circuit to legacy —
+    // authorize_list_read cannot be called on a null store).
+    if (!rbac_store_) {
+        gate.admitted = true;
+        return gate;
+    }
+
+    auto decision = rbac_store_->authorize_list_read(session->username, securable_type,
+                                                      operation, mgmt_group_store_);
+    switch (decision.decision) {
+    case ListReadDecision::DenyAll:
+        audit_log(req, "auth.permission_required", "denied", "", "",
+                  "RBAC denied list read " + perm);
+        res.status = 403;
+        res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
+                                          detail::A4ErrorOpts{.permission = perm}),
+                        "application/json");
+        return gate;
+    case ListReadDecision::AdmitAll:
+        gate.admitted = true;
+        return gate; // scope stays nullopt: unfiltered (global grant, or legacy-open)
+    case ListReadDecision::AdmitScoped:
+        gate.admitted = true;
+        gate.scope = std::move(decision.visible_agents); // engaged even when empty (INV-2)
+        return gate;
+    }
+    return gate; // unreachable — fail-closed default (admitted stays false)
 }
 
 std::string AuthRoutes::session_cookie_attrs() const {
@@ -1063,6 +1403,79 @@ bool AuthRoutes::audit_log_for_principal(const httplib::Request& req, const std:
     return ok;
 }
 
+bool AuthRoutes::deny_service_scoped_session(const httplib::Request& req, httplib::Response& res,
+                                             const std::string& action,
+                                             const std::string& message,
+                                             const std::string& target_type,
+                                             const std::string& target_id,
+                                             const std::string& permission) {
+    auto session = require_auth(req, res);
+    if (!session)
+        return true; // require_auth already wrote 401/redirect; caller returns.
+    if (session->token_scope_service.empty())
+        return false;
+    // Write the 403 FIRST, audit after: a throwing audit sink must not be
+    // able to suppress the 403 (mirrors the per-file deny_service_scoped_*
+    // family's ordering — see this method's declaration comment).
+    res.status = 403;
+    res.set_content(
+        detail::a4_denial(res, 403, message, detail::A4ErrorOpts{.permission = permission}),
+        "application/json");
+    // `audit_log` calls into a concrete `AuditStore*`, not an injected
+    // callback, so it cannot propagate a caller-supplied exception the way
+    // the per-file `deny_service_scoped_*` family's `audit_fn`/`audit_fn_`
+    // parameters could — but this try/catch matches their shape anyway
+    // (Gate 4/consistency-auditor: a family that looks identical everywhere
+    // is cheaper to reason about than one exception debated case-by-case).
+    try {
+        audit_log(req, action, "denied", target_type, target_id,
+                 message + " (path=" + req.path + ")");
+    } catch (const std::exception& e) {
+        spdlog::warn("deny_service_scoped_session: audit_log threw: {}", e.what());
+    } catch (...) {
+        spdlog::warn("deny_service_scoped_session: audit_log threw (non-std)");
+    }
+    return true;
+}
+
+bool AuthRoutes::deny_service_scoped_service_tag_mutation(const httplib::Request& req,
+                                                            httplib::Response& res,
+                                                            const std::string& action,
+                                                            const std::string& agent_id,
+                                                            const std::string& key) {
+    auto session = require_auth(req, res);
+    if (!session)
+        return true; // require_auth already wrote 401/redirect; caller returns.
+    if (authz::service_scope_may_mutate_tag_key(session->token_scope_service, key))
+        return false;
+    // Write the 403 FIRST, audit after — same throw-safety ordering as
+    // deny_service_scoped_session immediately above.
+    res.status = 403;
+    res.set_content(
+        detail::a4_denial(res, 403,
+                          authz::kServiceTagMutationDeniedMessage),
+        "application/json");
+    try {
+        // Gate 4/#3289 hardening round: target_type="Tag" matches REST v1's
+        // convention for this identical logical event (a denied tag
+        // mutation) — not "Agent", which matched neither REST's nor any
+        // other surface's convention. This does NOT resolve the separate,
+        // pre-existing mismatch against server.cpp's own tag.set/tag.delete
+        // success/failure rows, which use lowercase "tag" — this caller
+        // (server.cpp, via the legacy dashboard routes) is a DIFFERENT file
+        // from where this comment lives; see the routed-concern row for the
+        // tracked residual.
+        audit_log(req, action, "denied", "Tag", agent_id + ":" + key,
+                 "service-scoped token blocked: cannot mutate the service tag (path=" +
+                     req.path + ")");
+    } catch (const std::exception& e) {
+        spdlog::warn("deny_service_scoped_service_tag_mutation: audit_log threw: {}", e.what());
+    } catch (...) {
+        spdlog::warn("deny_service_scoped_service_tag_mutation: audit_log threw (non-std)");
+    }
+    return true;
+}
+
 void AuthRoutes::emit_event(const std::string& event_type, const httplib::Request& req,
                             const nlohmann::json& attrs, const nlohmann::json& payload_data,
                             Severity sev) {
@@ -1079,7 +1492,38 @@ void AuthRoutes::emit_event(const std::string& event_type, const httplib::Reques
         // effective_role: an elevated session's analytics row reflects admin too
         // (#1748 H1/L4). No-op when not elevated.
         ae.principal_role = auth::role_to_string(auth::effective_role(*session));
-        ae.session_id = extract_session_cookie(req);
+        // HASHED, never the raw cookie (ADR-0049 governance Gate 2, 2026-08-16):
+        // this value is durably persisted into AnalyticsEventStore (unbounded
+        // retention on Postgres, ADR-0049) and readable by anyone holding the
+        // broad Infrastructure:Read permission via /api/analytics/recent — the
+        // live bearer token is exactly what validate_session() accepts, so
+        // storing it raw would let any Infrastructure:Read holder hijack the
+        // session (including an elevated admin's, via role.elevation.granted
+        // events). The hash still correlates events from the same session
+        // (same cookie -> same hash) without being a redeemable credential.
+        // Guard on the COOKIE, not just the session (governance Gate 3
+        // cpp-expert finding, 2026-08-16): resolve_session() also succeeds
+        // for Bearer/X-Yuzu-Token auth, which carries no cookie —
+        // extract_session_cookie returns "", and sha256_hex("") is a FIXED
+        // constant. Hashing unconditionally would give every token-
+        // authenticated row the SAME non-empty session_id, falsely
+        // correlating unrelated principals as "the same session" — a
+        // regression the pre-hash code didn't have (empty stayed
+        // distinguishably empty). Only hash a real cookie; leave
+        // session_id at its default-empty value otherwise.
+        //
+        // Fail-soft parity (governance Gate 3 cpp-safety finding,
+        // 2026-08-16): sha256_hex can throw on an internal EVP failure
+        // (OOM-class, rare) — this whole function exists so a dropped
+        // analytics event never fails the operation that emitted it.
+        // Degrades to an empty session_id, not a failed request.
+        if (auto cookie = extract_session_cookie(req); !cookie.empty()) {
+            try {
+                ae.session_id = auth::AuthManager::sha256_hex(cookie);
+            } catch (const std::exception& e) {
+                spdlog::debug("AuthRoutes::emit_event: session_id hash failed: {}", e.what());
+            }
+        }
     }
     analytics_store_->emit(std::move(ae));
 }
@@ -1342,9 +1786,30 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                             // password-spray brute-force unlimited tries while
                             // the store is degraded.
                             res.status = 503;
+                            // #2396: honest backoff hint on a transient
+                            // store-unavailable 503 (header + A4-style body
+                            // field), and a reason-labelled degrade counter so
+                            // a retry-storm is distinguishable from a uniform
+                            // outage. Does NOT change the fail-closed decision.
+                            res.set_header("Retry-After", "2");
                             res.set_content(
-                                R"({"error":{"code":503,"message":"authentication store is temporarily unavailable"},"meta":{"api_version":"v1"}})",
+                                R"({"error":{"code":503,"message":"authentication store is temporarily unavailable","retry_after_ms":2000},"meta":{"api_version":"v1"}})",
                                 "application/json");
+                            if (auto* m = auth_mgr_.metrics_registry()) {
+                                // Both counters, matching the mfa_status / mfa_init
+                                // sites: the coarse route-level total (every
+                                // store-unavailable login 503) AND the reason
+                                // split. #2396 adv-review CDX-P1-01 — the coarse
+                                // series must move at every login-path 503 so an
+                                // alert on it does not undercount an outage.
+                                m->counter("yuzu_auth_secret_unavailable_total",
+                                           {{"route", "login"}})
+                                    .increment();
+                                m->counter(
+                                     "yuzu_auth_read_degrade_total",
+                                     {{"route", "login"}, {"reason", degrade_reason(rec.error())}})
+                                    .increment();
+                            }
                         }
                     }
                 }
@@ -1410,13 +1875,25 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 mfa_enrolled = status->enrolled;
             } else {
                 res.status = 503;
+                res.set_header("Retry-After", "2"); // #2396 honest backoff hint
                 res.set_content(
                     R"({"error":{"code":503,"message":"authentication store is temporarily )"
-                    R"(unavailable"},"meta":{"api_version":"v1"}})",
+                    R"(unavailable","retry_after_ms":2000},"meta":{"api_version":"v1"}})",
                     "application/json");
                 if (auto* m = auth_mgr_.metrics_registry()) {
                     m->counter("yuzu_auth_secret_unavailable_total", {{"route", "login"}})
                         .increment();
+                    // #2396: reason-labelled sibling of the counter above so a
+                    // transient pool-acquire retry-storm is distinguishable
+                    // from a uniform secret/query outage (#2401). Gated on
+                    // is_store_unavailable so a non-store error reaching this
+                    // fail-closed else (e.g. a UserNotFound row-vanished race)
+                    // is never mislabelled with a store-degrade reason.
+                    if (is_store_unavailable(status.error())) {
+                        m->counter("yuzu_auth_read_degrade_total",
+                                   {{"route", "login"}, {"reason", degrade_reason(status.error())}})
+                            .increment();
+                    }
                 }
                 audit_log_for_principal(
                     req, "mfa.status.unavailable", "error", username,
@@ -1543,16 +2020,23 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 // harmless one-off. No session is minted either way.
                 const bool store_unavailable = is_store_unavailable(init.error());
                 res.status = store_unavailable ? 503 : 500;
+                if (store_unavailable)
+                    res.set_header("Retry-After", "2"); // #2396 honest backoff hint (503 only)
                 res.set_content(
                     store_unavailable
                         ? R"({"error":{"code":503,"message":"authentication store is temporarily )"
-                          R"(unavailable"},"meta":{"api_version":"v1"}})"
+                          R"(unavailable","retry_after_ms":2000},"meta":{"api_version":"v1"}})"
                         : R"({"error":{"code":500,"message":"Could not initiate MFA enrollment"},)"
                           R"("meta":{"api_version":"v1"}})",
                     "application/json");
                 if (store_unavailable) {
                     if (auto* m = auth_mgr_.metrics_registry()) {
                         m->counter("yuzu_auth_secret_unavailable_total", {{"route", "login"}})
+                            .increment();
+                        // #2396 reason-labelled sibling (#2401).
+                        m->counter(
+                             "yuzu_auth_read_degrade_total",
+                             {{"route", "login"}, {"reason", degrade_reason(init.error())}})
                             .increment();
                     }
                 }
@@ -3117,6 +3601,127 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 return;
             }
 
+            // SAML fine-grained RBAC — parity with the OIDC block above
+            // (`#1832`, ~2531-2634): reconcile the configured
+            // `--saml-group-attribute`'s asserted values into the RBAC store
+            // under source "saml" BEFORE minting the session, so a
+            // provisioning failure denies the login outright (fail-closed)
+            // instead of granting a session under stale/unreconciled roles.
+            // Runs AFTER the PR4b primary deny check and BEFORE both link
+            // formation and create_saml_session, so a reconcile-deny leaves
+            // no link-write or session side effect behind.
+            //
+            // Only runs when `rbac_store_` is present AND a group attribute
+            // is configured — otherwise this is a no-op and the coarse
+            // `--saml-admin-group` role (create_saml_session, below) is the
+            // only mechanism in play, exactly as before this change.
+            //
+            // SAML cannot distinguish "group attribute absent from the
+            // assertion" from "attribute present, zero values" — both yield
+            // an empty `result.value().groups`. Unlike OIDC (which has an
+            // explicit `groups_claim_reconcilable` signal from the token),
+            // reconciling an empty SAML group set would DELETE every one of
+            // this user's `saml:`-sourced memberships (deprovision-to-zero),
+            // so an empty asserted set is SKIPPED entirely — the SCIM
+            // deprovision chokepoint (PR4a/PR4b above) remains the only full
+            // deprovisioning path here.
+            if (rbac_store_ && !cfg_.saml_group_attribute.empty()) {
+                const auto& asserted_groups = result.value().groups;
+                if (asserted_groups.empty()) {
+                    spdlog::info("SAML group provisioning skipped for '{}': no groups asserted",
+                                saml_principal);
+                    audit_log_for_principal(
+                        req, "auth.sso_group_provision", "skipped", saml_principal, "user", "User",
+                        saml_principal, "reason=groups_absent;source=saml");
+                    if (auto* m = auth_mgr_.metrics_registry()) {
+                        m->counter("yuzu_auth_sso_group_provision_total",
+                                  {{"source", "saml"}, {"result", "skipped"}})
+                            .increment();
+                    }
+                } else if (result.value().group_cap_truncated) {
+                    // Fail-closed: the verifier's `groups` vector is already
+                    // a TRUNCATED view once the assertion carried more than
+                    // `saml::kMaxGroupValues` (200) values — reconciling it
+                    // would false-deprovision every membership beyond the
+                    // cap. Deny the login instead, mirroring OIDC's
+                    // group_count_exceeded branch.
+                    spdlog::warn(
+                        "SAML group provisioning denied for '{}': asserted groups exceeded cap {}",
+                        saml_principal, saml::kMaxGroupValues);
+                    audit_log_for_principal(
+                        req, "auth.sso_group_provision", "error", saml_principal, "user", "User",
+                        saml_principal, "reason=group_count_exceeded;source=saml");
+                    audit_log_for_principal(
+                        req, "auth.saml_login_failed", "error", saml_principal, "user", "User",
+                        saml_principal, "reason=group_count_exceeded");
+                    emit_event("auth.saml_login_failed", req,
+                              {{"source_ip", req.remote_addr},
+                               {"username", saml_principal},
+                               {"error", "group_count_exceeded"}},
+                              {}, Severity::kWarn);
+                    if (auto* m = auth_mgr_.metrics_registry()) {
+                        m->counter("yuzu_saml_group_cap_truncated_total").increment();
+                        m->counter("yuzu_auth_sso_group_provision_total",
+                                  {{"source", "saml"}, {"result", "error"}})
+                            .increment();
+                        m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}).increment();
+                    }
+                    res.set_header("Set-Cookie", kBindCookieClear);
+                    res.set_redirect("/login?error=saml");
+                    return;
+                } else {
+                    std::vector<std::pair<std::string, std::string>> asserted;
+                    asserted.reserve(asserted_groups.size());
+                    for (const auto& gid : asserted_groups)
+                        asserted.emplace_back(gid, gid);
+
+                    auto reconciled =
+                        rbac_store_->reconcile_idp_memberships(saml_principal, "saml", asserted);
+                    if (!reconciled) {
+                        spdlog::warn("SAML group provisioning failed for '{}': {}", saml_principal,
+                                    reconciled.error());
+                        audit_log_for_principal(
+                            req, "auth.sso_group_provision", "error", saml_principal, "user",
+                            "User", saml_principal,
+                            "reason=" + reconciled.error() + ";source=saml");
+                        audit_log_for_principal(
+                            req, "auth.saml_login_failed", "error", saml_principal, "user", "User",
+                            saml_principal, "reason=" + reconciled.error());
+                        emit_event("auth.saml_login_failed", req,
+                                  {{"source_ip", req.remote_addr},
+                                   {"username", saml_principal},
+                                   {"error", reconciled.error()}},
+                                  {}, Severity::kWarn);
+                        if (auto* m = auth_mgr_.metrics_registry()) {
+                            m->counter("yuzu_auth_sso_group_provision_total",
+                                      {{"source", "saml"}, {"result", "error"}})
+                                .increment();
+                            m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}).increment();
+                        }
+                        res.set_header("Set-Cookie", kBindCookieClear);
+                        res.set_redirect("/login?error=saml");
+                        return;
+                    }
+
+                    // Mirrors OIDC's cons-S3: a no-op reconcile (nothing
+                    // added or removed) writes no provisioning audit row —
+                    // every login after the first steady-state one is
+                    // typically a no-op.
+                    if (reconciled->added + reconciled->removed > 0) {
+                        audit_log_for_principal(
+                            req, "auth.sso_group_provision", "ok", saml_principal, "user", "User",
+                            saml_principal,
+                            "source=saml;added=" + std::to_string(reconciled->added) +
+                                ";removed=" + std::to_string(reconciled->removed));
+                    }
+                    if (auto* m = auth_mgr_.metrics_registry()) {
+                        m->counter("yuzu_auth_sso_group_provision_total",
+                                  {{"source", "saml"}, {"result", "ok"}})
+                            .increment();
+                    }
+                }
+            }
+
             // ADR-2001 PR4a — form a durable SCIM<->SAML identity link when
             // the NameID Format is stable (see saml_scim_link.hpp), BEFORE
             // minting the session. Fail-OPEN: never fails this login. No
@@ -3239,10 +3844,16 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
             // #1828.3: the verifier flags (rather than logs or increments
             // directly — it has no metrics handle) when the assertion's
-            // group-attribute values exceeded the 64-value cap. Bump the
-            // counter here, once per login, not a per-value/per-login log
-            // line (anti-flood — same rationale as the sibling
-            // metric-only signals in docs/observability-conventions.md).
+            // group-attribute values exceeded the `saml::kMaxGroupValues`
+            // (200) cap. Bump the counter here, once per login, not a
+            // per-value/per-login log line (anti-flood — same rationale as
+            // the sibling metric-only signals in
+            // docs/observability-conventions.md). Reached ONLY when the
+            // fine-grained reconcile block above did NOT already deny this
+            // login for the same reason (`rbac_store_` absent, or
+            // `--saml-group-attribute` unconfigured) — a truncated assertion
+            // under an active reconcile is denied before session mint and
+            // never reaches this point.
             if (result.value().group_cap_truncated) {
                 if (auto* m = auth_mgr_.metrics_registry()) {
                     m->counter("yuzu_saml_group_cap_truncated_total").increment();

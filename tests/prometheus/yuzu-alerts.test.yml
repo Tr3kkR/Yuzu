@@ -1706,3 +1706,395 @@ tests:
       - expr: 'ALERTS{alertname="YuzuScimAuditWriteFailures"}'
         eval_time: 45m
         exp_samples: []
+
+  # ── YuzuTagStoreReadDegraded (ADR-0050) ─────────────────────────────────
+  #
+  # `sum(rate(yuzu_server_tag_store_read_degrade_total[5m])) by (reason) > 0`,
+  # for: 5m, warning. Callers fail CLOSED on a degraded tag read (evaluate_
+  # scope aborts, service-token authz 503s), so any sustained non-zero rate
+  # pages, keyed by reason.
+
+  # CASE 57 -- a sustained degrade reason pages, carrying its reason label.
+  - interval: 1m
+    name: tag store read degraded - a sustained degrade reason pages
+    input_series:
+      - series: 'yuzu_server_tag_store_read_degrade_total{job="yuzu",instance="s1",reason="query_error"}'
+        values: "0+1x20"
+    promql_expr_test:
+      # for: 5m pinned both sides (the file's bracketing convention): the
+      # rate is non-zero from t=1m, so firing begins ~t=6m -- still quiet
+      # at 5m, firing by 15m. A for: regression in either direction reds
+      # one of these two evals.
+      - expr: 'ALERTS{alertname="YuzuTagStoreReadDegraded", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuTagStoreReadDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuTagStoreReadDegraded", alertstate="firing", reason="query_error", severity="warning"}'
+            value: 1
+
+  # CASE 58 -- the boot-time pre-seed alone (all reasons present at zero,
+  # never incremented) must stay quiet: present-at-zero is the HEALTHY
+  # steady state, not a degrade.
+  - interval: 1m
+    name: tag store read degraded - pre-seeded flat counters stay quiet
+    input_series:
+      - series: 'yuzu_server_tag_store_read_degrade_total{job="yuzu",instance="s1",reason="store_not_open"}'
+        values: "0x30"
+      - series: 'yuzu_server_tag_store_read_degrade_total{job="yuzu",instance="s1",reason="pool_acquire_timeout"}'
+        values: "0x30"
+      - series: 'yuzu_server_tag_store_read_degrade_total{job="yuzu",instance="s1",reason="query_error"}'
+        values: "0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuTagStoreReadDegraded"}'
+        eval_time: 20m
+        exp_samples: []
+
+  # ── YuzuRuntimeConfigReadDegraded (ADR-0060) ────────────────────────────
+  #
+  # `sum(rate(yuzu_server_runtime_config_read_degrade_total[5m])) by (reason)
+  # > 0`, for: 5m, warning. Two failure families share one metric: ordinary
+  # substrate trouble (store_not_open/pool_acquire_timeout/query_error) and
+  # crypto_error (the OIDC client secret cannot be decrypted).
+
+  # CASE 67 -- a sustained substrate-trouble reason pages, carrying its
+  # reason label.
+  - interval: 1m
+    name: runtime config read degraded - a sustained substrate reason pages
+    input_series:
+      - series: 'yuzu_server_runtime_config_read_degrade_total{job="yuzu",instance="s1",reason="pool_acquire_timeout"}'
+        values: "0+1x20"
+    promql_expr_test:
+      # for: 5m pinned both sides (the file's bracketing convention): the
+      # rate is non-zero from t=1m, so firing begins ~t=6m -- still quiet
+      # at 5m, firing by 15m. A for: regression in either direction reds
+      # one of these two evals.
+      - expr: 'ALERTS{alertname="YuzuRuntimeConfigReadDegraded", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuRuntimeConfigReadDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRuntimeConfigReadDegraded", alertstate="firing", reason="pool_acquire_timeout", severity="warning"}'
+            value: 1
+
+  # CASE 68 -- exercises the rule mechanically for the crypto_error reason,
+  # keyed by its own label under the SAME rule (no separate alert for the
+  # crypto failure family). NOTE: this synthetic "sustained" shape is not how
+  # crypto_error can actually arise in production -- see the alert's own
+  # comment in docs/prometheus/yuzu-alerts.yml (correction, docs-writer,
+  # Gate 8): its one production call site is boot-time-only and a failure
+  # there exits the process before /metrics ever binds, so this reason is not
+  # actually scrapeable today. This case still proves the rule fires
+  # correctly IF the metric ever carries this value (a future non-boot call
+  # site, or a manual/test scrape), which is what it is testing.
+  - interval: 1m
+    name: runtime config read degraded - a sustained crypto_error pages
+    input_series:
+      - series: 'yuzu_server_runtime_config_read_degrade_total{job="yuzu",instance="s1",reason="crypto_error"}'
+        values: "0+1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRuntimeConfigReadDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRuntimeConfigReadDegraded", alertstate="firing", reason="crypto_error", severity="warning"}'
+            value: 1
+
+  # CASE 69 -- the boot-time pre-seed alone (all reasons present at zero,
+  # never incremented) must stay quiet: present-at-zero is the HEALTHY
+  # steady state, not a degrade.
+  - interval: 1m
+    name: runtime config read degraded - pre-seeded flat counters stay quiet
+    input_series:
+      - series: 'yuzu_server_runtime_config_read_degrade_total{job="yuzu",instance="s1",reason="store_not_open"}'
+        values: "0x30"
+      - series: 'yuzu_server_runtime_config_read_degrade_total{job="yuzu",instance="s1",reason="pool_acquire_timeout"}'
+        values: "0x30"
+      - series: 'yuzu_server_runtime_config_read_degrade_total{job="yuzu",instance="s1",reason="query_error"}'
+        values: "0x30"
+      - series: 'yuzu_server_runtime_config_read_degrade_total{job="yuzu",instance="s1",reason="crypto_error"}'
+        values: "0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRuntimeConfigReadDegraded"}'
+        eval_time: 20m
+        exp_samples: []
+
+  # ── YuzuTagStoreBackfillNotCompleted (ADR-0050) ─────────────────────────
+  #
+  # `absent_over_time(..._backfill_total{result=~"success|fresh"}[15m])`,
+  # for: 5m, critical. The rule is ABSENCE-keyed because a failed backfill
+  # sets startup_failed_ and /metrics is never served -- a result="failed"
+  # sample is unscrappable, so a failed-keyed expression could never fire
+  # (governance sre-1). These two cases pin both halves of that design.
+
+  # CASE 59 -- a scraped success outcome (the pre-seeded counter incremented
+  # once at boot) suppresses the alert for as long as it stays in the window.
+  - interval: 1m
+    name: tag store backfill - a scraped success outcome is quiet
+    input_series:
+      - series: 'yuzu_server_tag_store_backfill_total{job="yuzu",instance="s1",result="success"}'
+        values: "1x40"
+      - series: 'yuzu_server_tag_store_backfill_total{job="yuzu",instance="s1",result="failed"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuTagStoreBackfillNotCompleted"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE 60 -- the sre-1 pin: even with a result="failed" series PRESENT
+  # (hypothetically scraped), the rule fires on the ABSENCE of the two good
+  # outcomes -- it must never be rewritten to key on result="failed", which
+  # a refused boot never serves. The absent series carries no result label
+  # (regex matchers do not populate absent()-family label sets).
+  - interval: 1m
+    name: tag store backfill - absent good outcomes fire even with a failed series present
+    input_series:
+      - series: 'yuzu_server_tag_store_backfill_total{job="yuzu",instance="s1",result="failed"}'
+        values: "0+1x40"
+    promql_expr_test:
+      # for: 5m pinned both sides: absence is true from the first evaluation
+      # (absent_over_time needs no window population), so pending starts at
+      # t=0 and firing begins at exactly t=5m -- quiet at 4m, firing at 5m
+      # and still at 25m.
+      - expr: 'ALERTS{alertname="YuzuTagStoreBackfillNotCompleted", alertstate="firing"}'
+        eval_time: 4m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuTagStoreBackfillNotCompleted", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuTagStoreBackfillNotCompleted", alertstate="firing", severity="critical"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuTagStoreBackfillNotCompleted", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuTagStoreBackfillNotCompleted", alertstate="firing", severity="critical"}'
+            value: 1
+
+  # ── YuzuDispatchTargetRejected: the reason="quarantined" exclusion (#881) ──
+  #
+  # `sum by (route, reason)(increase(yuzu_server_dispatch_target_rejected_total
+  # {reason!="quarantined"}[15m])) > 3`, no `for:`, warning.
+  #
+  # #881 routes quarantine denials into this pre-existing counter family, and
+  # the counter is the ONE the rule reads. Without the matcher, correct
+  # containment fires a warning alert: a single looping automation against one
+  # contained host clears 3 in 15m on its own, and a fail-closed episode
+  # increments by the whole connected fleet in a single dispatch. A rule that
+  # pages on the control working gets silenced, and the genuine #2500
+  # near-miss signal is silenced with it -- the exact outcome the >3 threshold
+  # (rather than >0) was chosen to avoid.
+  #
+  # Mutate the rule -- drop `{reason!="quarantined"}` -- and CASE 61 goes red.
+  # That is the only thing that makes this pair evidence rather than decoration.
+
+  # CASE 61 -- a fail-closed episode: 40 denials in one dispatch, an order of
+  # magnitude past the threshold, on the route that carries them. Silent.
+  - interval: 1m
+    name: dispatch target rejected - quarantine denials never fire the targeting alert
+    input_series:
+      - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="quarantined"}'
+        values: "0 0 0 40x30"
+      - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="dispatch_closure",reason="quarantined"}'
+        values: "0 0 0 40x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDispatchTargetRejected"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDispatchTargetRejected"}'
+        eval_time: 25m
+        exp_samples: []
+
+  # CASE 62 -- the other half, so the exclusion cannot be widened into a
+  # silencer: a genuine targeting mistake on the SAME counter family, and on
+  # the same route as CASE 61, still fires. 5 in 15m clears the >3 threshold.
+  - interval: 1m
+    name: dispatch target rejected - a real targeting mistake still fires alongside
+    input_series:
+      - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="agent_ids_empty"}'
+        values: "0 0 0 0+1x30"
+      - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="quarantined"}'
+        values: "0 0 0 40x30"
+    promql_expr_test:
+      # No `for:` on this rule, so pending and firing coincide: the alert is
+      # firing on the first evaluation at which the 15m increase exceeds 3.
+      # An ALERTS series carries 1 while firing, never the expression's value —
+      # so the assertion that matters here is the LABEL SET: exactly one
+      # series, and its reason is the targeting mistake, not "quarantined".
+      - expr: 'ALERTS{alertname="YuzuDispatchTargetRejected", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDispatchTargetRejected", alertstate="firing", route="command", reason="agent_ids_empty", severity="warning"}'
+            value: 1
+      # And the underlying expression's own value, which the ALERTS series
+      # cannot show: 15 for the real mistake, and NO quarantined series at all
+      # — one series in the result, not two. That absence is the assertion.
+      - expr: 'sum by (route, reason) (increase(yuzu_server_dispatch_target_rejected_total{reason!="quarantined"}[15m]))'
+        eval_time: 20m
+        exp_samples:
+          - labels: '{route="command", reason="agent_ids_empty"}'
+            value: 15
+
+  # ── YuzuQuarantineGateFailClosed (#881) ───────────────────────────────────
+  #
+  # `increase(yuzu_server_quarantine_gate_total{outcome="fail_closed"}[5m]) > 0`,
+  # for: 2m, critical.
+  #
+  # The rule exists because #881 introduces a NEW outage mode with no other
+  # signal: containment state unreadable past the 60s stale budget means
+  # instruction dispatch reaches nobody, fleet-wide. It cannot be detected on
+  # the neighbouring targeting family, whose quarantine reason is deliberately
+  # excluded (CASE 61 above).
+  #
+  # Both halves pinned: the outage fires, and the ORDINARY gate outcomes —
+  # which increment on literally every dispatch — never do. The second half is
+  # the one that would make this rule useless if it were wrong.
+
+  # CASE 63 -- a healthy server: `fresh` on every dispatch, plus the exempt
+  # control-plugin path. Silent, however large the counts get.
+  - interval: 1m
+    name: quarantine gate - ordinary outcomes never fire the outage alert
+    input_series:
+      - series: 'yuzu_server_quarantine_gate_total{job="yuzu",instance="s1",outcome="fresh"}'
+        values: "0+50x40"
+      - series: 'yuzu_server_quarantine_gate_total{job="yuzu",instance="s1",outcome="stale"}'
+        values: "0+5x40"
+      - series: 'yuzu_server_quarantine_gate_total{job="yuzu",instance="s1",outcome="exempt_control_plugin"}'
+        values: "0+2x40"
+      - series: 'yuzu_server_quarantine_gate_total{job="yuzu",instance="s1",outcome="fail_closed"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineGateFailClosed"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE 64 -- the outage: fail_closed starts incrementing at t=10m. `for: 2m`
+  # is pinned on both sides, because the whole point of the delay is to absorb
+  # a single degraded evaluation during a pool blip.
+  - interval: 1m
+    name: quarantine gate - a sustained fail-closed episode fires critical
+    input_series:
+      - series: 'yuzu_server_quarantine_gate_total{job="yuzu",instance="s1",outcome="fail_closed"}'
+        values: "0x10 0+30x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineGateFailClosed", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuQuarantineGateFailClosed", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          # No `sum by` on this rule, deliberately: the series keeps `instance`
+          # so an alert routes to the affected server, and `outcome` so the
+          # payload is self-describing.
+          - labels: 'ALERTS{alertname="YuzuQuarantineGateFailClosed", alertstate="firing", instance="s1", job="yuzu", outcome="fail_closed", severity="critical"}'
+            value: 1
+
+  # ── YuzuQuarantineGateServingStaleState (#881) ────────────────────────────
+  #
+  # `sum(increase(yuzu_server_quarantine_gate_total{outcome="stale"}[10m])) > 0`,
+  # for: 10m, warning.
+  #
+  # There is no rule for yuzu_server_system_reserved_push_total. That was
+  # tried and withdrawn: `send_to` returns false whenever an agent's stream is
+  # null, which is what an ordinary suspended laptop looks like, and
+  # tar.fleet_snapshot fans out over the whole fleet on every viz fetch. A
+  # `> 0` rule on that family is permanently firing on any real fleet, and a
+  # permanently-firing rule gets silenced — taking the genuine
+  # "__guard__.push_rules never landed" signal with it. Same self-defeating
+  # shape YuzuDispatchTargetRejected chose `>3` to avoid. The metric ships and
+  # is documented with PromQL; the alert does not.
+
+  # CASE 65 -- the ordinary outcomes, at volume, stay quiet. `fresh` increments
+  # on every single dispatch, so a rule that could not tolerate that would be
+  # useless.
+  - interval: 1m
+    name: quarantine gate - fresh and exempt outcomes never fire the stale alert
+    input_series:
+      - series: 'yuzu_server_quarantine_gate_total{job="yuzu",instance="s1",outcome="fresh"}'
+        values: "0+50x40"
+      - series: 'yuzu_server_quarantine_gate_total{job="yuzu",instance="s1",outcome="exempt_control_plugin"}'
+        values: "0+2x40"
+      - series: 'yuzu_server_quarantine_gate_total{job="yuzu",instance="s1",outcome="stale"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineGateServingStaleState"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE 66 -- a sustained stale episode fires. `for: 10m` is pinned on both
+  # sides: quiet while the episode is younger than the hold, firing after it.
+  # This is the window in which containment UNDER-enforces, which is why it is
+  # alerted at all — the fail-closed rule only ever sees over-enforcement.
+  - interval: 1m
+    name: quarantine gate - a sustained stale episode fires warning
+    input_series:
+      - series: 'yuzu_server_quarantine_gate_total{job="yuzu",instance="s1",outcome="stale"}'
+        values: "0x5 0+3x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineGateServingStaleState", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuQuarantineGateServingStaleState", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuQuarantineGateServingStaleState", alertstate="firing", severity="warning"}'
+            value: 1
+
+  # ── YuzuQuarantineEndpointUnconfirmed (#3425) ─────────────────────────────
+  #
+  # `yuzu_server_quarantine_endpoint_unconfirmed{reachability="connected"} > 0`,
+  # for: 15m, warning. A GAUGE, unlike every other rule in this group — no
+  # increase()/sum() needed, `for:` alone provides the sustain requirement.
+
+  # CASE 67 -- the flagship case: a connected, quarantined device stays
+  # unconfirmed past the 15m hold. `for:` is pinned on both sides: quiet
+  # before the hold elapses, firing after.
+  - interval: 1m
+    name: quarantine endpoint unconfirmed - a sustained connected divergence fires warning
+    input_series:
+      - series: 'yuzu_server_quarantine_endpoint_unconfirmed{job="yuzu",instance="s1",reachability="connected"}'
+        values: "1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineEndpointUnconfirmed", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuQuarantineEndpointUnconfirmed", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuQuarantineEndpointUnconfirmed", alertstate="firing", instance="s1", job="yuzu", reachability="connected", severity="warning"}'
+            value: 1
+
+  # CASE 68 -- reachability="offline" NEVER fires, no matter how long or how
+  # high. A device quarantined while off is legitimately unconfirmed for its
+  # whole offline duration — paging on it would be paging on correct
+  # behaviour, the same self-defeating shape CASE 65's comment warns about
+  # for yuzu_server_system_reserved_push_total.
+  - interval: 1m
+    name: quarantine endpoint unconfirmed - offline reachability never fires, at any volume or duration
+    input_series:
+      - series: 'yuzu_server_quarantine_endpoint_unconfirmed{job="yuzu",instance="s1",reachability="offline"}'
+        values: "5x90"
+      - series: 'yuzu_server_quarantine_endpoint_unconfirmed{job="yuzu",instance="s1",reachability="connected"}'
+        values: "0x90"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineEndpointUnconfirmed"}'
+        eval_time: 90m
+        exp_samples: []
+
+  # CASE 69 -- resolution: the divergence clears (a confirm lands) and the
+  # alert un-fires, pinning the gauge shape's recovery behaviour distinct
+  # from the counter-based rules above (which only ever accumulate).
+  - interval: 1m
+    name: quarantine endpoint unconfirmed - resolves once the gauge returns to 0
+    input_series:
+      - series: 'yuzu_server_quarantine_endpoint_unconfirmed{job="yuzu",instance="s1",reachability="connected"}'
+        values: "1x20 0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineEndpointUnconfirmed", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuQuarantineEndpointUnconfirmed", alertstate="firing", instance="s1", job="yuzu", reachability="connected", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuQuarantineEndpointUnconfirmed", alertstate="firing"}'
+        eval_time: 55m
+        exp_samples: []

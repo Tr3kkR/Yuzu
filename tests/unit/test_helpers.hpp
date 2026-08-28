@@ -28,13 +28,16 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <random>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 
 #if defined(_WIN32)
@@ -176,6 +179,48 @@ struct TempDbFile {
     TempDbFile(TempDbFile&&) = delete;
     TempDbFile& operator=(TempDbFile&&) = delete;
 };
+
+/// Sanitizer-aware scale factor for the liveness deadlines below. Deadlines here bound
+/// "a background worker should have got to this by now" — they are a liveness backstop
+/// so a stuck worker fails the suite instead of hanging it, never the property under
+/// test, so stretching them cannot weaken an assertion.
+///
+/// Under a sanitizer they must stretch. Instrumented builds run several times slower
+/// and the whole agent suite shares one process, so a deadline sized for a normal build
+/// turns into an unexplained failure that reproduces nowhere: twice in
+/// test_guardian_outbox_drain_worker.cpp already, both times with ZERO ThreadSanitizer
+/// warnings and a clean 3/3 in isolation. Scaling once here beats discovering the next
+/// one in a nightly run.
+///
+/// Promoted from test_guardian_outbox_drain_worker.cpp (governance CON-S4 —
+/// promote-at-second-user; second user: test_guardian_engine_spark_reconcile.cpp #2238).
+inline constexpr int kSpinScale =
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
+    6;
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
+    6;
+#else
+    1;
+#endif
+#else
+    1;
+#endif
+
+/// Spin on `pred` until it is true or `timeout` (sanitizer-scaled) elapses; returns the
+/// final poll of `pred`. Liveness-only — never encode a timing property in `pred`
+/// itself, only "did the thing happen".
+[[nodiscard]] inline bool spin_until(std::function<bool()> pred,
+                                     std::chrono::milliseconds timeout = std::chrono::seconds{5}) {
+    timeout *= kSpinScale;
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (pred())
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    return pred();
+}
 
 #if defined(YUZU_TEST_ENABLE_PG)
 
@@ -1188,6 +1233,47 @@ inline PostgresTestDb::PostgresTestDb(PgTestTemplate& tpl) {
     INFO("[YUZU_REQUIRE_PG_DB_TPL] fixture status (blank == database came up OK): "                \
          << var.error());                                                                          \
     REQUIRE(var.available())
+
+/// The exact-"1" opt-in parsing rule for YUZU_TEST_PG_MIGRATION_DDL,
+/// extracted as a pure function so its contract is testable on every
+/// platform (not just Windows, where the caller below is the only live
+/// use) — nullptr, empty, "0", a typo, or any value other than the exact
+/// string "1" all opt IN to skipping (return false = "not opted in"),
+/// matching the fail-closed design: a shared, persistent runner (four CI
+/// agents share one OS identity on Wee Tam) must never silently un-skip
+/// an expensive fresh-migration test from a stale or malformed env value.
+inline bool is_migration_ddl_opt_in(const char* env_value) noexcept {
+    return env_value != nullptr && std::string_view(env_value) == "1";
+}
+
+/// FAIL-CLOSED runtime predicate for YUZU_REQUIRE_PG_MIGRATION_DB (below):
+/// skip on Windows unless the operator explicitly opted back in via
+/// is_migration_ddl_opt_in() above.
+inline bool pg_fresh_db_migration_skipped_here() noexcept {
+#ifdef _WIN32
+    return !is_migration_ddl_opt_in(std::getenv("YUZU_TEST_PG_MIGRATION_DDL"));
+#else
+    return false;
+#endif
+}
+
+/// Same contract as YUZU_REQUIRE_PG_DB, for migration-IN-SUBSTANCE fresh-DB
+/// tests only (a fresh migrate, "!is_open on a migration failure", backfill/
+/// upgrade, drift-detection). On Windows these SKIP by default: each
+/// fresh-DB case pays EXEC_BACKEND CreateProcess-per-connection (~19 ms) +
+/// CREATE DATABASE ... TEMPLATE (~26 ms) plus the migration DDL itself
+/// (#2354), and the behaviour stays covered on Linux on every PR and push.
+/// `--list-tests` still enumerates a skipped case (SKIP is a runtime throw,
+/// not a compile-time exclusion), so the pg-shard partition checker and any
+/// exact-case-count pin are unaffected by this macro. Set
+/// YUZU_TEST_PG_MIGRATION_DDL=1 to force these back on for local Windows
+/// debugging or a future dedicated leg.
+#define YUZU_REQUIRE_PG_MIGRATION_DB(var)                                                          \
+    if (yuzu::test::pg_fresh_db_migration_skipped_here()) {                                        \
+        SKIP("fresh-DB migration DDL skipped on Windows (#2354; covered on Linux; "                \
+             "set YUZU_TEST_PG_MIGRATION_DDL=1 to force it on locally)");                          \
+    }                                                                                              \
+    YUZU_REQUIRE_PG_DB(var)
 
 #endif // YUZU_TEST_ENABLE_PG
 

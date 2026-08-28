@@ -111,6 +111,30 @@ jobs:
       - name: Sweep leaked yuzu_test_* databases (#1367)
         run: bash scripts/ci/sweep-test-databases.sh
 
+  prune-macos:
+    name: "Prune macOS runner cache"
+    runs-on: [self-hosted, macOS, ARM64, yuzu-bigmags-macos]
+    timeout-minutes: 15  # parity with the sibling prune jobs
+    steps:
+      - name: Prune vcpkg binary cache zips older than 30 days
+        run: |
+          set -eu
+          # RUNNER_TOOL_CACHE on the BigMags Mac Minis; the macos job in ci.yml
+          # keys its vcpkg binary cache under ${runner.tool_cache}/yuzu-vcpkg-binary-cache-macos.
+          base="${RUNNER_TOOL_CACHE:-}"
+          if [[ -z "$base" || ! -d "$base" ]]; then
+            echo "::warning::RUNNER_TOOL_CACHE not found at '$base' — skipping"
+            exit 0
+          fi
+          echo "Pruning vcpkg binary-cache zips older than 30 days under: $base"
+          # `-type f` because the cache subdirs are kept; only the zip
+          # contents age out. -mtime +30 = strictly older than 30 days.
+          # Print before delete so the workflow log shows what went.
+          before_total=$(find "$base/yuzu-vcpkg-binary-cache-macos" -type f 2>/dev/null | wc -l || echo 0)
+          deleted=$(find "$base/yuzu-vcpkg-binary-cache-macos" -type f -mtime +30 -print -delete 2>/dev/null | wc -l || echo 0)
+          after_total=$(find "$base/yuzu-vcpkg-binary-cache-macos" -type f 2>/dev/null | wc -l || echo 0)
+          echo "before=${before_total} deleted=${deleted} after=${after_total}"
+
   prune-windows:
     name: "Prune Windows runner cache"
     runs-on: [self-hosted, Windows, X64, yuzu-weetam-windows]

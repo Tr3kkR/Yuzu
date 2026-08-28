@@ -399,6 +399,33 @@ template <class Ids>
     return out;
 }
 
+/// Lattice intersection of two `VisibleSet`s: `std::nullopt` is TOP
+/// (unfiltered), so it is the identity — `meet(nullopt, b) == b` and
+/// `meet(a, nullopt) == a`. A present set is a filter; the meet of two
+/// present sets is their set intersection, always present (never collapsed
+/// back to `nullopt`, even when the result is empty — `deny_all()` above is
+/// exactly that present-but-empty case, and it must survive a meet with
+/// TOP unchanged: `meet(deny_all(), b) == deny_all()`, the lattice bottom
+/// absorbing). Commutative and associative — composing more than two axes
+/// in any order is safe.
+///
+/// This is the primitive the new list-read gate uses to combine the
+/// management-group axis (`RbacStore::authorize_list_read`) with the
+/// service-scope axis: never a reuse of, and never a rewrite of,
+/// `compose_exec_visible` below — that function's *supersede* semantics for
+/// dispatch are a deliberately separate, unchanged decision.
+[[nodiscard]] inline VisibleSet meet(const VisibleSet& a, const VisibleSet& b) {
+    if (!a)
+        return b;
+    if (!b)
+        return a;
+    std::unordered_set<std::string> out;
+    for (const auto& id : *a)
+        if (b->contains(id))
+            out.insert(id);
+    return out;
+}
+
 /// The already-resolved facts `compose_exec_visible` decides from. Each is
 /// looked up by the caller (which owns the RbacStore/TagStore handles this
 /// registry-independent header deliberately does not depend on) so the DECISION

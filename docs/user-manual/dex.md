@@ -270,11 +270,16 @@ fleet-now/cohort perf endpoints are now-views (no window), while the
 group), not a now-view. All are gated on `GuaranteedState:Read`. The per-signal
 drill-down returns a most-affected **devices** list (behavioral) and is
 **audit-logged** (`dex.signal.view`) on every call, exactly like the dashboard
-view; the rollup, scope and aggregate perf endpoints are aggregates /
-machine-health telemetry and are not audited — and the app-perf aggregates
-suppress any sub-floor `(version, day)` point (fewer than 10 devices) to a count
-only. The per-device app-perf drill IS audited (`dex.device.app_perf.view`,
-fail-closed). The aggregate reads are exposed as MCP tools (`list_dex_signals`,
+view; the rollup, scope, and true aggregate perf endpoints (`/perf/fleet`,
+`/perf/cohorts`, `/perf/cohort-diff`, `/perf/apps`, `/perf/app`, `/perf/group`)
+are machine-health telemetry / fleet metadata and are not audited — and the
+app-perf aggregates suppress any sub-floor `(version, day)` point (fewer than
+10 devices) to a count only. **`/perf/devices` is the exception**: each row
+names an `agent_id` fleet-wide, so unlike its aggregate siblings it IS
+audited (`dex.perf.device.view`, fail-closed) and denies a service-scoped API
+token outright. The per-device app-perf drill IS also audited
+(`dex.device.app_perf.view`, fail-closed). The aggregate reads are exposed as
+MCP tools (`list_dex_signals`,
 `get_dex_signal_scope`, `get_dex_signal_detail`, `get_dex_perf_fleet`,
 `get_dex_perf_cohorts`, `get_dex_perf_cohort_diff`, `list_dex_perf_devices`,
 `list_dex_perf_apps`, `get_dex_app_perf`, `get_dex_group_app_perf`); the

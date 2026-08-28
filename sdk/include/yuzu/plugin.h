@@ -101,11 +101,16 @@ typedef enum {
 /**
  * One per-OS leg of an action's capability declaration.
  *
- * `rung` is a coarse 1-3 implementation-maturity rung local to this action
- * (1 = minimal/best-effort, 3 = fully hardened); 0 means undeclared. It is
- * deliberately independent of `support`: e.g. a PLANNED leg may already carry
- * a target rung, and a SUPPORTED leg's rung communicates how much further
- * hardening exists versus a plugin author who never filled it in.
+ * `rung` states HOW this leg acquires the capability on this OS, per the
+ * acquisition ladder fixed by docs/adr/3002-acquisition-ladder.md: rung 1 =
+ * the native OS interface (syscalls / kernel-published surfaces / OS APIs —
+ * zero processes, the best rung), rung 2 = the argv runner (a subprocess
+ * exec'd through the shared agent-core subprocess_runner), rung 3 = the
+ * governed shell (a runner-spawned shell — two-plus processes, string-as-
+ * code, the worst rung). 0 means undeclared. It is deliberately independent
+ * of `support`: e.g. a PLANNED leg may already name its target rung, and a
+ * SUPPORTED leg's rung says which acquisition method is actually wired —
+ * never how mature or hardened that wiring is.
  */
 typedef struct {
     YuzuSupportLevel support;

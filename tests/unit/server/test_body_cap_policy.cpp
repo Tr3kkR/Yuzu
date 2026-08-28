@@ -19,6 +19,7 @@
  */
 
 #include "body_cap_policy.hpp"
+#include "test_loopback_http.hpp"
 #include "web_utils.hpp"
 
 #include <httplib.h>
@@ -81,6 +82,16 @@ constexpr ExpectedResolution kExpected[] = {
     {"DELETE", "/mcp/v1/",                                4u * 1024 * 1024,   true,  "mcp"},
     // bundle_service.hpp:24-33 / rest_api_v1.cpp:1417.
     {"POST",   "/api/v1/bundles",                         70u * 1024 * 1024,  false, "bundles"},
+    // body_cap_policy.hpp upload_session row — the PR1.6a chunked-receive
+    // surface. Cap = upload_grant::kDefaultChunkMaxBytes (bound by the
+    // static_assert in file_retrieval_routes.cpp). requires_measurable=true:
+    // the chunk route's session gate runs in the HANDLER, after httplib
+    // buffers, so the pre-read bound is what stops an unauthenticated caller
+    // buffering 100 MB. ANY method — sibling verbs (status GET, commit POST,
+    // cancel DELETE, session-open POST on the bare prefix) share the class.
+    {"PUT",    "/api/v1/uploads/abc123/chunk",            8u * 1024 * 1024,   true,  "upload_session"},
+    {"POST",   "/api/v1/uploads",                          8u * 1024 * 1024,  true,  "upload_session"},
+    {"POST",   "/api/v1/uploads/abc123/commit",            8u * 1024 * 1024,  true,  "upload_session"},
     // body_cap_policy.hpp plugin_config row — the PR1.5 config/secret/
     // kill-switch plane. 256 KiB = the 64 KiB secret-plaintext grammar cap
     // (plugin_config_parsers.hpp) plus JSON framing headroom.
@@ -163,6 +174,7 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "saml_acs",
     "response_templates",
     "tar_dashboard_sql",
+    "upload_session",
     "plugin_config",
     "tar_result_set_sql",
     "guardian_rule_authoring",
@@ -305,16 +317,26 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // tar_dashboard_sql(1) + tar_result_set_sql(1) +
     // guardian_rule_authoring(2: POST create + PUT update) +
     // workflow_yaml(1) + product_pack_yaml(1) + instruction_import(1) +
-    // instruction_yaml(3: save/validate/preview) + plugin_config(1: the
-    // PR1.5 config/secret plane) + default(1).
-    CHECK(std::size(kBodyCapTable) == 26);
+    // instruction_yaml(3: save/validate/preview) + upload_session(1: the
+    // PR1.6a chunked-receive surface) + plugin_config(1: the PR1.5 config/
+    // secret plane) + default(1).
+    CHECK(std::size(kBodyCapTable) == 27);
 }
 
-// ── 7. requires_measurable: ON for /mcp/, OFF for the named public classes ──
+// ── 7. requires_measurable: ON for /mcp/ and upload_session, OFF elsewhere ──
 
-TEST_CASE("resolve_body_cap: requires_measurable is ON only for /mcp/", "[body_cap]") {
+// M2 (review finding): this case's own name claimed "ON only for /mcp/"
+// while never asserting the OTHER measurable class at all — the doc's
+// rest-api.md carried the identical stale claim (both fixed together). A
+// regression on the upload_session opt-in would have shipped with this
+// test green.
+TEST_CASE("resolve_body_cap: requires_measurable is ON for /mcp/ and upload_session, OFF "
+         "for every other named class",
+         "[body_cap]") {
     CHECK(resolve_body_cap("POST", "/mcp/v1/").requires_measurable);
     CHECK(resolve_body_cap("GET", "/mcp/v1/").requires_measurable);
+    CHECK(resolve_body_cap("PUT", "/api/v1/uploads/abc123/chunk").requires_measurable);
+    CHECK(resolve_body_cap("POST", "/api/v1/uploads").requires_measurable);
 
     // Public REST (bundles), SCIM, certificate import (REST + dashboard),
     // product-pack/workflow authoring, OTA upload, and plugin-config all
@@ -382,6 +404,13 @@ struct UnifiedBodyCapTestServer {
     std::thread server_thread;
     int port{0};
     std::atomic<int> handler_calls{0};
+    // Rejection witness (#2757): incremented exactly where the pre-routing
+    // handler below decides `decision.refuse`, so a Windows connection-reset
+    // fallback (test_loopback_http.hpp) can prove the rejection actually
+    // ran for a given request rather than accepting any lost response.
+    // Distinct from post_read_rejections below, which counts a DIFFERENT
+    // (later) stage.
+    std::atomic<int> pre_routing_rejections{0};
     // body-cap-post-read-stage (#2898-aware): counts every invocation of the
     // fixture's `set_pre_request_handler` below, admitted or refused. Used
     // to prove ORDERING against the pre-routing stage — a request the
@@ -447,6 +476,7 @@ struct UnifiedBodyCapTestServer {
                 httplib::detail::is_chunked_transfer_encoding(req.headers));
             if (decision.refuse) {
                 res.status = decision.status;
+                pre_routing_rejections.fetch_add(1);
                 return httplib::Server::HandlerResponse::Handled;
             }
             // Everything below this point (onbehalf-of, rate limiting, the
@@ -701,18 +731,22 @@ TEST_CASE("Pre-routing body cap: a non-identity Content-Encoding is refused rega
 
     // A class with requires_measurable == false (the "default" catch-all,
     // matched by /api/v1/devices) — proves D4 does NOT gate on that bit.
-    auto r1 = cli.Post("/api/v1/devices", {{"Content-Encoding", "gzip"}}, "small body",
-                       "application/json");
-    REQUIRE(r1);
-    CHECK(r1->status == 415);
+    yuzu::test::expect_pre_routing_rejection(
+        [&] {
+            return cli.Post("/api/v1/devices", {{"Content-Encoding", "gzip"}}, "small body",
+                            "application/json");
+        },
+        415, ts.pre_routing_rejections);
     CHECK(ts.handler_calls.load() == 0);
 
     // /mcp/ (requires_measurable == true) reaches the SAME refusal via the
     // SAME first check, not the class-specific unmeasurable path (411).
-    auto r2 = cli.Post("/mcp/v1/", {{"Content-Encoding", "br"}}, "small body",
-                       "application/json");
-    REQUIRE(r2);
-    CHECK(r2->status == 415);
+    yuzu::test::expect_pre_routing_rejection(
+        [&] {
+            return cli.Post("/mcp/v1/", {{"Content-Encoding", "br"}}, "small body",
+                            "application/json");
+        },
+        415, ts.pre_routing_rejections);
     CHECK(ts.handler_calls.load() == 0);
 
     // A request with NO Content-Encoding header (ordinary traffic) is still

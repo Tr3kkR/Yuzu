@@ -272,6 +272,26 @@ def _cmd_without_test_specs(cmd):
     return [cmd[0]] + [a for a in cmd[1:] if not CATCH2_TAG_SPEC.match(a)]
 
 
+def _cmd_for_case_retry(cmd):
+    """cmd minus tag-filter specs AND --allow-running-no-tests.
+
+    That flag (pg shard D, #2092) survives _cmd_without_test_specs — it
+    doesn't match CATCH2_TAG_SPEC — so it would otherwise carry straight into
+    an isolated single-case retry. Catch2 ORs a comma inside a positional
+    name spec into multiple sub-filters, so a case whose own name contains a
+    literal comma (real example: ADR-0051's "...missing ONLY
+    software_packages, with real deployment data in the other two tables")
+    legitimately zero-matches both halves. On a whole-shard run that
+    zero-match is the DSN-less-platform all-skip the flag exists for; on a
+    single already-known case name it is always an error, never a
+    legitimate skip — left in, that zero-match still exits 0 and
+    retry_case() reports a case that never ran as recovered."""
+    stripped = _cmd_without_test_specs(cmd)
+    if not stripped:
+        return stripped
+    return [stripped[0]] + [a for a in stripped[1:] if a != "--allow-running-no-tests"]
+
+
 def _run(cmd, env, workdir, extra=None, timeout=None):
     e = dict(os.environ)
     e.update(env or {})
@@ -315,10 +335,10 @@ def catch2_failed_cases(test, this_os):
 
 def retry_case(test, case, retries):
     """Return the 1-based retry attempt that passed, or 0 if none passed."""
+    cmd = _cmd_for_case_retry(test.get("cmd") or [])
     for attempt in range(1, retries + 1):
         try:
-            result = _run(_cmd_without_test_specs(test.get("cmd") or []),
-                          test.get("env"), test.get("workdir"), extra=[case],
+            result = _run(cmd, test.get("env"), test.get("workdir"), extra=[case],
                           timeout=test.get("timeout") or None)
         except subprocess.TimeoutExpired:
             continue
@@ -691,6 +711,23 @@ def _selftest():
     check(_cmd_without_test_specs(["x", "[.]"]) == ["x"], "strips hidden-tag spec")
     check(_cmd_without_test_specs(["x", ""]) == ["x", ""], "empty arg kept (not a spec)")
 
+    # _cmd_for_case_retry (2026-08-17, found reviewing PR #3174's pg-shard-D
+    # routing): --allow-running-no-tests must NOT survive into an isolated
+    # single-case retry. It doesn't match CATCH2_TAG_SPEC, so
+    # _cmd_without_test_specs() alone keeps it — and a case name with a
+    # literal comma (Catch2 ORs a comma inside a positional spec) then
+    # legitimately zero-matches, which the flag turns into a silent exit 0.
+    check(_cmd_for_case_retry(["x", "[pg][audit_store]~[routes]~[store]~[token],"
+                               "[pg][software_deployment]~[routes]~[store]~[token]",
+                               "--allow-running-no-tests"]) == ["x"],
+          "strips both the pg-shard-D tag spec and --allow-running-no-tests")
+    check(_cmd_for_case_retry(["x", "--allow-running-no-tests", "[pg]"]) == ["x"],
+          "strips the flag regardless of its position relative to the tag spec")
+    check(_cmd_for_case_retry(["x", "--foo"]) == ["x", "--foo"],
+          "an unrelated option flag is not mistaken for --allow-running-no-tests")
+    check(_cmd_for_case_retry(["--allow-running-no-tests"]) == ["--allow-running-no-tests"],
+          "argv[0] untouched even when it equals the flag")
+
     # Repo-hygiene guard (#2092): every positional arg on the server test()
     # entries in tests/meson.build must be a Catch2 tag-filter spec — the
     # invariant the retry surgery relies on. A future case-name or comma-list
@@ -707,7 +744,14 @@ def _selftest():
     # or the guard fails loudly instead of silently inspecting half the
     # surface.
     _entries = re.findall(r"test\(\s*'[^']*',\s*server_test_exe\b(.*?)\)", _src, re.S)
-    check(len(_entries) >= 4, "meson.build: all four server shard entries located")
+    # Windows CI test-phase restructuring (#3443, 2026-08-28): 11 pg shards
+    # (10 + new shard K) + 4 non-pg shards (A/B + shard C, then a later
+    # measured-by-time follow-up added shard D, carved from B's [body_cap]
+    # tests) + the smoke entry (also server_test_exe) = 16. The floor stays
+    # a loose ">=", same spirit as the original "twelve" (itself a floor,
+    # not an exact pin) -- exactness is check-pg-shard-partition.py's job,
+    # against the real binary.
+    check(len(_entries) >= 16, "meson.build: all sixteen server shard entries located")
     _shard_specs = []
     for _body in _entries:
         # Quote-aware list match: a naive [(.*?)] truncates at the tag spec's
@@ -719,32 +763,81 @@ def _selftest():
             continue  # an args-less entry has no positional specs to strip
         _args = re.findall(r"'([^']*)'", _m.group(1))
         check(bool(_args), "meson.build: args-carrying server entry extracted non-empty")
-        for _arg in _args:
+        # Positional tag-filter specs vs Catch2 OPTION flags. A shard whose
+        # cases ALL skip on a DSN-less platform (macOS: shard D, every case
+        # gated on YUZU_TEST_POSTGRES_DSN) needs `--allow-running-no-tests`, or
+        # Catch2 exits 4 on an all-skipped run and reds the leg (#2092). Option
+        # flags are exempt from the tag-spec hygiene guard and from the shard
+        # pin below (which keys on the positional specs). The whole-shard
+        # enumeration re-run (catch2_failed_cases) preserves options, including
+        # this one — it still needs to survive a DSN-less all-skip. The
+        # isolated SINGLE-CASE retry (_cmd_for_case_retry) does NOT preserve
+        # --allow-running-no-tests specifically: a comma-containing case name
+        # would otherwise zero-match (Catch2 ORs a comma in a positional name
+        # spec) and the flag would turn that into a silent false "recovered"
+        # instead of the honest failure a single-case retry should never
+        # tolerate zero matches on (found reviewing PR #3174's pg-shard-D
+        # routing, 2026-08-17 — see _cmd_for_case_retry's own docstring).
+        _specs = [a for a in _args if not a.startswith("-")]
+        _opts = [a for a in _args if a.startswith("-")]
+        check(bool(_specs), "meson.build: server entry has at least one positional spec")
+        for _arg in _specs:
             check(CATCH2_TAG_SPEC.match(_arg) is not None,
                   f"meson.build server test arg {_arg!r} is not a tag-filter spec")
-        _shard_specs.append(tuple(_args))
-    # Positive pin so hollow extraction can never pass again: the shard filters
-    # must come back verbatim. A shard add or rebalance updates this line
-    # consciously. #2394 split the single '[pg]' entry into two balanced halves
-    # (the auth->PG cutover ~doubled the [pg] population). #2395 then split the
-    # non-PG '~[pg]' entry the same way, after it reached 603/600s (101%) on
-    # Windows; the partition is [auth]+[mcp] vs the rest, balanced by measured
-    # time rather than case count ([auth] alone is ~40% of the non-PG runtime).
-    # #2697 (ADR-0040) added [audit_store] explicitly to both PG specs: measured
-    # (not projected) at ~3% of shard B's runtime, moving it to shard A instead
-    # of leaving every newly `[pg]`-tagged audit case to land there by default
-    # (tests/meson.build's own comment on this pair has the measurement).
-    # 2026-08-15 rebalance added [rbac_store]/[guaranteed_state_store]/
-    # [response_store] to both PG specs the same way: measured 793 (A) / 1154
-    # (B) at the time of the change, moving 207 cases off shard B after it had
-    # drifted to 2.3x shard A's size and started TIMEOUT-ing at 600s on Linux
-    # and Windows (tests/meson.build's own comment on this pair has the
-    # measurement).
-    check(("~[pg][auth],~[pg][mcp]",) in _shard_specs
-          and ("~[pg]~[auth]~[mcp]",) in _shard_specs
-          and ("[pg][routes],[pg][store],[pg][token],[pg][audit_store],[pg][rbac_store],[pg][guaranteed_state_store],[pg][response_store]",) in _shard_specs
-          and ("[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]",) in _shard_specs,
-          "meson.build: all four shard tag filters extracted verbatim")
+        for _opt in _opts:
+            check(_opt.startswith("--"),
+                  f"meson.build server test option {_opt!r} is not a --long flag")
+        _shard_specs.append(tuple(_specs))
+    # Positive pin, SCOPED DOWN (Phase 1, #3443): this used to pin all twelve
+    # shard filters verbatim -- a hardcoded string hand-updated on every
+    # pg-shard split/rebalance, missed 3 times in as many weeks, each time
+    # reddening CI unconditionally (full incident history was here; it's
+    # tests/meson.build's own shard-history comment now, the authoritative
+    # copy, not duplicated here a second time to go stale independently).
+    #
+    # The pg shards' partition identity is now proven STRUCTURALLY, against
+    # the real compiled binary, by scripts/ci/check-pg-shard-partition.py --
+    # a dedicated meson test() entry (suite: ['server', 'server-checks'],
+    # needs yuzu_server_tests built, which this selftest deliberately does
+    # not depend on). It
+    # discovers shard entries via `meson introspect --tests` keyed on suite
+    # membership ('yuzu:server-pg'), not a hardcoded name/filter list, so a
+    # pg-shard add/split/rebalance needs no update here at all -- only a
+    # correct suite: kwarg on the new/changed test() entry, which the same
+    # check would itself catch getting dropped (hollow-discovery guard).
+    #
+    # What's left to pin here: the NON-pg shard filters (auth/mcp split, now
+    # four since a later measured-by-time follow-up carved shard D's
+    # [body_cap] tests out of B, on top of the earlier B -> B+C split, #3443
+    # 2026-08-28) -- comparatively stable, unlike the pg shards, which get
+    # rebalanced -- so a small verbatim pin is proportionate for them
+    # specifically. Plus a COUNT-based (not exact-string) sanity check that
+    # extraction still finds a real pg-shard population (now 11: 10 + shard
+    # K, plus the smoke entry makes 12 total non-excluded specs -- see the
+    # comment on the >= 12 floor below), as a second, independent signal
+    # alongside check-pg-shard-partition.py's own hollow-discovery guard, in
+    # case the two checks are ever run without each other.
+    _NONPG_SPECS = (
+        ("~[pg][auth],~[pg][mcp]",),
+        ("~[pg]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]~[body_cap]",),
+        ("~[pg]~[auth]~[mcp][cel],~[pg]~[auth]~[mcp][viz],~[pg]~[auth]~[mcp][scope],"
+         "~[pg]~[auth]~[mcp][dispatch],~[pg]~[auth]~[mcp][nvd],~[pg]~[auth]~[mcp][dex]",),
+        ("[body_cap]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]",),
+    )
+    _pg_specs = [s for s in _shard_specs if s not in _NONPG_SPECS]
+    check(all(spec in _shard_specs for spec in _NONPG_SPECS),
+          "meson.build: all four non-pg shard tag filters extracted verbatim")
+    # _pg_specs = 11 real pg shards (10 + K) + the smoke entry (also
+    # server_test_exe, also not one of the three excluded non-pg tuples) =
+    # 12. Not 11 -- the smoke entry's own spec ('[pg-smoke]',) has always
+    # been counted here; this is a pre-existing property of the extraction,
+    # not new to this split (verified against the pre-split source: smoke
+    # was already included, making the OLD floor's true value 11, not the
+    # "10 pg-shard entries" the old message claimed).
+    check(len(_pg_specs) >= 12,
+          f"meson.build: at least 12 pg-shard-or-smoke entries found (got {len(_pg_specs)}) "
+          "-- exact partition identity is proven separately, against the real "
+          "binary, by check-pg-shard-partition.py")
 
     if failures:
         print("SELFTEST FAILURES:", *failures, sep="\n  ")

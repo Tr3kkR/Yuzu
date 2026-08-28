@@ -22,10 +22,12 @@
 #include <yuzu/plugin.h>
 
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -254,6 +256,14 @@ public:
     /// mutual-exclusion test seam.
     std::size_t spark_armed_rule_count() const;
 
+    /// Per-SparkType count of rules CURRENTLY classified RulePlacement::Unsupported -
+    /// enforced by neither armed_guard_count() nor spark_armed_rule_count() (F7,
+    /// #2298 rung 2). A CURRENT gauge, not a cumulative counter: aggregates the live
+    /// unsupported_rules_ map fresh on every call, so it can legally decrease (e.g. a
+    /// mechanism becoming available, or the rule being disabled/removed). Backs the
+    /// mech_unsupported_total heartbeat tag.
+    [[nodiscard]] std::map<SparkType, std::uint64_t> unsupported_counts_by_type() const;
+
     /// Current policy generation — monotonically increasing; bumped on
     /// every successful apply_rules call. Persisted across restarts.
     std::uint64_t policy_generation() const;
@@ -299,11 +309,35 @@ public:
     /// The current, immutable-after-set outcome of wire_spark_engine().
     [[nodiscard]] SparkAvailability spark_availability() const;
 
+    /// Constructor-time spark preference (F7). No lock needed: prefer_spark_ is const,
+    /// set once in the ctor initializer list before this object is ever shared across
+    /// threads - unlike spark_availability_, which IS written later by
+    /// wire_spark_engine() and needs mtx_ for the cross-thread happens-before edge.
+    /// Exposed for yuzu.guardian_backend (guardian_backend_from_state()): Available
+    /// alone does not mean the backend IS spark, since prefer_spark_ defaults false.
+    [[nodiscard]] bool prefer_spark() const noexcept { return prefer_spark_; }
+
     /// TEST-ONLY: the durable-journal component, for fault injection (see
     /// GuardianLifecycleJournal::inject_write_failures_for_test). Null until
     /// wire_spark_engine runs. No production caller.
     [[nodiscard]] GuardianLifecycleJournal* lifecycle_journal_for_test() {
         return lifecycle_journal_.get();
+    }
+
+    /// TEST-ONLY: the spark drain worker / convergence scheduler, for started-state
+    /// introspection (#2238, fixes BLOCKING-2b). wire_spark_engine() constructs both
+    /// unconditionally but starts them only under prefer_spark_ — journal_age_stats()
+    /// short-circuits on !prefer_spark_ BEFORE its stamp check, so that accessor alone
+    /// does not discriminate "constructed but never started" from "prefer_spark_
+    /// false"; reverting the start gate (always-start) fails no other test. Read-only
+    /// introspection — categorically outside the mutable-decision-setter class rev-1
+    /// review rejected (see SparkAvailability above). Null until wire_spark_engine
+    /// runs. No production caller.
+    [[nodiscard]] GuardianOutboxDrainWorker* drain_worker_for_test() {
+        return spark_drain_worker_.get();
+    }
+    [[nodiscard]] ConvergenceScheduler* convergence_scheduler_for_test() {
+        return spark_scheduler_.get();
     }
 
     /// TEST-ONLY: override the drain worker's periodic backstop and maintenance cadences.
@@ -333,6 +367,50 @@ public:
     /// immediately, so an inferred jitter would turn a real race assertion into a hollow
     /// pass rather than a failure (Sol review).
     void set_maintenance_jitter(bool on) { maintenance_jitter_ = on; }
+
+    /// TEST-ONLY: if set, invoked inside start_local()'s re-arm walk once per cached
+    /// enabled rule, immediately BEFORE reconcile_rule_locked() — so a throw from the
+    /// hook simulates the failure class the surrounding catch exists for (a legacy
+    /// guard's std::thread ctor throwing std::system_error under thread/handle
+    /// exhaustion), aimed at exactly one rule by rule_id. Deliberately NOT fired from
+    /// inside reconcile_rule_locked() itself, which would also fire on the apply_rules
+    /// path this seam is not meant to touch.
+    ///
+    /// This is fault INJECTION into an existing degrade handler, not the mutable
+    /// spark-vs-legacy DECISION setter rev-1 review rejected (see SparkAvailability
+    /// above) — same class of seam as SparkEngine::set_arm_fault_hook_for_test (#2270).
+    ///
+    /// CONTRACT: fires with mtx_ HELD (start_local() holds it for the whole re-arm
+    /// walk) — throw or observe only; re-entering the engine from the hook
+    /// self-deadlocks. This is a genuine same-thread std::mutex relock (undefined
+    /// behavior in practice: a silent hang, not the loud WorkerHostileMutex abort —
+    /// that guard only fires for the worker threads stop() joins, and the calling
+    /// thread here is never one of those). Arming a hook (non-null) MUST happen
+    /// BEFORE start_local() runs (set-then-use; asserted) — clearing it (nullptr),
+    /// typically during teardown after start_local() already ran, is always fine.
+    /// No production caller.
+    void set_rearm_fault_hook_for_test(std::function<void(const std::string& rule_id)> hook) {
+        assert((!hook || !started_) &&
+               "set_rearm_fault_hook_for_test: arming a hook must happen before start_local()");
+        rearm_fault_hook_for_test_ = std::move(hook);
+    }
+
+    /// TEST-ONLY: the exact message logged for the most recent start_local() re-arm
+    /// degrade (empty if none occurred this run). Recorded directly at the point of
+    /// emission rather than observed via spdlog - a test binary's process-wide
+    /// spdlog::set_default_logger() swap is not guaranteed to be visible to spdlog::
+    /// calls made inside this class's own translation unit across every supported
+    /// toolchain (confirmed on a macOS dylib build: the swap in the test image never
+    /// reached this catch's spdlog::error call, silently emptying the capture -
+    /// same cross-image-state class as the #501 abseil hash-seed split
+    /// guardian_dispatch_push_bytes_for_test works around). Plain object-member
+    /// state has no such hazard: it lives in the GuardianEngine instance regardless
+    /// of which image the writing method's code was compiled into. Locked (like
+    /// rule_count()/spark_armed_rule_count()) and returned BY VALUE, not by
+    /// reference - a reference into mtx_-protected state would keep aliasing it
+    /// after the lock_guard released, defeating the point of taking the lock. No
+    /// production caller.
+    [[nodiscard]] std::string last_rearm_degrade_message_for_test() const;
 
     /// Live bounded-I/O worker count on the spark reader (0 if never wired) -
     /// the F3 orphan-exit obligation's plumbing (rung 7.6 is the enforcement).
@@ -478,7 +556,24 @@ private:
     /// Maintenance phase/forced-page jitter (see set_maintenance_jitter). OFF unless the
     /// production wiring turns it on, so every test's cadence stays deterministic.
     bool maintenance_jitter_{false};
+    /// TEST-ONLY re-arm fault injector (see set_rearm_fault_hook_for_test); null = no-op.
+    std::function<void(const std::string&)> rearm_fault_hook_for_test_;
+    /// TEST-ONLY (see last_rearm_degrade_message_for_test); empty = no degrade this run.
+    std::string last_rearm_degrade_message_for_test_;
     std::unordered_map<std::string, std::unique_ptr<IGuard>> guards_;
+
+    /// rule_id -> SparkType for every rule CURRENTLY classified RulePlacement::Unsupported
+    /// (F7, #2298 rung 2): a known spark type with no mechanism registered on this host,
+    /// enforced by NEITHER backend. Maintained by reconcile_rule_locked (mtx_ held): every
+    /// outcome that is NOT Unsupported explicitly erases its own rule_id there; only the
+    /// Unsupported branch inserts/updates. Deliberately not an erase-at-function-entry +
+    /// reinsert pattern - that shape loses data if reconcile_rule_locked throws between the
+    /// erase and the (much later) reinsert point (apply_rules's per-rule try/catch means it
+    /// really can throw), and independently makes every retained-unsupported rule look
+    /// newly-unsupported on a full_sync pass, spamming the edge-triggered log. Backs
+    /// unsupported_counts_by_type(). Cleared (by rule_id sweep, not blanket) at the end of a
+    /// full_sync apply_rules pass, and blanket-cleared in stop().
+    std::unordered_map<std::string, SparkType> unsupported_rules_;
 
     // --- Spark detection path (rung 7) - all guarded by mtx_ except where noted ---
     const bool prefer_spark_; ///< IMMUTABLE for object lifetime; set only at construction

@@ -26,6 +26,18 @@ context-refs: #1634 (response-reader ruling), PR #1711 (per-row filter foundatio
 > wrappers (`require_list_read` etc.) land with their first caller in PR-B rather than uncalled here.
 > Ships alongside the decision-independent **#1717** fail-closed gate fix (`require_permission` /
 > `require_scoped_permission` gate on `rbac_enforcement_in_effect`).
+>
+> **Update (2026-08-15) — `AuthRoutes::require_list_read` has a live first caller, outside the
+> PR-B…E ladder.** `GET /api/v1/guaranteed-state/status` (#2298 item 6d / #3038) now gates via
+> `require_list_read` as its sole authorization primitive — the transport wrapper this ADR names
+> is no longer "uncalled." An earlier attempt (commit `9269b5636`) stacked a direct
+> `authorize_list_read` call behind the pre-existing flat `require_permission` gate instead of
+> replacing it, which does not compose (`require_permission`'s RBAC branch never consults
+> `ManagementGroupStore`); the corrected wiring (`369643caf`) replaced both with the single
+> `require_list_read` gate this ADR anticipated. This landed independently of the PR-B…E
+> enumeration below (which still tracks `responses`/device-list/inventory/audit-log/DEX/TAR) —
+> update that list's own status per-surface as each one actually switches, don't infer this
+> route's completion applies to any of them.
 
 ## Context
 
@@ -228,9 +240,9 @@ gate.
 - **Device list** — `/api/agents` (`server.cpp:5312`), `/fragments/devices/list`, the dashboard
   `get_visible_agents` callers (`dashboard_routes.cpp:989/1159/1889`, `server.cpp:7892`),
   `get_visible_agents_json` (`server.cpp:3784/8543`).
-- **Inventory** — `query_installed_software` (MCP, `mcp_server.cpp:1377`),
-  `GET /api/v1/inventory/software` (`rest_api_v1.cpp:3026+`) — #1713 / #1676 (needs its own UAT to
-  settle effective-vs-inert; the born-on-PG `SoftwareInventoryStore` path may differ).
+- **Inventory** — `query_installed_software` (MCP) + `GET /api/v1/inventory/software` (REST):
+  **DONE (#3290, 2026-08-20)** — migrated onto `require_fleet_read`, the admit-then-filter gate
+  this ADR designed; confinement is now effective on both surfaces.
   - **`/inventory` dashboard FIND** (`InventoryRoutes`, `inventory_routes.cpp` find/results) shares
     the SAME per-row drop filter + omission audit as the REST/MCP siblings above — it converts the
     same way (swap its `Inventory:Read` gate to admit-then-filter; the per-row filter is already
@@ -346,8 +358,8 @@ ahead of PR-A.)
    callers, `get_visible_agents_json`; **delete** the role-existence narrower + its #1453 full-fleet
    fallback (INV-6), replace with the permission-specific set. Six callers across dashboard + server
    + json — consider splitting REST vs dashboard.
-4. **PR-D — inventory.** `query_installed_software` + `GET /api/v1/inventory/software` (#1713 /
-   #1676), after the dedicated inventory UAT settles effective-vs-inert.
+4. **PR-D — inventory.** `query_installed_software` + `GET /api/v1/inventory/software` —
+   **DONE (#3290)**. `/inventory` dashboard FIND remains open (its own conversion, see above).
 5. **PR-E — DEX / TAR / audit-log.** The DEX `VisibleSetFn` seam + remaining dashboard fragments +
    the `AuditLog:Read` surface.
 

@@ -16,6 +16,7 @@
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <memory>
 #include <optional>
@@ -68,6 +69,7 @@ struct TarHarness {
     std::string compat_output = "config|dummy|1";
     bool audit_ok = true;      // #1647: flip to drop the evidence row (audit_fn → false)
     bool audit_throws = false; // #1647: simulate a bad_alloc-class throw out of audit_fn
+    bool service_scoped = false; // simulate a service-scoped API token session
 
     struct AuditRow {
         std::string action, result, target_id, detail;
@@ -82,6 +84,8 @@ struct TarHarness {
                 return std::nullopt;
             auth::Session s;
             s.username = session_user;
+            if (service_scoped)
+                s.token_scope_service = "printers";
             return s;
         };
         auto perm = [this](const httplib::Request&, httplib::Response&, const std::string&,
@@ -604,4 +608,44 @@ TEST_CASE("TAR capture-sources: a healthy device still renders the sources grid"
     CHECK(res->body.find("capTable") != std::string::npos);
     CHECK(res->body.find("TAR storage is offline") == std::string::npos);
     CHECK(res->body.find("failed the status query") == std::string::npos);
+}
+
+// SEC-2/SEC-3 confinement-gap class (found during a docs sweep): devices_fn_
+// backing both TAR frame device pickers is username-keyed and does not
+// confine a service-scoped API token whose principal resolves to an
+// unscoped grant.
+TEST_CASE("TAR device pickers: service-scoped token denied on both frames, "
+          "denial audited",
+          "[tar][tree][routes][security]") {
+    TarHarness h;
+    h.service_scoped = true;
+
+    auto tree = h.sink.Get("/fragments/tar/process-tree");
+    REQUIRE(tree);
+    CHECK(tree->status == 403);
+    // #3167: no `.permission` (no grant admits a service-scoped caller here —
+    // naming one is a false self-remediation claim), and header/body
+    // correlation-id parity.
+    auto tree_body = nlohmann::json::parse(tree->body, nullptr, false);
+    REQUIRE_FALSE(tree_body.is_discarded());
+    CHECK_FALSE(tree_body["error"].contains("permission"));
+    CHECK_FALSE(tree_body["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(tree->get_header_value("X-Correlation-Id") ==
+         tree_body["error"]["correlation_id"].get<std::string>());
+
+    auto cap = h.sink.Get("/fragments/tar/capture-sources");
+    REQUIRE(cap);
+    CHECK(cap->status == 403);
+    auto cap_body = nlohmann::json::parse(cap->body, nullptr, false);
+    REQUIRE_FALSE(cap_body.is_discarded());
+    CHECK_FALSE(cap_body["error"].contains("permission"));
+    CHECK_FALSE(cap_body["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(cap->get_header_value("X-Correlation-Id") ==
+         cap_body["error"]["correlation_id"].get<std::string>());
+
+    REQUIRE(h.audit_log.size() == 2);
+    CHECK(h.audit_log[0].action == "tar.device_picker.view");
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[1].action == "tar.device_picker.view");
+    CHECK(h.audit_log[1].result == "denied");
 }

@@ -192,7 +192,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     .counter("yuzu_enrollment_token_rejected_total",
                              {{"variant", "invalid_input_length"}})
                     .increment();
-                if (analytics_store_) {
+                if (auto analytics_store = analytics_store_.lock()) {
                     AnalyticsEvent ae;
                     ae.event_type = "agent.enrollment_denied";
                     ae.agent_id = info.agent_id();
@@ -202,7 +202,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     ae.severity = Severity::kWarn;
                     ae.attributes = {{"reason", "invalid_input_length"},
                                      {"token_length", enrollment_token.size()}};
-                    analytics_store_->emit(std::move(ae));
+                    analytics_store->emit(std::move(ae));
                 }
                 response->set_accepted(false);
                 response->set_reject_reason(
@@ -288,7 +288,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                 if (!audit_ok)
                     signal_grpc_audit_failed(context);
 
-                if (analytics_store_) {
+                if (auto analytics_store = analytics_store_.lock()) {
                     AnalyticsEvent ae;
                     ae.event_type = "agent.enrollment_denied";
                     ae.agent_id = info.agent_id();
@@ -311,7 +311,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                         attrs["already_consumed_by"] = already_consumed_by;
                     }
                     ae.attributes = std::move(attrs);
-                    analytics_store_->emit(std::move(ae));
+                    analytics_store->emit(std::move(ae));
                 }
 
                 response->set_accepted(false);
@@ -357,7 +357,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
             // mirroring the denial path's audit_ok handling. SOC 2 CC7.2.
             if (!enroll_audit_ok) {
                 signal_grpc_audit_failed(context);
-                if (analytics_store_) {
+                if (auto analytics_store = analytics_store_.lock()) {
                     AnalyticsEvent ae;
                     ae.event_type = "agent.enrollment_audit_dropped";
                     ae.agent_id = info.agent_id();
@@ -367,7 +367,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     ae.severity = Severity::kError;
                     ae.attributes = {
                         {"result", "success"}, {"audit_emitted", false}, {"source", "direct"}};
-                    analytics_store_->emit(std::move(ae));
+                    analytics_store->emit(std::move(ae));
                 }
             }
 
@@ -423,14 +423,14 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     response->set_enrollment_status("pending");
                     bus_.publish("pending-agent", info.agent_id());
                     spdlog::info("Agent {} placed in pending approval queue", info.agent_id());
-                    if (analytics_store_) {
+                    if (auto analytics_store = analytics_store_.lock()) {
                         AnalyticsEvent ae;
                         ae.event_type = "agent.enrollment_pending";
                         ae.agent_id = info.agent_id();
                         ae.hostname = info.hostname();
                         ae.os = info.platform().os();
                         ae.arch = info.platform().arch();
-                        analytics_store_->emit(std::move(ae));
+                        analytics_store->emit(std::move(ae));
                     }
                     return grpc::Status::OK;
                 }
@@ -446,7 +446,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     response->set_accepted(false);
                     response->set_reject_reason("enrollment denied by administrator");
                     response->set_enrollment_status("denied");
-                    if (analytics_store_) {
+                    if (auto analytics_store = analytics_store_.lock()) {
                         AnalyticsEvent ae;
                         ae.event_type = "agent.enrollment_denied";
                         ae.agent_id = info.agent_id();
@@ -455,7 +455,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                         ae.arch = info.platform().arch();
                         ae.severity = Severity::kWarn;
                         ae.attributes = {{"reason", "admin_denied"}};
-                        analytics_store_->emit(std::move(ae));
+                        analytics_store->emit(std::move(ae));
                     }
                     return grpc::Status::OK;
 
@@ -471,7 +471,17 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
 enrolled:
     // -- Agent is enrolled -- proceed with registration --------------------------
 
-    registry_.register_agent(info);
+    // #3401 Gap 2: register_agent fails closed if the W1.5/#823 device-token revoke sweep
+    // itself errors — refuse the registration rather than install a session the sweep could
+    // not clear stale tokens for. UNAVAILABLE (not accepted=false / reject_reason, which the
+    // agent treats as a PERMANENT rejection, agent.cpp:1649-1657) so the agent retries with its
+    // normal reconnect backoff. The PG failure detail stays server-side (spdlog only).
+    if (auto reg_result = registry_.register_agent(info); !reg_result) {
+        spdlog::error("Register: register_agent failed for '{}': {}", info.agent_id(),
+                      reg_result.error());
+        return grpc::Status(grpc::StatusCode::UNAVAILABLE,
+                            "registration temporarily unavailable");
+    }
     // Auto-add to root management group
     if (mgmt_group_store_ && mgmt_group_store_->is_open())
         mgmt_group_store_->add_member(ManagementGroupStore::kRootGroupId, info.agent_id());
@@ -483,7 +493,7 @@ enrolled:
     if (fleet_topology_store_)
         fleet_topology_store_->invalidate();
 
-    if (analytics_store_) {
+    if (auto analytics_store = analytics_store_.lock()) {
         AnalyticsEvent ae;
         ae.event_type = "agent.registered";
         ae.agent_id = info.agent_id();
@@ -499,17 +509,27 @@ enrolled:
             plugins_list.push_back(p.name());
         }
         ae.payload = {{"plugins", plugins_list}};
-        analytics_store_->emit(std::move(ae));
+        analytics_store->emit(std::move(ae));
     }
 
-    // Create notification for agent enrollment
-    if (notification_store_ && notification_store_->is_open()) {
+    // Create notification for FIRST enrollment only (#3261 governance
+    // hardening, Gate 4 happy-path + unhappy-path UP-3). Unconditional on
+    // is_reauth would fire "Agent Enrolled" on every gRPC reconnect - a
+    // server restart with N connected agents floods the (unreaper'd,
+    // docs/enterprise-readiness-soc2-first-customer.md:316) notification
+    // feed with N rows for zero new enrollments. This is deliberately
+    // narrower than the webhook/offload suppression below: `agent.registered`
+    // firing on reauth IS the documented contract
+    // (docs/user-manual/rest-api.md's webhook/offload sections say "enrolls
+    // or re-enrolls"), so only the dashboard-toast side is gated here.
+    if (!is_reauth && notification_store_ && notification_store_->is_open()) {
         notification_store_->create("success", "Agent Enrolled",
                                     "Agent " + info.agent_id() + " (" + info.hostname() +
                                         ") enrolled successfully");
     }
 
-    // Fire webhook + offload for agent enrollment.
+    // Fire webhook + offload for agent enrollment (documented to fire on
+    // both first enrollment AND re-enrollment - see the comment above).
     //
     // Both sinks receive the same serialised body; we build the JSON +
     // dump it ONCE (perf-S1) outside either guard so that one sink being
@@ -530,13 +550,25 @@ enrolled:
         }
     }
 
-    // Sync agent-reported tags to persistent TagStore
+    // Sync agent-reported tags to persistent TagStore. A failed sync cannot
+    // fail the Register RPC (enrollment must not hinge on a tag write), but
+    // it is surfaced rather than swallowed — the sync rolled back
+    // atomically, so the agent keeps its PRIOR complete tag set and
+    // re-syncs on its next Register. Observability is this warn line ONLY:
+    // write-path failures have no counter (yuzu_server_tag_store_read_
+    // degrade_total is reads-only — governance sec-L1/sre-2; a wave-level
+    // write-degrade-metric decision is tracked as follow-up, deliberately
+    // not a one-store one-off here).
     if (tag_store_ && !info.scopable_tags().empty()) {
         std::unordered_map<std::string, std::string> tags;
         for (const auto& [k, v] : info.scopable_tags()) {
             tags[k] = v;
         }
-        tag_store_->sync_agent_tags(info.agent_id(), tags);
+        if (auto sync = tag_store_->sync_agent_tags(info.agent_id(), tags); !sync) {
+            spdlog::warn("Register({}): tag sync failed ({}) — prior tag set retained, agent "
+                         "re-syncs on next Register",
+                         info.agent_id(), sync.error());
+        }
     }
 
     auto session_id =
@@ -796,7 +828,7 @@ grpc::Status AgentServiceImpl::Subscribe(
     // PR3: revoked-cert gate. The presented client leaf IS the agent's mTLS
     // identity (issued bound to agent_id at enrollment). If its serial is on the
     // CRL the whole data plane is closed to it — reject before any registry work.
-    // Independent of pending_mu_: reads only the gRPC auth context + ca.db, so it
+    // Independent of pending_mu_: reads only the gRPC auth context + ca_store, so it
     // runs BEFORE the plane lock is taken (no cross-store query under the lock,
     // gov #1117). No-op when no cert is presented or no checker is wired.
     if (revocation_checker_) {
@@ -1136,13 +1168,13 @@ grpc::Status AgentServiceImpl::Subscribe(
     registry_.map_session(session_id, agent_id);
 
     auto subscribe_start = std::chrono::steady_clock::now();
-    if (analytics_store_) {
+    if (auto analytics_store = analytics_store_.lock()) {
         AnalyticsEvent ae;
         ae.event_type = "agent.connected";
         ae.agent_id = agent_id;
         ae.session_id = session_id;
         ae.attributes = {{"via", "direct"}};
-        analytics_store_->emit(std::move(ae));
+        analytics_store->emit(std::move(ae));
     }
 
     // Read loop -- process responses from the agent
@@ -1242,14 +1274,14 @@ grpc::Status AgentServiceImpl::Subscribe(
             // `agent-transition` event fires for live updates.
             notify_exec_tracker(resp.command_id(), agent_id, resp);
 
-            if (analytics_store_) {
+            if (auto analytics_store = analytics_store_.lock()) {
                 AnalyticsEvent ae;
                 ae.event_type = "command.response";
                 ae.agent_id = agent_id;
                 ae.plugin = plugin;
                 ae.correlation_id = resp.command_id();
                 ae.payload = {{"output_bytes", resp.output().size()}};
-                analytics_store_->emit(std::move(ae));
+                analytics_store->emit(std::move(ae));
             }
 
         } else {
@@ -1329,7 +1361,7 @@ grpc::Status AgentServiceImpl::Subscribe(
                                                    "</span>");
             }
 
-            if (analytics_store_) {
+            if (auto analytics_store = analytics_store_.lock()) {
                 AnalyticsEvent ae;
                 ae.event_type = "command.completed";
                 ae.agent_id = agent_id;
@@ -1341,7 +1373,7 @@ grpc::Status AgentServiceImpl::Subscribe(
                 if (resp.has_error()) {
                     ae.payload["error_message"] = resp.error().message();
                 }
-                analytics_store_->emit(std::move(ae));
+                analytics_store->emit(std::move(ae));
             }
 
             // Create notification on execution failure
@@ -1405,7 +1437,7 @@ grpc::Status AgentServiceImpl::Subscribe(
         fleet_topology_store_->evict_pushed(agent_id);
     spdlog::info("Agent subscribe stream closed for {} (session={})", agent_id, session_id);
 
-    if (analytics_store_) {
+    if (auto analytics_store = analytics_store_.lock()) {
         auto session_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
                                     std::chrono::steady_clock::now() - subscribe_start)
                                     .count();
@@ -1414,7 +1446,7 @@ grpc::Status AgentServiceImpl::Subscribe(
         ae.agent_id = agent_id;
         ae.session_id = session_id;
         ae.payload = {{"session_duration_ms", session_duration}};
-        analytics_store_->emit(std::move(ae));
+        analytics_store->emit(std::move(ae));
     }
 
     return grpc::Status::OK;
@@ -1496,14 +1528,14 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         // UAT 2026-05-06 #8: gateway-streamed RUNNING — notify tracker.
         notify_exec_tracker(resp.command_id(), agent_id, resp);
 
-        if (analytics_store_) {
+        if (auto analytics_store = analytics_store_.lock()) {
             AnalyticsEvent ae;
             ae.event_type = "command.response";
             ae.agent_id = agent_id;
             ae.plugin = plugin;
             ae.correlation_id = resp.command_id();
             ae.payload = {{"output_bytes", resp.output().size()}};
-            analytics_store_->emit(std::move(ae));
+            analytics_store->emit(std::move(ae));
         }
     } else {
         spdlog::info("[gateway] Command {} completed: status={}, exit_code={}", resp.command_id(),
@@ -1566,7 +1598,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
                                                "</span>");
         }
 
-        if (analytics_store_) {
+        if (auto analytics_store = analytics_store_.lock()) {
             AnalyticsEvent ae;
             ae.event_type = "command.completed";
             ae.agent_id = agent_id;
@@ -1578,7 +1610,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             if (resp.has_error()) {
                 ae.payload["error_message"] = resp.error().message();
             }
-            analytics_store_->emit(std::move(ae));
+            analytics_store->emit(std::move(ae));
         }
 
         if (resp.status() != pb::CommandResponse::SUCCESS && notification_store_ &&

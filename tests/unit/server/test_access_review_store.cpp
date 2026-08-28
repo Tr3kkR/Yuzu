@@ -80,7 +80,7 @@ std::vector<GrantRef> three_grants() {
 // refuses. Mirrors test_engine_principal_store.cpp's equivalent test.
 TEST_CASE("AccessReviewStore reports !is_open on a migration failure",
           "[access_review][store][pg]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);

@@ -10,6 +10,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "agent_registry.hpp"
+#include "capability_decls/core_dispatch_capabilities.hpp"
+#include "command_capability.hpp"
+#include "dispatch_caller.hpp"
 #include "key_provider.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -27,6 +31,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -137,7 +142,7 @@ private:
 
 TEST_CASE("PluginConfigStore opens on a fresh Postgres and migrates once",
           "[pg][store][plugin_config]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     Wired w{db.dsn()};
     CHECK(w.store.is_open());
 
@@ -394,6 +399,96 @@ TEST_CASE("set_kill_switch rejects an invalid reason as InvalidInput",
     CHECK(res.error() == PluginConfigStore::Error::InvalidInput);
 }
 
+// ── #3265 regression: __guard__.push_rules must be kill-switch-addressable,
+//    and must default to allowed when no switch was ever set ─────────────
+
+TEST_CASE("#3265: __guard__.push_rules (a reserved-namespace, system_reserved dispatch "
+          "capability) defaults to allowed with no kill-switch row ever set",
+          "[pg][store][plugin_config][killswitch]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
+    Wired w{db.dsn()};
+    // This IS the exact shape of the live #3265 defect: on a fresh store, no
+    // kill switch has ever been touched for __guard__, yet
+    // is_valid_identifier("__guard__") used to fail parse_kill_switch_scope
+    // unconditionally, collapsing action_allowed to false regardless of any
+    // actual switch state.
+    CHECK(w.store.action_allowed("__guard__", "push_rules"));
+    CHECK(w.store.action_allowed("__guard__", "")); // whole-plugin form too
+}
+
+TEST_CASE("#3265: an explicitly-set kill switch on __guard__/push_rules still blocks the "
+          "dispatch — the reserved-namespace grammar fix must not make the switch INERT",
+          "[pg][store][plugin_config][killswitch]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
+    Wired w{db.dsn()};
+
+    REQUIRE(w.store.set_kill_switch("__guard__", "push_rules", false, "incident", "alice")
+                .has_value());
+    CHECK_FALSE(w.store.action_allowed("__guard__", "push_rules"));
+
+    // Re-enabling restores delivery.
+    REQUIRE(
+        w.store.set_kill_switch("__guard__", "push_rules", true, "resolved", "alice").has_value());
+    CHECK(w.store.action_allowed("__guard__", "push_rules"));
+}
+
+// ── #3265: the REAL finalize_classified_command composition, not a stubbed
+//    push_fn_ (TestRouteSink-style stubs bypass this chokepoint entirely,
+//    which is why the original regression shipped undetected) ────────────
+
+TEST_CASE("#3265: __guard__.push_rules survives the real classify+finalize dispatch "
+          "chokepoint composed over an open PluginConfigStore, with no switch set",
+          "[pg][store][plugin_config][killswitch][dispatch]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
+    Wired w{db.dsn()};
+
+    yuzu::server::CommandCapabilityRegistry registry{
+        std::span<const yuzu::server::CommandCapability>(
+            yuzu::server::capdecls::core_dispatch_capabilities())};
+    const yuzu::server::DispatchCaller system_caller{.system = true};
+
+    auto classified = yuzu::server::detail::classify_and_authorize_dispatch(
+        registry, system_caller, "__guard__", "push_rules",
+        [](std::string_view, std::string_view, yuzu::server::authz::Operation) { return false; });
+    REQUIRE(classified.has_value());
+
+    std::function<bool(std::string_view, std::string_view)> action_allowed =
+        [&w](std::string_view p, std::string_view a) { return w.store.action_allowed(p, a); };
+
+    auto finalized = yuzu::server::detail::finalize_classified_command(
+        *classified, action_allowed, "__guard__", "push_rules", "cmd-1");
+    REQUIRE(finalized.has_value());
+    CHECK(finalized->wire().plugin() == "__guard__");
+    CHECK(finalized->wire().action() == "push_rules");
+}
+
+TEST_CASE("#3265: the real chokepoint composition DOES still deny __guard__.push_rules once an "
+          "operator explicitly sets the kill switch — proving the fix isn't a bypass",
+          "[pg][store][plugin_config][killswitch][dispatch]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
+    Wired w{db.dsn()};
+    REQUIRE(w.store.set_kill_switch("__guard__", "push_rules", false, "incident", "alice")
+                .has_value());
+
+    yuzu::server::CommandCapabilityRegistry registry{
+        std::span<const yuzu::server::CommandCapability>(
+            yuzu::server::capdecls::core_dispatch_capabilities())};
+    const yuzu::server::DispatchCaller system_caller{.system = true};
+
+    auto classified = yuzu::server::detail::classify_and_authorize_dispatch(
+        registry, system_caller, "__guard__", "push_rules",
+        [](std::string_view, std::string_view, yuzu::server::authz::Operation) { return true; });
+    REQUIRE(classified.has_value());
+
+    std::function<bool(std::string_view, std::string_view)> action_allowed =
+        [&w](std::string_view p, std::string_view a) { return w.store.action_allowed(p, a); };
+
+    auto finalized = yuzu::server::detail::finalize_classified_command(
+        *classified, action_allowed, "__guard__", "push_rules", "cmd-2");
+    REQUIRE_FALSE(finalized.has_value());
+    CHECK(finalized.error().reason == yuzu::server::detail::DispatchDenialReason::KillSwitched);
+}
+
 // ── Fail-closed evaluation on a degraded store (no live Postgres needed —
 //    a bad conninfo fails fast and deterministically) ────────────────────
 
@@ -412,6 +507,10 @@ TEST_CASE("A degraded/unopened store makes action_allowed return false, never tr
     // "allowed" — the whole point of action_allowed's collapse (ADR-0036).
     CHECK_FALSE(store.action_allowed("firewall", "block"));
     CHECK_FALSE(store.action_allowed("email", ""));
+    // #3265 governance Gate 5 (chaos-injector): the reserved-namespace path
+    // inherits the SAME fail-closed collapse under a degraded store — a
+    // transient PG stall during a Guardian push must never read as allowed.
+    CHECK_FALSE(store.action_allowed("__guard__", "push_rules"));
 
     // The display accessor surfaces the degradation as a typed error rather
     // than silently answering "enabled" — a caller that (incorrectly) tried

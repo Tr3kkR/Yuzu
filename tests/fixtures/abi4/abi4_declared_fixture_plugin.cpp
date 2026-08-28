@@ -2,13 +2,15 @@
  * tests/fixtures/abi4/abi4_declared_fixture_plugin.cpp — a REAL ABI4 plugin
  * that DECLARES per-action, per-OS capabilities (PR1.1, #2204; finding F10).
  *
- * WHY this exists: every one of the 49 shipped plugins is still undeclared
- * (RATCHET_BASELINE_UNDECLARED=49 in scripts/ci/check-capability-matrix.sh),
- * so the capability-matrix gate only ever observes the all-undeclared state.
- * A green gate therefore proved nothing about how capmatrix-gen RENDERS a
- * declared descriptor — the entire reason the tool exists. This fixture is
- * the declared input that tests/shell/test_capability_matrix_gate.sh feeds
- * to the real binary.
+ * WHY this exists: the capability-matrix gate observes only the real plugin
+ * set, which is a single state at any moment — when this fixture was written
+ * none of the 49 shipped plugins declared; they all do now. A fixture the
+ * test controls outright is what makes capmatrix-gen's RENDERING of a
+ * declared descriptor — the entire reason the tool exists — provable
+ * independently of that moving target, including the per-OS support/rung/
+ * mechanism/fallback columns and the malformed-input rejections no shipped
+ * plugin would ever produce. This is the declared input that
+ * tests/shell/test_capability_matrix_gate.sh feeds to the real binary.
  *
  * Unlike the frozen tests/fixtures/abi3/ fixture, this one is compiled
  * against the LIVE sdk/include/yuzu/plugin.h on purpose: it must track the

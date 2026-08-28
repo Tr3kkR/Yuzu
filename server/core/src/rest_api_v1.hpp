@@ -8,6 +8,7 @@
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
+#include "auth_routes.hpp" // ListReadGate — ADR-0017 list-read gate result type
 #include "authz_model.hpp"
 #include "dispatch_caller.hpp"
 #include "device_token_store.hpp"
@@ -124,20 +125,36 @@ public:
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation,
                            const std::string& agent_id)>;
-    /// Per-device Inventory-scope predicate for the fleet-wide installed-software
-    /// read (GET /api/v1/inventory/software). Returns true iff `username` may see
-    /// `agent_id`'s rows via a management group. A FILTER, not a gate: unlike
-    /// ScopedPermFn it writes no response and is invoked per result row to drop
-    /// out-of-scope devices (the fleet query returns many agents). Mirrors the MCP
-    /// query_installed_software scope fn exactly (server.cpp wires the SAME
-    /// check_scoped_permission chokepoint). Empty/default `{}` = no filter
-    /// (legacy-open, matching the MCP default + require_scoped_permission).
-    /// NOTE (ADR-0017): wiring this does NOT close the #1676 cross-operator gap —
-    /// the filter is INERT under the global Inventory:Read gate (a confined operator
-    /// is denied at the gate before it runs; a global operator's filter is a no-op).
-    /// It is the foundation the ADR-0017 admit-then-filter list gate builds on (#1716).
-    using InventoryScopeFn =
-        std::function<bool(const std::string& username, const std::string& agent_id)>;
+    /// ADR-0017 admit-then-filter list-read gate for a list/fan-out route
+    /// over per-agent data (`AuthRoutes::require_list_read`). Unlike PermFn/
+    /// ScopedPermFn (bool: caller re-derives the session separately if
+    /// needed), this returns a `ListReadGate` carrying `admitted`, the
+    /// resolved `scope` (nullopt = unfiltered; engaged, incl. empty, INV-2 =
+    /// filter to exactly these agents), and the resolved `session`. This
+    /// MUST be the route's SOLE authorization gate — never stacked with
+    /// PermFn (require_permission's check_permission never consults
+    /// ManagementGroupStore, so the two gates do not compose; see
+    /// require_list_read's doc comment). The empty/default `{}` exists ONLY
+    /// for source-stability of unrelated call sites — a route that requires
+    /// this gate treats an unwired fn as misconfiguration and FAILS CLOSED
+    /// (503), mirroring ScopedPermFn's contract above.
+    using ListReadFn =
+        std::function<ListReadGate(const httplib::Request&, httplib::Response&,
+                                   const std::string& securable_type,
+                                   const std::string& operation)>;
+    /// #3290 Phase 2 — the injected-callback twin of `AuthRoutes::require_fleet_read`
+    /// (see `authz::FleetReadGate`'s doc comment, authz_gates.hpp, for why this is a
+    /// plain fakeable aggregate rather than `ListAuthority` itself). MUST be the
+    /// route's SOLE authorization gate — never stacked with `PermFn` for the same
+    /// `(securable_type, operation)` (the identical BLOCKING defect `ListReadFn`
+    /// above exists to avoid; `require_fleet_read`'s own doc comment has the
+    /// falsifier). The empty/default `{}` exists ONLY for source-stability of
+    /// unrelated call sites — a route that requires this gate treats an unwired fn
+    /// as misconfiguration and FAILS CLOSED (503), mirroring `ListReadFn`'s contract.
+    using FleetReadFn =
+        std::function<authz::FleetReadGate(const httplib::Request&, httplib::Response&,
+                                           const std::string& securable_type,
+                                           const std::string& operation)>;
     /// Per-agent Response-scope predicate for the fan-out response/execution
     /// readers (e.g. GET /api/v1/executions/{id}/visualization, which charts an
     /// instruction's responses across every agent that replied). Returns true
@@ -335,11 +352,11 @@ public:
         // Name-anchored per-device Guardian status route (appended as a trailing
         // optional dep to keep every existing register_routes call site source-stable).
         BaselineStore* baseline_store = nullptr, ScopedPermFn scoped_perm_fn = {},
-        // ADR-0016: typed installed-software store + its per-device Inventory-scope
-        // predicate for GET /api/v1/inventory/software (trailing optional deps;
-        // both MUST be wired from server.cpp — `{}` scope = unfiltered fleet read).
+        // ADR-0016: typed installed-software store for GET /api/v1/inventory/software
+        // (trailing optional dep; MUST be wired from server.cpp). Its per-agent scope
+        // predicate is `fleet_read_fn` below (#3290 Phase 2) — the route's own
+        // require_fleet_read gate replaced the retired InventoryScopeFn.
         SoftwareInventoryStore* software_inventory_store = nullptr,
-        InventoryScopeFn inventory_scope_fn = {},
         // #1634: per-agent Response-scope predicate for the fan-out response
         // readers (visualization). Trailing optional dep; MUST be wired from
         // server.cpp — `{}` scope = unfiltered fan-out read.
@@ -370,7 +387,16 @@ public:
         // #1788 defense-in-depth: see ExecVisibleFn's doc comment above. Trailing
         // optional dep; `{}` preserves the pre-existing unfiltered-VisibleSet
         // behaviour on POST /api/v1/bundles.
-        ExecVisibleFn exec_visible_fn = {});
+        ExecVisibleFn exec_visible_fn = {},
+        // ADR-0017: the fleet guaranteed-state status route's SOLE authorization
+        // gate (see ListReadFn's doc comment above). Trailing optional dep; `{}`
+        // makes the route FAIL CLOSED (503) rather than silently fall back to
+        // perm_fn — an unwired gate is misconfiguration, not "no filter".
+        ListReadFn list_read_fn = {},
+        // #3290 Phase 2: GET /api/v1/inventory/software's SOLE authorization gate
+        // (see FleetReadFn's doc comment above). Trailing optional dep; `{}` makes
+        // the route FAIL CLOSED (503), same contract as list_read_fn.
+        FleetReadFn fleet_read_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -405,11 +431,11 @@ public:
         // Name-anchored per-device Guardian status route (appended as a trailing
         // optional dep to keep every existing register_routes call site source-stable).
         BaselineStore* baseline_store = nullptr, ScopedPermFn scoped_perm_fn = {},
-        // ADR-0016: typed installed-software store + its per-device Inventory-scope
-        // predicate for GET /api/v1/inventory/software (trailing optional deps;
-        // both MUST be wired from server.cpp — `{}` scope = unfiltered fleet read).
+        // ADR-0016: typed installed-software store for GET /api/v1/inventory/software
+        // (trailing optional dep; MUST be wired from server.cpp). Its per-agent scope
+        // predicate is `fleet_read_fn` below (#3290 Phase 2) — the route's own
+        // require_fleet_read gate replaced the retired InventoryScopeFn.
         SoftwareInventoryStore* software_inventory_store = nullptr,
-        InventoryScopeFn inventory_scope_fn = {},
         // #1634: per-agent Response-scope predicate for the fan-out response
         // readers (visualization). Trailing optional dep; MUST be wired from
         // server.cpp — `{}` scope = unfiltered fan-out read.
@@ -432,7 +458,13 @@ public:
         // #1788 defense-in-depth: see ExecVisibleFn's doc comment above (production
         // overload). `{}` preserves the pre-existing unfiltered-VisibleSet behaviour
         // for test harnesses that haven't wired it.
-        ExecVisibleFn exec_visible_fn = {});
+        ExecVisibleFn exec_visible_fn = {},
+        // ADR-0017: see the production overload's doc comment above; identical
+        // trailing-optional-dep, fail-closed-when-unwired contract.
+        ListReadFn list_read_fn = {},
+        // #3290 Phase 2: see the production overload's doc comment above; identical
+        // trailing-optional-dep, fail-closed-when-unwired contract.
+        FleetReadFn fleet_read_fn = {});
 
     /// PR 4.3 — engine-principal lifecycle store backing
     /// `/api/v1/engine-principals`, threaded post-construction. (During the

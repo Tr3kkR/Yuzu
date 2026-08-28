@@ -231,3 +231,38 @@ request without needing to consult the other two.
   if a pre-existing `engine:`-named local user or RBAC group predates the reservation — see
   `docs/ops-runbooks/engine-principal-store-recovery.md` for the pre-upgrade check and recovery
   procedure, and the `## ⚠️ Breaking` section of `docs/user-manual/upgrading.md`.
+
+## Update (2026-08-21) — per-principal poisoning guard, and the backoff no longer arms unconditionally (#2454, #2456)
+
+**#2456 — confirmed vs. ambiguous unreachability.** The Consequences section above ("A read that
+could not reach the store instead arms a short jittered backoff") described the original #2367
+behavior: every `StoreUnreachable` outcome armed the backoff, regardless of cause. #2456 (PR #3362)
+narrowed this: `get_for_auth` now distinguishes a CONFIRMED failure — the store was never open, a
+query actually ran and returned an error, or a connection-pool lease-acquire timeout occurred with
+`PgPool`'s own connect-failure breaker already open — from an AMBIGUOUS one (a bare lease-acquire
+timeout with the breaker still closed) via a new `EngineLookup::confirmed_unreachable` field, and
+the backoff arms only on a confirmed case. A pool briefly saturated by unrelated load — with the
+database itself reachable — no longer arms it; that scenario used to suppress probing for the same
+5-10 s window a real outage does, which #2456 found and fixed.
+
+The rate-limiting property itself is unchanged for what it exists to prevent: a *sustained,
+confirmed* outage still arms the backoff on its very first tick and keeps re-arming it, so the
+O(streams × tick) amplifier the original design worried about is still bounded. What changed is
+which failures count as evidence of that outage, not whether a confirmed one is rate-limited.
+
+**#2454 — the poisoning guard's generation token is now per-principal, not global.** The
+Consequences section above ("`revoke()`/`transfer_owner()` invalidate synchronously after their
+write under a generation guard modelled on `ApiTokenStore`'s") described a SINGLE process-wide
+counter: any write to ANY engine principal bumped it, so a concurrent reader validating a
+DIFFERENT principal would observe the bump and skip its own cache-insert — a revoke burst (bulk
+revoke, an access-review remediation sweep, a credential-rotation loop) silently disabled the
+whole liveness cache process-wide for its duration. #2454 replaced the single counter with a
+per-principal generation map, so a write to one principal no longer defeats another's concurrent
+cache-write. The map is ceiling-capped (`max_entries_`, 1024 by default) and, once exhausted, falls
+back to bumping a coarse global epoch rather than silently declining to guard at all — a generation
+counter has no TTL, so silent decline would be *permanent* disablement for the affected principal,
+not one skipped race. That fallback is a one-way ratchet for the life of the process: once tripped,
+it reverts to the ORIGINAL global-counter behavior described above — defeating every concurrent
+principal's cache-write, not just the one that tripped it — until a restart. The map's own reclaim
+path (an empty-`principal_id` full clear) has no production caller today; see #3385 for the tracked
+gap in giving an operator a way to recover per-principal precision without a restart.

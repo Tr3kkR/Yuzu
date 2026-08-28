@@ -11,11 +11,13 @@
 
 #include "custom_properties_store.hpp"
 #include "dex_perf_rules.hpp"
+#include "guardian_health_fleet_tags.hpp" // Guardian M1 health-stream fleet telemetry table (#2298 gate 3, item 6d)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet telemetry table (#2298 gate 3)
 #include "network_perf_rules.hpp"
 #include "spark_fleet_tags.hpp" // SparkEngine fleet telemetry keys + count parse (rung 1)
 #include "result_set_store.hpp"
 #include "device_token_store.hpp"
+#include "service_scope_policy.hpp" // authz::is_service_tag_key — #3295
 #include "tag_store.hpp"
 #include "web_utils.hpp"
 
@@ -37,14 +39,41 @@ void AgentRegistry::set_device_token_store(DeviceTokenStore* store) {
     device_token_store_ = store;
 }
 
-void AgentRegistry::register_agent(const pb::AgentInfo& info) {
+void AgentRegistry::set_register_agent_interleave_hook_for_test(std::function<void()> hook) {
+    register_agent_interleave_hook_for_test_ = std::move(hook);
+}
+
+std::expected<void, std::string> AgentRegistry::register_agent(const pb::AgentInfo& info) {
     auto session = std::make_shared<AgentSession>();
     session->agent_id = info.agent_id();
     session->hostname = info.hostname();
     session->os = info.platform().os();
     session->arch = info.platform().arch();
     session->agent_version = info.agent_version();
+    // Ingest filter (#3295): validated and non-service, mirroring TagStore's
+    // own sync_agent_tags gate (tag_store.cpp) so a service claim or an
+    // oversized/malformed key never reaches scope-DSL evaluation via the
+    // in-memory fallback below, regardless of TagStore sync outcome.
     for (const auto& [k, v] : info.scopable_tags()) {
+        if (authz::is_service_tag_key(k)) {
+            spdlog::info("AgentRegistry::register_agent({}): dropping self-reported "
+                         "'service' tag from session scopable_tags (#3295)",
+                         info.agent_id());
+            // Gate 6 hardening: the store-side purge (tag_store.cpp,
+            // sync_agent_tags) has yuzu_server_tag_store_agent_service_purge_total;
+            // this session-level drop is the ONLY signal for a gateway-proxied
+            // agent (ProxyRegister never calls sync_agent_tags, so the store-side
+            // counter never fires for that population).
+            metrics_.counter("yuzu_server_agent_registry_service_tag_dropped_total")
+                .increment();
+            continue;
+        }
+        if (!TagStore::validate_key(k) || !TagStore::validate_value(v)) {
+            spdlog::info("AgentRegistry::register_agent({}): dropping invalid scopable_tag "
+                         "'{}' at ingest",
+                         info.agent_id(), k);
+            continue;
+        }
         session->scopable_tags[k] = v;
     }
     for (const auto& p : info.plugins()) {
@@ -59,25 +88,103 @@ void AgentRegistry::register_agent(const pb::AgentInfo& info) {
         session->plugin_meta.push_back(std::move(pm));
     }
 
+    // Phase 1 (under mu_): snapshot the CURRENT session for this agent_id (not just whether one
+    // exists) and the device-token store pointer. Only this read is guarded by mu_ (matches
+    // set_device_token_store's "guarded by mu_" contract) — the revoke call itself, a blocking
+    // Postgres round-trip, runs OFF the lock below. Holding the shared_ptr (not a bool) keeps
+    // phase 2's identity compare ABA-safe: as long as this call holds a strong ref, no other
+    // session can be allocated at the same address.
+    std::shared_ptr<AgentSession> prior_session;
+    DeviceTokenStore* store = nullptr;
     {
         std::lock_guard lock(mu_);
-        // Clean up stale session_to_agent_ entry from a prior connection
-        auto old = agents_.find(info.agent_id());
-        if (old != agents_.end()) {
-            // W1.5 / #823: re-registration revokes any device tokens still
-            // bound to this agent_id BEFORE the new session is installed. An
-            // attacker who briefly held this identity (mTLS-disabled flow,
-            // #779) could otherwise replay tokens previously issued to it
-            // indefinitely. Done under `mu_` so the install and the revoke
-            // are observed atomically by any concurrent reader. First-time
-            // registrations skip the revoke (agents_ has no entry), which
-            // preserves the operator workflow of pre-issuing a token for an
-            // agent_id that has not registered yet.
-            if (device_token_store_)
-                device_token_store_->revoke_by_principal(info.agent_id());
-            if (!old->second->session_id.empty())
-                session_to_agent_.erase(old->second->session_id);
+        auto it = agents_.find(info.agent_id());
+        if (it != agents_.end())
+            prior_session = it->second;
+        store = device_token_store_;
+    }
+    const bool prior_exists = (prior_session != nullptr);
+
+    // W1.5 / #823, corrected by #3401: re-registration revokes any device tokens bound to this
+    // agent_id BEFORE the new session is installed, so an attacker who briefly held this
+    // identity (mTLS-disabled flow, #779) cannot keep replaying a token issued to the legitimate
+    // agent. First-time registrations (no prior entry above) skip the revoke, preserving the
+    // operator workflow of pre-issuing a token for an agent_id that has not registered yet.
+    // `revoke_by_device` (not `revoke_by_principal` — #3401: REST issuance never writes the
+    // agent_id into `principal_id`) is the sweep bound to the column `validate_token` actually
+    // enforces the presenter against.
+    //
+    // Runs OFF `mu_` — precedent `sweep_revoked` below. The invariant #823 needs is "the revoke
+    // commits before the new session is installed", which holds here regardless of lock
+    // discipline (phase 2 below only runs after this call returns); holding `mu_` across the
+    // call bought nothing (nothing else in this class reads `device_auth_tokens`) while
+    // serializing every unrelated `register_agent` / `send_to` / `evaluate_scope` / `get_session`
+    // caller behind this store's pool-acquire latency (up to kWriteTimeout=4s) plus a possible
+    // additional FOR-UPDATE lock-wait (lock_timeout_ms, 10s default) if a concurrent
+    // `validate_token` holds the row lock — the same acquire-vs-lock-wait distinction ADR-0052's
+    // "Capacity note" documents for kValidateTimeout.
+    //
+    // Fails CLOSED (ADR-0012 §1, #3401 Gap 2): a genuine revoke failure REFUSES the registration
+    // — no session installed, no management-group membership, no topology invalidation — rather
+    // than installing a session the sweep could not clear stale tokens for. Both gRPC callers
+    // (agent_service_impl.cpp, gateway_service_impl.cpp) must surface this as a retryable
+    // grpc::Status, never `accepted=false` (the latter is the agent's PERMANENT give-up signal).
+    if (prior_exists && store) {
+        auto revoked = store->revoke_by_device(info.agent_id());
+        if (!revoked) {
+            spdlog::error("AgentRegistry::register_agent: device token revoke-by-device failed "
+                          "for '{}', refusing registration: {}",
+                          info.agent_id(), revoked.error());
+            metrics_
+                .counter("yuzu_agents_registration_refused_total",
+                         {{"reason", "device_token_revoke_failed"}})
+                .increment();
+            return std::unexpected("device token revoke failed: " + revoked.error());
         }
+    }
+
+    // Test-only interleave seam (Gate 5 CH-1a): fires once, synchronously, in this exact window
+    // — after the revoke, before phase 2 re-locks. A test callback that itself calls
+    // register_agent again for the same agent_id deterministically exercises the supersede path
+    // just below, without real threads. No-op (nullptr) in production.
+    if (register_agent_interleave_hook_for_test_) {
+        auto hook = std::move(register_agent_interleave_hook_for_test_);
+        register_agent_interleave_hook_for_test_ = nullptr;
+        hook();
+    }
+
+    // Phase 2 (under mu_): install the new session. Re-fetches the CURRENT entry rather than
+    // reusing phase 1's snapshot, then compares it BY POINTER against that snapshot before
+    // touching anything.
+    //
+    // Because the revoke above runs off mu_, a second register_agent call for this SAME
+    // agent_id can run its own phase 1 + revoke + phase 2 to completion entirely within this
+    // call's revoke window (e.g. its revoke hits an empty pool queue while this one waits behind
+    // a FOR-UPDATE lock). Under the OLD single-locked implementation this could not happen —
+    // holding mu_ across the whole call serialized both calls end to end, so install order always
+    // matched arrival order. Splitting the lock restores that ordering explicitly here instead of
+    // getting it for free: if the entry we see now is not the SAME object phase 1 saw, a newer
+    // registration already won and installed — this call yields rather than overwrite it (its
+    // own revoke already committed, so the #823 guarantee for its identity is satisfied
+    // regardless; only the session install is skipped). An entry that has instead been REMOVED
+    // (`it == end()` — e.g. the prior session's stream tore down independently) is NOT
+    // "superseded": there is nothing live to protect, so this call installs normally.
+    {
+        std::lock_guard lock(mu_);
+        auto it = agents_.find(info.agent_id());
+        if (it != agents_.end() && it->second != prior_session) {
+            spdlog::warn("AgentRegistry::register_agent: superseded by a concurrent "
+                         "registration for '{}', not installing (this call's revoke already "
+                         "committed)",
+                         info.agent_id());
+            metrics_
+                .counter("yuzu_agents_registration_refused_total",
+                         {{"reason", "superseded_by_concurrent_registration"}})
+                .increment();
+            return std::unexpected("superseded by a concurrent registration for this agent_id");
+        }
+        if (it != agents_.end() && !it->second->session_id.empty())
+            session_to_agent_.erase(it->second->session_id);
         agents_[info.agent_id()] = session;
     }
     metrics_.counter("yuzu_agents_registered_total").increment();
@@ -85,6 +192,7 @@ void AgentRegistry::register_agent(const pb::AgentInfo& info) {
     bus_.publish("agent-online", info.agent_id());
     spdlog::info("Agent registered: id={}, hostname={}, plugins={}", info.agent_id(),
                  info.hostname(), info.plugins_size());
+    return {};
 }
 
 void AgentRegistry::set_stream(
@@ -194,7 +302,7 @@ AgentRegistry::sweep_revoked(const std::function<bool(const std::string&)>& is_r
                 continue;
             pem = session->peer_cert_pem;
         }
-        // Evaluate revocation OFF stream_mu — is_revoked() reads ca.db under its
+        // Evaluate revocation OFF stream_mu — is_revoked() reads ca_store under its
         // own mutex, and holding a per-session lock across a cross-store query is
         // the lock-discipline footgun gov #1117 forbids.
         if (!is_revoked(pem))
@@ -716,6 +824,9 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // netstat
         {"netstat.netstat_list",
          "Active TCP/UDP connections and listening sockets with owning PID"},
+        {"netstat.attribution",
+         "Active TCP/UDP connections and listening sockets with owning process name and path "
+         "(folds the retired sockwho plugin in, #3403)"},
         // netprobe
         {"netprobe.icmp", "ICMP round-trip time, jitter, and loss to targets"},
         {"netprobe.tcp", "TCP connect-time RTT, jitter, and loss to targets (default port 443)"},
@@ -744,6 +855,8 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // antivirus
         {"antivirus.products", "List installed antivirus products"},
         {"antivirus.status", "Detailed antivirus status (Windows Defender / macOS XProtect)"},
+        {"antivirus.av_exclusions",
+         "Windows Defender exclusion lists (paths/processes/extensions)"},
         // http_client
         {"http_client.download", "Download a file from URL with optional hash verification"},
         {"http_client.get", "HTTP GET a URL, return status and body"},
@@ -794,8 +907,6 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"asset_tags.changes", "Report the change log (what changed and when)"},
         // procfetch
         {"procfetch.procfetch_fetch", "Enumerate processes with PID, name, path, and SHA-1 hash"},
-        // sockwho
-        {"sockwho.sockwho_list", "Map open sockets to owning processes (PID, name, path)"},
         // wol
         {"wol.wake", "Send a Wake-on-LAN magic packet to a MAC address"},
         {"wol.check", "Ping a host to verify it responded to WoL wake"},
@@ -1264,23 +1375,16 @@ static void collect_result_set_ids(const yuzu::scope::Expression& expr,
     }
 }
 
-// Collect every props.<key> reference in a scope expression, mirroring
-// collect_result_set_ids above — same reason: the resolver preloads all
-// referenced property keys ONCE, before the agent loop, rather than a
-// per-agent CustomPropertiesStore query while holding mu_ (same shape
-// review finding F fixed for from_result_set:).
-static void collect_props_keys(const yuzu::scope::Expression& expr,
-                               std::vector<std::string>& out) {
-    if (const auto* cond = std::get_if<yuzu::scope::Condition>(&expr)) {
-        if (cond->attribute.starts_with("props."))
-            out.push_back(cond->attribute.substr(6));
-    } else if (const auto* comb =
-                   std::get_if<std::unique_ptr<yuzu::scope::Combinator>>(&expr)) {
-        if (*comb)
-            for (const auto& child : (*comb)->children)
-                collect_props_keys(child, out);
-    }
-}
+// props.<key> and tag:<key> collection both use the shared
+// yuzu::scope::collect_attribute_suffixes (scope_engine.hpp) — added with
+// ADR-0050 for exactly this preload pattern. Folding props onto it (Gate 7,
+// governance DSL-3/arch-F1) also FIXED a pre-existing defect: the local
+// collector this replaced matched the raw attribute, so `LEN(props.x)` /
+// `STARTSWITH(props.x, …)` (synthetic `__len:`/`__startswith:` encodings)
+// never contributed `x` to the preload and those atoms resolved against
+// nothing. collect_result_set_ids above stays local — it is shape-different
+// (id extraction, not a prefix-suffix walk) and from_result_set: has no
+// synthetic interplay worth encoding.
 
 std::optional<std::vector<std::string>>
 AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStore* tag_store,
@@ -1367,7 +1471,7 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> props_values;
     {
         std::vector<std::string> prop_keys;
-        collect_props_keys(expr, prop_keys);
+        yuzu::scope::collect_attribute_suffixes(expr, "props.", prop_keys);
         if (!prop_keys.empty()) {
             if (props_store == nullptr) {
                 spdlog::error("AgentRegistry::evaluate_scope: scope references props.<key> but no "
@@ -1382,6 +1486,40 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
                 return std::nullopt;
             }
             props_values = std::move(*preload);
+        }
+    }
+
+    // Preload every tag:<key> value the expression references, ONE bulk query
+    // across all agents — mirrors the props.<key> preload directly above
+    // (ADR-0050; the pre-migration resolver queried TagStore per agent inside
+    // the loop below, and its degraded read collapsed to "" — the silent
+    // under/over-target of the #2500 family this migration closes). Same
+    // ADR-0036 fail-closed contract: a store/pool/query error ABORTS the
+    // whole evaluation (nullopt), never resolves tag:<key> to "no match"
+    // (which a NOT combinator inverts to "matches every agent").
+    //
+    // DELIBERATE ASYMMETRY vs the props preload: a NULL tag_store with a
+    // tag: atom does NOT abort. Tags have an in-memory FALLBACK source —
+    // session->scopable_tags, consulted only when the store has no row for
+    // that (agent, key) (#3295 — the store, any source, wins when present;
+    // see the resolver below) — that legitimately answers tag: atoms without
+    // any store; props have no such source, so a props.<key> atom without a
+    // store is unresolvable and must abort. In production the store cannot
+    // be null post-migration (a failed TagStore open is a fatal startup
+    // error); a null store here is a test/embedded configuration running on
+    // in-memory tags alone.
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>> tag_values;
+    {
+        std::vector<std::string> tag_keys;
+        yuzu::scope::collect_attribute_suffixes(expr, "tag:", tag_keys);
+        if (!tag_keys.empty() && tag_store != nullptr) {
+            auto preload = tag_store->get_values_for_keys(tag_keys);
+            if (!preload) {
+                spdlog::error("AgentRegistry::evaluate_scope: tag preload degraded — aborting "
+                              "scope evaluation");
+                return std::nullopt;
+            }
+            tag_values = std::move(*preload);
         }
     }
 
@@ -1409,16 +1547,28 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
                 return session->arch;
             if (key == "agent_version")
                 return session->agent_version;
-            // tag:X lookups
+            // tag:X lookups — STORE-FIRST (#3295): the bulk preload above (never
+            // a per-agent store query here; see the preload block's
+            // fail-closed contract) wins when it has a row for this agent,
+            // matching the DEX cohort precedent (server.cpp — "a rogue agent
+            // must not self-assign" — same rationale here for dispatch
+            // targeting). in-memory scopable_tags is a FALLBACK only, for
+            // agents the store has no row for at all (gateway-proxied agents
+            // never sync — ProxyRegister has no TagStore call; tracked as
+            // #3372). scopable_tags is validated
+            // and 'service'-filtered at register_agent ingest, so no
+            // additional validation is needed here.
             if (key.starts_with("tag:")) {
                 auto tag_key = key.substr(4);
-                // First check in-memory scopable_tags
+                if (auto agent_it = tag_values.find(id); agent_it != tag_values.end()) {
+                    if (auto tag_it = agent_it->second.find(tag_key);
+                        tag_it != agent_it->second.end())
+                        return tag_it->second;
+                }
                 auto it = session->scopable_tags.find(tag_key);
                 if (it != session->scopable_tags.end())
                     return it->second;
-                // Then check persistent TagStore
-                if (tag_store)
-                    return tag_store->get_tag(id, tag_key);
+                return {};
             }
             // props.X lookups (custom properties, Phase 7.6) — served from the
             // bulk preload above, never a per-agent store query (see the
@@ -1456,8 +1606,9 @@ const std::vector<ScopeKindInfo>& scope_kind_catalog() {
         {"agent_version", "agent_version <op> <value>", R"(agent_version == "0.12.0")",
          "Agent daemon version string."},
         {"tag:<key>", "tag:<key> <op> <value>", R"(tag:department == "finance")",
-         "Scopable tag value — checked in-memory first, then the persistent "
-         "TagStore (see docs/asset-tagging-guide.md)."},
+         "Scopable tag value — the persistent TagStore first, falling back to "
+         "a connected agent's self-report only when the store has no row "
+         "('service' never falls back; see docs/asset-tagging-guide.md)."},
         {"props.<key>", "props.<key> <op> <value>", R"(props.owner == "jdoe")",
          "Custom property value from the CustomPropertiesStore."},
     };
@@ -1578,6 +1729,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     metrics.clear_gauge_family("yuzu_fleet_spark_watch_rejected");
     metrics.clear_gauge_family("yuzu_fleet_spark_quarantined");
     metrics.clear_gauge_family("yuzu_fleet_spark_slow_op");
+    metrics.clear_gauge_family("yuzu_fleet_spark_unsupported"); // F7, #2298 rung 2
     // Guardian durable lifecycle-journal telemetry (#2298 gate 3). Same rule, and it
     // bites hardest here: the writer is sparse (a 0 counter ships no tag), so on a
     // healthy or inert fleet NOBODY reports and every family must be ABSENT. A
@@ -1590,6 +1742,12 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // worker, so a stale retained series here would misreport a fleet whose workers
     // all went dark as "fresh forever".
     for (const auto& m : kGuardianJournalAgeMetrics)
+        metrics.clear_gauge_family(m.gauge);
+    // Guardian M1 health-stream telemetry (#2298 gate 3, item 6d) - same absent-not-
+    // zero rule and same reason it bites hardest here: the writer is sparse, so a
+    // healthy or inert (prefer_spark off) fleet must see all 3 families ABSENT, never
+    // a fabricated 0.
+    for (const auto& m : kGuardianHealthMetrics)
         metrics.clear_gauge_family(m.gauge);
 
     // Aggregate
@@ -1643,9 +1801,9 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     std::unordered_map<std::string, double> spark_armed_faulted_os, spark_watch_faults_os,
         spark_queued_dropped_os, spark_consumer_errors_os;
     std::unordered_map<std::string, std::unordered_map<std::string, double>> spark_watch_rejected_om,
-        spark_quarantined_om, spark_slow_op_om;
+        spark_quarantined_om, spark_slow_op_om, spark_unsupported_om;
     // Per-{mechanism,metric} spark tag keys are loop-invariant across agents AND
-    // cycles — build the 3×3 once, not per agent per 15s sweep (gov perf-S1). Indexed
+    // cycles — build the 3×4 once, not per agent per 15s sweep (gov perf-S1). Indexed
     // [mechanism][metric] in kSparkMechTokens / kSparkMetricTokens order. Function-
     // static: recompute_metrics is single-threaded, and static-local init is
     // thread-safe regardless.
@@ -1719,6 +1877,21 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         std::array<std::string, kNGuardianJournalAgeMetrics> keys;
         for (std::size_t i = 0; i < kNGuardianJournalAgeMetrics; ++i)
             keys[i] = kGuardianJournalAgeMetrics[i].tag;
+        return keys;
+    }();
+    // Guardian M1 health-stream telemetry (#2298 gate 3, item 6d) - table-driven off
+    // kGuardianHealthMetrics exactly like the journal family above: unlabelled fleet
+    // SUM (no os split, no agent-controlled cardinality), `reported` tracked
+    // separately from the sum for the same non-conforming-explicit-"0" reason.
+    std::array<double, kNGuardianHealthMetrics> gh_sum{};
+    std::array<bool, kNGuardianHealthMetrics> gh_reported{};
+    int gh_reporting = 0;
+    int gh_tag_rejected = 0;
+    // Same static-destruction-safety rationale as gj_keys above.
+    static const std::array<std::string, kNGuardianHealthMetrics> gh_keys = [] {
+        std::array<std::string, kNGuardianHealthMetrics> keys;
+        for (std::size_t i = 0; i < kNGuardianHealthMetrics; ++i)
+            keys[i] = kGuardianHealthMetrics[i].tag;
         return keys;
     }();
     // `yuzu.os` is an agent-CONTROLLED heartbeat tag; using it raw as a metric
@@ -1902,17 +2075,35 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
                 spark_queued_dropped_os[net_os] += *v;
             if (auto v = parse_spark_count(get_view(kKeySparkConsumerErrors)))
                 spark_consumer_errors_os[net_os] += *v;
-            // Per-mechanism-type health counters (the three that back the alerts).
-            // Keys are the precomputed loop-invariants (perf-S1); index 0/1/2 =
-            // watch_rejected / quarantined / slow_op (kSparkMetricTokens order).
+            // Per-mechanism-type health counters. Keys are the precomputed
+            // loop-invariants (perf-S1), read by the NAMED indices in
+            // spark_fleet_tags.hpp (kSparkMetricIdx*), each pinned to its
+            // kSparkMetricTokens slot by a static_assert there - a future reorder
+            // or insertion fails to compile here rather than silently misattributing
+            // one health signal's fleet sum into another gauge family (governance
+            // finding, F7/#2298: consistency-auditor C1 / architect). The first
+            // three back the fleet alerts and are agent-side CUMULATIVE counters
+            // (only grow until agent restart), so their fleet sum can only grow
+            // too. unsupported (F7, #2298 rung 2) is a CURRENT gauge instead -
+            // GuardianEngine reports a live snapshot each heartbeat, not a running
+            // total, so its fleet sum can genuinely decrease. set_mech_gauge below
+            // (.set(), never delta-accumulated across sweeps) is identical for all
+            // four either way; the distinction is purely in what the agent-reported
+            // VALUE means, not in how the server publishes it.
             for (std::size_t mi = 0; mi < kNMech; ++mi) {
                 const char* mech = kSparkMechTokens[mi];
-                if (auto v = parse_spark_count(get_view(spark_mech_metric_keys[mi][0])))
+                if (auto v = parse_spark_count(
+                        get_view(spark_mech_metric_keys[mi][kSparkMetricIdxWatchRejected])))
                     spark_watch_rejected_om[net_os][mech] += *v;
-                if (auto v = parse_spark_count(get_view(spark_mech_metric_keys[mi][1])))
+                if (auto v = parse_spark_count(
+                        get_view(spark_mech_metric_keys[mi][kSparkMetricIdxQuarantined])))
                     spark_quarantined_om[net_os][mech] += *v;
-                if (auto v = parse_spark_count(get_view(spark_mech_metric_keys[mi][2])))
+                if (auto v = parse_spark_count(
+                        get_view(spark_mech_metric_keys[mi][kSparkMetricIdxSlowOp])))
                     spark_slow_op_om[net_os][mech] += *v;
+                if (auto v = parse_spark_count(
+                        get_view(spark_mech_metric_keys[mi][kSparkMetricIdxUnsupported])))
+                    spark_unsupported_om[net_os][mech] += *v;
             }
         } else if (spark_state == SparkRunState::NotRunning) {
             // running == "0" — the agent IS rung-1+ and is NOT running spark. Split the
@@ -1991,6 +2182,26 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
                 ++gj_tag_rejected;
             }
         }
+
+        // Guardian M1 health-stream telemetry (#2298 gate 3, item 6d). Same
+        // absent-vs-rejected split as the journal accumulate above: an empty view is
+        // the sparse writer's "nothing to report", not a rejection; a present value
+        // that fails the parse is.
+        bool health_reported_any = false;
+        for (std::size_t i = 0; i < kNGuardianHealthMetrics; ++i) {
+            const auto raw = get_view(gh_keys[i]);
+            if (raw.empty())
+                continue;
+            if (auto v = parse_guardian_health_count(raw)) {
+                gh_sum[i] += *v;
+                gh_reported[i] = true;
+                health_reported_any = true;
+            } else {
+                ++gh_tag_rejected;
+            }
+        }
+        if (health_reported_any)
+            ++gh_reporting;
     }
 
     metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
@@ -2106,6 +2317,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     set_mech_gauge("yuzu_fleet_spark_watch_rejected", spark_watch_rejected_om);
     set_mech_gauge("yuzu_fleet_spark_quarantined", spark_quarantined_om);
     set_mech_gauge("yuzu_fleet_spark_slow_op", spark_slow_op_om);
+    set_mech_gauge("yuzu_fleet_spark_unsupported", spark_unsupported_om); // F7, #2298 rung 2
 
     // Guardian journal rollup (#2298 gate 3). Families were cleared at the top, so a
     // signal NOBODY reported this cycle stays ABSENT - never a fabricated 0. On a
@@ -2127,6 +2339,16 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     metrics.gauge(kGuardianJournalReportingGauge).set(static_cast<double>(gj_reporting));
     metrics.gauge(kGuardianJournalTagRejectedGauge)
         .set(static_cast<double>(gj_tag_rejected));
+
+    // Guardian M1 health-stream rollup (#2298 gate 3, item 6d). Same absent-not-zero
+    // rule as the journal family: cleared at the top, so a signal nobody reported this
+    // cycle stays ABSENT.
+    for (std::size_t i = 0; i < kNGuardianHealthMetrics; ++i)
+        if (gh_reported[i])
+            metrics.gauge(kGuardianHealthMetrics[i].gauge).set(gh_sum[i]);
+    metrics.gauge(kGuardianHealthReportingGauge).set(static_cast<double>(gh_reporting));
+    metrics.gauge(kGuardianHealthTagRejectedGauge)
+        .set(static_cast<double>(gh_tag_rejected));
 }
 
 } // namespace yuzu::server::detail

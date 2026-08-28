@@ -208,6 +208,29 @@ TEST_CASE("REST POST /api/v1/quarantine is denied per-target by the scoped gate 
     CHECK_FALSE(h.is_quarantined("agent-B"));
 }
 
+TEST_CASE("REST POST /api/v1/quarantine passes an OMITTED agent_id through to the scope gate "
+          "unmodified — no route-level default/early-return that could diverge from "
+          "require_scoped_permission's own empty-agent_id 400 (#2298 PR 3 §3b)",
+          "[rest][quarantine][authz][pg][service_scope]") {
+    // security-guardian (Gate 4, this PR's own governance round) found that a
+    // pre-fix `require_scoped_permission` empty-agent_id degenerate would
+    // have unconditionally admitted a service-scoped token HERE — this
+    // route's `agent_id = body.value("agent_id", "")` has no upstream empty
+    // check of its own. The real 400 is proven at the function level in
+    // test_auth_routes.cpp; this test proves the ROUTE's wiring doesn't
+    // silently special-case an empty agent_id before reaching that gate
+    // (the fake `scoped_perm_fn` here can't itself enforce the 400 — it
+    // stands in for require_scoped_permission, which production wires in).
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineRouteHarness h(qpool);
+    h.scope_allow = true; // the fake would admit — proves the route itself adds no guard
+    auto res = h.post(R"({"reason":"test"})"); // no agent_id key at all
+    REQUIRE(res);
+    CHECK(h.scope_fn_called);
+    CHECK(h.scoped_target.empty()); // reached the gate with the raw empty value, unmodified
+}
+
 TEST_CASE("REST POST /api/v1/quarantine admits an in-scope caller and quarantines the device "
           "(201) (CDX-P1-02)",
           "[rest][quarantine][authz][pg]") {
@@ -249,6 +272,38 @@ TEST_CASE("REST POST /api/v1/quarantine rejects a malformed JSON body (400, no d
     CHECK(res->status == 400);
     CHECK_FALSE(h.scope_fn_called);
     CHECK_FALSE(h.is_quarantined("agent-B"));
+}
+
+TEST_CASE("REST POST /api/v1/quarantine rejects an unsafe whitelist (400, no write) "
+          "(#3425 gate3-rest-whitelist-validation-gap)",
+          "[rest][quarantine][authz][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineRouteHarness h(qpool);
+    h.scope_allow = true;
+    SECTION("unsafe charset (a CIDR slash)") {
+        auto res = h.post(R"({"agent_id":"agent-B","reason":"test","whitelist":"10.0.0.0/24"})");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.scope_fn_called); // scope gate runs before the validator, same order as agent_id
+        CHECK_FALSE(h.is_quarantined("agent-B")); // rejected, never written
+    }
+    SECTION("oversized (over kQuarantineWhitelistMaxLen)") {
+        const std::string oversized(600, '1');
+        const std::string body = R"({"agent_id":"agent-B","reason":"test","whitelist":")" +
+                                 oversized + R"("})";
+        auto res = h.post(body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK_FALSE(h.is_quarantined("agent-B"));
+    }
+    SECTION("a valid whitelist still succeeds (201)") {
+        auto res = h.post(
+            R"({"agent_id":"agent-B","reason":"test","whitelist":"10.0.0.1,10.0.0.2"})");
+        REQUIRE(res);
+        CHECK(res->status == 201);
+        CHECK(h.is_quarantined("agent-B"));
+    }
 }
 
 TEST_CASE("REST POST/DELETE /api/v1/quarantine audit the unwired-scope-gate 500 (gov-fix)",

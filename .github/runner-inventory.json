@@ -71,6 +71,20 @@
       "labels": ["self-hosted", "Windows", "X64", "yuzu-weetam-windows"],
       "role": "Windows MSVC CI pool (shared label yuzu-weetam-windows) — ci.yml windows matrix (release + debug), codeql Windows leg. Replaces yuzu-local-windows after the Shulgi cutover.",
       "installed": "2026-06-20"
+    },
+    {
+      "name": "yuzu-bigmags-macos-0",
+      "host": "BigMags (Mac Mini, Apple M4 Pro, 24 GiB, macOS 26)",
+      "labels": ["self-hosted", "macOS", "ARM64", "yuzu-bigmags-macos"],
+      "role": "macOS ARM64 CI pool (shared label yuzu-bigmags-macos) — ci.yml macos matrix (debug on PR, debug+release on push). Replaces GitHub-hosted macos-15 for the test leg and (PR #3348) the release.yml build-macos job — macOS release artifacts are unsigned/un-notarized until on-box signing (Phase B).",
+      "installed": "2026-08-17"
+    },
+    {
+      "name": "yuzu-bigmags-macos-1",
+      "host": "BigMags (Mac Mini, Apple M4 Pro, 24 GiB, macOS 26)",
+      "labels": ["self-hosted", "macOS", "ARM64", "yuzu-bigmags-macos"],
+      "role": "macOS ARM64 CI pool (shared label yuzu-bigmags-macos) — ci.yml macos matrix (debug on PR, debug+release on push). Replaces GitHub-hosted macos-15 for the test leg and (PR #3348) the release.yml build-macos job — macOS release artifacts are unsigned/un-notarized until on-box signing (Phase B).",
+      "installed": "2026-08-17"
     }
   ]
 }

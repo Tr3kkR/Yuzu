@@ -38,10 +38,6 @@ using yuzu::server::pg::PgPool;
 
 namespace {
 
-fs::path uniq(const std::string& prefix) {
-    return yuzu::test::unique_temp_path(prefix + "-");
-}
-
 // ResponseStore is now a migrated Postgres store (ADR-0039) — shares the
 // "responsestore" template key with test_response_store.cpp (identical setup).
 yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::string& dsn) {
@@ -49,6 +45,13 @@ yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::stri
     ResponseStore store{pool};
     if (!store.is_open())
         throw std::runtime_error("responsestore template: store failed to migrate");
+}};
+// InstructionStore is now a migrated Postgres store (ADR-0058).
+yuzu::test::PgTestTemplate restviz_instr_tpl{"restvizinstr", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    InstructionStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("restviz_instr template: store failed to migrate");
 }};
 
 struct AuditRecord {
@@ -62,7 +65,6 @@ struct AuditRecord {
 struct VizHarness {
     yuzu::server::test::TestRouteSink sink;
 
-    fs::path inst_db;
     std::unique_ptr<InstructionStore> instruction_store;
     std::unique_ptr<ResponseStore> response_store;
 
@@ -71,10 +73,10 @@ struct VizHarness {
 
     RestApiV1 api;
 
-    explicit VizHarness(pg::PgPool& pool, RestApiV1::ResponseScopeFn scope_fn = {})
-        : inst_db(uniq("rest-viz-inst")) {
-        fs::remove(inst_db);
-        instruction_store = std::make_unique<InstructionStore>(inst_db);
+    explicit VizHarness(pg::PgPool& pool, RestApiV1::ResponseScopeFn scope_fn = {}) {
+        // ADR-0058: InstructionStore is now a migrated Postgres store — shares
+        // the same pool/database as ResponseStore below (schema-per-store).
+        instruction_store = std::make_unique<InstructionStore>(pool);
         REQUIRE(instruction_store->is_open());
         // #1073: InstructionStore defaults to require_signed_definitions=true.
         // These tests exercise the import path + visualization-spec
@@ -139,16 +141,12 @@ struct VizHarness {
                             /*baseline_store=*/nullptr,
                             /*scoped_perm_fn=*/{},
                             /*software_inventory_store=*/nullptr,
-                            /*inventory_scope_fn=*/{},
                             /*response_scope_fn=*/std::move(scope_fn));
     }
 
     ~VizHarness() {
         response_store.reset();
         instruction_store.reset();
-        fs::remove(inst_db);
-        fs::remove(inst_db.string() + "-wal");
-        fs::remove(inst_db.string() + "-shm");
     }
 
     /// Insert a definition with the given visualization spec and return its id.
@@ -467,80 +465,75 @@ TEST_CASE("REST visualization: empty response set → 200 with empty payload",
 }
 
 TEST_CASE("InstructionStore: visualization_spec round-trips through create / get / update",
-          "[instruction_store][visualization]") {
-    auto db_path = uniq("inst-viz");
-    fs::remove(db_path);
-    {
-        InstructionStore store(db_path);
-        REQUIRE(store.is_open());
+          "[instruction_store][visualization][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, restviz_instr_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
-        InstructionDefinition d;
-        d.id = "def-viz-rt";
-        d.name = "rt";
-        d.type = "question";
-        d.plugin = "procfetch";
-        d.visualization_spec = R"({"type":"pie","processor":"single_series","label_field":1})";
-        auto created = store.create_definition(d);
-        REQUIRE(created.has_value());
+    InstructionDefinition d;
+    d.id = "def-viz-rt";
+    d.name = "rt";
+    d.type = "question";
+    d.plugin = "procfetch";
+    d.visualization_spec = R"({"type":"pie","processor":"single_series","label_field":1})";
+    auto created = store.create_definition(d);
+    REQUIRE(created.has_value());
 
-        auto got = store.get_definition("def-viz-rt");
-        REQUIRE(got.has_value());
-        CHECK(got->visualization_spec.find("\"type\":\"pie\"") != std::string::npos);
+    auto got = store.get_definition("def-viz-rt");
+    REQUIRE(got.has_value());
+    REQUIRE(got->has_value());
+    CHECK((*got)->visualization_spec.find("\"type\":\"pie\"") != std::string::npos);
 
-        // Update the spec to a different chart type and confirm it persists
-        got->visualization_spec = R"({"type":"line","processor":"datetime_series"})";
-        REQUIRE(store.update_definition(*got));
-        auto got2 = store.get_definition("def-viz-rt");
-        REQUIRE(got2.has_value());
-        CHECK(got2->visualization_spec.find("\"type\":\"line\"") != std::string::npos);
-    }
-    fs::remove(db_path);
-    fs::remove(db_path.string() + "-wal");
-    fs::remove(db_path.string() + "-shm");
+    // Update the spec to a different chart type and confirm it persists
+    InstructionDefinition updated = **got;
+    updated.visualization_spec = R"({"type":"line","processor":"datetime_series"})";
+    REQUIRE(store.update_definition(updated).has_value());
+    auto got2 = store.get_definition("def-viz-rt");
+    REQUIRE(got2.has_value());
+    REQUIRE(got2->has_value());
+    CHECK((*got2)->visualization_spec.find("\"type\":\"line\"") != std::string::npos);
 }
 
 TEST_CASE("InstructionStore: import_definition_json accepts visualization_spec as object or string",
-          "[instruction_store][visualization][import]") {
-    auto db_path = uniq("inst-viz-imp");
-    fs::remove(db_path);
-    {
-        InstructionStore store(db_path);
-        REQUIRE(store.is_open());
-        // #1073: opt out of signature enforcement — this test pins
-        // visualization_spec normalisation, not the signature gate.
-        store.set_require_signed_definitions(false);
+          "[instruction_store][visualization][import][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, restviz_instr_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+    // #1073: opt out of signature enforcement — this test pins
+    // visualization_spec normalisation, not the signature gate.
+    store.set_require_signed_definitions(false);
 
-        // Object form (CLI converts YAML→JSON in one shot)
-        nlohmann::json j;
-        j["id"] = "def-imp-obj";
-        j["name"] = "imp-obj";
-        j["type"] = "question";
-        j["plugin"] = "procfetch";
-        j["visualization_spec"] = nlohmann::json::object({
-            {"type", "pie"},
-            {"processor", "single_series"},
-            {"label_field", 1},
-        });
-        REQUIRE(store.import_definition_json(j.dump()).has_value());
-        auto got = store.get_definition("def-imp-obj");
-        REQUIRE(got.has_value());
-        CHECK(got->visualization_spec.find("\"type\":\"pie\"") != std::string::npos);
+    // Object form (CLI converts YAML→JSON in one shot)
+    nlohmann::json j;
+    j["id"] = "def-imp-obj";
+    j["name"] = "imp-obj";
+    j["type"] = "question";
+    j["plugin"] = "procfetch";
+    j["visualization_spec"] = nlohmann::json::object({
+        {"type", "pie"},
+        {"processor", "single_series"},
+        {"label_field", 1},
+    });
+    REQUIRE(store.import_definition_json(j.dump()).has_value());
+    auto got = store.get_definition("def-imp-obj");
+    REQUIRE(got.has_value());
+    REQUIRE(got->has_value());
+    CHECK((*got)->visualization_spec.find("\"type\":\"pie\"") != std::string::npos);
 
-        // Pre-serialized string form
-        nlohmann::json j2;
-        j2["id"] = "def-imp-str";
-        j2["name"] = "imp-str";
-        j2["type"] = "question";
-        j2["plugin"] = "procfetch";
-        j2["visualization_spec"] = R"({"type":"bar","processor":"single_series"})";
-        REQUIRE(store.import_definition_json(j2.dump()).has_value());
-        auto got2 = store.get_definition("def-imp-str");
-        REQUIRE(got2.has_value());
-        CHECK(got2->visualization_spec.find("\"type\":\"bar\"") != std::string::npos);
-    }
-    fs::remove(db_path);
-    fs::remove(db_path.string() + "-wal");
-    fs::remove(db_path.string() + "-shm");
+    // Pre-serialized string form
+    nlohmann::json j2;
+    j2["id"] = "def-imp-str";
+    j2["name"] = "imp-str";
+    j2["type"] = "question";
+    j2["plugin"] = "procfetch";
+    j2["visualization_spec"] = R"({"type":"bar","processor":"single_series"})";
+    REQUIRE(store.import_definition_json(j2.dump()).has_value());
+    auto got2 = store.get_definition("def-imp-str");
+    REQUIRE(got2.has_value());
+    REQUIRE(got2->has_value());
+    CHECK((*got2)->visualization_spec.find("\"type\":\"bar\"") != std::string::npos);
 }
 
 TEST_CASE("REST visualization: management-group scope drops out-of-scope agents' rows (#1634)",

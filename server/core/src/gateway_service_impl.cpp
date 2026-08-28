@@ -152,7 +152,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                                   {{"variant", "invalid_input_length"}})
                         .increment();
                 }
-                if (analytics_store_) {
+                if (auto analytics_store = analytics_store_.lock()) {
                     AnalyticsEvent ae;
                     ae.event_type = "agent.enrollment_denied";
                     ae.agent_id = info.agent_id();
@@ -163,7 +163,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                     ae.attributes = {{"reason", "invalid_input_length"},
                                      {"token_length", enrollment_token.size()},
                                      {"source", "gateway_proxy"}};
-                    analytics_store_->emit(std::move(ae));
+                    analytics_store->emit(std::move(ae));
                 }
                 response->set_accepted(false);
                 response->set_reject_reason(
@@ -229,7 +229,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                 if (!audit_ok)
                     signal_grpc_audit_failed(context);
 
-                if (analytics_store_) {
+                if (auto analytics_store = analytics_store_.lock()) {
                     AnalyticsEvent ae;
                     ae.event_type = "agent.enrollment_denied";
                     ae.agent_id = info.agent_id();
@@ -248,7 +248,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                         attrs["already_consumed_by"] = already_consumed_by;
                     }
                     ae.attributes = std::move(attrs);
-                    analytics_store_->emit(std::move(ae));
+                    analytics_store->emit(std::move(ae));
                 }
 
                 response->set_accepted(false);
@@ -291,7 +291,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
             // mirroring the denial path's audit_ok handling. SOC 2 CC7.2.
             if (!enroll_audit_ok) {
                 signal_grpc_audit_failed(context);
-                if (analytics_store_) {
+                if (auto analytics_store = analytics_store_.lock()) {
                     AnalyticsEvent ae;
                     ae.event_type = "agent.enrollment_audit_dropped";
                     ae.agent_id = info.agent_id();
@@ -302,7 +302,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                     ae.attributes = {{"result", "success"},
                                      {"audit_emitted", false},
                                      {"source", "gateway_proxy"}};
-                    analytics_store_->emit(std::move(ae));
+                    analytics_store->emit(std::move(ae));
                 }
             }
 
@@ -379,7 +379,18 @@ gw_enrolled:
         registry_.note_trusted_gateway_peer(extract_peer_ip(context->peer()));
     }
 
-    registry_.register_agent(info);
+    // #3401 Gap 2: register_agent fails closed if the W1.5/#823 device-token revoke sweep
+    // itself errors. Note the peer trust note above already ran — a store fault does not
+    // un-trust the gateway peer (that entry has its own TTL eviction, UP-2/UP-3); only the
+    // agent's own registration is refused. UNAVAILABLE, not accepted=false (the agent's
+    // PERMANENT-rejection signal, agent.cpp:1649-1657), so the agent retries on its normal
+    // reconnect backoff.
+    if (auto reg_result = registry_.register_agent(info); !reg_result) {
+        spdlog::error("ProxyRegister: register_agent failed for '{}': {}", info.agent_id(),
+                      reg_result.error());
+        return grpc::Status(grpc::StatusCode::UNAVAILABLE,
+                            "registration temporarily unavailable");
+    }
     // Auto-add to root management group
     if (mgmt_group_store_ && mgmt_group_store_->is_open())
         mgmt_group_store_->add_member(ManagementGroupStore::kRootGroupId, info.agent_id());

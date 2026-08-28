@@ -240,7 +240,7 @@ Server-side aggregation of response data. Support group-by columns with `count`,
 ### Issue 1.5: Device Tagging System :white_check_mark:
 **Capabilities:** 3.10, 3.6, 3.7 | **Scope:** Server + Agent | **Status:** Done
 
-`TagStore` with SQLite backend. `DeviceTag` struct: agent_id, key, value, source (agent/server/api), updated_at. Validation: key max 64 chars `[a-zA-Z0-9_.:-]`, value max 448 bytes. Agent tag sync from heartbeat. `agents_with_tag()` for scope queries. Device criticality (3.6) and location (3.7) implemented as special-purpose tags.
+`TagStore` on the PostgreSQL substrate (ADR-0050, schema `tag_store`). `DeviceTag` struct: agent_id, key, value, source (agent/server/api/mcp), updated_at. Validation: key max 64 chars `[a-zA-Z0-9_.:-]`, value max 448 bytes. Agent tag sync from heartbeat. `agents_with_tag()` for scope queries. Device criticality (3.6) and location (3.7) implemented as special-purpose tags.
 
 **Files:** `server/core/src/tag_store.hpp`, `server/core/src/tag_store.cpp`, `agents/plugins/tags/src/tags_plugin.cpp`
 
@@ -698,7 +698,7 @@ New `wmi` plugin (Windows-only):
 **Capability:** 7.5 | **Scope:** Plugin | **Status:** Done
 
 Extend `installed_apps` plugin:
-- Enumerate per-user installations from HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall for each user profile.
+- Enumerate per-user installations (`list_per_user`) via each profile's `Software\Microsoft\Windows\CurrentVersion\Uninstall`, read from the live `HKEY_USERS\<SID>` hive or an offline `NTUSER.DAT` mount — the shared ladder in `agents/shared/win_profiles.hpp` (#2771), not a literal `HKCU` read.
 - Distinguish system-wide from user-specific installs in output.
 
 **Files:** `agents/plugins/installed_apps/src/installed_apps_plugin.cpp`
@@ -971,15 +971,15 @@ REST CRUD at `/api/v1/definitions/{id}/response-templates[/{template_id}]`. Filt
 **Capability:** 20.7 | **Scope:** Server | **Status:** Done
 **Depends on:** 8.1
 
-Named external HTTP endpoints that receive a copy of `agent.registered` and `execution.completed` events as they fire. Built around a sibling `OffloadTargetStore` SQLite database (`offload_targets.db`) wired into `AgentServiceImpl` next to the existing webhook fan-out, so every event that fires a webhook also fans out to every enabled offload target whose `event_types` filter matches.
+Named external HTTP endpoints that receive a copy of `agent.registered` and `execution.completed` events as they fire. Built around a sibling `OffloadTargetStore` (Postgres schema `offload_target_store`, ADR-0059 — migrated off the original SQLite `offload_targets.db`) wired into `AgentServiceImpl` next to the existing webhook fan-out, so every event that fires a webhook also fans out to every enabled offload target whose `event_types` filter matches.
 
-Targets carry typed auth (none / bearer / basic / hmac), a server-side batching threshold (`batch_size > 1` accumulates events into a per-target buffer and flushes on threshold), and a unique `name` so a definition can name a specific subset via `spec.offload.targets` in YAML. `auth_credential` is persisted but never returned by any REST surface (paranoia-double-check assertion in `test_rest_offload_targets.cpp`). Outgoing requests carry `X-Yuzu-Event`, `X-Yuzu-Event-Count`, and (for hmac) `X-Yuzu-Signature: sha256=<hex>` headers — receivers can share verification code with webhooks.
+Targets carry typed auth (none / bearer / basic / hmac), a server-side batching threshold (`batch_size > 1` accumulates events into a per-target buffer and flushes on threshold), and a unique `name` so a definition can name a specific subset via `spec.offload.targets` in YAML. `auth_credential` is `SecretCodec`-encrypted at rest (ADR-0010) and never returned by any REST surface (paranoia-double-check assertion in `test_rest_offload_targets.cpp`); a `has_credential` flag reports whether one is configured. Outgoing requests carry `X-Yuzu-Event`, `X-Yuzu-Event-Count`, and (for hmac) `X-Yuzu-Signature: sha256=<hex>` headers — receivers can share verification code with webhooks.
 
 REST: `GET/POST/DELETE /api/v1/offload-targets`, `GET /api/v1/offload-targets/{id}`, `GET /api/v1/offload-targets/{id}/deliveries`. RBAC: `Infrastructure:Read`/`Write`. Audit events: `offload_target.create` (success | denied), `offload_target.delete`.
 
 **Known follow-up:** the dispatcher does not yet extract `spec.offload.targets` from the originating definition — `fire_event(target_filter)` honours an explicit caller-supplied filter, but the agent-service fan-out passes none. Wiring the per-instruction filter through `cmd_execution_ids_ → execution_id → definition_id → InstructionStore` is tracked separately so the global fan-out path lands clean first.
 
-**Files:** `server/core/src/offload_target_store.{hpp,cpp}` (new, migration v1), `server/core/src/offload_routes.{hpp,cpp}` (new), `server/core/src/server.cpp` (DB open + AgentService wiring + route registration), `server/core/src/agent_service_impl.{hpp,cpp}` (`set_offload_target_store` + fire_event at 3 call sites), `docs/yaml-dsl-spec.md` § `spec.offload`, `docs/user-manual/rest-api.md` § Offload Targets, `tests/unit/server/test_offload_target_store.cpp`, `tests/unit/server/test_rest_offload_targets.cpp`.
+**Files:** `server/core/src/offload_target_store.{hpp,cpp}` (Postgres migration, ADR-0059, fresh-start cutover — no backfill), `server/core/src/offload_routes.{hpp,cpp}`, `server/core/src/server.cpp` (`SecretCodec`-gated construction + AgentService wiring + route registration), `server/core/src/agent_service_impl.{hpp,cpp}` (`set_offload_target_store` + fire_event at 3 call sites), `docs/yaml-dsl-spec.md` § `spec.offload`, `docs/user-manual/rest-api.md` § Offload Targets, `docs/adr/0059-offload-target-store-postgres-migration.md`, `tests/unit/server/test_offload_target_store.cpp`, `tests/unit/server/test_rest_offload_targets.cpp`.
 
 ---
 
@@ -1884,7 +1884,7 @@ Cross-phase dependencies:
 
 Phases 0–7 are complete. For the remaining phases, execution order is based on enterprise value and dependencies:
 
-1. **Phase 8** — Visualization & response experience (immediate UX impact, small scope). 8.1 Response Visualization Engine done; six demo charts ship in `content/definitions/visualization_demo_set.yaml` and `content/packs/visualization-demo-pack.yaml`. 8.2 Response Templates done. 8.3 Response Offloading done — `offload_targets.db` + REST `/api/v1/offload-targets` + global fan-out wired into `AgentServiceImpl` for `agent.registered` and `execution.completed`. Phase 8 complete.
+1. **Phase 8** — Visualization & response experience (immediate UX impact, small scope). 8.1 Response Visualization Engine done; six demo charts ship in `content/definitions/visualization_demo_set.yaml` and `content/packs/visualization-demo-pack.yaml`. 8.2 Response Templates done. 8.3 Response Offloading done — `offload_target_store` (Postgres, ADR-0059) + REST `/api/v1/offload-targets` + global fan-out wired into `AgentServiceImpl` for `agent.registered` and `execution.completed`. Phase 8 complete.
 2. **Phase 9** — Connector framework (largest enterprise gap, enables Phases 10, 14.4–14.5)
 3. **Phase 10** — Software catalog & license compliance (builds on 9.8 normalization; superseded by ADR-0024 "Software Licensing & Entitlements" — see the Phase 10 section note)
 4. **Phase 12** — Remaining agent capabilities (closes capability map to 100%, parallelizable)

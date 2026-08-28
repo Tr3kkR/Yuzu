@@ -6,7 +6,11 @@
 #include "execution_event_bus.hpp"
 #include "http_route_sink.hpp"
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
+#include "rest_a4_envelope.hpp"     // detail::error_json_a4, make_correlation_id
+#include "rest_a4_envelope_http.hpp" // detail::a4_denial (deny_service_scoped_scope_estimate) —
+                                     // mints/reuses X-Correlation-Id so header and body agree
 #include "scope_engine.hpp"
+#include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
 #include "web_utils.hpp"
 
 #include <nlohmann/json.hpp>
@@ -23,6 +27,36 @@
 #include <vector>
 
 namespace yuzu::server {
+
+// Mirrors rest_api_v1.cpp's license_error_status/sw_deploy_error_status shape: ProductPackStore
+// widened list()/get() to std::expected and uninstall() now returns a machine-checkable
+// "not_found: " prefix (product_pack_store.hpp) as part of its PG migration — this classifier
+// keeps the REST surface's status codes correct instead of collapsing every failure to the
+// pre-migration 400/503-by-is_open()-only split. `kProductPackDbErrorPrefix` (a genuine DB/lease
+// failure) -> 503; `"not_found:"` -> 404 (a REST contract change for DELETE — the pre-migration
+// route always returned 400 for a missing id); anything else (signature rejection, validation,
+// business-rule error) -> 400.
+static int product_pack_error_status(const std::string& err) {
+    if (err.starts_with("not_found:"))
+        return 404;
+    if (err.starts_with(yuzu::server::kProductPackDbErrorPrefix))
+        return 503;
+    return 400;
+}
+
+// Mirrors rest_api_v1.cpp's sw_deploy_client_message/device_token_client_message: a
+// kProductPackDbErrorPrefix error carries a raw PQerrorMessage() fragment (connection string
+// detail, occasionally host:port) that is internal implementation detail, not caller-actionable
+// feedback (gov Gate 2 security-guardian). Logs the real error server-side and returns a generic
+// constant instead. A not_found/validation error (never carries the prefix) is safe to echo
+// verbatim — it's operator-authored request feedback, not database internals.
+static std::string product_pack_client_message(const char* op, const std::string& err) {
+    if (err.starts_with(yuzu::server::kProductPackDbErrorPrefix)) {
+        spdlog::error("{}: {}", op, err);
+        return "service unavailable";
+    }
+    return err;
+}
 
 // Production overload — wraps the Server in an HttplibRouteSink and forwards
 // to the sink-based body. Defined first so callers see a familiar signature.
@@ -158,9 +192,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             std::string def_label;
             std::string def_title;
             if (instruction_store && instruction_store->is_open() && !e.definition_id.empty()) {
-                auto def = instruction_store->get_definition(e.definition_id);
-                if (def && !def->name.empty()) {
-                    def_label = def->name;
+                // ADR-0058: a DB-error outer result falls through to the id-truncated
+                // fallback below, same as a not-found inner optional did pre-migration
+                // — this is a best-effort display label, not a security/dispatch path.
+                auto def_result = instruction_store->get_definition(e.definition_id);
+                if (def_result && *def_result && !(*def_result)->name.empty()) {
+                    def_label = (*def_result)->name;
                     def_title = e.definition_id;
                 }
             }
@@ -283,9 +320,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // -- Definition lookup -------------------------------------------
             std::string def_name = exec.definition_id;
             if (instruction_store && instruction_store->is_open() && !exec.definition_id.empty()) {
-                if (auto def = instruction_store->get_definition(exec.definition_id);
-                    def && !def->name.empty()) {
-                    def_name = def->name;
+                // ADR-0058: a DB-error outer result falls through to the id fallback
+                // above, same as a not-found inner optional did pre-migration.
+                if (auto def_result = instruction_store->get_definition(exec.definition_id);
+                    def_result && *def_result && !(*def_result)->name.empty()) {
+                    def_name = (*def_result)->name;
                 }
             }
 
@@ -905,11 +944,73 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                          }));
              });
 
-    // GET /fragments/schedules -- schedule list HTMX fragment
-    sink.Get("/fragments/schedules", [auth_fn, schedule_engine](const httplib::Request& req,
-                                                                httplib::Response& res) {
+    // guardian-confinement-2298: fleet-wide schedule list has no single
+    // schedule/agent to confine per-target, mirrors GuardianRoutes'/
+    // RestApiV1's blanket service-scoped deny for the identical reason —
+    // ITServiceOwner grants full CRUD on Schedule, so a bare Schedule:Read
+    // gate alone would still let a service-scoped token enumerate every
+    // schedule from every other service. Runs BEFORE this route's own
+    // `perm_fn(Schedule,Read)` call below (independent of RBAC on/off branch
+    // ordering) — matches the GuardianRoutes/DexRoutes/NetworkRoutes family
+    // of fragment/REST denies with no single per-target to scope against.
+    // Security-guardian correction (governance run 2026-08-21): an earlier
+    // draft of this comment claimed this fragment "has no permission gate of
+    // its own to run after" — false, `perm_fn` runs right below. The correct
+    // classification is LIVE-but-redundant (fires BEFORE its gate, the same
+    // bucket-1b class as the routed-concern row's other still-listed
+    // helpers), not gate-less/§3e — this deny stays for that reason, not
+    // because the route lacks a gate. Contrast the now-retired REST
+    // `/api/schedules` family's interim deny (#3290 Phase 2 bucket 1a — that
+    // one ran AFTER its route's permission gate(s) and was made provably
+    // dead by the flip).
+    auto deny_service_scoped_schedule_list = [auth_fn, audit_fn](const httplib::Request& req,
+                                                                  httplib::Response& res) -> bool {
         auto session = auth_fn(req, res);
         if (!session)
+            return true; // auth_fn already wrote 401/redirect; caller returns.
+        if (session->token_scope_service.empty())
+            return false;
+        // Write the 403 FIRST, audit after (mirrors GuardianRoutes'
+        // deny_service_scoped_): a throwing audit_fn must not suppress the 403.
+        res.status = 403;
+        // No `.permission`: `kServiceScopeGlobalSafe` is compile-time-empty,
+        // so no grant admits a service-scoped caller here (gov-fix, Gate 8,
+        // #2298 PR 3 hardening round — routed-concern MUST clause).
+        // `a4_denial` also fixes a second bug found in the same pass: the
+        // hand-built cid never reached the X-Correlation-Id header.
+        res.set_content(
+            detail::a4_denial(res, 403,
+                              "service-scoped tokens may not read the fleet-wide schedule list"),
+            "application/json");
+        if (audit_fn) {
+            try {
+                audit_fn(req, "schedule.list.access_denied", "denied", "schedule", "",
+                         "fleet-wide schedule list denied to a service-scoped token");
+            } catch (const std::exception& e) {
+                spdlog::warn("schedule.list.access_denied: audit_fn threw: {}", e.what());
+            } catch (...) {
+                spdlog::warn("schedule.list.access_denied: audit_fn threw (non-std)");
+            }
+        }
+        return true;
+    };
+
+    // GET /fragments/schedules -- schedule list HTMX fragment
+    sink.Get("/fragments/schedules", [perm_fn, schedule_engine,
+                                      deny_service_scoped_schedule_list](
+                                         const httplib::Request& req, httplib::Response& res) {
+        // deny_service_scoped_schedule_list already resolved (and validated)
+        // the session via auth_fn — a second auth_fn call here would be
+        // redundant, matching the original handler's only use of `session`
+        // (the existence check; the body never read the session itself).
+        if (deny_service_scoped_schedule_list(req, res))
+            return;
+        // sec-M1-style gate (mirrors /fragments/executions immediately above):
+        // the LIST exposes every schedule's name/frequency/enabled state/
+        // execution count fleet-wide — previously reachable by ANY
+        // authenticated session with no RBAC check at all (guardian-
+        // confinement-2298 hardening sweep).
+        if (!perm_fn(req, res, "Schedule", "Read"))
             return;
         if (!schedule_engine) {
             res.set_content("<div class=\"empty-state\">Not available</div>", "text/html");
@@ -952,9 +1053,54 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
     // -- Scope estimate API ----------------------------------------------------
 
+    // guardian-confinement-2298 PR3 §3e: /api/scope/estimate is auth_fn-only
+    // (no perm_fn at all) and probes an arbitrary caller-supplied scope
+    // expression against `scope_fn(expression, session->username)` — the
+    // minter's OWN visible fleet, which for a service-scoped token is still
+    // ITServiceOwner's full-CRUD-visible set (the route never consults
+    // token_scope_service). No per-target parameter to scope against, same
+    // gap class as deny_service_scoped_schedule_list above.
+    auto deny_service_scoped_scope_estimate = [auth_fn, audit_fn](const httplib::Request& req,
+                                                                   httplib::Response& res) -> bool {
+        auto session = auth_fn(req, res);
+        if (!session)
+            return true; // auth_fn already wrote 401/redirect; caller returns.
+        if (session->token_scope_service.empty())
+            return false;
+        res.status = 403;
+        // No `.permission` label: this route has no perm_fn gate at all — a
+        // blanket deny with no grant that would admit a service-scoped
+        // token, so naming one would be a false self-remediation claim.
+        //
+        // `a4_denial` (not a hand-built `error_json_a4` + bare correlation
+        // id): it mints/reuses the id via `ensure_correlation_id`, which
+        // ALSO sets the X-Correlation-Id response header — a hand-built id
+        // embeds a correlation_id in the body the header never carries,
+        // breaking the header/body-must-agree contract (consistency-auditor,
+        // Gate 4).
+        res.set_content(
+            detail::a4_denial(
+                res, 403,
+                "service-scoped tokens may not estimate scope expressions against the fleet"),
+            "application/json");
+        if (audit_fn) {
+            try {
+                audit_fn(req, "scope.estimate.access_denied", "denied", "ScopeExpression", "",
+                         "fleet-wide scope estimate denied to a service-scoped token");
+            } catch (const std::exception& e) {
+                spdlog::warn("scope.estimate.access_denied: audit_fn threw: {}", e.what());
+            } catch (...) {
+                spdlog::warn("scope.estimate.access_denied: audit_fn threw (non-std)");
+            }
+        }
+        return true;
+    };
+
     // POST /api/scope/estimate -- scope expression target count
-    sink.Post("/api/scope/estimate", [auth_fn, scope_fn](const httplib::Request& req,
-                                                         httplib::Response& res) {
+    sink.Post("/api/scope/estimate", [auth_fn, scope_fn, deny_service_scoped_scope_estimate](
+                                          const httplib::Request& req, httplib::Response& res) {
+        if (deny_service_scoped_scope_estimate(req, res))
+            return;
         auto session = auth_fn(req, res);
         if (!session)
             return;
@@ -1218,8 +1364,20 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 if (!session)
                     return;
                 for (const auto& step : workflow->steps) {
-                    auto step_def = instruction_store->get_definition(step.instruction_id);
-                    if (!step_def) {
+                    // ADR-0058: get_definition now returns std::expected — distinguish a
+                    // genuine DB error (503) from "no such instruction" (400, unchanged).
+                    auto step_def_result = instruction_store->get_definition(step.instruction_id);
+                    if (!step_def_result) {
+                        res.status = 503;
+                        res.set_content(
+                            nlohmann::json({{"error", {{"code", 503},
+                                                       {"message", "instruction store unavailable"}}},
+                                            {"meta", {{"api_version", "v1"}}}})
+                                .dump(),
+                            "application/json");
+                        return;
+                    }
+                    if (!*step_def_result) {
                         res.status = 400;
                         res.set_content(
                             nlohmann::json({{"error",
@@ -1232,12 +1390,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                             "application/json");
                         return;
                     }
-                    if (step_def->approval_mode == "auto")
+                    const auto& step_def = **step_def_result;
+                    if (step_def.approval_mode == "auto")
                         continue;
                     bool blocked = false;
-                    if (step_def->approval_mode == "always") {
+                    if (step_def.approval_mode == "always") {
                         blocked = true;
-                    } else if (step_def->approval_mode == "role-gated") {
+                    } else if (step_def.approval_mode == "role-gated") {
                         // effective_role so an active JIT admin elevation bypasses
                         // role-gated approval, consistent with require_admin.
                         blocked = (auth::effective_role(*session) != auth::Role::admin);
@@ -1253,7 +1412,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                    {"message",
                                     "workflow step '" + step.label + "' references instruction '" +
                                         step.instruction_id + "' which requires approval (mode: " +
-                                        step_def->approval_mode +
+                                        step_def.approval_mode +
                                         "). Submit each instruction individually for approval."}}},
                                  {"meta", {{"api_version", "v1"}}}})
                                 .dump(),
@@ -1276,9 +1435,20 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             if (!instruction_store || !instruction_store->is_open())
                 return std::unexpected<std::string>("instruction store not available");
 
-            auto def = instruction_store->get_definition(instruction_id);
-            if (!def)
+            // ADR-0058: get_definition now returns std::expected — a genuine DB error
+            // and "no such instruction" are distinct dispatch-path failures, both
+            // fail the step (neither can silently widen or narrow the target set).
+            auto def_result = instruction_store->get_definition(instruction_id);
+            if (!def_result)
+                // Gate 2 SEC-1: def_result.error() carries raw PQerrorMessage() text on a
+                // genuine DB failure — genericized before it reaches the stored step result
+                // (GET /api/workflow-executions/:id echoes this verbatim to any Workflow:Read
+                // holder).
+                return std::unexpected<std::string>(yuzu::server::genericize_db_error(
+                    "dispatch_fn instruction lookup", def_result.error()));
+            if (!*def_result)
                 return std::unexpected<std::string>("unknown instruction: " + instruction_id);
+            const auto& def = **def_result;
 
             // Parse agent_ids from JSON array
             std::vector<std::string> target_ids;
@@ -1327,7 +1497,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // record_execution_id is skipped and responses arrive with
             // the legacy sentinel (legacy fallback in detail handler
             // covers the rendering).
-            auto [command_id, sent] = cmd_dispatch(def->plugin, def->action, target_ids, "", params,
+            auto [command_id, sent] = cmd_dispatch(def.plugin, def.action, target_ids, "", params,
                                                    /*execution_id=*/"", caller);
 
             if (sent == 0)
@@ -1431,14 +1601,25 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         auto def_id = req.matches[1].str();
-        auto def = instruction_store->get_definition(def_id);
-        if (!def) {
+        // ADR-0058: get_definition now returns std::expected — distinguish a genuine
+        // DB error (503, same shape as the store-unavailable check above) from
+        // "no such definition" (404, unchanged).
+        auto def_result = instruction_store->get_definition(def_id);
+        if (!def_result) {
+            res.status = 503;
+            res.set_content(
+                R"({"error":{"code":503,"message":"instruction store not available"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
+        if (!*def_result) {
             res.status = 404;
             res.set_content(
                 R"({"error":{"code":404,"message":"instruction definition not found"},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }
+        const auto& def = **def_result;
 
         // Parse request body
         nlohmann::json j;
@@ -1541,21 +1722,21 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // available, create a pending approval instead of dispatching immediately.
         // Unknown approval_mode values are treated as requiring approval
         // (fail-closed) to prevent typos from silently bypassing the gate.
-        if (!approval_manager && def->approval_mode != "auto") {
+        if (!approval_manager && def.approval_mode != "auto") {
             spdlog::error("instruction '{}' requires approval (mode={}) but "
                           "approval_manager is not available — rejecting execution",
-                          def_id, def->approval_mode);
+                          def_id, def.approval_mode);
             res.status = 503;
             res.set_content(
                 R"({"error":{"code":503,"message":"approval system unavailable — cannot execute approval-gated instruction"},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }
-        if (approval_manager && def->approval_mode != "auto") {
+        if (approval_manager && def.approval_mode != "auto") {
             bool needs_approval = false;
-            if (def->approval_mode == "always") {
+            if (def.approval_mode == "always") {
                 needs_approval = true;
-            } else if (def->approval_mode == "role-gated") {
+            } else if (def.approval_mode == "role-gated") {
                 // role-gated: admins (incl. an active JIT elevation) bypass, all
                 // others need approval — effective_role for elevation consistency.
                 needs_approval = (auth::effective_role(*session) != auth::Role::admin);
@@ -1563,7 +1744,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 // Unknown mode — fail closed (require approval)
                 spdlog::warn("instruction '{}' has unrecognized approval_mode '{}' "
                              "— requiring approval (fail-closed)",
-                             def_id, def->approval_mode);
+                             def_id, def.approval_mode);
                 needs_approval = true;
             }
 
@@ -1592,7 +1773,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     return;
                 }
                 audit_fn(req, "instruction.approval_required", "pending", "instruction", def_id,
-                         "approval_id=" + *result + " mode=" + def->approval_mode);
+                         "approval_id=" + *result + " mode=" + def.approval_mode);
                 emit_fn("approval.created", req);
                 res.set_header(
                     "HX-Trigger",
@@ -1629,7 +1810,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             exec.definition_id = def_id;
             exec.status = "running";
             exec.scope_expression = scope_expr;
-            exec.parameter_values = nlohmann::json(params).dump();
+            // #3136 blocker: persist a REDACTED copy — the live dispatch
+            // below still uses the raw `params` map. See
+            // sensitive_instruction_params.hpp.
+            exec.parameter_values =
+                nlohmann::json(redact_sensitive_instruction_params(params)).dump();
             exec.dispatched_by = session->username;
             if (auto created = execution_tracker->create_execution(exec); created.has_value()) {
                 execution_id = *created;
@@ -1657,7 +1842,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 caller_fn ? caller_fn(req)
                           : yuzu::server::DispatchCaller{
                                 .exec_visible = yuzu::server::authz::deny_all()};
-            std::tie(command_id, sent) = cmd_dispatch(def->plugin, def->action, agent_ids,
+            std::tie(command_id, sent) = cmd_dispatch(def.plugin, def.action, agent_ids,
                                                       dispatch_scope, params, execution_id,
                                                       caller);
         } catch (const std::exception& e) {
@@ -1681,9 +1866,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             if (execution_tracker && !execution_id.empty()) {
                 execution_tracker->mark_cancelled(execution_id, session->username);
             }
+            // #881: "no agents reached" now covers a THIRD condition this
+            // route cannot see — every target withheld by the containment
+            // gate, or the gate failing closed fleet-wide because containment
+            // state is unreadable. The shared dispatch closure returns only a
+            // sent count, so the discriminator is not available here (#3424);
+            // until it is, the message must not assert unreachability, which
+            // is what sends an operator to the agent/networking team during a
+            // Postgres incident.
             res.status = 503;
             res.set_content(
-                R"({"error":{"code":503,"message":"no agents reached"},"meta":{"api_version":"v1"}})",
+                R"({"error":{"code":503,"message":"no agents reached: every target was unreachable, quarantined, or withheld because containment state could not be read. Check GET /api/v1/quarantine and yuzu_server_quarantine_gate_total before treating this as an agent-connectivity fault."},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }
@@ -1749,7 +1942,16 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        auto packs = product_pack_store->list(q);
+        auto packs_result = product_pack_store->list(q);
+        if (!packs_result) {
+            res.status = product_pack_error_status(packs_result.error());
+            res.set_content(detail::a4_error(res, product_pack_client_message(
+                                                       "GET /api/product-packs",
+                                                       packs_result.error())),
+                            "application/json");
+            return;
+        }
+        auto& packs = *packs_result;
         nlohmann::json arr = nlohmann::json::array();
         for (const auto& p : packs) {
             nlohmann::json items_arr = nlohmann::json::array();
@@ -1870,9 +2072,23 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // YAML so we don't echo it into target_id (would create an
             // attacker-influenced audit key); the pack name is recoverable
             // from the request body if forensics need it.
-            audit_fn(req, "product_pack.install", "denied", "ProductPack", "", result.error());
-            res.status = 400;
-            res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+            //
+            // Gate 4 Finding B / Gate 6 CO-1 (third instance of SEC-1/ARCH-1's class):
+            // result.error() can carry a genuine kDbErrorPrefix failure from any
+            // install_fn arm (InstructionStore/PolicyStore/WorkflowEngine) — the response
+            // body was already genericized below via product_pack_client_message, but this
+            // audit row previously stored the raw driver text verbatim AND hardcoded
+            // "denied" even on an infrastructure failure, misclassifying an outage as an
+            // access decision (the exact vocabulary bug commit 849cf6a34 fixed at 7 other
+            // sites, missed here).
+            audit_fn(req, "product_pack.install",
+                     yuzu::server::is_generic_db_error(result.error()) ? "error" : "denied",
+                     "ProductPack", "",
+                     yuzu::server::genericize_db_error("product_pack.install", result.error()));
+            res.status = product_pack_error_status(result.error());
+            res.set_content(detail::a4_error(res, product_pack_client_message(
+                                                       "POST /api/product-packs", result.error())),
+                            "application/json");
             return;
         }
         // gov W7.4 R2 sec-MEDIUM: target_type "ProductPack" matches the
@@ -1904,14 +2120,23 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         auto id = req.matches[1].str();
-        auto pack = product_pack_store->get(id);
-        if (!pack) {
+        auto pack_result = product_pack_store->get(id);
+        if (!pack_result) {
+            res.status = product_pack_error_status(pack_result.error());
+            res.set_content(detail::a4_error(res, product_pack_client_message(
+                                                       "GET /api/product-packs/:id",
+                                                       pack_result.error())),
+                            "application/json");
+            return;
+        }
+        if (!*pack_result) {
             res.status = 404;
             res.set_content(
                 R"({"error":{"code":404,"message":"product pack not found"},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }
+        auto& pack = *pack_result;
 
         nlohmann::json items_arr = nlohmann::json::array();
         for (const auto& item : pack->items) {
@@ -1950,25 +2175,65 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         auto id = req.matches[1].str();
 
-        // Uninstall callback: delegate to the appropriate store
-        auto uninstall_fn = [instruction_store, policy_store, workflow_engine](
-                                const std::string& kind, const std::string& item_id) -> bool {
+        // Uninstall callback: delegate to the appropriate store. InstructionDefinition passes
+        // through InstructionStore's real db_error/not_found split (ADR-0058) so a genuine DB
+        // failure aborts the whole pack uninstall instead of being silently tolerated as a
+        // removed item (product_pack_store.cpp's uninstall() checks the prefix). PolicyFragment/
+        // Policy/Workflow's origin stores are still bool-only — `false` there maps to a tolerated
+        // not_found, matching pre-ADR-0058 behaviour for those kinds.
+        auto uninstall_fn = [instruction_store, policy_store,
+                             workflow_engine](const std::string& kind, const std::string& item_id)
+            -> std::expected<void, std::string> {
             if (kind == "InstructionDefinition") {
-                return instruction_store && instruction_store->delete_definition(item_id);
+                // db_error, not not_found (gov Gate 3/4 finding): a null instruction_store is
+                // a genuine unavailability, not "this item doesn't exist" — using the tolerated
+                // prefix here would let ProductPackStore::uninstall delete the pack row while
+                // the (never-touched) instruction definition stays live. Currently unreachable
+                // (instruction_store_ and product_pack_store_ share one boot latch — cpp-expert
+                // Gate 3), kept correct as defense-in-depth against that invariant changing.
+                if (!instruction_store)
+                    return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                                           "instruction store unavailable");
+                return instruction_store->delete_definition(item_id);
             } else if (kind == "PolicyFragment") {
-                return policy_store && policy_store->delete_fragment(item_id);
+                if (policy_store && policy_store->delete_fragment(item_id))
+                    return {};
+                return std::unexpected("not_found: policy fragment '" + item_id + "'");
             } else if (kind == "Policy") {
-                return policy_store && policy_store->delete_policy(item_id);
+                if (policy_store && policy_store->delete_policy(item_id))
+                    return {};
+                return std::unexpected("not_found: policy '" + item_id + "'");
             } else if (kind == "Workflow") {
-                return workflow_engine && workflow_engine->delete_workflow(item_id);
+                if (workflow_engine && workflow_engine->delete_workflow(item_id))
+                    return {};
+                return std::unexpected("not_found: workflow '" + item_id + "'");
             }
-            return false;
+            return std::unexpected("not_found: unsupported item kind '" + kind + "'");
         };
 
         auto result = product_pack_store->uninstall(id, uninstall_fn);
         if (!result) {
-            res.status = 400;
-            res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+            // gov W7.4 R1 UP-1 parity (see install's denied branch above): a
+            // rejected uninstall — not-found, or a mid-uninstall DB failure —
+            // is an access decision SOC 2 CC6.7 requires logged. Pre-fix, this
+            // branch returned without ever calling audit_fn, so a probe of a
+            // nonexistent/unreachable pack id left zero audit rows. "denied"
+            // (not a distinct "error" result) matches install's own vocabulary
+            // for this same three-way not-found/validation/db-error split.
+            //
+            // gov Gate 8 round-2 (security-guardian + docs-writer, independently):
+            // uninstall()'s not_found check reads via get() first, whose own
+            // query-error branch can embed a raw PQerrorMessage() fragment —
+            // unlike install()'s db-error branch, which never does. Genericize
+            // ONCE and reuse the result for both the audit `detail` and the
+            // client response, rather than calling product_pack_client_message
+            // twice (it spdlog::errors as a side effect — calling it twice would
+            // double-log the same failure).
+            const std::string client_msg = product_pack_client_message(
+                "DELETE /api/product-packs/:id", result.error());
+            audit_fn(req, "product_pack.uninstall", "denied", "ProductPack", id, client_msg);
+            res.status = product_pack_error_status(result.error());
+            res.set_content(detail::a4_error(res, client_msg), "application/json");
             return;
         }
         // gov W7.4 R2 sec-MEDIUM: target_type "ProductPack" sibling parity

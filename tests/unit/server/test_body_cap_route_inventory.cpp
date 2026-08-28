@@ -145,13 +145,10 @@ struct RegisteredRoute {
 /// has a `pg/` subdirectory today; nothing forbids a route file landing
 /// under a future one) and return `{basename, contents}` pairs. `.inc` is
 /// scanned alongside `.cpp` because a route registration living in a
-/// textually-`#include`d fragment (as of this writing: two dead/orphaned
-/// files, `deployment_discovery_routes.inc` and `directory_patch_routes.inc`
-/// — both superseded by discovery_routes.cpp per that file's own header
-/// comment, and neither is `#include`d or listed in meson.build today) is
-/// still source text this scan must not silently skip; a `.inc` file that
-/// IS live in a future refactor must not regress this guard back to
-/// invisible. No other extension under server/core/src carries a route
+/// textually-`#include`d fragment is still source text this scan must not
+/// silently skip; no `.inc` file exists under server/core/src today, but a
+/// future one that IS live must not regress this guard back to invisible.
+/// No other extension under server/core/src carries a route
 /// registration (verified: `.cpp`/`.hpp`/`.inc` are the only three
 /// extensions present, and no `.hpp` matches the route-registration regex).
 ///
@@ -391,7 +388,8 @@ constexpr DefaultAllow kDefaultIsCorrectFor[] = {
     {"POST", R"body_cap_path(/api/v1/software-deployments/([a-f0-9]+)/rollback)body_cap_path", "REST management/config JSON body: ids, flags, small structured payloads (management groups, engine principals, tokens, tags, access reviews, inventory queries, result-set derivation, device tokens, software packages/deployments, license, guaranteed-state push, DEX live-snapshot trigger)."},
     {"POST", R"body_cap_path(/api/v1/software-deployments/([a-f0-9]+)/cancel)body_cap_path", "REST management/config JSON body: ids, flags, small structured payloads (management groups, engine principals, tokens, tags, access reviews, inventory queries, result-set derivation, device tokens, software packages/deployments, license, guaranteed-state push, DEX live-snapshot trigger)."},
     {"POST", R"body_cap_path(/api/v1/license)body_cap_path", "REST management/config JSON body: ids, flags, small structured payloads (management groups, engine principals, tokens, tags, access reviews, inventory queries, result-set derivation, device tokens, software packages/deployments, license, guaranteed-state push, DEX live-snapshot trigger)."},
-    {"POST", R"body_cap_path(/api/v1/file-retrieval)body_cap_path", "Metadata-only today: the handler parses agent_id/original_path/sha256/size JSON fields and never writes raw file bytes (rest_api_v1.cpp:7643-7672) -- revisit this entry if/when it starts accepting the actual retrieved file content."},
+    {"POST", R"body_cap_path(/api/v1/upload-grants)body_cap_path", "Mint request is a handful of small JSON fields (agent_id/declared_max_size/expected_sha256/retention_class -- file_retrieval_routes.cpp register_mint); the 4 MiB default is generous but bounded, and the mint route sits behind the operator auth session unlike the upload-session surface, which has its own upload_session row."},
+    {"DELETE", R"body_cap_path(/api/v1/upload-grants/([a-f0-9]+))body_cap_path", "Revoke carries no body at all; the default cap is irrelevant to a bodyless DELETE and a dedicated row would publish a class no code path can meaningfully reach."},
     {"POST", R"body_cap_path(/api/v1/guaranteed-state/push)body_cap_path", "REST management/config JSON body: ids, flags, small structured payloads (management groups, engine principals, tokens, tags, access reviews, inventory queries, result-set derivation, device tokens, software packages/deployments, license, guaranteed-state push, DEX live-snapshot trigger)."},
     {"POST", R"body_cap_path(/api/v1/dex/devices/([^/]+)/live)body_cap_path", "REST management/config JSON body: ids, flags, small structured payloads (management groups, engine principals, tokens, tags, access reviews, inventory queries, result-set derivation, device tokens, software packages/deployments, license, guaranteed-state push, DEX live-snapshot trigger)."},
 

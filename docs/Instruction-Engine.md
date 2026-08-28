@@ -56,7 +56,7 @@ This document is the architectural blueprint for that work.
 | **ScopeEngine** | `scope_engine.cpp` (494 LOC) | **Real** | Full recursive-descent parser. 9 comparison operators. AND/OR/NOT combinators. Wildcard LIKE matching. Numeric comparison with fallback. `AttributeResolver` callback for evaluation. |
 | **ResponseStore** | `response_store.hpp` | **Real** | SQLite-backed. `StoredResponse` with instruction_id, agent_id, timestamp, status, output, error_detail, ttl_expires_at. Query with agent/status/time filtering and pagination. Configurable retention (default 90 days). Background cleanup thread. |
 | **AuditStore** | `audit_store.hpp` | **Real** | SQLite-backed. `AuditEvent` with timestamp, principal, principal_role, action, target_type, target_id, detail, source_ip, user_agent, session_id, result. Query with filtering. Retention default 365 days. Background cleanup. |
-| **TagStore** | `tag_store.hpp` | **Real** | SQLite-backed. `DeviceTag` with agent_id, key, value, source ("agent"/"server"/"api"), updated_at. CRUD, sync from agent heartbeat, validation (key 64 chars, value 448 bytes). `agents_with_tag` for scope queries. |
+| **TagStore** | `tag_store.hpp` | **Real** | PostgreSQL-backed (ADR-0050, schema `tag_store`). `DeviceTag` with agent_id, key, value, source ("agent"/"server"/"api"/"mcp"), updated_at. CRUD, sync from agent heartbeat, validation (key 64 chars, value 448 bytes). `agents_with_tag` for scope queries. |
 | **Instruction UI** | `instruction_ui.cpp` | **Real** | HTMX page with 4 tabs (Definitions, Executions, Schedules, Approvals). Loads fragments via `hx-get`. Dark theme consistent with dashboard. |
 
 **Overall progress:** 150/184 capabilities done (82%). All 7 phases complete (72/72 issues). Instruction engine fully implemented.
@@ -529,7 +529,7 @@ This table replaces the previous per-OS tables (Sections 9, 10, 11 of the origin
 | `network.config.get` | `network_config` | Y | Y | Y | Verified | Interfaces, IPs, ARP table |
 | `network.route.list` | `network_config` | Y | Y | Y | Verified | Routing table |
 | `network.connection.list` | `netstat` | Y | Y | Y | Verified | TCP/UDP connections |
-| `network.socket.owner` | `sockwho` | Y | Y | Y | Verified | Socket → process mapping |
+| `network.socket.owner` | `netstat` (`attribution` action) | Y | Y | Y | Verified | Socket → process mapping (folded from the retired sockwho plugin, #3403) |
 | `network.dns.flush` | `network_actions` | Y | Y | Y | Verified | Flush DNS cache |
 | `network.diagnostics.run` | `network_diag` | Y | Y | Y | Verified | Ping, traceroute |
 | `network.adapter.enable` | `network_actions` | Y | Y | Y | Verified | Enable network adapter |
@@ -836,7 +836,7 @@ spec:
 
 ### 11.1 Storage
 
-Instruction definitions are stored in the `InstructionStore` SQLite database with:
+Instruction definitions are stored in the `InstructionStore` PostgreSQL schema (ADR-0058) with:
 - `yaml_source` — `TEXT` column containing the original YAML document (source of truth)
 - Denormalized columns (`name`, `version`, `type`, `plugin`, `action`, `enabled`, etc.) parsed from YAML for efficient queries
 
@@ -1454,6 +1454,6 @@ This document is grounded in the following implementation files:
 
 ## Build-time content embedding — there is no filesystem load path
 
-`content/definitions/*.yaml` and `content/packs/*.yaml` are converted to JSON envelopes by `server/core/scripts/embed_content.py` at build time, written into `bundled_content.cpp` as the `kBundledDefinitions` / `kBundledSets` vectors, linked into `yuzu-server`, and seeded into `instructions.db` on first boot via `import_definition_json` (conflict-skip on subsequent boots so operator REST/dashboard edits win). The runtime never reads YAML from disk — there is no `--content-dir` flag and none of the install packages ship the YAMLs separately. This is identical on Linux, macOS, and Windows.
+`content/definitions/*.yaml` and `content/packs/*.yaml` are converted to JSON envelopes by `server/core/scripts/embed_content.py` at build time, written into `bundled_content.cpp` as the `kBundledDefinitions` / `kBundledSets` vectors, linked into `yuzu-server`, and reseeded into the shared Postgres `instruction_store` schema on **every** boot via the build-time-trusted import path (ADR-0058; conflict-skip on id existence so operator REST/dashboard edits win — an operator-deleted bundled id stays deleted via a tombstone, never resurrected). The runtime never reads YAML from disk — there is no `--content-dir` flag and none of the install packages ship the YAMLs separately. This is identical on Linux, macOS, and Windows.
 
 **PyYAML is a hard build dependency.** `meson setup` probes `python -c "import yaml"` and fails the configure step if it's missing; `embed_content.py` itself fails the build (non-zero exit) on missing PyYAML, missing `content/` directory, missing required fields in any `InstructionDefinition`, or zero parsed defs. The historical "warn and emit empty bundle" fallback (which silently produced binaries with empty Instructions tabs) was removed. Provision PyYAML with `pip install pyyaml` (Linux/macOS) or `pacman -S python-yaml` (MSYS2).

@@ -26,6 +26,7 @@
 
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
+#include "test_analytics_pg_helper.hpp" // AnalyticsEventStorePg — ADR-0049 PG port
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
 #include "pg/pg_pool.hpp"
@@ -108,7 +109,9 @@ struct AuthRoutesHarness {
     std::optional<yuzu::test::PostgresTestDb> audit_db;
     std::optional<yuzu::server::pg::PgPool> audit_pool;
     std::unique_ptr<AuditStore> audit_store;
-    std::unique_ptr<AnalyticsEventStore> analytics_store;
+    // AnalyticsEventStore ported to Postgres (ADR-0049) — own ephemeral
+    // clone, matching audit_store's pattern above.
+    yuzu::test::AnalyticsEventStorePg analytics_store;
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
     std::unique_ptr<AuthRoutes> auth_routes;
@@ -164,7 +167,6 @@ struct AuthRoutesHarness {
         REQUIRE(audit_db->available());
         audit_pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = audit_db->dsn(), .size = 4});
         audit_store = std::make_unique<AuditStore>(*audit_pool);
-        analytics_store = std::make_unique<AnalyticsEventStore>(tmp.path / "analytics.db");
 
         auth_routes = std::make_unique<AuthRoutes>(
             cfg, auth_mgr,
@@ -315,6 +317,14 @@ TEST_CASE("POST /login for an ENROLLED user with an unreadable MFA secret fails 
     CHECK(res->status == 503);
     CHECK(res->get_header_value("Set-Cookie").empty());
     CHECK(res->body.find(R"("code":503)") != std::string::npos);
+    // #2396: the fail-closed 503 now carries an honest, machine-readable
+    // backoff hint — a Retry-After header AND a retry_after_ms body field — so
+    // a client/LB backs off instead of hammering a degraded store. (The
+    // reason-labelled yuzu_auth_read_degrade_total counter is exercised at the
+    // store layer + server metric wiring; this harness wires no
+    // MetricsRegistry, so the handler's null-guarded increment is inert here.)
+    CHECK(res->get_header_value("Retry-After") == "2");
+    CHECK(res->body.find(R"("retry_after_ms":2000)") != std::string::npos);
     // No session was minted on ANY path — the terminal auth.login row never
     // fires for this login attempt.
     CHECK(h.count_audits("auth.login", "admin") == 0);

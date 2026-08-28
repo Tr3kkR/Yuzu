@@ -116,7 +116,9 @@ struct DiscoverHarness {
         REQUIRE(rbac_pool->valid());
         rbac = std::make_unique<RbacStore>(*rbac_pool);
         REQUIRE(rbac->is_open());
-        instr = std::make_unique<InstructionStore>(":memory:");
+        // ADR-0058: InstructionStore is now a migrated Postgres store — shares
+        // the same pool/database as RbacStore above (schema-per-store, ADR-0008).
+        instr = std::make_unique<InstructionStore>(*rbac_pool);
         REQUIRE(instr->is_open());
 
         // The /discover/plugins parameter_schema enrichment is gated on the
@@ -404,9 +406,11 @@ TEST_CASE("discover.instructions: enabled-only subset with parsed parameter_sche
             // InstructionStore::create_definition defaults an empty
             // parameter_schema to the literal "{}" (instruction_store.cpp),
             // so a definition authored with none round-trips as an empty
-            // OBJECT, not null. null is reserved for a stored value that
-            // fails to parse as JSON at all (defensive branch, not
-            // reachable through the normal create_definition path).
+            // OBJECT, not null. null covers a stored value that fails to
+            // parse as JSON at all, OR one that parses but isn't an object
+            // (array/string/number/bool) — the latter IS reachable via
+            // create/update/import (no object-shape validation on write),
+            // see the "non-object parameter_schema nulls out" test below.
             CHECK(d["parameter_schema"].is_object());
             CHECK(d["parameter_schema"].empty());
         }
@@ -421,6 +425,52 @@ TEST_CASE("discover.instructions: enabled-only subset with parsed parameter_sche
     auto cached = h.sink.Get("/api/v1/discover/instructions", {{"If-None-Match", etag}});
     REQUIRE(cached);
     CHECK(cached->status == 304);
+}
+
+// Adversarial review of #2986 (2026-08-19): create/update/import bind a
+// caller-supplied parameter_schema as text with no object-shape validation,
+// so a non-object JSON value is reachable — the discover_instructions
+// outputSchema advertises parameter_schema as object|null only, so a stored
+// array/string/number/bool must null out, not forward raw. Mirrors
+// discover.plugins' existing is_object() guard (UP-9).
+TEST_CASE("discover.instructions: non-object parameter_schema nulls out, matching the "
+          "advertised object|null outputSchema",
+          "[discovery][instructions][pg]") {
+    DiscoverHarness h;
+    auto array_id = h.instr->create_definition(
+        make_def("Array Schema", /*enabled=*/true, "[1,2,3]"));
+    REQUIRE(array_id.has_value());
+    auto bool_id = h.instr->create_definition(make_def("Bool Schema", /*enabled=*/true, "true"));
+    REQUIRE(bool_id.has_value());
+    auto string_id =
+        h.instr->create_definition(make_def("String Schema", /*enabled=*/true, R"("not-a-schema")"));
+    REQUIRE(string_id.has_value());
+
+    auto res = h.sink.Get("/api/v1/discover/instructions");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto j = nlohmann::json::parse(res->body);
+    const auto& arr = j["instructions"];
+
+    bool saw_array = false, saw_bool = false, saw_string = false;
+    for (const auto& d : arr) {
+        if (d["id"] == *array_id) {
+            saw_array = true;
+            CHECK(d["parameter_schema"].is_null());
+        }
+        if (d["id"] == *bool_id) {
+            saw_bool = true;
+            CHECK(d["parameter_schema"].is_null());
+        }
+        if (d["id"] == *string_id) {
+            saw_string = true;
+            CHECK(d["parameter_schema"].is_null());
+        }
+    }
+    CHECK(saw_array);
+    CHECK(saw_bool);
+    CHECK(saw_string);
 }
 
 TEST_CASE("discover.instructions: null InstructionStore -> 503",
@@ -525,7 +575,7 @@ TEST_CASE("CROSS-CHECK: scope_kind_catalog entries are honored by evaluate_scope
     AgentRegistry registry(bus, metrics);
     auto info = make_agent_info("agent-1", "windows", "WIN-TESTBOX");
     (*info.mutable_scopable_tags())["department"] = "finance";
-    registry.register_agent(info);
+    (void)registry.register_agent(info);
 
     // tag:department and props.owner need their respective stores; both are
     // optional (nullptr) parameters to evaluate_scope, so kinds backed solely
@@ -630,7 +680,7 @@ TEST_CASE("discover.plugins: wraps AgentRegistry::help_json with a limitation no
     p->set_description("Process enumeration");
     p->add_capabilities("list");
     p->add_capabilities("query");
-    h.registry.register_agent(info);
+    (void)h.registry.register_agent(info);
 
     auto res = h.sink.Get("/api/v1/discover/plugins");
     REQUIRE(res);
@@ -679,7 +729,7 @@ TEST_CASE("discover.plugins: parameter_schema enriched when caller holds Instruc
     auto* p = info.add_plugins();
     p->set_name("system_info");
     p->add_capabilities("query");
-    h.registry.register_agent(info);
+    (void)h.registry.register_agent(info);
 
     auto res = h.sink.Get("/api/v1/discover/plugins");
     REQUIRE(res);
@@ -717,7 +767,7 @@ TEST_CASE("discover.plugins: enrichment withheld when caller lacks InstructionDe
     auto* p = info.add_plugins();
     p->set_name("system_info");
     p->add_capabilities("query");
-    h.registry.register_agent(info);
+    (void)h.registry.register_agent(info);
 
     auto res = h.sink.Get("/api/v1/discover/plugins");
     REQUIRE(res);

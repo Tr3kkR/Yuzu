@@ -14,10 +14,12 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/agent/cert_discovery.hpp>
 #include <yuzu/agent/cert_store.hpp>
 #include <yuzu/agent/cloud_identity.hpp>
+#include <yuzu/agent/command_dedup_store.hpp>
 #include <yuzu/agent/dex_observer.hpp>
 #include <yuzu/agent/guardian_engine.hpp>
 #include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
+#include <yuzu/agent/server_address_resolver.hpp>
 #include <yuzu/agent/subprocess_runner.hpp>
 #include <yuzu/agent/trigger_engine.hpp>
 #include <yuzu/agent/updater.hpp>
@@ -47,8 +49,10 @@ __declspec(allocate(".CRT$XCB"))
 #include "net_quality_sampler.hpp" // slice 4a: heartbeat network-quality facts
 #include "guardian_spark_send.hpp" // rung 7.7a: OutboxEntry -> GuaranteedStateEvent send mapping
 #include "spark_engine.hpp"    // ADR-0021 Stage-2 rung 1: instantiate observe-only
+#include "guardian_backend.hpp"           // GuardianBackend, guardian_backend_from_state/label (F7)
 #include "guardian_health_heartbeat.hpp"  // emit_guardian_health_heartbeat_tags (M1)
 #include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (item 7 PR-Ag)
+#include "guardian_unsupported_heartbeat.hpp" // emit_guardian_unsupported_heartbeat_tags (F7)
 #include "spark_heartbeat.hpp" // emit_spark_heartbeat_tags — spark fleet telemetry
 #include "spark_mechanism.hpp" // make_{file,registry,service}_mechanism factories
 #include "thread_pool.hpp" // bounded dispatch pool + per-task exception firewall (#2037)
@@ -79,7 +83,6 @@ __declspec(allocate(".CRT$XCB"))
 #include <string>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace yuzu::agent {
@@ -681,6 +684,14 @@ public:
         plugin_ctx_.config["agent.build_number"] = std::to_string(yuzu::kBuildNumber);
         plugin_ctx_.config["agent.git_commit"] = std::string{yuzu::kGitCommitHash};
         plugin_ctx_.config["agent.server_address"] = cfg_.server_address;
+        // Resolved ONCE, here, at startup -- see server_address_resolver.hpp
+        // for why this must not be re-resolved later by a plugin at
+        // quarantine-dispatch time (the quarantine plugin used to do this
+        // itself; #3429 round 4 moved it here after round 3's review found
+        // that let a possibly-already-compromised host's own DNS resolution
+        // decide what survives its own containment).
+        plugin_ctx_.config["agent.server_address_resolved"] =
+            yuzu::agent::resolve_server_address_literals(cfg_.server_address);
         plugin_ctx_.config["agent.tls_enabled"] = cfg_.tls_enabled ? "true" : "false";
         plugin_ctx_.config["agent.heartbeat_interval"] =
             std::to_string(cfg_.heartbeat_interval.count());
@@ -710,6 +721,27 @@ public:
             } else {
                 spdlog::error("Failed to open KV store: {}", kv_result.error().message);
                 spdlog::warn("Plugin KV storage will be unavailable");
+            }
+        }
+
+        // 1b'. Open the durable command-dedup store (HA WS-0, ADR-2002). Survives
+        // restart and remembers each command's terminal outcome so a redelivered
+        // duplicate replays the original result instead of a bare REJECTED. A
+        // failure to open is NOT fatal — the agent runs with replay protection
+        // degraded (a redelivered command may re-execute), which is logged loudly.
+        {
+            auto dedup_path = cfg_.data_dir / "command_dedup.db";
+            auto dedup_result = CommandDedupStore::open(dedup_path);
+            if (dedup_result.has_value()) {
+                command_dedup_ =
+                    std::make_unique<CommandDedupStore>(std::move(*dedup_result));
+                spdlog::info("Command dedup store ready: {}", dedup_path.string());
+            } else {
+                spdlog::error("Failed to open command dedup store: {}",
+                              dedup_result.error().message);
+                spdlog::warn("Durable command replay protection unavailable — a redelivered "
+                             "command may re-execute (fail-open, degraded)");
+                metrics_.counter("yuzu_agent_dedup_open_failed_total").increment();
             }
         }
 
@@ -1110,25 +1142,35 @@ public:
         guardian_->wire_spark_engine(
             spark_engine_.get(), cfg_.spark_disable,
             [this](const OutboxEntry& e) { return send_guardian_outbox_entry(e); });
-        switch (guardian_->spark_availability()) {
+        // F7: derive the reported backend from the SAME function the
+        // yuzu.guardian_backend heartbeat tag uses, so this log and the tag can
+        // never drift apart again the way "detection backend = legacy IGuard"
+        // (hardcoded, unconditionally) used to once prefer_spark_ could be true.
+        const bool ps = guardian_->prefer_spark();
+        const auto avail = guardian_->spark_availability();
+        const char* backend = guardian_backend_label(guardian_backend_from_state(ps, avail));
+        switch (avail) {
         case GuardianEngine::SparkAvailability::Available:
-            spdlog::info("Guardian: spark path WIRED (observe-only, prefer_spark=false); "
-                         "detection backend = legacy IGuard");
+            spdlog::info("Guardian: spark path WIRED (prefer_spark={}); detection backend = {}",
+                         ps, backend);
             break;
         case GuardianEngine::SparkAvailability::SparkDisabled:
             spdlog::info("Guardian: spark path wired as DISABLED (--spark-disable); "
-                         "detection backend = legacy IGuard");
+                         "detection backend = {}",
+                         backend); // accurate regardless of prefer_spark_: SparkDisabled always means legacy
             break;
         case GuardianEngine::SparkAvailability::SparkFailed:
             spdlog::warn("Guardian: spark path wired as FAILED (SparkEngine did not boot); "
-                         "detection backend = legacy IGuard");
+                         "detection backend = {}",
+                         backend);
             break;
         case GuardianEngine::SparkAvailability::Unwired:
             // Reachable, and NOT an error: wire_spark_engine() bails leaving Unwired when
             // a stop() already ran (a SIGTERM / service-stop during boot). Log at info -
             // the agent is shutting down; legacy was never displaced.
             spdlog::info("Guardian: spark path left Unwired (stop requested during boot); "
-                         "detection backend = legacy IGuard");
+                         "detection backend = {}",
+                         backend);
             break;
         }
 
@@ -2126,6 +2168,34 @@ public:
                             tags["yuzu.commands_executed"] = std::to_string(static_cast<int64_t>(
                                 metrics_.counter("yuzu_agent_commands_executed_total").value()));
                             tags["yuzu.plugins_loaded"] = std::to_string(plugins_.size());
+                            // HA WS-0 dedup safety-net signals, emitted every
+                            // heartbeat (the agent has no /metrics; the server-side
+                            // yuzu_fleet_* derivation + alert land with WS-11).
+                            // "degraded"=1 means the durable store never OPENED (a
+                            // real 0/1 reading, never absent-reads-as-zero). It is
+                            // the OPEN-failure signal ONLY; a store that opened then
+                            // fails to WRITE (post-boot disk-full) is surfaced by the
+                            // "claim_errors"/"record_errors"/"release_errors"
+                            // counters below — each a command that ran undeduplicated
+                            // or a possibly-leaked claim, so a post-boot degradation
+                            // is not invisible. "misses" counts terminal outcomes
+                            // that matched no in-flight row (ran undeduplicated, or a
+                            // duplicate terminal) — NOT the eviction double-execute,
+                            // which is not separately detectable. "replays" counts
+                            // served terminal replays.
+                            tags["yuzu.dedup_degraded"] = command_dedup_ ? "0" : "1";
+                            tags["yuzu.dedup_replays"] = std::to_string(static_cast<int64_t>(
+                                metrics_.counter("yuzu_agent_dedup_replays_total").value()));
+                            tags["yuzu.dedup_claim_errors"] = std::to_string(static_cast<int64_t>(
+                                metrics_.counter("yuzu_agent_dedup_claim_errors_total").value()));
+                            tags["yuzu.dedup_record_terminal_misses"] =
+                                std::to_string(static_cast<int64_t>(
+                                    metrics_.counter("yuzu_agent_dedup_record_terminal_miss_total")
+                                        .value()));
+                            tags["yuzu.dedup_record_errors"] = std::to_string(static_cast<int64_t>(
+                                metrics_.counter("yuzu_agent_dedup_record_errors_total").value()));
+                            tags["yuzu.dedup_release_errors"] = std::to_string(static_cast<int64_t>(
+                                metrics_.counter("yuzu_agent_dedup_release_errors_total").value()));
                             tags["yuzu.os"] = kAgentOs;
                             tags["yuzu.arch"] = kAgentArch;
                             tags["yuzu.agent_version"] = std::string{yuzu::kFullVersionString};
@@ -2169,6 +2239,17 @@ public:
                                         .unhealthy_suppressed = guardian_->unhealthy_suppressed(),
                                         .unhealthy_refreshed = guardian_->unhealthy_refreshed(),
                                         .priority_demoted = guardian_->priority_demoted()});
+                                // F7 (#2298 rung 2): per-type CURRENT count of rules classified
+                                // Unsupported (neither backend enforces them) - fleet-loud via
+                                // mech_unsupported_total, sparse (0 omits its tag).
+                                emit_guardian_unsupported_heartbeat_tags(
+                                    tags, guardian_->unsupported_counts_by_type());
+                                // F7: which backend is ACTUALLY enforcing - always emitted (a
+                                // categorical value, not a sparse counter), so the server can
+                                // distinguish SparkFailed (nothing enforced fleet-wide) from a
+                                // routine per-rule Unsupported classification.
+                                emit_guardian_backend_heartbeat_tag(
+                                    tags, guardian_->prefer_spark(), guardian_->spark_availability());
                             }
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
                             // DEX signal observer (every platform with a real observer —
@@ -2480,40 +2561,92 @@ public:
                     });
                 }
 
-                // 5. Read commands from server and dispatch to plugins
-                dedup_current_.clear(); // Fresh dedup sets per connection
-                dedup_previous_.clear();
+                // 5. Read commands from server and dispatch to plugins.
+                // Command replay protection is now durable (command_dedup_, HA
+                // WS-0): it survives reconnect AND restart, so there is no
+                // per-connection reset here.
                 bool update_verified = false;
                 pb::CommandRequest cmd;
                 while (stream->Read(&cmd)) {
                     if (stop_requested_.load(std::memory_order_acquire))
                         break;
 
-                    // Command replay protection: reject duplicate command_ids
+                    // True only when THIS delivery's claim() succeeded — gates the
+                    // queue-full release so it never deletes a concurrent owner's row.
+                    bool claimed_here = false;
+
+                    // Command replay protection (HA WS-0, ADR-2002). claim() is the
+                    // atomic first-writer-wins gate: on a duplicate we REPLAY the
+                    // original terminal outcome (never a bare REJECTED that would
+                    // lose the first result), or answer RUNNING while the first
+                    // attempt is still in flight — we never re-execute, because
+                    // re-running a destructive command is the failure the whole HA
+                    // design forbids. An empty command_id cannot be keyed and
+                    // proceeds unprotected; a store failure (Error) degrades to no
+                    // dedup for that one command, both falling through to dispatch.
+                    // The Guardian __guard__ side channel (handled below) is NOT
+                    // normal command execution — it carries no dedupable side
+                    // effect, must stay free to re-run (e.g. reconcile), and its
+                    // branch resolves via its own write + continue, so claiming it
+                    // would leak an unresolved in-flight record AND wrongly answer a
+                    // re-sent control command RUNNING. It is the ONLY dispatch that
+                    // bypasses the claim: gating on the literal (not the whole
+                    // reserved-name set) keeps durable idempotency the SAFE DEFAULT
+                    // for any future reserved-name command — a future __update__ OTA
+                    // path is deduplicated unless it, too, opts out here.
                     if (cmd.command_id().empty()) {
                         spdlog::warn("Received command with empty command_id — replay "
                                      "protection cannot apply");
-                    } else {
-                        if (dedup_current_.count(cmd.command_id()) ||
-                            dedup_previous_.count(cmd.command_id())) {
-                            spdlog::warn("Replay detected: duplicate command_id={} — rejecting",
-                                         cmd.command_id());
-                            pb::CommandResponse replay_resp;
-                            replay_resp.set_command_id(cmd.command_id());
-                            replay_resp.set_status(pb::CommandResponse::REJECTED);
-                            replay_resp.set_output("command replay rejected: duplicate command_id");
+                    } else if (command_dedup_ && cmd.plugin() != "__guard__") {
+                        auto claim = command_dedup_->claim(cmd.command_id());
+                        // Own the in-flight record ONLY when WE claimed it — a
+                        // fall-through on Error (fail-open) must NOT later release a
+                        // row a concurrent first delivery owns.
+                        claimed_here = (claim.status == ClaimStatus::Claimed);
+                        if (claim.status == ClaimStatus::Error)
+                            metrics_.counter("yuzu_agent_dedup_claim_errors_total").increment();
+                        if (claim.status == ClaimStatus::Duplicate) {
+                            pb::CommandResponse dup_resp;
+                            bool replayed = false;
+                            if (claim.state == DedupState::Terminal) {
+                                pb::CommandResponse stored;
+                                if (stored.ParseFromString(claim.response)) {
+                                    dup_resp = std::move(stored);
+                                    auto now_ms =
+                                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::system_clock::now().time_since_epoch())
+                                            .count();
+                                    dup_resp.mutable_sent_at()->set_millis_epoch(now_ms);
+                                    replayed = true;
+                                    metrics_.counter("yuzu_agent_dedup_replays_total").increment();
+                                    spdlog::info("Replay of command {} — returning stored "
+                                                 "terminal outcome",
+                                                 cmd.command_id());
+                                } else {
+                                    spdlog::error("Stored terminal outcome for {} failed to "
+                                                  "parse — answering RUNNING",
+                                                  cmd.command_id());
+                                }
+                            }
+                            if (!replayed) {
+                                dup_resp.set_command_id(cmd.command_id());
+                                dup_resp.set_status(pb::CommandResponse::RUNNING);
+                                // Plain progress text — NOT a parsed sentinel (no
+                                // "__x__|" contract); nothing consumes this string.
+                                dup_resp.set_output("duplicate command still in flight");
+                                if (claim.state == DedupState::InFlight)
+                                    spdlog::warn("Duplicate command {} still in flight — "
+                                                 "answering RUNNING",
+                                                 cmd.command_id());
+                            }
                             std::lock_guard lock(stream_write_mu_);
-                            stream->Write(replay_resp, grpc::WriteOptions());
+                            stream->Write(dup_resp, grpc::WriteOptions());
                             continue;
                         }
-                        // Double-buffer rotation: when current fills, discard previous,
-                        // swap current → previous, start fresh current.
-                        if (dedup_current_.size() >= kMaxDedupEntries) {
-                            spdlog::debug("Dedup buffer rotation ({} entries)", kMaxDedupEntries);
-                            dedup_previous_ = std::move(dedup_current_);
-                            dedup_current_.clear();
-                        }
-                        dedup_current_.insert(cmd.command_id());
+                        // Claimed / Error both fall through: Claimed owns the
+                        // in-flight record (resolved at a terminal write below or
+                        // released if the dispatch queue is full); Error runs
+                        // undeduplicated for this one command.
                     }
 
                     // Write health marker after first successful read (OTA rollback guard)
@@ -2596,6 +2729,10 @@ public:
                         resp.set_command_id(cmd.command_id());
                         resp.set_status(pb::CommandResponse::REJECTED);
                         resp.set_output("plugin not found: " + cmd.plugin());
+                        // Deterministic terminal for a claimed command (the plugin
+                        // set is fixed at boot): memoise so a redelivery replays
+                        // this REJECTED rather than re-running the claim path.
+                        record_command_terminal(cmd.command_id(), resp);
                         std::lock_guard lock(stream_write_mu_);
                         stream->Write(resp, grpc::WriteOptions());
                         continue;
@@ -2636,6 +2773,15 @@ public:
                         reject_resp.set_command_id(cmd.command_id());
                         reject_resp.set_status(pb::CommandResponse::REJECTED);
                         reject_resp.set_output("agent overloaded: command queue full");
+                        // Queue-full is TRANSIENT and the command never executed —
+                        // release OUR claim so a redelivery can be attempted (never
+                        // memoise a terminal outcome). Only when we actually claimed
+                        // here: releasing otherwise could delete a concurrent first
+                        // delivery's in-flight row. A failed release leaks the claim
+                        // (RUNNING-forever), so count it.
+                        if (command_dedup_ && claimed_here &&
+                            command_dedup_->release(cmd.command_id()) == ReleaseOutcome::Error)
+                            metrics_.counter("yuzu_agent_dedup_release_errors_total").increment();
                         std::lock_guard lock(stream_write_mu_);
                         stream->Write(reject_resp, grpc::WriteOptions());
                     }
@@ -2980,6 +3126,9 @@ private:
                                      .count();
                     expired_resp.mutable_sent_at()->set_millis_epoch(epoch);
 
+                    // Deterministic terminal (expires_at is fixed): memoise so a
+                    // redelivery replays this rather than sleeping the stagger again.
+                    record_command_terminal(cmd.command_id(), expired_resp);
                     std::lock_guard lock(stream_write_mu_);
                     stream->Write(expired_resp, grpc::WriteOptions());
                     return;
@@ -3092,8 +3241,87 @@ private:
                                  .count();
             final_resp.mutable_sent_at()->set_millis_epoch(now_epoch);
 
+            // Persist the terminal outcome BEFORE the wire send (HA WS-0): the
+            // durable record is the source of truth, the send is best-effort and
+            // replayable. record_command_terminal is noexcept + runs before the
+            // terminal Write, so it cannot cause the #2037 second-terminal hazard.
+            record_command_terminal(cmd.command_id(), final_resp);
             std::lock_guard lock(stream_write_mu_);
             stream->Write(final_resp, grpc::WriteOptions());
+        }
+    }
+
+    // Record a claimed command's terminal outcome into the durable dedup store
+    // (HA WS-0). Caps the stored blob so a huge plugin output cannot bloat
+    // command_dedup.db across up to kMaxDedupRows rows: beyond the cap the slim
+    // form preserves status/exit_code/result-status (the effectively-once signal)
+    // and drops the full output (a replay then returns the status, not the
+    // bytes). A Miss — the terminal matched no in-flight row (evicted or never
+    // claimed) — is counted: it is the signal a redelivery of this command could
+    // re-execute. noexcept + internally guarded: a failure here only degrades
+    // durability, it never propagates into the command path.
+    void record_command_terminal(const std::string& command_id,
+                                 const pb::CommandResponse& resp) noexcept {
+        if (!command_dedup_ || command_id.empty())
+            return;
+        try {
+            static constexpr size_t kMaxDedupResponseBytes = 64 * 1024;
+            static constexpr int kMaxDedupErrorMessageBytes = 1024;
+            std::string blob;
+            if (resp.ByteSizeLong() > kMaxDedupResponseBytes) {
+                // Store a slim form: keep the terminal SIGNAL (status/exit_code/
+                // result-status/error) that effectively-once needs; replace only
+                // the large `output` field with a fixed sentinel. `error.code` +
+                // a bounded `error.message` are preserved so a replayed failure
+                // still carries its reason.
+                pb::CommandResponse slim;
+                slim.set_command_id(resp.command_id());
+                slim.set_status(resp.status());
+                slim.set_exit_code(resp.exit_code());
+                slim.set_plugin_result_status(resp.plugin_result_status());
+                if (resp.has_sent_at())
+                    *slim.mutable_sent_at() = resp.sent_at();
+                if (resp.has_error()) {
+                    slim.mutable_error()->set_code(resp.error().code());
+                    slim.mutable_error()->set_message(
+                        resp.error().message().substr(0, kMaxDedupErrorMessageBytes));
+                }
+                slim.set_output("[output replaced in dedup store: response exceeded size cap; "
+                                "command completed]");
+                blob = slim.SerializeAsString();
+            } else {
+                blob = resp.SerializeAsString();
+            }
+            switch (command_dedup_->record_terminal(command_id, blob)) {
+            case RecordOutcome::Recorded:
+                break;
+            case RecordOutcome::Miss:
+                // A terminal outcome matched no in-flight row: the command ran
+                // undeduplicated (claim had failed — fail-open) or this is a
+                // duplicate terminal write. NOT the same as the eviction-driven
+                // double-execute, which produces a fresh claim and is not
+                // separately detectable here (bounded by kMaxDedupRows).
+                metrics_.counter("yuzu_agent_dedup_record_terminal_miss_total").increment();
+                break;
+            case RecordOutcome::Error:
+                // A durable WRITE failed (full disk / I/O error) after a healthy
+                // open — the write-side of the fail-open degradation, which must
+                // stay observable (invariant 7), not just logged in the store.
+                metrics_.counter("yuzu_agent_dedup_record_errors_total").increment();
+                break;
+            }
+        } catch (...) {
+            // Best-effort + noexcept: an allocation/serialization failure here
+            // leaves the row IN-FLIGHT (the terminal was never recorded), so a
+            // redelivery answers RUNNING and the command does NOT re-execute —
+            // durability degraded, not a double-run. Count + log so it is not
+            // silent; the log is itself guarded (spdlog can throw under OOM).
+            metrics_.counter("yuzu_agent_dedup_record_errors_total").increment();
+            try {
+                spdlog::error("record_command_terminal failed to persist outcome for {}",
+                              command_id);
+            } catch (...) {
+            }
         }
     }
 
@@ -3119,6 +3347,10 @@ private:
                              std::chrono::system_clock::now().time_since_epoch())
                              .count();
             resp.mutable_sent_at()->set_millis_epoch(epoch);
+            // Terminal outcome for a claimed command whose task threw before its
+            // own terminal write — memoise it so a redelivery replays this FAILURE
+            // instead of re-running (HA WS-0).
+            record_command_terminal(command_id, resp);
             std::lock_guard lock(stream_write_mu_);
             if (stream)
                 stream->Write(resp, grpc::WriteOptions());
@@ -3455,14 +3687,13 @@ private:
     std::string latest_snapshot_;                  // last JSON produced by pump
     std::atomic<uint64_t> latest_snapshot_seq_{0}; // monotonically increases on each new snapshot
 
-    // M8: Command replay protection — double-buffer dedup of command IDs.
-    // Two sets: "current" and "previous". When current fills, previous is
-    // discarded, current becomes previous, and a fresh current starts.
-    // Both sets are checked for duplicates, so recently-seen IDs are always
-    // protected. Cleared on each reconnect.
-    static constexpr size_t kMaxDedupEntries = 5000;
-    std::unordered_set<std::string> dedup_current_;
-    std::unordered_set<std::string> dedup_previous_;
+    // HA WS-0 (ADR-2002): durable command replay protection + terminal-outcome
+    // replay. Replaces the former in-memory double-buffer dedup sets (cleared on
+    // every reconnect, no outcome memory). Nullable — if the store fails to open
+    // the agent runs with replay protection degraded (logged at boot). Set once
+    // during startup and never reassigned, so the reader thread and the dispatch
+    // workers read the pointer freely; the store serialises its own access.
+    std::unique_ptr<CommandDedupStore> command_dedup_;
 };
 
 // Factory

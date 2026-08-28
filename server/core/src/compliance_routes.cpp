@@ -8,10 +8,13 @@
 #include "dispatch_target_shape.hpp" // check_targeting_shape (#2500)
 
 #include "policy_evaluator.hpp"
+#include "rest_a4_envelope_http.hpp" // detail::a4_denial (deny_service_scoped_) — mints/reuses
+                                     // X-Correlation-Id so header and body always agree
 #include "store_errors.hpp"
 #include "web_utils.hpp"
 
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 #include <chrono>
 #include <string>
@@ -45,27 +48,52 @@ std::string ComplianceRoutes::render_compliance_summary_fragment() {
     };
 
     std::vector<PolicyRow> policies;
+    // ADR-0056: a degraded read must render distinctly from "genuinely no
+    // policies" — collapsing them would show a false "0 policies, nothing to
+    // see" state when the real answer is "could not ask the store".
+    bool degraded = false;
 
     if (policy_store_ && policy_store_->is_open()) {
         auto all_policies = policy_store_->query_policies();
-        for (const auto& p : all_policies) {
-            auto cs = policy_store_->get_compliance_summary(p.id);
-            PolicyRow row;
-            row.id = p.id;
-            row.name = p.name;
-            row.scope = p.scope_expression;
-            row.total = static_cast<int>(cs.total);
-            row.compliant = static_cast<int>(cs.compliant);
-            row.pct = (cs.total > 0) ? static_cast<int>(cs.compliant * 100 / cs.total) : 0;
-            row.enabled = p.enabled;
-            policies.push_back(std::move(row));
+        if (!all_policies) {
+            degraded = true;
+        } else {
+            for (const auto& p : *all_policies) {
+                auto cs = policy_store_->get_compliance_summary(p.id);
+                if (!cs) {
+                    degraded = true;
+                    continue;
+                }
+                PolicyRow row;
+                row.id = p.id;
+                row.name = p.name;
+                row.scope = p.scope_expression;
+                row.total = static_cast<int>(cs->total);
+                row.compliant = static_cast<int>(cs->compliant);
+                row.pct = (cs->total > 0) ? static_cast<int>(cs->compliant * 100 / cs->total) : 0;
+                row.enabled = p.enabled;
+                policies.push_back(std::move(row));
+            }
         }
     }
 
+    if (degraded) {
+        return "<div class=\"detail-panel\"><div class=\"empty-state\">"
+               "Policy data temporarily unavailable (store degraded) — try again shortly."
+               "</div></div>";
+    }
+
     // Fleet-level compliance from PolicyStore
-    auto fc = (policy_store_ && policy_store_->is_open())
-                  ? policy_store_->get_fleet_compliance()
-                  : FleetCompliance{};
+    FleetCompliance fc;
+    if (policy_store_ && policy_store_->is_open()) {
+        auto fc_res = policy_store_->get_fleet_compliance();
+        if (!fc_res) {
+            return "<div class=\"detail-panel\"><div class=\"empty-state\">"
+                   "Fleet compliance temporarily unavailable (store degraded) — try again "
+                   "shortly.</div></div>";
+        }
+        fc = *fc_res;
+    }
     int fleet_pct = static_cast<int>(fc.compliance_pct);
 
     std::string html;
@@ -84,7 +112,6 @@ std::string ComplianceRoutes::render_compliance_summary_fragment() {
             "<div class=\"compliance-stats\">"
             "<span><strong>" + std::to_string(static_cast<int>(policies.size())) + "</strong> policies active</span>"
             "<span><strong>" + std::to_string(static_cast<int>(fc.total_checks)) + "</strong> device checks</span>"
-            "<span>Last evaluated: <strong>just now</strong></span>"
             "</div></div></div>";
 
     // Policy table
@@ -130,12 +157,14 @@ std::string ComplianceRoutes::render_compliance_summary_fragment() {
 }
 
 std::string ComplianceRoutes::render_compliance_detail_fragment(const std::string& policy_id) {
-    // Look up the policy from the PolicyStore
+    // Look up the policy from the PolicyStore. Low-stakes (page-title
+    // fallback only) — a degraded read just keeps the id as the displayed
+    // name, same as "not found" would; not worth a distinct error state here.
     std::string policy_name = policy_id;
     if (policy_store_ && policy_store_->is_open()) {
         auto policy = policy_store_->get_policy(policy_id);
-        if (policy)
-            policy_name = policy->name;
+        if (policy && *policy)
+            policy_name = (*policy)->name;
     }
 
     // Get real compliance statuses from the store
@@ -149,9 +178,14 @@ std::string ComplianceRoutes::render_compliance_detail_fragment(const std::strin
     };
 
     std::vector<AgentRow> agents;
+    bool degraded = false;
     if (policy_store_ && policy_store_->is_open()) {
         auto statuses = policy_store_->get_policy_agent_statuses(policy_id);
-        for (const auto& s : statuses) {
+        if (!statuses) {
+            degraded = true;
+            statuses = std::vector<PolicyAgentStatus>{};
+        }
+        for (const auto& s : *statuses) {
             AgentRow row;
             row.agent_id = s.agent_id;
             row.status = s.status;
@@ -189,6 +223,17 @@ std::string ComplianceRoutes::render_compliance_detail_fragment(const std::strin
         }
     }
 
+    if (degraded) {
+        // ADR-0056: must not read the same as "no compliance data yet" —
+        // that phrasing tells an operator to wait, when the real answer is
+        // "the store could not be asked".
+        return "<div class=\"detail-panel\">"
+               "<h3>" + html_escape(policy_name) +
+               " <span style=\"font-size:0.7rem;font-weight:400;color:var(--muted)\">"
+               "(" + html_escape(policy_id) + ")</span></h3>"
+               "<div class=\"empty-state\">Compliance data temporarily unavailable (store "
+               "degraded) — try again shortly.</div></div>";
+    }
     if (agents.empty()) {
         return "<div class=\"detail-panel\">"
                "<h3>" + html_escape(policy_name) +
@@ -258,9 +303,70 @@ std::string ComplianceRoutes::render_compliance_detail_fragment(const std::strin
     return html;
 }
 
+// guardian-confinement-2298 PR3 §3e — see the declaration comment in
+// compliance_routes.hpp for the ordering/throw-safety rationale (identical
+// to GuardianRoutes::deny_service_scoped_).
+bool ComplianceRoutes::deny_service_scoped_(const httplib::Request& req,
+                                            httplib::Response& res) const {
+    auto session = auth_fn_(req, res);
+    if (!session)
+        return true; // auth_fn_ already wrote 401/redirect; caller returns.
+    if (session->token_scope_service.empty())
+        return false;
+    // Write the 403 FIRST, audit after — a throwing audit_fn_ must not be
+    // able to suppress the 403 (mirrors GuardianRoutes::deny_service_scoped_).
+    res.status = 403;
+    // No `.permission` label: this is a blanket deny with no perm_fn_ gate on
+    // either fragment it covers — a service-scoped token HOLDING Policy:Read
+    // is still denied here, so naming it as "the missing grant" would be a
+    // false self-remediation claim (A4's permission field contract).
+    //
+    // `a4_denial` (not a hand-built `error_json_a4` + bare correlation id):
+    // it mints/reuses the id via `ensure_correlation_id`, which ALSO sets the
+    // X-Correlation-Id response header — a hand-built id embeds a
+    // correlation_id in the body that the header never carries, breaking the
+    // header/body-must-agree contract (found by consistency-auditor, Gate 4).
+    res.set_content(
+        detail::a4_denial(res, 403,
+                          "service-scoped tokens may not read this fleet-wide compliance view"),
+        "application/json");
+    if (audit_fn_) {
+        try {
+            audit_fn_(req, "compliance.fragment.access_denied", "denied", "Policy", "",
+                      "fleet-wide compliance dashboard fragment denied to a service-scoped "
+                      "token (path=" +
+                          req.path + ")");
+        } catch (const std::exception& e) {
+            spdlog::warn("compliance.fragment.access_denied: audit_fn_ threw: {}", e.what());
+        } catch (...) {
+            spdlog::warn("compliance.fragment.access_denied: audit_fn_ threw (non-std)");
+        }
+    }
+    return true;
+}
+
 // ── Route registration ──────────────────────────────────────────────────────
 
 void ComplianceRoutes::register_routes(httplib::Server& svr,
+                                       AuthFn auth_fn,
+                                       PermFn perm_fn,
+                                       AuditFn audit_fn,
+                                       EmitEventFn emit_event_fn,
+                                       PolicyStore* policy_store,
+                                       AgentsJsonFn agents_json_fn,
+                                       PolicyEvaluator* policy_evaluator,
+                                       yuzu::MetricsRegistry* metrics) {
+    // Production shim — wrap the real server in an HttplibRouteSink and
+    // delegate to the sink-based overload. Same handlers, same lambdas,
+    // same observable behaviour. Test code calls the sink overload directly
+    // with a TestRouteSink (#2298 PR 3 §3e).
+    HttplibRouteSink sink(svr);
+    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
+                    std::move(emit_event_fn), policy_store, std::move(agents_json_fn),
+                    policy_evaluator, metrics);
+}
+
+void ComplianceRoutes::register_routes(HttpRouteSink& sink,
                                        AuthFn auth_fn,
                                        PermFn perm_fn,
                                        AuditFn audit_fn,
@@ -280,7 +386,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
     policy_evaluator_ = policy_evaluator;
 
     // -- Compliance dashboard page ----------------------------------------
-    svr.Get("/compliance",
+    sink.Get("/compliance",
                      [this](const httplib::Request& req, httplib::Response& res) {
                          auto session = auth_fn_(req, res);
                          if (!session) {
@@ -291,8 +397,9 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
                      });
 
     // -- Compliance HTMX fragment: fleet summary --------------------------
-    svr.Get("/fragments/compliance/summary",
+    sink.Get("/fragments/compliance/summary",
                      [this](const httplib::Request& req, httplib::Response& res) {
+                         if (deny_service_scoped_(req, res)) return;
                          auto session = auth_fn_(req, res);
                          if (!session) return;
                          res.set_content(render_compliance_summary_fragment(),
@@ -300,8 +407,9 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
                      });
 
     // -- Compliance HTMX fragment: per-policy agent detail ----------------
-    svr.Get(R"(/fragments/compliance/(\w[\w\-]*))",
+    sink.Get(R"(/fragments/compliance/(\w[\w\-]*))",
                      [this](const httplib::Request& req, httplib::Response& res) {
+                         if (deny_service_scoped_(req, res)) return;
                          auto session = auth_fn_(req, res);
                          if (!session) return;
                          auto policy_id = req.matches[1].str();
@@ -312,7 +420,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
     // -- Policy Engine API (Phase 5) ------------------------------------------
 
     // GET /api/policy-fragments -- list all fragments
-    svr.Get("/api/policy-fragments",
+    sink.Get("/api/policy-fragments",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Read"))
                 return;
@@ -335,8 +443,13 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
             }
 
             auto frags = policy_store_->query_fragments(q);
+            if (!frags) {
+                res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"policy store degraded"},"meta":{"api_version":"v1"}})", "application/json");
+                return;
+            }
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& f : frags) {
+            for (const auto& f : *frags) {
                 arr.push_back({{"id", f.id},
                                {"name", f.name},
                                {"description", f.description},
@@ -353,7 +466,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
         });
 
     // POST /api/policy-fragments -- create fragment from YAML
-    svr.Post("/api/policy-fragments",
+    sink.Post("/api/policy-fragments",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Write"))
                 return;
@@ -388,7 +501,8 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
                 // string when audit needs it — the parsed YAML name isn't
                 // available here without re-extracting.
                 bool is_conflict = is_conflict_error(result.error());
-                res.status = is_conflict ? 409 : 400;
+                bool is_degraded = is_db_error(result.error());
+                res.status = is_conflict ? 409 : (is_degraded ? 503 : 400);
                 if (is_conflict) {
                     // iter-M1: target_id is the fragment name (parsed from
                     // YAML) so SOC 2 audit reviewers can answer "duplicate
@@ -397,10 +511,18 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
                     audit_fn_(req, "policy_fragment.create", "denied",
                               "policy_fragment", attempted_name, "duplicate_name");
                 }
-                auto body_msg = is_conflict
-                    ? std::string(strip_conflict_prefix(result.error()))
-                    : result.error();
-                res.set_content(nlohmann::json({{"error", body_msg}}).dump(), "application/json");
+                if (is_degraded) {
+                    res.set_content(
+                        nlohmann::json({{"error", {{"code", 503},
+                                                    {"message", std::string(strip_db_error_prefix(result.error()))}}},
+                                        {"meta", {{"api_version", "v1"}}}})
+                            .dump(),
+                        "application/json");
+                } else {
+                    std::string body_msg = is_conflict ? std::string(strip_conflict_prefix(result.error()))
+                                                        : result.error();
+                    res.set_content(nlohmann::json({{"error", body_msg}}).dump(), "application/json");
+                }
                 return;
             }
             audit_fn_(req, "policy_fragment.create", "success", "policy_fragment", *result, "");
@@ -411,7 +533,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
         });
 
     // DELETE /api/policy-fragments/:id
-    svr.Delete(R"(/api/policy-fragments/([^/]+))",
+    sink.Delete(R"(/api/policy-fragments/([^/]+))",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Delete"))
                 return;
@@ -431,7 +553,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
         });
 
     // GET /api/policies -- list all policies
-    svr.Get("/api/policies",
+    sink.Get("/api/policies",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Read"))
                 return;
@@ -458,8 +580,13 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
             }
 
             auto policies = policy_store_->query_policies(q);
+            if (!policies) {
+                res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"policy store degraded"},"meta":{"api_version":"v1"}})", "application/json");
+                return;
+            }
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& p : policies) {
+            for (const auto& p : *policies) {
                 nlohmann::json inputs_obj = nlohmann::json::object();
                 for (const auto& inp : p.inputs)
                     inputs_obj[inp.key] = inp.value;
@@ -489,7 +616,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
         });
 
     // POST /api/policies -- create policy from YAML
-    svr.Post("/api/policies",
+    sink.Post("/api/policies",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Write"))
                 return;
@@ -515,8 +642,18 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
 
             auto result = policy_store_->create_policy(yaml_source);
             if (!result) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                bool is_degraded = is_db_error(result.error());
+                res.status = is_degraded ? 503 : 400;
+                if (is_degraded) {
+                    res.set_content(
+                        nlohmann::json({{"error", {{"code", 503},
+                                                    {"message", std::string(strip_db_error_prefix(result.error()))}}},
+                                        {"meta", {{"api_version", "v1"}}}})
+                            .dump(),
+                        "application/json");
+                } else {
+                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                }
                 return;
             }
             audit_fn_(req, "policy.create", "success", "policy", *result, "");
@@ -529,7 +666,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
         });
 
     // GET /api/policies/:id -- get policy detail
-    svr.Get(R"(/api/policies/([^/]+))",
+    sink.Get(R"(/api/policies/([^/]+))",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Read"))
                 return;
@@ -540,19 +677,25 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
             }
 
             auto id = req.matches[1].str();
-            auto policy = policy_store_->get_policy(id);
-            if (!policy) {
+            auto policy_res = policy_store_->get_policy(id);
+            if (!policy_res) {
+                res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"policy store degraded"},"meta":{"api_version":"v1"}})", "application/json");
+                return;
+            }
+            if (!*policy_res) {
                 res.status = 404;
                 res.set_content(R"({"error":{"code":404,"message":"policy not found"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
+            const Policy& policy = **policy_res;
 
             nlohmann::json inputs_obj = nlohmann::json::object();
-            for (const auto& inp : policy->inputs)
+            for (const auto& inp : policy.inputs)
                 inputs_obj[inp.key] = inp.value;
 
             nlohmann::json triggers_arr = nlohmann::json::array();
-            for (const auto& t : policy->triggers) {
+            for (const auto& t : policy.triggers) {
                 triggers_arr.push_back({{"id", t.id},
                                         {"type", t.trigger_type},
                                         {"config", nlohmann::json::parse(t.config_json, nullptr, false)}});
@@ -560,39 +703,48 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
 
             // Also fetch compliance summary
             auto cs = policy_store_->get_compliance_summary(id);
+            if (!cs) {
+                res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"policy store degraded"},"meta":{"api_version":"v1"}})", "application/json");
+                return;
+            }
 
             // Remediation is only offered where the bound fragment defines a
-            // fix_instruction — the "would you like to remediate?" gate.
+            // fix_instruction — the "would you like to remediate?" gate. A
+            // degraded fragment read is treated the same as "not found" here
+            // (false, not offered) — this only gates a UI affordance, not a
+            // grant/enforce decision, so fail-soft is acceptable.
             bool remediation_available = false;
-            if (auto frag = policy_store_->get_fragment(policy->fragment_id))
-                remediation_available = !frag->fix_instruction.empty();
+            auto frag = policy_store_->get_fragment(policy.fragment_id);
+            if (frag && *frag)
+                remediation_available = !(*frag)->fix_instruction.empty();
 
             res.set_content(
-                nlohmann::json({{"id", policy->id},
-                                {"name", policy->name},
-                                {"description", policy->description},
-                                {"yaml_source", policy->yaml_source},
-                                {"fragment_id", policy->fragment_id},
-                                {"scope_expression", policy->scope_expression},
-                                {"enabled", policy->enabled},
+                nlohmann::json({{"id", policy.id},
+                                {"name", policy.name},
+                                {"description", policy.description},
+                                {"yaml_source", policy.yaml_source},
+                                {"fragment_id", policy.fragment_id},
+                                {"scope_expression", policy.scope_expression},
+                                {"enabled", policy.enabled},
                                 {"remediation_available", remediation_available},
                                 {"inputs", inputs_obj},
                                 {"triggers", triggers_arr},
-                                {"management_groups", policy->management_groups},
-                                {"created_at", policy->created_at},
-                                {"updated_at", policy->updated_at},
-                                {"compliance", {{"compliant", cs.compliant},
-                                                 {"non_compliant", cs.non_compliant},
-                                                 {"unknown", cs.unknown},
-                                                 {"fixing", cs.fixing},
-                                                 {"error", cs.error},
-                                                 {"total", cs.total}}}})
+                                {"management_groups", policy.management_groups},
+                                {"created_at", policy.created_at},
+                                {"updated_at", policy.updated_at},
+                                {"compliance", {{"compliant", cs->compliant},
+                                                 {"non_compliant", cs->non_compliant},
+                                                 {"unknown", cs->unknown},
+                                                 {"fixing", cs->fixing},
+                                                 {"error", cs->error},
+                                                 {"total", cs->total}}}})
                     .dump(),
                 "application/json");
         });
 
     // DELETE /api/policies/:id
-    svr.Delete(R"(/api/policies/([^/]+))",
+    sink.Delete(R"(/api/policies/([^/]+))",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Delete"))
                 return;
@@ -614,7 +766,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
         });
 
     // POST /api/policies/:id/enable
-    svr.Post(R"(/api/policies/([^/]+)/enable)",
+    sink.Post(R"(/api/policies/([^/]+)/enable)",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Write"))
                 return;
@@ -627,8 +779,18 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
             auto id = req.matches[1].str();
             auto result = policy_store_->enable_policy(id);
             if (!result) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                bool is_degraded = is_db_error(result.error());
+                res.status = is_degraded ? 503 : 400;
+                if (is_degraded) {
+                    res.set_content(
+                        nlohmann::json({{"error", {{"code", 503},
+                                                    {"message", std::string(strip_db_error_prefix(result.error()))}}},
+                                        {"meta", {{"api_version", "v1"}}}})
+                            .dump(),
+                        "application/json");
+                } else {
+                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                }
                 return;
             }
             audit_fn_(req, "policy.enable", "success", "policy", id, "");
@@ -639,7 +801,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
         });
 
     // POST /api/policies/:id/disable
-    svr.Post(R"(/api/policies/([^/]+)/disable)",
+    sink.Post(R"(/api/policies/([^/]+)/disable)",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Write"))
                 return;
@@ -652,8 +814,18 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
             auto id = req.matches[1].str();
             auto result = policy_store_->disable_policy(id);
             if (!result) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                bool is_degraded = is_db_error(result.error());
+                res.status = is_degraded ? 503 : 400;
+                if (is_degraded) {
+                    res.set_content(
+                        nlohmann::json({{"error", {{"code", 503},
+                                                    {"message", std::string(strip_db_error_prefix(result.error()))}}},
+                                        {"meta", {{"api_version", "v1"}}}})
+                            .dump(),
+                        "application/json");
+                } else {
+                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                }
                 return;
             }
             audit_fn_(req, "policy.disable", "success", "policy", id, "");
@@ -664,7 +836,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
         });
 
     // POST /api/policies/:id/invalidate -- invalidate cache for one policy
-    svr.Post(R"(/api/policies/([^/]+)/invalidate)",
+    sink.Post(R"(/api/policies/([^/]+)/invalidate)",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Execute"))
                 return;
@@ -677,8 +849,18 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
             auto id = req.matches[1].str();
             auto result = policy_store_->invalidate_policy(id);
             if (!result) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                bool is_degraded = is_db_error(result.error());
+                res.status = is_degraded ? 503 : 400;
+                if (is_degraded) {
+                    res.set_content(
+                        nlohmann::json({{"error", {{"code", 503},
+                                                    {"message", std::string(strip_db_error_prefix(result.error()))}}},
+                                        {"meta", {{"api_version", "v1"}}}})
+                            .dump(),
+                        "application/json");
+                } else {
+                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                }
                 return;
             }
             audit_fn_(req, "policy.invalidate", "success", "policy", id, "");
@@ -691,7 +873,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
         });
 
     // POST /api/policies/invalidate-all -- invalidate cache for all policies
-    svr.Post("/api/policies/invalidate-all",
+    sink.Post("/api/policies/invalidate-all",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Execute"))
                 return;
@@ -703,8 +885,18 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
 
             auto result = policy_store_->invalidate_all_policies();
             if (!result) {
-                res.status = 500;
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                bool is_degraded = is_db_error(result.error());
+                res.status = is_degraded ? 503 : 500;
+                if (is_degraded) {
+                    res.set_content(
+                        nlohmann::json({{"error", {{"code", 503},
+                                                    {"message", std::string(strip_db_error_prefix(result.error()))}}},
+                                        {"meta", {{"api_version", "v1"}}}})
+                            .dump(),
+                        "application/json");
+                } else {
+                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                }
                 return;
             }
             audit_fn_(req, "policy.invalidate_all", "success", "", "", "");
@@ -718,7 +910,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
 
     // POST /api/policies/:id/evaluate -- force an immediate compliance check
     // (the background evaluator picks it up on its next collect cycle).
-    svr.Post(R"(/api/policies/([^/]+)/evaluate)",
+    sink.Post(R"(/api/policies/([^/]+)/evaluate)",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Execute"))
                 return;
@@ -728,12 +920,37 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
                 return;
             }
             auto id = req.matches[1].str();
-            if (!policy_store_->get_policy(id)) {
+            auto policy_check = policy_store_->get_policy(id);
+            if (!policy_check) {
+                res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"policy store degraded"},"meta":{"api_version":"v1"}})", "application/json");
+                return;
+            }
+            if (!*policy_check) {
                 res.status = 404;
                 res.set_content(R"({"error":{"code":404,"message":"policy not found"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
-            auto exec_id = policy_evaluator_->evaluate_now(id);
+            auto exec_res = policy_evaluator_->evaluate_now(id);
+            if (!exec_res) {
+                // ADR-0058 / gov Gate 6: this 503 covers a genuine InstructionStore DB/lease
+                // failure (among the other internal-degrade causes evaluate_now can return) —
+                // audited the same as every other denial branch on this route, re-applied here
+                // in evaluate_now's new std::expected shape after ADR-0056's durable-claim
+                // rework (governance ledger finding gov8r1-cas-timestamp-aba's re-verify).
+                // "error", not "denied" (merge-time re-verify finding): an infra degrade is not
+                // an operator denial — matches /remediate's own degraded ? "error" : "denied"
+                // convention a few lines below, which this re-add had missed.
+                audit_fn_(req, "policy.evaluate", "error", "policy", id, "degraded");
+                res.status = 503;
+                res.set_content(
+                    nlohmann::json({{"error", {{"code", 503}, {"message", "policy evaluation degraded"}}},
+                                    {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
+                    "application/json");
+                return;
+            }
+            auto exec_id = *exec_res;
             if (exec_id.empty()) {
                 res.status = 409;
                 res.set_content(
@@ -758,7 +975,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
     // POST /api/policies/:id/remediate -- manual, gated remediation. Requires
     // the bound fragment to define a fix_instruction. Optional body
     // {"agent_ids":[...]} scopes the fix; absent => all non_compliant agents.
-    svr.Post(R"(/api/policies/([^/]+)/remediate)",
+    sink.Post(R"(/api/policies/([^/]+)/remediate)",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Execute"))
                 return;
@@ -840,14 +1057,27 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
             }
             auto result = policy_evaluator_->remediate(id, agent_ids);
             if (!result.ok) {
+                // Governance (2026-08-24): a genuine store-degrade error
+                // used to fall through to the 400/"denied" default below —
+                // a false diagnosis (this isn't a malformed/rejected
+                // request) AND a false audit entry (an infra failure is not
+                // an operator denial). Classified via RemediateResult::degraded
+                // (set explicitly by remediate() itself), not a string prefix
+                // guess (consistency-auditor SHOULD-2: an unshared,
+                // untested string contract on the route side).
+                bool degraded = result.degraded;
                 int code = 400;
-                if (result.error.find("not found") != std::string::npos)
+                if (degraded)
+                    code = 503;
+                else if (result.error.find("not found") != std::string::npos)
                     code = 404;
                 else if (result.error.find("remediation pathway") != std::string::npos ||
                          result.error.find("no non_compliant") != std::string::npos ||
-                         result.error.find("no in-scope") != std::string::npos)
+                         result.error.find("no in-scope") != std::string::npos ||
+                         result.error.find("already in flight") != std::string::npos)
                     code = 409;
-                audit_fn_(req, "policy.remediate", "denied", "policy", id, result.error);
+                audit_fn_(req, "policy.remediate", degraded ? "error" : "denied", "policy", id,
+                          result.error);
                 res.status = code;
                 // Nested A4 error envelope, matching /evaluate and the other
                 // policy endpoints (gov consistency SHOULD-1).
@@ -873,7 +1103,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
         });
 
     // GET /api/compliance -- fleet compliance summary
-    svr.Get("/api/compliance",
+    sink.Get("/api/compliance",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Read"))
                 return;
@@ -884,20 +1114,25 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
             }
 
             auto fc = policy_store_->get_fleet_compliance();
+            if (!fc) {
+                res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"policy store degraded"},"meta":{"api_version":"v1"}})", "application/json");
+                return;
+            }
             res.set_content(
-                nlohmann::json({{"compliance_pct", fc.compliance_pct},
-                                {"total_checks", fc.total_checks},
-                                {"compliant", fc.compliant},
-                                {"non_compliant", fc.non_compliant},
-                                {"unknown", fc.unknown},
-                                {"fixing", fc.fixing},
-                                {"error", fc.error}})
+                nlohmann::json({{"compliance_pct", fc->compliance_pct},
+                                {"total_checks", fc->total_checks},
+                                {"compliant", fc->compliant},
+                                {"non_compliant", fc->non_compliant},
+                                {"unknown", fc->unknown},
+                                {"fixing", fc->fixing},
+                                {"error", fc->error}})
                     .dump(),
                 "application/json");
         });
 
     // GET /api/compliance/:policy_id -- per-policy compliance detail
-    svr.Get(R"(/api/compliance/([^/]+))",
+    sink.Get(R"(/api/compliance/([^/]+))",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Read"))
                 return;
@@ -910,9 +1145,14 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
             auto policy_id = req.matches[1].str();
             auto summary = policy_store_->get_compliance_summary(policy_id);
             auto statuses = policy_store_->get_policy_agent_statuses(policy_id);
+            if (!summary || !statuses) {
+                res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"policy store degraded"},"meta":{"api_version":"v1"}})", "application/json");
+                return;
+            }
 
             nlohmann::json agents_arr = nlohmann::json::array();
-            for (const auto& s : statuses) {
+            for (const auto& s : *statuses) {
                 agents_arr.push_back({{"agent_id", s.agent_id},
                                       {"status", s.status},
                                       {"last_check_at", s.last_check_at},
@@ -922,12 +1162,12 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
 
             res.set_content(
                 nlohmann::json({{"policy_id", policy_id},
-                                {"summary", {{"compliant", summary.compliant},
-                                              {"non_compliant", summary.non_compliant},
-                                              {"unknown", summary.unknown},
-                                              {"fixing", summary.fixing},
-                                              {"error", summary.error},
-                                              {"total", summary.total}}},
+                                {"summary", {{"compliant", summary->compliant},
+                                              {"non_compliant", summary->non_compliant},
+                                              {"unknown", summary->unknown},
+                                              {"fixing", summary->fixing},
+                                              {"error", summary->error},
+                                              {"total", summary->total}}},
                                 {"agents", agents_arr}})
                     .dump(),
                 "application/json");

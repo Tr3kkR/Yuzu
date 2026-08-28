@@ -56,7 +56,7 @@ using yuzu::server::pg::PgResult;
 // schema_meta row: the migration runner's drift guard refuses. Mirrors
 // test_preflight_run_store.cpp's "reports !is_open on a migration failure".
 TEST_CASE("ApiTokenStore reports !is_open on a migration failure", "[pg][token][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
@@ -81,7 +81,7 @@ TEST_CASE("ApiTokenStore reports !is_open on a migration failure", "[pg][token][
 TEST_CASE("ApiTokenStore reports !is_open when schema_meta claims v3 but the schema is only "
           "at v2 (post-migration smoke-read guard, #2961 round-2)",
           "[pg][token][store][migration]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
@@ -169,7 +169,7 @@ TEST_CASE("ApiTokenStore reports !is_open when schema_meta claims v3 but the sch
 TEST_CASE("ApiTokenStore: a genuine v2->v3 upgrade (real ALTER against a populated table) "
           "opens cleanly and the new column is usable end-to-end (#2961 UP-7)",
           "[pg][token][store][migration]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     std::string preexisting_token_id;
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
@@ -276,7 +276,7 @@ TEST_CASE("ApiTokenStore: a genuine v2->v3 upgrade (real ALTER against a populat
 TEST_CASE("ApiTokenStore fails closed at construction when rotation_retention_meta is missing "
           "despite schema_meta already claiming v4 (#3013 migration-numbering collision)",
           "[pg][token][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
@@ -1729,7 +1729,7 @@ TEST_CASE("ApiTokenStore: confirm_rotation cuts over immediately — revokes the
     const std::string predecessor_id = predecessor->token_id;
     const std::string successor_id = successor->token_id;
 
-    auto confirmed = store.confirm_rotation(principal, successor_id, "admin");
+    auto confirmed = store.confirm_rotation(principal, successor_id, *rotated, "admin");
     REQUIRE(confirmed.has_value());
 
     auto predecessor_after = store.get_token(predecessor_id).value();
@@ -1780,7 +1780,10 @@ TEST_CASE("ApiTokenStore: confirm_rotation rejects an operator who did not initi
             successor_id = t.token_id;
     REQUIRE_FALSE(successor_id.empty());
 
-    auto stolen_confirm = store.confirm_rotation(principal, successor_id, "mallory");
+    // #3015: PoP is checked LAST (after the initiator binding), so a correct
+    // secret here does not let a non-initiator caller past the operator
+    // check — the test would be weaker, not stronger, with a wrong secret.
+    auto stolen_confirm = store.confirm_rotation(principal, successor_id, *rotated, "mallory");
     REQUIRE_FALSE(stolen_confirm.has_value());
     CHECK(stolen_confirm.error().find("different operator") != std::string::npos);
 
@@ -1791,7 +1794,7 @@ TEST_CASE("ApiTokenStore: confirm_rotation rejects an operator who did not initi
         CHECK(t.confirmed_at == 0);
 
     // The SAME operator who initiated it can still confirm afterward.
-    auto real_confirm = store.confirm_rotation(principal, successor_id, "admin");
+    auto real_confirm = store.confirm_rotation(principal, successor_id, *rotated, "admin");
     CHECK(real_confirm.has_value());
 }
 
@@ -1818,13 +1821,14 @@ TEST_CASE("ApiTokenStore: confirm_rotation sole-credential states are terminal, 
     // (confirmed_at == 0). Terminal conflict, NOT the old retryable error —
     // this is the positive-read guarantee (#2404). Pre-#2384 wording proof: a
     // client must be told "nothing to confirm", not told to retry.
-    auto resolved = store.confirm_rotation(principal, sole_id, "admin");
+    auto resolved = store.confirm_rotation(principal, sole_id, "irrelevant-secret", "admin");
     REQUIRE_FALSE(resolved.has_value());
     CHECK(resolved.error().find("already the sole active credential") != std::string::npos);
     CHECK(classify_engine_store_error(resolved.error()) == E::Conflict);
 
     // One credential, pin does NOT match it: the pinned rotation moved on.
-    auto other = store.confirm_rotation(principal, "deadbeefdeadbeefdeadbeef", "admin");
+    auto other = store.confirm_rotation(principal, "deadbeefdeadbeefdeadbeef",
+                                        "irrelevant-secret", "admin");
     REQUIRE_FALSE(other.has_value());
     CHECK(other.error().find("the rotation was resolved") != std::string::npos);
     CHECK(classify_engine_store_error(other.error()) == E::Conflict);
@@ -1835,7 +1839,7 @@ TEST_CASE("ApiTokenStore: confirm_rotation sole-credential states are terminal, 
     // terminal 409 (regression guard for the positive-read boundary).
     REQUIRE(store.revoke_token(sole_id).value());
     REQUIRE(store.list_active_for_principal(principal).empty());
-    auto none = store.confirm_rotation(principal, sole_id, "admin");
+    auto none = store.confirm_rotation(principal, sole_id, "irrelevant-secret", "admin");
     REQUIRE_FALSE(none.has_value());
     CHECK(none.error().find("no in-flight rotation to confirm") != std::string::npos);
     CHECK(classify_engine_store_error(none.error()) == E::Transient);
@@ -1867,11 +1871,11 @@ TEST_CASE("ApiTokenStore: confirm_rotation replay after success is a terminal al
     REQUIRE_FALSE(successor_id.empty());
 
     // First confirm succeeds (the real cutover).
-    REQUIRE(store.confirm_rotation(principal, successor_id, "admin").has_value());
+    REQUIRE(store.confirm_rotation(principal, successor_id, *rotated, "admin").has_value());
 
     // The network-dropped-200 replay: SAME args. The successor is now the sole
     // active credential with confirmed_at set, so this is terminal, not 503.
-    auto replay = store.confirm_rotation(principal, successor_id, "admin");
+    auto replay = store.confirm_rotation(principal, successor_id, "irrelevant-secret", "admin");
     REQUIRE_FALSE(replay.has_value());
     CHECK(replay.error().find("rotation already confirmed") != std::string::npos);
     CHECK(replay.error().find("sole active credential") != std::string::npos);
@@ -1937,7 +1941,8 @@ TEST_CASE("ApiTokenStore: confirm_rotation after the sweep cuts over is a termin
     // it disambiguates from kSoleConfirmed ("is the sole...") and kSoleOtherToken
     // (no "sole active credential") in a single check, so a partial message
     // drift on one branch can't false-pass (qe review, #2404).
-    auto swept_confirm = store.confirm_rotation(principal, successor_id, "admin");
+    auto swept_confirm =
+        store.confirm_rotation(principal, successor_id, "irrelevant-secret", "admin");
     REQUIRE_FALSE(swept_confirm.has_value());
     CHECK(swept_confirm.error().find("no rotation in flight") != std::string::npos);
     CHECK(swept_confirm.error().find("already the sole active credential") != std::string::npos);
@@ -1970,7 +1975,8 @@ TEST_CASE("ApiTokenStore: confirm_rotation with more than two active credentials
                 .has_value());
     REQUIRE(store.list_active_for_principal(principal).size() == 3);
 
-    auto over = store.confirm_rotation(principal, "deadbeefdeadbeefdeadbeef", "admin");
+    auto over = store.confirm_rotation(principal, "deadbeefdeadbeefdeadbeef",
+                                       "irrelevant-secret", "admin");
     REQUIRE_FALSE(over.has_value());
     CHECK(over.error().find("more than two active credentials") != std::string::npos);
     CHECK(classify_engine_store_error(over.error()) == E::ClientValidation);
@@ -2023,7 +2029,7 @@ TEST_CASE("ApiTokenStore: confirm_rotation on a sole credential with stale rotat
     CHECK(active[0].token_id == successor_id);
     CHECK_FALSE(active[0].rotation_group.empty()); // stale linkage survived
 
-    auto stale = store.confirm_rotation(principal, successor_id, "admin");
+    auto stale = store.confirm_rotation(principal, successor_id, "irrelevant-secret", "admin");
     REQUIRE_FALSE(stale.has_value());
     CHECK(stale.error().find("unresolved rotation metadata") != std::string::npos);
     CHECK(classify_engine_store_error(stale.error()) == E::Conflict);
@@ -2049,14 +2055,15 @@ TEST_CASE("ApiTokenStore: confirm_rotation never misattributes a historical conf
                 .has_value());
 
     // R1: rotate + confirm. S1 becomes the sole active credential, confirmed.
-    REQUIRE(store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin")
-                .has_value());
+    auto r1_rotated =
+        store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(r1_rotated.has_value());
     std::string s1_id;
     for (const auto& t : store.list_active_for_principal(principal))
         if (!t.supersedes_token_id.empty())
             s1_id = t.token_id;
     REQUIRE_FALSE(s1_id.empty());
-    REQUIRE(store.confirm_rotation(principal, s1_id, "admin").has_value());
+    REQUIRE(store.confirm_rotation(principal, s1_id, *r1_rotated, "admin").has_value());
     REQUIRE(store.get_token(s1_id).value()->confirmed_at > 0); // S1 carries R1's marker
 
     // R2: rotate again (S1 is now the predecessor, KEEPING its confirmed_at),
@@ -2075,7 +2082,7 @@ TEST_CASE("ApiTokenStore: confirm_rotation never misattributes a historical conf
 
     // Pin = S1 (the confirmed survivor): "already confirmed" is TRUE and
     // correct — the rotation in which S1 was successor (R1) WAS confirmed.
-    auto pin_s1 = store.confirm_rotation(principal, s1_id, "admin");
+    auto pin_s1 = store.confirm_rotation(principal, s1_id, "irrelevant-secret", "admin");
     REQUIRE_FALSE(pin_s1.has_value());
     CHECK(pin_s1.error().find("rotation already confirmed") != std::string::npos);
 
@@ -2083,7 +2090,7 @@ TEST_CASE("ApiTokenStore: confirm_rotation never misattributes a historical conf
     // the message must NOT claim "already confirmed" — it says "the rotation
     // was resolved", the cause-agnostic wording for a non-matching pin. This
     // is the F2 guard: historical confirmed_at never attributes R2's cause.
-    auto pin_s2 = store.confirm_rotation(principal, s2_id, "admin");
+    auto pin_s2 = store.confirm_rotation(principal, s2_id, "irrelevant-secret", "admin");
     REQUIRE_FALSE(pin_s2.has_value());
     CHECK(pin_s2.error().find("the rotation was resolved") != std::string::npos);
     CHECK(pin_s2.error().find("already confirmed") == std::string::npos);
@@ -2120,7 +2127,7 @@ TEST_CASE("ApiTokenStore: confirm_rotation rejects a token_id that is not the pe
     // The PREDECESSOR's id (the likely operator mistake) and a bogus id both
     // mismatch the pending successor.
     for (const std::string& wrong : {predecessor_id, std::string{"feedfacefeedfacefeedface"}}) {
-        auto mismatch = store.confirm_rotation(principal, wrong, "admin");
+        auto mismatch = store.confirm_rotation(principal, wrong, "irrelevant-secret", "admin");
         REQUIRE_FALSE(mismatch.has_value());
         CHECK(mismatch.error().find("does not match the pending rotation") != std::string::npos);
     }
@@ -2136,12 +2143,12 @@ TEST_CASE("ApiTokenStore: confirm_rotation rejects a token_id that is not the pe
     }
 
     // Empty token_id is rejected by the input guard, same no-mutation posture.
-    auto empty_id = store.confirm_rotation(principal, "", "admin");
+    auto empty_id = store.confirm_rotation(principal, "", "irrelevant-secret", "admin");
     REQUIRE_FALSE(empty_id.has_value());
     CHECK(empty_id.error().find("token_id required") != std::string::npos);
 
     // The correct id still confirms — the rejections above consumed nothing.
-    CHECK(store.confirm_rotation(principal, successor_id, "admin").has_value());
+    CHECK(store.confirm_rotation(principal, successor_id, *rotated, "admin").has_value());
 }
 
 TEST_CASE("ApiTokenStore: a blind retry carrying an EARLIER rotation's successor id cannot "
@@ -2160,18 +2167,20 @@ TEST_CASE("ApiTokenStore: a blind retry carrying an EARLIER rotation's successor
                 .has_value());
 
     // Rotation 1: rotate + confirm with R1's successor id (the happy flow).
-    REQUIRE(store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin")
-                .has_value());
+    auto r1_rotated =
+        store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(r1_rotated.has_value());
     std::string r1_successor_id;
     for (const auto& t : store.list_active_for_principal(principal))
         if (!t.supersedes_token_id.empty())
             r1_successor_id = t.token_id;
     REQUIRE_FALSE(r1_successor_id.empty());
-    REQUIRE(store.confirm_rotation(principal, r1_successor_id, "admin").has_value());
+    REQUIRE(store.confirm_rotation(principal, r1_successor_id, *r1_rotated, "admin").has_value());
 
     // Rotation 2 begins: R1's successor is now R2's predecessor.
-    REQUIRE(store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin")
-                .has_value());
+    auto r2_rotated =
+        store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(r2_rotated.has_value());
     std::string r2_successor_id;
     for (const auto& t : store.list_active_for_principal(principal))
         if (!t.supersedes_token_id.empty())
@@ -2182,7 +2191,11 @@ TEST_CASE("ApiTokenStore: a blind retry carrying an EARLIER rotation's successor
     // THE #2384 SCENARIO: a blind retry of the R1 confirm (same args, same
     // operator) lands after R2 started. Pre-pin this confirmed R2 early and
     // revoked R2's predecessor — R1's still-live successor. Now it mismatches.
-    auto stale_retry = store.confirm_rotation(principal, r1_successor_id, "admin");
+    // The REAL R1 secret is deliberately reused here too (#3015): the pin
+    // mismatch must fire regardless of whether the presented secret happens
+    // to be correct for r1_successor_id — PoP is checked strictly after it.
+    auto stale_retry =
+        store.confirm_rotation(principal, r1_successor_id, *r1_rotated, "admin");
     REQUIRE_FALSE(stale_retry.has_value());
     CHECK(stale_retry.error().find("does not match the pending rotation") != std::string::npos);
 
@@ -2204,7 +2217,7 @@ TEST_CASE("ApiTokenStore: a blind retry carrying an EARLIER rotation's successor
     CHECK(r1_successor_still_active);
 
     // R2's own successor id confirms R2 normally.
-    CHECK(store.confirm_rotation(principal, r2_successor_id, "admin").has_value());
+    CHECK(store.confirm_rotation(principal, r2_successor_id, *r2_rotated, "admin").has_value());
 }
 
 // ── Manual revoke resolves the rotation pair (design §7, PR #2284 review Major 3) ──
@@ -2707,15 +2720,19 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation rejects a non-owner even with t
 
     // "admin" knows the correct successor token_id (e.g. observed in an
     // audit log) but is not alice — must still be rejected, byte-identical
-    // to the not-found wording, never a distinguishable "not yours".
-    auto stolen_confirm = store.confirm_token_rotation(successor_id, "admin", "", "");
+    // to the not-found wording, never a distinguishable "not yours". #3015
+    // oracle-freedom: "admin" ALSO presents the CORRECT raw secret here —
+    // proves the ownership check still wins and the outcome does not flip
+    // to "confirmed" nor to a distinguishable "wrong secret", because PoP
+    // is checked strictly after ownership.
+    auto stolen_confirm = store.confirm_token_rotation(successor_id, *rotated, "admin", "", "");
     REQUIRE_FALSE(stolen_confirm.has_value());
     CHECK(stolen_confirm.error() == "no such token to confirm");
     CHECK(classify_engine_store_error(stolen_confirm.error()) == E::ClientValidation);
 
     // Nothing mutated — the pair is still intact and alice can still confirm.
     CHECK(store.list_active_for_principal("alice").size() == 2);
-    auto real_confirm = store.confirm_token_rotation(successor_id, "alice", "", "");
+    auto real_confirm = store.confirm_token_rotation(successor_id, *rotated, "alice", "", "");
     CHECK(real_confirm.has_value());
 }
 
@@ -3092,7 +3109,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation cuts over immediately — revok
             successor_id = t.token_id;
     REQUIRE_FALSE(successor_id.empty());
 
-    auto confirmed = store.confirm_token_rotation(successor_id, "alice", "", "");
+    auto confirmed = store.confirm_token_rotation(successor_id, *rotated, "alice", "", "");
     REQUIRE(confirmed.has_value());
 
     // Predecessor is revoked immediately (no need to wait for the overlap
@@ -3131,7 +3148,8 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation rejects a token_id that is not 
 
     // Passing the PREDECESSOR's own id (not the successor's) must be
     // rejected by the pin check, never silently accepted.
-    auto mismatch = store.confirm_token_rotation(predecessor_id, "alice", "", "");
+    auto mismatch =
+        store.confirm_token_rotation(predecessor_id, "irrelevant-secret", "alice", "", "");
     REQUIRE_FALSE(mismatch.has_value());
     CHECK(store.list_active_for_principal("alice").size() == 2); // unchanged
 }
@@ -3147,7 +3165,8 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation on an unknown token_id is a ter
     using yuzu::server::detail::classify_engine_store_error;
     using E = yuzu::server::detail::EngineStoreErrorClass;
 
-    auto confirmed = store.confirm_token_rotation("deadbeefdeadbeefdeadbeef", "admin", "", "");
+    auto confirmed = store.confirm_token_rotation("deadbeefdeadbeefdeadbeef",
+                                                  "irrelevant-secret", "admin", "", "");
     REQUIRE_FALSE(confirmed.has_value());
     CHECK(confirmed.error().find("no such token") != std::string::npos);
     CHECK(classify_engine_store_error(confirmed.error()) == E::ClientValidation);
@@ -3183,7 +3202,8 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation on a token that was never part 
     REQUIRE(raw.has_value());
     const std::string token_id = store.list_active_for_principal("alice")[0].token_id;
 
-    auto confirmed = store.confirm_token_rotation(token_id, "alice", "", "");
+    auto confirmed =
+        store.confirm_token_rotation(token_id, "irrelevant-secret", "alice", "", "");
     REQUIRE_FALSE(confirmed.has_value());
     CHECK(confirmed.error().find("no rotation currently pending") != std::string::npos);
     CHECK(confirmed.error().find("the rotation was resolved") == std::string::npos);
@@ -3214,12 +3234,13 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation replay after success is a termi
         if (t.token_id != predecessor_id)
             successor_id = t.token_id;
 
-    REQUIRE(store.confirm_token_rotation(successor_id, "alice", "", "").has_value());
+    REQUIRE(store.confirm_token_rotation(successor_id, *rotated, "alice", "", "").has_value());
 
     // Replay: the successor is now the SOLE active credential for alice, and
     // it is not in the pinned rotation_group any more (kGroupEmpty) — a
     // POSITIVE fact (rotation_confirm_state.hpp), terminal Conflict.
-    auto replay = store.confirm_token_rotation(successor_id, "alice", "", "");
+    auto replay =
+        store.confirm_token_rotation(successor_id, "irrelevant-secret", "alice", "", "");
     REQUIRE_FALSE(replay.has_value());
     CHECK(replay.error().find("no rotation currently pending") != std::string::npos);
     CHECK(replay.error().find("the rotation was resolved") == std::string::npos);
@@ -4474,7 +4495,8 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation on a group with three "
             ++in_group;
     REQUIRE(in_group == 3);
 
-    auto over = store.confirm_token_rotation(successor_id, "xena", "", "");
+    auto over =
+        store.confirm_token_rotation(successor_id, "irrelevant-secret", "xena", "", "");
     REQUIRE_FALSE(over.has_value());
     CHECK(over.error().find("more than two active credentials") != std::string::npos);
     CHECK(classify_engine_store_error(over.error()) == ClsE::ClientValidation);
@@ -4882,22 +4904,37 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation error classification "
 
     // Empty successor_token_id.
     {
-        auto r = store.confirm_token_rotation("", "admin", "", "");
+        auto r = store.confirm_token_rotation("", "irrelevant-secret", "admin", "", "");
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error().find("required") != std::string::npos);
         CHECK(classify_engine_store_error(r.error()) == ClsE::ClientValidation);
     }
 
     // Empty requesting_user, against a real token so the outcome isn't
-    // confounded with a "token not found" branch.
+    // confounded with a "token not found" branch. A non-empty secret is
+    // supplied so this genuinely isolates the requesting_user guard rather
+    // than tripping the #3015 secret guard first.
+    std::string kelly_token_id;
     {
         auto t = store.create_token("Confirm-guard PAT", "kelly", now + k90Days);
         REQUIRE(t.has_value());
         auto vt = store.validate_token(*t);
         REQUIRE(vt.has_value());
-        auto r = store.confirm_token_rotation(vt->token_id, "", "", "");
+        kelly_token_id = vt->token_id;
+        auto r = store.confirm_token_rotation(vt->token_id, "irrelevant-secret", "", "", "");
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error().find("required") != std::string::npos);
+        CHECK(classify_engine_store_error(r.error()) == ClsE::ClientValidation);
+    }
+
+    // #3015: empty presented_secret, against the SAME real/owned token, a
+    // non-empty requesting_user — isolates the secret guard specifically.
+    // Distinct message ("secret required") from the requesting_user case
+    // above, but the SAME ClientValidation class / 400.
+    {
+        auto r = store.confirm_token_rotation(kelly_token_id, "", "kelly", "", "");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().find("secret required") != std::string::npos);
         CHECK(classify_engine_store_error(r.error()) == ClsE::ClientValidation);
     }
 }
@@ -4926,7 +4963,8 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation on a never-rotated solo "
     // only, never verbatim (calibration rule stated in this section's header
     // comment) — this scenario is more likely to be reworded for a "rotation
     // group" model than the generic floor/ceiling/operator-binding strings.
-    auto resolved = store.confirm_token_rotation(vt->token_id, "leo", "", "");
+    auto resolved =
+        store.confirm_token_rotation(vt->token_id, "irrelevant-secret", "leo", "", "");
     REQUIRE_FALSE(resolved.has_value());
     CHECK(classify_engine_store_error(resolved.error()) == ClsE::Conflict);
 }
@@ -4957,10 +4995,11 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation replay after success is a "
     REQUIRE_FALSE(successor_id.empty());
 
     // First confirm succeeds (the real cutover).
-    REQUIRE(store.confirm_token_rotation(successor_id, "mia", "", "").has_value());
+    REQUIRE(store.confirm_token_rotation(successor_id, *rotated, "mia", "", "").has_value());
 
     // The network-dropped-200 replay: SAME args. Terminal, not 503.
-    auto replay = store.confirm_token_rotation(successor_id, "mia", "", "");
+    auto replay =
+        store.confirm_token_rotation(successor_id, "irrelevant-secret", "mia", "", "");
     REQUIRE_FALSE(replay.has_value());
     CHECK(classify_engine_store_error(replay.error()) == ClsE::Conflict);
     CHECK(store.list_active_for_principal("mia").size() == 1); // no side effect
@@ -5001,7 +5040,8 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation rejects a stale/mismatched "
     // REAL row nina owns, currently in-rotation but holding the WRONG role
     // in the pair (predecessor, not successor) — this genuinely reaches the
     // pin-mismatch branch.
-    auto mismatch = store.confirm_token_rotation(predecessor_id, "nina", "", "");
+    auto mismatch =
+        store.confirm_token_rotation(predecessor_id, "irrelevant-secret", "nina", "", "");
     REQUIRE_FALSE(mismatch.has_value());
     CHECK(mismatch.error().find("does not match the pending rotation") != std::string::npos);
     CHECK(classify_engine_store_error(mismatch.error()) == ClsE::Conflict);
@@ -5027,8 +5067,10 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation rejects a stale/mismatched "
     auto vt_other = store.validate_token(*other_owner);
     REQUIRE(vt_other.has_value());
 
-    auto fabricated = store.confirm_token_rotation("feedfacefeedfacefeedface", "nina", "", "");
-    auto not_owned = store.confirm_token_rotation(vt_other->token_id, "nina", "", "");
+    auto fabricated = store.confirm_token_rotation("feedfacefeedfacefeedface",
+                                                    "irrelevant-secret", "nina", "", "");
+    auto not_owned =
+        store.confirm_token_rotation(vt_other->token_id, "irrelevant-secret", "nina", "", "");
     REQUIRE_FALSE(fabricated.has_value());
     REQUIRE_FALSE(not_owned.has_value());
     CHECK(fabricated.error() == not_owned.error());
@@ -5045,7 +5087,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation rejects a stale/mismatched "
     }
 
     // The correct id still confirms — the rejections above consumed nothing.
-    CHECK(store.confirm_token_rotation(successor_id, "nina", "", "").has_value());
+    CHECK(store.confirm_token_rotation(successor_id, *rotated, "nina", "", "").has_value());
 }
 
 TEST_CASE("ApiTokenStore: a blind retry carrying an EARLIER rotation's "
@@ -5083,7 +5125,7 @@ TEST_CASE("ApiTokenStore: a blind retry carrying an EARLIER rotation's "
         if (tok.supersedes_token_id == t_id)
             r1_successor_id = tok.token_id;
     REQUIRE_FALSE(r1_successor_id.empty());
-    REQUIRE(store.confirm_token_rotation(r1_successor_id, "paul", "", "").has_value());
+    REQUIRE(store.confirm_token_rotation(r1_successor_id, *r1, "paul", "", "").has_value());
 
     // R2 begins: R1's successor is now R2's predecessor.
     auto r2 = store.rotate_token(r1_successor_id, kDefaultOverlapSecs, now, "paul", "", "");
@@ -5097,7 +5139,8 @@ TEST_CASE("ApiTokenStore: a blind retry carrying an EARLIER rotation's "
 
     // THE #2384 SCENARIO, token-keyed: a blind retry of the R1 confirm (same
     // args, same operator) lands after R2 started.
-    auto stale_retry = store.confirm_token_rotation(r1_successor_id, "paul", "", "");
+    auto stale_retry =
+        store.confirm_token_rotation(r1_successor_id, *r1, "paul", "", "");
     REQUIRE_FALSE(stale_retry.has_value());
     CHECK(stale_retry.error().find("does not match the pending rotation") != std::string::npos);
     CHECK(classify_engine_store_error(stale_retry.error()) == ClsE::Conflict);
@@ -5120,7 +5163,7 @@ TEST_CASE("ApiTokenStore: a blind retry carrying an EARLIER rotation's "
     CHECK(r1_successor_still_active);
 
     // R2's own successor id confirms R2 normally.
-    CHECK(store.confirm_token_rotation(r2_successor_id, "paul", "", "").has_value());
+    CHECK(store.confirm_token_rotation(r2_successor_id, *r2, "paul", "", "").has_value());
 }
 
 TEST_CASE("ApiTokenStore: a successor id from ONE token's already-resolved "
@@ -5159,7 +5202,7 @@ TEST_CASE("ApiTokenStore: a successor id from ONE token's already-resolved "
         if (tok.supersedes_token_id == a1_id)
             a2_id = tok.token_id;
     REQUIRE_FALSE(a2_id.empty());
-    REQUIRE(store.confirm_token_rotation(a2_id, "quinn", "", "").has_value());
+    REQUIRE(store.confirm_token_rotation(a2_id, *ra, "quinn", "", "").has_value());
 
     // Lineage B: a SEPARATE token for the SAME user, rotated but NOT yet
     // confirmed — a genuinely pending, unrelated pair, and (crucially) the
@@ -5179,7 +5222,7 @@ TEST_CASE("ApiTokenStore: a successor id from ONE token's already-resolved "
 
     // A2 (lineage A's resolved-away successor id) must NOT confirm lineage
     // B's pending pair.
-    auto cross = store.confirm_token_rotation(a2_id, "quinn", "", "");
+    auto cross = store.confirm_token_rotation(a2_id, "irrelevant-secret", "quinn", "", "");
     REQUIRE_FALSE(cross.has_value());
     CHECK(classify_engine_store_error(cross.error()) == ClsE::Conflict);
 
@@ -5196,7 +5239,7 @@ TEST_CASE("ApiTokenStore: a successor id from ONE token's already-resolved "
     CHECK(b_group_active == 2);
 
     // B's own successor id still confirms B normally.
-    CHECK(store.confirm_token_rotation(b2_id, "quinn", "", "").has_value());
+    CHECK(store.confirm_token_rotation(b2_id, *rb, "quinn", "", "").has_value());
 }
 
 TEST_CASE("ApiTokenStore: confirm_token_rotation on a group already resolved "
@@ -5248,7 +5291,8 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation on a group already resolved "
     // A confirm naming the now-revoked successor id must be told the
     // rotation resolved — terminal — never the retryable "no in-flight
     // rotation" (reserved below for a genuinely empty read).
-    auto resolved = store.confirm_token_rotation(successor_id, "karen", "", "");
+    auto resolved =
+        store.confirm_token_rotation(successor_id, "irrelevant-secret", "karen", "", "");
     REQUIRE_FALSE(resolved.has_value());
     CHECK(classify_engine_store_error(resolved.error()) == ClsE::Conflict);
 }
@@ -5303,7 +5347,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation on a revoked, "
     REQUIRE(store.revoke_token(t_id).value());
     REQUIRE(store.list_active_for_principal("oscar").empty());
 
-    auto none = store.confirm_token_rotation(t_id, "oscar", "", "");
+    auto none = store.confirm_token_rotation(t_id, "irrelevant-secret", "oscar", "", "");
     REQUIRE_FALSE(none.has_value());
     CHECK(classify_engine_store_error(none.error()) == ClsE::Conflict);
 }
@@ -5365,7 +5409,8 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation on a sole credential with "
     CHECK(active[0].token_id == successor_id);
     CHECK_FALSE(active[0].rotation_group.empty()); // stale linkage survived
 
-    auto stale = store.confirm_token_rotation(successor_id, "uma", "", "");
+    auto stale =
+        store.confirm_token_rotation(successor_id, "irrelevant-secret", "uma", "", "");
     REQUIRE_FALSE(stale.has_value());
     CHECK(classify_engine_store_error(stale.error()) == ClsE::Conflict);
 
@@ -5412,7 +5457,7 @@ TEST_CASE("ApiTokenStore: a credential's historical confirmed_at survives a "
         if (!tok.supersedes_token_id.empty())
             s1_id = tok.token_id;
     REQUIRE_FALSE(s1_id.empty());
-    REQUIRE(store.confirm_token_rotation(s1_id, "vince", "", "").has_value());
+    REQUIRE(store.confirm_token_rotation(s1_id, *r1, "vince", "", "").has_value());
     auto s1_after_r1 = store.get_token(s1_id);
     REQUIRE(s1_after_r1.has_value());
     REQUIRE(s1_after_r1->has_value());
@@ -5519,13 +5564,18 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation is strictly self-service — "
             successor_id = tok.token_id;
     REQUIRE_FALSE(successor_id.empty());
 
-    auto stolen_confirm = store.confirm_token_rotation(successor_id, "mallory", "", "");
+    // #3015 oracle-freedom: mallory ALSO presents the CORRECT raw secret —
+    // ownership still wins, and the outcome does not flip to "confirmed" nor
+    // to a distinguishable "wrong secret" (PoP is checked strictly after
+    // ownership).
+    auto stolen_confirm =
+        store.confirm_token_rotation(successor_id, *rotated, "mallory", "", "");
     REQUIRE_FALSE(stolen_confirm.has_value());
     for (const auto& tok : store.list_active_for_principal("bob-owner"))
         CHECK(tok.confirmed_at == 0); // both credentials unchanged
 
     // The owner's own confirm (a fresh call — "second session") still works.
-    CHECK(store.confirm_token_rotation(successor_id, "bob-owner", "", "").has_value());
+    CHECK(store.confirm_token_rotation(successor_id, *rotated, "bob-owner", "", "").has_value());
 }
 
 // ── Item 7b: absence of a token_id enumeration oracle ──────────────────
@@ -5651,9 +5701,10 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation rejects a nonexistent "
             sam_successor_id = tok.token_id;
     REQUIRE_FALSE(sam_successor_id.empty());
 
-    auto against_nonexistent =
-        store.confirm_token_rotation("2222222222222222deadbeef", "attacker", "", "");
-    auto against_real_pending = store.confirm_token_rotation(sam_successor_id, "attacker", "", "");
+    auto against_nonexistent = store.confirm_token_rotation(
+        "2222222222222222deadbeef", "irrelevant-secret", "attacker", "", "");
+    auto against_real_pending =
+        store.confirm_token_rotation(sam_successor_id, "irrelevant-secret", "attacker", "", "");
 
     REQUIRE_FALSE(against_nonexistent.has_value());
     REQUIRE_FALSE(against_real_pending.has_value());
@@ -5697,12 +5748,13 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation rejects a nonexistent "
             tara_successor_id = tok.token_id;
     REQUIRE_FALSE(tara_successor_id.empty());
     // The confirm revokes the predecessor.
-    REQUIRE(store.confirm_token_rotation(tara_successor_id, "tara-resolved", "", "").has_value());
+    REQUIRE(store.confirm_token_rotation(tara_successor_id, *rotated, "tara-resolved", "", "")
+                .has_value());
 
-    auto against_nonexistent =
-        store.confirm_token_rotation("3333333333333333deadbeef", "attacker", "", "");
-    auto against_revoked_predecessor =
-        store.confirm_token_rotation(tara_predecessor_id, "attacker", "", "");
+    auto against_nonexistent = store.confirm_token_rotation(
+        "3333333333333333deadbeef", "irrelevant-secret", "attacker", "", "");
+    auto against_revoked_predecessor = store.confirm_token_rotation(
+        tara_predecessor_id, "irrelevant-secret", "attacker", "", "");
 
     REQUIRE_FALSE(against_nonexistent.has_value());
     REQUIRE_FALSE(against_revoked_predecessor.has_value());
@@ -5750,13 +5802,289 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation cuts the revoked "
             successor_id = tok.token_id;
     REQUIRE_FALSE(successor_id.empty());
 
-    REQUIRE(store.confirm_token_rotation(successor_id, "judy-cache", "", "").has_value());
+    REQUIRE(
+        store.confirm_token_rotation(successor_id, *rotated, "judy-cache", "", "").has_value());
 
     // The predecessor's raw token must be rejected NOW, not up to 60s from
     // now — proving the cache entry populated above was actually evicted,
     // not merely left to expire on its own TTL.
     auto post = store.validate_token(*predecessor_raw);
     CHECK_FALSE(post.has_value());
+}
+
+// ── #3015: confirm rotation proof-of-possession ─────────────────────────────
+
+TEST_CASE("ApiTokenStore: confirm_token_rotation with the WRONG secret gets a distinct "
+          "'rotation secret mismatch' outcome, never the not-found wording (#3015, human arm)",
+          "[pg][token][rotation][human][confirm][pop]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    using yuzu::server::detail::classify_engine_store_error;
+    using E = yuzu::server::detail::EngineStoreErrorClass;
+
+    auto now = test_now_epoch();
+    auto t = store.create_token("PoP PAT", "wendy", now + k90Days);
+    REQUIRE(t.has_value());
+    auto vt = store.validate_token(*t);
+    REQUIRE(vt.has_value());
+    const std::string predecessor_id = vt->token_id;
+
+    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "wendy", "", "");
+    REQUIRE(rotated.has_value());
+    std::string successor_id;
+    for (const auto& tok : store.list_active_for_principal("wendy"))
+        if (tok.supersedes_token_id == predecessor_id)
+            successor_id = tok.token_id;
+    REQUIRE_FALSE(successor_id.empty());
+
+    // Wrong secret, but every OTHER admission gate (ownership, pair-state,
+    // token_id pin, initiator) passes — reachable ONLY because of that.
+    auto wrong = store.confirm_token_rotation(successor_id, "not-the-real-secret", "wendy", "",
+                                              "");
+    REQUIRE_FALSE(wrong.has_value());
+    CHECK(wrong.error().find("rotation secret mismatch") != std::string::npos);
+    CHECK(classify_engine_store_error(wrong.error()) == E::SecretMismatch);
+    // Distinct from the not-found/ownership-failure wording (e.g. a bogus
+    // token_id) — never conflated into the same outcome.
+    CHECK(wrong.error() != "no such token to confirm");
+
+    // No mutation: neither credential touched by the rejected attempt.
+    auto active = store.list_active_for_principal("wendy");
+    REQUIRE(active.size() == 2);
+    for (const auto& tok : active)
+        CHECK(tok.confirmed_at == 0);
+
+    // The correct secret still confirms afterward — the wrong attempt
+    // consumed nothing.
+    CHECK(store.confirm_token_rotation(successor_id, *rotated, "wendy", "", "").has_value());
+}
+
+TEST_CASE("ApiTokenStore: confirm_rotation with the WRONG secret gets a distinct "
+          "'rotation secret mismatch' outcome, never the initiator-binding wording "
+          "(#3015, engine arm)",
+          "[pg][token][rotation][confirm][pop]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    using yuzu::server::detail::classify_engine_store_error;
+    using E = yuzu::server::detail::EngineStoreErrorClass;
+
+    const std::string principal = "engine:rotation-pop-mismatch";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    auto rotated = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(rotated.has_value());
+    std::string successor_id;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (!t.supersedes_token_id.empty())
+            successor_id = t.token_id;
+    REQUIRE_FALSE(successor_id.empty());
+
+    auto wrong = store.confirm_rotation(principal, successor_id, "not-the-real-secret", "admin");
+    REQUIRE_FALSE(wrong.has_value());
+    CHECK(wrong.error().find("rotation secret mismatch") != std::string::npos);
+    CHECK(classify_engine_store_error(wrong.error()) == E::SecretMismatch);
+    CHECK(wrong.error().find("different operator") == std::string::npos);
+
+    auto active = store.list_active_for_principal(principal);
+    REQUIRE(active.size() == 2);
+    for (const auto& t : active)
+        CHECK(t.confirmed_at == 0);
+
+    CHECK(store.confirm_rotation(principal, successor_id, *rotated, "admin").has_value());
+}
+
+TEST_CASE("ApiTokenStore: a non-initiator presenting the CORRECT secret still gets the "
+          "SAME non-disclosing outcome as a wrong operator with no secret at all — "
+          "no cross-admin secret oracle (#3015, engine arm)",
+          "[pg][token][rotation][confirm][pop][oracle]") {
+    // The specific defect the PoP-checked-LAST ordering exists to close: if
+    // PoP ran before the initiator-binding check, a non-initiator admin who
+    // happened to also know (or guess) the correct secret could distinguish
+    // "wrong secret" from "valid secret, not your rotation" — a live oracle
+    // over WHO initiated a given rotation. With PoP last, both variants below
+    // must produce the IDENTICAL "different operator" outcome.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-pop-oracle";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    auto rotated = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(rotated.has_value());
+    std::string successor_id;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (!t.supersedes_token_id.empty())
+            successor_id = t.token_id;
+    REQUIRE_FALSE(successor_id.empty());
+
+    // Non-initiator "mallory" presenting the CORRECT secret.
+    auto with_correct_secret =
+        store.confirm_rotation(principal, successor_id, *rotated, "mallory");
+    // Non-initiator "mallory" presenting a WRONG secret.
+    auto with_wrong_secret =
+        store.confirm_rotation(principal, successor_id, "not-the-real-secret", "mallory");
+
+    REQUIRE_FALSE(with_correct_secret.has_value());
+    REQUIRE_FALSE(with_wrong_secret.has_value());
+    // Byte-identical outcome regardless of secret correctness — never
+    // "confirmed" and never the distinguishable "rotation secret mismatch".
+    CHECK(with_correct_secret.error() == with_wrong_secret.error());
+    CHECK(with_correct_secret.error().find("different operator") != std::string::npos);
+    CHECK(with_correct_secret.error().find("rotation secret mismatch") == std::string::npos);
+
+    // Nothing mutated by either attempt, and the real initiator can still
+    // confirm afterward with the real secret.
+    auto active = store.list_active_for_principal(principal);
+    REQUIRE(active.size() == 2);
+    for (const auto& t : active)
+        CHECK(t.confirmed_at == 0);
+    CHECK(store.confirm_rotation(principal, successor_id, *rotated, "admin").has_value());
+}
+
+TEST_CASE("ApiTokenStore: confirm_token_rotation with a missing/empty secret is a "
+          "distinct 400-class validation error (#3015, human arm)",
+          "[pg][token][rotation][human][confirm][pop]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    using yuzu::server::detail::classify_engine_store_error;
+    using E = yuzu::server::detail::EngineStoreErrorClass;
+
+    auto now = test_now_epoch();
+    auto t = store.create_token("Empty-secret PAT", "xander", now + k90Days);
+    REQUIRE(t.has_value());
+    auto vt = store.validate_token(*t);
+    REQUIRE(vt.has_value());
+    const std::string predecessor_id = vt->token_id;
+
+    auto rotated =
+        store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "xander", "", "");
+    REQUIRE(rotated.has_value());
+    std::string successor_id;
+    for (const auto& tok : store.list_active_for_principal("xander"))
+        if (tok.supersedes_token_id == predecessor_id)
+            successor_id = tok.token_id;
+    REQUIRE_FALSE(successor_id.empty());
+
+    auto missing = store.confirm_token_rotation(successor_id, "", "xander", "", "");
+    REQUIRE_FALSE(missing.has_value());
+    CHECK(missing.error() == "secret required");
+    CHECK(classify_engine_store_error(missing.error()) == E::ClientValidation);
+
+    // No mutation, and the real secret still confirms afterward.
+    auto active = store.list_active_for_principal("xander");
+    REQUIRE(active.size() == 2);
+    CHECK(store.confirm_token_rotation(successor_id, *rotated, "xander", "", "").has_value());
+}
+
+TEST_CASE("ApiTokenStore: confirm_token_rotation with the correct secret succeeds after "
+          "a process restart — durable rotation_initiator + PoP, no RAM dependency "
+          "(#3015, human arm)",
+          "[pg][token][rotation][human][confirm][pop][restart]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+
+    std::string successor_id;
+    std::string raw_secret;
+    {
+        ApiTokenStore store{pool};
+        REQUIRE(store.is_open());
+        auto now = test_now_epoch();
+        auto t = store.create_token("Restart PAT", "yara", now + k90Days);
+        REQUIRE(t.has_value());
+        auto vt = store.validate_token(*t);
+        REQUIRE(vt.has_value());
+        const std::string predecessor_id = vt->token_id;
+
+        auto rotated =
+            store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "yara", "", "");
+        REQUIRE(rotated.has_value());
+        raw_secret = *rotated;
+        for (const auto& tok : store.list_active_for_principal("yara"))
+            if (tok.supersedes_token_id == predecessor_id)
+                successor_id = tok.token_id;
+        REQUIRE_FALSE(successor_id.empty());
+        // `store` (and its RAM-only rotation_grace_cache_/token_cache_) goes
+        // out of scope here — the "restart".
+    }
+
+    // A FRESH store instance against the SAME database — its RAM caches
+    // start genuinely empty, so any confirm success below is driven entirely
+    // by DURABLE state (the rotation_initiator column + the persisted
+    // token_hash PoP reads), never by anything cached in the prior
+    // instance's RAM.
+    ApiTokenStore restarted{pool};
+    REQUIRE(restarted.is_open());
+    CHECK(restarted.rotation_grace_cache_size() == 0);
+
+    auto confirmed =
+        restarted.confirm_token_rotation(successor_id, raw_secret, "yara", "", "");
+    REQUIRE(confirmed.has_value());
+    auto active = restarted.list_active_for_principal("yara");
+    REQUIRE(active.size() == 1);
+    CHECK(active[0].token_id == successor_id);
+}
+
+TEST_CASE("ApiTokenStore: revoke_for_principal scrubs the RAM-only rotation grace-cache "
+          "entry — a re-serve no longer returns the secret after every credential is "
+          "revoked (#2961 residual A)",
+          "[pg][token][rotation][human][revoke][pop]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto now = test_now_epoch();
+    auto t = store.create_token("Grace-scrub PAT", "zack", now + k90Days);
+    REQUIRE(t.has_value());
+    auto vt = store.validate_token(*t);
+    REQUIRE(vt.has_value());
+    const std::string predecessor_id = vt->token_id;
+
+    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "zack", "", "");
+    REQUIRE(rotated.has_value());
+
+    // The mint above populated the RAM-only grace cache for this rotation's
+    // group — confirm that ahead of the assertion this test exists for.
+    REQUIRE(store.rotation_grace_cache_size() > 0);
+    // And a same-operator re-serve within the grace window really does
+    // return the cached raw secret right now (the behaviour this test does
+    // NOT touch — #2961 residual B stays intact).
+    auto reserve_before =
+        store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "zack", "", "");
+    REQUIRE(reserve_before.has_value());
+    CHECK(*reserve_before == *rotated);
+
+    // "Sign out everywhere" — revokes every active credential for zack,
+    // which is BOTH sides of the in-flight pair.
+    auto revoked = store.revoke_for_principal("zack");
+    REQUIRE(revoked.has_value());
+    CHECK(*revoked == 2);
+
+    // The grace-cache entry for this rotation's group is gone — scrubbed,
+    // not merely orphaned — so nothing in this store's RAM can re-serve the
+    // secret past this point.
+    CHECK(store.rotation_grace_cache_size() == 0);
+
+    // Both credentials are genuinely revoked at the DB too.
+    auto after = store.list_active_for_principal("zack");
+    CHECK(after.empty());
 }
 
 // ── #2964 round 3 review finding 6/7: SweepResult::failed_pairs coverage ────

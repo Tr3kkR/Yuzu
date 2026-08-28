@@ -734,11 +734,20 @@ ManagementGroupStore::get_group_roles(const std::string& group_id) const {
 std::expected<std::vector<GroupRoleAssignment>, std::string>
 ManagementGroupStore::get_assignments_for_principal(
     const std::string& user, const std::vector<std::string>& rbac_groups) const {
-    if (!open_)
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonStoreClosed, sampler))
+            spdlog::warn("ManagementGroupStore::get_assignments_for_principal: store not open — DENY");
         return std::unexpected("management group store not open");
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn(
+                "ManagementGroupStore::get_assignments_for_principal: pool acquire timed out — DENY");
         return std::unexpected("management group store: pool acquire timed out");
+    }
 
     // (principal_type='user' AND principal_id=$1) OR
     // (principal_type='group' AND principal_id IN ($2,$3,...))
@@ -756,8 +765,13 @@ ManagementGroupStore::get_assignments_for_principal(
     }
 
     pg::PgResult r = pg::exec_params(lease.get(), sql.c_str(), params);
-    if (r.status() != PGRES_TUPLES_OK)
+    if (r.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("ManagementGroupStore::get_assignments_for_principal: query failed: {} — DENY",
+                         PQerrorMessage(lease.get()));
         return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
+    }
     std::vector<GroupRoleAssignment> result;
     for (int i = 0; i < PQntuples(r.get()); ++i) {
         GroupRoleAssignment a;
@@ -775,11 +789,20 @@ ManagementGroupStore::get_member_agents_in_subtrees(
     const std::vector<std::string>& seed_groups) const {
     if (seed_groups.empty())
         return std::vector<std::string>{}; // no seeds → empty (no query)
-    if (!open_)
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonStoreClosed, sampler))
+            spdlog::warn("ManagementGroupStore::get_member_agents_in_subtrees: store not open — DENY");
         return std::unexpected("management group store not open");
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn(
+                "ManagementGroupStore::get_member_agents_in_subtrees: pool acquire timed out — DENY");
         return std::unexpected("management group store: pool acquire timed out");
+    }
 
     // Recursive CTE: seeds ∪ descendants (depth bound → cycle-safe), joined to
     // members. One query (INV-10), descendant-ward (INV-4). The depth bound
@@ -806,8 +829,13 @@ ManagementGroupStore::get_member_agents_in_subtrees(
         ") SELECT DISTINCT m.agent_id FROM management_group_store.management_group_members m"
         "  JOIN subtree ON m.group_id = subtree.id";
     pg::PgResult r = pg::exec_params(lease.get(), sql.c_str(), params);
-    if (r.status() != PGRES_TUPLES_OK)
+    if (r.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("ManagementGroupStore::get_member_agents_in_subtrees: query failed: {} — DENY",
+                         PQerrorMessage(lease.get()));
         return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
+    }
     std::vector<std::string> result;
     for (int i = 0; i < PQntuples(r.get()); ++i)
         result.push_back(text_col(r.get(), i, 0));
@@ -1015,6 +1043,40 @@ bool ManagementGroupStore::migrate_from_sqlite(const std::filesystem::path& lega
         return false;
     }
     sqlite3_exec(legacy.get(), "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
+
+    // A deferred transaction fixes ONE consistent snapshot for the corruption
+    // probe, the table-existence probe, and all three reads below (PR #3174's
+    // software_deployment_store.cpp fix is the precedent for this exact
+    // hazard, itself following custom_properties_store.cpp's
+    // read_legacy_snapshot): without it, this connection's default autocommit
+    // mode makes each probe/read its own independent transaction, so a legacy
+    // file still being written by another process mid-backfill can interleave
+    // a write between them, producing a torn cross-table read. The blast
+    // radius depends on WHICH write tears across the read: a group being
+    // deleted/renamed leaves a member/role row referencing a group_id the
+    // groups-read never captured -- the non-deferrable Postgres FK on
+    // management_group_members.group_id / management_group_roles.group_id
+    // catches that at INSERT time and aborts the whole backfill (fail-closed,
+    // but NONDETERMINISTICALLY without this transaction -- an operator
+    // hitting the race sees a spurious boot failure and must retry). A
+    // member moved between two groups that BOTH continue to exist is the
+    // more dangerous case: every FK stays satisfied (both group_ids remain
+    // valid references) yet the migrated snapshot never corresponds to any
+    // single moment the legacy file was actually in -- a silent, FK-invisible
+    // inconsistency, not merely a spurious refusal. This transaction closes
+    // both classes by construction, not just the FK-visible one. `BEGIN`
+    // (not `BEGIN IMMEDIATE`) is sufficient: this connection is
+    // SQLITE_OPEN_READONLY, so there is nothing for it to write that a
+    // reserved lock would need to protect. (#3210)
+    if (sqlite3_exec(legacy.get(), "BEGIN", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        spdlog::error("ManagementGroupStore: backfill: failed to start a snapshot transaction on "
+                      "legacy {}: {}",
+                      legacy_db_path.string(), sqlite3_errmsg(legacy.get()));
+        backfill_metric("failed");
+        return false;
+    }
+    SqliteTxn legacy_txn(legacy.get());
+
     // Corruption probe: an unreadable legacy DB must NOT be silently skipped
     // (that would drop every operator's confinement scope → fail-open).
     {
@@ -1109,6 +1171,18 @@ bool ManagementGroupStore::migrate_from_sqlite(const std::filesystem::path& lega
     if (!read_ok) {
         spdlog::error("ManagementGroupStore: backfill: legacy read failed: {}",
                       sqlite3_errmsg(legacy.get()));
+        backfill_metric("failed");
+        return false;
+    }
+    // Every prior early return in this scope leaves legacy_txn uncommitted, so
+    // its destructor ROLLBACKs (harmless — SQLITE_OPEN_READONLY, nothing
+    // written). Reaching here means the probes + reads all shared one
+    // consistent snapshot; commit closes it cleanly before `legacy` itself
+    // closes at end of scope.
+    if (legacy_txn.commit() != SQLITE_OK) {
+        spdlog::error("ManagementGroupStore: backfill: failed to close the snapshot transaction "
+                      "on legacy {}: {}",
+                      legacy_db_path.string(), sqlite3_errmsg(legacy.get()));
         backfill_metric("failed");
         return false;
     }

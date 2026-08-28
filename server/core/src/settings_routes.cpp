@@ -416,8 +416,8 @@ std::string SettingsRoutes::render_tls_fragment() {
 
     // Insecure-skip-client-verify (one-way TLS) — color red when enabled to flag the
     // weakened posture in the operator dashboard, not just the warm-orange "warning" hue.
-    std::string owt_color = cfg_->allow_one_way_tls ? "#f85149" : "#8b949e";
-    std::string owt_text = cfg_->allow_one_way_tls
+    std::string owt_color = cfg_->insecure_skip_client_verify ? "#f85149" : "#8b949e";
+    std::string owt_text = cfg_->insecure_skip_client_verify
                                ? "Client cert verification DISABLED (--insecure-skip-client-verify)"
                                : "Disabled (mTLS enforced)";
     html += "<div class=\"form-row\" style=\"margin-top:0.75rem\">"
@@ -1882,8 +1882,33 @@ std::string SettingsRoutes::render_tag_compliance_fragment() {
             "<th>Allowed Values</th>"
             "</tr></thead><tbody>";
 
-    auto gaps = tag_store_ ? tag_store_->get_compliance_gaps()
-                           : std::vector<std::pair<std::string, std::vector<std::string>>>{};
+    // Two bulk reads (ADR-0050 — the pre-migration version issued up to nine
+    // queries per render: gaps + agents_with_tag per category twice over).
+    // Dashboard render caller: a degraded read returns an explicit error
+    // fragment rather than silently rendering "0 tagged / 0 missing" as if
+    // the fleet were compliant.
+    std::vector<std::pair<std::string, std::vector<std::string>>> gaps;
+    std::unordered_map<std::string, int> tagged_count;
+    size_t total_agents = 0;
+    if (tag_store_) {
+        auto gaps_res = tag_store_->get_compliance_gaps();
+        auto values_res = tag_store_->get_values_for_keys(
+            std::vector<std::string>(std::begin(kCategoryKeys), std::end(kCategoryKeys)));
+        if (!gaps_res || !values_res) {
+            return "<div style=\"color:#f85149\">Tag store unavailable — tag-compliance data "
+                   "cannot be read right now.</div>";
+        }
+        gaps = std::move(*gaps_res);
+        std::unordered_set<std::string> seen;
+        for (const auto& [aid, m] : gaps)
+            seen.insert(aid);
+        for (const auto& [aid, keys] : *values_res) {
+            seen.insert(aid);
+            for (const auto& [k, v] : keys)
+                tagged_count[k]++;
+        }
+        total_agents = seen.size();
+    }
 
     std::unordered_map<std::string, int> missing_count;
     for (const auto& [agent_id, missing] : gaps) {
@@ -1891,24 +1916,9 @@ std::string SettingsRoutes::render_tag_compliance_fragment() {
             missing_count[k]++;
     }
 
-    size_t total_agents = 0;
-    if (tag_store_) {
-        std::unordered_set<std::string> seen;
-        for (const auto& [aid, m] : gaps)
-            seen.insert(aid);
-        for (auto cat_key : kCategoryKeys) {
-            auto agents = tag_store_->agents_with_tag(std::string(cat_key));
-            for (const auto& a : agents)
-                seen.insert(a);
-        }
-        total_agents = seen.size();
-    }
-
     for (const auto& cat : categories) {
         std::string key_str(cat.key);
-        int tagged = 0;
-        if (tag_store_)
-            tagged = static_cast<int>(tag_store_->agents_with_tag(key_str).size());
+        int tagged = tagged_count.count(key_str) ? tagged_count[key_str] : 0;
         int missing = missing_count.count(key_str) ? missing_count[key_str] : 0;
 
         std::string vals_str;

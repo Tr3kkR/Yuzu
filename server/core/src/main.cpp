@@ -21,10 +21,15 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
+#ifndef _WIN32
+#include <yuzu/shutdown_watcher.hpp> // POSIX self-pipe + watcher thread (#3007, mirrors the agent)
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
+#include <mutex>
 
 #ifdef _WIN32
 // clang-format off
@@ -50,18 +55,121 @@
 
 static std::atomic<yuzu::server::Server*> g_server{nullptr};
 
+// Read FROM A SIGNAL HANDLER. Only a lock-free atomic is legal there ([support.signal]) —
+// a non-lock-free one takes an internal spinlock, and a handler interrupting a thread that
+// holds it deadlocks the process. Mirrors agents/core/src/main.cpp's g_agent.
+static_assert(std::atomic<yuzu::server::Server*>::is_always_lock_free);
+
+#ifdef _WIN32
+/// WINDOWS ONLY. Serialises the console handler's `g_server->stop()` against main()'s
+/// unpublish-and-destroy, so the Server cannot be destroyed while a stop() is still running
+/// on it. Taken ONLY inside the `#ifdef _WIN32` branch of on_signal, where the CRT has
+/// already handed us an ordinary thread, so locking is legal — never on the POSIX path,
+/// where the self-pipe below gets this same barrier for free from ~ShutdownWatcher's
+/// join(). Mirrors agents/core/src/main.cpp's g_agent_mu (#1822 / Gate-8 round 8 UP8-1).
+/// There is no Windows SCM service path for the server today (unlike the agent's
+/// service_win.cpp), so the console handler is the only Windows caller of stop().
+static std::mutex g_server_mu;
+#endif
+
+/// Signals seen. The SECOND one escalates — see on_signal. Deliberately not under
+/// `#ifndef _WIN32`: escalation must exist on both platforms and must run BEFORE any lock
+/// (agents/core/src/main.cpp, Gate-8 round 9) — a wedged stop() parks the watcher thread
+/// (POSIX) or holds g_server_mu across s->stop() (Windows) indefinitely, so a second
+/// signal must be able to act regardless of which side is stuck.
+static std::atomic<int> g_signal_count{0};
+static_assert(std::atomic<int>::is_always_lock_free);
+
+#ifndef _WIN32
+/// Write end of the shutdown self-pipe. The handler's ONLY job is to poke this.
+static std::atomic<int> g_shutdown_wfd{-1};
+static_assert(std::atomic<int>::is_always_lock_free);
+#endif
+
+/// LAST-RESORT HANDLER — used before the shutdown watcher exists (the boot window ahead
+/// of Server::create(), which is not the trivial construction the agent's make_agent() is:
+/// TLS cert bootstrap, the gateway mTLS client, and the full gRPC BuildAndStart() can run
+/// for a real interval), if the watcher failed to construct or died, and after run()
+/// returns (see the "handlers must not outlive what serves them" comment below). It does
+/// not try to be graceful — there is nothing to run a graceful teardown, or nothing left
+/// worth waiting on — it only guarantees the process stays KILLABLE, including as PID 1 in
+/// a container, where the kernel discards a default-disposition signal entirely.
+/// Async-signal-safe: no locks, no stdio, no spdlog (which allocates and RETHROWS non-std
+/// exceptions — a throw here has no enclosing handler and std::terminate()s WITHOUT
+/// unwinding). Body is a deliberate 2-line duplicate of agents/core/src/hard_exit.hpp's
+/// hard_exit(), not a reuse — that header lives under agents/core/src, outside the server's
+/// include graph (server/core/meson.build only exposes include/ + ../../common/include),
+/// and pulling it in for a two-line function isn't worth the cross-binary header dependency.
+/// If a THIRD call site ever needs this, hoist it to common/include/yuzu/ alongside
+/// shutdown_watcher.hpp instead of adding a fourth copy. See that header anyway for why
+/// TerminateProcess, not ::_exit(), on Windows (no DllMain, no loader lock) and ::_exit(),
+/// not std::exit(), on POSIX (async-signal-safe, cannot block) — the rationale, not the code.
+static void on_signal_hard_exit(int sig) noexcept {
+    (void)sig;
+#ifdef _WIN32
+    ::TerminateProcess(::GetCurrentProcess(), 1);
+#else
+    ::_exit(1);
+#endif
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// SIGNAL HANDLING — the handler must do NOTHING but poke a pipe (#3007). Ported from
+// agents/core/src/main.cpp, which already fixed this exact defect for the agent daemon.
+// This used to call `s->stop()` directly, under a comment claiming "only async-signal-safe
+// calls allowed here" — ServerImpl::stop() is nothing of the sort: it takes mutexes across
+// ~60 stores, joins ~8 background threads, calls grpc::Server::Shutdown(), and logs
+// through spdlog — undefined behaviour inside a signal handler per signal-safety(7).
+// Reproduced empirically: SIGABRT "dying due to potential deadlock" from abseil's
+// DebugOnlyDeadlockCheck during grpc::Server::ShutdownInternal() while the main thread was
+// blocked in Wait(); the detector is compiled out under NDEBUG, so a release build is
+// expected to hit the identical interleaving as a silent, probabilistic hang instead — that
+// specific claim is inference from the mechanism (#3007), not separately observed on a
+// release binary.
+//
+// See agents/core/src/main.cpp's on_signal for the full trap list this dodges — the
+// mechanism (common/include/yuzu/shutdown_watcher.hpp) is now shared verbatim between the
+// two binaries. Windows keeps the direct call: the CRT dispatches console/CTRL signals on
+// a freshly created thread, so it is already an ordinary thread context, and there is no
+// SCM control path for the server to share it with (unlike the agent's service_win.cpp).
+// ─────────────────────────────────────────────────────────────────────────────────
 static void on_signal(int sig) {
-    // Only async-signal-safe calls allowed here.
-    // write() to stderr instead of spdlog (which allocates and locks).
+    // A process-directed signal lands on an ARBITRARY unmasked thread. Every write()
+    // below can set errno (the O_NONBLOCK write end is *expected* to return EAGAIN), so
+    // clobbering it here would silently rewrite an unrelated thread's error.
+    const int saved_errno = errno;
     const char msg[] = "Received signal, shutting down...\n";
+    (void)sig;
+
+    // Second signal => escalate, both platforms, BEFORE any lock. See
+    // agents/core/src/main.cpp's on_signal for the full rationale (Gate-8 round 9).
+    if (g_signal_count.fetch_add(1, std::memory_order_acq_rel) >= 1) {
+        on_signal_hard_exit(sig);
+    }
+
 #ifdef _WIN32
     _write(2, msg, sizeof(msg) - 1);
+    // Hold g_server_mu ACROSS s->stop(), not merely across the load — main() takes the
+    // same mutex to unpublish, so it blocks until an in-flight stop() has returned
+    // before destroying the Server. See agents/core/src/main.cpp's on_signal, Gate-8
+    // round 8 UP8-1.
+    {
+        std::lock_guard<std::mutex> lock(g_server_mu);
+        if (auto* s = g_server.load(std::memory_order_acquire))
+            s->stop();
+    }
 #else
-    (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    // The pipe byte goes first — it cannot block (the write end is O_NONBLOCK). The
+    // stderr log is best-effort and comes after: see shutdown_watcher.hpp.
+    const int wfd = g_shutdown_wfd.load(std::memory_order_acquire);
+    if (wfd >= 0) {
+        const char byte = yuzu::ShutdownWatcher::kSignal;
+        ssize_t n = ::write(wfd, &byte, 1); // async-signal-safe, and CANNOT block
+        (void)n; // EAGAIN on a full pipe just means a shutdown is already pending.
+    }
+    (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1); // best-effort; may block, harmlessly
 #endif
-    (void)sig;
-    if (auto* s = g_server.load(std::memory_order_acquire))
-        s->stop();
+    errno = saved_errno;
 }
 
 // Resolve the real OS account running this process for break-glass audit
@@ -287,16 +395,16 @@ int main(int argc, char* argv[]) {
         ->envname("YUZU_CERT_GROUP");
     app.add_option("--ca-cert", cfg.tls_ca_cert, "PEM CA cert (for mTLS agent verification)")
         ->envname("YUZU_CA_CERT");
-    bool deprecated_allow_one_way_tls_flag = false;
+    bool deprecated_tls_flag_used = false;
     app.add_flag("--insecure-skip-client-verify",
                  "Allow TLS without --ca-cert (disables mTLS client verification). "
                  "Requires YUZU_ALLOW_INSECURE_TLS=1.")
-        ->each([&cfg](const std::string&) { cfg.allow_one_way_tls = true; });
+        ->each([&cfg](const std::string&) { cfg.insecure_skip_client_verify = true; });
     app.add_flag("--allow-one-way-tls", "[DEPRECATED] Renamed to --insecure-skip-client-verify; "
                                         "still accepted for backward compatibility.")
-        ->each([&cfg, &deprecated_allow_one_way_tls_flag](const std::string&) {
-            cfg.allow_one_way_tls = true;
-            deprecated_allow_one_way_tls_flag = true;
+        ->each([&cfg, &deprecated_tls_flag_used](const std::string&) {
+            cfg.insecure_skip_client_verify = true;
+            deprecated_tls_flag_used = true;
         });
     app.add_option("--management-cert", cfg.mgmt_tls_server_cert,
                    "PEM management server certificate override");
@@ -773,10 +881,15 @@ int main(int argc, char* argv[]) {
         ->each([&cfg](const std::string&) { cfg.analytics_enabled = false; });
     app.add_option("--analytics-drain-interval", cfg.analytics_drain_interval_seconds,
                    "Analytics drain interval in seconds (default: 10)")
-        ->default_val(10);
+        ->default_val(10)
+        // governance Gate 3 sre finding, 2026-08-16: an interval <= 0 makes
+        // run_drain()'s inner sleep loop execute zero iterations, busy-
+        // spinning claim transactions against the shared pool with no delay.
+        ->check(CLI::PositiveNumber);
     app.add_option("--analytics-batch-size", cfg.analytics_batch_size,
                    "Analytics drain batch size (default: 100)")
-        ->default_val(100);
+        ->default_val(100)
+        ->check(CLI::PositiveNumber);
     app.add_option("--analytics-jsonl", cfg.analytics_jsonl_path,
                    "Path for JSON Lines analytics output file")
         ->envname("YUZU_ANALYTICS_JSONL");
@@ -1070,11 +1183,11 @@ int main(int argc, char* argv[]) {
     // an explicit environment variable, so that no single misconfiguration
     // (typo, copy-pasted command, leaked CLI history) can silently downgrade
     // the agent listener from mTLS to one-way TLS.
-    if (deprecated_allow_one_way_tls_flag) {
+    if (deprecated_tls_flag_used) {
         spdlog::warn("--allow-one-way-tls is deprecated; use --insecure-skip-client-verify "
                      "instead (this flag will be removed in a future release).");
     }
-    if (cfg.allow_one_way_tls && cfg.tls_enabled) {
+    if (cfg.insecure_skip_client_verify && cfg.tls_enabled) {
         if (!yuzu::server::security::insecure_tls_env_authorized()) {
             spdlog::error("--insecure-skip-client-verify requires YUZU_ALLOW_INSECURE_TLS=1 "
                           "in the environment as a second confirmation. Refusing to start.");
@@ -1622,13 +1735,149 @@ int main(int argc, char* argv[]) {
     auth_key_provider.reset();
     auth_pg_pool.reset();
 
-    std::signal(SIGINT, on_signal);
-    std::signal(SIGTERM, on_signal);
+    // #3007: installed BEFORE Server::create(), not deferred to right-before-publish
+    // the way the agent's make_agent() registration is. Server::create() is not the
+    // agent's trivial construction — TLS cert bootstrap, the gateway mTLS client, and
+    // the full gRPC BuildAndStart() can run for a real interval — and the server ships
+    // as PID 1 in every published container image, where a default disposition is
+    // discarded by the kernel. Nothing can be served gracefully yet, so a signal here
+    // should make the process LEAVE rather than hang: this replaces the old behaviour
+    // (silently swallowed, because g_server was still null and on_signal no-ops) with
+    // something strictly better (killable), at the honest cost of losing the
+    // graceful-attempt illusion the old code never actually delivered on this window
+    // anyway. Upgraded to the real handler once the watcher is live and g_server is
+    // published, below.
+    std::signal(SIGINT, on_signal_hard_exit);
+    std::signal(SIGTERM, on_signal_hard_exit);
 
     try {
-        auto server = yuzu::server::Server::create(std::move(cfg), auth_mgr);
+        auto server = yuzu::server::Server::create(std::move(cfg), auth_mgr); // 1st: destroyed LAST
+
+#ifndef _WIN32
+        // RAII, and DECLARATION ORDER IS LOAD-BEARING: declared AFTER `server`, so
+        // reverse-order destruction destroys the watcher FIRST — joining its thread,
+        // which runs any in-flight stop() to completion — before the Server it calls
+        // stop() on is destroyed. This is also half of the #3007 addendum fix: the old
+        // stop_entered_ CAS let a losing caller (~ServerImpl, reached via `server`'s own
+        // destructor below) return immediately while another thread was still
+        // mid-teardown; ~ShutdownWatcher's join() now makes main WAIT for that teardown
+        // to finish before ~ServerImpl even runs, so ServerImpl::stop()'s own completion
+        // barrier (server.cpp) never has to arbitrate a live race on this path — only
+        // the redundant, sequential, same-thread re-entry from run()'s
+        // startup_failed_ early return.
+        //
+        // CONSTRUCTED INSIDE A TRY. ShutdownWatcher's constructor body firewalls
+        // std::thread's ctor itself (catches std::system_error under EAGAIN internally,
+        // calls degrade(), never rethrows) — so this try is NOT for that. It's for
+        // `state_{std::make_shared<WatcherState>(...)}` in the ctor's mem-init-list,
+        // which runs BEFORE the body's try block and so is NOT firewalled: a bad_alloc
+        // there escapes to here. (#3007 governance cpp-expert LOW — corrected from an
+        // earlier version of this comment that misattributed the throw source.) Either
+        // way: if it throws, the hard-exit handler installed above is simply left in
+        // place.
+        std::optional<yuzu::ShutdownWatcher> shutdown_watcher;
+        try {
+            shutdown_watcher.emplace(
+                g_shutdown_wfd,
+                [] {
+                    auto* s = g_server.load(std::memory_order_acquire);
+                    if (!s)
+                        return false; // not published yet — keep waiting, don't consume
+                    s->stop();        // ordinary thread: safe to lock, join, malloc, log
+                    return true;
+                },
+                [] {
+                    // TRAP 6 (shutdown_watcher.hpp) — the watcher died on a read()
+                    // error. Leaving the handlers installed means on_signal keeps
+                    // writing bytes into a pipe with no reader: every SIGTERM is
+                    // swallowed and the server becomes unkillable by anything but
+                    // SIGKILL. SIG_DFL is not the answer either — the server is PID 1
+                    // in every shipped container image, and the kernel discards a
+                    // default-disposition signal there.
+                    std::signal(SIGINT, on_signal_hard_exit);
+                    std::signal(SIGTERM, on_signal_hard_exit);
+                });
+        } catch (...) {
+            // Firewalled — see shutdown_watcher.hpp's construction-failure comment. The
+            // hard-exit handler is already installed (pre-create, above), so this path
+            // just means it stays installed instead of being upgraded below.
+            spdlog::warn("could not construct the shutdown watcher (out of memory or "
+                         "threads) — SIGINT/SIGTERM will exit the process immediately "
+                         "and UNGRACEFULLY (no store flush, no clean DB close).");
+        }
+#endif
+
         g_server.store(server.get(), std::memory_order_release);
+
+        // UNPUBLISH ON EVERY PATH, BEFORE the watcher is destroyed — declared AFTER
+        // both `server` and `shutdown_watcher`, so reverse-order destruction runs this
+        // FIRST. On Windows this also WAITS (via g_server_mu) for any in-flight
+        // console-handler stop() to return before nulling g_server, closing the same
+        // race the POSIX side closes structurally via ~ShutdownWatcher's join(). Mirrors
+        // agents/core/src/main.cpp's AgentUnpublisher (#1822 / Gate-8 round 8 UP8-1).
+        //
+        // #3007 governance (cpp-expert LOW, unhappy-path UP-1): also reinstalls the
+        // hard-exit handlers, unconditionally. The explicit reinstall a few lines below
+        // `server->run();` only runs on NORMAL return — if run() itself throws, that
+        // line is skipped by the unwind, and the still-installed graceful `on_signal`
+        // would find a retracted/about-to-retract pipe for the whole span of
+        // `~ShutdownWatcher`'s join + `~ServerImpl`'s (first-time, synchronous) teardown,
+        // silently swallowing a signal there instead of leaving. This destructor runs
+        // FIRST on every exit path including that one, so putting the reinstall here
+        // covers both — redundant-but-harmless on the normal path (the explicit call
+        // already ran), and the only reinstall on the unwind path.
+        struct ServerUnpublisher {
+            ~ServerUnpublisher() {
+                std::signal(SIGINT, on_signal_hard_exit);
+                std::signal(SIGTERM, on_signal_hard_exit);
+#ifdef _WIN32
+                std::lock_guard<std::mutex> lock(g_server_mu);
+#endif
+                g_server.store(nullptr, std::memory_order_release);
+            }
+        } server_unpublisher;
+
+#ifndef _WIN32
+        // ONLY install the graceful handlers if the watcher is live. If it is not (pipe
+        // or thread creation failed), on_signal would catch the signal, find no pipe,
+        // and RETURN — swallowing it, with no default disposition left. The fallback is
+        // the hard-exit handler installed above (never SIG_DFL — pid 1 discards it).
+        if (shutdown_watcher && shutdown_watcher->ok()) {
+            std::signal(SIGINT, on_signal);
+            std::signal(SIGTERM, on_signal);
+            // RE-CHECK after the install (TOCTOU): a watcher dying between the ok()
+            // test above and these installs runs its died-callback FIRST — which
+            // installs the hard-exit handler — and the two std::signal calls above
+            // would then OVERWRITE it with on_signal, which finds wfd < 0 and returns:
+            // signal swallowed, server unkillable. See agents/core/src/main.cpp
+            // Gate-8 SHOULD-1.
+            if (!shutdown_watcher->ok()) {
+                std::signal(SIGINT, on_signal_hard_exit);
+                std::signal(SIGTERM, on_signal_hard_exit);
+            }
+        } else {
+            spdlog::warn("shutdown watcher unavailable — SIGINT/SIGTERM will now exit "
+                         "the process IMMEDIATELY and UNGRACEFULLY (no store flush, no "
+                         "clean DB close). A default disposition would be IGNORED by "
+                         "PID 1 in a container, so this is the killable posture.");
+        }
+#else
+        std::signal(SIGINT, on_signal);
+        std::signal(SIGTERM, on_signal);
+#endif
+
         server->run();
+
+        // THE HANDLERS MUST NOT OUTLIVE WHAT SERVES THEM. From here the watcher is
+        // about to be joined and g_shutdown_wfd cleared — on_signal would find wfd == -1
+        // and simply return, swallowing the signal, for the whole span of
+        // ~ServerImpl's teardown, which is not brief: #3261's quiesce waits alone total
+        // up to 120s. Leave a handler that guarantees the process LEAVES instead of
+        // hanging to the supervisor's kill timeout. See agents/core/src/main.cpp
+        // Gate-8 round 7 UP-2.
+        std::signal(SIGINT, on_signal_hard_exit);
+        std::signal(SIGTERM, on_signal_hard_exit);
+
         if (server->startup_failed()) {
 #ifdef _WIN32
             WSACleanup();

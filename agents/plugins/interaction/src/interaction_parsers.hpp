@@ -1,15 +1,18 @@
 #pragma once
 
 /**
- * interaction_parsers.hpp — pure parse helpers for the interaction plugin's
- * macOS message_box leg: decoding the sentinel-wrapped `osascript` output of a
- * try/on-error `display dialog` into a structured dialog outcome.
+ * interaction_parsers.hpp — pure parse helpers for the interaction plugin:
+ * decoding the sentinel-wrapped `osascript` output of a try/on-error
+ * `display dialog` (macOS message_box) into a structured dialog outcome,
+ * plus the POSIX zenity and Windows PowerShell dialog-capture exit-code/
+ * runner-state classification used by the input/survey legs on every OS.
  *
  * Header-only and OS-free so the parsing is unit-tested on every host
  * (test_interaction_parsers.cpp — the licensing_parsers.hpp pattern); the
- * popen shell-out in interaction_plugin.cpp is the impure shell, and the
- * operator-supplied title/message it interpolates are already run through
- * sanitize() there, so nothing attacker-controlled reaches this parser.
+ * runner-backed shell-out in interaction_plugin.cpp is the impure shell, and
+ * the operator-supplied title/message it interpolates are already run
+ * through sanitize() there, so nothing attacker-controlled reaches this
+ * parser.
  *
  * Honest-status invariant: an `osascript` that could not display the dialog
  * (no Aqua/GUI session on the root LaunchDaemon, a TCC denial, a missing
@@ -21,6 +24,7 @@
 #include <format>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace yuzu::interaction {
 
@@ -28,24 +32,35 @@ namespace yuzu::interaction {
 /// sentinel output. `not_reachable` is the fail-closed default.
 enum class DialogOutcome { ok, cancel, yes, no, not_reachable };
 
-/// Builds the try/on-error `display dialog` osascript invocation that
-/// `parse_dialog_result` below decodes. Pulled out as its own pure function
-/// (rather than left inline in the .cpp) so a typo in the AppleScript
-/// fragments — which would silently turn every real button press into
-/// `not_reachable` — is a unit-test failure, not a runtime-only regression.
-/// `safe_title`/`safe_msg` must already be sanitized by the caller; this
-/// function performs no escaping of its own.
-[[nodiscard]] inline std::string build_dialog_command(std::string_view safe_title,
-                                                       std::string_view safe_msg,
-                                                       std::string_view btn_spec) {
-    return std::format(
-        "osascript -e 'try' "
-        "-e 'display dialog \"{}\" with title \"{}\" {}' "
-        "-e 'return \"##BTN##\" & (button returned of result)' "
-        "-e 'on error errMsg number errNum' "
-        "-e 'return \"##ERR##\" & errNum' "
-        "-e 'end try' 2>&1",
-        safe_msg, safe_title, btn_spec);
+/// Builds the argv for the try/on-error `display dialog` osascript
+/// invocation that `parse_dialog_result` below decodes — one AppleScript
+/// fragment per `-e` argv element, exactly as osascript's own multi-`-e`
+/// form expects; no shell involved in the OUTER spawn (unlike a `-c`-style
+/// interpreter, osascript takes a multi-statement script as ordinary argv
+/// elements). This does NOT make it a rung-2 site: ADR-3002 Decision 5 is
+/// explicit that a site's rung is set by the deepest interpreter
+/// intentionally invoked, not the outer spawn API — osascript IS that
+/// interpreter, so this stays a rung-3 governed-interpreter site (Decision-5
+/// registration), just no longer a Decision-7 shell exception. Pulled out
+/// as its own pure
+/// function (rather than left inline in the .cpp) so a typo in the
+/// AppleScript fragments — which would silently turn every real button
+/// press into `not_reachable` — is a unit-test failure, not a runtime-only
+/// regression. `safe_title`/`safe_msg` must already be sanitized by the
+/// caller; this function performs no escaping of its own (each fragment is
+/// its own argv element, so there is no shell-quoting surface to escape).
+[[nodiscard]] inline std::vector<std::string> build_dialog_argv(std::string_view safe_title,
+                                                                 std::string_view safe_msg,
+                                                                 std::string_view btn_spec) {
+    return {
+        "-e", "try",
+        "-e", std::format("display dialog \"{}\" with title \"{}\" {}", safe_msg, safe_title,
+                          btn_spec),
+        "-e", "return \"##BTN##\" & (button returned of result)",
+        "-e", "on error errMsg number errNum",
+        "-e", "return \"##ERR##\" & errNum",
+        "-e", "end try",
+    };
 }
 
 /// The osascript command wraps `display dialog` in try/on-error and returns
@@ -108,6 +123,50 @@ inline CaptureDecision classify_input_capture(int exit_code, std::string_view ou
     if (output == "##CANCELLED##")
         return {"cancelled|true", 0};
     return {std::format("response|{}", output), 0};
+}
+
+/// Outcome of a POSIX run_command_capture() exit-code classification for the
+/// Linux zenity `--entry`/`--list` captures (input text, survey text/choice).
+/// Unlike macOS's osascript (any nonzero exit is a delivery failure), zenity's
+/// own contract makes a nonzero exit code a REAL domain signal (Cancel/
+/// dismiss = 1, ESC/timeout = 5) -- but run_command_capture's documented -1
+/// sentinel means the tool never produced a real exit status at all (spawn
+/// error, deadline, or signal death; see subprocess_runner.hpp), which must
+/// never be misread as the user clicking Cancel.
+enum class PosixCaptureOutcome { runner_failure, cancelled, real_output };
+
+[[nodiscard]] inline PosixCaptureOutcome classify_posix_capture(int exit_code) {
+    if (exit_code == -1) return PosixCaptureOutcome::runner_failure;
+    if (exit_code != 0) return PosixCaptureOutcome::cancelled;
+    return PosixCaptureOutcome::real_output;
+}
+
+/// The (output line, return code, is_failure) decision for the Windows
+/// input/survey PowerShell dialog legs, extracted here so it is
+/// unit-testable without a subprocess (the classify_input_capture pattern).
+/// Consolidates the three checks these sites must run, in order, before ever
+/// parsing PowerShell's stdout as a real dialog outcome: did the process
+/// launch at all (tool_ran), did it hit the deadline (timed_out), and --
+/// the gap this closes -- did it exit non-zero (a ShowDialog()/InputBox()
+/// exception under a non-interactive session, whose error text never
+/// reaches output since merge_stderr defaults false). Any of the three is a
+/// genuine runner/tool failure, never a fabricated cancel or an
+/// empty-but-"successful" response.
+struct WindowsDialogDecision {
+    std::string output_line;
+    int rc = 0;
+    bool is_failure = false;
+};
+
+[[nodiscard]] inline WindowsDialogDecision classify_windows_dialog_capture(
+    bool tool_ran, bool timed_out, int exit_code) {
+    if (!tool_ran)
+        return {"status|error|failed to launch PowerShell", 1, true};
+    if (timed_out)
+        return {"status|unavailable|PowerShell dialog timed out", 1, true};
+    if (exit_code != 0)
+        return {"status|unavailable|PowerShell dialog exited with an error", 1, true};
+    return {{}, 0, false};
 }
 
 } // namespace yuzu::interaction

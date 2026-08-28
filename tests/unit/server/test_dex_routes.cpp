@@ -1565,6 +1565,118 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[pg][dex][routes][rbac]") 
     }
 }
 
+// SEC-2/SEC-3 sibling class (found during a docs sweep): /fragments/dex/overview,
+// /fragments/dex/catalogue/signal, /fragments/dex/app, and /fragments/dex/perf/devices
+// each render more than one agent_id fleet-wide. Their resolve_visible() narrowing
+// is username-keyed (VisibleSetFn) and does not confine a service-scoped API
+// token — the same gap already closed on the REST/MCP/Guardian/network surfaces.
+TEST_CASE("DEX routes: service-scoped token denied on every fleet-wide device-list "
+          "fragment, denial audited",
+          "[pg][dex][routes][rbac][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    seed_crash(store, "e1", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayA + "T10:00:00Z");
+
+    auto serviceScopedAuth = [](const httplib::Request&, httplib::Response&) {
+        auth::Session s;
+        s.token_scope_service = "printers";
+        return std::optional<auth::Session>(s);
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{4, 5}; };
+    std::vector<std::string> audit_log;
+    auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,
+                     const std::string&, const std::string&, const std::string&) -> bool {
+        audit_log.push_back(a + "|" + r);
+        return true;
+    };
+    yuzu::server::DexRoutes::PerfFn perf_fn = [](const std::string&) {
+        yuzu::server::DexPerfSnapshot snap;
+        yuzu::server::DexPerfDevice d;
+        d.agent_id = "WS-1";
+        d.cpu_pct = 50.0;
+        snap.devices.push_back(d);
+        return snap;
+    };
+
+    DexRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, serviceScopedAuth, okPerm, &store, fleet, audit, /*dispatch_fn=*/{},
+                           /*responses_fn=*/{}, perf_fn);
+
+    auto ov = sink.Get("/fragments/dex/overview?window=7d");
+    REQUIRE(ov);
+    CHECK(ov->status == 403);
+    CHECK(ov->body.find("WS-1") == std::string::npos);
+
+    auto sig = sink.Get("/fragments/dex/catalogue/signal?type=process.crashed");
+    REQUIRE(sig);
+    CHECK(sig->status == 403);
+    CHECK(sig->body.find("WS-1") == std::string::npos);
+
+    auto app = sink.Get("/fragments/dex/app?name=chrome.exe");
+    REQUIRE(app);
+    CHECK(app->status == 403);
+    CHECK(app->body.find("WS-1") == std::string::npos);
+
+    auto perf = sink.Get("/fragments/dex/perf/devices");
+    REQUIRE(perf);
+    CHECK(perf->status == 403);
+    CHECK(perf->body.find("WS-1") == std::string::npos);
+
+    REQUIRE(audit_log.size() == 4);
+    CHECK(audit_log[0] == "dex.overview.view|denied");
+    CHECK(audit_log[1] == "dex.signal.view|denied");
+    CHECK(audit_log[2] == "dex.app.view|denied");
+    CHECK(audit_log[3] == "dex.perf.device.view|denied");
+}
+
+TEST_CASE("DEX routes: ordinary session reaches /fragments/dex/perf/devices, "
+          "dedicated success audit fires",
+          "[pg][dex][routes][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{4, 5}; };
+    std::vector<std::string> audit_log;
+    auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,
+                     const std::string&, const std::string&, const std::string&) -> bool {
+        audit_log.push_back(a + "|" + r);
+        return true;
+    };
+    yuzu::server::DexRoutes::PerfFn perf_fn = [](const std::string&) {
+        yuzu::server::DexPerfSnapshot snap;
+        yuzu::server::DexPerfDevice d;
+        d.agent_id = "WS-1";
+        d.cpu_pct = 50.0;
+        snap.devices.push_back(d);
+        return snap;
+    };
+
+    DexRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, /*dispatch_fn=*/{},
+                           /*responses_fn=*/{}, perf_fn);
+
+    auto perf = sink.Get("/fragments/dex/perf/devices");
+    REQUIRE(perf);
+    CHECK(perf->status == 200);
+    CHECK(perf->body.find("WS-1") != std::string::npos);
+    bool saw_success = false;
+    for (const auto& a : audit_log)
+        if (a == "dex.perf.device.view|success")
+            saw_success = true;
+    CHECK(saw_success);
+}
+
 // ── A4: device perf sparklines (federated TAR query) ────────────────────────
 
 TEST_CASE("DEX perf parse: schema-mapped columns, trailer skipped, chronological",

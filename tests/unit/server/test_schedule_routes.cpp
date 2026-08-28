@@ -39,6 +39,7 @@
 #include <nlohmann/json.hpp>
 #include <sqlite3.h>
 
+#include <ctime>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -92,10 +93,14 @@ struct ScheduleRouteHarness {
     ScheduleEngine schedule_engine{sdb.db};
     yuzu::test::TempDir tmp;
     // ApiTokenStore ported to Postgres (PR 4.1) — SKIPs the current TEST_CASE
-    // when YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but broken.
-    // api_tokens removed (PR 4.1 review #3): this fixture never calls a token
-    // store method, and AuthRoutes null-guards the pointer, so it gets nullptr
-    // below — embedding the PG fixture only made every case skip without a DSN.
+    // when YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but broken. Every
+    // TEST_CASE in this file already requires a DSN via the real RbacStore
+    // fixture above, so wiring this in adds no new skip surface. Needed by
+    // the service-scoped-token deny tests below: a service-scoped session
+    // only exists via a REAL Bearer token (AuthRoutes::resolve_session's
+    // Bearer path calls through api_token_store_ — there is no injectable
+    // AuthFn stub on this class, unlike PreflightRoutes/DeploymentRoutes).
+    yuzu::test::ApiTokenStorePg api_tokens;
     std::unique_ptr<AnalyticsEventStore> analytics;
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
@@ -127,10 +132,14 @@ struct ScheduleRouteHarness {
         // tries to open a file underneath it.
         std::filesystem::create_directories(tmp.path);
 
-        analytics = std::make_unique<AnalyticsEventStore>(tmp.path / "analytics.db");
+        // AnalyticsEventStore ported to Postgres (ADR-0049): schema-per-store
+        // on the same shared pool as rbac above (ADR-0008's production model)
+        // rather than a second ephemeral database.
+        analytics = std::make_unique<AnalyticsEventStore>(*rbac_pool);
+        REQUIRE(analytics->is_open());
 
         auth_routes = std::make_unique<AuthRoutes>(
-            cfg, auth_mgr, &*rbac, /*api_token_store=*/nullptr,
+            cfg, auth_mgr, &*rbac, api_tokens.get(),
             /*audit_store=*/nullptr, /*mgmt_group_store=*/nullptr,
             /*tag_store=*/nullptr, analytics.get(), oidc_mu, oidc_provider);
     }
@@ -159,6 +168,42 @@ struct ScheduleRouteHarness {
         REQUIRE(cookie.has_value());
         httplib::Request req;
         req.headers.emplace("Cookie", "yuzu_session=" + *cookie);
+        return req;
+    }
+
+    /// Same role/permission setup as session_request_for, but authenticates
+    /// via a REAL service-scoped API token (Bearer) instead of a cookie — no
+    /// auth_mgr user needed, since AuthRoutes::resolve_session's Bearer path
+    /// never touches auth_mgr_. `principal_id` is `username`, matching
+    /// production (ApiToken::principal_id, api_token_store.hpp:160), so this
+    /// reproduces the exact sub-pattern the interim deny closes: a token
+    /// whose session shares its creating principal's username with an
+    /// ordinary session for that same user.
+    httplib::Request
+    service_scoped_request_for(const std::string& username, const std::string& role_name,
+                               const std::vector<std::pair<std::string, std::string>>& perms,
+                               const std::string& scope_service) {
+        REQUIRE(rbac->create_role({.name = role_name}).has_value());
+        for (const auto& [type, op] : perms) {
+            REQUIRE(rbac->set_permission({.role_name = role_name,
+                                         .securable_type = type,
+                                         .operation = op,
+                                         .effect = "allow"})
+                        .has_value());
+        }
+        REQUIRE(rbac->assign_role({.principal_type = "user",
+                                   .principal_id = username,
+                                   .role_name = role_name})
+                    .has_value());
+
+        // Service-scoped tokens must carry an expiration (api_token_store.cpp
+        // validate_human_mint) — an hour out is plenty for a single test run.
+        auto expires_at = static_cast<int64_t>(std::time(nullptr)) + 3600;
+        auto raw =
+            api_tokens->create_token("svc-token", username, expires_at, scope_service);
+        REQUIRE(raw.has_value());
+        httplib::Request req;
+        req.headers.emplace("Authorization", "Bearer " + *raw);
         return req;
     }
 };
@@ -262,4 +307,67 @@ TEST_CASE("POST /api/schedules: an omitted parameters field defaults to the cano
     auto scheds = h.schedule_engine.query_schedules();
     REQUIRE(scheds.size() == 1);
     CHECK(scheds[0].parameter_values == "{}");
+}
+
+// ── Interim service-scoped-token deny (guardian-confinement-2298) ─────────
+//
+// A created/enabled schedule fires unattended through ScheduleRunner with NO
+// per-fire confinement (exec_visible=std::nullopt) — worse than a one-shot
+// mutating read. Bundled: DELETE/enable are also username-owner-scoped
+// (ApiToken::principal_id), so a service-scoped token sharing its creating
+// principal's username could otherwise arm recurring fleet-wide dispatch or
+// destroy another principal's schedule. See schedule_routes.hpp.
+
+TEST_CASE("POST /api/schedules: a service-scoped token is denied even holding "
+          "both Schedule:Write and Execution:Execute",
+          "[server][schedule][guardian-confinement][rest][pg]") {
+    ScheduleRouteHarness h;
+    // ITServiceOwner-shaped grant: the role alone would pass both of
+    // handle_create_schedule's permission gates, same as production.
+    auto req = h.service_scoped_request_for(
+        "svc-owner", "ServiceScheduleAndExecute",
+        {{"Schedule", "Write"}, {"Execution", "Execute"}}, "printers");
+    req.body = R"({"name":"nightly-scan","definition_id":"def-1","frequency_type":"daily"})";
+
+    httplib::Response res;
+    handle_create_schedule(*h.auth_routes, &h.schedule_engine, req, res);
+
+    CHECK(res.status == 403);
+    CHECK(h.schedule_engine.query_schedules().empty());
+    // Gate 8 (#2298 PR 3 hardening round, supersedes the prior GC-7 fix this
+    // test pinned): `.permission` is now omitted entirely, not renamed to
+    // the "correct" grant — `kServiceScopeGlobalSafe` is compile-time-empty,
+    // so no grant, correctly-named or not, actually admits a service-scoped
+    // caller here (routed-concern MUST clause 5).
+    auto body = nlohmann::json::parse(res.body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body["error"].contains("permission"));
+}
+
+// deny_service_scoped_schedule and its direct unit-test block used to sit
+// here — retired together (#3290 Phase 2 bucket 1a): the function's only
+// four call sites (this file's handle_create_schedule, and three inline
+// server.cpp schedule routes) all fire after their route's own
+// require_permission gate, which guardian-confinement-2298 PR 3 ("the
+// flip") made provably dead — a service-scoped session can never reach any
+// of them. The route-level regression test above ("a service-scoped token
+// is denied even holding both Schedule:Write and Execution:Execute")
+// still proves the observable 403 behavior is unchanged; it's now produced
+// by require_permission directly instead of this retired helper.
+
+// guardian-confinement-2298 hardening sweep: extract_json_string only
+// matches a JSON *string*, so a real JSON boolean {"enabled":false} — the
+// standards-compliant encoding every JSON client library produces for a
+// boolean field — used to silently fall through to the "absent" default
+// (true), inverting the request and defeating the disable-always-reachable
+// kill switch (H-01). Pure function, no harness needed.
+TEST_CASE("parse_schedule_enabled: accepts real JSON booleans, not just strings",
+          "[server][schedule][guardian-confinement]") {
+    CHECK(parse_schedule_enabled(R"({"enabled":true})") == true);
+    CHECK(parse_schedule_enabled(R"({"enabled":false})") == false); // the inversion bug
+    CHECK(parse_schedule_enabled(R"({"enabled":"true"})") == true);
+    CHECK(parse_schedule_enabled(R"({"enabled":"false"})") == false);
+    CHECK(parse_schedule_enabled(R"({})") == true);           // missing key -> default
+    CHECK(parse_schedule_enabled("not json") == true);        // malformed -> default
+    CHECK(parse_schedule_enabled(R"({"enabled":null})") == true); // non-bool/string -> default
 }
