@@ -8,7 +8,7 @@ It is the *how*; the *why* lives in the ADRs — **read these first**:
 | [0006](adr/0006-server-postgresql-substrate.md) | Postgres is the server substrate; **every** server store migrates (2026-06-22 Update) — none stays SQLite. Agent stays SQLite. |
 | [0007](adr/0007-server-single-backend-no-sqlite-fallback.md) | Single backend, **fail closed** — no SQLite fallback. |
 | [0008](adr/0008-postgres-substrate-architecture.md) | libpq + in-house RAII, one shared `PgPool`, schema-per-store, `PgMigrationRunner`; **schema naming**, non-transactional-migration rule, thin helper (2026-06-22 Update). |
-| [0009](adr/0009-per-store-first-boot-backfill-cutover.md) | How a *migrated* store backfills its legacy SQLite data (one-time, idempotent, fail-closed). |
+| [0009](adr/0009-per-store-first-boot-backfill-cutover.md) | How a store cuts over from legacy SQLite — **fresh-start-by-default since the 2026-08-25 amendment** (no `migrate_from_sqlite()` unless a store has a specific, documented reason); the original one-time/idempotent/fail-closed backfill mechanism is now the exception path, and stays in place for already-migrated stores. |
 | [0010](adr/0010-secrets-at-rest-envelope-encryption.md) | Secret-bearing stores use `SecretCodec`, never plain columns. |
 | [0012](adr/0012-server-postgres-store-contract.md) | The author-facing **contract**: failure posture, lease discipline, cross-store seam. |
 
@@ -141,10 +141,17 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
    schema per store; `CREATE TABLE foo (...)` lands in your schema. See the
    non-transactional-migration rule below before adding an index to a table that will be large.
 
-3. **Construct** via the thin helper (do not hand-roll): acquire a lease, run
-   `PgMigrationRunner::run(lease.get(), "<schema>", migrations())`, set `open_`. The helper
-   (`open_with_migrations`) makes this one call; `is_open()` is false if the lease was empty or
-   the migration failed.
+3. **Construct** — acquire a lease, run
+   `PgMigrationRunner::run(lease.get(), "<schema>", migrations())`, release the lease, set
+   `open_`; `is_open()` is false if the lease was empty or the migration failed.
+   **Correction (2026-08-28): the "thin helper" (`open_with_migrations`) this step used to name
+   does not exist anywhere in the tree.** Every shipped store hand-rolls this exact
+   acquire/run/release sequence instead — `runtime_config_store.cpp`'s own doc comment records
+   this directly ("the playbook names this sequence 'the `open_with_migrations` helper', but no
+   such helper exists anywhere in the tree; every store … hand-rolls this exact acquire/run/
+   release sequence"). `offload_target_store.cpp` (construction block) is a clean current example
+   to copy; `offline_endpoint_store.cpp`, `auth_db.cpp`, `plugin_config_store.cpp`, and
+   `tag_store.cpp` are others. Hand-roll it — don't go looking for a helper that isn't there.
 
 4. **Runtime statements** schema-qualify the table (`SELECT ... FROM widget_store.widgets`) —
    pooled connections carry **no** per-store `search_path`. Bind parameters with
@@ -214,9 +221,11 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   No production fleet has ever run a pre-Postgres build of any Yuzu store, so the original
   "mandatory for config/reference and audit" default assumed real legacy data that has never
   existed — skip the legacy-file *copy* entirely, the same unconditional way `ResponseStore`
-  already does (no flag, no `migrate_from_sqlite()`, no legacy-file read; note `ResponseStore`
-  does NOT log anything beyond its generic "initialized" line — there is no distinct fresh-start
-  log anywhere in this codebase today to model a new one on). **New requirement, not inherited
+  already does (no flag, no `migrate_from_sqlite()`, no legacy-file read). **Log a one-time
+  fresh-start line at construction** — `OffloadTargetStore` is now the model to copy
+  (`offload_target_store.cpp`: `"<Store> initialized (schema {}) — fresh start, no legacy
+  backfill"`); `ResponseStore` predates this convention and only logs its generic "initialized"
+  line, so don't copy `ResponseStore` for this specific detail. **New requirement, not inherited
   from that precedent: for a store holding real operator-authored config or secrets (this bites
   hardest for the two Wave 3 stores below), skip the data copy but do NOT skip detection** — check
   whether the legacy file exists and is non-empty, and if so `spdlog::warn` a row/key count
@@ -240,7 +249,11 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   Backfill opens it read-only; a wired subject/device erasure path must delete that identity
   from the rollback copy so rollback cannot resurrect erased data. The upgrade-test
   (`scripts/test/docker-compose.upgrade-test.yml`) must assert the
-  config/reference/audit data survives previous-release-SQLite → new-release-Postgres.
+  config/reference/audit data survives previous-release-SQLite → new-release-Postgres —
+  **for a store that DID build a backfill** (the documented-exception case, or an
+  already-migrated store). **Superseded for the skip-by-default case** (ADR-0009's 2026-08-25
+  amendment): there is no transition to assert when nothing is copied across, so this
+  requirement does not apply to the common case above.
 - **Port the transaction owner**: `SqliteTxn`/`SqliteStmt` → `pool.with_txn` (multi-statement
   invariants) or a single autocommit statement (single-statement mutate-and-return).
 - **Local source absence never creates terminal migration state on its own** (ADR-0040 round 3,
