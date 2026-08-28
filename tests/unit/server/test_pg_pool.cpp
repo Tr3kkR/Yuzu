@@ -82,7 +82,7 @@ TEST_CASE("PgPool acquire and release", "[pg][pool]") {
     }
 }
 
-TEST_CASE("PgPool exhaustion", "[pg][pool]") {
+TEST_CASE("PgPool exhaustion", "[pg][pool][pg-smoke]") {
     YUZU_REQUIRE_PG_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 1}};
 
@@ -137,7 +137,7 @@ TEST_CASE("PgPool failed construction", "[pg][pool]") {
     }
 }
 
-TEST_CASE("PgPool discards a connection lost mid-use", "[pg][pool]") {
+TEST_CASE("PgPool discards a connection lost mid-use", "[pg][pool][pg-smoke]") {
     YUZU_REQUIRE_PG_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
 

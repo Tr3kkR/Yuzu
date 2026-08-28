@@ -1,5 +1,6 @@
 #include "workflow_engine.hpp"
 #include "migration_runner.hpp"
+#include "store_errors.hpp"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -296,7 +297,7 @@ std::expected<std::string, std::string> WorkflowEngine::create_workflow(
     // Validate kind
     auto kind = extract_yaml_value(yaml_source, "kind");
     if (!kind.empty() && kind != "Workflow") {
-        return std::unexpected("expected kind: Workflow, got: " + kind);
+        return std::unexpected(kind_mismatch_error("Workflow", kind));
     }
 
     auto name = extract_yaml_value(yaml_source, "displayName");

@@ -212,7 +212,12 @@ struct ExecHarness {
             tracker->set_event_bus(event_bus.get());
         }
 
-        instructions = std::make_unique<InstructionStore>(instr_db);
+        // ADR-0058: InstructionStore is now a migrated Postgres store — shares
+        // the same pool/database as ResponseStore below (schema-per-store,
+        // ADR-0008). instr_db (the old SQLite path) is now unused dead weight
+        // in the fs::remove cleanup loops below, harmless (removing a path
+        // nothing ever creates is a silent no-op).
+        instructions = std::make_unique<InstructionStore>(pool);
         REQUIRE(instructions->is_open());
         responses = std::make_unique<ResponseStore>(pool, /*retention_days=*/0);
         REQUIRE(responses->is_open());
@@ -2580,4 +2585,26 @@ TEST_CASE("POST /api/scope/estimate: an ordinary session reaches the estimator",
     for (const auto& c : h.audit_calls) {
         CHECK(c.action != "scope.estimate.access_denied");
     }
+}
+
+// #3503 review finding: WorkflowEngine::create_workflow()'s wrong-kind path
+// routes through the shared kind_mismatch_error() helper (workflow_engine.cpp
+// :300), but until now was only pinned at the helper's own raw two-argument
+// level (test_store_errors.cpp) -- never exercised through the real
+// create_workflow() call site the way PolicyStore's equivalent path is
+// (test_policy_store.cpp's "create fragment with wrong kind"). A future edit
+// that stops WorkflowEngine routing through the shared helper would go
+// undetected without this. No PG/ExecHarness needed -- WorkflowEngine's
+// whole ctor is sqlite3_open_v2 + CREATE TABLE (CDX-FV-03).
+TEST_CASE("WorkflowEngine::create_workflow rejects a wrong kind via the shared "
+         "kind-mismatch helper", "[workflow][workflow_engine]") {
+    WorkflowEngine engine(uniq("wf-engine-kind-mismatch"));
+    REQUIRE(engine.is_open());
+
+    auto result = engine.create_workflow("kind: Policy\nmetadata:\n  displayName: oops\n");
+    REQUIRE(!result.has_value());
+    CHECK(result.error() ==
+          "kind must be 'Workflow', got 'Policy'. yaml_source must be a "
+          "complete YAML document including 'apiVersion: yuzu.io/v1alpha1' "
+          "and 'kind: Workflow'.");
 }

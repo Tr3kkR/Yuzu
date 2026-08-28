@@ -68,7 +68,7 @@ duplicates.
 | **TAR — netconn** (connectivity-transition timeline) (`$NetConn`) · *opt-in* | ✅ wevtapi | 🔜 journald | 🔜 oslog | Win EvtQuery over NetworkProfile/NCSI/WLAN-AutoConfig channels (allow-listed fields); Linux NetworkManager/networkd journal and macOS configd/Wi-Fi OSLog **planned**. `netconn_enabled`. `tar_netconn_win.cpp` |
 | **TAR — mapdrive** (network-share mappings) (`$MapDrive`) · *opt-in* | ✅ wnet | 🟡 procfs | 🔜 getfsstat | Win WNet outbound + NetSessionEnum inbound (+ history); Linux `/proc/mounts` cifs/nfs (username unavailable) + `smbstatus`; macOS `getfsstat`/smbutil **planned** (empty today). `mapdrive_enabled`. `tar_mapdrive_collector.cpp` |
 | **━━ Inventory & daily-sync sources (→ central Postgres) ━━** | | | | Agent daily-sync framework `sync_scheduler.cpp` pushes per-source state over `ReportInventory` (hash-skip), reusing plugins via `LocalDispatcher`. ADR-0016 |
-| **Installed-software inventory** | ✅ | ✅ | ✅ | `sync_source_installed_software.cpp` reuses `installed_apps` `list_inventory` (Win registry; Linux dpkg/rpm/pacman/**apk**; macOS `system_profiler`). Blob contract v2 (kind/ecosystem/EVR/arch/packager + rpm signature_status + distro; honest-empty; Win/macOS rows = kind=app, name/version/publisher). Machine-scope only. Server `SoftwareInventoryStore` |
+| **Installed-software inventory** | ✅ | ✅ | ✅ | `sync_source_installed_software.cpp` reuses `installed_apps` `list_inventory` (Win registry; Linux dpkg/rpm/pacman/**apk**; macOS `system_profiler` apps + `pkgutil` receipts, kind=pkg/ecosystem=macos_pkgutil). Blob contract v2 (kind/ecosystem/EVR/arch/packager + rpm/macOS signature_status + distro; honest-empty; macOS app rows also carry a native CFBundle/SecStaticCode publisher + signed/unsigned read, #2273 — no `codesign` subprocess). Machine-scope only. Server `SoftwareInventoryStore` |
 | **Software-licence detection (SLE)** | ✅ (WMI `SoftwareLicensingProduct` + Office C2R + `ProbeSpec` + per-user hives/files) | 🟡 (rpm/dpkg declared-licence classification — no lapse detection; RHEL entitlement + FlexLM `.lic` expiry authoritative) | 🟡 (`_MASReceipt` + machine-scope vendor plists — `probable` confidence only) | Per-OS TUs `license_scan/src/licensing_{win,linux,macos}.cpp` (Windows WMI probe via the shared `agents/shared/wmi_bounded.hpp`); `sync_source_software_licensing.cpp` → `SoftwareLicensingStore` (ADR-0024). Detail: `docs/user-manual/software-licensing.md`. Java + SWID tags are the fast-follow (#2112) |
 | **Device-identity inventory** (serial, UUID, BIOS, CPU/RAM/disk, MAC, OS) | ✅ | ✅ | ✅ | `sync_source_device_ci.cpp` reuses `hardware`/`device_identity`/`os_info`/`network_config`. `hardware` `system`: Win WMI `Win32_BIOS`/`Win32_ComputerSystemProduct`; Linux `/sys/class/dmi/id/product_{serial,uuid}` (0400 → needs `cap_dac_read_search`; `unknown` without it); macOS native IOKit `IOPlatformExpertDevice` (`IOServiceGetMatchingService`/`IORegistryEntryCreateCFProperty`; `IOPlatformUUID` ≠ SMBIOS UUID). Machine-scope only. Server `DeviceInventoryStore` |
 | **━━ Live device snapshot ("Get live info") ━━** | | | | Device page dispatch-and-poll snapshot; each kind has its own `device.live.<kind>` audit verb. `docs/user-manual/device-management.md` |
@@ -79,7 +79,7 @@ duplicates.
 | **Live — Wi-Fi current connection** | ✅ | ✅ | 🟡 | `wifi/connected` — Win `WlanQueryInterface`, Linux `nmcli`/`iwconfig`, macOS `wifi_corewlan.mm` `corewlan_current_connection` (CoreWLAN `CWWiFiClient`/`CWInterface`, first `.mm` TU; pure `format_connected_record` in `wifi_corewlan.hpp`). macOS 🟡: association/RSSI/channel/security read, but SSID/BSSID are withheld from a background daemon by Location Services on 14+ (`<ssid-withheld>`) — replaces the dead `airport -I` path |
 | **━━ Security posture & file/certificate surfaces ━━** | | | | Posture reads + signed-artifact/certificate actions; each row cites its per-OS legs |
 | **Antivirus posture** (`antivirus` plugin: `products` + `status` + `av_exclusions`) | ✅ SecurityCenter2 products + Defender status (in-process WMI) + Defender exclusion lists (in-process registry) | 🟡 process/dir detection + `status` now has a real leg (ClamAV liveness + rung-1 definitions mtime; CrowdStrike/Sophos presence-only) | 🟡 `products`: XProtect bundle version + endpoint-security system-extension enumeration (`systemextensionsctl`, unprivileged) + process fallback; `status`: XProtect definition version + bundle mtime + Remediator/MRT — **no real-time-protection state** (macOS exposes no queryable equivalent), `av\|XProtect\|active` is a definitions-readable proxy, not a running-protection read; `av_exclusions` unsupported (Windows-only concept) | `agents/plugins/antivirus/src/antivirus_plugin.cpp`; pure parsers/renderers `antivirus_parsers.hpp` (`parse_plist_version`/`parse_sysext_list`/`sysext_av_state`/`decode_wsc_product_state`/`render_wsc_products`/`render_defender_status`/`render_exclusion_lines`) tested every host |
-| **Firewall posture** (`firewall` plugin: `state` + `rules`) | ✅ per-profile via `INetFwPolicy2` COM (rung 1, native — no `netsh` shell-out) | ✅ backend autodetect, firewalld (rung 1, bounded sd-bus) → nftables (not yet implemented — falls through) → ufw → iptables (rung 2, `run_bounded_subprocess` argv, structured per-backend rows) | 🟡 `state`: Application Firewall primary (`socketfilterfw --getglobalstate`, unprivileged; `mode\|block_all` when State = 2) + pf secondary (`pfctl -s info`, root — `unknown` without it); `rules`: pf only (`pfctl -s rules`, root; no Application Firewall per-app list yet) — both via `run_bounded_subprocess` (rung 2, no shell) | `agents/plugins/firewall/src/firewall_plugin.cpp` `state`/`rules` legs; pure parsers `firewall_parsers.hpp` (tested every host) |
+| **Firewall posture** (`firewall` plugin: `state` + `rules`) | ✅ per-profile via `INetFwPolicy2` COM (rung 1, native — no `netsh` shell-out) | ✅ backend autodetect, firewalld (rung 1, bounded sd-bus) → nftables (rung 1, bounded `NETLINK_NETFILTER` — read-only table/chain/rule enumeration, no libnftnl/libmnl dependency) → ufw → iptables (rung 2, `run_bounded_subprocess` argv, structured per-backend rows) | 🟡 `state`: Application Firewall primary (`socketfilterfw --getglobalstate`, unprivileged; `mode\|block_all` when State = 2) + pf secondary (`pfctl -s info`, root — `unknown` without it); `rules`: pf only (`pfctl -s rules`, root; no Application Firewall per-app list yet) — both via `run_bounded_subprocess` (rung 2, no shell) | `agents/plugins/firewall/src/firewall_plugin.cpp` `state`/`rules` legs; pure parsers `firewall_parsers.hpp` (tested every host) |
 | **Digital-signature verification** (`filesystem.get_signature`) | ✅ | ⛔ | ✅ | Win: WinVerifyTrust (Authenticode: valid/invalid/unsigned/untrusted) in `filesystem_plugin.cpp`. macOS: `codesign --verify --deep --strict` mapped to valid/unsigned/invalid/unknown by `classify_codesign_result` in `agents/plugins/filesystem/src/filesystem_macos_sig.hpp` (macOS `valid` = seal integrity, not Gatekeeper/notarization trust). Linux emits platform-unsupported |
 | **File version info** (`filesystem.get_version_info`) | ✅ | ⛔ | ✅ | Win: `GetFileVersionInfoW`/`VerQueryValueW` (VS_FIXEDFILEINFO + string table) in `filesystem_plugin.cpp`. macOS: CFBundleShortVersionString/CFBundleVersion from the bundle Info.plist via `plutil -extract`, mapped by `classify_plutil_extract` in `filesystem_macos_sig.hpp` (binary + XML plists; `version_status\|not_available` when absent). Linux emits platform-unsupported |
 | **Certificate store — login-keychain read** (`certificates.list`/`details` `store=login`/`all`) | ⛔ | ⛔ | ✅ | macOS-specific: reads the console user's login keychain via `launchctl asuser <uid> sudo -n -u <user> security find-certificate` (root-only; see `docs/agent-privilege-model.md`), built by `build_login_keychain_read_command` in `agents/shared/macos_console_user.hpp`, invoked from `agents/plugins/certificates/src/certificates_plugin.cpp`. Windows machine stores (CryptoAPI) and Linux `/etc/ssl/certs` have no per-user login-keychain equivalent for this hop |
@@ -99,7 +99,7 @@ duplicates.
 | diagnostics | ✅ | ✅ | ✅ | portable — `std::filesystem` checks |
 | discovery | ✅ | ✅ | ✅ | all three legs are native (`GetIpNetTable2` / `/proc/net/arp` / sysctl routing table), and the sweep uses a shared unprivileged ICMP socket, constrained on Linux by `net.ipv4.ping_group_range` |
 | disk_space | ✅ | ✅ | ✅ | linux/apple/win branches; `#else` unsupported only |
-| event_logs | ✅ | ✅ | ✅ | win/linux/apple branches. macOS `log show` now runs under the bounded `SubprocessRunner` with a hard wall-clock deadline (no built-in timeout in the tool), classified by pure `event_logs_macos.hpp` (`decide_log_show_output`) — a timed-out/degraded run surfaces a sentinel row + non-zero rc, never a silent empty result |
+| event_logs | ✅ | ✅ | ✅ | win/linux/apple branches, natively acquired on Windows and Linux (ADR-3002 rung-1 migration): Windows reads wevtapi `EvtQuery`/`EvtRender` in-process (bounded `EvtNext` wait, typed permission_denied/unavailable/constrained statuses); Linux reads a bounded `sd_journal` walk behind the `systemd_guard` feature, falling back to a bounded pre-split `journalctl` argv when compiled out or the journal is unreachable. macOS `log show` runs under the bounded `SubprocessRunner` with a hard wall-clock deadline (no built-in timeout in the tool), classified by pure `event_logs_macos.hpp` (`decide_log_show_output`) — a timed-out/degraded run surfaces a sentinel row + non-zero rc, never a silent empty result |
 | example | ✅ | ✅ | ✅ | portable — sample plugin |
 | filesystem | ✅ | ✅ | ✅ | `_WIN32` vs POSIX. `get_signature`/`get_version_info` now Win + macOS (Linux platform-unsupported) — depth in the **Security posture** section rows |
 | firewall | ✅ | ✅ | ✅ | win/linux/apple all implemented |
@@ -111,20 +111,19 @@ duplicates.
 | license_scan | ✅ | ✅ | ✅ | per-OS TUs `licensing_{win,linux,macos}.cpp` (feeds SLE sync) |
 | msi_packages | ✅ | ⛔ | ✅ | Win MSI (`MsiEnumProductsA`); macOS `pkgutil --pkgs`/`--pkg-info` receipts (reverse-domain id / derived name / version / install location) — pure parser `msi_packages_macos.hpp` + `__APPLE__` branch in `msi_packages_plugin.cpp` (500-pkg cap, `__truncated__` sentinel); Linux `#else` → "platform not supported" |
 | netprobe | ✅ | ✅ | ✅ | `_WIN32` vs POSIX portable sockets |
-| netstat | ✅ | ✅ | ✅ | linux/apple/win branches |
+| netstat | ✅ | ✅ | ✅ | linux/apple/win branches. `attribution` action additionally resolves the owning process's name/path (folds the retired sockwho plugin in, #3403) |
 | network_actions | ✅ | ✅ | ✅ | win/linux/apple branches. macOS `flush_dns` runs both `dscacheutil -flushcache` **and** `killall -HUP mDNSResponder` (the load-bearing reset), honest status from real exit codes (`network_actions_plugin.cpp`) |
 | network_config | ✅ | ✅ | ✅ | win/linux/apple throughout. macOS: real adapter link speed via `SIOCGIFMEDIA` (was hardcoded 0); `arp`/`dns_cache` return honest `not_available`/`unsupported` sentinels (`network_config_plugin.cpp`) |
 | network_diag | ✅ | ✅ | ✅ | win/linux/apple all implemented |
 | os_info | ✅ | ✅ | ✅ | linux/apple/win branches |
 | processes | ✅ | ✅ | ✅ | win/linux/apple branches (point-in-time enum; streaming capture is under TAR `process`) |
 | procfetch | ✅ | ✅ | ✅ | linux/apple/win branches |
-| quarantine | ✅ | ⚠️ | ⚠️ | full per-OS blocks, but containment is not yet complete on Linux/macOS: Linux only filters IPv4 (`ip6tables` never called, #3282); macOS's status check doesn't verify pf is actually enabled, only that the ruleset was loaded (#3283); status checks on all three platforms verify partial/existence, not full containment (#3285) |
+| quarantine | ✅ | ✅ | ✅ | full per-OS blocks; Linux covers IPv4 and IPv6 (honest `note\|ipv6_unavailable` on hosts with no IPv6 stack), macOS verifies pf is actually ENABLED and not merely loaded, and status on all three platforms reports partial/degraded containment rather than a clean `active` (#3282, #3283, #3285). Windows containment now blocks via profile-default policy rather than named Block rules, so the loopback/whitelist Allow rules actually take effect once quarantined (#3284) — see docs/quarantine-windows-firewall-precedence.md |
 | rdp_control | ✅ | ⛔ | ⛔ | Windows-only. Off-Windows returns an honest `rdp_control\|unsupported` sentinel (macOS names Screen Sharing); state-changing `set_state` reports terminal FAILURE, read-only `status` rc=0 — `rdp_control_plugin.cpp` `#ifndef _WIN32` branch |
 | registry | ✅ | ⛔ | ⛔ | Windows-only (advapi32). Off-Windows returns an honest `registry\|unsupported` sentinel (reads rc=0; mutating `set_value`/`delete_*` report terminal FAILURE — no false success) — `registry_plugin.cpp` `#ifndef _WIN32` branch. `list_profiles` (PR1.7) enumerates local profiles via ProfileList/HKEY_USERS. `get_user_value` resolves the target profile via ProfileList and reads the live `HKEY_USERS\<SID>` hive when the user is logged in, falling back to an offline `RegLoadKey` mount (SeBackup/SeRestore privileges, required only for that fallback) when not. The ladder lives in `agents/shared/win_profiles.hpp` and is shared with `installed_apps.list_per_user`, `license_scan`'s per-user surfaces and `tar`'s mapdrive history (#2771) |
 | sccm | ✅ | ⛔ | ⛔ | Windows-only. macOS returns an honest `sccm\|unsupported` (points at Jamf/MDM); Linux `installed\|false` + "platform not supported" — `sccm_plugin.cpp` `__APPLE__` branch |
 | script_exec | ✅ | ✅ | ✅ | win/apple/linux. Different action sets per OS (`bash` POSIX-only; powershell/cmd on Windows) |
 | services | ✅ | ✅ | ✅ | win/linux/apple branches. macOS `list`/`running` now emit `startup_type` (automatic/disabled/unknown) from a bulk `launchctl print-disabled` join (parser `services_macos_launchd.hpp`); `set_start_mode` rejects `manual` (launchd is binary enable/disable) |
-| sockwho | ✅ | ✅ | ✅ | linux/apple/win branches |
 | software_actions | ✅ | ✅ | ✅ | win/linux/apple branches |
 | status | ✅ | ✅ | ✅ | linux/apple/win branches |
 | storage | ✅ | ✅ | ✅ | portable — persistent KV store |
@@ -271,12 +270,12 @@ implementation is.
 | disk_space | free | linux | supported | 1 | statvfs(2) | - |
 | disk_space | free | macos | supported | 1 | statfs(2) | - |
 | disk_space | free | windows | supported | 1 | GetDiskFreeSpaceExW | - |
-| event_logs | errors | linux | supported | 3 | journalctl | - |
-| event_logs | errors | macos | supported | 2 | log_show | - |
-| event_logs | errors | windows | supported | 3 | powershell_getwinevent | - |
-| event_logs | query | linux | supported | 3 | journalctl | - |
-| event_logs | query | macos | supported | 2 | log_show | - |
-| event_logs | query | windows | supported | 3 | powershell_getwinevent | - |
+| event_logs | errors | linux | supported | 1 | sd_journal (bounded local read, PRIORITY<=err) | falls back to a bounded journalctl argv invocation (rung 2) when libsystemd is compiled out (-Dsystemd_guard) or the journal is unreachable |
+| event_logs | errors | macos | supported | 2 | log_show | requires root or a real login session to open the local unified-log data store -- a non-root headless process gets EX_NOPERM/77 regardless of Full Disk Access (docs/darwin-compat.md); no gap in production, which runs as a root LaunchDaemon |
+| event_logs | errors | windows | supported | 1 | wevtapi (EvtQuery/EvtRender, Level=2, bounded EvtNext) | - |
+| event_logs | query | linux | supported | 1 | sd_journal (bounded local read, keyword match) | falls back to a bounded journalctl argv invocation (rung 2) when libsystemd is compiled out (-Dsystemd_guard) or the journal is unreachable |
+| event_logs | query | macos | supported | 2 | log_show | requires root or a real login session to open the local unified-log data store -- a non-root headless process gets EX_NOPERM/77 regardless of Full Disk Access (docs/darwin-compat.md); no gap in production, which runs as a root LaunchDaemon |
+| event_logs | query | windows | supported | 1 | wevtapi (EvtQuery/EvtRender, bounded EvtNext) | - |
 | example | ping | linux | supported | 1 | in-process | - |
 | example | ping | macos | supported | 1 | in-process | - |
 | example | ping | windows | supported | 1 | in-process | - |
@@ -331,10 +330,10 @@ implementation is.
 | filesystem | delete_lines | linux | supported | 1 | atomic_write_file | - |
 | filesystem | delete_lines | macos | supported | 1 | atomic_write_file | - |
 | filesystem | delete_lines | windows | supported | 1 | atomic_write_file | - |
-| firewall | state | linux | supported | 1 | firewalld sd-bus (rung 1), else ufw/iptables via run_bounded_subprocess (rung 2) | nftables backend not yet implemented -- falls through to ufw/iptables |
+| firewall | state | linux | supported | 1 | firewalld sd-bus, else nftables NETLINK_NETFILTER (both rung 1), else ufw/iptables via run_bounded_subprocess (rung 2) | - |
 | firewall | state | macos | supported | 2 | socketfilterfw/pfctl via run_bounded_subprocess | - |
 | firewall | state | windows | supported | 1 | INetFwPolicy2 COM (per-profile FirewallEnabled) | - |
-| firewall | rules | linux | supported | 1 | firewalld sd-bus (rung 1), else ufw/iptables via run_bounded_subprocess (rung 2) | nftables backend not yet implemented -- falls through to ufw/iptables |
+| firewall | rules | linux | supported | 1 | firewalld sd-bus, else nftables NETLINK_NETFILTER (both rung 1), else ufw/iptables via run_bounded_subprocess (rung 2) | - |
 | firewall | rules | macos | supported | 2 | pfctl via run_bounded_subprocess | - |
 | firewall | rules | windows | supported | 1 | INetFwPolicy2 COM (INetFwRules enumeration) | - |
 | hardware | manufacturer | linux | supported | 1 | /sys/class/dmi/id/sys_vendor | - |
@@ -370,17 +369,17 @@ implementation is.
 | http_client | head | linux | supported | 1 | cpp-httplib (native sockets) | - |
 | http_client | head | macos | supported | 1 | cpp-httplib (native sockets) | - |
 | http_client | head | windows | supported | 1 | cpp-httplib (native sockets) | - |
-| installed_apps | list | linux | supported | 3 | popen(dpkg-query / rpm / pacman) | - |
-| installed_apps | list | macos | supported | 3 | popen(system_profiler SPApplicationsDataType) | - |
+| installed_apps | list | linux | supported | 2 | dpkg-query/rpm/pacman via bounded argv runner | - |
+| installed_apps | list | macos | supported | 2 | system_profiler via bounded argv runner | - |
 | installed_apps | list | windows | supported | 1 | Reg*W enumeration of the Uninstall key(s) | - |
-| installed_apps | query | linux | supported | 3 | popen(dpkg-query / rpm / pacman) | - |
-| installed_apps | query | macos | supported | 3 | popen(system_profiler SPApplicationsDataType) | - |
+| installed_apps | query | linux | supported | 2 | dpkg-query/rpm/pacman via bounded argv runner | - |
+| installed_apps | query | macos | supported | 2 | system_profiler via bounded argv runner | - |
 | installed_apps | query | windows | supported | 1 | Reg*W enumeration of the Uninstall key(s) | - |
-| installed_apps | list_per_user | linux | supported | 3 | popen(dpkg-query / rpm / pacman) | - |
-| installed_apps | list_per_user | macos | supported | 3 | popen(system_profiler SPApplicationsDataType) + popen(brew list --versions) | - |
+| installed_apps | list_per_user | linux | supported | 2 | dpkg-query/rpm/pacman via bounded argv runner | - |
+| installed_apps | list_per_user | macos | supported | 2 | system_profiler + brew via bounded argv runner | - |
 | installed_apps | list_per_user | windows | supported | 1 | Reg*W enumeration of HKU\\<SID>'s Uninstall key, mounting NTUSER.DAT via RegLoadKeyW when not already loaded | - |
-| installed_apps | list_inventory | linux | supported | 3 | popen(dpkg-query / rpm / pacman / apk) | - |
-| installed_apps | list_inventory | macos | supported | 3 | popen(system_profiler SPApplicationsDataType) | - |
+| installed_apps | list_inventory | linux | supported | 2 | dpkg-query/rpm/pacman/apk via bounded argv runner | - |
+| installed_apps | list_inventory | macos | supported | 2 | system_profiler + pkgutil via bounded argv runner + native SecCode/CFBundle enrichment | - |
 | installed_apps | list_inventory | windows | supported | 1 | Reg*W enumeration of the Uninstall key(s) | - |
 | interaction | notify | linux | supported | 2 | notify_send | - |
 | interaction | notify | macos | constrained | 3 | osascript | no reachable GUI session under a headless/root LaunchDaemon |
@@ -407,10 +406,10 @@ implementation is.
 | license_scan | surfaces | macos | constrained | 1 | filesystem_probe(glob+plist) | binary (bplist00) Info.plist files are not parsed; falls back to the bundle name with an empty version |
 | license_scan | surfaces | windows | supported | 1 | wmi+win32_registry | - |
 | msi_packages | list | linux | unsupported | - | - | - |
-| msi_packages | list | macos | supported | 3 | pkgutil | - |
+| msi_packages | list | macos | supported | 2 | pkgutil via bounded argv runner | - |
 | msi_packages | list | windows | supported | 1 | msi_api | - |
 | msi_packages | product_codes | linux | unsupported | - | - | - |
-| msi_packages | product_codes | macos | supported | 3 | pkgutil | - |
+| msi_packages | product_codes | macos | supported | 2 | pkgutil via bounded argv runner | - |
 | msi_packages | product_codes | windows | supported | 1 | msi_api | - |
 | netprobe | icmp | linux | constrained | 1 | SOCK_DGRAM ICMP ping socket | requires net.ipv4.ping_group_range to admit the process group; reports not-permitted otherwise |
 | netprobe | icmp | macos | supported | 1 | SOCK_DGRAM ICMP ping socket | - |
@@ -424,6 +423,9 @@ implementation is.
 | netstat | netstat_list | linux | supported | 1 | /proc/net/{tcp,udp}[6] | - |
 | netstat | netstat_list | macos | supported | 1 | libproc | - |
 | netstat | netstat_list | windows | supported | 1 | GetExtendedTcpTable/GetExtendedUdpTable | - |
+| netstat | attribution | linux | supported | 1 | /proc/net/* + /proc/[pid]/{comm,exe,fd} | - |
+| netstat | attribution | macos | supported | 1 | libproc | - |
+| netstat | attribution | windows | supported | 1 | IP Helper API + QueryFullProcessImageNameW | - |
 | network_actions | flush_dns | linux | constrained | 2 | resolvectl/systemd-resolve via bounded argv runner (sudo -n) | requires resolvectl (systemd-resolved) or the legacy systemd-resolve CLI; an honest failure is reported if neither is present |
 | network_actions | flush_dns | macos | supported | 2 | dscacheutil + killall via bounded argv runner (sudo -n) | - |
 | network_actions | flush_dns | windows | supported | 2 | ipconfig via bounded argv runner | - |
@@ -553,9 +555,6 @@ implementation is.
 | services | set_start_mode | linux | supported | 2 | runner argv 'sudo -n -- systemctl enable\|disable\|mask\|unmask' | - |
 | services | set_start_mode | macos | supported | 2 | runner argv 'sudo -n -- launchctl enable\|disable' | - |
 | services | set_start_mode | windows | supported | 1 | win32_service_api | - |
-| sockwho | sockwho_list | linux | supported | 1 | /proc/net/* + /proc/[pid]/{comm,exe,fd} | - |
-| sockwho | sockwho_list | macos | supported | 1 | libproc | - |
-| sockwho | sockwho_list | windows | supported | 1 | IP Helper API + QueryFullProcessImageNameW | - |
 | software_actions | list_upgradable | linux | supported | 3 | apt+yum | - |
 | software_actions | list_upgradable | macos | supported | 3 | softwareupdate | - |
 | software_actions | list_upgradable | windows | supported | 3 | winget | - |

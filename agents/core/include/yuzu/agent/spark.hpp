@@ -55,6 +55,51 @@ enum class SparkType {
     Registry, ///< Windows registry key change (wait-pool; mechanism PR 1b)
 };
 
+/// Guardian convergence-scheduler lane cadences and jitter (ADR-0021 Stage 2 rung 4;
+/// design doc `guardian_convergence_scheduler.hpp`). Hoisted here, out of
+/// `ConvergenceScheduler::Config`'s struct defaults, so any OTHER site that needs to
+/// reason about a lane's sweep interval - `guardian_spark_bridge.hpp`'s per-type
+/// debounce default (#3388) is the first such site - single-sources them instead of
+/// risking a silently-drifted duplicate copy of the same tuning constants.
+inline constexpr std::uint64_t kGuardianServiceLaneCadenceMs = 60'000;
+inline constexpr std::uint64_t kGuardianRegistryLaneCadenceMs = 60'000;
+inline constexpr std::uint64_t kGuardianFileLaneCadenceMs = 600'000; ///< ~10 min (the 5-15 min band)
+inline constexpr std::uint32_t kGuardianLaneJitterPct = 20;         ///< +/- this % of the cadence
+
+/// The +/- jitter span (ms) applied to a cadence at the given jitter percentage -
+/// the SAME formula `ConvergenceScheduler::jittered()` applies at runtime
+/// (`guardian_convergence_scheduler.cpp`), hoisted here so a future edit to that
+/// arithmetic can't silently desync the scheduler's own jitter from any other
+/// site reasoning about a lane's worst-case sweep timing - starting with
+/// `guardian_spark_bridge.hpp`'s per-type debounce default (#3388). Sharing only
+/// the input CONSTANTS above (without also sharing this formula) would still
+/// let the two drift apart on a rounding/behavior change to just one copy -
+/// this closes that gap for real (Gate 3 cpp-expert finding).
+///
+/// NOT the same thing as `guardian_jitter_offset()` (`guardian_outbox_drain_worker.hpp`)
+/// despite the near-identical name - that one draws a random `[0,upper)` SAMPLE
+/// from an RNG for outbox-maintenance paging; this one is a deterministic BOUND
+/// computation with no randomness at all (Gate 4 consistency-auditor: flagged as
+/// a future grep-collision risk, naming disambiguated here rather than renamed).
+[[nodiscard]] constexpr std::uint64_t guardian_jitter_span_ms(std::uint64_t cadence_ms,
+                                                               std::uint32_t jitter_pct) noexcept {
+    return (cadence_ms * jitter_pct) / 100;
+}
+
+/// #3388's debounce default (lane cadence + one jitter span) must stay BELOW the
+/// two-sweep minimum (`2 * cadence * (1 - jitter_pct/100)`) - not merely above a
+/// single sweep, which holds trivially for any positive jitter and proves
+/// nothing - so a compliant-edge-then-redrift round trip across one sweep is
+/// never silently swallowed by the first drift's debounce window, only delayed
+/// (Gate 2 security-guardian derivation, corrected at Gate 8 after the same
+/// wrong-inequality mistake showed up in this very comment: `1+j/100 < 2*(1-j/100)`
+/// solves to `j < 33.3%`, comfortably true at 20%). A future jitter_pct raise
+/// past that bound should fail loud here, not silently reintroduce
+/// flap-suppression.
+static_assert(kGuardianLaneJitterPct < 34,
+             "raising jitter past ~1/3 needs re-deriving guardian_spark_bridge.hpp's "
+             "debounce-vs-two-sweep-minimum margin (#3388), not just bumping this constant");
+
 /// Stable token for logs, keys, and (later) the content plane.
 [[nodiscard]] constexpr const char* spark_type_token(SparkType t) noexcept {
     switch (t) {

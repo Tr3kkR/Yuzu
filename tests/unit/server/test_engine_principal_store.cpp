@@ -60,7 +60,7 @@ yuzu::test::PgTestTemplate engine_principal_tpl{
 // test_preflight_run_store.cpp / test_api_token_store.cpp's equivalent test.
 TEST_CASE("EnginePrincipalStore reports !is_open on a migration failure",
           "[pg][engine_principal][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);

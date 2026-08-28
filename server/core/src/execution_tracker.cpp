@@ -731,7 +731,15 @@ ExecutionTracker::get_definition_statistics(const ExecutionStatsQuery& q) const 
     if (!db_)
         return results;
 
-    // C5 fix: match all terminal execution statuses
+    // C5 fix: match all terminal execution statuses. NOTE (#3344): this
+    // "NOT IN (pending, running)" idiom is deliberately NOT what
+    // mcp_retry.hpp's is_execution_terminal() uses — that predicate is an
+    // explicit allowlist so an unrecognized future status defaults to
+    // non-terminal (keep polling) rather than terminal (stop silently) as
+    // it would here. A new terminal status added to this analytics query
+    // needs the same addition there, or the two poll tools sharing that
+    // predicate will disagree with this rollup about which executions are
+    // "done".
     std::string sql = R"(
         SELECT e.definition_id,
                COUNT(*) AS total,
