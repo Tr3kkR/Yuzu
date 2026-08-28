@@ -120,6 +120,22 @@ run() {
   "$@"
 }
 
+# Privileged read-only predicates (sudo test/grep/psql) would prompt for a
+# password under --dry-run, so they are not run: the dry run reports each one
+# and assumes the step it guards is needed (--assume-true for the one site
+# where a true predicate is the act arm). Reported on stderr because several
+# callers pipe stdout into grep. Live runs drop the probe's stderr; a sudo
+# prompt goes to the tty, not stderr, so it is never hidden.
+probe() { # probe [--assume-true] <predicate-cmd...>
+  local dry_status=1
+  if [ "$1" = --assume-true ]; then dry_status=0; shift; fi
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '  (dry-run) not probing, assuming the step is needed: %s\n' "$*" >&2
+    return "$dry_status"
+  fi
+  "$@" 2>/dev/null
+}
+
 FAILURES=0
 check() { # check <label> <condition-cmd...>
   local label="$1"; shift
@@ -408,7 +424,7 @@ if [ "$WITH_POSTGRES" = 1 ]; then
     ok "postgresql ${PG_STREAM} installed"
   fi
 
-  if sudo test -f /var/lib/pgsql/data/PG_VERSION; then
+  if probe sudo test -f /var/lib/pgsql/data/PG_VERSION; then
     skip "data directory already initialised"
   else
     run sudo /usr/bin/postgresql-setup --initdb
@@ -424,7 +440,7 @@ if [ "$WITH_POSTGRES" = 1 ]; then
 
   # RHEL's initdb leaves host connections on `ident`, which rejects the
   # password auth the DSN uses. Report the change rather than doing it silently.
-  if sudo grep -qE '^host[[:space:]]+all[[:space:]]+all[[:space:]]+(127\.0\.0\.1/32|::1/128)[[:space:]]+ident' \
+  if probe --assume-true sudo grep -qE '^host[[:space:]]+all[[:space:]]+all[[:space:]]+(127\.0\.0\.1/32|::1/128)[[:space:]]+ident' \
        /var/lib/pgsql/data/pg_hba.conf; then
     warn "pg_hba.conf has host auth = ident; switching the two loopback 'all all' lines to scram-sha-256"
     warn "  (original preserved as /var/lib/pgsql/data/pg_hba.conf.yuzu-orig)"
@@ -440,7 +456,7 @@ if [ "$WITH_POSTGRES" = 1 ]; then
 
   # CREATEDB is REQUIRED: PostgresTestDb (tests/unit/test_helpers.hpp) creates
   # and drops an ephemeral yuzu_test_<salt>_<n> database per test.
-  if sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='yuzu'" 2>/dev/null | grep -qx 1; then
+  if probe sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='yuzu'" | grep -qx 1; then
     skip "role 'yuzu' exists"
   else
     run sudo -u postgres psql -c "CREATE ROLE yuzu LOGIN CREATEDB PASSWORD 'yuzu';"
@@ -453,14 +469,14 @@ if [ "$WITH_POSTGRES" = 1 ]; then
   # pg_signal_backend that termination is denied, every test LEAKS its database,
   # and the [pg] shard slows down until it blows its 600 s meson timeout — with
   # the real cause buried in per-test log noise. GRANT is idempotent.
-  if sudo -u postgres psql -tAc \
-       "SELECT pg_has_role('yuzu','pg_signal_backend','member')" 2>/dev/null | grep -qx t; then
+  if probe sudo -u postgres psql -tAc \
+       "SELECT pg_has_role('yuzu','pg_signal_backend','member')" | grep -qx t; then
     skip "role 'yuzu' already has pg_signal_backend"
   else
     run sudo -u postgres psql -c "GRANT pg_signal_backend TO yuzu;"
     ok "granted pg_signal_backend to 'yuzu'"
   fi
-  if sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='yuzu_test'" 2>/dev/null | grep -qx 1; then
+  if probe sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='yuzu_test'" | grep -qx 1; then
     skip "database 'yuzu_test' exists"
   else
     run sudo -u postgres psql -c "CREATE DATABASE yuzu_test OWNER yuzu;"
@@ -515,6 +531,12 @@ if [ -n "${MANIFEST}" ] && [ "$DRY_RUN" = 0 ]; then
 fi
 
 # --- Done --------------------------------------------------------------------
+
+if [ "$DRY_RUN" = 1 ]; then
+  step "Dry run complete - nothing was changed"
+  printf '\n  Every "(dry-run)" line above is a command that was NOT executed;\n  %s was not written. Re-run without --dry-run to provision.\n\n' "${ENV_FILE}"
+  exit 0
+fi
 
 step "Toolchain ready"
 cat <<EOF
