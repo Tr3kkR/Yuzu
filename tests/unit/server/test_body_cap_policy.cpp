@@ -19,6 +19,7 @@
  */
 
 #include "body_cap_policy.hpp"
+#include "test_loopback_http.hpp"
 #include "web_utils.hpp"
 
 #include <httplib.h>
@@ -403,6 +404,13 @@ struct UnifiedBodyCapTestServer {
     std::thread server_thread;
     int port{0};
     std::atomic<int> handler_calls{0};
+    // Rejection witness (#2757): incremented exactly where the pre-routing
+    // handler below decides `decision.refuse`, so a Windows connection-reset
+    // fallback (test_loopback_http.hpp) can prove the rejection actually
+    // ran for a given request rather than accepting any lost response.
+    // Distinct from post_read_rejections below, which counts a DIFFERENT
+    // (later) stage.
+    std::atomic<int> pre_routing_rejections{0};
     // body-cap-post-read-stage (#2898-aware): counts every invocation of the
     // fixture's `set_pre_request_handler` below, admitted or refused. Used
     // to prove ORDERING against the pre-routing stage — a request the
@@ -468,6 +476,7 @@ struct UnifiedBodyCapTestServer {
                 httplib::detail::is_chunked_transfer_encoding(req.headers));
             if (decision.refuse) {
                 res.status = decision.status;
+                pre_routing_rejections.fetch_add(1);
                 return httplib::Server::HandlerResponse::Handled;
             }
             // Everything below this point (onbehalf-of, rate limiting, the
@@ -722,18 +731,22 @@ TEST_CASE("Pre-routing body cap: a non-identity Content-Encoding is refused rega
 
     // A class with requires_measurable == false (the "default" catch-all,
     // matched by /api/v1/devices) — proves D4 does NOT gate on that bit.
-    auto r1 = cli.Post("/api/v1/devices", {{"Content-Encoding", "gzip"}}, "small body",
-                       "application/json");
-    REQUIRE(r1);
-    CHECK(r1->status == 415);
+    yuzu::test::expect_pre_routing_rejection(
+        [&] {
+            return cli.Post("/api/v1/devices", {{"Content-Encoding", "gzip"}}, "small body",
+                            "application/json");
+        },
+        415, ts.pre_routing_rejections);
     CHECK(ts.handler_calls.load() == 0);
 
     // /mcp/ (requires_measurable == true) reaches the SAME refusal via the
     // SAME first check, not the class-specific unmeasurable path (411).
-    auto r2 = cli.Post("/mcp/v1/", {{"Content-Encoding", "br"}}, "small body",
-                       "application/json");
-    REQUIRE(r2);
-    CHECK(r2->status == 415);
+    yuzu::test::expect_pre_routing_rejection(
+        [&] {
+            return cli.Post("/mcp/v1/", {{"Content-Encoding", "br"}}, "small body",
+                            "application/json");
+        },
+        415, ts.pre_routing_rejections);
     CHECK(ts.handler_calls.load() == 0);
 
     // A request with NO Content-Encoding header (ordinary traffic) is still

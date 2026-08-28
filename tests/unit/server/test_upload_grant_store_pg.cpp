@@ -57,7 +57,7 @@ UploadGrantMintParams basic_params(const std::string& agent_id = "agent-1") {
 } // namespace
 
 TEST_CASE("UploadGrantStore fresh-start construction succeeds on an empty database", "[pg][store][upload]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     REQUIRE(pool.valid());
     UploadGrantStore store{pool};
@@ -65,7 +65,7 @@ TEST_CASE("UploadGrantStore fresh-start construction succeeds on an empty databa
 }
 
 TEST_CASE("UploadGrantStore reports !is_open on a migration failure", "[pg][store][upload]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);

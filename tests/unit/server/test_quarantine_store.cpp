@@ -65,7 +65,7 @@ yuzu::test::PgTestTemplate quarantine_tpl{"quarantinestore", [](const std::strin
 // ── Construction fail-closed ────────────────────────────────────────────────
 
 TEST_CASE("QuarantineStore: construction fails closed on migration drift", "[pg][quarantine]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
 
     // Pre-seed: create the quarantine_store schema + a conflicting table, but
     // no public.schema_meta row — the drift guard refuses (version 0 but
@@ -252,4 +252,239 @@ TEST_CASE("QuarantineStore: get_history on an empty agent_id returns an empty re
     auto history = store.get_history("");
     REQUIRE(history.has_value());
     CHECK(history->empty());
+}
+
+// ── Endpoint-confirmation state (#3425 schema v2) ──────────────────────────
+
+TEST_CASE("QuarantineStore: mark_endpoint_applied/confirmed happy path, read back via get_status",
+          "[pg][quarantine][reconciler]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.quarantine_device("agent-001", "admin", "reason", "10.0.0.1").has_value());
+
+    auto fresh = store.get_status("agent-001");
+    REQUIRE(fresh.has_value());
+    REQUIRE(fresh->has_value());
+    CHECK((*fresh)->last_applied_at == 0); // never, matches released_at's sentinel
+    CHECK((*fresh)->last_confirmed_at == 0);
+
+    REQUIRE(store.mark_endpoint_applied("agent-001", (*fresh)->id, 1000).has_value());
+    auto after_apply = store.get_status("agent-001");
+    REQUIRE(after_apply.has_value());
+    REQUIRE(after_apply->has_value());
+    CHECK((*after_apply)->last_applied_at == 1000);
+    CHECK((*after_apply)->last_confirmed_at == 0); // apply alone is not confirmation
+
+    REQUIRE(store.mark_endpoint_confirmed("agent-001", (*fresh)->id, 2000).has_value());
+    auto after_confirm = store.get_status("agent-001");
+    REQUIRE(after_confirm.has_value());
+    REQUIRE(after_confirm->has_value());
+    CHECK((*after_confirm)->last_applied_at == 1000); // unaffected by the confirm write
+    CHECK((*after_confirm)->last_confirmed_at == 2000);
+}
+
+TEST_CASE("QuarantineStore: mark_endpoint_applied/confirmed on a non-quarantined device is a "
+          "business error, not a store failure",
+          "[pg][quarantine][reconciler]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto applied = store.mark_endpoint_applied("never-quarantined", /*record_id=*/0, 1000);
+    REQUIRE_FALSE(applied.has_value());
+    CHECK(applied.error() == "device is not quarantined");
+    CHECK_FALSE(applied.error().starts_with(yuzu::server::kQuarantineDbErrorPrefix));
+
+    auto confirmed = store.mark_endpoint_confirmed("never-quarantined", /*record_id=*/0, 1000);
+    REQUIRE_FALSE(confirmed.has_value());
+    CHECK(confirmed.error() == "device is not quarantined");
+}
+
+TEST_CASE("QuarantineStore: mark_endpoint_applied/confirmed on a RELEASED (not active) record "
+          "is also a business error — the guarded UPDATE only matches status='active'",
+          "[pg][quarantine][reconciler]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.quarantine_device("agent-002", "admin", "reason", "").has_value());
+    auto before_release = store.get_status("agent-002");
+    REQUIRE(before_release.has_value());
+    REQUIRE(before_release->has_value());
+    const auto record_id = (*before_release)->id;
+    REQUIRE(store.release_device("agent-002").has_value());
+
+    // Even with the CORRECT (real, pre-release) id, status != 'active' alone
+    // still fails the guarded UPDATE — id-scoping is additive, not a
+    // replacement for the status check.
+    auto applied = store.mark_endpoint_applied("agent-002", record_id, 1000);
+    REQUIRE_FALSE(applied.has_value());
+    CHECK(applied.error() == "device is not quarantined");
+}
+
+TEST_CASE("QuarantineStore: mark_endpoint_applied/confirmed with the WRONG record id (a "
+          "release-then-requarantine race) is a business error, never silently stamps the new "
+          "record (governance Gate 4, unhappy-path Finding A)",
+          "[pg][quarantine][reconciler][regression]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.quarantine_device("agent-003", "admin", "malware", "10.0.0.1").has_value());
+    auto old_status = store.get_status("agent-003");
+    REQUIRE(old_status.has_value());
+    REQUIRE(old_status->has_value());
+    const auto old_id = (*old_status)->id;
+
+    // Simulates the race: the OLD record is released and a NEW, unrelated
+    // active record now exists for the same agent_id by the time the write
+    // for the OLD record's dispatch arrives.
+    REQUIRE(store.release_device("agent-003").has_value());
+    REQUIRE(
+        store.quarantine_device("agent-003", "admin", "NEW-reason", "99.99.99.99").has_value());
+    auto new_status = store.get_status("agent-003");
+    REQUIRE(new_status.has_value());
+    REQUIRE(new_status->has_value());
+    const auto new_id = (*new_status)->id;
+    REQUIRE(new_id != old_id); // a genuinely different row
+
+    // Using the STALE (old) record id must fail — id AND status='active' AND
+    // agent_id all have to match; the id alone belonging to a real row that
+    // once existed is not enough.
+    auto applied = store.mark_endpoint_applied("agent-003", old_id, 1000);
+    REQUIRE_FALSE(applied.has_value());
+    CHECK(applied.error() == "device is not quarantined");
+    auto confirmed = store.mark_endpoint_confirmed("agent-003", old_id, 1000);
+    REQUIRE_FALSE(confirmed.has_value());
+    CHECK(confirmed.error() == "device is not quarantined");
+
+    // The NEW record must be completely untouched by either failed call —
+    // this is the exact misattribution Finding A described.
+    auto after = store.get_status("agent-003");
+    REQUIRE(after.has_value());
+    REQUIRE(after->has_value());
+    CHECK((*after)->id == new_id);
+    CHECK((*after)->last_applied_at == 0);
+    CHECK((*after)->last_confirmed_at == 0);
+
+    // Using the CURRENT (new) record id succeeds, proving id-scoping isn't
+    // simply broken/over-strict.
+    REQUIRE(store.mark_endpoint_applied("agent-003", new_id, 1000).has_value());
+}
+
+TEST_CASE("QuarantineStore: mark_endpoint_applied/confirmed share quarantine_device's "
+          "empty-agent_id precondition guard",
+          "[pg][quarantine][reconciler]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+
+    // A precondition the store enforces BEFORE ever touching the pool — the
+    // db_error PREFIX contract on a genuine store failure is exercised
+    // end-to-end by the construction-fails-closed test above.
+    auto applied = store.mark_endpoint_applied("", /*record_id=*/0, 1000);
+    REQUIRE_FALSE(applied.has_value());
+    CHECK(applied.error() == "agent_id is required");
+
+    auto confirmed = store.mark_endpoint_confirmed("", /*record_id=*/0, 1000);
+    REQUIRE_FALSE(confirmed.has_value());
+    CHECK(confirmed.error() == "agent_id is required");
+}
+
+// UP-7 pattern (test_api_token_store.cpp's v2->v3 case): every other test in
+// this file clones `quarantine_tpl`, already at v2 — the real v1->v2 upgrade
+// path (PgMigrationRunner applying v2's ALTER against a genuinely-populated
+// v1 table) is otherwise untested. Hand-seeds v1 DDL verbatim (copied from
+// migrations() in quarantine_store.cpp, file-local and not exported), stamps
+// schema_meta at v1, and inserts an active row BEFORE handing the database
+// to a real QuarantineStore construction.
+TEST_CASE("QuarantineStore: a genuine v1->v2 upgrade (real ALTER against a populated table) "
+          "opens cleanly and the new columns default to 0 on the pre-existing row",
+          "[pg][quarantine][store][migration]") {
+    YUZU_REQUIRE_PG_DB(db);
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+
+        PgResult meta{PQexec(conn.get(),
+                             "CREATE TABLE public.schema_meta ("
+                             "  store       TEXT PRIMARY KEY,"
+                             "  version     INTEGER NOT NULL,"
+                             "  upgraded_at BIGINT NOT NULL)")};
+        REQUIRE(meta.ok());
+        PgResult schema{PQexec(conn.get(), "CREATE SCHEMA quarantine_store")};
+        REQUIRE(schema.ok());
+
+        // v1 DDL, copied from migrations() in quarantine_store.cpp — but
+        // SCHEMA-QUALIFIED throughout, unlike the source: the real
+        // migration runs its unqualified DDL under a transaction whose
+        // search_path PgMigrationRunner sets to the store schema (see that
+        // file's own "Unqualified DDL" comment), which a raw PQexec on a
+        // plain connection does NOT do (mirrors the api_token_store UP-7
+        // precedent's own schema-qualified copy, for the identical reason).
+        PgResult v1{PQexec(conn.get(),
+                           "CREATE TABLE quarantine_store.quarantine_records ("
+                           "  id              BIGSERIAL PRIMARY KEY,"
+                           "  agent_id        TEXT NOT NULL,"
+                           "  status          TEXT NOT NULL DEFAULT 'active' CHECK (status IN "
+                           "('active', 'released')),"
+                           "  quarantined_by  TEXT NOT NULL DEFAULT '',"
+                           "  quarantined_at  BIGINT NOT NULL DEFAULT 0,"
+                           "  released_at     BIGINT NOT NULL DEFAULT 0,"
+                           "  whitelist       TEXT NOT NULL DEFAULT '',"
+                           "  reason          TEXT NOT NULL DEFAULT '');"
+                           "CREATE INDEX idx_quarantine_agent ON "
+                           "quarantine_store.quarantine_records(agent_id);"
+                           "CREATE UNIQUE INDEX idx_quarantine_agent_active ON "
+                           "quarantine_store.quarantine_records(agent_id) WHERE status = 'active';"
+                           "CREATE TABLE quarantine_store.quarantine_meta ("
+                           "  key   TEXT PRIMARY KEY,"
+                           "  value TEXT NOT NULL"
+                           ")")};
+        REQUIRE(v1.ok());
+        PgResult stamp{PQexec(conn.get(),
+                              "INSERT INTO public.schema_meta (store, version, upgraded_at) "
+                              "VALUES ('quarantine_store', 1, extract(epoch FROM now())::bigint)")};
+        REQUIRE(stamp.ok());
+
+        // A row genuinely present BEFORE the v2 ALTER runs.
+        PgResult seed{PQexec(conn.get(),
+                             "INSERT INTO quarantine_store.quarantine_records "
+                             "(agent_id, status, quarantined_by, quarantined_at, whitelist, "
+                             "reason) VALUES ('pre-v2-agent', 'active', 'admin', 1000, "
+                             "'10.0.0.1', 'pre-upgrade')")};
+        REQUIRE(seed.ok());
+    }
+
+    // The real construction path: PgMigrationRunner::run reads version 1
+    // from schema_meta and applies v2's ALTER against the table seeded above.
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Pin the new columns from the OUTSIDE: get_status's kRecordCols
+    // projection now includes both, and the pre-existing row reads 0/0 (the
+    // DEFAULT), not an error.
+    auto status = store.get_status("pre-v2-agent");
+    REQUIRE(status.has_value());
+    REQUIRE(status->has_value());
+    CHECK((*status)->quarantined_by == "admin"); // untouched by the ALTER
+    CHECK((*status)->last_applied_at == 0);
+    CHECK((*status)->last_confirmed_at == 0);
+
+    // And mark_endpoint_applied/confirmed round-trip through the now-v2
+    // schema end-to-end for that same pre-existing row.
+    REQUIRE(store.mark_endpoint_applied("pre-v2-agent", (*status)->id, 5000).has_value());
+    auto after = store.get_status("pre-v2-agent");
+    REQUIRE(after.has_value());
+    REQUIRE(after->has_value());
+    CHECK((*after)->last_applied_at == 5000);
 }

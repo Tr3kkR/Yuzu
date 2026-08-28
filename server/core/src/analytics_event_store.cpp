@@ -291,11 +291,16 @@ void AnalyticsEventStore::start_drain() {
 }
 
 void AnalyticsEventStore::stop_drain() {
-    // Set first, before anything else below: this is what makes it safe
-    // for server.cpp's stop() to free pg_pool_ (which this object borrows
-    // by reference) without waiting on or joining the untracked
-    // forward_gateway_pending() detached thread — emit() checks this before
-    // ever touching pool_.
+    // Set first, before anything else below, so emit() sees it as early as
+    // possible: this is a latch, not a rundown/quiesce guard, on the same
+    // terms as emit()'s comment above (which is the full statement) —
+    // refusing NEW entrants doesn't block a caller that already read it as
+    // false an instant earlier, so this alone does not make it provably
+    // safe for server.cpp's stop() to free pg_pool_ without waiting on or
+    // joining the untracked forward_gateway_pending() detached thread. What
+    // makes that acceptable in practice is the same multi-second span
+    // before pg_pool_.reset() described in emit()'s comment, not this
+    // store alone.
     shutting_down_.store(true, std::memory_order_release);
 #ifdef __cpp_lib_jthread
     if (drain_thread_.joinable()) {

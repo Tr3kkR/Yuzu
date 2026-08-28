@@ -267,7 +267,7 @@ TEST_CASE("warn_if_legacy_data_present restricts the legacy file AND its WAL/SHM
 
 TEST_CASE("RuntimeConfigStore opens on a fresh Postgres and migrates once",
           "[pg][runtime_config][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);

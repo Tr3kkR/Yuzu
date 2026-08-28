@@ -131,7 +131,7 @@ void require_ok(const std::expected<void, std::string>& r) {
 
 TEST_CASE("CustomPropertiesStore: migrates at construction and reopens idempotently",
           "[pg][custom_props][db]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     {

@@ -125,7 +125,7 @@ ItemInstallFn make_counting_install_fn(int* counter) {
 // ── Construction fail-closed ────────────────────────────────────────────────
 
 TEST_CASE("ProductPackStore reports !is_open on a migration failure", "[product_pack_store][pg]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);

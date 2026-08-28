@@ -120,7 +120,7 @@ def test_check_partition_gap(failures):
     }
     ok, fail_msgs, _ = _mod.check_partition(entries, lambda exe, spec: cases_by_spec[spec])
     check(not ok, "gap: reports not-ok", failures)
-    check(any("in NO shard" in m and "t2" in m for m in fail_msgs),
+    check(any("in NO" in m and "shard" in m and "t2" in m for m in fail_msgs),
           "gap: failure message names the orphaned case", failures)
     check(any("(f.cpp:2)" in m for m in fail_msgs),
           "gap: failure message includes file:line (quality-engineer LOW)", failures)
@@ -148,7 +148,7 @@ def test_check_partition_extra(failures):
     }
     ok, fail_msgs, _ = _mod.check_partition(entries, lambda exe, spec: cases_by_spec[spec])
     check(not ok, "extra: reports not-ok", failures)
-    check(any("not in the [pg] reference set" in m and "stray" in m for m in fail_msgs),
+    check(any("not in the" in m and "reference set" in m and "stray" in m for m in fail_msgs),
           "extra: failure message names the over-matched case", failures)
 
 
@@ -179,6 +179,70 @@ def test_check_partition_zero_case_shard(failures):
     check(not ok, "zero-case shard: reports not-ok", failures)
     check(any("matched ZERO cases" in m and "shard B" in m for m in fail_msgs),
           "zero-case shard: failure message names the empty shard", failures)
+
+
+def test_parse_nonpg_entries_happy_path(failures):
+    # Windows CI test-phase restructuring (#3443, 2026-08-28): parse_nonpg_entries
+    # mirrors parse_shard_entries exactly (same _parse_suite_entries shape
+    # rules), just against SERVER_NONPG_SUITE instead of SERVER_PG_SUITE.
+    tests = [
+        _entry("server unit tests shard A", spec="~[pg][a]", suite=_mod.SERVER_NONPG_SUITE),
+        _entry("server unit tests shard B", spec="~[pg][b]", suite=_mod.SERVER_NONPG_SUITE),
+        _entry("server pg unit tests shard A", spec="[pg][a]"),  # pg shard ignored here
+    ]
+    entries, errors = _mod.parse_nonpg_entries(tests)
+    check(errors == [], "nonpg happy path: no shape errors", failures)
+    check(len(entries) == 2, "nonpg happy path: only the 2 server-nonpg entries found", failures)
+    check(entries[0] == ("server unit tests shard A", "/fake/exe", "~[pg][a]"),
+          "nonpg happy path: entry tuple shape correct", failures)
+
+
+def test_check_partition_nonpg_ref_spec_and_label(failures):
+    # The actually-NEW behavior: check_partition's ref_spec/label parameters,
+    # exercised with the non-pg values so a failure message never
+    # misleadingly says "[pg]"/"server-pg" while checking the non-pg
+    # partition (Sol review finding).
+    entries = [("shard A", "/fake/exe", "~[pg][a]"), ("shard B", "/fake/exe", "~[pg][b]")]
+    cases_by_spec = {
+        "~[pg]": {("t1", "f.cpp", "1"), ("t2", "f.cpp", "2")},
+        "~[pg][a]": {("t1", "f.cpp", "1")},
+        "~[pg][b]": {("t2", "f.cpp", "2")},
+    }
+    ok, fail_msgs, stats = _mod.check_partition(
+        entries, lambda exe, spec: cases_by_spec[spec],
+        ref_spec=_mod.NONPG_REF_SPEC, label="server-nonpg")
+    check(ok, "nonpg clean partition: reports OK", failures)
+    check(stats == {"shard_count": 2, "case_count": 2}, "nonpg clean partition: stats correct", failures)
+
+    # Same fixture shape as test_check_partition_gap, but nonpg-labelled —
+    # proves the wording carries the RIGHT label, not just that it fails.
+    gap_entries = [("shard A", "/fake/exe", "~[pg][a]")]
+    gap_cases = {
+        "~[pg]": {("t1", "f.cpp", "1"), ("t2", "f.cpp", "2")},
+        "~[pg][a]": {("t1", "f.cpp", "1")},
+    }
+    gap_ok, gap_fail_msgs, _ = _mod.check_partition(
+        gap_entries, lambda exe, spec: gap_cases[spec],
+        ref_spec=_mod.NONPG_REF_SPEC, label="server-nonpg")
+    check(not gap_ok, "nonpg gap: reports not-ok", failures)
+    check(any("server-nonpg" in m and "t2" in m for m in gap_fail_msgs),
+          "nonpg gap: failure message carries the server-nonpg label, not server-pg/[pg]", failures)
+    check(not any("[pg]" in m.replace("~[pg]", "") for m in gap_fail_msgs),
+          "nonpg gap: failure message never says the bare pg reference (only ~[pg])", failures)
+
+    # Duplication, nonpg-labelled — mirrors test_check_partition_duplication.
+    dup_entries = [("shard A", "/fake/exe", "~[pg][a]"), ("shard B", "/fake/exe", "~[pg][b]")]
+    dup_cases = {
+        "~[pg]": {("t1", "f.cpp", "1")},
+        "~[pg][a]": {("t1", "f.cpp", "1")},
+        "~[pg][b]": {("t1", "f.cpp", "1")},
+    }
+    dup_ok, dup_fail_msgs, _ = _mod.check_partition(
+        dup_entries, lambda exe, spec: dup_cases[spec],
+        ref_spec=_mod.NONPG_REF_SPEC, label="server-nonpg")
+    check(not dup_ok, "nonpg duplication: reports not-ok", failures)
+    check(any("appears in BOTH" in m and "t1" in m for m in dup_fail_msgs),
+          "nonpg duplication: failure message names the duplicated case", failures)
 
 
 def test_parse_list_tests_xml(failures):
@@ -355,6 +419,8 @@ def main():
     test_check_partition_multiple_binaries(failures)
     test_check_partition_empty_reference(failures)
     test_check_partition_zero_case_shard(failures)
+    test_parse_nonpg_entries_happy_path(failures)
+    test_check_partition_nonpg_ref_spec_and_label(failures)
     test_parse_list_tests_xml(failures)
     test_parse_smoke_entries_happy_path(failures)
     test_check_smoke_happy_path(failures)

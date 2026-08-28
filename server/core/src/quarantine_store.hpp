@@ -72,6 +72,16 @@ namespace yuzu::server {
 inline constexpr const char* kQuarantineDbErrorPrefix = "db_error: ";
 
 struct QuarantineRecord {
+    // #3425 governance Gate 4 (unhappy-path, Finding A): the row's own
+    // primary key — NOT exposed on REST/MCP (wire surfaces stay unchanged),
+    // used ONLY to scope `mark_endpoint_applied`/`mark_endpoint_confirmed`'s
+    // guarded UPDATE to the SPECIFIC record a dispatch/status-read was
+    // actually about. `agent_id`+`status='active'` alone is not a stable
+    // identity: a release-then-requarantine sequence lands a NEW active row
+    // for the same `agent_id` while a reconcile cycle for the OLD row is
+    // still in flight, and without `id` scoping the stamp write silently
+    // lands on the NEW row (whose whitelist was never actually dispatched).
+    std::int64_t id{0};
     std::string agent_id;
     std::string status; // "active" or "released"
     std::string quarantined_by;
@@ -79,6 +89,16 @@ struct QuarantineRecord {
     std::int64_t released_at{0};
     std::string whitelist; // comma-separated IPs
     std::string reason;
+    // Schema v2 (#3425): 0 = never, matching `released_at`'s existing
+    // never-happened sentinel on this same table — no optional plumbing.
+    // Written ONLY by QuarantineContainmentReconciler. `last_applied_at` is
+    // set when a system re-dispatch of the STORED whitelist is accepted by
+    // the plugin registry (agents_reached > 0); `last_confirmed_at` is set
+    // only after a FOLLOW-UP `quarantine.status` read reports `state|active`
+    // — dispatch acceptance is not proof of endpoint containment (the same
+    // distinction `quarantine_dispatch_decision.hpp` draws for the MCP path).
+    std::int64_t last_applied_at{0};
+    std::int64_t last_confirmed_at{0};
 };
 
 class QuarantineStore {
@@ -132,6 +152,36 @@ public:
     /// AUTHORITATIVE read: `std::nullopt` on a store/pool/query failure —
     /// NEVER a silent empty (an empty *value* is a genuinely empty result).
     [[nodiscard]] std::optional<std::vector<QuarantineRecord>> list_quarantined();
+
+    /// #3425: record that a system-initiated re-dispatch of the STORED
+    /// whitelist was accepted by the plugin registry (agents_reached > 0) —
+    /// NOT proof of endpoint containment, see `mark_endpoint_confirmed`.
+    /// Sole writer: `QuarantineContainmentReconciler`. `record_id` MUST be
+    /// the `QuarantineRecord::id` the dispatch was actually built from
+    /// (governance Gate 4, unhappy-path Finding A) — the guarded UPDATE is
+    /// scoped `WHERE id = record_id AND agent_id = ... AND status =
+    /// 'active'`, so a release-then-requarantine race that swaps in a NEW
+    /// active row for the same `agent_id` between the read and this write
+    /// affects zero rows here (misattributing the stamp to the new,
+    /// never-actually-dispatched record) rather than silently succeeding
+    /// against the wrong row. `std::unexpected(msg)` prefixed
+    /// `kQuarantineDbErrorPrefix` on a genuine store/pool/query failure;
+    /// `std::unexpected("device is not quarantined")` (unprefixed business
+    /// error, matching `release_device`) when the guarded UPDATE returned
+    /// zero rows — covers BOTH "released, nothing active" and "superseded by
+    /// a different active record" identically; every existing caller's
+    /// handling (erase in-memory state, let the record re-enter fresh next
+    /// cycle) is correct for either cause, so this is one error string, not
+    /// a fork.
+    [[nodiscard]] std::expected<void, std::string>
+    mark_endpoint_applied(const std::string& agent_id, std::int64_t record_id, std::int64_t at);
+
+    /// #3425: record that a FOLLOW-UP `quarantine.status` read confirmed
+    /// `state|active` on the device's own firewall — the only signal this
+    /// store treats as proof of endpoint containment. Same `record_id`
+    /// scoping and error contract as `mark_endpoint_applied`.
+    [[nodiscard]] std::expected<void, std::string>
+    mark_endpoint_confirmed(const std::string& agent_id, std::int64_t record_id, std::int64_t at);
 
     /// Full quarantine history (active and released) for `agent_id`, newest
     /// first. AUTHORITATIVE read: `std::nullopt` on a store/pool/query

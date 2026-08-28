@@ -24,6 +24,13 @@ if host_machine.system() == 'windows'
   endif
 endif
 
+# #3109: file_retrieval_routes.cpp's admit_to_write_lock() switches over the
+# 5-value SessionAuthOutcome with no `default:`, relying on the compiler to
+# fail the build if the enum ever grows without that switch being updated.
+# Promote -Wswitch (MSVC: C4062, the exact analogue) to an error so that
+# guarantee is actually enforced rather than merely warned about.
+switch_werror_args = cxx.get_id() == 'msvc' ? ['/we4062'] : ['-Werror=switch']
+
 https_cpp_args = []
 https_deps = []
 if not is_disabler(openssl_dep) and openssl_dep.found()
@@ -236,7 +243,10 @@ if _yaml_probe.returncode() != 0
     'PyYAML is required to embed shipped InstructionDefinitions but is '
     + 'not importable from ' + embed_python.full_path() + '. '
     + 'Install with `pip install pyyaml` (Linux/macOS) or '
-    + '`pacman -S python-yaml` (MSYS2). See CLAUDE.md "Instruction Engine".'
+    + '`pacman -S python-yaml` (MSYS2). If you have just installed PyYAML, '
+    + 're-run with `meson setup --wipe <builddir>` -- meson caches '
+    + 'run_command results in introspection state, so --reconfigure will '
+    + 'not re-probe. See CLAUDE.md "Instruction Engine".'
   )
 endif
 
@@ -430,6 +440,8 @@ yuzu_server_core_lib = static_library(
     'src/scim_routes.cpp',
     'src/deprovision_revoke.cpp',
     'src/quarantine_store.cpp',
+    'src/quarantine_reapply.cpp',
+    'src/quarantine_containment_reconciler.cpp',
     'src/result_set_store.cpp',
     'src/result_set_matcher.cpp',
     'src/policy_store.cpp',
@@ -563,7 +575,7 @@ yuzu_server_core_lib = static_library(
     'src/security_headers.cpp',
   )],
   include_directories: ['include', '../../common/include'],
-  cpp_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'] + (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
+  cpp_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'] + (cxx.get_id() == 'msvc' ? ['/bigobj'] : []) + switch_werror_args,
   dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
                  sqlite3_dep, nlohmann_json_dep, re2_dep, qrcodegen_dep,
                  libpq_dep, yuzu_key_provider_dep] + auth_crypto_deps + https_deps

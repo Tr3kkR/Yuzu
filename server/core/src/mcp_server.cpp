@@ -12,6 +12,7 @@
 #include "mcp_transport.hpp"     // Streamable HTTP transport pre-checks (2f)
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (streamed POST, 3b)
 #include "quarantine_dispatch_decision.hpp" // pure write/response classification (#3127)
+#include "quarantine_reapply.hpp" // shared stored-containment re-dispatch recipe (#3425)
 #include "reserved_definition_id.hpp" // kMcpDefinitionPrefix (#2442 — the ONE reserved-namespace rule)
 #include "rotation_confirm_state.hpp" // classify_confirm_state (#2443 confirm_engine_rotation precondition)
 #include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric (shared REST/MCP metric symbol)
@@ -1238,7 +1239,7 @@ static const ToolDef kTools[] = {
      R"j("dispatch_confirmed":{"const":true,"description":"#3127: the plugin registry ACCEPTED the isolation frame. NOT proof of isolation - for a gateway-attached agent the frame is only QUEUED. Confirming isolation requires a subsequent status read returning state|active"},)j"
      R"j("record_pre_existing":{"type":"boolean","description":"#3127: true when an active quarantine record already existed and this call re-dispatched the STORED intent (reason/whitelist) rather than writing a new record from this request"},)j"
      R"j("whitelist_request_ignored":{"type":"boolean","description":"#3127: true when this call supplied a whitelist that differs from the stored one; the STORED whitelist was dispatched and the request's was NOT applied"},)j"
-     R"j("quarantine_record":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"quarantined_by":{"type":"string"},"reason":{"type":"string"},"whitelist":{"type":"string"},"quarantined_at":{"type":"integer","description":"Present when record_pre_existing is true - the stored record's original creation time"}},"required":["agent_id","status","quarantined_by","reason","whitelist"]},)j"
+     R"j("quarantine_record":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"quarantined_by":{"type":"string"},"reason":{"type":"string"},"whitelist":{"type":"string"},"quarantined_at":{"type":"integer","description":"Present when record_pre_existing is true - the stored record's original creation time"},"last_applied_at":{"type":"integer","description":"#3425: epoch seconds a system re-dispatch of the stored whitelist was accepted; 0 = never. NOT proof of endpoint containment."},"last_confirmed_at":{"type":"integer","description":"#3425: epoch seconds a follow-up quarantine.status read reported state|active; 0 = never. This is the target agent's own self-report, not independently corroborated by any network-side signal - strong operational evidence of containment, not proof; see security-hardening.md Device Quarantine."}},"required":["agent_id","status","quarantined_by","reason","whitelist","last_applied_at","last_confirmed_at"]},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
      R"j(},"required":["command_id","agents_reached","dispatch_confirmed","record_pre_existing","whitelist_request_ignored","quarantine_record"]})j"},
 
@@ -8920,44 +8921,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 // Mirror the agent's is_safe_ip charset ([0-9a-fA-F.:], <=45) so we
-                // reject anything the agent would silently drop, loudly. Factored
-                // into a lambda (not just this request's inline block) so the
-                // STORED whitelist read back on the already_active retry path
-                // (#3127) can clear the SAME check below before it reaches the
-                // agent's netsh/iptables/pf sink — the REST twin that can
-                // populate that row (rest_api_v1.cpp) performs no validation of
-                // its own, and this PR is what makes the sink reachable from a
-                // stored (not just a live-request) whitelist.
-                auto whitelist_tokens_safe = [](std::string_view wl) {
-                    auto safe_ip = [](std::string_view tok) {
-                        if (tok.empty() || tok.size() > 45)
-                            return false;
-                        for (char c : tok)
-                            if (!(std::isxdigit(static_cast<unsigned char>(c)) || c == '.' ||
-                                  c == ':'))
-                                return false;
-                        return true;
-                    };
-                    size_t start = 0;
-                    while (start <= wl.size()) {
-                        size_t comma = wl.find(',', start);
-                        auto tok = wl.substr(start, comma == std::string_view::npos
-                                                         ? std::string_view::npos
-                                                         : comma - start);
-                        // trim surrounding spaces
-                        auto b = tok.find_first_not_of(' ');
-                        auto e = tok.find_last_not_of(' ');
-                        tok = (b != std::string_view::npos) ? tok.substr(b, e - b + 1)
-                                                             : std::string_view{};
-                        if (!tok.empty() && !safe_ip(tok))
-                            return false;
-                        if (comma == std::string_view::npos)
-                            break;
-                        start = comma + 1;
-                    }
-                    return true;
-                };
-                if (!whitelist_tokens_safe(whitelist)) {
+                // reject anything the agent would silently drop, loudly.
+                // #3425: moved to quarantine_reapply.hpp
+                // (quarantine_whitelist_tokens_safe) — the SAME shared
+                // chokepoint the already_active retry path below,
+                // QuarantineContainmentReconciler, and the REST twin
+                // (rest_api_v1.cpp's POST /api/v1/quarantine) all call, so
+                // this check exists in exactly one place rather than N
+                // hand-rolled copies.
+                if (!quarantine_whitelist_tokens_safe(whitelist)) {
                     res.set_content(
                         error_response(id, kInvalidParams,
                                        "whitelist must be comma-separated IPv4/IPv6 literals"),
@@ -9042,85 +9014,97 @@ McpServer::HandlerFn McpServer::build_handler(
                 std::string effective_reason = reason;
                 std::string effective_whitelist = whitelist;
                 std::int64_t stored_quarantined_at = 0;
+                // #3425: endpoint-containment confirmation state, surfaced
+                // in the response so a caller doesn't have to poll
+                // GET /api/v1/quarantine separately. Both stay 0 (never) on
+                // the `created` path — this call's own write never sets
+                // them; only QuarantineContainmentReconciler does.
+                std::int64_t stored_last_applied_at = 0;
+                std::int64_t stored_last_confirmed_at = 0;
                 bool whitelist_request_ignored = false;
+                std::string command_id;
+                int agents_reached = 0;
+                bool dispatch_threw = false;
+                // governance UP-9: thread a set CONFINED to the single
+                // scope-gate-checked target, not an unfiltered VisibleSet{} —
+                // defense in depth matching the bundle/execute_instruction
+                // dispatch arms (this was the last arm still passing
+                // unfiltered on a single already-authorized target).
+                // PLAN-006: `session` was authenticated at handler entry and
+                // is already used for the store write above — identify the
+                // caller to dispatch_confined too, not just its visible set.
+                const DispatchCaller quarantine_caller{
+                    .principal = session->username,
+                    .principal_role = auth::role_to_string(session->role),
+                    .exec_visible =
+                        yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{agent_id}}};
                 if (record_pre_existing) {
-                    auto status_res = quarantine_store->get_status(agent_id);
-                    // A read failure — or a success that comes back empty (the
-                    // record was released between the write conflict and this
-                    // read, a narrow race) — leaves nothing durable to
-                    // dispatch against. Both are treated like a store failure:
-                    // retry the whole request rather than dispatch or report
-                    // isolated on a record that turned out not to be there.
-                    if (!status_res || !status_res->has_value()) {
-                        const std::string detail =
-                            status_res ? std::string("quarantine record not found on retry read")
-                                       : status_res.error();
-                        mcp_audit("failure", "agent_id=" + agent_id + ", " + detail);
-                        res.set_content(a4_error(kInternalError, detail, "retry the request",
-                                                 /*retry_after_ms=*/5000),
+                    // #3425: the shared recipe (quarantine_reapply.hpp) owns
+                    // the read-stored-row + validate + dispatch sequence —
+                    // the SAME chokepoint QuarantineContainmentReconciler
+                    // uses on reconnect, so the stored-whitelist-only
+                    // invariant lives in exactly one function rather than
+                    // two hand-rolled copies.
+                    QuarantineRecord stored{};
+                    auto reapply_res = redispatch_stored_containment(
+                        *quarantine_store, agent_id,
+                        [&](const std::unordered_map<std::string, std::string>& params)
+                            -> std::pair<std::string, int> {
+                            return dispatch_fn ? dispatch_fn("quarantine", "quarantine",
+                                                             {agent_id}, /*scope=*/"", params,
+                                                             /*execution_id=*/"", quarantine_caller)
+                                                : std::pair<std::string, int>{};
+                        },
+                        stored);
+                    if (!reapply_res) {
+                        const auto& err = reapply_res.error();
+                        if (err.kind == ContainmentReapplyErrorKind::whitelist_invalid) {
+                            mcp_audit("failure", "agent_id=" + agent_id +
+                                                     ", stored whitelist failed edge validation");
+                            res.set_content(
+                                a4_error(kInternalError,
+                                         "stored quarantine whitelist is not dispatchable"),
+                                "application/json");
+                            return;
+                        }
+                        // store_error / no_active_record: both leave nothing
+                        // durable to dispatch against — retry the whole
+                        // request rather than report isolated on a record
+                        // that turned out not to be there.
+                        mcp_audit("failure", "agent_id=" + agent_id + ", " + err.detail);
+                        res.set_content(a4_error(kInternalError, err.detail, "retry the request",
+                                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                         "application/json");
                         return;
                     }
-                    const QuarantineRecord& stored = **status_res;
                     effective_by = stored.quarantined_by;
                     effective_reason = stored.reason;
                     effective_whitelist = stored.whitelist;
                     stored_quarantined_at = stored.quarantined_at;
+                    stored_last_applied_at = stored.last_applied_at;
+                    stored_last_confirmed_at = stored.last_confirmed_at;
                     // The caller's params were not applied — tell it, rather
                     // than silently discarding a whitelist it thought it was
                     // setting.
                     if (!whitelist.empty() && whitelist != stored.whitelist)
                         whitelist_request_ignored = true;
-                    // #3127: the stored whitelist may have been written by the
-                    // REST twin (record-only, no charset/length validation of
-                    // its own) and is about to reach the agent's firewall sink
-                    // on this retry-dispatch path — it must clear the SAME
-                    // server-edge check the request path cleared above before
-                    // it dispatches.
-                    if (effective_whitelist.size() > 512 ||
-                        !whitelist_tokens_safe(effective_whitelist)) {
-                        mcp_audit("failure", "agent_id=" + agent_id +
-                                                 ", stored whitelist failed edge validation");
-                        res.set_content(
-                            a4_error(kInternalError,
-                                     "stored quarantine whitelist is not dispatchable"),
-                            "application/json");
-                        return;
-                    }
-                }
-                // 2. Dispatch the live isolation command (plugin quarantine,
-                //    action quarantine). Out-of-band (no ExecutionTracker row):
-                //    quarantine is not an executions-drawer producer. A dispatch
-                //    failure leaves the record persisted (the agent may be offline)
-                //    and is surfaced via agents_reached=0, not a fatal error.
-                //    should_dispatch_isolation is true for both created and
-                //    already_active reached here — store_error already
-                //    returned above — but the call stays explicit: this IS the
-                //    retry no longer dead-ending (#3127).
-                std::string command_id;
-                int agents_reached = 0;
-                bool dispatch_threw = false;
-                if (dispatch_fn && should_dispatch_isolation(write_result)) {
+                    command_id = reapply_res->command_id;
+                    agents_reached = reapply_res->agents_reached;
+                    dispatch_threw = reapply_res->dispatch_threw;
+                } else if (dispatch_fn && should_dispatch_isolation(write_result)) {
+                    // `created`: dispatch this call's own (already
+                    // server-edge-validated above) whitelist directly — no
+                    // extra store read needed, the row we just wrote IS
+                    // `effective_whitelist`. `store_error` already returned
+                    // above, so `should_dispatch_isolation` is true here by
+                    // construction; the call stays explicit per #3127.
                     std::unordered_map<std::string, std::string> qparams;
                     if (!effective_whitelist.empty())
                         qparams["whitelist_ips"] = effective_whitelist;
                     try {
-                        // governance UP-9: thread a set CONFINED to the single
-                        // scope-gate-checked target, not an unfiltered VisibleSet{} —
-                        // defense in depth matching the bundle/execute_instruction
-                        // dispatch arms (this was the last arm still passing
-                        // unfiltered on a single already-authorized target).
-                        // PLAN-006: `session` was authenticated at handler entry and
-                        // is already used for the store write above — identify the
-                        // caller to dispatch_confined too, not just its visible set.
-                        std::tie(command_id, agents_reached) = dispatch_fn(
-                            "quarantine", "quarantine", {agent_id}, /*scope=*/"", qparams,
-                            /*execution_id=*/"",
-                            DispatchCaller{
-                                .principal = session->username,
-                                .principal_role = auth::role_to_string(session->role),
-                                .exec_visible = yuzu::server::authz::VisibleSet{
-                                    std::unordered_set<std::string>{agent_id}}});
+                        std::tie(command_id, agents_reached) =
+                            dispatch_fn("quarantine", "quarantine", {agent_id}, /*scope=*/"",
+                                        qparams, /*execution_id=*/"", quarantine_caller);
                     } catch (const std::exception& e) {
                         dispatch_threw = true;
                         spdlog::error("MCP quarantine_device: isolation dispatch failed: {}",
@@ -9177,22 +9161,21 @@ McpServer::HandlerFn McpServer::build_handler(
                     // every other command to this device, so containment at
                     // the control plane is in force.
                     //
-                    // And it says, explicitly, what does NOT happen — because
-                    // an earlier wording here promised "the endpoint firewall
-                    // applies when the agent reconnects" and nothing does that.
-                    // There is no reconnect hook that consults containment
-                    // state (verified: no `list_quarantined()` caller outside
-                    // `make_containment_gate` and the REST list route). A SOC
-                    // analyst who quarantines a powered-off laptop, reads that
-                    // sentence and closes the ticket gets a device that comes
-                    // back two days later with no endpoint containment at all
-                    // — and the #881 gate then refuses every command that would
-                    // have probed it. Recorded-but-not-enforced is exactly the
-                    // phantom-isolation class #3127 exists to eliminate, so the
-                    // message must not create a new one in the error text.
-                    // Automatic re-dispatch on reconnect is a real gap and is
-                    // tracked separately; until it exists the honest word is
-                    // "re-issue".
+                    // And it says, explicitly, what happens next — because an
+                    // earlier wording here promised "the endpoint firewall
+                    // applies when the agent reconnects" while nothing did
+                    // that, which was itself a phantom-isolation-shaped lie
+                    // (#3127's own class of bug) in the OPPOSITE direction: a
+                    // caller who believed it would under-react to an offline
+                    // device. #3425 closed that gap —
+                    // QuarantineContainmentReconciler re-applies the STORED
+                    // whitelist automatically once the device reconnects
+                    // (heartbeat-triggered, with a periodic tick backstop for
+                    // anything the heartbeat hook misses) and only marks
+                    // containment confirmed after a follow-up
+                    // `quarantine.status` read reports `state|active` — the
+                    // wording below reflects that a manual re-issue is no
+                    // longer load-bearing, only redundant-but-harmless.
                     //
                     // A first-attempt failure keeps the 5s hint — there, a
                     // retry genuinely can succeed.
@@ -9206,17 +9189,29 @@ McpServer::HandlerFn McpServer::build_handler(
                                      (device_durably_unreachable
                                           ? ". The record is persisted and the server is already "
                                             "denying dispatch to this device, so containment holds "
-                                            "at the control plane. The endpoint firewall is NOT "
-                                            "applied and nothing re-applies it automatically on "
-                                            "reconnect — re-issue this call once the agent is "
-                                            "back."
+                                            "at the control plane. The endpoint firewall is not yet "
+                                            "confirmed applied, but the server automatically "
+                                            "re-applies it once the device reconnects (#3425) — "
+                                            "re-issuing this call has the same effect and is not "
+                                            "required."
                                           : ""),
                                  device_durably_unreachable
                                      ? "the device has not been reachable across attempts — "
-                                       "re-issue once it reconnects; the endpoint firewall is not "
-                                       "applied until a dispatch reaches it"
+                                       "containment is re-applied automatically on reconnect; "
+                                       "re-issuing this call is optional, not required"
                                      : "retry the request",
-                                 /*retry_after_ms=*/device_durably_unreachable ? 60000 : 5000),
+                                 // 60000 (not a named constant — a one-site,
+                                 // deliberately longer wait for the durably-
+                                 // unreachable case, distinct from the
+                                 // ordinary store-fault retry below) vs
+                                 // kMcpStoreFaultRetryMs (#3425 governance
+                                 // correction round, architect LOW: this
+                                 // site's own retryable branch had drifted to
+                                 // a bare 5000 literal after #3344 named the
+                                 // sibling sites in this same handler).
+                                 /*retry_after_ms=*/device_durably_unreachable
+                                     ? 60000
+                                     : mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -9235,7 +9230,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     .add("status", "active")
                     .add("quarantined_by", effective_by)
                     .add("reason", effective_reason)
-                    .add("whitelist", effective_whitelist);
+                    .add("whitelist", effective_whitelist)
+                    // #3425: unconditional, like the REST list serializer —
+                    // 0 means never (a fresh `created` write, or a stored
+                    // row the reconciler has not yet touched), not "this
+                    // server version doesn't send it".
+                    .add("last_applied_at", stored_last_applied_at)
+                    .add("last_confirmed_at", stored_last_confirmed_at);
                 if (record_pre_existing)
                     record_obj.add("quarantined_at", stored_quarantined_at);
                 JObj payload;
