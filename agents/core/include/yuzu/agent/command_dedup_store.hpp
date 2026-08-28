@@ -147,10 +147,14 @@ public:
      * duplicate replays `serialized_response` (= CommandResponse::SerializeAsString()).
      * FIRST-WRITE-WINS: only an in-flight row is flipped, so a second terminal
      * (e.g. a spurious post-terminal throw) is a Miss, never an overwrite. A Miss
-     * on a command that WAS claimed means its row was evicted — the signal a
-     * redelivery could re-execute; the caller counts it. Best-effort + noexcept:
-     * a failure only degrades durability. No-op (Miss) on an empty id / closed
-     * store.
+     * means the terminal matched no in-flight row — the command ran
+     * undeduplicated (its claim had failed, fail-open) OR this is a duplicate
+     * terminal. It is NOT a measure of the eviction-driven double-execute: an
+     * outcome aged out of the ring produces a fresh Claimed on redelivery, not a
+     * Miss, so that path is not separately detectable here (it is bounded by
+     * kMaxDedupRows exceeding the server's retry horizon, not observed). Best-
+     * effort + noexcept: a failure only degrades durability. Miss on an empty id /
+     * closed store returns Miss / Error respectively.
      */
     RecordOutcome record_terminal(std::string_view command_id,
                                   std::string_view serialized_response) noexcept;

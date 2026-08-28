@@ -2168,14 +2168,18 @@ public:
                             tags["yuzu.commands_executed"] = std::to_string(static_cast<int64_t>(
                                 metrics_.counter("yuzu_agent_commands_executed_total").value()));
                             tags["yuzu.plugins_loaded"] = std::to_string(plugins_.size());
-                            // HA WS-0 dedup safety-net signal. "degraded"=1 means the
-                            // durable store never opened, so this agent runs commands
-                            // undeduplicated (fail-open) — a real reading emitted every
-                            // heartbeat, so an operator can spot it fleet-wide (the
-                            // server-side yuzu_fleet_* derivation + alert land with
-                            // WS-11). record_terminal_misses is the count of terminal
-                            // outcomes that matched no in-flight row — the signal a
-                            // redelivery could re-execute.
+                            // HA WS-0 dedup safety-net signals, emitted every
+                            // heartbeat (the agent has no /metrics; the server-side
+                            // yuzu_fleet_* derivation + alert land with WS-11).
+                            // "degraded"=1 means the durable store never OPENED, so
+                            // this agent runs commands undeduplicated (fail-open) — a
+                            // real 0/1 reading, never absent-reads-as-zero. "misses"
+                            // counts terminal outcomes that matched no in-flight row
+                            // (a command that ran undeduplicated, or a duplicate
+                            // terminal) — NOT the eviction double-execute, which is not
+                            // separately detectable. "record_errors" counts durable
+                            // WRITE failures after a healthy open (the write-side of
+                            // fail-open). "replays" counts served terminal replays.
                             tags["yuzu.dedup_degraded"] = command_dedup_ ? "0" : "1";
                             tags["yuzu.dedup_replays"] = std::to_string(static_cast<int64_t>(
                                 metrics_.counter("yuzu_agent_dedup_replays_total").value()));
@@ -2183,6 +2187,8 @@ public:
                                 std::to_string(static_cast<int64_t>(
                                     metrics_.counter("yuzu_agent_dedup_record_terminal_miss_total")
                                         .value()));
+                            tags["yuzu.dedup_record_errors"] = std::to_string(static_cast<int64_t>(
+                                metrics_.counter("yuzu_agent_dedup_record_errors_total").value()));
                             tags["yuzu.os"] = kAgentOs;
                             tags["yuzu.arch"] = kAgentArch;
                             tags["yuzu.agent_version"] = std::string{yuzu::kFullVersionString};
@@ -3256,8 +3262,24 @@ private:
             } else {
                 blob = resp.SerializeAsString();
             }
-            if (command_dedup_->record_terminal(command_id, blob) == RecordOutcome::Miss)
+            switch (command_dedup_->record_terminal(command_id, blob)) {
+            case RecordOutcome::Recorded:
+                break;
+            case RecordOutcome::Miss:
+                // A terminal outcome matched no in-flight row: the command ran
+                // undeduplicated (claim had failed — fail-open) or this is a
+                // duplicate terminal write. NOT the same as the eviction-driven
+                // double-execute, which produces a fresh claim and is not
+                // separately detectable here (bounded by kMaxDedupRows).
                 metrics_.counter("yuzu_agent_dedup_record_terminal_miss_total").increment();
+                break;
+            case RecordOutcome::Error:
+                // A durable WRITE failed (full disk / I/O error) after a healthy
+                // open — the write-side of the fail-open degradation, which must
+                // stay observable (invariant 7), not just logged in the store.
+                metrics_.counter("yuzu_agent_dedup_record_errors_total").increment();
+                break;
+            }
         } catch (...) {
             // best-effort: an allocation/serialization failure only degrades
             // durability (a redelivery may re-execute); never terminate.
