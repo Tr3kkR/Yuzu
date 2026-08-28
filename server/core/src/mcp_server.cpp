@@ -4925,20 +4925,31 @@ McpServer::HandlerFn McpServer::build_handler(
                     // codebase, and the scope-drop half mirrors
                     // query_installed_software's "denied" audit row.
                     //
-                    // Gate 8 re-review finding: mcp_audit (try_persist_audit)
-                    // is a SYNCHRONOUS write, so calling it on only ONE of
-                    // the two !found sub-cases would reopen a (much weaker)
-                    // echo of the exact existence-probe #1700 closes -- a
-                    // caller measuring response latency across many requests
-                    // could distinguish "exists, out of scope" (audit write)
-                    // from "genuinely nonexistent" (no write) even though the
-                    // response body is byte-identical. Audit UNCONDITIONALLY
-                    // on !found; only the server-side detail string (never
-                    // sent to the caller) varies by which sub-case it was.
-                    mcp_audit("denied", exists_out_of_scope
-                                             ? "scope: agent out of caller's fleet-read scope: " +
-                                                   agent_id
-                                             : "not found: " + agent_id);
+                    // Gate 8 re-review found and fixed two timing side-
+                    // channels here (synchronous-audit-write asymmetry,
+                    // scan-length asymmetry) -- both closed by making the
+                    // audit call and the scan unconditional. #3564 (external
+                    // adversarial review, Codex) then found the detail
+                    // STRING itself was still the leak: query_audit_log is a
+                    // documented MCP tool gated only on flat AuditLog:Read
+                    // (carried by the seeded Operator/PlatformEngineer roles)
+                    // and echoes every event's `detail` field back verbatim
+                    // -- a caller holding AuditLog:Read could call this tool,
+                    // then query_audit_log(principal=self), and read back
+                    // which detail string her own event got, learning
+                    // existence directly with no timing analysis at all.
+                    // Unlike query_installed_software's "denied" row (a
+                    // COUNT, safe because it never confirms/denies one
+                    // specific caller-supplied id), a single-agent lookup's
+                    // detail string cannot safely distinguish the two
+                    // sub-cases in ANY caller-queryable channel. Both now
+                    // audit the IDENTICAL detail string; the distinction is
+                    // recorded ONLY server-side, in the log line below, which
+                    // no MCP tool exposes back to a caller.
+                    spdlog::debug("get_agent_details: {} for {} (caller-visible audit unchanged)",
+                                  exists_out_of_scope ? "out-of-scope match" : "no match", agent_id);
+                    mcp_audit("denied", "agent not found or outside caller's fleet-read scope: " +
+                                            agent_id);
                     res.set_content(
                         error_response(id, kInvalidParams, "Agent not found: " + agent_id),
                         "application/json");

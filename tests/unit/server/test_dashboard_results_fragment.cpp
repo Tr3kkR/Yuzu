@@ -177,6 +177,43 @@ TEST_CASE("/fragments/results: admitted + scoped gate hides out-of-scope rows "
     CHECK_FALSE(contains(res->body, "2 agents"));
 }
 
+// #3565: this codebase has a documented prior incident (authz_model.hpp's
+// own doc comment on VisibleSet{}) of an engaged-empty scope (deny_all())
+// being mishandled as unfiltered/nullopt, serving the whole fleet to a
+// caller with no grants at all. Pin the distinction directly.
+TEST_CASE("/fragments/results: admitted-but-deny_all() scope shows nothing",
+          "[pg][server][dashboard][fragment][auth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-deny-all-1";
+    StoredResponse r;
+    r.instruction_id = command_id;
+    r.agent_id = "agent-x";
+    r.received_at_ms = 1000;
+    r.status = 0;
+    r.output = "should never render";
+    rs.store(r);
+
+    FragmentResultsHarness h(&rs);
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+          const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, yuzu::server::authz::deny_all()}; // admitted, engaged-empty scope
+        });
+    auto res = h.get("/fragments/results?command_id=" + command_id + "&plugin=registry");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_FALSE(contains(res->body, "should never render"));
+    CHECK_FALSE(contains(res->body, "agent-x"));
+    // Zero rows post-filter renders the same "no results" empty-state a
+    // genuinely-empty command_id would -- never a count (there is nothing
+    // to count for this caller, and "0 agents" would still be more
+    // information than a deny_all() caller is owed).
+    CHECK(contains(res->body, "No results match your filters"));
+}
+
 TEST_CASE("/fragments/results: admitted + unfiltered (TOP) gate shows every agent",
           "[pg][server][dashboard][fragment][auth]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);

@@ -5641,6 +5641,15 @@ TEST_CASE("MCP get_agent_details: out-of-scope agent collapses to not-found",
     auto nonexistent_body = nlohmann::json::parse(nonexistent->body);
     REQUIRE(nonexistent_body.contains("error"));
 
+    // #3565 (external adversarial review, Codex): the two prior CHECKs only
+    // asserted `out_body` on its own -- tighten to a direct byte-identity
+    // comparison between the two error CODES (the messages legitimately
+    // differ only by the caller-supplied agent_id substring, which is
+    // expected input-echo, not a scope-vs-absence signal).
+    CHECK(out_body["error"]["code"] == nonexistent_body["error"]["code"]);
+    CHECK(out_body["error"]["message"].get<std::string>().starts_with("Agent not found: "));
+    CHECK(nonexistent_body["error"]["message"].get<std::string>().starts_with("Agent not found: "));
+
     // Gate 6 sre finding: the RESPONSE collapses "out of scope" into "not
     // found" (by design, above), but the server-side audit trail must still
     // record the real reason -- same Pattern-D discipline as every other
@@ -5655,14 +5664,69 @@ TEST_CASE("MCP get_agent_details: out-of-scope agent collapses to not-found",
     // cost, no distinguishing signal.
     int denied_count = 0;
     bool saw_success = false;
-    for (const auto& a : ts.audit_log) {
-        if (a == "mcp.get_agent_details|denied")
+    std::vector<std::string> denied_details;
+    REQUIRE(ts.audit_log.size() == ts.audit_details.size());
+    for (std::size_t i = 0; i < ts.audit_log.size(); ++i) {
+        if (ts.audit_log[i] == "mcp.get_agent_details|denied") {
             ++denied_count;
-        if (a == "mcp.get_agent_details|success")
+            denied_details.push_back(ts.audit_details[i]);
+        }
+        if (ts.audit_log[i] == "mcp.get_agent_details|success")
             saw_success = true;
     }
     CHECK(denied_count == 2);  // agent-002 (out-of-scope) + agent-999 (nonexistent)
     CHECK(saw_success);        // the in-scope agent-001 lookup
+
+    // #3564 (the blocking finding this section exists to close): the audit
+    // DETAIL string -- not just the count/result -- must be identical for
+    // both !found sub-cases too. query_audit_log echoes `detail` back
+    // verbatim to any caller holding flat AuditLog:Read; a distinguishing
+    // detail string would let such a caller learn "out of scope" vs
+    // "genuinely nonexistent" by simply reading her own audit rows back,
+    // no timing analysis required -- the exact existence-oracle the
+    // response-body collapse above exists to prevent, reopened through a
+    // different, more direct channel.
+    REQUIRE(denied_details.size() == 2);
+    // The two details differ only by the caller-echoed agent_id suffix
+    // ("agent-002" vs "agent-999", expected input-echo); the TEMPLATE --
+    // everything that could carry a scope-vs-absence signal -- must be
+    // identical. Compare with each detail's own trailing agent_id stripped
+    // rather than a fixed prefix length, so this stays correct if the
+    // template wording ever changes.
+    auto strip_agent_id = [](const std::string& detail, const std::string& agent_id) {
+        auto pos = detail.rfind(agent_id);
+        REQUIRE(pos != std::string::npos);
+        return detail.substr(0, pos);
+    };
+    CHECK(strip_agent_id(denied_details[0], "agent-002") ==
+          strip_agent_id(denied_details[1], "agent-999"));
+}
+
+// #3565: this codebase has a documented prior incident (authz_model.hpp's
+// own doc comment on VisibleSet{}) of an engaged-empty scope (deny_all(),
+// zero visible agents) being mishandled as unfiltered/nullopt, serving the
+// whole fleet to a caller with no grants at all. Pin the distinction: an
+// ADMITTED caller with scope=deny_all() must see NOTHING, not everything.
+TEST_CASE("MCP get_agent_details: admitted-but-deny_all() scope sees nothing",
+          "[mcp][auth]") {
+    McpTestServer ts;
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, yuzu::server::authz::deny_all()}; // admitted=true, engaged-empty scope
+    };
+    ts.start();
+
+    // agent-001 genuinely exists in the fixture registry -- a mishandled
+    // deny_all() (silently read as unfiltered) would find and return it.
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":22,"params":{"name":"get_agent_details","arguments":{"agent_id":"agent-001"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK_FALSE(body.contains("result"));
 }
 
 // require_fleet_read's own doc comment: unwired = misconfiguration, FAILS

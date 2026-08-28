@@ -185,14 +185,24 @@ struct ExecHarness {
     /// empty deny-all) is exercised (K-R7-02).
     bool wire_exec_visible{true};
 
+    /// #3565: `fleet_read_fn` is captured BY VALUE into the detail route's
+    /// lambda at `register_routes` time (unlike DashboardRoutes' live
+    /// per-request member read), so a test wanting the genuinely-unwired
+    /// (empty std::function) contract must opt out HERE, at construction --
+    /// setting `fleet_read_grant`/`fleet_read_scope` after the fact can't
+    /// reach it, the closure is already captured.
+    bool wire_fleet_read_fn{true};
+
     explicit ExecHarness(pg::PgPool& pool, bool with_bus = true,
                          yuzu::server::detail::StreamBudget* budget = nullptr,
                          bool wire_exec_visible_arg = true,
-                         bool with_workflow_engine = false)
+                         bool with_workflow_engine = false,
+                         bool wire_fleet_read_fn_arg = true)
         : stream_budget(budget),
           tracker_db(uniq("wf-routes-exec")), instr_db(uniq("wf-routes-inst")),
           wf_db(uniq("wf-routes-wf")) {
         wire_exec_visible = wire_exec_visible_arg;
+        wire_fleet_read_fn = wire_fleet_read_fn_arg;
         for (auto& p : {tracker_db, instr_db, wf_db})
             fs::remove(p);
 
@@ -302,7 +312,10 @@ struct ExecHarness {
         WorkflowRoutes::Deps wf_deps;
         wf_deps.auth_fn = auth_fn;
         wf_deps.perm_fn = perm_fn;
-        wf_deps.fleet_read_fn = fleet_read_fn;
+        if (wire_fleet_read_fn)
+            wf_deps.fleet_read_fn = fleet_read_fn;
+        // else: leave genuinely default-constructed (empty std::function) --
+        // production's own unwired-misconfiguration contract (#3565).
         wf_deps.audit_fn = audit_fn;
         wf_deps.emit_fn = emit_fn;
         wf_deps.scope_fn = scope_fn;
@@ -610,6 +623,45 @@ TEST_CASE("executions detail: 403 when fleet_read_fn denies",
     auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
     REQUIRE(res);
     CHECK(res->status == 403);
+}
+
+// #3565: the dashboard (/fragments/results) and MCP (get_agent_details)
+// siblings both have an unwired-fleet_read_fn -> 503 fail-closed test; this
+// route's own equivalent contract (workflow_routes.cpp's own
+// `if (!fleet_read_fn) {...503...}` branch) had no test at all.
+TEST_CASE("executions detail: unwired fleet_read_fn -> 503, fail closed",
+          "[pg][workflow][executions][detail][rbac]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                 /*with_workflow_engine=*/false, /*wire_fleet_read_fn=*/false);
+    h.make_def("def-U", "U");
+    auto eid = h.make_exec("def-U", "completed", 1, 1, 0);
+    auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+}
+
+// #3565: this codebase has a documented prior incident (authz_model.hpp's
+// own doc comment on VisibleSet{}) of an engaged-empty scope (deny_all())
+// being mishandled as unfiltered/nullopt, serving the whole fleet to a
+// caller with no grants at all. Pin the distinction directly for this route.
+TEST_CASE("executions detail: admitted-but-deny_all() scope shows nothing",
+          "[pg][workflow][executions][detail][rbac]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-Y2", "Y2");
+    auto eid = h.make_exec("def-Y2", "completed", 1, 1, 0);
+    h.agent_status(eid, "agent-should-not-appear", "success", 0, "", 1735689601);
+    h.store_response("def-Y2", "agent-should-not-appear", "should never render", eid);
+
+    h.fleet_read_scope = yuzu::server::authz::deny_all();
+    auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("agent-should-not-appear") == std::string::npos);
+    CHECK(res->body.find("should never render") == std::string::npos);
 }
 
 // #1712 / #3290 Phase 2: the "Responses" section must drop rows for agents
