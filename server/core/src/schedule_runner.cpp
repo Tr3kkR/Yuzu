@@ -144,18 +144,23 @@ void ScheduleRunner::fire(const InstructionSchedule& s) {
 
 bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std::string& plugin,
                                         const std::string& action) {
-    // #1398 hardening (governance Gate 4 unhappy-path CRITICAL finding): the
-    // definition this schedule fires can be MUTATED (PUT /api/instructions/
-    // {id}, gated only on InstructionDefinition:Write) between a ticket's
-    // approval and this schedule's next tick — `fire()` re-fetches `def`
-    // fresh every time, so `plugin`/`action` here may be DIFFERENT from what
-    // was actually reviewed when the ticket below was approved. Comparing
-    // against `a.target_action` (see its doc comment, approval_manager.hpp)
-    // closes that: a mismatch — including a pre-migration empty value —
-    // simply fails the equality check below and falls through to submitting
-    // a fresh ticket for the NEW content, never redeeming stale review for
-    // unreviewed content.
-    const std::string target_action = plugin + "." + action;
+    // #1398 hardening (governance Gate 4 unhappy-path CRITICAL finding,
+    // then re-hardened by security-guardian's re-review): the definition
+    // this schedule fires can be MUTATED (PUT /api/instructions/{id}, gated
+    // only on InstructionDefinition:Write) between a ticket's approval and
+    // this schedule's next tick — `fire()` re-fetches `def` fresh every
+    // time, so `plugin`/`action` here may be DIFFERENT from what was
+    // actually reviewed when the ticket below was approved. Comparing
+    // against `a.target_plugin`/`a.target_action` (see their doc comment,
+    // approval_manager.hpp) closes that: a mismatch on EITHER field —
+    // including a pre-migration empty value — simply fails the equality
+    // check below and falls through to submitting a fresh ticket for the
+    // NEW content, never redeeming stale review for unreviewed content.
+    // TWO separate comparisons, not a concatenated string: `plugin`/`action`
+    // are free text with no charset restriction, so a single `plugin+"."
+    // +action` string would be collision-prone (28 shipped actions already
+    // contain a literal `.`) — matching `CommandCapabilityRegistry::
+    // classify`'s own independent-field shape eliminates that class.
 
     // 1) An APPROVED ticket for THIS schedule's occurrence, for THIS exact
     //    target → fire. The caller advances the schedule on our true return,
@@ -168,8 +173,25 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
     auto approved = d_.approval_manager->query({.status = "approved", .submitted_by = s.created_by});
     for (const auto& a : approved) {
         if (a.definition_id != s.definition_id || a.scope_expression != s.scope_expression ||
-            a.schedule_id != s.id || a.target_action != target_action || !ticket_is_current(a, s))
+            a.schedule_id != s.id || !ticket_is_current(a, s))
             continue;
+        // #1398 (security-guardian re-review, MEDIUM): a ticket that matches
+        // this occurrence's identity but NOT its current content is exactly
+        // the attack this hardening defends against (get benign content
+        // approved, then swap the definition before the next tick) — worth
+        // its own detectable audit signal, distinct from "no ticket found
+        // at all" (step 4's ordinary first-ask path below).
+        if (a.target_plugin != plugin || a.target_action != action) {
+            spdlog::warn("schedule_runner: schedule '{}' (id={}) approval {} no longer matches "
+                         "the definition's CURRENT target ({}.{} != approved {}.{}) — refusing "
+                         "to redeem stale review; a fresh ticket will be requested",
+                         s.name, s.id, a.id, plugin, action, a.target_plugin, a.target_action);
+            audit(s, "instruction.schedule_fired", "denied",
+                  "approval_content_mismatch approval_id=" + a.id + " schedule_id=" + s.id +
+                      " approved_target=" + a.target_plugin + "." + a.target_action +
+                      " current_target=" + plugin + "." + action);
+            continue;
+        }
         dispatch_tracked(s, plugin, action, a.id);
         return true;
     }
@@ -191,7 +213,8 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
     auto rejected = d_.approval_manager->query({.status = "rejected", .submitted_by = s.created_by});
     for (const auto& a : rejected) {
         if (a.definition_id != s.definition_id || a.scope_expression != s.scope_expression ||
-            a.schedule_id != s.id || a.target_action != target_action || !ticket_is_current(a, s))
+            a.schedule_id != s.id || a.target_plugin != plugin || a.target_action != action ||
+            !ticket_is_current(a, s))
             continue;
         spdlog::info("schedule_runner: schedule '{}' (id={}) occurrence skipped — approval {} "
                      "rejected by {}",
@@ -202,10 +225,10 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
     }
 
     // 4) No ticket yet → submit one (tagged with this schedule's id, M-02,
-    //    and this exact target_action, #1398 hardening) and hold the
+    //    and this exact target plugin/action, #1398 hardening) and hold the
     //    occurrence at its due time.
     auto submitted = d_.approval_manager->submit(s.definition_id, s.created_by, s.scope_expression,
-                                                 s.id, ApprovalOrigin::kSchedule, target_action);
+                                                 s.id, ApprovalOrigin::kSchedule, plugin, action);
     if (!submitted) {
         // Submit failure (pending cap, store error): drop THIS occurrence
         // (advance) rather than re-submitting every tick against a full cap.

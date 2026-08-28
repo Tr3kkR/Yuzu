@@ -19,4 +19,6 @@
   approval ticket is now bound to the specific `plugin.action` it was approved for, not just the
   definition id — a definition mutated (`PUT /api/instructions/{id}`) between a schedule's ticket
   approval and its next fire no longer redeems stale review for unreviewed, swapped content
-  (`ApprovalManager` schema v8, additive `target_action` column).
+  (`ApprovalManager` schema v8, additive `target_plugin`/`target_action` columns compared
+  independently rather than a concatenated string, avoiding a collision class 28 shipped
+  action names already brush up against).

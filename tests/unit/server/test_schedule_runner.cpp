@@ -436,15 +436,20 @@ TEST_CASE("ScheduleRunner: a definition mutated AFTER ticket approval does not f
 
     CHECK(h.calls.empty()); // no dispatch happened at all — the swap was refused
     // A fresh ticket for the NEW content is submitted and held, distinct
-    // from the original (now permanently stale — target_action mismatched)
-    // approved one.
+    // from the original (now permanently stale — target mismatched) approved
+    // one. Two separate fields (not a concatenated string, #1398
+    // security-guardian re-review) so a definition whose plugin/action
+    // happen to concatenate to the same string as another pair still can't
+    // collide here — asserted independently.
     auto still_pending = h.approvals.query({.status = "pending"});
     REQUIRE(still_pending.size() == 1);
-    CHECK(still_pending[0].target_action == "script_exec.bash");
+    CHECK(still_pending[0].target_plugin == "script_exec");
+    CHECK(still_pending[0].target_action == "bash");
     auto approved_now = h.approvals.query({.status = "approved"});
     REQUIRE(approved_now.size() == 1);
-    CHECK(approved_now[0].target_action == "procs.list"); // the stale, never-consumed ticket
-    CHECK(approved_now[0].consumed_at == 0);               // never redeemed
+    CHECK(approved_now[0].target_plugin == "procs"); // the stale, never-consumed ticket
+    CHECK(approved_now[0].target_action == "list");
+    CHECK(approved_now[0].consumed_at == 0); // never redeemed
 }
 
 TEST_CASE("ScheduleRunner: rejecting the ticket skips the occurrence and re-asks next time",
