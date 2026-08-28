@@ -27,13 +27,14 @@ set -euo pipefail
 # rewrite — which deploy/windows/Test-ToolchainContract.ps1 rightly fails on
 # ("the baseline updater covers every active tracked SHA reference").
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VCPKG_COMMIT="$(python3 -c "
+VCPKG_COMMIT="$(python3 -c '
 import json, sys
+path = sys.argv[1]
 try:
-    print(json.load(open('${REPO_ROOT}/vcpkg.json'))['builtin-baseline'])
+    print(json.load(open(path))["builtin-baseline"])
 except Exception as exc:
-    sys.exit(f'cannot read builtin-baseline from ${REPO_ROOT}/vcpkg.json: {exc}')
-")" || { echo "Error: could not resolve the vcpkg baseline from vcpkg.json." >&2; exit 1; }
+    sys.exit(f"cannot read builtin-baseline from {path}: {exc}")
+' "${REPO_ROOT}/vcpkg.json")" || { echo "Error: could not resolve the vcpkg baseline from vcpkg.json." >&2; exit 1; }
 
 # GCC 13+ is the documented floor (README "Prerequisites"). RHEL 9's system GCC
 # is 11, so the compiler must come from a gcc-toolset Software Collection.
@@ -186,7 +187,7 @@ if [ "$CHECK_ONLY" = 1 ]; then
   check "pyyaml ${PYYAML_VERSION}"           python3 -c "import yaml, sys; sys.exit(yaml.__version__ != '${PYYAML_VERSION}')"
   check "libsystemd headers present"       pkg-config --exists libsystemd
   check "VCPKG_ROOT set and bootstrapped"  test -x "${VCPKG_ROOT_ARG}/vcpkg"
-  check "vcpkg pinned to baseline"         bash -c "[ \"\$(git -C '${VCPKG_ROOT_ARG}' rev-parse HEAD 2>/dev/null)\" = '${VCPKG_COMMIT}' ]"
+  check "vcpkg pinned to baseline"         test "$(git -C "${VCPKG_ROOT_ARG}" rev-parse HEAD 2>/dev/null)" = "${VCPKG_COMMIT}"
 
   if [ "$WITH_POSTGRES" = 1 ] || [ -n "${YUZU_TEST_POSTGRES_DSN:-}" ]; then
     check "postgresql service active"      systemctl is-active --quiet postgresql
@@ -309,6 +310,10 @@ fi
 # the collection the binaries are plain `gcc`/`g++`, NOT `gcc-14`/`g++-14`.
 
 step "Writing ${ENV_FILE}"
+# The env file is sourced by every new shell, so a user-supplied path goes in
+# shell-quoted (%q), never raw: a `"` or `$(` in --vcpkg-root would otherwise
+# execute at every login.
+VCPKG_ROOT_Q="$(printf '%q' "${VCPKG_ROOT_ARG}")"
 if [ "$DRY_RUN" = 0 ]; then
   mkdir -p "$(dirname "${ENV_FILE}")"
   cat > "${ENV_FILE}" <<EOF
@@ -329,7 +334,7 @@ case ":\${PATH}:" in
 esac
 export PATH
 
-export VCPKG_ROOT="${VCPKG_ROOT_ARG}"
+export VCPKG_ROOT=${VCPKG_ROOT_Q}
 
 # ccache wrappers, matching .github/workflows/ci.yml. ccache is EPEL-only on
 # RHEL/Rocky/Alma, so fall back to the bare compilers when it is absent.
