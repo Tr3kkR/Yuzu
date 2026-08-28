@@ -328,6 +328,35 @@ TEST_CASE("caller_for_stored_username: an unresolvable creator denies at the cho
         CHECK(caller.principal_role == "operator");
         CHECK_FALSE(caller.system);
         CHECK_FALSE(caller.exec_visible.has_value()); // nullopt passed through unchanged
+        // #1398 (quality-engineer, Gate 3): the trailing `principal_is_admin`
+        // param is defaulted, so an omitted call site (this one) must still
+        // land `false` — the fail-closed direction. Not asserted before this
+        // fix; a positional-arg regression here would have gone unnoticed.
+        CHECK_FALSE(caller.principal_is_admin);
+
+        auto result =
+            classify_and_authorize_dispatch(registry, caller, "filesystem", "read", always_allow);
+        REQUIRE(result.has_value());
+    }
+    // #1398 (quality-engineer, Gate 3): the pure half of
+    // `ServerImpl::derive_dispatch_caller_for_username`'s admin-flag wiring
+    // (server.cpp) — this function has no unit test of its own (it lives on
+    // the ServerImpl god object and cannot be constructed in isolation), so
+    // this section is the falsifier for the ONLY part of that wiring that
+    // IS directly testable: `principal_is_admin` reaching the returned
+    // `DispatchCaller` in the correct positional slot. A wrong comparison
+    // inside `derive_dispatch_caller_for_username` itself (`user->role ==
+    // auth::Role::admin`) stays an accepted residual gap — unlike the
+    // provenance stamp this mirrors (schedule_runner.cpp, directly tested),
+    // the admin-flag derivation FAILS OPEN if wrong (could admit a
+    // role-gated dispatch with no ticket), which is why this coverage is
+    // worth adding even though the ServerImpl-embedded half is not.
+    SECTION("resolvable + admin: principal_is_admin reaches the returned caller") {
+        const auto caller = caller_for_stored_username(
+            "root-admin", /*principal_resolves=*/true, "admin", std::nullopt,
+            /*principal_is_admin=*/true);
+        CHECK(caller.principal == "root-admin");
+        CHECK(caller.principal_is_admin);
 
         auto result =
             classify_and_authorize_dispatch(registry, caller, "filesystem", "read", always_allow);

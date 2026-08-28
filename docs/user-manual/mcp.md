@@ -253,6 +253,16 @@ too (`mcp.stream.attach` / `mcp.stream.close`, the latter carrying the close rea
 
 ---
 
+
+[^1398]: Except the ~42 `plugin.action` pairs a compiled `ExecuteGate` marks
+`AdminOrApproval`/`AlwaysApproval` (#1398, `command_capability.hpp`) — e.g.
+`script_exec.exec`, `filesystem.delete`, `registry.set_value`. Those are denied
+at the shared dispatch chokepoint regardless of MCP tier, admin-role-holding
+tokens excepted (`principal_is_admin`). Today that denial surfaces as the SAME
+`no_agents_reached`-shaped tool result an offline/unreachable agent gets, not a
+discriminated approval error — JSON-RPC error-shaping for this case is tracked
+as #1398 Rung 4, not yet shipped. See `docs/mcp-server.md` "Security Model" for
+the full gate list.
 ## Authorization Tiers
 
 MCP tokens use a **tier** system that restricts what operations are available,
@@ -263,7 +273,7 @@ all writes.
 | Tier | Read | Tag Write/Delete | Execute Instructions | Policy/Security/Group Write | Delete (any) |
 |---|---|---|---|---|---|
 | `readonly` | Yes | No | No | No | No |
-| `operator` | Yes | Yes | Yes (auto-approved) | No | Tags only (via approval) |
+| `operator` | Yes | Yes | Yes (auto-approved)[^1398] | No | Tags only (via approval) |
 | `supervised` | Yes | Yes | Yes (via approval) | Yes (via approval) | Yes (via approval) |
 
 ### Tier details
@@ -274,7 +284,7 @@ log, and browse instruction definitions. It cannot make any changes.
 
 **operator** -- Adds the ability to write and delete tags, and to execute
 instructions. Instruction executions are auto-approved (they run immediately
-without admin approval). Tag deletions still require approval. Suitable for
+without admin approval)[^1398]. Tag deletions still require approval. Suitable for
 day-to-day operational use.
 
 **supervised** -- Full access to all operations, but destructive actions
@@ -586,7 +596,7 @@ for the tool to execute.
 
 > **`execute_instruction` tier behavior:**
 > - `readonly` tier: blocked.
-> - `operator` tier: executes immediately (auto-approved). If neither `scope` nor `agent_ids` is provided, targets **all** connected agents.
+> - `operator` tier: executes immediately (auto-approved)[^1398]. If neither `scope` nor `agent_ids` is provided, targets **all** connected agents.
 > - `supervised` tier: **approval-gated via the ticket-then-recall flow** (see the note above) — the first call returns `kApprovalRequired`, and after an admin approves, a re-call with the `approval_id` argument dispatches.
 
 > **`execute_instruction` response — agentic-first bridging (#1088):**
@@ -859,7 +869,7 @@ The following table shows which operations require approval, by tier:
 
 | Operation | `operator` tier | `supervised` tier |
 |-----------|----------------|-------------------|
-| Execute instruction | No (auto-approved) | Yes |
+| Execute instruction | No (auto-approved)[^1398] | Yes |
 | Delete tag | Yes | Yes |
 | Delete (any resource) | -- | Yes |
 | Write policy | -- | Yes |
@@ -964,7 +974,7 @@ rotation schedule:
 | Use Case | Recommended Tier |
 |----------|-----------------|
 | Read-only dashboards, reporting, investigation | `readonly` |
-| Day-to-day operations with AI assistance (tagging, auto-approved executions) | `operator` |
+| Day-to-day operations with AI assistance (tagging, auto-approved executions[^1398]) | `operator` |
 | Automation pipelines with human approval gates | `supervised` |
 | Unattended, unsupervised AI access | Not recommended. Use `readonly` at most. |
 
@@ -1293,8 +1303,10 @@ carrying a `correlation_id`, `retry_after_ms: null`, and a `remediation` hint.
 `readonly` token attempting a write). It is also the **degraded** response for an
 approval-gated operation when the server has no `ApprovalManager` and therefore
 cannot mint a pollable ticket (a stripped deploy); normally an approval-gated
-operation returns `-32006` (below), not `-32004`. (`operator`-tier executions are
-auto-approved and do not hit this path.)
+operation returns `-32006` (below), not `-32004`. (Most `operator`-tier executions
+are auto-approved and do not hit this path — the ~42 pairs a compiled gate marks
+approval-required[^1398] don't hit it either, since that denial happens at the
+dispatch chokepoint, not the MCP-level approval workflow this section describes.)
 
 **Fix**: Create a new token with a higher tier (`operator` or `supervised`), or
 use a tool within the current tier's permissions.

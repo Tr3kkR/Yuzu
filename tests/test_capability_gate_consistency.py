@@ -333,6 +333,21 @@ class TestFailureModesOnSyntheticData(unittest.TestCase):
         self.assertFalse(mismatches)
         self.assertFalse(unexempt_missing)
 
+    def test_invalid_mode_ignored_but_a_sibling_valid_mode_still_drives_strictest_wins(
+        self,
+    ) -> None:
+        # #1398 (quality-engineer, Gate 3, NICE): the case above proves an
+        # invalid mode alone doesn't crash the comparison; this proves it
+        # doesn't get silently counted toward strictest-wins either — a pair
+        # with one invalid def ("manual") and one valid role-gated def must
+        # still derive AdminOrApproval from the VALID sibling, not fall back
+        # to None because the invalid entry short-circuited the whole pair.
+        pair_modes = {("widget", "spin"): ["manual", "role-gated"]}
+        fragment_rows = [("widget", "spin", "None")]
+        mismatches, unexempt_missing = diff_gates(pair_modes, fragment_rows)
+        self.assertEqual(mismatches, {("widget", "spin"): ("None", "AdminOrApproval")})
+        self.assertFalse(unexempt_missing)
+
 
 if __name__ == "__main__":
     unittest.main()

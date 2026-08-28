@@ -253,16 +253,35 @@ classify_and_authorize_dispatch(
     // `AlwaysApproval` admits ONLY a caller carrying real provenance,
     // effective-admin or not.
     const bool has_provenance = caller.approval_provenance != ApprovalProvenance::None;
-    if (cap.execute_gate == ExecuteGate::AlwaysApproval && !has_provenance) {
-        return std::unexpected(
-            DispatchDenial{DispatchDenialReason::ApprovalRequired, std::string(cap.securable),
-                           cap.operation});
-    }
-    if (cap.execute_gate == ExecuteGate::AdminOrApproval && !has_provenance &&
-        !caller.principal_is_admin) {
-        return std::unexpected(
-            DispatchDenial{DispatchDenialReason::ApprovalRequired, std::string(cap.securable),
-                           cap.operation});
+    // Gate 3 (cpp-expert): a `switch` with no `default:`, not an if-chain —
+    // matches `to_string(DispatchDenialReason)`'s own no-`default:` doctrine
+    // above, so a future 5th `ExecuteGate` value is a `-Werror=switch` build
+    // failure here instead of a silent "no approval required" fallthrough.
+    switch (cap.execute_gate) {
+        case ExecuteGate::Unspecified:
+            // Unreachable in practice — the check earlier in this function
+            // already denies `Unspecified` before this point is reached.
+            // Enumerated explicitly (not folded into a `default:`, which
+            // would defeat the switch-exhaustiveness protection above) so
+            // this arm stays defense-in-depth rather than dead code that
+            // silently permits if the earlier check is ever removed.
+            return std::unexpected(
+                DispatchDenial{DispatchDenialReason::ApprovalRequired, std::string(cap.securable),
+                               cap.operation});
+        case ExecuteGate::None:
+            break;
+        case ExecuteGate::AdminOrApproval:
+            if (!has_provenance && !caller.principal_is_admin) {
+                return std::unexpected(DispatchDenial{DispatchDenialReason::ApprovalRequired,
+                                                       std::string(cap.securable), cap.operation});
+            }
+            break;
+        case ExecuteGate::AlwaysApproval:
+            if (!has_provenance) {
+                return std::unexpected(DispatchDenial{DispatchDenialReason::ApprovalRequired,
+                                                       std::string(cap.securable), cap.operation});
+            }
+            break;
     }
 
     return cap;

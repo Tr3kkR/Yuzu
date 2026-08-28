@@ -88,17 +88,27 @@ struct DispatchCaller {
     /// an audit reader nor a future maintainer can mistake one for the
     /// other. Trust-by-construction, exactly like `system` above: set ONLY
     /// at these three production sites, closed list —
-    ///   1. `ServerImpl::derive_dispatch_caller_for_username`
-    ///      (`server.cpp`) — `Ticket` when `ScheduleRunner` fires on an
-    ///      approved ticket, `None` on a direct `auto`-mode fire.
+    ///   1. `ScheduleRunner::dispatch_tracked` (`schedule_runner.cpp`) —
+    ///      `Ticket` when the fire carries a non-empty `approval_id`
+    ///      (an approved ticket), `None` on a direct `auto`-mode fire.
     ///   2. MCP `execute_instruction` / `quarantine_device` handlers
     ///      (`mcp_server.cpp`) — `Ticket`, stamped only after
     ///      `approval_ticket_just_consumed` is true (supervised tier).
     ///   3. `DeploymentEngine` / `DeploymentRoutes` (`deployment_engine.cpp`
     ///      / `deployment_routes.cpp`) — `GovernedPipeline` on their
     ///      content_dist dispatches.
-    /// A fourth stamping site is a diff against this stated list, not a
-    /// silent addition — if you are adding one, update this comment too.
+    /// `BundleOrchestrator::dispatch()` (`bundle_orchestrator.cpp`) is NOT a
+    /// fourth stamping site — it is a pass-through conduit: REST/MCP
+    /// `execute_bundle` derive provenance at one of the three sites above
+    /// (site 2, via `approval_ticket_just_consumed`) and thread it in as a
+    /// parameter, same as `principal`/`exec_visible`. `ServerImpl::
+    /// derive_dispatch_caller_for_username` stamps ONLY `principal_is_admin`
+    /// (see that field's comment above), never this one — do not confuse the
+    /// two; a caller can be admin-stamped there and still reach the gate
+    /// with `approval_provenance == None`.
+    /// A fifth stamping site (or a new pass-through conduit) is a diff
+    /// against this stated list, not a silent addition — if you are adding
+    /// one, update this comment too.
     ApprovalProvenance approval_provenance = ApprovalProvenance::None;
 };
 

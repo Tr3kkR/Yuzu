@@ -66,6 +66,7 @@
 #include <libpq-fe.h> // direct-SQL secret-row verification (M5 remediation)
 #include <sqlite3.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -73,6 +74,7 @@
 #include <memory>
 #include <set>
 #include <shared_mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -6440,6 +6442,84 @@ TEST_CASE("MCP Integration: execute_instruction zero agents reached",
     CHECK(sc["status"] == "no_agents_reached");
     CHECK(sc["agents_reached"] == 0);
     CHECK(sc.contains("message"));
+}
+
+// #1398 (quality-engineer, Gate 3): no prior test wired a fake dispatch_fn
+// that consults the REAL chokepoint (classify_and_authorize_dispatch) rather
+// than fabricating a bare {command_id, 0} directly — so nothing pinned what
+// an MCP caller ACTUALLY experiences today when a gated pair denies at the
+// chokepoint, as opposed to when an agent is genuinely offline. Production's
+// dispatch_confined (server.cpp) does exactly this: `if (!classified) return
+// {command_id, 0};` — a chokepoint denial and an unreachable agent are
+// indistinguishable at this boundary. This test locks that collapse in
+// explicitly, as a known-imperfect but INTENTIONAL regression guard: #1398
+// Rung 4 (tracked, not yet shipped) is the closure that gives a gate denial
+// its own discriminated JSON-RPC error instead of this shared envelope. If
+// this test starts failing because the envelope changed shape WITHOUT Rung 4
+// having shipped a real discriminator, that is a regression, not progress.
+TEST_CASE("MCP execute_instruction: a real chokepoint ApprovalRequired denial "
+          "collapses into the same no_agents_reached envelope as an offline agent (#1398)",
+          "[mcp][integration][execute][1398]") {
+    using yuzu::server::CommandCapability;
+    using yuzu::server::CommandCapabilityRegistry;
+    using yuzu::server::ExecuteGate;
+    using yuzu::server::detail::DispatchDenialReason;
+
+    static constexpr std::array<CommandCapability, 1> kGatedFixture{{
+        {
+            .plugin = "registry",
+            .action = "set_value",
+            .dispatch_class = yuzu::server::DispatchClass::Mutating,
+            .mutability = yuzu::server::Mutability::Reversible,
+            .securable = "Infrastructure",
+            .operation = yuzu::server::authz::Operation::Write,
+            .risk_tier = yuzu::server::authz::RiskTier::Medium,
+            .system_reserved = false,
+            .execute_gate = ExecuteGate::AdminOrApproval,
+        },
+    }};
+    CommandCapabilityRegistry registry{std::span<const CommandCapability>(kGatedFixture)};
+    const auto always_allow = [](std::string_view, std::string_view,
+                                 yuzu::server::authz::Operation) { return true; };
+
+    McpTestServer ts;
+    ts.caller_fn_for_test = [](const auth::Session&) -> yuzu::server::DispatchCaller {
+        // Non-admin, no approval provenance, RBAC-allowed — the exact caller
+        // shape `ExecuteGate::AdminOrApproval` is designed to deny.
+        return yuzu::server::DispatchCaller{.principal = "alice", .principal_role = "operator"};
+    };
+    bool chokepoint_denied = false;
+    auto dispatch = [&](const std::string& plugin, const std::string& action,
+                        const std::vector<std::string>&, const std::string&,
+                        const std::unordered_map<std::string, std::string>&, const std::string&,
+                        const yuzu::server::DispatchCaller& caller) -> std::pair<std::string, int> {
+        auto classified =
+            yuzu::server::detail::classify_and_authorize_dispatch(registry, caller, plugin, action,
+                                                                  always_allow);
+        if (!classified) {
+            chokepoint_denied =
+                classified.error().reason == DispatchDenialReason::ApprovalRequired;
+            return {"cmd-registry-set_value", 0}; // mirrors dispatch_confined's real shape
+        }
+        return {"cmd-registry-set_value", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1398,"params":{"name":"execute_instruction","arguments":{"plugin":"registry","action":"set_value"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    REQUIRE(chokepoint_denied); // the fixture registry actually denied, not skipped
+
+    auto body = nlohmann::json::parse(res->body);
+    auto& sc = body["result"]["structuredContent"];
+    // Rung-4-pending: today this is IDENTICAL to the offline-agent envelope
+    // asserted in "MCP Integration: execute_instruction zero agents reached"
+    // above — no `approval_required`/`ApprovalRequired` discriminator exists
+    // in this response yet.
+    CHECK(sc["status"] == "no_agents_reached");
+    CHECK(sc["agents_reached"] == 0);
+    CHECK_FALSE(sc.contains("approval_required"));
 }
 
 // ── 28. Default scope to __all__ ─────────────────────────────────────────
