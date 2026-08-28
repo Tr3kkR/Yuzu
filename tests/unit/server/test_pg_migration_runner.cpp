@@ -44,8 +44,8 @@ bool table_exists(PGconn* conn, const std::string& schema, const std::string& ta
 
 } // namespace
 
-TEST_CASE("PgMigrationRunner versioning", "[pg][migration]") {
-    YUZU_REQUIRE_PG_DB(db);
+TEST_CASE("PgMigrationRunner versioning", "[pg][migration][pg-smoke]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgConn conn = connect(db.dsn());
 
     const std::vector<PgMigration> v1 = {
@@ -86,7 +86,7 @@ TEST_CASE("PgMigrationRunner versioning", "[pg][migration]") {
 }
 
 TEST_CASE("PgMigrationRunner schema namespacing", "[pg][migration]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgConn conn = connect(db.dsn());
 
     // Two stores create the SAME unqualified table name; each must land in
@@ -115,7 +115,7 @@ TEST_CASE("PgMigrationRunner schema namespacing", "[pg][migration]") {
 }
 
 TEST_CASE("PgMigrationRunner failure handling", "[pg][migration]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgConn conn = connect(db.dsn());
 
     SECTION("failing step stops the run; earlier steps stay applied") {
@@ -184,7 +184,7 @@ TEST_CASE("PgMigrationRunner failure handling", "[pg][migration]") {
 // entire server suite green (4879 cases, 94587 assertions) before these
 // cases existed.
 TEST_CASE("PgMigrationRunner #3013 duplicate/non-monotonic version guard", "[pg][migration]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgConn conn = connect(db.dsn());
 
     SECTION("a duplicate version anywhere in the vector refuses the whole run") {

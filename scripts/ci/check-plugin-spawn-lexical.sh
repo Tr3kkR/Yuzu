@@ -477,18 +477,17 @@ RUNNER_ALLOWLIST = {
 # drifted). A meson.build hit (Meson's own `host_machine.system()`) is not a
 # C/C++ source file and is excluded by SCAN_EXT below, not by this list.
 GRANDFATHERED = {
-    "agents/plugins/antivirus/src/antivirus_plugin.cpp",
-    "agents/plugins/bitlocker/src/bitlocker_plugin.cpp",
     "agents/plugins/content_dist/src/content_dist_plugin.cpp",
-    "agents/plugins/device_identity/src/device_identity_plugin.cpp",
-    "agents/plugins/event_logs/src/event_logs_plugin.cpp",
     "agents/plugins/firewall/src/firewall_plugin.cpp",
-    "agents/plugins/hardware/src/hardware_plugin.cpp",
-    "agents/plugins/installed_apps/src/installed_apps_plugin.cpp",
     "agents/plugins/license_scan/src/licensing_linux.cpp",
-    "agents/plugins/msi_packages/src/msi_packages_plugin.cpp",
+    # installed_apps AND msi_packages both removed here (#3405): this PR
+    # argv-ised the last shell hop in each, so both files now have zero raw
+    # spawn primitives and their entries grandfathered nothing while masking any
+    # regression that re-introduced one. Removing an entry moves the file from
+    # the base-diff path onto the FULL scan, so it is strictly stricter.
+    # network_config stays -- it is still rung 3 and is PR4.1's to remove, the
+    # remaining half of #3405.
     "agents/plugins/network_config/src/network_config_plugin.cpp",
-    "agents/plugins/sccm/src/sccm_plugin.cpp",
     "agents/plugins/script_exec/src/script_exec_plugin.cpp",
     "agents/plugins/software_actions/src/software_actions_plugin.cpp",
     "agents/plugins/tar/src/tar_mapdrive_collector.cpp",

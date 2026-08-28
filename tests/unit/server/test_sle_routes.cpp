@@ -169,6 +169,16 @@ yuzu::test::PgTestTemplate rbac_tpl{"rbacstore", [](const std::string& dsn) {
                                                 "rbac template: store failed to migrate/seed");
                                     }};
 
+// Pre-migrated template for the [pg] end-to-end drill below, which exercises
+// SleRoutes against a real SoftwareLicensingStore — not RbacStore.
+yuzu::test::PgTestTemplate sle_route_tpl{
+    "sleroutes", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        SoftwareLicensingStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("sle_routes template: store failed to migrate");
+    }};
+
 } // namespace
 
 // ───────────────────── /sle/agents/{id} drill — D-4 scoped gate + G-2 audit ──────
@@ -465,7 +475,7 @@ TEST_CASE("SLE gate uses the fail-closed enforcement primitive (G-1 / #1717)",
 
 TEST_CASE("sle/agents/{id}: end-to-end through a real SoftwareLicensingStore renders user_ref",
           "[sle_routes][pg]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, sle_route_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     SoftwareLicensingStore store{pool};

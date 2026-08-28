@@ -34,6 +34,7 @@
 #include "on_behalf_guard.hpp"
 #include "rate_limiter.hpp"
 #include "saml_principal.hpp"
+#include "test_loopback_http.hpp"
 #include "test_route_sink.hpp"
 #include "web_utils.hpp"
 
@@ -85,9 +86,10 @@ struct Fixture {
     std::unique_ptr<ApiTokenStore> token_store;
     // ADR-2001 D1: the codebase's actual severity channel — AnalyticsEvent
     // ::severity via AnalyticsEventStore, the SAME mechanism AuthRoutes::
-    // emit_event uses for Severity::kCritical break-glass events. SQLite,
-    // ":memory:" per its own header doc ("in tests") — independent of the
-    // PG stores above, so no shared-pool concern here.
+    // emit_event uses for Severity::kCritical break-glass events. Ported to
+    // Postgres (ADR-0049): shares auth_db's PgPool/database, same "one
+    // PgPool, independent connections" pattern as ScimStore/ApiTokenStore
+    // above — no separate ephemeral database needed.
     std::unique_ptr<AnalyticsEventStore> analytics_store;
     // AuditStore ported to Postgres (ADR-0006): shares auth_db's PgPool/
     // database (same "one PgPool" pattern as ScimStore above) in the normal
@@ -121,7 +123,7 @@ struct Fixture {
         token_store = std::make_unique<ApiTokenStore>(auth_db.pool());
         REQUIRE(token_store->is_open());
 
-        analytics_store = std::make_unique<AnalyticsEventStore>(":memory:");
+        analytics_store = std::make_unique<AnalyticsEventStore>(auth_db.pool());
         REQUIRE(analytics_store->is_open());
 
         if (broken_audit) {
@@ -1669,8 +1671,9 @@ TEST_CASE("ScimRoutes: D1 — role-refused deprovision WITH an active linked ide
     // for break-glass logins) — asserted directly against the store, not
     // inferred from a magic string in an unrelated column.
     auto events = f.analytics_store->query_recent(10);
+    REQUIRE(events.has_value()); // degrade-distinguishable seam: not nullopt
     bool found_critical = false;
-    for (const auto& e : events) {
+    for (const auto& e : *events) {
         if (e.event_type == "scim.user.deprovision_role_refused_with_link") {
             CHECK(e.severity == Severity::kCritical);
             CHECK(e.attributes.value("scim_id", "") == id);
@@ -1704,7 +1707,8 @@ TEST_CASE("ScimRoutes: D1 — role-refused deprovision WITHOUT a link is a plain
          0.0);
 
     auto events = f.analytics_store->query_recent(10);
-    for (const auto& e : events)
+    REQUIRE(events.has_value()); // degrade-distinguishable seam: not nullopt
+    for (const auto& e : *events)
         CHECK(e.event_type != "scim.user.deprovision_role_refused_with_link");
 }
 
@@ -2576,6 +2580,12 @@ struct ScimIntegrationServer {
     yuzu::MetricsRegistry metrics;
     const std::string token{"integration-test-scim-bearer-0123456789"};
     std::string scim_admin_group;
+    // Rejection witness (#2757): incremented exactly where the pre-routing
+    // handler below rejects a reserved on-behalf-of header, so a Windows
+    // connection-reset fallback (test_loopback_http.hpp) can prove the
+    // rejection actually ran for a given request rather than accepting any
+    // lost response.
+    std::atomic<int> onbehalf_rejections{0};
 
     explicit ScimIntegrationServer(int rate_per_second = 100, std::string admin_group = {})
         : rate_limiter(rate_per_second), scim_admin_group(std::move(admin_group)) {}
@@ -2612,6 +2622,7 @@ struct ScimIntegrationServer {
                         R"({"error":{"code":403,"message":"on-behalf-of assertion rejected per ADR-1005"}})",
                         "application/json");
                     (void)reserved;
+                    onbehalf_rejections.fetch_add(1);
                     return httplib::Server::HandlerResponse::Handled;
                 }
                 if (!rate_limiter.allow(req.remote_addr)) {
@@ -2783,10 +2794,12 @@ TEST_CASE("H1 integration: a reserved on-behalf-of header against /scim/v2/* is 
     // presence of the reserved header, not on the absence of auth.
     httplib::Headers hdr{{"Authorization", "Bearer " + ts.token},
                          {"X-Yuzu-On-Behalf-Of", "alice@example.com"}};
-    auto r = cli.Post("/scim/v2/Users", hdr, R"({"userName":"onbehalf-user"})",
-                      "application/scim+json");
-    REQUIRE(r);
-    CHECK(r->status == 403);
+    yuzu::test::expect_pre_routing_rejection(
+        [&] {
+            return cli.Post("/scim/v2/Users", hdr, R"({"userName":"onbehalf-user"})",
+                            "application/scim+json");
+        },
+        403, ts.onbehalf_rejections);
 
     // Control: the same request MINUS the reserved header provisions
     // normally (201) — isolates the 403 to the on-behalf-of guard, not some

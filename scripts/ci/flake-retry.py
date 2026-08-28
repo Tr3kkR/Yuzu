@@ -744,7 +744,14 @@ def _selftest():
     # or the guard fails loudly instead of silently inspecting half the
     # surface.
     _entries = re.findall(r"test\(\s*'[^']*',\s*server_test_exe\b(.*?)\)", _src, re.S)
-    check(len(_entries) >= 8, "meson.build: all eight server shard entries located")
+    # Windows CI test-phase restructuring (#3443, 2026-08-28): 11 pg shards
+    # (10 + new shard K) + 4 non-pg shards (A/B + shard C, then a later
+    # measured-by-time follow-up added shard D, carved from B's [body_cap]
+    # tests) + the smoke entry (also server_test_exe) = 16. The floor stays
+    # a loose ">=", same spirit as the original "twelve" (itself a floor,
+    # not an exact pin) -- exactness is check-pg-shard-partition.py's job,
+    # against the real binary.
+    check(len(_entries) >= 16, "meson.build: all sixteen server shard entries located")
     _shard_specs = []
     for _body in _entries:
         # Quote-aware list match: a naive [(.*?)] truncates at the tag spec's
@@ -781,89 +788,56 @@ def _selftest():
             check(_opt.startswith("--"),
                   f"meson.build server test option {_opt!r} is not a --long flag")
         _shard_specs.append(tuple(_specs))
-    # Positive pin so hollow extraction can never pass again: the shard filters
-    # must come back verbatim. A shard add or rebalance updates this line
-    # consciously. #2394 split the single '[pg]' entry into two balanced halves
-    # (the auth->PG cutover ~doubled the [pg] population). #2395 then split the
-    # non-PG '~[pg]' entry the same way, after it reached 603/600s (101%) on
-    # Windows; the partition is [auth]+[mcp] vs the rest, balanced by measured
-    # time rather than case count ([auth] alone is ~40% of the non-PG runtime).
-    # #2697 (ADR-0040) added [audit_store] explicitly to both PG specs: measured
-    # (not projected) at ~3% of shard B's runtime, moving it to shard A instead
-    # of leaving every newly `[pg]`-tagged audit case to land there by default
-    # (tests/meson.build's own comment on this pair has the measurement).
-    # 2026-08-15 rebalance added [rbac_store]/[guaranteed_state_store]/
-    # [response_store] to both PG specs the same way: measured 793 (A) / 1154
-    # (B) at the time of the change, moving 207 cases off shard B after it had
-    # drifted to 2.3x shard A's size and started TIMEOUT-ing at 600s on Linux
-    # and Windows (tests/meson.build's own comment on this pair has the
-    # measurement). PR1.6a review remediation (same day) additionally added
-    # [operator_surface]: 3 new PG-backed MCP integration tests, untagged,
-    # all landed in shard B and tipped it over its 600s CI budget (killed by
-    # TIMEOUT at 600.57s).
-    # 2026-08-16 (PR #3156 review-response round, cherry-picked as 3f0796777,
-    # now also merged to dev via #3156 itself): B TIMEOUT-ed again the day
-    # after the rebalance above. A same-day two-shard fix was reviewed and
-    # rejected before merge — it would have concentrated more cases into
-    # shard A, whose own prior per-case rate was already HIGHER than shard
-    # B's (0.616s/case at 84% of budget), likely relocating the timeout
-    # rather than fixing it. Split into THREE pg shards instead: the
-    # store-heavy tag set (expensive per case — real Postgres template-clone
-    # cost, unlike lighter route/handler tests) is itself split across two
-    # shards (A, B) instead of concentrated in one; shard C holds everything
-    # else. Verified by running all three filters through the built binary,
-    # not projection. [license_store] folded into shard B on the cherry-pick
-    # (tests/meson.build's own comment on this trio has the reasoning and
-    # re-verified counts).
-    # 2026-08-16 (#2092/#2093): the combined store-tag pg shard B TIMEOUT-ed at
-    # 600/600s again (blocking PR #3159). Split B into B+D balanced by measured
-    # TIME, not case count: [rbac_store] alone was ~57s (~54% of the store-tag
-    # runtime), so shard B = [rbac_store] alone and new shard D = the other eight
-    # store tags (~48s). Deliberately count-lopsided (93 vs 335) because time is
-    # what blows the ceiling. shard C UNCHANGED. Local isolated: B 58s / D 49s.
-    # 2026-08-16 (ADR-0051, SoftwareDeploymentStore, PR #3174) followed the
-    # recipe from the comment above for its new [software_deployment] tag (66
-    # cases): measured in isolation — 4.0s, vs. B ([rbac_store]) 55.2s and D
-    # (the other eight tags) 31.5s on the same container — D is the lighter
-    # destination, so [software_deployment] joins D; also added to shard C's
-    # exclusion list per the same instruction (tests/meson.build's own
-    # comment on this pair has the measurement).
-    # 2026-08-17: shard C still TIMEOUT-ed at 600.07/600s on real CI after the
-    # move above (run 32004956605) — the local-measurement projection
-    # undersold real contention. Added a fifth shard E, carving a further
-    # 22-tag block out of C (A 554 / B 93 / D 401 / E 812 / C 271, summing to
-    # the unchanged 2131-case [pg] total; tests/meson.build's own comment on
-    # this quintet has the full reasoning).
-    # 2026-08-17 (PR #3216): shard E itself TIMEOUT-ed at 600.11/600s on dev's
-    # 2026-08-19 (#3322) -- shard E TIMEOUT-ed at 600.5-600.6s with Fail: 0 on 10
-    # of 14 consecutive Linux gcc-15 runs, reddening dev itself. E held 608 of the
-    # 1876 [pg] cases (32%) at ~1.0 s/case, i.e. exactly the ceiling. It had already
-    # been split twice that week and returned each time, because each split carved
-    # off a small piece and left E oversized; this halves it into E=329 / G=278.
-    # G defers to E by additionally excluding each of E's ten remaining tags --
-    # without that, 32 cases carrying a tag from each half would run in BOTH
-    # entries. Coverage verified identical (607 distinct before and after, 0
-    # missing, 0 added, 0 in both halves, 0 overlap with C).
+    # Positive pin, SCOPED DOWN (Phase 1, #3443): this used to pin all twelve
+    # shard filters verbatim -- a hardcoded string hand-updated on every
+    # pg-shard split/rebalance, missed 3 times in as many weeks, each time
+    # reddening CI unconditionally (full incident history was here; it's
+    # tests/meson.build's own shard-history comment now, the authoritative
+    # copy, not duplicated here a second time to go stale independently).
     #
-    # OWN CI with zero PR-specific tests (run 32047363814) -- carved [dex] and
-    # [mcp] out into a sixth shard F (A 554 / B 93 / D 407 / E 705 / F 159 /
-    # C 271 on this branch's 2189-case [pg] total; tests/meson.build's own
-    # comment on this sextet has the full reasoning and measurements).
-    check(("~[pg][auth],~[pg][mcp]",) in _shard_specs
-          and ("~[pg]~[auth]~[mcp]",) in _shard_specs
-          and ("[pg][routes],[pg][store],[pg][token]",) in _shard_specs
-          and ("[pg][rbac_store]~[routes]~[store]~[token]",) in _shard_specs
-          and ("[pg][audit_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token],[pg][software_deployment]~[routes]~[store]~[token]",)
-          in _shard_specs
-          and ("[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]",)
-          in _shard_specs
-          and ("[pg][engine_principal]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][scim]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][oidc]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][management_group]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][rbac]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][quarantine]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][custom_props]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][guaranteed_state]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][notification_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][software_inventory]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]",)
-          in _shard_specs
-          and ("[pg][auth_routes]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][saml]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][access_review]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][audit]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][authz]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][secrets]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][agent_service]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][discovery]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][result_set]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][tar]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine]",)
-          in _shard_specs
-          and ("[pg][dex]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment],[pg][mcp]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]",)
-          in _shard_specs,
-          "meson.build: all nine shard tag filters extracted verbatim")
+    # The pg shards' partition identity is now proven STRUCTURALLY, against
+    # the real compiled binary, by scripts/ci/check-pg-shard-partition.py --
+    # a dedicated meson test() entry (suite: ['server', 'server-checks'],
+    # needs yuzu_server_tests built, which this selftest deliberately does
+    # not depend on). It
+    # discovers shard entries via `meson introspect --tests` keyed on suite
+    # membership ('yuzu:server-pg'), not a hardcoded name/filter list, so a
+    # pg-shard add/split/rebalance needs no update here at all -- only a
+    # correct suite: kwarg on the new/changed test() entry, which the same
+    # check would itself catch getting dropped (hollow-discovery guard).
+    #
+    # What's left to pin here: the NON-pg shard filters (auth/mcp split, now
+    # four since a later measured-by-time follow-up carved shard D's
+    # [body_cap] tests out of B, on top of the earlier B -> B+C split, #3443
+    # 2026-08-28) -- comparatively stable, unlike the pg shards, which get
+    # rebalanced -- so a small verbatim pin is proportionate for them
+    # specifically. Plus a COUNT-based (not exact-string) sanity check that
+    # extraction still finds a real pg-shard population (now 11: 10 + shard
+    # K, plus the smoke entry makes 12 total non-excluded specs -- see the
+    # comment on the >= 12 floor below), as a second, independent signal
+    # alongside check-pg-shard-partition.py's own hollow-discovery guard, in
+    # case the two checks are ever run without each other.
+    _NONPG_SPECS = (
+        ("~[pg][auth],~[pg][mcp]",),
+        ("~[pg]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]~[body_cap]",),
+        ("~[pg]~[auth]~[mcp][cel],~[pg]~[auth]~[mcp][viz],~[pg]~[auth]~[mcp][scope],"
+         "~[pg]~[auth]~[mcp][dispatch],~[pg]~[auth]~[mcp][nvd],~[pg]~[auth]~[mcp][dex]",),
+        ("[body_cap]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]",),
+    )
+    _pg_specs = [s for s in _shard_specs if s not in _NONPG_SPECS]
+    check(all(spec in _shard_specs for spec in _NONPG_SPECS),
+          "meson.build: all four non-pg shard tag filters extracted verbatim")
+    # _pg_specs = 11 real pg shards (10 + K) + the smoke entry (also
+    # server_test_exe, also not one of the three excluded non-pg tuples) =
+    # 12. Not 11 -- the smoke entry's own spec ('[pg-smoke]',) has always
+    # been counted here; this is a pre-existing property of the extraction,
+    # not new to this split (verified against the pre-split source: smoke
+    # was already included, making the OLD floor's true value 11, not the
+    # "10 pg-shard entries" the old message claimed).
+    check(len(_pg_specs) >= 12,
+          f"meson.build: at least 12 pg-shard-or-smoke entries found (got {len(_pg_specs)}) "
+          "-- exact partition identity is proven separately, against the real "
+          "binary, by check-pg-shard-partition.py")
 
     if failures:
         print("SELFTEST FAILURES:", *failures, sep="\n  ")

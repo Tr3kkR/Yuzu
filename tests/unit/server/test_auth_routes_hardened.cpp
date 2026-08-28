@@ -28,6 +28,7 @@
 
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
+#include "test_analytics_pg_helper.hpp" // AnalyticsEventStorePg — ADR-0049 PG port
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
 #include "pg/pg_pool.hpp"
@@ -100,7 +101,10 @@ struct HardenedHarness {
     std::optional<yuzu::test::PostgresTestDb> audit_db;
     std::optional<yuzu::server::pg::PgPool> audit_pool;
     std::unique_ptr<AuditStore> audit_store;
-    std::unique_ptr<AnalyticsEventStore> analytics_store;
+    // AnalyticsEventStore ported to Postgres (ADR-0049) — own ephemeral
+    // clone, matching audit_store's pattern above rather than sharing
+    // auth_db's pool (this fixture keeps each additional store isolated).
+    yuzu::test::AnalyticsEventStorePg analytics_store;
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
     std::unique_ptr<AuthRoutes> auth_routes;
@@ -125,7 +129,6 @@ struct HardenedHarness {
         REQUIRE(audit_db->available());
         audit_pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = audit_db->dsn(), .size = 4});
         audit_store = std::make_unique<AuditStore>(*audit_pool);
-        analytics_store = std::make_unique<AnalyticsEventStore>(tmp.path / "analytics.db");
 
         auth_routes = std::make_unique<AuthRoutes>(
             cfg, auth_mgr,

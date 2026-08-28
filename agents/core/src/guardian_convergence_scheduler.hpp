@@ -66,11 +66,11 @@ namespace yuzu::agent {
 class YUZU_EXPORT ConvergenceScheduler {
 public:
     struct Config {
-        std::uint64_t service_cadence_ms{60'000};
-        std::uint64_t registry_cadence_ms{60'000};
-        std::uint64_t file_cadence_ms{600'000}; ///< ~10 min (the 5-15 min band)
+        std::uint64_t service_cadence_ms{kGuardianServiceLaneCadenceMs};
+        std::uint64_t registry_cadence_ms{kGuardianRegistryLaneCadenceMs};
+        std::uint64_t file_cadence_ms{kGuardianFileLaneCadenceMs}; ///< ~10 min (the 5-15 min band)
         std::uint64_t priority_poll_ms{5'000};  ///< pending-initial backstop poll (also CV-woken)
-        std::uint32_t jitter_pct{20};            ///< +/- this % of the cadence, per lane
+        std::uint32_t jitter_pct{kGuardianLaneJitterPct}; ///< +/- this % of the cadence, per lane
         std::uint64_t rng_seed{0x5eed};          ///< deterministic jitter source (per-lane offset)
     };
 
@@ -90,6 +90,12 @@ public:
     /// synchronously on the caller's thread.
     void sweep_lane(SparkType type);
     void sweep_pending_initial();
+    /// Deterministic test seam (also lane_loop's own wait-duration source, #3531):
+    /// apply cfg_'s jitter_pct to base_ms using the given RNG. Single-sourced with
+    /// guardian_spark_bridge.hpp's debounce-default computation via
+    /// guardian_jitter_span_ms (spark.hpp) - not just the same input constants, the
+    /// same arithmetic, so the two can't silently desync.
+    [[nodiscard]] std::chrono::milliseconds jittered(std::uint64_t base_ms, std::mt19937& rng) const;
 
 private:
     /// Heap sync state shared by the lane threads AND the pending-initial waker. The
@@ -113,7 +119,6 @@ private:
     /// terminates the whole agent daemon - the #2037 class of defect the drain worker was
     /// firewalled against and these lanes, identically exposed, were not (#2298 Gate 4).
     void firewalled_sweep(const std::function<void()>& fn);
-    [[nodiscard]] std::chrono::milliseconds jittered(std::uint64_t base_ms, std::mt19937& rng) const;
 
     GuardianSparkRuntime& rt_;
     Config cfg_;
@@ -129,6 +134,15 @@ public:
     /// tell those apart. Lock-free.
     [[nodiscard]] std::uint64_t sweep_exception_count() const noexcept {
         return sweep_exceptions_.load(std::memory_order_relaxed);
+    }
+
+    /// TEST-ONLY: whether start() actually ran (spawning the lane threads) — the
+    /// observable for GuardianEngine::wire_spark_engine's prefer_spark_ start gate
+    /// (#2238), which otherwise has none. Reads started_ under sig_->mu. No production
+    /// caller.
+    [[nodiscard]] bool started_for_test() const {
+        std::lock_guard<std::mutex> lk{sig_->mu};
+        return started_;
     }
 
 private:

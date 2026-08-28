@@ -14,24 +14,33 @@ cadences.
   the `installed_apps` plugin via its `list_inventory` action (Windows: `HKLM` +
   the agent service account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`;
   macOS: `system_profiler`). The operator-facing `list` action keeps its
-  original 4-column output — automation built on it is unaffected.
+  original 4-column `app|...` row shape for every successful acquisition —
+  automation built on parsing that shape is unaffected. On Linux/macOS, a
+  degraded acquisition (timeout, kill, spawn failure, truncation, or a
+  nonzero exit) now emits a single `error|installed_apps: acquisition
+  degraded (...)` row and a nonzero result instead of an empty or partial
+  `app|` list — see "Degraded collections are skipped, not published" below.
+  Automation that only parses `app|` rows and ignores `error|` is
+  unaffected; automation that assumed `list` always succeeds needs an
+  update. See `docs/user-manual/agent-plugins.md`'s `installed_apps`/
+  `msi_packages` entries for the exact per-action wording.
 - **The honest-empty contract:** a field the ecosystem does not store is the
   empty string, **never synthesised** (no `-` placeholders, no guessed `0`
   epoch). Per-ecosystem availability:
 
-  | Field | rpm | deb | apk | pacman | Windows | macOS |
-  |---|---|---|---|---|---|---|
-  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` |
-  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` |
-  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — |
-  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — |
-  | `arch` | ✓ | ✓ | — | — | — | — |
-  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | — |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified |
-  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | — |
-  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — |
+  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil |
+  |---|---|---|---|---|---|---|---|
+  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` |
+  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` |
+  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) |
+  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — |
+  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — |
+  | `arch` | ✓ | ✓ | — | — | — | — | — |
+  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds |
+  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — |
+  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — |
 
   Notes: rpm `signature_status` reflects the **stored** signature header tags in
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
@@ -39,6 +48,61 @@ cadences.
   `ID`/`VERSION_ID`), stamped on every Linux row. deb rows include **held**
   packages (they are installed). `homebrew` is a reserved `ecosystem` value —
   not collected yet (brew is per-user; the sync is machine-scope).
+
+  **macOS `app` rows** carry `publisher` and `signature_status` read natively
+  through CoreFoundation + Security.framework (`CFBundleCreate`,
+  `SecStaticCodeCreateWithPath`, `SecCodeCopySigningInformation`) — no
+  `codesign` subprocess, and no deep `SecStaticCodeCheckValidity` verify. Like
+  rpm's, the field records that a signature is **present**, not that it is
+  valid. `signed` means signing metadata was found; it does **not** mean the
+  signature verifies. An ad-hoc or self-signed bundle reads `signed`, and so
+  does a bundle whose signature has since been **broken** — deleting a bundle's
+  `_CodeSignature` directory or modifying its executable leaves the recorded
+  identifier and certificates in place, so such a bundle still reads `signed`
+  and still reports the original vendor's Common Name as `publisher`. Treat
+  `publisher` as unverified attribution, never proof of origin, and do **not**
+  use `signature_status` as tamper detection or as a Gatekeeper/notarization
+  result. (Deep verification — `SecStaticCodeCheckValidity` — is not performed;
+  adding it would turn this into a validity verdict and need a third state, an
+  open contract decision.) `publisher` is empty for ad-hoc-signed and unsigned
+  apps. Enrichment covers up to 5000 located apps per collection; that guard is
+  a runaway bound rather than a routine limit, and reaching it makes the agent
+  report the collection degraded (see below) instead of publishing rows whose
+  signature fields silently went blank.
+
+  **macOS `pkg` rows** are `pkgutil` receipts — system installer packages
+  (Command Line Tools, XProtect payloads, vendor `.pkg` installs) that never
+  appear in `system_profiler`'s GUI-app enumeration. `name` is the receipt's
+  reverse-domain identifier (`com.apple.pkg.CLTools_Executables`), not a
+  display name. `install_date` is the receipt's raw **UNIX epoch seconds**,
+  the only form `pkgutil --pkg-info` reports — deliberately carried through
+  verbatim under the honest-empty contract rather than reformatted into a
+  precision the receipt never recorded. Bounded at 5000 receipts per collection,
+  again a runaway guard rather than a routine limit.
+
+  **On Linux and macOS, degraded collections are skipped, not published.** If
+  any acquisition step does not complete on its own terms — a timeout, a spawn
+  failure, a killed child, a capture truncation, a nonzero exit from a
+  top-level enumerator, exhaustion of the 120-second whole-collection budget
+  mid-enrichment or mid-receipt-walk, either runaway guard above, or (macOS
+  only) `system_profiler` or `pkgutil` running successfully and reporting
+  nothing at all — the agent reports the whole collection as degraded and the
+  daily sync SKIPS that cycle. The previous inventory is retained. This is
+  deliberate: an incomplete snapshot is indistinguishable from a complete one
+  once it reaches the server, so the omissions would be read as uninstalls. A
+  stale inventory is recoverable; a confidently wrong one is not. Degraded
+  cycles are logged as warnings, and a host that degrades every day will stop
+  updating — treat repeated warnings as actionable.
+
+  The "ran but reported nothing" trigger is macOS-only by design: every Mac has
+  GUI applications and installer receipts, so zero means the tool failed. On
+  Linux an empty result is often honest — a host may legitimately have `rpm`
+  installed and no rpm packages — so that check is not applied there.
+
+  **Windows has no degraded signal today.** Its inventory is collected natively
+  from the registry rather than through the subprocess runner, so none of the
+  above applies: a partial registry walk publishes as complete. Tracked as a
+  known gap, not closed by this release.
 - **Changes for rpm fleets vs the v1 (4-field) contract:** `publisher` is now
   the rpm **PACKAGER** tag (was VENDOR), and `version` is the upstream version
   only — the release moved to its own `release` column (was fused
@@ -148,20 +212,20 @@ active" filter.)
 ### MCP (for agentic workers)
 
 The **`query_installed_software`** MCP tool exposes the same data to agentic
-workers (gated on `Inventory:Read`):
+workers, gated SOLELY by `AuthRoutes::require_fleet_read` (#3290 Phase 2):
 
 - Filter by software `name` and/or `agent_id`; omit both for a fleet-wide scan.
 - Returns up to `limit` rows (max 1000). When `result_truncated_by_cap` is
   `true`, more rows exist past the cap (keyset pagination is a follow-up).
-- **A per-agent management-group drop filter is applied** — out-of-scope
-  devices are dropped (and the omission audited), with the count returned as
-  `devices_omitted` (absent when zero). **Caveat (ADR-0017): this confinement is
-  not yet verified effective.** The tool gates on the *global* `Inventory:Read`
-  permission, under which the filter does not narrow results (a confined operator
-  is denied at the gate; a global operator sees all) — list-view management-group
-  confinement becomes effective only once the ADR-0017 admit-then-filter gate lands
-  and the #1713/#1676 UAT confirms it. When present, a positive `devices_omitted`
-  means matching software exists outside your scope — an empty or short result does
+- **A per-agent scope drop filter is applied** — out-of-scope devices are
+  dropped (and the omission audited), with the count returned as
+  `devices_omitted` (absent when zero). This confinement is **effective**: the
+  gate composes management-group visibility with the caller's service-scope tag
+  (`meet(management-group, service-scope)`), so a management-group-confined
+  operator and a correctly-confined service-scoped API token both get a real
+  filtered result — a service-scoped token is no longer denied outright as it
+  was before #3290. When present, a positive `devices_omitted` means matching
+  software exists outside your scope — an empty or short result does
   **not** mean the software is absent fleet-wide. This is distinct from the generic
   `query_inventory` / `get_agent_inventory` tools, which read a *separate*
   generic blob store on `Infrastructure:Read` and do **not** surface this typed
@@ -175,8 +239,9 @@ workers (gated on `Inventory:Read`):
 
 ### REST (for automation / scripts)
 
-The same data is exposed over REST at **`GET /api/v1/inventory/software`** (gated on
-`Inventory:Read`), the agentic-first sibling of the MCP tool:
+The same data is exposed over REST at **`GET /api/v1/inventory/software`**, gated
+SOLELY by `AuthRoutes::require_fleet_read` (#3290 Phase 2) — the agentic-first
+sibling of the MCP tool:
 
 ```bash
 # Which devices run Google Chrome (fleet-wide, within your scope)?
@@ -196,19 +261,24 @@ curl -H "Authorization: Bearer $TOKEN" \
   release, arch, signature_status, distro_id, distro_version}` — the v2 fields
   are `""` where the ecosystem does not store them (see the availability matrix
   above). The MCP tool's rows carry the identical field set.
-- **Carries the same per-agent management-group drop filter as the MCP tool**
+- **Carries the same per-agent scope drop filter as the MCP tool**
   (out-of-scope devices dropped, omission audited, `devices_omitted` reports the
-  count) — and the same **ADR-0017 caveat: not yet verified effective** under the
-  global `Inventory:Read` gate (see the MCP note above; #1713/#1676). When present, a
-  positive `devices_omitted` means matching software exists outside your scope — an
-  empty or short result does **not** mean the software is absent fleet-wide.
+  count) — the SAME `require_fleet_read` gate, so REST and MCP cannot observe a
+  different admit/filter decision for the same caller (see the MCP note above).
+  When present, a positive `devices_omitted` means matching software exists
+  outside your scope — an empty or short result does **not** mean the software
+  is absent fleet-wide.
 - `result_truncated_by_cap: true` (present only when set) means more rows exist past
   `limit` (keyset pagination is a follow-up, #1634).
 - **On store degradation** the endpoint returns **`503`** (an A4 error envelope with a
   `correlation_id`), **never** an empty `200` — so a vulnerability query cannot read a
   transient Postgres outage as "installed nowhere" (ADR-0016 §7 authoritative reads).
   Distinct from a genuinely empty result (`200` with `count: 0`), which means the query
-  succeeded and matched nothing in your scope.
+  succeeded and matched nothing in your scope. An unexpected `503` here for a
+  management-group-scoped-only caller (no global grant) correlates with the
+  `YuzuMgmtGroupReadDegraded` Prometheus alert firing — a management-group store
+  degrade, not an authorization problem; retry once it clears (sre, governance run
+  2026-08-20).
 
 **Narrow scope on a large fleet (applies to *both* the MCP tool and the REST
 endpoint).** The 1000-row cap is applied by the store *before* the management-group
@@ -266,12 +336,15 @@ same data, with three tabs:
   doesn't collect them (a future operator-set CMDB enrichment). A large device list is
   rendered first-N with the total shown; use the filter to narrow.
 - **Find software** — type an exact title to see **which devices run it** and at which
-  versions. Like the REST/MCP siblings, Find is gated on the **global `Inventory:Read`**
-  and returns **fleet-wide** results: management-group confinement is **not yet effective**
-  on this list view (the per-row scope filter is a foundation for the ADR-0017
-  admit-then-filter gate, #1716, not effective list-confinement today — only the
-  per-device drill is scoped). 1000-row cap; a short/zero result under a narrow scope is
-  *incomplete*, not *absent* (keyset paging is the #1634 follow-up).
+  versions. **Unlike the REST/MCP siblings** (migrated onto `require_fleet_read`, #3290
+  Phase 2, with real management-group + service-scope confinement), Find is still gated on
+  the **global `Inventory:Read`** and returns **fleet-wide** results: management-group
+  confinement is **not yet effective** on this list view (the per-row scope filter is a
+  foundation for the ADR-0017 admit-then-filter gate, not effective list-confinement today
+  on this surface — only the per-device drill is scoped; migrating this tab is tracked in
+  `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`). 1000-row cap; a
+  short/zero result under a narrow scope is *incomplete*, not *absent* (keyset paging is the
+  #1634 follow-up).
 
 **On store degradation** the **Software**, **Find**, and **per-device-software** views —
 the *authoritative* reads — show an explicit **"unavailable"** banner rather than an

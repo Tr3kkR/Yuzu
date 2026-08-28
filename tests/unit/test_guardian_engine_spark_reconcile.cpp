@@ -9,10 +9,13 @@
 #include <yuzu/agent/kv_store.hpp>
 
 #include "guaranteed_state.pb.h"
+#include "guardian_backend.hpp" // guardian_backend_from_state/label (#2298 F13)
+#include "guardian_convergence_scheduler.hpp" // ConvergenceScheduler (started_for_test, #2238)
 #include "guardian_journal_format.hpp" // kJournalNamespace, parse_journal_batch (item 7 PR-Ag)
 #include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (aggregate inertness)
 #include "guardian_lifecycle_journal.hpp" // GuardianLifecycleJournal (for the _for_test fault seam)
 #include "guardian_outbox.hpp" // OutboxEntry, SendResult - full definitions for the test's send_fn
+#include "guardian_outbox_drain_worker.hpp" // GuardianOutboxDrainWorker (started_for_test, #2238)
 #include "spark_engine.hpp"
 #include "spark_mechanism.hpp"
 
@@ -20,6 +23,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
@@ -30,6 +34,8 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <atomic>
 #include <condition_variable>
 #include <thread>
@@ -109,6 +115,10 @@ public:
         std::lock_guard<std::mutex> lk{mu_};
         return watched_.size();
     }
+    std::set<std::string> watched_snapshot() {
+        std::lock_guard<std::mutex> lk{mu_};
+        return watched_;
+    }
 
 private:
     std::mutex mu_;
@@ -117,7 +127,12 @@ private:
 };
 
 // Service: the ONE type with a mechanism registered in this fixture -> Arm.
-gpb::GuaranteedStateRule make_service_rule(const std::string& id, bool enabled = true) {
+// `service` defaults to "Spooler" so every existing call site is unaffected;
+// tests that need to distinguish which of several rules armed pass a distinct
+// name (#2238 item 1 - three rules sharing one service name would all derive
+// the same spark key and be indistinguishable in the mechanism's watch set).
+gpb::GuaranteedStateRule make_service_rule(const std::string& id, bool enabled = true,
+                                           const std::string& service = "Spooler") {
     gpb::GuaranteedStateRule r;
     r.set_rule_id(id);
     r.set_name(id);
@@ -126,7 +141,7 @@ gpb::GuaranteedStateRule make_service_rule(const std::string& id, bool enabled =
     r.mutable_spark()->set_type("service-status-change");
     auto* a = r.mutable_assertion();
     a->set_type("service-running");
-    (*a->mutable_params())["service_name"] = "Spooler";
+    (*a->mutable_params())["service_name"] = service;
     return r;
 }
 
@@ -447,6 +462,104 @@ TEST_CASE("a production-order restart reconstructs unsupported_rules_ from cache
     REQUIRE(counts.count(SparkType::File) == 1);
     CHECK(counts.at(SparkType::File) == 1);
 
+    engine.stop();
+    spark_engine.stop();
+}
+
+TEST_CASE("start_local degrades per-rule when a re-arm throws: the other cached rules "
+          "still arm",
+          "[spark][guardian][reconcile][boot]") {
+    // #2238 item 1 (fixes BLOCKING-2a): guardian_engine.cpp's start_local() catches a
+    // std::system_error thrown while re-arming a single cached rule (modelling a legacy
+    // guard's std::thread ctor throwing under thread/handle exhaustion) and continues to
+    // the next rule instead of letting the throw escape and terminate the agent. Nothing
+    // in production can force that throw deterministically (see the handover's survey of
+    // guard_systemd.cpp / guard_file.cpp / guard_registry.cpp), so this drives it via
+    // set_rearm_fault_hook_for_test, aimed at exactly one rule by id, and proves: (a)
+    // start_local() still returns success, (b) the OTHER cached rules still arm, and (c)
+    // an error is logged naming the failed rule.
+    const auto kv_path = unique_kv_path();
+    yuzu::test::TempDbFile db{kv_path};
+
+    // Phase 1: seed three rules with distinct service names, all armable via spark.
+    {
+        auto opened = KvStore::open(kv_path);
+        REQUIRE(opened.has_value());
+        KvStore kv{std::move(*opened)};
+        SparkEngine spark_engine;
+        auto mech = std::make_unique<FakeServiceMechanism>();
+        REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
+        spark_engine.start();
+        GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+        REQUIRE(engine.start_local().has_value());
+        engine.wire_spark_engine(&spark_engine, false,
+                                 [](const OutboxEntry&) { return SendResult::Sent; });
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        *p.add_rules() = make_service_rule("r1", true, "SvcA");
+        *p.add_rules() = make_service_rule("r2", true, "SvcB");
+        *p.add_rules() = make_service_rule("r3", true, "SvcC");
+        REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString())
+                    .exit_code == 0);
+        REQUIRE(engine.spark_armed_rule_count() == 3);
+        engine.stop();
+        spark_engine.stop();
+    }
+
+    // Phase 2: production order (wire_spark_engine before start_local), so spark is
+    // Available during the re-arm walk and the un-poisoned rules can actually arm on
+    // Linux (legacy guard start() stubs return false here - only the spark backend can
+    // demonstrate "other rules still arm").
+    auto opened = KvStore::open(kv_path);
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    auto mech = std::make_unique<FakeServiceMechanism>();
+    FakeServiceMechanism* mechanism = mech.get();
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
+    spark_engine.start();
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+    engine.wire_spark_engine(&spark_engine, false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+
+    engine.set_rearm_fault_hook_for_test([](const std::string& rule_id) {
+        if (rule_id == "r2")
+            throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again),
+                                    "injected thread exhaustion");
+    });
+
+    REQUIRE(engine.start_local().has_value()); // degrade contract: success despite one poisoned rule
+
+    // Assert BEFORE stop() - stop() unwinds spark watch state.
+    CHECK(engine.rule_count() == 3);           // cache intact, including the poisoned rule
+    CHECK(engine.spark_armed_rule_count() == 2); // r1 + r3 only
+    const auto watched = mechanism->watched_snapshot();
+    const bool has_a =
+        std::any_of(watched.begin(), watched.end(), [](const std::string& k) { return k.find("SvcA") != std::string::npos; });
+    const bool has_b =
+        std::any_of(watched.begin(), watched.end(), [](const std::string& k) { return k.find("SvcB") != std::string::npos; });
+    const bool has_c =
+        std::any_of(watched.begin(), watched.end(), [](const std::string& k) { return k.find("SvcC") != std::string::npos; });
+    CHECK(has_a);
+    CHECK_FALSE(has_b); // the poisoned rule never armed
+    CHECK(has_c);
+    CHECK(mechanism->watching_count() == 2);
+
+    // Read directly off the engine, not via spdlog: a captured-logger swap in the test
+    // binary was found (macOS CI) to be invisible to spdlog:: calls made inside guardian_engine.cpp,
+    // which is compiled into the separate libyuzu_agent_core shared library - the same class
+    // of cross-image state-duplication problem as the #501 abseil hash-seed split. Plain
+    // object-member state has no such hazard, hence last_rearm_degrade_message_for_test().
+    // "re-armed=2" is deliberately not re-checked here - spark_armed_rule_count()==2 above
+    // already proves the same fact more directly.
+    const std::string degrade_msg = engine.last_rearm_degrade_message_for_test();
+    CHECK(degrade_msg.find("r2") != std::string::npos);
+    CHECK(degrade_msg.find("failed to re-arm") != std::string::npos);
+    CHECK(degrade_msg.find("NOT enforcing") != std::string::npos);
+    CHECK(degrade_msg.find("injected thread exhaustion") != std::string::npos);
+
+    engine.set_rearm_fault_hook_for_test(nullptr);
     engine.stop();
     spark_engine.stop();
 }
@@ -834,6 +947,48 @@ TEST_CASE("journal_age_stats: present on a live prefer_spark worker, nullopt whe
         CHECK(tags.empty());
         engine.stop();
         spark_engine.stop();
+    }
+}
+
+TEST_CASE("wire_spark_engine constructs the spark workers unconditionally but starts them "
+          "ONLY under prefer_spark",
+          "[spark][guardian][reconcile]") {
+    // #2238 item 2 (fixes BLOCKING-2b): the convergence scheduler + drain worker are
+    // CONSTRUCTED in wire_spark_engine() regardless of prefer_spark_, but only START()ed
+    // under the flag (guardian_engine.cpp's `if (prefer_spark_) { ...->start(); ...
+    // ->start(); }`). Reverting that gate to always-start fails no other existing test
+    // (journal_age_stats() short-circuits on !prefer_spark_ before it would ever see a
+    // started-but-dormant worker). This drives both classes' started_for_test() directly.
+    {
+        // prefer_spark=false + wired: both constructed, neither started.
+        auto opened = KvStore::open(unique_kv_path());
+        REQUIRE(opened.has_value());
+        KvStore kv{std::move(*opened)};
+        SparkEngine spark_engine;
+        auto mech = std::make_unique<FakeServiceMechanism>();
+        REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
+        spark_engine.start();
+        GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/false};
+        REQUIRE(engine.start_local().has_value());
+        engine.wire_spark_engine(&spark_engine, false,
+                                 [](const OutboxEntry&) { return SendResult::Sent; });
+        REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+
+        REQUIRE(engine.drain_worker_for_test() != nullptr);
+        REQUIRE(engine.convergence_scheduler_for_test() != nullptr);
+        CHECK_FALSE(engine.drain_worker_for_test()->started_for_test());
+        CHECK_FALSE(engine.convergence_scheduler_for_test()->started_for_test());
+
+        engine.stop();
+        spark_engine.stop();
+    }
+    {
+        // prefer_spark=true (SparkReconcileFixture): both constructed AND started.
+        SparkReconcileFixture f;
+        REQUIRE(f.engine->drain_worker_for_test() != nullptr);
+        REQUIRE(f.engine->convergence_scheduler_for_test() != nullptr);
+        CHECK(f.engine->drain_worker_for_test()->started_for_test());
+        CHECK(f.engine->convergence_scheduler_for_test()->started_for_test());
     }
 }
 
@@ -1238,10 +1393,15 @@ TEST_CASE("PRODUCTION boot order: wire_spark_engine before start_local",
                                  [](const OutboxEntry&) { return SendResult::Retain; });
         gpb::GuaranteedStatePush p;
         p.set_full_sync(true);
+        // Distinct service names: the "Spooler" default collapses all five rules
+        // onto ONE spark key, and phase 2 needs to prove five DISTINCT re-watches
+        // survived the restart, not merely that some watch reappeared (#2298 F13).
         for (int i = 0; i < 5; ++i)
-            *p.add_rules() = make_service_rule("r" + std::to_string(i));
+            *p.add_rules() = make_service_rule("r" + std::to_string(i), true,
+                                               "Svc" + std::to_string(i));
         REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString())
                     .exit_code == 0);
+        REQUIRE(engine.spark_armed_rule_count() == 5); // armed via spark BEFORE the restart
         engine.journal_maintenance_tick(); // force the pending records durable
         engine.stop();
         spark_engine.stop();
@@ -1251,10 +1411,30 @@ TEST_CASE("PRODUCTION boot order: wire_spark_engine before start_local",
     auto opened = KvStore::open(kv_path);
     REQUIRE(opened.has_value());
     KvStore kv{std::move(*opened)};
+
+    // The durable journal must SURVIVE the restart (#2298 F13 goal 2). Read it from
+    // raw KV BEFORE constructing anything else: the phase-2 drain worker's first
+    // maintenance cycle pages/prunes immediately on wire, so reading after any
+    // engine exists would race that cycle instead of proving pre-restart durability.
+    {
+        auto surviving =
+            kv.list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix);
+        REQUIRE(surviving.has_value());
+        REQUIRE_FALSE(surviving->empty());
+        bool survived_armed_r0 = false;
+        for (const auto& row : *surviving) {
+            auto b = yuzu::agent::parse_journal_batch(row.value);
+            REQUIRE(b.has_value());
+            for (const auto& e : b->entries)
+                if (e.rule_id == "r0" && e.kind == "armed") survived_armed_r0 = true;
+        }
+        CHECK(survived_armed_r0);
+    }
+
     SparkEngine spark_engine;
-    REQUIRE(spark_engine.register_mechanism(SparkType::Service,
-                                            std::make_unique<FakeServiceMechanism>())
-                .has_value());
+    auto mech2 = std::make_unique<FakeServiceMechanism>();
+    auto* mechanism2 = mech2.get(); // borrowed; owned by spark_engine
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech2)).has_value());
     spark_engine.start();
 
     GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
@@ -1262,6 +1442,14 @@ TEST_CASE("PRODUCTION boot order: wire_spark_engine before start_local",
     engine.wire_spark_engine(&spark_engine, false,
                              [](const OutboxEntry&) { return SendResult::Sent; });
     REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+
+    // Spark machinery is running in the exact production window (post-wire,
+    // pre-start_local) - the direct observable that re-arm below runs against a
+    // LIVE spark backend, not one still spinning up.
+    REQUIRE(engine.drain_worker_for_test() != nullptr);
+    REQUIRE(engine.convergence_scheduler_for_test() != nullptr);
+    CHECK(engine.drain_worker_for_test()->started_for_test());
+    CHECK(engine.convergence_scheduler_for_test()->started_for_test());
 
     // ...and only THEN the pre-network re-arm, racing that maintenance on one KvStore.
     const auto start = std::chrono::steady_clock::now();
@@ -1281,8 +1469,222 @@ TEST_CASE("PRODUCTION boot order: wire_spark_engine before start_local",
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     CHECK(journal->pages() >= 1);
 
+    // The core F13 gap: rule_count() only proves the rules were RE-DISCOVERED. Prove
+    // they RE-ARMED VIA SPARK - mutual exclusion held, and each of the five distinct
+    // services is actually re-watched by the (new, phase-2) mechanism.
+    CHECK(engine.spark_armed_rule_count() == 5);
+    CHECK(engine.armed_guard_count() == 0);
+    CHECK(engine.unsupported_counts_by_type().empty());
+    const auto watched = mechanism2->watched_snapshot();
+    CHECK(mechanism2->watching_count() == 5);
+    for (int i = 0; i < 5; ++i) {
+        const std::string svc = "Svc" + std::to_string(i);
+        CHECK(std::any_of(watched.begin(), watched.end(),
+                          [&](const std::string& key) { return key.find(svc) != std::string::npos; }));
+    }
+    CHECK(std::string_view{yuzu::agent::guardian_backend_label(yuzu::agent::guardian_backend_from_state(
+              /*prefer_spark=*/true, engine.spark_availability()))} == "spark");
+
     engine.stop();
     spark_engine.stop();
+}
+
+TEST_CASE("a production-order restart into each degraded spark posture: cached rules "
+          "survive but spark NEVER half-arms",
+          "[spark][guardian][reconcile][boot]") {
+    // #2298 F13. The Available posture across a restart is covered above ("PRODUCTION
+    // boot order") and by "start_local degrades per-rule when a re-arm throws" (partial
+    // re-arm). This covers the other three SparkAvailability postures - SparkDisabled,
+    // SparkFailed, and BOTH shapes of Unwired - proving each is not just reported
+    // correctly on a single boot (see "wire_spark_engine reports Available; ..." above)
+    // but survives a restart with the mutual-exclusion invariant intact: a degraded
+    // posture NEVER silently falls back to legacy, and it never half-arms on spark
+    // either.
+    //
+    // Every leg re-checks spark_availability() AFTER start_local() too, not just after
+    // wire - stop()/start_local() never write spark_availability_, so pinning it twice
+    // is what "correct ACROSS a restart" means literally, not just "correct at wire time".
+    const auto seed_armed_rules = [](const fs::path& kv_path) {
+        auto opened = KvStore::open(kv_path);
+        REQUIRE(opened.has_value());
+        KvStore kv{std::move(*opened)};
+        SparkEngine spark_engine;
+        REQUIRE(spark_engine.register_mechanism(SparkType::Service,
+                                                std::make_unique<FakeServiceMechanism>())
+                    .has_value());
+        spark_engine.start();
+        GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+        REQUIRE(engine.start_local().has_value());
+        engine.wire_spark_engine(&spark_engine, false,
+                                 [](const OutboxEntry&) { return SendResult::Sent; });
+        REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        *p.add_rules() = make_service_rule("r1", true, "SvcA");
+        *p.add_rules() = make_service_rule("r2", true, "SvcB");
+        *p.add_rules() = make_service_rule("r3", true, "SvcC");
+        REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString())
+                    .exit_code == 0);
+        REQUIRE(engine.spark_armed_rule_count() == 3); // armed via spark BEFORE the restart
+        engine.stop();
+        spark_engine.stop();
+    };
+
+    { // SparkDisabled: --spark-disable at boot. Legacy is the CORRECT path here, not a
+      // fallback (guardian_engine.hpp's SparkDisabled doc), so armed_guard_count() is
+      // deliberately NOT asserted - Linux's legacy guard start() stubs return false
+      // regardless of correctness (the same trap documented at lines ~511 and
+      // ~889-891, in different test contexts), so the only portable assertion is
+      // that spark itself was never touched.
+        const auto kv_path = unique_kv_path();
+        yuzu::test::TempDbFile db{kv_path};
+        seed_armed_rules(kv_path);
+
+        auto opened = KvStore::open(kv_path);
+        REQUIRE(opened.has_value());
+        KvStore kv{std::move(*opened)};
+        GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+        engine.wire_spark_engine(nullptr, /*spark_disabled_by_config=*/true,
+                                 [](const OutboxEntry&) { return SendResult::Sent; });
+        REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::SparkDisabled);
+        REQUIRE(engine.start_local().has_value());
+
+        CHECK(engine.spark_availability() == GuardianEngine::SparkAvailability::SparkDisabled);
+        CHECK(engine.rule_count() == 3); // cache intact
+        CHECK(engine.spark_armed_rule_count() == 0);
+        CHECK(engine.unsupported_counts_by_type().empty()); // legacy-selected, not Unsupported
+        CHECK(engine.drain_worker_for_test() == nullptr);
+        CHECK(engine.convergence_scheduler_for_test() == nullptr);
+        CHECK(engine.lifecycle_journal_for_test() == nullptr); // wire returns before construction
+        CHECK_FALSE(engine.journal_age_stats().has_value());
+        CHECK(std::string_view{yuzu::agent::guardian_backend_label(
+                  yuzu::agent::guardian_backend_from_state(true, engine.spark_availability()))} ==
+              "legacy");
+        engine.stop();
+    }
+
+    { // SparkFailed (null-engine path): the boot machinery itself failed to construct.
+      // Errored, NEVER a silent fallback to legacy - the reconcile mutual-exclusion
+      // guard withdraws from BOTH backends.
+        const auto kv_path = unique_kv_path();
+        yuzu::test::TempDbFile db{kv_path};
+        seed_armed_rules(kv_path);
+
+        auto opened = KvStore::open(kv_path);
+        REQUIRE(opened.has_value());
+        KvStore kv{std::move(*opened)};
+        GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+        engine.wire_spark_engine(nullptr, /*spark_disabled_by_config=*/false, // boot failed
+                                 [](const OutboxEntry&) { return SendResult::Sent; });
+        REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::SparkFailed);
+        REQUIRE(engine.start_local().has_value());
+
+        CHECK(engine.spark_availability() == GuardianEngine::SparkAvailability::SparkFailed);
+        CHECK(engine.rule_count() == 3); // cache intact
+        CHECK(engine.spark_armed_rule_count() == 0);
+        // 0 today because reconcile_rule_locked's mutual-exclusion guard withdraws
+        // BEFORE ever calling start_guard_for_rule_locked - never a legacy fallback,
+        // and that holds on any host. Whether a HYPOTHETICAL regression here (the
+        // guard deleted) would still be caught is host-dependent, though: it hinges
+        // on whether SystemdServiceGuard::start() (the class make_service_guard
+        // dispatches to on Linux) can reach a system bus. Where it can (a live
+        // dbus.service - true on this box: the SparkDisabled leg's own log shows
+        // real "watching unit" entries, not "system bus unavailable"), a deleted
+        // guard would arm for real and armed_guard_count() would go nonzero,
+        // catching the regression. On a D-Bus-less CI sandbox, start() fails
+        // regardless of the guard's correctness (the SparkDisabled leg's own
+        // documented trap), and a deleted guard would stay silently masked. This
+        // assertion is deterministic proof against TODAY's code on any host; its
+        // power to catch a future regression varies by host D-Bus reachability.
+        CHECK(engine.armed_guard_count() == 0);
+        CHECK(engine.unsupported_counts_by_type().empty());
+        CHECK(engine.drain_worker_for_test() == nullptr);
+        CHECK(engine.convergence_scheduler_for_test() == nullptr);
+        CHECK(engine.lifecycle_journal_for_test() == nullptr); // null-engine branch returns first
+        CHECK_FALSE(engine.journal_age_stats().has_value());
+        CHECK(std::string_view{yuzu::agent::guardian_backend_label(
+                  yuzu::agent::guardian_backend_from_state(true, engine.spark_availability()))} ==
+              "spark_failed");
+        // Phase 1 DID wire spark (seed_armed_rules), so a durable journal was written -
+        // but this leg's phase-2 engine never constructs its own lifecycle_journal_ (the
+        // null-engine branch returns first, see the CHECK above), so there is nothing to
+        // page here. The raw-KV durability-survives-restart assertion lives in the
+        // extended "PRODUCTION boot order" test above.
+        engine.stop();
+    }
+
+    { // Unwired shape (a): never wired at all - the reconcile walk RUNS (rule_count()
+      // loads from cache) but the mutual-exclusion guard withdraws every rule from both
+      // backends, because SparkFailed/Unwired are NEVER a fallback path.
+        const auto kv_path = unique_kv_path();
+        yuzu::test::TempDbFile db{kv_path};
+        seed_armed_rules(kv_path);
+
+        auto opened = KvStore::open(kv_path);
+        REQUIRE(opened.has_value());
+        KvStore kv{std::move(*opened)};
+        GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+        REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Unwired);
+        REQUIRE(engine.start_local().has_value());
+
+        CHECK(engine.spark_availability() == GuardianEngine::SparkAvailability::Unwired);
+        CHECK(engine.rule_count() == 3); // the walk ran and loaded the cache
+        CHECK(engine.spark_armed_rule_count() == 0);
+        CHECK(engine.armed_guard_count() == 0); // see the SparkFailed leg's comment above -
+                                                 // same mutual-exclusion-guard-vs-D-Bus-stub caveat
+        CHECK(engine.unsupported_counts_by_type().empty());
+        CHECK(engine.drain_worker_for_test() == nullptr);
+        CHECK(engine.convergence_scheduler_for_test() == nullptr);
+        CHECK(engine.lifecycle_journal_for_test() == nullptr);
+        CHECK_FALSE(engine.journal_age_stats().has_value());
+        CHECK(std::string_view{yuzu::agent::guardian_backend_label(
+                  yuzu::agent::guardian_backend_from_state(true, engine.spark_availability()))} ==
+              "unwired");
+        engine.stop();
+    }
+
+    { // Unwired shape (b): the SIGTERM-beats-boot race - stop() lands before
+      // wire_spark_engine(), which is sticky and no-ops. A real concurrent stop() would
+      // simply block on the same mutex until start_local()'s walk finished, so a
+      // sequential stop() before wire reproduces the race's only observable effect
+      // faithfully (see stopped_'s two guard sites in guardian_engine.cpp).
+        const auto kv_path = unique_kv_path();
+        yuzu::test::TempDbFile db{kv_path};
+        seed_armed_rules(kv_path);
+
+        auto opened = KvStore::open(kv_path);
+        REQUIRE(opened.has_value());
+        KvStore kv{std::move(*opened)};
+        SparkEngine spark_engine; // a healthy engine, offered but never touched
+        auto mech = std::make_unique<FakeServiceMechanism>();
+        auto* mechanism = mech.get();
+        REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
+        spark_engine.start();
+        GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+
+        engine.stop(); // SIGTERM beat boot; sets the sticky stopped_ flag
+        engine.wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
+                                 [](const OutboxEntry&) { return SendResult::Sent; });
+        // no-oped
+        REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Unwired);
+
+        REQUIRE(engine.start_local().has_value()); // sticky-stop early return: SUCCESS, not an error
+
+        CHECK(engine.spark_availability() == GuardianEngine::SparkAvailability::Unwired);
+        CHECK(engine.rule_count() == 0); // the walk never ran - refresh_count_locked() never fired
+        CHECK(engine.spark_armed_rule_count() == 0);
+        CHECK(engine.armed_guard_count() == 0);
+        CHECK(engine.unsupported_counts_by_type().empty());
+        CHECK(engine.drain_worker_for_test() == nullptr);
+        CHECK(engine.convergence_scheduler_for_test() == nullptr);
+        CHECK(engine.lifecycle_journal_for_test() == nullptr);
+        CHECK_FALSE(engine.journal_age_stats().has_value());
+        CHECK(mechanism->watching_count() == 0); // offered, but the sticky stop kept it untouched
+        CHECK(std::string_view{yuzu::agent::guardian_backend_label(
+                  yuzu::agent::guardian_backend_from_state(true, engine.spark_availability()))} ==
+              "unwired");
+        spark_engine.stop();
+    }
 }
 
 TEST_CASE("prefer_spark=true: pending records are durable BEFORE stop() joins the drain worker",
@@ -1393,4 +1795,86 @@ TEST_CASE("prefer_spark=true: pending records are durable BEFORE stop() joins th
     send_cv.notify_all();
     stopper.join();
     spark_engine.stop();
+}
+
+TEST_CASE("start-drain-then-stop: the this-capturing send races stop()'s join (TSan "
+          "checkpoint)",
+          "[spark][guardian][reconcile][drain][tsan]") {
+    // #2238 item 3: no test started the drain worker with a REAL this-capturing send and
+    // raced a stop()/teardown against an in-flight send. The literal production callback
+    // (AgentImpl::send_guardian_outbox_entry, agent.cpp) is unlinkable from unit tests -
+    // AgentImpl is file-local to agent.cpp with zero test references - so this drives the
+    // fixture-level this-capturing send instead: SparkReconcileFixture's send lambda
+    // captures `this` and writes through a mutex-guarded vector, the same shape as
+    // production's stream_write_mu_-guarded write (agent.cpp's send_guardian_outbox_entry).
+    // Licensed by the drain contract (guardian_outbox_drain_worker.hpp): send MAY capture
+    // `this` because stop() always synchronously joins the worker before the callback's
+    // captures can dangle.
+    //
+    // Asserts liveness only - no timing upper bound, no exact send count (standing flake
+    // doctrine; see the drain-worker file's jitter-race test). This exists so nightly TSan
+    // actually DRIVES the start-drain-then-stop race, "safe by inspection" being the same
+    // posture the drain-worker file's own [tsan] checkpoints take for worker-vs-reader and
+    // worker-vs-persister races.
+    SparkReconcileFixture f{/*periodic_bound_ms=*/1};
+
+    // Two independent dispatch threads contend against the live drain worker + 4
+    // convergence-scheduler lanes. The pusher thread must NOT use Catch2 assertion
+    // macros (REQUIRE/CHECK) - those are main-thread-only - so it records raw exit codes
+    // for the main thread to assert after joining it.
+    std::mutex pusher_mu;
+    std::vector<int> pusher_exit_codes;
+    std::thread pusher{[&] {
+        for (int i = 0; i < 6; ++i) {
+            gpb::GuaranteedStatePush p;
+            p.set_full_sync(false);
+            *p.add_rules() = make_service_rule("p" + std::to_string(i), true,
+                                               "SvcP" + std::to_string(i));
+            auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine,
+                                                                         p.SerializeAsString());
+            std::lock_guard<std::mutex> lk{pusher_mu};
+            pusher_exit_codes.push_back(dr.exit_code);
+        }
+    }};
+    // A fatal assertion in the main-thread loop below (f.apply()'s REQUIRE) can unwind
+    // while pusher is still running. Join on scope exit so an unwind cannot destroy a
+    // joinable std::thread (std::terminate) and mask the real assertion failure behind
+    // a raw abort - same shape as ReleaseParkedWorker earlier in this file.
+    struct JoinOnExit {
+        std::thread& t;
+        ~JoinOnExit() {
+            if (t.joinable())
+                t.join();
+        }
+    } join_pusher_on_exit{pusher};
+    for (int i = 0; i < 6; ++i)
+        f.apply(make_service_rule("m" + std::to_string(i), true, "SvcM" + std::to_string(i)),
+                /*full_sync=*/false);
+
+    // Test-side lifetime only: the pusher thread dereferences f.engine, so it must finish
+    // before anything tears that down - not a production ordering constraint. Redundant
+    // with JoinOnExit's destructor on the non-throwing path (join() on an already-joined
+    // thread throws std::system_error, but joinable() is false by then, so the guard's
+    // join is skipped).
+    pusher.join();
+    {
+        std::lock_guard<std::mutex> lk{pusher_mu};
+        for (int code : pusher_exit_codes)
+            CHECK(code == 0);
+    }
+
+    REQUIRE(yuzu::test::spin_until([&] {
+        std::lock_guard<std::mutex> lk{f.sent_mu};
+        return !f.sent.empty();
+    }));
+
+    // Immediately tear down while sends may be in flight: ~GuardianEngine's stop() holds
+    // mtx_ across scheduler stop + the drain worker's join, racing whatever send is
+    // mid-callback right now. This is the race under test.
+    f.engine.reset();
+
+    std::lock_guard<std::mutex> lk{f.sent_mu};
+    CHECK(!f.sent.empty());
+    for (const auto& e : f.sent)
+        CHECK(!e.event_id.empty());
 }

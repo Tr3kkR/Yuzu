@@ -246,8 +246,20 @@ reasoning): `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md
   the tag being written IS the confinement boundary. A third, related
   finding — a live agent's in-memory self-reported tags shadowing the store
   during scope-DSL evaluation (`agent_registry.cpp`), independent of any
-  TagStore write — surfaced during the same review and is tracked
-  separately (#3295), not folded into this fix.
+  TagStore write — surfaced during the same review and was tracked
+  separately as #3295; it is now CLOSED: the `evaluate_scope` `tag:<key>`
+  resolver is store-first (a TagStore row of any source wins over a
+  connected agent's live claim; the in-memory value answers only when the
+  store has no row at all — e.g. a gateway-proxied agent, whose tags never
+  reach the store), and `register_agent` drops an agent-claimed `service`
+  key from the session entirely at ingest, the same way sync already drops
+  it from the store. `derive_exec_visible` and the dynamic service
+  management groups (`server.cpp`) were already store-only and unaffected
+  by #3295 either way — the confinement ceiling this ADR establishes was
+  never in question; the fix closes a narrower gap in dispatch-targeting
+  and cohort-selection scope-DSL evaluation. Full precedence rule:
+  `docs/asset-tagging-guide.md` "Tag source precedence (read time,
+  scope-DSL, #3295)".
 - **No cached derived confinement sets.** Every check in this design reads
   live state (RBAC grants, the allow-list, tag data) — no precomputed
   "this token can see these agents" cache is introduced, avoiding a whole
@@ -294,3 +306,36 @@ reasoning): `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md
   residual per-file helpers only remain for the smaller, now-closed §3e
   set, where the cost of a shared chokepoint no longer clearly outweighs
   the risk of a mid-migration call-site gap.
+
+## Update (2026-08-20, #3290 — Phase 2 begins)
+
+The first Phase 2 migration landed: `GET /api/v1/inventory/software` +
+its MCP twin `query_installed_software` are now on `require_fleet_read`,
+with their `deny_fleet_wide_service_scoped`/blanket-deny call sites
+retired. Two corrections to this ADR's own text, found while implementing:
+
+- **"Metric-prioritized" (Decision 2, above) does not hold yet.** There is
+  no production fleet, so `yuzu_auth_service_scope_default_denied_total`
+  carries no real traffic to rank migration order by. The substitute is
+  **documented reasoning** — rank by plausible ITServiceOwner value
+  (read-only high-value fleet reads first, mutations last) with the
+  reasoning recorded per migration, satisfying "rather than guessing" in
+  spirit without the metric data the original wording assumed would
+  exist by now. Revisit this bullet once real traffic exists.
+- **`require_fleet_read` gained the caller-class branches Decision 3
+  above never mentions needing.** Phase 0 (PR #3216) shipped it with none
+  of `require_permission`/`require_list_read`'s elevated/engine/mcp_tier
+  handling — harmless while it had zero callers, but a real regression
+  the moment a route migrates onto it: an engine principal under RBAC-off
+  would otherwise fall through to `authorize_list_read`'s legacy-open
+  `AdmitAll` (the exact fleet-wide-Read-on-RBAC-off hole Decision 3's
+  engine carve-out exists to close everywhere else), and a JIT-elevated
+  operator with no underlying grant would otherwise 403 (the #3038
+  regression class). #3290 added these branches, mirroring
+  `require_list_read`'s ladder, not `require_permission`'s (no
+  belt-and-braces service-scope check — `require_fleet_read` has no
+  `kServiceScopeGlobalSafe` allow-list for a corrupted engine row to
+  bypass in the first place).
+
+Ranked backlog, prioritization reasoning, and the migration checklist for
+subsequent routes: `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`.

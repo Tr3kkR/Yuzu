@@ -87,6 +87,28 @@ enum class AuthDBError : std::uint8_t {
     /// ever being told. Callers MUST surface this distinctly (503-class —
     /// retry/alert, never "reduced security posture and proceed").
     SecretUnavailable,
+    /// ★ The pool lease could not be acquired (an empty lease) — a TRANSIENT
+    /// store outage (pool saturation, or the shared pool's connect-backoff
+    /// breaker fast-failing every acquire for its 200ms..5s window after a
+    /// connectivity hiccup), NOT a query that ran and errored. Distinct from
+    /// `QueryFailed`/`WriteFailed` (a SELECT/UPDATE that executed against a live
+    /// connection and came back non-`PGRES_TUPLES_OK`) so the fail-closed 503
+    /// site can label its degrade metric `reason=pool_acquire_timeout` vs
+    /// `reason=query_error` (#2396/#2401). It is a store-unavailable outcome —
+    /// `is_store_unavailable()` returns true for it and every existing 503
+    /// mapping is preserved. StoreBusy means "empty lease", period: the bounded
+    /// acquire-retry (`acquire_with_retry`) is orthogonal — it just reduces how
+    /// often StoreBusy is returned on the two off-stripe login-decision reads
+    /// (`mfa_status`/`load_mfa_row`) that can afford to wait, and there StoreBusy
+    /// follows retry-exhaustion; the stripe-held login acquires
+    /// (`lockout_status`/`record_failed_login`/`clear_failed_logins`) return it
+    /// on a single un-retried acquire (retrying under the login stripe would
+    /// amplify an outage into worker starvation — see `acquire_with_retry`).
+    /// Either way it never weakens fail-closed: a genuine outage still 503s.
+    /// (Other AuthDB methods outside this login set still report an acquire
+    /// timeout as `QueryFailed`/`WriteFailed`; they emit no degrade metric, so
+    /// the reason split does not reach them — see `is_store_unavailable`.)
+    StoreBusy,
 };
 
 /// True iff `e` reflects the AuthDB store itself being unavailable (PG
@@ -103,7 +125,7 @@ enum class AuthDBError : std::uint8_t {
 /// the intended fail-closed 503.
 [[nodiscard]] inline bool is_store_unavailable(AuthDBError e) noexcept {
     return e == AuthDBError::SecretUnavailable || e == AuthDBError::QueryFailed ||
-           e == AuthDBError::WriteFailed;
+           e == AuthDBError::WriteFailed || e == AuthDBError::StoreBusy;
 }
 
 /// `list_users_including_inactive()` row — same fields as `auth::UserEntry`

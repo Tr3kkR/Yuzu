@@ -265,6 +265,43 @@ TEST_CASE("rule_assertion_from_rule: debounce_ms is sourced from the remediation
     CHECK(a->debounce_ms == 5000);
 }
 
+TEST_CASE("rule_assertion_from_rule: absent event_debounce_ms defaults per-lane, not to "
+          "legacy's flat 1000ms (#3388)",
+          "[spark][bridge][assertion]") {
+    // No event_debounce_ms set on any of these - forces the fallback path. Legacy's
+    // 1000ms default (still used by every guard_*.cpp call site, unaffected by this
+    // change) expires before every convergence sweep (60s/600s), so a persistently-
+    // drifted rule re-emitted on every single sweep. The lane-aware default is each
+    // lane's own cadence + the scheduler's jitter margin (spark.hpp), so debounce
+    // reliably survives at least one full sweep even at the jitter-shortened extreme.
+    SECTION("file lane: 600s cadence + 20% jitter margin = 720s") {
+        const auto a = rule_assertion_from_rule(make_rule("r", "file-change", "file-exists", {}));
+        REQUIRE(a.has_value());
+        CHECK(a->debounce_ms == 720'000);
+    }
+    SECTION("registry lane: 60s cadence + 20% jitter margin = 72s") {
+        const auto a = rule_assertion_from_rule(
+            make_rule("r", "registry-change", "registry-value-equals",
+                     {{"hive", "HKLM"}, {"key", "Software\\Yuzu"}}));
+        REQUIRE(a.has_value());
+        CHECK(a->debounce_ms == 72'000);
+    }
+    SECTION("service lane: 60s cadence + 20% jitter margin = 72s") {
+        const auto a = rule_assertion_from_rule(
+            make_rule("r", "service-status-change", "service-running", {{"service_name", "sshd"}}));
+        REQUIRE(a.has_value());
+        CHECK(a->debounce_ms == 72'000);
+    }
+    SECTION("an explicit event_debounce_ms still overrides the lane default") {
+        Rule r = make_rule("r", "registry-change", "registry-value-equals",
+                          {{"hive", "HKLM"}, {"key", "Software\\Yuzu"}});
+        set_remediation_param(r, "event_debounce_ms", "5000");
+        const auto a = rule_assertion_from_rule(r);
+        REQUIRE(a.has_value());
+        CHECK(a->debounce_ms == 5000); // author's explicit value, not the 72s lane default
+    }
+}
+
 TEST_CASE("rule_assertion_from_rule: an unrecognized spark type is an error",
           "[spark][bridge][assertion]") {
     const auto a = rule_assertion_from_rule(make_rule("r", "banana", "file-exists", {}));

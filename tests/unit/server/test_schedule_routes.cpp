@@ -132,7 +132,11 @@ struct ScheduleRouteHarness {
         // tries to open a file underneath it.
         std::filesystem::create_directories(tmp.path);
 
-        analytics = std::make_unique<AnalyticsEventStore>(tmp.path / "analytics.db");
+        // AnalyticsEventStore ported to Postgres (ADR-0049): schema-per-store
+        // on the same shared pool as rbac above (ADR-0008's production model)
+        // rather than a second ephemeral database.
+        analytics = std::make_unique<AnalyticsEventStore>(*rbac_pool);
+        REQUIRE(analytics->is_open());
 
         auth_routes = std::make_unique<AuthRoutes>(
             cfg, auth_mgr, &*rbac, api_tokens.get(),
@@ -340,76 +344,16 @@ TEST_CASE("POST /api/schedules: a service-scoped token is denied even holding "
     CHECK_FALSE(body["error"].contains("permission"));
 }
 
-TEST_CASE("deny_service_scoped_schedule: denies a service-scoped session, writes 403, "
-          "leaves an ordinary session untouched",
-          "[server][schedule][guardian-confinement][rest][pg]") {
-    ScheduleRouteHarness h;
-
-    SECTION("service-scoped token -> 403, caller must return") {
-        auto req = h.service_scoped_request_for("svc-enabler", "ServiceExecute",
-                                                 {{"Execution", "Execute"}}, "printers");
-        httplib::Response res;
-        bool denied = deny_service_scoped_schedule(*h.auth_routes, req, res, "schedule.enable",
-                                                    "sched-123");
-        CHECK(denied);
-        CHECK(res.status == 403);
-        CHECK(res.body.find("service-scoped") != std::string::npos);
-        // #3167: no `.permission` (no grant admits a service-scoped caller
-        // here — a caller passing a non-empty override would itself be a
-        // bug), and header/body correlation-id parity.
-        auto body = nlohmann::json::parse(res.body, nullptr, false);
-        REQUIRE_FALSE(body.is_discarded());
-        CHECK_FALSE(body["error"].contains("permission"));
-        CHECK_FALSE(body["error"]["correlation_id"].get<std::string>().empty());
-        CHECK(res.get_header_value("X-Correlation-Id") ==
-             body["error"]["correlation_id"].get<std::string>());
-    }
-
-    SECTION("service-scoped token, an upstream gate already minted a "
-            "correlation id -> reused, not overwritten") {
-        // Pre-#3167, this call site set X-Correlation-Id unconditionally via
-        // res.set_header, which emplaces into httplib's header multimap
-        // rather than replacing in place — an earlier gate's minted id would
-        // have gained a second entry rather than being overwritten, both of
-        // which reach the wire (unlike every sibling deny_service_scoped_*
-        // helper, which reuses via ensure_correlation_id). Pin the fixed
-        // behavior directly:
-        // empirically, this SECTION fails against the pre-#3167 code
-        // (get_header_value returns the freshly-minted id, not the upstream
-        // one), confirming it's a genuine, non-vacuous regression test.
-        auto req = h.service_scoped_request_for("svc-enabler", "ServiceExecute",
-                                                 {{"Execution", "Execute"}}, "printers");
-        httplib::Response res;
-        res.set_header("X-Correlation-Id", "req-upstream-cid");
-        bool denied = deny_service_scoped_schedule(*h.auth_routes, req, res, "schedule.enable",
-                                                    "sched-123");
-        CHECK(denied);
-        CHECK(res.get_header_value("X-Correlation-Id") == "req-upstream-cid");
-        auto body = nlohmann::json::parse(res.body, nullptr, false);
-        REQUIRE_FALSE(body.is_discarded());
-        CHECK(body["error"]["correlation_id"] == "req-upstream-cid");
-    }
-
-    SECTION("ordinary session -> not denied, response left untouched") {
-        auto req = h.session_request_for("ordinary-op", "OrdinaryExecute",
-                                         {{"Execution", "Execute"}});
-        httplib::Response res;
-        bool denied = deny_service_scoped_schedule(*h.auth_routes, req, res, "schedule.enable",
-                                                    "sched-123");
-        CHECK_FALSE(denied);
-        CHECK(res.status != 403);
-        CHECK(res.body.empty());
-    }
-
-    SECTION("no session at all -> not denied (caller's own permission gate handles it)") {
-        httplib::Request req; // no cookie, no Authorization header
-        httplib::Response res;
-        bool denied = deny_service_scoped_schedule(*h.auth_routes, req, res, "schedule.enable",
-                                                    "sched-123");
-        CHECK_FALSE(denied);
-        CHECK(res.body.empty());
-    }
-}
+// deny_service_scoped_schedule and its direct unit-test block used to sit
+// here — retired together (#3290 Phase 2 bucket 1a): the function's only
+// four call sites (this file's handle_create_schedule, and three inline
+// server.cpp schedule routes) all fire after their route's own
+// require_permission gate, which guardian-confinement-2298 PR 3 ("the
+// flip") made provably dead — a service-scoped session can never reach any
+// of them. The route-level regression test above ("a service-scoped token
+// is denied even holding both Schedule:Write and Execution:Execute")
+// still proves the observable 403 behavior is unchanged; it's now produced
+// by require_permission directly instead of this retired helper.
 
 // guardian-confinement-2298 hardening sweep: extract_json_string only
 // matches a JSON *string*, so a real JSON boolean {"enabled":false} — the
