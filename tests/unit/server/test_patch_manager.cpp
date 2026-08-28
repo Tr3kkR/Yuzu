@@ -247,6 +247,34 @@ TEST_CASE("PatchManager: record_patches upserts and queries", "[patch_manager][p
     CHECK(summary.empty()); // nothing missing anymore
 }
 
+// Regression test (governance Gate 2, empirically reproduced): a single
+// record_patches() call whose `patches` vector repeats a kb_id used to fail
+// the WHOLE batch — Postgres refuses to let one INSERT ... ON CONFLICT DO
+// UPDATE affect the same conflict target twice ("command cannot affect row
+// a second time"), which would otherwise silently stall an agent's entire
+// inventory report on any scan carrying a duplicate kb_id. Last occurrence
+// in the vector must win (matches the SQLite-era per-row INSERT OR REPLACE
+// semantics).
+TEST_CASE("PatchManager: record_patches de-duplicates a repeated kb_id in one call",
+          "[patch_manager][pg][inventory]") {
+    PATCH_MANAGER(mgr);
+
+    mgr.record_patches("agent-1", {
+        {.kb_id = "KB1111111", .title = "stale title", .severity = "Low",
+         .status = "missing", .agent_id = "agent-1", .released_at = 100},
+        {.kb_id = "KB1111111", .title = "current title", .severity = "Critical",
+         .status = "installed", .agent_id = "agent-1", .released_at = 100},
+    });
+
+    // The whole call must succeed (not silently no-op), and the LAST entry
+    // for the duplicated kb_id must be the one that landed.
+    CHECK(mgr.get_missing_patches({.agent_id = "agent-1"}).empty());
+    auto installed = mgr.get_installed_patches({.agent_id = "agent-1"});
+    REQUIRE(installed.size() == 1);
+    CHECK(installed[0].title == "current title");
+    CHECK(installed[0].severity == "Critical");
+}
+
 // gov fjarvis B1 precedent (test_offline_endpoint_store.cpp): a reachable
 // database whose schema migration FAILS must leave the store !is_open() —
 // which server.cpp wires to startup_failed_ (fail closed, not

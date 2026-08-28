@@ -6238,12 +6238,20 @@ The one device list behind every network-quality drill: worst devices by a metri
 
 - **Response (201):** `{"deployment_id": "...", "kb_id": "...", "target_count": N, "status": "pending"}`
 
-> **Note:** Reboot orchestration requires the Yuzu agent to run with root (Linux/macOS) or Administrator (Windows) privileges. If the agent lacks these privileges, the reboot command will fail silently; the patch installation itself will still succeed.
+> **Note:** this creates a deployment record + a `pending` row per target — there is no server-side
+> scan/install/verify/reboot orchestration (`PatchManager::execute_deployment()` was removed;
+> ADR-0062, `docs/capability-map.md` §8.3/§8.4/§8.6, tracking issue #3669). Nothing advances a
+> target past `pending` except `POST /api/patches/deployments/:id/cancel` (→ `cancelled`).
+> `reboot_if_needed`/`reboot_delay_seconds`/`reboot_at` are accepted, clamped, and stored, but
+> nothing acts on them.
 
 **`GET /api/patches/deployments/:id`** — Deployment details with per-target status.
 
 - **Permission:** `Patch:Read`
-- **Response includes:** `reboot_delay_seconds`, `reboot_at`, and per-target `status` (pending, scanning, downloading, installing, verifying, rebooting, completed, failed, skipped, cancelled).
+- **Response includes:** `reboot_delay_seconds`, `reboot_at`, and per-target `status` — always `pending`
+  or `cancelled` today (the fuller `scanning`/`downloading`/`installing`/`verifying`/`rebooting`/
+  `completed`/`failed`/`skipped` vocabulary is reserved by the schema but nothing currently sets
+  it). `completed_targets`/`failed_targets` are set once at creation and never recalculated.
 
 **`GET /api/patches/deployments`** — List deployments (paginated, default limit 50).
 

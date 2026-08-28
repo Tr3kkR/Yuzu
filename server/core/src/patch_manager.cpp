@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <random>
 #include <regex>
+#include <unordered_map>
 
 namespace yuzu::server {
 
@@ -175,19 +176,33 @@ void PatchManager::record_patches(const std::string& agent_id,
     if (!open_ || patches.empty())
         return;
 
+    // De-duplicate on kb_id, LAST occurrence wins — matches the SQLite era's
+    // per-row INSERT OR REPLACE semantics (a later row for the same kb_id
+    // silently overwrote an earlier one within the same call). A single
+    // batch INSERT ... ON CONFLICT DO UPDATE cannot express that: Postgres
+    // rejects a statement that would affect the same conflict target twice
+    // ("ON CONFLICT DO UPDATE command cannot affect row a second time"),
+    // which would otherwise fail the WHOLE upsert — silently stalling this
+    // agent's entire inventory report, not just the duplicated row — on a
+    // scan report containing the same kb_id more than once.
+    std::unordered_map<std::string, const PatchInfo*> latest;
+    latest.reserve(patches.size());
+    for (const auto& p : patches)
+        latest[p.kb_id] = &p;
+
     std::vector<std::string_view> kb_ids, titles, severities, statuses;
     std::vector<std::string> released_ats;
-    kb_ids.reserve(patches.size());
-    titles.reserve(patches.size());
-    severities.reserve(patches.size());
-    statuses.reserve(patches.size());
-    released_ats.reserve(patches.size());
-    for (const auto& p : patches) {
-        kb_ids.emplace_back(p.kb_id);
-        titles.emplace_back(p.title);
-        severities.emplace_back(p.severity);
-        statuses.emplace_back(p.status);
-        released_ats.push_back(std::to_string(p.released_at));
+    kb_ids.reserve(latest.size());
+    titles.reserve(latest.size());
+    severities.reserve(latest.size());
+    statuses.reserve(latest.size());
+    released_ats.reserve(latest.size());
+    for (const auto& [kb_id, p] : latest) {
+        kb_ids.emplace_back(p->kb_id);
+        titles.emplace_back(p->title);
+        severities.emplace_back(p->severity);
+        statuses.emplace_back(p->status);
+        released_ats.push_back(std::to_string(p->released_at));
     }
     std::vector<std::string_view> released_at_views(released_ats.begin(), released_ats.end());
 

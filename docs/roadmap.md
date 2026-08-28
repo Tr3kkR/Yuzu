@@ -844,6 +844,12 @@ New `patch` plugin and server-side patch management:
 - **Plugin (agent-side):** Deploy patch (download + install), get status, test patch server connection, restart with notification
 - **Server-side:** Patch metadata retrieval (KB details, severity, supersedence), per-device compliance tracking, fleet-wide compliance dashboard, deployment orchestration with reboot control
 
+**Correction (ADR-0062, 2026-08-28):** server-side **deployment orchestration with reboot
+control** (`PatchManager::execute_deployment()`) had zero production callers and was removed —
+`POST /api/patches/deploy` creates deployment/target records only; see `docs/capability-map.md`
+§8.3/§8.4/§8.6 and tracking issue #3669. The other server-side capabilities listed above are
+unaffected.
+
 **Files:** New `agents/plugins/patch/`, `server/core/src/server.cpp`
 
 ### Issue 7.9: Product Packs (Bundled Definitions)
