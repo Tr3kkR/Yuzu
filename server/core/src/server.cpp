@@ -2449,6 +2449,30 @@ public:
         for (auto route : {"login", "mfa_verify", "mfa_stepup", "mfa_enroll", "elevate"}) {
             metrics_.counter("yuzu_auth_secret_unavailable_total", {{"route", route}});
         }
+        // #2396 / #2401: reason-labelled sibling of the counter above. Same
+        // fail-closed 503 sites in the initial POST /login handler, but split by
+        // WHY the auth store was unavailable — a transient pool-acquire timeout
+        // (reason=pool_acquire_timeout: the shared pool's connect-backoff
+        // breaker or saturation, the class the bounded acquire-retry in
+        // auth_db.cpp rides out) vs a query that ran and errored
+        // (reason=query_error) vs an undecryptable/absent secret
+        // (reason=secret_unavailable). Lets SRE tell a transient retry-storm
+        // apart from a uniform outage, which the route-only counter above cannot
+        // (#2401). Only the initial POST /login handler is instrumented; the
+        // other is_store_unavailable->503 auth sites (login/mfa, stepup, enroll,
+        // elevate) keep only yuzu_auth_secret_unavailable_total{route}. Reason
+        // token matches the yuzu_*_read_degrade_total family. Bounded, pre-seeded
+        // closed label set per docs/observability-conventions.md so absent()
+        // alerts stay meaningful.
+        metrics_.describe("yuzu_auth_read_degrade_total",
+                          "Requests refused 503 by an is_store_unavailable fail-closed guard in "
+                          "the initial POST /login handler, labelled by why the auth store was "
+                          "unavailable (pool_acquire_timeout / query_error / secret_unavailable)",
+                          "counter");
+        for (auto reason : {"pool_acquire_timeout", "query_error", "secret_unavailable"}) {
+            metrics_.counter("yuzu_auth_read_degrade_total",
+                             {{"route", "login"}, {"reason", reason}});
+        }
         // First-boot seed observability (authdb MEDIUM). Incremented exactly
         // once, iff `seed_admin_if_empty` actually seeded the sole admin row
         // (an empty `auth.users` table) — a no-op (table already populated,

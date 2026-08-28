@@ -3289,6 +3289,68 @@ publishing) live in `.claude/agents/authdb.md` — the AuthDB review agent
 loads them on any change to `auth_db.{hpp,cpp}` / `auth_routes.{hpp,cpp}` /
 `auth.{hpp,cpp}`.
 
+### Availability coupling and the transient-blip ride-out (#2396)
+
+Every password login makes several PostgreSQL-backed AuthDB calls — the
+lockout pre-check, `record_failed_login`/`clear_failed_logins`, and
+`mfa_status`. Under ADR-0006 the auth substrate is **fail-closed with no
+SQLite fallback**, so a store error on the MFA read (or the lockout write)
+returns a `503` and mints no session — deliberately, because collapsing an
+unreadable enrolled-MFA state to "not enrolled" would silently strip a
+privileged account of its second factor (see "MFA / TOTP" above). The cost is
+that a *transient* Postgres outage — most commonly the shared pool's
+**connect-backoff breaker** fast-failing every acquire for its 200 ms–5 s
+window after one connectivity hiccup — could deny **all** logins until it
+cleared.
+
+To keep a momentary blip from becoming a console lockout, the **login-decision
+reads** `mfa_status` and `load_mfa_row` retry the acquire within a small bounded
+budget (`acquire_with_retry` in `auth_db.cpp`: the first acquire keeps its full
+`kReadTimeout` budget, then up to `kAcquireRetries` short retries — worst-case
+≈600 ms extra). `mfa_status` is the exact call #2396 names as denying **all**
+logins: it `503`s a legitimate, correct-password login on a blip. This **never
+weakens fail-closed**: only the *acquire* is retried (a query that ran and
+errored is not retried — it will not self-heal in milliseconds), and on budget
+exhaustion the call still returns a store-unavailable error
+(`AuthDBError::StoreBusy`, which `is_store_unavailable()` treats as unavailable)
+→ `503`, no session.
+
+The retry is **deliberately not applied to the lockout-section acquires**
+(`lockout_status`, `record_failed_login`, `clear_failed_logins`), which run
+under the `/login` per-username stripe mutex: sleeping under that mutex during
+an outage would extend the per-username hold and let a same-username login
+pile-up pin one HTTP worker per attempt, starving unrelated routes
+(worker-pool starvation, closed in governance review). Those reads lose nothing
+by not retrying — `lockout_status`/`clear_failed_logins` fail **open** (a blip
+degrades the brute-force throttle for that attempt but never denies a valid
+login), and `record_failed_login` only gates a wrong-password attempt. So no
+`acquire_with_retry` call ever sleeps under the login stripe.
+
+The remaining `503`s are made honest and observable: they carry a
+`Retry-After` header and a `retry_after_ms` body field, and each fail-closed
+refusal **in the initial `POST /login` handler** increments
+`yuzu_auth_read_degrade_total{route,reason}` alongside the existing
+`yuzu_auth_secret_unavailable_total{route}`. The `reason` label distinguishes a
+transient acquire outage (`pool_acquire_timeout`) from a query that ran and
+errored (`query_error`) and from an undecryptable/absent secret
+(`secret_unavailable`), so SRE can tell a retry-storm apart from a uniform
+outage. **Use `yuzu_auth_read_degrade_total{reason="secret_unavailable"}`, not
+the coarser `yuzu_auth_secret_unavailable_total`, to alert on a KEK/secret
+outage** — the latter also moves on a plain pool blip (it counts every
+store-unavailable `503` on the secret path, not only secret-decrypt failures).
+The other `is_store_unavailable`→`503` auth sites (`/login/mfa`, step-up,
+enrollment, elevate) are not yet reason-instrumented (finer cardinality and
+wider coverage tracked as #2401).
+
+**Not addressed here, by design:** break-glass arming (`--break-glass-arm`)
+and `--mfa-reset` are host-CLI one-shots that also require a reachable
+Postgres and have no PostgreSQL-free local escape hatch — that is inherent to
+the ADR-0006 fail-closed posture, and the mitigation for a *sustained*
+database outage is Postgres high availability (the `/ha` workstream), not a
+local bypass that would itself weaken the fail-closed guarantee.
+`--postgres-pool-size` is the operator lever for reducing acquire contention
+on the live server (the login path runs on the shared server pool).
+
 ## RbacStore — the authorization substrate (Postgres, ADR-0041 — SQLite `rbac.db` retired)
 
 `RbacStore` (`server/core/src/rbac_store.{hpp,cpp}`) is the **authorization
